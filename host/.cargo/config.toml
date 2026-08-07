@@ -1,0 +1,5 @@
+# Where build.rs / nvidia-video-codec-sdk's build script find nvEncodeAPI.lib + nvcuvid.lib.
+# A real Video Codec SDK install (env override) takes precedence; the generated stubs below
+# are produced from the driver DLLs by scripts/make-nvenc-stubs.ps1 (one-time per machine).
+[env]
+NVIDIA_VIDEO_CODEC_SDK_PATH = { value = "sdk-stub", relative = true }

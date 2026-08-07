@@ -1,0 +1,30 @@
+[package]
+name = "bubbleplay-host"
+version = "0.1.0"
+edition = "2021"
+description = "BubblePlay streaming host: DXGI capture -> NVENC -> str0m WebRTC"
+build = "build.rs"
+
+[dependencies]
+windows-capture = "2.0.0"
+nvidia-video-codec-sdk = "0.4.0"
+cudarc = { version = "0.16.4", features = ["cuda-version-from-build-system"] }
+str0m = "0.21.0"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+] }
+tungstenite = "0.30.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+
+[workspace]
