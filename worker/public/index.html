@@ -198,25 +198,71 @@ let framesDrawn = 0;
 let fpsWindow = 0;
 setInterval(() => { hudState.fps = fpsWindow; fpsWindow = 0; }, 1000);
 
-function onTrack(ev) {
-  const receiver = ev.receiver;
-  // Insertable streams: Chrome exposes complete encoded frames; H.264 arrives
-  // as Annex B NAL units (per the WebRTC encoded transform spec), which
-  // WebCodecs decodes directly with no `description`.
-  if (!receiver.createEncodedStreams) {
-    hudState.dec = "no-insertable-streams";
-    hud.classList.add("bad");
-    return;
-  }
-  const { readable } = receiver.createEncodedStreams();
-  const reader = readable.getReader();
+// Worker source for RTCRtpScriptTransform: forwards encoded frames to the
+// main thread for WebCodecs decoding (H.264 arrives as Annex B NAL units per
+// the WebRTC encoded transform spec).
+const ENCODED_FRAME_WORKER_SRC = `
+self.onrtctransform = (event) => {
+  const transformer = event.transformer;
+  const reader = transformer.readable.getReader();
   (async () => {
     for (;;) {
-      const { value: chunk, done } = await reader.read();
+      const { value, done } = await reader.read();
       if (done) break;
-      feedDecoder(chunk);
+      if (!value) continue;
+      const data = new Uint8Array(value.data.byteLength);
+      data.set(new Uint8Array(value.data));
+      self.postMessage(
+        { type: value.type, timestamp: value.timestamp, data: data.buffer },
+        [data.buffer]
+      );
     }
-  })().catch((e) => { hudState.dec = `read:${e}`; });
+  })();
+};
+`;
+
+function onTrack(ev) {
+  const receiver = ev.receiver;
+  const transceiver = pc.getTransceivers().find((t) => t.receiver === receiver);
+
+  // 1) Modern path: RTCRtpScriptTransform (Worker-based, current Chrome).
+  if (transceiver && "transform" in receiver && typeof RTCRtpScriptTransform !== "undefined") {
+    const worker = new Worker(URL.createObjectURL(
+      new Blob([ENCODED_FRAME_WORKER_SRC], { type: "text/javascript" })
+    ));
+    worker.onmessage = (e) => feedDecoder(e.data);
+    worker.onerror = (e) => { hudState.dec = `worker:${e.message || "err"}`; };
+    receiver.transform = new RTCRtpScriptTransform(worker, {});
+    hudState.dec = "transform";
+    return;
+  }
+
+  // 2) Legacy path: createEncodedStreams (older Chromium).
+  if (receiver.createEncodedStreams) {
+    const { readable } = receiver.createEncodedStreams();
+    const reader = readable.getReader();
+    (async () => {
+      for (;;) {
+        const { value: chunk, done } = await reader.read();
+        if (done) break;
+        feedDecoder(chunk);
+      }
+    })().catch((e) => { hudState.dec = `read:${e}`; });
+    hudState.dec = "streams";
+    return;
+  }
+
+  // 3) Last resort: plain <video> so frames are visible even without any
+  // insertable-streams API (e.g. WebKit-based browsers).
+  const video = document.createElement("video");
+  video.autoplay = true;
+  video.playsInline = true;
+  video.muted = true;
+  video.style.cssText = "position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000;";
+  document.body.appendChild(video);
+  video.srcObject = new MediaStream([ev.track]);
+  video.play().catch(() => {});
+  hudState.dec = "video-fallback";
 }
 
 function feedDecoder(chunk) {
