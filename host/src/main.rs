@@ -90,8 +90,26 @@ fn main() -> Result<()> {
     let args = parse_args()?;
     match args.mode.as_str() {
         "spike" => run_spike(&args),
-        "serve" => run_serve(&args),
+        "serve" => run_serve_forever(&args),
         other => bail!("unknown mode {other} (expected spike|serve)"),
+    }
+}
+
+/// Serve mode wrapper: a session ends when the peer leaves or ICE dies, but
+/// the host keeps running and accepts the next client. Fatal errors (bad
+/// token, capture failure) still exit — only session teardown retries.
+fn run_serve_forever(args: &Args) -> Result<()> {
+    loop {
+        match run_serve(args) {
+            Ok(()) => {
+                info!("session ended — waiting for next client");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(e) => {
+                error!(?e, "serve session failed fatally — exiting");
+                return Err(e);
+            }
+        }
     }
 }
 
@@ -215,7 +233,17 @@ fn run_serve(args: &Args) -> Result<()> {
             signaling.send_ping();
             next_signal_ping = Instant::now() + Duration::from_secs(20);
         }
-        for ev in signaling.poll()? {
+        let signal_events = match signaling.poll() {
+            Ok(evs) => evs,
+            Err(e) => {
+                // Transient signaling drops (edge recycling, DO eviction,
+                // network blips) must end the session so the outer loop can
+                // reconnect — they are NOT fatal.
+                warn!(?e, "signaling read failed — ending session to reconnect");
+                break 'run;
+            }
+        };
+        for ev in signal_events {
             match ev {
                 SignalEvent::Offer(sdp) => {
                     info!("received SDP offer");

@@ -16,10 +16,15 @@ worker/.wrangler/
 worker/.dev.vars
 worker/wr.*.txt
 host/serve*.txt
+host/host-*.txt
 host/e2e_*.png
+host/local_route*.png
 host/build*.txt
 host/probe*.log
 .chrome-test/
+worker/tail*.txt
+worker/probe*.out.txt
+.noindex
 
 # Scratch
 .tools/

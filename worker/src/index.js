@@ -28,7 +28,12 @@ export default {
 };
 
 function handleWebSocket(request, env) {
-  const roomId = env.ROOM.idFromName("room");
+  // Room name bump = fresh Durable Object state. The previous "room" instance
+  // accumulated stale sockets/buffers across several force-killed sessions
+  // (phone attempt, UAC crash, test browsers), which poisoned the relay: a
+  // stale offer from an old session was flushed to a new host, whose DTLS
+  // certificate then didn't match ("remote fingerprint no match").
+  const roomId = env.ROOM.idFromName("room-v3");
   const stub = env.ROOM.get(roomId);
   // Pass the ORIGINAL request straight through. Reconstructing headers here
   // strips the hop-by-hop `Upgrade: websocket` header, and the DO then rejects
@@ -46,6 +51,7 @@ export class Room {
     const queryToken = new URL(request.url).searchParams.get("token") || "";
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
+    console.log(`[room] socket accepted (queryToken=${queryToken ? "yes" : "no"})`);
 
     // Remember the query token + role on the socket itself: with the
     // hibernation API the DO class is re-instantiated per wake, so instance
@@ -67,6 +73,7 @@ export class Room {
     }
 
     const att = ws.deserializeAttachment() || {};
+    console.log(`[room] msg type=${msg.type} role=${att.role || "unassigned"}`);
     if (msg.type === "ping") {
       return; // keepalive, never relayed
     }
@@ -88,16 +95,19 @@ export class Room {
 
       // Exactly one host + one client: kick any stale socket of the same role.
       const existing = this.findPeer(role);
+      console.log(`[room] hello role=${role} existing=${existing ? "yes" : "none"}`);
       if (existing && existing !== ws) {
         this.reject(existing, `${role} replaced`);
       }
       ws.serializeAttachment({ ...att, role });
       ws.send(JSON.stringify({ type: "hello-ok" }));
+      console.log(`[room] ${role} registered, hello-ok sent`);
 
       // Flush anything the client sent before the host arrived.
       if (role === "host") {
         const pending = (await this.state.storage.get("pendingToHost")) || [];
         if (pending.length) {
+          console.log(`[room] flushing ${pending.length} buffered msg(s) to host`);
           // The buffered messages came FROM the client and go TO the host —
           // which is this socket, `ws`.
           for (const m of pending) {
@@ -111,6 +121,7 @@ export class Room {
 
     // Relay to the peer.
     const target = att.role === "host" ? this.findPeer("client") : this.findPeer("host");
+    console.log(`[room] relay ${msg.type} -> ${target ? "peer" : "NO PEER"}`);
     if (msg.type === "bye") {
       if (target) {
         target.send(JSON.stringify({ type: "peer-left" }));
@@ -134,6 +145,7 @@ export class Room {
   async webSocketClose(ws, _code, _reason, _wasClean) {
     const att = ws.deserializeAttachment() || {};
     const role = att.role;
+    console.log(`[room] socket closed role=${role || "unassigned"} replaced=${!!att.replaced}`);
     if (!role || att.replaced) return; // replaced sockets get no farewell
     const peer = role === "host" ? this.findPeer("client") : this.findPeer("host");
     if (peer) {
@@ -147,6 +159,7 @@ export class Room {
 
   reject(ws, message) {
     try {
+      console.log(`[room] REJECT: ${message}`);
       ws.send(JSON.stringify({ type: "error", message }));
       const att = ws.deserializeAttachment() || {};
       if (att.role) ws.serializeAttachment({ ...att, replaced: true });

@@ -130,8 +130,21 @@ impl Capture {
     ) -> Result<Option<(DxgiDuplicationFrame<'a>, bool)>> {
         // Deferred recovery from a previous AccessLost (see field doc).
         if self.pending_recreate {
-            self.recreate()?;
-            self.pending_recreate = false;
+            match self.recreate() {
+                Ok(()) => {
+                    self.pending_recreate = false;
+                }
+                Err(e) => {
+                    // Recreation can legitimately fail for a while: a UAC
+                    // secure-desktop switch or a locked screen invalidates the
+                    // session AND denies new ones until the desktop is back.
+                    // Never kill the stream over this — retry on the next
+                    // acquire with a short backoff.
+                    warn!(?e, "DDA recreate failed — will retry");
+                    std::thread::sleep(Duration::from_millis(250));
+                    return Ok(None);
+                }
+            }
         }
         let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
         let frame = match self.api.acquire_next_frame(timeout_ms) {
