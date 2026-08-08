@@ -247,10 +247,23 @@ fn run_serve(args: &Args) -> Result<()> {
             match ev {
                 SignalEvent::Offer(sdp) => {
                     info!("received SDP offer");
-                    let answer = rtc.accept_offer(&sdp)?;
-                    signaling.send_answer(&answer)?;
-                    offer_accepted = true;
-                    info!("SDP answer sent");
+                    match rtc.accept_offer(&sdp) {
+                        Ok(answer) => {
+                            if let Err(e) = signaling.send_answer(&answer) {
+                                warn!(?e, "send answer failed — ending session");
+                                break 'run;
+                            }
+                            offer_accepted = true;
+                            info!("SDP answer sent");
+                        }
+                        Err(e) => {
+                            // A bad or stale offer (client vanished before DTLS,
+                            // ICE never established) must not kill the host —
+                            // end this session and wait for the next client.
+                            warn!(?e, "accept_offer failed — ending session");
+                            break 'run;
+                        }
+                    }
                 }
                 SignalEvent::RemoteCandidate(sdp) => rtc.add_remote_candidate(&sdp),
                 SignalEvent::PeerLeft => {
