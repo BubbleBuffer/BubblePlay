@@ -28,16 +28,12 @@ export default {
 };
 
 function handleWebSocket(request, env) {
-  const url = new URL(request.url);
-  const queryToken = url.searchParams.get("token") || "";
   const roomId = env.ROOM.idFromName("room");
   const stub = env.ROOM.get(roomId);
-  return stub.fetch(request, {
-    headers: {
-      ...Object.fromEntries(request.headers),
-      "x-bp-token": queryToken,
-    },
-  });
+  // Pass the ORIGINAL request straight through. Reconstructing headers here
+  // strips the hop-by-hop `Upgrade: websocket` header, and the DO then rejects
+  // the 101 WebSocket response ("request did not contain Upgrade: websocket").
+  return stub.fetch(request);
 }
 
 export class Room {
@@ -47,7 +43,7 @@ export class Room {
   }
 
   async fetch(request) {
-    const queryToken = request.headers.get("x-bp-token") || "";
+    const queryToken = new URL(request.url).searchParams.get("token") || "";
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
@@ -102,11 +98,10 @@ export class Room {
       if (role === "host") {
         const pending = (await this.state.storage.get("pendingToHost")) || [];
         if (pending.length) {
-          const client = this.findPeer("client");
-          if (client) {
-            for (const m of pending) {
-              client.send(m);
-            }
+          // The buffered messages came FROM the client and go TO the host —
+          // which is this socket, `ws`.
+          for (const m of pending) {
+            ws.send(m);
           }
           await this.state.storage.delete("pendingToHost");
         }
