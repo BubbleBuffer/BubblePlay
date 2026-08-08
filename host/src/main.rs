@@ -30,7 +30,7 @@ use rtc::{RtcAction, RtcSession};
 use signaling::{SignalEvent, Signaling};
 
 const STUN_SERVER: &str = "stun.l.google.com:19302";
-const DEFAULT_BITRATE_BPS: u32 = 20_000_000;
+const DEFAULT_BITRATE_BPS: u32 = 8_000_000;
 const MIN_BITRATE_BPS: u32 = 1_000_000;
 const MAX_BITRATE_BPS: u32 = 40_000_000;
 const IDR_INTERVAL: Duration = Duration::from_secs(2);
@@ -99,15 +99,21 @@ fn main() -> Result<()> {
 /// the host keeps running and accepts the next client. Fatal errors (bad
 /// token, capture failure) still exit — only session teardown retries.
 fn run_serve_forever(args: &Args) -> Result<()> {
+    let mut backoff = Duration::from_secs(1);
     loop {
         match run_serve(args) {
             Ok(()) => {
                 info!("session ended — waiting for next client");
-                std::thread::sleep(Duration::from_secs(1));
+                backoff = Duration::from_secs(1);
+                std::thread::sleep(backoff);
             }
             Err(e) => {
-                error!(?e, "serve session failed fatally — exiting");
-                return Err(e);
+                // Worker deploys reset the Durable Object, killing our WS
+                // and briefly 500ing new connections. That's transient —
+                // retry with backoff instead of taking the host down.
+                error!(?e, backoff_secs = backoff.as_secs(), "serve session failed — retrying");
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }
     }
@@ -218,6 +224,7 @@ fn run_serve(args: &Args) -> Result<()> {
     let mut srflx_failures = 0u32;
     let mut next_idr = Instant::now() + IDR_INTERVAL;
     let mut next_signal_ping = Instant::now() + Duration::from_secs(20);
+    let mut last_logged_bwe: Option<u64> = None;
     let mut offer_accepted = false;
     let mut connected_since: Option<Instant> = None;
     let mut frames_sent = 0u64;
@@ -326,6 +333,17 @@ fn run_serve(args: &Args) -> Result<()> {
                                         bps.clamp(MIN_BITRATE_BPS as u64, MAX_BITRATE_BPS as u64)
                                             as u32;
                                     let _ = enc.set_bitrate(clamped);
+                                    // Log the first estimate and any step of
+                                    // >= 1 Mbps so the host log shows
+                                    // congestion control working in a test.
+                                    let log_it = match last_logged_bwe {
+                                        None => true,
+                                        Some(prev) => (clamped as i64 - prev as i64).abs() >= 1_000_000,
+                                    };
+                                    if log_it {
+                                        info!(bwe_bps = clamped, "BWE applied");
+                                        last_logged_bwe = Some(clamped as u64);
+                                    }
                                 }
                             }
                             RtcAction::InputData(d) => {

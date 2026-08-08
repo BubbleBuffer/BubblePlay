@@ -23,7 +23,17 @@ export default {
       return handleWebSocket(request, env);
     }
     // Everything else: the client page (index.html) and any static files.
-    return env.ASSETS.fetch(request);
+    const response = await env.ASSETS.fetch(request);
+    // The client page changes fast during bring-up; never let the browser or
+    // the edge cache it, or phones keep running the stale pre-fix version
+    // (which is exactly the blackscreen the user saw).
+    const headers = new Headers(response.headers);
+    headers.set("Cache-Control", "no-store");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
   },
 };
 
@@ -99,6 +109,12 @@ export class Room {
       if (existing && existing !== ws) {
         this.reject(existing, `${role} replaced`);
       }
+      // A fresh client means any buffered offer/ICE came from a previous,
+      // now-dead session — delivering them to a future host would poison it
+      // (the host accepts a stale offer, its DTLS times out, session dies).
+      if (role === "client") {
+        await this.state.storage.delete("pendingToHost");
+      }
       ws.serializeAttachment({ ...att, role });
       ws.send(JSON.stringify({ type: "hello-ok" }));
       console.log(`[room] ${role} registered, hello-ok sent`);
@@ -146,7 +162,13 @@ export class Room {
     const att = ws.deserializeAttachment() || {};
     const role = att.role;
     console.log(`[room] socket closed role=${role || "unassigned"} replaced=${!!att.replaced}`);
-    if (!role || att.replaced) return; // replaced sockets get no farewell
+    if (!role) return;
+    // When the client dies, its buffered offer/ICE is worthless — clear it so
+    // a later host never receives a stale offer from a dead peer.
+    if (role === "client") {
+      await this.state.storage.delete("pendingToHost");
+    }
+    if (att.replaced) return; // replaced sockets get no farewell
     const peer = role === "host" ? this.findPeer("client") : this.findPeer("host");
     if (peer) {
       try {

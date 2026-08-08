@@ -63,11 +63,12 @@ if (token) {
 }
 
 // ---- status HUD ------------------------------------------------------------
-const hudState = { ws: "…", ice: "…", dc: "…", dec: "…", fps: 0, queued: 0 };
+const hudState = { ws: "…", ice: "…", dc: "…", dec: "…", fps: 0, recv: 0, queued: 0, rtt: "…", jit: "…", loss: "…" };
 setInterval(() => {
   hud.innerHTML =
     `ws ${hudState.ws} | ice ${hudState.ice} | in ${hudState.dc}\n` +
-    `decoder ${hudState.dec} | queue ${hudState.queued} | ${hudState.fps} fps`;
+    `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | ${hudState.fps} fps\n` +
+    `rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | loss ${hudState.loss}%`;
 }, 250);
 
 // ---- signaling --------------------------------------------------------------
@@ -192,11 +193,153 @@ async function startPeer() {
 
 // ---- WebCodecs decode --------------------------------------------------------
 let decoder = null;
-let latestFrame = null;
-let rafPending = false;
 let framesDrawn = 0;
+let framesReceived = 0;
 let fpsWindow = 0;
 setInterval(() => { hudState.fps = fpsWindow; fpsWindow = 0; }, 1000);
+
+// Timestamp-paced render queue. Decoded frames arrive in bursts (network
+// jitter); drawing them the moment they arrive makes the picture stutter.
+// Instead each frame is scheduled for its RTP-timestamp-derived due time and
+// drawn on the next rAF tick at that cadence. Frames that arrive more than
+// one cadence interval late are dropped — never queued into latency.
+const RENDER = {
+  baseWall: 0,       // performance.now() when the first frame decoded
+  baseTs: null,      // first frame's timestamp
+  ticksPerMs: null,  // detected timestamp scale (~1000 for µs, ~90 for 90 kHz)
+  cadenceMs: 16.67,  // rolling average frame interval
+  prevTs: null,
+  prevWall: 0,
+  queue: [],
+  rafPending: false,
+};
+const MAX_RENDER_QUEUE = 3;
+
+function resetRenderPacing() {
+  RENDER.baseWall = 0;
+  RENDER.baseTs = null;
+  RENDER.ticksPerMs = null;
+  RENDER.cadenceMs = 16.67;
+  RENDER.prevTs = null;
+  RENDER.prevWall = 0;
+  for (const f of RENDER.queue) f.frame.close();
+  RENDER.queue = [];
+  RENDER.rafPending = false;
+  framesReceived = 0;
+}
+
+function onDecodedFrame(frame) {
+  try {
+  const now = performance.now();
+  const ts = frame.timestamp;
+  framesReceived++;
+  hudState.recv = framesReceived;
+
+    // First frame: anchor the wall-clock base and draw immediately.
+    if (RENDER.baseTs === null) {
+      RENDER.baseTs = ts;
+      RENDER.baseWall = now;
+      RENDER.prevTs = ts;
+      RENDER.prevWall = now;
+      drawFrame(frame);
+      return;
+    }
+
+    // Calibrate the timestamp scale ONLY from plausible pairs: a real frame
+    // gap at 60/30 fps is 8-33 ms of wall time. The startup pair (decoder
+    // warmup, PLI recovery) can be seconds apart and would poison the scale.
+    if (ts !== RENDER.prevTs) {
+      const tsDelta = ts - RENDER.prevTs;
+      const wallDelta = now - RENDER.prevWall;
+      if (tsDelta > 0 && wallDelta >= 5 && wallDelta <= 200 && RENDER.ticksPerMs === null) {
+        const ratio = tsDelta / wallDelta;
+        if (ratio > 500) RENDER.ticksPerMs = 1000; // microseconds
+        else if (ratio > 40) RENDER.ticksPerMs = 90; // 90 kHz RTP ticks
+      }
+      const ticks = RENDER.ticksPerMs || 1000;
+      const interval = tsDelta / ticks;
+      if (interval >= 8 && interval <= 100) {
+        RENDER.cadenceMs = RENDER.cadenceMs * 0.8 + interval * 0.2;
+      }
+      RENDER.prevTs = ts;
+      RENDER.prevWall = now;
+    }
+
+    const ticksPerMs = RENDER.ticksPerMs || 1000;
+    const due = RENDER.baseWall + (ts - RENDER.baseTs) / ticksPerMs;
+    RENDER.queue.push({ frame, due });
+    if (RENDER.queue.length > MAX_RENDER_QUEUE) {
+      RENDER.queue.shift().frame.close(); // drop oldest, keep latency low
+    }
+    if (!RENDER.rafPending) {
+      RENDER.rafPending = true;
+      requestAnimationFrame(renderTick);
+    }
+  } catch (e) {
+    hudState.dec = `render:${e.message}`;
+  }
+}
+
+function renderTick() {
+  try {
+    RENDER.rafPending = false;
+    const now = performance.now();
+    // Keep only the newest queued frame — older ones are stale the moment a
+    // fresher frame arrives.
+    while (RENDER.queue.length > 1) {
+      RENDER.queue.shift().frame.close();
+    }
+    const front = RENDER.queue[0];
+    if (!front) return;
+    const due = front.due;
+    // Draw when the frame is due (or past due, i.e. the decoder is slower
+    // than the stream — catch up by showing the newest frame). Only wait
+    // when a frame genuinely arrives early, which is real burst smoothing.
+    if (!Number.isFinite(due) || due <= now) {
+      RENDER.queue.shift();
+      drawFrame(front.frame);
+    } else {
+      RENDER.rafPending = true;
+      requestAnimationFrame(renderTick);
+    }
+    if (RENDER.queue.length && !RENDER.rafPending) {
+      RENDER.rafPending = true;
+      requestAnimationFrame(renderTick);
+    }
+  } catch (e) {
+    hudState.dec = `tick:${e.message}`;
+  }
+}
+
+// ---- network stats via getStats (latency diagnostics) -----------------------
+setInterval(async () => {
+  if (!pc || pc.iceConnectionState !== "connected") return;
+  try {
+    const stats = await pc.getStats();
+    let rtt = null, jitter = null, loss = null;
+    stats.forEach((s) => {
+      if (s.type === "candidate-pair" && s.state === "succeeded" && s.nominated) {
+        if (typeof s.currentRoundTripTime === "number" && s.currentRoundTripTime >= 0) {
+          rtt = Math.round(s.currentRoundTripTime * 1000);
+        }
+      } else if (s.type === "inbound-rtp" && s.kind === "video") {
+        if (typeof s.jitter === "number") {
+          jitter = Math.round(s.jitter * 1000);
+        }
+        const recv = s.packetsReceived || 0;
+        const lost = s.packetsLost || 0;
+        if (recv + lost > 0) {
+          loss = Math.round((lost / (recv + lost)) * 100);
+        }
+      }
+    });
+    if (rtt !== null) hudState.rtt = rtt;
+    if (jitter !== null) hudState.jit = jitter;
+    if (loss !== null) hudState.loss = loss;
+  } catch {
+    // stats unavailable (not connected / mid-restart)
+  }
+}, 1000);
 
 // Worker source for RTCRtpScriptTransform: forwards encoded frames to the
 // main thread for WebCodecs decoding (H.264 arrives as Annex B NAL units per
@@ -261,7 +404,12 @@ function onTrack(ev) {
   video.style.cssText = "position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000;";
   document.body.appendChild(video);
   video.srcObject = new MediaStream([ev.track]);
-  video.play().catch(() => {});
+  const tryPlay = () => video.play().catch(() => {});
+  tryPlay();
+  // Mobile browsers (iOS especially) may refuse autoplay until a user
+  // gesture; resume on the first tap anywhere.
+  document.addEventListener("pointerdown", tryPlay, { once: true });
+  video.addEventListener("click", tryPlay);
   hudState.dec = "video-fallback";
 }
 
@@ -271,15 +419,9 @@ function feedDecoder(chunk) {
 
   if (!decoder) {
     const codec = avcCodecFromSps(data) || "avc1.64002A";
+    resetRenderPacing();
     decoder = new VideoDecoder({
-      output: (frame) => {
-        latestFrame?.close();
-        latestFrame = frame;
-        if (!rafPending) {
-          rafPending = true;
-          requestAnimationFrame(drawLatest);
-        }
-      },
+      output: onDecodedFrame,
       error: (e) => { hudState.dec = `err:${e.message}`; },
     });
     try {
@@ -313,11 +455,7 @@ function feedDecoder(chunk) {
   }
 }
 
-function drawLatest() {
-  rafPending = false;
-  const frame = latestFrame;
-  latestFrame = null;
-  if (!frame) return;
+function drawFrame(frame) {
   const w = frame.displayWidth, h = frame.displayHeight;
   if (screen.width !== w || screen.height !== h) {
     screen.width = w;
