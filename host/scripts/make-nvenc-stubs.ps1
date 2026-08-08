@@ -37,8 +37,13 @@ function New-ImportLib {
     }
     if ($names.Count -eq 0) { throw "No named exports parsed from $DllName" }
 
+    # The `LIBRARY` directive pins the real driver DLL name into the import lib.
+    # Without it, lib.exe assumes <def-file-name>.dll — e.g. nvEncodeAPI.dll,
+    # which does not exist on 64-bit Windows (the real one is nvEncodeAPI64.dll)
+    # and the resulting binary dies at startup with STATUS_DLL_NOT_FOUND.
+    $dllBase = [System.IO.Path]::GetFileNameWithoutExtension($DllName)
     $defPath = Join-Path $out "$LibName.def"
-    @('EXPORTS') + $names | Set-Content -Path $defPath -Encoding ascii
+    @("LIBRARY $dllBase", 'EXPORTS') + $names | Set-Content -Path $defPath -Encoding ascii
 
     # 3) Generate the import library.
     $libPath = Join-Path $out "$LibName.lib"
