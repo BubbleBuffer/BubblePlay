@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BubblePlay</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #stage {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    cursor: crosshair;
+  }
+  canvas {
+    max-width: 100%; max-height: 100%;
+    width: auto; height: auto;
+    background: #000;
+    image-rendering: auto;
+  }
+  #hud {
+    position: fixed; top: 8px; left: 8px; z-index: 10;
+    font: 12px/1.5 ui-monospace, Consolas, monospace;
+    color: #cfc; background: rgba(0,0,0,.55); padding: 6px 10px;
+    border-radius: 6px; pointer-events: none; white-space: pre;
+    user-select: none;
+  }
+  #hud .bad { color: #f77; }
+  #hud .ok  { color: #8f8; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="screen"></canvas></div>
+<div id="hud">connecting…</div>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// BubblePlay browser client (Chromium + WebCodecs only).
+//
+// Flow:
+//   1. Open WebSocket to /ws?token=…, send hello (role=client).
+//   2. On hello-ok: create RTCPeerConnection with one recvonly video
+//      transceiver (H.264) + one unordered/unreliable input DataChannel.
+//   3. createOffer -> send to host via the relay. Host answers.
+//   4. Incoming video: insertable streams -> VideoDecoder (Annex B H.264)
+//      -> desynchronized 2D canvas, latest-frame-wins pacing.
+//   5. Pointer-lock mouse + keyboard -> binary little-endian packets on the
+//      DataChannel, matching host/src/input.rs.
+// ---------------------------------------------------------------------------
+
+const screen = document.getElementById("screen");
+const hud = document.getElementById("hud");
+const ctx = screen.getContext("2d", { alpha: false, desynchronized: true });
+
+// ---- token ----------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+let token = params.get("token") || localStorage.getItem("bp_token") || "";
+if (!token) {
+  token = prompt("BubblePlay token:");
+}
+if (token) {
+  localStorage.setItem("bp_token", token);
+}
+
+// ---- status HUD ------------------------------------------------------------
+const hudState = { ws: "…", ice: "…", dc: "…", dec: "…", fps: 0, queued: 0 };
+setInterval(() => {
+  hud.innerHTML =
+    `ws ${hudState.ws} | ice ${hudState.ice} | in ${hudState.dc}\n` +
+    `decoder ${hudState.dec} | queue ${hudState.queued} | ${hudState.fps} fps`;
+}, 250);
+
+// ---- signaling --------------------------------------------------------------
+const proto = location.protocol === "https:" ? "wss:" : "ws:";
+const ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
+
+let pc = null;
+let dc = null;
+let inputReady = false;
+let connected = false;
+let offerSent = false;
+
+ws.onopen = () => {
+  hudState.ws = "open";
+  ws.send(JSON.stringify({ type: "hello", token, role: "client" }));
+};
+ws.onclose = () => {
+  hudState.ws = "closed";
+  hud.classList.add("bad");
+};
+ws.onerror = () => { hudState.ws = "error"; };
+ws.onmessage = (ev) => {
+  let msg;
+  try { msg = JSON.parse(ev.data); } catch { return; }
+  switch (msg.type) {
+    case "hello-ok":
+      hudState.ws = "ok";
+      startPeer();
+      break;
+    case "answer":
+      pc.setRemoteDescription({ type: "answer", sdp: msg.sdp })
+        .then(() => { hudState.ice = "answer"; })
+        .catch((e) => { hudState.ice = `err:${e}`; });
+      break;
+    case "ice":
+      if (pc && msg.candidate) {
+        pc.addIceCandidate({ candidate: msg.candidate }).catch((e) => {
+          // Racing with setRemoteDescription is normal; retry once after answer.
+          console.warn("addIceCandidate", e);
+        });
+      }
+      break;
+    case "peer-left":
+      hudState.ice = "peer-left";
+      hud.classList.add("bad");
+      break;
+    case "error":
+      hudState.ws = `err:${msg.message}`;
+      hud.classList.add("bad");
+      break;
+  }
+};
+
+// Keep the relay's WebSocket alive.
+setInterval(() => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "ping" }));
+  }
+}, 25000);
+
+// ---- WebRTC ----------------------------------------------------------------
+async function startPeer() {
+  if (offerSent) return;
+  offerSent = true;
+
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    // No TURN in v0 (locked decision): ICE must succeed peer-to-peer or on
+    // a LAN. srflx candidates are trickled by both sides.
+  });
+
+  // Receive-only video; the browser offers, the host answers (locked).
+  const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
+  transceiver.receiver.playoutDelayHint = 0; // minimal jitter buffer
+
+  // Force H.264 (WebCodecs decodes Annex B; NVENC emits High profile).
+  try {
+    const caps = RTCRtpReceiver.getCapabilities("video");
+    const h264 = caps && caps.codecs.filter((c) => c.mimeType === "video/H264");
+    if (h264 && h264.length) {
+      transceiver.setCodecPreferences(h264);
+    }
+  } catch (e) {
+    console.warn("setCodecPreferences", e);
+  }
+
+  // Input channel: unordered + maxRetransmits 0 (UDP-like, fire-and-forget).
+  dc = pc.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
+  dc.binaryType = "arraybuffer";
+  dc.onopen = () => { hudState.dc = "open"; inputReady = true; };
+  dc.onclose = () => { hudState.dc = "closed"; inputReady = false; };
+  dc.onerror = (e) => { hudState.dc = `err:${e.message || ""}`; };
+
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "ice", candidate: ev.candidate.candidate }));
+    }
+  };
+  pc.oniceconnectionstatechange = () => {
+    hudState.ice = pc.iceConnectionState;
+    connected = pc.iceConnectionState === "connected";
+    if (connected) {
+      hud.classList.remove("bad");
+      requestPointerLock();
+    }
+  };
+  pc.ontrack = (ev) => onTrack(ev);
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+      hudState.ice = pc.connectionState;
+      hud.classList.add("bad");
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
+}
+
+// ---- WebCodecs decode --------------------------------------------------------
+let decoder = null;
+let latestFrame = null;
+let rafPending = false;
+let framesDrawn = 0;
+let fpsWindow = 0;
+setInterval(() => { hudState.fps = fpsWindow; fpsWindow = 0; }, 1000);
+
+function onTrack(ev) {
+  const receiver = ev.receiver;
+  // Insertable streams: Chrome exposes complete encoded frames; H.264 arrives
+  // as Annex B NAL units (per the WebRTC encoded transform spec), which
+  // WebCodecs decodes directly with no `description`.
+  if (!receiver.createEncodedStreams) {
+    hudState.dec = "no-insertable-streams";
+    hud.classList.add("bad");
+    return;
+  }
+  const { readable } = receiver.createEncodedStreams();
+  const reader = readable.getReader();
+  (async () => {
+    for (;;) {
+      const { value: chunk, done } = await reader.read();
+      if (done) break;
+      feedDecoder(chunk);
+    }
+  })().catch((e) => { hudState.dec = `read:${e}`; });
+}
+
+function feedDecoder(chunk) {
+  const data = new Uint8Array(chunk.data);
+  const isKey = chunk.type === "key";
+
+  if (!decoder) {
+    const codec = avcCodecFromSps(data) || "avc1.64002A";
+    decoder = new VideoDecoder({
+      output: (frame) => {
+        latestFrame?.close();
+        latestFrame = frame;
+        if (!rafPending) {
+          rafPending = true;
+          requestAnimationFrame(drawLatest);
+        }
+      },
+      error: (e) => { hudState.dec = `err:${e.message}`; },
+    });
+    try {
+      decoder.configure({
+        codec,
+        optimizeForLatency: true,
+        hardwareAcceleration: "prefer-hardware",
+      });
+      hudState.dec = `${codec}`;
+    } catch (e) {
+      hudState.dec = `cfg:${e.message}`;
+      decoder = null;
+      return;
+    }
+  }
+
+  if (decoder.state !== "configured") return;
+  if (!isKey && !decoder.sawKeyframe) return; // wait for first keyframe
+  decoder.sawKeyframe = decoder.sawKeyframe || isKey;
+  if (decoder.decodeQueueSize > 8) return; // drop late frames, never queue
+
+  try {
+    decoder.decode(new EncodedVideoChunk({
+      type: isKey ? "key" : "delta",
+      timestamp: chunk.timestamp,
+      data,
+    }));
+    hudState.queued = decoder.decodeQueueSize;
+  } catch (e) {
+    hudState.dec = `dec:${e.message}`;
+  }
+}
+
+function drawLatest() {
+  rafPending = false;
+  const frame = latestFrame;
+  latestFrame = null;
+  if (!frame) return;
+  const w = frame.displayWidth, h = frame.displayHeight;
+  if (screen.width !== w || screen.height !== h) {
+    screen.width = w;
+    screen.height = h;
+  }
+  ctx.drawImage(frame, 0, 0, w, h);
+  frame.close();
+  fpsWindow++;
+  framesDrawn++;
+}
+
+// Parse the codec string (avc1.PPCCLL) from the first SPS NAL of an Annex B
+// keyframe. profile_idc/constraint/level are the first 3 bytes of the SPS
+// RBSP and never contain emulation-prevention bytes.
+function avcCodecFromSps(bytes) {
+  const hex2 = (n) => n.toString(16).toUpperCase().padStart(2, "0");
+  let i = 0;
+  while (i + 4 < bytes.length) {
+    const sc = bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1;
+    const sc4 = bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 0 && bytes[i + 3] === 1;
+    if (!sc && !sc4) { i++; continue; }
+    const nalStart = i + (sc4 ? 4 : 3);
+    const nalType = bytes[nalStart] & 0x1f;
+    if (nalType === 7 && nalStart + 4 < bytes.length) {
+      return `avc1.${hex2(bytes[nalStart + 1])}${hex2(bytes[nalStart + 2])}${hex2(bytes[nalStart + 3])}`;
+    }
+    i = nalStart;
+  }
+  return null;
+}
+
+// ---- input: pointer lock mouse ----------------------------------------------
+const BM = { 0: 1, 1: 4, 2: 2 }; // e.button -> bitmask (left, middle, right)
+let buttons = 0;
+let locked = false;
+
+async function requestPointerLock() {
+  try {
+    await screen.requestPointerLock({ unadjustedMovement: true });
+    locked = true;
+  } catch {
+    try {
+      screen.requestPointerLock();
+      locked = true;
+    } catch { locked = false; }
+  }
+}
+document.addEventListener("pointerlockchange", () => {
+  locked = document.pointerLockElement === screen;
+  if (!locked) { sendInput(new Uint8Array([4, 0])); buttons = 0; }
+});
+screen.addEventListener("click", () => {
+  if (!locked && connected) requestPointerLock();
+});
+document.addEventListener("mousemove", (e) => {
+  if (!inputReady || !connected) return;
+  if (locked) {
+    // Relative (unadjusted) deltas.
+    const b = new ArrayBuffer(5);
+    const dv = new DataView(b);
+    dv.setUint8(0, 2);
+    dv.setInt16(1, clamp16(e.movementX), true);
+    dv.setInt16(3, clamp16(e.movementY), true);
+    sendInput(new Uint8Array(b));
+  } else {
+    // Absolute fallback over the canvas: 0..65535.
+    const r = screen.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return;
+    const x = clamp((e.clientX - r.left) / r.width, 0, 1);
+    const y = clamp((e.clientY - r.top) / r.height, 0, 1);
+    const b = new ArrayBuffer(5);
+    const dv = new DataView(b);
+    dv.setUint8(0, 3);
+    dv.setUint16(1, Math.round(x * 65535), true);
+    dv.setUint16(3, Math.round(y * 65535), true);
+    sendInput(new Uint8Array(b));
+  }
+});
+document.addEventListener("mousedown", (e) => {
+  if (!inputReady) return;
+  buttons |= BM[e.button] || 0;
+  sendInput(new Uint8Array([4, buttons]));
+  e.preventDefault();
+});
+document.addEventListener("mouseup", (e) => {
+  if (!inputReady) return;
+  buttons &= ~(BM[e.button] || 0);
+  sendInput(new Uint8Array([4, buttons]));
+  e.preventDefault();
+});
+document.addEventListener("contextmenu", (e) => e.preventDefault());
+document.addEventListener("wheel", (e) => {
+  if (!inputReady) return;
+  // Normalize browser deltas to WHEEL_DELTA (120 per notch).
+  const delta = e.deltaMode === 1 ? e.deltaY * 120 : e.deltaY * 1.2;
+  const b = new ArrayBuffer(3);
+  const dv = new DataView(b);
+  dv.setUint8(0, 5);
+  dv.setInt16(1, clamp16(Math.round(delta)), true);
+  sendInput(new Uint8Array(b));
+  e.preventDefault();
+}, { passive: false });
+
+// ---- input: keyboard (e.code -> Windows VK) ----------------------------------
+// US ANSI physical layout. SendInput on the host uses wVk, so the physical
+// key is what matters, not the character.
+const KEY = {
+  Backspace: 0x08, Tab: 0x09, Enter: 0x0D, ShiftLeft: 0x10, ShiftRight: 0x10,
+  ControlLeft: 0x11, ControlRight: 0x11, AltLeft: 0x12, AltRight: 0x12,
+  CapsLock: 0x14, Escape: 0x1B, Space: 0x20, PageUp: 0x21, PageDown: 0x22,
+  End: 0x23, Home: 0x24, ArrowLeft: 0x25, ArrowUp: 0x26, ArrowRight: 0x27,
+  ArrowDown: 0x28, PrintScreen: 0x2C, Insert: 0x2D, Delete: 0x2E,
+  MetaLeft: 0x5B, MetaRight: 0x5C, ContextMenu: 0x5D,
+  Numpad0: 0x60, Numpad1: 0x61, Numpad2: 0x62, Numpad3: 0x63, Numpad4: 0x64,
+  Numpad5: 0x65, Numpad6: 0x66, Numpad7: 0x67, Numpad8: 0x68, Numpad9: 0x69,
+  NumpadMultiply: 0x6A, NumpadAdd: 0x6B, NumpadSubtract: 0x6D,
+  NumpadDecimal: 0x6E, NumpadDivide: 0x6F,
+  Semicolon: 0xBA, Equal: 0xBB, Comma: 0xBC, Minus: 0xBD, Period: 0xBE,
+  Slash: 0xBF, Backquote: 0xC0, BracketLeft: 0xDB, Backslash: 0xDC,
+  BracketRight: 0xDD, Quote: 0xDE,
+  NumLock: 0x90, ScrollLock: 0x91, Pause: 0x13,
+};
+for (let i = 0; i < 26; i++) KEY["Key" + String.fromCharCode(65 + i)] = 0x41 + i;
+for (let i = 0; i < 10; i++) KEY["Digit" + i] = 0x30 + i;
+for (let i = 1; i <= 12; i++) KEY["F" + i] = 0x70 + (i - 1);
+
+const held = new Set();
+document.addEventListener("keydown", (e) => {
+  if (!inputReady) return;
+  const vk = KEY[e.code];
+  if (vk === undefined) return;
+  e.preventDefault();
+  if (e.repeat || held.has(e.code)) return;
+  held.add(e.code);
+  const b = new ArrayBuffer(3);
+  const dv = new DataView(b);
+  dv.setUint8(0, 0); // key down
+  dv.setUint16(1, vk, true);
+  sendInput(new Uint8Array(b));
+});
+document.addEventListener("keyup", (e) => {
+  const vk = KEY[e.code];
+  if (vk === undefined) return;
+  e.preventDefault();
+  if (!held.has(e.code)) return;
+  held.delete(e.code);
+  const b = new ArrayBuffer(3);
+  const dv = new DataView(b);
+  dv.setUint8(0, 1); // key up
+  dv.setUint16(1, vk, true);
+  sendInput(new Uint8Array(b));
+});
+window.addEventListener("blur", () => {
+  for (const code of held) {
+    const vk = KEY[code];
+    if (vk !== undefined) {
+      const b = new ArrayBuffer(3);
+      const dv = new DataView(b);
+      dv.setUint8(0, 1);
+      dv.setUint16(1, vk, true);
+      sendInput(new Uint8Array(b));
+    }
+  }
+  held.clear();
+});
+
+function sendInput(buf) {
+  if (dc && dc.readyState === "open") {
+    try { dc.send(buf); } catch { /* channel closed mid-send */ }
+  }
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function clamp16(v) { return clamp(v, -32768, 32767); }
+</script>
+</body>
+</html>

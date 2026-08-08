@@ -13,6 +13,8 @@ worker/.wrangler/
 # Local env / secrets
 .env
 *.local
+worker/.dev.vars
+worker/wr.*.txt
 
 # Scratch
 .tools/

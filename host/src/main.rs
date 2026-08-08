@@ -199,6 +199,7 @@ fn run_serve(args: &Args) -> Result<()> {
     let mut srflx_done = false;
     let mut srflx_failures = 0u32;
     let mut next_idr = Instant::now() + IDR_INTERVAL;
+    let mut next_signal_ping = Instant::now() + Duration::from_secs(20);
     let mut offer_accepted = false;
     let mut connected_since: Option<Instant> = None;
     let mut frames_sent = 0u64;
@@ -208,6 +209,10 @@ fn run_serve(args: &Args) -> Result<()> {
         let _now = Instant::now();
 
         // -- Signaling events ----------------------------------------------
+        if Instant::now() >= next_signal_ping {
+            signaling.send_ping();
+            next_signal_ping = Instant::now() + Duration::from_secs(20);
+        }
         for ev in signaling.poll()? {
             match ev {
                 SignalEvent::Offer(sdp) => {

@@ -1,0 +1,2 @@
+# Copy to .dev.vars for `wrangler dev`:
+TOKEN = "change-me"

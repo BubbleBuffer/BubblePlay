@@ -6,7 +6,8 @@
 //! - relayed: {type:"offer", sdp} (client -> host via worker),
 //!            {type:"answer", sdp} (host -> client),
 //!            {type:"ice", candidate} (both directions),
-//!            {type:"peer-left"}
+//!            {type:"peer-left"},
+//!            {type:"ping"} (keepalive — consumed, never relayed)
 //!
 //! The socket runs non-blocking; call `poll()` once per loop iteration.
 
@@ -38,6 +39,7 @@ pub enum SignalMsg {
     },
     #[serde(rename = "peer-left")]
     PeerLeft,
+    Ping,
     Error {
         message: String,
     },
@@ -131,6 +133,7 @@ impl Signaling {
                             events.push(SignalEvent::RemoteCandidate(candidate));
                         }
                         SignalMsg::PeerLeft => events.push(SignalEvent::PeerLeft),
+                        SignalMsg::Ping => {} // keepalive, ignore
                         SignalMsg::HelloOk => {} // duplicate ack, ignore
                         SignalMsg::Error { message } => {
                             warn!(message, "worker error message");
@@ -178,6 +181,15 @@ impl Signaling {
             serde_json::to_string(&SignalMsg::Bye).unwrap_or_default(),
         ));
         let _ = self.ws.flush();
+    }
+
+    /// Send an application-level keepalive so the relay's WebSocket stays
+    /// warm on both sides (the worker consumes pings, never relays them).
+    pub fn send_ping(&mut self) {
+        let msg = SignalMsg::Ping;
+        if self.ws.send(Message::text(serde_json::to_string(&msg).unwrap_or_default())).is_ok() {
+            self.ws.flush().ok();
+        }
     }
 }
 

@@ -1,0 +1,17 @@
+name = "bubbleplay-signal"
+main = "src/index.js"
+compatibility_date = "2026-07-15"
+
+# Static hosting of the client page (worker/public/).
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# One Durable Object per logical room: this relay hosts exactly one host and
+# one client per room, and the room name is fixed for v0 (single session).
+[durable_objects]
+bindings = [{ name = "ROOM", class_name = "Room" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
