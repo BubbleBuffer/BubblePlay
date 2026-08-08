@@ -135,6 +135,9 @@ async function startPeer() {
 
   pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    // Required for receiver.createEncodedStreams(); must be set at
+    // construction, not later ("Too late to create encoded streams").
+    encodedInsertableStreams: true,
     // No TURN in v0 (locked decision): ICE must succeed peer-to-peer or on
     // a LAN. srflx candidates are trickled by both sides.
   });

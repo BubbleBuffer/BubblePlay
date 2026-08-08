@@ -44,11 +44,6 @@ export class Room {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.host = null;
-    this.client = null;
-    // Messages from the client that arrived before the host connected
-    // (the browser creates its offer immediately after hello-ok).
-    this.pendingToHost = [];
   }
 
   async fetch(request) {
@@ -56,8 +51,9 @@ export class Room {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    // Remember the query token so webSocketMessage can accept it as an
-    // alternative to the hello body token.
+    // Remember the query token + role on the socket itself: with the
+    // hibernation API the DO class is re-instantiated per wake, so instance
+    // fields are NOT a safe place for peer state. Attachments and storage are.
     server.serializeAttachment({ role: null, queryToken });
 
     // acceptWebSocket() both accepts the server side and registers it for
@@ -93,32 +89,33 @@ export class Room {
         this.reject(ws, "bad role");
         return;
       }
-      if (role === "host") {
-        if (this.host && this.host !== ws) {
-          this.reject(this.host, "host replaced");
-        }
-        this.host = ws;
-      } else {
-        if (this.client && this.client !== ws) {
-          this.reject(this.client, "client replaced");
-        }
-        this.client = ws;
+
+      // Exactly one host + one client: kick any stale socket of the same role.
+      const existing = this.findPeer(role);
+      if (existing && existing !== ws) {
+        this.reject(existing, `${role} replaced`);
       }
       ws.serializeAttachment({ ...att, role });
       ws.send(JSON.stringify({ type: "hello-ok" }));
 
       // Flush anything the client sent before the host arrived.
-      if (role === "host" && this.pendingToHost.length) {
-        for (const m of this.pendingToHost) {
-          this.host.send(m);
+      if (role === "host") {
+        const pending = (await this.state.storage.get("pendingToHost")) || [];
+        if (pending.length) {
+          const client = this.findPeer("client");
+          if (client) {
+            for (const m of pending) {
+              client.send(m);
+            }
+          }
+          await this.state.storage.delete("pendingToHost");
         }
-        this.pendingToHost = [];
       }
       return;
     }
 
     // Relay to the peer.
-    const target = att.role === "host" ? this.client : this.host;
+    const target = att.role === "host" ? this.findPeer("client") : this.findPeer("host");
     if (msg.type === "bye") {
       if (target) {
         target.send(JSON.stringify({ type: "peer-left" }));
@@ -129,8 +126,10 @@ export class Room {
     if (!target) {
       // Buffer offer/ice from the client until the host connects.
       if (att.role === "client" && (msg.type === "offer" || msg.type === "ice")) {
-        this.pendingToHost.push(message);
-        if (this.pendingToHost.length > 64) this.pendingToHost.shift();
+        const pending = (await this.state.storage.get("pendingToHost")) || [];
+        pending.push(message);
+        if (pending.length > 64) pending.shift();
+        await this.state.storage.put("pendingToHost", pending);
       }
       return;
     }
@@ -140,10 +139,8 @@ export class Room {
   async webSocketClose(ws, _code, _reason, _wasClean) {
     const att = ws.deserializeAttachment() || {};
     const role = att.role;
-    if (!role) return;
-    if (role === "host" && this.host === ws) this.host = null;
-    if (role === "client" && this.client === ws) this.client = null;
-    const peer = role === "host" ? this.client : this.host;
+    if (!role || att.replaced) return; // replaced sockets get no farewell
+    const peer = role === "host" ? this.findPeer("client") : this.findPeer("host");
     if (peer) {
       try {
         peer.send(JSON.stringify({ type: "peer-left" }));
@@ -156,9 +153,21 @@ export class Room {
   reject(ws, message) {
     try {
       ws.send(JSON.stringify({ type: "error", message }));
+      const att = ws.deserializeAttachment() || {};
+      if (att.role) ws.serializeAttachment({ ...att, replaced: true });
       ws.close(1008, message);
     } catch {
       // socket already closed
     }
+  }
+
+  findPeer(role) {
+    const sockets = this.state.getWebSockets();
+    return (
+      sockets.find((s) => {
+        const a = s.deserializeAttachment() || {};
+        return a.role === role;
+      }) || null
+    );
   }
 }

@@ -162,7 +162,18 @@ impl RtcSession {
                 }
                 None
             }
-            Event::ChannelData(data) => Some(RtcAction::InputData(data.data)),
+            Event::ChannelOpen(id, label) => {
+                info!(channel_id = ?id, label, "data channel opened by peer");
+                Some(RtcAction::ChannelOpen(Vec::new()))
+            }
+            Event::ChannelClose(id) => {
+                info!(channel_id = ?id, "data channel closed by peer");
+                None
+            }
+            Event::ChannelData(data) => {
+                debug!(channel_id = ?data.id, binary = data.binary, len = data.data.len(), "channel data");
+                Some(RtcAction::InputData(data.data))
+            }
             Event::KeyframeRequest(KeyframeRequest { kind, .. }) => {
                 debug!(?kind, "keyframe request (PLI/FIR)");
                 Some(RtcAction::KeyframeRequested)

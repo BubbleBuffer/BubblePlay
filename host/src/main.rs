@@ -203,6 +203,8 @@ fn run_serve(args: &Args) -> Result<()> {
     let mut offer_accepted = false;
     let mut connected_since: Option<Instant> = None;
     let mut frames_sent = 0u64;
+    let mut input_packets = 0u64;
+    let mut input_bytes = 0u64;
     let mut buf = vec![0u8; 2000];
 
     'run: loop {
@@ -285,7 +287,18 @@ fn run_serve(args: &Args) -> Result<()> {
                                     let _ = enc.set_bitrate(clamped);
                                 }
                             }
-                            RtcAction::InputData(d) => input_sink.handle(&d),
+                            RtcAction::InputData(d) => {
+                                input_packets += 1;
+                                input_bytes += d.len() as u64;
+                                input_sink.handle(&d);
+                                if input_packets <= 20 || input_packets % 500 == 0 {
+                                    info!(
+                                        input_packets,
+                                        input_bytes,
+                                        "input packets applied via SendInput"
+                                    );
+                                }
+                            }
                             RtcAction::ChannelOpen(_) => {}
                         }
                     }
