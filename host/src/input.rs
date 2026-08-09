@@ -14,12 +14,14 @@
 //! Anti-cheat note: SendInput is the v0 injection method. Games with kernel
 //! anti-cheat may ignore synthetic input or flag the process; accepted for v0.
 
+use std::collections::BTreeSet;
+
 use tracing::{debug, warn};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, VIRTUAL_KEY,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
 
 const TYPE_KEY_DOWN: u8 = 0;
@@ -30,12 +32,53 @@ const TYPE_BUTTONS: u8 = 4;
 const TYPE_WHEEL: u8 = 5;
 
 pub struct InputSink {
-    prev_buttons: u8,
+    state: InputState,
+}
+
+#[derive(Default)]
+struct InputState {
+    pressed_keys: BTreeSet<u16>,
+    buttons: u8,
+}
+
+impl InputState {
+    fn key(&mut self, vk: u16, up: bool) {
+        if up {
+            self.pressed_keys.remove(&vk);
+        } else {
+            self.pressed_keys.insert(vk);
+        }
+    }
+
+    fn take_release_plan(&mut self) -> (Vec<u16>, u8) {
+        let keys = std::mem::take(&mut self.pressed_keys).into_iter().collect();
+        let buttons = std::mem::replace(&mut self.buttons, 0);
+        (keys, buttons)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InputState;
+
+    #[test]
+    fn release_plan_contains_each_held_key_and_pressed_button_once() {
+        let mut state = InputState::default();
+        state.key(0x41, false);
+        state.key(0x10, false);
+        state.key(0x41, false);
+        state.buttons = 0b101;
+
+        assert_eq!(state.take_release_plan(), (vec![0x10, 0x41], 0b101));
+        assert_eq!(state.take_release_plan(), (Vec::new(), 0));
+    }
 }
 
 impl InputSink {
     pub fn new() -> Self {
-        Self { prev_buttons: 0 }
+        Self {
+            state: InputState::default(),
+        }
     }
 
     /// Handle one data-channel packet. Malformed packets are logged and dropped.
@@ -45,12 +88,14 @@ impl InputSink {
             TYPE_KEY_DOWN => {
                 if data.len() >= 3 {
                     let vk = u16::from_le_bytes([data[1], data[2]]);
+                    self.state.key(vk, false);
                     self.key(vk, false);
                 }
             }
             TYPE_KEY_UP => {
                 if data.len() >= 3 {
                     let vk = u16::from_le_bytes([data[1], data[2]]);
+                    self.state.key(vk, true);
                     self.key(vk, true);
                 }
             }
@@ -142,8 +187,8 @@ impl InputSink {
 
     /// Bitmask diff -> press/release events for each button.
     fn buttons(&mut self, mask: u8) {
-        let changed = mask ^ self.prev_buttons;
-        self.prev_buttons = mask;
+        let changed = mask ^ self.state.buttons;
+        self.state.buttons = mask;
         if changed == 0 {
             return;
         }
@@ -190,5 +235,51 @@ impl InputSink {
             },
         };
         unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    }
+
+    /// Release input the browser may never get to send when its data channel
+    /// or signaling session disappears. This is also called from Drop.
+    pub fn release_all(&mut self) {
+        let (keys, buttons) = self.state.take_release_plan();
+        for vk in keys {
+            self.key(vk, true);
+        }
+        if buttons != 0 {
+            self.send_button_releases(buttons);
+        }
+    }
+
+    fn send_button_releases(&self, buttons: u8) {
+        let mut inputs = Vec::with_capacity(3);
+        for (bit, up_flag) in [
+            (1u8, MOUSEEVENTF_LEFTUP),
+            (2u8, MOUSEEVENTF_RIGHTUP),
+            (4u8, MOUSEEVENTF_MIDDLEUP),
+        ] {
+            if buttons & bit != 0 {
+                inputs.push(INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: 0,
+                            dy: 0,
+                            mouseData: 0,
+                            dwFlags: up_flag,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+        }
+        if !inputs.is_empty() {
+            unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        }
+    }
+}
+
+impl Drop for InputSink {
+    fn drop(&mut self) {
+        self.release_all();
     }
 }

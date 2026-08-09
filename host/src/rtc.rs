@@ -35,8 +35,6 @@ pub struct RtcSession {
     pub video_mid: Option<Mid>,
     pub h264_pt: Option<Pt>,
     pub ice_connected: bool,
-    /// Buffered remote candidates that arrived before the offer was accepted.
-    pending_remote: Vec<String>,
     /// Base instant for the 90 kHz RTP clock.
     clock_start: Instant,
     frames_written: u64,
@@ -55,7 +53,6 @@ impl RtcSession {
             video_mid: None,
             h264_pt: None,
             ice_connected: false,
-            pending_remote: Vec::new(),
             clock_start: now,
             frames_written: 0,
         }
@@ -80,12 +77,6 @@ impl RtcSession {
             .context("accept_offer")?;
         self.clock_start = Instant::now();
 
-        // Drain any remote candidates that trickled in early.
-        let buffered = std::mem::take(&mut self.pending_remote);
-        for c in buffered {
-            self.add_remote_candidate(&c);
-        }
-
         Ok(answer.to_sdp_string())
     }
 
@@ -104,11 +95,6 @@ impl RtcSession {
     /// Add a remote (browser) trickled candidate, given as an SDP `a=candidate`
     /// attribute line (with or without the `a=` prefix).
     pub fn add_remote_candidate(&mut self, sdp: &str) {
-        if self.video_mid.is_none() && !self.ice_connected {
-            // Before an offer is accepted, just buffer.
-            self.pending_remote.push(sdp.to_string());
-            return;
-        }
         match Candidate::from_sdp_string(sdp) {
             Ok(c) => {
                 self.rtc.add_remote_candidate(c);

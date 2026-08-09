@@ -45,7 +45,7 @@ test("modern transform keeps canvas/decode/render in the DedicatedWorker", () =>
 test("native video is the default path and WebCodecs is opt-in", () => {
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /const useWebCodecs = params\.get\("decoderPath"\) === "webcodecs";/);
-  assert.match(client, /if \(!useWebCodecs\) \{\s*startNativeVideo\(ev\.track\);\s*return;/);
+  assert.match(client, /if \(!useWebCodecs\) \{\s*startNativeVideo\(ev\.track(?:, generation)?\);\s*return;/);
   assert.match(client, /if \(useWebCodecs\) peerOptions\.encodedInsertableStreams = true;/);
   assert.match(client, /video\.requestVideoFrameCallback\(onVideoFrame\)/);
   assert.match(client, /nativePresentation:/);
@@ -64,4 +64,20 @@ test("native video keeps an explicit input overlay and diagnostics count present
   assert.match(client, /renderedTimestamp: lastRenderedTimestamp \?\? \(nativeFramesPresented > 0 \? nativeFramesPresented : null\)/);
   assert.match(collector, /function hasRenderedFrame\(snapshot\)/);
   assert.doesNotMatch(collector, /ready && ready\.ice === "connected" && Number\.isFinite\(ready\.renderedTimestamp\)/);
+});
+
+test("client starts a new signaling and peer epoch after relay loss or peer departure", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /function reconnectSignaling\(reason\)/);
+  assert.match(client, /case "peer-left":\s*restartPeer\("peer-left"\)/);
+  assert.match(client, /socket\.onclose = \(event\) => \{[\s\S]*reconnectSignaling\("ws-closed"\)/);
+  assert.match(client, /const generation = \+\+peerGeneration/);
+  assert.match(client, /pendingRemoteIce/);
+});
+
+test("worker policy closure is terminal while transient websocket closure reconnects", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /shouldReconnectAfterClose\(event\.code, terminalSignalingFailure\)/);
+  assert.match(client, /terminalSignalingFailure/);
+  assert.match(client, /reconnectSignaling\("ws-closed"\)/);
 });

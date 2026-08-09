@@ -35,10 +35,47 @@ const DEFAULT_BITRATE_BPS: u32 = 8_000_000;
 const MIN_BITRATE_BPS: u32 = 1_000_000;
 const MAX_BITRATE_BPS: u32 = 40_000_000;
 const IDR_INTERVAL: Duration = Duration::from_secs(2);
+const STATIC_REPLAY_DELAY: Duration = Duration::from_millis(250);
 // Chromium may repeat PLI while a large recovery IDR is still in flight.
 // Forcing a new IDR for every RTCP packet floods the link and prevents any
 // one keyframe from completing, so coalesce requests at the sender boundary.
 const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// Bounded policy for replaying the latest IDR when desktop duplication has
+/// no new presents. It never schedules a stream of static frames.
+#[derive(Default)]
+struct CachedIdrReplay {
+    initial_frame_pending: bool,
+    recovery_requested_at: Option<Instant>,
+}
+
+impl CachedIdrReplay {
+    fn on_ice_connected(&mut self) {
+        self.initial_frame_pending = true;
+    }
+
+    fn on_keyframe_requested(&mut self, now: Instant) {
+        self.recovery_requested_at.get_or_insert(now);
+    }
+
+    fn on_fresh_idr_admitted(&mut self) {
+        self.initial_frame_pending = false;
+        self.recovery_requested_at = None;
+    }
+
+    fn is_due(&self, now: Instant, cached_idr_available: bool) -> bool {
+        cached_idr_available
+            && (self.initial_frame_pending
+                || self
+                    .recovery_requested_at
+                    .is_some_and(|requested| now.duration_since(requested) >= STATIC_REPLAY_DELAY))
+    }
+
+    fn on_replayed(&mut self) {
+        self.initial_frame_pending = false;
+        self.recovery_requested_at = None;
+    }
+}
 
 #[derive(Debug)]
 struct Args {
@@ -226,18 +263,8 @@ fn run_serve(args: &Args) -> Result<()> {
     let host_addr: SocketAddr = SocketAddr::new(host_ip, local_port);
     info!(%host_addr, "media socket bound");
 
-    // 2. Signaling.
-    let mut signaling = Signaling::connect(&worker, &token)?;
-
-    // 3. RTC session.
-    let mut rtc = RtcSession::new(Instant::now());
-    rtc.add_host_candidate(host_addr)?;
-    drain_setup_outputs(&mut rtc, &socket)?;
-
-    // Discover the server-reflexive candidate before accepting an offer.
-    // The STUN helper is synchronous and uses this same media socket; doing
-    // it here means it cannot consume browser ICE/DTLS datagrams. Adding the
-    // candidate before SDP negotiation also puts it directly in the answer.
+    // Cache STUN while startup is otherwise idle: a fresh RTC epoch must not
+    // put an unreachable STUN round-trip on the offer-to-answer path.
     socket
         .set_nonblocking(false)
         .context("make media socket blocking for startup STUN")?;
@@ -245,23 +272,35 @@ fn run_serve(args: &Args) -> Result<()> {
     socket
         .set_nonblocking(true)
         .context("restore nonblocking media socket after startup STUN")?;
-    match stun_result {
+    let mapped_addr = match stun_result {
         Ok(mapped) => {
-            rtc.add_srflx_candidate(mapped, host_addr)?;
-            drain_setup_outputs(&mut rtc, &socket)?;
-            info!(%mapped, "srflx candidate ready for SDP answer");
+            info!(%mapped, "cached srflx candidate ready for RTC epochs");
+            Some(mapped)
         }
-        Err(e) => warn!(
-            ?e,
-            "STUN discovery failed; host candidate only for this session"
-        ),
-    }
+        Err(e) => {
+            warn!(
+                ?e,
+                "startup STUN failed; RTC epochs will use the host candidate only"
+            );
+            None
+        }
+    };
+
+    // 2. Signaling.
+    let mut signaling = Signaling::connect(&worker, &token)?;
+
+    // 3. Placeholder RTC epoch. str0m instances have negotiation timers, so
+    // the real epoch is always constructed immediately before an unconnected
+    // browser offer is accepted (rather than while the host waits idle).
+    let mut rtc = RtcSession::new(Instant::now());
 
     // 4. Capture (+ warm up encoder from the first frame).
     let _vdd = start_vdd_keepalive(args)?;
     let mut capture = Capture::new(args.monitor.as_deref()).context("capture init")?;
     let mut encoder: Option<Nvenc> = None;
     let mut input_sink = InputSink::new();
+    let mut latest_idr: Option<Vec<u8>> = None;
+    let mut cached_idr_replay = CachedIdrReplay::default();
 
     let mut next_idr = Instant::now() + IDR_INTERVAL;
     let mut last_idr_sent = Instant::now()
@@ -270,6 +309,8 @@ fn run_serve(args: &Args) -> Result<()> {
     let mut next_signal_ping = Instant::now() + Duration::from_secs(20);
     let mut last_logged_bwe: Option<u64> = None;
     let mut pending_signal_events = VecDeque::new();
+    let mut pending_remote_candidates: VecDeque<String> = VecDeque::new();
+    let mut offer_accepted = false;
     let mut connected_since: Option<Instant> = None;
     let mut frames_sent = 0u64;
     let mut input_packets = 0u64;
@@ -313,6 +354,7 @@ fn run_serve(args: &Args) -> Result<()> {
                         match action {
                             RtcAction::IceConnected => {
                                 let now = Instant::now();
+                                cached_idr_replay.on_ice_connected();
                                 connected_since = Some(now);
                                 next_idr = now; // immediate IDR
                                 transport_window_started = now;
@@ -331,6 +373,7 @@ fn run_serve(args: &Args) -> Result<()> {
                             RtcAction::KeyframeRequested => {
                                 let now = Instant::now();
                                 if now.duration_since(last_idr_sent) >= KEYFRAME_REQUEST_COOLDOWN {
+                                    cached_idr_replay.on_keyframe_requested(now);
                                     if let Some(enc) = encoder.as_mut() {
                                         enc.force_idr();
                                         info!("forcing IDR after receiver keyframe request");
@@ -402,12 +445,25 @@ fn run_serve(args: &Args) -> Result<()> {
                 }
             }
         }
+        if let Some(candidate) =
+            take_remote_candidate_after_answer(offer_accepted, &mut pending_remote_candidates)
+        {
+            rtc.add_remote_candidate(&candidate);
+            // One mutation per iteration; drain str0m before the next signal.
+            continue 'run;
+        }
         if let Some(ev) = pending_signal_events.pop_front() {
             match ev {
                 SignalEvent::Offer(sdp) => {
                     info!("received SDP offer");
+                    if !should_start_fresh_rtc_epoch(rtc.ice_connected) {
+                        debug!("ignoring duplicate offer for connected RTC epoch");
+                        continue 'run;
+                    }
+                    rtc = fresh_rtc_epoch(&socket, host_addr, mapped_addr)?;
                     match rtc.accept_offer(&sdp) {
                         Ok(answer) => {
+                            offer_accepted = true;
                             if let Err(e) = signaling.send_answer(&answer) {
                                 warn!(?e, "send answer failed — ending session");
                                 break 'run;
@@ -425,7 +481,11 @@ fn run_serve(args: &Args) -> Result<()> {
                     }
                 }
                 SignalEvent::RemoteCandidate(sdp) => {
-                    rtc.add_remote_candidate(&sdp);
+                    if offer_accepted {
+                        rtc.add_remote_candidate(&sdp);
+                    } else {
+                        pending_remote_candidates.push_back(sdp);
+                    }
                     continue 'run;
                 }
                 SignalEvent::ClientDiagnostics {
@@ -496,6 +556,28 @@ fn run_serve(args: &Args) -> Result<()> {
             continue 'run;
         }
 
+        // A static desktop can leave DDA with no new presents indefinitely.
+        // Replaying the cached IDR uses a new RTP timestamp in write_video and
+        // is one bounded RTC mutation followed by the next loop's full drain.
+        if rtc.ice_connected && cached_idr_replay.is_due(now, latest_idr.is_some()) {
+            let cached = latest_idr.as_ref().expect("checked above");
+            let encoded_bytes = cached.len();
+            match rtc.write_video(cached.clone()) {
+                Err(e) => warn!(?e, "cached IDR replay failed"),
+                Ok(false) => debug!("cached IDR replay was not admitted"),
+                Ok(true) => {
+                    frames_sent += 1;
+                    admitted_frames_window += 1;
+                    admitted_bytes_window += encoded_bytes as u64;
+                    last_idr_sent = now;
+                    next_idr = now + IDR_INTERVAL;
+                    info!(frames_sent, encoded_bytes, "cached IDR replayed for static desktop");
+                }
+            }
+            cached_idr_replay.on_replayed();
+            continue 'run;
+        }
+
         // -- Media pump: capture -> encode -> write ---------------------------
         // Poll DDA instead of waiting in it. str0m owns the next wake-up; a
         // new desktop present will be picked up on the next sub-millisecond
@@ -516,9 +598,13 @@ fn run_serve(args: &Args) -> Result<()> {
                     }
                 }
             }
-            if is_new {
+            // Bootstrap once even if DDA's first acquired texture is labelled
+            // duplicate, then retain normal duplicate skipping after an IDR is
+            // cached for static-first-frame and recovery replay.
+            if is_new || latest_idr.is_none() {
+                let bootstrap_encode = latest_idr.is_none();
                 // Periodic IDR.
-                if Instant::now() >= next_idr {
+                if bootstrap_encode || Instant::now() >= next_idr {
                     if let Some(enc) = encoder.as_mut() {
                         enc.force_idr();
                     }
@@ -531,8 +617,11 @@ fn run_serve(args: &Args) -> Result<()> {
                 };
                 match enc.encode_texture(texture_ptr(&frame)) {
                     Ok(encoded) => {
+                        let is_idr = encoded.is_idr;
+                        if is_idr {
+                            latest_idr = Some(encoded.data.clone());
+                        }
                         if rtc.ice_connected {
-                            let is_idr = encoded.is_idr;
                             let encoded_bytes = encoded.data.len();
                             let encode_us = encoded.encode_us;
                             match rtc.write_video(encoded.data) {
@@ -545,6 +634,7 @@ fn run_serve(args: &Args) -> Result<()> {
                                     if is_idr {
                                         last_idr_sent = Instant::now();
                                         next_idr = last_idr_sent + IDR_INTERVAL;
+                                        cached_idr_replay.on_fresh_idr_admitted();
                                         info!(frames_sent, encoded_bytes, "IDR sent");
                                     }
                                     if frames_sent % 300 == 0 {
@@ -612,6 +702,7 @@ fn run_serve(args: &Args) -> Result<()> {
         }
     }
 
+    input_sink.release_all();
     signaling.send_bye();
     let secs = connected_since
         .map(|t| t.elapsed().as_secs_f64())
@@ -642,6 +733,42 @@ fn drain_setup_outputs(rtc: &mut RtcSession, socket: &UdpSocket) -> Result<()> {
             Err(e) => return Err(e).context("drain RTC setup output"),
         }
     }
+}
+
+/// Construct an RTC epoch just in time for SDP negotiation. A str0m instance
+/// can expire while the host waits for a browser, so never reuse an idle one
+/// for its first offer. Every candidate mutation is followed by a full output
+/// drain before the next mutation or SDP operation.
+fn fresh_rtc_epoch(
+    socket: &UdpSocket,
+    host_addr: SocketAddr,
+    mapped_addr: Option<SocketAddr>,
+) -> Result<RtcSession> {
+    let mut rtc = RtcSession::new(Instant::now());
+    rtc.add_host_candidate(host_addr)?;
+    drain_setup_outputs(&mut rtc, socket)?;
+
+    if let Some(mapped) = mapped_addr {
+        rtc.add_srflx_candidate(mapped, host_addr)?;
+        drain_setup_outputs(&mut rtc, socket)?;
+        info!(%mapped, "cached srflx candidate ready for SDP answer");
+    }
+    Ok(rtc)
+}
+
+/// A connected transport owns its current peer. Extra offer messages at that
+/// point are duplicates, not a request to tear down live media/input.
+fn should_start_fresh_rtc_epoch(ice_connected: bool) -> bool {
+    !ice_connected
+}
+
+/// Pre-answer ICE stays outside RtcSession so accepting SDP remains one RTC
+/// mutation. The caller applies one candidate only after an answer is sent.
+fn take_remote_candidate_after_answer(
+    offer_accepted: bool,
+    pending: &mut VecDeque<String>,
+) -> Option<String> {
+    offer_accepted.then(|| pending.pop_front()).flatten()
 }
 
 /// Discover the local interface IP used for the default route (UDP-connect trick;
@@ -719,4 +846,58 @@ fn physical_monitor_count() -> Result<usize> {
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        should_start_fresh_rtc_epoch, take_remote_candidate_after_answer, CachedIdrReplay,
+        STATIC_REPLAY_DELAY,
+    };
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unconnected_offer_replaces_the_idle_rtc_epoch_but_connected_duplicate_does_not() {
+        assert!(should_start_fresh_rtc_epoch(false));
+        assert!(!should_start_fresh_rtc_epoch(true));
+    }
+
+    #[test]
+    fn early_remote_ice_stays_queued_until_after_the_answer_epoch() {
+        let mut queued = VecDeque::from(["candidate-a".to_string()]);
+        assert_eq!(take_remote_candidate_after_answer(false, &mut queued), None);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            take_remote_candidate_after_answer(true, &mut queued).as_deref(),
+            Some("candidate-a")
+        );
+    }
+
+    #[test]
+    fn cached_idr_replay_is_immediate_for_first_frame_and_delayed_once_for_pli() {
+        let mut replay = CachedIdrReplay::default();
+        let start = Instant::now();
+        replay.on_ice_connected();
+        assert!(replay.is_due(start, true));
+        replay.on_replayed();
+        assert!(!replay.is_due(start, true));
+
+        replay.on_keyframe_requested(start);
+        assert!(!replay.is_due(start, true));
+        assert!(!replay.is_due(start + STATIC_REPLAY_DELAY - Duration::from_millis(1), true));
+        assert!(replay.is_due(start + STATIC_REPLAY_DELAY, true));
+        replay.on_replayed();
+        assert!(!replay.is_due(start + STATIC_REPLAY_DELAY * 2, true));
+    }
+
+    #[test]
+    fn fresh_admitted_idr_cancels_a_pending_static_replay() {
+        let mut replay = CachedIdrReplay::default();
+        let start = Instant::now();
+        replay.on_ice_connected();
+        replay.on_keyframe_requested(start);
+        replay.on_fresh_idr_admitted();
+        assert!(!replay.is_due(start + STATIC_REPLAY_DELAY, true));
+    }
 }

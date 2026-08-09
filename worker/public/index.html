@@ -39,6 +39,10 @@
 <script type="module">
 "use strict";
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats } from "/latency.js";
+import {
+  shouldReconnectAfterClose,
+  shouldRecycleSignalingForPeerState,
+} from "/recovery.js";
 
 // ---------------------------------------------------------------------------
 // BubblePlay browser client. Native WebRTC video is the normal display path;
@@ -103,66 +107,150 @@ setInterval(() => {
 
 // ---- signaling --------------------------------------------------------------
 const proto = location.protocol === "https:" ? "wss:" : "ws:";
-const ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
-
+let ws = null;
+let signalingGeneration = 0;
+let reconnectTimer = null;
+let terminalSignalingFailure = false;
 let pc = null;
 let lastIceCandidateError = null;
 let dc = null;
 let inputReady = false;
 let connected = false;
 let offerSent = false;
+let peerGeneration = 0;
+let pendingRemoteIce = [];
+let remoteDescriptionSet = false;
 
-ws.onopen = () => {
-  hudState.ws = "open";
-  ws.send(JSON.stringify({ type: "hello", token, role: "client" }));
-};
-ws.onclose = () => {
-  hudState.ws = "closed";
-  hud.classList.add("bad");
-};
-ws.onerror = () => { hudState.ws = "error"; };
-ws.onmessage = (ev) => {
+function isCurrentPeer(generation, candidate = pc) {
+  return generation === peerGeneration && candidate === pc;
+}
+
+function sendSignal(message) {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+}
+
+function reconnectSignaling(reason) {
+  if (terminalSignalingFailure) return;
+  if (reconnectTimer || ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
+  hudState.ws = `reconnecting (${reason})`;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    const generation = ++signalingGeneration;
+    const socket = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
+    ws = socket;
+    socket.onopen = () => {
+      if (ws !== socket || generation !== signalingGeneration) return;
+      hudState.ws = "open";
+      sendSignal({ type: "hello", token, role: "client" });
+    };
+    socket.onclose = (event) => {
+      if (ws !== socket || generation !== signalingGeneration) return;
+      hudState.ws = "closed";
+      hud.classList.add("bad");
+      if (!shouldReconnectAfterClose(event.code, terminalSignalingFailure)) {
+        terminalSignalingFailure = true;
+        return;
+      }
+      restartPeer("ws-closed", false);
+      reconnectSignaling("ws-closed");
+    };
+    socket.onerror = () => { if (ws === socket) hudState.ws = "error"; };
+    socket.onmessage = (ev) => handleSignal(socket, generation, ev);
+  }, 250);
+}
+
+async function handleSignal(socket, generation, ev) {
+  if (ws !== socket || generation !== signalingGeneration) return;
   let msg;
   try { msg = JSON.parse(ev.data); } catch { return; }
   switch (msg.type) {
     case "hello-ok":
       hudState.ws = "ok";
-      startPeer();
+      startPeer(peerGeneration);
       break;
-    case "answer":
-      pc.setRemoteDescription({ type: "answer", sdp: msg.sdp })
-        .then(() => { hudState.ice = "answer"; })
-        .catch((e) => { hudState.ice = `err:${e}`; });
+    case "answer": {
+      const candidate = pc;
+      const peer = peerGeneration;
+      if (!candidate || remoteDescriptionSet) return;
+      try {
+        await candidate.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+        if (!isCurrentPeer(peer, candidate)) return;
+        remoteDescriptionSet = true;
+        hudState.ice = "answer";
+        const queued = pendingRemoteIce;
+        pendingRemoteIce = [];
+        for (const ice of queued) await addRemoteIce(candidate, peer, ice);
+      } catch (e) {
+        if (isCurrentPeer(peer, candidate)) hudState.ice = `err:${e}`;
+      }
       break;
+    }
     case "ice":
-      if (pc && msg.candidate) {
-        pc.addIceCandidate({ candidate: msg.candidate }).catch((e) => {
-          // Racing with setRemoteDescription is normal; retry once after answer.
-          console.warn("addIceCandidate", e);
-        });
+      if (msg.candidate) {
+        if (!pc || !remoteDescriptionSet) pendingRemoteIce.push(msg.candidate);
+        else addRemoteIce(pc, peerGeneration, msg.candidate);
       }
       break;
     case "peer-left":
-      hudState.ice = "peer-left";
-      hud.classList.add("bad");
+      restartPeer("peer-left");
       break;
     case "error":
+      terminalSignalingFailure = true;
       hudState.ws = `err:${msg.message}`;
       hud.classList.add("bad");
       break;
   }
-};
+}
+
+async function addRemoteIce(candidate, generation, ice) {
+  try {
+    await candidate.addIceCandidate({ candidate: ice });
+  } catch (e) {
+    if (isCurrentPeer(generation, candidate)) console.warn("addIceCandidate", e);
+  }
+}
 
 // Keep the relay's WebSocket alive.
 setInterval(() => {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "ping" }));
-  }
+  sendSignal({ type: "ping" });
 }, 25000);
 
 // ---- WebRTC ----------------------------------------------------------------
-async function startPeer() {
-  if (offerSent) return;
+function restartPeer(reason, reconnect = true) {
+  const generation = ++peerGeneration;
+  cleanupPeer();
+  pendingRemoteIce = [];
+  remoteDescriptionSet = false;
+  offerSent = false;
+  hudState.ice = reason;
+  hud.classList.add("bad");
+  if (ws?.readyState === WebSocket.OPEN) startPeer(generation);
+  else if (reconnect) reconnectSignaling(reason);
+}
+
+function cleanupPeer() {
+  inputReady = false;
+  connected = false;
+  try { dc?.close(); } catch {}
+  dc = null;
+  try { pc?.close(); } catch {}
+  pc = null;
+  try { decoder?.close(); } catch {}
+  decoder = null;
+  if (encodedWorker) {
+    encodedWorker.terminate();
+    encodedWorker = null;
+    replaceTransferredCanvas();
+  }
+  activeVideo?.remove();
+  activeVideo = null;
+  nativePresentation = null;
+  stage.classList.remove("native-video-input");
+  resetRenderPacing();
+}
+
+async function startPeer(generation = peerGeneration) {
+  if (offerSent || generation !== peerGeneration || ws?.readyState !== WebSocket.OPEN) return;
   offerSent = true;
   lastIceCandidateError = null;
 
@@ -174,10 +262,11 @@ async function startPeer() {
   // This must be set during construction, but only the opt-in WebCodecs path
   // needs it. The native path keeps browser decode/render untouched.
   if (useWebCodecs) peerOptions.encodedInsertableStreams = true;
-  pc = new RTCPeerConnection(peerOptions);
+  const candidate = new RTCPeerConnection(peerOptions);
+  pc = candidate;
 
   // Receive-only video; the browser offers, the host answers (locked).
-  const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
+  const transceiver = candidate.addTransceiver("video", { direction: "recvonly" });
   transceiver.receiver.playoutDelayHint = 0; // minimal jitter buffer
   // playoutDelayHint is advisory and Chromium may still grow hundreds of
   // milliseconds of buffer. jitterBufferTarget is the explicit millisecond
@@ -198,18 +287,20 @@ async function startPeer() {
   }
 
   // Input channel: unordered + maxRetransmits 0 (UDP-like, fire-and-forget).
-  dc = pc.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
-  dc.binaryType = "arraybuffer";
-  dc.onopen = () => { hudState.dc = "open"; inputReady = true; };
-  dc.onclose = () => { hudState.dc = "closed"; inputReady = false; };
-  dc.onerror = (e) => { hudState.dc = `err:${e.message || ""}`; };
+  const channel = candidate.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
+  dc = channel;
+  channel.binaryType = "arraybuffer";
+  channel.onopen = () => { if (isCurrentPeer(generation, candidate)) { hudState.dc = "open"; inputReady = true; } };
+  channel.onclose = () => { if (isCurrentPeer(generation, candidate)) { hudState.dc = "closed"; inputReady = false; } };
+  channel.onerror = (e) => { if (isCurrentPeer(generation, candidate)) hudState.dc = `err:${e.message || ""}`; };
 
-  pc.onicecandidate = (ev) => {
-    if (ev.candidate && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "ice", candidate: ev.candidate.candidate }));
+  candidate.onicecandidate = (ev) => {
+    if (isCurrentPeer(generation, candidate) && ev.candidate) {
+      sendSignal({ type: "ice", candidate: ev.candidate.candidate });
     }
   };
-  pc.onicecandidateerror = (ev) => {
+  candidate.onicecandidateerror = (ev) => {
+    if (!isCurrentPeer(generation, candidate)) return;
     // Keep this compact and omit address/port so profiling never reports a
     // client's private or public IP address through the signaling relay.
     lastIceCandidateError = {
@@ -219,26 +310,38 @@ async function startPeer() {
       atMs: Date.now(),
     };
   };
-  pc.oniceconnectionstatechange = () => {
-    hudState.ice = pc.iceConnectionState;
-    connected = pc.iceConnectionState === "connected";
+  candidate.oniceconnectionstatechange = () => {
+    if (!isCurrentPeer(generation, candidate)) return;
+    hudState.ice = candidate.iceConnectionState;
+    connected = candidate.iceConnectionState === "connected";
     if (connected) {
       hud.classList.remove("bad");
       requestPointerLock();
     }
   };
-  pc.ontrack = (ev) => onTrack(ev);
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-      hudState.ice = pc.connectionState;
+  candidate.ontrack = (ev) => { if (isCurrentPeer(generation, candidate)) onTrack(ev, generation); };
+  candidate.onconnectionstatechange = () => {
+    if (!isCurrentPeer(generation, candidate)) return;
+    if (shouldRecycleSignalingForPeerState(candidate.connectionState)) {
+      hudState.ice = candidate.connectionState;
       hud.classList.add("bad");
+      if (ws?.readyState === WebSocket.OPEN) ws.close(1000, "rtc-failed");
+      else restartPeer(candidate.connectionState);
     }
   };
 
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  ws.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
+  try {
+    const offer = await candidate.createOffer();
+    if (!isCurrentPeer(generation, candidate)) return;
+    await candidate.setLocalDescription(offer);
+    if (!isCurrentPeer(generation, candidate)) return;
+    sendSignal({ type: "offer", sdp: offer.sdp });
+  } catch (e) {
+    if (isCurrentPeer(generation, candidate)) restartPeer(`offer:${e.message || e}`);
+  }
 }
+
+reconnectSignaling("startup");
 
 // ---- WebCodecs decode --------------------------------------------------------
 let decoder = null;
@@ -446,7 +549,7 @@ function renderTick() {
 let previousInboundStats = null;
 
 function sendClientProfile() {
-  if (!profilingEnabled || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 65_536) return;
+  if (!profilingEnabled || ws?.readyState !== WebSocket.OPEN || ws.bufferedAmount > 65_536) return;
   const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
   const profile = {
     schemaVersion: 1,
@@ -491,7 +594,7 @@ function sendClientProfile() {
     atMs: Date.now(),
     profile,
   });
-  if (message.length <= 16_384) ws.send(message);
+  if (message.length <= 16_384 && ws?.readyState === WebSocket.OPEN) ws.send(message);
 }
 
 let statsPollPending = false;
@@ -550,12 +653,13 @@ setInterval(async () => {
   }
 }, 1000);
 
-function onTrack(ev) {
+function onTrack(ev, generation = peerGeneration) {
+  if (generation !== peerGeneration) return;
   const receiver = ev.receiver;
   const transceiver = pc.getTransceivers().find((t) => t.receiver === receiver);
 
   if (!useWebCodecs) {
-    startNativeVideo(ev.track);
+    startNativeVideo(ev.track, generation);
     return;
   }
 
@@ -570,12 +674,13 @@ function onTrack(ev) {
       location.replace(next.href);
     };
     worker.onmessage = (e) => {
+      if (generation !== peerGeneration || worker !== encodedWorker) return;
       const message = e.data;
       if (message.kind === "control") {
         if (message.type === "capabilities") {
           if (!message.supported) {
             worker.terminate(); encodedWorker = null;
-            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startNativeVideo(ev.track);
+            if (receiver.createEncodedStreams) startEncodedStreams(receiver, generation); else startNativeVideo(ev.track, generation);
             return;
           }
           try {
@@ -583,7 +688,7 @@ function onTrack(ev) {
             worker.postMessage({ type: "canvas", canvas: offscreen, diagnostics: diagnosticsEnabled }, [offscreen]);
           } catch {
             worker.terminate(); encodedWorker = null;
-            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startNativeVideo(ev.track);
+            if (receiver.createEncodedStreams) startEncodedStreams(receiver, generation); else startNativeVideo(ev.track, generation);
           }
           return;
         }
@@ -617,7 +722,7 @@ function onTrack(ev) {
           hudState.dec = `${message.type}:${message.message || "unavailable"}`;
           if (!transformAttached) {
             worker.terminate(); encodedWorker = null; replaceTransferredCanvas();
-            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startNativeVideo(ev.track);
+            if (receiver.createEncodedStreams) startEncodedStreams(receiver, generation); else startNativeVideo(ev.track, generation);
           } else {
             reloadFallback();
           }
@@ -625,22 +730,22 @@ function onTrack(ev) {
         return;
       }
     };
-    worker.onerror = (e) => { hudState.dec = `worker:${e.message || "err"}`; reloadFallback(); };
+    worker.onerror = (e) => { if (generation === peerGeneration) { hudState.dec = `worker:${e.message || "err"}`; reloadFallback(); } };
     worker.postMessage({ type: "capabilities" });
     return;
   }
 
   // 2) Legacy path: createEncodedStreams (older Chromium).
   if (receiver.createEncodedStreams) {
-    startEncodedStreams(receiver);
+    startEncodedStreams(receiver, generation);
     return;
   }
 
   // An explicit WebCodecs request can still fall back to native video.
-  startNativeVideo(ev.track);
+  startNativeVideo(ev.track, generation);
 }
 
-function startNativeVideo(track) {
+function startNativeVideo(track, generation = peerGeneration) {
   const video = document.createElement("video");
   video.autoplay = true;
   video.playsInline = true;
@@ -676,6 +781,7 @@ function startNativeVideo(track) {
   video.addEventListener("loadedmetadata", updateDimensions);
   if (nativePresentation.supported) {
     const onVideoFrame = (now, metadata) => {
+      if (generation !== peerGeneration || activeVideo !== video) return;
       const gap = lastFrameAt === null ? null : now - lastFrameAt;
       if (nativePresentation.firstFrameAtMs === null) nativePresentation.firstFrameAtMs = Date.now();
       nativePresentation.framesPresented = metadata.presentedFrames ?? nativePresentation.framesPresented + 1;
@@ -713,7 +819,7 @@ function startNativeVideo(track) {
   hudState.dec = "native video";
 }
 
-function startEncodedStreams(receiver) {
+function startEncodedStreams(receiver, generation = peerGeneration) {
   ensureMainCanvas();
   const { readable } = receiver.createEncodedStreams();
   const reader = readable.getReader();
@@ -721,6 +827,7 @@ function startEncodedStreams(receiver) {
     for (;;) {
       const { value: chunk, done } = await reader.read();
       if (done) break;
+      if (generation !== peerGeneration) { try { chunk.close(); } catch {} break; }
       const metadata = typeof chunk.getMetadata === "function" ? chunk.getMetadata() : {};
       const wrapped = {
         type: chunk.type,

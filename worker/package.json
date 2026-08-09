@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check:syntax": "node --check src/index.js && node --check public/latency.js && node --check public/latency-worker.js && node --check tools/latency-live.mjs",
+    "check:syntax": "node --check src/index.js && node --check public/latency.js && node --check public/latency-worker.js && node --check public/recovery.js && node --check tools/latency-live.mjs",
     "latency:live": "node tools/latency-live.mjs",
     "latency:bench": "node tools/latency-live.mjs --glass-to-glass"
   }

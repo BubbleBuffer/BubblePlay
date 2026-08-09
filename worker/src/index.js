@@ -205,7 +205,7 @@ export class Room {
     return (
       sockets.find((s) => {
         const a = s.deserializeAttachment() || {};
-        return a.role === role;
+        return a.role === role && !a.replaced && s.readyState === 1;
       }) || null
     );
   }
