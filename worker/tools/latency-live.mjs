@@ -27,6 +27,11 @@ const port = Number(option("--cdp-port", process.env.BUBBLEPLAY_CDP_PORT || 1933
 const output = resolve(root, "..", "artifacts", "latency", `${glassToGlass ? "benchmark" : "live"}-${Date.now()}.json`);
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 
+function hasRenderedFrame(snapshot) {
+  return Number.isFinite(snapshot?.renderedTimestamp) ||
+    (Number.isFinite(snapshot?.nativePresentation?.framesPresented) && snapshot.nativePresentation.framesPresented > 0);
+}
+
 function findChrome() {
   const candidates = [
     process.env.BUBBLEPLAY_CHROME,
@@ -150,7 +155,7 @@ async function main() {
     seconds,
     url: url.origin + url.pathname,
     glassToGlassEnabled: glassToGlass,
-    decoderPath: decoderPath || "transform",
+    decoderPath: decoderPath || "native",
     samples: [],
   };
 
@@ -167,17 +172,17 @@ async function main() {
       for (let retry = 0; retry < 40; retry++) {
         const raw = await evaluate(cdp, "JSON.stringify(window.__bubbleplayDiagnostics?.snapshot?.() ?? null)");
         ready = raw ? JSON.parse(raw) : null;
-        if (ready && ready.ice === "connected" && Number.isFinite(ready.renderedTimestamp)) break;
+        if (ready && ready.ice === "connected" && hasRenderedFrame(ready)) break;
         await sleep(250);
       }
-      if (ready && ready.ice === "connected" && Number.isFinite(ready.renderedTimestamp)) break;
+      if (ready && ready.ice === "connected" && hasRenderedFrame(ready)) break;
       // A stale offer can make the host recycle immediately after a Worker
       // deployment. Navigating away closes the old client before re-offering
       // to the freshly re-registered host.
       await cdp.call("Page.navigate", { url: "about:blank" });
       await sleep(750);
     }
-    if (!ready || ready.ice !== "connected" || !Number.isFinite(ready.renderedTimestamp)) {
+    if (!ready || ready.ice !== "connected" || !hasRenderedFrame(ready)) {
       throw new Error(`receiver did not reach ICE connected with rendered diagnostics (last=${JSON.stringify(ready)})`);
     }
 
@@ -198,7 +203,7 @@ async function main() {
       await sleep(250);
     }
 
-    const rendered = report.samples.filter((sample) => Number.isFinite(sample.renderedTimestamp));
+    const rendered = report.samples.filter(hasRenderedFrame);
     const stallEndElapsed = stallInjectedAt === null ? null : stallInjectedAt - started + stallMs;
     const recovery = stallEndElapsed === null ? null : rendered.find((sample) =>
       sample.elapsedMs >= stallEndElapsed &&

@@ -41,3 +41,27 @@ test("modern transform keeps canvas/decode/render in the DedicatedWorker", () =>
   assert.doesNotMatch(worker, /kind: "frame"/);
   assert.match(worker, /kind: "control"/);
 });
+
+test("native video is the default path and WebCodecs is opt-in", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /const useWebCodecs = params\.get\("decoderPath"\) === "webcodecs";/);
+  assert.match(client, /if \(!useWebCodecs\) \{\s*startNativeVideo\(ev\.track\);\s*return;/);
+  assert.match(client, /if \(useWebCodecs\) peerOptions\.encodedInsertableStreams = true;/);
+  assert.match(client, /video\.requestVideoFrameCallback\(onVideoFrame\)/);
+  assert.match(client, /nativePresentation:/);
+  assert.doesNotMatch(client, /encodedInsertableStreams:\s*true/);
+});
+
+test("native video keeps an explicit input overlay and diagnostics count presented frames", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const collector = readFileSync(new URL("../tools/latency-live.mjs", import.meta.url), "utf8");
+  assert.match(client, /#stage\.native-video-input #screen/);
+  assert.match(client, /stage\.classList\.add\("native-video-input"\)/);
+  assert.match(client, /z-index:1;pointer-events:none/);
+  assert.match(client, /function videoContentRect\(video\)/);
+  assert.match(client, /const r = activeVideo \? videoContentRect\(activeVideo\) : screen\.getBoundingClientRect\(\);/);
+  assert.match(client, /framesDrawn = nativePresentation\.framesPresented/);
+  assert.match(client, /renderedTimestamp: lastRenderedTimestamp \?\? \(nativeFramesPresented > 0 \? nativeFramesPresented : null\)/);
+  assert.match(collector, /function hasRenderedFrame\(snapshot\)/);
+  assert.doesNotMatch(collector, /ready && ready\.ice === "connected" && Number\.isFinite\(ready\.renderedTimestamp\)/);
+});

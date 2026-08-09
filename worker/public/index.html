@@ -9,13 +9,18 @@
   #stage {
     position: fixed; inset: 0;
     display: flex; align-items: center; justify-content: center;
-    cursor: crosshair;
+    cursor: crosshair; z-index: 2; pointer-events: none;
   }
   canvas {
     max-width: 100%; max-height: 100%;
     width: auto; height: auto;
     background: #000;
     image-rendering: auto;
+  }
+  #screen { pointer-events: auto; }
+  #stage.native-video-input #screen {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    max-width: none; max-height: none; background: transparent; opacity: 0;
   }
   #hud {
     position: fixed; top: 8px; left: 8px; z-index: 10;
@@ -36,20 +41,23 @@
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats } from "/latency.js";
 
 // ---------------------------------------------------------------------------
-// BubblePlay browser client (Chromium + WebCodecs only).
+// BubblePlay browser client. Native WebRTC video is the normal display path;
+// WebCodecs remains an explicit diagnostic/experimental opt-in.
 //
 // Flow:
 //   1. Open WebSocket to /ws?token=…, send hello (role=client).
 //   2. On hello-ok: create RTCPeerConnection with one recvonly video
 //      transceiver (H.264) + one unordered/unreliable input DataChannel.
 //   3. createOffer -> send to host via the relay. Host answers.
-//   4. Incoming video: insertable streams -> VideoDecoder (Annex B H.264)
-//      -> desynchronized 2D canvas, latest-frame-wins pacing.
+//   4. Incoming video: native <video> decode/render by default. With
+//      ?decoderPath=webcodecs, insertable streams -> VideoDecoder (Annex B
+//      H.264) -> desynchronized 2D canvas, latest-frame-wins pacing.
 //   5. Pointer-lock mouse + keyboard -> binary little-endian packets on the
 //      DataChannel, matching host/src/input.rs.
 // ---------------------------------------------------------------------------
 
 let screen = document.getElementById("screen");
+const stage = document.getElementById("stage");
 const hud = document.getElementById("hud");
 // Do not create a main-thread context until the legacy path is selected:
 // transferControlToOffscreen is only legal before a rendering context exists.
@@ -69,6 +77,7 @@ function replaceTransferredCanvas() {
 
 // ---- token ----------------------------------------------------------------
 const params = new URLSearchParams(location.search);
+const useWebCodecs = params.get("decoderPath") === "webcodecs";
 const diagnosticsEnabled = params.get("diag") === "1";
 const profilingEnabled = params.get("profile") === "1" || diagnosticsEnabled;
 const profileSessionId = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -83,11 +92,12 @@ if (token) {
 }
 
 // ---- status HUD ------------------------------------------------------------
-const hudState = { ws: "…", ice: "…", dc: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…" };
+const hudState = { ws: "…", ice: "…", dc: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: "…", dimensions: "…" };
 setInterval(() => {
   hud.innerHTML =
     `ws ${hudState.ws} | ice ${hudState.ice} | in ${hudState.dc}\n` +
     `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +
+    `presented ${hudState.presented} | gap ${hudState.frameGap}/${hudState.maxFrameGap}ms | ${hudState.dimensions}\n` +
     `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps`;
 }, 250);
 
@@ -156,14 +166,15 @@ async function startPeer() {
   offerSent = true;
   lastIceCandidateError = null;
 
-  pc = new RTCPeerConnection({
+  const peerOptions = {
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    // Required for receiver.createEncodedStreams(); must be set at
-    // construction, not later ("Too late to create encoded streams").
-    encodedInsertableStreams: true,
     // No TURN in v0 (locked decision): ICE must succeed peer-to-peer or on
     // a LAN. srflx candidates are trickled by both sides.
-  });
+  };
+  // This must be set during construction, but only the opt-in WebCodecs path
+  // needs it. The native path keeps browser decode/render untouched.
+  if (useWebCodecs) peerOptions.encodedInsertableStreams = true;
+  pc = new RTCPeerConnection(peerOptions);
 
   // Receive-only video; the browser offers, the host answers (locked).
   const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
@@ -233,6 +244,8 @@ async function startPeer() {
 let decoder = null;
 let encodedWorker = null;
 let encodedWorkerStats = null;
+let nativePresentation = null;
+let activeVideo = null;
 let lastRenderedTimestamp = null;
 let lastRenderedDueMs = null;
 const latencyGuard = createLatencyGuard({
@@ -242,7 +255,10 @@ const latencyGuard = createLatencyGuard({
 let framesDrawn = 0;
 let framesReceived = 0;
 let fpsWindow = 0;
-setInterval(() => { hudState.fps = fpsWindow; fpsWindow = 0; }, 1000);
+setInterval(() => {
+  if (useWebCodecs) hudState.fps = fpsWindow;
+  fpsWindow = 0;
+}, 1000);
 
 const PATTERN = { x: 64, y: 64, cell: 24, columns: 32, bits: 64 };
 function readTimestampPattern() {
@@ -295,16 +311,19 @@ if (diagnosticsEnabled) {
       framesReceived = 0;
     },
     snapshot() {
-      const renderedAgeMs = lastRenderedDueMs === null ? null : performance.now() - lastRenderedDueMs;
+      const nativeFramesPresented = nativePresentation?.framesPresented || 0;
+      const renderedAgeMs = lastRenderedDueMs !== null ? performance.now() - lastRenderedDueMs :
+        (nativePresentation?.lastFrameAtMs === null || nativePresentation?.lastFrameAtMs === undefined ? null : performance.now() - nativePresentation.lastFrameAtMs);
       return {
         ...hudState,
         generation: latencyGuard.generation,
-        renderedTimestamp: lastRenderedTimestamp,
+        renderedTimestamp: lastRenderedTimestamp ?? (nativeFramesPresented > 0 ? nativeFramesPresented : null),
         renderedAgeMs,
-        framesDrawn,
+        framesDrawn: nativeFramesPresented || framesDrawn,
         framesReceived,
-        glassToGlass: encodedWorkerStats?.glassToGlass || readTimestampPattern(),
+        glassToGlass: useWebCodecs ? (encodedWorkerStats?.glassToGlass || readTimestampPattern()) : null,
         worker: encodedWorkerStats,
+        nativePresentation: nativePresentation ? { ...nativePresentation } : null,
       };
     },
   };
@@ -463,6 +482,7 @@ function sendClientProfile() {
     },
     rtc: latestRtcProfile,
     worker: encodedWorkerStats,
+    nativePresentation: nativePresentation ? { ...nativePresentation } : null,
     hud: { ...hudState },
   };
   const message = JSON.stringify({
@@ -533,16 +553,9 @@ setInterval(async () => {
 function onTrack(ev) {
   const receiver = ev.receiver;
   const transceiver = pc.getTransceivers().find((t) => t.receiver === receiver);
-  const preferStreams = params.get("decoderPath") === "streams";
-  const preferVideo = params.get("decoderPath") === "video";
 
-  if (preferVideo) {
-    startVideoFallback(ev.track);
-    return;
-  }
-
-  if (preferStreams && receiver.createEncodedStreams) {
-    startEncodedStreams(receiver);
+  if (!useWebCodecs) {
+    startNativeVideo(ev.track);
     return;
   }
 
@@ -552,9 +565,8 @@ function onTrack(ev) {
     encodedWorker = worker;
     let transformAttached = false;
     const reloadFallback = () => {
-      const fallback = receiver.createEncodedStreams ? "streams" : "video";
       const next = new URL(location.href);
-      next.searchParams.set("decoderPath", fallback);
+      next.searchParams.delete("decoderPath");
       location.replace(next.href);
     };
     worker.onmessage = (e) => {
@@ -563,7 +575,7 @@ function onTrack(ev) {
         if (message.type === "capabilities") {
           if (!message.supported) {
             worker.terminate(); encodedWorker = null;
-            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startVideoFallback(ev.track);
+            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startNativeVideo(ev.track);
             return;
           }
           try {
@@ -571,7 +583,7 @@ function onTrack(ev) {
             worker.postMessage({ type: "canvas", canvas: offscreen, diagnostics: diagnosticsEnabled }, [offscreen]);
           } catch {
             worker.terminate(); encodedWorker = null;
-            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startVideoFallback(ev.track);
+            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startNativeVideo(ev.track);
           }
           return;
         }
@@ -605,7 +617,7 @@ function onTrack(ev) {
           hudState.dec = `${message.type}:${message.message || "unavailable"}`;
           if (!transformAttached) {
             worker.terminate(); encodedWorker = null; replaceTransferredCanvas();
-            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startVideoFallback(ev.track);
+            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startNativeVideo(ev.track);
           } else {
             reloadFallback();
           }
@@ -624,26 +636,81 @@ function onTrack(ev) {
     return;
   }
 
-  // 3) Last resort: plain <video> so frames are visible even without any
-  // insertable-streams API (e.g. WebKit-based browsers).
-  startVideoFallback(ev.track);
+  // An explicit WebCodecs request can still fall back to native video.
+  startNativeVideo(ev.track);
 }
 
-function startVideoFallback(track) {
+function startNativeVideo(track) {
   const video = document.createElement("video");
   video.autoplay = true;
   video.playsInline = true;
   video.muted = true;
-  video.style.cssText = "position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000;";
+  video.style.cssText = "position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000;z-index:1;pointer-events:none;";
   document.body.appendChild(video);
   video.srcObject = new MediaStream([track]);
+  stage.classList.add("native-video-input");
+  activeVideo = video;
+  nativePresentation = {
+    supported: typeof video.requestVideoFrameCallback === "function",
+    firstFrameAtMs: null,
+    framesPresented: 0,
+    fps: 0,
+    recentFrameGapMs: null,
+    maxFrameGapMs: 0,
+    width: 0,
+    height: 0,
+    mediaTime: null,
+    presentationTime: null,
+    expectedDisplayTime: null,
+    processingDurationMs: null,
+    lastFrameAtMs: null,
+  };
+  let lastFrameAt = null;
+  let fpsWindowStartedAt = null;
+  let framesInFpsWindow = 0;
+  const updateDimensions = () => {
+    nativePresentation.width = video.videoWidth;
+    nativePresentation.height = video.videoHeight;
+    hudState.dimensions = video.videoWidth && video.videoHeight ? `${video.videoWidth}x${video.videoHeight}` : "…";
+  };
+  video.addEventListener("loadedmetadata", updateDimensions);
+  if (nativePresentation.supported) {
+    const onVideoFrame = (now, metadata) => {
+      const gap = lastFrameAt === null ? null : now - lastFrameAt;
+      if (nativePresentation.firstFrameAtMs === null) nativePresentation.firstFrameAtMs = Date.now();
+      nativePresentation.framesPresented = metadata.presentedFrames ?? nativePresentation.framesPresented + 1;
+      nativePresentation.recentFrameGapMs = gap === null ? null : Math.round(gap);
+      nativePresentation.maxFrameGapMs = gap === null ? 0 : Math.max(nativePresentation.maxFrameGapMs, Math.round(gap));
+      nativePresentation.mediaTime = metadata.mediaTime ?? null;
+      nativePresentation.presentationTime = metadata.presentationTime ?? null;
+      nativePresentation.expectedDisplayTime = metadata.expectedDisplayTime ?? null;
+      nativePresentation.processingDurationMs = typeof metadata.processingDuration === "number" ? Math.round(metadata.processingDuration * 1000) : null;
+      nativePresentation.lastFrameAtMs = now;
+      updateDimensions();
+      if (fpsWindowStartedAt === null) fpsWindowStartedAt = now;
+      framesInFpsWindow++;
+      if (now - fpsWindowStartedAt >= 1_000) {
+        nativePresentation.fps = Math.round(framesInFpsWindow * 1_000 / (now - fpsWindowStartedAt));
+        framesInFpsWindow = 0;
+        fpsWindowStartedAt = now;
+      }
+      hudState.fps = nativePresentation.fps;
+      hudState.presented = nativePresentation.framesPresented;
+      hudState.frameGap = nativePresentation.recentFrameGapMs ?? "…";
+      hudState.maxFrameGap = nativePresentation.maxFrameGapMs || "…";
+      framesDrawn = nativePresentation.framesPresented;
+      lastFrameAt = now;
+      video.requestVideoFrameCallback(onVideoFrame);
+    };
+    video.requestVideoFrameCallback(onVideoFrame);
+  }
   const tryPlay = () => video.play().catch(() => {});
   tryPlay();
   // Mobile browsers (iOS especially) may refuse autoplay until a user
   // gesture; resume on the first tap anywhere.
   document.addEventListener("pointerdown", tryPlay, { once: true });
   video.addEventListener("click", tryPlay);
-  hudState.dec = "video-fallback";
+  hudState.dec = "native video";
 }
 
 function startEncodedStreams(receiver) {
@@ -701,7 +768,7 @@ function resyncPipeline(reason) {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") latencyGuard.reset("visibility-resume");
+  if (useWebCodecs && document.visibilityState === "visible") latencyGuard.reset("visibility-resume");
 });
 
 function feedDecoder(chunk, generation) {
@@ -799,6 +866,19 @@ const BM = { 0: 1, 1: 4, 2: 2 }; // e.button -> bitmask (left, middle, right)
 let buttons = 0;
 let locked = false;
 
+function videoContentRect(video) {
+  const box = video.getBoundingClientRect();
+  const aspect = video.videoWidth / video.videoHeight;
+  if (!Number.isFinite(aspect) || aspect <= 0 || box.width === 0 || box.height === 0) return box;
+  const boxAspect = box.width / box.height;
+  if (aspect > boxAspect) {
+    const height = box.width / aspect;
+    return { left: box.left, top: box.top + (box.height - height) / 2, width: box.width, height };
+  }
+  const width = box.height * aspect;
+  return { left: box.left + (box.width - width) / 2, top: box.top, width, height: box.height };
+}
+
 async function requestPointerLock() {
   try {
     await screen.requestPointerLock({ unadjustedMovement: true });
@@ -814,8 +894,8 @@ document.addEventListener("pointerlockchange", () => {
   locked = document.pointerLockElement === screen;
   if (!locked) { sendInput(new Uint8Array([4, 0])); buttons = 0; }
 });
-screen.addEventListener("click", () => {
-  if (!locked && connected) requestPointerLock();
+document.addEventListener("click", (event) => {
+  if (event.target === screen && !locked && connected) requestPointerLock();
 });
 document.addEventListener("mousemove", (e) => {
   if (!inputReady || !connected) return;
@@ -828,8 +908,8 @@ document.addEventListener("mousemove", (e) => {
     dv.setInt16(3, clamp16(e.movementY), true);
     sendInput(new Uint8Array(b));
   } else {
-    // Absolute fallback over the canvas: 0..65535.
-    const r = screen.getBoundingClientRect();
+    // Absolute fallback over the displayed video (not its letterbox): 0..65535.
+    const r = activeVideo ? videoContentRect(activeVideo) : screen.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
     const x = clamp((e.clientX - r.left) / r.width, 0, 1);
     const y = clamp((e.clientY - r.top) / r.height, 0, 1);

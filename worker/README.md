@@ -41,18 +41,20 @@ $env:BUBBLEPLAY_TOKEN = "<TOKEN>"
 npm run latency:live -- --url https://bubbleplay-signal.example.workers.dev/ --seconds 30
 ```
 
-The software glass-to-glass mode briefly opens a full-screen timestamp barcode
-on the captured primary display. It measures pattern draw -> DXGI -> NVENC ->
-WebRTC -> WebCodecs -> receiver canvas; physical panel scanout is not included.
+The production client uses Chromium's native WebRTC video decoder. The
+software glass-to-glass barcode reader still belongs to the diagnostic
+WebCodecs path, so select it explicitly when running that legacy benchmark;
+physical panel scanout is not included.
 
 ```powershell
-npm run latency:bench -- --url https://bubbleplay-signal.example.workers.dev/ --seconds 30
+npm run latency:bench -- --url https://bubbleplay-signal.example.workers.dev/ --decoder-path webcodecs --seconds 30
 ```
 
 For a real phone/cellular run, add `profile=1` to the authenticated client URL.
-The browser then relays one compact WebRTC/WebCodecs/network snapshot per
-second to the Rust host. Search the host log for `client diagnostics`; the
-profile contains absolute loss/retransmit/PLI/freeze/jitter-buffer counters,
-selected candidate types, decoder implementation, Worker queue/recovery state,
-and Android network hints. The token and local/remote IP addresses are never
-included in the profile payload.
+The browser then relays one compact WebRTC/network snapshot per second to the
+Rust host. Search the host log for `client diagnostics`; the profile contains
+absolute loss/retransmit/PLI/freeze/jitter-buffer counters, selected candidate
+types, decoder implementation, native presentation cadence, Android network
+hints, and WebCodecs Worker state only when that diagnostic path is selected.
+The token and local/remote IP addresses are never included in the profile
+payload.
