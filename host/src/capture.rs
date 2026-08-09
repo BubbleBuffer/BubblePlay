@@ -14,10 +14,10 @@
 
 use anyhow::{bail, Context, Result};
 use core::ffi::c_void;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
-use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows_capture::dxgi_duplication_api::{
     DxgiDuplicationApi, DxgiDuplicationFrame, Error as CaptureError,
 };
@@ -35,6 +35,9 @@ pub struct Capture {
     /// of the *next* acquire because the escaping frame borrows `self.api`
     /// for the whole call, so we cannot take `&mut self` in the Err arm.
     pending_recreate: bool,
+    /// Backoff deadline for a failed AccessLost recreation. Keeping this as
+    /// state avoids sleeping inside `acquire()` and starving the RTC pump.
+    next_recreate_attempt: Instant,
     /// Retained for AccessLost recreation. `None` = primary monitor.
     monitor_filter: Option<String>,
 }
@@ -61,8 +64,7 @@ pub fn pick_monitor(filter: Option<&str>) -> Result<Monitor> {
     for m in &monitors {
         let dev = m.device_name().unwrap_or_default();
         let name = m.name().unwrap_or_default();
-        if dev.to_ascii_lowercase().contains(&needle)
-            || name.to_ascii_lowercase().contains(&needle)
+        if dev.to_ascii_lowercase().contains(&needle) || name.to_ascii_lowercase().contains(&needle)
         {
             return Ok(*m);
         }
@@ -102,6 +104,7 @@ impl Capture {
             last_present_qpc: 0,
             device_obj: None,
             pending_recreate: false,
+            next_recreate_attempt: Instant::now(),
             monitor_filter: monitor_filter.map(|s| s.to_string()),
         })
     }
@@ -130,6 +133,9 @@ impl Capture {
     ) -> Result<Option<(DxgiDuplicationFrame<'a>, bool)>> {
         // Deferred recovery from a previous AccessLost (see field doc).
         if self.pending_recreate {
+            if Instant::now() < self.next_recreate_attempt {
+                return Ok(None);
+            }
             match self.recreate() {
                 Ok(()) => {
                     self.pending_recreate = false;
@@ -138,10 +144,10 @@ impl Capture {
                     // Recreation can legitimately fail for a while: a UAC
                     // secure-desktop switch or a locked screen invalidates the
                     // session AND denies new ones until the desktop is back.
-                    // Never kill the stream over this — retry on the next
-                    // acquire with a short backoff.
+                    // Never kill or block the stream over this — the RTC loop
+                    // keeps pumping while we wait for the next retry deadline.
                     warn!(?e, "DDA recreate failed — will retry");
-                    std::thread::sleep(Duration::from_millis(250));
+                    self.next_recreate_attempt = Instant::now() + Duration::from_millis(250);
                     return Ok(None);
                 }
             }
@@ -155,6 +161,7 @@ impl Capture {
                 // Disjoint field write; `self.api` is borrowed for 'a by the
                 // (absent) Ok frame, so no `&mut self` calls here.
                 self.pending_recreate = true;
+                self.next_recreate_attempt = Instant::now();
                 return Ok(None);
             }
             Err(e) => return Err(anyhow::anyhow!("acquire_next_frame: {e:?}")),
@@ -191,7 +198,11 @@ impl Capture {
         // Device may change after recreation; force re-pin on next frame.
         self.device_obj = None;
         self.last_present_qpc = 0;
-        info!(width = self.width, height = self.height, "DDA session recreated");
+        info!(
+            width = self.width,
+            height = self.height,
+            "DDA session recreated"
+        );
         Ok(())
     }
 

@@ -31,8 +31,9 @@
 <body>
 <div id="stage"><canvas id="screen"></canvas></div>
 <div id="hud">connecting…</div>
-<script>
+<script type="module">
 "use strict";
+import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp } from "/latency.js";
 
 // ---------------------------------------------------------------------------
 // BubblePlay browser client (Chromium + WebCodecs only).
@@ -48,12 +49,27 @@
 //      DataChannel, matching host/src/input.rs.
 // ---------------------------------------------------------------------------
 
-const screen = document.getElementById("screen");
+let screen = document.getElementById("screen");
 const hud = document.getElementById("hud");
-const ctx = screen.getContext("2d", { alpha: false, desynchronized: true });
+// Do not create a main-thread context until the legacy path is selected:
+// transferControlToOffscreen is only legal before a rendering context exists.
+let ctx = null;
+function ensureMainCanvas() {
+  if (!ctx) ctx = screen.getContext("2d", { alpha: false, desynchronized: true });
+  return ctx;
+}
+
+function replaceTransferredCanvas() {
+  const replacement = document.createElement("canvas");
+  replacement.id = "screen";
+  screen.replaceWith(replacement);
+  screen = replacement;
+  ctx = null;
+}
 
 // ---- token ----------------------------------------------------------------
 const params = new URLSearchParams(location.search);
+const diagnosticsEnabled = params.get("diag") === "1";
 let token = params.get("token") || localStorage.getItem("bp_token") || "";
 if (!token) {
   token = prompt("BubblePlay token:");
@@ -63,12 +79,12 @@ if (token) {
 }
 
 // ---- status HUD ------------------------------------------------------------
-const hudState = { ws: "…", ice: "…", dc: "…", dec: "…", fps: 0, recv: 0, queued: 0, rtt: "…", jit: "…", loss: "…" };
+const hudState = { ws: "…", ice: "…", dc: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…" };
 setInterval(() => {
   hud.innerHTML =
     `ws ${hudState.ws} | ice ${hudState.ice} | in ${hudState.dc}\n` +
-    `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | ${hudState.fps} fps\n` +
-    `rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | loss ${hudState.loss}%`;
+    `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +
+    `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps`;
 }, 250);
 
 // ---- signaling --------------------------------------------------------------
@@ -146,6 +162,12 @@ async function startPeer() {
   // Receive-only video; the browser offers, the host answers (locked).
   const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
   transceiver.receiver.playoutDelayHint = 0; // minimal jitter buffer
+  // playoutDelayHint is advisory and Chromium may still grow hundreds of
+  // milliseconds of buffer. jitterBufferTarget is the explicit millisecond
+  // target in current Chromium; zero chooses latency over concealment.
+  if ("jitterBufferTarget" in transceiver.receiver) {
+    try { transceiver.receiver.jitterBufferTarget = 0; } catch { /* older implementation */ }
+  }
 
   // Force H.264 (WebCodecs decodes Annex B; NVENC emits High profile).
   try {
@@ -193,10 +215,84 @@ async function startPeer() {
 
 // ---- WebCodecs decode --------------------------------------------------------
 let decoder = null;
+let encodedWorker = null;
+let encodedWorkerStats = null;
+let lastRenderedTimestamp = null;
+let lastRenderedDueMs = null;
+const latencyGuard = createLatencyGuard({
+  now: () => performance.now(),
+  onReset: ({ reason }) => resyncPipeline(reason),
+});
 let framesDrawn = 0;
 let framesReceived = 0;
 let fpsWindow = 0;
 setInterval(() => { hudState.fps = fpsWindow; fpsWindow = 0; }, 1000);
+
+const PATTERN = { x: 64, y: 64, cell: 24, columns: 32, bits: 64 };
+function readTimestampPattern() {
+  if (screen.width < PATTERN.x + PATTERN.cell * PATTERN.columns ||
+      screen.height < PATTERN.y + PATTERN.cell * 2) return null;
+  try {
+    const image = ctx.getImageData(
+      PATTERN.x,
+      PATTERN.y,
+      PATTERN.cell * PATTERN.columns,
+      PATTERN.cell * 2,
+    );
+    const bits = [];
+    for (let index = 0; index < PATTERN.bits; index++) {
+      const column = index % PATTERN.columns;
+      const row = Math.floor(index / PATTERN.columns);
+      const px = column * PATTERN.cell + Math.floor(PATTERN.cell / 2);
+      const py = row * PATTERN.cell + Math.floor(PATTERN.cell / 2);
+      const offset = (py * image.width + px) * 4;
+      const brightness = image.data[offset] + image.data[offset + 1] + image.data[offset + 2];
+      bits.push(brightness >= 384 ? 1 : 0);
+    }
+    const decoded = decodeTimestampPatternBits(bits);
+    if (!decoded) return null;
+    const ageMs = (((Date.now() >>> 0) - decoded.timestamp) >>> 0);
+    if (ageMs > 10_000) return null;
+    return { ...decoded, ageMs };
+  } catch {
+    return null;
+  }
+}
+
+if (diagnosticsEnabled) {
+  window.__bubbleplayDiagnostics = {
+    inject({ stallMs = 0, dropEvery = 0 } = {}) {
+      encodedWorker?.postMessage({ type: "fault", stallMs: Math.max(0, stallMs), dropEvery: Math.max(0, dropEvery) });
+    },
+    injectMainThreadStall(ms = 750) {
+      const duration = Math.max(0, Number(ms) || 0);
+      setTimeout(() => {
+        const until = performance.now() + duration;
+        while (performance.now() < until) { /* deliberate diagnostic stall */ }
+      }, 0);
+    },
+    reset() {
+      hudState.dropped = 0;
+      hudState.resyncs = 0;
+      hudState.keyframes = 0;
+      framesDrawn = 0;
+      framesReceived = 0;
+    },
+    snapshot() {
+      const renderedAgeMs = lastRenderedDueMs === null ? null : performance.now() - lastRenderedDueMs;
+      return {
+        ...hudState,
+        generation: latencyGuard.generation,
+        renderedTimestamp: lastRenderedTimestamp,
+        renderedAgeMs,
+        framesDrawn,
+        framesReceived,
+        glassToGlass: encodedWorkerStats?.glassToGlass || readTimestampPattern(),
+        worker: encodedWorkerStats,
+      };
+    },
+  };
+}
 
 // Timestamp-paced render queue. Decoded frames arrive in bursts (network
 // jitter); drawing them the moment they arrive makes the picture stutter.
@@ -204,72 +300,66 @@ setInterval(() => { hudState.fps = fpsWindow; fpsWindow = 0; }, 1000);
 // drawn on the next rAF tick at that cadence. Frames that arrive more than
 // one cadence interval late are dropped — never queued into latency.
 const RENDER = {
-  baseWall: 0,       // performance.now() when the first frame decoded
-  baseTs: null,      // first frame's timestamp
-  ticksPerMs: null,  // detected timestamp scale (~1000 for µs, ~90 for 90 kHz)
   cadenceMs: 16.67,  // rolling average frame interval
   prevTs: null,
   prevWall: 0,
   queue: [],
   rafPending: false,
 };
-const MAX_RENDER_QUEUE = 3;
+const MAX_RENDER_QUEUE = 1;
 
 function resetRenderPacing() {
-  RENDER.baseWall = 0;
-  RENDER.baseTs = null;
-  RENDER.ticksPerMs = null;
   RENDER.cadenceMs = 16.67;
   RENDER.prevTs = null;
   RENDER.prevWall = 0;
-  for (const f of RENDER.queue) f.frame.close();
+  for (const f of RENDER.queue) { try { f.frame.close(); } catch {} }
   RENDER.queue = [];
   RENDER.rafPending = false;
-  framesReceived = 0;
+  lastRenderedTimestamp = null;
+  lastRenderedDueMs = null;
+  hudState.queued = 0;
+  hudState.lag = "…";
 }
 
 function onDecodedFrame(frame) {
+  let retained = false;
   try {
   const now = performance.now();
   const ts = frame.timestamp;
   framesReceived++;
   hudState.recv = framesReceived;
 
-    // First frame: anchor the wall-clock base and draw immediately.
-    if (RENDER.baseTs === null) {
-      RENDER.baseTs = ts;
-      RENDER.baseWall = now;
-      RENDER.prevTs = ts;
-      RENDER.prevWall = now;
-      drawFrame(frame);
-      return;
+    if (lastRenderedTimestamp === null && RENDER.queue.length === 0) {
+      latencyGuard.reanchor(ts, now);
     }
 
-    // Calibrate the timestamp scale ONLY from plausible pairs: a real frame
-    // gap at 60/30 fps is 8-33 ms of wall time. The startup pair (decoder
-    // warmup, PLI recovery) can be seconds apart and would poison the scale.
-    if (ts !== RENDER.prevTs) {
+    // Encoded-frame timestamps are microseconds per the WebCodecs contract.
+    if (RENDER.prevTs !== null && ts !== RENDER.prevTs) {
       const tsDelta = ts - RENDER.prevTs;
       const wallDelta = now - RENDER.prevWall;
-      if (tsDelta > 0 && wallDelta >= 5 && wallDelta <= 200 && RENDER.ticksPerMs === null) {
-        const ratio = tsDelta / wallDelta;
-        if (ratio > 500) RENDER.ticksPerMs = 1000; // microseconds
-        else if (ratio > 40) RENDER.ticksPerMs = 90; // 90 kHz RTP ticks
-      }
-      const ticks = RENDER.ticksPerMs || 1000;
-      const interval = tsDelta / ticks;
+      const interval = tsDelta / 1000;
       if (interval >= 8 && interval <= 100) {
         RENDER.cadenceMs = RENDER.cadenceMs * 0.8 + interval * 0.2;
       }
       RENDER.prevTs = ts;
       RENDER.prevWall = now;
     }
+    if (RENDER.prevTs === null) {
+      RENDER.prevTs = ts;
+      RENDER.prevWall = now;
+    }
 
-    const ticksPerMs = RENDER.ticksPerMs || 1000;
-    const due = RENDER.baseWall + (ts - RENDER.baseTs) / ticksPerMs;
+    const due = latencyGuard.expectedWall(ts);
+    if (!Number.isFinite(due)) {
+      dropAndResync("missing-media-anchor");
+      return;
+    }
     RENDER.queue.push({ frame, due });
+    retained = true;
     if (RENDER.queue.length > MAX_RENDER_QUEUE) {
-      RENDER.queue.shift().frame.close(); // drop oldest, keep latency low
+      const stale = RENDER.queue.shift();
+      retained = stale.frame !== frame;
+      try { stale.frame.close(); } catch {}
     }
     if (!RENDER.rafPending) {
       RENDER.rafPending = true;
@@ -277,6 +367,8 @@ function onDecodedFrame(frame) {
     }
   } catch (e) {
     hudState.dec = `render:${e.message}`;
+  } finally {
+    if (!retained) { try { frame.close(); } catch {} }
   }
 }
 
@@ -287,7 +379,7 @@ function renderTick() {
     // Keep only the newest queued frame — older ones are stale the moment a
     // fresher frame arrives.
     while (RENDER.queue.length > 1) {
-      RENDER.queue.shift().frame.close();
+      try { RENDER.queue.shift().frame.close(); } catch {}
     }
     const front = RENDER.queue[0];
     if (!front) return;
@@ -297,7 +389,11 @@ function renderTick() {
     // when a frame genuinely arrives early, which is real burst smoothing.
     if (!Number.isFinite(due) || due <= now) {
       RENDER.queue.shift();
-      drawFrame(front.frame);
+      if (now - due > 100) {
+        try { front.frame.close(); } finally { hudState.dropped++; }
+      } else {
+        drawFrame(front.frame, due);
+      }
     } else {
       RENDER.rafPending = true;
       requestAnimationFrame(renderTick);
@@ -312,6 +408,7 @@ function renderTick() {
 }
 
 // ---- network stats via getStats (latency diagnostics) -----------------------
+let previousInboundStats = null;
 setInterval(async () => {
   if (!pc || pc.iceConnectionState !== "connected") return;
   try {
@@ -331,6 +428,20 @@ setInterval(async () => {
         if (recv + lost > 0) {
           loss = Math.round((lost / (recv + lost)) * 100);
         }
+        if (previousInboundStats && s.timestamp > previousInboundStats.timestamp) {
+          const elapsedSeconds = (s.timestamp - previousInboundStats.timestamp) / 1000;
+          const byteDelta = (s.bytesReceived || 0) - previousInboundStats.bytesReceived;
+          if (byteDelta >= 0) hudState.mbps = (byteDelta * 8 / elapsedSeconds / 1_000_000).toFixed(1);
+          const delayDelta = (s.jitterBufferDelay || 0) - previousInboundStats.jitterBufferDelay;
+          const emittedDelta = (s.jitterBufferEmittedCount || 0) - previousInboundStats.jitterBufferEmittedCount;
+          if (delayDelta >= 0 && emittedDelta > 0) hudState.jbuf = Math.round(delayDelta / emittedDelta * 1000);
+        }
+        previousInboundStats = {
+          timestamp: s.timestamp,
+          bytesReceived: s.bytesReceived || 0,
+          jitterBufferDelay: s.jitterBufferDelay || 0,
+          jitterBufferEmittedCount: s.jitterBufferEmittedCount || 0,
+        };
       }
     });
     if (rtt !== null) hudState.rtt = rtt;
@@ -341,69 +452,113 @@ setInterval(async () => {
   }
 }, 1000);
 
-// Worker source for RTCRtpScriptTransform: forwards encoded frames to the
-// main thread for WebCodecs decoding (H.264 arrives as Annex B NAL units per
-// the WebRTC encoded transform spec).
-const ENCODED_FRAME_WORKER_SRC = `
-self.onrtctransform = (event) => {
-  const transformer = event.transformer;
-  const reader = transformer.readable.getReader();
-  (async () => {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      const data = new Uint8Array(value.data.byteLength);
-      data.set(new Uint8Array(value.data));
-      self.postMessage(
-        { type: value.type, timestamp: value.timestamp, data: data.buffer },
-        [data.buffer]
-      );
-    }
-  })();
-};
-`;
-
 function onTrack(ev) {
   const receiver = ev.receiver;
   const transceiver = pc.getTransceivers().find((t) => t.receiver === receiver);
+  const preferStreams = params.get("decoderPath") === "streams";
+  const preferVideo = params.get("decoderPath") === "video";
+
+  if (preferVideo) {
+    startVideoFallback(ev.track);
+    return;
+  }
+
+  if (preferStreams && receiver.createEncodedStreams) {
+    startEncodedStreams(receiver);
+    return;
+  }
 
   // 1) Modern path: RTCRtpScriptTransform (Worker-based, current Chrome).
   if (transceiver && "transform" in receiver && typeof RTCRtpScriptTransform !== "undefined") {
-    const worker = new Worker(URL.createObjectURL(
-      new Blob([ENCODED_FRAME_WORKER_SRC], { type: "text/javascript" })
-    ));
-    worker.onmessage = (e) => feedDecoder(e.data);
-    worker.onerror = (e) => { hudState.dec = `worker:${e.message || "err"}`; };
-    receiver.transform = new RTCRtpScriptTransform(worker, {});
-    hudState.dec = "transform";
+    const worker = new Worker("/latency-worker.js", { type: "module" });
+    encodedWorker = worker;
+    let transformAttached = false;
+    const reloadFallback = () => {
+      const fallback = receiver.createEncodedStreams ? "streams" : "video";
+      const next = new URL(location.href);
+      next.searchParams.set("decoderPath", fallback);
+      location.replace(next.href);
+    };
+    worker.onmessage = (e) => {
+      const message = e.data;
+      if (message.kind === "control") {
+        if (message.type === "capabilities") {
+          if (!message.supported) {
+            worker.terminate(); encodedWorker = null;
+            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startVideoFallback(ev.track);
+            return;
+          }
+          try {
+            const offscreen = screen.transferControlToOffscreen();
+            worker.postMessage({ type: "canvas", canvas: offscreen, diagnostics: diagnosticsEnabled }, [offscreen]);
+          } catch {
+            worker.terminate(); encodedWorker = null;
+            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startVideoFallback(ev.track);
+          }
+          return;
+        }
+        if (message.type === "worker-ready" && !transformAttached) {
+          // The canvas must be owned by the Worker before media starts.
+          transformAttached = true;
+          receiver.transform = new RTCRtpScriptTransform(worker, {});
+          hudState.dec = "transform (off-main-thread)";
+          return;
+        }
+        if (message.stats) {
+          encodedWorkerStats = message.stats;
+          lastRenderedTimestamp = message.stats.renderedTimestamp;
+          lastRenderedDueMs = message.stats.renderedAgeMs === null ? null : performance.now() - message.stats.renderedAgeMs;
+          framesDrawn = message.stats.framesDrawn;
+          framesReceived = message.stats.framesReceived;
+          hudState.recv = message.stats.framesReceived;
+          hudState.fps = message.stats.fps;
+          hudState.dropped = message.stats.dropped;
+        }
+        if (message.type === "resync") { hudState.resyncs++; hudState.dec = `waiting keyframe (${message.reason})`; }
+        else if (message.type === "keyframe-requested") {
+          hudState.keyframes++;
+          hudState.dec = `waiting keyframe (${message.reason || "recovery"})`;
+        } else if (message.type === "keyframe-request-error") {
+          hudState.dec = "waiting periodic IDR (keyframe request unavailable)";
+        } else if (message.type === "worker-error") {
+          hudState.dec = `worker:${message.message}`;
+          reloadFallback();
+        } else if (message.type === "worker-init-error" || message.type === "passthrough-error") {
+          hudState.dec = `${message.type}:${message.message || "unavailable"}`;
+          if (!transformAttached) {
+            worker.terminate(); encodedWorker = null; replaceTransferredCanvas();
+            if (receiver.createEncodedStreams) startEncodedStreams(receiver); else startVideoFallback(ev.track);
+          } else {
+            reloadFallback();
+          }
+        }
+        return;
+      }
+    };
+    worker.onerror = (e) => { hudState.dec = `worker:${e.message || "err"}`; reloadFallback(); };
+    worker.postMessage({ type: "capabilities" });
     return;
   }
 
   // 2) Legacy path: createEncodedStreams (older Chromium).
   if (receiver.createEncodedStreams) {
-    const { readable } = receiver.createEncodedStreams();
-    const reader = readable.getReader();
-    (async () => {
-      for (;;) {
-        const { value: chunk, done } = await reader.read();
-        if (done) break;
-        feedDecoder(chunk);
-      }
-    })().catch((e) => { hudState.dec = `read:${e}`; });
-    hudState.dec = "streams";
+    startEncodedStreams(receiver);
     return;
   }
 
   // 3) Last resort: plain <video> so frames are visible even without any
   // insertable-streams API (e.g. WebKit-based browsers).
+  startVideoFallback(ev.track);
+}
+
+function startVideoFallback(track) {
   const video = document.createElement("video");
   video.autoplay = true;
   video.playsInline = true;
   video.muted = true;
   video.style.cssText = "position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000;";
   document.body.appendChild(video);
-  video.srcObject = new MediaStream([ev.track]);
+  video.srcObject = new MediaStream([track]);
   const tryPlay = () => video.play().catch(() => {});
   tryPlay();
   // Mobile browsers (iOS especially) may refuse autoplay until a user
@@ -413,7 +568,66 @@ function onTrack(ev) {
   hudState.dec = "video-fallback";
 }
 
-function feedDecoder(chunk) {
+function startEncodedStreams(receiver) {
+  ensureMainCanvas();
+  const { readable } = receiver.createEncodedStreams();
+  const reader = readable.getReader();
+  (async () => {
+    for (;;) {
+      const { value: chunk, done } = await reader.read();
+      if (done) break;
+      const metadata = typeof chunk.getMetadata === "function" ? chunk.getMetadata() : {};
+      const wrapped = {
+        type: chunk.type,
+        timestamp: normalizeEncodedTimestamp(chunk.timestamp, metadata),
+        data: chunk.data,
+        generation: latencyGuard.generation,
+      };
+      if (!latencyGuard.acceptWorkerFrame(wrapped)) { hudState.dropped++; continue; }
+      latencyGuard.releaseWorkerFrame();
+      feedDecoder(wrapped, wrapped.generation);
+    }
+  })().catch((e) => { hudState.dec = `read:${e}`; });
+  hudState.dec = "streams (periodic IDR fallback)";
+}
+
+function requestKeyframe(reason) {
+  // RTCRtpScriptTransformer's request API is only callable in its Dedicated
+  // Worker. Legacy createEncodedStreams keeps the host's periodic IDR path.
+  if (encodedWorker) {
+    encodedWorker.postMessage({ type: "request-keyframe", reason });
+    hudState.dec = `waiting keyframe (${reason})`;
+  } else {
+    hudState.dec = `waiting periodic IDR (${reason})`;
+  }
+}
+
+function dropAndResync(reason) {
+  hudState.dropped++;
+  latencyGuard.reset(reason);
+}
+
+function resyncPipeline(reason) {
+  hudState.resyncs++;
+  resetRenderPacing();
+  if (decoder) {
+    try { decoder.close(); } catch { /* already closed */ }
+    decoder = null;
+  }
+  if (encodedWorker) {
+    encodedWorker.postMessage({ type: "resync", generation: latencyGuard.generation, reason });
+    hudState.dec = `waiting keyframe (${reason})`;
+  } else {
+    requestKeyframe(reason);
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") latencyGuard.reset("visibility-resume");
+});
+
+function feedDecoder(chunk, generation) {
+  if (generation !== latencyGuard.generation) { hudState.dropped++; return; }
   const data = new Uint8Array(chunk.data);
   const isKey = chunk.type === "key";
 
@@ -421,8 +635,8 @@ function feedDecoder(chunk) {
     const codec = avcCodecFromSps(data) || "avc1.64002A";
     resetRenderPacing();
     decoder = new VideoDecoder({
-      output: onDecodedFrame,
-      error: (e) => { hudState.dec = `err:${e.message}`; },
+      output: (frame) => { latencyGuard.releaseDecode(); onDecodedFrame(frame); },
+      error: (e) => { hudState.dec = `err:${e.message}`; dropAndResync("decoder-error"); },
     });
     try {
       decoder.configure({
@@ -439,9 +653,16 @@ function feedDecoder(chunk) {
   }
 
   if (decoder.state !== "configured") return;
-  if (!isKey && !decoder.sawKeyframe) return; // wait for first keyframe
+  if (!isKey && !decoder.sawKeyframe) {
+    hudState.dropped++;
+    requestKeyframe("delta-before-keyframe");
+    return;
+  }
   decoder.sawKeyframe = decoder.sawKeyframe || isKey;
-  if (decoder.decodeQueueSize > 8) return; // drop late frames, never queue
+  if (decoder.decodeQueueSize >= 2 || !latencyGuard.admitDecode()) {
+    dropAndResync("decoder-backpressure");
+    return; // decoder pending work is capped at two frames
+  }
 
   try {
     decoder.decode(new EncodedVideoChunk({
@@ -451,20 +672,28 @@ function feedDecoder(chunk) {
     }));
     hudState.queued = decoder.decodeQueueSize;
   } catch (e) {
+    latencyGuard.releaseDecode();
     hudState.dec = `dec:${e.message}`;
+    dropAndResync("decoder-throw");
   }
 }
 
-function drawFrame(frame) {
-  const w = frame.displayWidth, h = frame.displayHeight;
-  if (screen.width !== w || screen.height !== h) {
-    screen.width = w;
-    screen.height = h;
+function drawFrame(frame, due = performance.now()) {
+  try {
+    const w = frame.displayWidth, h = frame.displayHeight;
+    if (screen.width !== w || screen.height !== h) {
+      screen.width = w;
+      screen.height = h;
+    }
+    ctx.drawImage(frame, 0, 0, w, h);
+    lastRenderedTimestamp = frame.timestamp;
+    lastRenderedDueMs = due;
+    hudState.lag = Math.max(0, Math.round(performance.now() - due));
+    fpsWindow++;
+    framesDrawn++;
+  } finally {
+    try { frame.close(); } catch {}
   }
-  ctx.drawImage(frame, 0, 0, w, h);
-  frame.close();
-  fpsWindow++;
-  framesDrawn++;
 }
 
 // Parse the codec string (avc1.PPCCLL) from the first SPS NAL of an Annex B

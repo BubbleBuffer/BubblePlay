@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>BubblePlay glass-to-glass timestamp pattern</title>
+<style>
+  html,body { margin:0; height:100%; background:#444; color:#fff; overflow:hidden }
+  body { display:grid; place-items:center; font:900 min(18vw,240px)/1 ui-monospace,Consolas,monospace }
+  #stamp { border:1.5vw solid #fff; padding:3vw; letter-spacing:.025em; background:#000 }
+  #barcode { position:fixed; left:64px; top:64px; width:768px; height:48px; image-rendering:pixelated }
+  #stripe { position:fixed; inset:auto 0 0; height:8vh; background:repeating-linear-gradient(90deg,#fff 0 3vw,#000 3vw 6vw) }
+</style>
+<canvas id="barcode" width="768" height="48"></canvas>
+<div id="stamp">00:00.000</div><div id="stripe"></div>
+<script>
+const stamp = document.querySelector("#stamp");
+const barcode = document.querySelector("#barcode");
+const barcodeContext = barcode.getContext("2d", { alpha: false });
+const started = performance.now();
+let sequence = 0;
+
+function crc8(bytes) {
+  let crc = 0;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+  }
+  return crc;
+}
+
+function drawBarcode(epochMs, frameSequence) {
+  const timestamp = epochMs >>> 0;
+  const payload = [
+    (timestamp >>> 24) & 0xff,
+    (timestamp >>> 16) & 0xff,
+    (timestamp >>> 8) & 0xff,
+    timestamp & 0xff,
+    (frameSequence >>> 8) & 0xff,
+    frameSequence & 0xff,
+  ];
+  const bytes = [0xa5, ...payload, crc8(payload)];
+  barcodeContext.fillStyle = "#000";
+  barcodeContext.fillRect(0, 0, barcode.width, barcode.height);
+  for (let index = 0; index < 64; index++) {
+    const byte = bytes[Math.floor(index / 8)];
+    const value = (byte >> (7 - (index % 8))) & 1;
+    barcodeContext.fillStyle = value ? "#fff" : "#000";
+    barcodeContext.fillRect((index % 32) * 24, Math.floor(index / 32) * 24, 24, 24);
+  }
+}
+
+function tick() {
+  const elapsed = Math.floor(performance.now() - started);
+  const mm = String(Math.floor(elapsed / 60000)).padStart(2, "0");
+  const ss = String(Math.floor(elapsed / 1000) % 60).padStart(2, "0");
+  stamp.textContent = `${mm}:${ss}.${String(elapsed % 1000).padStart(3, "0")}`;
+  drawBarcode(Date.now(), sequence++ & 0xffff);
+}
+tick();
+// A deterministic source clock keeps the benchmark valid even when Windows
+// decides the kiosk is occluded by the off-screen receiver window.
+setInterval(tick, 16);
+</script>

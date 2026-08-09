@@ -10,8 +10,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use str0m::bwe::BweKind;
 use str0m::change::SdpOffer;
-use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt};
 use str0m::media::MediaTime;
+use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt};
 use str0m::{Candidate, Event, Rtc};
 use tracing::{debug, info, warn};
 
@@ -178,7 +178,13 @@ impl RtcSession {
                 Some(RtcAction::InputData(data.data))
             }
             Event::KeyframeRequest(KeyframeRequest { kind, .. }) => {
-                debug!(?kind, "keyframe request (PLI/FIR)");
+                // This is an important recovery signal, not routine packet
+                // noise: the browser's bounded-latency decoder explicitly
+                // requests an IDR after repeated late frames.
+                info!(
+                    ?kind,
+                    "receiver keyframe request (PLI/FIR); scheduling IDR recovery"
+                );
                 Some(RtcAction::KeyframeRequested)
             }
             Event::EgressBitrateEstimate(bwe) => {
@@ -200,21 +206,21 @@ impl RtcSession {
 
     /// Write one Annex B access unit as an RTP media packet.
     ///
-    /// Silently a no-op before ICE connects or until the video m-line is known
-    /// (str0m drops pre-connect writes itself; we guard the pt/mid too).
-    pub fn write_video(&mut self, access_unit: Vec<u8>) -> Result<()> {
+    /// Returns `true` only when the access unit was actually admitted to the
+    /// negotiated video writer. This keeps transport telemetry honest during
+    /// connection setup and teardown.
+    pub fn write_video(&mut self, access_unit: Vec<u8>) -> Result<bool> {
         let (Some(mid), Some(pt)) = (self.video_mid, self.h264_pt) else {
-            return Ok(()); // media not negotiated yet
+            return Ok(false); // media not negotiated yet
         };
         let Some(writer) = self.rtc.writer(mid) else {
-            return Ok(());
+            return Ok(false);
         };
         let elapsed = self.clock_start.elapsed();
-        let rtp_time =
-            MediaTime::from_90khz(((elapsed.as_secs_f64()) * 90_000.0) as u64);
+        let rtp_time = MediaTime::from_90khz(((elapsed.as_secs_f64()) * 90_000.0) as u64);
         writer.write(pt, Instant::now(), rtp_time, access_unit)?;
         self.frames_written += 1;
-        Ok(())
+        Ok(true)
     }
 
     pub fn frames_written(&self) -> u64 {

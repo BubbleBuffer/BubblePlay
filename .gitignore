@@ -30,3 +30,6 @@ worker/probe*.out.txt
 .tools/
 *.h264
 *.mp4
+
+# Generated live latency soak/benchmark reports
+artifacts/latency/

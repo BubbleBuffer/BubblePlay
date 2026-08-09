@@ -1,0 +1,259 @@
+// Small, browser-and-Node compatible state machine for the receive pipeline.
+// WebCodecs timestamps are defined in microseconds; keeping that unit here
+// avoids silently treating RTP's 90 kHz clock as a wall clock.
+export function createLatencyGuard({ now = () => performance.now(), onReset = () => {}, startupGraceMs = 1000 } = {}) {
+  let generation = 0;
+  let workerFrames = 0;
+  let decodeFrames = 0;
+  let anchorTimestamp = null;
+  let anchorWall = 0;
+  let lastTimestamp = null;
+  let consecutiveLate = 0;
+  let graceUntil = 0;
+
+  function reset(reason = "resync", requestedGeneration) {
+    if (Number.isInteger(requestedGeneration)) {
+      // Worker notifications can race with a newer main-thread reset.
+      if (requestedGeneration <= generation) return;
+      generation = requestedGeneration;
+    } else {
+      generation++;
+    }
+    workerFrames = 0;
+    decodeFrames = 0;
+    anchorTimestamp = null;
+    anchorWall = 0;
+    lastTimestamp = null;
+    consecutiveLate = 0;
+    graceUntil = now() + startupGraceMs;
+    onReset({ generation, reason });
+  }
+
+  function acceptWorkerFrame(frame) {
+    if (frame.generation !== generation) return false;
+    if (workerFrames >= 2) {
+      reset("main-worker-overflow");
+      return false;
+    }
+    const timestamp = frame.timestamp;
+    const wall = now();
+    if (!Number.isFinite(timestamp)) {
+      reset("invalid-timestamp");
+      return false;
+    }
+    if (anchorTimestamp === null) {
+      anchorTimestamp = timestamp;
+      anchorWall = wall;
+      graceUntil = wall + startupGraceMs;
+    } else {
+      const delta = timestamp - lastTimestamp;
+      // A backwards clock or a multi-second jump is a new media timeline.
+      if (delta <= 0 || delta > 2_000_000) {
+        reset("timestamp-discontinuity");
+        return false;
+      }
+      const expectedWall = anchorWall + (timestamp - anchorTimestamp) / 1000;
+      if (wall >= graceUntil && wall - expectedWall > 100) {
+        consecutiveLate++;
+        // Decode the first two late frames to preserve H.264 reference
+        // continuity, but never render them. A sustained backlog resets the
+        // whole dependency chain and requests a fresh keyframe.
+        if (consecutiveLate >= 3) {
+          reset("three-late-frames");
+          return false;
+        }
+      } else {
+        consecutiveLate = 0;
+      }
+    }
+    lastTimestamp = timestamp;
+    workerFrames++;
+    return true;
+  }
+
+  function expectedWall(timestamp) {
+    if (anchorTimestamp === null || !Number.isFinite(timestamp)) return null;
+    return anchorWall + (timestamp - anchorTimestamp) / 1000;
+  }
+
+  function reanchor(timestamp, wall = now()) {
+    if (!Number.isFinite(timestamp) || !Number.isFinite(wall)) return false;
+    anchorTimestamp = timestamp;
+    anchorWall = wall;
+    lastTimestamp = timestamp;
+    consecutiveLate = 0;
+    graceUntil = wall + startupGraceMs;
+    return true;
+  }
+
+  return {
+    get generation() { return generation; },
+    get workerFrames() { return workerFrames; },
+    get decodeFrames() { return decodeFrames; },
+    acceptWorkerFrame,
+    expectedWall,
+    reanchor,
+    presentationAgeMs(timestamp, at = now()) {
+      const expected = expectedWall(timestamp);
+      return expected === null ? null : at - expected;
+    },
+    releaseWorkerFrame() { workerFrames = Math.max(0, workerFrames - 1); },
+    admitDecode() {
+      if (decodeFrames >= 2) return false;
+      decodeFrames++;
+      return true;
+    },
+    releaseDecode() { decodeFrames = Math.max(0, decodeFrames - 1); },
+    reset,
+  };
+}
+
+// The transform Worker owns this state. Keeping it pure lets tests cover the
+// identity-aware ACK and delayed-post races without a Chromium runtime.
+export function createEncodedWorkerState({ now = () => performance.now(), onResync = () => {} } = {}) {
+  let generation = 0;
+  let nextSequence = 0;
+  let pending = new Map();
+  let waitingForKeyframe = false;
+  let lastKeyframeRequest = -Infinity;
+  const key = (g, s) => `${g}:${s}`;
+  function resync(reason, requestedGeneration) {
+    if (Number.isInteger(requestedGeneration)) {
+      // Repeating the same control message is idempotent (main and Worker
+      // echo a resync to ensure both sides converge on one generation).
+      if (requestedGeneration <= generation) return generation;
+      generation = requestedGeneration;
+    } else {
+      generation++;
+    }
+    pending = new Map();
+    waitingForKeyframe = true;
+    onResync({ generation, reason });
+    return generation;
+  }
+  return {
+    get generation() { return generation; },
+    get pending() { return pending.size; },
+    get waitingForKeyframe() { return waitingForKeyframe; },
+    reserve(type) {
+      // Once a reference frame is discarded, no following H.264 delta is
+      // independently decodable. Quietly drain deltas until the requested
+      // keyframe arrives; do not create a new generation for each delta.
+      if (waitingForKeyframe && type !== "key") return null;
+      if (pending.size >= 2) {
+        resync("worker-drop");
+        return null;
+      }
+      if (type === "key") waitingForKeyframe = false;
+      const record = { generation, sequence: ++nextSequence };
+      pending.set(key(record.generation, record.sequence), record);
+      return record;
+    },
+    canPost(record) { return pending.has(key(record.generation, record.sequence)) && record.generation === generation; },
+    ack({ generation: ackGeneration, sequence }) {
+      // A delayed ACK may only remove its exact in-flight reservation.
+      return pending.delete(key(ackGeneration, sequence));
+    },
+    resync,
+    requestKeyframeAllowed() {
+      const at = now();
+      if (at - lastKeyframeRequest < 500) return false;
+      lastKeyframeRequest = at;
+      return true;
+    },
+  };
+}
+
+export function annexBHasIdr(bytes) {
+  for (let index = 0; index + 4 < bytes.length; index++) {
+    const start3 = bytes[index] === 0 && bytes[index + 1] === 0 && bytes[index + 2] === 1;
+    const start4 = bytes[index] === 0 && bytes[index + 1] === 0 && bytes[index + 2] === 0 && bytes[index + 3] === 1;
+    if (!start3 && !start4) continue;
+    const nal = index + (start4 ? 4 : 3);
+    if ((bytes[nal] & 0x1f) === 5) return true;
+    index = nal - 1;
+  }
+  return false;
+}
+
+export function normalizeEncodedTimestamp(valueTimestamp, metadata = {}) {
+  if (Number.isFinite(metadata.timestamp)) return metadata.timestamp;
+  if (Number.isFinite(metadata.rtpTimestamp)) {
+    return Math.round(metadata.rtpTimestamp * 1000 / 90);
+  }
+  return Number.isFinite(valueTimestamp) ? valueTimestamp : NaN;
+}
+
+// Shared by the production transform worker and Node tests: encoded timing is
+// judged on its media timeline, not on whichever thread received a callback.
+export function createWorkerTimeline({ now = () => performance.now(), startupGraceMs = 1000 } = {}) {
+  let baseTimestamp = null, baseWall = 0, lastTimestamp = null, late = 0, graceUntil = 0;
+  return {
+    observe(timestamp) {
+      const wall = now();
+      if (!Number.isFinite(timestamp)) return { ok: false, reason: "invalid-timestamp" };
+      if (baseTimestamp === null) { baseTimestamp = lastTimestamp = timestamp; baseWall = wall; graceUntil = wall + startupGraceMs; return { ok: true, due: wall }; }
+      const delta = timestamp - lastTimestamp;
+      if (delta <= 0 || delta > 2_000_000) return { ok: false, reason: "timestamp-discontinuity" };
+      lastTimestamp = timestamp; const due = baseWall + (timestamp - baseTimestamp) / 1000;
+      if (wall >= graceUntil && wall - due > 100) { late++; if (late >= 3) return { ok: false, reason: "three-late-frames" }; } else late = 0;
+      return { ok: true, due };
+    },
+    reset() { baseTimestamp = null; lastTimestamp = null; late = 0; },
+  };
+}
+
+// One decoded-frame mailbox. Replacing the pending item never disarms the
+// existing timer, so a continuous stream cannot debounce rendering forever.
+export function createLatestRenderSlot() {
+  let item = null;
+  let armed = false;
+  return {
+    offer(next) {
+      const replaced = item;
+      item = next;
+      const arm = !armed;
+      if (arm) armed = true;
+      return { arm, replaced };
+    },
+    take() {
+      const current = item;
+      item = null;
+      armed = false;
+      return current;
+    },
+    clear() {
+      const current = item;
+      item = null;
+      armed = false;
+      return current;
+    },
+  };
+}
+
+function crc8(bytes) {
+  let crc = 0;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+    }
+  }
+  return crc;
+}
+
+// Pattern wire shape: A5 preamble, uint32 epoch-ms low word, uint16 frame
+// sequence, CRC-8/ATM over the timestamp+sequence bytes. Bits are MSB-first.
+export function decodeTimestampPatternBits(bits) {
+  if (!Array.isArray(bits) || bits.length !== 64) return null;
+  const bytes = [];
+  for (let offset = 0; offset < 64; offset += 8) {
+    let byte = 0;
+    for (let bit = 0; bit < 8; bit++) byte = (byte << 1) | (bits[offset + bit] ? 1 : 0);
+    bytes.push(byte);
+  }
+  if (bytes[0] !== 0xa5 || crc8(bytes.slice(1, 7)) !== bytes[7]) return null;
+  const timestamp = (((bytes[1] << 24) >>> 0) | (bytes[2] << 16) | (bytes[3] << 8) | bytes[4]) >>> 0;
+  const sequence = (bytes[5] << 8) | bytes[6];
+  return { timestamp, sequence };
+}

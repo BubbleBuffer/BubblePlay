@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "defaultProfile": "client",
+  "fullProfile": "full",
+  "profiles": {
+    "client": {
+      "paths": ["worker/**"],
+      "commands": [
+        {
+          "id": "client-tests",
+          "argv": ["npm", "--prefix", "worker", "test"],
+          "timeout_ms": 120000,
+          "provides": ["tests"]
+        },
+        {
+          "id": "client-syntax",
+          "argv": ["npm", "--prefix", "worker", "run", "check:syntax"],
+          "timeout_ms": 120000,
+          "provides": ["syntax"]
+        }
+      ]
+    },
+    "host": {
+      "paths": ["host/**"],
+      "commands": [
+        {
+          "id": "host-check",
+          "argv": ["powershell", "-NoProfile", "-Command", "$env:NVIDIA_VIDEO_CODEC_SDK_PATH=(Resolve-Path 'host/sdk-stub'); cargo check --manifest-path host/Cargo.toml"],
+          "timeout_ms": 300000,
+          "provides": ["build"]
+        }
+      ]
+    },
+    "full": {
+      "commands": [
+        {
+          "id": "full-client-tests",
+          "argv": ["npm", "--prefix", "worker", "test"],
+          "timeout_ms": 120000,
+          "provides": ["tests"]
+        },
+        {
+          "id": "full-client-syntax",
+          "argv": ["npm", "--prefix", "worker", "run", "check:syntax"],
+          "timeout_ms": 120000,
+          "provides": ["syntax"]
+        },
+        {
+          "id": "full-host-check",
+          "argv": ["powershell", "-NoProfile", "-Command", "$env:NVIDIA_VIDEO_CODEC_SDK_PATH=(Resolve-Path 'host/sdk-stub'); cargo check --manifest-path host/Cargo.toml"],
+          "timeout_ms": 300000,
+          "provides": ["build"]
+        }
+      ]
+    }
+  }
+}

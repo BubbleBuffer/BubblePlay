@@ -14,6 +14,7 @@ mod signaling;
 mod stun;
 mod vdd;
 
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -34,10 +35,14 @@ const DEFAULT_BITRATE_BPS: u32 = 8_000_000;
 const MIN_BITRATE_BPS: u32 = 1_000_000;
 const MAX_BITRATE_BPS: u32 = 40_000_000;
 const IDR_INTERVAL: Duration = Duration::from_secs(2);
+// Chromium may repeat PLI while a large recovery IDR is still in flight.
+// Forcing a new IDR for every RTCP packet floods the link and prevents any
+// one keyframe from completing, so coalesce requests at the sender boundary.
+const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 struct Args {
-    mode: String,      // "spike" | "serve"
+    mode: String, // "spike" | "serve"
     worker: Option<String>,
     token: Option<String>,
     duration_secs: u32,
@@ -111,7 +116,11 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                 // Worker deploys reset the Durable Object, killing our WS
                 // and briefly 500ing new connections. That's transient —
                 // retry with backoff instead of taking the host down.
-                error!(?e, backoff_secs = backoff.as_secs(), "serve session failed — retrying");
+                error!(
+                    ?e,
+                    backoff_secs = backoff.as_secs(),
+                    "serve session failed — retrying"
+                );
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
@@ -196,12 +205,22 @@ fn run_spike(args: &Args) -> Result<()> {
 
 /// Full pipeline: signaling + WebRTC + media + input.
 fn run_serve(args: &Args) -> Result<()> {
-    let worker = args.worker.clone().context("--worker wss://... is required")?;
+    let worker = args
+        .worker
+        .clone()
+        .context("--worker wss://... is required")?;
     let token = args.token.clone().context("--token is required")?;
 
     // 1. Media UDP socket. Bind wildcard; discover the routed local IP for the
     //    host candidate via a throwaway connected socket.
     let socket = UdpSocket::bind("0.0.0.0:0").context("bind media socket")?;
+    // The RTC pump must never wait in recv_from: str0m's leaky-bucket pacer
+    // commonly asks to be called again in less than a millisecond. A blocking
+    // receive here used to cap us at roughly one RTP packet per loop and built
+    // a multi-second sender queue even on a lossless LAN.
+    socket
+        .set_nonblocking(true)
+        .context("make media socket nonblocking")?;
     let local_port = socket.local_addr()?.port();
     let host_ip = pick_host_ip().context("discover local host IP")?;
     let host_addr: SocketAddr = SocketAddr::new(host_ip, local_port);
@@ -213,6 +232,30 @@ fn run_serve(args: &Args) -> Result<()> {
     // 3. RTC session.
     let mut rtc = RtcSession::new(Instant::now());
     rtc.add_host_candidate(host_addr)?;
+    drain_setup_outputs(&mut rtc, &socket)?;
+
+    // Discover the server-reflexive candidate before accepting an offer.
+    // The STUN helper is synchronous and uses this same media socket; doing
+    // it here means it cannot consume browser ICE/DTLS datagrams. Adding the
+    // candidate before SDP negotiation also puts it directly in the answer.
+    socket
+        .set_nonblocking(false)
+        .context("make media socket blocking for startup STUN")?;
+    let stun_result = stun::discover_mapped_address(&socket, STUN_SERVER);
+    socket
+        .set_nonblocking(true)
+        .context("restore nonblocking media socket after startup STUN")?;
+    match stun_result {
+        Ok(mapped) => {
+            rtc.add_srflx_candidate(mapped, host_addr)?;
+            drain_setup_outputs(&mut rtc, &socket)?;
+            info!(%mapped, "srflx candidate ready for SDP answer");
+        }
+        Err(e) => warn!(
+            ?e,
+            "STUN discovery failed; host candidate only for this session"
+        ),
+    }
 
     // 4. Capture (+ warm up encoder from the first frame).
     let _vdd = start_vdd_keepalive(args)?;
@@ -220,91 +263,45 @@ fn run_serve(args: &Args) -> Result<()> {
     let mut encoder: Option<Nvenc> = None;
     let mut input_sink = InputSink::new();
 
-    let mut srflx_done = false;
-    let mut srflx_failures = 0u32;
     let mut next_idr = Instant::now() + IDR_INTERVAL;
+    let mut last_idr_sent = Instant::now()
+        .checked_sub(KEYFRAME_REQUEST_COOLDOWN)
+        .unwrap_or_else(Instant::now);
     let mut next_signal_ping = Instant::now() + Duration::from_secs(20);
     let mut last_logged_bwe: Option<u64> = None;
-    let mut offer_accepted = false;
+    let mut pending_signal_events = VecDeque::new();
     let mut connected_since: Option<Instant> = None;
     let mut frames_sent = 0u64;
     let mut input_packets = 0u64;
     let mut input_bytes = 0u64;
+    let mut transport_window_started = Instant::now();
+    let mut next_transport_log = transport_window_started + Duration::from_secs(1);
+    let mut tx_packets_window = 0u64;
+    let mut tx_bytes_window = 0u64;
+    let mut admitted_frames_window = 0u64;
+    let mut admitted_bytes_window = 0u64;
+    let mut overdue_deadlines_window = 0u64;
+    let mut max_deadline_overdue_us = 0u64;
     let mut buf = vec![0u8; 2000];
 
     'run: loop {
-        let _now = Instant::now();
-
-        // -- Signaling events ----------------------------------------------
-        if Instant::now() >= next_signal_ping {
-            signaling.send_ping();
-            next_signal_ping = Instant::now() + Duration::from_secs(20);
-        }
-        let signal_events = match signaling.poll() {
-            Ok(evs) => evs,
-            Err(e) => {
-                // Transient signaling drops (edge recycling, DO eviction,
-                // network blips) must end the session so the outer loop can
-                // reconnect — they are NOT fatal.
-                warn!(?e, "signaling read failed — ending session to reconnect");
-                break 'run;
-            }
-        };
-        for ev in signal_events {
-            match ev {
-                SignalEvent::Offer(sdp) => {
-                    info!("received SDP offer");
-                    match rtc.accept_offer(&sdp) {
-                        Ok(answer) => {
-                            if let Err(e) = signaling.send_answer(&answer) {
-                                warn!(?e, "send answer failed — ending session");
-                                break 'run;
-                            }
-                            offer_accepted = true;
-                            info!("SDP answer sent");
-                        }
-                        Err(e) => {
-                            // A bad or stale offer (client vanished before DTLS,
-                            // ICE never established) must not kill the host —
-                            // end this session and wait for the next client.
-                            warn!(?e, "accept_offer failed — ending session");
-                            break 'run;
-                        }
-                    }
-                }
-                SignalEvent::RemoteCandidate(sdp) => rtc.add_remote_candidate(&sdp),
-                SignalEvent::PeerLeft => {
-                    info!("peer left — exiting");
-                    break 'run;
-                }
-                SignalEvent::Registered => {}
-            }
-        }
-
-        // -- srflx discovery (once, from the media socket) -------------------
-        if offer_accepted && !srflx_done {
-            match stun::discover_mapped_address(&socket, STUN_SERVER) {
-                Ok(mapped) => {
-                    let cand = rtc.add_srflx_candidate(mapped, host_addr)?;
-                    signaling.send_candidate(&cand.to_sdp_string())?;
-                    srflx_done = true;
-                    info!(%mapped, "srflx candidate trickled");
-                }
-                Err(e) => {
-                    srflx_failures += 1;
-                    warn!(?e, srflx_failures, "STUN discovery failed (will retry)");
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            }
-        }
-
         // -- str0m outputs ----------------------------------------------------
         let timeout;
         loop {
             match rtc.rtc.poll_output() {
                 Ok(Output::Transmit(t)) => {
-                    if let Err(e) = socket.send_to(&t.contents, t.destination) {
-                        warn!(?e, dest = %t.destination, "UDP send failed");
+                    match socket.send_to(&t.contents, t.destination) {
+                        Ok(n) => {
+                            tx_packets_window += 1;
+                            tx_bytes_window += n as u64;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // UDP backpressure is unusual, but blocking the
+                            // pacer would be worse. Congestion control will
+                            // react to the resulting loss.
+                            debug!(dest = %t.destination, "UDP send would block; dropping datagram");
+                        }
+                        Err(e) => warn!(?e, dest = %t.destination, "UDP send failed"),
                     }
                 }
                 Ok(Output::Timeout(t)) => {
@@ -315,30 +312,47 @@ fn run_serve(args: &Args) -> Result<()> {
                     if let Some(action) = rtc.on_event(e) {
                         match action {
                             RtcAction::IceConnected => {
-                                connected_since = Some(Instant::now());
-                                next_idr = Instant::now(); // immediate IDR
+                                let now = Instant::now();
+                                connected_since = Some(now);
+                                next_idr = now; // immediate IDR
+                                transport_window_started = now;
+                                next_transport_log = now + Duration::from_secs(1);
+                                tx_packets_window = 0;
+                                tx_bytes_window = 0;
+                                admitted_frames_window = 0;
+                                admitted_bytes_window = 0;
+                                overdue_deadlines_window = 0;
+                                max_deadline_overdue_us = 0;
                             }
                             RtcAction::IceDisconnected | RtcAction::Closed => {
                                 info!("ICE gone — session closed");
                                 break 'run;
                             }
                             RtcAction::KeyframeRequested => {
-                                if let Some(enc) = encoder.as_mut() {
-                                    enc.force_idr();
+                                let now = Instant::now();
+                                if now.duration_since(last_idr_sent) >= KEYFRAME_REQUEST_COOLDOWN {
+                                    if let Some(enc) = encoder.as_mut() {
+                                        enc.force_idr();
+                                        info!("forcing IDR after receiver keyframe request");
+                                    }
+                                } else {
+                                    debug!("coalescing repeated receiver keyframe request");
                                 }
                             }
                             RtcAction::Bwe(bps) => {
                                 if let Some(enc) = encoder.as_mut() {
-                                    let clamped =
-                                        bps.clamp(MIN_BITRATE_BPS as u64, MAX_BITRATE_BPS as u64)
-                                            as u32;
+                                    let clamped = bps
+                                        .clamp(MIN_BITRATE_BPS as u64, MAX_BITRATE_BPS as u64)
+                                        as u32;
                                     let _ = enc.set_bitrate(clamped);
                                     // Log the first estimate and any step of
                                     // >= 1 Mbps so the host log shows
                                     // congestion control working in a test.
                                     let log_it = match last_logged_bwe {
                                         None => true,
-                                        Some(prev) => (clamped as i64 - prev as i64).abs() >= 1_000_000,
+                                        Some(prev) => {
+                                            (clamped as i64 - prev as i64).abs() >= 1_000_000
+                                        }
                                     };
                                     if log_it {
                                         info!(bwe_bps = clamped, "BWE applied");
@@ -353,8 +367,7 @@ fn run_serve(args: &Args) -> Result<()> {
                                 if input_packets <= 20 || input_packets % 500 == 0 {
                                     info!(
                                         input_packets,
-                                        input_bytes,
-                                        "input packets applied via SendInput"
+                                        input_bytes, "input packets applied via SendInput"
                                     );
                                 }
                             }
@@ -369,13 +382,69 @@ fn run_serve(args: &Args) -> Result<()> {
             }
         }
 
+        // -- Signaling events ----------------------------------------------
+        // str0m requires one mutation followed immediately by a complete
+        // poll_output drain. Retain batches from the WebSocket, but apply at
+        // most one RTC-mutating signal per outer iteration.
+        if Instant::now() >= next_signal_ping {
+            signaling.send_ping();
+            next_signal_ping = Instant::now() + Duration::from_secs(20);
+        }
+        if pending_signal_events.is_empty() {
+            match signaling.poll() {
+                Ok(events) => pending_signal_events.extend(events),
+                Err(e) => {
+                    // Transient signaling drops (edge recycling, DO eviction,
+                    // network blips) must end the session so the outer loop can
+                    // reconnect — they are NOT fatal.
+                    warn!(?e, "signaling read failed — ending session to reconnect");
+                    break 'run;
+                }
+            }
+        }
+        if let Some(ev) = pending_signal_events.pop_front() {
+            match ev {
+                SignalEvent::Offer(sdp) => {
+                    info!("received SDP offer");
+                    match rtc.accept_offer(&sdp) {
+                        Ok(answer) => {
+                            if let Err(e) = signaling.send_answer(&answer) {
+                                warn!(?e, "send answer failed — ending session");
+                                break 'run;
+                            }
+                            info!("SDP answer sent");
+                            continue 'run;
+                        }
+                        Err(e) => {
+                            // A bad or stale offer (client vanished before DTLS,
+                            // ICE never established) must not kill the host —
+                            // end this session and wait for the next client.
+                            warn!(?e, "accept_offer failed — ending session");
+                            break 'run;
+                        }
+                    }
+                }
+                SignalEvent::RemoteCandidate(sdp) => {
+                    rtc.add_remote_candidate(&sdp);
+                    continue 'run;
+                }
+                SignalEvent::PeerLeft => {
+                    info!("peer left — exiting");
+                    break 'run;
+                }
+                SignalEvent::Registered => {}
+            }
+        }
+
         // -- UDP ingress ------------------------------------------------------
-        let wait = timeout.saturating_duration_since(Instant::now());
-        let read_wait = wait.min(Duration::from_millis(16)).max(Duration::from_millis(1));
-        socket.set_read_timeout(Some(read_wait)).ok();
+        // Consume at most one datagram per iteration. An accepted packet is
+        // one str0m mutation, so immediately return to the output drain. This
+        // also prevents a busy or hostile source from starving media/timeouts.
         match socket.recv_from(&mut buf) {
             Ok((n, source)) => {
-                let Ok(contents) = buf[..n].try_into() else { continue };
+                let Ok(contents) = buf[..n].try_into() else {
+                    continue 'run;
+                };
                 let input = Input::Receive(
                     Instant::now(),
                     Receive {
@@ -389,90 +458,192 @@ fn run_serve(args: &Args) -> Result<()> {
                     if let Err(e) = rtc.rtc.handle_input(input) {
                         warn!(?e, "handle_input failed");
                     }
+                    continue 'run;
                 } else {
                     debug!(%source, "ignoring UDP packet (no accepting session)");
                 }
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => warn!(?e, "UDP recv failed"),
         }
-        let _ = rtc.rtc.handle_input(Input::Timeout(Instant::now()));
+
+        // Only advance str0m's clock when its advertised deadline is due.
+        // The old loop called Timeout unconditionally after a blocking read,
+        // then blocked in capture for another 4 ms. That starved the pacer.
+        let now = Instant::now();
+        if now >= timeout {
+            let overdue = now.duration_since(timeout);
+            if !overdue.is_zero() {
+                overdue_deadlines_window += 1;
+                max_deadline_overdue_us =
+                    max_deadline_overdue_us.max(overdue.as_micros().min(u64::MAX as u128) as u64);
+            }
+            if let Err(e) = rtc.rtc.handle_input(Input::Timeout(now)) {
+                warn!(?e, "timeout input failed");
+            }
+            continue 'run;
+        }
 
         // -- Media pump: capture -> encode -> write ---------------------------
-        let Some((frame, is_new)) = capture.acquire(Duration::from_millis(4))? else {
-            continue;
-        };
+        // Poll DDA instead of waiting in it. str0m owns the next wake-up; a
+        // new desktop present will be picked up on the next sub-millisecond
+        // pump iteration.
+        let captured = capture.acquire(Duration::ZERO)?;
 
-        if encoder.is_none() {
-            let dev = frame.device().as_raw() as *mut core::ffi::c_void;
-            match Nvenc::new(dev, frame.width(), frame.height(), 60, args.bitrate_bps) {
-                Ok(enc) => {
-                    encoder = Some(enc);
-                    info!("encoder ready");
-                }
-                Err(e) => {
-                    error!(?e, "encoder init failed");
-                    break 'run;
-                }
-            }
-        }
-        if !is_new {
-            continue;
-        }
-
-        // Periodic IDR.
-        if Instant::now() >= next_idr {
-            if let Some(enc) = encoder.as_mut() {
-                enc.force_idr();
-            }
-            next_idr = Instant::now() + IDR_INTERVAL;
-        }
-
-        let enc = match encoder.as_mut() {
-            Some(e) => e,
-            None => continue,
-        };
-        match enc.encode_texture(texture_ptr(&frame)) {
-            Ok(encoded) => {
-                if rtc.ice_connected {
-                    if let Err(e) = rtc.write_video(encoded.data) {
-                        warn!(?e, "write_video failed");
-                    } else {
-                        frames_sent += 1;
-                        if frames_sent % 300 == 0 {
-                            info!(frames_sent, encode_ms = format!("{:.2}", encoded.encode_us as f64 / 1000.0), idr = encoded.is_idr, "stream stats");
-                        }
+        if let Some((frame, is_new)) = captured {
+            if encoder.is_none() {
+                let dev = frame.device().as_raw() as *mut core::ffi::c_void;
+                match Nvenc::new(dev, frame.width(), frame.height(), 60, args.bitrate_bps) {
+                    Ok(enc) => {
+                        encoder = Some(enc);
+                        info!("encoder ready");
+                    }
+                    Err(e) => {
+                        error!(?e, "encoder init failed");
+                        break 'run;
                     }
                 }
             }
-            Err(e) => {
-                warn!(?e, "encode failed; forcing IDR on next frame");
-                if let Some(enc) = encoder.as_mut() {
-                    enc.force_idr();
+            if is_new {
+                // Periodic IDR.
+                if Instant::now() >= next_idr {
+                    if let Some(enc) = encoder.as_mut() {
+                        enc.force_idr();
+                    }
+                    next_idr = Instant::now() + IDR_INTERVAL;
                 }
+
+                let enc = match encoder.as_mut() {
+                    Some(e) => e,
+                    None => continue,
+                };
+                match enc.encode_texture(texture_ptr(&frame)) {
+                    Ok(encoded) => {
+                        if rtc.ice_connected {
+                            let is_idr = encoded.is_idr;
+                            let encoded_bytes = encoded.data.len();
+                            let encode_us = encoded.encode_us;
+                            match rtc.write_video(encoded.data) {
+                                Err(e) => warn!(?e, "write_video failed"),
+                                Ok(false) => {}
+                                Ok(true) => {
+                                    frames_sent += 1;
+                                    admitted_frames_window += 1;
+                                    admitted_bytes_window += encoded_bytes as u64;
+                                    if is_idr {
+                                        last_idr_sent = Instant::now();
+                                        next_idr = last_idr_sent + IDR_INTERVAL;
+                                        info!(frames_sent, encoded_bytes, "IDR sent");
+                                    }
+                                    if frames_sent % 300 == 0 {
+                                        info!(
+                                            frames_sent,
+                                            encode_ms = format!("{:.2}", encode_us as f64 / 1000.0),
+                                            idr = is_idr,
+                                            "stream stats"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(?e, "encode failed; forcing IDR on next frame");
+                        if let Some(enc) = encoder.as_mut() {
+                            enc.force_idr();
+                        }
+                    }
+                }
+
+                // write_video queued packets; drain them before any wait.
+                continue 'run;
             }
+        }
+
+        let now = Instant::now();
+        if connected_since.is_some() && now >= next_transport_log {
+            let elapsed = now
+                .duration_since(transport_window_started)
+                .as_secs_f64()
+                .max(0.001);
+            info!(
+                tx_mbps = format!(
+                    "{:.2}",
+                    tx_bytes_window as f64 * 8.0 / elapsed / 1_000_000.0
+                ),
+                tx_pps = format!("{:.0}", tx_packets_window as f64 / elapsed),
+                admitted_mbps = format!(
+                    "{:.2}",
+                    admitted_bytes_window as f64 * 8.0 / elapsed / 1_000_000.0
+                ),
+                admitted_fps = format!("{:.1}", admitted_frames_window as f64 / elapsed),
+                overdue_deadlines = overdue_deadlines_window,
+                max_overdue_us = max_deadline_overdue_us,
+                "RTC transport"
+            );
+            transport_window_started = now;
+            next_transport_log = now + Duration::from_secs(1);
+            tx_packets_window = 0;
+            tx_bytes_window = 0;
+            admitted_frames_window = 0;
+            admitted_bytes_window = 0;
+            overdue_deadlines_window = 0;
+            max_deadline_overdue_us = 0;
+        }
+
+        // Stay responsive to new desktop presents while respecting str0m's
+        // next deadline. A one-millisecond cap avoids the old 16 ms blind
+        // spot without burning an entire CPU core in a spin loop.
+        let wait = timeout.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            std::thread::sleep(wait.min(Duration::from_millis(1)));
         }
     }
 
     signaling.send_bye();
-    let secs = connected_since.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
-    info!(frames_sent, connected_secs = format!("{secs:.1}"), "host exiting");
+    let secs = connected_since
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    info!(
+        frames_sent,
+        connected_secs = format!("{secs:.1}"),
+        "host exiting"
+    );
     Ok(())
+}
+
+/// Complete str0m's required mutation -> drain cycle while local candidates
+/// are configured before SDP negotiation. No application-level events are
+/// expected yet, but handling them keeps this helper correct if str0m adds one.
+fn drain_setup_outputs(rtc: &mut RtcSession, socket: &UdpSocket) -> Result<()> {
+    loop {
+        match rtc.rtc.poll_output() {
+            Ok(Output::Transmit(t)) => {
+                socket
+                    .send_to(&t.contents, t.destination)
+                    .with_context(|| format!("send setup datagram to {}", t.destination))?;
+            }
+            Ok(Output::Event(e)) => {
+                let _ = rtc.on_event(e);
+            }
+            Ok(Output::Timeout(_)) => return Ok(()),
+            Err(e) => return Err(e).context("drain RTC setup output"),
+        }
+    }
 }
 
 /// Discover the local interface IP used for the default route (UDP-connect trick;
 /// no packets are sent).
 fn pick_host_ip() -> Result<std::net::IpAddr> {
     let probe = UdpSocket::bind("0.0.0.0:0")?;
-    let stun_addr: SocketAddr = format!("{STUN_SERVER}")
-        .parse()
-        .or_else(|_| -> Result<SocketAddr> {
-            Ok(std::net::ToSocketAddrs::to_socket_addrs(STUN_SERVER)?
-                .next()
-                .context("no stun addr")?)
-        })?;
+    let stun_addr: SocketAddr =
+        format!("{STUN_SERVER}")
+            .parse()
+            .or_else(|_| -> Result<SocketAddr> {
+                Ok(std::net::ToSocketAddrs::to_socket_addrs(STUN_SERVER)?
+                    .next()
+                    .context("no stun addr")?)
+            })?;
     probe.connect(stun_addr)?;
     Ok(probe.local_addr()?.ip())
 }
@@ -498,7 +669,10 @@ fn start_vdd_keepalive(args: &Args) -> Result<Option<vdd::VddKeepalive>> {
     let keep = match vdd::VddKeepalive::start() {
         Ok(k) => k,
         Err(e) => {
-            warn!(?e, "VDD keepalive unavailable — physical-monitor capture only");
+            warn!(
+                ?e,
+                "VDD keepalive unavailable — physical-monitor capture only"
+            );
             return Ok(None);
         }
     };
