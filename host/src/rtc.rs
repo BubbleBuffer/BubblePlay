@@ -41,12 +41,12 @@ pub struct RtcSession {
 }
 
 impl RtcSession {
-    pub fn new(now: Instant) -> Self {
+    pub fn new(now: Instant, initial_bitrate_bps: u32) -> Self {
         let rtc = Rtc::builder()
             // Initial BWE estimate must match the encoder's starting bitrate
             // (8 Mbps default) so congestion control doesn't fight the encoder
             // out of the gate; TWCC/REMB feedback then adjusts from there.
-            .enable_bwe(Some(str0m::bwe::Bitrate::mbps(8)))
+            .enable_bwe(Some(str0m::bwe::Bitrate::bps(initial_bitrate_bps as u64)))
             .build(now);
         Self {
             rtc,

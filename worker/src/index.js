@@ -9,7 +9,10 @@
 //   worker -> any    : {type:"hello-ok"} | {type:"error", message}
 //   client -> worker : {type:"offer", sdp} | {type:"ice", candidate}
 //                       | {type:"diag", seq, atMs, profile}
+//                       | {type:"qos", sessionId, seq, atMs, rx, presentation}
 //   host   -> worker : {type:"answer", sdp} | {type:"ice", candidate}
+//                       | {type:"quality", profile, width, height, fps,
+//                          targetBitrateBps, bweBps, reason}
 //   worker -> either : {type:"peer-left"} when the other side disconnects
 //   either -> worker : {type:"bye"} (graceful exit)
 //   either -> worker : {type:"ping"} (keepalive, consumed, never relayed)
@@ -143,6 +146,17 @@ export class Room {
         (att.role !== "client" || typeof message !== "string" || message.length > 16_384)) {
       return;
     }
+    // QoS is page-scoped receiver telemetry sent only from the browser client;
+    // quality is the host's bounded response. Drop invalid control frames while
+    // keeping both otherwise healthy peers connected.
+    if (msg.type === "qos" &&
+        (att.role !== "client" || typeof message !== "string" || utf8Length(message) > 2_048)) {
+      return;
+    }
+    if (msg.type === "quality" &&
+        (att.role !== "host" || typeof message !== "string" || utf8Length(message) > 1_024)) {
+      return;
+    }
     const target = att.role === "host" ? this.findPeer("client") : this.findPeer("host");
     if (msg.type !== "diag") {
       console.log(`[room] relay ${msg.type} -> ${target ? "peer" : "NO PEER"}`);
@@ -209,4 +223,8 @@ export class Room {
       }) || null
     );
   }
+}
+
+function utf8Length(value) {
+  return new TextEncoder().encode(value).byteLength;
 }

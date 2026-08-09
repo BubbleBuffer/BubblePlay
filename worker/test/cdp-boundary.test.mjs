@@ -75,6 +75,12 @@ test("client starts a new signaling and peer epoch after relay loss or peer depa
   assert.match(client, /pendingRemoteIce/);
 });
 
+test("QoS polling continues after ICE reaches completed", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /\["connected",\s*"completed"\]\.includes\(pc\.iceConnectionState\)/);
+  assert.doesNotMatch(client, /pc\.iceConnectionState\s*!==\s*"connected"/);
+});
+
 test("worker policy closure is terminal while transient websocket closure reconnects", () => {
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /shouldReconnectAfterClose\(event\.code, terminalSignalingFailure\)/);

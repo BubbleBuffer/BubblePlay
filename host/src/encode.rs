@@ -30,7 +30,7 @@ use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     NV_ENC_CREATE_BITSTREAM_BUFFER, NV_ENC_CREATE_BITSTREAM_BUFFER_VER, NV_ENC_DEVICE_TYPE,
     NV_ENC_INITIALIZE_PARAMS, NV_ENC_INITIALIZE_PARAMS_VER, NV_ENC_INPUT_RESOURCE_TYPE,
     NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_BITSTREAM_VER, NV_ENC_MAP_INPUT_RESOURCE,
-    NV_ENC_MAP_INPUT_RESOURCE_VER, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+    NV_ENC_MAP_INPUT_RESOURCE_VER, NV_ENC_MULTI_PASS, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_FLAGS,
     NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE,
     NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_RECONFIGURE_PARAMS,
@@ -52,6 +52,12 @@ const NV_ENC_PRESET_P1_GUID: GUID = GUID {
     Data2: 0x45f8,
     Data3: 0x4cf8,
     Data4: [0x80, 0xc7, 0x29, 0x88, 0x71, 0x59, 0x0e, 0xbf],
+};
+const NV_ENC_PRESET_P3_GUID: GUID = GUID {
+    Data1: 0x3685_0110,
+    Data2: 0x3a07,
+    Data3: 0x441f,
+    Data4: [0x94, 0xd5, 0x36, 0x70, 0x63, 0x1f, 0x91, 0xf6],
 };
 const NV_ENC_H264_PROFILE_HIGH_GUID: GUID = GUID {
     Data1: 0xe7cb_c309,
@@ -75,13 +81,29 @@ pub struct EncodedFrame {
     /// Encoder-side latency: register+map+encode+lock combined, in microseconds.
     pub encode_us: u64,
 }
+#[derive(Debug, Clone, Copy)]
+pub enum Preset {
+    P1,
+    P3,
+}
+impl Preset {
+    fn guid(self) -> GUID {
+        match self {
+            Self::P1 => NV_ENC_PRESET_P1_GUID,
+            Self::P3 => NV_ENC_PRESET_P3_GUID,
+        }
+    }
+}
 
 pub struct Nvenc {
     session: *mut c_void,
+    device: *mut c_void,
     bitstream: *mut c_void,
     width: u32,
     height: u32,
     fps: u32,
+    max_width: u32,
+    max_height: u32,
     bitrate_bps: u32,
     frame_idx: u64,
     force_idr_next: bool,
@@ -105,7 +127,51 @@ impl Nvenc {
         fps: u32,
         bitrate_bps: u32,
     ) -> Result<Self> {
+        Self::new_with_preset_native(
+            device,
+            width,
+            height,
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            Preset::P3,
+        )
+    }
+    pub fn new_with_preset(
+        device: *mut c_void,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u32,
+        preset: Preset,
+    ) -> Result<Self> {
+        Self::new_with_preset_native(
+            device,
+            width,
+            height,
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            preset,
+        )
+    }
+    pub fn new_with_preset_native(
+        device: *mut c_void,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+        fps: u32,
+        bitrate_bps: u32,
+        preset: Preset,
+    ) -> Result<Self> {
         ensure!(!device.is_null(), "null D3D11 device");
+        ensure!(
+            width <= max_width && height <= max_height,
+            "active dimensions exceed native maximum"
+        );
 
         // 1. Open session on the D3D11 device.
         let mut session_params: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = unsafe { zeroed() };
@@ -129,12 +195,13 @@ impl Nvenc {
             (ENCODE_API.get_encode_preset_config_ex)(
                 session,
                 NV_ENC_CODEC_H264_GUID,
-                NV_ENC_PRESET_P1_GUID,
+                preset.guid(),
                 NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 &mut preset_cfg,
             )
         };
-        st.result_without_string().context("GetEncodePresetConfigEx")?;
+        st.result_without_string()
+            .context("GetEncodePresetConfigEx")?;
 
         let mut cfg = Box::new(preset_cfg.presetCfg);
         cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
@@ -145,6 +212,14 @@ impl Nvenc {
         cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
         cfg.rcParams.averageBitRate = bitrate_bps;
         cfg.rcParams.maxBitRate = bitrate_bps;
+        cfg.rcParams.vbvBufferSize = bitrate_bps / fps.max(1);
+        cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
+        cfg.rcParams.set_enableAQ(1);
+        cfg.rcParams.set_aqStrength(8);
+        cfg.rcParams.set_enableTemporalAQ(0);
+        cfg.rcParams.set_enableLookahead(0);
+        cfg.rcParams.lookaheadDepth = 0;
+        cfg.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
 
         // H.264 specifics: IDR period + repeat SPS/PPS on every IDR.
         unsafe {
@@ -157,34 +232,44 @@ impl Nvenc {
         let mut init = Box::<NV_ENC_INITIALIZE_PARAMS>::new(unsafe { zeroed() });
         init.version = NV_ENC_INITIALIZE_PARAMS_VER;
         init.encodeGUID = NV_ENC_CODEC_H264_GUID;
-        init.presetGUID = NV_ENC_PRESET_P1_GUID;
+        init.presetGUID = preset.guid();
         init.encodeWidth = width;
         init.encodeHeight = height;
         init.darWidth = width;
         init.darHeight = height;
         init.frameRateNum = fps;
         init.frameRateDen = 1;
+        init.maxEncodeWidth = max_width;
+        init.maxEncodeHeight = max_height;
         init.enableEncodeAsync = 0; // sync D3D11 path
         init.enablePTD = 1;
         init.encodeConfig = cfg.as_mut();
         init.tuningInfo = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
         init.bufferFormat = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB;
         let st = unsafe { (ENCODE_API.initialize_encoder)(session, init.as_mut()) };
-        st.result_without_string().context("NvEncInitializeEncoder")?;
-        info!(width, height, fps, bitrate_bps, "NVENC initialized (H264 High, CBR, P1 ULL)");
+        st.result_without_string()
+            .context("NvEncInitializeEncoder")?;
+        info!(
+            width, height, max_width, max_height, fps, bitrate_bps, preset = ?preset,
+            "NVENC initialized (H264 High, CBR, ULL)"
+        );
 
         // 4. Bitstream output buffer.
         let mut bs_params: NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe { zeroed() };
         bs_params.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
         let st = unsafe { (ENCODE_API.create_bitstream_buffer)(session, &mut bs_params) };
-        st.result_without_string().context("NvEncCreateBitstreamBuffer")?;
+        st.result_without_string()
+            .context("NvEncCreateBitstreamBuffer")?;
 
         Ok(Self {
             session,
+            device,
             bitstream: bs_params.bitstreamBuffer,
             width,
             height,
             fps,
+            max_width,
+            max_height,
             bitrate_bps,
             frame_idx: 0,
             force_idr_next: true, // first frame must be IDR for the decoder
@@ -199,20 +284,32 @@ impl Nvenc {
         self.force_idr_next = true;
     }
 
+    pub fn is_for_device(&self, device: *mut c_void) -> bool {
+        self.device == device
+    }
+
     /// Reconfigure the encoder bitrate (BWE clamp). NVENC applies it from the
     /// next picture onward.
     pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
         if bitrate_bps == self.bitrate_bps {
             return Ok(());
         }
-        self.cfg.rcParams.averageBitRate = bitrate_bps;
-        self.cfg.rcParams.maxBitRate = bitrate_bps;
+        let mut cfg = *self.cfg;
+        cfg.rcParams.averageBitRate = bitrate_bps;
+        cfg.rcParams.maxBitRate = bitrate_bps;
+        cfg.rcParams.vbvBufferSize = bitrate_bps / self.fps.max(1);
+        cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
+        let mut init = *self.init_params;
+        init.encodeConfig = &mut cfg;
         let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
         reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-        reconf.reInitEncodeParams = *self.init_params;
+        reconf.reInitEncodeParams = init;
         let st = unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) };
         match st.result_without_string() {
             Ok(()) => {
+                *self.cfg = cfg;
+                *self.init_params = init;
+                self.init_params.encodeConfig = self.cfg.as_mut();
                 self.bitrate_bps = bitrate_bps;
                 info!(bitrate_bps, "NVENC bitrate reconfigured");
                 Ok(())
@@ -222,6 +319,44 @@ impl Nvenc {
                 Err(e.into())
             }
         }
+    }
+
+    /// Dimension/fps transition. The host requests its wall-clock IDR on the
+    /// first frame after this succeeds; GOP cadence itself is not reconfigured.
+    pub fn reconfigure_profile(&mut self, width: u32, height: u32, fps: u32) -> Result<()> {
+        if width > self.max_width || height > self.max_height {
+            bail!("profile exceeds native encoder dimensions");
+        }
+        if width == self.width && height == self.height && fps == self.fps {
+            return Ok(());
+        }
+        let mut cfg = *self.cfg;
+        cfg.rcParams.vbvBufferSize = self.bitrate_bps / fps.max(1);
+        cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
+        let mut init = *self.init_params;
+        init.encodeWidth = width;
+        init.encodeHeight = height;
+        init.darWidth = width;
+        init.darHeight = height;
+        init.frameRateNum = fps;
+        init.encodeConfig = &mut cfg;
+        let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
+        reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+        reconf.reInitEncodeParams = init;
+        unsafe {
+            reconf.set_resetEncoder(1);
+        }
+        unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) }
+            .result_without_string()
+            .context("NvEncReconfigureEncoder profile")?;
+        *self.cfg = cfg;
+        *self.init_params = init;
+        self.init_params.encodeConfig = self.cfg.as_mut();
+        self.width = width;
+        self.height = height;
+        self.fps = fps;
+        self.force_idr_next = true;
+        Ok(())
     }
 
     /// Encode one captured desktop texture (zero-copy).
@@ -242,7 +377,8 @@ impl Nvenc {
         reg.bufferFormat = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB;
         // bufferUsage zero == NV_ENC_INPUT_IMAGE.
         let st = unsafe { (ENCODE_API.register_resource)(self.session, &mut reg) };
-        st.result_without_string().context("NvEncRegisterResource")?;
+        st.result_without_string()
+            .context("NvEncRegisterResource")?;
         let registered = reg.registeredResource;
 
         let mut map: NV_ENC_MAP_INPUT_RESOURCE = unsafe { zeroed() };
@@ -298,7 +434,11 @@ impl Nvenc {
             let len = lock.bitstreamSizeInBytes as usize;
             let mut out = vec![0u8; len];
             unsafe {
-                ptr::copy_nonoverlapping(lock.bitstreamBufferPtr as *const u8, out.as_mut_ptr(), len);
+                ptr::copy_nonoverlapping(
+                    lock.bitstreamBufferPtr as *const u8,
+                    out.as_mut_ptr(),
+                    len,
+                );
             }
             let st = unsafe { (ENCODE_API.unlock_bitstream)(self.session, self.bitstream) };
             if let Err(e) = st.result_without_string() {
@@ -316,7 +456,9 @@ impl Nvenc {
             debug!(?e, "unregister_resource");
         }
 
-        let Some(data) = result else { bail!("no bitstream output") };
+        let Some(data) = result else {
+            bail!("no bitstream output")
+        };
         let is_idr = lock.pictureType == NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR || force_idr;
         self.frame_idx += 1;
         self.force_idr_next = false;
@@ -347,7 +489,8 @@ impl Nvenc {
         payload.spsppsBuffer = buf.as_mut_ptr() as *mut c_void;
         payload.outSPSPPSPayloadSize = &mut out_size;
         let st = unsafe { (ENCODE_API.get_sequence_params)(self.session, &mut payload) };
-        st.result_without_string().context("NvEncGetSequenceParams")?;
+        st.result_without_string()
+            .context("NvEncGetSequenceParams")?;
         buf.truncate(out_size as usize);
         Ok(buf)
     }

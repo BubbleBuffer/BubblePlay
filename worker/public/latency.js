@@ -246,6 +246,88 @@ export function summarizeRtcStats(report) {
   return { inbound: inboundSummary, candidatePair: pairSummary, codec };
 }
 
+// Return only the receiver telemetry that crosses the adaptive-quality wire.
+// `current` and `previous` are adjacent samples from one peer generation;
+// counters that decrease are treated as a reset instead of a negative spike.
+export function computeQosRxWindow(current = {}, previous = null) {
+  const finite = (value) => Number.isFinite(value) ? value : null;
+  const counterDelta = (key) => {
+    const value = finite(current[key]);
+    const before = finite(previous?.[key]);
+    if (value === null || before === null || value < 0 || before < 0 || value < before) return null;
+    return value - before;
+  };
+  const sameGeneration = previous && current.generation === previous.generation;
+  const elapsedMs = sameGeneration && finite(current.atMs) !== null && finite(previous.atMs) !== null ?
+    current.atMs - previous.atMs : null;
+  const usableWindow = elapsedMs !== null && elapsedMs > 0;
+  const delta = (key) => usableWindow ? counterDelta(key) : null;
+  const packetsReceivedDelta = delta("packetsReceived");
+  const packetsLostDelta = delta("packetsLost");
+  const bytesDelta = delta("bytesReceived");
+  const emittedDelta = delta("jitterBufferEmittedCount");
+  const delayDelta = delta("jitterBufferDelay");
+  const decodedDelta = delta("framesDecoded");
+  const qpDelta = delta("qpSum");
+  const packetTotal = packetsReceivedDelta === null || packetsLostDelta === null ? null :
+    packetsReceivedDelta + packetsLostDelta;
+  return {
+    mbps: bytesDelta === null ? null : bytesDelta * 8 / elapsedMs / 1_000,
+    lossPct: packetTotal ? packetsLostDelta / packetTotal * 100 : null,
+    rttMs: finite(current.rtt) === null ? null : Math.round(current.rtt * 1_000),
+    jitterMs: finite(current.jitter) === null ? null : Math.round(current.jitter * 1_000),
+    jitterBufferMs: delayDelta === null || emittedDelta === null || emittedDelta <= 0 ? null :
+      delayDelta / emittedDelta * 1_000,
+    nackDelta: delta("nackCount"),
+    pliDelta: delta("pliCount"),
+    packetsReceivedDelta,
+    framesReceivedDelta: delta("framesReceived"),
+    framesDecodedDelta: decodedDelta,
+    framesDroppedDelta: delta("framesDropped"),
+    freezeDelta: delta("freezeCount"),
+    qpPerFrame: qpDelta === null || decodedDelta === null || decodedDelta <= 0 ? null : qpDelta / decodedDelta,
+  };
+}
+
+export function createQosPayload({ sessionId, seq, atMs, rx = {}, presentation = {} }) {
+  const finiteOrNull = (value) => Number.isFinite(value) ? value : null;
+  const pick = (source, keys) => Object.fromEntries(keys.map((key) => [key, finiteOrNull(source[key])]));
+  if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > 128 ||
+      !Number.isSafeInteger(seq) || seq < 0 || !Number.isFinite(atMs)) return null;
+  return {
+    type: "qos",
+    sessionId,
+    seq,
+    atMs,
+    rx: pick(rx, [
+      "mbps", "lossPct", "rttMs", "jitterMs", "jitterBufferMs", "nackDelta", "pliDelta",
+      "packetsReceivedDelta", "framesReceivedDelta", "framesDecodedDelta", "framesDroppedDelta",
+      "freezeDelta", "qpPerFrame",
+    ]),
+    presentation: pick(presentation, ["fps", "recentGapMs", "width", "height"]),
+  };
+}
+
+// Host quality announcements are untrusted relay input. Keep the accepted
+// shape small, bounded, and JSON-safe before exposing it to the HUD/diagnostic
+// snapshot.
+export function parseHostQuality(message) {
+  const boundedInteger = (value, max) => Number.isInteger(value) && value >= 0 && value <= max ? value : null;
+  const boundedText = (value, max) => typeof value === "string" && value.length > 0 && value.length <= max &&
+    [...value].every((char) => char >= " " && char <= "~") ? value : null;
+  if (!message || message.type !== "quality") return null;
+  const profile = boundedText(message.profile, 32);
+  const width = boundedInteger(message.width, 16_384);
+  const height = boundedInteger(message.height, 16_384);
+  const fps = boundedInteger(message.fps, 240);
+  const targetBitrateBps = boundedInteger(message.targetBitrateBps, 100_000_000);
+  const bweBps = message.bweBps === null || message.bweBps === undefined ? null : boundedInteger(message.bweBps, 100_000_000);
+  const reason = boundedText(message.reason, 64);
+  const invalidBwe = bweBps === null && message.bweBps !== null && message.bweBps !== undefined;
+  if (profile === null || !width || !height || !fps || !targetBitrateBps || invalidBwe || reason === null) return null;
+  return { profile, width, height, fps, targetBitrateBps, bweBps, reason };
+}
+
 // Shared by the production transform worker and Node tests: encoded timing is
 // judged on its media timeline, not on whichever thread received a callback.
 export function createWorkerTimeline({ now = () => performance.now(), startupGraceMs = 1000 } = {}) {

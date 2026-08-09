@@ -9,6 +9,9 @@ import {
   createLatestRenderSlot,
   createWorkerTimeline,
   summarizeRtcStats,
+  computeQosRxWindow,
+  createQosPayload,
+  parseHostQuality,
 } from "../public/latency.js";
 
 test("limits worker-to-main and decode work to two frames", () => {
@@ -193,4 +196,71 @@ test("WebRTC profiling preserves decoder, recovery, codec, and candidate counter
   assert.equal(profile.candidatePair.currentRoundTripTimeMs, 87);
   assert.equal(profile.candidatePair.local.candidateType, "srflx");
   assert.equal(profile.codec.mimeType, "video/H264");
+});
+
+test("QoS receiver window derives deltas and leaves static counters honest", () => {
+  const previous = {
+    generation: 3, atMs: 1_000, bytesReceived: 1_000_000, packetsReceived: 100,
+    packetsLost: 5, jitterBufferDelay: 2, jitterBufferEmittedCount: 100,
+    nackCount: 2, pliCount: 1, framesReceived: 100, framesDecoded: 95,
+    framesDropped: 3, freezeCount: 1, qpSum: 1_900,
+  };
+  const current = {
+    generation: 3, atMs: 2_000, bytesReceived: 1_500_000, packetsReceived: 150,
+    packetsLost: 10, jitter: 0.012, rtt: 0.087, jitterBufferDelay: 3,
+    jitterBufferEmittedCount: 150, nackCount: 4, pliCount: 2,
+    framesReceived: 150, framesDecoded: 145, framesDropped: 4, freezeCount: 2, qpSum: 2_900,
+  };
+  assert.deepEqual(computeQosRxWindow(current, previous), {
+    mbps: 4,
+    lossPct: 9.090909090909092,
+    rttMs: 87,
+    jitterMs: 12,
+    jitterBufferMs: 20,
+    nackDelta: 2,
+    pliDelta: 1,
+    packetsReceivedDelta: 50,
+    framesReceivedDelta: 50,
+    framesDecodedDelta: 50,
+    framesDroppedDelta: 1,
+    freezeDelta: 1,
+    qpPerFrame: 20,
+  });
+  const staticWindow = computeQosRxWindow({ ...current, atMs: 3_000 }, current);
+  assert.equal(staticWindow.lossPct, null);
+  assert.equal(staticWindow.jitterBufferMs, null);
+  assert.equal(staticWindow.qpPerFrame, null);
+  assert.equal(staticWindow.mbps, 0);
+});
+
+test("QoS receiver window resets safely and host quality is privacy-minimal", () => {
+  const previous = { generation: 1, atMs: 1_000, bytesReceived: 20, packetsReceived: 5, packetsLost: 1 };
+  const reset = computeQosRxWindow({ generation: 2, atMs: 2_000, bytesReceived: 1, packetsReceived: 1, packetsLost: 0 }, previous);
+  assert.equal(reset.mbps, null);
+  assert.equal(reset.lossPct, null);
+  assert.equal(reset.packetsReceivedDelta, null);
+  const quality = parseHostQuality({ type: "quality", profile: "720p30", width: 1280, height: 720, fps: 30, targetBitrateBps: 3_000_000, bweBps: 3_500_000, reason: "bwe" });
+  assert.deepEqual(quality, { profile: "720p30", width: 1280, height: 720, fps: 30, targetBitrateBps: 3_000_000, bweBps: 3_500_000, reason: "bwe" });
+  assert.equal(parseHostQuality({ type: "quality", profile: "x".repeat(80), width: -1, height: 720, fps: 30, targetBitrateBps: "bad" }), null);
+  assert.deepEqual(Object.keys(computeQosRxWindow({ generation: 1, atMs: 1_000 }, null)).sort(), [
+    "framesDecodedDelta", "framesDroppedDelta", "framesReceivedDelta", "freezeDelta", "jitterBufferMs", "jitterMs", "lossPct", "mbps", "nackDelta", "packetsReceivedDelta", "pliDelta", "qpPerFrame", "rttMs",
+  ]);
+});
+
+test("QoS payload has only the minimal adaptive-quality wire shape", () => {
+  const payload = createQosPayload({
+    sessionId: "page-random", seq: 7, atMs: 1234,
+    rx: computeQosRxWindow({ generation: 1, atMs: 1234 }, null),
+    presentation: { fps: 30, recentGapMs: 33, width: 1280, height: 720, userAgent: "must-not-cross-wire" },
+  });
+  assert.deepEqual(payload, {
+    type: "qos", sessionId: "page-random", seq: 7, atMs: 1234,
+    rx: {
+      mbps: null, lossPct: null, rttMs: null, jitterMs: null, jitterBufferMs: null,
+      nackDelta: null, pliDelta: null, packetsReceivedDelta: null, framesReceivedDelta: null,
+      framesDecodedDelta: null, framesDroppedDelta: null, freezeDelta: null, qpPerFrame: null,
+    },
+    presentation: { fps: 30, recentGapMs: 33, width: 1280, height: 720 },
+  });
+  assert.equal(JSON.stringify(payload).includes("userAgent"), false);
 });

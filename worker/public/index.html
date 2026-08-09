@@ -38,7 +38,7 @@
 <div id="hud">connecting…</div>
 <script type="module">
 "use strict";
-import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats } from "/latency.js";
+import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats, computeQosRxWindow, createQosPayload, parseHostQuality } from "/latency.js";
 import {
   shouldReconnectAfterClose,
   shouldRecycleSignalingForPeerState,
@@ -86,7 +86,9 @@ const diagnosticsEnabled = params.get("diag") === "1";
 const profilingEnabled = params.get("profile") === "1" || diagnosticsEnabled;
 const profileSessionId = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 let profileSequence = 0;
+let qosSequence = 0;
 let latestRtcProfile = null;
+let hostQuality = null;
 let token = params.get("token") || localStorage.getItem("bp_token") || "";
 if (!token) {
   token = prompt("BubblePlay token:");
@@ -97,12 +99,19 @@ if (token) {
 
 // ---- status HUD ------------------------------------------------------------
 const hudState = { ws: "…", ice: "…", dc: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: "…", dimensions: "…" };
+function qualityHudText() {
+  if (!hostQuality) return "quality …";
+  const target = `${Math.round(hostQuality.targetBitrateBps / 1_000)}k`;
+  const bwe = hostQuality.bweBps === null ? "…" : `${Math.round(hostQuality.bweBps / 1_000)}k`;
+  return `quality ${hostQuality.profile} ${hostQuality.width}x${hostQuality.height}@${hostQuality.fps} ${target}/${bwe} ${hostQuality.reason}`;
+}
 setInterval(() => {
   hud.innerHTML =
     `ws ${hudState.ws} | ice ${hudState.ice} | in ${hudState.dc}\n` +
     `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +
     `presented ${hudState.presented} | gap ${hudState.frameGap}/${hudState.maxFrameGap}ms | ${hudState.dimensions}\n` +
-    `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps`;
+    `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps\n` +
+    qualityHudText();
 }, 250);
 
 // ---- signaling --------------------------------------------------------------
@@ -194,6 +203,11 @@ async function handleSignal(socket, generation, ev) {
     case "peer-left":
       restartPeer("peer-left");
       break;
+    case "quality": {
+      const quality = parseHostQuality(msg);
+      if (quality) hostQuality = quality;
+      break;
+    }
     case "error":
       terminalSignalingFailure = true;
       hudState.ws = `err:${msg.message}`;
@@ -218,6 +232,7 @@ setInterval(() => {
 // ---- WebRTC ----------------------------------------------------------------
 function restartPeer(reason, reconnect = true) {
   const generation = ++peerGeneration;
+  hostQuality = null;
   cleanupPeer();
   pendingRemoteIce = [];
   remoteDescriptionSet = false;
@@ -245,6 +260,7 @@ function cleanupPeer() {
   activeVideo?.remove();
   activeVideo = null;
   nativePresentation = null;
+  previousInboundStats = null;
   stage.classList.remove("native-video-input");
   resetRenderPacing();
 }
@@ -313,7 +329,7 @@ async function startPeer(generation = peerGeneration) {
   candidate.oniceconnectionstatechange = () => {
     if (!isCurrentPeer(generation, candidate)) return;
     hudState.ice = candidate.iceConnectionState;
-    connected = candidate.iceConnectionState === "connected";
+    connected = candidate.iceConnectionState === "connected" || candidate.iceConnectionState === "completed";
     if (connected) {
       hud.classList.remove("bad");
       requestPointerLock();
@@ -427,6 +443,7 @@ if (diagnosticsEnabled) {
         glassToGlass: useWebCodecs ? (encodedWorkerStats?.glassToGlass || readTimestampPattern()) : null,
         worker: encodedWorkerStats,
         nativePresentation: nativePresentation ? { ...nativePresentation } : null,
+        hostQuality,
       };
     },
   };
@@ -548,6 +565,44 @@ function renderTick() {
 // ---- network stats via getStats (latency diagnostics) -----------------------
 let previousInboundStats = null;
 
+function qosPresentationMetrics() {
+  if (nativePresentation) {
+    return {
+      fps: nativePresentation.fps || null,
+      recentGapMs: nativePresentation.recentFrameGapMs,
+      width: nativePresentation.width || null,
+      height: nativePresentation.height || null,
+    };
+  }
+  if (!useWebCodecs) {
+    return { fps: null, recentGapMs: null, width: null, height: null };
+  }
+  // WebCodecs is explicit. Its Worker reports rendered FPS; the canvas owns
+  // the current decoded dimensions when native rVFC is unavailable.
+  return {
+    fps: encodedWorkerStats?.fps || null,
+    recentGapMs: null,
+    width: screen.width || null,
+    height: screen.height || null,
+  };
+}
+
+function sendClientQos(rx, atMs) {
+  if (!connected || ws?.readyState !== WebSocket.OPEN || ws.bufferedAmount > 65_536) return;
+  const payload = createQosPayload({
+    sessionId: profileSessionId,
+    seq: ++qosSequence,
+    atMs,
+    rx,
+    presentation: qosPresentationMetrics(),
+  });
+  if (!payload) return;
+  const message = JSON.stringify(payload);
+  if (new TextEncoder().encode(message).byteLength <= 2_048 && ws?.readyState === WebSocket.OPEN && ws.bufferedAmount <= 65_536) {
+    ws.send(message);
+  }
+}
+
 function sendClientProfile() {
   if (!profilingEnabled || ws?.readyState !== WebSocket.OPEN || ws.bufferedAmount > 65_536) return;
   const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
@@ -602,7 +657,7 @@ setInterval(async () => {
   if (!pc) return;
   // The signaling WebSocket remains usable even when peer-to-peer ICE does
   // not. Report that state too so cellular/NAT failures are diagnosable.
-  if (pc.iceConnectionState !== "connected") {
+  if (!["connected", "completed"].includes(pc.iceConnectionState)) {
     sendClientProfile();
     return;
   }
@@ -611,40 +666,43 @@ setInterval(async () => {
   try {
     const stats = await pc.getStats();
     latestRtcProfile = summarizeRtcStats(stats);
-    let rtt = null, jitter = null, loss = null;
+    let inbound = null, rtt = null;
     stats.forEach((s) => {
       if (s.type === "candidate-pair" && s.state === "succeeded" && s.nominated) {
         if (typeof s.currentRoundTripTime === "number" && s.currentRoundTripTime >= 0) {
-          rtt = Math.round(s.currentRoundTripTime * 1000);
+          rtt = s.currentRoundTripTime;
         }
       } else if (s.type === "inbound-rtp" && (s.kind === "video" || s.mediaType === "video")) {
-        if (typeof s.jitter === "number") {
-          jitter = Math.round(s.jitter * 1000);
-        }
-        const recv = s.packetsReceived || 0;
-        const lost = s.packetsLost || 0;
-        if (recv + lost > 0) {
-          loss = Math.round((lost / (recv + lost)) * 100);
-        }
-        if (previousInboundStats && s.timestamp > previousInboundStats.timestamp) {
-          const elapsedSeconds = (s.timestamp - previousInboundStats.timestamp) / 1000;
-          const byteDelta = (s.bytesReceived || 0) - previousInboundStats.bytesReceived;
-          if (byteDelta >= 0) hudState.mbps = (byteDelta * 8 / elapsedSeconds / 1_000_000).toFixed(1);
-          const delayDelta = (s.jitterBufferDelay || 0) - previousInboundStats.jitterBufferDelay;
-          const emittedDelta = (s.jitterBufferEmittedCount || 0) - previousInboundStats.jitterBufferEmittedCount;
-          if (delayDelta >= 0 && emittedDelta > 0) hudState.jbuf = Math.round(delayDelta / emittedDelta * 1000);
-        }
-        previousInboundStats = {
-          timestamp: s.timestamp,
-          bytesReceived: s.bytesReceived || 0,
-          jitterBufferDelay: s.jitterBufferDelay || 0,
-          jitterBufferEmittedCount: s.jitterBufferEmittedCount || 0,
-        };
+        inbound = s;
       }
     });
-    if (rtt !== null) hudState.rtt = rtt;
-    if (jitter !== null) hudState.jit = jitter;
-    if (loss !== null) hudState.loss = loss;
+    const atMs = Date.now();
+    const currentInbound = inbound ? {
+      generation: peerGeneration,
+      atMs,
+      rtt,
+      jitter: inbound.jitter,
+      bytesReceived: inbound.bytesReceived,
+      packetsReceived: inbound.packetsReceived,
+      packetsLost: inbound.packetsLost,
+      jitterBufferDelay: inbound.jitterBufferDelay,
+      jitterBufferEmittedCount: inbound.jitterBufferEmittedCount,
+      nackCount: inbound.nackCount,
+      pliCount: inbound.pliCount,
+      framesReceived: inbound.framesReceived,
+      framesDecoded: inbound.framesDecoded,
+      framesDropped: inbound.framesDropped,
+      freezeCount: inbound.freezeCount,
+      qpSum: inbound.qpSum,
+    } : { generation: peerGeneration, atMs, rtt };
+    const rx = computeQosRxWindow(currentInbound, previousInboundStats);
+    previousInboundStats = currentInbound;
+    if (rx.rttMs !== null) hudState.rtt = rx.rttMs;
+    if (rx.jitterMs !== null) hudState.jit = rx.jitterMs;
+    if (rx.lossPct !== null) hudState.loss = Math.round(rx.lossPct);
+    if (rx.mbps !== null) hudState.mbps = rx.mbps.toFixed(1);
+    if (rx.jitterBufferMs !== null) hudState.jbuf = Math.round(rx.jitterBufferMs);
+    sendClientQos(rx, atMs);
   } catch {
     // stats unavailable (not connected / mid-restart)
   } finally {

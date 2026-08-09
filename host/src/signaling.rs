@@ -15,9 +15,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::net::TcpStream;
 use std::time::Duration;
+use tracing::{debug, info, warn};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Error as WsError, Message, WebSocket};
-use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -43,6 +43,28 @@ pub enum SignalMsg {
         at_ms: u64,
         profile: serde_json::Value,
     },
+    Qos {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        seq: u64,
+        #[serde(rename = "atMs")]
+        at_ms: u64,
+        #[serde(default)]
+        rx: QosRx,
+        #[serde(default)]
+        presentation: QosPresentation,
+    },
+    Quality {
+        profile: String,
+        width: u32,
+        height: u32,
+        fps: u32,
+        #[serde(rename = "targetBitrateBps")]
+        target_bitrate_bps: u32,
+        #[serde(rename = "bweBps")]
+        bwe_bps: Option<u32>,
+        reason: String,
+    },
     #[serde(rename = "peer-left")]
     PeerLeft,
     Ping,
@@ -50,6 +72,43 @@ pub enum SignalMsg {
         message: String,
     },
     Bye,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QosRx {
+    pub mbps: Option<f64>,
+    #[serde(rename = "lossPct")]
+    pub loss_pct: Option<f64>,
+    #[serde(rename = "rttMs")]
+    pub rtt_ms: Option<f64>,
+    #[serde(rename = "jitterMs")]
+    pub jitter_ms: Option<f64>,
+    #[serde(rename = "jitterBufferMs")]
+    pub jitter_buffer_ms: Option<f64>,
+    #[serde(rename = "nackDelta")]
+    pub nack_delta: Option<u64>,
+    #[serde(rename = "pliDelta")]
+    pub pli_delta: Option<u64>,
+    #[serde(rename = "packetsReceivedDelta")]
+    pub packets_received_delta: Option<u64>,
+    #[serde(rename = "framesReceivedDelta")]
+    pub frames_received_delta: Option<u64>,
+    #[serde(rename = "framesDecodedDelta")]
+    pub frames_decoded_delta: Option<u64>,
+    #[serde(rename = "framesDroppedDelta")]
+    pub frames_dropped_delta: Option<u64>,
+    #[serde(rename = "freezeDelta")]
+    pub freeze_delta: Option<u64>,
+    #[serde(rename = "qpPerFrame")]
+    pub qp_per_frame: Option<f64>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QosPresentation {
+    pub fps: Option<f64>,
+    #[serde(rename = "recentGapMs")]
+    pub recent_gap_ms: Option<f64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 pub enum SignalEvent {
@@ -64,6 +123,12 @@ pub enum SignalEvent {
         seq: u64,
         at_ms: u64,
         profile: serde_json::Value,
+    },
+    Qos {
+        seq: u64,
+        at_ms: u64,
+        rx: QosRx,
+        presentation: QosPresentation,
     },
     /// The client left (or the relay told us so).
     PeerLeft,
@@ -93,8 +158,8 @@ impl Signaling {
         loop {
             let msg = ws.read().context("read hello-ack")?;
             let Message::Text(text) = msg else { continue };
-            let parsed: SignalMsg = serde_json::from_str(&text)
-                .with_context(|| format!("bad hello ack: {text}"))?;
+            let parsed: SignalMsg =
+                serde_json::from_str(&text).with_context(|| format!("bad hello ack: {text}"))?;
             match parsed {
                 SignalMsg::HelloOk => break,
                 SignalMsg::Error { message } => bail!("worker rejected hello: {message}"),
@@ -153,8 +218,20 @@ impl Signaling {
                             at_ms,
                             profile,
                         }),
+                        SignalMsg::Qos {
+                            seq,
+                            at_ms,
+                            rx,
+                            presentation,
+                            ..
+                        } => events.push(SignalEvent::Qos {
+                            seq,
+                            at_ms,
+                            rx,
+                            presentation,
+                        }),
                         SignalMsg::PeerLeft => events.push(SignalEvent::PeerLeft),
-                        SignalMsg::Ping => {} // keepalive, ignore
+                        SignalMsg::Ping => {}    // keepalive, ignore
                         SignalMsg::HelloOk => {} // duplicate ack, ignore
                         SignalMsg::Error { message } => {
                             warn!(message, "worker error message");
@@ -208,7 +285,43 @@ impl Signaling {
     /// warm on both sides (the worker consumes pings, never relays them).
     pub fn send_ping(&mut self) {
         let msg = SignalMsg::Ping;
-        if self.ws.send(Message::text(serde_json::to_string(&msg).unwrap_or_default())).is_ok() {
+        if self
+            .ws
+            .send(Message::text(
+                serde_json::to_string(&msg).unwrap_or_default(),
+            ))
+            .is_ok()
+        {
+            self.ws.flush().ok();
+        }
+    }
+
+    pub fn send_quality(
+        &mut self,
+        profile: &str,
+        width: u32,
+        height: u32,
+        fps: u32,
+        target_bitrate_bps: u32,
+        bwe_bps: Option<u32>,
+        reason: &str,
+    ) {
+        let msg = SignalMsg::Quality {
+            profile: profile.into(),
+            width,
+            height,
+            fps,
+            target_bitrate_bps,
+            bwe_bps,
+            reason: reason.into(),
+        };
+        if self
+            .ws
+            .send(Message::text(
+                serde_json::to_string(&msg).unwrap_or_default(),
+            ))
+            .is_ok()
+        {
             self.ws.flush().ok();
         }
     }
@@ -250,5 +363,10 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+    #[test]
+    fn parses_sparse_qos_without_rejecting_missing_numbers() {
+        let message: SignalMsg = serde_json::from_str(r#"{"type":"qos","sessionId":"opaque","seq":1,"atMs":2,"rx":{"lossPct":5},"presentation":{"fps":30}}"#).unwrap();
+        assert!(matches!(message, SignalMsg::Qos { .. }));
     }
 }
