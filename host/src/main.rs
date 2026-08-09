@@ -428,6 +428,18 @@ fn run_serve(args: &Args) -> Result<()> {
                     rtc.add_remote_candidate(&sdp);
                     continue 'run;
                 }
+                SignalEvent::ClientDiagnostics {
+                    seq,
+                    at_ms,
+                    profile,
+                } => {
+                    info!(
+                        client_diag_seq = seq,
+                        client_at_ms = at_ms,
+                        client_profile = %profile,
+                        "client diagnostics"
+                    );
+                }
                 SignalEvent::PeerLeft => {
                     info!("peer left — exiting");
                     break 'run;

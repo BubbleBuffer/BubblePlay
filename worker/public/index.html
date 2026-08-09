@@ -33,7 +33,7 @@
 <div id="hud">connecting…</div>
 <script type="module">
 "use strict";
-import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp } from "/latency.js";
+import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats } from "/latency.js";
 
 // ---------------------------------------------------------------------------
 // BubblePlay browser client (Chromium + WebCodecs only).
@@ -70,6 +70,10 @@ function replaceTransferredCanvas() {
 // ---- token ----------------------------------------------------------------
 const params = new URLSearchParams(location.search);
 const diagnosticsEnabled = params.get("diag") === "1";
+const profilingEnabled = params.get("profile") === "1" || diagnosticsEnabled;
+const profileSessionId = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+let profileSequence = 0;
+let latestRtcProfile = null;
 let token = params.get("token") || localStorage.getItem("bp_token") || "";
 if (!token) {
   token = prompt("BubblePlay token:");
@@ -92,6 +96,7 @@ const proto = location.protocol === "https:" ? "wss:" : "ws:";
 const ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
 
 let pc = null;
+let lastIceCandidateError = null;
 let dc = null;
 let inputReady = false;
 let connected = false;
@@ -149,6 +154,7 @@ setInterval(() => {
 async function startPeer() {
   if (offerSent) return;
   offerSent = true;
+  lastIceCandidateError = null;
 
   pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -191,6 +197,16 @@ async function startPeer() {
     if (ev.candidate && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "ice", candidate: ev.candidate.candidate }));
     }
+  };
+  pc.onicecandidateerror = (ev) => {
+    // Keep this compact and omit address/port so profiling never reports a
+    // client's private or public IP address through the signaling relay.
+    lastIceCandidateError = {
+      errorCode: ev.errorCode,
+      errorText: ev.errorText,
+      url: ev.url,
+      atMs: Date.now(),
+    };
   };
   pc.oniceconnectionstatechange = () => {
     hudState.ice = pc.iceConnectionState;
@@ -409,17 +425,76 @@ function renderTick() {
 
 // ---- network stats via getStats (latency diagnostics) -----------------------
 let previousInboundStats = null;
+
+function sendClientProfile() {
+  if (!profilingEnabled || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 65_536) return;
+  const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  const profile = {
+    schemaVersion: 1,
+    sessionId: profileSessionId,
+    page: {
+      visibility: document.visibilityState,
+      focused: document.hasFocus(),
+      decoderPath: hudState.dec,
+      viewport: { width: innerWidth, height: innerHeight, dpr: devicePixelRatio },
+    },
+    device: {
+      userAgent: navigator.userAgent,
+      platform: navigator.userAgentData?.platform || navigator.platform,
+      mobile: navigator.userAgentData?.mobile,
+      brands: navigator.userAgentData?.brands,
+      hardwareConcurrency: navigator.hardwareConcurrency,
+      deviceMemoryGiB: navigator.deviceMemory,
+      screen: { width: window.screen.width, height: window.screen.height },
+    },
+    network: connection ? {
+      effectiveType: connection.effectiveType,
+      downlinkMbps: connection.downlink,
+      rttHintMs: connection.rtt,
+      saveData: connection.saveData,
+      type: connection.type,
+    } : null,
+    peer: {
+      iceConnectionState: pc?.iceConnectionState,
+      iceGatheringState: pc?.iceGatheringState,
+      connectionState: pc?.connectionState,
+      signalingState: pc?.signalingState,
+      lastIceCandidateError,
+    },
+    rtc: latestRtcProfile,
+    worker: encodedWorkerStats,
+    hud: { ...hudState },
+  };
+  const message = JSON.stringify({
+    type: "diag",
+    seq: ++profileSequence,
+    atMs: Date.now(),
+    profile,
+  });
+  if (message.length <= 16_384) ws.send(message);
+}
+
+let statsPollPending = false;
 setInterval(async () => {
-  if (!pc || pc.iceConnectionState !== "connected") return;
+  if (!pc) return;
+  // The signaling WebSocket remains usable even when peer-to-peer ICE does
+  // not. Report that state too so cellular/NAT failures are diagnosable.
+  if (pc.iceConnectionState !== "connected") {
+    sendClientProfile();
+    return;
+  }
+  if (statsPollPending) return;
+  statsPollPending = true;
   try {
     const stats = await pc.getStats();
+    latestRtcProfile = summarizeRtcStats(stats);
     let rtt = null, jitter = null, loss = null;
     stats.forEach((s) => {
       if (s.type === "candidate-pair" && s.state === "succeeded" && s.nominated) {
         if (typeof s.currentRoundTripTime === "number" && s.currentRoundTripTime >= 0) {
           rtt = Math.round(s.currentRoundTripTime * 1000);
         }
-      } else if (s.type === "inbound-rtp" && s.kind === "video") {
+      } else if (s.type === "inbound-rtp" && (s.kind === "video" || s.mediaType === "video")) {
         if (typeof s.jitter === "number") {
           jitter = Math.round(s.jitter * 1000);
         }
@@ -449,6 +524,9 @@ setInterval(async () => {
     if (loss !== null) hudState.loss = loss;
   } catch {
     // stats unavailable (not connected / mid-restart)
+  } finally {
+    statsPollPending = false;
+    sendClientProfile();
   }
 }, 1000);
 

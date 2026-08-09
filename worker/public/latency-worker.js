@@ -8,9 +8,9 @@ const MAX_DECODE_PENDING = 8;
 const MAX_PACING_DELAY_MS = 0;
 const timeline = createWorkerTimeline({ now: () => performance.now() });
 const renderSlot = createLatestRenderSlot();
-const stats = { renderedTimestamp: null, renderedAgeMs: null, framesDrawn: 0, framesReceived: 0, fps: 0, dropped: 0, resyncs: 0, recovering: true, glassToGlass: null };
+const stats = { renderedTimestamp: null, renderedAgeMs: null, framesDrawn: 0, framesReceived: 0, transformFrames: 0, keyframes: 0, renderReplacements: 0, fps: 0, dropped: 0, resyncs: 0, lastResetReason: null, recovering: true, glassToGlass: null };
 
-function control(type, extra = {}, force = true) { const now = performance.now(), interval = diagnostics ? 50 : 250; if (!force && now - lastStatsAt < interval) return; lastStatsAt = now; const live = { ...stats, renderedAgeMs: renderedDue === null ? null : Math.max(0, now - renderedDue) }; if (barcodeValue) { const ageMs = ((Date.now() >>> 0) - barcodeValue.timestamp) >>> 0; live.glassToGlass = ageMs < 10_000 ? { ...barcodeValue, ageMs } : null; } self.postMessage({ kind: "control", type, stats: live, ...extra }); }
+function control(type, extra = {}, force = true) { const now = performance.now(), interval = diagnostics ? 50 : 250; if (!force && now - lastStatsAt < interval) return; lastStatsAt = now; const live = { ...stats, decodePending, waitingForKeyframe, codec: pendingCodec, renderedAgeMs: renderedDue === null ? null : Math.max(0, now - renderedDue) }; if (barcodeValue) { const ageMs = ((Date.now() >>> 0) - barcodeValue.timestamp) >>> 0; live.glassToGlass = ageMs < 10_000 ? { ...barcodeValue, ageMs } : null; } self.postMessage({ kind: "control", type, stats: live, ...extra }); }
 function requestKeyframe(reason) {
   if (!transformer || performance.now() - lastKeyframeRequest < 500) return;
   lastKeyframeRequest = performance.now();
@@ -18,7 +18,7 @@ function requestKeyframe(reason) {
 }
 function clearRender() { if (renderTimer) clearTimeout(renderTimer); renderTimer = 0; const pending = renderSlot.clear(); if (pending) { try { pending.frame.close(); } catch {} } }
 function reset(reason) {
-  stats.resyncs++; stats.recovering = true; decodePending = 0; waitingForKeyframe = true; baseTimestamp = null; timeline.reset(); clearRender();
+  stats.resyncs++; stats.lastResetReason = reason; stats.recovering = true; decodePending = 0; waitingForKeyframe = true; baseTimestamp = null; timeline.reset(); clearRender();
   if (decoder) { try { decoder.close(); } catch {} decoder = null; }
   control("resync", { reason }); requestKeyframe(reason);
 }
@@ -44,7 +44,7 @@ function enqueue(frame) {
   const now = performance.now(); if (baseTimestamp === null) { baseTimestamp = frame.timestamp; baseWall = now; }
   const due = baseWall + (frame.timestamp - baseTimestamp) / 1000;
   const { arm, replaced } = renderSlot.offer({ frame, due });
-  if (replaced) { try { replaced.frame.close(); } finally { stats.dropped++; } }
+  if (replaced) { try { replaced.frame.close(); } finally { stats.dropped++; stats.renderReplacements++; } }
   // Latest-frame-wins is the latency policy. A zero-delay Worker task lets a
   // same-turn decode burst collapse into one draw without adding a frame of
   // intentional playout delay.
@@ -58,8 +58,10 @@ function ensureDecoder() {
 let pendingCodec = null;
 function codecFromSps(bytes) { for (let i = 0; i + 7 < bytes.length; i++) { const sc3 = bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1, sc4 = bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 0 && bytes[i + 3] === 1; const at = i + (sc4 ? 4 : 3); if ((sc3 || sc4) && (bytes[at] & 31) === 7) return `avc1.${[bytes[at + 1], bytes[at + 2], bytes[at + 3]].map((n) => n.toString(16).padStart(2, "0")).join("")}`; } return null; }
 function decode(value) {
+  stats.transformFrames++;
   const metadata = typeof value.getMetadata === "function" ? value.getMetadata() : {};
   const type = value.type === "key" || annexBHasIdr(new Uint8Array(value.data)) ? "key" : "delta";
+  if (type === "key") stats.keyframes++;
   const timestamp = normalizeEncodedTimestamp(value.timestamp, metadata), observed = timeline.observe(timestamp);
   if (!observed.ok) { reset(observed.reason); return; }
   if (waitingForKeyframe && type !== "key") { stats.dropped++; requestKeyframe("startup-delta"); return; }

@@ -184,6 +184,58 @@ export function normalizeEncodedTimestamp(valueTimestamp, metadata = {}) {
   return Number.isFinite(valueTimestamp) ? valueTimestamp : NaN;
 }
 
+// Convert a browser RTCStatsReport into a compact, JSON-safe absolute
+// snapshot. Absolute counters let the host compare any adjacent samples even
+// when a signaling message is lost; no browser-only objects cross the wire.
+export function summarizeRtcStats(report) {
+  let inbound = null;
+  let candidatePair = null;
+  report.forEach((entry) => {
+    if (entry.type === "inbound-rtp" &&
+        (entry.kind === "video" || entry.mediaType === "video")) inbound = entry;
+    if (entry.type === "candidate-pair" && entry.state === "succeeded" &&
+        (entry.nominated || entry.selected)) candidatePair = entry;
+  });
+
+  const copy = (source, keys) => Object.fromEntries(keys
+    .filter((key) => source?.[key] !== undefined && source?.[key] !== null)
+    .map((key) => [key, source[key]]));
+  const candidate = (id) => copy(report.get?.(id), [
+    "candidateType", "protocol", "networkType", "relayProtocol", "tcpType",
+  ]);
+
+  const inboundSummary = inbound ? {
+    ...copy(inbound, [
+      "timestamp", "packetsReceived", "packetsLost", "bytesReceived",
+      "framesReceived", "framesDecoded", "framesDropped", "keyFramesDecoded",
+      "framesPerSecond", "freezeCount", "pauseCount", "qpSum", "nackCount",
+      "pliCount", "firCount", "retransmittedPacketsReceived",
+      "jitterBufferEmittedCount", "decoderImplementation", "powerEfficientDecoder",
+    ]),
+    ...(Number.isFinite(inbound.jitter) ? { jitterMs: Math.round(inbound.jitter * 1000) } : {}),
+    ...(Number.isFinite(inbound.jitterBufferDelay) ? { jitterBufferDelayMs: Math.round(inbound.jitterBufferDelay * 1000) } : {}),
+    ...(Number.isFinite(inbound.jitterBufferMinimumDelay) ? { jitterBufferMinimumDelayMs: Math.round(inbound.jitterBufferMinimumDelay * 1000) } : {}),
+    ...(Number.isFinite(inbound.jitterBufferTargetDelay) ? { jitterBufferTargetDelayMs: Math.round(inbound.jitterBufferTargetDelay * 1000) } : {}),
+    ...(Number.isFinite(inbound.totalFreezesDuration) ? { totalFreezesDurationMs: Math.round(inbound.totalFreezesDuration * 1000) } : {}),
+    ...(Number.isFinite(inbound.totalDecodeTime) ? { totalDecodeTimeMs: Math.round(inbound.totalDecodeTime * 1000) } : {}),
+    ...(Number.isFinite(inbound.totalInterFrameDelay) ? { totalInterFrameDelayMs: Math.round(inbound.totalInterFrameDelay * 1000) } : {}),
+  } : null;
+  const pairSummary = candidatePair ? {
+    ...copy(candidatePair, [
+      "state", "nominated", "bytesReceived", "bytesSent", "packetsReceived",
+      "packetsSent", "availableIncomingBitrate", "availableOutgoingBitrate",
+    ]),
+    ...(Number.isFinite(candidatePair.currentRoundTripTime) ?
+      { currentRoundTripTimeMs: Math.round(candidatePair.currentRoundTripTime * 1000) } : {}),
+    local: candidate(candidatePair.localCandidateId),
+    remote: candidate(candidatePair.remoteCandidateId),
+  } : null;
+  const codec = inbound?.codecId ? copy(report.get?.(inbound.codecId), [
+    "mimeType", "clockRate", "channels", "sdpFmtpLine",
+  ]) : null;
+  return { inbound: inboundSummary, candidatePair: pairSummary, codec };
+}
+
 // Shared by the production transform worker and Node tests: encoded timing is
 // judged on its media timeline, not on whichever thread received a callback.
 export function createWorkerTimeline({ now = () => performance.now(), startupGraceMs = 1000 } = {}) {

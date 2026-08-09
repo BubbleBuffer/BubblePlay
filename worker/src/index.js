@@ -8,6 +8,7 @@
 //   any    -> worker : {type:"hello", token, role:"host"|"client"}
 //   worker -> any    : {type:"hello-ok"} | {type:"error", message}
 //   client -> worker : {type:"offer", sdp} | {type:"ice", candidate}
+//                       | {type:"diag", seq, atMs, profile}
 //   host   -> worker : {type:"answer", sdp} | {type:"ice", candidate}
 //   worker -> either : {type:"peer-left"} when the other side disconnects
 //   either -> worker : {type:"bye"} (graceful exit)
@@ -83,7 +84,9 @@ export class Room {
     }
 
     const att = ws.deserializeAttachment() || {};
-    console.log(`[room] msg type=${msg.type} role=${att.role || "unassigned"}`);
+    if (msg.type !== "diag") {
+      console.log(`[room] msg type=${msg.type} role=${att.role || "unassigned"}`);
+    }
     if (msg.type === "ping") {
       return; // keepalive, never relayed
     }
@@ -136,8 +139,14 @@ export class Room {
     }
 
     // Relay to the peer.
+    if (msg.type === "diag" &&
+        (att.role !== "client" || typeof message !== "string" || message.length > 16_384)) {
+      return;
+    }
     const target = att.role === "host" ? this.findPeer("client") : this.findPeer("host");
-    console.log(`[room] relay ${msg.type} -> ${target ? "peer" : "NO PEER"}`);
+    if (msg.type !== "diag") {
+      console.log(`[room] relay ${msg.type} -> ${target ? "peer" : "NO PEER"}`);
+    }
     if (msg.type === "bye") {
       if (target) {
         target.send(JSON.stringify({ type: "peer-left" }));

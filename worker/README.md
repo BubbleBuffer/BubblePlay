@@ -48,3 +48,11 @@ WebRTC -> WebCodecs -> receiver canvas; physical panel scanout is not included.
 ```powershell
 npm run latency:bench -- --url https://bubbleplay-signal.example.workers.dev/ --seconds 30
 ```
+
+For a real phone/cellular run, add `profile=1` to the authenticated client URL.
+The browser then relays one compact WebRTC/WebCodecs/network snapshot per
+second to the Rust host. Search the host log for `client diagnostics`; the
+profile contains absolute loss/retransmit/PLI/freeze/jitter-buffer counters,
+selected candidate types, decoder implementation, Worker queue/recovery state,
+and Android network hints. The token and local/remote IP addresses are never
+included in the profile payload.

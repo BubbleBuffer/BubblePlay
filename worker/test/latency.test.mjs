@@ -8,6 +8,7 @@ import {
   normalizeEncodedTimestamp,
   createLatestRenderSlot,
   createWorkerTimeline,
+  summarizeRtcStats,
 } from "../public/latency.js";
 
 test("limits worker-to-main and decode work to two frames", () => {
@@ -158,4 +159,30 @@ test("latest render slot replaces frames without postponing the armed deadline",
   assert.deepEqual(slot.offer("latest"), { arm: false, replaced: "second" });
   assert.equal(slot.take(), "latest");
   assert.deepEqual(slot.offer("next"), { arm: true, replaced: null });
+});
+
+test("WebRTC profiling preserves decoder, recovery, codec, and candidate counters", () => {
+  const report = new Map([
+    ["in", { id: "in", type: "inbound-rtp", kind: "video", timestamp: 1234,
+      codecId: "codec", packetsReceived: 900, packetsLost: 7, bytesReceived: 1_500_000,
+      jitter: 0.012, jitterBufferDelay: 4.5, jitterBufferEmittedCount: 300,
+      framesReceived: 301, framesDecoded: 299, framesDropped: 2, keyFramesDecoded: 4,
+      freezeCount: 3, totalFreezesDuration: 1.25, totalDecodeTime: 2.5,
+      nackCount: 8, pliCount: 2, firCount: 1, retransmittedPacketsReceived: 6,
+      decoderImplementation: "ExternalDecoder", powerEfficientDecoder: true }],
+    ["pair", { id: "pair", type: "candidate-pair", state: "succeeded", nominated: true,
+      localCandidateId: "local", remoteCandidateId: "remote", currentRoundTripTime: 0.087,
+      availableIncomingBitrate: 6_000_000 }],
+    ["local", { id: "local", type: "local-candidate", candidateType: "srflx", protocol: "udp", networkType: "cellular" }],
+    ["remote", { id: "remote", type: "remote-candidate", candidateType: "host", protocol: "udp" }],
+    ["codec", { id: "codec", type: "codec", mimeType: "video/H264", clockRate: 90_000, sdpFmtpLine: "profile-level-id=64002a" }],
+  ]);
+  const profile = summarizeRtcStats(report);
+  assert.equal(profile.inbound.packetsLost, 7);
+  assert.equal(profile.inbound.jitterMs, 12);
+  assert.equal(profile.inbound.freezeCount, 3);
+  assert.equal(profile.inbound.decoderImplementation, "ExternalDecoder");
+  assert.equal(profile.candidatePair.currentRoundTripTimeMs, 87);
+  assert.equal(profile.candidatePair.local.candidateType, "srflx");
+  assert.equal(profile.codec.mimeType, "video/H264");
 });

@@ -37,6 +37,12 @@ pub enum SignalMsg {
     Ice {
         candidate: String,
     },
+    Diag {
+        seq: u64,
+        #[serde(rename = "atMs")]
+        at_ms: u64,
+        profile: serde_json::Value,
+    },
     #[serde(rename = "peer-left")]
     PeerLeft,
     Ping,
@@ -53,6 +59,12 @@ pub enum SignalEvent {
     Offer(String),
     /// Browser trickled an ICE candidate (SDP string form).
     RemoteCandidate(String),
+    /// Authenticated browser profiling snapshot (enabled with ?profile=1).
+    ClientDiagnostics {
+        seq: u64,
+        at_ms: u64,
+        profile: serde_json::Value,
+    },
     /// The client left (or the relay told us so).
     PeerLeft,
 }
@@ -132,6 +144,15 @@ impl Signaling {
                             self.peer_seen = true;
                             events.push(SignalEvent::RemoteCandidate(candidate));
                         }
+                        SignalMsg::Diag {
+                            seq,
+                            at_ms,
+                            profile,
+                        } => events.push(SignalEvent::ClientDiagnostics {
+                            seq,
+                            at_ms,
+                            profile,
+                        }),
                         SignalMsg::PeerLeft => events.push(SignalEvent::PeerLeft),
                         SignalMsg::Ping => {} // keepalive, ignore
                         SignalMsg::HelloOk => {} // duplicate ack, ignore
@@ -205,4 +226,29 @@ fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<()> 
     // during the blocking handshake; reads are now poll-driven).
     std::thread::sleep(Duration::from_millis(0));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SignalMsg;
+
+    #[test]
+    fn parses_client_diagnostics_message() {
+        let message: SignalMsg = serde_json::from_str(
+            r#"{"type":"diag","seq":12,"atMs":1780000000000,"profile":{"rtc":{"inbound":{"packetsLost":3}}}}"#,
+        )
+        .expect("diagnostics message should deserialize");
+        match message {
+            SignalMsg::Diag {
+                seq,
+                at_ms,
+                profile,
+            } => {
+                assert_eq!(seq, 12);
+                assert_eq!(at_ms, 1_780_000_000_000);
+                assert_eq!(profile["rtc"]["inbound"]["packetsLost"], 3);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
 }
