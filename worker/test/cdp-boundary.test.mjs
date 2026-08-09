@@ -30,7 +30,11 @@ test("modern transform keeps canvas/decode/render in the DedicatedWorker", () =>
   assert.match(worker, /await writer\.write\(value\)/);
   assert.match(worker, /new VideoDecoder/);
   assert.match(worker, /createWorkerTimeline/);
-  assert.match(worker, /MAX_DECODE_PENDING\s*=\s*8/);
+  // Backpressure is the WebCodecs control queue, not frames already accepted
+  // by the hardware decoder and awaiting output.
+  assert.match(worker, /MAX_DECODE_QUEUE_SIZE\s*=\s*8/);
+  assert.match(worker, /decoder\.decodeQueueSize\s*>=\s*MAX_DECODE_QUEUE_SIZE/);
+  assert.doesNotMatch(worker, /decodePending\s*>=/);
   assert.match(worker, /MAX_PACING_DELAY_MS\s*=\s*0/);
   assert.match(worker, /recovering:\s*true/);
   assert.match(worker, /setTimeout\(render/);

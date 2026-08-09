@@ -8,6 +8,7 @@ export function createLatencyGuard({ now = () => performance.now(), onReset = ()
   let anchorTimestamp = null;
   let anchorWall = 0;
   let lastTimestamp = null;
+  let lastWall = null;
   let consecutiveLate = 0;
   let graceUntil = 0;
 
@@ -24,6 +25,7 @@ export function createLatencyGuard({ now = () => performance.now(), onReset = ()
     anchorTimestamp = null;
     anchorWall = 0;
     lastTimestamp = null;
+    lastWall = null;
     consecutiveLate = 0;
     graceUntil = now() + startupGraceMs;
     onReset({ generation, reason });
@@ -47,8 +49,14 @@ export function createLatencyGuard({ now = () => performance.now(), onReset = ()
       graceUntil = wall + startupGraceMs;
     } else {
       const delta = timestamp - lastTimestamp;
-      // A backwards clock or a multi-second jump is a new media timeline.
-      if (delta <= 0 || delta > 2_000_000) {
+      const mediaGapMs = delta / 1000;
+      const wallGapMs = wall - lastWall;
+      // A long capture gap is valid when the desktop was static: host RTP
+      // timestamps advance from wall time even though duplicate frames are
+      // omitted. Only treat a large forward jump as discontinuous when it did
+      // not also happen in wall time.
+      if (delta <= 0 ||
+          (mediaGapMs > 2000 && Math.abs(mediaGapMs - wallGapMs) > 500)) {
         reset("timestamp-discontinuity");
         return false;
       }
@@ -67,6 +75,7 @@ export function createLatencyGuard({ now = () => performance.now(), onReset = ()
       }
     }
     lastTimestamp = timestamp;
+    lastWall = wall;
     workerFrames++;
     return true;
   }
@@ -81,6 +90,7 @@ export function createLatencyGuard({ now = () => performance.now(), onReset = ()
     anchorTimestamp = timestamp;
     anchorWall = wall;
     lastTimestamp = timestamp;
+    lastWall = wall;
     consecutiveLate = 0;
     graceUntil = wall + startupGraceMs;
     return true;
@@ -239,19 +249,20 @@ export function summarizeRtcStats(report) {
 // Shared by the production transform worker and Node tests: encoded timing is
 // judged on its media timeline, not on whichever thread received a callback.
 export function createWorkerTimeline({ now = () => performance.now(), startupGraceMs = 1000 } = {}) {
-  let baseTimestamp = null, baseWall = 0, lastTimestamp = null, late = 0, graceUntil = 0;
+  let baseTimestamp = null, baseWall = 0, lastTimestamp = null, lastWall = null, late = 0, graceUntil = 0;
   return {
     observe(timestamp) {
       const wall = now();
       if (!Number.isFinite(timestamp)) return { ok: false, reason: "invalid-timestamp" };
-      if (baseTimestamp === null) { baseTimestamp = lastTimestamp = timestamp; baseWall = wall; graceUntil = wall + startupGraceMs; return { ok: true, due: wall }; }
+      if (baseTimestamp === null) { baseTimestamp = lastTimestamp = timestamp; baseWall = lastWall = wall; graceUntil = wall + startupGraceMs; return { ok: true, due: wall }; }
       const delta = timestamp - lastTimestamp;
-      if (delta <= 0 || delta > 2_000_000) return { ok: false, reason: "timestamp-discontinuity" };
-      lastTimestamp = timestamp; const due = baseWall + (timestamp - baseTimestamp) / 1000;
+      const mediaGapMs = delta / 1000, wallGapMs = wall - lastWall;
+      if (delta <= 0 || (mediaGapMs > 2000 && Math.abs(mediaGapMs - wallGapMs) > 500)) return { ok: false, reason: "timestamp-discontinuity" };
+      lastTimestamp = timestamp; lastWall = wall; const due = baseWall + (timestamp - baseTimestamp) / 1000;
       if (wall >= graceUntil && wall - due > 100) { late++; if (late >= 3) return { ok: false, reason: "three-late-frames" }; } else late = 0;
       return { ok: true, due };
     },
-    reset() { baseTimestamp = null; lastTimestamp = null; late = 0; },
+    reset() { baseTimestamp = null; lastTimestamp = null; lastWall = null; late = 0; },
   };
 }
 

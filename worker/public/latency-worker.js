@@ -4,13 +4,13 @@ let transformer, canvas, ctx, decoder, renderTimer = 0;
 let waitingForKeyframe = true, decodePending = 0, lastKeyframeRequest = -Infinity;
 let baseTimestamp = null, baseWall = 0, lastFpsWall = performance.now(), fpsFrames = 0;
 let renderedDue = null, diagnostics = false, lastStatsAt = 0, lastBarcodeAt = 0, barcodeValue = null, barcodeSequence = null;
-const MAX_DECODE_PENDING = 8;
+const MAX_DECODE_QUEUE_SIZE = 8;
 const MAX_PACING_DELAY_MS = 0;
 const timeline = createWorkerTimeline({ now: () => performance.now() });
 const renderSlot = createLatestRenderSlot();
 const stats = { renderedTimestamp: null, renderedAgeMs: null, framesDrawn: 0, framesReceived: 0, transformFrames: 0, keyframes: 0, renderReplacements: 0, fps: 0, dropped: 0, resyncs: 0, lastResetReason: null, recovering: true, glassToGlass: null };
 
-function control(type, extra = {}, force = true) { const now = performance.now(), interval = diagnostics ? 50 : 250; if (!force && now - lastStatsAt < interval) return; lastStatsAt = now; const live = { ...stats, decodePending, waitingForKeyframe, codec: pendingCodec, renderedAgeMs: renderedDue === null ? null : Math.max(0, now - renderedDue) }; if (barcodeValue) { const ageMs = ((Date.now() >>> 0) - barcodeValue.timestamp) >>> 0; live.glassToGlass = ageMs < 10_000 ? { ...barcodeValue, ageMs } : null; } self.postMessage({ kind: "control", type, stats: live, ...extra }); }
+function control(type, extra = {}, force = true) { const now = performance.now(), interval = diagnostics ? 50 : 250; if (!force && now - lastStatsAt < interval) return; lastStatsAt = now; const live = { ...stats, decodePending, decodeQueueSize: decoder?.decodeQueueSize || 0, waitingForKeyframe, codec: pendingCodec, renderedAgeMs: renderedDue === null ? null : Math.max(0, now - renderedDue) }; if (barcodeValue) { const ageMs = ((Date.now() >>> 0) - barcodeValue.timestamp) >>> 0; live.glassToGlass = ageMs < 10_000 ? { ...barcodeValue, ageMs } : null; } self.postMessage({ kind: "control", type, stats: live, ...extra }); }
 function requestKeyframe(reason) {
   if (!transformer || performance.now() - lastKeyframeRequest < 500) return;
   lastKeyframeRequest = performance.now();
@@ -65,9 +65,13 @@ function decode(value) {
   const timestamp = normalizeEncodedTimestamp(value.timestamp, metadata), observed = timeline.observe(timestamp);
   if (!observed.ok) { reset(observed.reason); return; }
   if (waitingForKeyframe && type !== "key") { stats.dropped++; requestKeyframe("startup-delta"); return; }
-  if (decodePending >= MAX_DECODE_PENDING) { stats.dropped++; reset("decode-overflow"); return; }
   if (type === "key") pendingCodec = codecFromSps(new Uint8Array(value.data)) || pendingCodec;
-  if (!ensureDecoder()) return; waitingForKeyframe = false; decodePending++;
+  if (!ensureDecoder()) return;
+  // decodePending includes frames already accepted by Android's hardware
+  // decoder. Those are not JS-side backlog. WebCodecs' decodeQueueSize is the
+  // actual control queue we must bound to prevent latency accumulation.
+  if (decoder.decodeQueueSize >= MAX_DECODE_QUEUE_SIZE) { stats.dropped++; reset("decode-queue-overflow"); return; }
+  waitingForKeyframe = false; decodePending++;
   try { decoder.decode(new EncodedVideoChunk({ type, timestamp, data: value.data })); }
   catch { decodePending--; reset("decode-throw"); }
 }

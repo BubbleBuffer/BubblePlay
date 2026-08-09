@@ -152,6 +152,14 @@ test("production worker timeline resets only after three sustained late encoded 
   assert.deepEqual(timeline.observe(5_000_001), { ok: false, reason: "timestamp-discontinuity" });
 });
 
+test("production worker timeline accepts a matching multi-second static-desktop gap", () => {
+  let now = 0;
+  const timeline = createWorkerTimeline({ now: () => now, startupGraceMs: 0 });
+  assert.equal(timeline.observe(1_000_000).ok, true);
+  now = 3_000;
+  assert.deepEqual(timeline.observe(4_000_000), { ok: true, due: 3_000 });
+});
+
 test("latest render slot replaces frames without postponing the armed deadline", () => {
   const slot = createLatestRenderSlot();
   assert.deepEqual(slot.offer("first"), { arm: true, replaced: null });
