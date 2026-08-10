@@ -17,6 +17,8 @@
 //   either -> worker : {type:"bye"} (graceful exit)
 //   either -> worker : {type:"ping"} (keepalive, consumed, never relayed)
 //
+import { createTurnIceServers } from "./turn.js";
+
 // Token auth: `hello.token` must equal the worker secret `TOKEN`. The client
 // page also accepts ?token= in the URL to prefill its input.
 
@@ -97,8 +99,10 @@ export class Room {
     // First message must be hello; assigns the socket a role.
     if (!att.role) {
       if (msg.type !== "hello") return;
+      const configuredToken = this.env.TOKEN;
       const tokenOk =
-        msg.token === this.env.TOKEN || att.queryToken === this.env.TOKEN;
+        typeof configuredToken === "string" && configuredToken.length > 0 &&
+        (msg.token === configuredToken || att.queryToken === configuredToken);
       if (!tokenOk) {
         this.reject(ws, "bad token");
         return;
@@ -122,7 +126,12 @@ export class Room {
         await this.state.storage.delete("pendingToHost");
       }
       ws.serializeAttachment({ ...att, role });
-      ws.send(JSON.stringify({ type: "hello-ok" }));
+      // Hosts keep the original wire shape. Clients receive only short-lived
+      // TURN REST credentials, minted after authentication and never stored.
+      const hello = role === "client"
+        ? { type: "hello-ok", iceServers: await createTurnIceServers(this.env) }
+        : { type: "hello-ok" };
+      ws.send(JSON.stringify(hello));
       console.log(`[room] ${role} registered, hello-ok sent`);
 
       // Flush anything the client sent before the host arrived.

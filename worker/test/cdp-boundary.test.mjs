@@ -69,7 +69,7 @@ test("native video keeps an explicit input overlay and diagnostics count present
 test("client starts a new signaling and peer epoch after relay loss or peer departure", () => {
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /function reconnectSignaling\(reason\)/);
-  assert.match(client, /case "peer-left":\s*restartPeer\("peer-left"\)/);
+  assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
   assert.match(client, /socket\.onclose = \(event\) => \{[\s\S]*reconnectSignaling\("ws-closed"\)/);
   assert.match(client, /const generation = \+\+peerGeneration/);
   assert.match(client, /pendingRemoteIce/);
@@ -86,4 +86,19 @@ test("worker policy closure is terminal while transient websocket closure reconn
   assert.match(client, /shouldReconnectAfterClose\(event\.code, terminalSignalingFailure\)/);
   assert.match(client, /terminalSignalingFailure/);
   assert.match(client, /reconnectSignaling\("ws-closed"\)/);
+});
+
+test("client applies validated ephemeral ICE configuration and keeps route diagnostics private", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /from "\/turn\.js"/);
+  assert.match(client, /currentIceServers = validateIceServers\(msg\.iceServers\);\s*startPeer\(peerGeneration\);/);
+  assert.match(client, /iceServers: currentIceServers,\s*iceTransportPolicy,/);
+  assert.match(client, /hudState\.route = deriveCandidateRoute\(latestRtcProfile\);/);
+  assert.match(client, /hudState\.route = "…";/);
+});
+
+test("peer departure recycles signaling before another peer offer", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
+  assert.match(client, /function recycleSignaling\(reason\)/);
 });

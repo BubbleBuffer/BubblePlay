@@ -39,6 +39,7 @@
 <script type="module">
 "use strict";
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats, computeQosRxWindow, createQosPayload, parseHostQuality } from "/latency.js";
+import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateIceServers } from "/turn.js";
 import {
   shouldReconnectAfterClose,
   shouldRecycleSignalingForPeerState,
@@ -84,6 +85,7 @@ const params = new URLSearchParams(location.search);
 const useWebCodecs = params.get("decoderPath") === "webcodecs";
 const diagnosticsEnabled = params.get("diag") === "1";
 const profilingEnabled = params.get("profile") === "1" || diagnosticsEnabled;
+const iceTransportPolicy = parseIceTransportPolicy(params);
 const profileSessionId = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 let profileSequence = 0;
 let qosSequence = 0;
@@ -98,7 +100,7 @@ if (token) {
 }
 
 // ---- status HUD ------------------------------------------------------------
-const hudState = { ws: "…", ice: "…", dc: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: "…", dimensions: "…" };
+const hudState = { ws: "…", ice: "…", route: "…", dc: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: "…", dimensions: "…" };
 function qualityHudText() {
   if (!hostQuality) return "quality …";
   const target = `${Math.round(hostQuality.targetBitrateBps / 1_000)}k`;
@@ -107,7 +109,7 @@ function qualityHudText() {
 }
 setInterval(() => {
   hud.innerHTML =
-    `ws ${hudState.ws} | ice ${hudState.ice} | in ${hudState.dc}\n` +
+    `ws ${hudState.ws} | ice ${hudState.ice} | route ${hudState.route} | in ${hudState.dc}\n` +
     `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +
     `presented ${hudState.presented} | gap ${hudState.frameGap}/${hudState.maxFrameGap}ms | ${hudState.dimensions}\n` +
     `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps\n` +
@@ -129,6 +131,7 @@ let offerSent = false;
 let peerGeneration = 0;
 let pendingRemoteIce = [];
 let remoteDescriptionSet = false;
+let currentIceServers = STUN_FALLBACK;
 
 function isCurrentPeer(generation, candidate = pc) {
   return generation === peerGeneration && candidate === pc;
@@ -168,6 +171,17 @@ function reconnectSignaling(reason) {
   }, 250);
 }
 
+function recycleSignaling(reason) {
+  if (terminalSignalingFailure) return;
+  // Invalidate first so the intentional close cannot restart a peer with
+  // credentials from the old signaling epoch.
+  const socket = ws;
+  ws = null;
+  signalingGeneration++;
+  try { socket?.close(1000, reason); } catch {}
+  reconnectSignaling(reason);
+}
+
 async function handleSignal(socket, generation, ev) {
   if (ws !== socket || generation !== signalingGeneration) return;
   let msg;
@@ -175,6 +189,7 @@ async function handleSignal(socket, generation, ev) {
   switch (msg.type) {
     case "hello-ok":
       hudState.ws = "ok";
+      currentIceServers = validateIceServers(msg.iceServers);
       startPeer(peerGeneration);
       break;
     case "answer": {
@@ -201,7 +216,8 @@ async function handleSignal(socket, generation, ev) {
       }
       break;
     case "peer-left":
-      restartPeer("peer-left");
+      recycleSignaling("peer-left");
+      restartPeer("peer-left", false);
       break;
     case "quality": {
       const quality = parseHostQuality(msg);
@@ -261,6 +277,7 @@ function cleanupPeer() {
   activeVideo = null;
   nativePresentation = null;
   previousInboundStats = null;
+  hudState.route = "…";
   stage.classList.remove("native-video-input");
   resetRenderPacing();
 }
@@ -271,14 +288,32 @@ async function startPeer(generation = peerGeneration) {
   lastIceCandidateError = null;
 
   const peerOptions = {
-    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    // No TURN in v0 (locked decision): ICE must succeed peer-to-peer or on
-    // a LAN. srflx candidates are trickled by both sides.
+    iceServers: currentIceServers,
+    iceTransportPolicy,
   };
   // This must be set during construction, but only the opt-in WebCodecs path
   // needs it. The native path keeps browser decode/render untouched.
   if (useWebCodecs) peerOptions.encodedInsertableStreams = true;
-  const candidate = new RTCPeerConnection(peerOptions);
+  let candidate;
+  try {
+    candidate = new RTCPeerConnection(peerOptions);
+  } catch {
+    // The validator should prevent this, but retain a safe direct fallback
+    // if a browser rejects a server-specific ICE URI we accepted.
+    if (currentIceServers === STUN_FALLBACK) {
+      offerSent = false;
+      hudState.ice = "ice-config-error";
+      return;
+    }
+    currentIceServers = STUN_FALLBACK;
+    try {
+      candidate = new RTCPeerConnection({ ...peerOptions, iceServers: STUN_FALLBACK });
+    } catch {
+      offerSent = false;
+      hudState.ice = "ice-config-error";
+      return;
+    }
+  }
   pc = candidate;
 
   // Receive-only video; the browser offers, the host answers (locked).
@@ -666,6 +701,7 @@ setInterval(async () => {
   try {
     const stats = await pc.getStats();
     latestRtcProfile = summarizeRtcStats(stats);
+    hudState.route = deriveCandidateRoute(latestRtcProfile);
     let inbound = null, rtt = null;
     stats.forEach((s) => {
       if (s.type === "candidate-pair" && s.state === "succeeded" && s.nominated) {
