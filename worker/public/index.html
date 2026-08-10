@@ -31,10 +31,17 @@
   }
   #hud .bad { color: #f77; }
   #hud .ok  { color: #8f8; }
+  #input-surface { position:fixed; inset:0; z-index:3; touch-action:none; overscroll-behavior:none; cursor:crosshair; }
+  #controls { position:fixed; right:max(8px, env(safe-area-inset-right)); bottom:max(8px, env(safe-area-inset-bottom)); z-index:11; display:flex; gap:4px; flex-wrap:wrap; max-width:calc(100vw - 16px); }
+  #controls button { background:rgba(0,0,0,.72); border:1px solid #777; border-radius:5px; color:#fff; padding:6px 8px; font:12px system-ui; }
+  #visual { position:fixed; inset:0; z-index:1; transform-origin:center center; pointer-events:none; }
+  @media (orientation:portrait) { #controls { left:max(8px, env(safe-area-inset-left)); right:auto; } }
 </style>
 </head>
 <body>
-<div id="stage"><canvas id="screen"></canvas></div>
+<div id="visual"><div id="stage"><canvas id="screen"></canvas></div></div>
+<div id="input-surface" tabindex="0" aria-label="Remote desktop input"></div>
+<div id="controls"><button id="capture">Capture cursor</button><button id="zoom-out">−</button><button id="zoom-reset">1×</button><button id="zoom-in">+</button><button id="fullscreen">Fullscreen</button></div>
 <div id="hud">connecting…</div>
 <script type="module">
 "use strict";
@@ -44,6 +51,7 @@ import {
   shouldReconnectAfterClose,
   shouldRecycleSignalingForPeerState,
 } from "/recovery.js";
+import { InputController, TouchGesture, Viewport } from "/input.js";
 
 // ---------------------------------------------------------------------------
 // BubblePlay browser client. Native WebRTC video is the normal display path;
@@ -63,6 +71,8 @@ import {
 
 let screen = document.getElementById("screen");
 const stage = document.getElementById("stage");
+const visual = document.getElementById("visual");
+const inputSurface = document.getElementById("input-surface");
 const hud = document.getElementById("hud");
 // Do not create a main-thread context until the legacy path is selected:
 // transferControlToOffscreen is only legal before a rendering context exists.
@@ -100,7 +110,7 @@ if (token) {
 }
 
 // ---- status HUD ------------------------------------------------------------
-const hudState = { ws: "…", ice: "…", route: "…", dc: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: "…", dimensions: "…" };
+const hudState = { ws: "…", ice: "…", route: "…", dc: "…", control: "…", motion: "…", motionSent: 0, motionCoalesced: 0, motionDropped: 0, zoom: 1, touch: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: "…", dimensions: "…" };
 function qualityHudText() {
   if (!hostQuality) return "quality …";
   const target = `${Math.round(hostQuality.targetBitrateBps / 1_000)}k`;
@@ -109,7 +119,8 @@ function qualityHudText() {
 }
 setInterval(() => {
   hud.innerHTML =
-    `ws ${hudState.ws} | ice ${hudState.ice} | route ${hudState.route} | in ${hudState.dc}\n` +
+    `ws ${hudState.ws} | ice ${hudState.ice} | route ${hudState.route} | control ${hudState.control} motion ${hudState.motion}\n` +
+    `zoom ${hudState.zoom}× | motion ${hudState.motionSent}/${hudState.motionCoalesced}/${hudState.motionDropped} | touch ${hudState.touch}\n` +
     `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +
     `presented ${hudState.presented} | gap ${hudState.frameGap}/${hudState.maxFrameGap}ms | ${hudState.dimensions}\n` +
     `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps\n` +
@@ -124,8 +135,19 @@ let reconnectTimer = null;
 let terminalSignalingFailure = false;
 let pc = null;
 let lastIceCandidateError = null;
-let dc = null;
+let dc = null, motionDc = null;
 let inputReady = false;
+let closingPeer = false;
+const input = new InputController({
+  sendControl: data => { if (dc?.readyState === "open") try { dc.send(data); return true; } catch {} return false; },
+  sendMotion: data => { if (motionDc?.readyState === "open") try { motionDc.send(data); return true; } catch {} return false; },
+  motionBuffered: () => motionDc?.bufferedAmount || 0,
+});
+let motionFrame = null;
+function armMotionFlush() { if (motionFrame === null) motionFrame = requestAnimationFrame(() => { motionFrame = null; input.flushMotion(); hudState.motionSent = input.stats.sent; hudState.motionCoalesced = input.stats.coalesced; hudState.motionDropped = input.stats.dropped; }); }
+function queueMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motion(dx, dy, wheelX, wheelY); armMotionFlush(); }
+function queueAbsolute(x, y) { input.absolute(x, y); armMotionFlush(); }
+function releaseInput(send = dc?.readyState === "open") { input.releaseAll(send); held.clear(); buttons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; }
 let connected = false;
 let offerSent = false;
 let peerGeneration = 0;
@@ -260,12 +282,17 @@ function restartPeer(reason, reconnect = true) {
 }
 
 function cleanupPeer() {
+  closingPeer = true;
+  releaseInput(dc?.readyState === "open");
   inputReady = false;
   connected = false;
   try { dc?.close(); } catch {}
+  try { motionDc?.close(); } catch {}
   dc = null;
+  motionDc = null;
   try { pc?.close(); } catch {}
   pc = null;
+  closingPeer = false;
   try { decoder?.close(); } catch {}
   decoder = null;
   if (encodedWorker) {
@@ -337,12 +364,19 @@ async function startPeer(generation = peerGeneration) {
     console.warn("setCodecPreferences", e);
   }
 
-  // Input channel: unordered + maxRetransmits 0 (UDP-like, fire-and-forget).
-  const channel = candidate.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
+  // Reliable ordered state lane plus lossy latest-only motion lane.
+  const channel = candidate.createDataChannel("input-control", { ordered: true });
+  const motionChannel = candidate.createDataChannel("input-motion", { ordered: false, maxRetransmits: 0 });
   dc = channel;
+  motionDc = motionChannel;
   channel.binaryType = "arraybuffer";
-  channel.onopen = () => { if (isCurrentPeer(generation, candidate)) { hudState.dc = "open"; inputReady = true; } };
-  channel.onclose = () => { if (isCurrentPeer(generation, candidate)) { hudState.dc = "closed"; inputReady = false; } };
+  motionChannel.binaryType = "arraybuffer";
+  const updateInputReady = () => { inputReady = dc?.readyState === "open" && motionDc?.readyState === "open"; hudState.control = dc?.readyState || "closed"; hudState.motion = motionDc?.readyState || "closed"; hudState.dc = inputReady ? "open" : "closed"; };
+  const laneClosed = () => { if (!isCurrentPeer(generation, candidate) || closingPeer) return; releaseInput(false); recycleSignaling("input-lane-closed"); restartPeer("input-lane-closed", false); };
+  channel.onopen = () => { if (isCurrentPeer(generation, candidate)) updateInputReady(); };
+  channel.onclose = laneClosed;
+  motionChannel.onopen = () => { if (isCurrentPeer(generation, candidate)) updateInputReady(); };
+  motionChannel.onclose = laneClosed;
   channel.onerror = (e) => { if (isCurrentPeer(generation, candidate)) hudState.dc = `err:${e.message || ""}`; };
 
   candidate.onicecandidate = (ev) => {
@@ -845,7 +879,7 @@ function startNativeVideo(track, generation = peerGeneration) {
   video.playsInline = true;
   video.muted = true;
   video.style.cssText = "position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000;z-index:1;pointer-events:none;";
-  document.body.appendChild(video);
+  visual.appendChild(video);
   video.srcObject = new MediaStream([track]);
   stage.classList.add("native-video-input");
   activeVideo = video;
@@ -872,7 +906,7 @@ function startNativeVideo(track, generation = peerGeneration) {
     nativePresentation.height = video.videoHeight;
     hudState.dimensions = video.videoWidth && video.videoHeight ? `${video.videoWidth}x${video.videoHeight}` : "…";
   };
-  video.addEventListener("loadedmetadata", updateDimensions);
+  video.addEventListener("loadedmetadata", () => { updateDimensions(); syncViewport(); });
   if (nativePresentation.supported) {
     const onVideoFrame = (now, metadata) => {
       if (generation !== peerGeneration || activeVideo !== video) return;
@@ -1030,6 +1064,7 @@ function drawFrame(frame, due = performance.now()) {
     if (screen.width !== w || screen.height !== h) {
       screen.width = w;
       screen.height = h;
+      syncViewport();
     }
     ctx.drawImage(frame, 0, 0, w, h);
     lastRenderedTimestamp = frame.timestamp;
@@ -1066,6 +1101,7 @@ function avcCodecFromSps(bytes) {
 const BM = { 0: 1, 1: 4, 2: 2 }; // e.button -> bitmask (left, middle, right)
 let buttons = 0;
 let locked = false;
+let lastNonMousePointerAt = -Infinity;
 
 function videoContentRect(video) {
   const box = video.getBoundingClientRect();
@@ -1082,68 +1118,62 @@ function videoContentRect(video) {
 
 async function requestPointerLock() {
   try {
-    await screen.requestPointerLock({ unadjustedMovement: true });
+    await inputSurface.requestPointerLock({ unadjustedMovement: true });
     locked = true;
   } catch {
     try {
-      screen.requestPointerLock();
+      inputSurface.requestPointerLock();
       locked = true;
     } catch { locked = false; }
   }
 }
 document.addEventListener("pointerlockchange", () => {
-  locked = document.pointerLockElement === screen;
-  if (!locked) { sendInput(new Uint8Array([4, 0])); buttons = 0; }
+  locked = document.pointerLockElement === inputSurface;
+  document.getElementById("capture").textContent = locked ? "Release cursor" : "Capture cursor";
+  if (!locked) releaseInput();
 });
 document.addEventListener("click", (event) => {
-  if (event.target === screen && !locked && connected) requestPointerLock();
+  if (event.target === inputSurface && event.detail && event.pointerType !== "touch" && event.pointerType !== "pen" && !event.sourceCapabilities?.firesTouchEvents && performance.now() - lastNonMousePointerAt > 1500 && !locked && connected) requestPointerLock();
 });
 document.addEventListener("mousemove", (e) => {
   if (!inputReady || !connected) return;
   if (locked) {
     // Relative (unadjusted) deltas.
-    const b = new ArrayBuffer(5);
-    const dv = new DataView(b);
-    dv.setUint8(0, 2);
-    dv.setInt16(1, clamp16(e.movementX), true);
-    dv.setInt16(3, clamp16(e.movementY), true);
-    sendInput(new Uint8Array(b));
+    queueMotion(e.movementX, e.movementY);
   } else {
+    if (e.target !== inputSurface) return;
     // Absolute fallback over the displayed video (not its letterbox): 0..65535.
     const r = activeVideo ? videoContentRect(activeVideo) : screen.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
     const x = clamp((e.clientX - r.left) / r.width, 0, 1);
     const y = clamp((e.clientY - r.top) / r.height, 0, 1);
-    const b = new ArrayBuffer(5);
-    const dv = new DataView(b);
-    dv.setUint8(0, 3);
-    dv.setUint16(1, Math.round(x * 65535), true);
-    dv.setUint16(3, Math.round(y * 65535), true);
-    sendInput(new Uint8Array(b));
+    queueAbsolute(x * 65535, y * 65535);
   }
 });
 document.addEventListener("mousedown", (e) => {
   if (!inputReady) return;
-  buttons |= BM[e.button] || 0;
-  sendInput(new Uint8Array([4, buttons]));
+  if (e.target !== inputSurface) return;
+  // The initial capture gesture is local-only; never turn it into a remote click.
+  if (!locked && connected) { requestPointerLock(); e.preventDefault(); return; }
+  buttons |= BM[e.button] || (e.button === 3 ? 8 : e.button === 4 ? 16 : 0);
+  input.buttons(buttons);
   e.preventDefault();
 });
 document.addEventListener("mouseup", (e) => {
   if (!inputReady) return;
-  buttons &= ~(BM[e.button] || 0);
-  sendInput(new Uint8Array([4, buttons]));
+  if (e.target !== inputSurface) return;
+  buttons &= ~(BM[e.button] || (e.button === 3 ? 8 : e.button === 4 ? 16 : 0));
+  input.buttons(buttons);
   e.preventDefault();
 });
 document.addEventListener("contextmenu", (e) => e.preventDefault());
 document.addEventListener("wheel", (e) => {
+  if (e.target !== inputSurface) return;
+  if (e.ctrlKey) { setZoom(viewport.zoom + (e.deltaY < 0 ? .1 : -.1), {x:e.clientX,y:e.clientY}); e.preventDefault(); return; }
   if (!inputReady) return;
   // Normalize browser deltas to WHEEL_DELTA (120 per notch).
   const delta = e.deltaMode === 1 ? e.deltaY * 120 : e.deltaY * 1.2;
-  const b = new ArrayBuffer(3);
-  const dv = new DataView(b);
-  dv.setUint8(0, 5);
-  dv.setInt16(1, clamp16(Math.round(delta)), true);
-  sendInput(new Uint8Array(b));
+  queueMotion(0, 0, clamp16(Math.round(e.deltaX * 1.2)), clamp16(Math.round(delta)));
   e.preventDefault();
 }, { passive: false });
 
@@ -1171,50 +1201,50 @@ for (let i = 0; i < 10; i++) KEY["Digit" + i] = 0x30 + i;
 for (let i = 1; i <= 12; i++) KEY["F" + i] = 0x70 + (i - 1);
 
 const held = new Set();
+function keyboardActive() { return locked || document.activeElement === inputSurface; }
 document.addEventListener("keydown", (e) => {
-  if (!inputReady) return;
+  if (!inputReady || !keyboardActive()) return;
   const vk = KEY[e.code];
   if (vk === undefined) return;
   e.preventDefault();
   if (e.repeat || held.has(e.code)) return;
   held.add(e.code);
-  const b = new ArrayBuffer(3);
-  const dv = new DataView(b);
-  dv.setUint8(0, 0); // key down
-  dv.setUint16(1, vk, true);
-  sendInput(new Uint8Array(b));
+  input.key(vk, false);
 });
 document.addEventListener("keyup", (e) => {
   const vk = KEY[e.code];
   if (vk === undefined) return;
+  if (!keyboardActive() && !held.has(e.code)) return;
   e.preventDefault();
   if (!held.has(e.code)) return;
   held.delete(e.code);
-  const b = new ArrayBuffer(3);
-  const dv = new DataView(b);
-  dv.setUint8(0, 1); // key up
-  dv.setUint16(1, vk, true);
-  sendInput(new Uint8Array(b));
+  input.key(vk, true);
 });
 window.addEventListener("blur", () => {
-  for (const code of held) {
-    const vk = KEY[code];
-    if (vk !== undefined) {
-      const b = new ArrayBuffer(3);
-      const dv = new DataView(b);
-      dv.setUint8(0, 1);
-      dv.setUint16(1, vk, true);
-      sendInput(new Uint8Array(b));
-    }
-  }
-  held.clear();
+  releaseInput(); held.clear();
 });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") releaseInput(); });
 
-function sendInput(buf) {
-  if (dc && dc.readyState === "open") {
-    try { dc.send(buf); } catch { /* channel closed mid-send */ }
-  }
-}
+// Touchpad and viewport state are pure modules, shared by all local zoom paths.
+const gestures = new TouchGesture(); const viewport = new Viewport(innerWidth, innerHeight);
+function containedContentRect() { const mediaWidth = activeVideo?.videoWidth || screen.width, mediaHeight = activeVideo?.videoHeight || screen.height; if (!mediaWidth || !mediaHeight) return {x:0,y:0,width:innerWidth,height:innerHeight}; const scale=Math.min(innerWidth/mediaWidth,innerHeight/mediaHeight), width=mediaWidth*scale, height=mediaHeight*scale; return {x:(innerWidth-width)/2,y:(innerHeight-height)/2,width,height}; }
+function syncViewport() { viewport.resize(innerWidth,innerHeight); viewport.setContent(containedContentRect()); }
+function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = "0 0"; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); document.getElementById("zoom-reset").textContent = `${s.zoom.toFixed(1)}×`; }
+function setZoom(next, anchor = {x:innerWidth/2,y:innerHeight/2}) { syncViewport(); viewport.setZoom(next, anchor); renderViewport(); }
+function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); }
+addEventListener("resize", () => { syncViewport(); renderViewport(); });
+function dispatchGesture(actions) { for (const action of actions) { if (action.type === "suppress-motion") { input.clearMotion(); if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; } else if (action.type === "motion") queueMotion(action.dx, action.dy); else if (action.type === "tap" && inputReady) { input.buttons(1); input.buttons(0); } else if (action.type === "pinch") setZoom(viewport.zoom * action.scale, action.anchor); else if (action.type === "translate") { if (viewport.zoom === 1) queueMotion(0,0,action.dx,action.dy); else panBy(action.dx,action.dy); } } hudState.touch = gestures.cancelled ? "cancelled" : (gestures.mode || (gestures.points.size > 1 ? "two-finger" : gestures.points.size ? "touch" : "…")); }
+inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY})); e.preventDefault(); });
+inputSurface.addEventListener("pointermove", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.move(e.pointerId,{x:e.clientX,y:e.clientY})); e.preventDefault(); });
+inputSurface.addEventListener("pointerup", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.up(e.pointerId)); e.preventDefault(); });
+inputSurface.addEventListener("pointercancel", e => { if (e.pointerType !== "touch") return; gestures.cancel(e.pointerId); releaseInput(); hudState.touch = gestures.cancelled ? "cancelled" : "…"; e.preventDefault(); });
+
+document.getElementById("capture").onclick = e => { e.stopPropagation(); if (locked) document.exitPointerLock?.(); else requestPointerLock(); };
+document.getElementById("zoom-out").onclick = e => { e.stopPropagation(); setZoom(viewport.zoom-.25); };
+document.getElementById("zoom-in").onclick = e => { e.stopPropagation(); setZoom(viewport.zoom+.25); };
+document.getElementById("zoom-reset").onclick = e => { e.stopPropagation(); setZoom(1); };
+document.getElementById("fullscreen").onclick = e => { e.stopPropagation(); if (document.fullscreenElement) document.exitFullscreen?.(); else document.documentElement.requestFullscreen?.(); };
+document.addEventListener("fullscreenchange", () => { document.getElementById("fullscreen").textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen"; });
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function clamp16(v) { return clamp(v, -32768, 32767); }

@@ -24,6 +24,12 @@
       "paths": ["host/**"],
       "commands": [
         {
+          "id": "host-tests",
+          "argv": ["powershell", "-NoProfile", "-Command", "$env:NVIDIA_VIDEO_CODEC_SDK_PATH=(Resolve-Path 'host/sdk-stub'); cargo test --manifest-path host/Cargo.toml"],
+          "timeout_ms": 300000,
+          "provides": ["tests"]
+        },
+        {
           "id": "host-check",
           "argv": ["powershell", "-NoProfile", "-Command", "$env:NVIDIA_VIDEO_CODEC_SDK_PATH=(Resolve-Path 'host/sdk-stub'); cargo check --manifest-path host/Cargo.toml"],
           "timeout_ms": 300000,
@@ -46,10 +52,22 @@
           "provides": ["syntax"]
         },
         {
+          "id": "full-host-tests",
+          "argv": ["powershell", "-NoProfile", "-Command", "$env:NVIDIA_VIDEO_CODEC_SDK_PATH=(Resolve-Path 'host/sdk-stub'); cargo test --manifest-path host/Cargo.toml"],
+          "timeout_ms": 300000,
+          "provides": ["tests"]
+        },
+        {
           "id": "full-host-check",
           "argv": ["powershell", "-NoProfile", "-Command", "$env:NVIDIA_VIDEO_CODEC_SDK_PATH=(Resolve-Path 'host/sdk-stub'); cargo check --manifest-path host/Cargo.toml"],
           "timeout_ms": 300000,
           "provides": ["build"]
+        },
+        {
+          "id": "full-diff-check",
+          "argv": ["git", "diff", "--check"],
+          "timeout_ms": 30000,
+          "provides": ["diff"]
         }
       ]
     }
