@@ -20,8 +20,8 @@ pub fn discover_mapped_address(socket: &UdpSocket, server: &str) -> Result<Socke
         a
     } else {
         // Resolve the first A record.
-        let mut iter = std::net::ToSocketAddrs::to_socket_addrs(server)
-            .context("resolve STUN server")?;
+        let mut iter =
+            std::net::ToSocketAddrs::to_socket_addrs(server).context("resolve STUN server")?;
         iter.next().context("no STUN server address")?
     };
 
@@ -39,9 +39,7 @@ pub fn discover_mapped_address(socket: &UdpSocket, server: &str) -> Result<Socke
     // Two attempts, short timeouts.
     let mut buf = [0u8; 576];
     for attempt in 1..=3 {
-        socket
-            .send_to(&req, server_addr)
-            .context("stun send")?;
+        socket.send_to(&req, server_addr).context("stun send")?;
         socket
             .set_read_timeout(Some(Duration::from_millis(900)))
             .ok();
@@ -132,7 +130,9 @@ fn rand_byte() -> u8 {
         .map(|d| d.subsec_nanos() as u64 ^ d.as_secs().wrapping_mul(0x100_0000))
         .unwrap_or(0)
         | 1;
-    let mut x = COUNTER.fetch_add(seed, Ordering::Relaxed).wrapping_add(seed);
+    let mut x = COUNTER
+        .fetch_add(seed, Ordering::Relaxed)
+        .wrapping_add(seed);
     x ^= x >> 30;
     x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x ^= x >> 27;

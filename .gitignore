@@ -34,3 +34,5 @@ worker/probe*.out.txt
 
 # Generated live latency soak/benchmark reports
 artifacts/latency/
+artifacts/stream-lab/
+artifacts/recovery-inventory/

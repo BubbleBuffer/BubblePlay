@@ -13,6 +13,74 @@ test("live collector attaches to a page target and collects rendered and barcode
   assert.doesNotMatch(source, /glassToGlass: \{ status: "unavailable"/);
 });
 
+test("receiver diagnostics identify both index and media asset capabilities", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const media = readFileSync(new URL("../public/media.js", import.meta.url), "utf8");
+  assert.match(media, /export const STREAM_LAB_ASSET_BUILD = "wss-v3-host20-edge12-bench2-hevc-tiles-v14"/);
+  assert.match(client, /STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD/);
+  assert.match(client, /const INDEX_ASSET_BUILD = STREAM_LAB_COMPATIBILITY\.receiverBuild/);
+  assert.match(client, /compatibility:\s*STREAM_LAB_COMPATIBILITY/);
+  assert.match(client, /assetBuild:\s*\{\s*index:\s*INDEX_ASSET_BUILD,\s*media:\s*MEDIA_ASSET_BUILD\s*\}/);
+  assert.match(client, /hostCapabilities:\s*\{\s*\.\.\.hostCapabilities,\s*current:\s*hostCapabilitiesGeneration === signalingGeneration/);
+  assert.match(client, /topologyAccepted:\s*wssTopologyAccepted/);
+  assert.match(client, /applyLateShardDeadline\(\{\s*reassembler:\s*wssReassembler,\s*ordered:\s*wssOrdered,\s*deadline:\s*wssDeadline,?\s*\}\)/);
+  assert.match(client, /tailDeadline:\s*\{\s*\.\.\.wssTailDeadlineTelemetry\s*\}/);
+  assert.match(client, /captureFrame\(\)\s*\{[\s\S]*?toDataURL\("image\/png"\)/);
+  assert.match(client, /clock:\s*\{\s*performanceMs:\s*snapshotAtMs,\s*epochMs:\s*snapshotAtEpochMs\s*\}/);
+});
+
+test("external debug attempts report before module imports and across the WSS presentation chain", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const preModule = client.indexOf("window.__bubbleplayDebugTrace");
+  const module = client.indexOf('<script type="module">');
+  assert.ok(preModule >= 0 && preModule < module, "debug reporter must execute before module imports");
+  const prelude = client.match(/<script>\s*([\s\S]*?)<\/script>\s*<script type="module">/)?.[1] || "";
+  assert.doesNotThrow(() => new Function(prelude));
+  assert.match(client, /fetch\("\/__diag\/client"/);
+  assert.match(client, /debugAttempt/);
+  assert.match(client, /trace\("bootstrap-inline"/);
+  for (const stage of [
+    "module-ready", "signaling-construct", "signaling-open",
+    "signaling-hello-ok", "media-lane-open", "media-first-packet",
+    "media-first-reconstructed", "decoder-configured", "decoder-first-output", "first-presented",
+  ]) assert.match(client, new RegExp(`debugTrace\\(\"${stage}\"`));
+});
+
+test("a normal page load creates and reports its own diagnostic attempt", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const prelude = client.match(/<script>\s*([\s\S]*?)<\/script>\s*<script type="module">/)?.[1] || "";
+  const generatedAttempt = "11111111-2222-4333-8444-555555555555";
+  const requests = [];
+  const windowObject = {};
+
+  new Function("location", "crypto", "fetch", "window", "addEventListener", "URLSearchParams", "Date", prelude)(
+    { search: "", pathname: "/" },
+    { randomUUID: () => generatedAttempt },
+    (url, options) => {
+      requests.push({ url, options });
+      return Promise.resolve({ ok: true });
+    },
+    windowObject,
+    () => {},
+    URLSearchParams,
+    { now: () => 1_777_777_777_777 },
+  );
+
+  assert.equal(windowObject.__bubbleplayDebugTrace?.attemptId, generatedAttempt);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/__diag/client");
+  assert.equal(JSON.parse(requests[0].options.body).attemptId, generatedAttempt);
+  assert.match(client, /detail: \{ attemptId: diagnosticAttemptId,/);
+});
+
+test("forced WSS debugging preserves the original failure instead of falling back", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const recovery = client.match(/function recoverWssStartup\(reason\) \{([\s\S]*?)\n\}/)?.[1] || "";
+  assert.match(recovery, /requestedTransport === TRANSPORT\.WSS[\s\S]*recoverNetworkRoute/);
+  const forced = recovery.match(/if \(requestedTransport === TRANSPORT\.WSS\) \{([\s\S]*?)\n  \}/)?.[1] || "";
+  assert.doesNotMatch(forced, /wssSelected\s*=\s*false|wss-fallback-webrtc/);
+});
+
 test("modern transform keeps canvas/decode/render in the DedicatedWorker", () => {
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   const worker = readFileSync(new URL("../public/latency-worker.js", import.meta.url), "utf8");
@@ -42,6 +110,66 @@ test("modern transform keeps canvas/decode/render in the DedicatedWorker", () =>
   assert.match(worker, /kind: "control"/);
 });
 
+test("automatic WSS fallback releases the WebRTC video sink before reclaiming its canvas", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /function releaseWebRtcVideoSink\(\)[\s\S]*encodedWorker\.terminate\(\)[\s\S]*replaceTransferredCanvas\(\)/);
+  assert.match(client, /function startWssMedia\(\)[\s\S]*releaseWebRtcVideoSink\(\);[\s\S]*ensureMainCanvas\(\);/);
+  assert.match(client, /const updateDimensions = \(\) => \{\s*if \(generation !== peerGeneration \|\| activeVideo !== video \|\| !nativePresentation\) return;/);
+  const release = client.match(/function releaseWebRtcVideoSink\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
+  assert.doesNotMatch(release, /\bpc\?*\.close|\bdc\?*\.close|\bmotionDc\?*\.close/);
+});
+
+test("automatic WSS negotiation waits briefly for current host capabilities before v2 fallback", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /case "host-capabilities":[\s\S]*hostCapabilitiesGeneration = generation;[\s\S]*requestWssMediaStart\(\)/);
+  assert.match(client, /function requestWssMediaStart\(\)[\s\S]*shouldDeferWssMediaStart[\s\S]*setTimeout\([\s\S]*500\)/);
+  assert.match(client, /case "hello-ok":[\s\S]*if \(wssSelected\) requestWssMediaStart\(\)/);
+});
+
+test("WSS diagnostics exclude lab trace trailers before reassembly and reset them atomically", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /stripLabEdgeTrace\(event\.data,\s*\{\s*requireEdgeTrace:\s*true,\s*requireHostTrace:\s*true\s*\}\)/);
+  assert.match(client, /wssMediaReceivedBytes\s*\+=\s*event\.data\.byteLength/);
+  assert.match(client, /wssMediaReceivedPackets\+\+/);
+  assert.match(client, /wssReassembler\.push\([\s\S]*?packet,[\s\S]*?stripe,[\s\S]*?event\.timeStamp,[\s\S]*?edgeReceivedAtEpochMs,[\s\S]*?hostSentAtEpochMs,[\s\S]*?hostRoiTrace,[\s\S]*?\)/);
+  assert.match(client, /wssMedia:\s*\{[\s\S]*receivedBytes:\s*wssMediaReceivedBytes[\s\S]*receivedPackets:\s*wssMediaReceivedPackets/);
+  assert.match(client, /highestSequenceByLane:\s*\[\.\.\.wssReassembler\.highestSequence\]/);
+  assert.match(client, /completionMissingByLane:\s*\[\.\.\.wssReassembler\.stats\.completionMissingByLane\]/);
+  assert.match(client, /resetPresentationCounters\(\)[\s\S]*wssMediaReceivedBytes\s*=\s*0[\s\S]*wssMediaReceivedPackets\s*=\s*0/);
+});
+
+test("WSS presentation diagnostics prove immediate draws and expose every RAF coalescing path", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /FramePresentationTelemetry/);
+  assert.match(client, /const framePresentationTelemetry = new FramePresentationTelemetry\(\)/);
+  assert.match(client, /presentWssFrameImmediately\([\s\S]*?framePresentationTelemetry[\s\S]*?\)/);
+  assert.match(client, /framePresentationTelemetry\.noteImmediatePresented\(\)/);
+  assert.match(client, /framePresentationTelemetry\.noteRafEnqueued\(\)/);
+  assert.match(client, /framePresentationTelemetry\.noteRafCoalesced\(\)/);
+  assert.match(client, /framePresentationTelemetry\.noteRafLateDrop\(\)/);
+  assert.match(client, /presentation:\s*framePresentationTelemetry\.snapshot\(\)/);
+  assert.match(client, /resetPresentationCounters\(\)[\s\S]*framePresentationTelemetry\.reset\(\)/);
+});
+
+test("Stream Lab can hold one WSS v3 data lane down and observes its bounded reconnect", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /injectWssLaneLoss\(stripe = 0, durationMs = 1_000\)/);
+  assert.match(client, /if \(!labRun \|\| !usingWssMedia \|\| wssProtocol !== 3/);
+  assert.match(client, /stripe >= wssTopology\.dataShards/);
+  assert.match(client, /wssDiagnosticLaneFaultUntil\[stripe\]/);
+  assert.match(client, /wssStripeOpened\[stripe\] = false/);
+  assert.match(client, /wssMediaSockets\[stripe\] = null/);
+  assert.match(client, /scheduleWssMediaReconnect\([\s\S]*?durationMs,[\s\S]*?"diagnostic-lane-loss"/);
+  assert.match(client, /lanes:\s*wssLaneLifecycle\.snapshot\(\)/);
+  assert.match(client, /openLanes:\s*wssStripeOpened\.filter\(Boolean\)\.length/);
+});
+
+test("stale WSS lane recycling schedules a replacement without waiting for onclose", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const recycle = client.match(/function recycleStaleWssLane\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
+  assert.match(recycle, /scheduleWssMediaReconnect\(\s*stripe,\s*wssLaneLifecycle\.currentGeneration\(stripe\),\s*0,\s*"stale-lane"\s*\)/);
+});
+
 test("native video is the default path and WebCodecs is opt-in", () => {
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /const useWebCodecs = params\.get\("decoderPath"\) === "webcodecs";/);
@@ -66,6 +194,102 @@ test("native video keeps an explicit input overlay and diagnostics count present
   assert.doesNotMatch(collector, /ready && ready\.ice === "connected" && Number\.isFinite\(ready\.renderedTimestamp\)/);
 });
 
+test("responsive product shell keeps normal controls compact and diagnostics advanced-only", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /id="app-brand"/);
+  assert.match(client, /id="connection-status"/);
+  assert.match(client, /id="desktop-toolbar"/);
+  assert.match(client, /id="mobile-toolbar"/);
+  assert.match(client, /data-ui-action="keyboard"/);
+  assert.match(client, /data-ui-action="monitors"/);
+  assert.match(client, /data-ui-action="settings"/);
+  assert.match(client, /id="tab-settings"/);
+  assert.match(client, /id="diagnostics-output"/);
+  assert.match(client, /function setDiagnosticsVisible\(visible\)/);
+  assert.match(client, /params\.get\("diag"\) === "1"/);
+  assert.match(client, /id="secure-desktop-status"/);
+  assert.match(client, /Windows secure desktop/);
+  assert.match(client, /desktopKind === "secure"/);
+  assert.match(client, /keyboardInput\.setAttribute\("autocorrect", secureDesktop \? "off" : "on"\)/);
+  assert.match(client, /secureTextUnits/);
+  assert.match(client, /@media \(max-width:767px\), \(any-pointer:coarse\)/);
+  assert.match(client, /id="mobile-toolbar"[\s\S]*Keyboard[\s\S]*Monitor[\s\S]*More/);
+});
+
+test("session controls use a top-edge dock and a persistent reveal tab", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../public/bubbleplay.css", import.meta.url), "utf8");
+  assert.match(client, /id="chrome-reveal"[^>]*aria-expanded="false"/);
+  assert.match(client, /function setChromeDockOpen\(open/);
+  assert.match(styles, /#controls\s*\{[\s\S]*inset:\s*calc\(var\(--top-seam-height\)/);
+  assert.match(styles, /#chrome-reveal\s*\{[\s\S]*top:/);
+  assert.match(styles, /body\.chrome-dock-closed #controls/);
+  assert.doesNotMatch(styles, /#controls\s*\{[\s\S]{0,220}inset:\s*auto 0 0/);
+  assert.doesNotMatch(styles, /#control-sheet\s*\{[\s\S]{0,220}inset:\s*auto 0 0/);
+});
+
+test("first-frame startup uses one bounded retry and clears on native or decoded presentation", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /id="desktop-state"[^>]*data-state="starting"/);
+  assert.match(client, /id="first-frame-retry"/);
+  assert.match(client, /type: "first-frame"/);
+  assert.match(client, /phase: "request"/);
+  assert.match(client, /phase: "presented"/);
+  assert.match(client, /phase === "admitted"/);
+  assert.match(client, /phase === "failed"/);
+  assert.match(client, /phase === "failed"[\s\S]*firstFrameHandshake\.presented[\s\S]*first-frame-failure-ignored[\s\S]*return;/);
+  assert.match(client, /function resetPresentationCounters\(\)/);
+  assert.match(client, /function cleanupPeer\(\)[\s\S]*resetPresentationCounters\(\)/);
+  assert.match(client, /recoverWssStartup/);
+  assert.match(client, /wssStartDeadlineAt/);
+  assert.match(client, /monitorTransition/);
+  assert.match(client, /monitor-switched/);
+  assert.match(client, /function startFirstFrameHandshake\(reason, forceNew = false\)/);
+  assert.match(client, /firstFrameHandshake.retries < 1/);
+  assert.match(client, /}, 5_000\)/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)/);
+  assert.match(client, /video\.requestVideoFrameCallback/);
+  assert.match(client, /markFirstFramePresented\(\);/);
+  assert.match(client, /lastDecodedDimensions/);
+});
+
+test("login uses the BubblePlay responsive shell while preserving remembered auth", () => {
+  const login = readFileSync(new URL("../public/login.html", import.meta.url), "utf8");
+  assert.match(login, /class="brand"/);
+  assert.match(login, /Welcome back/);
+  assert.match(login, /security-note/);
+  assert.match(login, /autocomplete="current-password"/);
+  assert.match(login, /Remember this browser for 30 days/);
+  assert.match(login, /fetch\("\/__auth\/login"/);
+});
+
+test("BubbleBuffer edge instrument replaces purple glass and exposes adaptive session controls", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const login = readFileSync(new URL("../public/login.html", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../public/bubbleplay.css", import.meta.url), "utf8");
+
+  assert.match(client, /href="\/bubbleplay\.css"/);
+  assert.match(login, /href="\/bubbleplay\.css"/);
+  assert.match(client, /class="session-page/);
+  assert.match(login, /class="auth-page"/);
+  assert.match(client, /class="signal-cut"/);
+  assert.match(login, /class="signal-cut"/);
+  assert.match(client, /id="context-hint"/);
+  assert.match(client, /id="logout-session"/);
+  assert.match(client, /id="forget-browser"/);
+  assert.match(client, /function syncShellMode\(\)/);
+  assert.match(client, /classList\.toggle\("mode-game"/);
+  assert.match(client, /classList\.add\("has-presented-frame"\)/);
+  assert.match(client, /endBrowserSession\("\/__auth\/logout", false\)/);
+  assert.match(client, /endBrowserSession\("\/__auth\/forget-browser", true\)/);
+  assert.match(styles, /--bright-apricot:\s*#F0A064/i);
+  assert.match(styles, /@font-face[\s\S]*atkinson-hyperlegible-next\.woff2/);
+  assert.match(styles, /@media \(orientation:\s*landscape\)/);
+  assert.match(styles, /body\.mode-game\.chrome-idle/);
+  assert.doesNotMatch(styles, /#7c3aed|#9b6cff|backdrop-filter|linear-gradient|radial-gradient/i);
+  assert.doesNotMatch(login, /#7c3aed|#9b6cff|backdrop-filter|linear-gradient|radial-gradient/i);
+});
+
 test("client starts a new signaling and peer epoch after relay loss or peer departure", () => {
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /function reconnectSignaling\(reason\)/);
@@ -73,6 +297,196 @@ test("client starts a new signaling and peer epoch after relay loss or peer depa
   assert.match(client, /socket\.onclose = \(event\) => \{[\s\S]*reconnectSignaling\("ws-closed"\)/);
   assert.match(client, /const generation = \+\+peerGeneration/);
   assert.match(client, /pendingRemoteIce/);
+});
+
+test("browser signaling uses the remembered server session and never stores an application secret", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const login = readFileSync(new URL("../public/login.html", import.meta.url), "utf8");
+  assert.match(client, /const labRun = parseLabRun\(params\)/);
+  assert.match(client, /labRun \? "\/lab-ws" : "\/ws"/);
+  assert.match(client, /labRun \? "\/lab-media-ws" : "\/media-ws"/);
+  assert.match(client, /sendSignal\(\{ type: "hello", role: "client" \}\)/);
+  assert.doesNotMatch(client, /bp_token|BubblePlay token|hello", token/);
+  assert.match(login, /autocomplete="current-password"/);
+  assert.match(login, /Remember this browser for 30 days/);
+  assert.match(login, /fetch\("\/__auth\/login"/);
+  assert.match(login, /location\.replace\(`\$\{location\.pathname\}\$\{location\.search\}`\)/);
+  const inlineScript = login.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(inlineScript);
+  assert.doesNotThrow(() => new Function(inlineScript));
+});
+
+test("WSS fallback keeps v2 compatibility and negotiates bounded v3 media lanes", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /parseTransport\(params\)/);
+  assert.match(client, /parseQualityPreset\(params, localStorage\)/);
+  assert.match(client, /<select id="quality"/);
+  assert.match(client, /action: "quality"/);
+  assert.match(client, /quality: qualityPreset === "auto" \? "high" : qualityPreset, adaptive: wssAdaptive/);
+  assert.match(client, /streamMode: streamModeValue\(\)/);
+  assert.match(client, /<option value="auto">Auto<\/option>/);
+  assert.match(client, /VariableParityFrameReassembler/);
+  assert.match(client, /validateWssTopology/);
+  assert.match(client, /media-ack-v3/);
+  assert.match(client, /case "media-topology"/);
+  assert.match(client, /laneCount: wssTopology\.laneCount/);
+  assert.match(client, /wssMediaSockets = Array\(wssTopology\.laneCount\)/);
+  assert.match(client, /function mediaSocketUrl\(stripe\)/);
+  assert.match(client, /role: "media-client"/);
+  assert.match(client, /hev1\.1\.6\.L120\.B0/);
+  assert.match(client, /media-ack-v2/);
+  assert.match(client, /media-control/);
+  assert.match(client, /fullFrameDiagnostic/);
+  assert.match(client, /diagnostic-full-frame/);
+  assert.match(client, /clientBuild/);
+  assert.match(client, /mediaGeneration/);
+  assert.match(client, /<canvas id="screen"><\/canvas><canvas id="sharp-screen"><\/canvas>/);
+  assert.match(client, /desiredSharpCrop/);
+  assert.match(client, /function viewportForGeneration\(generation\)/);
+  assert.match(client, /never render a generation with stale geometry/);
+  assert.match(client, /viewport-timeout-full/);
+  assert.match(client, /function beginWssRecovery\(reason, requestId = null\)/);
+  assert.match(client, /wssRecoveryPending/);
+  assert.match(client, /wss-recovery-keyframe/);
+  assert.match(client, /case "desktop-state"/);
+  assert.match(client, /case "monitor-list"/);
+  assert.match(client, /action: "monitor"/);
+  assert.match(client, /id="control-sheet"/);
+  assert.match(client, /id="keyboard-input"/);
+  assert.match(client, /reconcileTextEdit/);
+  assert.match(client, /let keyboardShadow = ""/);
+  assert.match(client, /compositionstart/);
+  assert.match(client, /Applied correction/);
+  assert.doesNotMatch(client, /keyboardInput\.value = "";\s*\}\);/);
+  assert.match(client, /data-vk="162"/);
+  assert.match(client, /function setControlsOpen\(open\)/);
+  assert.match(client, /desktop-unavailable/);
+  assert.match(client, /if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
+  assert.doesNotMatch(client, /sharpZoomEnabled\s*&&\s*pointerMode\s*===\s*"desktop"/);
+  assert.match(client, /function startWssMedia\(\) \{\s*if \(usingWssMedia\) return;\s*if \(!mediaEpoch\)[\s\S]*ensureMainCanvas\(\);/);
+  assert.match(client, /wssStripeOpened\.filter\(Boolean\)\.length[\s\S]*open < wssTopology\.dataShards/);
+  assert.match(client, /new ParityFrameReassembler\(\)/);
+  assert.match(client, /new OrderedFrameRelease\(\)/);
+  assert.match(client, /function startWssMedia\(\)[\s\S]*stage\.classList\.remove\("native-video-input"\)/);
+  assert.match(client, /function recoverNetworkRoute\(reason\)/);
+  assert.match(client, /addEventListener\("online", \(\) => recoverNetworkRoute\("online"\)\)/);
+  assert.match(client, /function probeNetworkRouteChange\(\)/);
+  assert.match(client, /routeConnection\?\.addEventListener\("change", probeNetworkRouteChange\)/);
+  assert.doesNotMatch(client, /routeConnection\?\.addEventListener\("change", \(\) => recoverNetworkRoute/);
+  assert.match(client, /function openWssMediaStripe\(stripe\)/);
+  assert.match(client, /wssMediaSockets\[stripe\] !== socket/);
+  assert.match(client, /function scheduleWssMediaReconnect\([\s\S]*?setTimeout\(\(\) => \{[\s\S]*?openWssMediaStripe\(stripe\)/);
+  assert.match(client, /4_000/);
+  assert.match(client, /2_000/);
+  assert.doesNotMatch(client, /localStorage\.setItem\([^\n]*codec/);
+  assert.match(client, /const due = usingWssMedia \? now : latencyGuard\.expectedWall\(ts\)/);
+  assert.match(client, /wssLatestFrameTrace/);
+  assert.match(client, /wssPresentedFrameTraces/);
+  assert.match(client, /frameTraceHistory/);
+  assert.match(client, /wssPresentedSequence\s*=\s*metadata\.sequence\s*>>>\s*0/);
+  assert.doesNotMatch(client, /wssPresentedSequence\s*=\s*Math\.max\(/);
+  assert.match(client, /armPresentedIdentityHistory\(frameCount = 16\)/);
+  assert.match(client, /wssPresentedIdentityFramesRemaining > 0\s*\?\s*readTimestampPattern\(presentedCanvas, presentedContext\)/);
+  assert.match(client, /wssPresentedIdentityFramesRemaining--/);
+  assert.match(client, /stripLabEdgeTrace\(event\.data,\s*\{\s*requireEdgeTrace:\s*true,\s*requireHostTrace:\s*true\s*\}\)/);
+  assert.match(client, /wssReassembler\.push\([\s\S]*?packet,[\s\S]*?stripe,[\s\S]*?event\.timeStamp,[\s\S]*?edgeReceivedAtEpochMs,[\s\S]*?hostSentAtEpochMs,[\s\S]*?hostRoiTrace,[\s\S]*?\)/);
+  assert.match(client, /decodeQueuedAtMs/);
+  assert.match(client, /decodedAtMs/);
+  assert.match(client, /presentedAtMs/);
+});
+
+test("v2 fallback ACK construction does not evaluate v3-only completion telemetry", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const schedule = client.match(
+    /function scheduleWssAck\(generation, immediate = false\) \{[\s\S]*?\n\}\n\nfunction switchToWss/,
+  )?.[0]?.replace(/\n\nfunction switchToWss$/, "");
+  assert.ok(schedule);
+  const message = new Function(`
+    let wssAckTimer = null;
+    const wssProtocol = 2;
+    const mediaEpoch = null;
+    const wssTopology = { laneCount: 4, dataShards: 3, parityShards: 1 };
+    const wssReassembler = {
+      highestSequence: [7, 7, 7, 7],
+      highestReconstructed: 7,
+      stats: { recoveredFrames: 1, expiredFrames: 0 },
+    };
+    const wssPresentedSequence = 7;
+    const wssDependencyLosses = 0;
+    const wssDeadline = { deadlineMs: 120, p95Ms: 8 };
+    const wssRecoveryState = "healthy";
+    const hudState = { dropped: 0 };
+    let sent = null;
+    const sendSignal = value => { sent = value; return true; };
+    ${schedule}
+    scheduleWssAck(3, true);
+    return sent;
+  `)();
+  assert.deepEqual(message, {
+    type: "media-ack-v2",
+    generation: 3,
+    lanes: [7, 7, 7, 7],
+    reconstructed: 7,
+    presented: 7,
+    recoveredFrames: 1,
+    expiredFrames: 0,
+    dependencyLosses: 0,
+    deadlineMs: 120,
+    reassemblyP95Ms: 8,
+    recoveryState: "healthy",
+    decoderDrops: 0,
+  });
+});
+
+test("WSS ACK scheduling reports whether signaling accepted the exact recovery ACK", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const schedule = client.match(
+    /function scheduleWssAck\(generation, immediate = false\) \{[\s\S]*?\n\}\n\nfunction switchToWss/,
+  )?.[0]?.replace(/\n\nfunction switchToWss$/, "");
+  assert.ok(schedule);
+  const report = new Function(`
+    let wssAckTimer = null;
+    const wssProtocol = 3;
+    const mediaEpoch = "0123456789abcdef0123456789abcdef";
+    const wssTopology = { laneCount: 4, dataShards: 3, parityShards: 1 };
+    const wssReassembler = {
+      highestSequence: [1, 1, 1, 1],
+      highestReconstructed: 1,
+      stats: { recoveredFrames: 1, expiredFrames: 0, completionMissingByLane: [0, 0, 0, 1] },
+    };
+    const wssPresentedSequence = 1;
+    const wssDependencyLosses = 0;
+    const wssDeadline = { deadlineMs: 300, p95Ms: 11 };
+    const wssRecoveryState = "awaiting-keyframe";
+    const hudState = { dropped: 0 };
+    const sendSignal = () => false;
+    let observed = null;
+    const recordWssAckAttempt = (message, immediate, sent) => { observed = { message, immediate, sent }; };
+    ${schedule}
+    scheduleWssAck(2, true);
+    return observed;
+  `)();
+  assert.equal(report.immediate, true);
+  assert.equal(report.sent, false);
+  assert.deepEqual(report.message, {
+    type: "media-ack-v3",
+    protocol: 3,
+    epoch: "0123456789abcdef0123456789abcdef",
+    topology: { laneCount: 4, dataShards: 3, parityShards: 1 },
+    completionMissingByLane: [0, 0, 0, 1],
+    generation: 2,
+    lanes: [1, 1, 1, 1],
+    reconstructed: 1,
+    presented: 1,
+    recoveredFrames: 1,
+    expiredFrames: 0,
+    dependencyLosses: 0,
+    deadlineMs: 300,
+    reassemblyP95Ms: 11,
+    recoveryState: "awaiting-keyframe",
+    decoderDrops: 0,
+  });
 });
 
 test("QoS polling continues after ICE reaches completed", () => {
@@ -91,14 +505,171 @@ test("worker policy closure is terminal while transient websocket closure reconn
 test("client applies validated ephemeral ICE configuration and keeps route diagnostics private", () => {
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /from "\/turn\.js"/);
-  assert.match(client, /currentIceServers = validateIceServers\(msg\.iceServers\);\s*startPeer\(peerGeneration\);/);
+  assert.match(client, /currentIceServers = validateIceServers\(msg\.iceServers\);/);
+  assert.match(client, /mediaEpoch = \/\^\[a-f0-9\]\{32\}\$\/\.test\(msg\.mediaEpoch/);
+  assert.match(client, /if \(wssSelected\) requestWssMediaStart\(\);\s*else startPeer\(peerGeneration\);/);
   assert.match(client, /iceServers: currentIceServers,\s*iceTransportPolicy,/);
   assert.match(client, /hudState\.route = deriveCandidateRoute\(latestRtcProfile\);/);
   assert.match(client, /hudState\.route = "…";/);
+});
+
+test("diagnostic snapshots expose the latest validated host benchmark sample", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /let latestBenchStatus = null/);
+  assert.match(client, /case "bench-status":[\s\S]*applyBenchStatus\(msg\)/);
+  assert.match(client, /function applyBenchStatus\(status\)[\s\S]*latestBenchStatus = status/);
+  assert.match(client, /snapshot\(\)[\s\S]*benchStatus: latestBenchStatus/);
+});
+
+test("WSS HEVC decoder tracks Main versus Main10 and probes Main10 without H264 fallback", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /hev1\.1\.6\.L120\.B0/);
+  assert.match(client, /hev1\.2\.4\.L120\.B0/);
+  assert.match(client, /latestBenchStatus\?\.effective\?\.encoder\?\.main10/);
+  assert.match(client, /main10[\s\S]*configure-unsupported/);
+});
+
+test("WSS hybrid presentation parses before decode and composites only after the base frame", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const activeHybridMode = client.match(
+    /function activeWssHybridMode\(\) \{[\s\S]*?\n\}/,
+  )?.[0];
+  assert.match(client, /prepareHybridWssFrame/);
+  assert.match(client, /new HybridTileCache/);
+  assert.match(client, /new HevcTileCache/);
+  assert.match(client, /probeHevcTileDecoderSupport/);
+  assert.ok(activeHybridMode);
+  assert.match(activeHybridMode, /codecSession\.codec === "hevc"/);
+  assert.match(client, /function decodeWssFrame\(frame\)[\s\S]*prepareHybridWssFrame/);
+  assert.match(client, /sendClientLog\("info", "hybrid-frame-activity"/);
+  assert.match(client, /sendClientLog\("warn", "wss-recovery-reset"/);
+  assert.match(client, /client-health[\s\S]*hybrid:\s*activeWssHybridCache\(\)\.snapshot\(\)/);
+  assert.match(client, /sendClientLog\("error", "decoder-decode-throw", \{\s*message:/);
+  assert.match(client, /function drawFrame\(frame[\s\S]*drawBaseThenHybrid/);
+  assert.match(client, /stopWssMedia\(\)[\s\S]*clearWssHybridCaches\(\)/);
+  assert.match(client, /resyncWssDecoder\(reason\)[\s\S]*clearWssHybridCaches\(\)/);
+  assert.match(client, /wssMedia:\s*\{[\s\S]*hybrid:\s*activeWssHybridCache\(\)\.snapshot\(\)/);
 });
 
 test("peer departure recycles signaling before another peer offer", () => {
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
   assert.match(client, /function recycleSignaling\(reason\)/);
+});
+
+test("intentional signaling recycle retains its initiator before invalidating the old epoch", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const recycle = client.match(/function recycleSignaling\(reason\) \{([\s\S]*?)\n\}/)?.[1] || "";
+  assert.match(recycle, /createSignalingRecycleDiagnostic\(\{/);
+  assert.match(recycle, /reason,[\s\S]*signalingGeneration,[\s\S]*signalingRegistered,/);
+  assert.match(recycle, /socketReadyState:\s*ws\?\.readyState\s*\?\?\s*null/);
+  assert.match(recycle, /usingWssMedia,[\s\S]*wssProtocol,[\s\S]*laneCount:[\s\S]*openLanes:/);
+  assert.match(recycle, /mediaGeneration:[\s\S]*reconstructed:[\s\S]*presented:[\s\S]*receivedPackets:/);
+  assert.match(recycle, /lastSignalingRecycle\s*=\s*\{\s*\.\.\.diagnostic,\s*atMs:\s*Date\.now\(\)\s*\}/);
+  const emittedAt = recycle.indexOf('sendClientLog("warn", "signaling-recycle", diagnostic)');
+  const invalidatedAt = recycle.indexOf("ws = null");
+  assert.ok(emittedAt >= 0 && invalidatedAt > emittedAt,
+    "the diagnostic must use the still-open old signaling socket before it is invalidated");
+  assert.match(client, /signaling:\s*\{[\s\S]*lastRecycle:\s*lastSignalingRecycle\s*\?\s*\{\s*\.\.\.lastSignalingRecycle\s*\}\s*:\s*null/);
+});
+
+test("predicted cursor repaints through one follow boundary and has a real black outline", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /<div id="touch-cursor"[^>]*>\s*<svg[\s\S]*?<path[^>]*stroke="black"/);
+  assert.match(client, /function updateRemoteCursor\(update\)[\s\S]*update\(remoteCursor\);[\s\S]*centerCameraOnCursor\(\);\s*renderViewport\(\);/);
+  assert.match(client, /function centerCameraOnCursor\(\)[\s\S]*viewport\.centerOnNormalized\(remoteCursor\.snapshot\(\)\)/);
+  assert.match(client, /updateRemoteCursor\(cursor\s*=>\s*cursor\.moveScreen\(/);
+  assert.match(client, /updateRemoteCursor\(cursor\s*=>\s*cursor\.setNormalized\(/);
+});
+
+test("mobile press actions atomically warp reliable control to the overlay cursor", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /function setTouchButtonsAtCursor\(mask\)[\s\S]*input\.buttonsAt\(point\.x,point\.y,mask\)/);
+  assert.match(client, /action\.type === "tap"[\s\S]*setTouchButtonsAtCursor\(1\); setTouchButtons\(0\)/);
+  assert.match(client, /action\.type === "drag-start"[\s\S]*setTouchButtonsAtCursor\(1\)/);
+  assert.match(client, /action\.type === "right-tap"[\s\S]*setTouchButtonsAtCursor\(2\); setTouchButtons\(0\)/);
+});
+
+test("mobile desktop pointer uses absolute targets and authoritative host reconciliation", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /Mode: Work/);
+  assert.match(client, /new CursorReconciler\(remoteCursor\)/);
+  assert.match(client, /channel\.onmessage[\s\S]*handleCursorState/);
+  assert.match(client, /motionChannel\.onmessage[\s\S]*handleCursorState/);
+  assert.match(client, /function queueTouchAbsolute[\s\S]*input\.absolute/);
+  assert.match(client, /pointerMode === "desktop"[\s\S]*queueTouchAbsolute\(point\.x,point\.y\)/);
+  assert.match(client, /action\.type === "motion-end"[\s\S]*setTouchButtonsAtCursor\(touchButtons\)/);
+  assert.match(client, /pointerMode === "game"[\s\S]*queueTouchMotion/);
+  assert.match(client, /shouldCorrectCursorDrift/);
+  assert.match(client, /capture\.disabled = workMode/);
+});
+
+test("desktop input suspension is enforced at the final browser transport boundary", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /function sendInput\(data, channel\) \{\s*if \(desktopInputState !== "enabled"\) return false;/);
+  assert.match(client, /if \(desktopInputState !== "enabled"\) releaseInput\(false\);/);
+});
+
+test("desktop source transitions preserve the last frame without authorizing stale input", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /const sourceTransition = message\.state === "active" && \["desktop-switched", "capture-recovered", "session-changed", "agent-restarted"\]\.includes\(message\.reason\)/);
+  assert.doesNotMatch(client, /sourceTransition = message\.state === "active" && \(secureDesktop \|\|/);
+  assert.match(client, /if \(monitorTransition && alreadyRendering\) \{[\s\S]*desktopAwaitingFrame = true;[\s\S]*suppressDesktopTransitionOverlay = true;[\s\S]*if \(!usingWssMedia\) \{[\s\S]*restartPeer\("monitor-transition", false\);[\s\S]*startFirstFrameHandshake\("monitor-transition", true\);[\s\S]*return;\s*\}/);
+  assert.match(client, /if \(sourceTransition && alreadyRendering\) \{[\s\S]*desktopAwaitingFrame = true;[\s\S]*startFirstFrameHandshake\("desktop-source-transition", true\);[\s\S]*return;\s*\}/);
+  assert.match(client, /if \(!usingWssMedia\) \{[\s\S]*restartPeer\("desktop-source-transition", false\);[\s\S]*return;/);
+  assert.match(client, /if \(workerPresented\) markFirstFramePresented\(\)/);
+  assert.match(client, /firstFrameHandshake\.requireAdmission && !usingWssMedia && useWebCodecs[\s\S]*resyncPipeline\("desktop-transition-admitted"\)/);
+  assert.match(client, /if \(!usingWssMedia && firstFrameHandshake\.requireAdmission\) \{[\s\S]*if \(!firstFrameHandshake\.admitted\)[\s\S]*if \(transitionNeedsKeyframe\)[\s\S]*if \(!isKey\)/);
+  assert.match(client, /function sendInput\(data, channel\) \{[\s\S]*if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false;/);
+  assert.match(client, /firstFrameHandshake\.requireAdmission = forceNew \|\| reason === "desktop-source-transition"/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*requireAdmission && !firstFrameHandshake\.admitted[\s\S]*return false/);
+  assert.match(client, /presentedGeneration !== firstFrameHandshake\.generation[\s\S]*return false/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*desktopAwaitingFrame = false/);
+});
+
+test("an active desktop generation change re-arms the first-frame input gate", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const handler = client.match(/function handleDesktopState\(message\) \{[\s\S]*?\n\}/)?.[0] || "";
+  assert.match(client, /let desktopGeneration = null/);
+  assert.match(handler, /const desktopGenerationChanged = Number\.isInteger\(message\.generation\)[\s\S]*message\.generation !== desktopGeneration/);
+  assert.match(handler, /desktopGeneration = message\.generation/);
+  assert.match(handler, /startFirstFrameHandshake\("desktop-state", desktopGenerationChanged\)/);
+  assert.match(client, /firstFrameHandshake\.requireAdmission = forceNew \|\| reason === "desktop-source-transition" \|\| reason === "monitor-transition"/);
+});
+
+test("normal text assistance is restored outside the secure desktop", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /id="keyboard-input"[^>]*autocomplete="on"[^>]*autocorrect="on"[^>]*spellcheck="true"/);
+  assert.match(client, /keyboardInput\.setAttribute\("autocorrect", secureDesktop \? "off" : "on"\)/);
+  assert.match(client, /keyboardInput\.setAttribute\("autocomplete", secureDesktop \? "off" : "on"\)/);
+  assert.match(client, /keyboardInput\.spellcheck = !secureDesktop/);
+});
+
+test("secure Android composition commits through one pending transaction", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const begin = client.indexOf("// BEGIN secure-composition-gate");
+  const end = client.indexOf("// END secure-composition-gate");
+  assert.ok(begin >= 0 && end > begin);
+  const factory = new Function(`${client.slice(begin, end)}\nreturn createCompositionCommitGate;`)();
+  const committed = [];
+  let scheduled = null;
+  const gate = factory(value => committed.push(value), callback => { scheduled = callback; return callback; }, handle => { if (scheduled === handle) scheduled = null; });
+
+  // Android commonly emits compositionend followed by one non-composing
+  // input event. That input consumes the pending transaction synchronously;
+  // the fallback cannot send the same text a second time.
+  assert.equal(gate.stage("é"), true);
+  assert.equal(gate.consume("é"), true);
+  scheduled?.();
+  assert.deepEqual(committed, ["é"]);
+
+  // Browsers which omit the trailing input still commit once via fallback.
+  assert.equal(gate.stage("🙂"), true);
+  const fallback = scheduled;
+  fallback();
+  fallback();
+  assert.deepEqual(committed, ["é", "🙂"]);
+
+  assert.match(client, /if \(desktopKind === "secure" && secureCompositionCommit\.consume\(event\.data \?\? keyboardInput\.value\)\) return/);
+  assert.match(client, /compositionend", event =>[\s\S]*secureCompositionCommit\.stage\(event\.data \?\? keyboardInput\.value\)/);
 });

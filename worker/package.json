@@ -4,8 +4,25 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check:syntax": "node --check src/index.js && node --check src/turn.js && node --check public/input.js && node --check public/turn.js && node --check public/latency.js && node --check public/latency-worker.js && node --check public/recovery.js && node --check tools/latency-live.mjs",
+    "check:syntax": "node --check src/index.js && node --check src/gate.js && node --check src/client_diag.js && node --check src/turn.js && node --check public/input.js && node --check public/turn.js && node --check public/transport.js && node --check public/media.js && node --check public/latency.js && node --check public/latency-worker.js && node --check public/recovery.js && node --check tools/latency-live.mjs && node --check tools/recovery-inventory.mjs && node --check tools/stream-lab-core.mjs && node --check tools/stream-lab-runtime.mjs && node --check tools/stream-lab-parity.mjs && node --check tools/stream-lab-activity.mjs && node --check tools/stream-lab-optimize.mjs && node --check tools/stream-lab-live.mjs && node --check tools/stream-lab-direct-relay.mjs && node --check tools/stream-lab-helper-probe.mjs && node --check tools/stream-lab.mjs",
+    "recovery:inventory": "node tools/recovery-inventory.mjs ..",
     "latency:live": "node tools/latency-live.mjs",
-    "latency:bench": "node tools/latency-live.mjs --glass-to-glass"
+    "latency:bench": "node tools/latency-live.mjs --glass-to-glass",
+    "lab:preflight": "node tools/stream-lab.mjs preflight",
+    "lab:manual": "node tools/stream-lab.mjs manual",
+    "lab:baseline": "node tools/stream-lab.mjs baseline",
+    "lab:smoke": "node tools/stream-lab.mjs smoke",
+    "lab:sweep": "node tools/stream-lab.mjs sweep",
+    "lab:campaign": "node tools/stream-lab.mjs campaign",
+    "lab:optimize": "node tools/stream-lab.mjs optimize",
+    "lab:topology-sweep": "node tools/stream-lab.mjs topology-sweep",
+    "lab:lane-recovery": "node tools/stream-lab.mjs lane-recovery",
+    "lab:compare": "node tools/stream-lab.mjs compare",
+    "lab:cleanup": "node tools/stream-lab.mjs cleanup",
+    "lab:diagnostics": "powershell -NoProfile -ExecutionPolicy Bypass -File ../host/scripts/collect-diagnostics.ps1",
+    "lab:direct-relay": "node tools/stream-lab-direct-relay.mjs"
+  },
+  "devDependencies": {
+    "ws": "^8.21.3"
   }
 }

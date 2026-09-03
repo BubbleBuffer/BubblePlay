@@ -32,11 +32,7 @@ fn main() {
                 continue;
             }
         };
-        println!(
-            "[{i}] session ok {}x{}",
-            api.width(),
-            api.height()
-        );
+        println!("[{i}] session ok {}x{}", api.width(), api.height());
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut acquired = 0u64;
         let mut presents = 0u64;

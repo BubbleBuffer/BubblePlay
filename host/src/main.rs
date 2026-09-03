@@ -6,43 +6,1134 @@
 //! - `serve` (default): full pipeline. Connect the signaling worker, wait for
 //!   a browser offer, answer it, trickle srflx, stream video, apply input.
 
+mod agent_client;
+mod benchmark;
 mod capture;
+mod desktop_session;
 mod encode;
+mod feedback_roi;
+mod frame_damage;
+mod hevc_tiles;
+mod hybrid;
 mod input;
+mod privileged_ipc;
+mod privileged_pipe;
 mod quality;
+mod reconstruction_feedback;
 mod rtc;
 mod scale;
 mod signaling;
 mod stun;
+mod temporal_diff;
+mod transport;
 mod vdd;
+mod wss_media;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
-use str0m::net::{Protocol, Receive};
-use str0m::{Input, Output};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use windows::core::Interface;
+use windows::Win32::Foundation::RECT;
 
-use capture::{pick_monitor, texture_ptr, Capture};
-use encode::{EncodedFrame, Nvenc, Preset};
-use input::InputSink;
-use quality::{Controller, Decision, Profile, Qos};
-use rtc::{RtcAction, RtcSession};
+use agent_client::AgentClient;
+use benchmark::{
+    BenchmarkAqMode, BenchmarkHybridCacheMode, BenchmarkHybridMode, BenchmarkMultipass,
+    BenchmarkPreset, BenchmarkResourceMode, BenchmarkRoiMode, BenchmarkStreamMode,
+    BenchmarkTransport, BenchmarkTuning,
+};
+use capture::{
+    encode_texture_png_crop, pick_monitor, texture_ptr, Capture, CaptureAvailability, CapturedFrame,
+};
+use encode::{
+    AqMode, EncodeStageTimings, EncodedFrame, EncoderOptions, FrameDamage, Multipass, Nvenc,
+    Preset, RateControlMode, ResourceMode, RoiMapReason, RoiMapTelemetry, RoiMode, Tuning,
+    VideoCodec,
+};
+use feedback_roi::{
+    changed_ctb_mask, FeedbackBudgetPolicy, FeedbackPlan, FeedbackPlanReason, FeedbackRoiPlanner,
+    FeedbackWireBudget, FeedbackWireDecision,
+};
+use hevc_tiles::{is_supported_output_rect, HevcTileEncoder};
+use hybrid::{
+    encode_hybrid_frame_v1, hybrid_operation_wire_bytes, HybridFrame, HybridTileOperation,
+    HybridWireBudget, QuiescentTilePlan, QuiescentTilePlanner, StaticTilePlanner, ViewportGeometry,
+    MAX_HYBRID_SIDECAR_BYTES,
+};
+use input::{CursorTracker, DesktopRegion, InputSink};
+use privileged_ipc::{
+    Codec as AgentCodec, CropRect as AgentCrop, EncoderAqMode as AgentAqMode,
+    EncoderMultipass as AgentMultipass, EncoderPreset as AgentPreset, EncoderTuning as AgentTuning,
+    Message as AgentMessage, StreamMode as AgentStreamMode,
+};
+use privileged_pipe::RetryPolicy;
+use quality::{Controller, Decision, Profile, Qos, StreamMode};
+use reconstruction_feedback::{
+    is_exact_previous_feedback, ReconstructionFeedbackAnalyzer, ReconstructionFeedbackSubmission,
+};
+use rtc::RtcAction;
 use scale::{ScaleOutput, Scaler};
-use signaling::{SignalEvent, Signaling};
+use signaling::{
+    BenchEncodeStages, BenchHybridActivity, BenchRoiActivity, BenchStageTiming, SignalEvent,
+    Signaling, WssTopologyWire,
+};
+use temporal_diff::{
+    DamageCoverageAudit, DeferredReadbackActivity, QuiescentValidationStatus, TemporalDiffAnalyzer,
+    TemporalDiffResult, TemporalMaskDecision,
+};
+use transport::{AccessUnit, TransportCommand, TransportEvent, TransportPump};
+use wss_media::{
+    AccessUnitMeta as WssAccessUnitMeta, LabRoiReason, LabRoiTrace, MediaCodec,
+    ReserveOutcome as WssReserveOutcome, SubmitOutcome as WssSubmitOutcome, WssMediaEgress,
+    WssTopology,
+};
 
 const STUN_SERVER: &str = "stun.l.google.com:19302";
 const DEFAULT_BITRATE_BPS: u32 = 1_500_000;
 const MAX_BITRATE_BPS: u32 = 40_000_000;
 const IDR_INTERVAL: Duration = Duration::from_secs(2);
-const STATIC_REPLAY_DELAY: Duration = Duration::from_millis(250);
-// Chromium may repeat PLI while a large recovery IDR is still in flight.
-// Forcing a new IDR for every RTCP packet floods the link and prevents any
-// one keyframe from completing, so coalesce requests at the sender boundary.
 const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_secs(2);
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
+const STATIC_REPLAY_DELAY: Duration = Duration::from_millis(250);
+const WSS_GOP_INTERVAL: Duration = Duration::from_secs(1);
+const WSS_HIGH_BITRATE_BPS: u32 = 6_000_000;
+const WSS_BALANCED_BITRATE_BPS: u32 = 3_000_000;
+const WSS_SAVER_BITRATE_BPS: u32 = 1_500_000;
+
+fn wss_gop_interval(mode: StreamMode) -> Duration {
+    if mode == StreamMode::Work {
+        IDR_INTERVAL
+    } else {
+        WSS_GOP_INTERVAL
+    }
+}
+
+fn benchmark_mode_matches(benchmark_mode: BenchmarkStreamMode, stream_mode: StreamMode) -> bool {
+    matches!(
+        (benchmark_mode, stream_mode),
+        (BenchmarkStreamMode::Work, StreamMode::Work)
+            | (BenchmarkStreamMode::Game, StreamMode::Game)
+    )
+}
+
+fn benchmark_owned_encoder_bitrate(
+    requested_bitrate_bps: u32,
+    benchmark_profile: Option<&benchmark::BenchmarkProfile>,
+    transport: BenchmarkTransport,
+    stream_mode: StreamMode,
+    codec: VideoCodec,
+) -> u32 {
+    benchmark_profile
+        .filter(|profile| {
+            codec == VideoCodec::Hevc
+                && profile.transport == transport
+                && benchmark_mode_matches(profile.stream_mode, stream_mode)
+        })
+        .map_or(requested_bitrate_bps, |profile| profile.bitrate_bps)
+}
+
+fn effective_idr_interval(
+    stream_mode: StreamMode,
+    wss_active: bool,
+    benchmark_gop_seconds: Option<u8>,
+) -> Duration {
+    benchmark_gop_seconds
+        .map(|seconds| Duration::from_secs(u64::from(seconds)))
+        .unwrap_or_else(|| {
+            if wss_active {
+                wss_gop_interval(stream_mode)
+            } else {
+                IDR_INTERVAL
+            }
+        })
+}
+
+fn advance_benchmark_profile_revision(current: u64, effective_profile_changed: bool) -> u64 {
+    if effective_profile_changed {
+        current.wrapping_add(1).max(1)
+    } else {
+        current
+    }
+}
+
+fn new_benchmark_roi_activity(profile: &benchmark::BenchmarkProfile) -> Option<BenchRoiActivity> {
+    let mode = match profile.effective_roi_mode() {
+        BenchmarkRoiMode::Off => return None,
+        BenchmarkRoiMode::Damage => "damage",
+        BenchmarkRoiMode::TextEdge => "text-edge",
+        BenchmarkRoiMode::Feedback => return Some(BenchRoiActivity::feedback()),
+        BenchmarkRoiMode::FeedbackHeadroom => return Some(BenchRoiActivity::feedback_headroom()),
+    };
+    Some(BenchRoiActivity {
+        mode: mode.into(),
+        ..BenchRoiActivity::default()
+    })
+}
+
+fn new_benchmark_hybrid_activity(
+    profile: &benchmark::BenchmarkProfile,
+) -> Option<BenchHybridActivity> {
+    let mode = match profile.hybrid_mode {
+        BenchmarkHybridMode::PngQuiescentDetail => "png-quiescent-detail",
+        BenchmarkHybridMode::HevcQuiescentTiles => "hevc-quiescent-tiles",
+        _ => return None,
+    };
+    Some(BenchHybridActivity {
+        mode: mode.into(),
+        ..BenchHybridActivity::default()
+    })
+}
+
+fn record_benchmark_hybrid_plan(
+    window: &mut Option<BenchHybridActivity>,
+    analysis_samples_us: &mut Vec<u32>,
+    plan: &QuiescentTilePlan,
+    damage_empty: bool,
+    analysis_us: u32,
+) {
+    let Some(window) = window.as_mut() else {
+        return;
+    };
+    window.frames = window.frames.saturating_add(1);
+    window.history_resets = window
+        .history_resets
+        .saturating_add(u64::from(plan.clear && !plan.history_preserved));
+    window.history_preserved_frames = window
+        .history_preserved_frames
+        .saturating_add(u64::from(plan.history_preserved));
+    window.motion_bypasses = window
+        .motion_bypasses
+        .saturating_add(u64::from(plan.motion_bypass));
+    window.crop_remaps = window
+        .crop_remaps
+        .saturating_add(u64::from(plan.clear && plan.history_preserved));
+    window.cursor_neutral_frames = window.cursor_neutral_frames.saturating_add(u64::from(
+        damage_empty && !plan.clear && plan.invalidated.is_empty() && plan.candidates.is_empty(),
+    ));
+    window.candidates = window
+        .candidates
+        .saturating_add(plan.candidates.len() as u64);
+    window.reissued_tiles = window
+        .reissued_tiles
+        .saturating_add(if plan.history_preserved {
+            plan.candidates.len() as u64
+        } else {
+            0
+        });
+    window.invalidations = window
+        .invalidations
+        .saturating_add(plan.invalidated.len() as u64);
+    analysis_samples_us.push(analysis_us);
+    let mut ordered = analysis_samples_us.clone();
+    ordered.sort_unstable();
+    let p95_index = ordered
+        .len()
+        .saturating_mul(95)
+        .div_ceil(100)
+        .saturating_sub(1);
+    window.analysis_p95_us = ordered.get(p95_index).copied();
+    window.analysis_max_us = ordered.last().copied();
+}
+
+fn record_benchmark_hybrid_validation(
+    window: &mut Option<BenchHybridActivity>,
+    submit_samples_us: &mut Vec<u32>,
+    collect_samples_us: &mut Vec<u32>,
+    deferred_age_samples_frames: &mut Vec<u32>,
+    submit_us: u32,
+    collect_us: u32,
+    status: QuiescentValidationStatus,
+    deferred: &DeferredReadbackActivity,
+    damage_audit: Option<DamageCoverageAudit>,
+    sequence: u32,
+) {
+    let Some(window) = window.as_mut() else {
+        return;
+    };
+    window.validation_frames = window.validation_frames.saturating_add(1);
+    window.validation_unavailable_frames = window
+        .validation_unavailable_frames
+        .saturating_add(u64::from(status == QuiescentValidationStatus::Unavailable));
+    window.validation_failed_frames = window
+        .validation_failed_frames
+        .saturating_add(u64::from(status == QuiescentValidationStatus::Failed));
+    window.last_validation_sequence = Some(sequence);
+    window.deferred_validation_ready_frames = window
+        .deferred_validation_ready_frames
+        .saturating_add(deferred.ready_ages_frames.len() as u64);
+    window.deferred_validation_pending_frames = window
+        .deferred_validation_pending_frames
+        .saturating_add(u64::from(deferred.pending_frames));
+    if let Some(pending_age) = deferred.max_pending_age_frames {
+        window.deferred_validation_pending_max_age_frames = Some(
+            window
+                .deferred_validation_pending_max_age_frames
+                .map_or(pending_age, |current| current.max(pending_age)),
+        );
+    }
+    deferred_age_samples_frames.extend_from_slice(&deferred.ready_ages_frames);
+    deferred_age_samples_frames.sort_unstable();
+    let deferred_p95 = deferred_age_samples_frames
+        .len()
+        .saturating_mul(95)
+        .div_ceil(100)
+        .saturating_sub(1);
+    window.deferred_validation_age_p95_frames =
+        deferred_age_samples_frames.get(deferred_p95).copied();
+    window.deferred_validation_age_max_frames = deferred_age_samples_frames.last().copied();
+
+    if let Some(audit) = damage_audit {
+        window.damage_audit_frames = window.damage_audit_frames.saturating_add(1);
+        window.damage_audit_metadata_unavailable_frames = window
+            .damage_audit_metadata_unavailable_frames
+            .saturating_add(u64::from(!audit.metadata_available));
+        window.damage_audit_changed_ctbs = window
+            .damage_audit_changed_ctbs
+            .saturating_add(u64::from(audit.changed_ctbs));
+        window.damage_audit_covered_ctbs = window
+            .damage_audit_covered_ctbs
+            .saturating_add(u64::from(audit.covered_ctbs));
+        window.damage_audit_missed_ctbs = window
+            .damage_audit_missed_ctbs
+            .saturating_add(u64::from(audit.missed_ctbs));
+    }
+
+    submit_samples_us.push(submit_us);
+    submit_samples_us.sort_unstable();
+    let submit_p95 = submit_samples_us
+        .len()
+        .saturating_mul(95)
+        .div_ceil(100)
+        .saturating_sub(1);
+    window.validation_submit_p95_us = submit_samples_us.get(submit_p95).copied();
+    window.validation_submit_max_us = submit_samples_us.last().copied();
+
+    collect_samples_us.push(collect_us);
+    collect_samples_us.sort_unstable();
+    let collect_p95 = collect_samples_us
+        .len()
+        .saturating_mul(95)
+        .div_ceil(100)
+        .saturating_sub(1);
+    window.validation_collect_p95_us = collect_samples_us.get(collect_p95).copied();
+    window.validation_collect_max_us = collect_samples_us.last().copied();
+}
+
+const fn quiescent_transition_followup_needed(
+    output_changed: bool,
+    upserts: usize,
+    budget_skipped_upserts: usize,
+    suppressed_tiles: usize,
+) -> bool {
+    suppressed_tiles > 0 || (output_changed && (upserts > 0 || budget_skipped_upserts > 0))
+}
+
+fn coalesce_quiescent_cache_round_trips(operations: &mut Vec<HybridTileOperation>) {
+    let mut suppress_index = 0usize;
+    while suppress_index < operations.len() {
+        let Some((tile_id, content_revision, validation_sequence)) =
+            (match &operations[suppress_index] {
+                HybridTileOperation::Suppress {
+                    tile_id,
+                    content_revision,
+                    validation_sequence,
+                } => Some((*tile_id, *content_revision, *validation_sequence)),
+                _ => None,
+            })
+        else {
+            suppress_index += 1;
+            continue;
+        };
+        let matching_reactivation = operations
+            .iter()
+            .enumerate()
+            .skip(suppress_index + 1)
+            .find_map(|(index, operation)| match operation {
+                HybridTileOperation::Reactivate {
+                    tile_id: candidate_tile_id,
+                    content_revision: candidate_content_revision,
+                    validation_sequence: candidate_validation_sequence,
+                } if (
+                    *candidate_tile_id,
+                    *candidate_content_revision,
+                    *candidate_validation_sequence,
+                ) == (tile_id, content_revision, validation_sequence) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            });
+        if let Some(reactivation_index) = matching_reactivation {
+            operations.remove(reactivation_index);
+            operations.remove(suppress_index);
+        } else {
+            suppress_index += 1;
+        }
+    }
+}
+
+const fn quiescent_transition_upsert_allowed(
+    output_changed: bool,
+    successful_upserts: usize,
+) -> bool {
+    !output_changed || successful_upserts == 0
+}
+
+fn recover_quiescent_after_unsubmitted_frame(
+    planner: &mut QuiescentTilePlanner,
+    wire_budget: &mut HybridWireBudget,
+) {
+    planner.reset();
+    wire_budget.reset();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleSnapshotCompletionOrder {
+    None,
+    Acknowledge,
+    Request,
+    AcknowledgeThenRequest,
+}
+
+const fn idle_snapshot_completion_order(
+    acknowledge_current: bool,
+    request_followup: bool,
+) -> IdleSnapshotCompletionOrder {
+    match (acknowledge_current, request_followup) {
+        (false, false) => IdleSnapshotCompletionOrder::None,
+        (true, false) => IdleSnapshotCompletionOrder::Acknowledge,
+        (false, true) => IdleSnapshotCompletionOrder::Request,
+        (true, true) => IdleSnapshotCompletionOrder::AcknowledgeThenRequest,
+    }
+}
+
+fn record_benchmark_roi_activity(
+    window: &mut Option<BenchRoiActivity>,
+    frame: RoiMapTelemetry,
+    sequence: Option<u32>,
+) {
+    let Some(window) = window.as_mut() else {
+        return;
+    };
+    window.evaluated_frames = window.evaluated_frames.saturating_add(1);
+    match frame.reason {
+        RoiMapReason::Applied => {
+            window.mapped_frames = window.mapped_frames.saturating_add(1);
+        }
+        RoiMapReason::MissingDamage => {
+            window.missing_damage_frames = window.missing_damage_frames.saturating_add(1);
+        }
+        RoiMapReason::EmptyDamage => {
+            window.empty_damage_frames = window.empty_damage_frames.saturating_add(1);
+        }
+        RoiMapReason::Idr => {
+            window.idr_frames = window.idr_frames.saturating_add(1);
+        }
+        RoiMapReason::CoverageAtLeastHalf => {
+            window.coverage_rejected_frames = window.coverage_rejected_frames.saturating_add(1);
+        }
+        RoiMapReason::UnsupportedEncoderState => {
+            window.unsupported_frames = window.unsupported_frames.saturating_add(1);
+        }
+    }
+    window.last_sequence = sequence;
+    window.last_reason = Some(frame.reason.label().into());
+    window.last_changed_ctbs = Some(frame.changed_ctbs);
+    window.last_total_ctbs = Some(frame.total_ctbs);
+    window.last_min_delta = frame.min_delta;
+    window.last_max_delta = frame.max_delta;
+}
+
+fn lab_roi_trace(frame: Option<RoiMapTelemetry>) -> Option<LabRoiTrace> {
+    frame.map(|frame| LabRoiTrace {
+        reason: match frame.reason {
+            RoiMapReason::Applied => LabRoiReason::Applied,
+            RoiMapReason::MissingDamage => LabRoiReason::MissingDamage,
+            RoiMapReason::EmptyDamage => LabRoiReason::EmptyDamage,
+            RoiMapReason::Idr => LabRoiReason::Idr,
+            RoiMapReason::CoverageAtLeastHalf => LabRoiReason::CoverageAtLeastHalf,
+            RoiMapReason::UnsupportedEncoderState => LabRoiReason::UnsupportedEncoderState,
+        },
+        changed_ctbs: frame.changed_ctbs.min(u32::from(u16::MAX)) as u16,
+        total_ctbs: frame.total_ctbs.min(u32::from(u16::MAX)) as u16,
+    })
+}
+
+fn record_benchmark_temporal_activity(
+    window: &mut Option<BenchRoiActivity>,
+    analysis_samples_us: &mut Vec<u32>,
+    frame: &TemporalDiffResult,
+    sequence: Option<u32>,
+) {
+    let Some(window) = window.as_mut() else {
+        return;
+    };
+    let (changed_ctbs, total_ctbs) = match &frame.decision {
+        TemporalMaskDecision::Applied {
+            changed_ctbs,
+            total_ctbs,
+            ..
+        }
+        | TemporalMaskDecision::Rejected {
+            changed_ctbs,
+            total_ctbs,
+            ..
+        } => (*changed_ctbs, *total_ctbs),
+    };
+    window.source = Some("gpu-temporal".into());
+    window.temporal_frames = window.temporal_frames.saturating_add(1);
+    if frame.priming {
+        window.temporal_priming_frames = window.temporal_priming_frames.saturating_add(1);
+    }
+    analysis_samples_us.push(frame.analysis_us);
+    let mut ordered = analysis_samples_us.clone();
+    ordered.sort_unstable();
+    let p95_index = ordered
+        .len()
+        .saturating_mul(95)
+        .div_ceil(100)
+        .saturating_sub(1);
+    window.analysis_p95_us = ordered.get(p95_index).copied();
+    window.analysis_max_us = ordered.last().copied();
+    window.last_sequence = sequence;
+    window.last_changed_ctbs = Some(changed_ctbs);
+    window.last_total_ctbs = Some(total_ctbs);
+}
+
+fn add_feedback_count(field: &mut Option<u64>, amount: u64) {
+    *field = Some(field.unwrap_or(0).saturating_add(amount));
+}
+
+fn record_feedback_timing(
+    samples: &mut Vec<u32>,
+    p95: &mut Option<u32>,
+    max: &mut Option<u32>,
+    elapsed_us: u32,
+) {
+    samples.push(elapsed_us);
+    let mut ordered = samples.clone();
+    ordered.sort_unstable();
+    let p95_index = ordered
+        .len()
+        .saturating_mul(95)
+        .div_ceil(100)
+        .saturating_sub(1);
+    *p95 = ordered.get(p95_index).copied();
+    *max = ordered.last().copied();
+}
+
+fn record_benchmark_feedback_plan(
+    window: &mut Option<BenchRoiActivity>,
+    wire_occupancy_samples_bps: &mut Vec<u64>,
+    plan: &FeedbackPlan,
+    wire_decision: Option<FeedbackWireDecision>,
+) {
+    let Some(window) = window.as_mut() else {
+        return;
+    };
+    match plan.reason {
+        FeedbackPlanReason::Applied => {
+            add_feedback_count(&mut window.feedback_adjusted_frames, 1);
+            add_feedback_count(
+                &mut window.feedback_eligible_ctbs,
+                u64::from(plan.eligible_ctbs),
+            );
+            add_feedback_count(
+                &mut window.feedback_refined_ctbs,
+                u64::from(plan.refined_ctbs),
+            );
+            add_feedback_count(
+                &mut window.feedback_funded_ctbs,
+                u64::from(plan.funded_ctbs),
+            );
+            if let Some(decision) = wire_decision {
+                match decision.policy {
+                    FeedbackBudgetPolicy::NetZero => {
+                        add_feedback_count(&mut window.feedback_net_zero_frames, 1)
+                    }
+                    FeedbackBudgetPolicy::SpendHeadroom => {
+                        add_feedback_count(&mut window.feedback_spend_headroom_frames, 1)
+                    }
+                }
+                wire_occupancy_samples_bps.push(decision.occupancy_bps);
+                let mut ordered = wire_occupancy_samples_bps.clone();
+                ordered.sort_unstable();
+                let p95_index = ordered
+                    .len()
+                    .saturating_mul(95)
+                    .div_ceil(100)
+                    .saturating_sub(1);
+                window.feedback_wire_occupancy_p95_bps = ordered.get(p95_index).copied();
+                window.feedback_wire_occupancy_max_bps = ordered.last().copied();
+                window.last_feedback_budget_policy = Some(
+                    match decision.policy {
+                        FeedbackBudgetPolicy::NetZero => "net-zero",
+                        FeedbackBudgetPolicy::SpendHeadroom => "spend-headroom",
+                    }
+                    .into(),
+                );
+                window.last_feedback_wire_occupancy_bps = Some(decision.occupancy_bps);
+            }
+        }
+        FeedbackPlanReason::Warmup => {
+            add_feedback_count(&mut window.feedback_warmup_frames, 1);
+        }
+        FeedbackPlanReason::MotionBypass => {
+            add_feedback_count(&mut window.feedback_motion_bypasses, 1);
+        }
+        FeedbackPlanReason::MissingFeedback
+        | FeedbackPlanReason::EmptyDetail
+        | FeedbackPlanReason::IdrReset => {}
+    }
+}
+
+fn record_benchmark_feedback_submission(
+    window: &mut Option<BenchRoiActivity>,
+    samples: &mut Vec<u32>,
+    submission: ReconstructionFeedbackSubmission,
+) {
+    let Some(window) = window.as_mut() else {
+        return;
+    };
+    if submission.submitted {
+        add_feedback_count(&mut window.feedback_submitted_frames, 1);
+        record_feedback_timing(
+            samples,
+            &mut window.feedback_submit_p95_us,
+            &mut window.feedback_submit_max_us,
+            submission.submit_us,
+        );
+    } else {
+        add_feedback_count(&mut window.feedback_skipped_frames, 1);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemporalReadbackPolicy {
+    Deferred,
+    Aligned,
+}
+
+fn temporal_readback_policy(
+    static_hybrid_enabled: bool,
+    _feedback_roi_enabled: bool,
+) -> TemporalReadbackPolicy {
+    if static_hybrid_enabled {
+        TemporalReadbackPolicy::Aligned
+    } else {
+        TemporalReadbackPolicy::Deferred
+    }
+}
+
+fn record_benchmark_stage(stage: &mut BenchStageTiming, count: u32, elapsed_us: u64) {
+    if count == 0 {
+        return;
+    }
+    stage.count = stage.count.saturating_add(u64::from(count));
+    stage.total_us = stage.total_us.saturating_add(elapsed_us);
+    stage.max_us = stage.max_us.max(elapsed_us.min(u64::from(u32::MAX)) as u32);
+}
+
+fn record_benchmark_encode_stages(window: &mut BenchEncodeStages, frame: EncodeStageTimings) {
+    window.frames = window.frames.saturating_add(1);
+    record_benchmark_stage(
+        &mut window.register,
+        frame.register_calls,
+        frame.register_us,
+    );
+    record_benchmark_stage(&mut window.map, 1, frame.map_us);
+    record_benchmark_stage(&mut window.submit, 1, frame.submit_us);
+    record_benchmark_stage(&mut window.lock, 1, frame.lock_us);
+    record_benchmark_stage(&mut window.copy, 1, frame.copy_us);
+    record_benchmark_stage(&mut window.unmap, 1, frame.unmap_us);
+    record_benchmark_stage(
+        &mut window.unregister,
+        frame.unregister_calls,
+        frame.unregister_us,
+    );
+}
+
+fn should_reset_lab_encoder_for_keyframe(
+    enabled: bool,
+    action: &str,
+    reason: Option<&str>,
+) -> bool {
+    enabled && action == "keyframe" && reason == Some("stream-lab-quality-capture")
+}
+
+fn valid_lab_quality_request_id(value: &str) -> bool {
+    (8..=96).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn lab_quality_keyframe_request<'a>(
+    action: &str,
+    reason: Option<&str>,
+    request_id: Option<&'a str>,
+) -> Option<&'a str> {
+    if action != "keyframe" || reason != Some("stream-lab-quality-capture") {
+        return None;
+    }
+    request_id.filter(|value| valid_lab_quality_request_id(value))
+}
+
+fn benchmark_status_retry_delay(status_sent: bool) -> Duration {
+    if status_sent {
+        Duration::from_secs(1)
+    } else {
+        Duration::ZERO
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WssAdjustment {
+    mode: VideoMode,
+    target_bps: u32,
+    reason: &'static str,
+}
+
+#[derive(Debug)]
+struct WssQualityController {
+    generation: Option<u32>,
+    last_sample: Instant,
+    last_recovered: u64,
+    last_dependency_losses: u64,
+    last_decoder_drops: u64,
+    last_lanes: [u32; 4],
+    lane_progress_at: [Instant; 4],
+    last_reconstructed: u32,
+    unhealthy_since: Option<Instant>,
+    floor_since: Option<Instant>,
+    clean_since: Option<Instant>,
+    last_bitrate_change: Instant,
+    upgrade_blocked_until: Instant,
+    last_preencode_skips: u64,
+    preencode_pressure_until: Option<Instant>,
+}
+
+impl WssQualityController {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_sample: now,
+            last_recovered: 0,
+            last_dependency_losses: 0,
+            last_decoder_drops: 0,
+            generation: None,
+            last_lanes: [0; 4],
+            lane_progress_at: [now; 4],
+            last_reconstructed: 0,
+            unhealthy_since: None,
+            floor_since: None,
+            clean_since: None,
+            last_bitrate_change: now,
+            upgrade_blocked_until: now,
+            last_preencode_skips: 0,
+            preencode_pressure_until: None,
+        }
+    }
+    fn observe_preencode_skips(&mut self, now: Instant, total: u64) {
+        if total > self.last_preencode_skips {
+            self.last_preencode_skips = total;
+            self.preencode_pressure_until = Some(now + Duration::from_millis(600));
+        }
+    }
+    fn sample(
+        &mut self,
+        now: Instant,
+        generation: u32,
+        quality: &Controller,
+        profiles: &ProfileTransition,
+        lanes: [u32; 4],
+        reconstructed: u32,
+        presented: u32,
+        recovered: u64,
+        dependency_losses: u64,
+        decoder_drops: u64,
+    ) -> Option<WssAdjustment> {
+        if self.generation != Some(generation) {
+            self.generation = Some(generation);
+            self.last_lanes = [0; 4];
+            self.lane_progress_at = [now; 4];
+            self.last_reconstructed = 0;
+            self.last_recovered = recovered;
+            self.last_dependency_losses = dependency_losses;
+            self.last_decoder_drops = decoder_drops;
+            self.unhealthy_since = None;
+            self.floor_since = None;
+            self.clean_since = None;
+        }
+        for index in 0..lanes.len() {
+            if lanes[index] != self.last_lanes[index]
+                && sequence_reached(lanes[index], self.last_lanes[index])
+            {
+                self.lane_progress_at[index] = now;
+            }
+        }
+        // ACKs are batched and four TCP lanes naturally report at different
+        // instants. Judge lane health over a real window, never one message.
+        let healthy_lanes = self
+            .lane_progress_at
+            .iter()
+            .filter(|&&at| now.saturating_duration_since(at) <= Duration::from_secs(2))
+            .count();
+        let stream_progressed = reconstructed != self.last_reconstructed
+            && sequence_reached(reconstructed, self.last_reconstructed);
+        let presentation_lag = reconstructed.wrapping_sub(presented);
+        let presentation_backlogged = presentation_lag < (1 << 31) && presentation_lag > 4;
+        let preencode_pressure = self
+            .preencode_pressure_until
+            .is_some_and(|until| now <= until);
+        let emergency = dependency_losses > self.last_dependency_losses
+            || decoder_drops > self.last_decoder_drops
+            || presentation_backlogged
+            || preencode_pressure;
+        // Reconstructing from parity is a successful delivery, not loss. It is
+        // intentionally diagnostic only; expiry/backlog/decoder drops are the
+        // signals that the recovered stream failed to stay healthy.
+        let degraded = stream_progressed && healthy_lanes < 3;
+        let unhealthy = emergency || degraded;
+        self.last_sample = now;
+        self.last_recovered = recovered;
+        self.last_dependency_losses = dependency_losses;
+        self.last_lanes = lanes;
+        self.last_reconstructed = reconstructed;
+        self.last_decoder_drops = decoder_drops;
+        if unhealthy {
+            self.clean_since = None;
+            let since = self.unhealthy_since.get_or_insert(now);
+            let stream_mode = profiles.stream_mode();
+            let floor = wss_mode_range(profiles.active, stream_mode).0;
+            if quality.target() <= floor {
+                self.floor_since.get_or_insert(now);
+            }
+            let bitrate_hold = Duration::from_secs(match stream_mode {
+                StreamMode::Work => 8,
+                StreamMode::Game => 3,
+            });
+            if now.duration_since(*since) >= bitrate_hold {
+                let target = (quality.target().saturating_mul(85) / 100).max(floor);
+                if target < quality.target() {
+                    self.unhealthy_since = None;
+                    self.last_bitrate_change = now;
+                    self.upgrade_blocked_until = now
+                        + Duration::from_secs(match stream_mode {
+                            StreamMode::Work => 60,
+                            StreamMode::Game => 30,
+                        });
+                    self.floor_since = None;
+                    return Some(WssAdjustment {
+                        mode: profiles.active,
+                        target_bps: target,
+                        reason: "wss-congestion",
+                    });
+                }
+                if self.floor_since.is_some_and(|floor_since| {
+                    now.duration_since(floor_since)
+                        >= Duration::from_secs(match stream_mode {
+                            StreamMode::Work => 12,
+                            StreamMode::Game => 6,
+                        })
+                }) {
+                    let mode = wss_mode_down(profiles.active, stream_mode);
+                    if mode != profiles.active {
+                        self.floor_since = None;
+                        self.unhealthy_since = None;
+                        self.clean_since = None;
+                        self.upgrade_blocked_until = now
+                            + Duration::from_secs(match stream_mode {
+                                StreamMode::Work => 60,
+                                StreamMode::Game => 30,
+                            });
+                        return Some(WssAdjustment {
+                            mode,
+                            target_bps: wss_mode_range(mode, stream_mode).1.min(quality.target()),
+                            reason: "wss-sustained-down",
+                        });
+                    }
+                }
+            }
+            return None;
+        }
+        self.unhealthy_since = None;
+        self.floor_since = None;
+        let clean = self.clean_since.get_or_insert(now);
+        if now >= self.upgrade_blocked_until
+            && now.duration_since(*clean)
+                >= Duration::from_secs(match profiles.stream_mode() {
+                    StreamMode::Work => 20,
+                    StreamMode::Game => 10,
+                })
+            && now.duration_since(self.last_bitrate_change) >= Duration::from_secs(10)
+        {
+            let ceiling = wss_mode_range(profiles.active, profiles.stream_mode()).1;
+            let target = (quality.target().saturating_mul(110) / 100).min(ceiling);
+            if target > quality.target() {
+                self.last_bitrate_change = now;
+                return Some(WssAdjustment {
+                    mode: profiles.active,
+                    target_bps: target,
+                    reason: "wss-probe",
+                });
+            }
+        }
+        if now >= self.upgrade_blocked_until
+            && now.duration_since(*clean)
+                >= Duration::from_secs(match profiles.stream_mode() {
+                    StreamMode::Work => 60,
+                    StreamMode::Game => 30,
+                })
+        {
+            let mode = wss_mode_up(profiles.active, profiles.stream_mode());
+            if mode != profiles.active
+                && quality.target() >= wss_mode_range(mode, profiles.stream_mode()).0
+            {
+                self.clean_since = None;
+                return Some(WssAdjustment {
+                    mode,
+                    target_bps: quality
+                        .target()
+                        .max(wss_mode_range(mode, profiles.stream_mode()).0),
+                    reason: "wss-stable-up",
+                });
+            }
+        }
+        None
+    }
+}
+
+fn wss_codec(codec: VideoCodec) -> MediaCodec {
+    match codec {
+        VideoCodec::Hevc => MediaCodec::Hevc,
+        VideoCodec::H264 => MediaCodec::H264,
+    }
+}
+
+fn parse_media_codec(value: Option<&str>) -> Option<VideoCodec> {
+    match value {
+        Some("hevc") => Some(VideoCodec::Hevc),
+        Some("h264") => Some(VideoCodec::H264),
+        _ => None,
+    }
+}
+
+fn valid_v2_epoch(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn should_replace_wss_media_session(
+    has_active_media: bool,
+    active_epoch: Option<&str>,
+    requested_epoch: &str,
+) -> bool {
+    has_active_media && active_epoch != Some(requested_epoch)
+}
+
+fn valid_monitor_refresh_control(
+    protocol: Option<u8>,
+    epoch: Option<&str>,
+    _active_wss_epoch: Option<&str>,
+) -> bool {
+    matches!(protocol, Some(2 | 3)) && epoch.is_some_and(valid_v2_epoch)
+}
+
+fn valid_stripe_reconnect_recovery_control(
+    action: &str,
+    reason: Option<&str>,
+    protocol: Option<u8>,
+    epoch: Option<&str>,
+    active_wss_epoch: Option<&str>,
+) -> bool {
+    action == "keyframe"
+        && reason == Some("stripe-reconnect")
+        && protocol == Some(3)
+        && epoch.is_some_and(|value| {
+            valid_v2_epoch(value) && active_wss_epoch.is_some_and(|active| active == value)
+        })
+}
+
+fn accept_session_codec(current: VideoCodec, requested: VideoCodec) -> bool {
+    current == requested || matches!((current, requested), (VideoCodec::Hevc, VideoCodec::H264))
+}
+
+struct WssAckRate {
+    generation: u32,
+    pending: BTreeMap<u32, usize>,
+    window_started: Instant,
+    acked_bytes: u64,
+}
+
+impl WssAckRate {
+    fn new(now: Instant) -> Self {
+        Self {
+            generation: 0,
+            pending: BTreeMap::new(),
+            window_started: now,
+            acked_bytes: 0,
+        }
+    }
+    fn submitted(&mut self, generation: u32, sequence: u32, bytes: usize) {
+        if generation != self.generation {
+            self.generation = generation;
+            self.pending.clear();
+            self.acked_bytes = 0;
+            self.window_started = Instant::now();
+        }
+        self.pending.insert(sequence, bytes);
+        while self.pending.len() > 256 {
+            if let Some(oldest) = self.pending.keys().next().copied() {
+                self.pending.remove(&oldest);
+            }
+        }
+    }
+    fn acknowledged(&mut self, now: Instant, generation: u32, sequence: u32) -> Option<u32> {
+        if generation != self.generation {
+            return None;
+        }
+        let acknowledged: Vec<u32> = self
+            .pending
+            .range(..=sequence)
+            .map(|(&key, _)| key)
+            .collect();
+        if acknowledged.is_empty() {
+            return None;
+        }
+        for key in acknowledged {
+            if let Some(bytes) = self.pending.remove(&key) {
+                self.acked_bytes = self.acked_bytes.saturating_add(bytes as u64);
+            }
+        }
+        let elapsed = now.duration_since(self.window_started);
+        if elapsed < Duration::from_secs(1) {
+            return None;
+        }
+        let bps = ((self.acked_bytes as f64 * 8.0) / elapsed.as_secs_f64()) as u64;
+        self.window_started = now;
+        self.acked_bytes = 0;
+        Some(bps.min(u32::MAX as u64) as u32)
+    }
+}
+
+/// WSS ACK throughput is capped by the bytes the encoder chose to produce, so
+/// it is not a direct bandwidth estimate. The adaptive controller keeps 20%
+/// headroom (`target = capacity * 0.8`); report at least the inverse of the
+/// current target or that headroom would recursively reduce the target even
+/// while every submitted frame is arriving.
+fn wss_capacity_observation(delivery_bps: u32, encoder_target_bps: u32) -> u32 {
+    let target_with_headroom = (encoder_target_bps as u64)
+        .saturating_mul(5)
+        .div_ceil(4)
+        .min(u32::MAX as u64) as u32;
+    delivery_bps.max(target_with_headroom)
+}
+
+/// Poll the one-shot idle snapshot state only after a peer can receive it.
+/// The capture state remains authoritative after an IDR is cached because
+/// viewport transitions can explicitly re-arm one activation frame.
+fn should_snapshot_idle_desktop(ice_connected: bool, _latest_idr_missing: bool) -> bool {
+    ice_connected
+}
+
+#[derive(Debug, Default)]
+struct WssRecoverySnapshotGate {
+    last_request: Option<Instant>,
+}
+
+impl WssRecoverySnapshotGate {
+    fn should_request(
+        &mut self,
+        now: Instant,
+        needs_recovery_idr: bool,
+        awaiting_recovery_ack: bool,
+        retry_interval: Duration,
+    ) -> bool {
+        if !needs_recovery_idr && !awaiting_recovery_ack {
+            self.last_request = None;
+            return false;
+        }
+        if !needs_recovery_idr {
+            return false;
+        }
+        if self
+            .last_request
+            .is_some_and(|requested| now.duration_since(requested) < retry_interval)
+        {
+            return false;
+        }
+        self.last_request = Some(now);
+        true
+    }
+}
+
+fn capture_admission_ready(
+    capture_available: bool,
+    privileged_probe_allowed: bool,
+    negotiation_active: bool,
+    ice_connected: bool,
+    wss_active: bool,
+    rtc_reserved: bool,
+    prewarm_needed: bool,
+) -> bool {
+    (capture_available || privileged_probe_allowed)
+        && (wss_active
+            || (ice_connected && rtc_reserved)
+            || (negotiation_active && !ice_connected && prewarm_needed))
+}
+
+fn privileged_no_frame_retry_delay(capture_available: bool) -> Duration {
+    if capture_available {
+        Duration::from_millis(1)
+    } else {
+        Duration::from_millis(250)
+    }
+}
+
+fn encoder_benchmark_contract_changed(
+    encoder_available: bool,
+    applied_profile_revision: Option<u64>,
+    desired_profile_revision: Option<u64>,
+) -> bool {
+    encoder_available && applied_profile_revision != desired_profile_revision
+}
+
+fn producer_poll_interval(media_demand_active: bool) -> Duration {
+    if media_demand_active {
+        Duration::from_millis(1)
+    } else {
+        Duration::from_secs(1)
+    }
+}
+
+fn frame_admission_due(
+    now: Instant,
+    next_admission: Instant,
+    frame_interval: Duration,
+    urgent: bool,
+) -> bool {
+    urgent
+        || now
+            .checked_add(frame_interval / 2)
+            .is_none_or(|nearest| nearest >= next_admission)
+}
+
+fn advance_frame_deadline(previous: Instant, now: Instant, frame_interval: Duration) -> Instant {
+    let scheduled = previous.checked_add(frame_interval).unwrap_or(now);
+    if scheduled
+        .checked_add(frame_interval)
+        .is_some_and(|stale| stale < now)
+    {
+        now.checked_add(frame_interval).unwrap_or(now)
+    } else {
+        scheduled
+    }
+}
 
 /// Bounded policy for replaying the latest IDR when desktop duplication has
 /// no new presents. It never schedules a stream of static frames.
@@ -73,6 +1164,37 @@ impl VideoMode {
             fps,
         }
     }
+    fn for_stream(profile: Profile, mode: StreamMode) -> Self {
+        let (width, height) = match profile {
+            Profile::Mobile => (854, 480),
+            Profile::Low => (960, 540),
+            Profile::Balanced => (1280, 720),
+            Profile::Full => (1920, 1080),
+        };
+        let fps = match (mode, profile) {
+            (_, Profile::Mobile) => 24,
+            (StreamMode::Work, Profile::Low) => 24,
+            (StreamMode::Work, _) => 30,
+            (StreamMode::Game, Profile::Low) => 30,
+            (StreamMode::Game, Profile::Balanced | Profile::Full) => 60,
+        };
+        let label = match (profile, fps) {
+            (Profile::Mobile, _) => "480p24",
+            (Profile::Low, 24) => "540p24",
+            (Profile::Low, _) => "540p30",
+            (Profile::Balanced, 60) => "720p60",
+            (Profile::Balanced, _) => "720p30",
+            (Profile::Full, 30) => "1080p30",
+            (Profile::Full, _) => "1080p60",
+        };
+        Self {
+            profile,
+            label,
+            width,
+            height,
+            fps,
+        }
+    }
     fn native(width: u32, height: u32, fps: u32) -> Self {
         Self {
             profile: Profile::Full,
@@ -89,11 +1211,108 @@ struct ProfileTransition {
     announced: Option<VideoMode>,
     announcement_reason: &'static str,
     pinned: bool,
+    stream_mode: Option<StreamMode>,
 }
 
 struct CachedIdr {
     data: Vec<u8>,
     mode: VideoMode,
+}
+
+/// A profile IDR has been encoded and accepted by the one-slot AU queue, but
+/// is not applied until the transport confirms that exact AU reached str0m.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSubmittedIdr {
+    id: u64,
+    mode: VideoMode,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingWssIdr {
+    generation: u32,
+    sequence: u32,
+    mode: VideoMode,
+    reason: &'static str,
+}
+
+fn sequence_reached(current: u32, target: u32) -> bool {
+    current.wrapping_sub(target) < (1 << 31)
+}
+
+fn next_media_sequence(current: u32) -> u32 {
+    current.wrapping_add(1)
+}
+
+fn commit_media_sequence(current: &mut u32, admitted: u32) {
+    *current = admitted;
+}
+
+fn take_matching_transition(
+    pending: &mut Option<PendingSubmittedIdr>,
+    id: u64,
+) -> Option<PendingSubmittedIdr> {
+    pending
+        .as_ref()
+        .is_some_and(|candidate| candidate.id == id)
+        .then(|| pending.take())
+        .flatten()
+}
+
+/// Select a recovery contract before touching the encoder.  A usable scaler
+/// lets us return to the last *exact* mode; otherwise only the exact capture
+/// dimensions are safe.
+fn fallback_mode(
+    old: VideoMode,
+    native_width: u32,
+    native_height: u32,
+    scaler_available: bool,
+) -> VideoMode {
+    if scaler_available {
+        old
+    } else {
+        VideoMode::native(native_width, native_height, old.fps)
+    }
+}
+
+fn is_fallback_reason(reason: &str) -> bool {
+    reason.ends_with("fallback")
+}
+
+/// Commit only the AU that the transport actually admitted.  Fallbacks become
+/// pinned at that point, never while their IDR is merely queued or encoded.
+fn commit_matching_transition(
+    profiles: &mut ProfileTransition,
+    pending: PendingSubmittedIdr,
+    admitted_id: u64,
+) -> bool {
+    if pending.id != admitted_id {
+        return false;
+    }
+    if is_fallback_reason(pending.reason) {
+        profiles.pinned = true;
+    }
+    profiles.commit_mode(pending.mode, pending.reason);
+    true
+}
+
+fn cached_replay_transition(
+    profiles: &ProfileTransition,
+    cached_mode: VideoMode,
+    id: u64,
+) -> Option<PendingSubmittedIdr> {
+    profiles
+        .staged
+        .filter(|(staged, _)| *staged == cached_mode)
+        .map(|(mode, reason)| PendingSubmittedIdr { id, mode, reason })
+}
+
+fn rejected_transition_requires_recovery(pending: &Option<PendingSubmittedIdr>, id: u64) -> bool {
+    pending.as_ref().is_some_and(|candidate| candidate.id == id)
+}
+
+fn should_forward_offer(ice_connected: bool, offer_accepted: bool, offer_in_flight: bool) -> bool {
+    !ice_connected && !offer_accepted && !offer_in_flight
 }
 
 impl ProfileTransition {
@@ -106,7 +1325,33 @@ impl ProfileTransition {
             announced: None,
             announcement_reason: "startup",
             pinned: false,
+            stream_mode: None,
         }
+    }
+
+    fn new_for_mode(active: Profile, desired: Profile, stream_mode: StreamMode) -> Self {
+        let active = VideoMode::for_stream(active, stream_mode);
+        let desired = VideoMode::for_stream(desired, stream_mode);
+        Self {
+            active,
+            staged: (desired != active).then_some((desired, "startup")),
+            announced: None,
+            announcement_reason: "startup",
+            pinned: false,
+            stream_mode: Some(stream_mode),
+        }
+    }
+
+    fn stream_mode(&self) -> StreamMode {
+        self.stream_mode.unwrap_or(StreamMode::Work)
+    }
+
+    fn set_stream_mode(&mut self, mode: StreamMode) -> bool {
+        self.stream_mode = Some(mode);
+        self.stage_mode(
+            VideoMode::for_stream(self.active.profile, mode),
+            "stream-mode",
+        )
     }
 
     fn active(&self) -> Profile {
@@ -118,9 +1363,6 @@ impl ProfileTransition {
     fn active_fps(&self) -> u32 {
         self.active.fps
     }
-    fn staged_reason(&self) -> Option<&'static str> {
-        self.staged.map(|(_, reason)| reason)
-    }
     fn announced(&self) -> Option<Profile> {
         self.announced.map(|mode| mode.profile)
     }
@@ -131,7 +1373,14 @@ impl ProfileTransition {
     /// Returns true when an unapplied dimension change is now staged. The
     /// caller uses this to invalidate any IDR cached at the old dimensions.
     fn stage(&mut self, desired: Profile, reason: &'static str) -> bool {
-        let desired_mode = VideoMode::rung(desired);
+        let mode = self
+            .stream_mode
+            .map(|stream| VideoMode::for_stream(desired, stream))
+            .unwrap_or_else(|| VideoMode::rung(desired));
+        self.stage_mode(mode, reason)
+    }
+
+    fn stage_mode(&mut self, desired_mode: VideoMode, reason: &'static str) -> bool {
         if self.pinned {
             // A scaler fallback has no trustworthy alternate texture path.
             // Keep the exact native encoder contract until this session ends;
@@ -151,7 +1400,10 @@ impl ProfileTransition {
         self.commit_mode(
             VideoMode {
                 fps,
-                ..VideoMode::rung(profile)
+                ..self
+                    .stream_mode
+                    .map(|stream| VideoMode::for_stream(profile, stream))
+                    .unwrap_or_else(|| VideoMode::rung(profile))
             },
             reason,
         );
@@ -178,6 +1430,174 @@ impl ProfileTransition {
 
     fn on_idr_admitted(&mut self) {
         self.announced = Some(self.active);
+    }
+}
+
+fn wss_full30() -> VideoMode {
+    VideoMode {
+        profile: Profile::Full,
+        label: "1080p30",
+        width: 1920,
+        height: 1080,
+        fps: 30,
+    }
+}
+
+struct PendingFirstFrame {
+    request_id: String,
+    transport: String,
+    epoch: Option<String>,
+    generation: u32,
+    admitted: bool,
+    armed_at: Instant,
+}
+
+impl PendingFirstFrame {
+    /// Bind a WSS startup request to the generation of the first IDR that was
+    /// actually accepted by the current media egress. Viewport and codec
+    /// transitions may legitimately advance the generation after the request
+    /// was armed but before that IDR is queued.
+    fn admit_wss_access_unit(&mut self, generation: u32, is_idr: bool) -> bool {
+        if self.transport != "wss" || self.admitted || !is_idr {
+            return false;
+        }
+        self.generation = generation;
+        self.admitted = true;
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingViewportIdr {
+    generation: u32,
+    sequence: u32,
+    crop: ViewportCrop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewportCrop {
+    revision: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+fn same_viewport_geometry(left: ViewportCrop, right: ViewportCrop) -> bool {
+    left.x == right.x
+        && left.y == right.y
+        && left.width == right.width
+        && left.height == right.height
+}
+
+fn viewport_from_q16(
+    revision: u32,
+    enabled: bool,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    desktop_width: u32,
+    desktop_height: u32,
+) -> Option<ViewportCrop> {
+    if !enabled {
+        return Some(ViewportCrop {
+            revision,
+            x: 0,
+            y: 0,
+            width: desktop_width,
+            height: desktop_height,
+        });
+    }
+    if desktop_width < 320 || desktop_height < 180 || width == 0 || height == 0 {
+        return None;
+    }
+    let to_px =
+        |value: u16, extent: u32| -> u32 { ((value as u64 * extent as u64) / 65535) as u32 };
+    let mut crop = ViewportCrop {
+        revision,
+        x: to_px(x, desktop_width),
+        y: to_px(y, desktop_height),
+        width: to_px(width, desktop_width),
+        height: to_px(height, desktop_height),
+    };
+    crop.width = crop.width.max(320).min(desktop_width);
+    crop.height = crop.height.max(180).min(desktop_height);
+    crop.x = crop.x.min(desktop_width.saturating_sub(crop.width));
+    crop.y = crop.y.min(desktop_height.saturating_sub(crop.height));
+    crop.x &= !1;
+    crop.y &= !1;
+    crop.width &= !1;
+    crop.height &= !1;
+    (crop.width >= 320 && crop.height >= 180).then_some(crop)
+}
+
+fn wss_saver24() -> VideoMode {
+    VideoMode {
+        profile: Profile::Low,
+        label: "540p24",
+        width: 960,
+        height: 540,
+        fps: 24,
+    }
+}
+
+fn wss_preset(value: Option<&str>, max_bps: u32, stream_mode: StreamMode) -> WssAdjustment {
+    let (mode, target_bps) = match value {
+        Some("balanced") => (
+            VideoMode::for_stream(Profile::Balanced, stream_mode),
+            if stream_mode == StreamMode::Game {
+                4_500_000
+            } else {
+                WSS_BALANCED_BITRATE_BPS
+            },
+        ),
+        Some("saver") => (
+            VideoMode::for_stream(Profile::Low, stream_mode),
+            WSS_SAVER_BITRATE_BPS,
+        ),
+        _ => (
+            VideoMode::for_stream(Profile::Full, stream_mode),
+            if stream_mode == StreamMode::Game {
+                8_000_000
+            } else {
+                WSS_HIGH_BITRATE_BPS
+            },
+        ),
+    };
+    WssAdjustment {
+        mode,
+        target_bps: target_bps.min(max_bps),
+        reason: "wss-preset",
+    }
+}
+
+fn wss_mode_range(mode: VideoMode, stream_mode: StreamMode) -> (u32, u32) {
+    match (stream_mode, mode.profile) {
+        (_, Profile::Mobile) => (350_000, 1_000_000),
+        (_, Profile::Low) => (800_000, 2_000_000),
+        (StreamMode::Work, Profile::Balanced) => (1_500_000, 4_000_000),
+        (StreamMode::Work, Profile::Full) => (3_200_000, 8_000_000),
+        (StreamMode::Game, Profile::Balanced) => (3_000_000, 7_000_000),
+        (StreamMode::Game, Profile::Full) => (6_000_000, 12_000_000),
+    }
+}
+
+fn wss_mode_down(mode: VideoMode, stream_mode: StreamMode) -> VideoMode {
+    match mode.profile {
+        Profile::Full => VideoMode::for_stream(Profile::Balanced, stream_mode),
+        Profile::Balanced => VideoMode::for_stream(Profile::Low, stream_mode),
+        Profile::Low => VideoMode::for_stream(Profile::Mobile, stream_mode),
+        Profile::Mobile => mode,
+    }
+}
+
+fn wss_mode_up(mode: VideoMode, stream_mode: StreamMode) -> VideoMode {
+    match mode.profile {
+        Profile::Mobile => VideoMode::for_stream(Profile::Low, stream_mode),
+        Profile::Low => VideoMode::for_stream(Profile::Balanced, stream_mode),
+        Profile::Balanced => VideoMode::for_stream(Profile::Full, stream_mode),
+        Profile::Full => mode,
     }
 }
 
@@ -208,12 +1628,7 @@ fn encoder_mode_for_capture(
     // rung cannot be initialized or reconfigured on this device, so make the
     // actual native contract explicit before any texture or encoder work.
     let native = VideoMode::native(native_width, native_height, candidate.fps);
-    profiles.pin_native(
-        native.width,
-        native.height,
-        native.fps,
-        "native-size-fallback",
-    );
+    profiles.stage_mode(native, "native-size-fallback");
     native
 }
 
@@ -226,8 +1641,9 @@ fn create_encoder_with_fallback(
     fps: u32,
     bitrate_bps: u32,
     requested: Preset,
+    codec: VideoCodec,
 ) -> Result<Nvenc> {
-    Nvenc::new_with_preset_native(
+    Nvenc::new_with_preset_native_codec(
         device,
         width,
         height,
@@ -236,6 +1652,7 @@ fn create_encoder_with_fallback(
         fps,
         bitrate_bps,
         requested,
+        codec,
     )
     .or_else(|first| {
         if matches!(requested, Preset::P3) {
@@ -243,7 +1660,7 @@ fn create_encoder_with_fallback(
                 ?first,
                 width, height, fps, "P3 initialization failed; retrying P1"
             );
-            Nvenc::new_with_preset_native(
+            Nvenc::new_with_preset_native_codec(
                 device,
                 width,
                 height,
@@ -252,11 +1669,185 @@ fn create_encoder_with_fallback(
                 fps,
                 bitrate_bps,
                 Preset::P1,
+                codec,
             )
         } else {
             Err(first)
         }
     })
+}
+
+fn benchmark_encoder_options(profile: &benchmark::BenchmarkProfile) -> EncoderOptions {
+    EncoderOptions {
+        preset: match profile.encoder.preset {
+            BenchmarkPreset::P1 => Preset::P1,
+            BenchmarkPreset::P2 => Preset::P2,
+            BenchmarkPreset::P3 => Preset::P3,
+            BenchmarkPreset::P4 => Preset::P4,
+            BenchmarkPreset::P5 => Preset::P5,
+            BenchmarkPreset::P6 => Preset::P6,
+            BenchmarkPreset::P7 => Preset::P7,
+        },
+        tuning: match profile.encoder.tuning {
+            BenchmarkTuning::UltraLowLatency => Tuning::UltraLowLatency,
+            BenchmarkTuning::LowLatency => Tuning::LowLatency,
+        },
+        rate_control: match profile.encoder.rate_control_mode {
+            benchmark::BenchmarkRateControlMode::Cbr => RateControlMode::Cbr,
+            benchmark::BenchmarkRateControlMode::ExternalBudgetVbr => {
+                RateControlMode::ExternalBudgetVbr {
+                    target_quality: profile.encoder.target_quality.unwrap_or(23),
+                    peak_bitrate_multiplier: profile.encoder.peak_bitrate_multiplier.unwrap_or(4),
+                }
+            }
+        },
+        multipass: match profile.encoder.multipass {
+            BenchmarkMultipass::Disabled => Multipass::Disabled,
+            BenchmarkMultipass::Quarter => Multipass::Quarter,
+            BenchmarkMultipass::Full => Multipass::Full,
+        },
+        aq_mode: match profile.effective_aq_mode() {
+            BenchmarkAqMode::None => AqMode::None,
+            BenchmarkAqMode::Spatial => AqMode::Spatial,
+            BenchmarkAqMode::Temporal => AqMode::Temporal,
+        },
+        aq_strength: profile.encoder.aq_strength,
+        vbv_frames: profile.encoder.vbv_frames,
+        lookahead_depth: profile.encoder.lookahead_depth,
+        weighted_prediction: profile.encoder.weighted_prediction,
+        gop_seconds: profile.gop_seconds,
+        roi_mode: match profile.effective_roi_mode() {
+            BenchmarkRoiMode::Off => RoiMode::Off,
+            BenchmarkRoiMode::Damage => RoiMode::Damage,
+            BenchmarkRoiMode::TextEdge => RoiMode::TextEdge,
+            BenchmarkRoiMode::Feedback | BenchmarkRoiMode::FeedbackHeadroom => RoiMode::Feedback,
+        },
+        resource_mode: match profile.encoder.resource_mode {
+            BenchmarkResourceMode::PerFrame => ResourceMode::PerFrame,
+            BenchmarkResourceMode::Persistent => ResourceMode::Persistent,
+        },
+        async_depth: profile.encoder.async_depth,
+        main10: profile.encoder.main10,
+    }
+}
+
+fn encode_frame_damage<'a>(
+    frame: &'a CapturedFrame<'_>,
+    viewport_crop: Option<ViewportCrop>,
+    mode: VideoMode,
+) -> Option<FrameDamage<'a>> {
+    let rects = frame.damage()?;
+    let crop = if mode.label != "native" {
+        viewport_crop.map_or(
+            frame_damage::DamageRect {
+                left: 0,
+                top: 0,
+                right: frame.width(),
+                bottom: frame.height(),
+            },
+            |crop| frame_damage::DamageRect {
+                left: crop.x,
+                top: crop.y,
+                right: crop.x + crop.width,
+                bottom: crop.y + crop.height,
+            },
+        )
+    } else {
+        frame_damage::DamageRect {
+            left: 0,
+            top: 0,
+            right: frame.width(),
+            bottom: frame.height(),
+        }
+    };
+    Some(FrameDamage {
+        source_width: frame.width(),
+        source_height: frame.height(),
+        crop,
+        rects,
+        edge_scores: None,
+        prepared_qp_map: None,
+    })
+}
+
+fn quiescent_damage_rects<'a>(
+    _capture_damage: Option<&'a [frame_damage::DamageRect]>,
+    temporal_damage: &'a [frame_damage::DamageRect],
+    is_idle_snapshot: bool,
+) -> &'a [frame_damage::DamageRect] {
+    if is_idle_snapshot {
+        &[]
+    } else {
+        temporal_damage
+    }
+}
+
+fn quiescent_validation_requests(
+    planner: &QuiescentTilePlanner,
+    viewport: ViewportGeometry,
+    validation_sequence: u32,
+    capture_damage: Option<&[frame_damage::DamageRect]>,
+    is_idle_snapshot: bool,
+) -> Vec<hybrid::QuiescentValidationRequest> {
+    planner.validation_requests(
+        viewport,
+        validation_sequence,
+        capture_damage,
+        is_idle_snapshot,
+    )
+}
+
+fn quiescent_immediate_damage_rects<'a>(
+    cache_mode: BenchmarkHybridCacheMode,
+    capture_damage: Option<&'a [frame_damage::DamageRect]>,
+    verified_damage: &'a [frame_damage::DamageRect],
+    is_idle_snapshot: bool,
+) -> &'a [frame_damage::DamageRect] {
+    if is_idle_snapshot {
+        return &[];
+    }
+    match cache_mode {
+        BenchmarkHybridCacheMode::DdaGated => capture_damage.unwrap_or(&[]),
+        BenchmarkHybridCacheMode::SuppressReactivate => verified_damage,
+    }
+}
+
+fn create_local_encoder(
+    device: *mut core::ffi::c_void,
+    width: u32,
+    height: u32,
+    native_width: u32,
+    native_height: u32,
+    fps: u32,
+    bitrate_bps: u32,
+    requested: Preset,
+    codec: VideoCodec,
+    benchmark_profile: Option<&benchmark::BenchmarkProfile>,
+) -> Result<Nvenc> {
+    if let Some(profile) = benchmark_profile {
+        return Nvenc::new_with_options_native_codec(
+            device,
+            width,
+            height,
+            native_width,
+            native_height,
+            fps,
+            profile.bitrate_bps,
+            benchmark_encoder_options(profile),
+            codec,
+        );
+    }
+    create_encoder_with_fallback(
+        device,
+        width,
+        height,
+        native_width,
+        native_height,
+        fps,
+        bitrate_bps,
+        requested,
+        codec,
+    )
 }
 
 fn configure_encoder_profile(
@@ -267,6 +1858,8 @@ fn configure_encoder_profile(
     native_height: u32,
     bitrate_bps: u32,
     requested: Preset,
+    codec: VideoCodec,
+    benchmark_profile: Option<&benchmark::BenchmarkProfile>,
 ) -> Result<()> {
     let reconfigure = encoder
         .as_mut()
@@ -280,7 +1873,7 @@ fn configure_encoder_profile(
         );
         *encoder = None;
         *encoder = Some(
-            create_encoder_with_fallback(
+            create_local_encoder(
                 device,
                 mode.width,
                 mode.height,
@@ -289,6 +1882,8 @@ fn configure_encoder_profile(
                 mode.fps,
                 bitrate_bps,
                 requested,
+                codec,
+                benchmark_profile,
             )
             .with_context(|| format!("recreate NVENC for {}", mode.label))?,
         );
@@ -297,6 +1892,9 @@ fn configure_encoder_profile(
     Ok(())
 }
 
+/// Recreate a known-good encoder contract and force its recovery IDR. This is
+/// intentionally separate from a target transition: callers only commit the
+/// target after its IDR has been admitted by the transport pump.
 fn recreate_and_encode_profile(
     encoder: &mut Option<Nvenc>,
     device: *mut core::ffi::c_void,
@@ -304,11 +1902,14 @@ fn recreate_and_encode_profile(
     native_width: u32,
     native_height: u32,
     bitrate_bps: u32,
-    requested: Preset,
+    preset: Preset,
+    codec: VideoCodec,
+    benchmark_profile: Option<&benchmark::BenchmarkProfile>,
     texture: *mut core::ffi::c_void,
+    reconstruction_texture: Option<*mut core::ffi::c_void>,
 ) -> Result<EncodedFrame> {
     *encoder = None;
-    let mut replacement = create_encoder_with_fallback(
+    let mut replacement = create_local_encoder(
         device,
         mode.width,
         mode.height,
@@ -316,16 +1917,20 @@ fn recreate_and_encode_profile(
         native_height,
         mode.fps,
         bitrate_bps,
-        requested,
-    )
-    .with_context(|| format!("restore NVENC at {}", mode.label))?;
+        preset,
+        codec,
+        benchmark_profile,
+    )?;
     replacement.force_idr();
-    let encoded = replacement
-        .encode_texture(texture)
-        .context("encode fallback IDR")?;
-    if !encoded.is_idr {
-        bail!("fallback encoder did not produce the forced IDR");
-    }
+    let encoded = if let Some(reconstruction_texture) = reconstruction_texture {
+        replacement.encode_texture_with_feedback(texture, None, reconstruction_texture)?
+    } else {
+        replacement.encode_texture(texture)?
+    };
+    ensure!(
+        encoded.is_idr,
+        "recovery encoder did not produce a forced IDR"
+    );
     *encoder = Some(replacement);
     Ok(encoded)
 }
@@ -337,7 +1942,63 @@ fn prepare_profile_texture(
     input_width: u32,
     input_height: u32,
     profile: Profile,
+    main10: bool,
 ) -> Result<ScaleOutput> {
+    prepare_profile_texture_with_resource(
+        scaler,
+        device,
+        texture,
+        input_width,
+        input_height,
+        profile,
+        main10,
+        ResourceMode::PerFrame,
+    )
+}
+
+fn full_profile_uses_native_texture(
+    profile: Profile,
+    width: u32,
+    height: u32,
+    resource_mode: ResourceMode,
+) -> bool {
+    profile == Profile::Full
+        && width == 1920
+        && height == 1080
+        && resource_mode == ResourceMode::PerFrame
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_profile_texture_with_resource(
+    scaler: &mut Option<Scaler>,
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    input_width: u32,
+    input_height: u32,
+    profile: Profile,
+    main10: bool,
+    resource_mode: ResourceMode,
+) -> Result<ScaleOutput> {
+    if main10 {
+        ensure!(
+            profile == Profile::Full,
+            "Main10 is limited to the Full 1920x1080 profile"
+        );
+        if scaler
+            .as_ref()
+            .map_or(true, |current| !current.is_for_device(device))
+        {
+            *scaler = Some(
+                Scaler::new(device, input_width, input_height)
+                    .context("initialize D3D11 video scaler")?,
+            );
+        }
+        return scaler
+            .as_mut()
+            .expect("initialized above")
+            .scale_main10(texture)
+            .context("D3D11 BGRA to P010 conversion");
+    }
     if profile == Profile::Full {
         let texture_device = unsafe { texture.GetDevice() }.context("Full texture GetDevice")?;
         if texture_device.as_raw() != device.as_raw() {
@@ -353,7 +2014,7 @@ fn prepare_profile_texture(
             input_width,
             input_height
         );
-        if desc.Width == 1920 && desc.Height == 1080 {
+        if full_profile_uses_native_texture(profile, desc.Width, desc.Height, resource_mode) {
             return Ok(ScaleOutput {
                 texture: texture.as_raw() as *mut core::ffi::c_void,
                 scale_us: 0,
@@ -385,7 +2046,25 @@ fn prepare_video_mode_texture(
     input_width: u32,
     input_height: u32,
     mode: VideoMode,
+    main10: bool,
+    resource_mode: ResourceMode,
 ) -> Result<ScaleOutput> {
+    if main10 {
+        ensure!(
+            mode.width == 1920 && mode.height == 1080,
+            "Main10 mode must remain 1920x1080"
+        );
+        return prepare_profile_texture_with_resource(
+            scaler,
+            device,
+            texture,
+            input_width,
+            input_height,
+            Profile::Full,
+            true,
+            resource_mode,
+        );
+    }
     if mode.label == "native" {
         let texture_device = unsafe { texture.GetDevice() }.context("native texture GetDevice")?;
         ensure!(
@@ -414,13 +2093,15 @@ fn prepare_video_mode_texture(
             height: desc.Height,
         });
     }
-    let output = prepare_profile_texture(
+    let output = prepare_profile_texture_with_resource(
         scaler,
         device,
         texture,
         input_width,
         input_height,
         mode.profile,
+        false,
+        resource_mode,
     )?;
     ensure!(
         output.width == mode.width && output.height == mode.height,
@@ -482,29 +2163,136 @@ fn apply_quality_decision(
             applied_bitrate,
             quality.bwe(),
             reason,
+            profiles.stream_mode().label(),
         );
     }
 }
 
-fn announce_admitted_profile(
+fn apply_wss_adjustment(
+    quality: &mut Controller,
+    adjustment: WssAdjustment,
+    encoder_bitrate_bps: u32,
     profiles: &mut ProfileTransition,
+    latest_idr: &mut Option<CachedIdr>,
+    encoder: &mut Option<Nvenc>,
     signaling: &mut Signaling,
-    bitrate_bps: u32,
-    bwe_bps: Option<u32>,
-) {
-    let Some((mode, reason)) = profiles.pending_announcement() else {
-        return;
+) -> bool {
+    let adjustment = WssAdjustment {
+        mode: if profiles.pinned {
+            profiles.active
+        } else {
+            adjustment.mode
+        },
+        ..adjustment
     };
-    signaling.send_quality(
-        mode.label,
-        mode.width,
-        mode.height,
-        mode.fps,
-        bitrate_bps,
-        bwe_bps,
-        reason,
+    if let Some(enc) = encoder.as_mut() {
+        if let Err(error) = enc.set_bitrate(encoder_bitrate_bps) {
+            warn!(
+                ?error,
+                bitrate_bps = encoder_bitrate_bps,
+                "WSS NVENC bitrate update failed"
+            );
+            return false;
+        }
+    }
+    quality.apply(
+        Instant::now(),
+        Decision {
+            profile: adjustment.mode.profile,
+            target_bps: adjustment.target_bps,
+            reason: quality::Reason::Bitrate,
+        },
     );
-    profiles.on_idr_admitted();
+    if profiles.stage_mode(adjustment.mode, adjustment.reason) {
+        *latest_idr = None;
+        if let Some(enc) = encoder.as_mut() {
+            enc.force_idr();
+        }
+        return true;
+    }
+    if profiles.announced == Some(profiles.active) {
+        let active = profiles.active;
+        signaling.send_quality(
+            active.label,
+            active.width,
+            active.height,
+            active.fps,
+            encoder
+                .as_ref()
+                .map(Nvenc::bitrate)
+                .unwrap_or(adjustment.target_bps),
+            quality.bwe(),
+            adjustment.reason,
+            profiles.stream_mode().label(),
+        );
+    }
+    false
+}
+
+fn prepare_profile_texture_with_crop(
+    scaler: &mut Option<Scaler>,
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    input_width: u32,
+    input_height: u32,
+    profile: Profile,
+    crop: Option<ViewportCrop>,
+    main10: bool,
+) -> Result<ScaleOutput> {
+    let Some(crop) = crop else {
+        return prepare_profile_texture(
+            scaler,
+            device,
+            texture,
+            input_width,
+            input_height,
+            profile,
+            main10,
+        );
+    };
+    if crop.x == 0 && crop.y == 0 && crop.width == input_width && crop.height == input_height {
+        return prepare_profile_texture(
+            scaler,
+            device,
+            texture,
+            input_width,
+            input_height,
+            profile,
+            main10,
+        );
+    }
+    if scaler
+        .as_ref()
+        .map_or(true, |current| !current.is_for_device(device))
+    {
+        *scaler = Some(
+            Scaler::new(device, input_width, input_height)
+                .context("initialize D3D11 video scaler")?,
+        );
+    }
+    let source = RECT {
+        left: crop.x as i32,
+        top: crop.y as i32,
+        right: (crop.x + crop.width) as i32,
+        bottom: (crop.y + crop.height) as i32,
+    };
+    if main10 {
+        ensure!(
+            profile == Profile::Full,
+            "Main10 crop is limited to the Full 1920x1080 profile"
+        );
+        scaler
+            .as_mut()
+            .expect("initialized above")
+            .scale_main10_with_source(texture, source)
+            .context("D3D11 cropped BGRA to P010 conversion")
+    } else {
+        scaler
+            .as_mut()
+            .expect("initialized above")
+            .scale_with_source(texture, profile, source)
+            .context("D3D11 cropped video scale")
+    }
 }
 
 impl CachedIdrReplay {
@@ -540,11 +2328,31 @@ impl CachedIdrReplay {
     }
 }
 
+fn cached_wss_replay_payload(
+    cached: &CachedIdr,
+    hybrid: bool,
+    generation: u32,
+    sequence: u32,
+    crop_revision: u32,
+) -> Result<Vec<u8>> {
+    if !hybrid {
+        return Ok(cached.data.clone());
+    }
+    encode_hybrid_frame_v1(&HybridFrame {
+        generation,
+        sequence,
+        crop_revision,
+        access_unit: cached.data.clone(),
+        operations: vec![HybridTileOperation::Clear],
+    })
+}
+
 #[derive(Debug)]
 struct Args {
     mode: String, // "spike" | "serve"
     worker: Option<String>,
     token: Option<String>,
+    host_gate_token: Option<String>,
     duration_secs: u32,
     bitrate_bps: u32,
     max_bitrate_bps: u32,
@@ -554,13 +2362,16 @@ struct Args {
     out: String,
     monitor: Option<String>,
     vdd: bool,
+    privileged_agent: bool,
+    benchmark_profile: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
     let mut args = Args {
         mode: "serve".to_string(),
         worker: None,
-        token: None,
+        token: std::env::var("BUBBLEPLAY_TOKEN").ok(),
+        host_gate_token: std::env::var("BUBBLEPLAY_HOST_GATE_TOKEN").ok(),
         duration_secs: 10,
         bitrate_bps: DEFAULT_BITRATE_BPS,
         max_bitrate_bps: 12_000_000,
@@ -570,6 +2381,8 @@ fn parse_args() -> Result<Args> {
         out: "test.h264".to_string(),
         monitor: None,
         vdd: false,
+        privileged_agent: false,
+        benchmark_profile: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -577,6 +2390,9 @@ fn parse_args() -> Result<Args> {
             "--mode" => args.mode = it.next().context("--mode value")?,
             "--worker" => args.worker = Some(it.next().context("--worker value")?),
             "--token" => args.token = Some(it.next().context("--token value")?),
+            "--host-gate-token" => {
+                args.host_gate_token = Some(it.next().context("--host-gate-token value")?)
+            }
             "--duration" => args.duration_secs = it.next().context("--duration value")?.parse()?,
             "--bitrate" => args.bitrate_bps = it.next().context("--bitrate value")?.parse()?,
             "--max-bitrate" => {
@@ -590,8 +2406,14 @@ fn parse_args() -> Result<Args> {
             "--out" => args.out = it.next().context("--out value")?,
             "--monitor" => args.monitor = Some(it.next().context("--monitor value")?),
             "--vdd" => args.vdd = true,
+            "--privileged-agent" => args.privileged_agent = true,
+            "--benchmark-profile" => {
+                args.benchmark_profile = Some(PathBuf::from(
+                    it.next().context("--benchmark-profile value")?,
+                ))
+            }
             "-h" | "--help" => {
-                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd]");
+                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--host-gate-token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--privileged-agent] [--benchmark-profile absolute-path]");
                 std::process::exit(0);
             }
             other => bail!("unknown argument: {other}"),
@@ -608,9 +2430,9 @@ fn parse_args() -> Result<Args> {
     }
     if !matches!(
         args.quality.as_str(),
-        "auto" | "540p30" | "720p30" | "1080p60"
+        "auto" | "480p24" | "540p30" | "720p30" | "1080p60"
     ) {
-        bail!("--quality must be auto|540p30|720p30|1080p60");
+        bail!("--quality must be auto|480p24|540p30|720p30|1080p60");
     }
     if let Some(fixed) = args.fixed_bitrate_bps {
         if fixed == 0 || fixed > args.max_bitrate_bps {
@@ -623,11 +2445,20 @@ fn parse_args() -> Result<Args> {
     if !matches!(args.preset.as_str(), "p1" | "p3") {
         bail!("--preset must be p1|p3");
     }
+    if args
+        .benchmark_profile
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        bail!("--benchmark-profile must be an absolute path");
+    }
     Ok(args)
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(|| std::io::LineWriter::new(std::io::stderr()))
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -635,6 +2466,10 @@ fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+    info!(
+        build = env!("CARGO_PKG_VERSION"),
+        "BubblePlay host starting"
+    );
     match args.mode.as_str() {
         "spike" => run_spike(&args),
         "serve" => run_serve_forever(&args),
@@ -655,6 +2490,11 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                 std::thread::sleep(backoff);
             }
             Err(e) => {
+                if !should_retry_serve_error(args.privileged_agent) {
+                    return Err(e).context(
+                        "privileged serve session failed; returning to the external service supervisor",
+                    );
+                }
                 // Worker deploys reset the Durable Object, killing our WS
                 // and briefly 500ing new connections. That's transient —
                 // retry with backoff instead of taking the host down.
@@ -668,6 +2508,10 @@ fn run_serve_forever(args: &Args) -> Result<()> {
             }
         }
     }
+}
+
+fn should_retry_serve_error(privileged_agent: bool) -> bool {
+    !privileged_agent
 }
 
 /// M1 spike: capture + encode to a local file, measure latency.
@@ -694,7 +2538,7 @@ fn run_spike(args: &Args) -> Result<()> {
     let mut bytes = 0u64;
 
     while Instant::now() < deadline {
-        let Some((frame, is_new)) = capture.acquire(Duration::from_millis(100))? else {
+        let Some((frame, is_new, _recovered)) = capture.acquire(Duration::from_millis(100))? else {
             continue;
         };
         if encoder.is_none() {
@@ -745,352 +2589,1551 @@ fn run_spike(args: &Args) -> Result<()> {
     Ok(())
 }
 
+enum CaptureSource {
+    Local(LocalCaptureSource),
+    Privileged(PrivilegedSource),
+}
+
+struct LocalCaptureSource {
+    capture: Option<Capture>,
+    selector: String,
+    width: u32,
+    height: u32,
+    region: DesktopRegion,
+    idle_snapshot_requested: bool,
+}
+
+impl LocalCaptureSource {
+    fn open(selector: Option<&str>) -> Result<Self> {
+        // Monitor enumeration is cheap and does not create D3D/DDA resources.
+        // Resolve geometry now so signaling and cursor contracts remain
+        // truthful while the actual duplication session stays lazy.
+        let monitor = pick_monitor(selector).context("select capture monitor")?;
+        let selector = monitor.device_name().unwrap_or_else(|_| "primary".into());
+        let width = monitor.width().context("capture monitor width")?;
+        let height = monitor.height().context("capture monitor height")?;
+        let region = capture::monitor_region(monitor).context("capture monitor bounds")?;
+        Ok(Self {
+            capture: None,
+            selector,
+            width,
+            height,
+            region,
+            idle_snapshot_requested: false,
+        })
+    }
+
+    fn ensure_capture(&mut self) -> Result<&mut Capture> {
+        if self.capture.is_none() {
+            let mut capture = Capture::new(Some(&self.selector)).context("capture init")?;
+            self.width = capture.width();
+            self.height = capture.height();
+            self.region = capture.region();
+            if self.idle_snapshot_requested {
+                capture.request_idle_snapshot();
+                self.idle_snapshot_requested = false;
+            }
+            self.capture = Some(capture);
+        }
+        Ok(self.capture.as_mut().expect("capture initialized"))
+    }
+
+    fn monitors(&self) -> Result<Vec<capture::MonitorInfo>> {
+        capture::enumerate_monitors(Some(&self.selector))
+    }
+
+    fn switch_monitor(&mut self, selector: &str) -> Result<()> {
+        if let Some(capture) = self.capture.as_mut() {
+            capture.switch_monitor(selector)?;
+            self.selector = capture.monitor_selector().to_string();
+            self.width = capture.width();
+            self.height = capture.height();
+            self.region = capture.region();
+            return Ok(());
+        }
+
+        let monitor = pick_monitor(Some(selector)).context("select capture monitor")?;
+        self.selector = monitor
+            .device_name()
+            .unwrap_or_else(|_| selector.to_string());
+        self.width = monitor.width().context("capture monitor width")?;
+        self.height = monitor.height().context("capture monitor height")?;
+        self.region = capture::monitor_region(monitor).context("capture monitor bounds")?;
+        Ok(())
+    }
+
+    fn request_idle_snapshot(&mut self) {
+        self.idle_snapshot_requested = true;
+        if let Some(capture) = self.capture.as_mut() {
+            capture.request_idle_snapshot();
+            self.idle_snapshot_requested = false;
+        }
+    }
+}
+
+struct PrivilegedSource {
+    client: Option<AgentClient>,
+    next_agent_connect: Instant,
+    agent_reconnect_step: usize,
+    disconnect_event_pending: bool,
+    width: u32,
+    height: u32,
+    monitors: Vec<capture::MonitorInfo>,
+    selected_monitor: Option<u32>,
+    desktop_available: bool,
+    desktop: &'static str,
+    input_state: &'static str,
+    generation: u32,
+    reconnect_log: ReconnectLogGate,
+}
+
+const AGENT_RECONNECT_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default)]
+struct ReconnectLogGate {
+    last_emitted: Option<Instant>,
+    suppressed: u64,
+}
+
+impl ReconnectLogGate {
+    fn admit(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last_emitted
+            .is_some_and(|last| now.saturating_duration_since(last) < AGENT_RECONNECT_LOG_INTERVAL)
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.last_emitted = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+fn agent_reconnect_delay(step: usize) -> Duration {
+    const DELAYS: [Duration; 4] = [
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+    ];
+    DELAYS[step.min(DELAYS.len() - 1)]
+}
+
+impl PrivilegedSource {
+    fn new(now: Instant) -> Self {
+        Self {
+            client: None,
+            next_agent_connect: now,
+            agent_reconnect_step: 0,
+            disconnect_event_pending: false,
+            width: 1920,
+            height: 1080,
+            monitors: Vec::new(),
+            selected_monitor: None,
+            desktop_available: false,
+            desktop: "none",
+            input_state: "suspended",
+            generation: 0,
+            reconnect_log: ReconnectLogGate::default(),
+        }
+    }
+
+    fn connect_startup(now: Instant) -> Result<Self> {
+        let mut client = AgentClient::connect().context("connect initial privileged Agent")?;
+        client
+            .send(&AgentMessage::ListMonitors)
+            .context("request initial privileged monitor topology")?;
+        let mut source = Self::new(now);
+        source.client = Some(client);
+        info!("initial privileged Agent connection established");
+        Ok(source)
+    }
+
+    fn mark_agent_unavailable(&mut self, now: Instant, error: &anyhow::Error) {
+        let was_connected = self.client.take().is_some();
+        self.desktop_available = false;
+        self.input_state = "suspended";
+        if was_connected {
+            self.disconnect_event_pending = true;
+        }
+        let delay = agent_reconnect_delay(self.agent_reconnect_step);
+        self.agent_reconnect_step = self.agent_reconnect_step.saturating_add(1);
+        self.next_agent_connect = now + delay;
+        if let Some(suppressed) = self.reconnect_log.admit(now) {
+            warn!(
+                ?error,
+                retry_ms = delay.as_millis(),
+                suppressed,
+                "privileged Agent unavailable; preserving network session"
+            );
+        }
+    }
+
+    fn connect_agent_if_due(&mut self, now: Instant) {
+        if self.client.is_some() || now < self.next_agent_connect {
+            return;
+        }
+        let policy = RetryPolicy::new(Duration::ZERO, Duration::from_millis(1))
+            .expect("valid one-shot Agent retry policy");
+        match AgentClient::connect_with_retry(policy) {
+            Ok(mut client) => {
+                // Refresh topology after every process-boundary recovery. The
+                // browser may have issued its request while the Agent was down.
+                if let Err(error) = client.send(&AgentMessage::ListMonitors) {
+                    self.client = Some(client);
+                    self.mark_agent_unavailable(now, &error);
+                    return;
+                }
+                self.client = Some(client);
+                self.agent_reconnect_step = 0;
+                self.next_agent_connect = now;
+                info!("privileged Agent connected");
+            }
+            Err(error) => self.mark_agent_unavailable(now, &error),
+        }
+    }
+
+    fn tick_agent(&mut self, now: Instant) {
+        self.connect_agent_if_due(now);
+        let result = self.client.as_mut().map(|client| client.tick(now));
+        if let Some(Err(error)) = result {
+            self.mark_agent_unavailable(now, &error);
+        }
+    }
+
+    fn try_agent_message(&mut self, now: Instant) -> Option<AgentMessage> {
+        let result = self.client.as_ref()?.try_event();
+        match result {
+            Ok(message) => message,
+            Err(error) => {
+                self.mark_agent_unavailable(now, &error);
+                None
+            }
+        }
+    }
+
+    fn send_agent(&mut self, message: &AgentMessage) -> Result<()> {
+        let result = self
+            .client
+            .as_mut()
+            .context("privileged Agent is reconnecting")?
+            .send(message);
+        if let Err(error) = &result {
+            self.mark_agent_unavailable(Instant::now(), error);
+        }
+        result
+    }
+
+    fn encode_agent(&mut self, permit: AgentMessage) -> Result<AgentMessage> {
+        let result = self
+            .client
+            .as_mut()
+            .context("privileged Agent is reconnecting")?
+            .encode(permit);
+        if let Err(error) = &result {
+            self.mark_agent_unavailable(Instant::now(), error);
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrivilegedDesktopState {
+    available: bool,
+    desktop: &'static str,
+    input: &'static str,
+    agent_generation: u32,
+}
+
+fn record_privileged_desktop_state(
+    last: &mut Option<PrivilegedDesktopState>,
+    next: PrivilegedDesktopState,
+) -> bool {
+    if *last == Some(next) {
+        return false;
+    }
+    *last = Some(next);
+    true
+}
+
+fn privileged_input_ready_after_presentation(
+    privileged: bool,
+    capture_available: bool,
+    state: PrivilegedDesktopState,
+    presented_generation: u32,
+    current_generation: u32,
+) -> bool {
+    !privileged
+        || (capture_available
+            && state.available
+            && state.input == "enabled"
+            && presented_generation == current_generation)
+}
+
+enum PrivilegedEvent {
+    Desktop {
+        available: bool,
+        desktop: &'static str,
+        input: &'static str,
+        generation: u32,
+        reason: &'static str,
+    },
+    Cursor([u8; 8]),
+    Monitors(Vec<capture::MonitorInfo>),
+    MonitorSwitch {
+        accepted: bool,
+        monitor: String,
+        error_code: i32,
+    },
+}
+
+impl CaptureSource {
+    fn open(args: &Args) -> Result<Self> {
+        if args.privileged_agent {
+            // Cold service startup must prove the privileged boundary before
+            // the host advertises signaling readiness. Runtime disconnects
+            // after this point still use the bounded in-session reconnect path.
+            Ok(Self::Privileged(PrivilegedSource::connect_startup(
+                Instant::now(),
+            )?))
+        } else {
+            Ok(Self::Local(LocalCaptureSource::open(
+                args.monitor.as_deref(),
+            )?))
+        }
+    }
+
+    fn width(&self) -> u32 {
+        match self {
+            Self::Local(source) => source.width,
+            Self::Privileged(source) => source.width,
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            Self::Local(source) => source.height,
+            Self::Privileged(source) => source.height,
+        }
+    }
+
+    fn region(&self) -> DesktopRegion {
+        match self {
+            Self::Local(source) => source.region,
+            Self::Privileged(source) => DesktopRegion::new(0, 0, source.width, source.height),
+        }
+    }
+
+    fn monitors(&mut self) -> Result<Vec<capture::MonitorInfo>> {
+        match self {
+            Self::Local(source) => source.monitors(),
+            Self::Privileged(source) => {
+                source.send_agent(&AgentMessage::ListMonitors)?;
+                Ok(source.monitors.clone())
+            }
+        }
+    }
+
+    fn switch_monitor(&mut self, selector: &str) -> Result<bool> {
+        match self {
+            Self::Local(source) => {
+                source.switch_monitor(selector)?;
+                Ok(true)
+            }
+            Self::Privileged(source) => {
+                let monitor_id = selector
+                    .strip_prefix("agent:")
+                    .unwrap_or(selector)
+                    .parse::<u32>()
+                    .context("privileged monitor selector must be agent:<id>")?;
+                source.send_agent(&AgentMessage::SelectMonitor { monitor_id })?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn request_idle_snapshot(&mut self) {
+        if let Self::Local(source) = self {
+            source.request_idle_snapshot();
+        }
+        // Privileged permits carry allow_idle_snapshot and force_idr, so the
+        // next one is already a complete static-desktop wake request.
+    }
+
+    fn request_idle_followup_snapshot(&mut self, delay: Duration) {
+        if let Self::Local(source) = self {
+            if let Some(capture) = source.capture.as_mut() {
+                capture.request_idle_followup_snapshot(delay);
+            }
+        }
+    }
+
+    fn cancel_idle_followup_snapshot(&mut self) {
+        if let Self::Local(source) = self {
+            if let Some(capture) = source.capture.as_mut() {
+                capture.cancel_idle_followup_snapshot();
+            }
+        }
+    }
+
+    fn acquire(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<(capture::CapturedFrame<'_>, bool, bool)>> {
+        match self {
+            Self::Local(source) => source.ensure_capture()?.acquire(timeout),
+            Self::Privileged(_) => Ok(None),
+        }
+    }
+
+    fn take_idle_snapshot_frame(&mut self) -> Option<capture::CapturedFrame<'_>> {
+        match self {
+            Self::Local(source) => source
+                .capture
+                .as_mut()
+                .and_then(Capture::take_idle_snapshot_frame),
+            Self::Privileged(_) => None,
+        }
+    }
+
+    fn acknowledge_idle_snapshot_idr(&mut self) {
+        if let Self::Local(source) = self {
+            if let Some(capture) = source.capture.as_mut() {
+                capture.acknowledge_idle_snapshot_idr();
+            }
+        }
+    }
+
+    fn local_capture_stats(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Local(source) => source.capture.as_ref().map(Capture::stats),
+            Self::Privileged(_) => None,
+        }
+    }
+
+    fn tick(&mut self, now: Instant) -> Result<()> {
+        if let Self::Privileged(source) = self {
+            source.tick_agent(now);
+        }
+        Ok(())
+    }
+
+    fn try_privileged_event(&mut self) -> Result<Option<PrivilegedEvent>> {
+        let Self::Privileged(source) = self else {
+            return Ok(None);
+        };
+        if source.disconnect_event_pending {
+            source.disconnect_event_pending = false;
+            return Ok(Some(PrivilegedEvent::Desktop {
+                available: false,
+                desktop: source.desktop,
+                input: "suspended",
+                generation: source.generation,
+                reason: "agent-disconnected",
+            }));
+        }
+        let Some(message) = source.try_agent_message(Instant::now()) else {
+            return Ok(None);
+        };
+        Ok(match message {
+            AgentMessage::DesktopTransition {
+                desktop,
+                generation,
+                input_enabled,
+                reason,
+            } => {
+                let desktop = match desktop {
+                    privileged_ipc::Desktop::Default => "default",
+                    privileged_ipc::Desktop::Winlogon => "secure",
+                    privileged_ipc::Desktop::Unknown => "none",
+                };
+                let input = if input_enabled {
+                    "enabled"
+                } else {
+                    "suspended"
+                };
+                if source.generation != generation || desktop == "none" {
+                    // A freshly-bound desktop is not safe to expose until the
+                    // Agent proves capture with a frame from this generation.
+                    source.desktop_available = false;
+                }
+                source.desktop = desktop;
+                source.input_state = input;
+                source.generation = generation;
+                let available = source.desktop_available && desktop != "none";
+                let reason = match reason {
+                    privileged_ipc::DesktopTransitionReason::Startup => "agent-startup",
+                    privileged_ipc::DesktopTransitionReason::DesktopSwitched => "desktop-switched",
+                    privileged_ipc::DesktopTransitionReason::SessionChanged => "session-changed",
+                    privileged_ipc::DesktopTransitionReason::AgentRestarted => "agent-restarted",
+                };
+                Some(PrivilegedEvent::Desktop {
+                    available,
+                    desktop,
+                    input: if available { input } else { "suspended" },
+                    generation,
+                    reason,
+                })
+            }
+            AgentMessage::CaptureHealth { state, .. } => {
+                let available = state == privileged_ipc::CaptureState::Active;
+                source.desktop_available = available;
+                Some(PrivilegedEvent::Desktop {
+                    available,
+                    // Preserve which desktop is being recovered. In
+                    // particular, reconnecting during Winlogon must retain the
+                    // secure-desktop policy even while no new frame exists.
+                    desktop: source.desktop,
+                    input: if available {
+                        source.input_state
+                    } else {
+                        "suspended"
+                    },
+                    generation: source.generation,
+                    reason: if available {
+                        "capture-recovered"
+                    } else {
+                        "capture-unavailable"
+                    },
+                })
+            }
+            AgentMessage::Cursor(cursor) => Some(PrivilegedEvent::Cursor(
+                input::CursorState {
+                    acknowledged_sequence: cursor.acknowledged_sequence,
+                    x: cursor.x,
+                    y: cursor.y,
+                    in_bounds: cursor.in_bounds,
+                    visible: cursor.visible,
+                }
+                .encode(),
+            )),
+            AgentMessage::MonitorList(monitors) => {
+                source.monitors = monitors
+                    .into_iter()
+                    .map(|monitor| capture::MonitorInfo {
+                        selector: format!("agent:{}", monitor.id),
+                        name: monitor.name,
+                        width: monitor.width as u32,
+                        height: monitor.height as u32,
+                        origin_x: 0,
+                        origin_y: 0,
+                        selected: source.selected_monitor == Some(monitor.id)
+                            || monitor.primary && source.selected_monitor.is_none(),
+                    })
+                    .collect();
+                Some(PrivilegedEvent::Monitors(source.monitors.clone()))
+            }
+            AgentMessage::MonitorSwitchResult(result) => {
+                if result.accepted {
+                    source.selected_monitor = Some(result.monitor_id);
+                    source.width = result.width as u32;
+                    source.height = result.height as u32;
+                    for monitor in &mut source.monitors {
+                        monitor.selected =
+                            monitor.selector == format!("agent:{}", result.monitor_id);
+                    }
+                }
+                Some(PrivilegedEvent::MonitorSwitch {
+                    accepted: result.accepted,
+                    monitor: format!("agent:{}", result.monitor_id),
+                    error_code: result.error_code,
+                })
+            }
+            AgentMessage::Capabilities(_)
+            | AgentMessage::ConfigAck { .. }
+            | AgentMessage::InputStats(_) => None,
+            AgentMessage::RecoverableError(error) => {
+                warn!(
+                    operation = ?error.operation,
+                    error_code = error.error_code,
+                    session_generation = error.session_generation,
+                    config_revision = error.config_revision,
+                    permit_id = ?error.permit_id,
+                    "privileged Agent reported a recoverable error"
+                );
+                None
+            }
+            AgentMessage::FatalError(error) => {
+                warn!(
+                    operation = ?error.operation,
+                    error_code = error.error_code,
+                    session_generation = error.session_generation,
+                    config_revision = error.config_revision,
+                    permit_id = ?error.permit_id,
+                    "privileged Agent reported a fatal error"
+                );
+                source.desktop_available = false;
+                source.input_state = "suspended";
+                Some(PrivilegedEvent::Desktop {
+                    available: false,
+                    desktop: source.desktop,
+                    input: "suspended",
+                    generation: source.generation,
+                    reason: "agent-fatal-error",
+                })
+            }
+            _ => None,
+        })
+    }
+
+    fn desktop_state(&self) -> PrivilegedDesktopState {
+        match self {
+            Self::Local(_) => PrivilegedDesktopState {
+                available: true,
+                desktop: "default",
+                input: "enabled",
+                agent_generation: 0,
+            },
+            Self::Privileged(source) => PrivilegedDesktopState {
+                available: source.desktop_available,
+                desktop: source.desktop,
+                input: if source.desktop_available {
+                    source.input_state
+                } else {
+                    "suspended"
+                },
+                agent_generation: source.generation,
+            },
+        }
+    }
+
+    fn send_input(&mut self, data: &[u8]) -> Result<bool> {
+        match self {
+            Self::Local(_) => Ok(false),
+            Self::Privileged(source)
+                if source.desktop_available && source.input_state == "enabled" =>
+            {
+                // An Agent failure must suspend input, not tear down the
+                // authenticated browser/signaling session.
+                let _ = source.send_agent(&AgentMessage::Input(data.to_vec()));
+                Ok(true)
+            }
+            Self::Privileged(_) => Ok(true),
+        }
+    }
+
+    fn is_privileged(&self) -> bool {
+        matches!(self, Self::Privileged(_))
+    }
+
+    fn release_input(&mut self) {
+        if let Self::Privileged(source) = self {
+            let _ = source.send_agent(&AgentMessage::ReleaseAll);
+        }
+    }
+}
+
 /// Full pipeline: signaling + WebRTC + media + input.
+/// Live producer/session loop.  The transport pump exclusively owns str0m and
+/// the media UDP socket; this thread owns capture, D3D scaling and NVENC.
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 fn run_serve(args: &Args) -> Result<()> {
     let worker = args
         .worker
         .clone()
         .context("--worker wss://... is required")?;
     let token = args.token.clone().context("--token is required")?;
-
-    // 1. Media UDP socket. Bind wildcard; discover the routed local IP for the
-    //    host candidate via a throwaway connected socket.
+    let reset_lab_encoder_on_diagnostic_keyframe =
+        std::env::var("BUBBLEPLAY_LAB_RESET_ENCODER_ON_DIAGNOSTIC_KEYFRAME")
+            .is_ok_and(|value| value == "1");
+    let mut capture = CaptureSource::open(args)?;
     let socket = UdpSocket::bind("0.0.0.0:0").context("bind media socket")?;
-    // The RTC pump must never wait in recv_from: str0m's leaky-bucket pacer
-    // commonly asks to be called again in less than a millisecond. A blocking
-    // receive here used to cap us at roughly one RTP packet per loop and built
-    // a multi-second sender queue even on a lossless LAN.
-    socket
-        .set_nonblocking(true)
-        .context("make media socket nonblocking")?;
-    let local_port = socket.local_addr()?.port();
-    let host_ip = pick_host_ip().context("discover local host IP")?;
-    let host_addr: SocketAddr = SocketAddr::new(host_ip, local_port);
-    info!(%host_addr, "media socket bound");
-
-    // Cache STUN while startup is otherwise idle: a fresh RTC epoch must not
-    // put an unreachable STUN round-trip on the offer-to-answer path.
-    socket
-        .set_nonblocking(false)
-        .context("make media socket blocking for startup STUN")?;
-    let stun_result = stun::discover_mapped_address(&socket, STUN_SERVER);
-    socket
-        .set_nonblocking(true)
-        .context("restore nonblocking media socket after startup STUN")?;
-    let mapped_addr = match stun_result {
-        Ok(mapped) => {
-            info!(%mapped, "cached srflx candidate ready for RTC epochs");
-            Some(mapped)
-        }
-        Err(e) => {
-            warn!(
-                ?e,
-                "startup STUN failed; RTC epochs will use the host candidate only"
-            );
-            None
-        }
-    };
-
-    // 2. Signaling.
-    let mut signaling = Signaling::connect(&worker, &token)?;
-
-    // 3. Placeholder RTC epoch. str0m instances have negotiation timers, so
-    // the real epoch is always constructed immediately before an unconnected
-    // browser offer is accepted (rather than while the host waits idle).
-    let pinned_profile = match args.quality.as_str() {
+    let host_addr = SocketAddr::new(
+        pick_host_ip().context("discover local host IP")?,
+        socket.local_addr()?.port(),
+    );
+    socket.set_nonblocking(false)?;
+    let mapped_addr = stun::discover_mapped_address(&socket, STUN_SERVER).ok();
+    let mut signaling = Signaling::connect(&worker, &token, args.host_gate_token.as_deref())?;
+    signaling.send_host_capabilities(
+        args.privileged_agent,
+        args.privileged_agent,
+        args.privileged_agent,
+        args.privileged_agent,
+    );
+    let pinned = match args.quality.as_str() {
+        "480p24" => Some(Profile::Mobile),
         "540p30" => Some(Profile::Low),
         "720p30" => Some(Profile::Balanced),
         "1080p60" => Some(Profile::Full),
         _ => None,
     };
-    let mut quality = pinned_profile
-        .map(|profile| {
-            Controller::fixed(
-                profile,
+    let mut stream_mode = StreamMode::Work;
+    let mut quality = pinned
+        .map(|p| {
+            Controller::fixed_with_mode(
+                p,
                 args.max_bitrate_bps,
                 args.fixed_bitrate_bps.unwrap_or(args.bitrate_bps),
+                stream_mode,
             )
         })
-        .unwrap_or_else(|| Controller::new(args.max_bitrate_bps, args.bitrate_bps));
-    // RTC's initial BWE and NVENC's initial CBR must start at the policy's
-    // effective (bounded) bitrate, including fixed-profile mode.
-    let initial_bitrate = quality.target();
-    let mut rtc = RtcSession::new(Instant::now(), initial_bitrate);
-
-    // 4. Capture (+ warm up encoder from the first frame).
-    let _vdd = start_vdd_keepalive(args)?;
-    let mut capture = Capture::new(args.monitor.as_deref()).context("capture init")?;
+        .unwrap_or_else(|| {
+            Controller::adaptive(Profile::Full, args.max_bitrate_bps, 6_000_000, stream_mode)
+        });
+    let pump = TransportPump::spawn(socket, host_addr, mapped_addr, quality.target());
+    let _vdd = if args.privileged_agent {
+        None
+    } else {
+        start_vdd_keepalive(args)?
+    };
     let mut encoder: Option<Nvenc> = None;
+    let mut active_codec = VideoCodec::preferred();
+    let mut wss_media: Option<WssMediaEgress> = None;
+    let mut active_wss_epoch: Option<String> = None;
+    let mut media_generation = 1u32;
+    let mut media_gop = 0u32;
+    let mut media_sequence = 0u32;
+    let media_clock_start = Instant::now();
+    let mut wss_ack_rate = WssAckRate::new(Instant::now());
+    let mut wss_quality = WssQualityController::new(Instant::now());
+    let mut wss_recovery_snapshot_gate = WssRecoverySnapshotGate::default();
+    let mut wss_adaptive = false;
     let mut scaler: Option<Scaler> = None;
-    let requested_preset = if args.preset == "p1" {
+    let preset = if args.preset == "p1" {
         Preset::P1
     } else {
         Preset::P3
     };
-    // NVENC is first opened at the native maximum. Auto starts by staging its
-    // Balanced controller intent for the first captured frame.
-    let mut profiles = ProfileTransition::new(Profile::Full, quality.profile());
+    let mut profiles =
+        ProfileTransition::new_for_mode(Profile::Full, quality.profile(), stream_mode);
     let mut input_sink = InputSink::new();
+    input_sink.set_absolute_region(capture.region());
+    let mut cursor_tracker = CursorTracker::for_region(capture.region(), Instant::now());
+    let mut next_cursor_poll = Instant::now();
+    let mut next_input_log = Instant::now() + Duration::from_secs(1);
     let mut latest_idr: Option<CachedIdr> = None;
-    let mut cached_idr_replay = CachedIdrReplay::default();
-
-    let mut next_idr = Instant::now() + IDR_INTERVAL;
-    let mut last_idr_sent = Instant::now()
+    let mut replay = CachedIdrReplay::default();
+    let mut ice_connected = false;
+    let mut offer_accepted = false;
+    let mut offer_in_flight = false;
+    let mut pending_candidates = VecDeque::new();
+    let mut next_admission = Instant::now();
+    let mut next_idr = Instant::now();
+    let mut next_ping = Instant::now() + Duration::from_secs(20);
+    let mut next_wss_stats = Instant::now() + Duration::from_secs(1);
+    let mut next_quality_tick = Instant::now() + Duration::from_secs(1);
+    let mut benchmark_lease = args
+        .benchmark_profile
+        .clone()
+        .map(benchmark::BenchmarkLease::at)
+        .unwrap_or_else(benchmark::BenchmarkLease::program_data);
+    let mut next_benchmark_refresh = Instant::now();
+    let mut benchmark_profile: Option<benchmark::BenchmarkProfile> = None;
+    let mut next_benchmark_status = Instant::now() + Duration::from_secs(1);
+    let mut benchmark_window_started = Instant::now();
+    let mut benchmark_sequence = 0u64;
+    let mut benchmark_profile_revision = 0u64;
+    let mut encoder_benchmark_profile_revision: Option<u64> = None;
+    let mut benchmark_encoded_bytes = 0u64;
+    let mut benchmark_wss_payload_bytes = 0u64;
+    let mut benchmark_encode_count = 0u64;
+    let mut benchmark_encode_us_total = 0u64;
+    let mut benchmark_encode_us_max = 0u32;
+    let mut benchmark_idr_count = 0u64;
+    let mut benchmark_delta_count = 0u64;
+    let mut benchmark_skips = 0u64;
+    let mut benchmark_qp_map_frames = 0u64;
+    let mut benchmark_qp_map_changed_ctbs = 0u64;
+    let mut benchmark_qp_map_total_ctbs = 0u64;
+    let mut benchmark_roi_activity: Option<BenchRoiActivity> = None;
+    let mut benchmark_temporal_analysis_us = Vec::<u32>::new();
+    let mut benchmark_hybrid_activity: Option<BenchHybridActivity> = None;
+    let mut benchmark_hybrid_analysis_us = Vec::<u32>::new();
+    let mut benchmark_hybrid_validation_submit_us = Vec::<u32>::new();
+    let mut benchmark_hybrid_validation_collect_us = Vec::<u32>::new();
+    let mut benchmark_hybrid_validation_age_frames = Vec::<u32>::new();
+    let mut temporal_diff_analyzer: Option<TemporalDiffAnalyzer> = None;
+    let mut temporal_diff_key: Option<(u64, u32, u32, VideoMode)> = None;
+    let mut temporal_diff_failed_key: Option<(u64, u32, u32, VideoMode)> = None;
+    let mut reconstruction_feedback_analyzer: Option<ReconstructionFeedbackAnalyzer> = None;
+    let mut feedback_roi_planner: Option<FeedbackRoiPlanner> = None;
+    let mut reconstruction_feedback_key: Option<(u64, u32, u32, VideoMode)> = None;
+    let mut reconstruction_feedback_failed_key: Option<(u64, u32, u32, VideoMode)> = None;
+    let mut benchmark_feedback_submit_us = Vec::<u32>::new();
+    let mut benchmark_feedback_readback_us = Vec::<u32>::new();
+    let mut benchmark_feedback_wire_occupancy_bps = Vec::<u64>::new();
+    let mut feedback_wire_budget: Option<FeedbackWireBudget> = None;
+    let mut hybrid_tile_planner = StaticTilePlanner::default();
+    let mut quiescent_tile_planner = QuiescentTilePlanner::default();
+    let mut quiescent_wire_budget = HybridWireBudget::default();
+    let mut quiescent_diff_analyzer: Option<TemporalDiffAnalyzer> = None;
+    let mut quiescent_diff_revision = 0u64;
+    let mut hevc_tile_encoder: Option<HevcTileEncoder> = None;
+    let mut hevc_tile_encoder_failed_key: Option<(u64, usize)> = None;
+    let mut benchmark_encode_stages = BenchEncodeStages::default();
+    let mut last_keyframe_request = Instant::now()
         .checked_sub(KEYFRAME_REQUEST_COOLDOWN)
         .unwrap_or_else(Instant::now);
-    let mut next_signal_ping = Instant::now() + Duration::from_secs(20);
-    let mut last_logged_bwe: Option<u64> = None;
-    let mut pending_signal_events = VecDeque::new();
-    let mut pending_remote_candidates: VecDeque<String> = VecDeque::new();
-    let mut offer_accepted = false;
-    let mut connected_since: Option<Instant> = None;
-    let mut frames_sent = 0u64;
-    let mut input_packets = 0u64;
-    let mut input_bytes = 0u64;
-    let mut transport_window_started = Instant::now();
-    let mut next_transport_log = transport_window_started + Duration::from_secs(1);
-    let mut next_quality_tick = Instant::now() + Duration::from_secs(1);
-    let mut next_frame_admission = Instant::now();
-    let mut tx_packets_window = 0u64;
-    let mut tx_bytes_window = 0u64;
-    let mut admitted_frames_window = 0u64;
-    let mut admitted_bytes_window = 0u64;
-    let mut overdue_deadlines_window = 0u64;
-    let mut max_deadline_overdue_us = 0u64;
-    let mut scale_sum_us = 0u64;
-    let mut scale_max_us = 0u64;
-    let mut scale_count = 0u64;
-    let mut encode_sum_us = 0u64;
-    let mut encode_max_us = 0u64;
-    let mut encode_count = 0u64;
-    let mut buf = vec![0u8; 2000];
-
-    'run: loop {
-        if args.fixed_bitrate_bps.is_none() && Instant::now() >= next_quality_tick {
-            let now = Instant::now();
-            if let Some(decision) = quality.tick(now) {
-                apply_quality_decision(
-                    &mut quality,
-                    decision,
-                    &mut profiles,
-                    &mut latest_idr,
-                    &mut encoder,
-                    &mut signaling,
+    let mut skipped_before_encode = 0u64;
+    let mut next_skip_log = Instant::now() + Duration::from_secs(1);
+    let mut wss_preencode_skips = 0u64;
+    let mut wss_preencode_skips_total = 0u64;
+    let mut wss_submission_failures = 0u64;
+    let mut wss_idr_count = 0u64;
+    let mut wss_delta_count = 0u64;
+    let mut wss_max_access_unit_bytes = 0usize;
+    let mut next_au_id = 1u64;
+    let mut capture_available = !args.privileged_agent;
+    // The privileged path stays fail-closed across desktop/monitor/source
+    // transitions until the browser acknowledges presentation of a frame from
+    // the newly announced media generation.
+    let mut remote_input_ready = !args.privileged_agent;
+    let mut last_privileged_desktop_state: Option<PrivilegedDesktopState> = None;
+    let mut pending_transition_idr: Option<PendingSubmittedIdr> = None;
+    let mut pending_wss_idr: Option<PendingWssIdr> = None;
+    let mut pending_lab_quality_keyframe: Option<String> = None;
+    let mut pending_first_frame: Option<PendingFirstFrame> = None;
+    let mut pending_viewport_idr: Option<PendingViewportIdr> = None;
+    let mut viewport_crop: Option<ViewportCrop> = None;
+    let mut active_viewport: Option<(u32, u32)> = None;
+    let mut viewport_revision = 0u32;
+    let mut last_logged_bwe: Option<u32> = None;
+    let mut producer_loop_iterations = 0u64;
+    let mut last_capture_stats = (0u64, 0u64);
+    'session: loop {
+        producer_loop_iterations = producer_loop_iterations.saturating_add(1);
+        let loop_now = Instant::now();
+        if loop_now >= next_benchmark_refresh {
+            let next_profile = benchmark_lease.refresh(unix_time_ms()).cloned();
+            if next_profile != benchmark_profile {
+                benchmark_profile_revision =
+                    advance_benchmark_profile_revision(benchmark_profile_revision, true);
+                match (benchmark_profile.as_ref(), next_profile.as_ref()) {
+                    (None, Some(profile)) => {
+                        info!(run_id = %profile.run_id, "stream-lab benchmark lease activated")
+                    }
+                    (Some(previous), Some(profile)) => info!(
+                        run_id = %profile.run_id,
+                        previous_bitrate_bps = previous.bitrate_bps,
+                        bitrate_bps = profile.bitrate_bps,
+                        "stream-lab benchmark profile changed"
+                    ),
+                    (Some(_), None) => {
+                        info!("stream-lab benchmark lease cleared; production policy restored")
+                    }
+                    (None, None) => {}
+                }
+                if !args.privileged_agent {
+                    // The local candidate owns its NVENC session. Any effective
+                    // lease change must recreate that session so bench-status
+                    // cannot claim options that the encoder never applied.
+                    encoder = None;
+                    scaler = None;
+                    latest_idr = None;
+                    pending_transition_idr = None;
+                    pending_wss_idr = None;
+                    pending_viewport_idr = None;
+                    next_admission = Instant::now();
+                    next_idr = Instant::now();
+                }
+                benchmark_profile = next_profile;
+                benchmark_roi_activity = benchmark_profile
+                    .as_ref()
+                    .and_then(new_benchmark_roi_activity);
+                benchmark_hybrid_activity = benchmark_profile
+                    .as_ref()
+                    .and_then(new_benchmark_hybrid_activity);
+                benchmark_sequence = 0;
+                benchmark_window_started = loop_now;
+                benchmark_encoded_bytes = 0;
+                benchmark_wss_payload_bytes = 0;
+                benchmark_encode_count = 0;
+                benchmark_encode_us_total = 0;
+                benchmark_encode_us_max = 0;
+                benchmark_idr_count = 0;
+                benchmark_delta_count = 0;
+                benchmark_skips = 0;
+                benchmark_qp_map_frames = 0;
+                benchmark_qp_map_changed_ctbs = 0;
+                benchmark_qp_map_total_ctbs = 0;
+                benchmark_temporal_analysis_us.clear();
+                benchmark_hybrid_analysis_us.clear();
+                benchmark_hybrid_validation_submit_us.clear();
+                benchmark_hybrid_validation_collect_us.clear();
+                benchmark_hybrid_validation_age_frames.clear();
+                temporal_diff_analyzer = None;
+                temporal_diff_key = None;
+                temporal_diff_failed_key = None;
+                reconstruction_feedback_analyzer = None;
+                feedback_roi_planner = None;
+                reconstruction_feedback_key = None;
+                reconstruction_feedback_failed_key = None;
+                benchmark_feedback_submit_us.clear();
+                benchmark_feedback_readback_us.clear();
+                benchmark_feedback_wire_occupancy_bps.clear();
+                feedback_wire_budget = None;
+                benchmark_encode_stages = BenchEncodeStages::default();
+            }
+            next_benchmark_refresh = loop_now + Duration::from_secs(1);
+        }
+        // Publish benchmark state before capture or encoding. Candidate encoder
+        // failures deliberately continue the session for recovery; placing this
+        // at the producer tail starves the only telemetry that lets Stream Lab
+        // classify an unsupported NVENC combination and move on safely.
+        let benchmark_status_now = Instant::now();
+        if benchmark_status_now >= next_benchmark_status {
+            let status_sent = if let Some(profile) =
+                benchmark_lease.active().cloned().filter(|profile| {
+                    active_codec == VideoCodec::Hevc
+                        && benchmark_mode_matches(profile.stream_mode, stream_mode)
+                }) {
+                benchmark_sequence = benchmark_sequence.wrapping_add(1);
+                signaling.send_bench_status(
+                    profile.schema_version,
+                    &profile.run_id,
+                    benchmark_sequence,
+                    benchmark_profile_revision,
+                    "sample",
+                    if profile.schema_version == 2 {
+                        Some(match profile.implementation_variant {
+                            benchmark::BenchmarkImplementationVariant::Production => "production",
+                            benchmark::BenchmarkImplementationVariant::Candidate => "candidate",
+                        })
+                    } else {
+                        None
+                    },
+                    profile.experiment_id.as_deref(),
+                    match profile.transport {
+                        BenchmarkTransport::Wss => "wss",
+                        BenchmarkTransport::Webrtc => "webrtc",
+                    },
+                    "hevc",
+                    match profile.stream_mode {
+                        BenchmarkStreamMode::Work => "work",
+                        BenchmarkStreamMode::Game => "game",
+                    },
+                    profile.width,
+                    profile.height,
+                    profile.fps,
+                    profile.bitrate_bps,
+                    profile.gop_seconds,
+                    profile.wss_topology.map(|topology| WssTopologyWire {
+                        lane_count: topology.lane_count,
+                        data_shards: topology.data_shards,
+                        parity_shards: topology.parity_shards,
+                    }),
+                    match profile.encoder.preset {
+                        BenchmarkPreset::P1 => "p1",
+                        BenchmarkPreset::P2 => "p2",
+                        BenchmarkPreset::P3 => "p3",
+                        BenchmarkPreset::P4 => "p4",
+                        BenchmarkPreset::P5 => "p5",
+                        BenchmarkPreset::P6 => "p6",
+                        BenchmarkPreset::P7 => "p7",
+                    },
+                    match profile.encoder.tuning {
+                        BenchmarkTuning::UltraLowLatency => "ultra-low-latency",
+                        BenchmarkTuning::LowLatency => "low-latency",
+                    },
+                    match profile.encoder.multipass {
+                        BenchmarkMultipass::Disabled => "disabled",
+                        BenchmarkMultipass::Quarter => "quarter",
+                        BenchmarkMultipass::Full => "full",
+                    },
+                    profile.encoder.aq_strength,
+                    match profile.effective_aq_mode() {
+                        BenchmarkAqMode::None => "none",
+                        BenchmarkAqMode::Spatial => "spatial",
+                        BenchmarkAqMode::Temporal => "temporal",
+                    },
+                    profile.encoder.vbv_frames,
+                    match profile.encoder.rate_control_mode {
+                        benchmark::BenchmarkRateControlMode::Cbr => "cbr",
+                        benchmark::BenchmarkRateControlMode::ExternalBudgetVbr => {
+                            "external-budget-vbr"
+                        }
+                    },
+                    profile.encoder.target_quality,
+                    profile.encoder.peak_bitrate_multiplier,
+                    profile.encoder.lookahead_depth,
+                    profile.encoder.weighted_prediction,
+                    profile.encoder.dirty_qp_map,
+                    profile.encoder.main10,
+                    match profile.effective_roi_mode() {
+                        BenchmarkRoiMode::Off => "off",
+                        BenchmarkRoiMode::Damage => "damage",
+                        BenchmarkRoiMode::TextEdge => "text-edge",
+                        BenchmarkRoiMode::Feedback => "feedback",
+                        BenchmarkRoiMode::FeedbackHeadroom => "feedback-headroom",
+                    },
+                    match profile.encoder.resource_mode {
+                        BenchmarkResourceMode::PerFrame => "per-frame",
+                        BenchmarkResourceMode::Persistent => "persistent",
+                    },
+                    profile.encoder.async_depth,
+                    match profile.hybrid_mode {
+                        BenchmarkHybridMode::Off => "off",
+                        BenchmarkHybridMode::PngStaticRoi => "png-static-roi",
+                        BenchmarkHybridMode::PngQuiescentDetail => "png-quiescent-detail",
+                        BenchmarkHybridMode::HevcQuiescentTiles => "hevc-quiescent-tiles",
+                    },
+                    match profile.hybrid_cache_mode {
+                        BenchmarkHybridCacheMode::DdaGated => "dda-gated",
+                        BenchmarkHybridCacheMode::SuppressReactivate => "suppress-reactivate",
+                    },
+                    benchmark_window_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    benchmark_encoded_bytes,
+                    benchmark_wss_payload_bytes,
+                    benchmark_encode_count,
+                    benchmark_encode_us_total,
+                    benchmark_encode_us_max,
+                    benchmark_idr_count,
+                    benchmark_delta_count,
+                    benchmark_skips,
+                    benchmark_qp_map_frames,
+                    benchmark_qp_map_changed_ctbs,
+                    benchmark_qp_map_total_ctbs,
+                    benchmark_roi_activity.clone(),
+                    (profile.schema_version == 2).then(|| benchmark_encode_stages.clone()),
+                    benchmark_hybrid_activity.clone(),
                 );
+                benchmark_encoded_bytes = 0;
+                benchmark_wss_payload_bytes = 0;
+                benchmark_encode_count = 0;
+                benchmark_encode_us_total = 0;
+                benchmark_encode_us_max = 0;
+                benchmark_idr_count = 0;
+                benchmark_delta_count = 0;
+                benchmark_skips = 0;
+                benchmark_qp_map_frames = 0;
+                benchmark_qp_map_changed_ctbs = 0;
+                benchmark_qp_map_total_ctbs = 0;
+                benchmark_temporal_analysis_us.clear();
+                benchmark_feedback_submit_us.clear();
+                benchmark_feedback_readback_us.clear();
+                benchmark_hybrid_analysis_us.clear();
+                benchmark_hybrid_validation_submit_us.clear();
+                benchmark_hybrid_validation_collect_us.clear();
+                benchmark_hybrid_validation_age_frames.clear();
+                benchmark_roi_activity = new_benchmark_roi_activity(&profile);
+                benchmark_hybrid_activity = new_benchmark_hybrid_activity(&profile);
+                benchmark_encode_stages = BenchEncodeStages::default();
+                benchmark_window_started = Instant::now();
+                true
+            } else {
+                false
+            };
+            next_benchmark_status =
+                benchmark_status_now + benchmark_status_retry_delay(status_sent);
+        }
+        capture.tick(loop_now)?;
+        while let Some(event) = capture.try_privileged_event()? {
+            match event {
+                PrivilegedEvent::Desktop {
+                    available,
+                    desktop,
+                    input,
+                    generation: agent_generation,
+                    reason,
+                } => {
+                    let announced = PrivilegedDesktopState {
+                        available,
+                        desktop,
+                        input,
+                        agent_generation,
+                    };
+                    if !record_privileged_desktop_state(
+                        &mut last_privileged_desktop_state,
+                        announced,
+                    ) {
+                        continue;
+                    }
+                    last_privileged_desktop_state = Some(announced);
+                    remote_input_ready = false;
+                    capture_available = available;
+                    media_generation = media_generation.wrapping_add(1).max(1);
+                    if !available {
+                        pending_first_frame = None;
+                        latest_idr = None;
+                        pending_transition_idr = None;
+                        pending_wss_idr = None;
+                        pending_viewport_idr = None;
+                    } else {
+                        next_admission = Instant::now();
+                        next_idr = Instant::now();
+                    }
+                    signaling.send_desktop_state_kind(
+                        if available { "active" } else { "unavailable" },
+                        Some(desktop),
+                        Some(input),
+                        media_generation,
+                        reason,
+                    );
+                    info!(
+                        agent_generation,
+                        media_generation, desktop, input, "privileged desktop state"
+                    );
+                }
+                PrivilegedEvent::Cursor(encoded) => {
+                    signaling.send_binary(&encoded);
+                    if ice_connected {
+                        pump.publish_cursor_state(encoded);
+                    }
+                }
+                PrivilegedEvent::Monitors(monitors) => signaling.send_monitor_list(monitors),
+                PrivilegedEvent::MonitorSwitch {
+                    accepted,
+                    monitor,
+                    error_code,
+                } => {
+                    if accepted {
+                        media_generation = media_generation.wrapping_add(1).max(1);
+                        let state = capture.desktop_state();
+                        signaling.send_desktop_state_kind(
+                            if state.available {
+                                "active"
+                            } else {
+                                "unavailable"
+                            },
+                            Some(state.desktop),
+                            Some(state.input),
+                            media_generation,
+                            "monitor-switched",
+                        );
+                        if let Ok(monitors) = capture.monitors() {
+                            signaling.send_monitor_list(monitors);
+                        }
+                    } else {
+                        signaling.send_monitor_error(
+                            &monitor,
+                            &format!("privileged Agent error {error_code}"),
+                        );
+                    }
+                }
+            }
+        }
+        if let CaptureSource::Local(source) = &mut capture {
+            if let Some(state) = source
+                .capture
+                .as_mut()
+                .and_then(Capture::take_availability_transition)
+            {
+                match state {
+                    CaptureAvailability::Unavailable => {
+                        capture_available = false;
+                        pending_first_frame = None;
+                        input_sink.release_all();
+                        latest_idr = None;
+                        pending_transition_idr = None;
+                        pending_wss_idr = None;
+                        pending_viewport_idr = None;
+                        encoder = None;
+                        scaler = None;
+                        signaling.send_desktop_state(
+                            "unavailable",
+                            media_generation,
+                            "capture-unavailable",
+                        );
+                        warn!(
+                            generation = media_generation,
+                            "desktop capture unavailable; input suspended"
+                        );
+                    }
+                    CaptureAvailability::Active => {
+                        capture_available = true;
+                        pending_first_frame = None;
+                        media_generation = media_generation.wrapping_add(1).max(1);
+                        media_gop = 0;
+                        media_sequence = 0;
+                        latest_idr = None;
+                        pending_transition_idr = None;
+                        pending_wss_idr = None;
+                        pending_viewport_idr = None;
+                        encoder = None;
+                        scaler = None;
+                        next_admission = Instant::now();
+                        next_idr = Instant::now();
+                        signaling.send_desktop_state(
+                            "active",
+                            media_generation,
+                            "capture-recovered",
+                        );
+                        info!(
+                            generation = media_generation,
+                            "desktop capture recovered; waiting for fresh IDR"
+                        );
+                    }
+                }
+            }
+        }
+        while let Some(event) = pump.try_event() {
+            match event {
+                TransportEvent::Answer(answer) => {
+                    signaling.send_answer(&answer)?;
+                    offer_in_flight = false;
+                    offer_accepted = true;
+                }
+                TransportEvent::OfferRejected => break 'session,
+                TransportEvent::Action(RtcAction::IceConnected) => {
+                    ice_connected = true;
+                    replay.on_ice_connected();
+                    next_idr = Instant::now();
+                }
+                TransportEvent::Action(RtcAction::IceDisconnected | RtcAction::Closed)
+                | TransportEvent::Stopped => break 'session,
+                TransportEvent::Action(RtcAction::VideoCodecSelected(codec)) => {
+                    if codec != active_codec && accept_session_codec(active_codec, codec) {
+                        info!(
+                            from = active_codec.name(),
+                            to = codec.name(),
+                            "negotiated codec changed; recreating encoder on next frame"
+                        );
+                        active_codec = codec;
+                        encoder = None;
+                        latest_idr = None;
+                        pending_first_frame = None;
+                        pending_transition_idr = None;
+                        next_idr = Instant::now();
+                    }
+                }
+                TransportEvent::Action(RtcAction::KeyframeRequested) => {
+                    let now = Instant::now();
+                    if now.duration_since(last_keyframe_request) >= KEYFRAME_REQUEST_COOLDOWN {
+                        replay.on_keyframe_requested(now);
+                        if let Some(enc) = encoder.as_mut() {
+                            enc.force_idr();
+                        }
+                        last_keyframe_request = now;
+                    }
+                }
+                TransportEvent::Action(RtcAction::Bwe(bps))
+                    if args.fixed_bitrate_bps.is_none() && wss_media.is_none() =>
+                {
+                    let clamped = bps.min(args.max_bitrate_bps as u64) as u32;
+                    if last_logged_bwe
+                        .is_none_or(|previous| previous.abs_diff(clamped) >= 1_000_000)
+                    {
+                        info!(bwe_bps = clamped, raw_bwe_bps = bps, "RTC BWE estimate");
+                        last_logged_bwe = Some(clamped);
+                    }
+                    if benchmark_lease.active().is_none_or(|profile| {
+                        !benchmark_mode_matches(profile.stream_mode, stream_mode)
+                    }) {
+                        if let Some(d) = quality.bwe_sample(Instant::now(), clamped) {
+                            apply_quality_decision(
+                                &mut quality,
+                                d,
+                                &mut profiles,
+                                &mut latest_idr,
+                                &mut encoder,
+                                &mut signaling,
+                            );
+                        }
+                    }
+                }
+                TransportEvent::Action(RtcAction::InputData(data)) => {
+                    if !capture_available || !remote_input_ready {
+                        continue;
+                    }
+                    if capture.send_input(&data)? {
+                        continue;
+                    }
+                    let outcome = input_sink.handle(&data);
+                    if outcome.cursor_changed || outcome.sync_requested {
+                        if let Some(state) =
+                            cursor_tracker.sample(outcome.accepted_sequence, Instant::now())
+                        {
+                            let encoded = state.encode();
+                            if outcome.feedback_reliable {
+                                let _ =
+                                    pump.command(TransportCommand::CursorStateReliable(encoded));
+                            } else {
+                                pump.publish_cursor_state(encoded);
+                            }
+                        }
+                    }
+                }
+                TransportEvent::AccessUnitWritten { id, is_idr: true } => {
+                    replay.on_fresh_idr_admitted();
+                    if let Some(pending) = pending_first_frame
+                        .as_mut()
+                        .filter(|pending| pending.transport == "webrtc" && !pending.admitted)
+                    {
+                        pending.admitted = true;
+                        signaling.send_first_frame(
+                            "admitted",
+                            &pending.request_id,
+                            pending.generation,
+                            Some("webrtc"),
+                            pending.epoch.as_deref(),
+                            Some(active_codec.name()),
+                        );
+                    }
+                    if let Some(pending) = take_matching_transition(&mut pending_transition_idr, id)
+                    {
+                        let _ = commit_matching_transition(&mut profiles, pending, id);
+                    }
+                    if let Some((mode, reason)) = profiles.pending_announcement() {
+                        signaling.send_quality(
+                            mode.label,
+                            mode.width,
+                            mode.height,
+                            mode.fps,
+                            encoder
+                                .as_ref()
+                                .map(Nvenc::bitrate)
+                                .unwrap_or(quality.target()),
+                            quality.bwe(),
+                            reason,
+                            stream_mode.label(),
+                        );
+                        profiles.on_idr_admitted();
+                    }
+                }
+                TransportEvent::AccessUnitNotAdmitted { id, is_idr } => {
+                    let pending =
+                        rejected_transition_requires_recovery(&pending_transition_idr, id);
+                    if pending {
+                        pending_transition_idr = None;
+                        latest_idr = None;
+                    }
+                    let now = Instant::now();
+                    // Any rejected AU can break the decoder's reference chain.
+                    // Never continue with dependent P-frames: force a fresh IDR
+                    // and let the bounded static-replay policy recover it.
+                    if let Some(enc) = encoder.as_mut() {
+                        enc.force_idr();
+                    }
+                    next_idr = now;
+                    if is_idr || latest_idr.is_some() {
+                        replay.on_not_admitted(now);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let cursor_now = Instant::now();
+        if !capture.is_privileged() && cursor_now >= next_cursor_poll {
+            if let Some(state) = cursor_tracker.sample(None, cursor_now) {
+                pump.publish_cursor_state(state.encode());
+            }
+            next_cursor_poll = cursor_now + Duration::from_millis(16);
+        }
+        if cursor_now >= next_input_log {
+            let stats = input_sink.take_stats();
+            if !stats.is_empty() {
+                info!(
+                    relative_packets = stats.relative_packets,
+                    absolute_packets = stats.absolute_packets,
+                    stale_motion_dropped = stats.stale_motion_dropped,
+                    cursor_sync_requests = stats.cursor_sync_requests,
+                    "remote input"
+                );
+            }
+            next_input_log = cursor_now + Duration::from_secs(1);
+        }
+        if Instant::now() >= next_ping {
+            signaling.send_ping();
+            next_ping = Instant::now() + Duration::from_secs(20);
+        }
+        if args.fixed_bitrate_bps.is_none()
+            && wss_media.is_none()
+            && Instant::now() >= next_quality_tick
+        {
+            let now = Instant::now();
+            if benchmark_lease
+                .active()
+                .is_none_or(|profile| !benchmark_mode_matches(profile.stream_mode, stream_mode))
+            {
+                if let Some(decision) = quality.tick(now) {
+                    apply_quality_decision(
+                        &mut quality,
+                        decision,
+                        &mut profiles,
+                        &mut latest_idr,
+                        &mut encoder,
+                        &mut signaling,
+                    );
+                }
             }
             next_quality_tick = now + Duration::from_secs(1);
         }
-        // -- str0m outputs ----------------------------------------------------
-        let timeout;
-        loop {
-            match rtc.rtc.poll_output() {
-                Ok(Output::Transmit(t)) => {
-                    match socket.send_to(&t.contents, t.destination) {
-                        Ok(n) => {
-                            tx_packets_window += 1;
-                            tx_bytes_window += n as u64;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // UDP backpressure is unusual, but blocking the
-                            // pacer would be worse. Congestion control will
-                            // react to the resulting loss.
-                            debug!(dest = %t.destination, "UDP send would block; dropping datagram");
-                        }
-                        Err(e) => warn!(?e, dest = %t.destination, "UDP send failed"),
-                    }
-                }
-                Ok(Output::Timeout(t)) => {
-                    timeout = t;
-                    break;
-                }
-                Ok(Output::Event(e)) => {
-                    if let Some(action) = rtc.on_event(e) {
-                        match action {
-                            RtcAction::IceConnected => {
-                                let now = Instant::now();
-                                cached_idr_replay.on_ice_connected();
-                                connected_since = Some(now);
-                                next_idr = now; // immediate IDR
-                                transport_window_started = now;
-                                next_transport_log = now + Duration::from_secs(1);
-                                tx_packets_window = 0;
-                                tx_bytes_window = 0;
-                                admitted_frames_window = 0;
-                                admitted_bytes_window = 0;
-                                overdue_deadlines_window = 0;
-                                max_deadline_overdue_us = 0;
-                                scale_sum_us = 0;
-                                scale_max_us = 0;
-                                scale_count = 0;
-                                encode_sum_us = 0;
-                                encode_max_us = 0;
-                                encode_count = 0;
-                            }
-                            RtcAction::IceDisconnected | RtcAction::Closed => {
-                                info!("ICE gone — session closed");
-                                break 'run;
-                            }
-                            RtcAction::KeyframeRequested => {
-                                let now = Instant::now();
-                                if now.duration_since(last_idr_sent) >= KEYFRAME_REQUEST_COOLDOWN {
-                                    cached_idr_replay.on_keyframe_requested(now);
-                                    if let Some(enc) = encoder.as_mut() {
-                                        enc.force_idr();
-                                        info!("forcing IDR after receiver keyframe request");
-                                    }
-                                } else {
-                                    debug!("coalescing repeated receiver keyframe request");
-                                }
-                            }
-                            RtcAction::Bwe(bps) => {
-                                if args.fixed_bitrate_bps.is_none() {
-                                    if let Some(decision) = quality.bwe_sample(
-                                        Instant::now(),
-                                        bps.min(args.max_bitrate_bps as u64) as u32,
-                                    ) {
-                                        apply_quality_decision(
-                                            &mut quality,
-                                            decision,
-                                            &mut profiles,
-                                            &mut latest_idr,
-                                            &mut encoder,
-                                            &mut signaling,
-                                        );
-                                    }
-                                }
-                                {
-                                    let clamped = bps.min(args.max_bitrate_bps as u64) as u32;
-                                    // Log the first estimate and any step of
-                                    // >= 1 Mbps so the host log shows
-                                    // congestion control working in a test.
-                                    let log_it = match last_logged_bwe {
-                                        None => true,
-                                        Some(prev) => {
-                                            (clamped as i64 - prev as i64).abs() >= 1_000_000
-                                        }
-                                    };
-                                    if log_it {
-                                        info!(bwe_bps = clamped, "BWE applied");
-                                        last_logged_bwe = Some(clamped as u64);
-                                    }
-                                }
-                            }
-                            RtcAction::InputData(d) => {
-                                input_packets += 1;
-                                input_bytes += d.len() as u64;
-                                input_sink.handle(&d);
-                                if input_packets <= 20 || input_packets % 500 == 0 {
-                                    info!(
-                                        input_packets,
-                                        input_bytes, "input packets applied via SendInput"
-                                    );
-                                }
-                            }
-                            RtcAction::ChannelOpen(_) => {}
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(?e, "poll_output failed");
-                    break 'run;
-                }
-            }
-        }
-
-        // -- Signaling events ----------------------------------------------
-        // str0m requires one mutation followed immediately by a complete
-        // poll_output drain. Retain batches from the WebSocket, but apply at
-        // most one RTC-mutating signal per outer iteration.
-        if Instant::now() >= next_signal_ping {
-            signaling.send_ping();
-            next_signal_ping = Instant::now() + Duration::from_secs(20);
-        }
-        if pending_signal_events.is_empty() {
-            match signaling.poll() {
-                Ok(events) => pending_signal_events.extend(events),
-                Err(e) => {
-                    // Transient signaling drops (edge recycling, DO eviction,
-                    // network blips) must end the session so the outer loop can
-                    // reconnect — they are NOT fatal.
-                    warn!(?e, "signaling read failed — ending session to reconnect");
-                    break 'run;
-                }
-            }
-        }
-        if let Some(candidate) =
-            take_remote_candidate_after_answer(offer_accepted, &mut pending_remote_candidates)
-        {
-            rtc.add_remote_candidate(&candidate);
-            // One mutation per iteration; drain str0m before the next signal.
-            continue 'run;
-        }
-        if let Some(ev) = pending_signal_events.pop_front() {
-            match ev {
+        for event in signaling.poll()? {
+            match event {
                 SignalEvent::Offer(sdp) => {
-                    info!("received SDP offer");
-                    if !should_start_fresh_rtc_epoch(rtc.ice_connected) {
-                        debug!("ignoring duplicate offer for connected RTC epoch");
-                        continue 'run;
+                    if args.privileged_agent {
+                        remote_input_ready = false;
+                        capture.release_input();
                     }
-                    rtc = fresh_rtc_epoch(&socket, host_addr, mapped_addr, initial_bitrate)?;
-                    match rtc.accept_offer(&sdp) {
-                        Ok(answer) => {
-                            offer_accepted = true;
-                            if let Err(e) = signaling.send_answer(&answer) {
-                                warn!(?e, "send answer failed — ending session");
-                                break 'run;
-                            }
-                            info!("SDP answer sent");
-                            continue 'run;
+                    signaling.send_host_capabilities(
+                        args.privileged_agent,
+                        args.privileged_agent,
+                        args.privileged_agent,
+                        args.privileged_agent,
+                    );
+                    if let Ok(monitors) = capture.monitors() {
+                        signaling.send_monitor_list(monitors);
+                    }
+                    let state = capture.desktop_state();
+                    signaling.send_desktop_state_kind(
+                        if state.available {
+                            "active"
+                        } else {
+                            "unavailable"
+                        },
+                        Some(state.desktop),
+                        Some(state.input),
+                        media_generation,
+                        "offer-state-replay",
+                    );
+                    if should_forward_offer(ice_connected, offer_accepted, offer_in_flight) {
+                        if !pump.command(TransportCommand::Offer(sdp)) {
+                            break 'session;
                         }
-                        Err(e) => {
-                            // A bad or stale offer (client vanished before DTLS,
-                            // ICE never established) must not kill the host —
-                            // end this session and wait for the next client.
-                            warn!(?e, "accept_offer failed — ending session");
-                            break 'run;
-                        }
+                        offer_in_flight = true;
                     }
                 }
-                SignalEvent::RemoteCandidate(sdp) => {
-                    if offer_accepted {
-                        rtc.add_remote_candidate(&sdp);
-                    } else {
-                        pending_remote_candidates.push_back(sdp);
+                SignalEvent::FirstFrame {
+                    protocol,
+                    phase,
+                    request_id,
+                    transport,
+                    epoch,
+                    generation,
+                    sequence: _,
+                    codec,
+                    reason: _,
+                } => {
+                    if protocol != 1
+                        || request_id.len() < 8
+                        || request_id.len() > 64
+                        || !request_id.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+                        })
+                    {
+                        continue;
                     }
-                    continue 'run;
+                    match phase.as_str() {
+                        "request" => {
+                            let Some(transport) =
+                                transport.filter(|value| value == "webrtc" || value == "wss")
+                            else {
+                                continue;
+                            };
+                            if transport == "wss"
+                                && epoch.as_deref().is_none_or(|value| value.len() != 32)
+                            {
+                                continue;
+                            }
+                            if (transport == "wss") != wss_media.is_some()
+                                || (transport == "webrtc") != (wss_media.is_none() && ice_connected)
+                            {
+                                continue;
+                            }
+                            if transport == "wss" && epoch.as_deref() != active_wss_epoch.as_deref()
+                            {
+                                continue;
+                            }
+                            let now = Instant::now();
+                            pending_first_frame = Some(PendingFirstFrame {
+                                request_id,
+                                transport,
+                                epoch,
+                                generation: media_generation,
+                                admitted: false,
+                                armed_at: now,
+                            });
+                            replay.on_keyframe_requested(now);
+                            if let Some(enc) = encoder.as_mut() {
+                                enc.force_idr();
+                            }
+                            next_idr = now;
+                            next_admission = now;
+                            info!(
+                                generation = media_generation,
+                                ?codec,
+                                "first-frame request armed"
+                            );
+                        }
+                        "presented" => {
+                            let Some(pending) = pending_first_frame.as_ref() else {
+                                continue;
+                            };
+                            if pending.request_id != request_id
+                                || generation != Some(pending.generation)
+                                || !pending.admitted
+                            {
+                                continue;
+                            }
+                            let (transport, epoch, codec, generation) = (
+                                pending.transport.clone(),
+                                pending.epoch.clone(),
+                                codec.or_else(|| Some(active_codec.name().to_string())),
+                                pending.generation,
+                            );
+                            signaling.send_first_frame(
+                                "ready",
+                                &request_id,
+                                generation,
+                                Some(&transport),
+                                epoch.as_deref(),
+                                codec.as_deref(),
+                            );
+                            let state = capture.desktop_state();
+                            remote_input_ready = privileged_input_ready_after_presentation(
+                                args.privileged_agent,
+                                capture_available,
+                                state,
+                                generation,
+                                media_generation,
+                            );
+                            pending_first_frame = None;
+                            info!(generation, "first-frame handshake ready");
+                        }
+                        _ => {}
+                    }
                 }
                 SignalEvent::ClientDiagnostics {
                     seq,
                     at_ms,
                     profile,
-                } => {
-                    info!(
-                        client_diag_seq = seq,
-                        client_at_ms = at_ms,
-                        client_profile = %profile,
-                        "client diagnostics"
-                    );
-                }
-                SignalEvent::Qos {
+                } => info!(seq, at_ms, client_profile = %profile, "client diagnostics"),
+                SignalEvent::ClientLog {
                     seq,
                     at_ms,
+                    level,
+                    event,
+                    detail,
+                } => match level.as_str() {
+                    "error" => {
+                        tracing::error!(seq, at_ms, client_event = %event, client_detail = %detail, "client log")
+                    }
+                    "warn" => {
+                        tracing::warn!(seq, at_ms, client_event = %event, client_detail = %detail, "client log")
+                    }
+                    _ => {
+                        info!(seq, at_ms, client_event = %event, client_detail = %detail, "client log")
+                    }
+                },
+                SignalEvent::RemoteCandidate(c) if offer_accepted => {
+                    let _ = pump.command(TransportCommand::RemoteCandidate(c));
+                }
+                SignalEvent::RemoteCandidate(c) => pending_candidates.push_back(c),
+                SignalEvent::PeerLeft => break 'session,
+                SignalEvent::Qos {
+                    seq: _,
+                    at_ms: _,
                     rx,
                     presentation,
-                } => {
-                    let backlog = match (rx.frames_received_delta, rx.frames_decoded_delta) {
-                        (Some(r), Some(d)) => Some(r as i64 - d as i64),
-                        _ => None,
-                    };
-                    if args.fixed_bitrate_bps.is_none() {
-                        let admitted_fps = if transport_window_started.elapsed().is_zero() {
-                            presentation.fps
-                        } else {
-                            Some(
-                                admitted_frames_window as f64
-                                    / transport_window_started.elapsed().as_secs_f64().max(0.001),
-                            )
-                        };
+                } if args.fixed_bitrate_bps.is_none() && wss_media.is_none() => {
+                    let backlog = rx
+                        .frames_received_delta
+                        .zip(rx.frames_decoded_delta)
+                        .map(|(r, d)| r as i64 - d as i64);
+                    if benchmark_lease.active().is_none_or(|profile| {
+                        !benchmark_mode_matches(profile.stream_mode, stream_mode)
+                    }) {
                         if let Some(d) = quality.qos_sample(
                             Instant::now(),
                             Qos {
@@ -1098,7 +4141,7 @@ fn run_serve(args: &Args) -> Result<()> {
                                 packets: rx.packets_received_delta,
                                 decode_backlog_growth: backlog,
                                 freeze_delta: rx.freeze_delta,
-                                admitted_fps,
+                                admitted_fps: presentation.fps,
                             },
                         ) {
                             apply_quality_decision(
@@ -1111,634 +4154,3251 @@ fn run_serve(args: &Args) -> Result<()> {
                             );
                         }
                     }
-                    debug!(seq, at_ms, "qos accepted");
                 }
-                SignalEvent::PeerLeft => {
-                    info!("peer left — exiting");
-                    break 'run;
+                SignalEvent::InputData(data) => {
+                    if !capture_available || !remote_input_ready {
+                        continue;
+                    }
+                    if capture.send_input(&data)? {
+                        continue;
+                    }
+                    let outcome = input_sink.handle(&data);
+                    if outcome.cursor_changed || outcome.sync_requested {
+                        if let Some(state) =
+                            cursor_tracker.sample(outcome.accepted_sequence, Instant::now())
+                        {
+                            // WSS mode uses the authenticated signaling socket
+                            // for cursor feedback; the Worker relays binary in
+                            // the opposite direction without JSON wrapping.
+                            signaling.send_binary(&state.encode());
+                            if outcome.sync_requested {
+                                info!(ack = ?state.acknowledged_sequence, in_bounds = state.in_bounds, os_visible = state.visible, "WSS cursor feedback sent");
+                            }
+                        }
+                    }
                 }
-                SignalEvent::Registered => {}
+                SignalEvent::MediaControl {
+                    action,
+                    request_id,
+                    stream_mode: requested_stream_mode,
+                    codec,
+                    reason,
+                    protocol,
+                    epoch,
+                    quality: requested_quality,
+                    adaptive,
+                    revision,
+                    enabled,
+                    x_q16,
+                    y_q16,
+                    width_q16,
+                    height_q16,
+                    monitor,
+                    topology,
+                } => {
+                    if action == "monitors" {
+                        if !valid_monitor_refresh_control(
+                            protocol,
+                            epoch.as_deref(),
+                            active_wss_epoch.as_deref(),
+                        ) {
+                            warn!(
+                                ?protocol,
+                                ?epoch,
+                                "monitor refresh missing current v2 epoch"
+                            );
+                            continue;
+                        }
+                        match capture.monitors() {
+                            Ok(monitors) => signaling.send_monitor_list(monitors),
+                            Err(error) => warn!(?error, "monitor refresh enumeration failed"),
+                        }
+                        continue;
+                    }
+                    if let Some(next_mode) = StreamMode::parse(requested_stream_mode.as_deref()) {
+                        if next_mode != stream_mode {
+                            stream_mode = next_mode;
+                            quality.set_mode(next_mode);
+                            let staged = profiles.set_stream_mode(next_mode);
+                            wss_quality = WssQualityController::new(Instant::now());
+                            if let Some(egress) = wss_media.as_ref() {
+                                egress.set_stream_mode(next_mode);
+                            }
+                            if let Some(enc) = encoder.as_mut() {
+                                let transport = if wss_media.is_some() {
+                                    BenchmarkTransport::Wss
+                                } else {
+                                    BenchmarkTransport::Webrtc
+                                };
+                                let encoder_bitrate_bps = benchmark_owned_encoder_bitrate(
+                                    quality.target(),
+                                    benchmark_lease.active(),
+                                    transport,
+                                    stream_mode,
+                                    active_codec,
+                                );
+                                if let Err(error) = enc.set_bitrate(encoder_bitrate_bps) {
+                                    warn!(?error, "stream-mode bitrate update failed");
+                                }
+                                enc.force_idr();
+                            }
+                            if staged {
+                                latest_idr = None;
+                                pending_wss_idr = None;
+                                pending_transition_idr = None;
+                            }
+                            next_idr = Instant::now();
+                            info!(stream_mode = stream_mode.label(), "stream mode changed");
+                        }
+                    }
+                    let requested = parse_media_codec(codec.as_deref());
+                    if action == "monitor" {
+                        let Some(selector) = monitor
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty() && value.len() <= 128)
+                        else {
+                            warn!("monitor control missing bounded selector");
+                            continue;
+                        };
+                        input_sink.release_all();
+                        capture.release_input();
+                        remote_input_ready = false;
+                        signaling.send_desktop_state(
+                            "unavailable",
+                            media_generation,
+                            "monitor-switch",
+                        );
+                        media_generation = media_generation.wrapping_add(1).max(1);
+                        media_gop = 0;
+                        media_sequence = 0;
+                        latest_idr = None;
+                        pending_transition_idr = None;
+                        pending_wss_idr = None;
+                        pending_viewport_idr = None;
+                        encoder = None;
+                        scaler = None;
+                        next_admission = Instant::now();
+                        next_idr = Instant::now();
+                        match capture.switch_monitor(selector) {
+                            Ok(completed) => {
+                                // Local capture completes synchronously. The
+                                // privileged Agent returns false and must prove
+                                // the newly selected monitor with
+                                // CaptureHealth::Active before input/media are
+                                // advertised ready.
+                                capture_available = completed;
+                                if completed {
+                                    input_sink.set_absolute_region(capture.region());
+                                    cursor_tracker =
+                                        CursorTracker::for_region(capture.region(), Instant::now());
+                                    signaling.send_desktop_state(
+                                        "active",
+                                        media_generation,
+                                        "monitor-switched",
+                                    );
+                                }
+                                if let Ok(monitors) = capture.monitors() {
+                                    signaling.send_monitor_list(monitors);
+                                }
+                                info!(
+                                    monitor = selector,
+                                    generation = media_generation,
+                                    "live monitor switch complete"
+                                );
+                            }
+                            Err(error) => {
+                                capture_available = true;
+                                signaling.send_monitor_error(selector, &error.to_string());
+                                if let Ok(monitors) = capture.monitors() {
+                                    signaling.send_monitor_list(monitors);
+                                }
+                                warn!(
+                                    monitor = selector,
+                                    ?error,
+                                    "live monitor switch failed; retaining previous capture"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    if action == "start" {
+                        if let Some(requested_epoch) =
+                            epoch.as_deref().filter(|value| valid_v2_epoch(value))
+                        {
+                            if should_replace_wss_media_session(
+                                wss_media.is_some(),
+                                active_wss_epoch.as_deref(),
+                                requested_epoch,
+                            ) {
+                                info!(
+                                    previous_epoch = active_wss_epoch.as_deref(),
+                                    epoch = requested_epoch,
+                                    "replacing stale WSS media egress for new browser epoch"
+                                );
+                                if let Some(egress) = wss_media.take() {
+                                    egress.shutdown();
+                                }
+                                active_wss_epoch = None;
+                                media_generation = media_generation.wrapping_add(1).max(1);
+                                media_gop = 0;
+                                media_sequence = 0;
+                                latest_idr = None;
+                                pending_first_frame = None;
+                                pending_transition_idr = None;
+                                pending_wss_idr = None;
+                                pending_viewport_idr = None;
+                                wss_ack_rate = WssAckRate::new(Instant::now());
+                                wss_quality = WssQualityController::new(Instant::now());
+                                wss_recovery_snapshot_gate = WssRecoverySnapshotGate::default();
+                                next_admission = Instant::now();
+                                next_idr = Instant::now();
+                            }
+                        }
+                    }
+                    if action == "start" && wss_media.is_none() {
+                        let Some(bearer) = args.host_gate_token.as_deref() else {
+                            warn!("WSS media requested but --host-gate-token is missing");
+                            continue;
+                        };
+                        let Some(epoch) = epoch.as_deref().filter(|value| valid_v2_epoch(value))
+                        else {
+                            warn!(?protocol, "WSS media request missing session epoch");
+                            continue;
+                        };
+                        let connect_result = match protocol {
+                            Some(2) if topology.is_none() => {
+                                WssMediaEgress::connect(&worker, bearer, epoch)
+                            }
+                            Some(3) => topology
+                                .ok_or_else(|| anyhow::anyhow!("protocol v3 requires topology"))
+                                .and_then(|wire| {
+                                    WssTopology::new(
+                                        wire.lane_count as usize,
+                                        wire.data_shards as usize,
+                                        wire.parity_shards as usize,
+                                    )
+                                    .and_then(|topology| {
+                                        WssMediaEgress::connect_v3(&worker, bearer, epoch, topology)
+                                    })
+                                }),
+                            _ => Err(anyhow::anyhow!("unsupported WSS media protocol")),
+                        };
+                        match connect_result {
+                            Ok(egress) => {
+                                if args.privileged_agent {
+                                    remote_input_ready = false;
+                                    capture.release_input();
+                                }
+                                egress.set_stream_mode(stream_mode);
+                                let lane_health = egress.health();
+                                let healthy_lanes =
+                                    lane_health.iter().filter(|lane| lane.healthy).count();
+                                info!(codec = active_codec.name(), healthy_lanes, lane_health = ?lane_health, "WSS media egress connected");
+                                wss_media = Some(egress);
+                                active_wss_epoch = Some(epoch.to_owned());
+                                if protocol == Some(3) {
+                                    signaling.send_media_topology(
+                                        epoch,
+                                        "accepted",
+                                        topology.expect("v3 topology validated above"),
+                                        None,
+                                    );
+                                }
+                                // A browser can reconnect after a previous
+                                // secure-desktop transition.  Announce the
+                                // current capture state at every media start
+                                // so the client cannot retain stale overlay
+                                // state across WSS epochs.
+                                let state = capture.desktop_state();
+                                signaling.send_desktop_state_kind(
+                                    if state.available {
+                                        "active"
+                                    } else {
+                                        "unavailable"
+                                    },
+                                    Some(state.desktop),
+                                    Some(state.input),
+                                    media_generation,
+                                    "wss-session-start",
+                                );
+                                signaling.send_host_capabilities(
+                                    args.privileged_agent,
+                                    args.privileged_agent,
+                                    args.privileged_agent,
+                                    args.privileged_agent,
+                                );
+                                // WSS-only clients do not necessarily complete
+                                // the WebRTC offer path, so announce monitors
+                                // here as well as on a normal offer.
+                                if let Ok(monitors) = capture.monitors() {
+                                    signaling.send_monitor_list(monitors);
+                                }
+                                wss_adaptive = adaptive.unwrap_or(false);
+                                let adjustment = wss_preset(
+                                    requested_quality.as_deref(),
+                                    args.max_bitrate_bps,
+                                    stream_mode,
+                                );
+                                let encoder_bitrate_bps = benchmark_owned_encoder_bitrate(
+                                    adjustment.target_bps,
+                                    benchmark_lease.active(),
+                                    BenchmarkTransport::Wss,
+                                    stream_mode,
+                                    active_codec,
+                                );
+                                let staged = apply_wss_adjustment(
+                                    &mut quality,
+                                    adjustment,
+                                    encoder_bitrate_bps,
+                                    &mut profiles,
+                                    &mut latest_idr,
+                                    &mut encoder,
+                                    &mut signaling,
+                                );
+                                if staged {
+                                    // Announce intent immediately; a second quality
+                                    // message after the IDR ACK confirms activation.
+                                    signaling.send_quality(
+                                        adjustment.mode.label,
+                                        adjustment.mode.width,
+                                        adjustment.mode.height,
+                                        adjustment.mode.fps,
+                                        adjustment.target_bps,
+                                        quality.bwe(),
+                                        "wss-preset-pending",
+                                        stream_mode.label(),
+                                    );
+                                }
+                                next_idr = Instant::now();
+                                latest_idr = None;
+                            }
+                            Err(error) => {
+                                if protocol == Some(3) {
+                                    if let Some(topology) = topology {
+                                        signaling.send_media_topology(
+                                            epoch,
+                                            "rejected",
+                                            topology,
+                                            Some("host-connect-failed"),
+                                        );
+                                    }
+                                }
+                                warn!(?error, "WSS media egress connection failed");
+                            }
+                        }
+                    }
+                    if action == "quality" {
+                        if wss_media.is_some() {
+                            wss_adaptive = adaptive.unwrap_or(false);
+                        }
+                        let adjustment = wss_preset(
+                            requested_quality.as_deref(),
+                            args.max_bitrate_bps,
+                            stream_mode,
+                        );
+                        let transport = if wss_media.is_some() {
+                            BenchmarkTransport::Wss
+                        } else {
+                            BenchmarkTransport::Webrtc
+                        };
+                        let encoder_bitrate_bps = benchmark_owned_encoder_bitrate(
+                            adjustment.target_bps,
+                            benchmark_lease.active(),
+                            transport,
+                            stream_mode,
+                            active_codec,
+                        );
+                        let staged = apply_wss_adjustment(
+                            &mut quality,
+                            adjustment,
+                            encoder_bitrate_bps,
+                            &mut profiles,
+                            &mut latest_idr,
+                            &mut encoder,
+                            &mut signaling,
+                        );
+                        if staged {
+                            signaling.send_quality(
+                                adjustment.mode.label,
+                                adjustment.mode.width,
+                                adjustment.mode.height,
+                                adjustment.mode.fps,
+                                adjustment.target_bps,
+                                quality.bwe(),
+                                if wss_media.is_some() {
+                                    "wss-preset-pending"
+                                } else {
+                                    "rtc-preset-pending"
+                                },
+                                stream_mode.label(),
+                            );
+                        }
+                        next_idr = Instant::now();
+                    }
+                    if action == "viewport" && wss_media.is_some() {
+                        if !matches!(protocol, Some(2 | 3)) || epoch.is_none() {
+                            warn!(?protocol, "WSS viewport request missing session metadata");
+                            continue;
+                        }
+                        let Some(revision) = revision else {
+                            continue;
+                        };
+                        if revision <= viewport_revision {
+                            continue;
+                        }
+                        let crop = match viewport_from_q16(
+                            revision,
+                            enabled.unwrap_or(false),
+                            x_q16.unwrap_or(0),
+                            y_q16.unwrap_or(0),
+                            width_q16.unwrap_or(u16::MAX),
+                            height_q16.unwrap_or(u16::MAX),
+                            capture.width(),
+                            capture.height(),
+                        ) {
+                            Some(crop) => crop,
+                            None => {
+                                warn!(revision, "invalid WSS viewport request");
+                                continue;
+                            }
+                        };
+                        let implicit_full = ViewportCrop {
+                            revision,
+                            x: 0,
+                            y: 0,
+                            width: capture.width(),
+                            height: capture.height(),
+                        };
+                        let current_crop = viewport_crop.unwrap_or(implicit_full);
+                        if pending_viewport_idr.is_none()
+                            && same_viewport_geometry(current_crop, crop)
+                        {
+                            viewport_revision = revision;
+                            viewport_crop = Some(crop);
+                            let state = if crop.x == 0
+                                && crop.y == 0
+                                && crop.width == capture.width()
+                                && crop.height == capture.height()
+                            {
+                                "full"
+                            } else {
+                                "active"
+                            };
+                            signaling.send_media_view(
+                                state,
+                                crop.revision,
+                                media_generation,
+                                capture.width(),
+                                capture.height(),
+                                crop.x,
+                                crop.y,
+                                crop.width,
+                                crop.height,
+                                "viewport-unchanged",
+                            );
+                            active_viewport = Some((crop.revision, media_generation));
+                            info!(
+                                revision,
+                                generation = media_generation,
+                                crop_x = crop.x,
+                                crop_y = crop.y,
+                                crop_width = crop.width,
+                                crop_height = crop.height,
+                                "WSS viewport unchanged; acknowledged without IDR"
+                            );
+                            continue;
+                        }
+                        viewport_revision = revision;
+                        viewport_crop = Some(crop);
+                        info!(
+                            revision,
+                            enabled = enabled.unwrap_or(false),
+                            crop_x = crop.x,
+                            crop_y = crop.y,
+                            crop_width = crop.width,
+                            crop_height = crop.height,
+                            "WSS viewport prepared"
+                        );
+                        media_generation = media_generation.wrapping_add(1).max(1);
+                        media_gop = 0;
+                        media_sequence = 0;
+                        pending_wss_idr = None;
+                        pending_viewport_idr = None;
+                        latest_idr = None;
+                        capture.request_idle_snapshot();
+                        if let Some(enc) = encoder.as_mut() {
+                            enc.force_idr();
+                        }
+                        next_idr = Instant::now();
+                        signaling.send_media_view(
+                            "pending",
+                            crop.revision,
+                            media_generation,
+                            capture.width(),
+                            capture.height(),
+                            crop.x,
+                            crop.y,
+                            crop.width,
+                            crop.height,
+                            reason.as_deref().unwrap_or("sharp-viewport"),
+                        );
+                    }
+                    if valid_stripe_reconnect_recovery_control(
+                        &action,
+                        reason.as_deref(),
+                        protocol,
+                        epoch.as_deref(),
+                        active_wss_epoch.as_deref(),
+                    ) {
+                        if let Some(egress) = wss_media.as_ref() {
+                            let rearmed_lanes = egress.rearm_awaiting_recovery_lanes();
+                            info!(
+                                rearmed_lanes,
+                                "WSS stripe reconnect rearmed lanes awaiting an unreachable recovery ACK"
+                            );
+                        }
+                    }
+                    if matches!(action.as_str(), "start" | "keyframe") {
+                        if let Some(requested) = requested {
+                            if requested != active_codec
+                                && accept_session_codec(active_codec, requested)
+                            {
+                                info!(
+                                    from = active_codec.name(),
+                                    to = requested.name(),
+                                    ?reason,
+                                    "browser requested one-way codec fallback"
+                                );
+                                active_codec = requested;
+                                media_generation = media_generation.wrapping_add(1).max(1);
+                                media_gop = 0;
+                                media_sequence = 0;
+                                encoder = None;
+                                latest_idr = None;
+                                pending_transition_idr = None;
+                                pending_wss_idr = None;
+                                pending_viewport_idr = None;
+                            }
+                        }
+                        // A keyframe request must wake a static desktop too.
+                        // Clearing the cached IDR makes the next producer
+                        // pass take an idle snapshot instead of waiting for a
+                        // new desktop present that may never arrive.
+                        if action == "keyframe" {
+                            latest_idr = None;
+                            if benchmark_lease.active().is_some_and(|profile| {
+                                profile.schema_version == 2
+                                    && profile.implementation_variant
+                                        == benchmark::BenchmarkImplementationVariant::Candidate
+                                    && profile.hybrid_mode == BenchmarkHybridMode::PngStaticRoi
+                                    && profile.transport == BenchmarkTransport::Wss
+                                    && benchmark_mode_matches(profile.stream_mode, stream_mode)
+                            }) {
+                                hybrid_tile_planner.reset();
+                            } else if benchmark_lease.active().is_some_and(|profile| {
+                                profile.schema_version == 2
+                                    && profile.implementation_variant
+                                        == benchmark::BenchmarkImplementationVariant::Candidate
+                                    && matches!(
+                                        profile.hybrid_mode,
+                                        BenchmarkHybridMode::PngQuiescentDetail
+                                            | BenchmarkHybridMode::HevcQuiescentTiles
+                                    )
+                                    && profile.transport == BenchmarkTransport::Wss
+                                    && benchmark_mode_matches(profile.stream_mode, stream_mode)
+                            }) {
+                                quiescent_tile_planner.mark_output_stale();
+                            }
+                            capture.request_idle_snapshot();
+                        }
+                        let lab_quality_request = lab_quality_keyframe_request(
+                            &action,
+                            reason.as_deref(),
+                            request_id.as_deref(),
+                        );
+                        if let Some(request_id) = lab_quality_request {
+                            pending_lab_quality_keyframe = Some(request_id.to_owned());
+                        }
+                        if let Some(enc) = encoder.as_mut() {
+                            if should_reset_lab_encoder_for_keyframe(
+                                reset_lab_encoder_on_diagnostic_keyframe,
+                                &action,
+                                reason.as_deref(),
+                            ) {
+                                if lab_quality_request.is_some() {
+                                    enc.reset_rate_control()
+                                        .context("resetting Stream Lab NVENC rate-control state")?;
+                                } else {
+                                    warn!("ignoring Stream Lab encoder reset without a valid request id");
+                                }
+                            }
+                            enc.force_idr();
+                        }
+                        next_idr = Instant::now();
+                    }
+                }
+                SignalEvent::MediaAck {
+                    generation,
+                    gop,
+                    sequence,
+                } => {
+                    if let Some(egress) = wss_media.as_ref() {
+                        // ACKs identify GOP/frame globally. The egress tracks
+                        // the owning stripe and resolves it without trusting
+                        // browser-provided routing metadata.
+                        egress.on_frame_ack(generation, gop, sequence);
+                    }
+                    if args.fixed_bitrate_bps.is_none() {
+                        if let Some(delivery_bps) =
+                            wss_ack_rate.acknowledged(Instant::now(), generation, sequence)
+                        {
+                            let encoder_target_bps = quality.target();
+                            let capacity_bps =
+                                wss_capacity_observation(delivery_bps, encoder_target_bps);
+                            let unhealthy_lanes = wss_media
+                                .as_ref()
+                                .map(|egress| {
+                                    egress
+                                        .health()
+                                        .into_iter()
+                                        .filter(|lane| !lane.healthy)
+                                        .count()
+                                })
+                                .unwrap_or_default();
+                            info!(
+                                delivery_bps,
+                                encoder_target_bps,
+                                capacity_bps,
+                                pending_frames = wss_ack_rate.pending.len(),
+                                unhealthy_lanes,
+                                "WSS delivery window"
+                            );
+                        }
+                    }
+                }
+                SignalEvent::MediaAckV2 {
+                    generation,
+                    lanes,
+                    reconstructed,
+                    presented,
+                    recovered_frames,
+                    expired_frames,
+                    decoder_drops,
+                    dependency_losses,
+                    deadline_ms,
+                    reassembly_p95_ms,
+                    recovery_state,
+                } => {
+                    if let Some(egress) = wss_media.as_ref() {
+                        egress.on_v2_ack(generation, lanes);
+                    }
+                    if pending_wss_idr.as_ref().is_some_and(|pending| {
+                        pending.generation == generation
+                            && sequence_reached(reconstructed, pending.sequence)
+                    }) {
+                        let pending = pending_wss_idr.take().expect("checked above");
+                        if is_fallback_reason(pending.reason) {
+                            profiles.pinned = true;
+                        }
+                        profiles.commit_mode(pending.mode, pending.reason);
+                        if let Some((mode, reason)) = profiles.pending_announcement() {
+                            signaling.send_quality(
+                                mode.label,
+                                mode.width,
+                                mode.height,
+                                mode.fps,
+                                encoder
+                                    .as_ref()
+                                    .map(Nvenc::bitrate)
+                                    .unwrap_or(quality.target()),
+                                quality.bwe(),
+                                reason,
+                                stream_mode.label(),
+                            );
+                            profiles.on_idr_admitted();
+                        }
+                    }
+                    if pending_viewport_idr.as_ref().is_some_and(|pending| {
+                        pending.generation == generation
+                            && sequence_reached(reconstructed, pending.sequence)
+                    }) {
+                        if let Some(pending) = pending_viewport_idr.take() {
+                            let state = if pending.crop.x == 0
+                                && pending.crop.y == 0
+                                && pending.crop.width == capture.width()
+                                && pending.crop.height == capture.height()
+                            {
+                                "full"
+                            } else {
+                                "active"
+                            };
+                            signaling.send_media_view(
+                                state,
+                                pending.crop.revision,
+                                pending.generation,
+                                capture.width(),
+                                capture.height(),
+                                pending.crop.x,
+                                pending.crop.y,
+                                pending.crop.width,
+                                pending.crop.height,
+                                "viewport-active",
+                            );
+                            active_viewport = Some((pending.crop.revision, pending.generation));
+                            info!(
+                                revision = pending.crop.revision,
+                                generation = pending.generation,
+                                crop_x = pending.crop.x,
+                                crop_y = pending.crop.y,
+                                crop_width = pending.crop.width,
+                                crop_height = pending.crop.height,
+                                "WSS viewport activated after IDR"
+                            );
+                        }
+                    }
+                    if args.fixed_bitrate_bps.is_none() {
+                        if benchmark_lease.active().is_none_or(|profile| {
+                            !benchmark_mode_matches(profile.stream_mode, stream_mode)
+                        }) && wss_adaptive
+                            && pending_wss_idr.is_none()
+                        {
+                            let now = Instant::now();
+                            wss_quality.observe_preencode_skips(now, wss_preencode_skips_total);
+                            if let Some(adjustment) = wss_quality.sample(
+                                now,
+                                generation,
+                                &quality,
+                                &profiles,
+                                lanes,
+                                reconstructed,
+                                presented,
+                                recovered_frames,
+                                dependency_losses,
+                                decoder_drops,
+                            ) {
+                                let _ = apply_wss_adjustment(
+                                    &mut quality,
+                                    adjustment,
+                                    adjustment.target_bps,
+                                    &mut profiles,
+                                    &mut latest_idr,
+                                    &mut encoder,
+                                    &mut signaling,
+                                );
+                            }
+                        }
+                        if let Some(delivery_bps) =
+                            wss_ack_rate.acknowledged(Instant::now(), generation, reconstructed)
+                        {
+                            let encoder_target_bps = quality.target();
+                            let capacity_bps =
+                                wss_capacity_observation(delivery_bps, encoder_target_bps);
+                            let unhealthy_lanes = wss_media
+                                .as_ref()
+                                .map(|egress| {
+                                    egress
+                                        .health()
+                                        .into_iter()
+                                        .filter(|lane| !lane.healthy)
+                                        .count()
+                                })
+                                .unwrap_or_default();
+                            info!(
+                                delivery_bps,
+                                encoder_target_bps,
+                                capacity_bps,
+                                pending_frames = wss_ack_rate.pending.len(),
+                                unhealthy_lanes,
+                                presented,
+                                recovered_frames,
+                                expired_frames,
+                                dependency_losses,
+                                deadline_ms,
+                                reassembly_p95_ms,
+                                recovery_state = recovery_state.as_deref().unwrap_or("legacy"),
+                                decoder_drops,
+                                "WSS v2 delivery window"
+                            );
+                        }
+                    }
+                }
+                SignalEvent::MediaAckV3 {
+                    generation,
+                    topology,
+                    lanes,
+                    completion_missing_by_lane,
+                    reconstructed,
+                    presented,
+                    recovered_frames,
+                    expired_frames,
+                    decoder_drops,
+                    dependency_losses,
+                    deadline_ms,
+                    reassembly_p95_ms,
+                    recovery_state,
+                } => {
+                    let ack_topology = WssTopology::new(
+                        topology.lane_count as usize,
+                        topology.data_shards as usize,
+                        topology.parity_shards as usize,
+                    );
+                    let valid = wss_media.as_ref().is_some_and(|egress| {
+                        egress.protocol() == 3
+                            && ack_topology
+                                .as_ref()
+                                .is_ok_and(|value| *value == egress.topology())
+                    });
+                    if !valid {
+                        warn!(
+                            ?topology,
+                            lane_count = lanes.len(),
+                            "ignoring mismatched WSS v3 ACK"
+                        );
+                        continue;
+                    }
+                    if let Some(egress) = wss_media.as_ref() {
+                        if let Err(error) =
+                            egress.on_v3_ack(generation, &lanes, &completion_missing_by_lane)
+                        {
+                            warn!(?error, "ignoring invalid WSS v3 ACK lanes");
+                            continue;
+                        }
+                    }
+                    if pending_wss_idr.as_ref().is_some_and(|pending| {
+                        pending.generation == generation
+                            && sequence_reached(reconstructed, pending.sequence)
+                    }) {
+                        let pending = pending_wss_idr.take().expect("checked above");
+                        if is_fallback_reason(pending.reason) {
+                            profiles.pinned = true;
+                        }
+                        profiles.commit_mode(pending.mode, pending.reason);
+                        if let Some((mode, reason)) = profiles.pending_announcement() {
+                            signaling.send_quality(
+                                mode.label,
+                                mode.width,
+                                mode.height,
+                                mode.fps,
+                                encoder
+                                    .as_ref()
+                                    .map(Nvenc::bitrate)
+                                    .unwrap_or(quality.target()),
+                                quality.bwe(),
+                                reason,
+                                stream_mode.label(),
+                            );
+                            profiles.on_idr_admitted();
+                        }
+                    }
+                    if pending_viewport_idr.as_ref().is_some_and(|pending| {
+                        pending.generation == generation
+                            && sequence_reached(reconstructed, pending.sequence)
+                    }) {
+                        if let Some(pending) = pending_viewport_idr.take() {
+                            let state = if pending.crop.x == 0
+                                && pending.crop.y == 0
+                                && pending.crop.width == capture.width()
+                                && pending.crop.height == capture.height()
+                            {
+                                "full"
+                            } else {
+                                "active"
+                            };
+                            signaling.send_media_view(
+                                state,
+                                pending.crop.revision,
+                                pending.generation,
+                                capture.width(),
+                                capture.height(),
+                                pending.crop.x,
+                                pending.crop.y,
+                                pending.crop.width,
+                                pending.crop.height,
+                                "viewport-active",
+                            );
+                            active_viewport = Some((pending.crop.revision, pending.generation));
+                        }
+                    }
+                    if let Some(delivery_bps) =
+                        wss_ack_rate.acknowledged(Instant::now(), generation, reconstructed)
+                    {
+                        info!(
+                            delivery_bps,
+                            encoder_target_bps = quality.target(),
+                            lanes = lanes.len(),
+                            data_shards = topology.data_shards,
+                            parity_shards = topology.parity_shards,
+                            presented,
+                            recovered_frames,
+                            expired_frames,
+                            dependency_losses,
+                            deadline_ms,
+                            reassembly_p95_ms,
+                            recovery_state = recovery_state.as_deref().unwrap_or("unknown"),
+                            decoder_drops,
+                            "WSS v3 delivery window"
+                        );
+                    }
+                }
+                SignalEvent::MediaTopology { .. } => {}
+                _ => {}
             }
         }
-
-        // -- UDP ingress ------------------------------------------------------
-        // Consume at most one datagram per iteration. An accepted packet is
-        // one str0m mutation, so immediately return to the output drain. This
-        // also prevents a busy or hostile source from starving media/timeouts.
-        match socket.recv_from(&mut buf) {
-            Ok((n, source)) => {
-                let Ok(contents) = buf[..n].try_into() else {
-                    continue 'run;
+        if offer_accepted {
+            // Retain an early candidate until the bounded control queue has
+            // accepted it; a saturated pump must not silently lose ICE.
+            while let Some(candidate) = pending_candidates.front() {
+                if !pump.command(TransportCommand::RemoteCandidate(candidate.clone())) {
+                    break;
+                }
+                pending_candidates.pop_front();
+            }
+        }
+        let now = Instant::now();
+        if pending_first_frame
+            .as_ref()
+            .is_some_and(|pending| now.duration_since(pending.armed_at) >= FIRST_FRAME_TIMEOUT)
+        {
+            if let Some(pending) = pending_first_frame.take() {
+                let reason = if pending.admitted {
+                    "presentation-timeout"
+                } else {
+                    "no-idr-admitted"
                 };
-                let input = Input::Receive(
-                    Instant::now(),
-                    Receive {
-                        proto: Protocol::Udp,
-                        source,
-                        destination: host_addr,
-                        contents,
+                signaling.send_first_frame_failed(
+                    &pending.request_id,
+                    pending.generation,
+                    Some(&pending.transport),
+                    pending.epoch.as_deref(),
+                    Some(active_codec.name()),
+                    reason,
+                );
+                warn!(generation = pending.generation, transport = %pending.transport, reason, "first-frame handshake failed");
+            }
+        }
+        let media_ready = ice_connected || wss_media.is_some();
+        let wss_recovery_status = wss_media
+            .as_ref()
+            .map(WssMediaEgress::recovery_snapshot_status);
+        if wss_recovery_snapshot_gate.should_request(
+            now,
+            wss_recovery_status.is_some_and(|status| status.needs_idr),
+            wss_recovery_status.is_some_and(|status| status.awaiting_ack),
+            wss_gop_interval(stream_mode),
+        ) {
+            // Lane recovery can become necessary after the desktop has gone
+            // static. Invalidate any earlier-scene cache and explicitly wake
+            // the idle snapshot path; otherwise the producer never reaches
+            // WSS reservation and the lane cannot receive its recovery IDR.
+            latest_idr = None;
+            capture.request_idle_snapshot();
+            if let Some(enc) = encoder.as_mut() {
+                enc.force_idr();
+            }
+            next_idr = now;
+            info!(
+                retry_ms = wss_gop_interval(stream_mode).as_millis(),
+                "WSS lane recovery requested a fresh idle-desktop snapshot"
+            );
+        }
+        if wss_media.is_some() && replay.is_due(now, latest_idr.is_some()) {
+            if let Some(cached) = latest_idr.as_ref() {
+                let candidate_gop = media_gop.wrapping_add(1).max(1);
+                let candidate_sequence = next_media_sequence(media_sequence);
+                let hybrid_replay = benchmark_lease.active().is_some_and(|profile| {
+                    active_codec == VideoCodec::Hevc
+                        && benchmark_mode_matches(profile.stream_mode, stream_mode)
+                        && profile.transport == BenchmarkTransport::Wss
+                        && matches!(
+                            profile.hybrid_mode,
+                            BenchmarkHybridMode::PngStaticRoi
+                                | BenchmarkHybridMode::PngQuiescentDetail
+                                | BenchmarkHybridMode::HevcQuiescentTiles
+                        )
+                });
+                if benchmark_lease.active().is_some_and(|profile| {
+                    matches!(
+                        profile.hybrid_mode,
+                        BenchmarkHybridMode::PngQuiescentDetail
+                            | BenchmarkHybridMode::HevcQuiescentTiles
+                    )
+                }) {
+                    quiescent_tile_planner.mark_output_stale();
+                }
+                let replay_payload = match cached_wss_replay_payload(
+                    cached,
+                    hybrid_replay,
+                    media_generation,
+                    candidate_sequence,
+                    viewport_revision,
+                ) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        warn!(?error, "hybrid cached IDR replay envelope rejected");
+                        replay.on_not_admitted(now);
+                        continue 'session;
+                    }
+                };
+                let meta = WssAccessUnitMeta {
+                    codec: wss_codec(active_codec),
+                    generation: media_generation,
+                    gop: candidate_gop,
+                    sequence: candidate_sequence,
+                    timestamp90k: (media_clock_start.elapsed().as_secs_f64() * 90_000.0) as u32,
+                    key: true,
+                    lab_roi: None,
+                };
+                if let Some(egress) = wss_media.as_ref() {
+                    match egress.reserve(meta) {
+                        Ok(reservation) => {
+                            if matches!(
+                                reservation.submit(replay_payload),
+                                WssSubmitOutcome::Queued { .. }
+                            ) {
+                                media_gop = candidate_gop;
+                                commit_media_sequence(&mut media_sequence, candidate_sequence);
+                                if let Some(pending) = pending_first_frame.as_mut() {
+                                    let armed_generation = pending.generation;
+                                    if pending.admit_wss_access_unit(media_generation, true) {
+                                        signaling.send_first_frame(
+                                            "admitted",
+                                            &pending.request_id,
+                                            pending.generation,
+                                            Some("wss"),
+                                            pending.epoch.as_deref(),
+                                            Some(active_codec.name()),
+                                        );
+                                        info!(
+                                            armed_generation,
+                                            admitted_generation = pending.generation,
+                                            source = "cached-idr",
+                                            "first-frame WSS IDR admitted"
+                                        );
+                                    }
+                                }
+                                replay.on_replayed();
+                            } else {
+                                replay.on_not_admitted(now);
+                            }
+                        }
+                        Err(_) => replay.on_not_admitted(now),
+                    }
+                }
+            }
+        }
+        if media_ready && replay.is_due(now, latest_idr.is_some()) {
+            if let Some(cached) = latest_idr.as_ref() {
+                let expected = profiles
+                    .staged
+                    .map(|(mode, _)| mode)
+                    .unwrap_or(profiles.active);
+                if cached.mode != expected {
+                    latest_idr = None;
+                    continue 'session;
+                }
+                if ice_connected && wss_media.is_none() {
+                    if let Some(reservation) = pump.reserve_access_unit() {
+                        let id = next_au_id;
+                        next_au_id += 1;
+                        if reservation.submit(AccessUnit {
+                            id,
+                            data: cached.data.clone(),
+                            produced_at: now,
+                            is_idr: true,
+                        }) {
+                            pending_transition_idr =
+                                cached_replay_transition(&profiles, cached.mode, id);
+                            replay.on_replayed();
+                        }
+                    }
+                }
+            }
+        }
+        // Reserve the RTC queue only when RTC is active. WSS owns a separately
+        // bounded negotiated lane set, so it is never gated by an unused RTC slot.
+        let rtc_reservation = if ice_connected && wss_media.is_none() {
+            pump.reserve_access_unit()
+        } else {
+            None
+        };
+        let negotiation_active = offer_in_flight || offer_accepted;
+        let media_demand_active = negotiation_active || ice_connected || wss_media.is_some();
+        let prewarm_needed = negotiation_active && !ice_connected && latest_idr.is_none();
+        if capture_admission_ready(
+            capture_available,
+            capture.is_privileged() && !capture_available,
+            negotiation_active,
+            ice_connected,
+            wss_media.is_some(),
+            rtc_reservation.is_some(),
+            prewarm_needed,
+        ) {
+            let active_benchmark_profile = benchmark_lease.active().filter(|profile| {
+                active_codec == VideoCodec::Hevc
+                    && benchmark_mode_matches(profile.stream_mode, stream_mode)
+                    && match profile.transport {
+                        BenchmarkTransport::Wss => wss_media.is_some(),
+                        BenchmarkTransport::Webrtc => wss_media.is_none() && ice_connected,
+                    }
+            });
+            if let CaptureSource::Privileged(source) = &mut capture {
+                let old_mode = profiles.active;
+                let mode = profiles.staged.map(|(mode, _)| mode).unwrap_or(old_mode);
+                let benchmark_profile = active_benchmark_profile;
+                let transition = profiles.staged().is_some();
+                if now < next_admission {
+                    continue 'session;
+                }
+                let mut force_idr = now >= next_idr || latest_idr.is_none() || transition;
+                let mut wss_reservation = None;
+                if let Some(egress) = wss_media.as_ref() {
+                    let base_meta = WssAccessUnitMeta {
+                        codec: wss_codec(active_codec),
+                        generation: media_generation,
+                        gop: media_gop,
+                        sequence: media_sequence.wrapping_add(1),
+                        timestamp90k: (media_clock_start.elapsed().as_secs_f64() * 90_000.0) as u32,
+                        key: force_idr,
+                        lab_roi: None,
+                    };
+                    match egress.reserve(base_meta) {
+                        Ok(reservation) => wss_reservation = Some(reservation),
+                        Err(WssReserveOutcome::RequireKeyframe) if !force_idr => {
+                            force_idr = true;
+                            match egress.reserve(WssAccessUnitMeta {
+                                key: true,
+                                ..base_meta
+                            }) {
+                                Ok(reservation) => wss_reservation = Some(reservation),
+                                Err(WssReserveOutcome::Stopped) => break 'session,
+                                Err(_) => {
+                                    wss_preencode_skips = wss_preencode_skips.saturating_add(1);
+                                    benchmark_skips = benchmark_skips.saturating_add(1);
+                                    wss_preencode_skips_total =
+                                        wss_preencode_skips_total.saturating_add(1);
+                                    continue 'session;
+                                }
+                            }
+                        }
+                        Err(WssReserveOutcome::Stopped) => break 'session,
+                        Err(_) => {
+                            wss_preencode_skips = wss_preencode_skips.saturating_add(1);
+                            benchmark_skips = benchmark_skips.saturating_add(1);
+                            wss_preencode_skips_total = wss_preencode_skips_total.saturating_add(1);
+                            continue 'session;
+                        }
+                    }
+                }
+                let permit_id = next_au_id;
+                next_au_id = next_au_id.wrapping_add(1).max(1);
+                let crop = viewport_crop.map(|crop| AgentCrop::Pixels {
+                    x: crop.x,
+                    y: crop.y,
+                    width: crop.width,
+                    height: crop.height,
+                });
+                let result = source.encode_agent(AgentMessage::EncodePermit {
+                    permit_id,
+                    session_generation: media_generation,
+                    config_revision: 1,
+                    stream_mode: if stream_mode == StreamMode::Work {
+                        AgentStreamMode::Work
+                    } else {
+                        AgentStreamMode::Gaming
+                    },
+                    width: benchmark_profile
+                        .map_or(mode.width, |profile| u32::from(profile.width))
+                        .min(u16::MAX as u32) as u16,
+                    height: benchmark_profile
+                        .map_or(mode.height, |profile| u32::from(profile.height))
+                        .min(u16::MAX as u32) as u16,
+                    fps: benchmark_profile
+                        .map_or(mode.fps, |profile| u32::from(profile.fps))
+                        .min(u16::MAX as u32) as u16,
+                    bitrate_bps: benchmark_profile
+                        .map_or_else(|| quality.target(), |profile| profile.bitrate_bps),
+                    codec: if active_codec == VideoCodec::Hevc {
+                        AgentCodec::Hevc
+                    } else {
+                        AgentCodec::H264
+                    },
+                    preset: benchmark_profile.map_or_else(
+                        || {
+                            if args.preset == "p1" {
+                                AgentPreset::P1
+                            } else {
+                                AgentPreset::P3
+                            }
+                        },
+                        |profile| match profile.encoder.preset {
+                            BenchmarkPreset::P1 => AgentPreset::P1,
+                            BenchmarkPreset::P2 => AgentPreset::P2,
+                            BenchmarkPreset::P3 => AgentPreset::P3,
+                            BenchmarkPreset::P4 => AgentPreset::P4,
+                            BenchmarkPreset::P5 => AgentPreset::P5,
+                            BenchmarkPreset::P6 => AgentPreset::P6,
+                            BenchmarkPreset::P7 => AgentPreset::P7,
+                        },
+                    ),
+                    tuning: benchmark_profile.map_or(AgentTuning::UltraLowLatency, |profile| {
+                        match profile.encoder.tuning {
+                            BenchmarkTuning::UltraLowLatency => AgentTuning::UltraLowLatency,
+                            BenchmarkTuning::LowLatency => AgentTuning::LowLatency,
+                        }
+                    }),
+                    multipass: benchmark_profile.map_or(AgentMultipass::Disabled, |profile| {
+                        match profile.encoder.multipass {
+                            BenchmarkMultipass::Disabled => AgentMultipass::Disabled,
+                            BenchmarkMultipass::Quarter => AgentMultipass::Quarter,
+                            BenchmarkMultipass::Full => AgentMultipass::Full,
+                        }
+                    }),
+                    aq_mode: benchmark_profile.map_or(
+                        AgentAqMode::Spatial,
+                        |profile| match profile.effective_aq_mode() {
+                            BenchmarkAqMode::None => AgentAqMode::None,
+                            BenchmarkAqMode::Spatial => AgentAqMode::Spatial,
+                            BenchmarkAqMode::Temporal => AgentAqMode::Temporal,
+                        },
+                    ),
+                    aq_strength: benchmark_profile.map_or(8, |profile| profile.encoder.aq_strength),
+                    vbv_frames: benchmark_profile.map_or(1, |profile| profile.encoder.vbv_frames),
+                    lookahead_depth: benchmark_profile
+                        .map_or(0, |profile| profile.encoder.lookahead_depth),
+                    weighted_prediction: benchmark_profile
+                        .is_some_and(|profile| profile.encoder.weighted_prediction),
+                    gop_seconds: benchmark_profile.map_or_else(
+                        || {
+                            if stream_mode == StreamMode::Game {
+                                1
+                            } else {
+                                2
+                            }
+                        },
+                        |profile| profile.gop_seconds,
+                    ),
+                    crop,
+                    force_idr,
+                    allow_idle_snapshot: true,
+                });
+                let access = match result {
+                    Ok(AgentMessage::EncodedAccessUnit(access)) => access,
+                    Ok(AgentMessage::NoFrame { .. }) => {
+                        next_admission = now + privileged_no_frame_retry_delay(capture_available);
+                        continue 'session;
+                    }
+                    Ok(other) => {
+                        warn!(kind = ?other.kind(), "unexpected privileged Agent media result");
+                        continue 'session;
+                    }
+                    Err(error) => {
+                        warn!(?error, "privileged Agent encode failed");
+                        capture_available = false;
+                        // Keep signaling and WSS/WebRTC control alive while
+                        // the privileged process boundary reconnects. The
+                        // queued disconnect transition announces Unavailable
+                        // exactly once. The Agent must publish
+                        // CaptureHealth::Active before another frame is
+                        // admitted.
+                        continue 'session;
+                    }
+                };
+                source.width = access.width as u32;
+                source.height = access.height as u32;
+                if benchmark_profile.is_some() {
+                    benchmark_encoded_bytes =
+                        benchmark_encoded_bytes.saturating_add(access.data.len() as u64);
+                    benchmark_encode_count = benchmark_encode_count.saturating_add(1);
+                    benchmark_encode_us_total =
+                        benchmark_encode_us_total.saturating_add(u64::from(access.encode_us));
+                    benchmark_encode_us_max = benchmark_encode_us_max.max(access.encode_us);
+                    if access.keyframe {
+                        benchmark_idr_count = benchmark_idr_count.saturating_add(1);
+                    } else {
+                        benchmark_delta_count = benchmark_delta_count.saturating_add(1);
+                    }
+                }
+                next_admission = now + Duration::from_secs_f64(1.0 / (access.fps as f64).max(1.0));
+                if force_idr {
+                    next_idr = now
+                        + effective_idr_interval(
+                            stream_mode,
+                            wss_media.is_some(),
+                            benchmark_profile.map(|profile| profile.gop_seconds),
+                        );
+                }
+                if access.keyframe {
+                    latest_idr = Some(CachedIdr {
+                        data: access.data.clone(),
+                        mode,
+                    });
+                    if wss_media.is_some() {
+                        media_gop = media_gop.wrapping_add(1).max(1);
+                    }
+                }
+                let id = permit_id;
+                if let Some(mut reservation) = wss_reservation {
+                    media_sequence = media_sequence.wrapping_add(1);
+                    let meta = WssAccessUnitMeta {
+                        codec: wss_codec(active_codec),
+                        generation: media_generation,
+                        gop: media_gop,
+                        sequence: media_sequence,
+                        timestamp90k: access.timestamp_90khz as u32,
+                        key: access.keyframe,
+                        lab_roi: None,
+                    };
+                    reservation.set_meta(meta);
+                    let encoded_len = access.data.len();
+                    if matches!(
+                        reservation.submit(access.data.clone()),
+                        WssSubmitOutcome::Queued { .. }
+                    ) {
+                        if benchmark_profile.is_some() {
+                            benchmark_wss_payload_bytes = benchmark_wss_payload_bytes
+                                .saturating_add(
+                                    wss_media
+                                        .as_ref()
+                                        .map_or(0, |egress| egress.wire_payload_bytes(encoded_len)),
+                                );
+                        }
+                        wss_ack_rate.submitted(media_generation, media_sequence, encoded_len);
+                        if access.keyframe {
+                            wss_idr_count = wss_idr_count.saturating_add(1);
+                            if let Some(pending) = pending_first_frame.as_mut() {
+                                if pending.admit_wss_access_unit(media_generation, true) {
+                                    signaling.send_first_frame(
+                                        "admitted",
+                                        &pending.request_id,
+                                        pending.generation,
+                                        Some("wss"),
+                                        pending.epoch.as_deref(),
+                                        Some(active_codec.name()),
+                                    );
+                                }
+                            }
+                            let transition_reason = profiles
+                                .staged
+                                .filter(|(staged, _)| *staged == mode)
+                                .map(|(_, reason)| reason);
+                            if let Some(reason) = transition_reason {
+                                pending_wss_idr = Some(PendingWssIdr {
+                                    generation: media_generation,
+                                    sequence: media_sequence,
+                                    mode,
+                                    reason,
+                                });
+                            }
+                            if let Some(crop) = viewport_crop {
+                                pending_viewport_idr = Some(PendingViewportIdr {
+                                    generation: media_generation,
+                                    sequence: media_sequence,
+                                    crop,
+                                });
+                            }
+                        } else {
+                            wss_delta_count = wss_delta_count.saturating_add(1);
+                        }
+                        wss_max_access_unit_bytes = wss_max_access_unit_bytes.max(encoded_len);
+                    } else {
+                        wss_submission_failures = wss_submission_failures.saturating_add(1);
+                        next_idr = now;
+                    }
+                }
+                if ice_connected && wss_media.is_none() {
+                    if let Some(reservation) = rtc_reservation {
+                        if reservation.submit(AccessUnit {
+                            id,
+                            data: access.data,
+                            produced_at: Instant::now(),
+                            is_idr: access.keyframe,
+                        }) && access.keyframe
+                        {
+                            if transition {
+                                pending_transition_idr = Some(PendingSubmittedIdr {
+                                    id,
+                                    mode,
+                                    reason: "transition",
+                                });
+                            }
+                        }
+                    }
+                }
+                continue 'session;
+            }
+            let desired_encoder_benchmark_profile_revision =
+                active_benchmark_profile.map(|_| benchmark_profile_revision);
+            if encoder_benchmark_contract_changed(
+                encoder.is_some(),
+                encoder_benchmark_profile_revision,
+                desired_encoder_benchmark_profile_revision,
+            ) {
+                info!(
+                    applied_profile_revision = ?encoder_benchmark_profile_revision,
+                    desired_profile_revision = ?desired_encoder_benchmark_profile_revision,
+                    "effective benchmark transport changed; rebuilding local encoder contract"
+                );
+                encoder = None;
+                scaler = None;
+                latest_idr = None;
+                pending_transition_idr = None;
+                pending_wss_idr = None;
+                pending_viewport_idr = None;
+                next_admission = Instant::now();
+                next_idr = Instant::now();
+            }
+            let captured = match capture.acquire(Duration::ZERO)? {
+                Some(frame) => Some(frame),
+                None if should_snapshot_idle_desktop(media_ready, latest_idr.is_none()) => capture
+                    .take_idle_snapshot_frame()
+                    .map(|frame| (frame, true, false)),
+                None => None,
+            };
+            if let Some((mut frame, is_new, recovered)) = captured {
+                if recovered {
+                    capture_available = true;
+                    pending_first_frame = None;
+                    media_generation = media_generation.wrapping_add(1).max(1);
+                    media_gop = 0;
+                    media_sequence = 0;
+                    latest_idr = None;
+                    pending_transition_idr = None;
+                    pending_wss_idr = None;
+                    pending_viewport_idr = None;
+                    encoder = None;
+                    scaler = None;
+                    next_admission = Instant::now();
+                    next_idr = Instant::now();
+                    signaling.send_desktop_state("active", media_generation, "capture-recovered");
+                    info!(
+                        generation = media_generation,
+                        "desktop capture recovered from verified frame; waiting for fresh IDR"
+                    );
+                }
+                let is_idle_snapshot = frame.is_idle_snapshot();
+                let main10 = active_benchmark_profile.is_some_and(|profile| profile.encoder.main10);
+                let dev = frame.device().as_raw() as *mut core::ffi::c_void;
+                if encoder.as_ref().map_or(true, |e| !e.is_for_device(dev)) {
+                    if encoder.is_some() {
+                        warn!("capture D3D11 device changed; invalidating scaler and IDR state");
+                        scaler = None;
+                        latest_idr = None;
+                        pending_transition_idr = None;
+                        next_idr = Instant::now();
+                    }
+                    let mode =
+                        encoder_mode_for_capture(&mut profiles, frame.width(), frame.height());
+                    encoder = Some(create_local_encoder(
+                        dev,
+                        mode.width,
+                        mode.height,
+                        frame.width(),
+                        frame.height(),
+                        mode.fps,
+                        quality.target(),
+                        preset,
+                        active_codec,
+                        active_benchmark_profile,
+                    )?);
+                    encoder_benchmark_profile_revision = desired_encoder_benchmark_profile_revision;
+                }
+                let old_mode = profiles.active;
+                let mut mode = profiles.staged.map(|(m, _)| m).unwrap_or(old_mode);
+                let transition = profiles.staged().is_some();
+                let encoder_resource_mode = active_benchmark_profile.map_or(
+                    ResourceMode::PerFrame,
+                    |profile| match profile.encoder.resource_mode {
+                        BenchmarkResourceMode::PerFrame => ResourceMode::PerFrame,
+                        BenchmarkResourceMode::Persistent => ResourceMode::Persistent,
                     },
                 );
-                if rtc.rtc.accepts(&input) {
-                    if let Err(e) = rtc.rtc.handle_input(input) {
-                        warn!(?e, "handle_input failed");
+                let frame_interval = Duration::from_secs_f64(1.0 / (mode.fps as f64).max(1.0));
+                let urgent = latest_idr.is_none() || transition;
+                if (is_new && frame_admission_due(now, next_admission, frame_interval, urgent))
+                    || (!is_new && urgent)
+                {
+                    let mut wss_reservation = None;
+                    let mut wss_forced_idr = false;
+                    if let Some(egress) = wss_media.as_ref() {
+                        let mut wants_key = now >= next_idr || latest_idr.is_none() || transition;
+                        let base_meta = WssAccessUnitMeta {
+                            codec: wss_codec(active_codec),
+                            generation: media_generation,
+                            gop: media_gop,
+                            sequence: media_sequence.wrapping_add(1),
+                            timestamp90k: (media_clock_start.elapsed().as_secs_f64() * 90_000.0)
+                                as u32,
+                            key: wants_key,
+                            lab_roi: None,
+                        };
+                        let reservation: Result<_, WssReserveOutcome> = match egress
+                            .reserve(base_meta)
+                        {
+                            Ok(reservation) => Ok(reservation),
+                            Err(WssReserveOutcome::RequireKeyframe) if !wants_key => {
+                                wants_key = true;
+                                encoder.as_mut().unwrap().force_idr();
+                                next_idr = now + wss_gop_interval(stream_mode);
+                                match egress.reserve(WssAccessUnitMeta {
+                                    key: true,
+                                    ..base_meta
+                                }) {
+                                    Ok(reservation) => Ok(reservation),
+                                    Err(
+                                        WssReserveOutcome::Backpressured
+                                        | WssReserveOutcome::RequireKeyframe,
+                                    ) => {
+                                        wss_preencode_skips = wss_preencode_skips.saturating_add(1);
+                                        benchmark_skips = benchmark_skips.saturating_add(1);
+                                        wss_preencode_skips_total =
+                                            wss_preencode_skips_total.saturating_add(1);
+                                        continue 'session;
+                                    }
+                                    Err(WssReserveOutcome::Stopped) => {
+                                        warn!(
+                                            "WSS media egress stopped during keyframe reservation"
+                                        );
+                                        continue 'session;
+                                    }
+                                }
+                            }
+                            Err(WssReserveOutcome::Backpressured) => {
+                                wss_preencode_skips = wss_preencode_skips.saturating_add(1);
+                                benchmark_skips = benchmark_skips.saturating_add(1);
+                                wss_preencode_skips_total =
+                                    wss_preencode_skips_total.saturating_add(1);
+                                continue 'session;
+                            }
+                            Err(WssReserveOutcome::RequireKeyframe) => {
+                                wss_preencode_skips = wss_preencode_skips.saturating_add(1);
+                                benchmark_skips = benchmark_skips.saturating_add(1);
+                                wss_preencode_skips_total =
+                                    wss_preencode_skips_total.saturating_add(1);
+                                continue 'session;
+                            }
+                            Err(WssReserveOutcome::Stopped) => {
+                                warn!("WSS media egress stopped during pre-encode reservation");
+                                continue 'session;
+                            }
+                        };
+                        let reservation = match reservation {
+                            Ok(reservation) => reservation,
+                            Err(_) => unreachable!("all WSS reservation errors are handled above"),
+                        };
+                        if wants_key {
+                            encoder.as_mut().unwrap().force_idr();
+                            next_idr = now + wss_gop_interval(stream_mode);
+                            wss_forced_idr = true;
+                        }
+                        wss_reservation = Some(reservation);
                     }
-                    continue 'run;
-                } else {
-                    debug!(%source, "ignoring UDP packet (no accepting session)");
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => warn!(?e, "UDP recv failed"),
-        }
-
-        // Only advance str0m's clock when its advertised deadline is due.
-        // The old loop called Timeout unconditionally after a blocking read,
-        // then blocked in capture for another 4 ms. That starved the pacer.
-        let now = Instant::now();
-        if now >= timeout {
-            let overdue = now.duration_since(timeout);
-            if !overdue.is_zero() {
-                overdue_deadlines_window += 1;
-                max_deadline_overdue_us =
-                    max_deadline_overdue_us.max(overdue.as_micros().min(u64::MAX as u128) as u64);
-            }
-            if let Err(e) = rtc.rtc.handle_input(Input::Timeout(now)) {
-                warn!(?e, "timeout input failed");
-            }
-            continue 'run;
-        }
-
-        // A static desktop can leave DDA with no new presents indefinitely.
-        // Replaying the cached IDR uses a new RTP timestamp in write_video and
-        // is one bounded RTC mutation followed by the next loop's full drain.
-        if rtc.ice_connected && cached_idr_replay.is_due(now, latest_idr.is_some()) {
-            let cached = latest_idr.as_ref().expect("checked above");
-            // A staged profile invalidates the cache immediately, and the tag
-            // is a second guard against cross-dimension SPS/PPS replay.
-            if cached.mode != profiles.active || profiles.staged().is_some() {
-                latest_idr = None;
-                continue 'run;
-            }
-            let encoded_bytes = cached.data.len();
-            match rtc.write_video(cached.data.clone()) {
-                Err(e) => {
-                    warn!(?e, "cached IDR replay failed");
-                    cached_idr_replay.on_not_admitted(now);
-                }
-                Ok(false) => {
-                    debug!("cached IDR replay was not admitted");
-                    cached_idr_replay.on_not_admitted(now);
-                }
-                Ok(true) => {
-                    frames_sent += 1;
-                    admitted_frames_window += 1;
-                    admitted_bytes_window += encoded_bytes as u64;
-                    last_idr_sent = now;
-                    next_idr = now + IDR_INTERVAL;
-                    cached_idr_replay.on_replayed();
-                    announce_admitted_profile(
-                        &mut profiles,
-                        &mut signaling,
-                        encoder
-                            .as_ref()
-                            .map(Nvenc::bitrate)
-                            .unwrap_or(quality.target()),
-                        quality.bwe(),
-                    );
-                    info!(
-                        frames_sent,
-                        encoded_bytes, "cached IDR replayed for static desktop"
-                    );
-                }
-            }
-            continue 'run;
-        }
-
-        // -- Media pump: capture -> encode -> write ---------------------------
-        // Poll DDA instead of waiting in it. str0m owns the next wake-up; a
-        // new desktop present will be picked up on the next sub-millisecond
-        // pump iteration.
-        let captured = capture.acquire(Duration::ZERO)?;
-
-        if let Some((frame, is_new)) = captured {
-            let dev = frame.device().as_raw() as *mut core::ffi::c_void;
-            if encoder.as_ref().map_or(true, |enc| !enc.is_for_device(dev)) {
-                if encoder.is_some() {
-                    warn!("capture D3D11 device changed; recreating scaler and encoder");
-                    scaler = None;
-                    latest_idr = None;
-                }
-                // Bootstrap for the texture path that will run immediately
-                // below. If this capture device cannot support that rung, the
-                // selector pins a truthful native contract before NVENC opens.
-                let init_mode =
-                    encoder_mode_for_capture(&mut profiles, frame.width(), frame.height());
-                match create_encoder_with_fallback(
-                    dev,
-                    init_mode.width,
-                    init_mode.height,
-                    frame.width(),
-                    frame.height(),
-                    init_mode.fps,
-                    quality.target(),
-                    requested_preset,
-                ) {
-                    Ok(enc) => {
-                        encoder = Some(enc);
-                        info!(
-                            width = init_mode.width,
-                            height = init_mode.height,
-                            fps = init_mode.fps,
-                            "encoder ready"
-                        );
-                    }
-                    Err(e) => {
-                        error!(?e, "encoder init failed");
-                        break 'run;
-                    }
-                }
-            }
-            // A staged profile bypasses normal admission so it is applied on
-            // the very next acquired texture, including a duplicate wake.
-            let staged = profiles.staged();
-            let now = Instant::now();
-            if staged.is_some() || ((is_new || latest_idr.is_none()) && now >= next_frame_admission)
-            {
-                let old_mode = profiles.active;
-                let mut target_mode = profiles.staged.map(|(mode, _)| mode).unwrap_or(old_mode);
-                let mut transition_reason = profiles.staged_reason().unwrap_or("startup");
-                let mut is_transition = target_mode != old_mode;
-                let mut scaler_failed = false;
-                let device_ptr = frame.device().as_raw() as *mut core::ffi::c_void;
-
-                let scaled = match prepare_video_mode_texture(
-                    &mut scaler,
-                    frame.device(),
-                    frame.texture(),
-                    frame.width(),
-                    frame.height(),
-                    target_mode,
-                ) {
-                    Ok(output) => output,
-                    Err(e) => {
-                        warn!(
-                            ?e,
-                            "GPU scaler failed; pinning native output for this session"
-                        );
-                        target_mode =
-                            VideoMode::native(frame.width(), frame.height(), target_mode.fps);
-                        transition_reason = "scaler-fallback";
-                        is_transition = target_mode != old_mode;
-                        scaler_failed = true;
-                        profiles.pin_native(
+                    // A fallback is a separate transaction: first prepare a
+                    // texture for its exact dimensions, then recreate NVENC
+                    // for that same mode, and only commit after its IDR is
+                    // admitted by the transport.
+                    let mut fallback_reason = None;
+                    let mut scaled = match if viewport_crop.is_some() && mode.label != "native" {
+                        prepare_profile_texture_with_crop(
+                            &mut scaler,
+                            frame.device(),
+                            frame.texture(),
                             frame.width(),
                             frame.height(),
-                            target_mode.fps,
-                            transition_reason,
-                        );
-                        latest_idr = None;
+                            mode.profile,
+                            viewport_crop,
+                            main10,
+                        )
+                    } else {
                         prepare_video_mode_texture(
                             &mut scaler,
                             frame.device(),
                             frame.texture(),
                             frame.width(),
                             frame.height(),
-                            target_mode,
-                        )?
-                    }
-                };
-                scale_sum_us = scale_sum_us.saturating_add(scaled.scale_us);
-                scale_max_us = scale_max_us.max(scaled.scale_us);
-                scale_count += 1;
-
-                if is_transition {
-                    latest_idr = None;
-                    if let Err(target_error) = configure_encoder_profile(
-                        &mut encoder,
-                        device_ptr,
-                        target_mode,
-                        frame.width(),
-                        frame.height(),
-                        quality.target(),
-                        requested_preset,
-                    ) {
-                        warn!(
-                            ?target_error,
-                            target = target_mode.label,
-                            "target profile unavailable; restoring last working profile"
-                        );
-                        let mut fallback_mode = if scaler_failed { target_mode } else { old_mode };
-                        let fallback_texture = match prepare_video_mode_texture(
-                            &mut scaler,
-                            frame.device(),
-                            frame.texture(),
-                            frame.width(),
-                            frame.height(),
-                            fallback_mode,
-                        ) {
-                            Ok(output) => output,
-                            Err(scale_error) => {
-                                warn!(
-                                    ?scale_error,
-                                    "last scaled profile unavailable; falling back to native"
-                                );
-                                fallback_mode = VideoMode::native(
-                                    frame.width(),
-                                    frame.height(),
-                                    target_mode.fps,
-                                );
-                                prepare_video_mode_texture(
-                                    &mut scaler,
-                                    frame.device(),
-                                    frame.texture(),
-                                    frame.width(),
-                                    frame.height(),
-                                    fallback_mode,
-                                )?
-                            }
-                        };
-                        scale_sum_us = scale_sum_us.saturating_add(fallback_texture.scale_us);
-                        scale_max_us = scale_max_us.max(fallback_texture.scale_us);
-                        scale_count += 1;
-                        let fallback_reason = if fallback_mode.label == "native" {
-                            "scaler-fallback"
-                        } else {
-                            "encoder-fallback"
-                        };
-                        if fallback_mode.label == "native" {
-                            profiles.pin_native(
-                                fallback_mode.width,
-                                fallback_mode.height,
-                                fallback_mode.fps,
-                                fallback_reason,
-                            );
-                        } else {
-                            profiles.pin(fallback_mode.profile, fallback_mode.fps, fallback_reason);
-                        }
-                        match recreate_and_encode_profile(
-                            &mut encoder,
-                            device_ptr,
-                            fallback_mode,
-                            frame.width(),
-                            frame.height(),
-                            quality.target(),
-                            requested_preset,
-                            fallback_texture.texture,
-                        ) {
-                            Ok(encoded) => {
-                                encode_sum_us = encode_sum_us.saturating_add(encoded.encode_us);
-                                encode_max_us = encode_max_us.max(encoded.encode_us);
-                                encode_count += 1;
-                                latest_idr = Some(CachedIdr {
-                                    data: encoded.data.clone(),
-                                    mode: profiles.active,
-                                });
-                                if rtc.ice_connected {
-                                    let encoded_bytes = encoded.data.len();
-                                    match rtc.write_video(encoded.data) {
-                                        Err(e) => {
-                                            warn!(?e, "fallback IDR write failed");
-                                            cached_idr_replay.on_not_admitted(Instant::now());
-                                        }
-                                        Ok(false) => {
-                                            debug!("fallback IDR was not admitted");
-                                            cached_idr_replay.on_not_admitted(Instant::now());
-                                        }
-                                        Ok(true) => {
-                                            frames_sent += 1;
-                                            admitted_frames_window += 1;
-                                            admitted_bytes_window += encoded_bytes as u64;
-                                            last_idr_sent = Instant::now();
-                                            next_idr = last_idr_sent + IDR_INTERVAL;
-                                            cached_idr_replay.on_fresh_idr_admitted();
-                                            announce_admitted_profile(
-                                                &mut profiles,
-                                                &mut signaling,
-                                                encoder
-                                                    .as_ref()
-                                                    .map(Nvenc::bitrate)
-                                                    .unwrap_or(quality.target()),
-                                                quality.bwe(),
-                                            );
-                                            info!(
-                                                frames_sent,
-                                                encoded_bytes,
-                                                profile = fallback_mode.label,
-                                                "fallback IDR sent"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Err(fallback_error) => {
-                                error!(
-                                    ?fallback_error,
-                                    "failed to restore last working encoder profile"
-                                );
-                                encoder = None;
-                            }
-                        }
-                        continue 'run;
-                    }
-                }
-
-                let bootstrap_encode = latest_idr.is_none();
-                if is_transition || bootstrap_encode || now >= next_idr {
-                    if let Some(enc) = encoder.as_mut() {
-                        enc.force_idr();
-                    }
-                    next_idr = now + IDR_INTERVAL;
-                }
-                let encoded_attempt = encoder
-                    .as_mut()
-                    .context("encoder unavailable")?
-                    .encode_texture(scaled.texture);
-                let transition_failed = is_transition
-                    && encoded_attempt
-                        .as_ref()
-                        .map_or(true, |encoded| !encoded.is_idr);
-                let encoded = if transition_failed {
-                    let target_error = match encoded_attempt {
-                        Ok(_) => anyhow::anyhow!("target encoder did not return the forced IDR"),
-                        Err(e) => e,
-                    };
-                    warn!(
-                        ?target_error,
-                        target = target_mode.label,
-                        "profile transition encode failed; restoring last working profile"
-                    );
-                    let mut fallback_mode = old_mode;
-                    let fallback_texture = match prepare_video_mode_texture(
-                        &mut scaler,
-                        frame.device(),
-                        frame.texture(),
-                        frame.width(),
-                        frame.height(),
-                        fallback_mode,
-                    ) {
+                            mode,
+                            main10,
+                            encoder_resource_mode,
+                        )
+                    } {
                         Ok(output) => output,
-                        Err(scale_error) => {
-                            warn!(?scale_error, "fallback scale failed; pinning native output");
-                            fallback_mode =
-                                VideoMode::native(frame.width(), frame.height(), target_mode.fps);
-                            prepare_video_mode_texture(
+                        Err(error) => {
+                            warn!(
+                                ?error,
+                                target = mode.label,
+                                "target texture preparation failed; recovering native mode"
+                            );
+                            mode = fallback_mode(old_mode, frame.width(), frame.height(), false);
+                            fallback_reason = Some("scaler-fallback");
+                            match prepare_video_mode_texture(
                                 &mut scaler,
                                 frame.device(),
                                 frame.texture(),
                                 frame.width(),
                                 frame.height(),
-                                fallback_mode,
-                            )?
+                                mode,
+                                main10,
+                                encoder_resource_mode,
+                            ) {
+                                Ok(output) => output,
+                                Err(native_error) => {
+                                    warn!(?native_error, "fallback texture preparation failed; retaining session for retry");
+                                    latest_idr = None;
+                                    pending_transition_idr = None;
+                                    next_idr = now;
+                                    continue 'session;
+                                }
+                            }
                         }
                     };
-                    scale_sum_us = scale_sum_us.saturating_add(fallback_texture.scale_us);
-                    scale_max_us = scale_max_us.max(fallback_texture.scale_us);
-                    scale_count += 1;
-                    let fallback_reason = if fallback_mode.label == "native" {
-                        "scaler-fallback"
-                    } else {
-                        "encoder-fallback"
-                    };
-                    if fallback_mode.label == "native" {
-                        profiles.pin_native(
-                            fallback_mode.width,
-                            fallback_mode.height,
-                            fallback_mode.fps,
-                            fallback_reason,
+                    if transition
+                        && fallback_reason.is_none()
+                        && configure_encoder_profile(
+                            &mut encoder,
+                            dev,
+                            mode,
+                            frame.width(),
+                            frame.height(),
+                            quality.target(),
+                            preset,
+                            active_codec,
+                            active_benchmark_profile,
+                        )
+                        .is_err()
+                    {
+                        warn!(
+                            target = mode.label,
+                            "transition reconfigure failed; recovering last working mode"
                         );
-                    } else {
-                        profiles.pin(fallback_mode.profile, fallback_mode.fps, fallback_reason);
+                        mode = fallback_mode(old_mode, frame.width(), frame.height(), true);
+                        fallback_reason = Some("encoder-fallback");
                     }
-                    // The replacement encoder is now the actual applied
-                    // profile. Do not relabel its IDR as the failed target.
-                    is_transition = false;
-                    match recreate_and_encode_profile(
-                        &mut encoder,
-                        device_ptr,
-                        fallback_mode,
-                        frame.width(),
-                        frame.height(),
-                        quality.target(),
-                        requested_preset,
-                        fallback_texture.texture,
-                    ) {
-                        Ok(encoded) => encoded,
-                        Err(fallback_error) => {
-                            error!(
-                                ?fallback_error,
-                                "failed to restore and encode last working profile"
-                            );
-                            encoder = None;
-                            continue 'run;
+                    if fallback_reason.is_some() {
+                        // The target texture is never passed to the fallback
+                        // encoder, even if both textures happen to share a
+                        // device.  That contract prevents dimension drift.
+                        scaled = match prepare_video_mode_texture(
+                            &mut scaler,
+                            frame.device(),
+                            frame.texture(),
+                            frame.width(),
+                            frame.height(),
+                            mode,
+                            main10,
+                            encoder_resource_mode,
+                        ) {
+                            Ok(output) => output,
+                            Err(error) => {
+                                warn!(
+                                    ?error,
+                                    "scaled fallback unavailable; recovering exact native mode"
+                                );
+                                mode =
+                                    fallback_mode(old_mode, frame.width(), frame.height(), false);
+                                fallback_reason = Some("scaler-fallback");
+                                match prepare_video_mode_texture(
+                                    &mut scaler,
+                                    frame.device(),
+                                    frame.texture(),
+                                    frame.width(),
+                                    frame.height(),
+                                    mode,
+                                    main10,
+                                    encoder_resource_mode,
+                                ) {
+                                    Ok(output) => output,
+                                    Err(native_error) => {
+                                        warn!(?native_error, "native fallback texture preparation failed; retaining session for retry");
+                                        latest_idr = None;
+                                        pending_transition_idr = None;
+                                        next_idr = now;
+                                        continue 'session;
+                                    }
+                                }
+                            }
+                        };
+                    }
+                    if fallback_reason.is_none()
+                        && !wss_forced_idr
+                        && (now >= next_idr || latest_idr.is_none() || transition)
+                    {
+                        encoder.as_mut().unwrap().force_idr();
+                        next_idr = now
+                            + if wss_media.is_some() {
+                                wss_gop_interval(stream_mode)
+                            } else {
+                                IDR_INTERVAL
+                            };
+                    }
+                    let static_hybrid_enabled = active_benchmark_profile.is_some_and(|profile| {
+                        profile.schema_version == 2
+                            && profile.implementation_variant
+                                == benchmark::BenchmarkImplementationVariant::Candidate
+                            && profile.hybrid_mode == BenchmarkHybridMode::PngStaticRoi
+                            && !profile.encoder.main10
+                            && wss_media.is_some()
+                    });
+                    let feedback_roi_enabled = active_benchmark_profile.is_some_and(|profile| {
+                        profile.schema_version == 2
+                            && profile.implementation_variant
+                                == benchmark::BenchmarkImplementationVariant::Candidate
+                            && matches!(
+                                profile.effective_roi_mode(),
+                                BenchmarkRoiMode::Feedback | BenchmarkRoiMode::FeedbackHeadroom
+                            )
+                            && !profile.encoder.main10
+                            && wss_media.is_some()
+                            && stream_mode == StreamMode::Work
+                    });
+                    let feedback_headroom_enabled =
+                        active_benchmark_profile.is_some_and(|profile| {
+                            feedback_roi_enabled
+                                && profile.effective_roi_mode()
+                                    == BenchmarkRoiMode::FeedbackHeadroom
+                        });
+                    let hevc_quiescent_tiles_enabled =
+                        active_benchmark_profile.is_some_and(|profile| {
+                            profile.schema_version == 2
+                                && profile.implementation_variant
+                                    == benchmark::BenchmarkImplementationVariant::Candidate
+                                && profile.hybrid_mode == BenchmarkHybridMode::HevcQuiescentTiles
+                                && !profile.encoder.main10
+                                && wss_media.is_some()
+                                && stream_mode == StreamMode::Work
+                        });
+                    let quiescent_hybrid_enabled =
+                        active_benchmark_profile.is_some_and(|profile| {
+                            profile.schema_version == 2
+                                && profile.implementation_variant
+                                    == benchmark::BenchmarkImplementationVariant::Candidate
+                                && matches!(
+                                    profile.hybrid_mode,
+                                    BenchmarkHybridMode::PngQuiescentDetail
+                                        | BenchmarkHybridMode::HevcQuiescentTiles
+                                )
+                                && !profile.encoder.main10
+                                && wss_media.is_some()
+                                && stream_mode == StreamMode::Work
+                        });
+                    if !hevc_quiescent_tiles_enabled {
+                        hevc_tile_encoder = None;
+                        hevc_tile_encoder_failed_key = None;
+                    }
+                    let quiescent_cache_mode = active_benchmark_profile
+                        .map_or(BenchmarkHybridCacheMode::SuppressReactivate, |profile| {
+                            profile.hybrid_cache_mode
+                        });
+                    let quiescent_suppress_reactivate = quiescent_hybrid_enabled
+                        && quiescent_cache_mode == BenchmarkHybridCacheMode::SuppressReactivate;
+                    let hybrid_enabled = static_hybrid_enabled || quiescent_hybrid_enabled;
+                    let mut hybrid_temporal_result = None;
+                    let mut quiescent_temporal_result = None;
+                    let mut quiescent_temporal_submission = None;
+                    let mut quiescent_suppression_operations = Vec::new();
+                    let mut quiescent_resolution_operations = Vec::new();
+                    let mut quiescent_verified_changed_rects = Vec::new();
+                    let quiescent_viewport = quiescent_hybrid_enabled.then(|| {
+                        let source = viewport_crop.map_or(
+                            frame_damage::DamageRect {
+                                left: 0,
+                                top: 0,
+                                right: frame.width(),
+                                bottom: frame.height(),
+                            },
+                            |crop| frame_damage::DamageRect {
+                                left: crop.x,
+                                top: crop.y,
+                                right: crop.x + crop.width,
+                                bottom: crop.y + crop.height,
+                            },
+                        );
+                        ViewportGeometry {
+                            generation: media_generation,
+                            crop_revision: viewport_revision,
+                            source,
+                            output_width: scaled.width,
+                            output_height: scaled.height,
+                        }
+                    });
+                    if quiescent_hybrid_enabled {
+                        if quiescent_diff_revision != benchmark_profile_revision {
+                            quiescent_diff_revision = benchmark_profile_revision;
+                            quiescent_diff_analyzer = None;
+                            quiescent_tile_planner.reset();
+                            quiescent_wire_budget.reset();
+                        }
+                        let analyzer_matches =
+                            quiescent_diff_analyzer.as_ref().is_some_and(|analyzer| {
+                                analyzer.is_for(frame.device(), frame.width(), frame.height())
+                            });
+                        if !analyzer_matches {
+                            quiescent_diff_analyzer = TemporalDiffAnalyzer::new(
+                                frame.device(),
+                                frame.width(),
+                                frame.height(),
+                            )
+                            .ok();
+                        }
+                        let mut submission_failed = false;
+                        if let Some(analyzer) = quiescent_diff_analyzer.as_mut() {
+                            let validation_requests = if quiescent_suppress_reactivate {
+                                quiescent_validation_requests(
+                                    &quiescent_tile_planner,
+                                    quiescent_viewport.expect("quiescent viewport is available"),
+                                    media_sequence.wrapping_add(1),
+                                    frame.damage(),
+                                    is_idle_snapshot,
+                                )
+                            } else {
+                                Vec::new()
+                            };
+                            match analyzer.submit_quiescent(
+                                frame.texture(),
+                                &validation_requests,
+                                frame.damage(),
+                            ) {
+                                Ok(submission) => {
+                                    if quiescent_suppress_reactivate {
+                                        quiescent_suppression_operations = quiescent_tile_planner
+                                            .suppress_requests(&submission.accepted_requests);
+                                    }
+                                    if let Some(activity) = benchmark_hybrid_activity.as_mut() {
+                                        activity.cached_bytes_retained =
+                                            activity
+                                                .cached_bytes_retained
+                                                .max(quiescent_tile_planner.retained_png_bytes()
+                                                    as u64);
+                                    }
+                                    quiescent_temporal_submission = Some(submission);
+                                }
+                                Err(error) => {
+                                    submission_failed = true;
+                                    warn!(
+                                        ?error,
+                                        "GPU quiescent-detail validation submission failed"
+                                    );
+                                }
+                            }
+                        }
+                        if submission_failed {
+                            quiescent_diff_analyzer = None;
+                            quiescent_tile_planner.reset();
                         }
                     }
-                } else {
-                    match encoded_attempt {
-                        Ok(encoded) => encoded,
-                        Err(e) => {
-                            warn!(?e, "encode failed; forcing IDR on next frame");
+                    let feedback_key = (
+                        benchmark_profile_revision,
+                        media_generation,
+                        viewport_revision,
+                        mode,
+                    );
+                    if feedback_roi_enabled {
+                        let analyzer_mismatch = reconstruction_feedback_analyzer
+                            .as_ref()
+                            .is_some_and(|analyzer| {
+                                !analyzer.is_for(frame.device(), scaled.width, scaled.height)
+                            });
+                        if reconstruction_feedback_key != Some(feedback_key) || analyzer_mismatch {
+                            reconstruction_feedback_analyzer = None;
+                            feedback_roi_planner = None;
+                            feedback_wire_budget = None;
+                            reconstruction_feedback_key = Some(feedback_key);
+                            reconstruction_feedback_failed_key = None;
+                        }
+                        if reconstruction_feedback_analyzer.is_none()
+                            && reconstruction_feedback_failed_key != Some(feedback_key)
+                        {
+                            match ReconstructionFeedbackAnalyzer::new(
+                                frame.device(),
+                                scaled.width,
+                                scaled.height,
+                            )
+                            .and_then(|analyzer| {
+                                Ok((
+                                    analyzer,
+                                    FeedbackRoiPlanner::new(scaled.width, scaled.height)?,
+                                ))
+                            }) {
+                                Ok((analyzer, planner)) => {
+                                    reconstruction_feedback_analyzer = Some(analyzer);
+                                    feedback_roi_planner = Some(planner);
+                                    feedback_wire_budget = feedback_headroom_enabled
+                                        .then(|| FeedbackWireBudget::new(Instant::now()));
+                                }
+                                Err(error) => {
+                                    reconstruction_feedback_failed_key = Some(feedback_key);
+                                    warn!(
+                                        ?error,
+                                        width = scaled.width,
+                                        height = scaled.height,
+                                        "reconstruction-feedback candidate initialization failed"
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(activity) = benchmark_roi_activity.as_mut() {
+                            activity.reconstruction_active = Some(
+                                reconstruction_feedback_analyzer.is_some()
+                                    && feedback_roi_planner.is_some(),
+                            );
+                        }
+                        if reconstruction_feedback_analyzer.is_none()
+                            || feedback_roi_planner.is_none()
+                        {
+                            continue 'session;
+                        }
+                    }
+                    let feedback_sequence = media_sequence.wrapping_add(1);
+                    let feedback_reconstruction_texture = feedback_roi_enabled.then(|| {
+                        reconstruction_feedback_analyzer
+                            .as_ref()
+                            .expect("feedback analyzer initialized above")
+                            .reconstruction_texture_raw(feedback_sequence)
+                    });
+                    let mut feedback_plan = None;
+                    let mut feedback_wire_decision = None;
+                    let encoded = if let Some(reason) = fallback_reason {
+                        match recreate_and_encode_profile(
+                            &mut encoder,
+                            dev,
+                            mode,
+                            frame.width(),
+                            frame.height(),
+                            quality.target(),
+                            preset,
+                            active_codec,
+                            active_benchmark_profile,
+                            scaled.texture,
+                            feedback_reconstruction_texture,
+                        ) {
+                            Ok(encoded) => encoded,
+                            Err(error) => {
+                                warn!(
+                                    ?error,
+                                    ?reason,
+                                    "fallback encoder recovery failed; retaining session for retry"
+                                );
+                                latest_idr = None;
+                                pending_transition_idr = None;
+                                next_idr = now;
+                                continue 'session;
+                            }
+                        }
+                    } else {
+                        let temporal_roi_enabled =
+                            active_benchmark_profile.is_some_and(|profile| {
+                                profile.schema_version == 2
+                                    && profile.implementation_variant
+                                        == benchmark::BenchmarkImplementationVariant::Candidate
+                                    && matches!(
+                                        profile.effective_roi_mode(),
+                                        BenchmarkRoiMode::Damage
+                                            | BenchmarkRoiMode::TextEdge
+                                            | BenchmarkRoiMode::Feedback
+                                            | BenchmarkRoiMode::FeedbackHeadroom
+                                    )
+                                    && !profile.encoder.main10
+                            });
+                        let temporal_analysis_enabled =
+                            temporal_roi_enabled || static_hybrid_enabled;
+                        let temporal_key = (
+                            benchmark_profile_revision,
+                            media_generation,
+                            viewport_revision,
+                            mode,
+                        );
+                        let mut temporal_result = None;
+                        let frame_damage = if temporal_analysis_enabled {
+                            let analyzer_matches =
+                                temporal_diff_analyzer.as_ref().is_some_and(|analyzer| {
+                                    analyzer.is_for(frame.device(), scaled.width, scaled.height)
+                                });
+                            if temporal_diff_key != Some(temporal_key) || !analyzer_matches {
+                                temporal_diff_analyzer = None;
+                                temporal_diff_key = Some(temporal_key);
+                                temporal_diff_failed_key = None;
+                            }
+                            if temporal_diff_analyzer.is_none()
+                                && temporal_diff_failed_key != Some(temporal_key)
+                            {
+                                match TemporalDiffAnalyzer::new(
+                                    frame.device(),
+                                    scaled.width,
+                                    scaled.height,
+                                ) {
+                                    Ok(analyzer) => temporal_diff_analyzer = Some(analyzer),
+                                    Err(error) => {
+                                        temporal_diff_failed_key = Some(temporal_key);
+                                        warn!(
+                                            ?error,
+                                            width = scaled.width,
+                                            height = scaled.height,
+                                            "GPU temporal-difference ROI is unsupported for this candidate state"
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(analyzer) = temporal_diff_analyzer.as_mut() {
+                                let source = unsafe {
+                                    windows::Win32::Graphics::Direct3D11::ID3D11Texture2D::from_raw_borrowed(
+                                        &scaled.texture,
+                                    )
+                                };
+                                match source.context("scaled texture pointer is null").and_then(
+                                    |texture| match temporal_readback_policy(
+                                        static_hybrid_enabled,
+                                        feedback_roi_enabled,
+                                    ) {
+                                        TemporalReadbackPolicy::Aligned => {
+                                            analyzer.analyze_aligned(texture)
+                                        }
+                                        TemporalReadbackPolicy::Deferred => {
+                                            analyzer.analyze(texture)
+                                        }
+                                    },
+                                ) {
+                                    Ok(result) => {
+                                        if temporal_roi_enabled {
+                                            record_benchmark_temporal_activity(
+                                                &mut benchmark_roi_activity,
+                                                &mut benchmark_temporal_analysis_us,
+                                                &result,
+                                                wss_media
+                                                    .as_ref()
+                                                    .map(|_| media_sequence.wrapping_add(1)),
+                                            );
+                                        }
+                                        temporal_result = Some(result);
+                                    }
+                                    Err(error) => {
+                                        temporal_diff_analyzer = None;
+                                        temporal_diff_failed_key = Some(temporal_key);
+                                        warn!(
+                                            ?error,
+                                            "GPU temporal-difference ROI failed; DDA fallback remains disabled"
+                                        );
+                                    }
+                                }
+                            }
+                            if static_hybrid_enabled {
+                                hybrid_temporal_result = temporal_result.clone();
+                            }
+                            if feedback_roi_enabled {
+                                let completed = match reconstruction_feedback_analyzer
+                                    .as_mut()
+                                    .expect("feedback analyzer initialized above")
+                                    .collect_blocking(feedback_sequence)
+                                {
+                                    Ok(completed) => completed,
+                                    Err(error) => {
+                                        warn!(
+                                            ?error,
+                                            sequence = feedback_sequence,
+                                            "reconstruction-feedback readback failed"
+                                        );
+                                        reconstruction_feedback_analyzer = None;
+                                        feedback_roi_planner = None;
+                                        feedback_wire_budget = None;
+                                        reconstruction_feedback_failed_key = Some(feedback_key);
+                                        if let Some(activity) = benchmark_roi_activity.as_mut() {
+                                            activity.reconstruction_active = Some(false);
+                                        }
+                                        continue 'session;
+                                    }
+                                };
+                                let mut feedback_errors = None;
+                                match completed {
+                                    Some(completed)
+                                        if is_exact_previous_feedback(
+                                            feedback_sequence,
+                                            completed.sequence,
+                                            completed.age_frames,
+                                        ) =>
+                                    {
+                                        if let Some(activity) = benchmark_roi_activity.as_mut() {
+                                            add_feedback_count(
+                                                &mut activity.feedback_ready_frames,
+                                                1,
+                                            );
+                                            activity.last_feedback_sequence =
+                                                Some(completed.sequence);
+                                            activity.last_feedback_age_frames =
+                                                Some(completed.age_frames);
+                                            record_feedback_timing(
+                                                &mut benchmark_feedback_readback_us,
+                                                &mut activity.feedback_readback_p95_us,
+                                                &mut activity.feedback_readback_max_us,
+                                                completed.readback_us,
+                                            );
+                                        }
+                                        feedback_errors = Some(completed.errors);
+                                    }
+                                    Some(completed) => {
+                                        if let Some(activity) = benchmark_roi_activity.as_mut() {
+                                            add_feedback_count(
+                                                &mut activity.feedback_late_frames,
+                                                1,
+                                            );
+                                            record_feedback_timing(
+                                                &mut benchmark_feedback_readback_us,
+                                                &mut activity.feedback_readback_p95_us,
+                                                &mut activity.feedback_readback_max_us,
+                                                completed.readback_us,
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        if let Some(activity) = benchmark_roi_activity.as_mut() {
+                                            add_feedback_count(
+                                                &mut activity.feedback_missing_frames,
+                                                1,
+                                            );
+                                        }
+                                    }
+                                }
+                                if let Some(result) = temporal_result.as_ref() {
+                                    let changed = match changed_ctb_mask(
+                                        scaled.width,
+                                        scaled.height,
+                                        &result.damage_rects,
+                                    ) {
+                                        Ok(changed) => changed,
+                                        Err(error) => {
+                                            warn!(
+                                                ?error,
+                                                "reconstruction-feedback damage mask failed"
+                                            );
+                                            continue 'session;
+                                        }
+                                    };
+                                    let edge_fallback;
+                                    let edge_scores = if result.edge_scores.len() == changed.len() {
+                                        result.edge_scores.as_slice()
+                                    } else {
+                                        edge_fallback = vec![0; changed.len()];
+                                        edge_fallback.as_slice()
+                                    };
+                                    let decision = if feedback_headroom_enabled {
+                                        let cap_bps = active_benchmark_profile
+                                            .and_then(|profile| profile.total_media_cap_bps)
+                                            .or_else(|| {
+                                                active_benchmark_profile
+                                                    .map(|profile| profile.bitrate_bps)
+                                            })
+                                            .unwrap_or(6_000_000);
+                                        feedback_wire_budget
+                                            .as_mut()
+                                            .expect("headroom budget initialized with analyzer")
+                                            .decision(Instant::now(), u64::from(cap_bps))
+                                    } else {
+                                        FeedbackWireDecision {
+                                            policy: FeedbackBudgetPolicy::NetZero,
+                                            occupancy_bps: 0,
+                                        }
+                                    };
+                                    match feedback_roi_planner
+                                        .as_mut()
+                                        .expect("feedback planner initialized above")
+                                        .plan_with_policy(
+                                            &changed,
+                                            edge_scores,
+                                            feedback_errors.as_deref(),
+                                            false,
+                                            decision.policy,
+                                        ) {
+                                        Ok(plan) => {
+                                            feedback_plan = Some(plan);
+                                            feedback_wire_decision =
+                                                feedback_headroom_enabled.then_some(decision);
+                                        }
+                                        Err(error) => {
+                                            warn!(
+                                                ?error,
+                                                "reconstruction-feedback ROI plan failed"
+                                            );
+                                            continue 'session;
+                                        }
+                                    }
+                                }
+                            }
+                            temporal_roi_enabled
+                                .then(|| {
+                                    temporal_result.as_ref().map(|result| FrameDamage {
+                                        source_width: scaled.width,
+                                        source_height: scaled.height,
+                                        crop: frame_damage::DamageRect {
+                                            left: 0,
+                                            top: 0,
+                                            right: scaled.width,
+                                            bottom: scaled.height,
+                                        },
+                                        rects: &result.damage_rects,
+                                        edge_scores: active_benchmark_profile
+                                            .filter(|profile| {
+                                                profile.effective_roi_mode()
+                                                    == BenchmarkRoiMode::TextEdge
+                                            })
+                                            .map(|_| result.edge_scores.as_slice()),
+                                        prepared_qp_map: feedback_plan
+                                            .as_ref()
+                                            .and_then(|plan| plan.map.as_ref()),
+                                    })
+                                })
+                                .flatten()
+                        } else {
+                            encode_frame_damage(&frame, viewport_crop, mode)
+                        };
+                        let encode_result =
+                            if let Some(reconstruction_texture) = feedback_reconstruction_texture {
+                                encoder.as_mut().unwrap().encode_texture_with_feedback(
+                                    scaled.texture,
+                                    frame_damage,
+                                    reconstruction_texture,
+                                )
+                            } else {
+                                encoder
+                                    .as_mut()
+                                    .unwrap()
+                                    .encode_texture_with_damage(scaled.texture, frame_damage)
+                            };
+                        match encode_result {
+                            Ok(encoded) if !transition || encoded.is_idr => encoded,
+                            Ok(_) | Err(_) => {
+                                if feedback_roi_enabled {
+                                    warn!(
+                                        target = mode.label,
+                                        "feedback encode failed; resetting the candidate session"
+                                    );
+                                    encoder = None;
+                                    reconstruction_feedback_analyzer = None;
+                                    feedback_roi_planner = None;
+                                    feedback_wire_budget = None;
+                                    latest_idr = None;
+                                    pending_transition_idr = None;
+                                    next_idr = now;
+                                    continue 'session;
+                                }
+                                warn!(
+                                    target = mode.label,
+                                    "transition encode failed; recovering last working mode"
+                                );
+                                mode = fallback_mode(old_mode, frame.width(), frame.height(), true);
+                                let reason = "encoder-fallback";
+                                let fallback_texture = match prepare_video_mode_texture(
+                                    &mut scaler,
+                                    frame.device(),
+                                    frame.texture(),
+                                    frame.width(),
+                                    frame.height(),
+                                    mode,
+                                    main10,
+                                    encoder_resource_mode,
+                                ) {
+                                    Ok(output) => output,
+                                    Err(error) => {
+                                        warn!(?error, "scaled fallback unavailable; recovering exact native mode");
+                                        mode = fallback_mode(
+                                            old_mode,
+                                            frame.width(),
+                                            frame.height(),
+                                            false,
+                                        );
+                                        fallback_reason = Some("scaler-fallback");
+                                        match prepare_video_mode_texture(
+                                            &mut scaler,
+                                            frame.device(),
+                                            frame.texture(),
+                                            frame.width(),
+                                            frame.height(),
+                                            mode,
+                                            main10,
+                                            encoder_resource_mode,
+                                        ) {
+                                            Ok(output) => output,
+                                            Err(native_error) => {
+                                                warn!(?native_error, "native fallback texture preparation failed; retaining session for retry");
+                                                latest_idr = None;
+                                                pending_transition_idr = None;
+                                                next_idr = now;
+                                                continue 'session;
+                                            }
+                                        }
+                                    }
+                                };
+                                match recreate_and_encode_profile(
+                                    &mut encoder,
+                                    dev,
+                                    mode,
+                                    frame.width(),
+                                    frame.height(),
+                                    quality.target(),
+                                    preset,
+                                    active_codec,
+                                    active_benchmark_profile,
+                                    fallback_texture.texture,
+                                    None,
+                                ) {
+                                    Ok(encoded) => {
+                                        fallback_reason.get_or_insert(reason);
+                                        encoded
+                                    }
+                                    Err(error) => {
+                                        warn!(?error, "fallback encoder recovery failed; retaining session for retry");
+                                        latest_idr = None;
+                                        pending_transition_idr = None;
+                                        next_idr = now;
+                                        continue 'session;
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    if feedback_roi_enabled {
+                        if encoded.is_idr {
+                            feedback_roi_planner
+                                .as_mut()
+                                .expect("feedback planner initialized above")
+                                .reset();
+                            reconstruction_feedback_analyzer
+                                .as_mut()
+                                .expect("feedback analyzer initialized above")
+                                .reset();
+                        } else if let Some(plan) = feedback_plan.as_ref() {
+                            record_benchmark_feedback_plan(
+                                &mut benchmark_roi_activity,
+                                &mut benchmark_feedback_wire_occupancy_bps,
+                                plan,
+                                feedback_wire_decision,
+                            );
+                        }
+                        let source = unsafe {
+                            windows::Win32::Graphics::Direct3D11::ID3D11Texture2D::from_raw_borrowed(
+                                &scaled.texture,
+                            )
+                        };
+                        let submission = source
+                            .context("feedback source texture pointer is null")
+                            .and_then(|texture| {
+                                reconstruction_feedback_analyzer
+                                    .as_mut()
+                                    .expect("feedback analyzer initialized above")
+                                    .submit(texture, feedback_sequence)
+                            });
+                        match submission {
+                            Ok(submission) => record_benchmark_feedback_submission(
+                                &mut benchmark_roi_activity,
+                                &mut benchmark_feedback_submit_us,
+                                submission,
+                            ),
+                            Err(error) => {
+                                warn!(
+                                    ?error,
+                                    sequence = feedback_sequence,
+                                    "reconstruction-feedback GPU submission failed"
+                                );
+                                reconstruction_feedback_analyzer = None;
+                                feedback_roi_planner = None;
+                                feedback_wire_budget = None;
+                                reconstruction_feedback_failed_key = Some(feedback_key);
+                                encoder = None;
+                                if let Some(activity) = benchmark_roi_activity.as_mut() {
+                                    activity.reconstruction_active = Some(false);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(submission) = quiescent_temporal_submission.take() {
+                        if let Some(analyzer) = quiescent_diff_analyzer.as_mut() {
+                            let completion = analyzer.collect_quiescent(submission);
+                            let validation_failed =
+                                completion.validation_status == QuiescentValidationStatus::Failed;
+                            if let Some(error) = completion.validation_error.as_deref() {
+                                warn!(
+                                    error,
+                                    sequence = media_sequence.wrapping_add(1),
+                                    "GPU quiescent-detail validation collection failed; invalidating active tiles"
+                                );
+                            }
+                            record_benchmark_hybrid_validation(
+                                &mut benchmark_hybrid_activity,
+                                &mut benchmark_hybrid_validation_submit_us,
+                                &mut benchmark_hybrid_validation_collect_us,
+                                &mut benchmark_hybrid_validation_age_frames,
+                                completion.submit_us,
+                                completion.collect_us,
+                                completion.validation_status,
+                                &completion.deferred_readback,
+                                completion.result.damage_audit,
+                                media_sequence.wrapping_add(1),
+                            );
+                            let mut result = completion.result;
+                            for verdict in &completion.deferred_readback.verdicts {
+                                let cached_png_bytes = quiescent_tile_planner
+                                    .cached_png_bytes(verdict.request.tile_id)
+                                    .unwrap_or_default()
+                                    as u64;
+                                let superseded = quiescent_tile_planner
+                                    .validation_verdict_superseded(
+                                        quiescent_viewport
+                                            .expect("quiescent viewport is available"),
+                                        verdict,
+                                    );
+                                if let Some(operation) = quiescent_tile_planner.resolve_validation(
+                                    quiescent_viewport.expect("quiescent viewport is available"),
+                                    verdict,
+                                ) {
+                                    if let Some(activity) = benchmark_hybrid_activity.as_mut() {
+                                        match &operation {
+                                            HybridTileOperation::Reactivate { .. } => {
+                                                activity.png_bytes_avoided = activity
+                                                    .png_bytes_avoided
+                                                    .saturating_add(cached_png_bytes);
+                                            }
+                                            HybridTileOperation::InvalidateValidated { .. } => {
+                                                quiescent_verified_changed_rects
+                                                    .push(verdict.request.source);
+                                                activity.permanent_invalidations = activity
+                                                    .permanent_invalidations
+                                                    .saturating_add(1);
+                                                activity.invalidations =
+                                                    activity.invalidations.saturating_add(1);
+                                            }
+                                            _ => {}
+                                        }
+                                        activity.cached_bytes_retained =
+                                            activity
+                                                .cached_bytes_retained
+                                                .max(quiescent_tile_planner.retained_png_bytes()
+                                                    as u64);
+                                    }
+                                    quiescent_resolution_operations.push(operation);
+                                } else if !superseded {
+                                    if let Some(activity) = benchmark_hybrid_activity.as_mut() {
+                                        activity.stale_reactivation_rejects =
+                                            activity.stale_reactivation_rejects.saturating_add(1);
+                                    }
+                                }
+                            }
+                            result.immediate_damage_rects = quiescent_immediate_damage_rects(
+                                quiescent_cache_mode,
+                                frame.damage(),
+                                &quiescent_verified_changed_rects,
+                                is_idle_snapshot,
+                            )
+                            .to_vec();
+                            result.damage_rects = quiescent_damage_rects(
+                                frame.damage(),
+                                &result.damage_rects,
+                                is_idle_snapshot,
+                            )
+                            .to_vec();
+                            quiescent_temporal_result = Some(result);
+                            if validation_failed {
+                                quiescent_diff_analyzer = None;
+                            }
+                        }
+                    }
+                    if active_benchmark_profile.is_some() {
+                        record_benchmark_encode_stages(
+                            &mut benchmark_encode_stages,
+                            encoded.stage_timings,
+                        );
+                        if let Some(activity) = encoded.roi_activity {
+                            record_benchmark_roi_activity(
+                                &mut benchmark_roi_activity,
+                                activity,
+                                wss_media.as_ref().map(|_| media_sequence.wrapping_add(1)),
+                            );
+                        }
+                        benchmark_encoded_bytes =
+                            benchmark_encoded_bytes.saturating_add(encoded.data.len() as u64);
+                        benchmark_encode_count = benchmark_encode_count.saturating_add(1);
+                        benchmark_encode_us_total =
+                            benchmark_encode_us_total.saturating_add(encoded.encode_us);
+                        benchmark_encode_us_max = benchmark_encode_us_max
+                            .max(encoded.encode_us.min(u64::from(u32::MAX)) as u32);
+                        if let Some(qp_map) = encoded.qp_map {
+                            benchmark_qp_map_frames = benchmark_qp_map_frames.saturating_add(1);
+                            benchmark_qp_map_changed_ctbs = benchmark_qp_map_changed_ctbs
+                                .saturating_add(u64::from(qp_map.changed_ctbs));
+                            benchmark_qp_map_total_ctbs = benchmark_qp_map_total_ctbs
+                                .saturating_add(u64::from(qp_map.total_ctbs));
+                        }
+                        if encoded.is_idr {
+                            benchmark_idr_count = benchmark_idr_count.saturating_add(1);
+                        } else {
+                            benchmark_delta_count = benchmark_delta_count.saturating_add(1);
+                        }
+                    }
+                    let mut hybrid_wss_payload = None;
+                    let mut request_quiescent_transition_followup = false;
+                    if hybrid_enabled {
+                        let mut operations = Vec::new();
+                        if quiescent_hybrid_enabled {
+                            operations.append(&mut quiescent_suppression_operations);
+                            operations.append(&mut quiescent_resolution_operations);
+                            coalesce_quiescent_cache_round_trips(&mut operations);
+                            if let Some(activity) = benchmark_hybrid_activity.as_mut() {
+                                for operation in &operations {
+                                    match operation {
+                                        HybridTileOperation::Suppress { .. } => {
+                                            activity.suppressions =
+                                                activity.suppressions.saturating_add(1);
+                                        }
+                                        HybridTileOperation::Reactivate { .. } => {
+                                            activity.reactivations =
+                                                activity.reactivations.saturating_add(1);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if let Some(result) = quiescent_temporal_result.as_ref() {
+                                let plan = quiescent_tile_planner.plan_with_immediate_damage(
+                                    frame.width(),
+                                    frame.height(),
+                                    quiescent_viewport.expect("quiescent viewport is available"),
+                                    &result.damage_rects,
+                                    &result.immediate_damage_rects,
+                                    &result.edge_scores,
+                                );
+                                let planned_sequence = media_sequence.wrapping_add(1);
+                                if plan.output_changed || planned_sequence.is_multiple_of(30) {
+                                    info!(
+                                        sequence = planned_sequence,
+                                        generation = media_generation,
+                                        crop_revision = viewport_revision,
+                                        history_damage_rects = result.damage_rects.len(),
+                                        immediate_damage_rects =
+                                            result.immediate_damage_rects.len(),
+                                        changed_cells = plan.changed_cells,
+                                        total_cells = plan.total_cells,
+                                        edge_score_cells = plan.edge_score_cells,
+                                        expected_edge_score_cells = plan.expected_edge_score_cells,
+                                        stability_zero_cells = plan.stability_zero_cells,
+                                        stability_one_cells = plan.stability_one_cells,
+                                        stability_two_cells = plan.stability_two_cells,
+                                        stability_three_plus_cells =
+                                            plan.stability_three_plus_cells,
+                                        fully_stable_blocks = plan.fully_stable_blocks,
+                                        edge_eligible_blocks = plan.edge_eligible_blocks,
+                                        candidates = plan.candidates.len(),
+                                        motion_bypass = plan.motion_bypass,
+                                        "quiescent detail eligibility diagnostic"
+                                    );
+                                }
+                                let plan_diagnostic = plan.output_changed.then_some((
+                                    plan.history_preserved,
+                                    plan.active_before_planning,
+                                    plan.changed_cells,
+                                    plan.total_cells,
+                                    plan.motion_bypass,
+                                    plan.preserved_candidates,
+                                    plan.rejected_damage,
+                                    plan.rejected_partial_visibility,
+                                    plan.rejected_mapping,
+                                    plan.rejected_dimension,
+                                    plan.candidates.len(),
+                                ));
+                                record_benchmark_hybrid_plan(
+                                    &mut benchmark_hybrid_activity,
+                                    &mut benchmark_hybrid_analysis_us,
+                                    &plan,
+                                    result.damage_rects.is_empty(),
+                                    result.analysis_us,
+                                );
+                                if let Some(activity) = benchmark_hybrid_activity.as_mut() {
+                                    activity.cached_bytes_retained = activity
+                                        .cached_bytes_retained
+                                        .max(quiescent_tile_planner.retained_png_bytes() as u64);
+                                }
+                                if plan.clear {
+                                    operations.push(HybridTileOperation::Clear);
+                                }
+                                operations.extend(
+                                    plan.invalidated
+                                        .into_iter()
+                                        .map(|tile_id| HybridTileOperation::Invalidate { tile_id }),
+                                );
+                                let mut sidecar_bytes = operations
+                                    .iter()
+                                    .map(hybrid_operation_wire_bytes)
+                                    .sum::<usize>();
+                                let sidecar_budget = active_benchmark_profile
+                                    .map(|profile| {
+                                        let topology = profile.wss_topology.unwrap_or(
+                                            benchmark::BenchmarkWssTopology {
+                                                lane_count: 16,
+                                                data_shards: 15,
+                                                parity_shards: 1,
+                                            },
+                                        );
+                                        quiescent_wire_budget.begin_frame(
+                                            profile.bitrate_bps,
+                                            u32::from(profile.fps),
+                                            topology.lane_count,
+                                            topology.data_shards,
+                                            encoded.data.len(),
+                                        )
+                                    })
+                                    .unwrap_or(MAX_HYBRID_SIDECAR_BYTES);
+                                let mut frame_upserts = 0usize;
+                                let mut frame_budget_skipped_upserts = 0usize;
+                                let mut frame_deferred_upserts = 0usize;
+                                let progressive_transition = plan.output_changed;
+                                let scaled_texture = unsafe {
+                                    windows::Win32::Graphics::Direct3D11::ID3D11Texture2D::from_raw_borrowed(
+                                        &scaled.texture,
+                                    )
+                                };
+                                if let Some(scaled_texture) = scaled_texture {
+                                    let tile_encoder_key =
+                                        (benchmark_profile_revision, dev as usize);
+                                    let has_supported_hevc_geometry = hevc_quiescent_tiles_enabled
+                                        && plan.candidates.iter().any(|candidate| {
+                                            is_supported_output_rect(candidate.output)
+                                        });
+                                    if hevc_quiescent_tiles_enabled
+                                        && hevc_tile_encoder.as_ref().is_some_and(|encoder| {
+                                            !encoder.is_for_device(frame.device())
+                                        })
+                                    {
+                                        hevc_tile_encoder = None;
+                                    }
+                                    if has_supported_hevc_geometry
+                                        && hevc_tile_encoder.is_none()
+                                        && hevc_tile_encoder_failed_key != Some(tile_encoder_key)
+                                    {
+                                        match HevcTileEncoder::new(frame.device()) {
+                                            Ok(encoder) => {
+                                                hevc_tile_encoder = Some(encoder);
+                                                if let Some(activity) =
+                                                    benchmark_hybrid_activity.as_mut()
+                                                {
+                                                    activity.hevc_tile_encoder_opens = activity
+                                                        .hevc_tile_encoder_opens
+                                                        .saturating_add(1);
+                                                }
+                                            }
+                                            Err(error) => {
+                                                hevc_tile_encoder_failed_key =
+                                                    Some(tile_encoder_key);
+                                                if let Some(activity) =
+                                                    benchmark_hybrid_activity.as_mut()
+                                                {
+                                                    activity.hevc_tile_encoder_failures = activity
+                                                        .hevc_tile_encoder_failures
+                                                        .saturating_add(1);
+                                                }
+                                                warn!(
+                                                    ?error,
+                                                    "HEVC quiescent tile capability probe failed; base video remains active"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    for candidate in plan.candidates {
+                                        if !quiescent_transition_upsert_allowed(
+                                            progressive_transition,
+                                            frame_upserts,
+                                        ) {
+                                            frame_deferred_upserts =
+                                                frame_deferred_upserts.saturating_add(1);
+                                            quiescent_tile_planner
+                                                .reject_candidate(candidate.tile_id);
+                                            continue;
+                                        }
+                                        if hevc_quiescent_tiles_enabled {
+                                            if !is_supported_output_rect(candidate.output) {
+                                                quiescent_tile_planner
+                                                    .reject_candidate(candidate.tile_id);
+                                                continue;
+                                            }
+                                            if sidecar_bytes.saturating_add(16) > sidecar_budget {
+                                                frame_budget_skipped_upserts =
+                                                    frame_budget_skipped_upserts.saturating_add(1);
+                                                if let Some(activity) =
+                                                    benchmark_hybrid_activity.as_mut()
+                                                {
+                                                    activity.budget_skipped_upserts = activity
+                                                        .budget_skipped_upserts
+                                                        .saturating_add(1);
+                                                }
+                                                quiescent_tile_planner
+                                                    .reject_candidate(candidate.tile_id);
+                                                continue;
+                                            }
+                                            let Some(tile_encoder) = hevc_tile_encoder.as_mut()
+                                            else {
+                                                quiescent_tile_planner
+                                                    .reject_candidate(candidate.tile_id);
+                                                continue;
+                                            };
+                                            match tile_encoder
+                                                .copy_and_encode(scaled_texture, candidate.output)
+                                            {
+                                                Ok(tile)
+                                                    if sidecar_bytes
+                                                        .saturating_add(16)
+                                                        .saturating_add(tile.frame.data.len())
+                                                        <= sidecar_budget =>
+                                                {
+                                                    let access_unit_len = tile.frame.data.len();
+                                                    sidecar_bytes += 16 + access_unit_len;
+                                                    frame_upserts = frame_upserts.saturating_add(1);
+                                                    quiescent_tile_planner.commit_candidate(
+                                                        candidate.tile_id,
+                                                        media_sequence.wrapping_add(1),
+                                                        access_unit_len,
+                                                    );
+                                                    if let Some(activity) =
+                                                        benchmark_hybrid_activity.as_mut()
+                                                    {
+                                                        activity.upserts =
+                                                            activity.upserts.saturating_add(1);
+                                                        activity.hevc_tile_bytes = activity
+                                                            .hevc_tile_bytes
+                                                            .saturating_add(access_unit_len as u64);
+                                                        activity.hevc_tile_copy_us_total = activity
+                                                            .hevc_tile_copy_us_total
+                                                            .saturating_add(tile.copy_us);
+                                                        activity.hevc_tile_copy_us_max =
+                                                            activity.hevc_tile_copy_us_max.max(
+                                                                tile.copy_us
+                                                                    .min(u64::from(u32::MAX))
+                                                                    as u32,
+                                                            );
+                                                        activity.hevc_tile_encode_us_total =
+                                                            activity
+                                                                .hevc_tile_encode_us_total
+                                                                .saturating_add(
+                                                                    tile.frame.encode_us,
+                                                                );
+                                                        activity.hevc_tile_encode_us_max =
+                                                            activity.hevc_tile_encode_us_max.max(
+                                                                tile.frame
+                                                                    .encode_us
+                                                                    .min(u64::from(u32::MAX))
+                                                                    as u32,
+                                                            );
+                                                    }
+                                                    operations.push(
+                                                        HybridTileOperation::HevcUpsert {
+                                                            tile_id: candidate.tile_id,
+                                                            rect: candidate.output,
+                                                            access_unit: tile.frame.data,
+                                                        },
+                                                    );
+                                                }
+                                                Ok(_) => {
+                                                    frame_budget_skipped_upserts =
+                                                        frame_budget_skipped_upserts
+                                                            .saturating_add(1);
+                                                    if let Some(activity) =
+                                                        benchmark_hybrid_activity.as_mut()
+                                                    {
+                                                        activity.budget_skipped_upserts = activity
+                                                            .budget_skipped_upserts
+                                                            .saturating_add(1);
+                                                    }
+                                                    quiescent_tile_planner
+                                                        .reject_candidate(candidate.tile_id);
+                                                }
+                                                Err(error) => {
+                                                    hevc_tile_encoder = None;
+                                                    hevc_tile_encoder_failed_key =
+                                                        Some(tile_encoder_key);
+                                                    if let Some(activity) =
+                                                        benchmark_hybrid_activity.as_mut()
+                                                    {
+                                                        activity.hevc_tile_encoder_failures =
+                                                            activity
+                                                                .hevc_tile_encoder_failures
+                                                                .saturating_add(1);
+                                                    }
+                                                    quiescent_tile_planner
+                                                        .reject_candidate(candidate.tile_id);
+                                                    warn!(
+                                                        ?error,
+                                                        tile_id = candidate.tile_id,
+                                                        "HEVC quiescent tile encode failed; base video remains active"
+                                                    );
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        let png_started = Instant::now();
+                                        let png_result = encode_texture_png_crop(
+                                            scaled_texture,
+                                            candidate.output,
+                                        );
+                                        let png_us = png_started
+                                            .elapsed()
+                                            .as_micros()
+                                            .min(u128::from(u64::MAX))
+                                            as u64;
+                                        if let Some(activity) = benchmark_hybrid_activity.as_mut() {
+                                            activity.png_us_total =
+                                                activity.png_us_total.saturating_add(png_us);
+                                            activity.png_us_max = activity
+                                                .png_us_max
+                                                .max(png_us.min(u64::from(u32::MAX)) as u32);
+                                        }
+                                        match png_result {
+                                            Ok(png)
+                                                if sidecar_bytes
+                                                    .saturating_add(16)
+                                                    .saturating_add(png.len())
+                                                    <= sidecar_budget =>
+                                            {
+                                                sidecar_bytes += 16 + png.len();
+                                                frame_upserts = frame_upserts.saturating_add(1);
+                                                quiescent_tile_planner.commit_candidate(
+                                                    candidate.tile_id,
+                                                    media_sequence.wrapping_add(1),
+                                                    png.len(),
+                                                );
+                                                if let Some(activity) =
+                                                    benchmark_hybrid_activity.as_mut()
+                                                {
+                                                    activity.upserts =
+                                                        activity.upserts.saturating_add(1);
+                                                    activity.png_bytes = activity
+                                                        .png_bytes
+                                                        .saturating_add(png.len() as u64);
+                                                }
+                                                operations.push(HybridTileOperation::Upsert {
+                                                    tile_id: candidate.tile_id,
+                                                    rect: candidate.output,
+                                                    png,
+                                                });
+                                            }
+                                            Ok(_) => {
+                                                frame_budget_skipped_upserts =
+                                                    frame_budget_skipped_upserts.saturating_add(1);
+                                                if let Some(activity) =
+                                                    benchmark_hybrid_activity.as_mut()
+                                                {
+                                                    activity.budget_skipped_upserts = activity
+                                                        .budget_skipped_upserts
+                                                        .saturating_add(1);
+                                                }
+                                                quiescent_tile_planner
+                                                    .reject_candidate(candidate.tile_id);
+                                            }
+                                            Err(error) => {
+                                                quiescent_tile_planner
+                                                    .reject_candidate(candidate.tile_id);
+                                                warn!(
+                                                    ?error,
+                                                    tile_id = candidate.tile_id,
+                                                    "quiescent detail tile generation failed"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some((
+                                    history_preserved,
+                                    active_before_planning,
+                                    changed_cells,
+                                    total_cells,
+                                    motion_bypass,
+                                    preserved_candidates,
+                                    rejected_damage,
+                                    rejected_partial_visibility,
+                                    rejected_mapping,
+                                    rejected_dimension,
+                                    candidates_after_remap,
+                                )) = plan_diagnostic
+                                {
+                                    info!(
+                                        sequence = media_sequence.wrapping_add(1),
+                                        generation = media_generation,
+                                        crop_revision = viewport_revision,
+                                        history_preserved,
+                                        active_before_planning,
+                                        changed_cells,
+                                        total_cells,
+                                        motion_bypass,
+                                        preserved_candidates,
+                                        rejected_damage,
+                                        rejected_partial_visibility,
+                                        rejected_mapping,
+                                        rejected_dimension,
+                                        candidates_after_remap,
+                                        budget_skipped_candidates = frame_budget_skipped_upserts,
+                                        deferred_candidates = frame_deferred_upserts,
+                                        sidecar_budget,
+                                        sidecar_bytes,
+                                        "quiescent detail transition plan"
+                                    );
+                                }
+                                let suppressed_tiles =
+                                    quiescent_tile_planner.suppressed_tile_count();
+                                if quiescent_transition_followup_needed(
+                                    plan_diagnostic.is_some(),
+                                    frame_upserts,
+                                    frame_budget_skipped_upserts,
+                                    suppressed_tiles,
+                                ) {
+                                    request_quiescent_transition_followup = true;
+                                    info!(
+                                        sequence = media_sequence.wrapping_add(1),
+                                        generation = media_generation,
+                                        crop_revision = viewport_revision,
+                                        upserts = frame_upserts,
+                                        budget_skipped_candidates = frame_budget_skipped_upserts,
+                                        suppressed_tiles,
+                                        "quiescent detail transition requested one activation frame"
+                                    );
+                                }
+                                if let Some(activity) = benchmark_hybrid_activity.as_mut() {
+                                    activity.sidecar_bytes =
+                                        activity.sidecar_bytes.saturating_add(sidecar_bytes as u64);
+                                }
+                                quiescent_wire_budget.commit_sidecar(sidecar_bytes);
+                            } else {
+                                operations.push(HybridTileOperation::Clear);
+                            }
+                        } else if scaled.width != frame.width()
+                            || scaled.height != frame.height()
+                            || viewport_crop.is_some()
+                        {
+                            operations.push(HybridTileOperation::Clear);
+                        } else if let Some(result) = hybrid_temporal_result.as_ref() {
+                            let plan = hybrid_tile_planner.plan(
+                                media_generation,
+                                viewport_revision,
+                                scaled.width,
+                                scaled.height,
+                                &result.damage_rects,
+                                &result.edge_scores,
+                            );
+                            if plan.clear {
+                                operations.push(HybridTileOperation::Clear);
+                            }
+                            operations.extend(
+                                plan.invalidated
+                                    .into_iter()
+                                    .map(|tile_id| HybridTileOperation::Invalidate { tile_id }),
+                            );
+                            let mut sidecar_bytes = operations.len() * 4;
+                            for (tile_id, rect) in plan.candidates {
+                                match frame.encode_png_crop(rect) {
+                                    Ok(png)
+                                        if sidecar_bytes
+                                            .saturating_add(16)
+                                            .saturating_add(png.len())
+                                            <= MAX_HYBRID_SIDECAR_BYTES =>
+                                    {
+                                        sidecar_bytes += 16 + png.len();
+                                        operations.push(HybridTileOperation::Upsert {
+                                            tile_id,
+                                            rect,
+                                            png,
+                                        });
+                                    }
+                                    Ok(_) => hybrid_tile_planner.reject_candidate(tile_id),
+                                    Err(error) => {
+                                        hybrid_tile_planner.reject_candidate(tile_id);
+                                        warn!(
+                                            ?error,
+                                            tile_id, "lossless detail tile generation failed"
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            operations.push(HybridTileOperation::Clear);
+                        }
+                        match encode_hybrid_frame_v1(&HybridFrame {
+                            generation: media_generation,
+                            sequence: media_sequence.wrapping_add(1),
+                            crop_revision: viewport_revision,
+                            access_unit: encoded.data.clone(),
+                            operations,
+                        }) {
+                            Ok(payload) => hybrid_wss_payload = Some(payload),
+                            Err(error) => {
+                                warn!(?error, "hybrid frame envelope rejected");
+                                if quiescent_hybrid_enabled {
+                                    recover_quiescent_after_unsubmitted_frame(
+                                        &mut quiescent_tile_planner,
+                                        &mut quiescent_wire_budget,
+                                    );
+                                    quiescent_diff_analyzer = None;
+                                }
+                                continue 'session;
+                            }
+                        }
+                    }
+                    if encoded.is_idr {
+                        if wss_media.is_some() {
+                            media_gop = media_gop.wrapping_add(1).max(1);
+                        }
+                        latest_idr = Some(CachedIdr {
+                            data: encoded.data.clone(),
+                            mode,
+                        });
+                    }
+                    capture.cancel_idle_followup_snapshot();
+                    match idle_snapshot_completion_order(
+                        encoded.is_idr && is_idle_snapshot,
+                        request_quiescent_transition_followup,
+                    ) {
+                        IdleSnapshotCompletionOrder::None => {}
+                        IdleSnapshotCompletionOrder::Acknowledge => {
+                            capture.acknowledge_idle_snapshot_idr();
+                        }
+                        IdleSnapshotCompletionOrder::Request => {
+                            capture.request_idle_followup_snapshot(frame_interval);
+                        }
+                        IdleSnapshotCompletionOrder::AcknowledgeThenRequest => {
+                            capture.acknowledge_idle_snapshot_idr();
+                            capture.request_idle_followup_snapshot(frame_interval);
+                        }
+                    }
+                    next_admission = advance_frame_deadline(next_admission, now, frame_interval);
+                    let id = next_au_id;
+                    next_au_id += 1;
+                    let rtc_active = ice_connected && wss_media.is_none();
+                    let rtc_data = if rtc_active {
+                        Some(encoded.data.clone())
+                    } else {
+                        None
+                    };
+                    if wss_media.is_some() {
+                        media_sequence = media_sequence.wrapping_add(1);
+                        let meta = WssAccessUnitMeta {
+                            codec: wss_codec(active_codec),
+                            generation: media_generation,
+                            gop: media_gop,
+                            sequence: media_sequence,
+                            timestamp90k: (media_clock_start.elapsed().as_secs_f64() * 90_000.0)
+                                as u32,
+                            key: encoded.is_idr,
+                            lab_roi: lab_roi_trace(encoded.roi_activity),
+                        };
+                        let payload = hybrid_wss_payload
+                            .take()
+                            .unwrap_or_else(|| encoded.data.clone());
+                        let encoded_len = payload.len();
+                        wss_max_access_unit_bytes = wss_max_access_unit_bytes.max(encoded_len);
+                        if encoded.is_idr {
+                            wss_idr_count = wss_idr_count.saturating_add(1);
+                        } else {
+                            wss_delta_count = wss_delta_count.saturating_add(1);
+                        }
+                        if let Some(mut wss_reservation) = wss_reservation.take() {
+                            wss_reservation.set_meta(meta);
+                            if matches!(
+                                wss_reservation.submit(payload),
+                                WssSubmitOutcome::Queued { .. }
+                            ) {
+                                if active_benchmark_profile.is_some() {
+                                    let wire_payload_bytes = wss_media
+                                        .as_ref()
+                                        .map_or(0, |egress| egress.wire_payload_bytes(encoded_len));
+                                    benchmark_wss_payload_bytes = benchmark_wss_payload_bytes
+                                        .saturating_add(wire_payload_bytes);
+                                    if feedback_headroom_enabled {
+                                        if let Some(budget) = feedback_wire_budget.as_mut() {
+                                            budget.record(Instant::now(), wire_payload_bytes);
+                                        }
+                                    }
+                                }
+                                if let Some(pending) = pending_first_frame.as_mut() {
+                                    let armed_generation = pending.generation;
+                                    if pending
+                                        .admit_wss_access_unit(media_generation, encoded.is_idr)
+                                    {
+                                        signaling.send_first_frame(
+                                            "admitted",
+                                            &pending.request_id,
+                                            pending.generation,
+                                            Some("wss"),
+                                            pending.epoch.as_deref(),
+                                            Some(active_codec.name()),
+                                        );
+                                        info!(
+                                            armed_generation,
+                                            admitted_generation = pending.generation,
+                                            source = "fresh-idr",
+                                            "first-frame WSS IDR admitted"
+                                        );
+                                    }
+                                }
+                                wss_ack_rate.submitted(
+                                    media_generation,
+                                    media_sequence,
+                                    encoded_len,
+                                );
+                                if encoded.is_idr {
+                                    if let Some(request_id) = pending_lab_quality_keyframe.take() {
+                                        signaling.send_lab_quality_keyframe_admitted(
+                                            &request_id,
+                                            media_generation,
+                                            media_sequence,
+                                            active_codec.name(),
+                                        );
+                                    }
+                                    if let Some(crop) = viewport_crop.filter(|crop| {
+                                        active_viewport != Some((crop.revision, media_generation))
+                                            && pending_viewport_idr.is_none()
+                                    }) {
+                                        pending_viewport_idr = Some(PendingViewportIdr {
+                                            generation: media_generation,
+                                            sequence: media_sequence,
+                                            crop,
+                                        });
+                                    }
+                                    let transition_reason = fallback_reason.or_else(|| {
+                                        profiles
+                                            .staged
+                                            .filter(|(staged_mode, _)| *staged_mode == mode)
+                                            .map(|(_, reason)| reason)
+                                    });
+                                    if let Some(reason) = transition_reason {
+                                        pending_wss_idr = Some(PendingWssIdr {
+                                            generation: media_generation,
+                                            sequence: media_sequence,
+                                            mode,
+                                            reason,
+                                        });
+                                    }
+                                }
+                            } else {
+                                wss_submission_failures = wss_submission_failures.saturating_add(1);
+                                pending_wss_idr = None;
+                                pending_viewport_idr = None;
+                                if quiescent_hybrid_enabled {
+                                    recover_quiescent_after_unsubmitted_frame(
+                                        &mut quiescent_tile_planner,
+                                        &mut quiescent_wire_budget,
+                                    );
+                                    quiescent_diff_analyzer = None;
+                                }
+                                if let Some(enc) = encoder.as_mut() {
+                                    enc.force_idr();
+                                }
+                                next_idr = Instant::now();
+                            }
+                        } else {
+                            wss_submission_failures = wss_submission_failures.saturating_add(1);
+                            warn!("WSS access unit reached submit without a reservation");
+                            if quiescent_hybrid_enabled {
+                                recover_quiescent_after_unsubmitted_frame(
+                                    &mut quiescent_tile_planner,
+                                    &mut quiescent_wire_budget,
+                                );
+                                quiescent_diff_analyzer = None;
+                            }
                             if let Some(enc) = encoder.as_mut() {
                                 enc.force_idr();
                             }
-                            continue 'run;
+                            next_idr = Instant::now();
                         }
                     }
-                };
-
-                if is_transition && encoded.is_idr {
-                    profiles.commit_mode(target_mode, transition_reason);
-                }
-                let active_profile = profiles.active();
-                let active_fps = profiles.active_fps();
-                next_frame_admission =
-                    Instant::now() + Duration::from_secs_f64(1.0 / active_fps as f64);
-                encode_sum_us = encode_sum_us.saturating_add(encoded.encode_us);
-                encode_max_us = encode_max_us.max(encoded.encode_us);
-                encode_count += 1;
-                let is_idr = encoded.is_idr;
-                if is_idr {
-                    latest_idr = Some(CachedIdr {
-                        data: encoded.data.clone(),
-                        mode: profiles.active,
-                    });
-                }
-                if rtc.ice_connected {
-                    let encoded_bytes = encoded.data.len();
-                    let encode_us = encoded.encode_us;
-                    match rtc.write_video(encoded.data) {
-                        Err(e) => {
-                            warn!(?e, "write_video failed");
-                            if is_idr {
-                                cached_idr_replay.on_not_admitted(Instant::now());
-                            }
-                        }
-                        Ok(false) => {
-                            if is_idr {
-                                cached_idr_replay.on_not_admitted(Instant::now());
-                            }
-                        }
-                        Ok(true) => {
-                            frames_sent += 1;
-                            admitted_frames_window += 1;
-                            admitted_bytes_window += encoded_bytes as u64;
-                            if is_idr {
-                                last_idr_sent = Instant::now();
-                                next_idr = last_idr_sent + IDR_INTERVAL;
-                                cached_idr_replay.on_fresh_idr_admitted();
-                                announce_admitted_profile(
-                                    &mut profiles,
-                                    &mut signaling,
-                                    encoder
-                                        .as_ref()
-                                        .map(Nvenc::bitrate)
-                                        .unwrap_or(quality.target()),
-                                    quality.bwe(),
-                                );
-                                info!(
-                                    frames_sent,
-                                    encoded_bytes,
-                                    profile = active_profile.name(),
-                                    "IDR sent"
-                                );
-                            }
-                            if frames_sent % 300 == 0 {
-                                info!(
-                                    frames_sent,
-                                    encode_ms = format!("{:.2}", encode_us as f64 / 1000.0),
-                                    idr = is_idr,
-                                    "stream stats"
-                                );
+                    if rtc_active {
+                        if let Some(reservation) = rtc_reservation {
+                            if reservation.submit(AccessUnit {
+                                id,
+                                data: rtc_data.expect("ICE data cloned above"),
+                                produced_at: Instant::now(),
+                                is_idr: encoded.is_idr,
+                            }) && encoded.is_idr
+                            {
+                                if let Some(reason) = fallback_reason {
+                                    pending_transition_idr =
+                                        Some(PendingSubmittedIdr { id, mode, reason });
+                                } else if transition {
+                                    pending_transition_idr = Some(PendingSubmittedIdr {
+                                        id,
+                                        mode,
+                                        reason: "transition",
+                                    });
+                                }
                             }
                         }
                     }
                 }
-
-                // write_video queued packets; drain them before any wait.
-                continue 'run;
             }
+        } else if media_demand_active {
+            skipped_before_encode += 1;
         }
-
-        let now = Instant::now();
-        if connected_since.is_some() && now >= next_transport_log {
-            let elapsed = now
-                .duration_since(transport_window_started)
-                .as_secs_f64()
-                .max(0.001);
+        if skipped_before_encode != 0 && Instant::now() >= next_skip_log {
             info!(
-                tx_mbps = format!(
-                    "{:.2}",
-                    tx_bytes_window as f64 * 8.0 / elapsed / 1_000_000.0
-                ),
-                tx_pps = format!("{:.0}", tx_packets_window as f64 / elapsed),
-                admitted_mbps = format!(
-                    "{:.2}",
-                    admitted_bytes_window as f64 * 8.0 / elapsed / 1_000_000.0
-                ),
-                admitted_fps = format!("{:.1}", admitted_frames_window as f64 / elapsed),
-                overdue_deadlines = overdue_deadlines_window,
-                max_overdue_us = max_deadline_overdue_us,
-                scale_us_sum = scale_sum_us,
-                scale_us_max = scale_max_us,
-                scale_count,
-                encode_us_sum = encode_sum_us,
-                encode_us_max = encode_max_us,
-                encode_count,
-                "RTC transport"
+                skipped_before_encode,
+                "producer skipped frames before encode due to AU backpressure"
             );
-            transport_window_started = now;
-            next_transport_log = now + Duration::from_secs(1);
-            tx_packets_window = 0;
-            tx_bytes_window = 0;
-            admitted_frames_window = 0;
-            admitted_bytes_window = 0;
-            overdue_deadlines_window = 0;
-            max_deadline_overdue_us = 0;
-            scale_sum_us = 0;
-            scale_max_us = 0;
-            scale_count = 0;
-            encode_sum_us = 0;
-            encode_max_us = 0;
-            encode_count = 0;
+            skipped_before_encode = 0;
+            next_skip_log = Instant::now() + Duration::from_secs(1);
         }
-
-        // Stay responsive to new desktop presents while respecting str0m's
-        // next deadline. A one-millisecond cap avoids the old 16 ms blind
-        // spot without burning an entire CPU core in a spin loop.
-        let wait = timeout.saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
-            std::thread::sleep(wait.min(Duration::from_millis(1)));
+        if wss_media.is_some() && Instant::now() >= next_wss_stats {
+            let (lane_health, pipeline_stats) = wss_media
+                .as_ref()
+                .map(|egress| (egress.health(), egress.take_window_stats()))
+                .expect("WSS media checked above");
+            let encoded_total = wss_idr_count.saturating_add(wss_delta_count);
+            let idr_percent = if encoded_total == 0 {
+                0
+            } else {
+                wss_idr_count.saturating_mul(100) / encoded_total
+            };
+            let capture_stats = capture.local_capture_stats().unwrap_or(last_capture_stats);
+            let capture_acquired = capture_stats.0.saturating_sub(last_capture_stats.0);
+            let capture_new = capture_stats.1.saturating_sub(last_capture_stats.1);
+            last_capture_stats = capture_stats;
+            info!(wss_preencode_skips, wss_submission_failures, wss_idr_count, wss_delta_count,
+                idr_percent, dependency_losses = wss_quality.last_dependency_losses,
+                producer_loop_iterations, capture_acquired, capture_new,
+                lane_health = ?lane_health, wss_max_access_unit_bytes,
+                reserve_count = pipeline_stats.reserve_count,
+                reserve_us_total = pipeline_stats.reserve_us_total,
+                reserve_us_max = pipeline_stats.reserve_us_max,
+                 reserve_backpressured = pipeline_stats.reserve_backpressured,
+                 reserve_require_keyframe = pipeline_stats.reserve_require_keyframe,
+                 blocked_queued_lanes = pipeline_stats.blocked_queued_lanes,
+                 blocked_ack_window_lanes = pipeline_stats.blocked_ack_window_lanes,
+                 blocked_recovery_lanes = pipeline_stats.blocked_recovery_lanes,
+                unavailable_lanes = pipeline_stats.unavailable_lanes,
+                submit_count = pipeline_stats.submit_count,
+                access_unit_bytes = pipeline_stats.access_unit_bytes,
+                packet_bytes = pipeline_stats.packet_bytes,
+                shard_us_total = pipeline_stats.shard_us_total,
+                shard_us_max = pipeline_stats.shard_us_max,
+                dispatch_us_total = pipeline_stats.dispatch_us_total,
+                dispatch_us_max = pipeline_stats.dispatch_us_max,
+                queue_full = pipeline_stats.queue_full,
+                queue_age_us_total = pipeline_stats.queue_age_us_total,
+                queue_age_us_max = pipeline_stats.queue_age_us_max,
+                send_count = pipeline_stats.send_count,
+                send_us_total = pipeline_stats.send_us_total,
+                send_us_max = pipeline_stats.send_us_max,
+                send_over_10ms = pipeline_stats.send_over_10ms,
+                send_over_frame_budget = pipeline_stats.send_over_frame_budget,
+                send_failures = pipeline_stats.send_failures,
+                "WSS producer window");
+            next_wss_stats = Instant::now() + Duration::from_secs(1);
+            producer_loop_iterations = 0;
+            wss_preencode_skips = 0;
+            wss_submission_failures = 0;
+            wss_idr_count = 0;
+            wss_delta_count = 0;
+            wss_max_access_unit_bytes = 0;
         }
+        // This bounds producer polling only; the RTC transport is a separate
+        // thread and continues to wake on its own timers and channels.
+        std::thread::sleep(producer_poll_interval(media_demand_active));
     }
-
     input_sink.release_all();
+    capture.release_input();
     signaling.send_bye();
-    let secs = connected_since
-        .map(|t| t.elapsed().as_secs_f64())
-        .unwrap_or(0.0);
-    info!(
-        frames_sent,
-        connected_secs = format!("{secs:.1}"),
-        "host exiting"
-    );
+    if let Some(egress) = wss_media {
+        egress.shutdown();
+    }
+    pump.shutdown();
     Ok(())
-}
-
-/// Complete str0m's required mutation -> drain cycle while local candidates
-/// are configured before SDP negotiation. No application-level events are
-/// expected yet, but handling them keeps this helper correct if str0m adds one.
-fn drain_setup_outputs(rtc: &mut RtcSession, socket: &UdpSocket) -> Result<()> {
-    loop {
-        match rtc.rtc.poll_output() {
-            Ok(Output::Transmit(t)) => {
-                socket
-                    .send_to(&t.contents, t.destination)
-                    .with_context(|| format!("send setup datagram to {}", t.destination))?;
-            }
-            Ok(Output::Event(e)) => {
-                let _ = rtc.on_event(e);
-            }
-            Ok(Output::Timeout(_)) => return Ok(()),
-            Err(e) => return Err(e).context("drain RTC setup output"),
-        }
-    }
-}
-
-/// Construct an RTC epoch just in time for SDP negotiation. A str0m instance
-/// can expire while the host waits for a browser, so never reuse an idle one
-/// for its first offer. Every candidate mutation is followed by a full output
-/// drain before the next mutation or SDP operation.
-fn fresh_rtc_epoch(
-    socket: &UdpSocket,
-    host_addr: SocketAddr,
-    mapped_addr: Option<SocketAddr>,
-    initial_bitrate: u32,
-) -> Result<RtcSession> {
-    let mut rtc = RtcSession::new(Instant::now(), initial_bitrate);
-    rtc.add_host_candidate(host_addr)?;
-    drain_setup_outputs(&mut rtc, socket)?;
-
-    if let Some(mapped) = mapped_addr {
-        rtc.add_srflx_candidate(mapped, host_addr)?;
-        drain_setup_outputs(&mut rtc, socket)?;
-        info!(%mapped, "cached srflx candidate ready for SDP answer");
-    }
-    Ok(rtc)
-}
-
-/// A connected transport owns its current peer. Extra offer messages at that
-/// point are duplicates, not a request to tear down live media/input.
-fn should_start_fresh_rtc_epoch(ice_connected: bool) -> bool {
-    !ice_connected
-}
-
-/// Pre-answer ICE stays outside RtcSession so accepting SDP remains one RTC
-/// mutation. The caller applies one candidate only after an answer is sent.
-fn take_remote_candidate_after_answer(
-    offer_accepted: bool,
-    pending: &mut VecDeque<String>,
-) -> Option<String> {
-    offer_accepted.then(|| pending.pop_front()).flatten()
 }
 
 /// Discover the local interface IP used for the default route (UDP-connect trick;
@@ -1821,29 +7481,1561 @@ fn physical_monitor_count() -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_encoder_dimensions, encoder_mode_for_capture, should_start_fresh_rtc_epoch,
-        take_remote_candidate_after_answer, CachedIdr, CachedIdrReplay, ProfileTransition,
-        VideoMode, STATIC_REPLAY_DELAY,
+        active_encoder_dimensions, advance_benchmark_profile_revision, advance_frame_deadline,
+        agent_reconnect_delay, benchmark_encoder_options, benchmark_mode_matches,
+        benchmark_owned_encoder_bitrate, benchmark_status_retry_delay, cached_replay_transition,
+        cached_wss_replay_payload, capture_admission_ready, coalesce_quiescent_cache_round_trips,
+        commit_matching_transition, commit_media_sequence, effective_idr_interval,
+        encoder_benchmark_contract_changed, encoder_mode_for_capture, fallback_mode,
+        frame_admission_due, full_profile_uses_native_texture, idle_snapshot_completion_order,
+        lab_quality_keyframe_request, next_media_sequence,
+        privileged_input_ready_after_presentation, privileged_no_frame_retry_delay,
+        producer_poll_interval, quiescent_damage_rects, quiescent_immediate_damage_rects,
+        quiescent_transition_followup_needed, quiescent_transition_upsert_allowed,
+        quiescent_validation_requests, record_benchmark_encode_stages,
+        record_benchmark_feedback_plan, record_benchmark_feedback_submission,
+        record_benchmark_hybrid_validation, record_benchmark_roi_activity,
+        record_benchmark_temporal_activity, record_privileged_desktop_state,
+        recover_quiescent_after_unsubmitted_frame, rejected_transition_requires_recovery,
+        same_viewport_geometry, should_forward_offer, should_replace_wss_media_session,
+        should_reset_lab_encoder_for_keyframe, should_snapshot_idle_desktop,
+        take_matching_transition, temporal_readback_policy, valid_lab_quality_request_id,
+        valid_monitor_refresh_control, valid_stripe_reconnect_recovery_control, viewport_from_q16,
+        wss_capacity_observation, CachedIdr, CachedIdrReplay, IdleSnapshotCompletionOrder,
+        PendingFirstFrame, PendingSubmittedIdr, PrivilegedDesktopState, ProfileTransition,
+        ReconnectLogGate, TemporalReadbackPolicy, VideoMode, ViewportCrop, WssAckRate,
+        WssQualityController, WssRecoverySnapshotGate, AGENT_RECONNECT_LOG_INTERVAL,
+        STATIC_REPLAY_DELAY,
     };
-    use crate::quality::Profile;
-    use std::collections::VecDeque;
+    use crate::encode::{
+        AqMode, EncodeStageTimings, Multipass, Preset, RateControlMode, ResourceMode, RoiMapReason,
+        RoiMapTelemetry, RoiMode, Tuning,
+    };
+    use crate::feedback_roi::{
+        FeedbackBudgetPolicy, FeedbackPlan, FeedbackPlanReason, FeedbackWireDecision,
+    };
+    use crate::frame_damage::DamageRect;
+    use crate::hybrid::{
+        HybridTileOperation, HybridWireBudget, QuiescentTilePlanner, ViewportGeometry,
+    };
+    use crate::quality::{Profile, StreamMode};
+    use crate::reconstruction_feedback::ReconstructionFeedbackSubmission;
+    use crate::signaling::{BenchEncodeStages, BenchHybridActivity, BenchRoiActivity};
+    use crate::temporal_diff::{
+        DamageCoverageAudit, DeferredReadbackActivity, QuiescentValidationStatus,
+        TemporalDiffResult, TemporalMaskDecision, TemporalMaskRejectReason,
+    };
+    use crate::{BenchmarkHybridCacheMode, BenchmarkStreamMode, BenchmarkTransport, VideoCodec};
     use std::time::{Duration, Instant};
 
     #[test]
-    fn unconnected_offer_replaces_the_idle_rtc_epoch_but_connected_duplicate_does_not() {
-        assert!(should_start_fresh_rtc_epoch(false));
-        assert!(!should_start_fresh_rtc_epoch(true));
+    fn privileged_agent_reconnect_backoff_is_bounded_and_resets() {
+        assert_eq!(agent_reconnect_delay(0), Duration::from_millis(250));
+        assert_eq!(agent_reconnect_delay(1), Duration::from_millis(500));
+        assert_eq!(agent_reconnect_delay(2), Duration::from_secs(1));
+        assert_eq!(agent_reconnect_delay(3), Duration::from_secs(2));
+        assert_eq!(agent_reconnect_delay(30), Duration::from_secs(2));
     }
 
     #[test]
-    fn early_remote_ice_stays_queued_until_after_the_answer_epoch() {
-        let mut queued = VecDeque::from(["candidate-a".to_string()]);
-        assert_eq!(take_remote_candidate_after_answer(false, &mut queued), None);
-        assert_eq!(queued.len(), 1);
+    fn privileged_service_mode_errors_exit_for_external_supervision() {
+        assert!(!super::should_retry_serve_error(true));
+        assert!(super::should_retry_serve_error(false));
+    }
+
+    #[test]
+    fn privileged_agent_reconnect_logs_are_rate_limited_with_a_suppressed_count() {
+        let start = Instant::now();
+        let mut gate = ReconnectLogGate::default();
+        assert_eq!(gate.admit(start), Some(0));
+        assert_eq!(gate.admit(start + Duration::from_secs(1)), None);
+        assert_eq!(gate.admit(start + Duration::from_secs(2)), None);
+        assert_eq!(gate.admit(start + AGENT_RECONNECT_LOG_INTERVAL), Some(2));
+    }
+
+    #[test]
+    fn new_browser_epoch_replaces_the_active_wss_media_session() {
+        let old_epoch = "0123456789abcdef0123456789abcdef";
+        let new_epoch = "fedcba9876543210fedcba9876543210";
+        assert!(!should_replace_wss_media_session(false, None, new_epoch));
+        assert!(!should_replace_wss_media_session(
+            true,
+            Some(old_epoch),
+            old_epoch
+        ));
+        assert!(should_replace_wss_media_session(
+            true,
+            Some(old_epoch),
+            new_epoch
+        ));
+    }
+
+    #[test]
+    fn benchmark_profile_revision_ignores_renewal_but_advances_for_effective_change() {
+        let profile: crate::benchmark::BenchmarkProfile =
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 1,
+                "runId": "123e4567-e89b-42d3-a456-426614174000",
+                "expiresAtMs": 10_000,
+                "transport": "wss",
+                "codec": "hevc",
+                "streamMode": "work",
+                "adaptive": false,
+                "width": 1920,
+                "height": 1080,
+                "fps": 30,
+                "bitrateBps": 4_000_000,
+                "gopSeconds": 2,
+                "encoder": {
+                    "preset": "p5",
+                    "tuning": "low-latency",
+                    "multipass": "quarter",
+                    "aqStrength": 10,
+                    "temporalAq": true,
+                    "vbvFrames": 2
+                }
+            }))
+            .unwrap();
+        let mut renewal = profile.clone();
+        renewal.expires_at_ms += 1_000;
+        let mut changed = profile.clone();
+        changed.bitrate_bps += 500_000;
+
+        assert_eq!(profile, renewal);
+        assert_ne!(profile, changed);
+        assert_eq!(advance_benchmark_profile_revision(7, profile != renewal), 7);
+        assert_eq!(advance_benchmark_profile_revision(7, profile != changed), 8);
+    }
+
+    #[test]
+    fn lab_encoder_reset_is_scoped_to_diagnostic_quality_keyframes() {
         assert_eq!(
-            take_remote_candidate_after_answer(true, &mut queued).as_deref(),
-            Some("candidate-a")
+            lab_quality_keyframe_request(
+                "keyframe",
+                Some("stream-lab-quality-capture"),
+                Some("quality-01234567-89ab-cdef-0123-456789abcdef"),
+            ),
+            Some("quality-01234567-89ab-cdef-0123-456789abcdef")
         );
+        assert_eq!(
+            lab_quality_keyframe_request(
+                "keyframe",
+                Some("stream-lab-quality-capture"),
+                Some("quality request"),
+            ),
+            None
+        );
+        assert_eq!(
+            lab_quality_keyframe_request(
+                "keyframe",
+                Some("diagnostic-injected-fault"),
+                Some("quality-01234567-89ab-cdef-0123-456789abcdef"),
+            ),
+            None
+        );
+        assert!(should_reset_lab_encoder_for_keyframe(
+            true,
+            "keyframe",
+            Some("stream-lab-quality-capture")
+        ));
+        assert!(!should_reset_lab_encoder_for_keyframe(
+            false,
+            "keyframe",
+            Some("stream-lab-quality-capture")
+        ));
+        assert!(!should_reset_lab_encoder_for_keyframe(
+            true,
+            "start",
+            Some("stream-lab-quality-capture")
+        ));
+        assert!(!should_reset_lab_encoder_for_keyframe(
+            true,
+            "keyframe",
+            Some("diagnostic-injected-fault")
+        ));
+        assert!(valid_lab_quality_request_id(
+            "quality-01234567-89ab-cdef-0123-456789abcdef"
+        ));
+        assert!(!valid_lab_quality_request_id("quality request"));
+    }
+
+    #[test]
+    fn benchmark_status_remains_due_until_transport_and_profile_match() {
+        assert_eq!(benchmark_status_retry_delay(false), Duration::ZERO);
+        assert_eq!(benchmark_status_retry_delay(true), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn local_candidate_maps_every_requested_nvenc_option() {
+        let profile: crate::benchmark::BenchmarkProfile =
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 2,
+                "runId": "123e4567-e89b-42d3-a456-426614174000",
+                "expiresAtMs": 10_000,
+                "implementationVariant": "candidate",
+                "experimentId": "full-option-proof",
+                "transport": "wss",
+                "codec": "hevc",
+                "streamMode": "work",
+                "adaptive": false,
+                "width": 1920,
+                "height": 1080,
+                "fps": 30,
+                "bitrateBps": 8_000_000,
+                "gopSeconds": 4,
+                "encoder": {
+                    "preset": "p7",
+                    "tuning": "low-latency",
+                    "multipass": "full",
+                    "aqMode": "temporal",
+                    "aqStrength": 15,
+                    "vbvFrames": 4,
+                    "lookaheadDepth": 2,
+                    "weightedPrediction": true,
+                    "dirtyQpMap": true
+                }
+            }))
+            .unwrap();
+
+        let options = benchmark_encoder_options(&profile);
+        assert_eq!(options.preset, Preset::P7);
+        assert_eq!(options.tuning, Tuning::LowLatency);
+        assert_eq!(options.multipass, Multipass::Full);
+        assert_eq!(options.aq_mode, AqMode::Temporal);
+        assert_eq!(options.aq_strength, 15);
+        assert_eq!(options.vbv_frames, 4);
+        assert_eq!(options.lookahead_depth, 2);
+        assert!(options.weighted_prediction);
+        assert_eq!(options.gop_seconds, 4);
+        assert_eq!(options.roi_mode, RoiMode::Damage);
+        assert_eq!(options.resource_mode, ResourceMode::PerFrame);
+        assert_eq!(options.async_depth, 0);
+        assert_eq!(options.rate_control, RateControlMode::Cbr);
+
+        let mut vbr_profile = profile;
+        vbr_profile.encoder.dirty_qp_map = false;
+        vbr_profile.encoder.roi_mode = crate::benchmark::BenchmarkRoiMode::Off;
+        vbr_profile.encoder.rate_control_mode =
+            crate::benchmark::BenchmarkRateControlMode::ExternalBudgetVbr;
+        vbr_profile.encoder.target_quality = Some(23);
+        vbr_profile.encoder.peak_bitrate_multiplier = Some(4);
+        let vbr_options = benchmark_encoder_options(&vbr_profile);
+        assert_eq!(
+            vbr_options.rate_control,
+            RateControlMode::ExternalBudgetVbr {
+                target_quality: 23,
+                peak_bitrate_multiplier: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn benchmark_roi_activity_keeps_reason_counts_and_the_exact_media_sequence() {
+        let mut activity = Some(BenchRoiActivity {
+            mode: "damage".into(),
+            ..BenchRoiActivity::default()
+        });
+        record_benchmark_roi_activity(
+            &mut activity,
+            RoiMapTelemetry {
+                reason: RoiMapReason::Applied,
+                changed_ctbs: 120,
+                total_ctbs: 2_040,
+                min_delta: Some(-3),
+                max_delta: Some(1),
+            },
+            Some(44),
+        );
+        record_benchmark_roi_activity(
+            &mut activity,
+            RoiMapTelemetry {
+                reason: RoiMapReason::MissingDamage,
+                changed_ctbs: 0,
+                total_ctbs: 0,
+                min_delta: None,
+                max_delta: None,
+            },
+            Some(45),
+        );
+        let activity = activity.unwrap();
+        assert_eq!(activity.evaluated_frames, 2);
+        assert_eq!(activity.mapped_frames, 1);
+        assert_eq!(activity.missing_damage_frames, 1);
+        assert_eq!(activity.last_sequence, Some(45));
+        assert_eq!(activity.last_reason.as_deref(), Some("missing-damage"));
+    }
+
+    #[test]
+    fn benchmark_temporal_activity_records_source_timing_priming_and_ctb_evidence() {
+        let changed = crate::frame_damage::DamageRect {
+            left: 32,
+            top: 0,
+            right: 64,
+            bottom: 32,
+        };
+        let mut activity = Some(BenchRoiActivity {
+            mode: "damage".into(),
+            ..BenchRoiActivity::default()
+        });
+        let mut samples = Vec::new();
+        record_benchmark_temporal_activity(
+            &mut activity,
+            &mut samples,
+            &TemporalDiffResult {
+                decision: TemporalMaskDecision::Rejected {
+                    reason: TemporalMaskRejectReason::EmptyDamage,
+                    changed_ctbs: 0,
+                    total_ctbs: 2_040,
+                },
+                damage_rects: Vec::new(),
+                immediate_damage_rects: Vec::new(),
+                edge_scores: Vec::new(),
+                analysis_us: 120,
+                priming: true,
+                damage_audit: None,
+            },
+            Some(43),
+        );
+        record_benchmark_temporal_activity(
+            &mut activity,
+            &mut samples,
+            &TemporalDiffResult {
+                decision: TemporalMaskDecision::Applied {
+                    rects: vec![changed],
+                    changed_ctbs: 1,
+                    total_ctbs: 2_040,
+                },
+                damage_rects: vec![changed],
+                immediate_damage_rects: Vec::new(),
+                edge_scores: vec![0; 2_040],
+                analysis_us: 1_800,
+                priming: false,
+                damage_audit: None,
+            },
+            Some(44),
+        );
+
+        let activity = activity.unwrap();
+        assert_eq!(activity.source.as_deref(), Some("gpu-temporal"));
+        assert_eq!(activity.temporal_frames, 2);
+        assert_eq!(activity.temporal_priming_frames, 1);
+        assert_eq!(activity.analysis_p95_us, Some(1_800));
+        assert_eq!(activity.analysis_max_us, Some(1_800));
+        assert_eq!(activity.last_sequence, Some(44));
+        assert_eq!(activity.last_changed_ctbs, Some(1));
+        assert_eq!(activity.last_total_ctbs, Some(2_040));
+    }
+
+    #[test]
+    fn benchmark_feedback_activity_keeps_funded_plan_and_gpu_timing_evidence() {
+        let mut activity = Some(BenchRoiActivity::feedback());
+        let mut wire_samples = Vec::new();
+        record_benchmark_feedback_plan(
+            &mut activity,
+            &mut wire_samples,
+            &FeedbackPlan {
+                reason: FeedbackPlanReason::Applied,
+                map: None,
+                eligible_ctbs: 12,
+                refined_ctbs: 2,
+                funded_ctbs: 4,
+                feedback_frames: 10,
+            },
+            None,
+        );
+        let mut samples = Vec::new();
+        record_benchmark_feedback_submission(
+            &mut activity,
+            &mut samples,
+            ReconstructionFeedbackSubmission {
+                submitted: true,
+                submit_us: 80,
+            },
+        );
+        record_benchmark_feedback_submission(
+            &mut activity,
+            &mut samples,
+            ReconstructionFeedbackSubmission {
+                submitted: true,
+                submit_us: 120,
+            },
+        );
+        record_benchmark_feedback_submission(
+            &mut activity,
+            &mut samples,
+            ReconstructionFeedbackSubmission {
+                submitted: false,
+                submit_us: 0,
+            },
+        );
+
+        let activity = activity.unwrap();
+        assert_eq!(activity.feedback_adjusted_frames, Some(1));
+        assert_eq!(activity.feedback_eligible_ctbs, Some(12));
+        assert_eq!(activity.feedback_refined_ctbs, Some(2));
+        assert_eq!(activity.feedback_funded_ctbs, Some(4));
+        assert_eq!(activity.feedback_submitted_frames, Some(2));
+        assert_eq!(activity.feedback_skipped_frames, Some(1));
+        assert_eq!(activity.feedback_submit_p95_us, Some(120));
+        assert_eq!(activity.feedback_submit_max_us, Some(120));
+    }
+
+    #[test]
+    fn benchmark_feedback_headroom_records_exact_policy_and_wire_occupancy() {
+        let mut activity = Some(BenchRoiActivity::feedback_headroom());
+        let mut wire_samples = Vec::new();
+        record_benchmark_feedback_plan(
+            &mut activity,
+            &mut wire_samples,
+            &FeedbackPlan {
+                reason: FeedbackPlanReason::Applied,
+                map: None,
+                eligible_ctbs: 12,
+                refined_ctbs: 2,
+                funded_ctbs: 0,
+                feedback_frames: 10,
+            },
+            Some(FeedbackWireDecision {
+                policy: FeedbackBudgetPolicy::SpendHeadroom,
+                occupancy_bps: 1_900_000,
+            }),
+        );
+
+        let activity = activity.unwrap();
+        assert_eq!(activity.feedback_spend_headroom_frames, Some(1));
+        assert_eq!(activity.feedback_net_zero_frames, Some(0));
+        assert_eq!(activity.feedback_wire_occupancy_p95_bps, Some(1_900_000));
+        assert_eq!(activity.feedback_wire_occupancy_max_bps, Some(1_900_000));
+        assert_eq!(
+            activity.last_feedback_budget_policy.as_deref(),
+            Some("spend-headroom")
+        );
+        assert_eq!(activity.last_feedback_wire_occupancy_bps, Some(1_900_000));
+    }
+
+    #[test]
+    fn feedback_temporal_analysis_is_deferred_while_hybrid_validation_stays_aligned() {
+        assert_eq!(
+            temporal_readback_policy(false, true),
+            TemporalReadbackPolicy::Deferred
+        );
+        assert_eq!(
+            temporal_readback_policy(true, false),
+            TemporalReadbackPolicy::Aligned
+        );
+        assert_eq!(
+            temporal_readback_policy(false, false),
+            TemporalReadbackPolicy::Deferred
+        );
+    }
+
+    #[test]
+    fn benchmark_hybrid_validation_records_deferred_age_and_aligned_damage_audit() {
+        let mut activity = Some(BenchHybridActivity {
+            mode: "png-quiescent-detail".into(),
+            ..BenchHybridActivity::default()
+        });
+        let mut submit_samples = Vec::new();
+        let mut collect_samples = Vec::new();
+        let mut age_samples = Vec::new();
+
+        record_benchmark_hybrid_validation(
+            &mut activity,
+            &mut submit_samples,
+            &mut collect_samples,
+            &mut age_samples,
+            140,
+            8,
+            QuiescentValidationStatus::Unavailable,
+            &DeferredReadbackActivity {
+                ready_ages_frames: vec![1, 2],
+                pending_frames: 1,
+                max_pending_age_frames: Some(3),
+                verdicts: Vec::new(),
+            },
+            Some(DamageCoverageAudit {
+                metadata_available: true,
+                changed_ctbs: 5,
+                covered_ctbs: 4,
+                missed_ctbs: 1,
+            }),
+            44,
+        );
+
+        let activity = activity.unwrap();
+        assert_eq!(activity.deferred_validation_ready_frames, 2);
+        assert_eq!(activity.deferred_validation_pending_frames, 1);
+        assert_eq!(activity.deferred_validation_age_p95_frames, Some(2));
+        assert_eq!(activity.deferred_validation_age_max_frames, Some(2));
+        assert_eq!(activity.deferred_validation_pending_max_age_frames, Some(3));
+        assert_eq!(activity.damage_audit_frames, 1);
+        assert_eq!(activity.damage_audit_metadata_unavailable_frames, 0);
+        assert_eq!(activity.damage_audit_changed_ctbs, 5);
+        assert_eq!(activity.damage_audit_covered_ctbs, 4);
+        assert_eq!(activity.damage_audit_missed_ctbs, 1);
+    }
+
+    #[test]
+    fn quiescent_transition_requests_one_followup_for_activation_or_budget_retry() {
+        assert!(quiescent_transition_followup_needed(true, 1, 0, 0));
+        assert!(quiescent_transition_followup_needed(true, 0, 1, 0));
+        assert!(quiescent_transition_followup_needed(false, 0, 0, 1));
+        assert!(!quiescent_transition_followup_needed(true, 0, 0, 0));
+        assert!(!quiescent_transition_followup_needed(false, 1, 1, 0));
+    }
+
+    #[test]
+    fn same_frame_unchanged_validation_emits_no_browser_cache_round_trip() {
+        let mut operations = vec![
+            HybridTileOperation::Suppress {
+                tile_id: 7,
+                content_revision: 41,
+                validation_sequence: 52,
+            },
+            HybridTileOperation::Reactivate {
+                tile_id: 7,
+                content_revision: 41,
+                validation_sequence: 52,
+            },
+        ];
+
+        coalesce_quiescent_cache_round_trips(&mut operations);
+
+        assert!(operations.is_empty());
+    }
+
+    #[test]
+    fn suppress_reactivate_validation_is_gated_by_current_dda_damage() {
+        let viewport = ViewportGeometry {
+            generation: 1,
+            crop_revision: 0,
+            source: DamageRect {
+                left: 0,
+                top: 0,
+                right: 256,
+                bottom: 128,
+            },
+            output_width: 256,
+            output_height: 128,
+        };
+        let mut planner = QuiescentTilePlanner::default();
+        let edges = vec![100; 8 * 4];
+        let mut candidate_tile = None;
+        for _ in 0..3 {
+            candidate_tile = planner
+                .plan(256, 128, viewport, &[], &edges)
+                .candidates
+                .first()
+                .map(|candidate| candidate.tile_id)
+                .or(candidate_tile);
+        }
+        let tile_id = candidate_tile.expect("stable detail candidate");
+        assert!(planner.commit_candidate(tile_id, 10, 12_345));
+
+        assert!(
+            quiescent_validation_requests(&planner, viewport, 11, Some(&[]), false,).is_empty()
+        );
+
+        let damage = [DamageRect {
+            left: 0,
+            top: 0,
+            right: 128,
+            bottom: 128,
+        }];
+        assert_eq!(
+            quiescent_validation_requests(&planner, viewport, 12, Some(&damage), false,).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn quiescent_transition_sends_one_progressive_upsert_before_followup_fill() {
+        assert!(quiescent_transition_upsert_allowed(true, 0));
+        assert!(!quiescent_transition_upsert_allowed(true, 1));
+        assert!(quiescent_transition_upsert_allowed(false, 0));
+        assert!(quiescent_transition_upsert_allowed(false, 3));
+    }
+
+    #[test]
+    fn unsubmitted_quiescent_frame_forgets_mutations_and_clears_the_next_delivery() {
+        let viewport = ViewportGeometry {
+            generation: 7,
+            crop_revision: 3,
+            source: DamageRect {
+                left: 0,
+                top: 0,
+                right: 256,
+                bottom: 128,
+            },
+            output_width: 256,
+            output_height: 128,
+        };
+        let mut planner = QuiescentTilePlanner::default();
+        let edges = vec![100; 8 * 4];
+        for _ in 0..3 {
+            planner.plan(256, 128, viewport, &[], &edges);
+        }
+        assert!(planner.commit_candidate(1, 10, 12_345));
+        let requests = planner.validation_requests(
+            viewport,
+            11,
+            Some(&[DamageRect {
+                left: 0,
+                top: 0,
+                right: 128,
+                bottom: 128,
+            }]),
+            false,
+        );
+        assert_eq!(planner.suppress_requests(&requests).len(), 1);
+
+        let mut budget = HybridWireBudget::default();
+        assert!(budget.begin_frame(6_000_000, 30, 16, 15, 1_000) > 0);
+        recover_quiescent_after_unsubmitted_frame(&mut planner, &mut budget);
+
+        let next = planner.plan(256, 128, viewport, &[], &edges);
+        assert!(next.clear);
+        assert_eq!(next.active_before_planning, 0);
+        assert_eq!(planner.suppressed_tile_count(), 0);
+        assert_eq!(planner.retained_png_bytes(), 0);
+        assert_eq!(budget.carried_bytes(), 0);
+    }
+
+    #[test]
+    fn quiescent_damage_uses_aligned_pixel_changes_and_keeps_idle_snapshots_neutral() {
+        let aligned_pixel_diff = [crate::frame_damage::DamageRect {
+            left: 64,
+            top: 64,
+            right: 96,
+            bottom: 96,
+        }];
+        let broad_surface_repaint = [crate::frame_damage::DamageRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        }];
+
+        assert_eq!(
+            quiescent_damage_rects(Some(&broad_surface_repaint), &aligned_pixel_diff, false),
+            aligned_pixel_diff
+        );
+        assert!(quiescent_damage_rects(None, &aligned_pixel_diff, true).is_empty());
+        assert_eq!(
+            quiescent_damage_rects(None, &aligned_pixel_diff, false),
+            aligned_pixel_diff
+        );
+    }
+
+    #[test]
+    fn quiescent_cache_policy_selects_dda_or_verified_immediate_damage() {
+        let capture_damage = [DamageRect {
+            left: 0,
+            top: 0,
+            right: 128,
+            bottom: 128,
+        }];
+        let verified_damage = [DamageRect {
+            left: 32,
+            top: 32,
+            right: 64,
+            bottom: 64,
+        }];
+
+        assert_eq!(
+            quiescent_immediate_damage_rects(
+                BenchmarkHybridCacheMode::DdaGated,
+                Some(&capture_damage),
+                &verified_damage,
+                false,
+            ),
+            capture_damage
+        );
+        assert_eq!(
+            quiescent_immediate_damage_rects(
+                BenchmarkHybridCacheMode::SuppressReactivate,
+                Some(&capture_damage),
+                &verified_damage,
+                false,
+            ),
+            verified_damage
+        );
+        assert!(quiescent_immediate_damage_rects(
+            BenchmarkHybridCacheMode::DdaGated,
+            Some(&capture_damage),
+            &verified_damage,
+            true,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn quiescent_followup_is_rearmed_after_acknowledging_the_current_idle_idr() {
+        assert_eq!(
+            idle_snapshot_completion_order(true, true),
+            IdleSnapshotCompletionOrder::AcknowledgeThenRequest
+        );
+    }
+
+    #[test]
+    fn benchmark_encode_stages_accumulate_call_counts_totals_and_maxima() {
+        let mut stages = BenchEncodeStages::default();
+        record_benchmark_encode_stages(
+            &mut stages,
+            EncodeStageTimings {
+                register_calls: 1,
+                register_us: 120,
+                map_us: 40,
+                submit_us: 1_100,
+                lock_us: 500,
+                copy_us: 20,
+                unmap_us: 30,
+                unregister_calls: 1,
+                unregister_us: 80,
+            },
+        );
+        record_benchmark_encode_stages(
+            &mut stages,
+            EncodeStageTimings {
+                register_calls: 0,
+                register_us: 0,
+                map_us: 50,
+                submit_us: 900,
+                lock_us: 700,
+                copy_us: 25,
+                unmap_us: 35,
+                unregister_calls: 0,
+                unregister_us: 0,
+            },
+        );
+
+        assert_eq!(stages.frames, 2);
+        assert_eq!(stages.register.count, 1);
+        assert_eq!(stages.register.total_us, 120);
+        assert_eq!(stages.map.count, 2);
+        assert_eq!(stages.map.total_us, 90);
+        assert_eq!(stages.map.max_us, 50);
+        assert_eq!(stages.submit.total_us, 2_000);
+        assert_eq!(stages.submit.max_us, 1_100);
+        assert_eq!(stages.lock.total_us, 1_200);
+        assert_eq!(stages.lock.max_us, 700);
+        assert_eq!(stages.unregister.count, 1);
+        assert_eq!(stages.unregister.total_us, 80);
+    }
+
+    #[test]
+    fn benchmark_profile_only_matches_its_current_stream_mode() {
+        assert!(benchmark_mode_matches(
+            BenchmarkStreamMode::Work,
+            StreamMode::Work
+        ));
+        assert!(benchmark_mode_matches(
+            BenchmarkStreamMode::Game,
+            StreamMode::Game
+        ));
+        assert!(!benchmark_mode_matches(
+            BenchmarkStreamMode::Work,
+            StreamMode::Game
+        ));
+        assert!(!benchmark_mode_matches(
+            BenchmarkStreamMode::Game,
+            StreamMode::Work
+        ));
+    }
+
+    #[test]
+    fn active_benchmark_lease_owns_encoder_bitrate_across_client_quality_controls() {
+        let profile: crate::benchmark::BenchmarkProfile =
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 2,
+                "implementationVariant": "candidate",
+                "experimentId": "wss-bitrate-owner",
+                "runId": "123e4567-e89b-42d3-a456-426614174000",
+                "expiresAtMs": 10_000,
+                "transport": "wss",
+                "codec": "hevc",
+                "streamMode": "work",
+                "adaptive": false,
+                "width": 1920,
+                "height": 1080,
+                "fps": 30,
+                "bitrateBps": 2_800_000,
+                "gopSeconds": 2,
+                "wssTopology": {
+                    "laneCount": 16,
+                    "dataShards": 15,
+                    "parityShards": 1
+                },
+                "encoder": {
+                    "preset": "p3",
+                    "tuning": "ultra-low-latency",
+                    "multipass": "disabled",
+                    "aqMode": "spatial",
+                    "aqStrength": 8,
+                    "vbvFrames": 1,
+                    "lookaheadDepth": 0,
+                    "weightedPrediction": false
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(
+            benchmark_owned_encoder_bitrate(
+                6_000_000,
+                Some(&profile),
+                BenchmarkTransport::Wss,
+                StreamMode::Work,
+                VideoCodec::Hevc,
+            ),
+            2_800_000
+        );
+        assert_eq!(
+            benchmark_owned_encoder_bitrate(
+                6_000_000,
+                Some(&profile),
+                BenchmarkTransport::Webrtc,
+                StreamMode::Work,
+                VideoCodec::Hevc,
+            ),
+            6_000_000
+        );
+    }
+
+    #[test]
+    fn active_benchmark_gop_overrides_production_idr_cadence() {
+        assert_eq!(
+            effective_idr_interval(StreamMode::Work, true, Some(4)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            effective_idr_interval(StreamMode::Game, false, Some(1)),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn production_idr_cadence_is_unchanged_without_a_matching_benchmark() {
+        assert_eq!(
+            effective_idr_interval(StreamMode::Work, true, None),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            effective_idr_interval(StreamMode::Game, true, None),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            effective_idr_interval(StreamMode::Game, false, None),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn repeated_privileged_desktop_state_does_not_churn_media_generation() {
+        let state = PrivilegedDesktopState {
+            available: true,
+            desktop: "secure",
+            input: "enabled",
+            agent_generation: 7,
+        };
+        let mut last = None;
+        assert!(record_privileged_desktop_state(&mut last, state));
+        assert!(!record_privileged_desktop_state(&mut last, state));
+        assert!(record_privileged_desktop_state(
+            &mut last,
+            PrivilegedDesktopState {
+                input: "suspended",
+                ..state
+            }
+        ));
+    }
+
+    #[test]
+    fn privileged_input_requires_presented_current_generation() {
+        let state = PrivilegedDesktopState {
+            available: true,
+            desktop: "secure",
+            input: "enabled",
+            agent_generation: 2,
+        };
+        assert!(!privileged_input_ready_after_presentation(
+            true, true, state, 8, 9
+        ));
+        assert!(!privileged_input_ready_after_presentation(
+            true, false, state, 9, 9
+        ));
+        assert!(privileged_input_ready_after_presentation(
+            true, true, state, 9, 9
+        ));
+    }
+
+    #[test]
+    fn viewport_geometry_is_idempotent_across_revisions() {
+        let first = ViewportCrop {
+            revision: 1,
+            x: 320,
+            y: 180,
+            width: 960,
+            height: 540,
+        };
+        let retry = ViewportCrop {
+            revision: 9,
+            ..first
+        };
+        let moved = ViewportCrop {
+            revision: 10,
+            x: 336,
+            ..first
+        };
+        assert!(same_viewport_geometry(first, retry));
+        assert!(!same_viewport_geometry(first, moved));
+    }
+
+    #[test]
+    fn disabled_viewport_is_exact_full_frame_and_enabled_crop_is_even_and_bounded() {
+        assert_eq!(
+            viewport_from_q16(2, false, 1, 1, 1, 1, 1920, 1080),
+            Some(ViewportCrop {
+                revision: 2,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080
+            })
+        );
+        let crop = viewport_from_q16(3, true, 60_000, 60_000, 40_000, 40_000, 1920, 1080).unwrap();
+        assert_eq!(crop.x % 2, 0);
+        assert_eq!(crop.y % 2, 0);
+        assert_eq!(crop.width % 2, 0);
+        assert_eq!(crop.height % 2, 0);
+        assert!(crop.x + crop.width <= 1920);
+        assert!(crop.y + crop.height <= 1080);
+    }
+
+    #[test]
+    fn only_matching_admitted_idr_consumes_a_pending_transition() {
+        let mode = VideoMode::rung(Profile::Balanced);
+        let mut pending = Some(PendingSubmittedIdr {
+            id: 7,
+            mode,
+            reason: "transition",
+        });
+        assert!(take_matching_transition(&mut pending, 6).is_none()); // stale/ordinary IDR
+        assert!(pending.is_some());
+        assert_eq!(
+            take_matching_transition(&mut pending, 7).unwrap().mode,
+            mode
+        );
+        assert!(pending.is_none()); // failed/unsubmitted work never commits
+    }
+
+    #[test]
+    fn fallback_plan_preserves_old_exact_dimensions_until_matching_admission() {
+        let old = VideoMode {
+            profile: Profile::Balanced,
+            label: "custom",
+            width: 1184,
+            height: 666,
+            fps: 27,
+        };
+        assert_eq!(fallback_mode(old, 2560, 1440, true), old);
+        assert_eq!(
+            fallback_mode(old, 2560, 1440, false),
+            VideoMode::native(2560, 1440, 27)
+        );
+
+        let mut state = ProfileTransition::new(Profile::Balanced, Profile::Full);
+        let pending = PendingSubmittedIdr {
+            id: 9,
+            mode: old,
+            reason: "encoder-fallback",
+        };
+        assert!(!commit_matching_transition(&mut state, pending, 8));
+        assert_eq!(state.active(), Profile::Balanced);
+        assert!(!state.is_pinned());
+    }
+
+    #[test]
+    fn matching_admitted_fallback_commits_and_pins_once() {
+        let old = VideoMode::rung(Profile::Balanced);
+        let mut state = ProfileTransition::new(Profile::Balanced, Profile::Full);
+        let pending = PendingSubmittedIdr {
+            id: 9,
+            mode: old,
+            reason: "encoder-fallback",
+        };
+        assert!(commit_matching_transition(&mut state, pending, 9));
+        assert!(state.is_pinned());
+        assert_eq!(state.active, old);
+        assert!(!commit_matching_transition(
+            &mut state,
+            PendingSubmittedIdr {
+                id: 9,
+                mode: old,
+                reason: "encoder-fallback"
+            },
+            8
+        ));
+    }
+
+    #[test]
+    fn cached_startup_replay_requires_exact_staged_mode() {
+        let state = ProfileTransition::new(Profile::Full, Profile::Balanced);
+        assert_eq!(
+            cached_replay_transition(&state, VideoMode::rung(Profile::Balanced), 3),
+            Some(PendingSubmittedIdr {
+                id: 3,
+                mode: VideoMode::rung(Profile::Balanced),
+                reason: "startup"
+            })
+        );
+        assert_eq!(
+            cached_replay_transition(&state, VideoMode::rung(Profile::Full), 3),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_offer_is_not_forwarded_while_in_flight() {
+        assert!(should_forward_offer(false, false, false));
+        assert!(!should_forward_offer(false, false, true));
+        assert!(!should_forward_offer(true, false, false));
+    }
+
+    #[test]
+    fn monitor_refresh_is_v2_epoch_scoped_and_accepts_pre_wss_refresh() {
+        let epoch = "0123456789abcdef0123456789abcdef";
+        assert!(valid_monitor_refresh_control(Some(2), Some(epoch), None));
+        assert!(valid_monitor_refresh_control(
+            Some(2),
+            Some(epoch),
+            Some(epoch)
+        ));
+        assert!(!valid_monitor_refresh_control(Some(1), Some(epoch), None));
+        assert!(!valid_monitor_refresh_control(Some(2), None, None));
+        assert!(!valid_monitor_refresh_control(
+            Some(2),
+            Some("A123456789abcdef0123456789abcdef"),
+            None
+        ));
+        assert!(valid_monitor_refresh_control(
+            Some(2),
+            Some(epoch),
+            Some("ffffffffffffffffffffffffffffffff")
+        ));
+    }
+
+    #[test]
+    fn stripe_reconnect_recovery_is_scoped_to_current_protocol_v3_epoch() {
+        let epoch = "0123456789abcdef0123456789abcdef";
+        assert!(valid_stripe_reconnect_recovery_control(
+            "keyframe",
+            Some("stripe-reconnect"),
+            Some(3),
+            Some(epoch),
+            Some(epoch),
+        ));
+        assert!(!valid_stripe_reconnect_recovery_control(
+            "keyframe",
+            Some("stripe-reconnect"),
+            Some(3),
+            Some("fedcba9876543210fedcba9876543210"),
+            Some(epoch),
+        ));
+        assert!(!valid_stripe_reconnect_recovery_control(
+            "keyframe",
+            Some("diagnostic-injected-fault"),
+            Some(3),
+            Some(epoch),
+            Some(epoch),
+        ));
+        assert!(!valid_stripe_reconnect_recovery_control(
+            "keyframe",
+            Some("stripe-reconnect"),
+            Some(2),
+            Some(epoch),
+            Some(epoch),
+        ));
+    }
+
+    #[test]
+    fn wss_delivery_rate_counts_cumulative_acknowledged_frames_and_stays_bounded() {
+        let start = Instant::now();
+        let mut rate = WssAckRate::new(start);
+        rate.submitted(7, 1, 100_000);
+        rate.submitted(7, 2, 200_000);
+        let window = rate.window_started;
+        assert_eq!(
+            rate.acknowledged(window + Duration::from_secs(1), 6, 1),
+            None
+        );
+        assert_eq!(
+            rate.acknowledged(window + Duration::from_secs(1), 7, 2),
+            Some(2_400_000)
+        );
+        assert!(rate.pending.is_empty());
+        for sequence in 3..400 {
+            rate.submitted(7, sequence, 1);
+        }
+        assert!(rate.pending.len() <= 256);
+    }
+
+    #[test]
+    fn wss_delivery_observation_cannot_recursively_shrink_the_encoder_target() {
+        // ACK throughput is application-limited by the encoder target. Feeding
+        // 80% of it back as link capacity would decay on every window.
+        assert_eq!(wss_capacity_observation(350_000, 1_200_000), 1_500_000);
+        assert_eq!(wss_capacity_observation(3_000_000, 1_200_000), 3_000_000);
+    }
+
+    #[test]
+    fn wss_presets_are_explicit_stable_modes_and_respect_the_ceiling() {
+        let high = super::wss_preset(None, 40_000_000, StreamMode::Work);
+        assert_eq!(
+            (
+                high.mode.label,
+                high.mode.width,
+                high.mode.height,
+                high.mode.fps
+            ),
+            ("1080p30", 1920, 1080, 30)
+        );
+        assert_eq!(high.target_bps, 6_000_000);
+
+        let balanced = super::wss_preset(Some("balanced"), 40_000_000, StreamMode::Work);
+        assert_eq!(
+            (
+                balanced.mode.label,
+                balanced.mode.width,
+                balanced.mode.height,
+                balanced.mode.fps
+            ),
+            ("720p30", 1280, 720, 30)
+        );
+        assert_eq!(balanced.target_bps, 3_000_000);
+
+        let saver = super::wss_preset(Some("saver"), 40_000_000, StreamMode::Work);
+        assert_eq!(
+            (
+                saver.mode.label,
+                saver.mode.width,
+                saver.mode.height,
+                saver.mode.fps
+            ),
+            ("540p24", 960, 540, 24)
+        );
+        assert_eq!(saver.target_bps, 1_500_000);
+
+        assert_eq!(
+            super::wss_preset(Some("invalid"), 4_000_000, StreamMode::Work).target_bps,
+            4_000_000
+        );
+
+        let game_high = super::wss_preset(Some("high"), 40_000_000, StreamMode::Game);
+        assert_eq!(
+            (
+                game_high.mode.label,
+                game_high.mode.fps,
+                game_high.target_bps
+            ),
+            ("1080p60", 60, 8_000_000)
+        );
+        let game_balanced = super::wss_preset(Some("balanced"), 40_000_000, StreamMode::Game);
+        assert_eq!(
+            (
+                game_balanced.mode.label,
+                game_balanced.mode.fps,
+                game_balanced.target_bps
+            ),
+            ("720p60", 60, 4_500_000)
+        );
+        let game_saver = super::wss_preset(Some("saver"), 40_000_000, StreamMode::Game);
+        assert_eq!(
+            (
+                game_saver.mode.label,
+                game_saver.mode.fps,
+                game_saver.target_bps
+            ),
+            ("540p30", 30, 1_500_000)
+        );
+    }
+
+    #[test]
+    fn pending_wss_first_frame_rebinds_to_the_queued_idr_generation_once() {
+        let mut pending = PendingFirstFrame {
+            request_id: "firstFrame_1".into(),
+            transport: "wss".into(),
+            epoch: Some("a".repeat(32)),
+            generation: 1,
+            admitted: false,
+            armed_at: Instant::now(),
+        };
+        assert!(!pending.admit_wss_access_unit(4, false));
+        assert_eq!((pending.generation, pending.admitted), (1, false));
+        assert!(pending.admit_wss_access_unit(4, true));
+        assert_eq!((pending.generation, pending.admitted), (4, true));
+        assert!(!pending.admit_wss_access_unit(5, true));
+        assert_eq!(pending.generation, 4);
+    }
+
+    #[test]
+    fn webrtc_first_frame_is_not_admitted_by_the_wss_boundary() {
+        let mut pending = PendingFirstFrame {
+            request_id: "firstFrame_2".into(),
+            transport: "webrtc".into(),
+            epoch: None,
+            generation: 2,
+            admitted: false,
+            armed_at: Instant::now(),
+        };
+        assert!(!pending.admit_wss_access_unit(3, true));
+        assert_eq!((pending.generation, pending.admitted), (2, false));
+    }
+
+    #[test]
+    fn one_short_wss_recovery_event_does_not_change_quality() {
+        let start = Instant::now();
+        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
+        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
+        let mut controller = WssQualityController::new(start);
+        assert!(controller
+            .sample(start, 1, &quality, &profiles, [1; 4], 1, 1, 1, 0, 0)
+            .is_none());
+        assert!(controller
+            .sample(
+                start + Duration::from_secs(1),
+                1,
+                &quality,
+                &profiles,
+                [2; 4],
+                2,
+                2,
+                1,
+                0,
+                0
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn sustained_preencode_pressure_reduces_bitrate_without_marking_every_frame_key() {
+        let start = Instant::now();
+        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
+        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
+        let mut controller = WssQualityController::new(start);
+        controller.observe_preencode_skips(start, 1);
+        assert!(controller
+            .sample(start, 1, &quality, &profiles, [1; 4], 1, 1, 0, 0, 0)
+            .is_none());
+        controller.observe_preencode_skips(start + Duration::from_millis(7_500), 2);
+        assert!(controller
+            .sample(
+                start + Duration::from_millis(7_500),
+                1,
+                &quality,
+                &profiles,
+                [2; 4],
+                2,
+                2,
+                0,
+                0,
+                0
+            )
+            .is_none());
+        let decision = controller
+            .sample(
+                start + Duration::from_secs(8),
+                1,
+                &quality,
+                &profiles,
+                [3; 4],
+                3,
+                3,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(decision.reason, "wss-congestion");
+        assert_eq!(decision.target_bps, 2_550_000);
+    }
+
+    #[test]
+    fn sustained_wss_damage_reduces_bitrate_then_resolution_at_the_floor() {
+        let start = Instant::now();
+        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 1_500_000);
+        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
+        let mut controller = WssQualityController::new(start);
+        assert!(controller
+            .sample(start, 1, &quality, &profiles, [1; 4], 1, 0, 0, 0, 0)
+            .is_none());
+        assert!(controller
+            .sample(
+                start + Duration::from_millis(1),
+                1,
+                &quality,
+                &profiles,
+                [2; 4],
+                2,
+                0,
+                0,
+                1,
+                0
+            )
+            .is_none());
+        assert!(controller
+            .sample(
+                start + Duration::from_millis(8_001),
+                1,
+                &quality,
+                &profiles,
+                [3; 4],
+                3,
+                0,
+                0,
+                2,
+                0
+            )
+            .is_none());
+        let decision = controller
+            .sample(
+                start + Duration::from_millis(12_001),
+                1,
+                &quality,
+                &profiles,
+                [4; 4],
+                4,
+                0,
+                0,
+                3,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            decision.mode,
+            VideoMode::for_stream(Profile::Low, StreamMode::Work)
+        );
+        assert_eq!(decision.reason, "wss-sustained-down");
+    }
+
+    #[test]
+    fn clean_wss_requires_long_windows_before_bitrate_or_spatial_probes() {
+        let start = Instant::now();
+        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
+        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
+        let mut controller = WssQualityController::new(start);
+        assert!(controller
+            .sample(start, 1, &quality, &profiles, [1; 4], 1, 1, 0, 0, 0)
+            .is_none());
+        assert!(controller
+            .sample(
+                start + Duration::from_secs(19),
+                1,
+                &quality,
+                &profiles,
+                [2; 4],
+                2,
+                2,
+                0,
+                0,
+                0
+            )
+            .is_none());
+        assert_eq!(
+            controller
+                .sample(
+                    start + Duration::from_secs(20),
+                    1,
+                    &quality,
+                    &profiles,
+                    [3; 4],
+                    3,
+                    3,
+                    0,
+                    0,
+                    0
+                )
+                .unwrap()
+                .reason,
+            "wss-probe"
+        );
+
+        let ceiling = super::Controller::fixed(Profile::Balanced, 40_000_000, 4_000_000);
+        let mut spatial = WssQualityController::new(start);
+        assert!(spatial
+            .sample(start, 1, &ceiling, &profiles, [1; 4], 1, 1, 0, 0, 0)
+            .is_none());
+        let decision = spatial
+            .sample(
+                start + Duration::from_secs(60),
+                1,
+                &ceiling,
+                &profiles,
+                [2; 4],
+                2,
+                2,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            decision.mode,
+            VideoMode::for_stream(Profile::Full, StreamMode::Work)
+        );
+        assert_eq!(decision.reason, "wss-stable-up");
+    }
+
+    #[test]
+    fn parity_recovery_and_staggered_ack_batches_are_not_congestion() {
+        let start = Instant::now();
+        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
+        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
+        let mut controller = WssQualityController::new(start);
+        assert!(controller
+            .sample(start, 1, &quality, &profiles, [1, 1, 1, 0], 1, 1, 1, 0, 0)
+            .is_none());
+        assert!(controller
+            .sample(
+                start + Duration::from_millis(500),
+                1,
+                &quality,
+                &profiles,
+                [2, 1, 2, 1],
+                2,
+                2,
+                2,
+                0,
+                0
+            )
+            .is_none());
+        assert!(controller
+            .sample(
+                start + Duration::from_millis(1_500),
+                1,
+                &quality,
+                &profiles,
+                [2, 2, 3, 2],
+                3,
+                3,
+                3,
+                0,
+                0
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn a_downshift_blocks_immediate_probe_back_up() {
+        let start = Instant::now();
+        let mut quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
+        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
+        let mut controller = WssQualityController::new(start);
+        assert!(controller
+            .sample(start, 1, &quality, &profiles, [1; 4], 1, 1, 0, 0, 0)
+            .is_none());
+        assert!(controller
+            .sample(
+                start + Duration::from_millis(1),
+                1,
+                &quality,
+                &profiles,
+                [2; 4],
+                2,
+                0,
+                0,
+                1,
+                0
+            )
+            .is_none());
+        let down = controller
+            .sample(
+                start + Duration::from_millis(8_002),
+                1,
+                &quality,
+                &profiles,
+                [3; 4],
+                3,
+                0,
+                0,
+                2,
+                0,
+            )
+            .unwrap();
+        quality.apply(
+            start + Duration::from_millis(8_002),
+            super::Decision {
+                profile: down.mode.profile,
+                target_bps: down.target_bps,
+                reason: super::quality::Reason::Bitrate,
+            },
+        );
+        assert!(controller
+            .sample(
+                start + Duration::from_secs(20),
+                1,
+                &quality,
+                &profiles,
+                [3; 4],
+                3,
+                3,
+                0,
+                2,
+                0
+            )
+            .is_none());
+        assert!(controller
+            .sample(
+                start + Duration::from_secs(31),
+                1,
+                &quality,
+                &profiles,
+                [4; 4],
+                4,
+                4,
+                0,
+                2,
+                0
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn new_wss_generation_resets_sequence_and_damage_baselines() {
+        let start = Instant::now();
+        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
+        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
+        let mut controller = WssQualityController::new(start);
+        assert!(controller
+            .sample(start, 1, &quality, &profiles, [100; 4], 100, 100, 5, 2, 2)
+            .is_none());
+        assert!(controller
+            .sample(
+                start + Duration::from_secs(2),
+                2,
+                &quality,
+                &profiles,
+                [1; 4],
+                1,
+                1,
+                0,
+                0,
+                0
+            )
+            .is_none());
+        assert_eq!(controller.generation, Some(2));
+        assert_eq!(controller.last_reconstructed, 1);
+    }
+
+    #[test]
+    fn rejected_matching_transition_invalidates_cache_and_requests_recovery() {
+        let mode = VideoMode::rung(Profile::Balanced);
+        let pending = Some(PendingSubmittedIdr {
+            id: 7,
+            mode,
+            reason: "transition",
+        });
+        assert!(rejected_transition_requires_recovery(&pending, 7));
+        assert!(!rejected_transition_requires_recovery(&pending, 6));
     }
 
     #[test]
@@ -1882,6 +9074,167 @@ mod tests {
         replay.on_not_admitted(start);
         assert!(!replay.is_due(start, true));
         assert!(replay.is_due(start + STATIC_REPLAY_DELAY, true));
+    }
+
+    #[test]
+    fn rejected_cached_idr_replay_does_not_consume_a_media_sequence() {
+        let mut committed = 41;
+        let candidate = next_media_sequence(committed);
+
+        assert_eq!(candidate, 42);
+        assert_eq!(committed, 41);
+
+        commit_media_sequence(&mut committed, candidate);
+        assert_eq!(committed, 42);
+    }
+
+    #[test]
+    fn hybrid_cached_idr_replay_is_rewrapped_for_the_new_outer_sequence() {
+        let mode = VideoMode::rung(Profile::Full);
+        let cached = CachedIdr {
+            data: vec![0, 0, 0, 1, 38],
+            mode,
+        };
+        let payload = cached_wss_replay_payload(&cached, true, 7, 42, 3).unwrap();
+        let decoded = crate::hybrid::decode_hybrid_frame_v1(&payload).unwrap();
+
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.sequence, 42);
+        assert_eq!(decoded.crop_revision, 3);
+        assert_eq!(decoded.access_unit, cached.data);
+        assert_eq!(decoded.operations, vec![HybridTileOperation::Clear]);
+    }
+
+    #[test]
+    fn idle_desktop_snapshot_polling_only_needs_a_connected_peer() {
+        assert!(!should_snapshot_idle_desktop(false, true));
+        assert!(should_snapshot_idle_desktop(true, false));
+        assert!(should_snapshot_idle_desktop(true, true));
+    }
+
+    #[test]
+    fn wss_lane_recovery_snapshot_is_bounded_and_rearms_after_ack() {
+        let start = Instant::now();
+        let retry = Duration::from_secs(2);
+        let mut gate = WssRecoverySnapshotGate::default();
+
+        assert!(gate.should_request(start, true, false, retry));
+        assert!(!gate.should_request(start + Duration::from_millis(500), false, true, retry));
+        assert!(!gate.should_request(start + Duration::from_millis(501), true, false, retry));
+        assert!(!gate.should_request(start + Duration::from_millis(1_999), true, false, retry));
+        assert!(gate.should_request(start + retry, true, false, retry));
+
+        assert!(!gate.should_request(start + retry, false, false, retry));
+        assert!(gate.should_request(start + retry + Duration::from_millis(1), true, false, retry));
+    }
+
+    #[test]
+    fn signaling_without_a_client_does_not_admit_capture_or_encode() {
+        assert!(!capture_admission_ready(
+            true, false, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn unavailable_capture_without_a_privileged_probe_does_not_admit_wss_encode() {
+        assert!(!capture_admission_ready(
+            false, false, true, true, true, false, false
+        ));
+    }
+
+    #[test]
+    fn unverified_privileged_capture_admits_a_bootstrap_probe_for_active_wss() {
+        assert!(capture_admission_ready(
+            false, true, true, true, true, false, false
+        ));
+    }
+
+    #[test]
+    fn unverified_privileged_capture_probe_retries_are_bounded() {
+        assert_eq!(
+            privileged_no_frame_retry_delay(false),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            privileged_no_frame_retry_delay(true),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn idle_producer_uses_a_coarser_poll_interval() {
+        assert_eq!(producer_poll_interval(false), Duration::from_secs(1));
+        assert_eq!(producer_poll_interval(true), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn capture_resampling_selects_nearest_source_frames_without_deadline_drift() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(33);
+        let first_deadline = start + interval;
+        assert!(frame_admission_due(
+            start + Duration::from_millis(25),
+            first_deadline,
+            interval,
+            false,
+        ));
+        let second_deadline = advance_frame_deadline(first_deadline, start, interval);
+        assert!(frame_admission_due(
+            start + Duration::from_millis(50),
+            second_deadline,
+            interval,
+            false,
+        ));
+        let third_deadline = advance_frame_deadline(second_deadline, start, interval);
+        assert!(!frame_admission_due(
+            start + Duration::from_millis(75),
+            third_deadline,
+            interval,
+            false,
+        ));
+        assert!(frame_admission_due(
+            start + Duration::from_millis(100),
+            third_deadline,
+            interval,
+            false,
+        ));
+        assert!(frame_admission_due(
+            start,
+            start + Duration::from_secs(1),
+            interval,
+            true,
+        ));
+    }
+
+    #[test]
+    fn negotiation_prewarms_only_while_a_first_idr_is_needed() {
+        assert!(capture_admission_ready(
+            true, false, true, false, false, false, true
+        ));
+        assert!(!capture_admission_ready(
+            true, false, true, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn active_wss_does_not_require_a_dormant_rtc_reservation() {
+        assert!(capture_admission_ready(
+            true, false, true, true, true, false, false
+        ));
+        assert!(!capture_admission_ready(
+            true, false, true, true, false, false, false
+        ));
+        assert!(capture_admission_ready(
+            true, false, true, true, false, true, false
+        ));
+    }
+
+    #[test]
+    fn wss_admission_rebuilds_encoder_when_benchmark_contract_becomes_effective() {
+        assert!(encoder_benchmark_contract_changed(true, None, Some(7)));
+        assert!(!encoder_benchmark_contract_changed(true, Some(7), Some(7)));
+        assert!(encoder_benchmark_contract_changed(true, Some(7), None));
+        assert!(!encoder_benchmark_contract_changed(false, None, Some(7)));
     }
 
     #[test]
@@ -1967,18 +9320,55 @@ mod tests {
     }
 
     #[test]
-    fn device_replacement_below_active_rung_pins_exact_native_mode() {
+    fn persistent_resource_mode_forces_the_stable_full_scaler_target() {
+        assert!(full_profile_uses_native_texture(
+            Profile::Full,
+            1920,
+            1080,
+            ResourceMode::PerFrame
+        ));
+        assert!(!full_profile_uses_native_texture(
+            Profile::Full,
+            1920,
+            1080,
+            ResourceMode::Persistent
+        ));
+    }
+
+    #[test]
+    fn device_replacement_below_active_rung_stages_exact_native_until_admitted() {
         let mut state = ProfileTransition::new(Profile::Full, Profile::Full);
-        assert_eq!(
-            encoder_mode_for_capture(&mut state, 1600, 900),
-            VideoMode::native(1600, 900, 60)
-        );
+        let native = VideoMode::native(1600, 900, 60);
+        assert_eq!(encoder_mode_for_capture(&mut state, 1600, 900), native);
+        assert_eq!(state.active(), Profile::Full);
+        assert!(!state.is_pinned());
+        assert_eq!(state.staged, Some((native, "native-size-fallback")));
+        assert!(commit_matching_transition(
+            &mut state,
+            PendingSubmittedIdr {
+                id: 11,
+                mode: native,
+                reason: "native-size-fallback"
+            },
+            11
+        ));
         assert!(state.is_pinned());
-        assert_eq!(state.staged(), None);
+        assert_eq!(state.active, native);
         assert_eq!(
             state.pending_announcement(),
-            Some((VideoMode::native(1600, 900, 60), "native-size-fallback"))
+            Some((native, "native-size-fallback"))
         );
+    }
+
+    #[test]
+    fn cached_native_startup_replay_preserves_fallback_reason_for_admission() {
+        let mut state = ProfileTransition::new(Profile::Full, Profile::Full);
+        let native = encoder_mode_for_capture(&mut state, 1600, 900);
+        let pending = cached_replay_transition(&state, native, 12).unwrap();
+        assert_eq!(pending.reason, "native-size-fallback");
+        assert!(commit_matching_transition(&mut state, pending, 12));
+        assert!(state.is_pinned());
+        assert_eq!(state.active, native);
     }
 
     #[test]

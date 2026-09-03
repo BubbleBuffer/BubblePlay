@@ -4,21 +4,25 @@
 
 use std::time::{Duration, Instant};
 
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
-    DXGI_OUTDUPL_FRAME_INFO, IDXGIResource,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIResource,
+    DXGI_OUTDUPL_FRAME_INFO,
 };
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFOEXW};
-use windows::core::Interface;
 
 fn monitor_name(h: HMONITOR) -> String {
     let mut mi = MONITORINFOEXW::default();
     mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     unsafe {
         if GetMonitorInfoW(h, &mut mi.monitorInfo).as_bool() {
-            let end = mi.szDevice.iter().position(|c| *c == 0).unwrap_or(mi.szDevice.len());
+            let end = mi
+                .szDevice
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(mi.szDevice.len());
             String::from_utf16_lossy(&mi.szDevice[..end])
         } else {
             "<GetMonitorInfoW failed>".into()
@@ -114,12 +118,19 @@ fn probe_output(adapter: &IDXGIAdapter1, output: &IDXGIOutput) {
 fn main() {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.expect("CreateDXGIFactory1");
     for ai in 0.. {
-        let Ok(adapter) = (unsafe { factory.EnumAdapters1(ai) }) else { break };
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(ai) }) else {
+            break;
+        };
         let adesc = unsafe { adapter.GetDesc1() }.unwrap();
         let name = wide_to_string(&adesc.Description);
-        println!("adapter {ai}: {name} vendor=0x{:X} flags=0x{:X}", adesc.VendorId, adesc.Flags);
+        println!(
+            "adapter {ai}: {name} vendor=0x{:X} flags=0x{:X}",
+            adesc.VendorId, adesc.Flags
+        );
         for oi in 0.. {
-            let Ok(output) = (unsafe { adapter.EnumOutputs(oi) }) else { break };
+            let Ok(output) = (unsafe { adapter.EnumOutputs(oi) }) else {
+                break;
+            };
             probe_output(&adapter, &output);
         }
     }

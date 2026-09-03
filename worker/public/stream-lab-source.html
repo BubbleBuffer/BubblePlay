@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BubblePlay Stream Lab Source</title>
+<style>
+  * { box-sizing: border-box }
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #101218 }
+  canvas { display: block; width: 100vw; height: 100vh; image-rendering: auto; pointer-events: none }
+</style>
+<canvas id="scene" width="1920" height="1080" data-frame-id="0"></canvas>
+<script>
+(() => {
+  "use strict";
+  const canvas = document.querySelector("#scene");
+  const context = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  const sceneIds = ["ui-text", "thin-lines", "gradients", "scrolling", "motion-60", "localized-change",
+    "source-code", "chrome-text", "chrome-canvas", "generated-video"];
+  const params = new URLSearchParams(location.search);
+  let scene = sceneIds.includes(params.get("scene")) ? params.get("scene") : "ui-text";
+  let seed = finiteInteger(params.get("seed"), 469);
+  let frameId = 0;
+  let epochMs = Date.now();
+  let paused = false;
+  let pausedFrame = null;
+  let actionId = 0;
+  let actionFrameId = null;
+  let generation = 1;
+  let sourceCode = "// BubblePlay allowlisted source fixture\nfn main() {\n    println!(\"private streaming, measured exactly\");\n}";
+  let lastTick = performance.now();
+  const referenceText = [
+    "BubblePlay Arbeitsbereich", "Verbindung geschützt", "Qualität und Leistung",
+    "The quick brown fox jumps over the lazy dog.", "Größe ändern · Öffnen · Schließen",
+    "Einstellungen  Monitor  Tastatur  Vollbild", "0123456789 !? @ # € % &",
+  ].join("\n");
+
+  function finiteInteger(value, fallback) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : fallback;
+  }
+
+  function rngFor(frame = frameId) {
+    let state = (seed ^ Math.imul(frame + 1, 0x9e3779b1)) >>> 0;
+    return () => {
+      state = (Math.imul(state ^ (state >>> 15), 1 | state) + 0x6d2b79f5) >>> 0;
+      return ((state ^ (state >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clear(color = "#101218") {
+    context.fillStyle = color;
+    context.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  function panel(x, y, width, height, title) {
+    context.fillStyle = "#f6f7fb";
+    context.fillRect(x, y, width, height);
+    context.strokeStyle = "#1d2530";
+    context.lineWidth = 2;
+    context.strokeRect(x + 1, y + 1, width - 2, height - 2);
+    context.fillStyle = "#232a36";
+    context.fillRect(x, y, width, 54);
+    context.fillStyle = "#fff";
+    context.font = "700 24px Arial, sans-serif";
+    context.fillText(title, x + 24, y + 35);
+  }
+
+  function drawUiText(offset = 0) {
+    clear("#18202a");
+    panel(110, 88, 820, 850, "BubblePlay Arbeitsbereich");
+    context.save();
+    context.beginPath();
+    context.rect(110, 142, 820, 796);
+    context.clip();
+    const sizes = [8, 10, 12, 14, 16, 18, 20, 24];
+    const lines = referenceText.split("\n");
+    let y = 190 - offset;
+    for (const size of sizes) {
+      context.fillStyle = "#17202b";
+      context.font = `${size}px Arial, sans-serif`;
+      context.fillText(`${size}px  ${lines[(size / 2) % lines.length | 0]}`, 146, y);
+      context.fillStyle = "#4a5568";
+      context.fillText(lines[(size + 1) % lines.length], 146, y + size + 10);
+      y += size * 2 + 42;
+    }
+    context.restore();
+    panel(990, 88, 820, 850, "Controls · Einstellungen");
+    for (let row = 0; row < 7; row++) {
+      const y0 = 180 + row * 104;
+      context.fillStyle = row % 2 ? "#fff" : "#eef1f5";
+      context.fillRect(1030, y0, 740, 80);
+      context.fillStyle = "#18202a";
+      context.font = "600 18px Arial, sans-serif";
+      context.fillText(lines[row], 1054, y0 + 32);
+      context.font = "14px Arial, sans-serif";
+      context.fillStyle = "#596778";
+      context.fillText(`Status ${row + 1} · 1920 × 1080 · HEVC`, 1054, y0 + 58);
+      context.fillStyle = row === 2 ? "#f0a064" : "#227b70";
+      context.fillRect(1630, y0 + 20, 104, 40);
+    }
+  }
+
+  function drawThinLines() {
+    clear("#f7f7f7");
+    for (let x = 40, index = 0; x < 1880; x += 24, index++) {
+      context.fillStyle = index % 3 === 0 ? "#000" : index % 3 === 1 ? "#0057ff" : "#f04b38";
+      context.fillRect(x, 60, 1 + index % 3, 450);
+    }
+    for (let y = 540, index = 0; y < 1020; y += 16, index++) {
+      context.fillStyle = index % 2 ? "#111" : "#777";
+      context.fillRect(40, y, 1840, 1 + index % 2);
+    }
+    const colors = ["#ff0000", "#00ff00", "#0000ff", "#00ffff", "#ff00ff", "#ffff00", "#000", "#fff"];
+    colors.forEach((color, index) => {
+      context.fillStyle = color;
+      context.fillRect(80 + index * 220, 760, 180, 180);
+      context.strokeStyle = "#000";
+      context.lineWidth = 1;
+      context.strokeRect(80.5 + index * 220, 760.5, 179, 179);
+    });
+  }
+
+  function drawGradients() {
+    clear("#202020");
+    const horizontal = context.createLinearGradient(40, 0, 1880, 0);
+    horizontal.addColorStop(0, "#000"); horizontal.addColorStop(0.5, "#777"); horizontal.addColorStop(1, "#fff");
+    context.fillStyle = horizontal; context.fillRect(40, 60, 1840, 280);
+    const chroma = context.createLinearGradient(40, 0, 1880, 0);
+    chroma.addColorStop(0, "#f00"); chroma.addColorStop(0.2, "#ff0"); chroma.addColorStop(0.4, "#0f0");
+    chroma.addColorStop(0.6, "#0ff"); chroma.addColorStop(0.8, "#00f"); chroma.addColorStop(1, "#f0f");
+    context.fillStyle = chroma; context.fillRect(40, 390, 1840, 280);
+    for (let step = 0; step < 32; step++) {
+      const gray = Math.round(step * 255 / 31);
+      context.fillStyle = `rgb(${gray},${gray},${gray})`;
+      context.fillRect(40 + step * 57.5, 720, 58, 260);
+    }
+  }
+
+  function drawMotion() {
+    clear("#0d1117");
+    const random = rngFor();
+    for (let index = 0; index < 64; index++) {
+      const radius = 4 + Math.floor(random() * 28);
+      const x = (random() * 1920 + frameId * (1 + index % 7)) % 1920;
+      const y = (random() * 1080 + frameId * (1 + index % 5)) % 1080;
+      context.fillStyle = `hsl(${Math.floor(random() * 360)} 80% 60%)`;
+      context.beginPath(); context.arc(x, y, radius, 0, Math.PI * 2); context.fill();
+    }
+    context.fillStyle = "#fff";
+    context.fillRect((frameId * 13) % 1720, 440, 200, 200);
+  }
+
+  function drawLocalizedChange() {
+    drawUiText(0);
+    const phase = Math.floor(frameId / 30) % 4;
+    const x = 1230 + (phase % 2) * 220;
+    const y = 720 + Math.floor(phase / 2) * 90;
+    context.fillStyle = phase % 2 ? "#f0a064" : "#227b70";
+    context.fillRect(x, y, 180, 64);
+    context.fillStyle = "#fff";
+    context.font = "700 18px Arial, sans-serif";
+    context.fillText(`Update ${phase}`, x + 36, y + 40);
+  }
+
+  function drawSourceCode() {
+    clear("#1e1e1e");
+    context.fillStyle = "#181818"; context.fillRect(0, 0, 1920, 64);
+    context.fillStyle = "#2b2b2b"; context.fillRect(0, 64, 310, 1016);
+    context.fillStyle = "#cccccc"; context.font = "15px Consolas, monospace";
+    context.fillText("EXPLORER · BUBBLEPLAY", 24, 104);
+    context.fillStyle = "#252526"; context.fillRect(310, 64, 1610, 48);
+    context.fillStyle = "#ffffff"; context.fillText("allowlisted-source · isolated profile", 344, 94);
+    const lines = sourceCode.replaceAll("\t", "    ").split("\n").slice(0, 48);
+    context.font = "18px Consolas, monospace";
+    lines.forEach((line, index) => {
+      const y = 148 + index * 19;
+      context.fillStyle = "#858585"; context.fillText(String(index + 1).padStart(3), 326, y);
+      context.fillStyle = /^(\s*)(function|const|let|fn|pub|use|import|export)\b/.test(line) ? "#c586c0" :
+        /[\"'`]/.test(line) ? "#ce9178" : "#d4d4d4";
+      context.fillText(line.slice(0, 126), 382, y);
+    });
+  }
+
+  function drawChromeText() {
+    clear("#f7f8fa");
+    context.fillStyle = "#dee1e6"; context.fillRect(0, 0, 1920, 92);
+    context.fillStyle = "#fff"; context.beginPath(); context.roundRect(250, 20, 1420, 52, 26); context.fill();
+    context.fillStyle = "#3c4043"; context.font = "18px Arial, sans-serif";
+    context.fillText("local://bubbleplay-stream-lab/text", 292, 53);
+    context.fillStyle = "#202124"; context.font = "700 42px Arial, sans-serif";
+    context.fillText("Browser text fidelity", 112, 180);
+    context.font = "18px Arial, sans-serif";
+    for (let row = 0; row < 30; row++) {
+      context.fillStyle = row % 3 ? "#3c4043" : "#174ea6";
+      context.fillText(`${row + 1}. ${referenceText.split("\n")[row % 7]} · Frame ${frameId}`, 112, 236 + row * 25);
+    }
+  }
+
+  function drawChromeCanvas() {
+    clear("#07111f");
+    const random = rngFor();
+    for (let index = 0; index < 144; index++) {
+      const x = (index % 18) * 106 + ((frameId * (index % 5 + 1)) % 106);
+      const y = Math.floor(index / 18) * 126 + 30;
+      context.fillStyle = `hsl(${Math.floor(random() * 360)} 75% ${35 + Math.floor(random() * 40)}%)`;
+      context.fillRect(x, y, 54 + index % 31, 54 + index % 23);
+    }
+  }
+
+  function drawGeneratedVideo() {
+    const phase = frameId / 60;
+    const gradient = context.createLinearGradient(0, 0, 1920, 1080);
+    gradient.addColorStop(0, `hsl(${(frameId * 2) % 360} 80% 35%)`);
+    gradient.addColorStop(1, `hsl(${(frameId * 2 + 140) % 360} 80% 45%)`);
+    context.fillStyle = gradient; context.fillRect(0, 0, 1920, 1080);
+    for (let index = 0; index < 12; index++) {
+      const x = 960 + Math.sin(phase * (1 + index / 10) + index) * (180 + index * 55);
+      const y = 540 + Math.cos(phase * (1.2 + index / 12) + index) * (120 + index * 31);
+      context.fillStyle = `hsla(${(frameId * 5 + index * 29) % 360} 90% 70% / .82)`;
+      context.beginPath(); context.arc(x, y, 30 + index * 7, 0, Math.PI * 2); context.fill();
+    }
+    context.fillStyle = "#fff"; context.font = "700 36px Arial, sans-serif";
+    context.fillText(`Generated 1080p60 · ${String(frameId).padStart(6, "0")}`, 64, 1020);
+  }
+
+  function crc8(bytes) {
+    let crc = 0;
+    for (const byte of bytes) {
+      crc ^= byte;
+      for (let bit = 0; bit < 8; bit++) crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+    }
+    return crc;
+  }
+
+  function drawBarcode(currentEpochMs, currentFrameId) {
+    const timestamp = currentEpochMs >>> 0;
+    const identity = currentFrameId & 0xffff;
+    const payload = [timestamp >>> 24, timestamp >>> 16, timestamp >>> 8, timestamp, identity >>> 8, identity].map(v => v & 0xff);
+    const bytes = [0xa5, ...payload, crc8(payload)];
+    const x0 = 64, y0 = 64, size = 24, markSize = 8;
+    context.fillStyle = "#000"; context.fillRect(x0, y0, 32 * size, 2 * size);
+    for (let index = 0; index < 64; index++) {
+      const value = (bytes[index >> 3] >> (7 - (index & 7))) & 1;
+      context.fillStyle = "#fff";
+      context.fillRect(
+        x0 + (index % 32) * size + (value ? markSize : 0),
+        y0 + Math.floor(index / 32) * size + markSize,
+        markSize,
+        markSize,
+      );
+    }
+    context.fillStyle = "#fff"; context.font = "16px monospace";
+    context.fillText(`${scene} · seed ${seed} · frame ${currentFrameId} · identity marker`, 64, 140);
+    context.fillStyle = actionId % 2 ? "#f0a064" : "#227b70";
+    context.fillRect(1744, 16, 144, 72);
+    context.fillStyle = "#fff"; context.font = "700 18px Arial, sans-serif";
+    context.fillText(`ACTION ${actionId}`, 1756, 59);
+  }
+
+  function triggerAction() {
+    actionId++;
+    actionFrameId = ++frameId;
+    epochMs = Date.now();
+    render();
+    return { actionId, frameId: actionFrameId, epochMs };
+  }
+
+  function render() {
+    if (scene === "ui-text") drawUiText(0);
+    else if (scene === "thin-lines") drawThinLines();
+    else if (scene === "gradients") drawGradients();
+    else if (scene === "scrolling") drawUiText((frameId * 2) % 540);
+    else if (scene === "motion-60") drawMotion();
+    else if (scene === "localized-change") drawLocalizedChange();
+    else if (scene === "source-code") drawSourceCode();
+    else if (scene === "chrome-text") drawChromeText();
+    else if (scene === "chrome-canvas") drawChromeCanvas();
+    else drawGeneratedVideo();
+    drawBarcode(epochMs, frameId);
+    canvas.dataset.frameId = String(frameId);
+  }
+
+  function loop(now) {
+    if (!paused && now - lastTick >= 1000 / 60) {
+      const steps = Math.max(1, Math.floor((now - lastTick) / (1000 / 60)));
+      frameId += steps;
+      epochMs = Date.now();
+      lastTick = now;
+      if (pausedFrame !== null && frameId >= pausedFrame) {
+        frameId = pausedFrame;
+        paused = true;
+        pausedFrame = null;
+      }
+      render();
+    }
+    requestAnimationFrame(loop);
+  }
+
+  window.__bubbleplaySource = Object.freeze({
+    scenes: () => [...sceneIds],
+    setScene(nextScene, nextSeed = seed) {
+      if (!sceneIds.includes(nextScene)) throw new RangeError(`unknown scene: ${nextScene}`);
+      scene = nextScene; seed = finiteInteger(nextSeed, seed); frameId = 0; epochMs = Date.now(); generation++; render();
+      return this.metadata();
+    },
+    setPausedScene(nextScene, nextSeed = seed, nextFrameId = 0) {
+      if (!sceneIds.includes(nextScene)) throw new RangeError(`unknown scene: ${nextScene}`);
+      const target = Math.max(0, finiteInteger(nextFrameId, 0));
+      scene = nextScene;
+      seed = finiteInteger(nextSeed, seed);
+      frameId = 0;
+      epochMs = Date.now();
+      generation++;
+      paused = target === 0;
+      pausedFrame = target === 0 ? null : target;
+      render();
+      return this.metadata();
+    },
+    setSeed(nextSeed) { seed = finiteInteger(nextSeed, seed); render(); return seed; },
+    setSourceCode(nextSource) {
+      if (typeof nextSource !== "string" || nextSource.length > 65536) throw new RangeError("source fixture must be at most 64 KiB");
+      sourceCode = nextSource; generation++; render(); return { bytes: sourceCode.length, generation };
+    },
+    pauseAt(nextFrameId = frameId) {
+      const target = Math.max(0, finiteInteger(nextFrameId, frameId));
+      if (target <= frameId) { frameId = target; paused = true; pausedFrame = null; epochMs = Date.now(); render(); }
+      else { pausedFrame = target; paused = false; }
+      return target;
+    },
+    resume() { paused = false; pausedFrame = null; lastTick = performance.now(); },
+    triggerAction,
+    metadata: () => ({ scene, seed, generation, frameId, epochMs, paused, actionId, actionFrameId, width: canvas.width, height: canvas.height, referenceText }),
+  });
+
+  addEventListener("keydown", event => {
+    if (event.code !== "F8") return;
+    event.preventDefault();
+    triggerAction();
+  });
+
+  render();
+  requestAnimationFrame(loop);
+})();
+</script>
+</html>

@@ -5,7 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BubblePlay</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  :root { color-scheme: dark; --bg:#050507; --glass:rgba(18,18,24,.86); --glass-solid:#15151c; --line:rgba(255,255,255,.14); --muted:#a8a8b4; --text:#f7f7fb; --accent:#9b6cff; --accent-strong:#7c3aed; --good:#65d59a; --warn:#f5c76a; --bad:#ff7187; }
+  * { box-sizing:border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color:var(--text); overflow: hidden; font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
   #stage {
     position: fixed; inset: 0;
     display: flex; align-items: center; justify-content: center;
@@ -18,12 +20,15 @@
     image-rendering: auto;
   }
   #screen { pointer-events: auto; }
+  #sharp-screen { display:none; position:absolute; pointer-events:none; max-width:none; max-height:none; background:transparent; }
+  #sharp-screen.active { display:block; }
   #stage.native-video-input #screen {
     position: fixed; inset: 0; width: 100%; height: 100%;
     max-width: none; max-height: none; background: transparent; opacity: 0;
   }
+  #stage.native-video-input #sharp-screen { display:none; }
   #hud {
-    position: fixed; top: 8px; left: 8px; z-index: 10;
+    display:none; position: fixed; top: 8px; left: 8px; z-index: 30;
     font: 12px/1.5 ui-monospace, Consolas, monospace;
     color: #cfc; background: rgba(0,0,0,.55); padding: 6px 10px;
     border-radius: 6px; pointer-events: none; white-space: pre;
@@ -31,34 +36,234 @@
   }
   #hud .bad { color: #f77; }
   #hud .ok  { color: #8f8; }
+  body.diagnostics-mode #hud { display:block; }
+  #desktop-state { position:fixed; left:50%; top:50%; z-index:12; width:min(360px,calc(100vw - 32px)); transform:translate(-50%,-50%); padding:18px 20px; box-sizing:border-box; color:#fff; background:rgba(18,18,24,.92); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 60px #000b; backdrop-filter:blur(18px); font:14px/1.45 system-ui; text-align:center; }
+  body.desktop-unavailable #visual { opacity:.28; }
+  .startup-card-icon { display:grid; place-items:center; width:38px; height:38px; margin:0 auto 10px; border-radius:13px; background:#7c3aed33; color:#c4b5fd; }
+  .startup-card-icon svg { width:21px; height:21px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+  #desktop-state-title { display:block; font-weight:700; font-size:15px; }
+  #desktop-state-detail { display:block; margin-top:5px; color:var(--muted); }
+  #first-frame-retry { display:none; margin:13px auto 0; border:1px solid #ffffff2b; border-radius:10px; padding:9px 14px; color:#fff; background:#7c3aed; font:650 13px system-ui; cursor:pointer; }
+  #desktop-state[data-state="failed"] #first-frame-retry { display:inline-block; }
+  #desktop-state[data-state="unavailable"] #first-frame-retry { display:inline-block; }
+  #desktop-state[data-state="starting"] .startup-card-icon svg { animation:startup-spin 1.1s linear infinite; }
+  @keyframes startup-spin { to { transform:rotate(360deg); } }
   #input-surface { position:fixed; inset:0; z-index:3; touch-action:none; overscroll-behavior:none; cursor:crosshair; }
-  #controls { position:fixed; right:max(8px, env(safe-area-inset-right)); bottom:max(8px, env(safe-area-inset-bottom)); z-index:11; display:flex; gap:4px; flex-wrap:wrap; max-width:calc(100vw - 16px); }
-  #controls button { background:rgba(0,0,0,.72); border:1px solid #777; border-radius:5px; color:#fff; padding:6px 8px; font:12px system-ui; }
+  #touch-cursor {
+    position:fixed; left:0; top:0; z-index:4; width:24px; height:32px;
+    pointer-events:none; opacity:0; transform:translate3d(-100px,-100px,0);
+    transition:opacity 80ms linear; will-change:transform;
+  }
+  #touch-cursor svg { display:block; width:100%; height:100%; overflow:visible; }
+  #touch-cursor.visible { opacity:1; }
+  #app-brand { position:fixed; top:max(14px,env(safe-area-inset-top)); left:max(16px,env(safe-area-inset-left)); z-index:11; display:flex; align-items:center; gap:8px; pointer-events:none; font-weight:700; letter-spacing:.02em; text-shadow:0 2px 12px #000; }
+  #app-brand .brand-mark { display:grid; place-items:center; width:28px; height:28px; border-radius:9px; background:linear-gradient(135deg,#a78bfa,#6d28d9); box-shadow:0 5px 18px #0008; font-size:15px; }
+  #connection-status { position:fixed; top:max(14px,env(safe-area-inset-top)); right:max(16px,env(safe-area-inset-right)); z-index:11; display:flex; align-items:center; gap:8px; max-width:min(70vw,360px); padding:8px 11px; border:1px solid var(--line); border-radius:999px; background:var(--glass); box-shadow:0 8px 30px #0007; backdrop-filter:blur(14px); font-size:12px; color:#e9e9ef; pointer-events:auto; }
+  #connection-status .status-dot { width:8px; height:8px; border-radius:50%; background:var(--warn); box-shadow:0 0 0 3px #f5c76a1c; flex:0 0 auto; }
+  #connection-status[data-state="connected"] .status-dot { background:var(--good); box-shadow:0 0 0 3px #65d59a1c; }
+  #connection-status[data-state="error"] .status-dot { background:var(--bad); box-shadow:0 0 0 3px #ff71871c; }
+  #connection-status button { display:none; border:0; background:transparent; color:#fff; padding:0; text-decoration:underline; cursor:pointer; font:inherit; }
+  #connection-status[data-state="error"] button { display:block; }
+  #controls { position:fixed; inset:auto 0 max(12px,env(safe-area-inset-bottom)); z-index:11; display:flex; justify-content:center; pointer-events:none; padding:0 max(12px,env(safe-area-inset-right)) 0 max(12px,env(safe-area-inset-left)); }
+  #desktop-toolbar, #mobile-toolbar { pointer-events:auto; display:flex; align-items:center; gap:5px; padding:7px; border:1px solid var(--line); border-radius:18px; background:var(--glass); box-shadow:0 12px 40px #0009; backdrop-filter:blur(16px); }
+  #mobile-toolbar { display:none; width:min(100%,520px); justify-content:space-around; border-radius:18px 18px 10px 10px; padding:7px max(6px,env(safe-area-inset-left)) max(7px,env(safe-area-inset-bottom)); }
+  #controls button, #control-sheet button, #control-sheet select { border:1px solid var(--line); border-radius:11px; color:var(--text); background:rgba(22,22,29,.92); padding:9px 11px; font:13px ui-sans-serif,system-ui,sans-serif; cursor:pointer; transition:background .15s,border-color .15s,transform .15s; }
+  #controls button:hover, #control-sheet button:hover, #control-sheet select:hover { background:#292332; border-color:#ffffff38; }
+  #controls button:active, #control-sheet button:active { transform:translateY(1px); }
+  #controls button:focus-visible, #control-sheet button:focus-visible, #control-sheet select:focus-visible, #keyboard-input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .ui-action { display:inline-flex; align-items:center; justify-content:center; gap:7px; min-height:38px; white-space:nowrap; }
+  .ui-action .ui-icon { width:17px; height:17px; display:block; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+  #mobile-toolbar .ui-action { flex:1; flex-direction:column; gap:2px; min-width:0; padding:7px 4px; font-size:10px; border-color:transparent; background:transparent; }
+  #mobile-toolbar .ui-action .ui-icon { width:19px; height:19px; }
+  #mobile-toolbar .ui-action:hover { background:#ffffff12; }
+  #control-sheet { position:fixed; left:50%; bottom:0; z-index:20; width:min(720px,100vw); max-height:min(78vh,680px); transform:translate(-50%,0); padding:14px max(16px,env(safe-area-inset-right)) max(18px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left)); box-sizing:border-box; background:rgba(21,21,28,.98); border:1px solid var(--line); border-bottom:0; border-radius:20px 20px 0 0; box-shadow:0 -16px 50px #000c; overflow:auto; }
+  #control-sheet[hidden] { display:none; }
+  .sheet-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
+  .sheet-title { font:700 17px system-ui; }
+  .sheet-subtitle { color:var(--muted); font-size:12px; margin-top:3px; }
+  .sheet-tabs { display:flex; gap:6px; margin-bottom:14px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+  .sheet-tabs button { flex:1; padding:9px 8px !important; }
+  .sheet-tabs button.active { background:var(--accent-strong); border-color:#a78bfa; }
+  .sheet-panel[hidden] { display:none; }
+  .sheet-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(74px,1fr)); gap:7px; }
+  .sheet-grid button { min-height:42px; }
+  .modifier.active { background:#2563eb; border-color:#60a5fa; }
+  #keyboard-input { width:100%; box-sizing:border-box; margin:4px 0 9px; padding:13px 14px; border-radius:11px; border:1px solid var(--line); background:#09090b; color:#fff; font:15px system-ui; }
+  #keyboard-status, #monitor-status { color:var(--muted); font:12px system-ui; margin:8px 2px; min-height:18px; }
+  .monitor-card { display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%; text-align:left; margin:5px 0; }
+  .monitor-card.current { border-color:#8b5cf6; }
+  .monitor-card small { display:block; color:#aaa; margin-top:2px; }
+  .session-actions { display:flex; flex-wrap:wrap; gap:7px; align-items:center; }
+  .settings-section { padding:12px 0; border-top:1px solid var(--line); }
+  .settings-section:first-child { border-top:0; padding-top:0; }
+  .settings-label { font-weight:650; margin-bottom:4px; }
+  .settings-help { color:var(--muted); font-size:12px; line-height:1.45; }
+  #diagnostics-output { max-height:36vh; overflow:auto; white-space:pre-wrap; word-break:break-word; margin:10px 0 0; padding:10px; border:1px solid var(--line); border-radius:10px; background:#09090b; color:#c8facc; font:11px/1.45 ui-monospace,Consolas,monospace; }
   #visual { position:fixed; inset:0; z-index:1; transform-origin:center center; pointer-events:none; }
-  @media (orientation:portrait) { #controls { left:max(8px, env(safe-area-inset-left)); right:auto; } }
+  @media (max-width:767px), (any-pointer:coarse) {
+    #app-brand { top:max(10px,env(safe-area-inset-top)); left:max(12px,env(safe-area-inset-left)); font-size:13px; }
+    #app-brand .brand-mark { width:25px; height:25px; border-radius:8px; }
+    #connection-status { top:max(10px,env(safe-area-inset-top)); right:max(10px,env(safe-area-inset-right)); max-width:58vw; padding:7px 9px; }
+    #desktop-toolbar { display:none; }
+    #mobile-toolbar { display:flex; }
+    #controls { bottom:0; padding:0; }
+    #control-sheet { max-height:min(84svh,720px); border-radius:20px 20px 0 0; }
+  }
+  @media (min-width:768px) and (pointer:fine) {
+    #control-sheet { width:min(760px,calc(100vw - 32px)); }
+  }
 </style>
+<link rel="stylesheet" href="/bubbleplay.css">
 </head>
-<body>
-<div id="visual"><div id="stage"><canvas id="screen"></canvas></div></div>
+<body class="session-page mode-work chrome-dock-closed">
+<header id="top-seam">
+  <div id="app-brand" aria-label="BubblePlay">
+    <span class="signal-cut" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 4H4v16h16v-5M15 4h5v5"/><path class="signal-piece" d="m10 14 4-4m-4 0h4v4"/></svg></span>
+    <span class="wordmark">BubblePlay</span>
+  </div>
+  <div id="secure-desktop-status" hidden role="status" aria-live="polite"><span aria-hidden="true">◆</span><span>Windows secure desktop · protected input</span></div>
+  <div id="connection-status" data-state="connecting" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="connection-status-label">Connecting…</span><button id="connection-retry" type="button">Retry</button></div>
+</header>
+<div id="visual"><div id="stage"><canvas id="screen"></canvas><canvas id="sharp-screen"></canvas></div></div>
 <div id="input-surface" tabindex="0" aria-label="Remote desktop input"></div>
-<div id="controls"><button id="capture">Capture cursor</button><button id="zoom-out">−</button><button id="zoom-reset">1×</button><button id="zoom-in">+</button><button id="fullscreen">Fullscreen</button></div>
+<div id="touch-cursor" aria-hidden="true">
+  <svg viewBox="0 0 24 32" aria-hidden="true">
+    <path d="M2 2v22l6.2-5.5 5 11 3.8-1.8-5-10.7h9L2 2Z" fill="white" stroke="black" stroke-width="2" stroke-linejoin="round"/>
+  </svg>
+</div>
+<div id="controls">
+  <div id="desktop-toolbar" aria-label="Remote desktop controls">
+    <button class="ui-action" data-ui-action="keyboard" type="button" title="Keyboard"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M6 9h.01M9 9h.01M12 9h.01M15 9h.01M18 9h.01M6 13h.01M9 13h.01M12 13h.01M15 13h3M6 16h12"/></svg><span>Keyboard</span></button>
+    <button class="ui-action" data-ui-action="pointer" type="button" title="Switch pointer mode"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 3 13 9-6 1-3 7-4-17Z"/><path d="m14 15 4 4"/></svg><span>Pointer</span></button>
+    <button class="ui-action" data-ui-action="monitors" type="button" title="Choose monitor"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span>Monitor</span></button>
+    <button class="ui-action" data-ui-action="zoom-out" type="button" title="Zoom out"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5M8 10.8h5.5"/></svg><span>Zoom −</span></button>
+    <button class="ui-action" data-ui-action="zoom-in" type="button" title="Zoom in"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5M8 10.8h5.5M10.8 8v5.5"/></svg><span>Zoom +</span></button>
+    <button class="ui-action" data-ui-action="fullscreen" type="button" title="Fullscreen"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5"/></svg><span>Fullscreen</span></button>
+    <button id="open-controls" class="ui-action" data-ui-action="settings" aria-expanded="false" type="button" title="More settings"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 1.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.2h-2.6v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1-1.8-1.8.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H6v-2.6h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.8-1.8.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5V4h2.6v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.8 1.8-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.5 1h.2v2.6h-.2a1.7 1.7 0 0 0-1.5 1Z"/></svg><span>More</span></button>
+  </div>
+  <div id="mobile-toolbar" aria-label="Remote desktop controls">
+    <button class="ui-action" data-ui-action="keyboard" type="button" title="Keyboard"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M6 9h.01M9 9h.01M12 9h.01M15 9h.01M18 9h.01M6 13h.01M9 13h.01M12 13h.01M15 13h3M6 16h12"/></svg><span>Keyboard</span></button>
+    <button class="ui-action" data-ui-action="pointer" type="button" title="Switch pointer mode"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 3 13 9-6 1-3 7-4-17Z"/><path d="m14 15 4 4"/></svg><span>Pointer</span></button>
+    <button class="ui-action" data-ui-action="monitors" type="button" title="Choose monitor"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span>Monitor</span></button>
+    <button class="ui-action" data-ui-action="settings" type="button" title="More settings"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg><span>More</span></button>
+  </div>
+</div>
+<button id="chrome-reveal" type="button" aria-label="Show controls" aria-controls="controls" aria-expanded="false"><span aria-hidden="true">⌄</span><span>Controls</span></button>
+<aside id="control-sheet" hidden aria-hidden="true" role="dialog" aria-modal="false" aria-labelledby="control-sheet-title">
+  <div class="sheet-head"><div><div id="control-sheet-title" class="sheet-title">BubblePlay controls</div><div class="sheet-subtitle">Remote desktop session</div></div><button id="close-controls" aria-label="Close controls" type="button">×</button></div>
+  <div class="sheet-tabs" role="tablist" aria-label="Control sections"><button id="control-tab-keyboard" class="active" data-tab="keyboard" role="tab" aria-selected="true" aria-controls="tab-keyboard" type="button">Keyboard</button><button id="control-tab-monitors" data-tab="monitors" role="tab" aria-selected="false" aria-controls="tab-monitors" tabindex="-1" type="button">Monitors</button><button id="control-tab-session" data-tab="session" role="tab" aria-selected="false" aria-controls="tab-session" tabindex="-1" type="button">Session</button><button id="control-tab-settings" data-tab="settings" role="tab" aria-selected="false" aria-controls="tab-settings" tabindex="-1" type="button">Settings</button></div>
+  <section id="tab-keyboard" class="sheet-panel" role="tabpanel" aria-labelledby="control-tab-keyboard">
+    <input id="keyboard-input" autocomplete="on" autocorrect="on" autocapitalize="sentences" spellcheck="true" aria-label="Remote text input" placeholder="Tap here to open the device keyboard">
+    <div id="modifier-row" class="sheet-grid"><button class="modifier" data-vk="162">Ctrl</button><button class="modifier" data-vk="164">Alt</button><button class="modifier" data-vk="160">Shift</button><button class="modifier" data-vk="91">Win</button><button id="clear-modifiers">Clear</button></div>
+    <div id="special-key-grid" class="sheet-grid" style="margin-top:7px"></div>
+    <div id="keyboard-status">Native text input is ready.</div>
+  </section>
+  <section id="tab-monitors" class="sheet-panel" role="tabpanel" aria-labelledby="control-tab-monitors" hidden><div id="monitor-status">Waiting for monitor information…</div><div id="monitor-list"></div></section>
+  <section id="tab-session" class="sheet-panel" role="tabpanel" aria-labelledby="control-tab-session" hidden>
+    <dl class="session-summary"><dt>Transport</dt><dd id="session-transport">Connecting</dd><dt>Pointer</dt><dd id="session-pointer">Work</dd><dt>Display</dt><dd id="session-display">Waiting for host</dd></dl>
+    <div class="session-actions"><button id="capture">Capture cursor</button><button id="pointer-mode">Mode: Work</button><select id="quality" aria-label="Stream quality"><option value="auto">Auto</option><option value="high">High</option><option value="balanced">Balanced</option><option value="saver">Data Saver</option></select><button id="zoom-out">−</button><button id="zoom-reset">1×</button><button id="zoom-in">+</button><button id="fullscreen">Fullscreen</button></div>
+    <div class="session-danger"><h3>Browser access</h3><p>Sign out keeps this browser approved. Forgetting it requires a new ntfy approval.</p><div class="session-actions"><button id="logout-session" type="button">Sign out</button><button id="forget-browser" type="button">Forget this browser</button></div><p id="session-action-status" role="status" aria-live="polite"></p></div>
+  </section>
+  <section id="tab-settings" class="sheet-panel" role="tabpanel" aria-labelledby="control-tab-settings" hidden>
+    <div class="settings-section"><div class="settings-label">Session settings</div><div class="settings-help">Adjust quality and pointer behavior from the Session tab. These controls stay out of the way while you work.</div></div>
+    <div class="settings-section"><div class="settings-label">Diagnostics</div><div class="settings-help">Detailed transport, decoder, latency, and viewport metrics are hidden here during normal use.</div><div class="session-actions" style="margin-top:9px"><button id="open-diagnostics" type="button">Show diagnostics</button><button id="copy-diagnostics" type="button">Copy report</button></div><pre id="diagnostics-output" aria-live="polite">Diagnostics are hidden.</pre></div>
+  </section>
+</aside>
+<aside id="context-hint" hidden><span id="context-hint-copy"></span><button id="dismiss-context-hint" type="button" aria-label="Dismiss control hint">Dismiss</button></aside>
 <div id="hud">connecting…</div>
+<div id="desktop-state" data-state="starting" hidden role="status" aria-live="polite">
+  <span class="startup-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l2.5 2.5"/></svg></span>
+  <strong id="desktop-state-title">Starting stream…</strong>
+  <span id="desktop-state-detail">Waiting for the first visible frame.</span>
+  <button id="first-frame-retry" type="button">Retry stream</button>
+</div>
+<script>
+(() => {
+  "use strict";
+  const search = new URLSearchParams(location.search);
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const suppliedAttemptId = search.get("debugAttempt") || "";
+  const attemptId = uuid.test(suppliedAttemptId)
+    ? suppliedAttemptId.toLowerCase()
+    : crypto.randomUUID();
+  const state = {
+    attemptId,
+    runId: uuid.test(search.get("labRun") || "") ? search.get("labRun").toLowerCase() : null,
+    compatibilityId: search.get("labCompat") || null,
+    receiverBuild: null,
+    seq: 0,
+  };
+  const normalizeDetail = detail => Object.fromEntries(Object.entries(detail || {}).slice(0, 16).map(([key, value]) => {
+    if (Array.isArray(value)) return [key, value.slice(0, 16).map(item => typeof item === "string" ? item.slice(0, 512) : item)];
+    if (typeof value === "string") return [key, value.slice(0, 512)];
+    return [key, value ?? null];
+  }));
+  const trace = (stage, detail = {}) => {
+    const payload = {
+      schemaVersion: 1,
+      attemptId: state.attemptId,
+      runId: state.runId,
+      compatibilityId: state.compatibilityId,
+      receiverBuild: state.receiverBuild,
+      seq: ++state.seq,
+      atMs: Date.now(),
+      stage,
+      detail: normalizeDetail(detail),
+    };
+    fetch("/__diag/client", {
+      method: "POST",
+      credentials: "same-origin",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  };
+  window.__bubbleplayDebugTrace = {
+    attemptId: state.attemptId,
+    configure({ runId, compatibilityId, receiverBuild }) {
+      if (runId === null || uuid.test(runId || "")) state.runId = runId?.toLowerCase() ?? null;
+      state.compatibilityId = compatibilityId || null;
+      state.receiverBuild = receiverBuild || null;
+    },
+    trace,
+  };
+  addEventListener("error", event => trace("window-error", {
+    message: String(event.message || "unknown"), source: String(event.filename || ""), line: event.lineno || 0,
+  }));
+  addEventListener("unhandledrejection", event => trace("unhandled-rejection", {
+    message: String(event.reason?.stack || event.reason || "unknown"),
+  }));
+  trace("bootstrap-inline", {
+    pathname: location.pathname,
+    transport: search.get("transport") || "auto",
+    decoderPath: search.get("decoderPath") || "native",
+    hasLabRun: state.runId !== null,
+  });
+})();
+</script>
 <script type="module">
 "use strict";
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats, computeQosRxWindow, createQosPayload, parseHostQuality } from "/latency.js";
 import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateIceServers } from "/turn.js";
 import {
+  shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
   shouldRecycleSignalingForPeerState,
 } from "/recovery.js";
-import { InputController, TouchGesture, Viewport } from "/input.js";
+ import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
+import { AdaptiveFrameDeadline, applyLateShardDeadline, classifyMediaShardV3, CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, OrderedFrameRelease, ParityFrameReassembler, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, selectStaleWssLane, selectWssMediaTopology, shouldDeferWssMediaStart, shouldRecoverWssStripeReconnect, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY, stripLabEdgeTrace, VariableParityFrameReassembler, validateWssTopology, WssLaneLifecycleTelemetry } from "/media.js";
+import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
+import { TRANSPORT, createCodecSession, parseAdaptive, parseQualityPreset, parseTransport, rtpCodecMimeTypes } from "/transport.js";
+
+const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
+const diagnosticAttemptId = window.__bubbleplayDebugTrace?.attemptId || null;
 
 // ---------------------------------------------------------------------------
 // BubblePlay browser client. Native WebRTC video is the normal display path;
 // WebCodecs remains an explicit diagnostic/experimental opt-in.
 //
 // Flow:
-//   1. Open WebSocket to /ws?token=…, send hello (role=client).
+//   1. Open the gate-cookie protected /ws, then send hello (role=client).
 //   2. On hello-ok: create RTCPeerConnection with one recvonly video
 //      transceiver (H.264) + one unordered/unreliable input DataChannel.
 //   3. createOffer -> send to host via the relay. Host answers.
@@ -70,16 +275,27 @@ import { InputController, TouchGesture, Viewport } from "/input.js";
 // ---------------------------------------------------------------------------
 
 let screen = document.getElementById("screen");
+const sharpScreen = document.getElementById("sharp-screen");
 const stage = document.getElementById("stage");
 const visual = document.getElementById("visual");
 const inputSurface = document.getElementById("input-surface");
 const hud = document.getElementById("hud");
+const connectionStatus = document.getElementById("connection-status");
+const connectionStatusLabel = document.getElementById("connection-status-label");
+const secureDesktopStatus = document.getElementById("secure-desktop-status");
+const diagnosticsOutput = document.getElementById("diagnostics-output");
 // Do not create a main-thread context until the legacy path is selected:
 // transferControlToOffscreen is only legal before a rendering context exists.
 let ctx = null;
+let sharpCtx = null;
+let lastDecodedDimensions = null;
 function ensureMainCanvas() {
   if (!ctx) ctx = screen.getContext("2d", { alpha: false, desynchronized: true });
   return ctx;
+}
+function ensureSharpCanvas() {
+  if (!sharpCtx) sharpCtx = sharpScreen.getContext("2d", { alpha: false, desynchronized: true });
+  return sharpCtx;
 }
 
 function replaceTransferredCanvas() {
@@ -90,27 +306,383 @@ function replaceTransferredCanvas() {
   ctx = null;
 }
 
-// ---- token ----------------------------------------------------------------
+function releaseWebRtcVideoSink() {
+  try { decoder?.close(); } catch {}
+  decoder = null;
+  if (encodedWorker) {
+    encodedWorker.terminate();
+    encodedWorker = null;
+    replaceTransferredCanvas();
+  }
+  encodedWorkerStats = null;
+  activeVideo?.remove();
+  activeVideo = null;
+  nativePresentation = null;
+}
+
 const params = new URLSearchParams(location.search);
+function parseLabRun(searchParams) {
+  const value = searchParams.get("labRun") || "";
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : null;
+}
+const labRun = parseLabRun(params);
+const labCompatibilityId = labRun ? STREAM_LAB_COMPATIBILITY.id : null;
+function parseRequestedWssTopology(searchParams, runId) {
+  if (!runId || !searchParams.has("wssLanes")) return null;
+  const laneCount = Number(searchParams.get("wssLanes"));
+  const parityShards = Number(searchParams.get("wssParity") ?? 1);
+  const topology = { laneCount, dataShards: laneCount - parityShards, parityShards };
+  return validateWssTopology(topology) ? topology : null;
+}
+const requestedWssTopology = parseRequestedWssTopology(params, labRun);
+const V2_WSS_TOPOLOGY = Object.freeze({ laneCount: 4, dataShards: 3, parityShards: 1 });
 const useWebCodecs = params.get("decoderPath") === "webcodecs";
+const requestedTransport = parseTransport(params);
+let qualityPreset = parseQualityPreset(params, localStorage);
+let wssAdaptive = qualityPreset === "auto" || parseAdaptive(params);
+const codecSession = createCodecSession(); // page-local: never persisted
 const diagnosticsEnabled = params.get("diag") === "1";
 const profilingEnabled = params.get("profile") === "1" || diagnosticsEnabled;
+const INDEX_ASSET_BUILD = STREAM_LAB_COMPATIBILITY.receiverBuild;
+window.__bubbleplayDebugTrace?.configure({
+  runId: labRun,
+  compatibilityId: labCompatibilityId,
+  receiverBuild: INDEX_ASSET_BUILD,
+});
+debugTrace("module-ready", {
+  mediaBuild: MEDIA_ASSET_BUILD,
+  transport: requestedTransport,
+  decoderPath: useWebCodecs ? "webcodecs" : "native",
+  hasLabRun: labRun !== null,
+});
+const fullFrameDiagnostic = params.get("fullFrame") === "1";
 const iceTransportPolicy = parseIceTransportPolicy(params);
 const profileSessionId = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 let profileSequence = 0;
 let qosSequence = 0;
 let latestRtcProfile = null;
 let hostQuality = null;
-let token = params.get("token") || localStorage.getItem("bp_token") || "";
-if (!token) {
-  token = prompt("BubblePlay token:");
+let latestBenchStatus = null;
+let latestBenchStatusRejection = null;
+const sharpZoomEnabled = !fullFrameDiagnostic && params.get("sharpZoom") !== "0";
+const desktopState = document.getElementById("desktop-state");
+const desktopStateTitle = document.getElementById("desktop-state-title");
+const desktopStateDetail = document.getElementById("desktop-state-detail");
+const firstFrameRetry = document.getElementById("first-frame-retry");
+let desktopAvailable = true;
+let desktopAwaitingFrame = false;
+let suppressDesktopTransitionOverlay = false;
+let transitionNeedsKeyframe = false;
+let desktopKind = "default";
+let desktopInputState = "enabled";
+let desktopGeneration = null;
+let hostCapabilities = { serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false,
+  mediaProtocols: [2], maxWssLanes: 4, wssFec: ["xor-1"] };
+let hostCapabilitiesGeneration = 0;
+let hasPresentedFrame = false;
+const firstFrameHandshake = { requestId: null, transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, failureReason: "", timer: null };
+const labQualityKeyframeAcks = new Map();
+let viewportRevision = 0;
+let viewportTimer = null;
+let viewportLast = null;
+let viewportState = { enabled: false, revision: 0, generation: 0 };
+let viewportPending = null;
+let viewportDesired = null;
+let viewportTransitionTimer = null;
+let viewportLastSentAt = -Infinity;
+let viewportConsecutiveTimeouts = 0;
+let sharpDisabledForSession = false;
+let renderedSharpView = null;
+let viewportTelemetry = { state: "full", revision: 0, generation: 0, crop: "1920x1080@0,0" };
+const clientBuild = "edge-instrument-2026-08-17";
+
+function renderDesktopState() {
+  document.body.classList.toggle("desktop-unavailable", !desktopAvailable);
+  const state = !desktopAvailable ? "unavailable" : desktopAwaitingFrame ? (firstFrameHandshake.phase === "failed" ? "failed" : firstFrameHandshake.phase === "retrying" ? "retrying" : "starting") : "ready";
+  desktopState.dataset.state = state;
+  desktopState.hidden = state === "ready" || (suppressDesktopTransitionOverlay && hasPresentedFrame && desktopAwaitingFrame);
+  desktopStateTitle.textContent = state === "unavailable" ? "Windows desktop unavailable" : state === "failed" ? (hasPresentedFrame ? "Stream paused" : "Stream did not start") : state === "retrying" ? (hasPresentedFrame ? "Reconnecting…" : "Still starting the stream…") : (hasPresentedFrame ? "Refreshing stream…" : "Starting stream…");
+  desktopStateDetail.textContent = state === "unavailable" ? (hasPresentedFrame ? "The last frame remains visible. Input is released until the desktop returns." : "The secure or locked desktop cannot be captured right now.") : state === "failed" ? `${hasPresentedFrame ? "The last frame remains visible; " : ""}no new frame arrived${firstFrameHandshake.failureReason ? ` (${firstFrameHandshake.failureReason})` : ""}.` : state === "retrying" ? "Input is released while BubblePlay rebuilds the media path." : firstFrameHandshake.phase === "in-flight" ? "The host admitted a keyframe; waiting for browser presentation." : (hasPresentedFrame ? "The last frame remains visible while a fresh keyframe arrives." : "Waiting for the first visible frame.");
 }
-if (token) {
-  localStorage.setItem("bp_token", token);
+function handleDesktopState(message) {
+  if (message?.state !== "unavailable" && message?.state !== "active") return;
+  const desktopGenerationChanged = Number.isInteger(message.generation) &&
+    message.generation !== desktopGeneration;
+  if (Number.isInteger(message.generation)) desktopGeneration = message.generation;
+  if (["default", "secure", "none"].includes(message.desktop)) desktopKind = message.desktop;
+  if (["enabled", "suspended", "read-only"].includes(message.input)) desktopInputState = message.input;
+  if (desktopInputState !== "enabled") releaseInput(false);
+  const secureDesktop = desktopKind === "secure";
+  document.body.classList.toggle("secure-desktop", secureDesktop);
+  secureDesktopStatus.hidden = !secureDesktop;
+  keyboardInput.setAttribute("autocorrect", secureDesktop ? "off" : "on");
+  keyboardInput.setAttribute("autocomplete", secureDesktop ? "off" : "on");
+  keyboardInput.setAttribute("autocapitalize", secureDesktop ? "off" : "sentences");
+  keyboardInput.spellcheck = !secureDesktop;
+  if (secureDesktop) keyboardStatus.textContent = desktopInputState === "enabled" ? "Protected typing is active. Paste and autocorrect are disabled." : "Secure desktop is read-only.";
+  else if (keyboardStatus.textContent.startsWith("Protected") || keyboardStatus.textContent.includes("secure desktop")) keyboardStatus.textContent = "Native text input is ready.";
+  // Monitor changes intentionally announce an unavailable/active pair while
+  // the host rebuilds capture and emits the new-generation IDR. The old frame
+  // is still a valid visible desktop during that short transition, so do not
+  // replace it with the global startup card or restart the handshake.
+  const monitorTransition = message.reason === "monitor-switch" || message.reason === "monitor-switched";
+  const sourceTransition = message.state === "active" && ["desktop-switched", "capture-recovered", "session-changed", "agent-restarted"].includes(message.reason);
+  const alreadyRendering = hudState.presented > 0 || framesDrawn > 0 || firstFrameHandshake.phase === "ready" || firstFrameHandshake.phase === "presented";
+  if (monitorTransition && alreadyRendering) {
+    desktopAvailable = true;
+    desktopAwaitingFrame = true;
+    suppressDesktopTransitionOverlay = true;
+    releaseInput(false);
+    renderDesktopState();
+    if (message.state === "active") {
+      if (!usingWssMedia) {
+        restartPeer("monitor-transition", false);
+        return;
+      }
+      startFirstFrameHandshake("monitor-transition", true);
+    }
+    return;
+  }
+  // Keep the last decoded frame visible across UAC/Winlogon/default desktop
+  // changes, but never treat it as proof that the newly selected desktop is
+  // ready for input. Only presentation from the new handshake clears this
+  // gate in markFirstFramePresented().
+  if (sourceTransition && alreadyRendering) {
+    desktopAvailable = true;
+    desktopAwaitingFrame = true;
+    suppressDesktopTransitionOverlay = false;
+    releaseInput(false);
+    renderDesktopState();
+    // WebRTC does not expose BubblePlay's host media generation. Recreate the
+    // complete receiver epoch so neither native-video jitter buffers nor a
+    // WebCodecs worker can authorize Winlogon/default input with an old frame.
+    // WSS carries an explicit generation and can transition in place.
+    if (!usingWssMedia) {
+      restartPeer("desktop-source-transition", false);
+      return;
+    }
+    startFirstFrameHandshake("desktop-source-transition", true);
+    return;
+  }
+  desktopAvailable = message.state === "active";
+  desktopAwaitingFrame = true;
+  suppressDesktopTransitionOverlay = false;
+  if (!desktopAvailable) {
+    clearFirstFrameWatchdog();
+    firstFrameHandshake.phase = "idle";
+  }
+  releaseInput(false);
+  if (!desktopAvailable) sharpScreen.classList.remove("active");
+  renderDesktopState();
+  if (desktopAvailable) startFirstFrameHandshake("desktop-state", desktopGenerationChanged);
+}
+function clearFirstFrameWatchdog() {
+  if (firstFrameHandshake.timer !== null) clearTimeout(firstFrameHandshake.timer);
+  firstFrameHandshake.timer = null;
+}
+function firstFrameRequestId() {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function sendFirstFrameRequest() {
+  if (!firstFrameHandshake.requestId || ws?.readyState !== WebSocket.OPEN) return false;
+  sendSignal({ type: "first-frame", protocol: 1, phase: "request", requestId: firstFrameHandshake.requestId, transport: firstFrameHandshake.transport, ...(firstFrameHandshake.epoch ? { epoch: firstFrameHandshake.epoch } : {}) });
+  return true;
+}
+function armFirstFrameWatchdog() {
+  clearFirstFrameWatchdog();
+  const requestId = firstFrameHandshake.requestId;
+  firstFrameHandshake.timer = setTimeout(() => {
+    if (requestId !== firstFrameHandshake.requestId || firstFrameHandshake.presented) return;
+    if (firstFrameHandshake.retries < 1) {
+      firstFrameHandshake.retries++;
+      firstFrameHandshake.phase = "retrying";
+      renderDesktopState();
+      sendFirstFrameRequest();
+      sendSignal({ type: "media-control", action: "keyframe", protocol: wssProtocol, epoch: firstFrameHandshake.epoch, reason: "first-frame-timeout", codec: codecSession.codec });
+      armFirstFrameWatchdog();
+    } else {
+      firstFrameHandshake.phase = "failed";
+      firstFrameHandshake.failureReason = "presentation-timeout";
+      firstFrameHandshake.timer = null;
+      renderDesktopState();
+      recoverWssStartup("presentation-timeout");
+    }
+  }, 5_000);
+}
+function startFirstFrameHandshake(reason, forceNew = false) {
+  if (ws?.readyState !== WebSocket.OPEN) return;
+  const transport = usingWssMedia ? "wss" : "webrtc";
+  const epoch = usingWssMedia ? mediaEpoch : null;
+  if (!forceNew && firstFrameHandshake.requestId && firstFrameHandshake.transport === transport && firstFrameHandshake.epoch === epoch && firstFrameHandshake.phase !== "failed") return;
+  clearFirstFrameWatchdog();
+  firstFrameHandshake.requestId = firstFrameRequestId();
+  firstFrameHandshake.transport = transport;
+  firstFrameHandshake.epoch = epoch;
+  firstFrameHandshake.generation = 0;
+  firstFrameHandshake.phase = "starting";
+  firstFrameHandshake.retries = 0;
+  firstFrameHandshake.admitted = false;
+  firstFrameHandshake.presented = false;
+  transitionNeedsKeyframe = false;
+  firstFrameHandshake.requireAdmission = forceNew || reason === "desktop-source-transition" || reason === "monitor-transition";
+  transitionNeedsKeyframe = firstFrameHandshake.requireAdmission && !usingWssMedia && useWebCodecs;
+  firstFrameHandshake.failureReason = "";
+  desktopAvailable = true;
+  desktopAwaitingFrame = true;
+  renderDesktopState();
+  sendFirstFrameRequest();
+  sendClientLog("info", "first-frame-request", { reason, transport });
+  armFirstFrameWatchdog();
+}
+function markFirstFramePresented(presentedGeneration = null) {
+  if (firstFrameHandshake.presented) return true;
+  if (firstFrameHandshake.requireAdmission && !firstFrameHandshake.admitted) return false;
+  if (firstFrameHandshake.requireAdmission
+      && Number.isInteger(presentedGeneration)
+      && Number.isInteger(firstFrameHandshake.generation)
+      && firstFrameHandshake.generation !== 0
+      && presentedGeneration !== firstFrameHandshake.generation) return false;
+  if (usingWssMedia) wssStartupRecoveries = 0;
+  firstFrameHandshake.presented = true;
+  hasPresentedFrame = true;
+  document.body.classList.add("has-presented-frame");
+  firstFrameHandshake.phase = "presented";
+  debugTrace("first-presented", {
+    transport: usingWssMedia ? "wss" : "webrtc",
+    generation: Number.isInteger(presentedGeneration) ? presentedGeneration : 0,
+  });
+  clearFirstFrameWatchdog();
+  desktopAwaitingFrame = false;
+  suppressDesktopTransitionOverlay = false;
+  renderDesktopState();
+  showContextHint();
+  if (firstFrameHandshake.admitted && firstFrameHandshake.requestId) {
+    sendSignal({ type: "first-frame", protocol: 1, phase: "presented", requestId: firstFrameHandshake.requestId, generation: firstFrameHandshake.generation });
+  }
+  return true;
+}
+function handleFirstFrameMessage(message) {
+  if (message?.protocol === 1 && message.phase === "quality-keyframe-admitted") {
+    if (typeof message.requestId === "string" && Number.isInteger(message.generation) &&
+        Number.isInteger(message.sequence)) {
+      labQualityKeyframeAcks.set(message.requestId, {
+        requestId: message.requestId,
+        generation: message.generation,
+        sequence: message.sequence,
+      });
+      while (labQualityKeyframeAcks.size > 8)
+        labQualityKeyframeAcks.delete(labQualityKeyframeAcks.keys().next().value);
+    }
+    return;
+  }
+  if (!message || message.protocol !== 1 || message.requestId !== firstFrameHandshake.requestId) return;
+  if (message.phase === "admitted") {
+    firstFrameHandshake.admitted = true;
+    firstFrameHandshake.generation = Number.isInteger(message.generation) ? message.generation : firstFrameHandshake.generation;
+    firstFrameHandshake.phase = "in-flight";
+    if (firstFrameHandshake.requireAdmission && !usingWssMedia && useWebCodecs) {
+      transitionNeedsKeyframe = true;
+      resyncPipeline("desktop-transition-admitted");
+    }
+    renderDesktopState();
+    if (firstFrameHandshake.presented) sendSignal({ type: "first-frame", protocol: 1, phase: "presented", requestId: message.requestId, generation: firstFrameHandshake.generation });
+  } else if (message.phase === "failed") {
+    if (firstFrameHandshake.presented) {
+      // Visible output from this request is stronger evidence than a delayed
+      // host watchdog failure. Never recycle a healthy stream or resurrect
+      // the blocking startup card after presentation.
+      clearFirstFrameWatchdog();
+      firstFrameHandshake.phase = "presented";
+      firstFrameHandshake.failureReason = "";
+      desktopAwaitingFrame = false;
+      renderDesktopState();
+      sendClientLog("warn", "first-frame-failure-ignored", {
+        reason: String(message.reason || "host-failure").slice(0, 96),
+        generation: message.generation ?? null,
+      });
+      return;
+    }
+    firstFrameHandshake.phase = "failed";
+    firstFrameHandshake.failureReason = String(message.reason || "host-failure").slice(0, 96);
+    clearFirstFrameWatchdog();
+    renderDesktopState();
+    recoverWssStartup(firstFrameHandshake.failureReason);
+  } else if (message.phase === "ready") {
+    firstFrameHandshake.phase = "ready";
+    clearFirstFrameWatchdog();
+  }
+}
+let monitorList = [];
+let monitorListRevision = 0;
+let monitorSwitchPending = null;
+function renderMonitorList() {
+  const list = document.getElementById("monitor-list");
+  const status = document.getElementById("monitor-status");
+  if (!list || !status) return;
+  list.replaceChildren();
+  if (!monitorList.length) { status.textContent = "No monitor information yet."; return; }
+  status.textContent = monitorSwitchPending ? "Switching display…" : "Select a display for the stream.";
+  for (const monitor of monitorList) {
+    const button = document.createElement("button");
+    button.className = `monitor-card${monitor.selected ? " current" : ""}`;
+    button.disabled = !!monitorSwitchPending;
+    const label = document.createElement("span");
+    label.textContent = monitor.name || monitor.selector;
+    const detail = document.createElement("small");
+    detail.textContent = `${monitor.width || "?"}×${monitor.height || "?"}${monitor.selected ? " · current" : ""}`;
+    label.append(detail);
+    button.append(label);
+    button.onclick = () => requestMonitor(monitor.selector);
+    list.append(button);
+  }
+}
+function handleMonitorList(message) {
+  if (!Array.isArray(message.monitors) || message.monitors.length > 16) return;
+  monitorList = message.monitors.filter(m => m && typeof m.selector === "string" && m.selector.length <= 128)
+    .map(m => ({ selector: m.selector, name: typeof m.name === "string" ? m.name : m.selector, width: Number(m.width) || 0, height: Number(m.height) || 0, selected: !!m.selected }));
+  monitorListRevision++;
+  const selected = monitorList.find(m => m.selected);
+  const sessionDisplay = document.getElementById("session-display");
+  if (sessionDisplay) sessionDisplay.textContent = selected?.name || "No display selected";
+  if (selected?.width > 0 && selected?.height > 0 && typeof remoteDesktop !== "undefined") {
+    remoteDesktop.width = selected.width; remoteDesktop.height = selected.height;
+    syncViewportAndFollow?.();
+  }
+  monitorSwitchPending = null;
+  renderMonitorList();
+}
+function handleMonitorError(message) {
+  monitorSwitchPending = null;
+  const status = document.getElementById("monitor-status");
+  if (status) status.textContent = `Monitor switch failed: ${String(message.reason || "unknown error").slice(0, 180)}`;
+  renderMonitorList();
+}
+function requestMonitor(selector) {
+  if (monitorSwitchPending || !inputReady && !usingWssMedia) return false;
+  monitorSwitchPending = selector;
+  renderMonitorList();
+  sendSignal({ type: "media-control", action: "monitor", protocol: usingWssMedia ? wssProtocol : 2, epoch: mediaEpoch, monitor: selector, reason: "user-monitor" });
+  return true;
 }
 
 // ---- status HUD ------------------------------------------------------------
-const hudState = { ws: "…", ice: "…", route: "…", dc: "…", control: "…", motion: "…", motionSent: 0, motionCoalesced: 0, motionDropped: 0, zoom: 1, touch: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: "…", dimensions: "…" };
+const hudState = { ws: "…", ice: "…", route: "…", dc: "…", control: "…", motion: "…", pointer: "desktop", cursorSeq: "…/…", cursorAge: "…", motionSent: 0, motionCoalesced: 0, motionDropped: 0, zoom: 1, touch: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: 0, dimensions: "…", mediaGeneration: "…" };
+function renderConnectionStatus() {
+  let state = "connecting";
+  let label = "Connecting…";
+  if (terminalSignalingFailure) { state = "error"; label = "Session unavailable"; }
+  else if (!desktopAvailable) { state = "error"; label = "Desktop unavailable"; }
+  else if (inputReady && usingWssMedia) { state = "connected"; label = "Connected · WSS"; }
+  else if (inputReady && (hudState.ice === "connected" || hudState.ice === "completed" || hudState.ice === "connected/connected")) { state = "connected"; label = "Connected · WebRTC"; }
+  else if (hudState.ws.startsWith("reconnecting") || hudState.ws === "closed") { label = "Reconnecting…"; }
+  else if (hudState.ws === "error") { state = "error"; label = "Connection error"; }
+  connectionStatus.dataset.state = state;
+  connectionStatusLabel.textContent = label;
+  const sessionTransport = document.getElementById("session-transport");
+  if (sessionTransport) sessionTransport.textContent = label.replace(" · ", " via ");
+}
 function qualityHudText() {
   if (!hostQuality) return "quality …";
   const target = `${Math.round(hostQuality.targetBitrateBps / 1_000)}k`;
@@ -118,13 +690,17 @@ function qualityHudText() {
   return `quality ${hostQuality.profile} ${hostQuality.width}x${hostQuality.height}@${hostQuality.fps} ${target}/${bwe} ${hostQuality.reason}`;
 }
 setInterval(() => {
+  if (cursorReconciler?.feedbackAt !== null && cursorReconciler?.feedbackAt !== undefined) hudState.cursorAge = Math.round(performance.now()-cursorReconciler.feedbackAt);
   hud.innerHTML =
     `ws ${hudState.ws} | ice ${hudState.ice} | route ${hudState.route} | control ${hudState.control} motion ${hudState.motion}\n` +
-    `zoom ${hudState.zoom}× | motion ${hudState.motionSent}/${hudState.motionCoalesced}/${hudState.motionDropped} | touch ${hudState.touch}\n` +
+    `zoom ${hudState.zoom}× | pointer ${hudState.pointer} ${hudState.cursorSeq} ${hudState.cursorAge}ms | motion ${hudState.motionSent}/${hudState.motionCoalesced}/${hudState.motionDropped} | touch ${hudState.touch}\n` +
     `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +
     `presented ${hudState.presented} | gap ${hudState.frameGap}/${hudState.maxFrameGap}ms | ${hudState.dimensions}\n` +
     `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps\n` +
+    `${clientBuild} | ${fullFrameDiagnostic ? "full-frame" : "sharp-zoom"} | media g${hudState.mediaGeneration} | view ${viewportTelemetry.state} r${viewportTelemetry.revision} ${viewportTelemetry.crop}\n` +
     qualityHudText();
+  if (diagnosticsOutput && diagnosticsVisible) diagnosticsOutput.textContent = diagnosticsReport();
+  renderConnectionStatus();
 }, 250);
 
 // ---- signaling --------------------------------------------------------------
@@ -138,30 +714,156 @@ let lastIceCandidateError = null;
 let dc = null, motionDc = null;
 let inputReady = false;
 let closingPeer = false;
+let cursorReconciler = null;
+const latchedModifiers = new Set();
 const input = new InputController({
-  sendControl: data => { if (dc?.readyState === "open") try { dc.send(data); return true; } catch {} return false; },
-  sendMotion: data => { if (motionDc?.readyState === "open") try { motionDc.send(data); return true; } catch {} return false; },
-  motionBuffered: () => motionDc?.bufferedAmount || 0,
+  sendControl: data => sendInput(data, dc),
+  sendMotion: data => sendInput(data, motionDc),
+  motionBuffered: () => motionDc?.bufferedAmount || (usingWssMedia ? ws?.bufferedAmount || 0 : 0),
 });
+function sendInput(data, channel) {
+  if (desktopInputState !== "enabled") return false;
+  if (!desktopAvailable || desktopAwaitingFrame) return false;
+  if (channel?.readyState === "open") try { channel.send(data); return true; } catch {}
+  // The WSS media fallback deliberately keeps input/cursor on /ws.
+  if (usingWssMedia && ws?.readyState === WebSocket.OPEN && ws.bufferedAmount <= 16_384) try { ws.send(data); return true; } catch {}
+  return false;
+}
 let motionFrame = null;
 function armMotionFlush() { if (motionFrame === null) motionFrame = requestAnimationFrame(() => { motionFrame = null; input.flushMotion(); hudState.motionSent = input.stats.sent; hudState.motionCoalesced = input.stats.coalesced; hudState.motionDropped = input.stats.dropped; }); }
 function queueMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motion(dx, dy, wheelX, wheelY); armMotionFlush(); }
+function updateMotionHud() { hudState.motionSent = input.stats.sent; hudState.motionCoalesced = input.stats.coalesced; hudState.motionDropped = input.stats.dropped; }
+function queueTouchMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motionNow(dx, dy, wheelX, wheelY); updateMotionHud(); }
+function queueTouchAbsolute(x, y) { input.absolute(x, y); const sent = input.flushMotion(); if (sent) cursorReconciler?.noteSent(input.lastSentSequence); updateMotionHud(); return sent; }
 function queueAbsolute(x, y) { input.absolute(x, y); armMotionFlush(); }
-function releaseInput(send = dc?.readyState === "open") { input.releaseAll(send); held.clear(); buttons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; }
+function releaseInput(send = dc?.readyState === "open") { input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; renderKeyboardModifiers?.(); }
 let connected = false;
 let offerSent = false;
 let peerGeneration = 0;
 let pendingRemoteIce = [];
 let remoteDescriptionSet = false;
 let currentIceServers = STUN_FALLBACK;
+let mediaEpoch = null;
+let usingWssMedia = false;
+let wssSelected = requestedTransport === TRANSPORT.WSS;
+let wssMediaSockets = [];
+let wssReconnectTimers = [];
+const wssLaneLifecycle = new WssLaneLifecycleTelemetry();
+let wssStripeOpened = [];
+let wssStripeEverOpened = [];
+let wssDiagnosticLaneFaultUntil = [];
+let wssReassembler = new ParityFrameReassembler();
+let wssProtocol = requestedWssTopology ? 3 : 2;
+let wssTopology = requestedWssTopology || V2_WSS_TOPOLOGY;
+let wssTopologyAccepted = wssProtocol === 2;
+let wssV3Rejected = false;
+let wssOrdered = new OrderedFrameRelease();
+let wssKeyframeTimer = null;
+let wssDecoderEpoch = 0;
+let wssNoOutputFailures = 0;
+let wssRecoveryPending = false;
+let wssRecoveryState = "awaiting-keyframe";
+let wssLastRecoveryAt = -Infinity;
+let wssDependencyLosses = 0;
+let wssBackpressureSince = null;
+const wssDeadline = new AdaptiveFrameDeadline({ mode: "work" });
+let wssTailDeadlineTelemetry = {
+  observations: 0,
+  raises: 0,
+  maxAgeMs: 0,
+  lastAgeMs: null,
+  previousDeadlineMs: null,
+  deadlineMs: wssDeadline.deadlineMs,
+  raisedByMs: 0,
+};
+let wssStartupRecoveries = 0;
+let wssExpiryTimer = null;
+let wssAckTimer = null;
+let wssAckAttempts = 0;
+let wssAckSent = 0;
+let wssAckFailed = 0;
+let wssLastAckAttempt = null;
+let wssStartedHost = false;
+let wssStartInFlight = false;
+let wssStartDeadlineAt = 0;
+let wssStartDeadlineTimer = null;
+let wssStaleLaneRecycleAt = 0;
+let wssCapabilityTimer = null;
+let wssPresentedSequence = 0;
+let wssShardPackets = 0;
+let debugFirstMediaPacket = false;
+let debugFirstMediaReconstructed = false;
+let debugFirstDecoderConfigured = false;
+let debugFirstDecoderOutput = false;
+let wssMediaReceivedBytes = 0;
+let wssMediaReceivedPackets = 0;
+let wssPacketRejects = { total: 0, byReason: {} };
+let wssDecodeSequenceByTimestamp = new Map();
+let wssFrameMeta = new WeakMap();
+let wssLatestFrameTrace = null;
+let wssPresentedFrameTraces = new Map();
+let wssPresentedIdentityFramesRemaining = 0;
+let wssTimestampFallbackLogged = false;
+const hybridTileCache = new HybridTileCache();
+const hevcTileCache = new HevcTileCache();
+let iceFallbackTimer = null;
+let rtpFallbackTimer = null;
+let clientLogSequence = 0;
+let signalingRegistered = false;
+let signalingRegisteredAtMs = null;
+let signalingHostEvidence = { seen: false, type: null, atMs: null };
+let lastSignalingError = null;
+let lastSignalingRecycle = null;
 
 function isCurrentPeer(generation, candidate = pc) {
   return generation === peerGeneration && candidate === pc;
 }
 
 function sendSignal(message) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+  if (ws?.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify(message));
+  return true;
 }
+
+function recordHostEvidence(type) {
+  signalingHostEvidence = { seen: true, type, atMs: Date.now() };
+}
+
+function recordSignalingError(kind, message, detail = null) {
+  lastSignalingError = { kind, message: String(message || kind), detail, atMs: Date.now() };
+}
+
+function sendClientLog(level, event, detail = {}) {
+  if (!signalingRegistered || ws?.readyState !== WebSocket.OPEN || ws.bufferedAmount > 32_768) return;
+  const message = JSON.stringify({ type: "client-log", seq: ++clientLogSequence, atMs: Date.now(),
+    level, event, detail: { attemptId: diagnosticAttemptId, build: clientBuild, transport: requestedTransport, codec: codecSession.codec, ...detail } });
+  if (message.length <= 2_048) ws.send(message);
+}
+
+setInterval(() => sendClientLog("info", "client-health", {
+  hud: { ice: hudState.ice, decoder: hudState.dec, fps: hudState.fps, presented: hudState.presented,
+    drops: hudState.dropped, resets: hudState.resyncs, gapMs: hudState.frameGap, maxGapMs: hudState.maxFrameGap,
+    dimensions: hudState.dimensions, generation: hudState.mediaGeneration },
+  media: { reconstructed: wssReassembler.highestReconstructed, presented: wssPresentedSequence,
+    recovered: wssReassembler.stats.recoveredFrames, expired: wssReassembler.stats.expiredFrames,
+    dependencyLosses: wssDependencyLosses, deadlineMs: wssDeadline.deadlineMs,
+    reassemblyP95Ms: wssDeadline.p95Ms, recoveryState: wssRecoveryState,
+    tailDeadline: { ...wssTailDeadlineTelemetry },
+    stripes: wssStripeOpened.filter(Boolean).length, packets: wssShardPackets,
+    presentation: framePresentationTelemetry.snapshot(),
+    hybrid: activeWssHybridCache().snapshot() },
+  view: viewportHealthSnapshot(),
+  input: { ready: inputReady, state: desktopInputState,
+    sent: input.stats.controlSent, rejected: input.stats.controlDropped,
+    motionSent: input.stats.sent, motionRejected: input.stats.dropped },
+}), 5_000);
+
+addEventListener("error", event => sendClientLog("error", "window-error", {
+  message: String(event.message || "unknown"), source: String(event.filename || ""), line: event.lineno || 0,
+}));
+addEventListener("unhandledrejection", event => sendClientLog("error", "unhandled-rejection", {
+  message: String(event.reason?.stack || event.reason || "unknown"),
+}));
 
 function reconnectSignaling(reason) {
   if (terminalSignalingFailure) return;
@@ -170,16 +872,28 @@ function reconnectSignaling(reason) {
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     const generation = ++signalingGeneration;
-    const socket = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
+    const socketUrl = signalingSocketUrl();
+    debugTrace("signaling-construct", {
+      path: new URL(socketUrl).pathname,
+      generation,
+      reason,
+      hasLabRun: labRun !== null,
+    });
+    const socket = new WebSocket(socketUrl);
+    socket.binaryType = "arraybuffer";
     ws = socket;
     socket.onopen = () => {
       if (ws !== socket || generation !== signalingGeneration) return;
       hudState.ws = "open";
-      sendSignal({ type: "hello", token, role: "client" });
+      debugTrace("signaling-open", { generation });
+      sendSignal({ type: "hello", role: "client" });
     };
     socket.onclose = (event) => {
       if (ws !== socket || generation !== signalingGeneration) return;
       hudState.ws = "closed";
+      signalingRegistered = false;
+      recordSignalingError("socket-close", `WebSocket closed (${event.code})`, { code: event.code, reason: event.reason || "" });
+      debugTrace("signaling-close", { generation, code: event.code, reason: event.reason || "" });
       hud.classList.add("bad");
       if (!shouldReconnectAfterClose(event.code, terminalSignalingFailure)) {
         terminalSignalingFailure = true;
@@ -188,17 +902,47 @@ function reconnectSignaling(reason) {
       restartPeer("ws-closed", false);
       reconnectSignaling("ws-closed");
     };
-    socket.onerror = () => { if (ws === socket) hudState.ws = "error"; };
+    socket.onerror = () => { if (ws === socket) { hudState.ws = "error"; recordSignalingError("socket-error", "WebSocket signaling error"); debugTrace("signaling-error", { generation }); } };
     socket.onmessage = (ev) => handleSignal(socket, generation, ev);
   }, 250);
 }
 
+function signalingSocketUrl() {
+  const path = labRun ? "/lab-ws" : "/ws";
+  const query = labRun
+    ? `?run=${encodeURIComponent(labRun)}&compat=${encodeURIComponent(labCompatibilityId)}`
+    : "";
+  return `${proto}//${location.host}${path}${query}`;
+}
+
 function recycleSignaling(reason) {
   if (terminalSignalingFailure) return;
+  const renderedAgeMs = lastRenderedDueMs === null ? null : performance.now() - lastRenderedDueMs;
+  const diagnostic = createSignalingRecycleDiagnostic({
+    reason,
+    signalingGeneration,
+    signalingRegistered,
+    socketReadyState: ws?.readyState ?? null,
+    usingWssMedia,
+    wssProtocol,
+    laneCount: wssTopology.laneCount,
+    openLanes: wssStripeOpened.filter(Boolean).length,
+    mediaGeneration: wssReassembler.generation,
+    reconstructed: wssReassembler.highestReconstructed,
+    presented: wssPresentedSequence,
+    receivedPackets: wssMediaReceivedPackets,
+    recoveryState: wssRecoveryState,
+    renderedAgeMs,
+    online: navigator.onLine,
+  });
+  lastSignalingRecycle = { ...diagnostic, atMs: Date.now() };
+  debugTrace("signaling-recycle", diagnostic);
+  sendClientLog("warn", "signaling-recycle", diagnostic);
   // Invalidate first so the intentional close cannot restart a peer with
   // credentials from the old signaling epoch.
   const socket = ws;
   ws = null;
+  signalingRegistered = false;
   signalingGeneration++;
   try { socket?.close(1000, reason); } catch {}
   reconnectSignaling(reason);
@@ -206,13 +950,25 @@ function recycleSignaling(reason) {
 
 async function handleSignal(socket, generation, ev) {
   if (ws !== socket || generation !== signalingGeneration) return;
+  if (ev.data instanceof ArrayBuffer || ArrayBuffer.isView(ev.data)) {
+    handleCursorState(ev.data);
+    return;
+  }
   let msg;
   try { msg = JSON.parse(ev.data); } catch { return; }
+  if (["answer", "ice", "quality", "bench-status", "media-view", "desktop-state", "host-capabilities", "media-topology", "first-frame", "monitor-list", "monitor-error"].includes(msg.type)) recordHostEvidence(msg.type);
   switch (msg.type) {
     case "hello-ok":
+      signalingRegistered = true;
+      signalingRegisteredAtMs = Date.now();
+      sendClientLog("info", "signaling-registered");
+      debugTrace("signaling-hello-ok", { generation, hasMediaEpoch: typeof msg.mediaEpoch === "string" });
       hudState.ws = "ok";
       currentIceServers = validateIceServers(msg.iceServers);
-      startPeer(peerGeneration);
+      mediaEpoch = /^[a-f0-9]{32}$/.test(msg.mediaEpoch || "") ? msg.mediaEpoch : null;
+      sendStreamMode("signaling-start");
+      if (wssSelected) requestWssMediaStart();
+      else startPeer(peerGeneration);
       break;
     case "answer": {
       const candidate = pc;
@@ -246,7 +1002,63 @@ async function handleSignal(socket, generation, ev) {
       if (quality) hostQuality = quality;
       break;
     }
+    case "bench-status":
+      latestBenchStatusRejection = null;
+      applyBenchStatus(msg);
+      break;
+    case "bench-status-rejected":
+      if (labRun && msg.protocol === 1 && typeof msg.reason === "string") {
+        latestBenchStatusRejection = { reason: msg.reason, atMs: Date.now() };
+        recordHostEvidence("bench-status-rejected");
+      }
+      break;
+    case "media-view":
+      handleMediaView(msg);
+      break;
+    case "desktop-state":
+      handleDesktopState(msg);
+      break;
+    case "host-capabilities":
+      hostCapabilities = {
+        serviceMode: msg.serviceMode === true,
+        coldBoot: msg.coldBoot === true,
+        secureDesktop: msg.secureDesktop === true,
+        secureText: msg.secureText === true,
+        mediaProtocols: Array.isArray(msg.mediaProtocols) ? msg.mediaProtocols.filter(value => value === 2 || value === 3) : [2],
+        maxWssLanes: Number.isInteger(msg.maxWssLanes) ? Math.max(4, Math.min(16, msg.maxWssLanes)) : 4,
+        wssFec: Array.isArray(msg.wssFec) ?
+          msg.wssFec.filter(value => value === "none" || value === "xor-1" || value === "rs-2") :
+          ["xor-1"],
+      };
+      hostCapabilitiesGeneration = generation;
+      if (wssSelected && !usingWssMedia) requestWssMediaStart();
+      break;
+    case "media-topology":
+      if (msg.protocol !== 3 || msg.epoch !== mediaEpoch || !validateWssTopology(msg.topology) ||
+          msg.topology.laneCount !== wssTopology.laneCount || msg.topology.dataShards !== wssTopology.dataShards ||
+          msg.topology.parityShards !== wssTopology.parityShards) break;
+      if (msg.status === "accepted") {
+        wssTopologyAccepted = true;
+        sendClientLog("info", "wss-topology-accepted", { topology: wssTopology });
+      } else if (msg.status === "rejected") {
+        wssV3Rejected = true;
+        sendClientLog("warn", "wss-topology-rejected", { topology: wssTopology, reason: msg.reason || "host-rejected" });
+        recycleSignaling("wss-topology-rejected");
+        restartPeer("wss-topology-rejected", false);
+      }
+      break;
+    case "first-frame":
+      handleFirstFrameMessage(msg);
+      break;
+    case "monitor-list":
+      handleMonitorList(msg);
+      break;
+    case "monitor-error":
+      handleMonitorError(msg);
+      break;
     case "error":
+      recordSignalingError("relay-error", msg.message, msg);
+      sendClientLog("error", "signaling-error", { message: msg.message });
       terminalSignalingFailure = true;
       hudState.ws = `err:${msg.message}`;
       hud.classList.add("bad");
@@ -270,6 +1082,15 @@ setInterval(() => {
 // ---- WebRTC ----------------------------------------------------------------
 function restartPeer(reason, reconnect = true) {
   const generation = ++peerGeneration;
+  clearFirstFrameWatchdog();
+  firstFrameHandshake.requestId = null;
+  firstFrameHandshake.phase = "idle";
+  firstFrameHandshake.admitted = false;
+  firstFrameHandshake.presented = false;
+  transitionNeedsKeyframe = false;
+  firstFrameHandshake.failureReason = "";
+  desktopAwaitingFrame = true;
+  renderDesktopState();
   hostQuality = null;
   cleanupPeer();
   pendingRemoteIce = [];
@@ -277,13 +1098,20 @@ function restartPeer(reason, reconnect = true) {
   offerSent = false;
   hudState.ice = reason;
   hud.classList.add("bad");
-  if (ws?.readyState === WebSocket.OPEN) startPeer(generation);
+  if (ws?.readyState === WebSocket.OPEN) {
+    if (wssSelected) requestWssMediaStart();
+    else startPeer(generation);
+  }
   else if (reconnect) reconnectSignaling(reason);
 }
 
 function cleanupPeer() {
+  if (usingWssMedia) stopWssMedia();
+  clearWssTimers();
   closingPeer = true;
   releaseInput(dc?.readyState === "open");
+  resetKeyboardDraft();
+  resetTouchCursor();
   inputReady = false;
   connected = false;
   try { dc?.close(); } catch {}
@@ -307,9 +1135,794 @@ function cleanupPeer() {
   hudState.route = "…";
   stage.classList.remove("native-video-input");
   resetRenderPacing();
+  resetPresentationCounters();
+}
+
+function clearWssTimers() {
+  clearTimeout(iceFallbackTimer); iceFallbackTimer = null;
+  clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
+  clearWssKeyframeWatchdog();
+  clearInterval(wssExpiryTimer); wssExpiryTimer = null;
+  clearTimeout(wssAckTimer); wssAckTimer = null;
+  clearTimeout(wssStartDeadlineTimer); wssStartDeadlineTimer = null;
+  clearTimeout(wssCapabilityTimer); wssCapabilityTimer = null;
+  for (const timer of wssReconnectTimers) clearTimeout(timer);
+  wssReconnectTimers = [];
+}
+
+function stopWssMedia() {
+  usingWssMedia = false;
+  clearWssTimers();
+  wssDecoderEpoch++;
+  for (const socket of wssMediaSockets) try { socket.close(1000, "switch"); } catch {}
+  wssMediaSockets = []; wssStripeOpened = []; wssStripeEverOpened = []; wssDiagnosticLaneFaultUntil = [];
+  wssLaneLifecycle.reset();
+  wssStartedHost = false; wssStartDeadlineAt = 0; wssStaleLaneRecycleAt = 0; wssReassembler.reset(); wssOrdered.reset();
+  wssPresentedSequence = 0; wssShardPackets = 0; wssDecodeSequenceByTimestamp.clear(); wssFrameMeta = new WeakMap();
+  wssAckAttempts = 0; wssAckSent = 0; wssAckFailed = 0; wssLastAckAttempt = null;
+  debugFirstMediaPacket = false; debugFirstMediaReconstructed = false;
+  debugFirstDecoderConfigured = false; debugFirstDecoderOutput = false;
+  wssPresentedFrameTraces.clear();
+  wssPresentedIdentityFramesRemaining = 0;
+  wssLatestFrameTrace = null; wssTimestampFallbackLogged = false;
+  clearWssHybridCaches();
+  requestWssKeyframe.lastAt = 0;
+  wssRecoveryPending = false;
+  wssRecoveryState = "awaiting-keyframe";
+  wssDependencyLosses = 0;
+  wssBackpressureSince = null;
+  wssLastRecoveryAt = -Infinity;
+  viewportState = { enabled: false, revision: viewportRevision, generation: 0 };
+  viewportPending = null;
+  viewportDesired = null;
+  viewportLast = null;
+  clearTimeout(viewportTimer); viewportTimer = null;
+  clearTimeout(viewportTransitionTimer); viewportTransitionTimer = null;
+  viewportConsecutiveTimeouts = 0;
+  sharpDisabledForSession = false;
+  renderedSharpView = null;
+  sharpScreen.classList.remove("active");
+}
+
+function noteOrderedDependencyLoss(before, reason) {
+  const added = Math.max(0, wssOrdered.dependencyLosses - before);
+  if (!added) return false;
+  wssDependencyLosses += added;
+  wssDeadline.noteExpiry();
+  beginWssRecovery(reason);
+  return true;
+}
+
+function processExpiredWssFrames(expired, reason = "v2-frame-expired") {
+  if (!expired.length) return false;
+  const before = wssOrdered.dependencyLosses;
+  for (const frame of expired) wssOrdered.markLost(frame.sequence);
+  wssReassembler.setTtlMs(wssDeadline.deadlineMs);
+  return noteOrderedDependencyLoss(before, reason);
+}
+
+function scheduleWssMediaReconnect(stripe, socketGeneration, delayMs, reason) {
+  clearTimeout(wssReconnectTimers[stripe]);
+  const boundedDelayMs = Math.max(0, Number(delayMs) || 0);
+  wssLaneLifecycle.reconnectScheduled(stripe, socketGeneration, reason, boundedDelayMs);
+  debugTrace("media-lane-reconnect-scheduled", {
+    stripe, socketGeneration, reason, delayMs: boundedDelayMs,
+  });
+  wssReconnectTimers[stripe] = setTimeout(() => {
+    if (!usingWssMedia || wssLaneLifecycle.currentGeneration(stripe) !== socketGeneration) return;
+    wssLaneLifecycle.reconnectFired(stripe, socketGeneration, reason);
+    debugTrace("media-lane-reconnect-fired", { stripe, socketGeneration, reason });
+    openWssMediaStripe(stripe);
+  }, boundedDelayMs);
+}
+
+function openWssMediaStripe(stripe) {
+  if (!usingWssMedia || !mediaEpoch) return;
+  const faultDelayMs = Math.max(0, Number(wssDiagnosticLaneFaultUntil[stripe] || 0) - performance.now());
+  if (faultDelayMs > 0) {
+    scheduleWssMediaReconnect(
+      stripe,
+      wssLaneLifecycle.currentGeneration(stripe),
+      faultDelayMs,
+      "diagnostic-lane-loss",
+    );
+    return;
+  }
+  const socketGeneration = wssLaneLifecycle.construct(stripe);
+  debugTrace("media-lane-construct", { stripe, socketGeneration });
+  const socket = new WebSocket(mediaSocketUrl(stripe));
+  socket.binaryType = "arraybuffer";
+  wssMediaSockets[stripe] = socket;
+  socket.onopen = () => {
+    if (!usingWssMedia || wssMediaSockets[stripe] !== socket) return;
+    wssLaneLifecycle.transportOpen(stripe, socketGeneration);
+    debugTrace("media-lane-transport-open", { stripe, socketGeneration });
+    socket.send(JSON.stringify({ type: "hello", role: "media-client" }));
+  };
+  socket.onmessage = (event) => {
+    if (!usingWssMedia || wssMediaSockets[stripe] !== socket) return;
+    if (typeof event.data === "string") {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === "media-forward") {
+          const registeredAtMs = Number(message.registeredAtMs);
+          wssLaneLifecycle.mediaForward(
+            stripe,
+            socketGeneration,
+            Number.isFinite(registeredAtMs) ? registeredAtMs : null,
+          );
+          debugTrace("media-lane-forward-target", {
+            stripe, socketGeneration,
+            registeredAtMs: Number.isFinite(registeredAtMs) ? registeredAtMs : null,
+          });
+          return;
+        }
+        if (message.type === "hello-ok") {
+          const registeredAtMs = Number(message.registeredAtMs);
+          wssLaneLifecycle.helloOk(
+            stripe,
+            socketGeneration,
+            Number.isFinite(registeredAtMs) ? registeredAtMs : null,
+          );
+          const reconnect = wssStripeEverOpened[stripe];
+          wssReassembler.noteLaneConnected?.(stripe);
+          wssStripeEverOpened[stripe] = true;
+          wssStripeOpened[stripe] = true; maybeStartWssHost();
+          debugTrace("media-lane-open", {
+            stripe, socketGeneration,
+            registeredAtMs: Number.isFinite(registeredAtMs) ? registeredAtMs : null,
+            openLanes: wssStripeOpened.filter(Boolean).length,
+          });
+          if (reconnect) {
+            if (shouldRecoverWssStripeReconnect({ protocol: wssProtocol, topology: wssTopology })) {
+              beginWssRecovery("stripe-reconnect");
+            } else {
+              // Parity keeps presentation healthy while one lane is absent,
+              // so preserve decoder state but tell the host that any recovery
+              // IDR sent before this replacement existed cannot be ACKed.
+              requestWssKeyframe("stripe-reconnect");
+            }
+          }
+        }
+      } catch { /* ignore non-protocol text */ }
+      return;
+    }
+    const trace = labRun
+      ? stripLabEdgeTrace(event.data, { requireEdgeTrace: true, requireHostTrace: true })
+      : { packet: event.data, edgeReceivedAtEpochMs: null, hostSentAtEpochMs: null, hostRoiTrace: null };
+    wssMediaReceivedBytes += event.data.byteLength;
+    wssMediaReceivedPackets++;
+    wssShardPackets++;
+    if (wssLaneLifecycle.firstPacket(stripe, socketGeneration, event.data.byteLength)) {
+      debugFirstMediaPacket = true;
+      const lane = wssLaneLifecycle.snapshot()[stripe];
+      debugTrace("media-first-packet", {
+        stripe, socketGeneration, bytes: event.data.byteLength, protocol: wssProtocol,
+        registeredAtMs: lane?.workerRegisteredAtMs ?? null,
+        forwardRegisteredAtMs: lane?.mediaForwardRegisteredAtMs ?? null,
+      });
+    }
+    if (trace.rejection) {
+      recordWssPacketRejection(trace.rejection, stripe);
+      return;
+    }
+    const { packet, edgeReceivedAtEpochMs, hostSentAtEpochMs, hostRoiTrace } = trace;
+    const packetRejection = wssProtocol === 3
+      ? classifyMediaShardV3(packet, {
+        topology: wssTopology,
+        lane: stripe,
+        generation: wssReassembler.generation,
+      })
+      : null;
+    if (packetRejection) {
+      recordWssPacketRejection(packetRejection, stripe);
+      return;
+    }
+    const frame = wssReassembler.push(
+      packet,
+      stripe,
+      event.timeStamp,
+      edgeReceivedAtEpochMs,
+      hostSentAtEpochMs,
+      hostRoiTrace,
+    );
+    const tailDeadlineUpdate = applyLateShardDeadline({
+      reassembler: wssReassembler,
+      ordered: wssOrdered,
+      deadline: wssDeadline,
+    });
+    if (tailDeadlineUpdate) {
+      wssTailDeadlineTelemetry.observations += tailDeadlineUpdate.observations;
+      wssTailDeadlineTelemetry.raises += tailDeadlineUpdate.raisedByMs > 0 ? 1 : 0;
+      wssTailDeadlineTelemetry.maxAgeMs = Math.max(
+        wssTailDeadlineTelemetry.maxAgeMs,
+        tailDeadlineUpdate.maxAgeMs,
+      );
+      wssTailDeadlineTelemetry.lastAgeMs = tailDeadlineUpdate.maxAgeMs;
+      wssTailDeadlineTelemetry.previousDeadlineMs = tailDeadlineUpdate.previousDeadlineMs;
+      wssTailDeadlineTelemetry.deadlineMs = tailDeadlineUpdate.deadlineMs;
+      wssTailDeadlineTelemetry.raisedByMs = tailDeadlineUpdate.raisedByMs;
+      debugTrace("wss-tail-deadline", { ...tailDeadlineUpdate });
+    }
+    const immediateAck = wssReassembler.takeImmediateAck?.() === true;
+    processExpiredWssFrames(wssReassembler.takeExpired());
+    if (wssReassembler.generation !== null) scheduleWssAck(wssReassembler.generation, immediateAck);
+    if (!frame) return;
+    if (!debugFirstMediaReconstructed) {
+      debugFirstMediaReconstructed = true;
+      debugTrace("media-first-reconstructed", {
+        generation: frame.generation, sequence: frame.sequence, recovered: frame.recovered === true,
+      });
+    }
+    wssDeadline.observeCompletion(wssReassembler.lastCompletionAgeMs);
+    wssReassembler.setTtlMs(wssDeadline.deadlineMs); wssOrdered.setTtlMs(wssDeadline.deadlineMs);
+    const lossBefore = wssOrdered.dependencyLosses;
+    for (const ordered of wssOrdered.push(frame)) {
+      scheduleWssAck(ordered.generation, ordered.key || ordered.recovered);
+      decodeWssFrame(ordered);
+    }
+    noteOrderedDependencyLoss(lossBefore, "v2-frame-expired");
+  };
+  socket.onclose = (event) => {
+    if (!usingWssMedia || wssMediaSockets[stripe] !== socket) return;
+    wssStripeOpened[stripe] = false;
+    hudState.ice = `wss stripe ${stripe} reconnecting`;
+    wssLaneLifecycle.close(stripe, socketGeneration, event);
+    debugTrace("media-lane-close", {
+      stripe, socketGeneration, code: event.code,
+      reason: event.reason || "", wasClean: event.wasClean,
+    });
+    const faultDelayMs = Math.max(0, Number(wssDiagnosticLaneFaultUntil[stripe] || 0) - performance.now());
+    scheduleWssMediaReconnect(
+      stripe,
+      socketGeneration,
+      Math.max(250, faultDelayMs),
+      faultDelayMs > 0 ? "diagnostic-lane-loss" : "socket-close",
+    );
+  };
+  socket.onerror = () => {
+    if (!usingWssMedia || wssMediaSockets[stripe] !== socket) return;
+    wssLaneLifecycle.error(stripe, socketGeneration);
+    debugTrace("media-lane-error", { stripe, socketGeneration });
+    try { socket.close(); } catch {}
+  };
+}
+
+function recycleStaleWssLane() {
+  if (wssProtocol !== 3 || performance.now() < wssStaleLaneRecycleAt) return false;
+  const stripe = selectStaleWssLane({
+    highestReconstructed: wssReassembler.highestReconstructed,
+    highestSequenceByLane: wssReassembler.highestSequence,
+    lastProgressAtMsByLane: wssReassembler.lastProgressAtMs,
+    openByLane: wssStripeOpened,
+    nowMs: performance.now(),
+  });
+  if (stripe === null) return false;
+  const lagFrames = (wssReassembler.highestReconstructed - wssReassembler.highestSequence[stripe]) >>> 0;
+  wssStaleLaneRecycleAt = performance.now() + 1_500;
+  wssStripeOpened[stripe] = false;
+  sendClientLog("warn", "wss-stale-lane-recycle", { stripe, lagFrames, topology: wssTopology });
+  const staleSocket = wssMediaSockets[stripe];
+  wssMediaSockets[stripe] = null;
+  scheduleWssMediaReconnect(
+    stripe,
+    wssLaneLifecycle.currentGeneration(stripe),
+    0,
+    "stale-lane"
+  );
+  try { staleSocket?.close(4001, "stale-lane"); } catch {}
+  return true;
+}
+
+function mediaSocketUrl(stripe) {
+  const path = labRun ? "/lab-media-ws" : "/media-ws";
+  const query = new URLSearchParams({ v: String(wssProtocol), epoch: mediaEpoch, stripe: String(stripe) });
+  if (labRun) {
+    query.set("run", labRun);
+    query.set("compat", labCompatibilityId);
+  }
+  return `${proto}//${location.host}${path}?${query}`;
+}
+
+function recordWssPacketRejection(reason, stripe) {
+  wssPacketRejects.total++;
+  wssPacketRejects.byReason[reason] = (wssPacketRejects.byReason[reason] || 0) + 1;
+  if (wssPacketRejects.total <= 4) {
+    sendClientLog("error", "wss-media-packet-rejected", {
+      reason,
+      stripe,
+      count: wssPacketRejects.byReason[reason],
+    });
+  }
+}
+
+function requestWssMediaStart() {
+  if (usingWssMedia) return;
+  const defer = shouldDeferWssMediaStart({
+    requestedTopology: requestedWssTopology,
+    capabilitiesGeneration: hostCapabilitiesGeneration,
+    signalingGeneration,
+  });
+  if (!defer) {
+    clearTimeout(wssCapabilityTimer);
+    wssCapabilityTimer = null;
+    startWssMedia();
+    return;
+  }
+  if (wssCapabilityTimer !== null) return;
+  wssCapabilityTimer = setTimeout(() => {
+    wssCapabilityTimer = null;
+    if (wssSelected) startWssMedia();
+  }, 500);
+}
+
+function startWssMedia() {
+  if (usingWssMedia) return;
+  if (!mediaEpoch) { hudState.ice = "wss session unavailable"; return; }
+  // Automatic fallback keeps the peer and data channels alive, but the
+  // WebRTC transform worker may still own the visible canvas. Release only
+  // that video sink before WSS reclaims a main-thread 2D context.
+  releaseWebRtcVideoSink();
+  ensureMainCanvas();
+  stage.classList.remove("native-video-input");
+  wssSelected = true;
+  usingWssMedia = true;
+  const selectedTopology = selectWssMediaTopology({
+    requestedTopology: requestedWssTopology,
+    hostCapabilities,
+    capabilitiesCurrent: hostCapabilitiesGeneration === signalingGeneration,
+    v3Rejected: wssV3Rejected,
+  });
+  wssProtocol = selectedTopology ? 3 : 2;
+  wssTopology = selectedTopology || V2_WSS_TOPOLOGY;
+  wssTopologyAccepted = wssProtocol === 2;
+  wssReassembler = wssProtocol === 3
+    ? new VariableParityFrameReassembler({ topology: wssTopology })
+    : new ParityFrameReassembler();
+  wssPacketRejects = { total: 0, byReason: {} };
+  wssRecoveryPending = true;
+  wssRecoveryState = "awaiting-keyframe";
+  wssDeadline.setMode(streamModeValue());
+  wssTailDeadlineTelemetry = {
+    observations: 0,
+    raises: 0,
+    maxAgeMs: 0,
+    lastAgeMs: null,
+    previousDeadlineMs: null,
+    deadlineMs: wssDeadline.deadlineMs,
+    raisedByMs: 0,
+  };
+  wssReassembler.setTtlMs(wssDeadline.deadlineMs); wssOrdered.setTtlMs(wssDeadline.deadlineMs);
+  // A new WSS epoch is a fresh desktop-state conversation.  Do not carry a
+  // secure-desktop overlay from an older, disconnected session into this one;
+  // wait for the first authenticated keyframe instead.
+  desktopAvailable = true;
+  desktopAwaitingFrame = true;
+  renderDesktopState();
+  // In auto mode keep the peer object alive as a control/lifecycle anchor.
+  // Closing it here makes the host interpret the transport fallback as the
+  // browser leaving. The host stops admitting RTP once WSS is selected.
+  hudState.ice = "wss"; hudState.route = "wss"; hudState.dec = `${codecSession.codec} wss`;
+  sendClientLog("info", "wss-start", { epoch: mediaEpoch, protocol: wssProtocol, topology: wssTopology });
+  inputReady = connected = true; onInputReady();
+  // One role/socket per stripe is enforced by the DO. No browser secret is sent.
+  wssMediaSockets = Array(wssTopology.laneCount);
+  wssStripeOpened = Array(wssTopology.laneCount).fill(false);
+  wssStripeEverOpened = Array(wssTopology.laneCount).fill(false);
+  wssDiagnosticLaneFaultUntil = Array(wssTopology.laneCount).fill(0);
+  wssStaleLaneRecycleAt = 0;
+  wssStartedHost = false;
+  // Let all four media Durable Objects register before the host emits its
+  // first IDR. If one lane is unavailable, the bounded deadline still allows
+  // parity with three lanes instead of hanging forever.
+  wssStartDeadlineAt = performance.now() + 1_500;
+  clearTimeout(wssStartDeadlineTimer);
+  wssStartDeadlineTimer = setTimeout(() => { wssStartDeadlineTimer = null; maybeStartWssHost(); }, 1_550);
+  wssExpiryTimer = setInterval(() => {
+    wssDeadline.tick();
+    wssReassembler.setTtlMs(wssDeadline.deadlineMs); wssOrdered.setTtlMs(wssDeadline.deadlineMs);
+    wssReassembler.expire();
+    processExpiredWssFrames(wssReassembler.takeExpired());
+    recycleStaleWssLane();
+    const before = wssOrdered.dependencyLosses;
+    wssOrdered.expire();
+    noteOrderedDependencyLoss(before, "v2-frame-expired");
+  }, 40);
+  for (let stripe = 0; stripe < wssTopology.laneCount; stripe++) openWssMediaStripe(stripe);
+}
+
+function activeWssMain10() {
+  return latestBenchStatus?.effective?.encoder?.main10 === true;
+}
+
+function activeWssHybridMode() {
+  return codecSession.codec === "hevc" && [
+    "png-static-roi", "png-quiescent-detail", "hevc-quiescent-tiles",
+  ].includes(activeWssHybridModeName());
+}
+
+function activeWssHybridModeName() {
+  return latestBenchStatus?.effective?.hybridMode || "off";
+}
+
+function activeWssHybridCache() {
+  return latestBenchStatus?.effective?.hybridMode === "hevc-quiescent-tiles"
+    ? hevcTileCache
+    : hybridTileCache;
+}
+
+function clearWssHybridCaches() {
+  hybridTileCache.clear();
+  hevcTileCache.clear();
+}
+
+function activeWssHevcCodec() {
+  return activeWssMain10() ? "hev1.2.4.L120.B0" : "hev1.1.6.L120.B0";
+}
+
+function applyBenchStatus(status) {
+  const previousMain10 = activeWssMain10();
+  const previousHybrid = activeWssHybridModeName();
+  latestBenchStatus = status;
+  const main10 = activeWssMain10();
+  const hybrid = activeWssHybridModeName();
+  if ((previousMain10 !== main10 || previousHybrid !== hybrid) &&
+      usingWssMedia && codecSession.codec === "hevc") {
+    wssRecoveryPending = true;
+    wssRecoveryState = "awaiting-keyframe";
+    clearWssHybridCaches();
+    resyncWssDecoder(previousMain10 !== main10 ? "hevc-profile-change" : "hybrid-mode-change");
+  }
+}
+
+async function selectWssCodec() {
+  if (codecSession.codec !== "hevc" || typeof VideoDecoder === "undefined" || typeof VideoDecoder.isConfigSupported !== "function") {
+    if (codecSession.codec === "hevc" && typeof VideoDecoder === "undefined") codecSession.fallbackToH264();
+    return codecSession.codec;
+  }
+  const main10 = activeWssMain10();
+  const codec = activeWssHevcCodec();
+  try {
+    const support = await VideoDecoder.isConfigSupported({
+      codec, codedWidth: 1920, codedHeight: 1080,
+      optimizeForLatency: true, hardwareAcceleration: "prefer-hardware",
+    });
+    if (!support?.supported) {
+      if (main10) {
+        sendClientLog("error", "main10-configure-unsupported", { codec });
+        hudState.dec = "Main10 unsupported";
+        return null;
+      }
+      codecSession.fallbackToH264();
+    }
+  } catch {
+    if (main10) {
+      sendClientLog("error", "main10-configure-unsupported", { codec });
+      hudState.dec = "Main10 unsupported";
+      return null;
+    }
+    codecSession.fallbackToH264();
+  }
+  if (codecSession.codec === "hevc") {
+    const tileCapability = await probeHevcTileDecoderSupport(
+      config => VideoDecoder.isConfigSupported(config),
+    );
+    hevcTileCache.setDecoderCapability(tileCapability);
+    sendClientLog(tileCapability.state === "supported" ? "info" : "warn",
+      "hevc-tile-decoder-capability", tileCapability);
+  }
+  return codecSession.codec;
+}
+
+async function maybeStartWssHost() {
+  const open = wssStripeOpened.filter(Boolean).length;
+  const waitingForAll = open < wssTopology.laneCount && performance.now() < wssStartDeadlineAt;
+  hudState.ice = waitingForAll ? `wss ${open}/${wssTopology.laneCount} waiting lanes` : `wss ${open}/${wssTopology.laneCount}`;
+  if (wssStartedHost || wssStartInFlight || open < wssTopology.dataShards || waitingForAll) return;
+  wssStartInFlight = true;
+  const codec = await selectWssCodec();
+  if (!codec) {
+    wssStartInFlight = false;
+    return;
+  }
+  if (!usingWssMedia || wssStartedHost || wssStripeOpened.filter(Boolean).length < wssTopology.dataShards) {
+    wssStartInFlight = false;
+    return;
+  }
+  wssStartedHost = true;
+  wssStartInFlight = false;
+  sendSignal({ type: "media-control", action: "start", protocol: wssProtocol, epoch: mediaEpoch,
+    ...(wssProtocol === 3 ? { topology: { laneCount: wssTopology.laneCount,
+      dataShards: wssTopology.dataShards, parityShards: wssTopology.parityShards } } : {}),
+    codec, streamMode: streamModeValue(), reason: "client-start",
+    quality: qualityPreset === "auto" ? "high" : qualityPreset, adaptive: wssAdaptive });
+  startFirstFrameHandshake("wss-host-start");
+  scheduleSharpViewport(fullFrameDiagnostic ? "diagnostic-full-frame" : "wss-start");
+}
+
+function requestWssKeyframe(reason, requestId = null) {
+  const now = performance.now();
+  if (!requestId && requestWssKeyframe.lastAt && now - requestWssKeyframe.lastAt < 250) return false;
+  requestWssKeyframe.lastAt = now;
+  sendClientLog("warn", "wss-keyframe-request", { reason, requestId });
+  sendSignal({ type: "media-control", action: "keyframe", protocol: wssProtocol, epoch: mediaEpoch, reason,
+    ...(requestId ? { requestId } : {}), codec: codecSession.codec });
+  return true;
+}
+
+function clearWssKeyframeWatchdog() {
+  clearTimeout(wssKeyframeTimer);
+  wssKeyframeTimer = null;
+}
+
+function armWssKeyframeWatchdog() {
+  clearWssKeyframeWatchdog();
+  const epoch = wssDecoderEpoch;
+  const timer = setTimeout(() => {
+    if (wssKeyframeTimer !== timer || epoch !== wssDecoderEpoch) return;
+    wssKeyframeTimer = null;
+    noteWssFailure("no-output-after-keyframe");
+  }, 2_000);
+  wssKeyframeTimer = timer;
+}
+
+function resyncWssDecoder(reason) {
+  hudState.resyncs++;
+  clearWssKeyframeWatchdog();
+  wssDecoderEpoch++;
+  try { decoder?.close(); } catch {} decoder = null;
+  latencyGuard.reset(reason);
+  resetRenderPacing();
+  wssDecodeSequenceByTimestamp.clear(); wssFrameMeta = new WeakMap();
+  wssPresentedFrameTraces.clear();
+  sendClientLog("warn", "wss-recovery-reset", {
+    reason,
+    decoderEpoch: wssDecoderEpoch,
+    hybrid: activeWssHybridCache().snapshot(),
+  });
+  clearWssHybridCaches();
+  wssReassembler.waitForKeyframe(); wssOrdered.reset(wssReassembler.generation);
+  hudState.dec = `waiting keyframe (${reason})`;
+}
+
+function beginWssRecovery(reason, requestId = null) {
+  const now = performance.now();
+  const probeInterval = streamModeValue() === "game" ? 1_000 : 2_000;
+  const identifiedRequest = typeof requestId === "string" && requestId.length > 0;
+  if (wssRecoveryState !== "healthy") {
+    if (identifiedRequest ||
+        (wssRecoveryState === "awaiting-keyframe" && now - wssLastRecoveryAt >= probeInterval)) {
+      wssLastRecoveryAt = now;
+      const requested = requestWssKeyframe(reason, requestId);
+      if (requested) armWssKeyframeWatchdog();
+      return requested;
+    }
+    return false;
+  }
+  if (!identifiedRequest && now - wssLastRecoveryAt < probeInterval) return false;
+  wssRecoveryPending = true;
+  wssRecoveryState = "awaiting-keyframe";
+  wssLastRecoveryAt = now;
+  resyncWssDecoder(reason);
+  const requested = requestWssKeyframe(reason, requestId);
+  if (requested) armWssKeyframeWatchdog();
+  return requested;
+}
+
+function recordWssAckAttempt(message, immediate, sent) {
+  wssAckAttempts++;
+  if (sent) wssAckSent++;
+  else wssAckFailed++;
+  wssLastAckAttempt = {
+    attempt: wssAckAttempts,
+    sent,
+    immediate,
+    signalingGeneration,
+    signalingRegistered,
+    socketOpen: ws?.readyState === WebSocket.OPEN,
+    bufferedAmount: Number(ws?.bufferedAmount || 0),
+    protocol: message.protocol ?? 2,
+    generation: message.generation,
+    reconstructed: message.reconstructed,
+    presented: message.presented,
+    recoveryState: message.recoveryState,
+    lanes: message.lanes.length,
+    laneMin: Math.min(...message.lanes),
+    laneMax: Math.max(...message.lanes),
+  };
+  if (labRun !== null && (wssAckAttempts === 1 || !sent)) {
+    sendClientLog(sent ? "info" : "warn", "wss-ack-attempt", wssLastAckAttempt);
+  }
+}
+
+function scheduleWssAck(generation, immediate = false) {
+  const send = () => {
+    clearTimeout(wssAckTimer); wssAckTimer = null;
+    const message = { type: wssProtocol === 3 ? "media-ack-v3" : "media-ack-v2",
+      ...(wssProtocol === 3 ? {
+        protocol: 3, epoch: mediaEpoch, topology: wssTopology,
+        completionMissingByLane: [...wssReassembler.stats.completionMissingByLane],
+      } : {}),
+      generation, lanes: [...wssReassembler.highestSequence],
+      reconstructed: wssReassembler.highestReconstructed, presented: wssPresentedSequence,
+      recoveredFrames: wssReassembler.stats.recoveredFrames, expiredFrames: wssReassembler.stats.expiredFrames,
+      dependencyLosses: wssDependencyLosses, deadlineMs: Math.round(wssDeadline.deadlineMs),
+      reassemblyP95Ms: Math.round(wssDeadline.p95Ms), recoveryState: wssRecoveryState,
+      decoderDrops: hudState.dropped };
+    const sent = sendSignal(message);
+    if (typeof recordWssAckAttempt === "function") recordWssAckAttempt(message, immediate, sent);
+  };
+  if (immediate) { send(); return; }
+  if (wssAckTimer === null) wssAckTimer = setTimeout(send, 100);
+}
+
+function switchToWss(reason) {
+  if (usingWssMedia) return;
+  wssSelected = true;
+  hudState.ice = `wss (${reason})`;
+  requestWssMediaStart();
+}
+
+let lastNetworkRecoveryAt = -Infinity;
+let networkRouteProbeTimer = null;
+const NETWORK_ROUTE_PROBE_MS = 1_500;
+function networkRouteHealthSnapshot() {
+  const renderedAgeMs = lastRenderedDueMs === null ? null : performance.now() - lastRenderedDueMs;
+  return {
+    signalingGeneration,
+    online: navigator.onLine,
+    signalingRegistered,
+    signalingSocketOpen: ws?.readyState === WebSocket.OPEN,
+    usingWssMedia,
+    openLanes: wssStripeOpened.filter(Boolean).length,
+    dataShards: wssTopology.dataShards,
+    recoveryState: wssRecoveryState,
+    allowQuiescentIdle: labRun !== null,
+    receivedPackets: wssMediaReceivedPackets,
+    reconstructed: wssReassembler.highestReconstructed,
+    presented: wssPresentedSequence,
+    renderedAgeMs,
+    peerConnectionState: pc?.connectionState ?? null,
+  };
+}
+
+function probeNetworkRouteChange() {
+  if (terminalSignalingFailure || !navigator.onLine || networkRouteProbeTimer !== null) return;
+  const before = networkRouteHealthSnapshot();
+  sendClientLog("info", "network-route-probe", { phase: "start", ...before });
+  networkRouteProbeTimer = setTimeout(() => {
+    networkRouteProbeTimer = null;
+    if (terminalSignalingFailure || before.signalingGeneration !== signalingGeneration) return;
+    const after = networkRouteHealthSnapshot();
+    const maxRenderedAgeMs = Math.max(1_000, Math.round(wssDeadline.deadlineMs * 4));
+    const recover = shouldRecoverAfterNetworkRouteProbe(before, after, { maxRenderedAgeMs });
+    sendClientLog(recover ? "warn" : "info", "network-route-probe", {
+      phase: "complete", recover, maxRenderedAgeMs, ...after,
+    });
+    if (recover) recoverNetworkRoute("connection-change-stalled");
+  }, NETWORK_ROUTE_PROBE_MS);
+}
+
+function recoverNetworkRoute(reason) {
+  if (terminalSignalingFailure || !navigator.onLine) return;
+  const now = performance.now();
+  if (now - lastNetworkRecoveryAt < 5_000) return;
+  lastNetworkRecoveryAt = now;
+  hudState.ice = `route change (${reason})`;
+  // A Wi-Fi/cellular handoff can leave apparently-open TCP/WebRTC sockets on
+  // the old route. Rebuild the signaling epoch and all selected media lanes;
+  // hello-ok will restore WSS or start a fresh WebRTC offer.
+  recycleSignaling(`network-${reason}`);
+  restartPeer(`network-${reason}`, false);
+}
+
+function recoverWssStartup(reason) {
+  if (!usingWssMedia) return;
+  sendClientLog("error", "wss-startup-failure", { reason, attempt: wssStartupRecoveries + 1 });
+  if (requestedTransport === TRANSPORT.WSS) {
+    // Forced WSS remains forced: rebuild the epoch, but never silently switch
+    // to a different media transport.
+    recoverNetworkRoute(`wss-${reason}`);
+    return;
+  }
+  if (wssStartupRecoveries === 0) {
+    wssStartupRecoveries = 1;
+    recoverNetworkRoute(`wss-retry-${reason}`);
+    return;
+  }
+  wssSelected = false;
+  stopWssMedia();
+  sendClientLog("warn", "wss-fallback-webrtc", { reason });
+  recycleSignaling(`wss-fallback-${reason}`);
+  restartPeer(`wss-fallback-${reason}`, false);
+}
+
+addEventListener("online", () => recoverNetworkRoute("online"));
+const routeConnection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+routeConnection?.addEventListener("change", probeNetworkRouteChange);
+
+function noteWssFailure(reason) {
+  sendClientLog("error", "wss-failure", { reason });
+  const hardCodecFailure = reason === "webcodecs-unsupported" || reason === "configure-unsupported" ||
+    reason === "decode-error" || reason === "decode-throw";
+  const main10 = activeWssMain10();
+  if (reason === "no-output-after-keyframe") wssNoOutputFailures++;
+  const exhaustedHevcRecovery = reason === "no-output-after-keyframe" && wssNoOutputFailures >= 3;
+  if (!main10 && codecSession.codec === "hevc" && (hardCodecFailure || exhaustedHevcRecovery) && codecSession.fallbackToH264()) {
+    wssNoOutputFailures = 0;
+    sendSignal({ type: "media-control", action: "keyframe", reason, codec: codecSession.codec });
+    hudState.dec = "H264 fallback";
+    stopWssMedia();
+    setTimeout(requestWssMediaStart, 0);
+    return;
+  }
+  beginWssRecovery(reason);
+  hudState.dec = `waiting keyframe (${reason})`;
+}
+
+function decodeWssFrame(frame) {
+  if (frame.codec !== (codecSession.codec === "hevc" ? CODEC.HEVC : CODEC.H264)) return;
+  if (typeof VideoDecoder === "undefined") { noteWssFailure("webcodecs-unsupported"); return; }
+  const prepared = prepareHybridWssFrame(frame, {
+    active: activeWssHybridMode(),
+    cache: activeWssHybridCache(),
+  });
+  if (!prepared) {
+    noteWssFailure("hybrid-frame-invalid");
+    return;
+  }
+  if (prepared.activity && (prepared.activity.upserts || prepared.activity.invalidations ||
+      prepared.activity.clears || prepared.activity.pngBytes)) {
+    sendClientLog("info", "hybrid-frame-activity", {
+      generation: frame.generation,
+      sequence: frame.sequence,
+      cropRevision: prepared.cropRevision,
+      ...prepared.activity,
+      hybrid: activeWssHybridCache().snapshot(),
+    });
+  }
+  const timestamp = Math.round(frame.timestamp90k * 1_000_000 / 90_000);
+  hudState.mediaGeneration = frame.generation;
+  if (frame.key && wssRecoveryState === "awaiting-keyframe") {
+    wssRecoveryPending = true;
+    wssRecoveryState = "awaiting-keyframe-output";
+    sendClientLog("info", "wss-recovery-keyframe", { generation: frame.generation, sequence: frame.sequence, codec: frame.codec });
+  }
+  const frameTrace = frame.frameTrace ? { ...frame.frameTrace } : {};
+  if (prepared.activity) {
+    frameTrace.hybridCropRevision = prepared.cropRevision;
+    frameTrace.hybridTileUpserts = prepared.activity.upserts;
+    frameTrace.hybridTileInvalidations = prepared.activity.invalidations;
+    frameTrace.hybridTileSuppressions = prepared.activity.suppressions;
+    frameTrace.hybridTileReactivations = prepared.activity.reactivations;
+    frameTrace.hybridTilePermanentInvalidations = prepared.activity.permanentInvalidations;
+    frameTrace.hybridTileClears = prepared.activity.clears;
+    frameTrace.hybridPngBytes = prepared.activity.pngBytes;
+  }
+  wssDecodeSequenceByTimestamp.set(timestamp, {
+    sequence: frame.sequence,
+    generation: frame.generation,
+    key: frame.key,
+    cropRevision: prepared.cropRevision,
+    frameTrace,
+  });
+  while (wssDecodeSequenceByTimestamp.size > 8) wssDecodeSequenceByTimestamp.delete(wssDecodeSequenceByTimestamp.keys().next().value);
+  const chunk = {
+    type: frame.key ? "key" : "delta",
+    timestamp,
+    data: prepared.data,
+    codec: codecSession.codec,
+    frameTrace,
+  };
+  feedDecoder(chunk, latencyGuard.generation);
+  // Arm only after feedDecoder has created/retained a configured decoder.
+  // A backpressure reset invalidates the decoder epoch and must not leave an
+  // obsolete timer behind that can force a healthy HEVC session to H.264.
+  if (frame.key && decoder?.state === "configured") armWssKeyframeWatchdog();
 }
 
 async function startPeer(generation = peerGeneration) {
+  if (requestedTransport === TRANSPORT.WSS || usingWssMedia) return;
   if (offerSent || generation !== peerGeneration || ws?.readyState !== WebSocket.OPEN) return;
   offerSent = true;
   lastIceCandidateError = null;
@@ -342,6 +1955,11 @@ async function startPeer(generation = peerGeneration) {
     }
   }
   pc = candidate;
+  if (requestedTransport === TRANSPORT.AUTO) {
+    iceFallbackTimer = setTimeout(() => {
+      if (isCurrentPeer(generation, candidate) && !connected) switchToWss("ice-timeout");
+    }, 4_000);
+  }
 
   // Receive-only video; the browser offers, the host answers (locked).
   const transceiver = candidate.addTransceiver("video", { direction: "recvonly" });
@@ -353,12 +1971,19 @@ async function startPeer(generation = peerGeneration) {
     try { transceiver.receiver.jitterBufferTarget = 0; } catch { /* older implementation */ }
   }
 
-  // Force H.264 (WebCodecs decodes Annex B; NVENC emits High profile).
+  // Prefer HEVC for a fresh page. H.264 is only selected after the one local
+  // capability/decode fallback; no selection is persisted between sessions.
   try {
     const caps = RTCRtpReceiver.getCapabilities("video");
-    const h264 = caps && caps.codecs.filter((c) => c.mimeType === "video/H264");
-    if (h264 && h264.length) {
-      transceiver.setCodecPreferences(h264);
+    const wanted = rtpCodecMimeTypes(codecSession.codec);
+    const codec = caps && caps.codecs.filter((c) => wanted.includes(c.mimeType.toLowerCase()));
+    if (codec && codec.length) {
+      transceiver.setCodecPreferences(codec);
+    } else if (codecSession.codec === "hevc" && codecSession.fallbackToH264()) {
+      offerSent = false;
+      try { candidate.close(); } catch {}
+      startPeer(generation);
+      return;
     }
   } catch (e) {
     console.warn("setCodecPreferences", e);
@@ -371,13 +1996,15 @@ async function startPeer(generation = peerGeneration) {
   motionDc = motionChannel;
   channel.binaryType = "arraybuffer";
   motionChannel.binaryType = "arraybuffer";
-  const updateInputReady = () => { inputReady = dc?.readyState === "open" && motionDc?.readyState === "open"; hudState.control = dc?.readyState || "closed"; hudState.motion = motionDc?.readyState || "closed"; hudState.dc = inputReady ? "open" : "closed"; };
+  const updateInputReady = () => { const wasReady=inputReady; inputReady = dc?.readyState === "open" && motionDc?.readyState === "open"; hudState.control = dc?.readyState || "closed"; hudState.motion = motionDc?.readyState || "closed"; hudState.dc = inputReady ? "open" : "closed"; if (!wasReady && inputReady) onInputReady(); };
   const laneClosed = () => { if (!isCurrentPeer(generation, candidate) || closingPeer) return; releaseInput(false); recycleSignaling("input-lane-closed"); restartPeer("input-lane-closed", false); };
   channel.onopen = () => { if (isCurrentPeer(generation, candidate)) updateInputReady(); };
   channel.onclose = laneClosed;
   motionChannel.onopen = () => { if (isCurrentPeer(generation, candidate)) updateInputReady(); };
   motionChannel.onclose = laneClosed;
   channel.onerror = (e) => { if (isCurrentPeer(generation, candidate)) hudState.dc = `err:${e.message || ""}`; };
+  channel.onmessage = (event) => { if (isCurrentPeer(generation, candidate)) handleCursorState(event.data); };
+  motionChannel.onmessage = (event) => { if (isCurrentPeer(generation, candidate)) handleCursorState(event.data); };
 
   candidate.onicecandidate = (ev) => {
     if (isCurrentPeer(generation, candidate) && ev.candidate) {
@@ -400,8 +2027,15 @@ async function startPeer(generation = peerGeneration) {
     hudState.ice = candidate.iceConnectionState;
     connected = candidate.iceConnectionState === "connected" || candidate.iceConnectionState === "completed";
     if (connected) {
+      clearTimeout(iceFallbackTimer); iceFallbackTimer = null;
+      if (requestedTransport === TRANSPORT.AUTO) {
+        rtpFallbackTimer = setTimeout(() => {
+          if (isCurrentPeer(generation, candidate) && !framesReceived) switchToWss("no-rtp");
+        }, 2_000);
+      }
       hud.classList.remove("bad");
-      requestPointerLock();
+      if (!mobilePointerDevice) requestPointerLock();
+      startFirstFrameHandshake("ice-connected");
     }
   };
   candidate.ontrack = (ev) => { if (isCurrentPeer(generation, candidate)) onTrack(ev, generation); };
@@ -443,17 +2077,37 @@ const latencyGuard = createLatencyGuard({
 let framesDrawn = 0;
 let framesReceived = 0;
 let fpsWindow = 0;
+let lastFrameDrawnAt = null;
+const framePresentationTelemetry = new FramePresentationTelemetry();
+function resetPresentationCounters() {
+  framesDrawn = 0;
+  framesReceived = 0;
+  wssMediaReceivedBytes = 0;
+  wssMediaReceivedPackets = 0;
+  wssPacketRejects = { total: 0, byReason: {} };
+  fpsWindow = 0;
+  lastFrameDrawnAt = null;
+  lastDecodedDimensions = null;
+  framePresentationTelemetry.reset();
+  hudState.fps = 0;
+  hudState.recv = 0;
+  hudState.presented = 0;
+  hudState.frameGap = "…";
+  hudState.maxFrameGap = 0;
+  hudState.dimensions = "…";
+  hudState.mediaGeneration = "…";
+}
 setInterval(() => {
-  if (useWebCodecs) hudState.fps = fpsWindow;
+  if (useWebCodecs || usingWssMedia) hudState.fps = fpsWindow;
   fpsWindow = 0;
 }, 1000);
 
 const PATTERN = { x: 64, y: 64, cell: 24, columns: 32, bits: 64 };
-function readTimestampPattern() {
-  if (screen.width < PATTERN.x + PATTERN.cell * PATTERN.columns ||
-      screen.height < PATTERN.y + PATTERN.cell * 2) return null;
+function readTimestampPattern(target = screen, context = ctx) {
+  if (target.width < PATTERN.x + PATTERN.cell * PATTERN.columns ||
+      target.height < PATTERN.y + PATTERN.cell * 2) return null;
   try {
-    const image = ctx.getImageData(
+    const image = context.getImageData(
       PATTERN.x,
       PATTERN.y,
       PATTERN.cell * PATTERN.columns,
@@ -481,6 +2135,119 @@ function readTimestampPattern() {
 
 if (diagnosticsEnabled) {
   window.__bubbleplayDiagnostics = {
+    requestMonitors() {
+      return sendSignal({ type: "media-control", action: "monitors", protocol: usingWssMedia ? wssProtocol : 2, epoch: mediaEpoch, reason: "diagnostic-refresh" });
+    },
+    selectMonitor(selector) {
+      if (typeof selector !== "string" || !monitorList.some(monitor => monitor.selector === selector)) return false;
+      return requestMonitor(selector);
+    },
+    injectDecoderFault(requestReason = "diagnostic-injected-fault", qualityRequestId = null) {
+      const reason = requestReason === "stream-lab-quality-capture"
+        ? requestReason : "diagnostic-injected-fault";
+      if (reason === "stream-lab-quality-capture" &&
+          (typeof qualityRequestId !== "string" || !/^quality-[0-9a-f-]{36}$/.test(qualityRequestId)))
+        return false;
+      if (usingWssMedia) {
+        wssLastRecoveryAt = -Infinity;
+        // An identified lab request must reach the host even when another
+        // recovery is already awaiting a keyframe; the host acknowledgement
+        // binds scoring to the exact reset IDR admitted to WSS.
+        return beginWssRecovery(reason, qualityRequestId);
+      }
+      if (!encodedWorker) return false;
+      encodedWorker.postMessage({ type: "resync", reason });
+      return true;
+    },
+    qualityKeyframeAck(requestId) {
+      return labQualityKeyframeAcks.get(requestId) ?? null;
+    },
+    armPresentedIdentityHistory(frameCount = 16) {
+      frameCount = Number(frameCount);
+      if (!labRun || !Number.isInteger(frameCount) || frameCount < 1 || frameCount > 64)
+        return false;
+      wssPresentedIdentityFramesRemaining = Math.max(
+        wssPresentedIdentityFramesRemaining,
+        frameCount,
+      );
+      return true;
+    },
+    injectWssLaneLoss(stripe = 0, durationMs = 1_000) {
+      if (!labRun || !usingWssMedia || wssProtocol !== 3 || wssTopology.parityShards < 1) return false;
+      stripe = Number(stripe);
+      durationMs = Number(durationMs);
+      if (!Number.isInteger(stripe) || stripe < 0 || stripe >= wssTopology.dataShards ||
+          !Number.isFinite(durationMs) || durationMs < 500 || durationMs > 5_000) return false;
+      const socket = wssMediaSockets[stripe];
+      if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+      wssDiagnosticLaneFaultUntil[stripe] = performance.now() + durationMs;
+      wssStripeOpened[stripe] = false;
+      const socketGeneration = wssLaneLifecycle.currentGeneration(stripe);
+      sendClientLog("warn", "wss-diagnostic-lane-loss", { stripe, durationMs, topology: wssTopology });
+      wssLaneLifecycle.close(stripe, socketGeneration, {
+        code: 4000,
+        reason: "diagnostic-lane-loss",
+        wasClean: false,
+      });
+      debugTrace("media-lane-close", {
+        stripe, socketGeneration, code: 4000,
+        reason: "diagnostic-lane-loss", wasClean: false,
+      });
+      try { socket.close(4000, "diagnostic-lane-loss"); } catch { return false; }
+      // A locally initiated close can remain in CLOSING while the relay keeps
+      // the peer half-open, so do not depend on `onclose` to arm the lab
+      // reconnect. Detach this socket and schedule the bounded replacement
+      // directly; the lane DO will replace any stale server-side association.
+      wssMediaSockets[stripe] = null;
+      scheduleWssMediaReconnect(
+        stripe,
+        socketGeneration,
+        durationMs,
+        "diagnostic-lane-loss",
+      );
+      return { accepted: true, stripe, durationMs };
+    },
+    setFixedZoom(zoom) {
+      const value = Number(zoom);
+      if (!Number.isFinite(value) || value < 1 || value > 4 || streamModeValue() !== "work") return false;
+      syncViewport();
+      const center = { x: innerWidth / 2, y: innerHeight / 2 };
+      viewport.setZoom(1, center);
+      viewport.setZoom(value, center);
+      renderViewport();
+      scheduleSharpViewport("diagnostic-fixed-zoom");
+      return true;
+    },
+    panFixedViewport(dx, dy) {
+      const x = Number(dx), y = Number(dy);
+      if (!Number.isFinite(x) || !Number.isFinite(y) ||
+          streamModeValue() !== "work" || viewport.zoom <= 1) return false;
+      panBy(x, y);
+      return true;
+    },
+    moveCursorNormalized(x, y) {
+      const nx = Number(x), ny = Number(y);
+      if (!canMoveAbsoluteCursor({ pointerMode, inputReady }, nx, ny)) return false;
+      updateRemoteCursor(cursor => cursor.setNormalized(nx, ny));
+      const point = remoteCursor.absolutePoint();
+      return queueTouchAbsolute(point.x, point.y);
+    },
+    setStreamMode(mode) {
+      if (mode !== "work" && mode !== "game") return false;
+      const target = mode === "game" ? "game" : "desktop";
+      if (pointerMode === target) sendStreamMode("diagnostic-mode");
+      else setPointerMode(target, true);
+      return true;
+    },
+    forceH264Fallback() {
+      if (!usingWssMedia) return false;
+      if (codecSession.codec === "h264") return true;
+      if (!codecSession.fallbackToH264()) return false;
+      hudState.dec = "H264 diagnostic fallback";
+      stopWssMedia();
+      setTimeout(requestWssMediaStart, 0);
+      return true;
+    },
     inject({ stallMs = 0, dropEvery = 0 } = {}) {
       encodedWorker?.postMessage({ type: "fault", stallMs: Math.max(0, stallMs), dropEvery: Math.max(0, dropEvery) });
     },
@@ -495,14 +2262,33 @@ if (diagnosticsEnabled) {
       hudState.dropped = 0;
       hudState.resyncs = 0;
       hudState.keyframes = 0;
-      framesDrawn = 0;
-      framesReceived = 0;
+      resetPresentationCounters();
+    },
+    captureFrame() {
+      if (!usingWssMedia || !screen.width || !screen.height || !wssLatestFrameTrace) return null;
+      const target = sharpScreen.classList.contains("active") ? sharpScreen : screen;
+      return {
+        pngDataUrl: target.toDataURL("image/png"),
+        diagnostics: {
+          glassToGlass: readTimestampPattern(),
+          renderedTimestamp: lastRenderedTimestamp,
+          framesDrawn,
+          frameTrace: { ...wssLatestFrameTrace },
+          frameTraceHistory: [...wssPresentedFrameTraces.values()].map(trace => ({ ...trace })),
+        },
+      };
     },
     snapshot() {
+      const snapshotAtMs = performance.now();
+      const snapshotAtEpochMs = Date.now();
       const nativeFramesPresented = nativePresentation?.framesPresented || 0;
       const renderedAgeMs = lastRenderedDueMs !== null ? performance.now() - lastRenderedDueMs :
         (nativePresentation?.lastFrameAtMs === null || nativePresentation?.lastFrameAtMs === undefined ? null : performance.now() - nativePresentation.lastFrameAtMs);
       return {
+        diagnosticAttemptId,
+        assetBuild: { index: INDEX_ASSET_BUILD, media: MEDIA_ASSET_BUILD },
+        compatibility: STREAM_LAB_COMPATIBILITY,
+        clock: { performanceMs: snapshotAtMs, epochMs: snapshotAtEpochMs },
         ...hudState,
         generation: latencyGuard.generation,
         renderedTimestamp: lastRenderedTimestamp ?? (nativeFramesPresented > 0 ? nativeFramesPresented : null),
@@ -513,6 +2299,59 @@ if (diagnosticsEnabled) {
         worker: encodedWorkerStats,
         nativePresentation: nativePresentation ? { ...nativePresentation } : null,
         hostQuality,
+        hostCapabilities: {
+          ...hostCapabilities,
+          current: hostCapabilitiesGeneration === signalingGeneration,
+          generation: hostCapabilitiesGeneration,
+        },
+        benchStatus: latestBenchStatus,
+        frameTrace: wssLatestFrameTrace ? { ...wssLatestFrameTrace } : null,
+        frameTraceHistory: [...wssPresentedFrameTraces.values()].map(trace => ({ ...trace })),
+        wssMedia: {
+          receivedBytes: wssMediaReceivedBytes, receivedPackets: wssMediaReceivedPackets,
+          protocol: wssProtocol, topology: { ...wssTopology },
+          topologyAccepted: wssTopologyAccepted,
+          openLanes: wssStripeOpened.filter(Boolean).length,
+          reconstructed: wssReassembler.highestReconstructed, presented: wssPresentedSequence,
+          highestSequenceByLane: [...wssReassembler.highestSequence],
+          recoveredFrames: wssReassembler.stats.recoveredFrames,
+          expiredFrames: wssReassembler.stats.expiredFrames,
+          completionMissingByLane: wssReassembler.stats.completionMissingByLane ?
+            [...wssReassembler.stats.completionMissingByLane] : null,
+          lateShardCountByLane: wssReassembler.stats.lateShardCountByLane ?
+            [...wssReassembler.stats.lateShardCountByLane] : null,
+          lateShardDelayMsTotalByLane: wssReassembler.stats.lateShardDelayMsTotalByLane ?
+            [...wssReassembler.stats.lateShardDelayMsTotalByLane] : null,
+          lateShardDelayMsMaxByLane: wssReassembler.stats.lateShardDelayMsMaxByLane ?
+            [...wssReassembler.stats.lateShardDelayMsMaxByLane] : null,
+          dependencyLosses: wssDependencyLosses, recoveryState: wssRecoveryState,
+          acknowledgements: {
+            attempts: wssAckAttempts,
+            sent: wssAckSent,
+            failed: wssAckFailed,
+            last: wssLastAckAttempt ? { ...wssLastAckAttempt } : null,
+          },
+          packetRejects: {
+            total: wssPacketRejects.total,
+            byReason: { ...wssPacketRejects.byReason },
+          },
+          tailDeadline: { ...wssTailDeadlineTelemetry },
+          presentation: framePresentationTelemetry.snapshot(),
+          lanes: wssLaneLifecycle.snapshot(),
+          hybrid: activeWssHybridCache().snapshot(),
+        },
+        viewport: viewportHealthSnapshot(),
+        signaling: {
+          registered: signalingRegistered,
+          registeredAtMs: signalingRegisteredAtMs,
+          hostEvidence: { ...signalingHostEvidence },
+          lastError: lastSignalingError ? { ...lastSignalingError } : null,
+          lastRecycle: lastSignalingRecycle ? { ...lastSignalingRecycle } : null,
+          benchStatusRejection: latestBenchStatusRejection ? { ...latestBenchStatusRejection } : null,
+          monitorRevision: monitorListRevision,
+          monitors: monitorList.map(monitor => ({ ...monitor })),
+        },
+        cursor: cursorReconciler ? { mode: pointerMode, synced: cursorReconciler.synced, pending: cursorReconciler.pending, lastSent: cursorReconciler.lastSent, lastAck: cursorReconciler.lastAck, feedbackAt: cursorReconciler.feedbackAt } : null,
       };
     },
   };
@@ -573,16 +2412,24 @@ function onDecodedFrame(frame) {
       RENDER.prevWall = now;
     }
 
-    const due = latencyGuard.expectedWall(ts);
+    // TCP/WSS has already paid its delivery delay. Present the newest decoded
+    // frame immediately; timestamp pacing remains only for WebRTC burst smoothing.
+    const due = usingWssMedia ? now : latencyGuard.expectedWall(ts);
     if (!Number.isFinite(due)) {
       dropAndResync("missing-media-anchor");
       return;
     }
+    if (presentWssFrameImmediately(frame, usingWssMedia, now, drawFrame, framePresentationTelemetry)) {
+      retained = true;
+      return;
+    }
+    framePresentationTelemetry.noteRafEnqueued();
     RENDER.queue.push({ frame, due });
     retained = true;
     if (RENDER.queue.length > MAX_RENDER_QUEUE) {
       const stale = RENDER.queue.shift();
       retained = stale.frame !== frame;
+      framePresentationTelemetry.noteRafCoalesced();
       try { stale.frame.close(); } catch {}
     }
     if (!RENDER.rafPending) {
@@ -603,6 +2450,7 @@ function renderTick() {
     // Keep only the newest queued frame — older ones are stale the moment a
     // fresher frame arrives.
     while (RENDER.queue.length > 1) {
+      framePresentationTelemetry.noteRafCoalesced();
       try { RENDER.queue.shift().frame.close(); } catch {}
     }
     const front = RENDER.queue[0];
@@ -614,7 +2462,10 @@ function renderTick() {
     if (!Number.isFinite(due) || due <= now) {
       RENDER.queue.shift();
       if (now - due > 100) {
-        try { front.frame.close(); } finally { hudState.dropped++; }
+        try { front.frame.close(); } finally {
+          hudState.dropped++;
+          framePresentationTelemetry.noteRafLateDrop();
+        }
       } else {
         drawFrame(front.frame, due);
       }
@@ -633,6 +2484,18 @@ function renderTick() {
 
 // ---- network stats via getStats (latency diagnostics) -----------------------
 let previousInboundStats = null;
+let hevcDecodeFailureWindows = 0;
+
+function fallbackWebRtcCodec(reason) {
+  if (usingWssMedia || codecSession.codec !== "hevc" || !codecSession.fallbackToH264()) return false;
+  hudState.dec = `H264 fallback (${reason})`;
+  // The host intentionally accepts one offer per signaling epoch. Recycle
+  // signaling first so the H.264-only offer cannot be mistaken for a stale
+  // duplicate of the failed HEVC negotiation.
+  recycleSignaling(`hevc-${reason}`);
+  restartPeer(`hevc-${reason}`, false);
+  return true;
+}
 
 function qosPresentationMetrics() {
   if (nativePresentation) {
@@ -766,6 +2629,16 @@ setInterval(async () => {
       qpSum: inbound.qpSum,
     } : { generation: peerGeneration, atMs, rtt };
     const rx = computeQosRxWindow(currentInbound, previousInboundStats);
+    if (!usingWssMedia && codecSession.codec === "hevc" && inbound) {
+      const mediaArrived = (inbound.framesReceived || 0) > 0 || (inbound.bytesReceived || 0) > 0;
+      const decoded = (inbound.framesDecoded || 0) > 0 || (nativePresentation?.framesPresented || 0) > 0 || framesDrawn > 0;
+      hevcDecodeFailureWindows = mediaArrived && !decoded ? hevcDecodeFailureWindows + 1 : 0;
+      if (hevcDecodeFailureWindows >= 2) {
+        hevcDecodeFailureWindows = 0;
+        fallbackWebRtcCodec("decode-timeout");
+        return;
+      }
+    }
     previousInboundStats = currentInbound;
     if (rx.rttMs !== null) hudState.rtt = rx.rttMs;
     if (rx.jitterMs !== null) hudState.jit = rx.jitterMs;
@@ -828,6 +2701,7 @@ function onTrack(ev, generation = peerGeneration) {
           return;
         }
         if (message.stats) {
+          const workerPresented = Number(message.stats.framesDrawn || 0) > 0;
           encodedWorkerStats = message.stats;
           lastRenderedTimestamp = message.stats.renderedTimestamp;
           lastRenderedDueMs = message.stats.renderedAgeMs === null ? null : performance.now() - message.stats.renderedAgeMs;
@@ -836,6 +2710,10 @@ function onTrack(ev, generation = peerGeneration) {
           hudState.recv = message.stats.framesReceived;
           hudState.fps = message.stats.fps;
           hudState.dropped = message.stats.dropped;
+          // This worker belongs to the current peerGeneration. Once it has
+          // drawn a frame, presentation is concrete and cannot come from the
+          // receiver epoch discarded during a privileged desktop switch.
+          if (workerPresented) markFirstFramePresented();
         }
         if (message.type === "resync") { hudState.resyncs++; hudState.dec = `waiting keyframe (${message.reason})`; }
         else if (message.type === "keyframe-requested") {
@@ -902,14 +2780,16 @@ function startNativeVideo(track, generation = peerGeneration) {
   let fpsWindowStartedAt = null;
   let framesInFpsWindow = 0;
   const updateDimensions = () => {
+    if (generation !== peerGeneration || activeVideo !== video || !nativePresentation) return;
     nativePresentation.width = video.videoWidth;
     nativePresentation.height = video.videoHeight;
     hudState.dimensions = video.videoWidth && video.videoHeight ? `${video.videoWidth}x${video.videoHeight}` : "…";
   };
-  video.addEventListener("loadedmetadata", () => { updateDimensions(); syncViewport(); });
+  video.addEventListener("loadedmetadata", () => { updateDimensions(); syncViewportAndFollow(); });
   if (nativePresentation.supported) {
     const onVideoFrame = (now, metadata) => {
       if (generation !== peerGeneration || activeVideo !== video) return;
+      markFirstFramePresented();
       const gap = lastFrameAt === null ? null : now - lastFrameAt;
       if (nativePresentation.firstFrameAtMs === null) nativePresentation.firstFrameAtMs = Date.now();
       nativePresentation.framesPresented = metadata.presentedFrames ?? nativePresentation.framesPresented + 1;
@@ -938,6 +2818,8 @@ function startNativeVideo(track, generation = peerGeneration) {
     };
     video.requestVideoFrameCallback(onVideoFrame);
   }
+  video.addEventListener("loadeddata", () => { if (video.videoWidth && video.videoHeight) markFirstFramePresented(); }, { once: true });
+  video.addEventListener("playing", () => { if (video.videoWidth && video.videoHeight) markFirstFramePresented(); }, { once: true });
   const tryPlay = () => video.play().catch(() => {});
   tryPlay();
   // Mobile browsers (iOS especially) may refuse autoplay until a user
@@ -1007,16 +2889,70 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function feedDecoder(chunk, generation) {
+  // An encoded frame is the concrete RTP/media arrival signal. Do not cancel
+  // auto fallback merely because a track object was announced.
+  clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
   if (generation !== latencyGuard.generation) { hudState.dropped++; return; }
   const data = new Uint8Array(chunk.data);
   const isKey = chunk.type === "key";
+  if (!usingWssMedia && firstFrameHandshake.requireAdmission) {
+    if (!firstFrameHandshake.admitted) {
+      hudState.dropped++;
+      return;
+    }
+    if (transitionNeedsKeyframe) {
+      if (!isKey) {
+        hudState.dropped++;
+        return;
+      }
+      transitionNeedsKeyframe = false;
+    }
+  }
 
   if (!decoder) {
-    const codec = avcCodecFromSps(data) || "avc1.64002A";
+    // WSS HEVC is Annex-B and has no decoder description/config record.
+    const codec = chunk.codec === "hevc" ? activeWssHevcCodec() : (avcCodecFromSps(data) || "avc1.64002A");
     resetRenderPacing();
+    const decoderEpoch = ++wssDecoderEpoch;
     decoder = new VideoDecoder({
-      output: (frame) => { latencyGuard.releaseDecode(); onDecodedFrame(frame); },
-      error: (e) => { hudState.dec = `err:${e.message}`; dropAndResync("decoder-error"); },
+      output: (frame) => {
+        if (decoderEpoch !== wssDecoderEpoch) { try { frame.close(); } catch {} return; }
+        clearWssKeyframeWatchdog();
+        wssNoOutputFailures = 0;
+        if (usingWssMedia && !debugFirstDecoderOutput) {
+          debugFirstDecoderOutput = true;
+          debugTrace("decoder-first-output", { timestamp: frame.timestamp });
+        }
+        if (usingWssMedia) {
+          let metadata = wssDecodeSequenceByTimestamp.get(frame.timestamp);
+          if (metadata !== undefined) {
+            wssDecodeSequenceByTimestamp.delete(frame.timestamp);
+          } else if (wssDecodeSequenceByTimestamp.size) {
+            // Some Chromium builds normalize WebCodecs output timestamps by
+            // a few microseconds. WSS frames are decoded in order, so the
+            // oldest pending metadata is the safe association fallback.
+            const first = wssDecodeSequenceByTimestamp.entries().next().value;
+            if (first) {
+              metadata = first[1];
+              wssDecodeSequenceByTimestamp.delete(first[0]);
+              if (!wssTimestampFallbackLogged) {
+                wssTimestampFallbackLogged = true;
+                sendClientLog("warn", "wss-timestamp-association-fallback", { frameTimestamp: frame.timestamp, metadataTimestamp: first[0] });
+              }
+            }
+          }
+          if (metadata !== undefined) {
+            metadata.frameTrace.decodedAtMs = performance.now();
+            wssFrameMeta.set(frame, metadata);
+          }
+          if (metadata?.key && wssRecoveryState === "awaiting-keyframe-output") {
+            wssRecoveryPending = false;
+            wssRecoveryState = "healthy";
+          }
+        }
+        latencyGuard.releaseDecode(); onDecodedFrame(frame);
+      },
+      error: (e) => { sendClientLog("error", "decoder-error", { message: String(e?.message || e) }); hudState.dec = `err:${e.message}`; if (usingWssMedia) noteWssFailure("decode-error"); else dropAndResync("decoder-error"); },
     });
     try {
       decoder.configure({
@@ -1025,9 +2961,15 @@ function feedDecoder(chunk, generation) {
         hardwareAcceleration: "prefer-hardware",
       });
       hudState.dec = `${codec}`;
+      if (usingWssMedia && !debugFirstDecoderConfigured) {
+        debugFirstDecoderConfigured = true;
+        debugTrace("decoder-configured", { codec });
+      }
     } catch (e) {
+      sendClientLog("error", "decoder-config-error", { message: String(e?.message || e), codec });
       hudState.dec = `cfg:${e.message}`;
       decoder = null;
+      if (usingWssMedia) noteWssFailure("configure-unsupported");
       return;
     }
   }
@@ -1035,16 +2977,32 @@ function feedDecoder(chunk, generation) {
   if (decoder.state !== "configured") return;
   if (!isKey && !decoder.sawKeyframe) {
     hudState.dropped++;
-    requestKeyframe("delta-before-keyframe");
+    if (usingWssMedia) beginWssRecovery("delta-before-keyframe");
+    else requestKeyframe("delta-before-keyframe");
     return;
   }
   decoder.sawKeyframe = decoder.sawKeyframe || isKey;
-  if (decoder.decodeQueueSize >= 2 || !latencyGuard.admitDecode()) {
-    dropAndResync("decoder-backpressure");
-    return; // decoder pending work is capped at two frames
+  const decodeLimit = usingWssMedia ? (streamModeValue() === "game" ? 4 : 8) : 2;
+  const decodeHardLimit = usingWssMedia ? decodeLimit + 2 : decodeLimit;
+  if (usingWssMedia && decoder.decodeQueueSize >= decodeLimit) {
+    wssBackpressureSince ??= performance.now();
+    const graceMs = streamModeValue() === "game" ? 150 : 500;
+    if (performance.now() - wssBackpressureSince >= graceMs || decoder.decodeQueueSize >= decodeHardLimit) {
+      hudState.dropped++;
+      beginWssRecovery("decoder-backpressure");
+      return;
+    }
+  } else {
+    wssBackpressureSince = null;
+  }
+  if (!latencyGuard.admitDecode(decodeHardLimit)) {
+    if (usingWssMedia) { hudState.dropped++; beginWssRecovery("decoder-backpressure"); }
+    else dropAndResync("decoder-backpressure");
+    return;
   }
 
   try {
+    if (chunk.frameTrace) chunk.frameTrace.decodeQueuedAtMs = performance.now();
     decoder.decode(new EncodedVideoChunk({
       type: isKey ? "key" : "delta",
       timestamp: chunk.timestamp,
@@ -1053,25 +3011,89 @@ function feedDecoder(chunk, generation) {
     hudState.queued = decoder.decodeQueueSize;
   } catch (e) {
     latencyGuard.releaseDecode();
+    sendClientLog("error", "decoder-decode-throw", {
+      message: String(e?.message || e).slice(0, 512),
+      codec: chunk.codec,
+      type: isKey ? "key" : "delta",
+      byteLength: data.byteLength,
+    });
     hudState.dec = `dec:${e.message}`;
-    dropAndResync("decoder-throw");
+    if (usingWssMedia) noteWssFailure("decode-throw"); else dropAndResync("decoder-throw");
   }
 }
 
 function drawFrame(frame, due = performance.now()) {
   try {
+    if (!desktopAvailable) return;
     const w = frame.displayWidth, h = frame.displayHeight;
-    if (screen.width !== w || screen.height !== h) {
-      screen.width = w;
-      screen.height = h;
-      syncViewport();
+    lastDecodedDimensions = { width: w, height: h };
+    const metadata = usingWssMedia ? wssFrameMeta.get(frame) : null;
+    const view = metadata ? viewportForGeneration(metadata.generation) : null;
+    if (usingWssMedia && (!metadata || !view)) return; // never render a generation with stale geometry
+    let hybridTilesDrawn = 0;
+    let presentedCanvas = screen;
+    let presentedContext = ctx;
+    if (usingWssMedia && view?.enabled) {
+      if (sharpScreen.width !== w || sharpScreen.height !== h) {
+        sharpScreen.width = w;
+        sharpScreen.height = h;
+      }
+      const context = ensureSharpCanvas();
+      presentedCanvas = sharpScreen;
+      presentedContext = context;
+      hybridTilesDrawn = activeWssHybridMode()
+        ? drawBaseThenHybrid(context, frame, activeWssHybridCache(), metadata, w, h)
+        : (context.drawImage(frame, 0, 0, w, h), 0);
+      layoutSharpCanvas(view);
+      const gain = cropGain(view, w, h);
+      hudState.dimensions = `${view.width}x${view.height}→${w}x${h} ${gain.x.toFixed(1)}x/${gain.y.toFixed(1)}x`;
+    } else {
+      if (screen.width !== w || screen.height !== h) {
+        screen.width = w;
+        screen.height = h;
+        syncViewportAndFollow();
+      }
+      const context = ensureMainCanvas();
+      presentedContext = context;
+      hybridTilesDrawn = activeWssHybridMode()
+        ? drawBaseThenHybrid(context, frame, activeWssHybridCache(), metadata, w, h)
+        : (context.drawImage(frame, 0, 0, w, h), 0);
+      layoutSharpCanvas(null);
+      hudState.dimensions = `${w}x${h}`;
     }
-    ctx.drawImage(frame, 0, 0, w, h);
+    // Mark only after the frame has been copied to its visible canvas. Codec
+    // labels and host admission alone are not enough to hide startup UI.
+    markFirstFramePresented(metadata?.generation ?? null);
+    if (usingWssMedia) framePresentationTelemetry.noteImmediatePresented();
+    const renderedAt = performance.now();
+    if (metadata?.frameTrace) {
+      metadata.frameTrace.hybridTilesDrawn = hybridTilesDrawn;
+      metadata.frameTrace.presentedAtMs = renderedAt;
+      metadata.frameTrace.presentedIdentity = wssPresentedIdentityFramesRemaining > 0
+        ? readTimestampPattern(presentedCanvas, presentedContext) : null;
+      if (wssPresentedIdentityFramesRemaining > 0)
+        wssPresentedIdentityFramesRemaining--;
+      wssLatestFrameTrace = { ...metadata.frameTrace };
+      wssPresentedFrameTraces.set(metadata.frameTrace.sequence >>> 0, { ...metadata.frameTrace });
+      while (wssPresentedFrameTraces.size > 64)
+        wssPresentedFrameTraces.delete(wssPresentedFrameTraces.keys().next().value);
+    }
+    if (lastFrameDrawnAt !== null) {
+      const frameGap = Math.max(0, Math.round(renderedAt - lastFrameDrawnAt));
+      hudState.frameGap = frameGap;
+      hudState.maxFrameGap = Math.max(Number(hudState.maxFrameGap) || 0, frameGap);
+    }
+    lastFrameDrawnAt = renderedAt;
     lastRenderedTimestamp = frame.timestamp;
     lastRenderedDueMs = due;
-    hudState.lag = Math.max(0, Math.round(performance.now() - due));
+    hudState.lag = Math.max(0, Math.round(renderedAt - due));
     fpsWindow++;
     framesDrawn++;
+    hudState.presented = framesDrawn;
+    if (usingWssMedia && wssOrdered.expected !== null) {
+      if (metadata !== undefined) wssPresentedSequence = metadata.sequence >>> 0;
+      scheduleWssAck(wssReassembler.generation);
+    }
   } finally {
     try { frame.close(); } catch {}
   }
@@ -1099,7 +3121,7 @@ function avcCodecFromSps(bytes) {
 
 // ---- input: pointer lock mouse ----------------------------------------------
 const BM = { 0: 1, 1: 4, 2: 2 }; // e.button -> bitmask (left, middle, right)
-let buttons = 0;
+let buttons = 0, touchButtons = 0;
 let locked = false;
 let lastNonMousePointerAt = -Infinity;
 
@@ -1117,6 +3139,7 @@ function videoContentRect(video) {
 }
 
 async function requestPointerLock() {
+  if (pointerMode !== "game") return;
   try {
     await inputSurface.requestPointerLock({ unadjustedMovement: true });
     locked = true;
@@ -1129,47 +3152,52 @@ async function requestPointerLock() {
 }
 document.addEventListener("pointerlockchange", () => {
   locked = document.pointerLockElement === inputSurface;
-  document.getElementById("capture").textContent = locked ? "Release cursor" : "Capture cursor";
+  updatePointerHud();
   if (!locked) releaseInput();
+  scheduleChromeIdle();
 });
 document.addEventListener("click", (event) => {
-  if (event.target === inputSurface && event.detail && event.pointerType !== "touch" && event.pointerType !== "pen" && !event.sourceCapabilities?.firesTouchEvents && performance.now() - lastNonMousePointerAt > 1500 && !locked && connected) requestPointerLock();
+  if (pointerMode === "game" && event.target === inputSurface && event.detail && event.pointerType !== "touch" && event.pointerType !== "pen" && !event.sourceCapabilities?.firesTouchEvents && performance.now() - lastNonMousePointerAt > 1500 && !locked && connected) requestPointerLock();
 });
 document.addEventListener("mousemove", (e) => {
   if (!inputReady || !connected) return;
-  if (locked) {
+  if (pointerMode === "game" && locked) {
     // Relative (unadjusted) deltas.
+    updateRemoteCursor(cursor => cursor.moveScreen(e.movementX, e.movementY, viewport));
     queueMotion(e.movementX, e.movementY);
   } else {
+    if (pointerMode !== "desktop") return;
     if (e.target !== inputSurface) return;
     // Absolute fallback over the displayed video (not its letterbox): 0..65535.
     const r = activeVideo ? videoContentRect(activeVideo) : screen.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
     const x = clamp((e.clientX - r.left) / r.width, 0, 1);
     const y = clamp((e.clientY - r.top) / r.height, 0, 1);
-    queueAbsolute(x * 65535, y * 65535);
+    updateRemoteCursor(cursor => cursor.setNormalized(x, y));
+    locallyAuthoritativeCursor = true; queueAbsolute(x * 65535, y * 65535); showTouchCursor();
   }
 });
 document.addEventListener("mousedown", (e) => {
   if (!inputReady) return;
   if (e.target !== inputSurface) return;
+  inputSurface.focus({ preventScroll: true });
   // The initial capture gesture is local-only; never turn it into a remote click.
-  if (!locked && connected) { requestPointerLock(); e.preventDefault(); return; }
+  if (pointerMode === "game" && !locked && connected) { requestPointerLock(); e.preventDefault(); return; }
   buttons |= BM[e.button] || (e.button === 3 ? 8 : e.button === 4 ? 16 : 0);
-  input.buttons(buttons);
+  if (pointerMode === "desktop") setTouchButtonsAtCursor(buttons); else input.buttons(buttons);
   e.preventDefault();
 });
 document.addEventListener("mouseup", (e) => {
   if (!inputReady) return;
   if (e.target !== inputSurface) return;
   buttons &= ~(BM[e.button] || (e.button === 3 ? 8 : e.button === 4 ? 16 : 0));
-  input.buttons(buttons);
+  if (pointerMode === "desktop") setTouchButtonsAtCursor(buttons); else input.buttons(buttons);
   e.preventDefault();
 });
 document.addEventListener("contextmenu", (e) => e.preventDefault());
 document.addEventListener("wheel", (e) => {
   if (e.target !== inputSurface) return;
-  if (e.ctrlKey) { setZoom(viewport.zoom + (e.deltaY < 0 ? .1 : -.1), {x:e.clientX,y:e.clientY}); e.preventDefault(); return; }
+  if (e.ctrlKey) { syncViewport(); updateRemoteCursor(cursor => cursor.setFromScreen({x:e.clientX,y:e.clientY}, viewport)); setZoom(viewport.zoom + (e.deltaY < 0 ? .1 : -.1), {x:e.clientX,y:e.clientY}); e.preventDefault(); return; }
   if (!inputReady) return;
   // Normalize browser deltas to WHEEL_DELTA (120 per notch).
   const delta = e.deltaMode === 1 ? e.deltaY * 120 : e.deltaY * 1.2;
@@ -1201,9 +3229,23 @@ for (let i = 0; i < 10; i++) KEY["Digit" + i] = 0x30 + i;
 for (let i = 1; i <= 12; i++) KEY["F" + i] = 0x70 + (i - 1);
 
 const held = new Set();
-function keyboardActive() { return locked || document.activeElement === inputSurface; }
+function keyboardActive() {
+  const active = document.activeElement;
+  const keyboard = document.getElementById("keyboard-input");
+  const localControlFocused = active !== keyboard && Boolean(active?.closest?.("#controls, #control-sheet, #connection-status"));
+  return shouldCaptureKeyboard({ inputReady, pointerMode, locked,
+    surfaceFocused: active === inputSurface, keyboardFocused: active === keyboard, localControlFocused });
+}
 document.addEventListener("keydown", (e) => {
   if (!inputReady || !keyboardActive()) return;
+  if (e.target?.id === "keyboard-input") {
+    // Let the native field own text editing. Its resulting value is mirrored
+    // by the reconciliation listener below, which avoids duplicate Backspace
+    // packets and preserves mobile autocorrect/composition behavior.
+    const localEditKey = ["Backspace", "Delete", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"];
+    if (localEditKey.includes(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey) return;
+    if (e.key?.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) return;
+  }
   const vk = KEY[e.code];
   if (vk === undefined) return;
   e.preventDefault();
@@ -1220,31 +3262,625 @@ document.addEventListener("keyup", (e) => {
   held.delete(e.code);
   input.key(vk, true);
 });
-window.addEventListener("blur", () => {
-  releaseInput(); held.clear();
+const keyboardInput = document.getElementById("keyboard-input");
+const keyboardStatus = document.getElementById("keyboard-status");
+let keyboardShadow = "";
+let keyboardComposing = false;
+// BEGIN secure-composition-gate
+function createCompositionCommitGate(commit, schedule = setTimeout, cancel = clearTimeout) {
+  let pending = null;
+  return {
+    stage(text) {
+      this.reset();
+      const value = String(text ?? "");
+      if (!value) return false;
+      const transaction = { value, timer: null };
+      transaction.timer = schedule(() => {
+        if (pending !== transaction) return;
+        pending = null;
+        commit(transaction.value);
+      }, 50);
+      pending = transaction;
+      return true;
+    },
+    consume(text) {
+      if (!pending) return false;
+      const transaction = pending;
+      pending = null;
+      cancel(transaction.timer);
+      commit(String(text ?? "") || transaction.value);
+      return true;
+    },
+    reset() {
+      if (pending) cancel(pending.timer);
+      pending = null;
+    },
+  };
+}
+// END secure-composition-gate
+const secureCompositionCommit = createCompositionCommitGate(text => {
+  if (!inputReady || desktopKind !== "secure") { resetKeyboardDraft(); return; }
+  handleSecureKeyboardInput({ data: text, inputType: "insertCompositionText" });
 });
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") releaseInput(); });
+const modifierVks = new Map([["Ctrl", 0x11], ["Alt", 0x12], ["Shift", 0x10], ["Win", 0x5B]]);
+const specialKeys = [
+  ["Esc", 0x1B], ["Tab", 0x09], ["Enter", 0x0D], ["Backspace", 0x08], ["Delete", 0x2E],
+  ["↑", 0x26], ["↓", 0x28], ["←", 0x25], ["→", 0x27], ["Home", 0x24], ["End", 0x23],
+  ["PgUp", 0x21], ["PgDn", 0x22], ["Insert", 0x2D], ["Space", 0x20],
+  ...Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, 0x70 + i]),
+];
+function renderKeyboardModifiers() {
+  document.querySelectorAll(".modifier[data-vk]").forEach(button => button.classList.toggle("active", latchedModifiers.has(Number(button.dataset.vk))));
+}
+function releaseLatchedModifiers() {
+  for (const vk of latchedModifiers) input.key(vk, true);
+  latchedModifiers.clear();
+  renderKeyboardModifiers();
+}
+function sendSpecialKey(vk) {
+  if (!inputReady) return;
+  input.key(vk, false); input.key(vk, true);
+  releaseLatchedModifiers();
+}
+document.querySelectorAll(".modifier[data-vk]").forEach(button => {
+  button.onclick = () => {
+    const vk = Number(button.dataset.vk);
+    if (latchedModifiers.has(vk)) { input.key(vk, true); latchedModifiers.delete(vk); }
+    else { input.key(vk, false); latchedModifiers.add(vk); }
+    renderKeyboardModifiers();
+  };
+});
+for (const [label, vk] of specialKeys) {
+  const button = document.createElement("button");
+  button.type = "button"; button.textContent = label; button.dataset.vk = String(vk);
+  button.onclick = () => sendSpecialKey(vk);
+  document.getElementById("special-key-grid").append(button);
+}
+document.getElementById("clear-modifiers").onclick = () => releaseLatchedModifiers();
+function resetKeyboardDraft() {
+  keyboardComposing = false;
+  secureCompositionCommit.reset();
+  keyboardShadow = "";
+  keyboardInput.value = "";
+}
+function sendKeyboardText(text) {
+  let chunk = "";
+  let sent = 0;
+  for (const character of String(text)) {
+    const candidate = chunk + character;
+    if (new TextEncoder().encode(candidate).byteLength > 500 && chunk) {
+      if (input.text(chunk)) sent += Array.from(chunk).length;
+      chunk = character;
+    } else chunk = candidate;
+  }
+  if (chunk && input.text(chunk)) sent += Array.from(chunk).length;
+  return sent;
+}
+function reconcileKeyboardValue(nextValue) {
+  const next = String(nextValue ?? "");
+  const edit = reconcileTextEdit(keyboardShadow, next);
+   if (inputReady) {
+    for (let i = 0; i < edit.deleteCount; i++) {
+      input.key(0x08, false);
+      input.key(0x08, true);
+    }
+    const inserted = sendKeyboardText(edit.insert);
+    if (edit.deleteCount || inserted) {
+      keyboardStatus.textContent = edit.deleteCount
+        ? `Applied correction: ${edit.deleteCount} delete${edit.deleteCount === 1 ? "" : "s"}${inserted ? ` + ${inserted} character${inserted === 1 ? "" : "s"}` : ""}.`
+        : `Sent ${inserted} character${inserted === 1 ? "" : "s"}.`;
+    }
+  }
+  keyboardShadow = next;
+}
+function handleSecureKeyboardInput(event) {
+  if (desktopInputState !== "enabled") { resetKeyboardDraft(); return; }
+  if (event.inputType === "deleteContentBackward") {
+    input.key(0x08, false); input.key(0x08, true);
+    keyboardStatus.textContent = "Protected input sent.";
+    resetKeyboardDraft();
+    return;
+  }
+  const source = event.data ?? keyboardInput.value;
+  const units = secureTextUnits(source, event.inputType || "insertText");
+  for (const unit of units) input.text(unit);
+  keyboardStatus.textContent = units.length ? "Protected input sent." : "Paste and automatic corrections are disabled on secure desktop.";
+  resetKeyboardDraft();
+}
+keyboardInput.addEventListener("compositionstart", () => { secureCompositionCommit.reset(); keyboardComposing = true; });
+keyboardInput.addEventListener("input", event => {
+  if (!inputReady || event.isComposing || keyboardComposing) return;
+  if (desktopKind === "secure" && secureCompositionCommit.consume(event.data ?? keyboardInput.value)) return;
+  if (desktopKind === "secure") { handleSecureKeyboardInput(event); return; }
+  reconcileKeyboardValue(keyboardInput.value);
+});
+keyboardInput.addEventListener("compositionend", event => {
+  keyboardComposing = false;
+  if (desktopKind === "secure") {
+    if (inputReady) secureCompositionCommit.stage(event.data ?? keyboardInput.value);
+    else resetKeyboardDraft();
+    return;
+  }
+  if (inputReady) reconcileKeyboardValue(keyboardInput.value);
+});
+window.addEventListener("blur", () => {
+  releaseInput(); held.clear(); resetKeyboardDraft();
+});
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") { releaseInput(); resetTouchCursor(); } });
 
-// Touchpad and viewport state are pure modules, shared by all local zoom paths.
-const gestures = new TouchGesture(); const viewport = new Viewport(innerWidth, innerHeight);
+// TeamViewer-style Mouse mode: the screen is a touchpad. A predicted cursor
+// responds locally while the real input travels over the low-latency motion
+// lane, and every local zoom path keeps that cursor as its focus.
+const gestures = new TouchGesture();
+const viewport = new Viewport(innerWidth, innerHeight);
+const remoteCursor = new RemoteCursor();
+cursorReconciler = new CursorReconciler(remoteCursor);
+const touchCursor = document.getElementById("touch-cursor");
+const mobilePointerDevice = navigator.maxTouchPoints > 0 && matchMedia("(any-pointer:coarse)").matches;
+const pointerModeButton = document.getElementById("pointer-mode");
+const qualitySelect = document.getElementById("quality");
+let pointerMode = localStorage.getItem("bp_pointer_mode") === "game" ? "game" : "desktop";
+let cursorSyncTimer = null;
+let locallyAuthoritativeCursor = false;
+let lastCursorCorrectionAt = -Infinity;
+// v0 captures one 1920x1080 desktop. Query overrides keep touch sensitivity
+// correct for a manually selected monitor until native dimensions are signaled.
+const remoteDesktop = {
+  width: clamp(Number(params.get("remoteWidth")) || 1920, 320, 16384),
+  height: clamp(Number(params.get("remoteHeight")) || 1080, 240, 16384),
+};
+let touchCursorVisible = false;
+const coarsePointerQuery = matchMedia("(any-pointer:coarse)");
+let chromeIdleTimer = null;
+const contextHint = document.getElementById("context-hint");
+const contextHintCopy = document.getElementById("context-hint-copy");
+
+function syncPointerCapability() {
+  document.body.classList.toggle("coarse-pointer", coarsePointerQuery.matches);
+}
+
+function syncShellMode() {
+  const gameMode = pointerMode === "game";
+  document.body.classList.toggle("mode-game", gameMode);
+  document.body.classList.toggle("mode-work", !gameMode);
+  document.querySelectorAll('[data-ui-action="pointer"]').forEach(button => {
+    button.setAttribute("aria-pressed", String(gameMode));
+    const label = button.querySelector("span:last-child");
+    if (label) label.textContent = gameMode ? (locked ? "Release" : "Game") : "Work";
+  });
+  if (!gameMode) {
+    clearTimeout(chromeIdleTimer);
+    chromeIdleTimer = null;
+    document.body.classList.remove("chrome-idle");
+  }
+}
+
+function scheduleChromeIdle() {
+  clearTimeout(chromeIdleTimer);
+  chromeIdleTimer = null;
+  document.body.classList.remove("chrome-idle");
+  if (pointerMode !== "game" || (!locked && !coarsePointerQuery.matches) || !controlSheet.hidden) return;
+  chromeIdleTimer = setTimeout(() => document.body.classList.add("chrome-idle"), 1_750);
+}
+
+function revealChrome() {
+  document.body.classList.remove("chrome-idle");
+  scheduleChromeIdle();
+}
+
+function setChromeDockOpen(open, remember = true) {
+  const reveal = document.getElementById("chrome-reveal");
+  const expanded = Boolean(open);
+  document.body.classList.toggle("chrome-dock-closed", !expanded);
+  reveal.setAttribute("aria-expanded", String(expanded));
+  reveal.setAttribute("aria-label", expanded ? "Hide controls" : "Show controls");
+  reveal.querySelector("span:first-child").textContent = expanded ? "⌃" : "⌄";
+  reveal.querySelector("span:last-child").textContent = expanded ? "Hide" : "Controls";
+  if (remember) {
+    try { localStorage.setItem("bp_controls_open", expanded ? "1" : "0"); } catch {}
+  }
+  if (expanded) revealChrome();
+}
+
+function showContextHint() {
+  if (!hasPresentedFrame || !contextHint || !contextHintCopy) return;
+  const mode = pointerMode === "game" ? "game" : "work";
+  let dismissed = false;
+  try { dismissed = localStorage.getItem(`bp_hint_${mode}_dismissed`) === "1"; } catch {}
+  contextHint.hidden = dismissed;
+  contextHint.dataset.mode = mode;
+  contextHintCopy.textContent = mode === "game"
+    ? "Capture the pointer to control the game · reveal controls from the edge."
+    : "Drag to move the pointer · pinch to zoom · two-finger tap to right-click.";
+}
+
+syncPointerCapability();
+coarsePointerQuery.addEventListener?.("change", () => { syncPointerCapability(); scheduleChromeIdle(); });
+function clearCursorSyncTimer() { if (cursorSyncTimer !== null) clearTimeout(cursorSyncTimer); cursorSyncTimer = null; }
+ function updatePointerHud() {
+   const workMode = pointerMode === "desktop";
+   hudState.pointer = workMode ? "work" : "gaming";
+   hudState.cursorSeq = `${cursorReconciler.lastSent ?? "…"}/${cursorReconciler.lastAck ?? "…"}`;
+   hudState.cursorAge = cursorReconciler.feedbackAt === null ? "…" : Math.round(performance.now()-cursorReconciler.feedbackAt);
+   pointerModeButton.textContent = `Mode: ${workMode ? "Work" : "Game"}`;
+   pointerModeButton.setAttribute("aria-pressed", String(!workMode));
+   const capture = document.getElementById("capture");
+   capture.disabled = workMode;
+   capture.textContent = workMode ? "Work cursor" : (locked ? "Release cursor" : "Capture cursor");
+   const sessionPointer = document.getElementById("session-pointer");
+   if (sessionPointer) sessionPointer.textContent = workMode ? "Work · authoritative" : (locked ? "Game · captured" : "Game · released");
+   syncShellMode();
+ }
+function requestCursorSync() {
+  clearCursorSyncTimer();
+  if (pointerMode !== "desktop" || !inputReady) { updatePointerHud(); return; }
+  if (input.cursorSync()) cursorReconciler.noteSent(input.lastSentSequence);
+  updatePointerHud();
+  if (!cursorReconciler.synced) cursorSyncTimer = setTimeout(requestCursorSync, 500);
+}
+function onInputReady() { cursorReconciler.reset(); locallyAuthoritativeCursor=false; touchCursorVisible=shouldShowPredictedCursor({pointerMode,inputReady}); renderTouchCursor(); requestCursorSync(); }
+function handleCursorState(data) {
+  const state=decodeCursorState(data);
+  if (!state || !cursorReconciler) return;
+  const applied=cursorReconciler.apply(state,{touchActive:gestures.points.size>0,preserveCursor:pointerMode === "desktop" && locallyAuthoritativeCursor});
+  const now=performance.now();
+  if (shouldCorrectCursorDrift({pointerMode,locallyAuthoritative:locallyAuthoritativeCursor,state,cursor:remoteCursor,remote:remoteDesktop,now,lastCorrectionAt:lastCursorCorrectionAt})) {
+    const point=remoteCursor.absolutePoint();
+    if (input.buttonsAt(point.x,point.y,touchButtons || buttons)) { cursorReconciler.noteSent(input.lastSentSequence); lastCursorCorrectionAt=now; }
+  }
+  if (cursorReconciler.synced) clearCursorSyncTimer();
+  touchCursorVisible=shouldShowCursorOverlay({pointerMode, ...cursorReconciler});
+  updatePointerHud();
+  if (applied) { centerCameraOnCursor(); renderViewport(); } else renderTouchCursor();
+}
+function setPointerMode(next, persist=true) {
+  next = next === "game" ? "game" : "desktop";
+  if (pointerMode === next && persist) return;
+  releaseInput(); gestures.reset(); cursorReconciler.reset(); touchCursorVisible=false; pointerMode=next;
+  locallyAuthoritativeCursor=false;
+  if (pointerMode === "desktop" && document.pointerLockElement) document.exitPointerLock?.();
+  if (persist) localStorage.setItem("bp_pointer_mode", pointerMode);
+  wssDeadline.setMode(streamModeValue());
+  wssReassembler.setTtlMs(wssDeadline.deadlineMs); wssOrdered.setTtlMs(wssDeadline.deadlineMs);
+  if (persist) sendStreamMode("user-mode");
+  clearCursorSyncTimer(); updatePointerHud(); renderTouchCursor();
+  if (inputReady) {
+    if (input.cursorSync()) cursorReconciler.noteSent(input.lastSentSequence);
+    if (pointerMode === "desktop") cursorSyncTimer=setTimeout(requestCursorSync,500);
+   }
+   scheduleSharpViewport("pointer-mode");
+   showContextHint();
+   scheduleChromeIdle();
+ }
+function streamModeValue() { return pointerMode === "game" ? "game" : "work"; }
+function sendStreamMode(reason) {
+  if (!signalingRegistered || ws?.readyState !== WebSocket.OPEN) return;
+  sendSignal({ type: "media-control", action: "mode", protocol: wssSelected ? wssProtocol : 2, epoch: mediaEpoch,
+    streamMode: streamModeValue(), reason });
+}
 function containedContentRect() { const mediaWidth = activeVideo?.videoWidth || screen.width, mediaHeight = activeVideo?.videoHeight || screen.height; if (!mediaWidth || !mediaHeight) return {x:0,y:0,width:innerWidth,height:innerHeight}; const scale=Math.min(innerWidth/mediaWidth,innerHeight/mediaHeight), width=mediaWidth*scale, height=mediaHeight*scale; return {x:(innerWidth-width)/2,y:(innerHeight-height)/2,width,height}; }
-function syncViewport() { viewport.resize(innerWidth,innerHeight); viewport.setContent(containedContentRect()); }
-function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = "0 0"; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); document.getElementById("zoom-reset").textContent = `${s.zoom.toFixed(1)}×`; }
-function setZoom(next, anchor = {x:innerWidth/2,y:innerHeight/2}) { syncViewport(); viewport.setZoom(next, anchor); renderViewport(); }
-function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); }
-addEventListener("resize", () => { syncViewport(); renderViewport(); });
-function dispatchGesture(actions) { for (const action of actions) { if (action.type === "suppress-motion") { input.clearMotion(); if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; } else if (action.type === "motion") queueMotion(action.dx, action.dy); else if (action.type === "tap" && inputReady) { input.buttons(1); input.buttons(0); } else if (action.type === "pinch") setZoom(viewport.zoom * action.scale, action.anchor); else if (action.type === "translate") { if (viewport.zoom === 1) queueMotion(0,0,action.dx,action.dy); else panBy(action.dx,action.dy); } } hudState.touch = gestures.cancelled ? "cancelled" : (gestures.mode || (gestures.points.size > 1 ? "two-finger" : gestures.points.size ? "touch" : "…")); }
-inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY})); e.preventDefault(); });
+function syncViewport() { viewport.resize(innerWidth,innerHeight); viewport.setContent(containedContentRect()); renderTouchCursor(); }
+function renderTouchCursor() { const p=remoteCursor.screenPoint(viewport); touchCursor.style.transform=`translate3d(${p.x}px,${p.y}px,0)`; touchCursor.classList.toggle("visible",touchCursorVisible); }
+function centerCameraOnCursor() { if (shouldCenterCameraOnCursor({ zoom: viewport.zoom, pointerMode, synced: cursorReconciler.synced, locallyAuthoritative: locallyAuthoritativeCursor })) viewport.centerOnNormalized(remoteCursor.snapshot()); }
+function syncViewportAndFollow() { syncViewport(); centerCameraOnCursor(); renderViewport(); }
+function updateRemoteCursor(update) { update(remoteCursor); if (pointerMode === "desktop") locallyAuthoritativeCursor=true; centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("cursor-follow"); }
+function showTouchCursor() { touchCursorVisible=shouldShowCursorOverlay({pointerMode, ...cursorReconciler}); renderTouchCursor(); }
+function resetTouchCursor() { clearCursorSyncTimer(); touchCursorVisible=false; gestures.reset(); cursorReconciler.reset(); renderTouchCursor(); }
+function mediaViewCrop(message) {
+  const desktopWidth = Number(message?.desktopWidth) || remoteDesktop.width;
+  const desktopHeight = Number(message?.desktopHeight) || remoteDesktop.height;
+  const width = Number(message?.sourceWidth) || desktopWidth;
+  const height = Number(message?.sourceHeight) || desktopHeight;
+  return { enabled: message?.state !== "full" && (width < desktopWidth || height < desktopHeight),
+    x: Number(message?.sourceX) || 0, y: Number(message?.sourceY) || 0, width, height,
+    desktopWidth, desktopHeight, revision: Number(message?.revision) || 0,
+    generation: Number(message?.generation) || 0, source: message };
+}
+function viewportHealthSnapshot() {
+  const crop = renderedSharpView || activeViewportCrop();
+  const gain = cropGain(crop, lastDecodedDimensions?.width || 1920, lastDecodedDimensions?.height || 1080);
+  return { state: viewportTelemetry.state, revision: viewportTelemetry.revision, generation: viewportTelemetry.generation,
+    crop: viewportTelemetry.crop, zoom: Number(viewport.zoom.toFixed(2)), pointer: pointerMode,
+    pending: viewportPending?.revision || null,
+    transitionMs: viewportPending ? Math.round(performance.now() - viewportPending.sentAt) : 0,
+    gainX: Number(gain.x.toFixed(2)), gainY: Number(gain.y.toFixed(2)), requested: viewportLast };
+}
+function activeViewportCrop() {
+  return viewportState.source ? mediaViewCrop(viewportState.source) : fullDesktopCrop(remoteDesktop.width, remoteDesktop.height);
+}
+function computeDesiredViewport() {
+  if (streamModeValue() === "game" || !sharpZoomEnabled || sharpDisabledForSession) return fullDesktopCrop(remoteDesktop.width, remoteDesktop.height);
+  return desiredSharpCrop({ viewport: viewport.snapshot(), viewportWidth: innerWidth, viewportHeight: innerHeight,
+    content: viewport.content, desktopWidth: remoteDesktop.width, desktopHeight: remoteDesktop.height,
+    wasEnabled: viewportState.enabled || !!viewportPending?.requested?.enabled });
+}
+function q16(value, extent) { return Math.max(0, Math.min(65535, Math.round(value / Math.max(1, extent) * 65535))); }
+function armViewportTransitionTimeout(revision) {
+  clearTimeout(viewportTransitionTimer);
+  viewportTransitionTimer = setTimeout(() => {
+    if (!viewportPending || viewportPending.revision !== revision) return;
+    if (!viewportPending.recoveryRequested) {
+      viewportPending.recoveryRequested = true;
+      beginWssRecovery("viewport-transition-timeout");
+      armViewportTransitionTimeout(revision);
+      return;
+    }
+    sendClientLog("warn", "viewport-transition-failed", { revision, requested: viewportPending.requested });
+    viewportConsecutiveTimeouts++;
+    viewportPending = null;
+    if (viewportConsecutiveTimeouts >= 2) sharpDisabledForSession = true;
+    sendViewportRequest(fullDesktopCrop(remoteDesktop.width, remoteDesktop.height), "viewport-timeout-full", true);
+  }, 1_500);
+}
+function sendViewportRequest(crop, reason, force = false) {
+  if (!usingWssMedia || !wssStartedHost || viewportPending) return false;
+  const active = activeViewportCrop();
+  if (!force && !cropNeedsUpdate(active, crop, remoteDesktop.width, remoteDesktop.height)) return false;
+  const revision = viewportRevision = (viewportRevision + 1) >>> 0;
+  viewportLastSentAt = performance.now();
+  viewportLast = { enabled: crop.enabled, x: crop.x, y: crop.y, width: crop.width, height: crop.height };
+  viewportPending = { revision, requested: crop, reason, sentAt: viewportLastSentAt, recoveryRequested: false, generation: 0, source: null };
+  viewportTelemetry = { state: "refining", revision, generation: 0, crop: `${crop.width}x${crop.height}@${crop.x},${crop.y}` };
+  sendSignal({ type: "media-control", action: "viewport", protocol: wssProtocol, epoch: mediaEpoch,
+    revision, enabled: crop.enabled, xQ16: q16(crop.x, remoteDesktop.width), yQ16: q16(crop.y, remoteDesktop.height),
+    widthQ16: q16(crop.width, remoteDesktop.width), heightQ16: q16(crop.height, remoteDesktop.height), reason });
+  armViewportTransitionTimeout(revision);
+  return true;
+}
+function flushSharpViewport(reason = "sharp-viewport") {
+  viewportTimer = null;
+  viewportDesired = computeDesiredViewport();
+  if (viewportPending) return;
+  sendViewportRequest(viewportDesired, reason);
+}
+function scheduleSharpViewport(reason = "sharp-viewport") {
+  if (!usingWssMedia || !wssStartedHost) return;
+  viewportDesired = computeDesiredViewport();
+  if (viewportPending) return;
+  clearTimeout(viewportTimer);
+  const wait = Math.max(0, 100 - (performance.now() - viewportLastSentAt));
+  viewportTimer = setTimeout(() => flushSharpViewport(reason), wait);
+}
+function handleMediaView(message) {
+  if (!Number.isInteger(message.revision)) return;
+  const minimumRevision = Math.max(viewportState.revision || 0, viewportPending?.revision || 0);
+  if (message.revision < minimumRevision) return;
+  viewportTelemetry = { state: message.state || "?", revision: message.revision, generation: message.generation || 0,
+    crop: `${message.sourceWidth || "?"}x${message.sourceHeight || "?"}@${message.sourceX || 0},${message.sourceY || 0}` };
+  if (message.state === "pending") {
+    if (viewportPending?.revision === message.revision) Object.assign(viewportPending, { source: message, generation: message.generation || 0 });
+    return;
+  }
+  const crop = mediaViewCrop(message);
+  const completed = viewportPending?.revision === message.revision ? viewportPending : null;
+  viewportState = { enabled: crop.enabled, revision: message.revision, generation: message.generation || 0, source: message };
+  if (completed) {
+    viewportPending = null;
+    if (crop.enabled || completed.reason !== "viewport-timeout-full") viewportConsecutiveTimeouts = 0;
+    clearTimeout(viewportTransitionTimer); viewportTransitionTimer = null;
+  }
+  const gain = cropGain(crop, lastDecodedDimensions?.width || 1920, lastDecodedDimensions?.height || 1080);
+  viewportTelemetry = { state: crop.enabled ? `sharp ${gain.x.toFixed(1)}x/${gain.y.toFixed(1)}x` : "full",
+    revision: message.revision, generation: message.generation || 0,
+    crop: `${crop.width}x${crop.height}@${crop.x},${crop.y}` };
+  scheduleSharpViewport("viewport-committed");
+}
+function viewportForGeneration(generation) {
+  if (viewportPending?.source && viewportPending.generation === generation) return mediaViewCrop(viewportPending.source);
+  if (viewportState.source && viewportState.generation === generation) return mediaViewCrop(viewportState.source);
+  if (!viewportPending && viewportState.source) return { ...mediaViewCrop(viewportState.source), generation };
+  if (!viewportPending && !viewportState.enabled) return { ...fullDesktopCrop(remoteDesktop.width, remoteDesktop.height), generation };
+  return null;
+}
+function layoutSharpCanvas(crop) {
+  if (!crop?.enabled) { sharpScreen.classList.remove("active"); renderedSharpView = null; return; }
+  const content = viewport.content;
+  const desktopWidth = Math.max(1, crop.desktopWidth || remoteDesktop.width);
+  const desktopHeight = Math.max(1, crop.desktopHeight || remoteDesktop.height);
+  sharpScreen.style.left = `${content.x + crop.x / desktopWidth * content.width}px`;
+  sharpScreen.style.top = `${content.y + crop.y / desktopHeight * content.height}px`;
+  sharpScreen.style.width = `${crop.width / desktopWidth * content.width}px`;
+  sharpScreen.style.height = `${crop.height / desktopHeight * content.height}px`;
+  sharpScreen.classList.add("active");
+  renderedSharpView = crop;
+}
+function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = "0 0"; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); document.getElementById("zoom-reset").textContent = `${s.zoom.toFixed(1)}×`; if (renderedSharpView) layoutSharpCanvas(renderedSharpView); renderTouchCursor(); }
+function setZoom(next) { syncViewport(); const anchor=mobilePointerDevice && (pointerMode !== "desktop" || !cursorReconciler.synced) ? {x:innerWidth/2,y:innerHeight/2} : remoteCursor.screenPoint(viewport); viewport.setZoom(next, anchor); centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("zoom"); }
+function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); scheduleSharpViewport("pan"); }
+addEventListener("resize", syncViewportAndFollow);
+function setTouchButtons(mask) { touchButtons=mask; if (inputReady) input.buttons(mask); }
+function setTouchButtonsAtCursor(mask) { const point=remoteCursor.absolutePoint(); touchButtons=mask; if (inputReady && input.buttonsAt(point.x,point.y,mask)) cursorReconciler.noteSent(input.lastSentSequence); updatePointerHud(); }
+function dispatchGesture(actions) {
+  if (!desktopAvailable || desktopAwaitingFrame) return;
+  for (const action of actions) {
+    if (action.type === "suppress-motion") { input.clearMotion(); if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; }
+    else if (action.type === "motion") { const remote=remoteCursor.remoteDeltaForScreen(action.dx,action.dy,viewport,remoteDesktop); if (pointerMode === "desktop") { if (!cursorReconciler.synced) { requestCursorSync(); continue; } updateRemoteCursor(cursor => cursor.moveScreen(action.dx,action.dy,viewport)); showTouchCursor(); const point=remoteCursor.absolutePoint(); if (inputReady) queueTouchAbsolute(point.x,point.y); } else if (inputReady) queueTouchMotion(remote.dx,remote.dy); }
+    else if (action.type === "motion-end" && pointerMode === "desktop" && cursorReconciler.synced) setTouchButtonsAtCursor(touchButtons);
+    else if (action.type === "tap" && inputReady) { if (pointerMode === "desktop") { if (!cursorReconciler.synced) { requestCursorSync(); continue; } setTouchButtonsAtCursor(1); setTouchButtons(0); } else { setTouchButtons(1); setTouchButtons(0); } }
+    else if (action.type === "drag-start") { if (pointerMode === "desktop" && cursorReconciler.synced) setTouchButtonsAtCursor(1); else if (pointerMode === "game") setTouchButtons(1); }
+    else if (action.type === "drag-end" && touchButtons) { if (pointerMode === "desktop" && cursorReconciler.synced) setTouchButtonsAtCursor(0); else setTouchButtons(0); }
+    else if (action.type === "right-tap" && inputReady) { if (pointerMode === "desktop") { if (!cursorReconciler.synced) { requestCursorSync(); continue; } setTouchButtonsAtCursor(2); setTouchButtons(0); } else { setTouchButtons(2); setTouchButtons(0); } }
+    else if (action.type === "pinch") setZoom(viewport.zoom * action.scale);
+    else if (action.type === "translate") { if (viewport.zoom === 1) { if (inputReady) queueTouchMotion(0,0,action.dx,action.dy); } else panBy(action.dx,action.dy); }
+  }
+  hudState.touch = gestures.cancelled ? "cancelled" : (gestures.dragActive ? "drag" : gestures.mode || (gestures.points.size > 1 ? "two-finger" : gestures.points.size ? "touch" : "…"));
+}
+inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); showTouchCursor(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY},e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointermove", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.move(e.pointerId,{x:e.clientX,y:e.clientY})); e.preventDefault(); });
-inputSurface.addEventListener("pointerup", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.up(e.pointerId)); e.preventDefault(); });
-inputSurface.addEventListener("pointercancel", e => { if (e.pointerType !== "touch") return; gestures.cancel(e.pointerId); releaseInput(); hudState.touch = gestures.cancelled ? "cancelled" : "…"; e.preventDefault(); });
+inputSurface.addEventListener("pointerup", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.up(e.pointerId,e.timeStamp)); e.preventDefault(); });
+inputSurface.addEventListener("pointercancel", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.cancel(e.pointerId)); releaseInput(); resetTouchCursor(); hudState.touch = "cancelled"; e.preventDefault(); });
 
-document.getElementById("capture").onclick = e => { e.stopPropagation(); if (locked) document.exitPointerLock?.(); else requestPointerLock(); };
+document.getElementById("capture").onclick = e => { e.stopPropagation(); if (pointerMode !== "game") return; if (locked) document.exitPointerLock?.(); else requestPointerLock(); };
+pointerModeButton.onclick = e => { e.stopPropagation(); setPointerMode(pointerMode === "desktop" ? "game" : "desktop"); };
+qualitySelect.value = qualityPreset;
+qualitySelect.onchange = e => {
+  e.stopPropagation();
+  qualityPreset = qualitySelect.value;
+  wssAdaptive = qualityPreset === "auto";
+  try { localStorage.setItem("bp_quality", qualityPreset); } catch {}
+  if (signalingRegistered) {
+    const effectiveQuality = qualityPreset === "auto" ? "high" : qualityPreset;
+    sendSignal({ type: "media-control", action: "quality", protocol: usingWssMedia ? wssProtocol : 2,
+      ...(usingWssMedia ? { epoch: mediaEpoch } : {}),
+      codec: codecSession.codec, streamMode: streamModeValue(), reason: "user-preset",
+      quality: effectiveQuality, adaptive: wssAdaptive });
+  }
+};
 document.getElementById("zoom-out").onclick = e => { e.stopPropagation(); setZoom(viewport.zoom-.25); };
 document.getElementById("zoom-in").onclick = e => { e.stopPropagation(); setZoom(viewport.zoom+.25); };
 document.getElementById("zoom-reset").onclick = e => { e.stopPropagation(); setZoom(1); };
 document.getElementById("fullscreen").onclick = e => { e.stopPropagation(); if (document.fullscreenElement) document.exitFullscreen?.(); else document.documentElement.requestFullscreen?.(); };
 document.addEventListener("fullscreenchange", () => { document.getElementById("fullscreen").textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen"; });
+const controlSheet = document.getElementById("control-sheet");
+const openControls = document.getElementById("open-controls");
+let diagnosticsVisible = diagnosticsEnabled;
+function diagnosticsReport() {
+  const view = viewportHealthSnapshot();
+  return [
+    "TRANSPORT",
+    `state       ${connectionStatusLabel.textContent}`,
+    `route       ${hudState.route}`,
+    `rtt/jitter  ${hudState.rtt} / ${hudState.jit}`,
+    `loss        ${hudState.loss}`,
+    "",
+    "VIDEO",
+    `decoder     ${hudState.dec}`,
+    `dimensions  ${hudState.dimensions}`,
+    `fps         ${hudState.fps}`,
+    `queue/drop  ${hudState.queued} / ${hudState.dropped}`,
+    `presented   ${hudState.presented}`,
+    `WSS direct  ${framePresentationTelemetry.immediatePresented}/${framePresentationTelemetry.immediateAttempts}`,
+    `RAF merged  ${framePresentationTelemetry.rafCoalesced}`,
+    "",
+    "INPUT",
+    `mode        ${pointerMode === "desktop" ? "work" : "game"}`,
+    `capture     ${locked ? "captured" : "released"}`,
+    `control     ${hudState.control}`,
+    "",
+    "VIEWPORT",
+    `zoom        ${view.zoom}x`,
+    `state       ${view.state}`,
+    `crop        ${view.crop}`,
+    `generation  ${view.generation}`,
+  ].join("\n");
+}
+function selectControlTab(tabName) {
+  const tab = document.querySelector(`.sheet-tabs [data-tab="${tabName}"]`);
+  if (!tab) return;
+  tab.click();
+}
+function setDiagnosticsVisible(visible) {
+  diagnosticsVisible = Boolean(visible);
+  document.body.classList.toggle("diagnostics-mode", diagnosticsVisible);
+  if (diagnosticsOutput) diagnosticsOutput.textContent = diagnosticsVisible ? diagnosticsReport() : "Diagnostics are hidden.";
+  const button = document.getElementById("open-diagnostics");
+  if (button) button.textContent = diagnosticsVisible ? "Hide diagnostics" : "Show diagnostics";
+}
+function setControlsOpen(open) {
+  controlSheet.hidden = !open;
+  controlSheet.setAttribute("aria-hidden", String(!open));
+  openControls.setAttribute("aria-expanded", String(open));
+  if (!open) { keyboardInput.blur(); resetKeyboardDraft(); releaseLatchedModifiers(); }
+  if (open) document.body.classList.remove("chrome-idle");
+  else scheduleChromeIdle();
+}
+openControls.onclick = e => { e.stopPropagation(); setControlsOpen(controlSheet.hidden); };
+document.getElementById("close-controls").onclick = e => { e.stopPropagation(); setControlsOpen(false); };
+const controlTabs = [...document.querySelectorAll(".sheet-tabs [data-tab]")];
+function activateControlTab(tab, focus = false) {
+  const selected = tab.dataset.tab;
+  controlTabs.forEach(button => {
+    const active = button === tab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+  });
+  document.querySelectorAll(".sheet-panel").forEach(panel => { panel.hidden = panel.id !== `tab-${selected}`; });
+  if (selected === "monitors") renderMonitorList();
+  if (focus) tab.focus();
+}
+controlTabs.forEach((tab, index) => {
+  tab.onclick = () => activateControlTab(tab);
+  tab.onkeydown = event => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const direction = event.key === "ArrowRight" ? 1 : -1;
+    activateControlTab(controlTabs[(index + direction + controlTabs.length) % controlTabs.length], true);
+  };
+});
+document.getElementById("open-diagnostics").onclick = e => { e.stopPropagation(); setDiagnosticsVisible(!diagnosticsVisible); };
+document.getElementById("copy-diagnostics").onclick = async e => {
+  e.stopPropagation();
+  setDiagnosticsVisible(true);
+  try {
+    await navigator.clipboard?.writeText(diagnosticsReport());
+    e.currentTarget.textContent = "Copied";
+    setTimeout(() => { e.currentTarget.textContent = "Copy report"; }, 1400);
+  } catch { e.currentTarget.textContent = "Copy unavailable"; }
+};
+document.getElementById("dismiss-context-hint").onclick = e => {
+  e.stopPropagation();
+  const mode = contextHint.dataset.mode === "game" ? "game" : "work";
+  try { localStorage.setItem(`bp_hint_${mode}_dismissed`, "1"); } catch {}
+  contextHint.hidden = true;
+};
+document.getElementById("chrome-reveal").onclick = e => {
+  e.stopPropagation();
+  if (document.body.classList.contains("chrome-idle")) {
+    revealChrome();
+    setChromeDockOpen(true);
+    return;
+  }
+  setChromeDockOpen(document.body.classList.contains("chrome-dock-closed"));
+};
+
+async function endBrowserSession(endpoint, forgetBrowser) {
+  if (forgetBrowser && !confirm("Forget this browser? The next visit will require a new ntfy approval.")) return;
+  const status = document.getElementById("session-action-status");
+  status.textContent = forgetBrowser ? "Forgetting this browser…" : "Signing out…";
+  releaseInput();
+  if (document.pointerLockElement) document.exitPointerLock?.();
+  try {
+    const response = await fetch(endpoint, { method: "POST", credentials: "same-origin" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    terminalSignalingFailure = true;
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    cleanupPeer();
+    try { ws?.close(1000, "session-ended"); } catch {}
+    location.replace("/");
+  } catch {
+    status.textContent = "The session stayed open because the request failed. Check the connection and try again.";
+  }
+}
+
+document.getElementById("logout-session").onclick = e => { e.stopPropagation(); endBrowserSession("/__auth/logout", false); };
+document.getElementById("forget-browser").onclick = e => { e.stopPropagation(); endBrowserSession("/__auth/forget-browser", true); };
+
+document.addEventListener("pointerdown", () => {
+  if (pointerMode === "game") revealChrome();
+}, { capture: true, passive: true });
+document.addEventListener("mousemove", () => {
+  if (pointerMode === "game" && !locked) revealChrome();
+}, { passive: true });
+document.querySelectorAll("[data-ui-action]").forEach(button => button.addEventListener("click", e => {
+  e.stopPropagation();
+  if (button === openControls) return;
+  const action = button.dataset.uiAction;
+  if (action === "settings") { setControlsOpen(true); selectControlTab("settings"); return; }
+  if (action === "keyboard") { setControlsOpen(true); selectControlTab("keyboard"); setTimeout(() => keyboardInput.focus(), 80); return; }
+  if (action === "monitors") { setControlsOpen(true); selectControlTab("monitors"); return; }
+  const target = document.getElementById(action === "pointer" ? "pointer-mode" : action);
+  if (target) target.click();
+}));
+document.getElementById("connection-retry").onclick = e => { e.stopPropagation(); terminalSignalingFailure = false; restartPeer("user-retry", true); };
+firstFrameRetry.onclick = e => { e.stopPropagation(); startFirstFrameHandshake("user-retry", true); };
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !locked && !controlSheet.hidden) setControlsOpen(false); });
+setPointerMode(pointerMode,false);
+let controlsInitiallyOpen = false;
+try { controlsInitiallyOpen = localStorage.getItem("bp_controls_open") === "1"; } catch {}
+setChromeDockOpen(controlsInitiallyOpen, false);
+setDiagnosticsVisible(diagnosticsEnabled);
+if (diagnosticsEnabled) { setControlsOpen(true); selectControlTab("settings"); }
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function clamp16(v) { return clamp(v, -32768, 32767); }

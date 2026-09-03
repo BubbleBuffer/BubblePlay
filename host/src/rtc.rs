@@ -10,39 +10,52 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use str0m::bwe::BweKind;
 use str0m::change::SdpOffer;
+use str0m::channel::ChannelId;
 use str0m::media::MediaTime;
 use str0m::media::{KeyframeRequest, MediaKind, Mid, Pt};
 use str0m::{Candidate, Event, Rtc};
 use tracing::{debug, info, warn};
 
+use crate::encode::VideoCodec;
+
+fn preferred_negotiated_codec(hevc: Option<Pt>, h264: Option<Pt>) -> Option<(VideoCodec, Pt)> {
+    hevc.map(|pt| (VideoCodec::Hevc, pt))
+        .or_else(|| h264.map(|pt| (VideoCodec::H264, pt)))
+}
+
 /// Events the run loop cares about, extracted from str0m's Output::Event.
 pub enum RtcAction {
     IceConnected,
     IceDisconnected,
-    /// Browser opened the input data channel.
-    ChannelOpen(Vec<u8>), // placeholder not used; channel data below
     /// Binary data from the input channel.
     InputData(Vec<u8>),
     /// PLI/FIR — force an IDR.
     KeyframeRequested,
     /// Egress bandwidth estimate (bps).
     Bwe(u64),
+    /// Codec selected from the browser offer. The producer recreates NVENC
+    /// before admitting media for this RTC epoch.
+    VideoCodecSelected(VideoCodec),
     Closed,
 }
 
 pub struct RtcSession {
     pub rtc: Rtc,
     pub video_mid: Option<Mid>,
-    pub h264_pt: Option<Pt>,
+    pub video_pt: Option<Pt>,
+    pub video_codec: Option<VideoCodec>,
     pub ice_connected: bool,
     /// Base instant for the 90 kHz RTP clock.
     clock_start: Instant,
     frames_written: u64,
+    input_control: Option<ChannelId>,
+    input_motion: Option<ChannelId>,
 }
 
 impl RtcSession {
     pub fn new(now: Instant, initial_bitrate_bps: u32) -> Self {
         let rtc = Rtc::builder()
+            .enable_h265(true)
             // Initial BWE estimate must match the encoder's starting bitrate
             // (8 Mbps default) so congestion control doesn't fight the encoder
             // out of the gate; TWCC/REMB feedback then adjusts from there.
@@ -51,10 +64,13 @@ impl RtcSession {
         Self {
             rtc,
             video_mid: None,
-            h264_pt: None,
+            video_pt: None,
+            video_codec: None,
             ice_connected: false,
             clock_start: now,
             frames_written: 0,
+            input_control: None,
+            input_motion: None,
         }
     }
 
@@ -128,12 +144,17 @@ impl RtcSession {
             Event::MediaAdded(added) => {
                 if added.kind == MediaKind::Video && added.direction.is_sending() {
                     self.video_mid = Some(added.mid);
-                    // Pick the H.264 payload type. Prefer High profile (0x64..),
-                    // then anything; NVENC emits High.
+                    // HEVC is the policy default. H.264 High remains the
+                    // negotiated compatibility fallback for this epoch.
+                    let mut hevc: Option<Pt> = None;
                     let mut fallback: Option<Pt> = None;
                     let mut high: Option<Pt> = None;
                     if let Some(writer) = self.rtc.writer(added.mid) {
                         for p in writer.payload_params() {
+                            if p.spec().codec == str0m::format::Codec::H265 {
+                                hevc.get_or_insert(p.pt());
+                                continue;
+                            }
                             if p.spec().codec != str0m::format::Codec::H264 {
                                 continue;
                             }
@@ -146,21 +167,42 @@ impl RtcSession {
                             }
                         }
                     }
-                    self.h264_pt = high.or(fallback);
-                    info!(mid = %added.mid, pt = ?self.h264_pt, "video send media added");
+                    if let Some((codec, pt)) = preferred_negotiated_codec(hevc, high.or(fallback)) {
+                        self.video_codec = Some(codec);
+                        self.video_pt = Some(pt);
+                        info!(mid = %added.mid, ?pt, codec = codec.name(), "video send media added");
+                        return Some(RtcAction::VideoCodecSelected(codec));
+                    }
+                    warn!(mid = %added.mid, "browser offered no supported HEVC/H264 video payload");
                 }
                 None
             }
             Event::ChannelOpen(id, label) => {
-                info!(channel_id = ?id, label, "data channel opened by peer");
-                Some(RtcAction::ChannelOpen(Vec::new()))
+                info!(channel_id = ?id, label = %label, "data channel opened by peer");
+                match label.as_str() {
+                    "input-control" => self.input_control = Some(id),
+                    "input-motion" => self.input_motion = Some(id),
+                    _ => return None,
+                }
+                None
             }
             Event::ChannelClose(id) => {
                 info!(channel_id = ?id, "data channel closed by peer");
+                if self.input_control == Some(id) {
+                    self.input_control = None;
+                }
+                if self.input_motion == Some(id) {
+                    self.input_motion = None;
+                }
                 None
             }
             Event::ChannelData(data) => {
                 debug!(channel_id = ?data.id, binary = data.binary, len = data.data.len(), "channel data");
+                if !data.binary
+                    || (Some(data.id) != self.input_control && Some(data.id) != self.input_motion)
+                {
+                    return None;
+                }
                 Some(RtcAction::InputData(data.data))
             }
             Event::KeyframeRequest(KeyframeRequest { kind, .. }) => {
@@ -196,7 +238,7 @@ impl RtcSession {
     /// negotiated video writer. This keeps transport telemetry honest during
     /// connection setup and teardown.
     pub fn write_video(&mut self, access_unit: Vec<u8>) -> Result<bool> {
-        let (Some(mid), Some(pt)) = (self.video_mid, self.h264_pt) else {
+        let (Some(mid), Some(pt)) = (self.video_mid, self.video_pt) else {
             return Ok(false); // media not negotiated yet
         };
         let Some(writer) = self.rtc.writer(mid) else {
@@ -209,11 +251,51 @@ impl RtcSession {
         Ok(true)
     }
 
+    /// Write authoritative cursor feedback on the browser-created input lane.
+    pub fn write_cursor_state(&mut self, reliable: bool, data: &[u8]) -> Result<bool> {
+        let id = if reliable {
+            self.input_control
+        } else {
+            self.input_motion
+        };
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        let Some(mut channel) = self.rtc.channel(id) else {
+            return Ok(false);
+        };
+        channel
+            .write(true, data)
+            .context("write cursor state data channel")
+    }
+
     pub fn frames_written(&self) -> u64 {
         self.frames_written
     }
 
     pub fn alive(&self) -> bool {
         self.rtc.is_alive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preferred_negotiated_codec;
+    use crate::encode::VideoCodec;
+    use str0m::media::Pt;
+
+    #[test]
+    fn negotiated_codec_prefers_hevc_and_falls_back_to_h264() {
+        let hevc = Pt::new_with_value(102);
+        let h264 = Pt::new_with_value(96);
+        assert_eq!(
+            preferred_negotiated_codec(Some(hevc), Some(h264)),
+            Some((VideoCodec::Hevc, hevc))
+        );
+        assert_eq!(
+            preferred_negotiated_codec(None, Some(h264)),
+            Some((VideoCodec::H264, h264))
+        );
+        assert_eq!(preferred_negotiated_codec(None, None), None);
     }
 }

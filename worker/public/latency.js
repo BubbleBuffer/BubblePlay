@@ -108,8 +108,8 @@ export function createLatencyGuard({ now = () => performance.now(), onReset = ()
       return expected === null ? null : at - expected;
     },
     releaseWorkerFrame() { workerFrames = Math.max(0, workerFrames - 1); },
-    admitDecode() {
-      if (decodeFrames >= 2) return false;
+    admitDecode(limit = 2) {
+      if (decodeFrames >= limit) return false;
       decodeFrames++;
       return true;
     },

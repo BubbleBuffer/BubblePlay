@@ -23,8 +23,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tracing::{debug, info, warn};
 use std::time::Instant as StdInstant;
+use tracing::{debug, info, warn};
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
@@ -52,6 +52,7 @@ const PING_INTERVAL: Duration = Duration::from_millis(100);
 struct SendHandle(HANDLE);
 unsafe impl Send for SendHandle {}
 
+#[derive(Debug)]
 pub struct VddKeepalive {
     handle: HANDLE,
     stop: Arc<AtomicBool>,
@@ -214,14 +215,8 @@ fn find_device_path() -> Result<String> {
 
         // First call: ask for the required buffer size (returns false + size).
         let mut needed = 0u32;
-        let _ = SetupDiGetDeviceInterfaceDetailW(
-            info_set,
-            &iface,
-            None,
-            0,
-            Some(&mut needed),
-            None,
-        );
+        let _ =
+            SetupDiGetDeviceInterfaceDetailW(info_set, &iface, None, 0, Some(&mut needed), None);
         if needed < 8 {
             let _ = SetupDiDestroyDeviceInfoList(info_set);
             bail!("SetupDiGetDeviceInterfaceDetail: no buffer size reported");
@@ -231,7 +226,11 @@ fn find_device_path() -> Result<String> {
         let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
         // cbSize is documented as 8 on Win64 / 6 on Win32 (DWORD + the start
         // of the path field), not `size_of` of the bindgen struct.
-        let cb_size: u32 = if cfg!(target_pointer_width = "64") { 8 } else { 6 };
+        let cb_size: u32 = if cfg!(target_pointer_width = "64") {
+            8
+        } else {
+            6
+        };
         (detail as *mut u32).write(cb_size);
 
         SetupDiGetDeviceInterfaceDetailW(
@@ -252,6 +251,8 @@ fn find_device_path() -> Result<String> {
         while len < max_chars && *path_ptr.add(len) != 0 {
             len += 1;
         }
-        Ok(String::from_utf16_lossy(std::slice::from_raw_parts(path_ptr, len)))
+        Ok(String::from_utf16_lossy(std::slice::from_raw_parts(
+            path_ptr, len,
+        )))
     }
 }

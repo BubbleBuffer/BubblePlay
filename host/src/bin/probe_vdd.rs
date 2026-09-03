@@ -49,9 +49,7 @@ fn parsec_attached_count() -> u32 {
             .take_while(|&&c| c != 0)
             .map(|&c| char::from_u32(c as u32).unwrap_or('?'))
             .collect::<String>();
-        if name.contains("Parsec")
-            && d.StateFlags.contains(DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
-        {
+        if name.contains("Parsec") && d.StateFlags.contains(DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) {
             n += 1;
         }
         i += 1;

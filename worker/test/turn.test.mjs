@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createTurnIceServers } from "../src/turn.js";
-import { Room } from "../src/index.js";
+import workerRuntime, { Room } from "../src/index.js";
 
 const STUN_URL = "stun:stun.l.google.com:19302";
 
@@ -31,8 +31,8 @@ test("uses STUN only when TURN_SECRET is missing or invalid", async () => {
 });
 
 class FakeSocket {
-  constructor() {
-    this.attachment = { role: null, queryToken: "" };
+  constructor(expectedRole) {
+    this.attachment = { role: null, expectedRole };
     this.readyState = 1;
     this.messages = [];
     this.closed = [];
@@ -43,15 +43,15 @@ class FakeSocket {
   close(code, reason) { this.closed.push({ code, reason }); }
 }
 
-test("only authenticated client hello receives ephemeral TURN config", async () => {
+test("host relay token and preauthenticated client role remain separate", async () => {
   const storage = { values: new Map(), get: async (key) => storage.values.get(key), put: async (key, value) => storage.values.set(key, value), delete: async (key) => storage.values.delete(key) };
-  const client = new FakeSocket();
-  const host = new FakeSocket();
+  const client = new FakeSocket("client");
+  const host = new FakeSocket("host");
   const env = { TOKEN: "token", TURN_SECRET: "1234567890" };
   const room = new Room({ getWebSockets: () => [client, host], storage }, env);
 
   await room.webSocketMessage(host, JSON.stringify({ type: "hello", token: "token", role: "host" }));
-  await room.webSocketMessage(client, JSON.stringify({ type: "hello", token: "token", role: "client" }));
+  await room.webSocketMessage(client, JSON.stringify({ type: "hello", role: "client" }));
 
   const hostHello = JSON.parse(host.messages[0]);
   const clientHello = JSON.parse(client.messages[0]);
@@ -63,17 +63,95 @@ test("only authenticated client hello receives ephemeral TURN config", async () 
   assert.equal(observable.includes("turn:turn.example.com"), true);
 });
 
-test("never authenticates hello when TOKEN is absent, empty, or mismatched", async () => {
+test("never authenticates a host hello when TOKEN is absent, empty, or mismatched", async () => {
   for (const env of [
     { TURN_SECRET: "1234567890" },
     { TOKEN: "", TURN_SECRET: "1234567890" },
     { TOKEN: "configured", TURN_SECRET: "1234567890" },
   ]) {
     const storage = { get: async () => [], put: async () => {}, delete: async () => {} };
-    const client = new FakeSocket();
-    const room = new Room({ getWebSockets: () => [client], storage }, env);
-    await room.webSocketMessage(client, JSON.stringify({ type: "hello", token: "wrong", role: "client" }));
-    assert.equal(client.messages.some((message) => JSON.parse(message).type === "hello-ok"), false);
-    assert.equal(client.messages.some((message) => message.includes("turn:turn.example.com")), false);
+    const host = new FakeSocket("host");
+    const room = new Room({ getWebSockets: () => [host], storage }, env);
+    await room.webSocketMessage(host, JSON.stringify({ type: "hello", token: "wrong", role: "host" }));
+    assert.equal(host.messages.some((message) => JSON.parse(message).type === "hello-ok"), false);
+    assert.equal(host.messages.some((message) => message.includes("turn:turn.example.com")), false);
   }
+});
+
+test("a loopback Stream Lab socket can authenticate its host without a production relay token", async () => {
+  const storage = { get: async () => [], put: async () => {}, delete: async () => {} };
+  const host = new FakeSocket("host");
+  host.attachment.localLab = true;
+  const room = new Room({ getWebSockets: () => [host], storage }, { STREAM_LAB_LOCAL_BYPASS: "1" });
+
+  await room.webSocketMessage(host, JSON.stringify({ type: "hello", role: "host" }));
+
+  assert.deepEqual(JSON.parse(host.messages[0]), { type: "hello-ok" });
+  assert.equal(host.closed.length, 0);
+});
+
+test("a version probe reports the immutable Worker version without replacing the live host", async () => {
+  const storage = { get: async () => [], put: async () => {}, delete: async () => {} };
+  const host = new FakeSocket("host");
+  host.attachment.role = "host";
+  const probe = new FakeSocket("version-probe");
+  const versionId = "2fae2311-36ac-41fa-8d8c-8607007c99cc";
+  const room = new Room({ getWebSockets: () => [host, probe], storage }, {
+    TOKEN: "token",
+    WORKER_VERSION: { id: versionId },
+  });
+
+  await room.webSocketMessage(probe,
+    JSON.stringify({ type: "hello", token: "token", role: "version-probe" }));
+
+  assert.deepEqual(JSON.parse(probe.messages[0]), {
+    type: "hello-ok",
+    workerVersionId: versionId,
+  });
+  assert.equal(probe.closed[0].code, 1000);
+  assert.deepEqual(host.closed, []);
+  assert.deepEqual(host.messages, []);
+});
+
+test("the version-probe route requires host authorization before it reaches the signaling room", async () => {
+  const roomNames = [];
+  let forwarded = 0;
+  const env = {
+    HOST_GATE_TOKEN: "host-secret",
+    GATE: {
+      idFromName: () => "gate",
+      get: () => ({ fetch: async () => new Response("gate") }),
+    },
+    ROOM: {
+      idFromName: (name) => {
+        roomNames.push(name);
+        return name;
+      },
+      get: () => ({
+        fetch: async () => {
+          forwarded++;
+          return new Response("room");
+        },
+      }),
+    },
+  };
+
+  const rejected = await workerRuntime.fetch(new Request("https://play.example/host-version-ws"), env);
+  assert.equal(rejected.status, 404);
+  assert.equal(forwarded, 0);
+
+  const accepted = await workerRuntime.fetch(new Request("https://play.example/host-version-ws", {
+    headers: { Authorization: "Bearer host-secret" },
+  }), env);
+  assert.equal(accepted.status, 200);
+  assert.equal(forwarded, 1);
+  assert.deepEqual(roomNames, ["room-v3"]);
+});
+
+test("a websocket entrance cannot claim the opposite role", async () => {
+  const storage = { get: async () => [], put: async () => {}, delete: async () => {} };
+  const socket = new FakeSocket("client");
+  const room = new Room({ getWebSockets: () => [socket], storage }, { TOKEN: "host-secret" });
+  await room.webSocketMessage(socket, JSON.stringify({ type: "hello", token: "host-secret", role: "host" }));
+  assert.equal(socket.closed[0].code, 1008);
 });

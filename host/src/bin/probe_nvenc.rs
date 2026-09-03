@@ -6,12 +6,12 @@
 
 use nvidia_video_codec_sdk::safe::ENCODE_API;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
-    GUID, NVENCAPI_VERSION, NV_ENC_DEVICE_TYPE,
-    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, NV_ENC_PRESET_CONFIG, NV_ENC_TUNING_INFO,
-    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+    GUID, NVENCAPI_VERSION, NV_ENC_CAPS, NV_ENC_CAPS_PARAM, NV_ENC_CAPS_PARAM_VER,
+    NV_ENC_DEVICE_TYPE, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_PRESET_CONFIG, NV_ENC_TUNING_INFO,
 };
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
 use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
 use windows::Win32::Graphics::Direct3D11::D3D11CreateDevice;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
@@ -20,6 +20,12 @@ const NV_ENC_CODEC_H264_GUID: GUID = GUID {
     Data2: 0x4e63,
     Data3: 0x4ca4,
     Data4: [0xaa, 0x85, 0x1e, 0x50, 0xf3, 0x21, 0xf6, 0xbf],
+};
+const NV_ENC_CODEC_HEVC_GUID: GUID = GUID {
+    Data1: 0x790c_dc88,
+    Data2: 0x4522,
+    Data3: 0x4d7b,
+    Data4: [0x94, 0x25, 0xbd, 0xa9, 0x97, 0x5f, 0x76, 0x03],
 };
 const NV_ENC_PRESET_P1_GUID: GUID = GUID {
     Data1: 0xfc0a_8d3e,
@@ -53,7 +59,9 @@ unsafe fn zeroed<T>() -> T {
 fn main() {
     // 1. Max supported version.
     let mut max_ver: u32 = 0;
-    let st = unsafe { nvidia_video_codec_sdk::sys::nvEncodeAPI::NvEncodeAPIGetMaxSupportedVersion(&mut max_ver) };
+    let st = unsafe {
+        nvidia_video_codec_sdk::sys::nvEncodeAPI::NvEncodeAPIGetMaxSupportedVersion(&mut max_ver)
+    };
     println!(
         "NvEncodeAPIGetMaxSupportedVersion -> status {st:?}, version {max_ver} (major {}, minor {})",
         max_ver >> 24,
@@ -93,6 +101,20 @@ fn main() {
         return;
     }
 
+    // This is the decisive capability check for the codec-native feedback
+    // experiment: it asks the active driver about HEVC reconstructed-output
+    // surfaces rather than inferring support from the SDK header alone.
+    {
+        let mut caps: NV_ENC_CAPS_PARAM = unsafe { zeroed() };
+        caps.version = NV_ENC_CAPS_PARAM_VER;
+        caps.capsToQuery = NV_ENC_CAPS::NV_ENC_CAPS_OUTPUT_RECON_SURFACE;
+        let mut supported = -1;
+        let st = unsafe {
+            (ENCODE_API.get_encode_caps)(session, NV_ENC_CODEC_HEVC_GUID, &mut caps, &mut supported)
+        };
+        println!("GetEncodeCaps(HEVC OUTPUT_RECON_SURFACE) -> {st:?}, supported={supported}");
+    }
+
     // 4. Matrix: (api base) x (struct ver) x (1<<31 flag) for preset config.
     //    a) Enumerate encode codec GUIDs + preset GUIDs the driver knows.
     //    b) Try legacy NvEncGetEncodePresetConfig (no tuningInfo).
@@ -111,21 +133,21 @@ fn main() {
     for (i, g) in guids.iter().take(got as usize).enumerate() {
         let label = if *g == NV_ENC_CODEC_H264_GUID {
             " <== H264"
-        } else if g.Data1 == 0x790c_d807 {
+        } else if *g == NV_ENC_CODEC_HEVC_GUID {
             " <== HEVC"
         } else {
             ""
         };
         println!(
             "  encode[{i}] {:08X}-{:04X}-{:04X}{label}",
-            g.Data1,
-            g.Data2,
-            g.Data3
+            g.Data1, g.Data2, g.Data3
         );
     }
 
     let mut pcount = 0u32;
-    let st = unsafe { (ENCODE_API.get_encode_preset_count)(session, NV_ENC_CODEC_H264_GUID, &mut pcount) };
+    let st = unsafe {
+        (ENCODE_API.get_encode_preset_count)(session, NV_ENC_CODEC_H264_GUID, &mut pcount)
+    };
     println!("GetEncodePresetCount(H264) -> {st:?}, count={pcount}");
     let mut pguids = vec![GUID::default(); pcount as usize];
     let mut pgot = 0u32;
@@ -140,7 +162,11 @@ fn main() {
     };
     println!("GetEncodePresetGUIDs -> {st:?}, got={pgot}");
     for (i, g) in pguids.iter().take(pgot as usize).enumerate() {
-        let label = if *g == NV_ENC_PRESET_P1_GUID { " <== P1" } else { "" };
+        let label = if *g == NV_ENC_PRESET_P1_GUID {
+            " <== P1"
+        } else {
+            ""
+        };
         println!(
             "  preset[{i}] {:08X}-{:04X}-{:04X}-{:02X?}{label}",
             g.Data1, g.Data2, g.Data3, g.Data4
@@ -269,18 +295,23 @@ fn main() {
                     &mut cfg,
                 )
             };
-            println!("presetCfg v{v} f31={} base0xD0 -> {st:?}", if f31 != 0 { 1 } else { 0 });
+            println!(
+                "presetCfg v{v} f31={} base0xD0 -> {st:?}",
+                if f31 != 0 { 1 } else { 0 }
+            );
         }
     }
 
     // Sanity: does ANY call with version work? Try caps query.
     {
-        use nvidia_video_codec_sdk::sys::nvEncodeAPI::{NV_ENC_CAPS_PARAM, NV_ENC_CAPS};
+        use nvidia_video_codec_sdk::sys::nvEncodeAPI::{NV_ENC_CAPS, NV_ENC_CAPS_PARAM};
         let mut caps: NV_ENC_CAPS_PARAM = unsafe { zeroed() };
         caps.version = (0x7 << 28) | (1 << 16) | 0x0D;
         caps.capsToQuery = NV_ENC_CAPS::NV_ENC_CAPS_NUM_MAX_BFRAMES;
         let mut val: i32 = -1;
-        let st = unsafe { (ENCODE_API.get_encode_caps)(session, NV_ENC_CODEC_H264_GUID, &mut caps, &mut val) };
+        let st = unsafe {
+            (ENCODE_API.get_encode_caps)(session, NV_ENC_CODEC_H264_GUID, &mut caps, &mut val)
+        };
         println!("GetEncodeCaps(NUM_MAX_BFRAMES, 13.0 v1) -> {st:?}, val={val}");
     }
 

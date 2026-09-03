@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BubblePlay · Sign in</title>
+<link rel="stylesheet" href="/bubbleplay.css">
+</head>
+<body class="auth-page">
+<section class="auth-identity" aria-label="BubblePlay">
+  <div class="brand">
+    <span class="signal-cut" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M9 4H4v16h16v-5M15 4h5v5"/><path class="signal-piece" d="m10 14 4-4m-4 0h4v4"/></svg>
+    </span>
+    <span class="wordmark">BubblePlay</span>
+  </div>
+  <div class="auth-statement">Your desktop,<br><span>held close.</span></div>
+  <div class="auth-proof">This browser has passed the private approval gate. The application password is the final boundary before control begins.</div>
+</section>
+
+<main class="auth-form-field">
+  <div class="auth-card">
+    <p class="auth-kicker">Browser approved</p>
+    <h1>Welcome back</h1>
+    <p class="auth-intro">Enter the BubblePlay password to open a private remote session.</p>
+    <form id="login">
+      <label class="sr-only">Username<input name="username" autocomplete="username" value="BubblePlay"></label>
+      <label class="field-label" for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+      <label class="remember remember-control"><input id="remember" type="checkbox" checked> <span>Remember this browser for 30 days</span></label>
+      <button class="auth-submit" type="submit">Open BubblePlay</button>
+      <div id="status" class="auth-status" role="alert" aria-live="polite"></div>
+    </form>
+    <div class="security-note">The password creates a server-held browser session. It is never stored in this page or local storage.</div>
+  </div>
+</main>
+
+<script>
+  const form = document.getElementById("login");
+  const password = document.getElementById("password");
+  const remember = document.getElementById("remember");
+  const status = document.getElementById("status");
+  const button = form.querySelector("button");
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    button.disabled = true;
+    button.textContent = "Opening…";
+    status.textContent = "";
+    try {
+      const response = await fetch("/__auth/login", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: password.value, remember: remember.checked }),
+      });
+      if (response.ok) {
+        // The held navigation may intentionally select a transport/profile.
+        // Keep its same-origin path and query; never reflect an external URL.
+        location.replace(`${location.pathname}${location.search}`);
+        return;
+      }
+      password.select();
+      status.textContent = response.status === 429
+        ? "Too many attempts. This browser can try again after the cooldown."
+        : "That password did not match. Approval is still intact; try again.";
+    } catch {
+      status.textContent = "The connection failed. Approval is still intact; check the network and retry.";
+    } finally {
+      button.disabled = false;
+      button.textContent = "Open BubblePlay";
+      password.focus();
+    }
+  });
+</script>
+</body>
+</html>
