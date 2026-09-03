@@ -113,6 +113,7 @@ function Invoke-BubblePlayManifestUpdate([string]$ManifestPath, [switch]$Validat
     if (-not $manifestSource.Equals($expectedSource, [StringComparison]::OrdinalIgnoreCase)) { throw 'Manifest sourceDir is not the fixed release directory.' }
     Assert-BubblePlayNoReparse $manifestSource
     $required = @('bubbleplay_broker.exe', 'bubbleplay_transport.exe', 'bubbleplay_agent.exe', 'bubbleplay_input_proxy.exe', 'bubbleplay_lab_helper.exe', 'bubbleplay-host.exe')
+    $additiveMigrationBinaries = @('bubbleplay_input_proxy.exe')
     $manifestFiles = @($manifest.files)
     if ($manifestFiles.Count -ne $required.Count) { throw 'Manifest must contain exactly the six required binaries.' }
     foreach ($name in $required) {
@@ -140,6 +141,7 @@ function Invoke-BubblePlayManifestUpdate([string]$ManifestPath, [switch]$Validat
     $startedAt = [DateTimeOffset]::UtcNow
     $mutationStarted = $false
     $rollbackSource = Join-Path (Join-Path $env:ProgramData 'BubblePlay-UpdateRollback') $receiptId
+    $absentBefore = [Collections.Generic.List[string]]::new()
     $diagnosticsPath = ''
     Write-BubblePlayTransactionReceipt $receiptPath $receiptId 'validated' '' @{ manifestSha256 = $manifestSha256 }
 
@@ -151,10 +153,19 @@ function Invoke-BubblePlayManifestUpdate([string]$ManifestPath, [switch]$Validat
         if ($LASTEXITCODE -ne 0) { throw 'Unable to protect the rollback snapshot directory.' }
         foreach ($name in $required) {
             $installed = Join-Path $env:ProgramFiles "BubblePlay\$name"
-            if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) { throw "Installed rollback source is missing: $installed" }
+            if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
+                if ($name -notin $additiveMigrationBinaries) { throw "Installed rollback source is missing: $installed" }
+                $absentBefore.Add($name)
+                Copy-Item -Force -LiteralPath (Join-Path $manifestSource $name) -Destination (Join-Path $rollbackSource $name)
+                continue
+            }
             Copy-Item -Force -LiteralPath $installed -Destination (Join-Path $rollbackSource $name)
         }
-        Write-BubblePlayTransactionReceipt $receiptPath $receiptId 'snapshot-complete' '' @{ manifestSha256 = $manifestSha256; rollbackSource = $rollbackSource }
+        Write-BubblePlayTransactionReceipt $receiptPath $receiptId 'snapshot-complete' '' @{
+            manifestSha256 = $manifestSha256
+            rollbackSource = $rollbackSource
+            absentBefore = @($absentBefore)
+        }
 
         $hostLog = Join-Path $env:ProgramData 'BubblePlay\logs\transport\transport-host.stderr.log'
         $mutationStarted = $true
@@ -253,6 +264,12 @@ function Invoke-BubblePlayManifestUpdate([string]$ManifestPath, [switch]$Validat
         if ($mutationStarted -and (Test-Path -LiteralPath $rollbackSource -PathType Container)) {
             try {
                 & $installer -Action Upgrade -SourceDir $rollbackSource -StartServices -Confirm:$false
+                foreach ($name in $absentBefore) {
+                    $installed = Join-Path $env:ProgramFiles "BubblePlay\$name"
+                    if (Test-Path -LiteralPath $installed -PathType Leaf) {
+                        Remove-Item -Force -LiteralPath $installed
+                    }
+                }
                 Write-BubblePlayTransactionReceipt $receiptPath $receiptId 'rolled-back' $failure @{ manifestSha256 = $manifestSha256; diagnosticsPath = $diagnosticsPath; rollbackSource = $rollbackSource }
                 throw "BubblePlay update failed validation and was rolled back: $failure (receipt $receiptPath)"
             }

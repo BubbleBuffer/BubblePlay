@@ -547,6 +547,23 @@ test("manifest updater is a two-phase transaction with bounded rollback", () => 
   assert.match(updater, /Test-BubblePlayRecentHostRegistration\s+\$hostLog/i);
 });
 
+test("the first input-proxy rollout preserves a complete rollback for an additive binary", () => {
+  const updater = readFileSync(new URL("../../host/scripts/update-service.ps1", import.meta.url), "utf8");
+  assert.match(updater,
+    /\$additiveMigrationBinaries\s*=\s*@\(\s*'bubbleplay_input_proxy\.exe'\s*\)/i,
+    "only the explicitly additive input proxy may be absent from the old installation");
+  assert.match(updater, /\$absentBefore\s*=\s*\[Collections\.Generic\.List\[string\]\]::new\(\)/i);
+  assert.match(updater,
+    /if\s*\(\$name\s+-notin\s+\$additiveMigrationBinaries\)\s*\{\s*throw\s+"Installed rollback source is missing:/i,
+    "a missing pre-existing core binary must still fail closed");
+  assert.match(updater,
+    /\$absentBefore\.Add\(\$name\)[\s\S]*Copy-Item[^\r\n]+\$manifestSource[^\r\n]+\$rollbackSource/i,
+    "the rollback source must remain installer-complete without inventing an old proxy binary");
+  assert.match(updater,
+    /foreach\s*\(\$name\s+in\s+\$absentBefore\)[\s\S]*Remove-Item\s+-Force\s+-LiteralPath\s+\$installed/i,
+    "rollback must restore the pre-update absence of additive binaries");
+});
+
 test("the privileged helper probe exercises a real no-VDD begin/end lifecycle", () => {
   const probe = readFileSync(new URL("../tools/stream-lab-helper-probe.mjs", import.meta.url), "utf8");
   assert.match(probe, /openDemandStartedHelperSession/);
