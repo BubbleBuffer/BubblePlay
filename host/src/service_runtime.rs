@@ -362,14 +362,16 @@ fn active_console_session_id() -> Option<u32> {
 
 #[derive(Debug)]
 struct RestartPolicy {
-    failures: usize,
+    backoff_step: usize,
+    consecutive_start_failures: usize,
     next_attempt: Instant,
 }
 
 impl RestartPolicy {
     fn new(now: Instant) -> Self {
         Self {
-            failures: 0,
+            backoff_step: 0,
+            consecutive_start_failures: 0,
             next_attempt: now,
         }
     }
@@ -386,19 +388,31 @@ impl RestartPolicy {
             Duration::from_secs(10),
             Duration::from_secs(30),
         ];
-        let delay = DELAYS[self.failures.min(DELAYS.len() - 1)];
-        self.failures = self.failures.saturating_add(1);
+        let delay = DELAYS[self.backoff_step.min(DELAYS.len() - 1)];
+        self.backoff_step = self.backoff_step.saturating_add(1);
         self.next_attempt = now + delay;
         delay
     }
 
+    fn startup_failed(&mut self, now: Instant) -> Duration {
+        let delay = self.failed(now);
+        self.consecutive_start_failures = self.consecutive_start_failures.saturating_add(1);
+        delay
+    }
+
+    fn runtime_exited(&mut self, now: Instant) -> Duration {
+        self.consecutive_start_failures = 0;
+        self.failed(now)
+    }
+
     fn healthy(&mut self, now: Instant) {
-        self.failures = 0;
+        self.backoff_step = 0;
+        self.consecutive_start_failures = 0;
         self.next_attempt = now;
     }
 
     fn circuit_open(&self) -> bool {
-        self.failures >= MAX_CONSECUTIVE_START_FAILURES
+        self.consecutive_start_failures >= MAX_CONSECUTIVE_START_FAILURES
     }
 }
 
@@ -407,14 +421,18 @@ fn record_restart_failure(
     now: Instant,
     component: &'static str,
 ) -> Result<Duration> {
-    let delay = restart.failed(now);
+    let delay = restart.startup_failed(now);
     if restart.circuit_open() {
         bail!(
             "{component} failed {} consecutive times; supervised restart circuit is open",
-            restart.failures
+            restart.consecutive_start_failures
         );
     }
     Ok(delay)
+}
+
+fn record_runtime_exit(restart: &mut RestartPolicy, now: Instant) -> Duration {
+    restart.runtime_exited(now)
 }
 
 fn stop_on_failure(result: Result<()>, stop: impl FnOnce(), data_dir: &Path) -> Result<()> {
@@ -504,7 +522,7 @@ impl BrokerSupervisor {
         }
         self.stop_agent();
         if had_agent {
-            record_restart_failure(&mut self.restart, now, "BubblePlay Agent")?;
+            record_runtime_exit(&mut self.restart, now);
         }
         if !self.restart.ready(now) {
             return Ok(());
@@ -651,7 +669,7 @@ impl TransportSupervisor {
             }
             self.child = None;
             self.child_started = None;
-            record_restart_failure(&mut self.restart, now, "BubblePlay transport host")?;
+            record_runtime_exit(&mut self.restart, now);
         }
         if !self.restart.ready(now) {
             return Ok(());
@@ -1436,7 +1454,7 @@ mod tests {
         let start = Instant::now();
         let mut policy = RestartPolicy::new(start);
         for _ in 0..MAX_CONSECUTIVE_START_FAILURES {
-            policy.failed(start);
+            policy.startup_failed(start);
         }
         assert!(policy.circuit_open());
         policy.healthy(start);
@@ -1455,6 +1473,18 @@ mod tests {
         assert!(error
             .to_string()
             .contains(&MAX_CONSECUTIVE_START_FAILURES.to_string()));
+    }
+
+    #[test]
+    fn repeated_runtime_exits_back_off_without_stopping_the_service() {
+        let start = Instant::now();
+        let mut policy = RestartPolicy::new(start);
+        let observed: Vec<_> = (0..12)
+            .map(|_| record_runtime_exit(&mut policy, start))
+            .collect();
+        assert_eq!(observed[0], Duration::from_secs(1));
+        assert_eq!(observed[4], Duration::from_secs(30));
+        assert_eq!(observed[11], Duration::from_secs(30));
     }
 
     #[test]
