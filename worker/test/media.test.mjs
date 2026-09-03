@@ -150,15 +150,16 @@ test("WSS lane lifecycle telemetry ignores stale callbacks after a replacement i
 });
 
 test("Stream Lab compatibility identifies the exact WSS trace and benchmark contract", () => {
-  assert.equal(STREAM_LAB_ASSET_BUILD, "wss-v3-host20-edge12-bench2-hevc-tiles-v14");
+  assert.equal(STREAM_LAB_ASSET_BUILD, "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15");
   assert.deepEqual(STREAM_LAB_COMPATIBILITY, {
     schemaVersion: 1,
-    id: "wss-v3-host20-edge12-bench2-hevc-tiles-v14",
-    receiverBuild: "wss-v3-host20-edge12-bench2-hevc-tiles-v14",
+    id: "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15",
+    receiverBuild: "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15",
     mediaProtocol: 3,
     hostTrace: { version: 1, bytes: 20 },
     edgeTrace: { version: 1, bytes: 12 },
     benchStatusProtocol: 2,
+    privilegedIpc: { version: 4 },
     roiModes: ["off", "damage", "text-edge", "feedback", "feedback-headroom"],
     hybridModes: ["off", "png-static-roi", "png-quiescent-detail", "hevc-quiescent-tiles"],
     hybridCacheModes: ["dda-gated", "suppress-reactivate"],

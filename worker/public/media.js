@@ -1,5 +1,5 @@
 export const VERSION = 1;
-export const STREAM_LAB_ASSET_BUILD = "wss-v3-host20-edge12-bench2-hevc-tiles-v14";
+export const STREAM_LAB_ASSET_BUILD = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
 export const CODEC = Object.freeze({ HEVC: 1, H264: 2 });
 export const FRAME_HEADER_BYTES = 24;
 export const MAX_FRAGMENT_BYTES = 48 * 1024;
@@ -29,6 +29,7 @@ export const STREAM_LAB_COMPATIBILITY = Object.freeze({
   hostTrace: Object.freeze({ version: 1, bytes: LAB_HOST_TRACE_BYTES }),
   edgeTrace: Object.freeze({ version: 1, bytes: LAB_EDGE_TRACE_BYTES }),
   benchStatusProtocol: 2,
+  privilegedIpc: Object.freeze({ version: 4 }),
   roiModes: Object.freeze(["off", "damage", "text-edge", "feedback", "feedback-headroom"]),
   hybridModes: Object.freeze([
     "off", "png-static-roi", "png-quiescent-detail", "hevc-quiescent-tiles",

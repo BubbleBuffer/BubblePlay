@@ -17,7 +17,7 @@ $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString
 $runDir = Join-Path $hostDir "target-privileged\update-preflight\$runId"
 $manifestPath = Join-Path $runDir 'manifest.json'
 $checks = [Collections.Generic.List[object]]::new()
-$requiredBinaries = @('bubbleplay_broker.exe', 'bubbleplay_transport.exe', 'bubbleplay_agent.exe', 'bubbleplay_lab_helper.exe', 'bubbleplay-host.exe')
+$requiredBinaries = @('bubbleplay_broker.exe', 'bubbleplay_transport.exe', 'bubbleplay_agent.exe', 'bubbleplay_input_proxy.exe', 'bubbleplay_lab_helper.exe', 'bubbleplay-host.exe')
 
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
 

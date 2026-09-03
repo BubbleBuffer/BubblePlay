@@ -630,6 +630,25 @@ test("relays host desktop availability state to the client", async () => {
   assert.deepEqual(client.closed, []);
 });
 
+test("relays only bounded applied-input receipts from the host", async () => {
+  const { room, sockets: [client, host] } = createRoom();
+  const status = JSON.stringify({
+    type: "input-status", protocol: 1, generation: 4,
+    receivedPackets: 12, acceptedPackets: 11, failedPackets: 1, droppedPackets: 1,
+    releasedInputs: 2, requestedEvents: 14, appliedEvents: 13,
+    lastErrorCode: 5, lastSequence: 99,
+  });
+  await room.webSocketMessage(host, status);
+  await room.webSocketMessage(client, status);
+  await room.webSocketMessage(host, JSON.stringify({
+    type: "input-status", protocol: 1, generation: 4,
+    receivedPackets: 1, acceptedPackets: 2, failedPackets: 0, droppedPackets: 0,
+    releasedInputs: 0, requestedEvents: 1, appliedEvents: 2,
+  }));
+  assert.deepEqual(client.messages, [status]);
+  assert.deepEqual(host.messages, []);
+});
+
 test("relays only bounded privileged capability and secure desktop state from the host", async () => {
   const { room, sockets: [client, host] } = createRoom();
   const capability = JSON.stringify({ type: "host-capabilities", serviceMode: true, coldBoot: true, secureDesktop: true, secureText: true });

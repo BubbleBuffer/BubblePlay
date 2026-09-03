@@ -25,7 +25,8 @@ use crate::desktop_session::{BoundInputDesktop, DesktopKind, InputDesktop};
 use crate::encode::{
     AqMode, EncodedFrame, EncoderOptions, Multipass, Nvenc, Preset, Tuning, VideoCodec,
 };
-use crate::input::{CursorTracker, DesktopRegion, InputApplication, InputSink};
+use crate::input::{CursorTracker, DesktopRegion, InputApplication};
+use crate::input_proxy_client::{current_process_session_id, InputProxyClient};
 use crate::privileged_ipc::{
     CaptureState, Codec, CropRect, EncodedAccessUnit, EncoderAqMode, EncoderMultipass,
     EncoderPreset, EncoderTuning, InputStatistics, MediaConfig, Message, MonitorInfo,
@@ -279,13 +280,8 @@ fn crop_rect(crop: Option<CropRect>, source_width: u32, source_height: u32) -> R
     })
 }
 
-fn secure_input_allowed(packet: &[u8]) -> bool {
-    if packet.first() != Some(&11) {
-        return true;
-    }
-    std::str::from_utf8(&packet[1..])
-        .ok()
-        .is_some_and(|text| text.chars().count() == 1)
+fn proxy_input_supported(desktop: DesktopKind) -> bool {
+    desktop == DesktopKind::Default
 }
 
 fn input_is_enabled(suspended: bool, capture_active: bool) -> bool {
@@ -670,7 +666,7 @@ impl AgentBackend for RealAgentBackend {
         };
         let binding = DesktopBinding {
             work_ready: media_binding.work_ready,
-            input_ready: desktop != DesktopKind::Other,
+            input_ready: proxy_input_supported(desktop),
         };
         let setup = (|| -> Result<Vec<Message>> {
             let mut events = Vec::new();
@@ -914,7 +910,7 @@ struct InputWorkerState {
     desktop: DesktopKind,
     generation: u32,
     capture_active: Arc<AtomicBool>,
-    input: InputSink,
+    input_proxy: Option<InputProxyClient>,
     cursor: CursorTracker,
     suspended: bool,
     delivery: InputDeliveryCounters,
@@ -946,6 +942,18 @@ impl InputDeliveryCounters {
             self.accepted_packets = self.accepted_packets.saturating_add(1);
         } else if application.requested > 0 {
             self.failed_packets = self.failed_packets.saturating_add(1);
+            self.last_error_code = application.last_error_code;
+        }
+    }
+
+    fn observe_release(&mut self, application: InputApplication) {
+        self.requested_events = self
+            .requested_events
+            .saturating_add(u64::from(application.requested));
+        self.applied_events = self
+            .applied_events
+            .saturating_add(u64::from(application.applied));
+        if application.failed_calls > 0 {
             self.last_error_code = application.last_error_code;
         }
     }
@@ -985,15 +993,20 @@ fn input_worker_main(
                 warn!(generation, desktop = ?desktop, ?error, "failed to inspect privileged input security context")
             }
         }
-        let mut input = InputSink::new();
-        input.set_absolute_region(region);
+        let input_proxy = if proxy_input_supported(desktop) {
+            let mut proxy = InputProxyClient::launch(current_process_session_id()?, generation)?;
+            proxy.set_region(region)?;
+            Some(proxy)
+        } else {
+            None
+        };
         Ok((
             bound,
             InputWorkerState {
                 desktop,
                 generation,
                 capture_active,
-                input,
+                input_proxy,
                 cursor: CursorTracker::for_region(region, Instant::now()),
                 suspended: true,
                 delivery: InputDeliveryCounters::default(),
@@ -1024,7 +1037,7 @@ fn input_worker_main(
             break;
         }
     }
-    state.input.release_all();
+    state.release_all();
     drop(state);
     drop(bound_desktop);
 }
@@ -1037,7 +1050,9 @@ impl InputWorkerState {
                 if region.width == 0 || region.height == 0 {
                     bail!("cursor dimensions must be non-zero");
                 }
-                self.input.set_absolute_region(region);
+                if let Some(proxy) = self.input_proxy.as_mut() {
+                    proxy.set_region(region)?;
+                }
                 self.cursor = CursorTracker::for_region(region, Instant::now());
                 Ok(Vec::new())
             }
@@ -1068,20 +1083,21 @@ impl InputWorkerState {
         if !input_is_enabled(self.suspended, capture_active) {
             bail!("input is suspended until capture produces a verified encoded frame");
         }
-        if self.desktop == DesktopKind::Secure && !secure_input_allowed(packet) {
+        if !proxy_input_supported(self.desktop) {
             self.dropped_inputs = self.dropped_inputs.saturating_add(1);
-            bail!("secure desktop text packets must contain exactly one Unicode scalar");
+            bail!("input is unsupported outside the interactive default desktop");
         }
-        let outcome = self.input.handle(packet);
+        let (outcome, stale_motion_dropped) = self
+            .input_proxy
+            .as_mut()
+            .context("interactive-user input proxy is unavailable")?
+            .input(packet)?;
         self.delivery.observe(outcome.application);
         if outcome.application.requested > 0 && !outcome.application.succeeded() {
             self.dropped_inputs = self.dropped_inputs.saturating_add(1);
         }
         self.last_input_sequence = outcome.accepted_sequence.or(self.last_input_sequence);
-        let stats = self.input.take_stats();
-        self.dropped_inputs = self
-            .dropped_inputs
-            .saturating_add(stats.stale_motion_dropped);
+        self.dropped_inputs = self.dropped_inputs.saturating_add(stale_motion_dropped);
         let mut events = Vec::new();
         if outcome.cursor_changed || outcome.sync_requested || outcome.feedback_reliable {
             if let Some(cursor) = self
@@ -1104,7 +1120,11 @@ impl InputWorkerState {
     }
 
     fn release_all(&mut self) {
-        self.input.release_all();
+        if let Some(proxy) = self.input_proxy.as_mut() {
+            if let Ok(application) = proxy.release_all() {
+                self.delivery.observe_release(application);
+            }
+        }
         self.released_inputs = self.released_inputs.saturating_add(1);
     }
 
@@ -1769,12 +1789,10 @@ mod tests {
     }
 
     #[test]
-    fn secure_text_accepts_one_scalar_and_rejects_bulk_or_invalid_utf8() {
-        assert!(secure_input_allowed(&[11, b'a']));
-        assert!(secure_input_allowed(&[11, 0xC3, 0xA9]));
-        assert!(!secure_input_allowed(&[11, b'a', b'b']));
-        assert!(!secure_input_allowed(&[11, 0xFF]));
-        assert!(secure_input_allowed(&[1, 0xFF]));
+    fn interactive_user_proxy_is_never_advertised_for_secure_desktop() {
+        assert!(proxy_input_supported(DesktopKind::Default));
+        assert!(!proxy_input_supported(DesktopKind::Secure));
+        assert!(!proxy_input_supported(DesktopKind::Other));
     }
 
     #[test]

@@ -516,6 +516,11 @@ test("service update preflight emits a short-lived hash-bound ready manifest onl
   assert.match(preflight, /update-preflight/);
   assert.match(preflight, /collect-diagnostics\.ps1/);
   assert.match(preflight, /BubblePlayLabHelper/);
+  assert.match(preflight, /bubbleplay_input_proxy\.exe/);
+  const updater = readFileSync(new URL("../../host/scripts/update-service.ps1", import.meta.url), "utf8");
+  const installer = readFileSync(new URL("../../host/scripts/install-service.ps1", import.meta.url), "utf8");
+  assert.match(updater, /bubbleplay_input_proxy\.exe/);
+  assert.match(installer, /bubbleplay_input_proxy\.exe/);
   assert.doesNotMatch(preflight, /Get-Content\s+-Raw\s+-LiteralPath\s+\$hostLog/i);
   assert.match(preflight, /findstr(?:\.exe)?['"]?\s+['"]?\/M/i,
     "an aged-out registration baseline must use the constant-memory first-match probe");

@@ -16,7 +16,7 @@ test("live collector attaches to a page target and collects rendered and barcode
 test("receiver diagnostics identify both index and media asset capabilities", () => {
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   const media = readFileSync(new URL("../public/media.js", import.meta.url), "utf8");
-  assert.match(media, /export const STREAM_LAB_ASSET_BUILD = "wss-v3-host20-edge12-bench2-hevc-tiles-v14"/);
+  assert.match(media, /export const STREAM_LAB_ASSET_BUILD = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15"/);
   assert.match(client, /STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD/);
   assert.match(client, /const INDEX_ASSET_BUILD = STREAM_LAB_COMPATIBILITY\.receiverBuild/);
   assert.match(client, /compatibility:\s*STREAM_LAB_COMPATIBILITY/);
@@ -608,6 +608,14 @@ test("desktop input suspension is enforced at the final browser transport bounda
   const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /function sendInput\(data, channel\) \{\s*if \(desktopInputState !== "enabled"\) return false;/);
   assert.match(client, /if \(desktopInputState !== "enabled"\) releaseInput\(false\);/);
+});
+
+test("browser diagnostics retain host-side applied input evidence", () => {
+  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /case "input-status"/);
+  assert.match(client, /latestInputStatus = msg/);
+  assert.match(client, /host-input-application-failed/);
+  assert.match(client, /appliedEvents.*requestedEvents/);
 });
 
 test("desktop source transitions preserve the last frame without authorizing stale input", () => {

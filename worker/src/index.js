@@ -192,6 +192,23 @@ function validHostMediaCapabilities(message) {
     message.maxWssLanes === 16 && validFec;
 }
 
+function validInputStatus(message, role, raw) {
+  if (role !== "host" || typeof raw !== "string" || utf8Length(raw) > 1_024 ||
+      message.protocol !== 1 || !uint32(message.generation)) return false;
+  const counters = ["receivedPackets", "acceptedPackets", "failedPackets", "droppedPackets",
+    "releasedInputs", "requestedEvents", "appliedEvents"];
+  if (!counters.every(field => Number.isSafeInteger(message[field]) && message[field] >= 0)) return false;
+  if (message.acceptedPackets > message.receivedPackets ||
+      message.failedPackets > message.receivedPackets ||
+      message.droppedPackets > message.receivedPackets ||
+      message.appliedEvents > message.requestedEvents) return false;
+  if (message.lastErrorCode !== undefined &&
+      (!Number.isInteger(message.lastErrorCode) || message.lastErrorCode < -0x8000_0000 ||
+       message.lastErrorCode > 0x7fff_ffff)) return false;
+  return message.lastSequence === undefined ||
+    (Number.isInteger(message.lastSequence) && message.lastSequence >= 0 && message.lastSequence <= 0xffff);
+}
+
 export class Room {
   constructor(state, env) {
     this.state = state;
@@ -427,6 +444,7 @@ export class Room {
          (msg.input !== undefined && msg.input !== "enabled" && msg.input !== "suspended" && msg.input !== "read-only"))) {
       return;
     }
+    if (msg.type === "input-status" && !validInputStatus(msg, att.role, message)) return;
     if (msg.type === "first-frame" && !validFirstFrameMessage(msg, att.role, message)) {
       return;
     }

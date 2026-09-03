@@ -2879,6 +2879,7 @@ enum PrivilegedEvent {
         reason: &'static str,
     },
     Cursor([u8; 8]),
+    InputStatus(privileged_ipc::InputStatistics),
     Monitors(Vec<capture::MonitorInfo>),
     MonitorSwitch {
         accepted: bool,
@@ -3139,9 +3140,8 @@ impl CaptureSource {
                     error_code: result.error_code,
                 })
             }
-            AgentMessage::Capabilities(_)
-            | AgentMessage::ConfigAck { .. }
-            | AgentMessage::InputStats(_) => None,
+            AgentMessage::InputStats(stats) => Some(PrivilegedEvent::InputStatus(stats)),
+            AgentMessage::Capabilities(_) | AgentMessage::ConfigAck { .. } => None,
             AgentMessage::RecoverableError(error) => {
                 warn!(
                     operation = ?error.operation,
@@ -3256,7 +3256,7 @@ fn run_serve(args: &Args) -> Result<()> {
         args.privileged_agent,
         args.privileged_agent,
         args.privileged_agent,
-        args.privileged_agent,
+        false,
     );
     let pinned = match args.quality.as_str() {
         "480p24" => Some(Profile::Mobile),
@@ -3681,6 +3681,18 @@ fn run_serve(args: &Args) -> Result<()> {
                         pump.publish_cursor_state(encoded);
                     }
                 }
+                PrivilegedEvent::InputStatus(stats) => signaling.send_input_status(
+                    stats.session_generation,
+                    stats.received_packets,
+                    stats.accepted_packets,
+                    stats.failed_packets,
+                    stats.dropped_packets,
+                    stats.released_inputs,
+                    stats.requested_events,
+                    stats.applied_events,
+                    stats.last_error_code,
+                    stats.last_sequence,
+                ),
                 PrivilegedEvent::Monitors(monitors) => signaling.send_monitor_list(monitors),
                 PrivilegedEvent::MonitorSwitch {
                     accepted,
@@ -3970,7 +3982,7 @@ fn run_serve(args: &Args) -> Result<()> {
                         args.privileged_agent,
                         args.privileged_agent,
                         args.privileged_agent,
-                        args.privileged_agent,
+                        false,
                     );
                     if let Ok(monitors) = capture.monitors() {
                         signaling.send_monitor_list(monitors);
@@ -4426,7 +4438,7 @@ fn run_serve(args: &Args) -> Result<()> {
                                     args.privileged_agent,
                                     args.privileged_agent,
                                     args.privileged_agent,
-                                    args.privileged_agent,
+                                    false,
                                 );
                                 // WSS-only clients do not necessarily complete
                                 // the WebRTC offer path, so announce monitors

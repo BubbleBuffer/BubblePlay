@@ -2430,11 +2430,11 @@ test("candidate host launch reuses the broker-owned VDD and reads only its scrat
   const runId = "123e4567-e89b-42d3-a456-426614174000";
   const profilePath = "C:\\lab\\candidate-profile.json";
   assert.equal(buildLabHostUrl("https://play.example/something", runId).href,
-    `wss://play.example/lab-host-ws?run=${runId}&compat=wss-v3-host20-edge12-bench2-hevc-tiles-v14`);
+    `wss://play.example/lab-host-ws?run=${runId}&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15`);
   const launch = buildCandidateHostLaunch("C:\\lab\\bubbleplay-host.exe", "https://play.example/", runId, profilePath);
   assert.equal(launch.command, "C:\\lab\\bubbleplay-host.exe");
   assert.deepEqual(launch.args.slice(0, 4), ["--mode", "serve", "--worker",
-    `wss://play.example/lab-host-ws?run=${runId}&compat=wss-v3-host20-edge12-bench2-hevc-tiles-v14`]);
+    `wss://play.example/lab-host-ws?run=${runId}&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15`]);
   assert.deepEqual(launch.args.slice(-2), ["--benchmark-profile", profilePath]);
   assert.deepEqual(launch.env, {
     BUBBLEPLAY_LAB_IDR_TELEMETRY: "1",

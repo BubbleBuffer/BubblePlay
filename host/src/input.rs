@@ -936,7 +936,7 @@ impl InputSink {
         let _ = self.release_all_report();
     }
 
-    fn release_all_report(&mut self) -> InputApplication {
+    pub fn release_all_report(&mut self) -> InputApplication {
         let (keys, buttons) = self.state.take_release_plan();
         let mut application = InputApplication::default();
         for vk in keys {

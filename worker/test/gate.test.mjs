@@ -87,7 +87,7 @@ async function authenticatedBrowser(f, remember = true) {
 
 const DEBUG_ATTEMPT = "123e4567-e89b-42d3-a456-426614174000";
 const DEBUG_RUN = "cab5bd95-81a3-4ef6-9fc6-8566abbb17d5";
-const DEBUG_COMPATIBILITY = "wss-v3-host20-edge12-bench2-hevc-tiles-v14";
+const DEBUG_COMPATIBILITY = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
 
 function diagnosticRequest(cookie, payload, origin = "https://playfull-cat.example") {
   return new Request("https://playfull-cat.example/__diag/client", {
@@ -474,7 +474,7 @@ test("pinned browser sockets preserve the Worker version override across the int
     ROOM: { idFromName: name => name, get: () => ({ fetch: async () => signalResponse }) },
   };
   const run = "123e4567-e89b-42d3-a456-426614174000";
-  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-v14";
+  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
   const response = await worker.fetch(new Request(
     `https://playfull-cat.example/lab-ws?run=${run}&compat=${compat}`,
     {
@@ -516,7 +516,7 @@ test("explicit local Stream Lab mode bypasses auth only for valid loopback lab s
     },
   };
   const run = "123e4567-e89b-42d3-a456-426614174000";
-  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-v14";
+  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
 
   assert.equal(await worker.fetch(new Request("http://127.0.0.1:8787/"), env), assetResponse);
   assert.equal(await worker.fetch(
@@ -574,7 +574,7 @@ test("lab websocket routing is isolated by canonical run id without changing pro
   const runA = "123e4567-e89b-42d3-a456-426614174000";
   const runB = "123e4567-e89b-42d3-a456-426614174001";
   const epoch = "0123456789abcdef0123456789abcdef";
-  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-v14";
+  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
   const browserHeaders = { Upgrade: "websocket", Cookie: "remembered=1" };
   const hostHeaders = { Upgrade: "websocket", Authorization: "Bearer host-only" };
 
@@ -609,7 +609,7 @@ test("media protocol v3 admits bounded lane ids without relaxing v2", async () =
   };
   const run = "123e4567-e89b-42d3-a456-426614174000";
   const epoch = "0123456789abcdef0123456789abcdef";
-  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-v14";
+  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
   const headers = { Upgrade: "websocket", Authorization: "Bearer host-only" };
 
   const lane15 = await worker.fetch(new Request(

@@ -112,9 +112,9 @@ function Invoke-BubblePlayManifestUpdate([string]$ManifestPath, [switch]$Validat
     $manifestSource = [IO.Path]::GetFullPath([string]$manifest.sourceDir)
     if (-not $manifestSource.Equals($expectedSource, [StringComparison]::OrdinalIgnoreCase)) { throw 'Manifest sourceDir is not the fixed release directory.' }
     Assert-BubblePlayNoReparse $manifestSource
-    $required = @('bubbleplay_broker.exe', 'bubbleplay_transport.exe', 'bubbleplay_agent.exe', 'bubbleplay_lab_helper.exe', 'bubbleplay-host.exe')
+    $required = @('bubbleplay_broker.exe', 'bubbleplay_transport.exe', 'bubbleplay_agent.exe', 'bubbleplay_input_proxy.exe', 'bubbleplay_lab_helper.exe', 'bubbleplay-host.exe')
     $manifestFiles = @($manifest.files)
-    if ($manifestFiles.Count -ne $required.Count) { throw 'Manifest must contain exactly the five required binaries.' }
+    if ($manifestFiles.Count -ne $required.Count) { throw 'Manifest must contain exactly the six required binaries.' }
     foreach ($name in $required) {
         $entries = @($manifestFiles | Where-Object { [string]$_.name -eq $name })
         if ($entries.Count -ne 1) { throw "Manifest has an invalid entry count for $name." }
@@ -331,6 +331,7 @@ foreach ($name in @(
     'bubbleplay_broker.exe',
     'bubbleplay_transport.exe',
     'bubbleplay_agent.exe',
+    'bubbleplay_input_proxy.exe',
     'bubbleplay_lab_helper.exe',
     'bubbleplay-host.exe'
 )) {

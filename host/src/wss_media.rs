@@ -42,7 +42,7 @@ const V3_FEC_PQ: u8 = 1;
 const LAB_HOST_TRACE_BYTES: usize = 20;
 const LAB_HOST_TRACE_MAGIC: u32 = 0x4250_4854;
 const LAB_HOST_TRACE_VERSION: u8 = 1;
-const STREAM_LAB_COMPATIBILITY_ID: &str = "wss-v3-host20-edge12-bench2-hevc-tiles-v14";
+const STREAM_LAB_COMPATIBILITY_ID: &str = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WssTopology {
@@ -1666,7 +1666,7 @@ mod tests {
     #[test]
     fn derives_run_scoped_lab_media_endpoints_from_lab_signaling_url() {
         let request = media_request(
-            "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-v14",
+            "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15",
             "host-bearer",
             "0123456789abcdef0123456789abcdef",
             3,
@@ -1675,14 +1675,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             request.uri().to_string(),
-            "wss://worker.example/lab-host-media-ws?v=2&epoch=0123456789abcdef0123456789abcdef&stripe=3&run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-v14"
+            "wss://worker.example/lab-host-media-ws?v=2&epoch=0123456789abcdef0123456789abcdef&stripe=3&run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15"
         );
     }
 
     #[test]
     fn lab_media_worker_version_override_is_header_only_and_never_reaches_production() {
         let request = media_request_with_worker_version(
-            "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-v14",
+            "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15",
             "host-bearer",
             "0123456789abcdef0123456789abcdef",
             15,
@@ -1715,7 +1715,7 @@ mod tests {
 
     #[test]
     fn lab_v3_host_trace_marks_egress_without_changing_production_packets() {
-        let lab_url = "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-v14";
+        let lab_url = "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
         assert!(lab_host_trace_enabled(lab_url, V3_FRAME_VERSION));
         assert!(!lab_host_trace_enabled(lab_url, FRAME_VERSION));
         assert!(!lab_host_trace_enabled(

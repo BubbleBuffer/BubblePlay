@@ -376,6 +376,7 @@ let transitionNeedsKeyframe = false;
 let desktopKind = "default";
 let desktopInputState = "enabled";
 let desktopGeneration = null;
+let latestInputStatus = null;
 let hostCapabilities = { serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false,
   mediaProtocols: [2], maxWssLanes: 4, wssFec: ["xor-1"] };
 let hostCapabilitiesGeneration = 0;
@@ -855,7 +856,8 @@ setInterval(() => sendClientLog("info", "client-health", {
   view: viewportHealthSnapshot(),
   input: { ready: inputReady, state: desktopInputState,
     sent: input.stats.controlSent, rejected: input.stats.controlDropped,
-    motionSent: input.stats.sent, motionRejected: input.stats.dropped },
+    motionSent: input.stats.sent, motionRejected: input.stats.dropped,
+    host: latestInputStatus },
 }), 5_000);
 
 addEventListener("error", event => sendClientLog("error", "window-error", {
@@ -956,7 +958,7 @@ async function handleSignal(socket, generation, ev) {
   }
   let msg;
   try { msg = JSON.parse(ev.data); } catch { return; }
-  if (["answer", "ice", "quality", "bench-status", "media-view", "desktop-state", "host-capabilities", "media-topology", "first-frame", "monitor-list", "monitor-error"].includes(msg.type)) recordHostEvidence(msg.type);
+  if (["answer", "ice", "quality", "bench-status", "media-view", "desktop-state", "input-status", "host-capabilities", "media-topology", "first-frame", "monitor-list", "monitor-error"].includes(msg.type)) recordHostEvidence(msg.type);
   switch (msg.type) {
     case "hello-ok":
       signalingRegistered = true;
@@ -1018,6 +1020,16 @@ async function handleSignal(socket, generation, ev) {
     case "desktop-state":
       handleDesktopState(msg);
       break;
+    case "input-status": {
+      const previousFailures = latestInputStatus?.failedPackets || 0;
+      latestInputStatus = msg;
+      if ((msg.failedPackets || 0) > previousFailures) sendClientLog("error", "host-input-application-failed", {
+        generation: msg.generation, requestedEvents: msg.requestedEvents,
+        appliedEvents: msg.appliedEvents, failedPackets: msg.failedPackets,
+        lastErrorCode: msg.lastErrorCode ?? null,
+      });
+      break;
+    }
     case "host-capabilities":
       hostCapabilities = {
         serviceMode: msg.serviceMode === true,
@@ -3756,6 +3768,7 @@ function diagnosticsReport() {
     `mode        ${pointerMode === "desktop" ? "work" : "game"}`,
     `capture     ${locked ? "captured" : "released"}`,
     `control     ${hudState.control}`,
+    `host apply  ${latestInputStatus ? `${latestInputStatus.appliedEvents}/${latestInputStatus.requestedEvents} (${latestInputStatus.failedPackets} failed)` : "…"}`,
     "",
     "VIEWPORT",
     `zoom        ${view.zoom}x`,

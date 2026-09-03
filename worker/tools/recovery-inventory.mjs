@@ -166,7 +166,7 @@ export async function captureRecoveryInventory(options = {}) {
       query: redactCommandLine(query.stdout), config: redactCommandLine(config.stdout) };
   });
   const installed = [];
-  for (const name of ["bubbleplay_broker.exe", "bubbleplay_transport.exe", "bubbleplay_agent.exe", "bubbleplay_lab_helper.exe", "bubbleplay-host.exe"]) {
+  for (const name of ["bubbleplay_broker.exe", "bubbleplay_transport.exe", "bubbleplay_agent.exe", "bubbleplay_input_proxy.exe", "bubbleplay_lab_helper.exe", "bubbleplay-host.exe"]) {
     const path = join(process.env.ProgramFiles ?? "C:\\Program Files", "BubblePlay", name);
     try { installed.push({ name, path, ...(await fingerprintFile(path, options)) }); }
     catch (error) { installed.push({ name, path, missing: error.code === "ENOENT", error: error.code ?? error.message }); }

@@ -586,6 +586,29 @@ pub enum SignalMsg {
         generation: u32,
         reason: String,
     },
+    #[serde(rename = "input-status")]
+    InputStatus {
+        protocol: u8,
+        generation: u32,
+        #[serde(rename = "receivedPackets")]
+        received_packets: u64,
+        #[serde(rename = "acceptedPackets")]
+        accepted_packets: u64,
+        #[serde(rename = "failedPackets")]
+        failed_packets: u64,
+        #[serde(rename = "droppedPackets")]
+        dropped_packets: u64,
+        #[serde(rename = "releasedInputs")]
+        released_inputs: u64,
+        #[serde(rename = "requestedEvents")]
+        requested_events: u64,
+        #[serde(rename = "appliedEvents")]
+        applied_events: u64,
+        #[serde(rename = "lastErrorCode", skip_serializing_if = "Option::is_none")]
+        last_error_code: Option<i32>,
+        #[serde(rename = "lastSequence", skip_serializing_if = "Option::is_none")]
+        last_sequence: Option<u16>,
+    },
     #[serde(rename = "host-capabilities")]
     HostCapabilities {
         #[serde(rename = "serviceMode")]
@@ -1563,6 +1586,44 @@ impl Signaling {
             input_state: input_state.map(str::to_owned),
             generation,
             reason: reason.into(),
+        };
+        if self
+            .ws
+            .send(Message::text(
+                serde_json::to_string(&msg).unwrap_or_default(),
+            ))
+            .is_ok()
+        {
+            let _ = self.ws.flush();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_input_status(
+        &mut self,
+        generation: u32,
+        received_packets: u64,
+        accepted_packets: u64,
+        failed_packets: u64,
+        dropped_packets: u64,
+        released_inputs: u64,
+        requested_events: u64,
+        applied_events: u64,
+        last_error_code: Option<i32>,
+        last_sequence: Option<u16>,
+    ) {
+        let msg = SignalMsg::InputStatus {
+            protocol: 1,
+            generation,
+            received_packets,
+            accepted_packets,
+            failed_packets,
+            dropped_packets,
+            released_inputs,
+            requested_events,
+            applied_events,
+            last_error_code,
+            last_sequence,
         };
         if self
             .ws
@@ -2854,6 +2915,26 @@ mod tests {
         assert!(
             matches!(state, SignalMsg::DesktopState { state, generation: 4, .. } if state == "unavailable")
         );
+    }
+
+    #[test]
+    fn input_status_preserves_windows_application_evidence() {
+        let status: SignalMsg = serde_json::from_str(
+            r#"{"type":"input-status","protocol":1,"generation":4,"receivedPackets":12,"acceptedPackets":11,"failedPackets":1,"droppedPackets":1,"releasedInputs":2,"requestedEvents":14,"appliedEvents":13,"lastErrorCode":5,"lastSequence":99}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            status,
+            SignalMsg::InputStatus {
+                generation: 4,
+                failed_packets: 1,
+                requested_events: 14,
+                applied_events: 13,
+                last_error_code: Some(5),
+                last_sequence: Some(99),
+                ..
+            }
+        ));
     }
 
     #[test]

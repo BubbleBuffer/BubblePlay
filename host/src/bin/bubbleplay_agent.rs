@@ -10,6 +10,10 @@ mod encode;
 mod frame_damage;
 #[path = "../input.rs"]
 mod input;
+#[path = "../input_proxy_client.rs"]
+mod input_proxy_client;
+#[path = "../input_proxy_protocol.rs"]
+mod input_proxy_protocol;
 #[path = "../privileged_backend.rs"]
 mod privileged_backend;
 #[path = "../privileged_ipc.rs"]

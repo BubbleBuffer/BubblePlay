@@ -31,6 +31,7 @@ $required = @(
     'bubbleplay_broker.exe',
     'bubbleplay_transport.exe',
     'bubbleplay_agent.exe',
+    'bubbleplay_input_proxy.exe',
     'bubbleplay_lab_helper.exe',
     'bubbleplay-host.exe'
 )
