@@ -727,8 +727,7 @@ fn owned_apply_revision_unlocked(path: &Path, run_id: &str) -> Result<u64> {
 }
 
 fn write_profile_atomic_unlocked(path: &Path, stored: &StoredProfile) -> Result<()> {
-    let parent = path.parent().context("benchmark profile has no parent")?;
-    let temp = parent.join(format!(".{PROFILE_FILE_NAME}.{}.tmp", stored.run_id));
+    let temp = profile_temp_path(path, &stored.run_id)?;
     let bytes = serde_json::to_vec_pretty(stored)?;
     fs::write(&temp, bytes).context("write temporary benchmark profile")?;
     let result = move_file_replace(&temp, path).context("publish benchmark profile atomically");
@@ -736,6 +735,19 @@ fn write_profile_atomic_unlocked(path: &Path, stored: &StoredProfile) -> Result<
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+fn profile_temp_path(path: &Path, run_id: &str) -> Result<PathBuf> {
+    let parent = path.parent().context("benchmark profile has no parent")?;
+    let file_name = path
+        .file_name()
+        .context("benchmark profile has no file name")?;
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(".");
+    temp_name.push(run_id);
+    temp_name.push(".tmp");
+    Ok(parent.join(temp_name))
 }
 
 fn profile_lock_path(path: &Path) -> PathBuf {
@@ -2337,6 +2349,15 @@ mod tests {
             host_benchmark::BenchmarkHybridCacheMode::DdaGated
         );
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn independent_profile_destinations_never_share_an_atomic_temp_file() {
+        let parent = std::env::temp_dir();
+        let run_id = "bb66c7b7-0981-44cf-8122-3d3449e5fd47";
+        let first = profile_temp_path(&parent.join("first-profile.json"), run_id).unwrap();
+        let second = profile_temp_path(&parent.join("second-profile.json"), run_id).unwrap();
+        assert_ne!(first, second);
     }
 
     #[test]
