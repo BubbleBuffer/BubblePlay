@@ -9,7 +9,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"BPIP";
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const HEADER_LEN: usize = 20;
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_MEDIA_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -330,9 +330,17 @@ pub struct MonitorSwitchResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputStatistics {
     pub session_generation: u32,
+    /// Valid packets received by the input worker. This is never application proof.
+    pub received_packets: u64,
+    /// Packets whose complete non-empty SendInput plan Windows accepted.
     pub accepted_packets: u64,
+    /// Packets for which at least one requested SendInput event was not applied.
+    pub failed_packets: u64,
     pub dropped_packets: u64,
     pub released_inputs: u64,
+    pub requested_events: u64,
+    pub applied_events: u64,
+    pub last_error_code: Option<i32>,
     pub last_sequence: Option<u16>,
 }
 
@@ -769,9 +777,15 @@ fn encode_message(message: &Message) -> Result<Vec<u8>, ProtocolError> {
         }
         Message::InputStats(stats) => {
             out.u32(stats.session_generation);
+            out.u64(stats.received_packets);
             out.u64(stats.accepted_packets);
+            out.u64(stats.failed_packets);
             out.u64(stats.dropped_packets);
             out.u64(stats.released_inputs);
+            out.u64(stats.requested_events);
+            out.u64(stats.applied_events);
+            out.i32(stats.last_error_code.unwrap_or(0));
+            out.bool(stats.last_error_code.is_some());
             out.u16(stats.last_sequence.unwrap_or(0));
             out.bool(stats.last_sequence.is_some());
         }
@@ -934,16 +948,27 @@ fn decode_message(kind: MessageKind, payload: &[u8]) -> Result<Message, Protocol
         }),
         MessageKind::InputStats => {
             let session_generation = input.u32()?;
+            let received_packets = input.u64()?;
             let accepted_packets = input.u64()?;
+            let failed_packets = input.u64()?;
             let dropped_packets = input.u64()?;
             let released_inputs = input.u64()?;
+            let requested_events = input.u64()?;
+            let applied_events = input.u64()?;
+            let last_error_code = input.i32()?;
+            let has_last_error_code = input.bool()?;
             let last_sequence = input.u16()?;
             let has_last_sequence = input.bool()?;
             Message::InputStats(InputStatistics {
                 session_generation,
+                received_packets,
                 accepted_packets,
+                failed_packets,
                 dropped_packets,
                 released_inputs,
+                requested_events,
+                applied_events,
+                last_error_code: has_last_error_code.then_some(last_error_code),
                 last_sequence: has_last_sequence.then_some(last_sequence),
             })
         }
@@ -1474,9 +1499,14 @@ mod tests {
             }),
             Message::InputStats(InputStatistics {
                 session_generation: 4,
+                received_packets: 103,
                 accepted_packets: 100,
+                failed_packets: 1,
                 dropped_packets: 2,
                 released_inputs: 1,
+                requested_events: 121,
+                applied_events: 120,
+                last_error_code: Some(5),
                 last_sequence: Some(99),
             }),
             Message::RecoverableError(AgentError {

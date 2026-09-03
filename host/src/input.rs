@@ -211,6 +211,42 @@ pub struct InputOutcome {
     pub cursor_changed: bool,
     pub sync_requested: bool,
     pub feedback_reliable: bool,
+    pub application: InputApplication,
+}
+
+/// What Windows accepted at the `SendInput` boundary for one browser packet.
+/// Packet parsing and motion sequencing are intentionally tracked elsewhere:
+/// neither is proof that Windows applied the requested input.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct InputApplication {
+    pub requested: u32,
+    pub applied: u32,
+    pub failed_calls: u32,
+    pub last_error_code: Option<i32>,
+}
+
+impl InputApplication {
+    fn observe(&mut self, requested: u32, applied: u32, error_code: i32) {
+        self.requested = self.requested.saturating_add(requested);
+        self.applied = self.applied.saturating_add(applied.min(requested));
+        if applied != requested {
+            self.failed_calls = self.failed_calls.saturating_add(1);
+            self.last_error_code = Some(error_code);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.requested = self.requested.saturating_add(other.requested);
+        self.applied = self.applied.saturating_add(other.applied);
+        self.failed_calls = self.failed_calls.saturating_add(other.failed_calls);
+        if other.last_error_code.is_some() {
+            self.last_error_code = other.last_error_code;
+        }
+    }
+
+    pub fn succeeded(self) -> bool {
+        self.requested > 0 && self.requested == self.applied && self.failed_calls == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,7 +445,8 @@ impl InputState {
 mod tests {
     use super::{
         cursor_snapshot, decode, map_monitor_absolute_to_virtual, newer_sequence, Command,
-        CursorState, DesktopRegion, InputFailureLogGate, InputState, INPUT_FAILURE_LOG_INTERVAL,
+        CursorState, DesktopRegion, InputApplication, InputFailureLogGate, InputState,
+        INPUT_FAILURE_LOG_INTERVAL,
     };
     use std::time::Instant;
 
@@ -420,6 +457,19 @@ mod tests {
         assert_eq!(gate.admit(start), Some(0));
         assert_eq!(gate.admit(start + INPUT_FAILURE_LOG_INTERVAL / 2), None);
         assert_eq!(gate.admit(start + INPUT_FAILURE_LOG_INTERVAL), Some(1));
+    }
+
+    #[test]
+    fn input_application_distinguishes_parsed_packets_from_windows_applied_events() {
+        let mut application = InputApplication::default();
+        application.observe(1, 0, 5);
+        application.observe(2, 2, 0);
+
+        assert_eq!(application.requested, 3);
+        assert_eq!(application.applied, 2);
+        assert_eq!(application.failed_calls, 1);
+        assert_eq!(application.last_error_code, Some(5));
+        assert!(!application.succeeded());
     }
 
     #[test]
@@ -608,30 +658,30 @@ impl InputSink {
         match command {
             Command::Key(vk, up) => {
                 self.state.key(vk, up);
-                self.key(vk, up);
+                outcome.application.merge(self.key(vk, up));
             }
             Command::Rel(dx, dy) => {
                 self.stats.relative_packets += 1;
                 self.state.last_absolute_position = None;
-                self.mouse_rel(dx, dy);
+                outcome.application.merge(self.mouse_rel(dx, dy));
                 outcome.cursor_changed = dx != 0 || dy != 0;
             }
             Command::Abs(x, y) => {
                 self.stats.absolute_packets += 1;
                 self.state.last_absolute_position = Some((x, y));
-                self.mouse_abs(x, y);
+                outcome.application.merge(self.mouse_abs(x, y));
                 outcome.cursor_changed = true;
             }
-            Command::Buttons(mask) => self.buttons(mask),
-            Command::Wheel(delta) => self.wheel(delta),
-            Command::ReleaseAll => self.release_all(),
+            Command::Buttons(mask) => outcome.application.merge(self.buttons(mask)),
+            Command::Wheel(delta) => outcome.application.merge(self.wheel(delta)),
+            Command::ReleaseAll => outcome.application.merge(self.release_all_report()),
             Command::Motion(seq, dx, dy, wx, wy) => {
                 if self.state.accept_motion(seq) {
                     self.stats.relative_packets += 1;
                     self.state.last_absolute_position = None;
-                    self.mouse_rel(dx, dy);
-                    self.wheel_horizontal(wx);
-                    self.wheel(wy);
+                    outcome.application.merge(self.mouse_rel(dx, dy));
+                    outcome.application.merge(self.wheel_horizontal(wx));
+                    outcome.application.merge(self.wheel(wy));
                     outcome.accepted_sequence = Some(seq);
                     outcome.cursor_changed = dx != 0 || dy != 0;
                 } else {
@@ -642,7 +692,7 @@ impl InputSink {
                 if self.state.accept_motion(seq) {
                     self.stats.absolute_packets += 1;
                     self.state.last_absolute_position = Some((x, y));
-                    self.mouse_abs(x, y);
+                    outcome.application.merge(self.mouse_abs(x, y));
                     outcome.accepted_sequence = Some(seq);
                     outcome.cursor_changed = true;
                 } else {
@@ -658,10 +708,12 @@ impl InputSink {
                     .then_some(self.state.last_absolute_position)
                     .flatten();
                 self.stats.absolute_packets += 1;
-                self.mouse_abs(x, y);
-                self.buttons(mask);
+                outcome.application.merge(self.mouse_abs(x, y));
+                outcome.application.merge(self.buttons(mask));
                 if let Some((latest_x, latest_y)) = restore {
-                    self.mouse_abs(latest_x, latest_y);
+                    outcome
+                        .application
+                        .merge(self.mouse_abs(latest_x, latest_y));
                 } else if barrier_advanced {
                     self.state.last_absolute_position = Some((x, y));
                 }
@@ -676,7 +728,7 @@ impl InputSink {
                 outcome.sync_requested = true;
                 outcome.feedback_reliable = true;
             }
-            Command::Text(text) => self.text(&text),
+            Command::Text(text) => outcome.application.merge(self.text(&text)),
         }
         outcome
     }
@@ -685,26 +737,35 @@ impl InputSink {
         std::mem::take(&mut self.stats)
     }
 
-    fn record_injection_result(&mut self, operation: &'static str, sent: u32, expected: u32) {
-        if sent == expected {
-            return;
+    fn send_inputs(&mut self, operation: &'static str, inputs: &[INPUT]) -> InputApplication {
+        if inputs.is_empty() {
+            return InputApplication::default();
         }
+        unsafe { SetLastError(WIN32_ERROR(0)) };
+        let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+        let expected = inputs.len().min(u32::MAX as usize) as u32;
         // SendInput does not reliably set a useful error for UIPI rejection,
         // but capture it immediately: other desktop/session failures do.
         let error = std::io::Error::last_os_error();
-        if let Some(suppressed) = self.failure_log.admit(Instant::now()) {
-            warn!(
-                operation,
-                sent,
-                expected,
-                ?error,
-                suppressed,
-                "Windows input injection failed"
-            );
+        let error_code = error.raw_os_error().unwrap_or(0);
+        if sent != expected {
+            if let Some(suppressed) = self.failure_log.admit(Instant::now()) {
+                warn!(
+                    operation,
+                    sent,
+                    expected,
+                    ?error,
+                    suppressed,
+                    "Windows input injection failed"
+                );
+            }
         }
+        let mut application = InputApplication::default();
+        application.observe(expected, sent, error_code);
+        application
     }
 
-    fn key(&mut self, vk: u16, up: bool) {
+    fn key(&mut self, vk: u16, up: bool) -> InputApplication {
         let mut flags = windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS::default();
         if up {
             flags |= KEYEVENTF_KEYUP;
@@ -721,12 +782,10 @@ impl InputSink {
                 },
             },
         };
-        unsafe { SetLastError(WIN32_ERROR(0)) };
-        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-        self.record_injection_result(if up { "key-up" } else { "key-down" }, sent, 1);
+        self.send_inputs(if up { "key-up" } else { "key-down" }, &[input])
     }
 
-    fn text(&mut self, text: &str) {
+    fn text(&mut self, text: &str) -> InputApplication {
         let mut inputs = Vec::new();
         for unit in text.encode_utf16() {
             for up in [false, true] {
@@ -748,16 +807,12 @@ impl InputSink {
                 });
             }
         }
-        if !inputs.is_empty() {
-            unsafe { SetLastError(WIN32_ERROR(0)) };
-            let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-            self.record_injection_result("text", sent, inputs.len() as u32);
-        }
+        self.send_inputs("text", &inputs)
     }
 
-    fn mouse_rel(&mut self, dx: i16, dy: i16) {
+    fn mouse_rel(&mut self, dx: i16, dy: i16) -> InputApplication {
         if dx == 0 && dy == 0 {
-            return;
+            return InputApplication::default();
         }
         let input = INPUT {
             r#type: INPUT_MOUSE,
@@ -772,12 +827,10 @@ impl InputSink {
                 },
             },
         };
-        unsafe { SetLastError(WIN32_ERROR(0)) };
-        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-        self.record_injection_result("mouse-relative", sent, 1);
+        self.send_inputs("mouse-relative", &[input])
     }
 
-    fn mouse_abs(&mut self, x: u16, y: u16) {
+    fn mouse_abs(&mut self, x: u16, y: u16) -> InputApplication {
         let virtual_desktop = virtual_desktop_region().unwrap_or(self.absolute_region);
         let (x, y) = map_monitor_absolute_to_virtual(x, y, self.absolute_region, virtual_desktop);
         let input = INPUT {
@@ -793,17 +846,15 @@ impl InputSink {
                 },
             },
         };
-        unsafe { SetLastError(WIN32_ERROR(0)) };
-        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-        self.record_injection_result("mouse-absolute", sent, 1);
+        self.send_inputs("mouse-absolute", &[input])
     }
 
     /// Bitmask diff -> press/release events for each button.
-    fn buttons(&mut self, mask: u8) {
+    fn buttons(&mut self, mask: u8) -> InputApplication {
         let changed = mask ^ self.state.buttons;
         self.state.buttons = mask;
         if changed == 0 {
-            return;
+            return InputApplication::default();
         }
         let mut inputs = Vec::with_capacity(5);
         for (bit, down_flag, up_flag) in [
@@ -836,16 +887,12 @@ impl InputSink {
                 });
             }
         }
-        if !inputs.is_empty() {
-            unsafe { SetLastError(WIN32_ERROR(0)) };
-            let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-            self.record_injection_result("mouse-buttons", sent, inputs.len() as u32);
-        }
+        self.send_inputs("mouse-buttons", &inputs)
     }
 
-    fn wheel(&mut self, delta: i16) {
+    fn wheel(&mut self, delta: i16) -> InputApplication {
         if delta == 0 {
-            return;
+            return InputApplication::default();
         }
         let input = INPUT {
             r#type: INPUT_MOUSE,
@@ -860,14 +907,12 @@ impl InputSink {
                 },
             },
         };
-        unsafe { SetLastError(WIN32_ERROR(0)) };
-        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-        self.record_injection_result("mouse-wheel", sent, 1);
+        self.send_inputs("mouse-wheel", &[input])
     }
 
-    fn wheel_horizontal(&mut self, delta: i16) {
+    fn wheel_horizontal(&mut self, delta: i16) -> InputApplication {
         if delta == 0 {
-            return;
+            return InputApplication::default();
         }
         let input = INPUT {
             r#type: INPUT_MOUSE,
@@ -882,24 +927,28 @@ impl InputSink {
                 },
             },
         };
-        unsafe { SetLastError(WIN32_ERROR(0)) };
-        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-        self.record_injection_result("mouse-wheel-horizontal", sent, 1);
+        self.send_inputs("mouse-wheel-horizontal", &[input])
     }
 
     /// Release input the browser may never get to send when its data channel
     /// or signaling session disappears. This is also called from Drop.
     pub fn release_all(&mut self) {
-        let (keys, buttons) = self.state.take_release_plan();
-        for vk in keys {
-            self.key(vk, true);
-        }
-        if buttons != 0 {
-            self.send_button_releases(buttons);
-        }
+        let _ = self.release_all_report();
     }
 
-    fn send_button_releases(&mut self, buttons: u8) {
+    fn release_all_report(&mut self) -> InputApplication {
+        let (keys, buttons) = self.state.take_release_plan();
+        let mut application = InputApplication::default();
+        for vk in keys {
+            application.merge(self.key(vk, true));
+        }
+        if buttons != 0 {
+            application.merge(self.send_button_releases(buttons));
+        }
+        application
+    }
+
+    fn send_button_releases(&mut self, buttons: u8) -> InputApplication {
         let mut inputs = Vec::with_capacity(5);
         for (bit, up_flag) in [
             (1u8, MOUSEEVENTF_LEFTUP),
@@ -930,11 +979,7 @@ impl InputSink {
                 });
             }
         }
-        if !inputs.is_empty() {
-            unsafe { SetLastError(WIN32_ERROR(0)) };
-            let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-            self.record_injection_result("mouse-button-release", sent, inputs.len() as u32);
-        }
+        self.send_inputs("mouse-button-release", &inputs)
     }
 }
 

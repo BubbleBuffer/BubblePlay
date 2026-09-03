@@ -25,7 +25,7 @@ use crate::desktop_session::{BoundInputDesktop, DesktopKind, InputDesktop};
 use crate::encode::{
     AqMode, EncodedFrame, EncoderOptions, Multipass, Nvenc, Preset, Tuning, VideoCodec,
 };
-use crate::input::{CursorTracker, DesktopRegion, InputSink};
+use crate::input::{CursorTracker, DesktopRegion, InputApplication, InputSink};
 use crate::privileged_ipc::{
     CaptureState, Codec, CropRect, EncodedAccessUnit, EncoderAqMode, EncoderMultipass,
     EncoderPreset, EncoderTuning, InputStatistics, MediaConfig, Message, MonitorInfo,
@@ -917,10 +917,38 @@ struct InputWorkerState {
     input: InputSink,
     cursor: CursorTracker,
     suspended: bool,
-    accepted_inputs: u64,
+    delivery: InputDeliveryCounters,
     dropped_inputs: u64,
     released_inputs: u64,
     last_input_sequence: Option<u16>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct InputDeliveryCounters {
+    received_packets: u64,
+    accepted_packets: u64,
+    failed_packets: u64,
+    requested_events: u64,
+    applied_events: u64,
+    last_error_code: Option<i32>,
+}
+
+impl InputDeliveryCounters {
+    fn observe(&mut self, application: InputApplication) {
+        self.received_packets = self.received_packets.saturating_add(1);
+        self.requested_events = self
+            .requested_events
+            .saturating_add(u64::from(application.requested));
+        self.applied_events = self
+            .applied_events
+            .saturating_add(u64::from(application.applied));
+        if application.succeeded() {
+            self.accepted_packets = self.accepted_packets.saturating_add(1);
+        } else if application.requested > 0 {
+            self.failed_packets = self.failed_packets.saturating_add(1);
+            self.last_error_code = application.last_error_code;
+        }
+    }
 }
 
 fn input_worker_main(
@@ -968,7 +996,7 @@ fn input_worker_main(
                 input,
                 cursor: CursorTracker::for_region(region, Instant::now()),
                 suspended: true,
-                accepted_inputs: 0,
+                delivery: InputDeliveryCounters::default(),
                 dropped_inputs: 0,
                 released_inputs: 0,
                 last_input_sequence: None,
@@ -1045,7 +1073,10 @@ impl InputWorkerState {
             bail!("secure desktop text packets must contain exactly one Unicode scalar");
         }
         let outcome = self.input.handle(packet);
-        self.accepted_inputs = self.accepted_inputs.saturating_add(1);
+        self.delivery.observe(outcome.application);
+        if outcome.application.requested > 0 && !outcome.application.succeeded() {
+            self.dropped_inputs = self.dropped_inputs.saturating_add(1);
+        }
         self.last_input_sequence = outcome.accepted_sequence.or(self.last_input_sequence);
         let stats = self.input.take_stats();
         self.dropped_inputs = self
@@ -1066,7 +1097,7 @@ impl InputWorkerState {
                 }));
             }
         }
-        if outcome.feedback_reliable {
+        if outcome.feedback_reliable || outcome.application.failed_calls > 0 {
             events.push(self.input_stats());
         }
         Ok(events)
@@ -1080,9 +1111,14 @@ impl InputWorkerState {
     fn input_stats(&self) -> Message {
         Message::InputStats(InputStatistics {
             session_generation: self.generation,
-            accepted_packets: self.accepted_inputs,
+            received_packets: self.delivery.received_packets,
+            accepted_packets: self.delivery.accepted_packets,
+            failed_packets: self.delivery.failed_packets,
             dropped_packets: self.dropped_inputs,
             released_inputs: self.released_inputs,
+            requested_events: self.delivery.requested_events,
+            applied_events: self.delivery.applied_events,
+            last_error_code: self.delivery.last_error_code,
             last_sequence: self.last_input_sequence,
         })
     }
@@ -1614,6 +1650,24 @@ fn capture_health(state: CaptureState) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_windows_application_is_received_but_never_accepted() {
+        let mut counters = InputDeliveryCounters::default();
+        counters.observe(crate::input::InputApplication {
+            requested: 1,
+            applied: 0,
+            failed_calls: 1,
+            last_error_code: Some(5),
+        });
+
+        assert_eq!(counters.received_packets, 1);
+        assert_eq!(counters.accepted_packets, 0);
+        assert_eq!(counters.failed_packets, 1);
+        assert_eq!(counters.requested_events, 1);
+        assert_eq!(counters.applied_events, 0);
+        assert_eq!(counters.last_error_code, Some(5));
+    }
 
     #[test]
     fn privileged_media_resources_expire_after_five_idle_seconds() {
