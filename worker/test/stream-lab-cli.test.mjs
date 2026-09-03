@@ -610,6 +610,19 @@ test("external service validation is logged, bounded, and publishes pass or roll
   assert.doesNotMatch(validator, /Start-Process|Verb\s+RunAs|elevat/i);
 });
 
+test("external validation admits bounded Host child recovery while the Transport service remains stable", () => {
+  const validator = readFileSync(new URL("../../host/scripts/validate-service-update.ps1", import.meta.url), "utf8");
+  assert.match(validator, /\$MaxHostRecoveries\s*=\s*3/);
+  assert.match(validator, /Test-BubblePlayRecentHostRegistration/);
+  assert.match(validator, /Get-Content\s+-LiteralPath\s+\$Path\s+-Tail\s+3000/i,
+    "re-registration evidence must use a bounded log tail");
+  assert.match(validator,
+    /\$HostRecoveries\.Count\s+-ge\s+\$MaxHostRecoveries[\s\S]*throw[^\r\n]+recovery budget/i,
+    "repeated child flapping must still fail validation");
+  assert.match(validator, /Add-Evidence\s+'host-recovery'\s+'pass'/i);
+  assert.match(validator, /BubblePlayTransport stopped or restarted during external validation/);
+});
+
 test("encoder rounds vary one dimension around the champion", () => {
   const champion = { preset: "p3", tuning: "ultra-low-latency", multipass: "disabled", vbvFrames: 1, aqStrength: 8, temporalAq: false, gopSeconds: 2 };
   const round = buildEncoderRound(champion, "vbvFrames");
