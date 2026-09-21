@@ -1,9 +1,10 @@
+import { readClientSource } from "./helpers/client-source.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { campaignCheckpointContract } from "../tools/stream-lab-live.mjs";
 
-const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+const client = readClientSource();
 const runner = readFileSync(new URL("../tools/stream-lab-live.mjs", import.meta.url), "utf8");
 
 test("diagnostics exposes structured signaling and monitor evidence", () => {

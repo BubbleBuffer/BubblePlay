@@ -63,6 +63,8 @@ function decode(value) {
   const type = value.type === "key" || annexBHasIdr(new Uint8Array(value.data)) ? "key" : "delta";
   if (type === "key") stats.keyframes++;
   const timestamp = normalizeEncodedTimestamp(value.timestamp, metadata), observed = timeline.observe(timestamp);
+  if (diagnostics) stats.inputTiming = { valueTimestamp: value.timestamp, pts: metadata.timestamp,
+    rtpTimestamp: metadata.rtpTimestamp, normalizedUs: timestamp, receivedAtMs: performance.now() };
   if (!observed.ok) { reset(observed.reason); return; }
   if (waitingForKeyframe && type !== "key") { stats.dropped++; requestKeyframe("startup-delta"); return; }
   if (type === "key") pendingCodec = codecFromSps(new Uint8Array(value.data)) || pendingCodec;

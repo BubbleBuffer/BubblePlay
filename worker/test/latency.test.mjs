@@ -140,7 +140,7 @@ test("Annex-B IDR detection does not depend on the browser frame label", () => {
 test("encoded timestamps prefer microsecond PTS and normalize RTP 90 kHz fallback", () => {
   assert.equal(normalizeEncodedTimestamp(90_000, { timestamp: 1_234_567, rtpTimestamp: 90_000 }), 1_234_567);
   assert.equal(normalizeEncodedTimestamp(90_000, { rtpTimestamp: 90_000 }), 1_000_000);
-  assert.equal(normalizeEncodedTimestamp(1_234_567, {}), 1_234_567);
+  assert.equal(normalizeEncodedTimestamp(90_000, {}), 1_000_000);
 });
 
 test("production worker timeline resets only after three sustained late encoded frames", () => {

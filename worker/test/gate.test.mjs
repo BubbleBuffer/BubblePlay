@@ -186,6 +186,8 @@ test("holds one exact navigation until its approve capability is posted", async 
 test("approval releases only the request carrying that notification's capability", async () => {
   const { gate, notices } = fixture();
   const first = gate.fetch(navigation("203.0.113.1"));
+  // Notification order follows asynchronous crypto, not invocation order.
+  await waitFor(() => notices.length === 1);
   const second = gate.fetch(navigation("198.51.100.2"));
   await waitFor(() => notices.length === 2);
   const firstApprove = notices[0].body.actions.find((action) => action.label === "Approve");

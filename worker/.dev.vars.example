@@ -1,2 +1,6 @@
 # Copy to .dev.vars for `wrangler dev`:
 TOKEN = "change-me"
+HOST_GATE_TOKEN = "change-me-host-endpoint"
+GATE_ADMIN_TOKEN = "change-me-approval-admin"
+APP_PASSWORD = "change-me-browser-password"
+NTFY_TOKEN = "change-me-notification-service"

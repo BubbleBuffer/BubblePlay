@@ -18,6 +18,29 @@ use tracing::{debug, info, warn};
 
 use crate::encode::VideoCodec;
 
+/// Keep Windows timed channel waits usable for the RTP pacer's deadlines.
+/// Acquire only for a negotiated RTC epoch; Drop also covers errors/teardown.
+struct RtcTimerPeriod;
+
+impl RtcTimerPeriod {
+    fn acquire() -> Option<Self> {
+        // No pointer arguments; pair each successful request with timeEndPeriod.
+        let status = unsafe { windows::Win32::Media::timeBeginPeriod(1) };
+        if status == 0 {
+            Some(Self)
+        } else {
+            warn!(status, "RTC high resolution timer request failed");
+            None
+        }
+    }
+}
+
+impl Drop for RtcTimerPeriod {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::Media::timeEndPeriod(1); }
+    }
+}
+
 fn preferred_negotiated_codec(hevc: Option<Pt>, h264: Option<Pt>) -> Option<(VideoCodec, Pt)> {
     hevc.map(|pt| (VideoCodec::Hevc, pt))
         .or_else(|| h264.map(|pt| (VideoCodec::H264, pt)))
@@ -50,6 +73,7 @@ pub struct RtcSession {
     frames_written: u64,
     input_control: Option<ChannelId>,
     input_motion: Option<ChannelId>,
+    timer_period: Option<RtcTimerPeriod>,
 }
 
 impl RtcSession {
@@ -71,6 +95,7 @@ impl RtcSession {
             frames_written: 0,
             input_control: None,
             input_motion: None,
+            timer_period: None,
         }
     }
 
@@ -92,6 +117,9 @@ impl RtcSession {
             .accept_offer(offer)
             .context("accept_offer")?;
         self.clock_start = Instant::now();
+        if self.timer_period.is_none() {
+            self.timer_period = RtcTimerPeriod::acquire();
+        }
 
         Ok(answer.to_sdp_string())
     }

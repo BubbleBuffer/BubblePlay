@@ -1,5 +1,4 @@
-#[path = "../desktop_session.rs"]
-mod desktop_session;
+use bubbleplay_host::desktop_session;
 
 use anyhow::Result;
 use desktop_session::InputDesktop;

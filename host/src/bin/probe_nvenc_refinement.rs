@@ -6,12 +6,9 @@
 //! against BubblePlay's cumulative 6 Mbps transport budget using exact NVENC
 //! reconstructed-frame luma error measured on the GPU.
 
-#[path = "../encode.rs"]
-mod encode;
-#[path = "../frame_damage.rs"]
-mod frame_damage;
-#[path = "../reconstruction_feedback.rs"]
-mod reconstruction_feedback;
+use bubbleplay_host::encode;
+use bubbleplay_host::frame_damage;
+use bubbleplay_host::reconstruction_feedback;
 
 use std::ffi::c_void;
 use std::path::PathBuf;

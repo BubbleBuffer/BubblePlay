@@ -1,3 +1,4 @@
+import { readClientSource } from "./helpers/client-source.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
@@ -1701,7 +1702,7 @@ test("quality pass cannot overwrite live cadence or freeze gates", () => {
 });
 
 test("WSS canvas presentation records wall-clock frame gaps and performance resets them", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const collector = readFileSync(new URL("../tools/stream-lab-live.mjs", import.meta.url), "utf8");
   assert.match(client, /const frameGap = Math\.max\(0, Math\.round\(renderedAt - lastFrameDrawnAt\)\)/);
   assert.match(client, /hudState\.maxFrameGap = Math\.max/);

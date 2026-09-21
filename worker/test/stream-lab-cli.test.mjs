@@ -394,7 +394,7 @@ test("a completed but rejected campaign exits nonzero", () => {
   assert.equal(reportExitCode({ result: "unavailable" }), 2);
 });
 
-test("preflight treats the legacy helper service as optional", () => {
+test("preflight rejects a missing helper needed by live startup", () => {
   const root = mkdtempSync(join(tmpdir(), "bubbleplay-preflight-"));
   try {
     const report = runPreflight({
@@ -403,8 +403,8 @@ test("preflight treats the legacy helper service as optional", () => {
       chromeFinder: () => "chrome-fixture.exe",
       serviceProbe: () => ({ installed: false, queryable: true, state: null, stateName: "missing" }),
     });
-    assert.equal(report.result, "ready");
-    assert.deepEqual(report.missing, []);
+    assert.equal(report.result, "unavailable");
+    assert.deepEqual(report.missing, ["lab-helper-service"]);
     assert.equal(report.labService.installed, false);
     assert.match(report.receiverProfile, /BubblePlay[\\/]StreamLab[\\/]Chrome$/);
     assert.ok(report.dependencies.every((dependency) => dependency.available));
@@ -413,15 +413,15 @@ test("preflight treats the legacy helper service as optional", () => {
   }
 });
 
-test("preflight records service query denial without blocking the unprivileged lab", () => {
+test("preflight rejects denied helper access needed to verify cleanup", () => {
   const report = runPreflight({
     commandProbe: () => ({ available: true, version: "fixture" }),
     chromeFinder: () => "chrome-fixture.exe",
     serviceProbe: () => ({ installed: null, queryable: false, state: null,
       error: { code: "service-query-denied", message: "query denied" } }),
   });
-  assert.deepEqual(report.missing, []);
-  assert.equal(report.result, "ready");
+  assert.deepEqual(report.missing, ["lab-helper-service-access"]);
+  assert.equal(report.result, "unavailable");
   assert.equal(report.labService.error.code, "service-query-denied");
 });
 

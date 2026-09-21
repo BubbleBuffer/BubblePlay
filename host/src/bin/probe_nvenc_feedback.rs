@@ -3,12 +3,8 @@
 //! reads the texture back only to establish the hardware/API boundary; the
 //! streaming experiment consumes the same surface with a compute shader.
 
-#[path = "../encode.rs"]
-mod encode;
-#[path = "../frame_damage.rs"]
-mod frame_damage;
-#[path = "../reconstruction_feedback.rs"]
-mod reconstruction_feedback;
+use bubbleplay_host::encode;
+use bubbleplay_host::reconstruction_feedback;
 
 use std::ffi::c_void;
 

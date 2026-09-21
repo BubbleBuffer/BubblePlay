@@ -28,10 +28,15 @@ export function parseAdaptive(params) {
   return params.get("quality") === QUALITY.AUTO;
 }
 
-/** A fresh page starts HEVC; one concrete failure may choose H.264 for this page. */
-export function createCodecSession() {
-  let codec = "hevc";
-  let h264FallbackUsed = false;
+export function decoderSupportsCodec(transport, decoderPath, codec) {
+  if (!["hevc", "h264"].includes(codec)) return false;
+  return transport === "wss" || decoderPath !== "webcodecs" || codec === "h264";
+}
+
+/** Codec selection is page-local and constrained by the selected decoder. */
+export function createCodecSession({ transport = "webrtc", decoderPath = "native" } = {}) {
+  let codec = decoderSupportsCodec(transport, decoderPath, "hevc") ? "hevc" : "h264";
+  let h264FallbackUsed = codec === "h264";
   return {
     get codec() { return codec; },
     get h264FallbackUsed() { return h264FallbackUsed; },

@@ -7,22 +7,29 @@ relay that pairs exactly one host with one client.
 
 ```powershell
 wrangler login
-wrangler secret put TOKEN     # one shared secret; host and client must match
+wrangler secret put TOKEN             # host signaling registration secret
+wrangler secret put HOST_GATE_TOKEN   # host endpoint bearer credential
+wrangler secret put GATE_ADMIN_TOKEN  # approval management and password fingerprinting
+wrangler secret put APP_PASSWORD      # browser application login
+wrangler secret put NTFY_TOKEN        # approval notification service credential
 wrangler deploy
 ```
 
 ## Local dev
 
 ```powershell
-Copy-Item .dev.vars.example .dev.vars   # set TOKEN
+Copy-Item .dev.vars.example .dev.vars   # configure separate local credentials
 wrangler dev
 ```
 
-Then open http://localhost:8787/?token=<TOKEN> in Chrome (Chromium required).
-The host connects to the Worker's /ws endpoint:
+Open the local site in Chromium. Browser access uses approval and application
+login cookies; a token query parameter does not authenticate the browser. The
+approval flow also needs a reachable notification service configured through
+`NTFY_URL`, `NTFY_TOPIC`, and `NTFY_TOKEN`. The host connects to `/ws` with its
+registration secret and separate endpoint credential:
 
 ```powershell
-bubbleplay-host.exe --mode serve --worker ws://localhost:8787/ws --token <TOKEN>
+bubbleplay-host.exe --mode serve --worker ws://localhost:8787/ws --token <TOKEN> --host-gate-token <HOST_GATE_TOKEN>
 ```
 
 ## Latency tests
@@ -43,8 +50,13 @@ npm run latency:live -- --url https://bubbleplay-signal.example.workers.dev/ --s
 
 The production client uses Chromium's native WebRTC video decoder. The
 software glass-to-glass barcode reader still belongs to the diagnostic
-WebCodecs path, so select it explicitly when running that legacy benchmark;
-physical panel scanout is not included.
+WebCodecs path, so select it explicitly when running that legacy benchmark.
+Diagnostic WebRTC negotiates H.264; native WebRTC retains its HEVC preference.
+The lab rejects HEVC benchmark overrides on the H.264 diagnostic decoder before
+changing profiles. Its separate H.264 compatibility sample releases the override
+and requires advancing, fresh presentation throughout the sampled route.
+Physical panel scanout is not included, and diagnostic H.264 compatibility does
+not establish native HEVC benchmark performance.
 
 ```powershell
 npm run latency:bench -- --url https://bubbleplay-signal.example.workers.dev/ --decoder-path webcodecs --seconds 30

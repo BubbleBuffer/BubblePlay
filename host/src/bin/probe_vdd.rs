@@ -7,8 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-#[path = "../vdd.rs"]
-mod vdd;
+use bubbleplay_host::vdd;
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayDevicesW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
 };

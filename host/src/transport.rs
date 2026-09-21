@@ -258,7 +258,9 @@ fn schedule_timeout(deadline: Instant, now: Instant, offer_active: bool) -> Inst
         return deadline;
     }
     now + if offer_active {
-        UDP_POLL_CEILING
+        // An active pacer uses an immediate deadline to release queued RTP.
+        // Adding the UDP polling ceiling here throttles every packet burst.
+        Duration::ZERO
     } else {
         Duration::from_secs(1)
     }
@@ -636,7 +638,7 @@ mod tests {
     use super::{
         dead_epoch_action, emit, replace_latest_cursor, schedule_timeout, stop_takes_priority,
         try_admit_access_unit, try_send_command, DeadEpochAction, TransportCounters,
-        TransportEvent, UDP_POLL_CEILING,
+        TransportEvent,
     };
     use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -706,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_str0m_deadline_backs_off_without_delaying_future_deadlines() {
+    fn idle_deadlines_back_off_but_due_media_deadlines_run_immediately() {
         let now = std::time::Instant::now();
         let future = now + std::time::Duration::from_millis(17);
         assert_eq!(schedule_timeout(future, now, false), future);
@@ -714,6 +716,7 @@ mod tests {
             schedule_timeout(now, now, false),
             now + std::time::Duration::from_secs(1)
         );
-        assert_eq!(schedule_timeout(now, now, true), now + UDP_POLL_CEILING);
+        assert_eq!(schedule_timeout(now, now, true), now);
+        assert_eq!(schedule_timeout(now - std::time::Duration::from_millis(1), now, true), now);
     }
 }

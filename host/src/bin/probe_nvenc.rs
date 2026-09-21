@@ -34,11 +34,7 @@ const NV_ENC_PRESET_P1_GUID: GUID = GUID {
     Data4: [0x80, 0xc7, 0x29, 0x88, 0x71, 0x59, 0x0e, 0xbf],
 };
 
-const fn struct_version(ver: u32) -> u32 {
-    // Same recipe as the crate: NVENCAPI_VERSION | (ver << 16) | (0x7 << 28),
-    // plus the 1<<31 flag the SDK uses for config structs.
-    NVENCAPI_VERSION | (ver << 16) | (0x7 << 28) | (1 << 31)
-}
+
 
 /// Zero-init like the C SDK (`memset` + set version). `std::mem::zeroed`
 /// trips a validity panic on this union-heavy struct; MaybeUninit works.

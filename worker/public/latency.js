@@ -191,7 +191,9 @@ export function normalizeEncodedTimestamp(valueTimestamp, metadata = {}) {
   if (Number.isFinite(metadata.rtpTimestamp)) {
     return Math.round(metadata.rtpTimestamp * 1000 / 90);
   }
-  return Number.isFinite(valueTimestamp) ? valueTimestamp : NaN;
+  // Legacy RTCEncodedVideoFrame.timestamp is the 90 kHz RTP timestamp,
+  // unlike metadata.timestamp (microsecond PTS).
+  return Number.isFinite(valueTimestamp) ? Math.round(valueTimestamp * 1000 / 90) : NaN;
 }
 
 // Convert a browser RTCStatsReport into a compact, JSON-safe absolute

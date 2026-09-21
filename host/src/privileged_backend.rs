@@ -68,6 +68,7 @@ impl CaptureRecovery {
         }
     }
 
+    #[cfg(test)]
     fn state(self) -> CaptureState {
         self.state
     }

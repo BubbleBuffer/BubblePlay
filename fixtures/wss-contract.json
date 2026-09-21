@@ -1,0 +1,29 @@
+{
+  "topologies": [
+    { "laneCount": 1, "dataShards": 1, "parityShards": 0, "accepted": true },
+    { "laneCount": 4, "dataShards": 3, "parityShards": 1, "accepted": true },
+    { "laneCount": 16, "dataShards": 14, "parityShards": 2, "accepted": true },
+    { "laneCount": 0, "dataShards": 0, "parityShards": 0, "accepted": false },
+    { "laneCount": 17, "dataShards": 16, "parityShards": 1, "accepted": false },
+    { "laneCount": 4, "dataShards": 0, "parityShards": 4, "accepted": false },
+    { "laneCount": 4, "dataShards": 2, "parityShards": 1, "accepted": false },
+    { "laneCount": 4, "dataShards": 1, "parityShards": 3, "accepted": false }
+  ],
+  "epochs": [
+    { "value": "0123456789abcdef0123456789abcdef", "accepted": true },
+    { "value": "0123456789ABCDEF0123456789ABCDEF", "accepted": false },
+    { "value": "0123456789abcdef0123456789abcdeg", "accepted": false },
+    { "value": "", "accepted": false },
+    { "value": "0123456789abcdef0123456789abcdef0", "accepted": false }
+  ],
+  "v2": {
+    "generation": 287454020, "gop": 1432778632, "sequence": 2578103244,
+    "timestamp90k": 16909060, "data": [222, 173, 190, 239],
+    "packets": [
+      "02020100112233445566778899aabbcc0102030400000004dead",
+      "02020101112233445566778899aabbcc0102030400000004beef",
+      "02020102112233445566778899aabbcc01020304000000040000",
+      "02020103112233445566778899aabbcc01020304000000046042"
+    ]
+  }
+}

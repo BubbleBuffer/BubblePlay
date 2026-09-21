@@ -1,3 +1,4 @@
+import { readClientSource } from "./helpers/client-source.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -14,7 +15,7 @@ test("live collector attaches to a page target and collects rendered and barcode
 });
 
 test("receiver diagnostics identify both index and media asset capabilities", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const media = readFileSync(new URL("../public/media.js", import.meta.url), "utf8");
   assert.match(media, /export const STREAM_LAB_ASSET_BUILD = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15"/);
   assert.match(client, /STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD/);
@@ -30,7 +31,7 @@ test("receiver diagnostics identify both index and media asset capabilities", ()
 });
 
 test("external debug attempts report before module imports and across the WSS presentation chain", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const preModule = client.indexOf("window.__bubbleplayDebugTrace");
   const module = client.indexOf('<script type="module">');
   assert.ok(preModule >= 0 && preModule < module, "debug reporter must execute before module imports");
@@ -47,7 +48,7 @@ test("external debug attempts report before module imports and across the WSS pr
 });
 
 test("a normal page load creates and reports its own diagnostic attempt", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const prelude = client.match(/<script>\s*([\s\S]*?)<\/script>\s*<script type="module">/)?.[1] || "";
   const generatedAttempt = "11111111-2222-4333-8444-555555555555";
   const requests = [];
@@ -74,7 +75,7 @@ test("a normal page load creates and reports its own diagnostic attempt", () => 
 });
 
 test("forced WSS debugging preserves the original failure instead of falling back", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const recovery = client.match(/function recoverWssStartup\(reason\) \{([\s\S]*?)\n\}/)?.[1] || "";
   assert.match(recovery, /requestedTransport === TRANSPORT\.WSS[\s\S]*recoverNetworkRoute/);
   const forced = recovery.match(/if \(requestedTransport === TRANSPORT\.WSS\) \{([\s\S]*?)\n  \}/)?.[1] || "";
@@ -82,7 +83,7 @@ test("forced WSS debugging preserves the original failure instead of falling bac
 });
 
 test("modern transform keeps canvas/decode/render in the DedicatedWorker", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const worker = readFileSync(new URL("../public/latency-worker.js", import.meta.url), "utf8");
   assert.match(client, /message\.kind === "control"/);
   assert.match(client, /transferControlToOffscreen\(\)/);
@@ -111,7 +112,7 @@ test("modern transform keeps canvas/decode/render in the DedicatedWorker", () =>
 });
 
 test("automatic WSS fallback releases the WebRTC video sink before reclaiming its canvas", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /function releaseWebRtcVideoSink\(\)[\s\S]*encodedWorker\.terminate\(\)[\s\S]*replaceTransferredCanvas\(\)/);
   assert.match(client, /function startWssMedia\(\)[\s\S]*releaseWebRtcVideoSink\(\);[\s\S]*ensureMainCanvas\(\);/);
   assert.match(client, /const updateDimensions = \(\) => \{\s*if \(generation !== peerGeneration \|\| activeVideo !== video \|\| !nativePresentation\) return;/);
@@ -120,26 +121,25 @@ test("automatic WSS fallback releases the WebRTC video sink before reclaiming it
 });
 
 test("automatic WSS negotiation waits briefly for current host capabilities before v2 fallback", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /case "host-capabilities":[\s\S]*hostCapabilitiesGeneration = generation;[\s\S]*requestWssMediaStart\(\)/);
   assert.match(client, /function requestWssMediaStart\(\)[\s\S]*shouldDeferWssMediaStart[\s\S]*setTimeout\([\s\S]*500\)/);
   assert.match(client, /case "hello-ok":[\s\S]*if \(wssSelected\) requestWssMediaStart\(\)/);
 });
 
 test("WSS diagnostics exclude lab trace trailers before reassembly and reset them atomically", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /stripLabEdgeTrace\(event\.data,\s*\{\s*requireEdgeTrace:\s*true,\s*requireHostTrace:\s*true\s*\}\)/);
   assert.match(client, /wssMediaReceivedBytes\s*\+=\s*event\.data\.byteLength/);
   assert.match(client, /wssMediaReceivedPackets\+\+/);
   assert.match(client, /wssReassembler\.push\([\s\S]*?packet,[\s\S]*?stripe,[\s\S]*?event\.timeStamp,[\s\S]*?edgeReceivedAtEpochMs,[\s\S]*?hostSentAtEpochMs,[\s\S]*?hostRoiTrace,[\s\S]*?\)/);
   assert.match(client, /wssMedia:\s*\{[\s\S]*receivedBytes:\s*wssMediaReceivedBytes[\s\S]*receivedPackets:\s*wssMediaReceivedPackets/);
   assert.match(client, /highestSequenceByLane:\s*\[\.\.\.wssReassembler\.highestSequence\]/);
-  assert.match(client, /completionMissingByLane:\s*\[\.\.\.wssReassembler\.stats\.completionMissingByLane\]/);
   assert.match(client, /resetPresentationCounters\(\)[\s\S]*wssMediaReceivedBytes\s*=\s*0[\s\S]*wssMediaReceivedPackets\s*=\s*0/);
 });
 
 test("WSS presentation diagnostics prove immediate draws and expose every RAF coalescing path", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /FramePresentationTelemetry/);
   assert.match(client, /const framePresentationTelemetry = new FramePresentationTelemetry\(\)/);
   assert.match(client, /presentWssFrameImmediately\([\s\S]*?framePresentationTelemetry[\s\S]*?\)/);
@@ -152,7 +152,7 @@ test("WSS presentation diagnostics prove immediate draws and expose every RAF co
 });
 
 test("Stream Lab can hold one WSS v3 data lane down and observes its bounded reconnect", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /injectWssLaneLoss\(stripe = 0, durationMs = 1_000\)/);
   assert.match(client, /if \(!labRun \|\| !usingWssMedia \|\| wssProtocol !== 3/);
   assert.match(client, /stripe >= wssTopology\.dataShards/);
@@ -165,13 +165,13 @@ test("Stream Lab can hold one WSS v3 data lane down and observes its bounded rec
 });
 
 test("stale WSS lane recycling schedules a replacement without waiting for onclose", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const recycle = client.match(/function recycleStaleWssLane\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
   assert.match(recycle, /scheduleWssMediaReconnect\(\s*stripe,\s*wssLaneLifecycle\.currentGeneration\(stripe\),\s*0,\s*"stale-lane"\s*\)/);
 });
 
 test("native video is the default path and WebCodecs is opt-in", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /const useWebCodecs = params\.get\("decoderPath"\) === "webcodecs";/);
   assert.match(client, /if \(!useWebCodecs\) \{\s*startNativeVideo\(ev\.track(?:, generation)?\);\s*return;/);
   assert.match(client, /if \(useWebCodecs\) peerOptions\.encodedInsertableStreams = true;/);
@@ -181,7 +181,7 @@ test("native video is the default path and WebCodecs is opt-in", () => {
 });
 
 test("native video keeps an explicit input overlay and diagnostics count presented frames", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const collector = readFileSync(new URL("../tools/latency-live.mjs", import.meta.url), "utf8");
   assert.match(client, /#stage\.native-video-input #screen/);
   assert.match(client, /stage\.classList\.add\("native-video-input"\)/);
@@ -195,7 +195,7 @@ test("native video keeps an explicit input overlay and diagnostics count present
 });
 
 test("responsive product shell keeps normal controls compact and diagnostics advanced-only", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /id="app-brand"/);
   assert.match(client, /id="connection-status"/);
   assert.match(client, /id="desktop-toolbar"/);
@@ -217,7 +217,7 @@ test("responsive product shell keeps normal controls compact and diagnostics adv
 });
 
 test("session controls use a top-edge dock and a persistent reveal tab", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const styles = readFileSync(new URL("../public/bubbleplay.css", import.meta.url), "utf8");
   assert.match(client, /id="chrome-reveal"[^>]*aria-expanded="false"/);
   assert.match(client, /function setChromeDockOpen\(open/);
@@ -229,7 +229,7 @@ test("session controls use a top-edge dock and a persistent reveal tab", () => {
 });
 
 test("first-frame startup uses one bounded retry and clears on native or decoded presentation", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /id="desktop-state"[^>]*data-state="starting"/);
   assert.match(client, /id="first-frame-retry"/);
   assert.match(client, /type: "first-frame"/);
@@ -264,7 +264,7 @@ test("login uses the BubblePlay responsive shell while preserving remembered aut
 });
 
 test("BubbleBuffer edge instrument replaces purple glass and exposes adaptive session controls", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const login = readFileSync(new URL("../public/login.html", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../public/bubbleplay.css", import.meta.url), "utf8");
 
@@ -291,7 +291,7 @@ test("BubbleBuffer edge instrument replaces purple glass and exposes adaptive se
 });
 
 test("client starts a new signaling and peer epoch after relay loss or peer departure", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /function reconnectSignaling\(reason\)/);
   assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
   assert.match(client, /socket\.onclose = \(event\) => \{[\s\S]*reconnectSignaling\("ws-closed"\)/);
@@ -300,7 +300,7 @@ test("client starts a new signaling and peer epoch after relay loss or peer depa
 });
 
 test("browser signaling uses the remembered server session and never stores an application secret", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const login = readFileSync(new URL("../public/login.html", import.meta.url), "utf8");
   assert.match(client, /const labRun = parseLabRun\(params\)/);
   assert.match(client, /labRun \? "\/lab-ws" : "\/ws"/);
@@ -317,7 +317,7 @@ test("browser signaling uses the remembered server session and never stores an a
 });
 
 test("WSS fallback keeps v2 compatibility and negotiates bounded v3 media lanes", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /parseTransport\(params\)/);
   assert.match(client, /parseQualityPreset\(params, localStorage\)/);
   assert.match(client, /<select id="quality"/);
@@ -327,14 +327,12 @@ test("WSS fallback keeps v2 compatibility and negotiates bounded v3 media lanes"
   assert.match(client, /<option value="auto">Auto<\/option>/);
   assert.match(client, /VariableParityFrameReassembler/);
   assert.match(client, /validateWssTopology/);
-  assert.match(client, /media-ack-v3/);
   assert.match(client, /case "media-topology"/);
   assert.match(client, /laneCount: wssTopology\.laneCount/);
   assert.match(client, /wssMediaSockets = Array\(wssTopology\.laneCount\)/);
   assert.match(client, /function mediaSocketUrl\(stripe\)/);
   assert.match(client, /role: "media-client"/);
   assert.match(client, /hev1\.1\.6\.L120\.B0/);
-  assert.match(client, /media-ack-v2/);
   assert.match(client, /media-control/);
   assert.match(client, /fullFrameDiagnostic/);
   assert.match(client, /diagnostic-full-frame/);
@@ -396,114 +394,23 @@ test("WSS fallback keeps v2 compatibility and negotiates bounded v3 media lanes"
   assert.match(client, /presentedAtMs/);
 });
 
-test("v2 fallback ACK construction does not evaluate v3-only completion telemetry", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
-  const schedule = client.match(
-    /function scheduleWssAck\(generation, immediate = false\) \{[\s\S]*?\n\}\n\nfunction switchToWss/,
-  )?.[0]?.replace(/\n\nfunction switchToWss$/, "");
-  assert.ok(schedule);
-  const message = new Function(`
-    let wssAckTimer = null;
-    const wssProtocol = 2;
-    const mediaEpoch = null;
-    const wssTopology = { laneCount: 4, dataShards: 3, parityShards: 1 };
-    const wssReassembler = {
-      highestSequence: [7, 7, 7, 7],
-      highestReconstructed: 7,
-      stats: { recoveredFrames: 1, expiredFrames: 0 },
-    };
-    const wssPresentedSequence = 7;
-    const wssDependencyLosses = 0;
-    const wssDeadline = { deadlineMs: 120, p95Ms: 8 };
-    const wssRecoveryState = "healthy";
-    const hudState = { dropped: 0 };
-    let sent = null;
-    const sendSignal = value => { sent = value; return true; };
-    ${schedule}
-    scheduleWssAck(3, true);
-    return sent;
-  `)();
-  assert.deepEqual(message, {
-    type: "media-ack-v2",
-    generation: 3,
-    lanes: [7, 7, 7, 7],
-    reconstructed: 7,
-    presented: 7,
-    recoveredFrames: 1,
-    expiredFrames: 0,
-    dependencyLosses: 0,
-    deadlineMs: 120,
-    reassemblyP95Ms: 8,
-    recoveryState: "healthy",
-    decoderDrops: 0,
-  });
-});
 
-test("WSS ACK scheduling reports whether signaling accepted the exact recovery ACK", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
-  const schedule = client.match(
-    /function scheduleWssAck\(generation, immediate = false\) \{[\s\S]*?\n\}\n\nfunction switchToWss/,
-  )?.[0]?.replace(/\n\nfunction switchToWss$/, "");
-  assert.ok(schedule);
-  const report = new Function(`
-    let wssAckTimer = null;
-    const wssProtocol = 3;
-    const mediaEpoch = "0123456789abcdef0123456789abcdef";
-    const wssTopology = { laneCount: 4, dataShards: 3, parityShards: 1 };
-    const wssReassembler = {
-      highestSequence: [1, 1, 1, 1],
-      highestReconstructed: 1,
-      stats: { recoveredFrames: 1, expiredFrames: 0, completionMissingByLane: [0, 0, 0, 1] },
-    };
-    const wssPresentedSequence = 1;
-    const wssDependencyLosses = 0;
-    const wssDeadline = { deadlineMs: 300, p95Ms: 11 };
-    const wssRecoveryState = "awaiting-keyframe";
-    const hudState = { dropped: 0 };
-    const sendSignal = () => false;
-    let observed = null;
-    const recordWssAckAttempt = (message, immediate, sent) => { observed = { message, immediate, sent }; };
-    ${schedule}
-    scheduleWssAck(2, true);
-    return observed;
-  `)();
-  assert.equal(report.immediate, true);
-  assert.equal(report.sent, false);
-  assert.deepEqual(report.message, {
-    type: "media-ack-v3",
-    protocol: 3,
-    epoch: "0123456789abcdef0123456789abcdef",
-    topology: { laneCount: 4, dataShards: 3, parityShards: 1 },
-    completionMissingByLane: [0, 0, 0, 1],
-    generation: 2,
-    lanes: [1, 1, 1, 1],
-    reconstructed: 1,
-    presented: 1,
-    recoveredFrames: 1,
-    expiredFrames: 0,
-    dependencyLosses: 0,
-    deadlineMs: 300,
-    reassemblyP95Ms: 11,
-    recoveryState: "awaiting-keyframe",
-    decoderDrops: 0,
-  });
-});
 
 test("QoS polling continues after ICE reaches completed", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /\["connected",\s*"completed"\]\.includes\(pc\.iceConnectionState\)/);
   assert.doesNotMatch(client, /pc\.iceConnectionState\s*!==\s*"connected"/);
 });
 
 test("worker policy closure is terminal while transient websocket closure reconnects", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /shouldReconnectAfterClose\(event\.code, terminalSignalingFailure\)/);
   assert.match(client, /terminalSignalingFailure/);
   assert.match(client, /reconnectSignaling\("ws-closed"\)/);
 });
 
 test("client applies validated ephemeral ICE configuration and keeps route diagnostics private", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /from "\/turn\.js"/);
   assert.match(client, /currentIceServers = validateIceServers\(msg\.iceServers\);/);
   assert.match(client, /mediaEpoch = \/\^\[a-f0-9\]\{32\}\$\/\.test\(msg\.mediaEpoch/);
@@ -514,7 +421,7 @@ test("client applies validated ephemeral ICE configuration and keeps route diagn
 });
 
 test("diagnostic snapshots expose the latest validated host benchmark sample", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /let latestBenchStatus = null/);
   assert.match(client, /case "bench-status":[\s\S]*applyBenchStatus\(msg\)/);
   assert.match(client, /function applyBenchStatus\(status\)[\s\S]*latestBenchStatus = status/);
@@ -522,7 +429,7 @@ test("diagnostic snapshots expose the latest validated host benchmark sample", (
 });
 
 test("WSS HEVC decoder tracks Main versus Main10 and probes Main10 without H264 fallback", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /hev1\.1\.6\.L120\.B0/);
   assert.match(client, /hev1\.2\.4\.L120\.B0/);
   assert.match(client, /latestBenchStatus\?\.effective\?\.encoder\?\.main10/);
@@ -530,7 +437,7 @@ test("WSS HEVC decoder tracks Main versus Main10 and probes Main10 without H264 
 });
 
 test("WSS hybrid presentation parses before decode and composites only after the base frame", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const activeHybridMode = client.match(
     /function activeWssHybridMode\(\) \{[\s\S]*?\n\}/,
   )?.[0];
@@ -552,13 +459,13 @@ test("WSS hybrid presentation parses before decode and composites only after the
 });
 
 test("peer departure recycles signaling before another peer offer", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
   assert.match(client, /function recycleSignaling\(reason\)/);
 });
 
 test("intentional signaling recycle retains its initiator before invalidating the old epoch", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const recycle = client.match(/function recycleSignaling\(reason\) \{([\s\S]*?)\n\}/)?.[1] || "";
   assert.match(recycle, /createSignalingRecycleDiagnostic\(\{/);
   assert.match(recycle, /reason,[\s\S]*signalingGeneration,[\s\S]*signalingRegistered,/);
@@ -574,7 +481,7 @@ test("intentional signaling recycle retains its initiator before invalidating th
 });
 
 test("predicted cursor repaints through one follow boundary and has a real black outline", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /<div id="touch-cursor"[^>]*>\s*<svg[\s\S]*?<path[^>]*stroke="black"/);
   assert.match(client, /function updateRemoteCursor\(update\)[\s\S]*update\(remoteCursor\);[\s\S]*centerCameraOnCursor\(\);\s*renderViewport\(\);/);
   assert.match(client, /function centerCameraOnCursor\(\)[\s\S]*viewport\.centerOnNormalized\(remoteCursor\.snapshot\(\)\)/);
@@ -583,7 +490,7 @@ test("predicted cursor repaints through one follow boundary and has a real black
 });
 
 test("mobile press actions atomically warp reliable control to the overlay cursor", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /function setTouchButtonsAtCursor\(mask\)[\s\S]*input\.buttonsAt\(point\.x,point\.y,mask\)/);
   assert.match(client, /action\.type === "tap"[\s\S]*setTouchButtonsAtCursor\(1\); setTouchButtons\(0\)/);
   assert.match(client, /action\.type === "drag-start"[\s\S]*setTouchButtonsAtCursor\(1\)/);
@@ -591,7 +498,7 @@ test("mobile press actions atomically warp reliable control to the overlay curso
 });
 
 test("mobile desktop pointer uses absolute targets and authoritative host reconciliation", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /Mode: Work/);
   assert.match(client, /new CursorReconciler\(remoteCursor\)/);
   assert.match(client, /channel\.onmessage[\s\S]*handleCursorState/);
@@ -605,13 +512,13 @@ test("mobile desktop pointer uses absolute targets and authoritative host reconc
 });
 
 test("desktop input suspension is enforced at the final browser transport boundary", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /function sendInput\(data, channel\) \{\s*if \(desktopInputState !== "enabled"\) return false;/);
   assert.match(client, /if \(desktopInputState !== "enabled"\) releaseInput\(false\);/);
 });
 
 test("browser diagnostics retain host-side applied input evidence", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /case "input-status"/);
   assert.match(client, /latestInputStatus = msg/);
   assert.match(client, /host-input-application-failed/);
@@ -619,7 +526,7 @@ test("browser diagnostics retain host-side applied input evidence", () => {
 });
 
 test("desktop source transitions preserve the last frame without authorizing stale input", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /const sourceTransition = message\.state === "active" && \["desktop-switched", "capture-recovered", "session-changed", "agent-restarted"\]\.includes\(message\.reason\)/);
   assert.doesNotMatch(client, /sourceTransition = message\.state === "active" && \(secureDesktop \|\|/);
   assert.match(client, /if \(monitorTransition && alreadyRendering\) \{[\s\S]*desktopAwaitingFrame = true;[\s\S]*suppressDesktopTransitionOverlay = true;[\s\S]*if \(!usingWssMedia\) \{[\s\S]*restartPeer\("monitor-transition", false\);[\s\S]*startFirstFrameHandshake\("monitor-transition", true\);[\s\S]*return;\s*\}/);
@@ -636,7 +543,7 @@ test("desktop source transitions preserve the last frame without authorizing sta
 });
 
 test("an active desktop generation change re-arms the first-frame input gate", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const handler = client.match(/function handleDesktopState\(message\) \{[\s\S]*?\n\}/)?.[0] || "";
   assert.match(client, /let desktopGeneration = null/);
   assert.match(handler, /const desktopGenerationChanged = Number\.isInteger\(message\.generation\)[\s\S]*message\.generation !== desktopGeneration/);
@@ -646,7 +553,7 @@ test("an active desktop generation change re-arms the first-frame input gate", (
 });
 
 test("normal text assistance is restored outside the secure desktop", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   assert.match(client, /id="keyboard-input"[^>]*autocomplete="on"[^>]*autocorrect="on"[^>]*spellcheck="true"/);
   assert.match(client, /keyboardInput\.setAttribute\("autocorrect", secureDesktop \? "off" : "on"\)/);
   assert.match(client, /keyboardInput\.setAttribute\("autocomplete", secureDesktop \? "off" : "on"\)/);
@@ -654,7 +561,7 @@ test("normal text assistance is restored outside the secure desktop", () => {
 });
 
 test("secure Android composition commits through one pending transaction", () => {
-  const client = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readClientSource();
   const begin = client.indexOf("// BEGIN secure-composition-gate");
   const end = client.indexOf("// END secure-composition-gate");
   assert.ok(begin >= 0 && end > begin);

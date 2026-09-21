@@ -63,6 +63,10 @@ export function runPreflight(options = {}) {
     { name: "nvidia-smi", ...commandProbe("nvidia-smi", ["--query-gpu=name", "--format=csv,noheader"]) },
   ];
   const missing = dependencies.filter(({ available }) => !available).map(({ name }) => name);
+  // Live sessions require begin/renew/end even with a persistent display, and
+  // cleanup verifies STOPPED through SCM. A reachable pipe alone is insufficient.
+  if (!labService.queryable) missing.push("lab-helper-service-access");
+  else if (!labService.installed) missing.push("lab-helper-service");
   const activityGuard = options.activityGuardPath ?? defaultActivityGuardPath();
   if (options.requireActivityGuard && !existsSync(activityGuard)) missing.push("physical-activity-guard");
   return {

@@ -74,7 +74,7 @@ fn probe_output(adapter: &IDXGIAdapter1, output: &IDXGIOutput) {
         println!("  no IDXGIOutput1");
         return;
     };
-    let mut dup = match unsafe { out1.DuplicateOutput(&device) } {
+    let dup = match unsafe { out1.DuplicateOutput(&device) } {
         Ok(d) => d,
         Err(e) => {
             println!("  DuplicateOutput failed: {e:?}");

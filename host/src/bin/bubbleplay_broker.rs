@@ -3,8 +3,7 @@ use std::ffi::OsString;
 use anyhow::{Context, Result};
 use windows_service::{define_windows_service, service_dispatcher};
 
-#[path = "../service_runtime.rs"]
-mod service_runtime;
+use bubbleplay_host::service_runtime;
 
 use service_runtime::ServiceRole;
 

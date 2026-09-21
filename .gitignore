@@ -36,3 +36,12 @@ worker/probe*.out.txt
 artifacts/latency/
 artifacts/stream-lab/
 artifacts/recovery-inventory/
+
+# Local builds, service diagnostics, and captured runs (keep existing files).
+/target-*/
+/host-run-*.txt
+/relay-*.txt
+/host/rollback/
+/worker/.wrangler-dry-run/
+/artifacts/service-diagnostics/
+/artifacts/stabilization-*.txt

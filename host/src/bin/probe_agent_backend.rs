@@ -1,31 +1,9 @@
 #![allow(dead_code)]
 
-#[path = "../agent_runtime.rs"]
-mod agent_runtime;
-#[path = "../capture.rs"]
-mod capture;
-#[path = "../desktop_session.rs"]
-mod desktop_session;
-#[path = "../encode.rs"]
-mod encode;
-#[path = "../frame_damage.rs"]
-mod frame_damage;
-#[path = "../input.rs"]
-mod input;
-#[path = "../input_proxy_client.rs"]
-mod input_proxy_client;
-#[path = "../input_proxy_protocol.rs"]
-mod input_proxy_protocol;
-#[path = "../privileged_backend.rs"]
-mod privileged_backend;
-#[path = "../privileged_ipc.rs"]
-mod privileged_ipc;
-#[path = "../privileged_pipe.rs"]
-mod privileged_pipe;
-#[path = "../quality.rs"]
-mod quality;
-#[path = "../scale.rs"]
-mod scale;
+use bubbleplay_host::agent_runtime;
+use bubbleplay_host::desktop_session;
+use bubbleplay_host::privileged_backend;
+use bubbleplay_host::privileged_ipc;
 
 use anyhow::{Context, Result};
 

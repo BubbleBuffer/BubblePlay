@@ -1329,10 +1329,8 @@ impl Nvenc {
         let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
         reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
         reconf.reInitEncodeParams = init;
-        unsafe {
-            reconf.set_resetEncoder(1);
-            reconf.set_forceIDR(1);
-        }
+        reconf.set_resetEncoder(1);
+        reconf.set_forceIDR(1);
         unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) }
             .result_without_string()
             .context("NvEncReconfigureEncoder rate-control reset")?;
@@ -1369,9 +1367,7 @@ impl Nvenc {
         let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
         reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
         reconf.reInitEncodeParams = init;
-        unsafe {
-            reconf.set_resetEncoder(1);
-        }
+        reconf.set_resetEncoder(1);
         unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) }
             .result_without_string()
             .context("NvEncReconfigureEncoder profile")?;

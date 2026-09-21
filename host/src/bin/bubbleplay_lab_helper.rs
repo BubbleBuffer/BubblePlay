@@ -38,10 +38,8 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 #[cfg(test)]
 #[allow(dead_code)]
-#[path = "../benchmark.rs"]
-mod host_benchmark;
-#[path = "../vdd.rs"]
-mod vdd;
+use bubbleplay_host::benchmark as host_benchmark;
+use bubbleplay_host::vdd;
 
 const PIPE_NAME: &str = r"\\.\pipe\BubblePlay.StreamLab.v1";
 const MAX_COMMAND_BYTES: usize = 64 * 1024;

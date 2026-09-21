@@ -1,11 +1,4 @@
-#[path = "../desktop_session.rs"]
-mod desktop_session;
-#[path = "../input.rs"]
-mod input;
-#[path = "../input_proxy_protocol.rs"]
-mod input_proxy_protocol;
-#[path = "../input_proxy_runtime.rs"]
-mod input_proxy_runtime;
+use bubbleplay_host::input_proxy_runtime;
 
 use anyhow::{Context, Result};
 
