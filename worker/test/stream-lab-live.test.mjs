@@ -29,6 +29,7 @@ import {
   captureReceiverFrame,
   candidateStartupRejection,
   classifyCandidateProfileFailure,
+  classifyMonitorSelectionFailure,
   chooseOptimizationFinalists,
   collectLaneRecoveryQualitySequence,
   collectQualityRepetitions,
@@ -39,6 +40,8 @@ import {
   firstFrameReadiness,
   hevcTileDecoderAdmission,
   hybridSceneRequirement,
+  nativeFrameState,
+  NATIVE_RENDERED_AGE_LIMIT_MS,
   shouldRetryMeasuredFrame,
   effectiveEncoderBitrateMbps,
   evaluateLaneRecoveryQuality,
@@ -51,6 +54,9 @@ import {
   measureOptimizationScreenCandidate,
   inspectCleanupResources,
   nextStabilizedBitrateMbps,
+  normalizeDecoderPath,
+  normalizeReceiverOptions,
+  sameReceiverOptions,
   qualityAnchorAlignmentOptions,
   runFreshCheckpoint,
   LiveStreamLabSession,
@@ -2410,6 +2416,30 @@ test("receiver URL fixes Work profile and forces relay only for WebRTC", () => {
   assert.equal(isolated.searchParams.get("labRun"), labRun);
 });
 
+test("receiver URL defaults to the diagnostic decoder and carries a native opt-in", () => {
+  const diagnostic = buildReceiverUrl("https://play.example/", "webrtc", { relay: false });
+  assert.equal(diagnostic.searchParams.get("decoderPath"), "webcodecs");
+  const native = buildReceiverUrl("https://play.example/", "webrtc", { relay: false, decoderPath: "native" });
+  assert.equal(native.searchParams.get("decoderPath"), "native");
+  // An unknown decoder path never silently selects native playback.
+  const invalid = buildReceiverUrl("https://play.example/", "webrtc", { decoderPath: "hardware" });
+  assert.equal(invalid.searchParams.get("decoderPath"), "webcodecs");
+});
+
+test("session receiver options keep the decoder path across partial transport switches", () => {
+  const current = { relay: false, adaptive: false, decoderPath: "native" };
+  assert.equal(normalizeDecoderPath(undefined), "webcodecs");
+  assert.equal(normalizeDecoderPath("native"), "native");
+  // A partial switch inherits the session decoder path; an explicit one wins.
+  assert.equal(normalizeReceiverOptions({ adaptive: false }, current).decoderPath, "native");
+  assert.equal(normalizeReceiverOptions({ decoderPath: "webcodecs" }, current).decoderPath, "webcodecs");
+  assert.equal(normalizeReceiverOptions({}, {}).decoderPath, "webcodecs");
+  // A decoder-path-only switch must not be treated as a no-op.
+  assert.equal(sameReceiverOptions(normalizeReceiverOptions({ relay: false, adaptive: false }, current), current), true);
+  assert.equal(sameReceiverOptions(normalizeReceiverOptions({ decoderPath: "webcodecs" }, current), current), false);
+  assert.equal(sameReceiverOptions(normalizeReceiverOptions({ relay: true }, current), current), false);
+});
+
 test("receiver URL carries only validated protocol-v3 topology controls", () => {
   const labRun = "123e4567-e89b-42d3-a456-426614174000";
   const url = buildReceiverUrl("https://play.example/", "wss", {
@@ -2729,6 +2759,22 @@ test("virtual monitor selection waits for reconnect registration and retries the
   assert.equal(selections.length, 2);
   assert.ok(commands.indexOf(refreshes[0]) < commands.indexOf(selections[0]));
   assert.ok(selections.every(command => command.includes("DISPLAY5") && !command.includes("DISPLAY1")));
+});
+
+test("monitor selection failure classification separates deferral from host rejection", () => {
+  const deferred = { sawRegistered: true, sawFreshMonitorList: true, sawExactTarget: true,
+    sawHostRejection: false, sawDeferredSelection: true };
+  assert.equal(classifyMonitorSelectionFailure(deferred).code, "monitor-selection-deferred");
+  assert.equal(classifyMonitorSelectionFailure({ ...deferred, sawHostRejection: true }).code,
+    "monitor-selection-rejected");
+  assert.equal(classifyMonitorSelectionFailure({ ...deferred, sawDeferredSelection: false }).code,
+    "monitor-switch-timeout");
+  assert.equal(classifyMonitorSelectionFailure({ ...deferred, sawRegistered: false }).code,
+    "signaling-registration-timeout");
+  assert.equal(classifyMonitorSelectionFailure({ ...deferred, sawFreshMonitorList: false }).code,
+    "monitor-list-timeout");
+  assert.equal(classifyMonitorSelectionFailure({ ...deferred, sawExactTarget: false }).code,
+    "monitor-ambiguous");
 });
 
 test("benchmark profile maps a candidate into the helper's nested schema", () => {
@@ -3676,6 +3722,75 @@ test("measured first-frame retry is bounded and only repairs an otherwise primed
   assert.equal(shouldRetryMeasuredFrame(state, 1_000, 0), true);
   assert.equal(shouldRetryMeasuredFrame(state, 5_000, 1), false);
   assert.equal(shouldRetryMeasuredFrame({ ...state, routeOkay: false }, 1_000, 0), false);
+});
+
+test("native readiness proves presented HEVC frames instead of the HUD label", () => {
+  const expected = benchmarkProfile({ preset: "p3", tuning: "ultra-low-latency", multipass: "disabled",
+    aqStrength: 8, vbvFrames: 1, bitrateMbps: 2.2, gopSeconds: 2 }, "webrtc");
+  const runId = "123e4567-e89b-42d3-a456-426614174000";
+  const benchStatus = { protocol: 2, runId, profileRevision: 2, sequence: 9, phase: "sample",
+    effective: { ...expected, encoder: expected.encoder } };
+  const snapshot = { route: "host->srflx", dec: "native video", renderedTimestamp: 120, renderedAgeMs: 120,
+    nativePresentation: { generation: 4, supported: true, framesPresented: 12, width: 1920, height: 1080,
+      firstFrameAtMs: 1_700_000_000_000, firstFramePerformanceMs: 5_000, lastFrameAtMs: 5_120 },
+    rtc: { generation: 4, codec: { mimeType: "video/H265" },
+      inbound: { timestamp: 1_700_000_000_500, framesDecoded: 12 } },
+    glassToGlass: { timestamp: 101 }, benchStatus };
+  const options = { expected, preApplyBenchStatus: { ...benchStatus, profileRevision: 1, sequence: 99 },
+    runId, transport: "webrtc", relay: false, decoderPath: "native", expectedTimestamp: 101 };
+  const state = firstFrameReadiness(snapshot, options);
+  assert.equal(state.decoderOkay, true);
+  assert.equal(state.ready, true);
+  assert.deepEqual(nativeFrameState(snapshot), {
+    supported: true, presented: true, sized: true, firstFrameRecorded: true, codecOkay: true,
+    epochMatches: true, statsAfterFirstFrame: true, decoded: true, freshFrame: true, ready: true });
+  // Chromium reports inbound.timestamp as wall-clock epoch ms, so the ordering
+  // check uses firstFrameAtMs and ignores the rVFC time-origin clock.
+  assert.equal(nativeFrameState({ ...snapshot,
+    nativePresentation: { ...snapshot.nativePresentation, firstFramePerformanceMs: null } }).ready, true);
+  const unproven = firstFrameReadiness({ ...snapshot, nativePresentation: null, renderedTimestamp: null }, options);
+  assert.equal(unproven.decoderOkay, false);
+  assert.equal(unproven.ready, false);
+  // Missing nullable timestamps are not coerced to zero and must fail closed.
+  const missingFirstFrame = firstFrameReadiness({ ...snapshot,
+    nativePresentation: { ...snapshot.nativePresentation, firstFrameAtMs: null } }, options);
+  assert.equal(missingFirstFrame.decoderOkay, false);
+  assert.equal(nativeFrameState({ ...snapshot,
+    nativePresentation: { ...snapshot.nativePresentation, firstFrameAtMs: null } }).firstFrameRecorded, false);
+  assert.equal(nativeFrameState({ ...snapshot, renderedAgeMs: null }).freshFrame, false);
+  assert.equal(nativeFrameState({ ...snapshot,
+    nativePresentation: { ...snapshot.nativePresentation, width: null, height: null } }).sized, false);
+  // Presented frames on a non-HEVC codec are not HEVC acceptance.
+  const h264 = firstFrameReadiness({ ...snapshot, rtc: { ...snapshot.rtc, codec: { mimeType: "video/H264" } } }, options);
+  assert.equal(h264.decoderOkay, false);
+  // RTC stats left over from the previous peer are not evidence either.
+  const previousPeer = firstFrameReadiness({ ...snapshot,
+    rtc: { ...snapshot.rtc, generation: 3, inbound: { timestamp: 1_700_000_001_000, framesDecoded: 900 } } }, options);
+  assert.equal(previousPeer.decoderOkay, false);
+  const staleSample = firstFrameReadiness({ ...snapshot,
+    rtc: { ...snapshot.rtc, inbound: { timestamp: 1_699_999_999_000, framesDecoded: 12 } } }, options);
+  assert.equal(staleSample.decoderOkay, false);
+  const undecoded = firstFrameReadiness({ ...snapshot,
+    rtc: { ...snapshot.rtc, inbound: { timestamp: 1_700_000_000_500, framesDecoded: 0 } } }, options);
+  assert.equal(undecoded.decoderOkay, false);
+  // A frozen frame from this epoch is still not a live stream.
+  const frozen = firstFrameReadiness({ ...snapshot, renderedAgeMs: NATIVE_RENDERED_AGE_LIMIT_MS + 1 }, options);
+  assert.equal(frozen.decoderOkay, false);
+  // The WebCodecs diagnostic path keeps its HUD-label contract.
+  const diagnostic = firstFrameReadiness({ ...snapshot, dec: "hev1.1.6.L120.B0" },
+    { ...options, decoderPath: "webcodecs" });
+  assert.equal(diagnostic.decoderOkay, true);
+  // Switching back to WSS retains the RTC decoder preference, but WSS still
+  // decodes through WebCodecs and must not require native video callbacks.
+  const wss = firstFrameReadiness({ ...snapshot, route: "wss", dec: "hev1.1.6.L120.B0",
+    nativePresentation: null, rtc: null }, { ...options, transport: "wss" });
+  assert.equal(wss.decoderOkay, true);
+});
+
+test("native playback cannot enter the source-barcode benchmark", async () => {
+  await assert.rejects(() => liveModule.LiveStreamLabSession.prototype.applyCandidateProfile.call(
+    { receiverOptions: { decoderPath: "native" }, transport: "webrtc" }, { codec: "hevc" }),
+    error => error.code === "native-benchmark-unavailable");
 });
 
 test("startup classification distinguishes a missing recovery ACK from a silent DDA session", () => {

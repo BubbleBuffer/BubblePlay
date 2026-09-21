@@ -303,19 +303,44 @@ pub(super) enum PrivilegedEvent {
     },
 }
 
+/// The display a session must capture: the runtime selection when one exists,
+/// otherwise the launch selector. The host never substitutes another display
+/// for a remembered selection.
+pub(super) fn session_capture_selector<'a>(
+    selected: Option<&'a str>,
+    launch: Option<&'a str>,
+) -> Option<&'a str> {
+    selected.or(launch)
+}
+
 impl CaptureSource {
-    pub(super) fn open(args: &Args) -> Result<Self> {
+    /// `selector_override` is the runtime selection the host remembered across
+    /// sessions. It wins over the launch selector; when it no longer resolves,
+    /// opening fails instead of silently capturing a different display.
+    pub(super) fn open(args: &Args, selector_override: Option<&str>) -> Result<Self> {
         if args.privileged_agent {
             // Cold service startup must prove the privileged boundary before
             // the host advertises signaling readiness. Runtime disconnects
             // after this point still use the bounded in-session reconnect path.
+            // The privileged Agent owns its monitor selection; the host keeps
+            // no local override for it.
             Ok(Self::Privileged(PrivilegedSource::connect_startup(
                 Instant::now(),
             )?))
         } else {
             Ok(Self::Local(LocalCaptureSource::open(
-                args.monitor.as_deref(),
+                session_capture_selector(selector_override, args.monitor.as_deref()),
             )?))
+        }
+    }
+
+    /// Canonical selector for the live local capture. `None` for the
+    /// privileged source: its selection lives in the Agent and the host must
+    /// not substitute a local display choice for it.
+    pub(super) fn monitor_selector(&self) -> Option<String> {
+        match self {
+            Self::Local(source) => Some(source.selector.clone()),
+            Self::Privileged(_) => None,
         }
     }
 

@@ -529,9 +529,9 @@ test("desktop source transitions preserve the last frame without authorizing sta
   const client = readClientSource();
   assert.match(client, /const sourceTransition = message\.state === "active" && \["desktop-switched", "capture-recovered", "session-changed", "agent-restarted"\]\.includes\(message\.reason\)/);
   assert.doesNotMatch(client, /sourceTransition = message\.state === "active" && \(secureDesktop \|\|/);
-  assert.match(client, /if \(monitorTransition && alreadyRendering\) \{[\s\S]*desktopAwaitingFrame = true;[\s\S]*suppressDesktopTransitionOverlay = true;[\s\S]*if \(!usingWssMedia\) \{[\s\S]*restartPeer\("monitor-transition", false\);[\s\S]*startFirstFrameHandshake\("monitor-transition", true\);[\s\S]*return;\s*\}/);
+  assert.match(client, /if \(monitorTransition && alreadyRendering\) \{[\s\S]*desktopAwaitingFrame = true;[\s\S]*suppressDesktopTransitionOverlay = true;[\s\S]*if \(!usingWssMedia\) \{[\s\S]*restartPeerInNewEpoch\(\{ recycleSignaling, restartPeer \}, "monitor-transition"\);[\s\S]*startFirstFrameHandshake\("monitor-transition", true\);[\s\S]*return;\s*\}/);
   assert.match(client, /if \(sourceTransition && alreadyRendering\) \{[\s\S]*desktopAwaitingFrame = true;[\s\S]*startFirstFrameHandshake\("desktop-source-transition", true\);[\s\S]*return;\s*\}/);
-  assert.match(client, /if \(!usingWssMedia\) \{[\s\S]*restartPeer\("desktop-source-transition", false\);[\s\S]*return;/);
+  assert.match(client, /if \(!usingWssMedia\) \{[\s\S]*restartPeerInNewEpoch\(\{ recycleSignaling, restartPeer \}, "desktop-source-transition"\);[\s\S]*return;/);
   assert.match(client, /if \(workerPresented\) markFirstFramePresented\(\)/);
   assert.match(client, /firstFrameHandshake\.requireAdmission && !usingWssMedia && useWebCodecs[\s\S]*resyncPipeline\("desktop-transition-admitted"\)/);
   assert.match(client, /if \(!usingWssMedia && firstFrameHandshake\.requireAdmission\) \{[\s\S]*if \(!firstFrameHandshake\.admitted\)[\s\S]*if \(transitionNeedsKeyframe\)[\s\S]*if \(!isKey\)/);
@@ -540,6 +540,21 @@ test("desktop source transitions preserve the last frame without authorizing sta
   assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*requireAdmission && !firstFrameHandshake\.admitted[\s\S]*return false/);
   assert.match(client, /presentedGeneration !== firstFrameHandshake\.generation[\s\S]*return false/);
   assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*desktopAwaitingFrame = false/);
+});
+
+test("monitor control uses the signaling epoch and drops stale confirmations", () => {
+  const client = readClientSource();
+  assert.match(client, /import \{ monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch \} from "\/monitor-selection\.js"/);
+  // Both epoch restarts drop an outstanding confirmation instead of latching
+  // monitor selection off for the rest of the page.
+  assert.match(client, /function recycleSignaling\(reason\) \{[\s\S]*invalidatePendingMonitorRequest\(reason\);/);
+  assert.match(client, /function restartPeer\(reason, reconnect = true\) \{[\s\S]*invalidatePendingMonitorRequest\(reason\);/);
+  assert.match(client, /function invalidatePendingMonitorRequest\(reason\) \{[\s\S]*monitorRequestAfterRestart\(monitorSwitchPending, reason\)[\s\S]*monitorSwitchPending = null;/);
+  // The monitor control is a signaling message; input data channels are not a
+  // precondition.
+  assert.match(client, /function requestMonitor\(selector\) \{[\s\S]*monitorRequestReadiness\(\{[\s\S]*signalingRegistered,[\s\S]*\}\);/);
+  assert.doesNotMatch(client, /if \(monitorSwitchPending \|\| !inputReady && !usingWssMedia\) return false;/);
+  assert.match(client, /monitorSwitchPending,\s*lastMonitorRequest:/);
 });
 
 test("an active desktop generation change re-arms the first-frame input gate", () => {

@@ -268,6 +268,20 @@ test("approved browsers can load only the login design assets before password au
   assert.equal(script.status, 404);
 });
 
+test("an authenticated browser can load the receiver module graph from static assets", async () => {
+  const f = fixture();
+  const browser = await authenticatedBrowser(f);
+  // The receiver imports /monitor-selection.js by absolute path, so the
+  // production asset passthrough must serve it exactly like /receiver.js.
+  for (const path of ["/receiver.js", "/monitor-selection.js", "/transport.js"]) {
+    const response = await f.gate.fetch(new Request(`https://playfull-cat.example${path}`, {
+      headers: { Cookie: browser.cookie },
+    }));
+    assert.equal(response.status, 200, `${path} must be served`);
+  }
+  assert.deepEqual(f.assets.slice(-3), ["/receiver.js", "/monitor-selection.js", "/transport.js"]);
+});
+
 test("pre-signaling client diagnostics require app authentication and retain a readable timeline", async () => {
   const f = fixture();
   assert.equal((await f.gate.fetch(diagnosticRequest("", diagnosticEvent(1)))).status, 404);

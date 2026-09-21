@@ -92,16 +92,81 @@ export function aggressiveOptimizationContract() {
   };
 }
 
+/** A native frame is only decode evidence while the newest RTC sample still
+ * describes the current peer epoch. A HUD label plus counters left over from a
+ * previous peer must never satisfy HEVC acceptance.
+ *
+ * Chromium RTC timestamps and firstFrameAtMs use wall-clock milliseconds;
+ * video callback times use performance time and cannot be compared to them.
+ * Check nullable values directly because Number(null) would become zero. */
+export const NATIVE_RENDERED_AGE_LIMIT_MS = 1_500;
+
+export function nativeFrameState(snapshot) {
+  const native = snapshot?.nativePresentation ?? null;
+  const inbound = snapshot?.rtc?.inbound ?? null;
+  const width = native?.width;
+  const height = native?.height;
+  const framesPresented = native?.framesPresented;
+  const firstFrameAtMs = native?.firstFrameAtMs;
+  const sampleAt = inbound?.timestamp;
+  const framesDecoded = inbound?.framesDecoded;
+  const renderedAgeMs = snapshot?.renderedAgeMs;
+  const state = {
+    supported: native?.supported === true,
+    presented: Number.isFinite(framesPresented) && framesPresented > 0,
+    sized: Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0,
+    firstFrameRecorded: Number.isFinite(firstFrameAtMs),
+    codecOkay: /hevc|h265|hev1/i.test(String(snapshot?.rtc?.codec?.mimeType || "")),
+    // The stats sample must come from the same peer generation and must be at
+    // or after the first presented frame of that generation.
+    epochMatches: Number.isInteger(native?.generation) &&
+      native.generation === snapshot?.rtc?.generation,
+    statsAfterFirstFrame: Number.isFinite(sampleAt) && Number.isFinite(firstFrameAtMs) &&
+      sampleAt >= firstFrameAtMs,
+    decoded: Number.isFinite(framesDecoded) && framesDecoded > 0,
+    freshFrame: Number.isFinite(renderedAgeMs) && renderedAgeMs >= 0 &&
+      renderedAgeMs <= NATIVE_RENDERED_AGE_LIMIT_MS,
+  };
+  state.ready = state.supported && state.presented && state.sized && state.firstFrameRecorded &&
+    state.codecOkay && state.epochMatches && state.statsAfterFirstFrame && state.decoded &&
+    state.freshFrame;
+  return state;
+}
+
 export function firstFrameReadiness(snapshot, options) {
   const { expected, preApplyBenchStatus, runId, transport, relay, expectedTimestamp } = options;
-  const rendered = Number.isFinite(snapshot?.renderedTimestamp) || Number(snapshot?.nativePresentation?.framesPresented) > 0;
+  const decoderPath = normalizeDecoderPath(options.decoderPath);
+  const nativePresented = Number(snapshot?.nativePresentation?.framesPresented) > 0;
+  const rendered = Number.isFinite(snapshot?.renderedTimestamp) || nativePresented;
   const routeOkay = transport === "wss" ? snapshot?.route === "wss" : relay === true ?
     isRelayRoute(snapshot?.route) : relay === false ? isPeerToPeerRoute(snapshot?.route) : isRtcRoute(snapshot?.route);
-  const decoderOkay = expected.codec === "h264" ? /h264|avc1/i.test(snapshot?.dec ?? "") : /hevc|h265|hev1/i.test(snapshot?.dec ?? "");
+  // The HUD `dec` label is not decode evidence. Native playback must prove the
+  // <video> element presented HEVC frames for the current peer epoch.
+  const decoderOkay = expected.codec === "h264" ? /h264|avc1/i.test(snapshot?.dec ?? "")
+    : transport === "webrtc" && decoderPath === "native" ? nativeFrameState(snapshot).ready
+    : /hevc|h265|hev1/i.test(snapshot?.dec ?? "");
   const benchOkay = benchStatusConfirmsApply(preApplyBenchStatus, snapshot?.benchStatus, expected, runId);
   const fresh = Number.isFinite(expectedTimestamp) && timestampReached(snapshot?.glassToGlass?.timestamp, expectedTimestamp >>> 0);
   return { rendered, routeOkay, decoderOkay, benchOkay, fresh,
     ready: rendered && routeOkay && decoderOkay && benchOkay && fresh };
+}
+
+/** Persistent monitor selection only counts as a host rejection when the host
+ * actually answered with a monitor error for the exact target. A receiver that
+ * could not issue the control is a deferral, not a rejection. */
+export function classifyMonitorSelectionFailure(evidence = {}) {
+  if (!evidence.sawRegistered) return { code: "signaling-registration-timeout",
+    message: "Signaling did not register before persistent monitor selection timed out." };
+  if (!evidence.sawFreshMonitorList) return { code: "monitor-list-timeout",
+    message: "The host did not publish a fresh monitor list after signaling registration." };
+  if (!evidence.sawExactTarget) return { code: "monitor-ambiguous",
+    message: "A fresh host monitor list did not contain exactly one persistent virtual display selector." };
+  if (evidence.sawHostRejection) return { code: "monitor-selection-rejected",
+    message: "The host rejected the exact persistent virtual display selector." };
+  if (evidence.sawDeferredSelection) return { code: "monitor-selection-deferred",
+    message: "The receiver never issued the monitor control before persistent monitor selection timed out." };
+  return { code: "monitor-switch-timeout",
+    message: "The host did not confirm the exact persistent virtual display in a fresh monitor response." };
 }
 
 export function hevcTileDecoderAdmission(snapshot, expected = {}) {
@@ -373,6 +438,28 @@ export function webRtcDiagnosticProgress(samples) {
     timestampReached(last.glassToGlass?.timestamp, ((first.glassToGlass?.timestamp ?? 0) + 1) >>> 0);
 }
 
+export function normalizeDecoderPath(decoderPath) {
+  return decoderPath === "native" ? "native" : "webcodecs";
+}
+
+/** Session receiver options carry the decoder path so a reconnect cannot
+ * silently fall back to the diagnostic WebCodecs decoder. Partial options
+ * inherit the current session's decoder path unless they set one. */
+export function normalizeReceiverOptions(options = {}, current = {}) {
+  return {
+    relay: options.relay !== false,
+    adaptive: options.adaptive === true,
+    decoderPath: normalizeDecoderPath(options.decoderPath ?? current.decoderPath),
+    ...(options.wssTopology ? { wssTopology: { ...options.wssTopology } } : {}),
+  };
+}
+
+export function sameReceiverOptions(a = {}, b = {}) {
+  return a.relay === b.relay && a.adaptive === b.adaptive &&
+    normalizeDecoderPath(a.decoderPath) === normalizeDecoderPath(b.decoderPath) &&
+    JSON.stringify(a.wssTopology ?? null) === JSON.stringify(b.wssTopology ?? null);
+}
+
 export function buildReceiverUrl(baseUrl, transport, options = {}) {
   if (!["wss", "webrtc"].includes(transport)) throw new RangeError("transport must be wss or webrtc");
   const url = new URL(baseUrl);
@@ -381,7 +468,9 @@ export function buildReceiverUrl(baseUrl, transport, options = {}) {
   url.searchParams.set("adaptive", options.adaptive ? "1" : "0");
   url.searchParams.set("diag", "1");
   url.searchParams.set("profile", "1");
-  url.searchParams.set("decoderPath", "webcodecs");
+  // The diagnostic default stays WebCodecs; native playback is an explicit
+  // opt-in that must survive every navigation/reconnect the session performs.
+  url.searchParams.set("decoderPath", normalizeDecoderPath(options.decoderPath));
   if (options.labRun) {
     url.searchParams.set("labRun", options.labRun);
     url.searchParams.set("labCompat", STREAM_LAB_COMPATIBILITY.id);
@@ -2323,7 +2412,7 @@ export class LiveStreamLabSession {
     this.lastFirstFrameMs = null;
     this.applyExpectedSource = null;
     this.transport = "wss";
-    this.receiverOptions = { relay: true, adaptive: false,
+    this.receiverOptions = { relay: true, adaptive: false, decoderPath: "webcodecs",
       ...(options.wssTopology ? { wssTopology: { ...options.wssTopology } } : {}) };
     this.heartbeat = null;
     this.disposeTermination = null;
@@ -2406,8 +2495,7 @@ export class LiveStreamLabSession {
   }
 
   async startReceiver(transport, receiverOptions = this.receiverOptions, launchOptions = {}) {
-    this.receiverOptions = { relay: receiverOptions.relay !== false, adaptive: receiverOptions.adaptive === true,
-      ...(receiverOptions.wssTopology ? { wssTopology: { ...receiverOptions.wssTopology } } : {}) };
+    this.receiverOptions = normalizeReceiverOptions(receiverOptions, this.receiverOptions);
     const url = buildReceiverUrl(this.baseUrl, transport, { ...this.receiverOptions, labRun: this.runId });
     const bootstrapUrl = receiverBootstrapUrl(url.href, {
       workerVersionOverride: this.workerVersionOverride,
@@ -2596,10 +2684,14 @@ export class LiveStreamLabSession {
   }
 
   async applyCandidateProfile(candidate, bandwidthMbps = null, transport = this.transport) {
-    if (!decoderSupportsCodec(transport, "webcodecs", candidate.codec ?? "hevc"))
+    const decoderPath = normalizeDecoderPath(this.receiverOptions?.decoderPath);
+    if (transport === "webrtc" && decoderPath === "native")
+      throw new StreamLabUnavailable("native-benchmark-unavailable",
+        "Native playback has no source-barcode measurement; use the separate native HEVC acceptance check.");
+    if (!decoderSupportsCodec(transport, decoderPath, candidate.codec ?? "hevc"))
       throw new StreamLabUnavailable("unsupported-decoder-codec",
-        "The diagnostic WebRTC decoder supports H264 only; native HEVC requires a separate playback check.",
-        { transport, decoderPath: "webcodecs", codec: candidate.codec ?? "hevc" });
+        "The diagnostic WebCodecs decoder supports H264 only; native HEVC requires the native decoder path.",
+        { transport, decoderPath, codec: candidate.codec ?? "hevc" });
     this.assertLeaseHealthy();
     await this.setBandwidthCap(bandwidthMbps);
     const profile = benchmarkProfile(candidate, transport);
@@ -2710,10 +2802,8 @@ export class LiveStreamLabSession {
 
   async switchTransport(transport, receiverOptions = {}) {
     this.assertLeaseHealthy();
-    const next = { relay: receiverOptions.relay !== false, adaptive: receiverOptions.adaptive === true,
-      ...(receiverOptions.wssTopology ? { wssTopology: { ...receiverOptions.wssTopology } } : {}) };
-    const sameTopology = JSON.stringify(next.wssTopology ?? null) === JSON.stringify(this.receiverOptions.wssTopology ?? null);
-    if (transport === this.transport && next.relay === this.receiverOptions.relay && next.adaptive === this.receiverOptions.adaptive && sameTopology) return;
+    const next = normalizeReceiverOptions(receiverOptions, this.receiverOptions);
+    if (transport === this.transport && sameReceiverOptions(next, this.receiverOptions)) return;
     this.transport = transport;
     this.receiverOptions = next;
     await this.receiver.navigate(buildReceiverUrl(this.baseUrl, transport, { ...next, labRun: this.runId }).href);
@@ -2723,8 +2813,7 @@ export class LiveStreamLabSession {
   async restartTransport(transport = this.transport, receiverOptions = this.receiverOptions) {
     this.assertLeaseHealthy();
     this.transport = transport;
-    this.receiverOptions = { relay: receiverOptions.relay !== false, adaptive: receiverOptions.adaptive === true,
-      ...(receiverOptions.wssTopology ? { wssTopology: { ...receiverOptions.wssTopology } } : {}) };
+    this.receiverOptions = normalizeReceiverOptions(receiverOptions, this.receiverOptions);
     const url = buildReceiverUrl(this.baseUrl, transport, { ...this.receiverOptions, labRun: this.runId });
     url.searchParams.set("labAttempt", String(Date.now()));
     await this.receiver.navigate(url.href);
@@ -2762,7 +2851,9 @@ export class LiveStreamLabSession {
     let sawRegistered = false;
     let sawFreshMonitorList = false;
     let sawExactTarget = false;
-    let sawRejectedSelection = false;
+    let sawHostRejection = false;
+    let sawDeferredSelection = false;
+    const selectionStartedAt = Date.now();
     while (Date.now() < deadline) {
       this.assertLeaseHealthy();
       snapshot = await this.snapshot();
@@ -2825,27 +2916,25 @@ export class LiveStreamLabSession {
         selectionRevision = revision;
         selectionRequestedAt = Date.now();
       } else {
-        sawRejectedSelection = true;
+        // Distinguish "the receiver could not issue the control yet" from
+        // "the host rejected this exact selector": only the latter is a
+        // monitor-selection rejection.
+        const hostError = signaling?.lastMonitorError;
+        const rejectedByHost = hostError &&
+          String(hostError.selector || "").toLowerCase() === normalizedTarget &&
+          Number(hostError.atMs) >= selectionStartedAt;
+        if (rejectedByHost) sawHostRejection = true;
+        else sawDeferredSelection = true;
         refreshRequested = false;
         refreshBaseRevision = revision;
       }
       await sleep(250);
     }
     const detail = { targetSelector, selectionAttempts, diagnostics: snapshot };
-    if (!sawRegistered)
-      throw new StreamLabUnavailable("signaling-registration-timeout",
-        "Signaling did not register before persistent monitor selection timed out.", detail);
-    if (!sawFreshMonitorList)
-      throw new StreamLabUnavailable("monitor-list-timeout",
-        "The host did not publish a fresh monitor list after signaling registration.", detail);
-    if (!sawExactTarget)
-      throw new StreamLabUnavailable("monitor-ambiguous",
-        "A fresh host monitor list did not contain exactly one persistent virtual display selector.", detail);
-    if (sawRejectedSelection)
-      throw new StreamLabUnavailable("monitor-selection-rejected",
-        "The diagnostic monitor selector kept rejecting the exact persistent virtual display.", detail);
-    throw new StreamLabUnavailable("monitor-switch-timeout",
-      "The host did not confirm the exact persistent virtual display in a fresh monitor response.", detail);
+    const failure = classifyMonitorSelectionFailure({
+      sawRegistered, sawFreshMonitorList, sawExactTarget, sawHostRejection, sawDeferredSelection,
+    });
+    throw new StreamLabUnavailable(failure.code, failure.message, detail);
   }
 
   async ensureVirtualMonitorSelected(snapshot = null) {
@@ -2882,6 +2971,7 @@ export class LiveStreamLabSession {
       }
       const state = firstFrameReadiness(last, { expected, preApplyBenchStatus: readiness.preApplyBenchStatus,
         runId: this.runId, transport, relay: readiness.relay,
+        decoderPath: this.receiverOptions?.decoderPath,
         expectedTimestamp: this.applyExpectedSource?.epochMs });
       if (state.ready) return last;
       const elapsedMs = performance.now() - readinessStartedAt;
@@ -2969,7 +3059,8 @@ export class LiveStreamLabSession {
       }
       if (tileAdmission.required && !tileAdmission.ready) return false;
       const state = firstFrameReadiness(last, { expected, preApplyBenchStatus: readiness.preApplyBenchStatus,
-        runId: this.runId, transport, relay: readiness.relay, expectedTimestamp: null });
+        runId: this.runId, transport, relay: readiness.relay,
+        decoderPath: this.receiverOptions?.decoderPath, expectedTimestamp: null });
       return state.rendered && state.routeOkay && state.decoderOkay && state.benchOkay ? last : false;
     }, 10_000);
     if (!primed) throw new StreamLabUnavailable("media-prime-timeout",

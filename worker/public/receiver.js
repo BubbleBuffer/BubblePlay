@@ -11,6 +11,7 @@ import {
 import { AdaptiveFrameDeadline, applyLateShardDeadline, classifyMediaShardV3, CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, OrderedFrameRelease, ParityFrameReassembler, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, selectStaleWssLane, selectWssMediaTopology, shouldDeferWssMediaStart, shouldRecoverWssStripeReconnect, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY, stripLabEdgeTrace, VariableParityFrameReassembler, validateWssTopology, WssLaneLifecycleTelemetry } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
 import { TRANSPORT, createCodecSession, parseAdaptive, parseQualityPreset, parseTransport, rtpCodecMimeTypes } from "/transport.js";
+import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
 
 const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
 const diagnosticAttemptId = window.__bubbleplayDebugTrace?.attemptId || null;
@@ -118,6 +119,7 @@ const profileSessionId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()
 let profileSequence = 0;
 let qosSequence = 0;
 let latestRtcProfile = null;
+let latestRtcProfileGeneration = null;
 let hostQuality = null;
 let latestBenchStatus = null;
 let latestBenchStatusRejection = null;
@@ -194,7 +196,7 @@ function handleDesktopState(message) {
     renderDesktopState();
     if (message.state === "active") {
       if (!usingWssMedia) {
-        restartPeer("monitor-transition", false);
+        restartPeerInNewEpoch({ recycleSignaling, restartPeer }, "monitor-transition");
         return;
       }
       startFirstFrameHandshake("monitor-transition", true);
@@ -216,7 +218,7 @@ function handleDesktopState(message) {
     // WebCodecs worker can authorize Winlogon/default input with an old frame.
     // WSS carries an explicit generation and can transition in place.
     if (!usingWssMedia) {
-      restartPeer("desktop-source-transition", false);
+      restartPeerInNewEpoch({ recycleSignaling, restartPeer }, "desktop-source-transition");
       return;
     }
     startFirstFrameHandshake("desktop-source-transition", true);
@@ -375,6 +377,15 @@ function handleFirstFrameMessage(message) {
 let monitorList = [];
 let monitorListRevision = 0;
 let monitorSwitchPending = null;
+let lastMonitorRequest = null;
+let lastMonitorError = null;
+function invalidatePendingMonitorRequest(reason) {
+  const invalidated = monitorRequestAfterRestart(monitorSwitchPending, reason);
+  if (!invalidated) return;
+  monitorSwitchPending = null;
+  sendClientLog("warn", "monitor-request-invalidated", invalidated);
+  renderMonitorList();
+}
 function renderMonitorList() {
   const list = document.getElementById("monitor-list");
   const status = document.getElementById("monitor-status");
@@ -413,13 +424,28 @@ function handleMonitorList(message) {
 }
 function handleMonitorError(message) {
   monitorSwitchPending = null;
+  lastMonitorError = {
+    selector: typeof message.selector === "string" ? message.selector : null,
+    reason: String(message.reason || "unknown error").slice(0, 180),
+    atMs: Date.now(),
+  };
   const status = document.getElementById("monitor-status");
-  if (status) status.textContent = `Monitor switch failed: ${String(message.reason || "unknown error").slice(0, 180)}`;
+  if (status) status.textContent = `Monitor switch failed: ${lastMonitorError.reason}`;
   renderMonitorList();
 }
 function requestMonitor(selector) {
-  if (monitorSwitchPending || !inputReady && !usingWssMedia) return false;
+  const readiness = monitorRequestReadiness({
+    socketOpen: ws?.readyState === WebSocket.OPEN,
+    signalingRegistered,
+    pending: monitorSwitchPending,
+  });
+  if (!readiness.allowed) {
+    if (readiness.reason !== "pending")
+      sendClientLog("info", "monitor-request-deferred", { reason: readiness.reason, selector });
+    return false;
+  }
   monitorSwitchPending = selector;
+  lastMonitorRequest = { selector, atMs: Date.now() };
   renderMonitorList();
   sendSignal({ type: "media-control", action: "monitor", protocol: usingWssMedia ? wssProtocol : 2, epoch: mediaEpoch, monitor: selector, reason: "user-monitor" });
   return true;
@@ -681,6 +707,7 @@ function signalingSocketUrl() {
 
 function recycleSignaling(reason) {
   if (terminalSignalingFailure) return;
+  invalidatePendingMonitorRequest(reason);
   const renderedAgeMs = lastRenderedDueMs === null ? null : performance.now() - lastRenderedDueMs;
   const diagnostic = createSignalingRecycleDiagnostic({
     reason,
@@ -856,6 +883,7 @@ setInterval(() => {
 // ---- WebRTC ----------------------------------------------------------------
 function restartPeer(reason, reconnect = true) {
   const generation = ++peerGeneration;
+  invalidatePendingMonitorRequest(reason);
   clearFirstFrameWatchdog();
   firstFrameHandshake.requestId = null;
   firstFrameHandshake.phase = "idle";
@@ -2055,7 +2083,7 @@ if (diagnosticsEnabled) {
         glassToGlass: useWebCodecs ? (encodedWorkerStats?.glassToGlass || readTimestampPattern()) : null,
         worker: encodedWorkerStats,
         nativePresentation: nativePresentation ? { ...nativePresentation } : null,
-        rtc: latestRtcProfile,
+        rtc: latestRtcProfile ? { ...latestRtcProfile, generation: latestRtcProfileGeneration } : null,
         hostQuality,
         hostCapabilities: {
           ...hostCapabilities,
@@ -2107,6 +2135,9 @@ if (diagnosticsEnabled) {
           lastRecycle: lastSignalingRecycle ? { ...lastSignalingRecycle } : null,
           benchStatusRejection: latestBenchStatusRejection ? { ...latestBenchStatusRejection } : null,
           monitorRevision: monitorListRevision,
+          monitorSwitchPending,
+          lastMonitorRequest: lastMonitorRequest ? { ...lastMonitorRequest } : null,
+          lastMonitorError: lastMonitorError ? { ...lastMonitorError } : null,
           monitors: monitorList.map(monitor => ({ ...monitor })),
         },
         cursor: cursorReconciler ? { mode: pointerMode, synced: cursorReconciler.synced, pending: cursorReconciler.pending, lastSent: cursorReconciler.lastSent, lastAck: cursorReconciler.lastAck, feedbackAt: cursorReconciler.feedbackAt } : null,
@@ -2354,8 +2385,14 @@ setInterval(async () => {
   if (statsPollPending) return;
   statsPollPending = true;
   try {
-    const stats = await pc.getStats();
+    const sampledPeer = pc;
+    const sampledGeneration = peerGeneration;
+    const stats = await sampledPeer.getStats();
+    if (pc !== sampledPeer || peerGeneration !== sampledGeneration) return;
     latestRtcProfile = summarizeRtcStats(stats);
+    // Stats sampled before a peer restart describe the previous epoch; the
+    // generation lets consumers reject them as decode evidence.
+    latestRtcProfileGeneration = sampledGeneration;
     hudState.route = deriveCandidateRoute(latestRtcProfile);
     let inbound = null, rtt = null;
     stats.forEach((s) => {
@@ -2520,8 +2557,10 @@ function startNativeVideo(track, generation = peerGeneration) {
   stage.classList.add("native-video-input");
   activeVideo = video;
   nativePresentation = {
+    generation,
     supported: typeof video.requestVideoFrameCallback === "function",
     firstFrameAtMs: null,
+    firstFramePerformanceMs: null,
     framesPresented: 0,
     fps: 0,
     recentFrameGapMs: null,
@@ -2550,6 +2589,7 @@ function startNativeVideo(track, generation = peerGeneration) {
       markFirstFramePresented();
       const gap = lastFrameAt === null ? null : now - lastFrameAt;
       if (nativePresentation.firstFrameAtMs === null) nativePresentation.firstFrameAtMs = Date.now();
+      if (nativePresentation.firstFramePerformanceMs === null) nativePresentation.firstFramePerformanceMs = now;
       nativePresentation.framesPresented = metadata.presentedFrames ?? nativePresentation.framesPresented + 1;
       nativePresentation.recentFrameGapMs = gap === null ? null : Math.round(gap);
       nativePresentation.maxFrameGapMs = gap === null ? 0 : Math.max(nativePresentation.maxFrameGapMs, Math.round(gap));

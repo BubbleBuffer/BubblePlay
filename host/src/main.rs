@@ -268,13 +268,95 @@ fn main() -> Result<()> {
     }
 }
 
+/// The display the client asked for, retained for the lifetime of the serve
+/// loop so a session restart (peer left, ICE loss) reopens the same monitor.
+/// The privileged Agent keeps its own selection; the host never records one
+/// for it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CaptureSelection {
+    selector: Option<String>,
+    /// True once a live switch replaced the launch selector. Only a runtime
+    /// selection is retried boundedly before the host refuses to serve; the
+    /// launch selector keeps its original unbounded retry behavior.
+    runtime: bool,
+}
+
+impl CaptureSelection {
+    fn from_launch(launch: Option<&str>) -> Self {
+        Self {
+            selector: launch.map(str::to_string),
+            runtime: false,
+        }
+    }
+
+    fn selector(&self) -> Option<&str> {
+        self.selector.as_deref()
+    }
+
+    fn is_runtime(&self) -> bool {
+        self.runtime
+    }
+
+    /// Record a live switch. `None` (privileged source) leaves the selection
+    /// untouched so privileged behavior is preserved.
+    fn remember(&mut self, selector: Option<String>) -> bool {
+        match selector.filter(|value| !value.is_empty()) {
+            Some(selector) => {
+                self.selector = Some(selector);
+                self.runtime = true;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Bounded retries before the host refuses to serve rather than capture an
+/// unintended display after a remembered monitor disappears.
+const REMEMBERED_MONITOR_MAX_ATTEMPTS: u32 = 3;
+
+fn remembered_monitor_attempt_exhausted(attempts: u32) -> bool {
+    attempts >= REMEMBERED_MONITOR_MAX_ATTEMPTS
+}
+
 /// Serve mode wrapper: a session ends when the peer leaves or ICE dies, but
 /// the host keeps running and accepts the next client. Fatal errors (bad
 /// token, capture failure) still exit — only session teardown retries.
 fn run_serve_forever(args: &Args) -> Result<()> {
+    // The inline VDD keepalive outlives a single session: dropping it between
+    // sessions would unplug a remembered virtual display.
+    let _vdd = if args.privileged_agent {
+        None
+    } else {
+        start_vdd_keepalive(args)?
+    };
+    let mut selection = CaptureSelection::from_launch(args.monitor.as_deref());
     let mut backoff = Duration::from_secs(1);
+    let mut unavailable_attempts = 0u32;
     loop {
-        match run_serve(args) {
+        if !args.privileged_agent && selection.is_runtime() {
+            if let Some(selector) = selection.selector() {
+                if let Err(error) = pick_monitor(Some(selector)) {
+                    unavailable_attempts += 1;
+                    error!(
+                        monitor = selector,
+                        attempt = unavailable_attempts,
+                        ?error,
+                        "remembered capture monitor is unavailable; refusing to capture a different display"
+                    );
+                    if remembered_monitor_attempt_exhausted(unavailable_attempts) {
+                        return Err(error.context(format!(
+                            "remembered capture monitor {selector} did not return"
+                        )));
+                    }
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+                unavailable_attempts = 0;
+            }
+        }
+        match run_serve(args, &mut selection) {
             Ok(()) => {
                 info!("session ended — waiting for next client");
                 backoff = Duration::from_secs(1);
@@ -391,7 +473,7 @@ fn unix_time_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn run_serve(args: &Args) -> Result<()> {
+fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let worker = args
         .worker
         .clone()
@@ -400,7 +482,7 @@ fn run_serve(args: &Args) -> Result<()> {
     let reset_lab_encoder_on_diagnostic_keyframe =
         std::env::var("BUBBLEPLAY_LAB_RESET_ENCODER_ON_DIAGNOSTIC_KEYFRAME")
             .is_ok_and(|value| value == "1");
-    let mut capture = CaptureSource::open(args)?;
+    let mut capture = CaptureSource::open(args, selection.selector())?;
     let socket = UdpSocket::bind("0.0.0.0:0").context("bind media socket")?;
     let host_addr = SocketAddr::new(
         pick_host_ip().context("discover local host IP")?,
@@ -436,11 +518,6 @@ fn run_serve(args: &Args) -> Result<()> {
             Controller::adaptive(Profile::Full, args.max_bitrate_bps, 6_000_000, stream_mode)
         });
     let pump = TransportPump::spawn(socket, host_addr, mapped_addr, quality.target());
-    let _vdd = if args.privileged_agent {
-        None
-    } else {
-        start_vdd_keepalive(args)?
-    };
     let mut encoder: Option<Nvenc> = None;
     let mut active_codec = VideoCodec::preferred();
     let mut wss_media: Option<WssMediaEgress> = None;
@@ -1458,6 +1535,10 @@ fn run_serve(args: &Args) -> Result<()> {
                                 // advertised ready.
                                 capture_available = completed;
                                 if completed {
+                                    // The client owns the display choice for
+                                    // the lifetime of the host process: a
+                                    // later session reopens the same monitor.
+                                    selection.remember(capture.monitor_selector());
                                     input_sink.set_absolute_region(capture.region());
                                     cursor_tracker =
                                         CursorTracker::for_region(capture.region(), Instant::now());
@@ -4666,14 +4747,17 @@ mod tests {
         record_benchmark_hybrid_validation, record_benchmark_roi_activity,
         record_benchmark_temporal_activity, record_privileged_desktop_state,
         recover_quiescent_after_unsubmitted_frame, rejected_transition_requires_recovery,
-        same_viewport_geometry, should_forward_offer, should_replace_wss_media_session,
+        remembered_monitor_attempt_exhausted, same_viewport_geometry, session_capture_selector,
+        should_forward_offer, should_replace_wss_media_session,
         should_reset_lab_encoder_for_keyframe, should_snapshot_idle_desktop,
         take_matching_transition, temporal_readback_policy, valid_lab_quality_request_id,
         valid_monitor_refresh_control, valid_stripe_reconnect_recovery_control, viewport_from_q16,
-        wss_capacity_observation, CachedIdr, CachedIdrReplay, IdleSnapshotCompletionOrder,
+        wss_capacity_observation, CachedIdr, CachedIdrReplay, CaptureSelection,
+        IdleSnapshotCompletionOrder,
         PendingFirstFrame, PendingSubmittedIdr, PrivilegedDesktopState, ProfileTransition,
         ReconnectLogGate, TemporalReadbackPolicy, VideoMode, ViewportCrop, WssAckRate,
         WssQualityController, WssRecoverySnapshotGate, AGENT_RECONNECT_LOG_INTERVAL,
+        REMEMBERED_MONITOR_MAX_ATTEMPTS,
         STATIC_REPLAY_DELAY,
     };
     use crate::encode::{
@@ -4704,6 +4788,70 @@ mod tests {
         assert_eq!(agent_reconnect_delay(2), Duration::from_secs(1));
         assert_eq!(agent_reconnect_delay(3), Duration::from_secs(2));
         assert_eq!(agent_reconnect_delay(30), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn remembered_capture_selection_survives_a_session_restart() {
+        let mut selection = CaptureSelection::from_launch(None);
+        assert_eq!(selection.selector(), None);
+        assert!(!selection.is_runtime());
+        assert!(selection.remember(Some("\\\\.\\DISPLAY5".into())));
+        assert_eq!(selection.selector(), Some("\\\\.\\DISPLAY5"));
+        assert!(selection.is_runtime());
+        // A restarted session reopens the remembered display, not the launch
+        // default that the candidate host was started with.
+        assert_eq!(
+            session_capture_selector(selection.selector(), None),
+            Some("\\\\.\\DISPLAY5")
+        );
+    }
+
+    #[test]
+    fn launch_selector_only_applies_until_a_live_switch_is_remembered() {
+        let mut selection = CaptureSelection::from_launch(Some("primary"));
+        assert_eq!(
+            session_capture_selector(selection.selector(), Some("primary")),
+            Some("primary")
+        );
+        // The launch selector keeps the original unbounded serve retry; only a
+        // runtime selection is bounded before the host refuses to substitute.
+        assert!(!selection.is_runtime());
+        assert!(selection.remember(Some("\\\\.\\DISPLAY5".into())));
+        assert!(selection.is_runtime());
+        assert_eq!(
+            session_capture_selector(selection.selector(), Some("primary")),
+            Some("\\\\.\\DISPLAY5")
+        );
+    }
+
+    #[test]
+    fn privileged_source_never_records_a_local_monitor_selection() {
+        let mut selection = CaptureSelection::from_launch(None);
+        // CaptureSource::monitor_selector() returns None for the privileged
+        // source, so the remembered selection is left untouched.
+        assert!(!selection.remember(None));
+        assert_eq!(selection.selector(), None);
+        assert!(!selection.is_runtime());
+        assert!(!selection.remember(Some(String::new())));
+        assert_eq!(selection.selector(), None);
+        assert!(!selection.is_runtime());
+    }
+
+    #[test]
+    fn a_vanished_remembered_monitor_is_retried_boundedly_without_substitution() {
+        assert!(!remembered_monitor_attempt_exhausted(0));
+        assert!(!remembered_monitor_attempt_exhausted(
+            REMEMBERED_MONITOR_MAX_ATTEMPTS - 1
+        ));
+        assert!(remembered_monitor_attempt_exhausted(
+            REMEMBERED_MONITOR_MAX_ATTEMPTS
+        ));
+        // Precedence stays with the remembered selector, so the launch default
+        // can never become an unintended capture target.
+        assert_eq!(
+            session_capture_selector(Some("\\\\.\\DISPLAY5"), Some("primary")),
+            Some("\\\\.\\DISPLAY5")
+        );
     }
 
     #[test]

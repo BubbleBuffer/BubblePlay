@@ -130,3 +130,25 @@ bounded tails of the six fixed Broker, Agent, Transport, and host logs beneath
 lab owner read/traverse access to those logs; service configuration, secrets,
 write access, and service-control privileges remain protected. Reconnect storms
 are rate-limited in-process and legacy oversized rotations are pruned on start.
+
+Native HEVC acceptance uses a visible receiver on a display separate from the
+synthetic source. From the repository root, run:
+
+```powershell
+node worker/tools/native-hevc-acceptance.mjs --candidate-host host/target/release/bubbleplay-host.exe
+```
+
+The default run performs ten WSS/native transport cycles with native monitor
+switches, a 600-second native soak, and 60 seconds of cleanup/idle sampling.
+It checks the negotiated HEVC codec, current monitor selection, fresh video-frame
+callbacks, and uninterrupted frame progression. It does not measure native
+glass-to-glass latency; native playback is rejected by the source-barcode
+benchmark entry point. The run writes a JSON report under `artifacts/` and
+detailed telemetry under `artifacts/stream-lab/<run-id>/`.
+On failure it also saves source/receiver screenshots for diagnosis.
+
+Use `--cycles 1 --soak-seconds 5 --idle-seconds 1` for a short reproduction;
+that is not the full acceptance gate. If ActiveStore QoS inspection is denied,
+the report remains unsupported. After the run ends, an administrator can obtain
+separate read-only cleanup evidence with
+`./tools/verify-lab-qos.ps1 -RunId <run-id>`; retain both reports.
