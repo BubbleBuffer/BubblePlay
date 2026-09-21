@@ -1283,6 +1283,21 @@ export function shouldDeferWssMediaStart({
   return !validateWssTopology(requestedTopology) && capabilitiesGeneration !== signalingGeneration;
 }
 
+/** A connected WebRTC peer is only abandoned for WSS when no media has
+ * arrived. The native `<video>` path presents frames through
+ * requestVideoFrameCallback independently of encoded-frame callbacks, so
+ * both concrete arrival signals must be consulted before falling back. */
+export function shouldFallbackToWssOnMissingRtp({
+  connected = false,
+  framesReceived = 0,
+  nativeFramesPresented = 0,
+} = {}) {
+  if (connected !== true) return false;
+  const received = Number.isFinite(framesReceived) ? framesReceived : 0;
+  const presented = Number.isFinite(nativeFramesPresented) ? nativeFramesPresented : 0;
+  return received <= 0 && presented <= 0;
+}
+
 export function selectWssMediaTopology({
   requestedTopology = null,
   hostCapabilities = null,

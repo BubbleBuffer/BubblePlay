@@ -8,7 +8,7 @@ import {
   shouldRecycleSignalingForPeerState,
 } from "/recovery.js";
  import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
-import { AdaptiveFrameDeadline, applyLateShardDeadline, classifyMediaShardV3, CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, OrderedFrameRelease, ParityFrameReassembler, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, selectStaleWssLane, selectWssMediaTopology, shouldDeferWssMediaStart, shouldRecoverWssStripeReconnect, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY, stripLabEdgeTrace, VariableParityFrameReassembler, validateWssTopology, WssLaneLifecycleTelemetry } from "/media.js";
+import { AdaptiveFrameDeadline, applyLateShardDeadline, classifyMediaShardV3, CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, OrderedFrameRelease, ParityFrameReassembler, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, selectStaleWssLane, selectWssMediaTopology, shouldDeferWssMediaStart, shouldFallbackToWssOnMissingRtp, shouldRecoverWssStripeReconnect, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY, stripLabEdgeTrace, VariableParityFrameReassembler, validateWssTopology, WssLaneLifecycleTelemetry } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
 import { TRANSPORT, createCodecSession, parseAdaptive, parseQualityPreset, parseTransport, rtpCodecMimeTypes } from "/transport.js";
 import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
@@ -1815,7 +1815,15 @@ async function startPeer(generation = peerGeneration) {
       clearTimeout(iceFallbackTimer); iceFallbackTimer = null;
       if (requestedTransport === TRANSPORT.AUTO) {
         rtpFallbackTimer = setTimeout(() => {
-          if (isCurrentPeer(generation, candidate) && !framesReceived) switchToWss("no-rtp");
+          if (!isCurrentPeer(generation, candidate)) return;
+          // Check the current native presentation epoch as well as the shared
+          // receive counter before abandoning a peer that may be playing.
+          const nativeFramesPresented = nativePresentation?.generation === generation
+            ? nativePresentation.framesPresented
+            : 0;
+          if (shouldFallbackToWssOnMissingRtp({ connected, framesReceived, nativeFramesPresented })) {
+            switchToWss("no-rtp");
+          }
         }, 2_000);
       }
       hud.classList.remove("bad");
@@ -2586,6 +2594,10 @@ function startNativeVideo(track, generation = peerGeneration) {
   if (nativePresentation.supported) {
     const onVideoFrame = (now, metadata) => {
       if (generation !== peerGeneration || activeVideo !== video) return;
+      // A presented native frame is the concrete media arrival signal for this
+      // peer epoch: cancel the RTC auto-fallback exactly like feedDecoder does
+      // for the encoded path, and surface the frame in the received counter.
+      clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
       markFirstFramePresented();
       const gap = lastFrameAt === null ? null : now - lastFrameAt;
       if (nativePresentation.firstFrameAtMs === null) nativePresentation.firstFrameAtMs = Date.now();
@@ -2611,6 +2623,10 @@ function startNativeVideo(track, generation = peerGeneration) {
       hudState.frameGap = nativePresentation.recentFrameGapMs ?? "…";
       hudState.maxFrameGap = nativePresentation.maxFrameGapMs || "…";
       framesDrawn = nativePresentation.framesPresented;
+      if (nativePresentation.framesPresented > framesReceived) {
+        framesReceived = nativePresentation.framesPresented;
+      }
+      hudState.recv = framesReceived;
       lastFrameAt = now;
       video.requestVideoFrameCallback(onVideoFrame);
     };

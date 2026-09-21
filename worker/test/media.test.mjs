@@ -30,6 +30,7 @@ import {
   selectWssMediaTopology,
   selectStaleWssLane,
   shouldDeferWssMediaStart,
+  shouldFallbackToWssOnMissingRtp,
   shouldRecoverWssStripeReconnect,
   validateWssTopology,
 } from "../public/media.js";
@@ -1361,6 +1362,43 @@ test("automatic WSS waits for current host capabilities while explicit lab topol
     capabilitiesGeneration: 2,
     signalingGeneration: 3,
   }), false);
+});
+
+test("a connected native WebRTC peer with presented frames never falls back to WSS", () => {
+  // Production regression: ICE connected, native HEVC presented 11 frames at
+  // 8 fps, yet the 2 s no-rtp timer fired because only the encoded-frame
+  // counter was consulted.
+  assert.equal(shouldFallbackToWssOnMissingRtp({
+    connected: true,
+    framesReceived: 0,
+    nativeFramesPresented: 11,
+  }), false);
+  assert.equal(shouldFallbackToWssOnMissingRtp({
+    connected: true,
+    framesReceived: 7,
+    nativeFramesPresented: 0,
+  }), false);
+  assert.equal(shouldFallbackToWssOnMissingRtp({
+    connected: true,
+    framesReceived: 0,
+    nativeFramesPresented: 0,
+  }), true);
+  assert.equal(shouldFallbackToWssOnMissingRtp({ connected: false }), false);
+  // Unknown counters keep the original rescue behavior for a genuinely silent
+  // peer; they must never be read as evidence that media arrived.
+  assert.equal(shouldFallbackToWssOnMissingRtp({
+    connected: true,
+    framesReceived: null,
+    nativeFramesPresented: null,
+  }), true);
+});
+
+test("the receiver consults native presentation before the automatic WSS fallback", () => {
+  const receiver = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
+  assert.match(receiver,
+    /shouldFallbackToWssOnMissingRtp\(\{ connected, framesReceived, nativeFramesPresented \}\)/);
+  assert.match(receiver,
+    /clearTimeout\(rtpFallbackTimer\); rtpFallbackTimer = null;\s*\n\s*markFirstFramePresented\(\);/);
 });
 
 test("a healthy parity lane reconnect preserves decoder state while non-parity reconnects recover", () => {
