@@ -2643,14 +2643,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         continue 'session;
                     }
                     Err(error) => {
-                        warn!(?error, "privileged Agent encode failed");
+                        let failed_at = Instant::now();
+                        let retry = source.note_encode_failure(failed_at, &error);
                         capture_available = false;
                         // Keep signaling and WSS/WebRTC control alive while
                         // the privileged process boundary reconnects. The
                         // queued disconnect transition announces Unavailable
                         // exactly once. The Agent must publish
                         // CaptureHealth::Active before another frame is
-                        // admitted.
+                        // admitted. Both the retry cadence and the report are
+                        // bounded: an unconditional warn plus an immediate
+                        // retry against the reconnecting client spins here and
+                        // floods stderr until the service log-budget guard
+                        // stops the transport.
+                        next_admission = failed_at + retry;
                         continue 'session;
                     }
                 };

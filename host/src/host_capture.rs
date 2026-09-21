@@ -104,6 +104,11 @@ pub(super) struct PrivilegedSource {
 
 pub(super) const AGENT_RECONNECT_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Floor for the producer's retry after a failed privileged permit. The
+/// reconnect backoff supplies the real cadence; this only guarantees that a
+/// failure can never be retried in the same instant it was observed.
+pub(super) const MIN_AGENT_ENCODE_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 #[derive(Debug, Default)]
 pub(super) struct ReconnectLogGate {
     pub(super) last_emitted: Option<Instant>,
@@ -249,6 +254,33 @@ impl PrivilegedSource {
             self.mark_agent_unavailable(Instant::now(), error);
         }
         result
+    }
+
+    /// Bounded wait before the next privileged encode attempt. The reconnect
+    /// backoff already owns this cadence; the producer must respect it instead
+    /// of re-issuing a permit against a client that is being reconnected.
+    pub(super) fn agent_retry_delay(&self, now: Instant) -> Duration {
+        self.next_agent_connect
+            .saturating_duration_since(now)
+            .max(MIN_AGENT_ENCODE_RETRY_DELAY)
+    }
+
+    /// Producer-side companion to `mark_agent_unavailable`: returns the bounded
+    /// retry delay and reports the failure at most once per reconnect window.
+    /// The failure is normally already reported by `mark_agent_unavailable`;
+    /// this gate exists so the producer's retry loop cannot emit an unbounded
+    /// warning per iteration (that flood trips the service log-budget guard).
+    pub(super) fn note_encode_failure(&mut self, now: Instant, error: &anyhow::Error) -> Duration {
+        let delay = self.agent_retry_delay(now);
+        if let Some(suppressed) = self.reconnect_log.admit(now) {
+            warn!(
+                ?error,
+                retry_ms = delay.as_millis(),
+                suppressed,
+                "privileged Agent encode failed; preserving network session"
+            );
+        }
+        delay
     }
 }
 
@@ -660,5 +692,65 @@ impl CaptureSource {
         if let Self::Privileged(source) = self {
             let _ = source.send_agent(&AgentMessage::ReleaseAll);
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_encode_recovery_tests {
+    use super::*;
+
+    fn timed_out() -> anyhow::Error {
+        anyhow::anyhow!("Agent encode permit timed out")
+    }
+
+    #[test]
+    fn encode_failure_retry_respects_the_reconnect_backoff() {
+        let now = Instant::now();
+        let mut source = PrivilegedSource::new(now);
+        // Even without a recorded failure the floor forbids a same-instant
+        // retry, so the producer loop can never spin at full speed.
+        assert_eq!(source.agent_retry_delay(now), MIN_AGENT_ENCODE_RETRY_DELAY);
+        source.mark_agent_unavailable(now, &timed_out());
+        let delay = source.agent_retry_delay(now);
+        assert_eq!(delay, agent_reconnect_delay(0));
+        assert!(delay >= MIN_AGENT_ENCODE_RETRY_DELAY);
+        // The deadline is absolute: once it passes, one retry is allowed.
+        assert_eq!(
+            source.agent_retry_delay(now + delay),
+            MIN_AGENT_ENCODE_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn repeated_encode_failures_do_not_report_per_iteration() {
+        let now = Instant::now();
+        let mut source = PrivilegedSource::new(now);
+        let error = timed_out();
+        // The first failure of a window is reported by mark_agent_unavailable.
+        source.mark_agent_unavailable(now, &error);
+        assert!(source.reconnect_log.last_emitted.is_some());
+        let suppressed_before = source.reconnect_log.suppressed;
+        // A producer that retried as fast as it could (the production flood)
+        // must accumulate suppressions instead of stderr lines.
+        for step in 0..5_000u64 {
+            let at = now + Duration::from_micros(step);
+            let delay = source.note_encode_failure(at, &error);
+            assert!(delay >= MIN_AGENT_ENCODE_RETRY_DELAY);
+        }
+        assert!(source.reconnect_log.suppressed > suppressed_before);
+        // Still inside the same window: nothing further is emitted.
+        assert_eq!(
+            source
+                .reconnect_log
+                .admit(now + AGENT_RECONNECT_LOG_INTERVAL - Duration::from_millis(1)),
+            None
+        );
+        // A later window reports again and carries the suppressed count.
+        assert!(
+            source
+                .reconnect_log
+                .admit(now + AGENT_RECONNECT_LOG_INTERVAL)
+                .is_some()
+        );
     }
 }
