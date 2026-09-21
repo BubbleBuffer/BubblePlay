@@ -468,15 +468,18 @@ export function buildReceiverUrl(baseUrl, transport, options = {}) {
   url.searchParams.set("adaptive", options.adaptive ? "1" : "0");
   url.searchParams.set("diag", "1");
   url.searchParams.set("profile", "1");
-  // The diagnostic default stays WebCodecs; native playback is an explicit
-  // opt-in that must survive every navigation/reconnect the session performs.
-  url.searchParams.set("decoderPath", normalizeDecoderPath(options.decoderPath));
+  // Keep the session's native RTC preference across reconnects; WSS always
+  // decodes through WebCodecs regardless of that retained preference.
+  url.searchParams.set("decoderPath", transport === "wss" ? "webcodecs" : normalizeDecoderPath(options.decoderPath));
   if (options.labRun) {
     url.searchParams.set("labRun", options.labRun);
     url.searchParams.set("labCompat", STREAM_LAB_COMPATIBILITY.id);
   }
-  if (options.wssTopology !== undefined) {
-    const topology = options.wssTopology;
+  // Lab packets require protocol-v3 host/edge traces. Pin the lab default so
+  // a slow host reconnect cannot make capability discovery fall back to v2.
+  const topology = options.wssTopology === undefined && options.labRun && transport === "wss"
+    ? productionProbeTopology() : options.wssTopology;
+  if (topology !== undefined) {
     const valid = topology && Number.isInteger(topology.laneCount) && topology.laneCount >= 1 && topology.laneCount <= 16 &&
       Number.isInteger(topology.dataShards) && topology.dataShards >= 1 &&
       Number.isInteger(topology.parityShards) && topology.parityShards >= 0 && topology.parityShards <= 2 &&

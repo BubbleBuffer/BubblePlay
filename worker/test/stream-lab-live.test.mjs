@@ -3787,6 +3787,25 @@ test("native readiness proves presented HEVC frames instead of the HUD label", (
   assert.equal(wss.decoderOkay, true);
 });
 
+test("native-to-WSS navigation retains the lab v3 contract before host capabilities arrive", async () => {
+  const urls = [];
+  const session = {
+    transport: "wss", receiverOptions: normalizeReceiverOptions(),
+    runId: "123e4567-e89b-42d3-a456-426614174000", baseUrl: "https://play.example/",
+    assertLeaseHealthy() {}, async waitForAuthentication() {},
+    receiver: { async navigate(url) { urls.push(new URL(url)); } },
+  };
+  await liveModule.LiveStreamLabSession.prototype.switchTransport.call(session, "webrtc",
+    { relay: false, decoderPath: "native" });
+  await liveModule.LiveStreamLabSession.prototype.switchTransport.call(session, "wss", { adaptive: false });
+  assert.equal(urls[0].searchParams.get("decoderPath"), "native");
+  assert.equal(urls[0].searchParams.has("wssLanes"), false);
+  assert.equal(urls[1].searchParams.get("wssLanes"), "16");
+  assert.equal(urls[1].searchParams.get("wssParity"), "1");
+  assert.equal(urls[1].searchParams.get("decoderPath"), "webcodecs");
+  assert.equal(session.receiverOptions.decoderPath, "native");
+});
+
 test("native playback cannot enter the source-barcode benchmark", async () => {
   await assert.rejects(() => liveModule.LiveStreamLabSession.prototype.applyCandidateProfile.call(
     { receiverOptions: { decoderPath: "native" }, transport: "webrtc" }, { codec: "hevc" }),

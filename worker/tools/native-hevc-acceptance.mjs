@@ -1,6 +1,6 @@
 import { fork } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -57,6 +57,29 @@ async function selectMonitor(session, monitor, allowStatic = false) {
   throw new Error(`Receiver rejected monitor selection: ${monitor}`);
 }
 
+async function waitWss(session, monitor) {
+  const deadline = Date.now() + 15_000;
+  let previous = null, snapshot;
+  while (Date.now() < deadline) {
+    session.assertLeaseHealthy();
+    snapshot = await session.snapshot();
+    const selected = snapshot?.signaling?.monitors?.filter(item => item.selected);
+    const fresh = snapshot?.route === "wss" && snapshot.signaling?.registered === true &&
+      selected?.length === 1 && selected[0].selector.toLowerCase() === monitor.toLowerCase() &&
+      snapshot.framesDrawn > 0 && Number.isFinite(snapshot.renderedAgeMs) &&
+      snapshot.renderedAgeMs >= 0 && snapshot.renderedAgeMs < 1000;
+    if (fresh && previous && snapshot.framesDrawn > previous.framesDrawn &&
+        snapshot.signaling.registeredAtMs === previous.signaling.registeredAtMs)
+      return { framesDrawn: snapshot.framesDrawn, renderedAgeMs: snapshot.renderedAgeMs,
+        registeredAtMs: snapshot.signaling.registeredAtMs };
+    previous = fresh ? snapshot : null;
+    await delay(250);
+  }
+  const error = new Error("WSS did not recover between native cycles");
+  error.diagnostics = snapshot;
+  throw error;
+}
+
 async function sampleNative(session, monitor, seconds, store) {
   const initial = await waitNative(session, monitor);
   const started = performance.now();
@@ -65,12 +88,16 @@ async function sampleNative(session, monitor, seconds, store) {
   while (performance.now() - started < seconds * 1000) {
     await delay(1000);
     session.assertLeaseHealthy();
-    const state = nativeFrameState(await session.snapshot(), monitor);
+    const snapshot = await session.snapshot();
+    const state = nativeFrameState(snapshot, monitor);
     const elapsedSeconds = (performance.now() - started) / 1000;
     store.appendTelemetry({ phase: "native-soak", elapsedSeconds, ...state });
     if (!state.ready || state.firstFrameAtMs !== initial.firstFrameAtMs ||
-        state.registeredAtMs !== initial.registeredAtMs || state.frames <= previous.frames)
-      throw new Error(`Native HEVC continuity failed at ${elapsedSeconds.toFixed(1)}s: ${JSON.stringify(state)}`);
+        state.registeredAtMs !== initial.registeredAtMs || state.frames <= previous.frames) {
+      const error = new Error(`Native HEVC continuity failed at ${elapsedSeconds.toFixed(1)}s: ${JSON.stringify(state)}`);
+      error.diagnostics = snapshot;
+      throw error;
+    }
     samples.push(state);
     previous = state;
     if (elapsedSeconds >= nextProgress) { console.log(`Native soak: ${Math.floor(elapsedSeconds)}s, ${state.fps} fps`); nextProgress += 60; }
@@ -99,6 +126,7 @@ async function main() {
     throw new Error("Cycle and duration arguments must be positive integers");
   const runId = randomUUID(), store = artifactStore(resolve(root, "artifacts/stream-lab"), runId);
   const report = { runId, startedAt: new Date().toISOString(), candidateHost: resolve(values["candidate-host"]), cycles: [] };
+  report.candidateHostSha256 = createHash("sha256").update(readFileSync(report.candidateHost)).digest("hex");
   mkdirSync(resolve(root, "artifacts"), { recursive: true });
   const reportPath = resolve(root, `artifacts/native-hevc-${runId}.json`);
   const save = () => writeFileSync(reportPath, JSON.stringify(report, null, 2));
@@ -147,24 +175,18 @@ async function main() {
       // presented frame there, then advancing motion on return to the source.
       await selectMonitor(session, other.selector, true);
       const returned = await selectMonitor(session, target);
-      report.cycles.push({ cycle: index + 1, result: "complete", native: ready, returned }); save();
+      await session.switchTransport("wss", { adaptive: false });
+      await session.selectVirtualMonitor();
+      const wss = await waitWss(session, target);
+      report.cycles.push({ cycle: index + 1, result: "complete", native: ready, returned, wss }); save();
       console.log(`Native monitor/transport cycle ${index + 1}/${cycles} complete`);
-      if (index + 1 < cycles) {
-        await session.switchTransport("wss", { adaptive: false });
-        await session.selectVirtualMonitor();
-        const deadline = Date.now() + 15_000;
-        let readyWss = false;
-        while (Date.now() < deadline) {
-          const snapshot = await session.snapshot();
-          if (snapshot?.route === "wss" && snapshot.framesDrawn > 0 && Number.isFinite(snapshot.renderedAgeMs) && snapshot.renderedAgeMs < 1000) { readyWss = true; break; }
-          await delay(250);
-        }
-        if (!readyWss) throw new Error("WSS did not recover between native cycles");
-      }
     }
+    await session.switchTransport("webrtc", { relay: false, adaptive: false, decoderPath: "native" });
+    await session.selectVirtualMonitor();
     report.soak = await sampleNative(session, target, soakSeconds, store);
   } catch (error) {
     report.error = { message: error.message, code: error.code, detail: error.detail, diagnostics: error.diagnostics };
+    save();
     try { report.sourceAtFailure = await session?.source?.evaluate("({...window.__bubbleplaySource.metadata(), visibility:document.visibilityState, screenX, screenY})"); } catch {}
     if (session?.receiver && session?.source) {
       for (const [name, page] of [["receiver", session.receiver], ["source", session.source]]) {

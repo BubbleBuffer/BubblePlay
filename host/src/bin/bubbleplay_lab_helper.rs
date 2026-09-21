@@ -2933,14 +2933,14 @@ mod tests {
         let (line_tx, line_rx) = mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let accepted = server
-                .accept_for_sid_cancelable(&server_sid, server_stop, Duration::from_secs(5))
+                .accept_for_sid_cancelable(&server_sid, server_stop, Duration::from_secs(15))
                 .unwrap();
             let mut reader = BufReader::new(accepted.expect("client accepted"));
             let line = read_line_limited(&mut reader, MAX_COMMAND_BYTES).unwrap();
             let _ = line_tx.send(line);
         });
 
-        const CLIENT_SCRIPT: &str = r#"$ErrorActionPreference='Stop'; $p=[IO.Pipes.NamedPipeClientStream]::new('.', $env:BUBBLEPLAY_TEST_PIPE, [IO.Pipes.PipeDirection]::InOut); $p.Connect(3000); $w=[IO.StreamWriter]::new($p); $w.AutoFlush=$true; $w.WriteLine('{"command":"ping"}'); Start-Sleep -Seconds 5"#;
+        const CLIENT_SCRIPT: &str = r#"$ErrorActionPreference='Stop'; $p=[IO.Pipes.NamedPipeClientStream]::new('.', $env:BUBBLEPLAY_TEST_PIPE, [IO.Pipes.PipeDirection]::InOut); $p.Connect(10000); $w=[IO.StreamWriter]::new($p); $w.AutoFlush=$true; $w.WriteLine('{"command":"ping"}'); Start-Sleep -Seconds 60"#;
         let powershell = system_directory()
             .unwrap()
             .join("WindowsPowerShell")
@@ -2954,7 +2954,10 @@ mod tests {
         )
         .spawn()
         .unwrap();
-        let received = line_rx.recv_timeout(Duration::from_secs(2));
+        // PowerShell cold startup is not the pipe-read contract. Allow startup
+        // under load, then prove the line arrived while the client is alive.
+        let received = line_rx.recv_timeout(Duration::from_secs(10));
+        let client_still_connected = client.try_wait().unwrap().is_none();
         if received.is_err() {
             stop.store(true, Ordering::Release);
         }
@@ -2962,6 +2965,7 @@ mod tests {
         let _ = client.wait();
         server_thread.join().unwrap();
         assert_eq!(received.unwrap(), Some(r#"{"command":"ping"}"#.to_owned()));
+        assert!(client_still_connected);
     }
 
     #[test]

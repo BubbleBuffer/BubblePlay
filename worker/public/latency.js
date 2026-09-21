@@ -202,12 +202,22 @@ export function normalizeEncodedTimestamp(valueTimestamp, metadata = {}) {
 export function summarizeRtcStats(report) {
   let inbound = null;
   let candidatePair = null;
+  const transports = [];
   report.forEach((entry) => {
     if (entry.type === "inbound-rtp" &&
         (entry.kind === "video" || entry.mediaType === "video")) inbound = entry;
     if (entry.type === "candidate-pair" && entry.state === "succeeded" &&
         (entry.nominated || entry.selected)) candidatePair = entry;
+    if (entry.type === "transport") transports.push(entry);
   });
+  // RTCTransportStats identifies the pair actually carrying this video. Its
+  // current checklist state need not match the legacy nominated-pair filter.
+  const transport = inbound?.transportId ? report.get?.(inbound.transportId)
+    : transports.length === 1 ? transports[0] : null;
+  if (transport?.selectedCandidatePairId) {
+    const selected = report.get?.(transport.selectedCandidatePairId);
+    candidatePair = selected?.type === "candidate-pair" ? selected : null;
+  }
 
   const copy = (source, keys) => Object.fromEntries(keys
     .filter((key) => source?.[key] !== undefined && source?.[key] !== null)
@@ -245,7 +255,8 @@ export function summarizeRtcStats(report) {
   const codec = inbound?.codecId ? copy(report.get?.(inbound.codecId), [
     "mimeType", "clockRate", "channels", "sdpFmtpLine",
   ]) : null;
-  return { inbound: inboundSummary, candidatePair: pairSummary, codec };
+  return { inbound: inboundSummary, candidatePair: pairSummary, codec,
+    transport: transport ? copy(transport, ["iceState", "dtlsState", "selectedCandidatePairId"]) : null };
 }
 
 // Return only the receiver telemetry that crosses the adaptive-quality wire.

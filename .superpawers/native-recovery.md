@@ -1,60 +1,69 @@
 # Native monitor recovery — 2026-09-21
 
-The prior stabilization work is checkpointed at `df40ec0`. Optimization remains
-on hold: the new ten-cycle native acceptance and fresh ten-minute soak have not
-passed.
+Stabilization checkpoints: `df40ec0` (runtime refactor) and `1adcd6e`
+(native monitor ownership/recovery). The final live run passed ten complete
+transport/monitor round trips and a fresh ten-minute native HEVC soak.
+The separate elevated QoS cleanup receipt also passed, completing this gate.
 
 ## Implemented and reviewed
 
-- Local monitor selection and inline VDD keepalive now belong to the host serve
-  loop, surviving signaling sessions. A missing runtime-selected display is
-  retried three times and then reported; capture never substitutes a screen.
-  Privileged Agent ownership is unchanged.
+- Local monitor selection and inline VDD keepalive belong to the host serve
+  loop and survive signaling sessions. Missing runtime-selected displays retry
+  three times and then fail explicitly, without substituting another screen.
 - Native monitor/source transitions recycle signaling before restarting the
-  peer. Pending monitor requests expire with their epoch. Monitor commands use
-  signaling readiness; fresh-frame input admission is unchanged.
-- The lab preserves native decoder selection across reconnects. Native evidence
-  requires matching peer generations, presented/decoded HEVC frames, dimensions,
-  current RTC statistics and fresh presentation. A stats poll finishing after a
-  peer change is discarded. Nullable timestamps fail closed.
-- WSS still uses its WebCodecs readiness contract when returning from native.
-  Native playback cannot enter source-barcode benchmarks or claim latency.
-- `worker/tools/native-hevc-acceptance.mjs` exercises monitor/transport changes,
-  a native continuity soak and cleanup. Static alternate desktops require a new
-  peer's presented frame; the synthetic-source monitor requires advancing frames.
+  peer. Pending requests expire with their epoch; stale RTC stats are discarded.
+  Input admission still requires fresh frames.
+- Native readiness requires matching peer generations, presented/decoded HEVC,
+  dimensions, current RTC statistics and fresh presentation. Native playback
+  cannot enter source-barcode benchmarks or claim measured latency.
+- Lab WSS navigation explicitly retains the v3 trace/topology contract. Slow
+  reconnect capability discovery previously fell back to v2, whose packets
+  lacked the trace trailers required by the lab. WSS always uses WebCodecs;
+  the session retains its native preference for subsequent RTC navigation.
+- RTC route telemetry follows the video transport's selected candidate-pair
+  reference. The old nominated/succeeded filter could report no route while
+  media continued. Legacy fallback remains for reports without that reference.
+- Acceptance counts a cycle only after native monitor switching away/back and
+  fresh, advancing WSS recovery. It records the candidate binary hash and full
+  failure diagnostics. The pipe test tolerates PowerShell startup under load
+  while directly asserting that the client remains alive when its line arrives.
 
-## Evidence and remaining gate
+## Evidence
 
-Full checks passed (547 Node tests, 389 Rust tests, syntax/all-target/whitespace
-checks), log `artifacts/stabilization-native-final-check.txt`. The final native
-benchmark guard and WSS regression passed the focused 151-test suite in
-`artifacts/stabilization-native-focused-check.txt`. Release host built successfully.
+Final run: `artifacts/native-hevc-114758ef-3a92-4a17-a083-3ed3f2b7adc1.json`,
+completed `2026-09-21T20:41:54.227Z`.
 
-Post-fix short runs retain DISPLAY5 across WSS-to-native transitions, without the
-previous repeated peer-left loop. They fail fresh-frame acceptance: the source
-advances at roughly 56 fps, but capture supplies no new desktop frames and the
-host replays cached IDRs. Source and receiver windows were verified on separate
-displays. WSS capture counters likewise show zero acquisitions over hundreds of
-producer iterations. Artifacts include runs `44b9b515-6a6d-444b-a545-836ea05386d5`,
-`498ddf47-ee6f-4725-88aa-355c093e324e`, and
-`cefae60c-6e00-44cf-a356-a0f184ef3466` (with diagnostic screenshots).
+- Ten complete WSS/native/monitor/WSS round trips passed.
+- Fresh native soak: 600.45 seconds, 588 samples, 31.99 presented fps,
+  maximum recorded frame gap 283 ms; no continuity failure or peer epoch reset.
+- Owned receiver, source and candidate-host processes exited gracefully;
+  helper stopped and the persistent VDD remained present.
+- Sixty-second idle sample: zero mean encoder utilization and zero host memory
+  delta. The original report remains `unsupported` because unelevated QoS
+  inspection was unavailable; other cleanup evidence was available.
+- Full checks passed: 550 Node tests and 389 Rust tests, plus the check command's
+  syntax/all-target/whitespace validation. See
+  `artifacts/stabilization-native-route-final-check.txt`.
+- Release host SHA256:
+  `1945082236ba39b36af8764d78307b6c3ae409ccf8a0ea41b895cda2568671bd`.
+- Elevated read-only ActiveStore query at `2026-09-21T20:42:36.7103431Z`
+  found no lab QoS policies and confirmed the helper stopped. Receipt:
+  `artifacts/native-qos-114758ef-3a92-4a17-a083-3ed3f2b7adc1.json`.
+  The combined verdict is complete; the original unelevated report is preserved.
 
-Direct three-second capture/NVENC probes, bypassing transport, exited 0 but
-reported `frames_encoded=0 acquired=0 new_presents=0` on both DISPLAY5 and
-DISPLAY1. See `artifacts/capture-probe-6e2c047c-9f2c-42b3-b777-b21188fe936f.txt`
-and the corresponding `-physical.txt`. This establishes a capture-path failure
-on both outputs; it does not prove its environmental cause. A TeamViewer session
-popup is visible in the received image. Interference from another capture client
-is a hypothesis, not a confirmed diagnosis. TeamViewer was not stopped.
+Capture initially acquired zero frames on both physical and virtual outputs.
+After authorized closure of the TeamViewer desktop process, direct capture
+probes and live playback recovered. This temporal association does not prove
+an underlying driver cause. The TeamViewer service remains running; its UAC
+stop attempt was cancelled. Successful short reproduction:
+`artifacts/native-hevc-3b3f5693-a456-4dda-a93d-ebb10358f116.json`.
 
-All test-owned host/browser processes exited, helper stopped, and persistent VDD
-was retained. Short idle samples are not the required 60-second acceptance run.
-ActiveStore QoS inspection remains unverified: unelevated access was denied and
-the Windows elevation request for `tools/verify-lab-qos.ps1` was cancelled.
+Earlier run `26517d62-3c8b-4cf7-b335-1aedf992c40c` passed ten cycles but stopped
+at 140 seconds when route telemetry disappeared despite advancing fresh frames.
+It is not soak acceptance evidence. The selected-candidate-pair fix preceded
+and passed the final fresh run above.
 
-Next: establish whether TeamViewer can be closed safely, repeat direct capture,
-then run the full native acceptance command and obtain read-only elevated QoS
-evidence. Do not treat connected sockets or cached-IDR playback as stability.
-
-Wiki capture write tools were unavailable; this sourced task capsule is retained
-locally for later memory ingestion. No deployment or push was performed.
+This validates the native recovery gate on this machine, not the broader
+interruption matrix or an optimization/latency improvement. No push or
+deployment was performed. Wiki capture tools were unavailable; this sourced
+capsule remains local for later ingestion.

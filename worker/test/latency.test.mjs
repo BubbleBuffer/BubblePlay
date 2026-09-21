@@ -198,6 +198,23 @@ test("WebRTC profiling preserves decoder, recovery, codec, and candidate counter
   assert.equal(profile.codec.mimeType, "video/H264");
 });
 
+test("RTC route follows the video transport's selected pair during connectivity checks", () => {
+  const report = new Map([
+    ["video", { type: "inbound-rtp", kind: "video", transportId: "transport" }],
+    ["transport", { type: "transport", selectedCandidatePairId: "active", iceState: "connected" }],
+    ["active", { type: "candidate-pair", state: "in-progress", localCandidateId: "local", remoteCandidateId: "remote" }],
+    ["other", { type: "candidate-pair", state: "succeeded", nominated: true, localCandidateId: "relay", remoteCandidateId: "remote" }],
+    ["local", { type: "local-candidate", candidateType: "host" }],
+    ["remote", { type: "remote-candidate", candidateType: "host" }],
+    ["relay", { type: "local-candidate", candidateType: "relay" }],
+  ]);
+  assert.equal(summarizeRtcStats(report).candidatePair.local.candidateType, "host");
+  assert.equal(summarizeRtcStats(report).candidatePair.state, "in-progress");
+  report.delete("active");
+  assert.equal(summarizeRtcStats(report).candidatePair, null,
+    "a missing selected pair must not be replaced with an unrelated nominated pair");
+});
+
 test("QoS receiver window derives deltas and leaves static counters honest", () => {
   const previous = {
     generation: 3, atMs: 1_000, bytesReceived: 1_000_000, packetsReceived: 100,

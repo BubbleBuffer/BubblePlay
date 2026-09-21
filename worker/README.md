@@ -138,8 +138,9 @@ synthetic source. From the repository root, run:
 node worker/tools/native-hevc-acceptance.mjs --candidate-host host/target/release/bubbleplay-host.exe
 ```
 
-The default run performs ten WSS/native transport cycles with native monitor
-switches, a 600-second native soak, and 60 seconds of cleanup/idle sampling.
+The default run performs ten complete WSS-to-native-to-WSS round trips, each
+including native monitor switching away and back, then a fresh 600-second
+native soak and 60 seconds of cleanup/idle sampling.
 It checks the negotiated HEVC codec, current monitor selection, fresh video-frame
 callbacks, and uninterrupted frame progression. It does not measure native
 glass-to-glass latency; native playback is rejected by the source-barcode
