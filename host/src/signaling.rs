@@ -27,9 +27,6 @@ use tungstenite::{client_tls_with_config, Error as WsError, Message, WebSocket};
 const SIGNALING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKER_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(15);
-/// WSS media protocols this host can serve. v4 (single socket) is preferred by
-/// production receivers; v2/v3 remain available for Stream Lab runs.
-pub const HOST_MEDIA_PROTOCOLS: [u8; 3] = [2, 3, 4];
 const BENCH_STATUS_MAX_BYTES: usize = 4_096;
 
 const V2_REDUNDANT_BENCH_FIELDS: [&str; 12] = [
@@ -46,10 +43,6 @@ const V2_REDUNDANT_BENCH_FIELDS: [&str; 12] = [
     "dirtyQpMap",
     "main10",
 ];
-
-fn is_zero_u8(value: &u8) -> bool {
-    *value == 0
-}
 
 /// Every host build injects set-1 scan codes and syncs text clipboard (the
 /// browser still disables clipboard on the secure desktop).
@@ -111,8 +104,6 @@ pub struct BenchStatusEffective {
     pub fps: u16,
     pub bitrate_bps: u32,
     pub gop_seconds: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wss_topology: Option<WssTopologyWire>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hybrid_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -436,14 +427,6 @@ pub struct BenchHybridActivity {
     pub sidecar_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WssTopologyWire {
-    pub lane_count: u8,
-    pub data_shards: u8,
-    pub parity_shards: u8,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum SignalMsg {
@@ -633,16 +616,6 @@ pub enum SignalMsg {
         secure_desktop: bool,
         #[serde(rename = "secureText")]
         secure_text: bool,
-        #[serde(
-            rename = "mediaProtocols",
-            default,
-            skip_serializing_if = "Vec::is_empty"
-        )]
-        media_protocols: Vec<u8>,
-        #[serde(rename = "maxWssLanes", default, skip_serializing_if = "is_zero_u8")]
-        max_wss_lanes: u8,
-        #[serde(rename = "wssFec", default, skip_serializing_if = "Vec::is_empty")]
-        wss_fec: Vec<String>,
     },
     #[serde(rename = "monitor-list")]
     MonitorList {
@@ -709,8 +682,6 @@ pub enum SignalMsg {
         #[serde(default)]
         quality: Option<String>,
         #[serde(default)]
-        adaptive: Option<bool>,
-        #[serde(default)]
         revision: Option<u32>,
         #[serde(default)]
         enabled: Option<bool>,
@@ -724,68 +695,6 @@ pub enum SignalMsg {
         height_q16: Option<u16>,
         #[serde(default)]
         monitor: Option<String>,
-        #[serde(default)]
-        topology: Option<WssTopologyWire>,
-    },
-    #[serde(rename = "media-ack")]
-    MediaAck {
-        generation: u32,
-        gop: u32,
-        sequence: u32,
-    },
-    #[serde(rename = "media-ack-v2")]
-    MediaAckV2 {
-        generation: u32,
-        lanes: [u32; 4],
-        reconstructed: u32,
-        presented: u32,
-        #[serde(rename = "recoveredFrames")]
-        recovered_frames: u64,
-        #[serde(rename = "expiredFrames")]
-        expired_frames: u64,
-        #[serde(rename = "decoderDrops")]
-        decoder_drops: u64,
-        #[serde(rename = "dependencyLosses", default)]
-        dependency_losses: u64,
-        #[serde(rename = "deadlineMs", default)]
-        deadline_ms: u32,
-        #[serde(rename = "reassemblyP95Ms", default)]
-        reassembly_p95_ms: u32,
-        #[serde(rename = "recoveryState", default)]
-        recovery_state: Option<String>,
-    },
-    #[serde(rename = "media-ack-v3")]
-    MediaAckV3 {
-        generation: u32,
-        topology: WssTopologyWire,
-        lanes: Vec<u32>,
-        #[serde(rename = "completionMissingByLane", default)]
-        completion_missing_by_lane: Vec<u32>,
-        reconstructed: u32,
-        presented: u32,
-        #[serde(rename = "recoveredFrames")]
-        recovered_frames: u64,
-        #[serde(rename = "expiredFrames")]
-        expired_frames: u64,
-        #[serde(rename = "decoderDrops")]
-        decoder_drops: u64,
-        #[serde(rename = "dependencyLosses", default)]
-        dependency_losses: u64,
-        #[serde(rename = "deadlineMs", default)]
-        deadline_ms: u32,
-        #[serde(rename = "reassemblyP95Ms", default)]
-        reassembly_p95_ms: u32,
-        #[serde(rename = "recoveryState", default)]
-        recovery_state: Option<String>,
-    },
-    #[serde(rename = "media-topology")]
-    MediaTopology {
-        protocol: u8,
-        epoch: String,
-        status: String,
-        topology: WssTopologyWire,
-        #[serde(default)]
-        reason: Option<String>,
     },
     #[serde(rename = "peer-left")]
     PeerLeft,
@@ -869,7 +778,6 @@ pub enum SignalEvent {
         protocol: Option<u8>,
         epoch: Option<String>,
         quality: Option<String>,
-        adaptive: Option<bool>,
         revision: Option<u32>,
         enabled: Option<bool>,
         x_q16: Option<u16>,
@@ -877,7 +785,6 @@ pub enum SignalEvent {
         width_q16: Option<u16>,
         height_q16: Option<u16>,
         monitor: Option<String>,
-        topology: Option<WssTopologyWire>,
     },
     MediaView {
         state: String,
@@ -890,46 +797,6 @@ pub enum SignalEvent {
         source_width: u32,
         source_height: u32,
         reason: String,
-    },
-    MediaAck {
-        generation: u32,
-        gop: u32,
-        sequence: u32,
-    },
-    MediaAckV2 {
-        generation: u32,
-        lanes: [u32; 4],
-        reconstructed: u32,
-        presented: u32,
-        recovered_frames: u64,
-        expired_frames: u64,
-        decoder_drops: u64,
-        dependency_losses: u64,
-        deadline_ms: u32,
-        reassembly_p95_ms: u32,
-        recovery_state: Option<String>,
-    },
-    MediaAckV3 {
-        generation: u32,
-        topology: WssTopologyWire,
-        lanes: Vec<u32>,
-        completion_missing_by_lane: Vec<u32>,
-        reconstructed: u32,
-        presented: u32,
-        recovered_frames: u64,
-        expired_frames: u64,
-        decoder_drops: u64,
-        dependency_losses: u64,
-        deadline_ms: u32,
-        reassembly_p95_ms: u32,
-        recovery_state: Option<String>,
-    },
-    MediaTopology {
-        protocol: u8,
-        epoch: String,
-        status: String,
-        topology: WssTopologyWire,
-        reason: Option<String>,
     },
     FirstFrame {
         protocol: u8,
@@ -1145,7 +1012,6 @@ impl Signaling {
                             protocol,
                             epoch,
                             quality,
-                            adaptive,
                             revision,
                             enabled,
                             x_q16,
@@ -1153,7 +1019,6 @@ impl Signaling {
                             width_q16,
                             height_q16,
                             monitor,
-                            topology,
                         } => {
                             events.push(SignalEvent::MediaControl {
                                 action,
@@ -1164,7 +1029,6 @@ impl Signaling {
                                 protocol,
                                 epoch,
                                 quality,
-                                adaptive,
                                 revision,
                                 enabled,
                                 x_q16,
@@ -1172,7 +1036,6 @@ impl Signaling {
                                 width_q16,
                                 height_q16,
                                 monitor,
-                                topology,
                             });
                         }
                         SignalMsg::MediaView {
@@ -1200,88 +1063,6 @@ impl Signaling {
                                 reason,
                             });
                         }
-                        SignalMsg::MediaAck {
-                            generation,
-                            gop,
-                            sequence,
-                        } => {
-                            events.push(SignalEvent::MediaAck {
-                                generation,
-                                gop,
-                                sequence,
-                            });
-                        }
-                        SignalMsg::MediaAckV2 {
-                            generation,
-                            lanes,
-                            reconstructed,
-                            presented,
-                            recovered_frames,
-                            expired_frames,
-                            decoder_drops,
-                            dependency_losses,
-                            deadline_ms,
-                            reassembly_p95_ms,
-                            recovery_state,
-                        } => {
-                            events.push(SignalEvent::MediaAckV2 {
-                                generation,
-                                lanes,
-                                reconstructed,
-                                presented,
-                                recovered_frames,
-                                expired_frames,
-                                decoder_drops,
-                                dependency_losses,
-                                deadline_ms,
-                                reassembly_p95_ms,
-                                recovery_state,
-                            });
-                        }
-                        SignalMsg::MediaAckV3 {
-                            generation,
-                            topology,
-                            lanes,
-                            completion_missing_by_lane,
-                            reconstructed,
-                            presented,
-                            recovered_frames,
-                            expired_frames,
-                            decoder_drops,
-                            dependency_losses,
-                            deadline_ms,
-                            reassembly_p95_ms,
-                            recovery_state,
-                        } => {
-                            events.push(SignalEvent::MediaAckV3 {
-                                generation,
-                                topology,
-                                lanes,
-                                completion_missing_by_lane,
-                                reconstructed,
-                                presented,
-                                recovered_frames,
-                                expired_frames,
-                                decoder_drops,
-                                dependency_losses,
-                                deadline_ms,
-                                reassembly_p95_ms,
-                                recovery_state,
-                            });
-                        }
-                        SignalMsg::MediaTopology {
-                            protocol,
-                            epoch,
-                            status,
-                            topology,
-                            reason,
-                        } => events.push(SignalEvent::MediaTopology {
-                            protocol,
-                            epoch,
-                            status,
-                            topology,
-                            reason,
-                        }),
                         SignalMsg::FirstFrame {
                             protocol,
                             phase,
@@ -1438,7 +1219,6 @@ impl Signaling {
         fps: u16,
         bitrate_bps: u32,
         gop_seconds: u8,
-        wss_topology: Option<WssTopologyWire>,
         preset: &str,
         tuning: &str,
         multipass: &str,
@@ -1504,7 +1284,6 @@ impl Signaling {
                 fps,
                 bitrate_bps,
                 gop_seconds,
-                wss_topology,
                 hybrid_mode: (protocol == 2).then(|| hybrid_mode.to_owned()),
                 hybrid_cache_mode: (protocol == 2).then(|| hybrid_cache_mode.to_owned()),
                 encoder: BenchStatusEncoder {
@@ -1681,9 +1460,6 @@ impl Signaling {
             cold_boot,
             secure_desktop,
             secure_text,
-            media_protocols: HOST_MEDIA_PROTOCOLS.to_vec(),
-            max_wss_lanes: 16,
-            wss_fec: vec!["none".into(), "xor-1".into(), "rs-2".into()],
         };
         if self
             .ws
@@ -1747,31 +1523,6 @@ impl Signaling {
         let msg = SignalMsg::MonitorError {
             selector: selector.into(),
             reason: reason.into(),
-        };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
-    }
-
-    pub fn send_media_topology(
-        &mut self,
-        epoch: &str,
-        status: &str,
-        topology: WssTopologyWire,
-        reason: Option<&str>,
-    ) {
-        let msg = SignalMsg::MediaTopology {
-            protocol: 3,
-            epoch: epoch.into(),
-            status: status.into(),
-            topology,
-            reason: reason.map(str::to_owned),
         };
         if self
             .ws
@@ -2089,8 +1840,8 @@ mod tests {
         bench_status_wire, keepalive_expired, signaling_request,
         signaling_request_with_worker_version, worker_version_changed, worker_version_probe_url,
         BenchEncodeStages, BenchHybridActivity, BenchRoiActivity, BenchStageTiming,
-        BenchStatusEffective, BenchStatusEncoder, SignalMsg, WssTopologyWire,
-        BENCH_STATUS_MAX_BYTES, KEEPALIVE_TIMEOUT, V2_REDUNDANT_BENCH_FIELDS,
+        BenchStatusEffective, BenchStatusEncoder, SignalMsg, BENCH_STATUS_MAX_BYTES,
+        KEEPALIVE_TIMEOUT, V2_REDUNDANT_BENCH_FIELDS,
     };
     use std::time::{Duration, Instant};
 
@@ -2219,7 +1970,6 @@ mod tests {
                 fps: 30,
                 bitrate_bps: 4_000_000,
                 gop_seconds: 2,
-                wss_topology: None,
                 hybrid_mode: None,
                 hybrid_cache_mode: None,
                 encoder: BenchStatusEncoder {
@@ -2344,11 +2094,6 @@ mod tests {
                 fps: 30,
                 bitrate_bps: 6_000_000,
                 gop_seconds: 2,
-                wss_topology: Some(WssTopologyWire {
-                    lane_count: 16,
-                    data_shards: 15,
-                    parity_shards: 1,
-                }),
                 hybrid_mode: Some("off".into()),
                 hybrid_cache_mode: Some("suppress-reactivate".into()),
                 encoder: BenchStatusEncoder {
@@ -2573,11 +2318,6 @@ mod tests {
                 fps: 30,
                 bitrate_bps: 6_000_000,
                 gop_seconds: 2,
-                wss_topology: Some(WssTopologyWire {
-                    lane_count: 16,
-                    data_shards: 15,
-                    parity_shards: 1,
-                }),
                 hybrid_mode: Some("off".into()),
                 hybrid_cache_mode: Some("suppress-reactivate".into()),
                 encoder: BenchStatusEncoder {
@@ -2692,11 +2432,6 @@ mod tests {
                 fps: 30,
                 bitrate_bps: 6_000_000,
                 gop_seconds: 2,
-                wss_topology: Some(WssTopologyWire {
-                    lane_count: 16,
-                    data_shards: 15,
-                    parity_shards: 1,
-                }),
                 hybrid_mode: Some("png-quiescent-detail".into()),
                 hybrid_cache_mode: Some("suppress-reactivate".into()),
                 encoder: BenchStatusEncoder {
@@ -2931,22 +2666,11 @@ mod tests {
     #[test]
     fn parses_wss_media_control_and_ack_messages() {
         let start: SignalMsg = serde_json::from_str(
-            r#"{"type":"media-control","action":"start","codec":"hevc","quality":"high","adaptive":false}"#,
+            r#"{"type":"media-control","action":"start","codec":"hevc","quality":"high","protocol":4}"#,
         ).unwrap();
         assert!(matches!(start, SignalMsg::MediaControl {
-            action, codec: Some(codec), quality: Some(quality), adaptive: Some(false), ..
+            action, codec: Some(codec), quality: Some(quality), protocol: Some(4), ..
         } if action == "start" && codec == "hevc" && quality == "high"));
-        let ack: SignalMsg =
-            serde_json::from_str(r#"{"type":"media-ack","generation":3,"gop":4,"sequence":5}"#)
-                .unwrap();
-        assert!(matches!(
-            ack,
-            SignalMsg::MediaAck {
-                generation: 3,
-                gop: 4,
-                sequence: 5
-            }
-        ));
         let quality_keyframe: SignalMsg = serde_json::from_str(
             r#"{"type":"media-control","action":"keyframe","reason":"stream-lab-quality-capture","requestId":"quality-0123456789abcdef"}"#,
         )
@@ -3044,52 +2768,6 @@ mod tests {
         assert!(
             matches!(control, SignalMsg::MediaControl { stream_mode: Some(mode), .. } if mode == "game")
         );
-        let ack: SignalMsg = serde_json::from_str(
-            r#"{"type":"media-ack-v2","generation":3,"lanes":[1,2,3,4],"reconstructed":4,"presented":3,"recoveredFrames":2,"expiredFrames":1,"decoderDrops":0,"dependencyLosses":1,"deadlineMs":300,"reassemblyP95Ms":180,"recoveryState":"healthy"}"#,
-        ).unwrap();
-        assert!(
-            matches!(ack, SignalMsg::MediaAckV2 { dependency_losses: 1, deadline_ms: 300, recovery_state: Some(state), .. } if state == "healthy")
-        );
-    }
-
-    #[test]
-    fn parses_protocol_v3_topology_control_dynamic_ack_and_acceptance() {
-        let control: SignalMsg = serde_json::from_str(
-            r#"{"type":"media-control","action":"start","protocol":3,"epoch":"0123456789abcdef0123456789abcdef","topology":{"laneCount":9,"dataShards":8,"parityShards":1}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            control,
-            SignalMsg::MediaControl {
-                protocol: Some(3),
-                topology: Some(WssTopologyWire {
-                    lane_count: 9,
-                    data_shards: 8,
-                    parity_shards: 1
-                }),
-                ..
-            }
-        ));
-
-        let ack: SignalMsg = serde_json::from_str(
-            r#"{"type":"media-ack-v3","generation":7,"topology":{"laneCount":5,"dataShards":4,"parityShards":1},"lanes":[10,11,12,13,14],"reconstructed":15,"presented":14,"recoveredFrames":2,"expiredFrames":1,"decoderDrops":0,"dependencyLosses":1,"deadlineMs":180,"reassemblyP95Ms":90,"recoveryState":"healthy","completionMissingByLane":[1,7,0,2,14]}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            ack,
-            SignalMsg::MediaAckV3 { generation: 7, lanes, completion_missing_by_lane,
-                topology: WssTopologyWire { lane_count: 5, .. }, .. }
-                if lanes == vec![10, 11, 12, 13, 14] &&
-                    completion_missing_by_lane == vec![1, 7, 0, 2, 14]
-        ));
-
-        let accepted: SignalMsg = serde_json::from_str(
-            r#"{"type":"media-topology","protocol":3,"epoch":"0123456789abcdef0123456789abcdef","status":"accepted","topology":{"laneCount":9,"dataShards":8,"parityShards":1}}"#,
-        )
-        .unwrap();
-        assert!(
-            matches!(accepted, SignalMsg::MediaTopology { status, .. } if status == "accepted")
-        );
     }
 
     #[test]
@@ -3124,23 +2802,18 @@ mod tests {
     }
 
     #[test]
-    fn host_capabilities_advertise_bounded_v3_and_single_socket_v4_support() {
+    fn host_capabilities_carry_no_media_protocol_negotiation() {
         let message = SignalMsg::HostCapabilities {
             service_mode: true,
             cold_boot: true,
             secure_desktop: true,
             secure_text: true,
-            media_protocols: super::HOST_MEDIA_PROTOCOLS.to_vec(),
-            max_wss_lanes: 16,
-            wss_fec: vec!["none".into(), "xor-1".into(), "rs-2".into()],
         };
         let encoded = serde_json::to_value(message).unwrap();
-        assert_eq!(encoded["mediaProtocols"], serde_json::json!([2, 3, 4]));
-        assert_eq!(encoded["maxWssLanes"], 16);
-        assert_eq!(
-            encoded["wssFec"],
-            serde_json::json!(["none", "xor-1", "rs-2"])
-        );
+        let object = encoded.as_object().unwrap();
+        for legacy in ["mediaProtocols", "maxWssLanes", "wssFec"] {
+            assert!(!object.contains_key(legacy), "{legacy} must not be sent");
+        }
     }
 
     #[test]

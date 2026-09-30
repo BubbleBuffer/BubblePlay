@@ -37,7 +37,7 @@ use bubbleplay_host::transport;
 use bubbleplay_host::vdd;
 use bubbleplay_host::wss_media;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -86,7 +86,7 @@ use rtc::RtcAction;
 use scale::{ScaleOutput, Scaler};
 use signaling::{
     BenchEncodeStages, BenchHybridActivity, BenchRoiActivity, BenchStageTiming, SignalEvent,
-    Signaling, WssTopologyWire,
+    Signaling,
 };
 use temporal_diff::{
     DamageCoverageAudit, DeferredReadbackActivity, QuiescentValidationStatus, TemporalDiffAnalyzer,
@@ -94,9 +94,8 @@ use temporal_diff::{
 };
 use transport::{AccessUnit, TransportCommand, TransportEvent, TransportPump};
 use wss_media::{
-    AccessUnitMeta as WssAccessUnitMeta, LabRoiReason, LabRoiTrace, MediaCodec,
-    ReserveOutcome as WssReserveOutcome, SubmitOutcome as WssSubmitOutcome, WssMediaEgress,
-    WssTopology,
+    AccessUnitMeta as WssAccessUnitMeta, MediaCodec, ReserveOutcome as WssReserveOutcome,
+    SubmitOutcome as WssSubmitOutcome, WssMediaEgress,
 };
 
 const STUN_SERVER: &str = "stun.l.google.com:19302";
@@ -129,13 +128,9 @@ fn wss_gop_interval(mode: StreamMode) -> Duration {
     }
 }
 
-fn wss_is_v4(egress: Option<&WssMediaEgress>) -> bool {
-    egress.is_some_and(WssMediaEgress::is_v4)
-}
-
 /// Periodic IDR interval for the WSS producer; v4 has none.
 fn wss_periodic_idr_interval(mode: StreamMode, egress: Option<&WssMediaEgress>) -> Duration {
-    if wss_is_v4(egress) {
+    if egress.is_some() {
         WSS_V4_PRODUCER_IDR_PARK
     } else {
         wss_gop_interval(mode)
@@ -146,25 +141,6 @@ fn wss_v4_refine_bitrate(current_bps: u32) -> u32 {
     current_bps
         .saturating_mul(WSS_V4_REFINE_BITRATE_FACTOR)
         .min(MAX_BITRATE_BPS)
-}
-
-fn cached_wss_replay_payload(
-    cached: &CachedIdr,
-    hybrid: bool,
-    generation: u32,
-    sequence: u32,
-    crop_revision: u32,
-) -> Result<Vec<u8>> {
-    if !hybrid {
-        return Ok(cached.data.clone());
-    }
-    encode_hybrid_frame_v1(&HybridFrame {
-        generation,
-        sequence,
-        crop_revision,
-        access_unit: cached.data.clone(),
-        operations: vec![HybridTileOperation::Clear],
-    })
 }
 
 #[derive(Debug)]
@@ -562,7 +538,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let host_addr = match pick_host_ip() {
         Ok(ip) => Some(SocketAddr::new(ip, socket.local_addr()?.port())),
         Err(error) => {
-            warn!(?error, "local host IP discovery failed; RTC host candidates disabled, WSS unaffected");
+            warn!(
+                ?error,
+                "local host IP discovery failed; RTC host candidates disabled, WSS unaffected"
+            );
             None
         }
     };
@@ -601,13 +580,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut wss_media: Option<WssMediaEgress> = None;
     let mut active_wss_epoch: Option<String> = None;
     let mut media_generation = 1u32;
-    let mut media_gop = 0u32;
     let mut media_sequence = 0u32;
     let media_clock_start = Instant::now();
-    let mut wss_ack_rate = WssAckRate::new(Instant::now());
-    let mut wss_quality = WssQualityController::new(Instant::now());
-    let mut wss_recovery_snapshot_gate = WssRecoverySnapshotGate::default();
-    let mut wss_adaptive = false;
     let mut scaler: Option<Scaler> = None;
     let preset = if args.preset == "p1" {
         Preset::P1
@@ -832,11 +806,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     profile.fps,
                     profile.bitrate_bps,
                     profile.gop_seconds,
-                    profile.wss_topology.map(|topology| WssTopologyWire {
-                        lane_count: topology.lane_count,
-                        data_shards: topology.data_shards,
-                        parity_shards: topology.parity_shards,
-                    }),
                     match profile.encoder.preset {
                         BenchmarkPreset::P1 => "p1",
                         BenchmarkPreset::P2 => "p2",
@@ -1079,7 +1048,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         capture_available = true;
                         pending_first_frame = None;
                         media_generation = media_generation.wrapping_add(1).max(1);
-                        media_gop = 0;
                         media_sequence = 0;
                         latest_idr = None;
                         pending_transition_idr = None;
@@ -1526,7 +1494,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     protocol,
                     epoch,
                     quality: requested_quality,
-                    adaptive,
                     revision,
                     enabled,
                     x_q16,
@@ -1534,7 +1501,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     width_q16,
                     height_q16,
                     monitor,
-                    topology,
                 } => {
                     if action == "monitors" {
                         if !valid_monitor_refresh_control(
@@ -1545,7 +1511,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             warn!(
                                 ?protocol,
                                 ?epoch,
-                                "monitor refresh missing current v2 epoch"
+                                "monitor refresh missing current v4 epoch"
                             );
                             continue;
                         }
@@ -1560,10 +1526,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             stream_mode = next_mode;
                             quality.set_mode(next_mode);
                             let staged = profiles.set_stream_mode(next_mode);
-                            wss_quality = WssQualityController::new(Instant::now());
-                            if let Some(egress) = wss_media.as_ref() {
-                                egress.set_stream_mode(next_mode);
-                            }
                             if let Some(enc) = encoder.as_mut() {
                                 let transport = if wss_media.is_some() {
                                     BenchmarkTransport::Wss
@@ -1610,7 +1572,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             "monitor-switch",
                         );
                         media_generation = media_generation.wrapping_add(1).max(1);
-                        media_gop = 0;
                         media_sequence = 0;
                         latest_idr = None;
                         pending_transition_idr = None;
@@ -1668,7 +1629,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                     if action == "start" {
                         if let Some(requested_epoch) =
-                            epoch.as_deref().filter(|value| valid_v2_epoch(value))
+                            epoch.as_deref().filter(|value| valid_media_epoch(value))
                         {
                             if should_replace_wss_media_session(
                                 wss_media.is_some(),
@@ -1685,16 +1646,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 }
                                 active_wss_epoch = None;
                                 media_generation = media_generation.wrapping_add(1).max(1);
-                                media_gop = 0;
                                 media_sequence = 0;
                                 latest_idr = None;
                                 pending_first_frame = None;
                                 pending_transition_idr = None;
                                 pending_wss_idr = None;
                                 pending_viewport_idr = None;
-                                wss_ack_rate = WssAckRate::new(Instant::now());
-                                wss_quality = WssQualityController::new(Instant::now());
-                                wss_recovery_snapshot_gate = WssRecoverySnapshotGate::default();
                                 next_admission = Instant::now();
                                 next_idr = Instant::now();
                             }
@@ -1705,44 +1662,28 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             warn!("WSS media requested but --host-gate-token is missing");
                             continue;
                         };
-                        let Some(epoch) = epoch.as_deref().filter(|value| valid_v2_epoch(value))
+                        let Some(epoch) = epoch.as_deref().filter(|value| valid_media_epoch(value))
                         else {
                             warn!(?protocol, "WSS media request missing session epoch");
                             continue;
                         };
-                        let connect_result = match protocol {
-                            Some(2) if topology.is_none() => {
-                                WssMediaEgress::connect(&worker, bearer, epoch)
-                            }
-                            Some(3) => topology
-                                .ok_or_else(|| anyhow::anyhow!("protocol v3 requires topology"))
-                                .and_then(|wire| {
-                                    WssTopology::new(
-                                        wire.lane_count as usize,
-                                        wire.data_shards as usize,
-                                        wire.parity_shards as usize,
-                                    )
-                                    .and_then(|topology| {
-                                        WssMediaEgress::connect_v3(&worker, bearer, epoch, topology)
-                                    })
-                                }),
-                            Some(4) if topology.is_none() => {
-                                // The preset is the controller's ceiling; the
-                                // delay controller only ever lowers from it.
-                                let preset = wss_preset(
-                                    requested_quality.as_deref(),
-                                    args.max_bitrate_bps,
-                                    stream_mode,
-                                );
-                                WssMediaEgress::connect_v4(
-                                    &worker,
-                                    bearer,
-                                    epoch,
-                                    u64::from(preset.target_bps),
-                                    u64::from(preset.target_bps),
-                                )
-                            }
-                            _ => Err(anyhow::anyhow!("unsupported WSS media protocol")),
+                        let connect_result = if protocol == Some(4) {
+                            // The preset is the controller's ceiling; the
+                            // delay controller only ever lowers from it.
+                            let preset = wss_preset(
+                                requested_quality.as_deref(),
+                                args.max_bitrate_bps,
+                                stream_mode,
+                            );
+                            WssMediaEgress::connect(
+                                &worker,
+                                bearer,
+                                epoch,
+                                u64::from(preset.target_bps),
+                                u64::from(preset.target_bps),
+                            )
+                        } else {
+                            Err(anyhow::anyhow!("unsupported WSS media protocol"))
                         };
                         match connect_result {
                             Ok(egress) => {
@@ -1750,21 +1691,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     remote_input_ready = false;
                                     capture.release_input();
                                 }
-                                egress.set_stream_mode(stream_mode);
-                                let lane_health = egress.health();
-                                let healthy_lanes =
-                                    lane_health.iter().filter(|lane| lane.healthy).count();
-                                info!(codec = active_codec.name(), healthy_lanes, lane_health = ?lane_health, "WSS media egress connected");
+                                info!(codec = active_codec.name(), "WSS media egress connected");
                                 wss_media = Some(egress);
                                 active_wss_epoch = Some(epoch.to_owned());
-                                if protocol == Some(3) {
-                                    signaling.send_media_topology(
-                                        epoch,
-                                        "accepted",
-                                        topology.expect("v3 topology validated above"),
-                                        None,
-                                    );
-                                }
                                 // A browser can reconnect after a previous
                                 // secure-desktop transition.  Announce the
                                 // current capture state at every media start
@@ -1794,7 +1723,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 if let Ok(monitors) = capture.monitors() {
                                     signaling.send_monitor_list(monitors);
                                 }
-                                wss_adaptive = adaptive.unwrap_or(false);
                                 let adjustment = wss_preset(
                                     requested_quality.as_deref(),
                                     args.max_bitrate_bps,
@@ -1817,7 +1745,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     &mut signaling,
                                 );
                                 if let Some(egress) = wss_media.as_ref() {
-                                    egress.set_v4_bitrate_bounds(
+                                    egress.set_bitrate_bounds(
                                         u64::from(encoder_bitrate_bps),
                                         u64::from(adjustment.target_bps),
                                     );
@@ -1841,24 +1769,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 latest_idr = None;
                             }
                             Err(error) => {
-                                if protocol == Some(3) {
-                                    if let Some(topology) = topology {
-                                        signaling.send_media_topology(
-                                            epoch,
-                                            "rejected",
-                                            topology,
-                                            Some("host-connect-failed"),
-                                        );
-                                    }
-                                }
                                 warn!(?error, "WSS media egress connection failed");
                             }
                         }
                     }
                     if action == "quality" {
-                        if wss_media.is_some() {
-                            wss_adaptive = adaptive.unwrap_or(false);
-                        }
                         let adjustment = wss_preset(
                             requested_quality.as_deref(),
                             args.max_bitrate_bps,
@@ -1886,7 +1801,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             &mut signaling,
                         );
                         if let Some(egress) = wss_media.as_ref() {
-                            egress.set_v4_bitrate_bounds(
+                            egress.set_bitrate_bounds(
                                 u64::from(encoder_bitrate_bps),
                                 u64::from(adjustment.target_bps),
                             );
@@ -1995,7 +1910,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             "WSS viewport prepared"
                         );
                         media_generation = media_generation.wrapping_add(1).max(1);
-                        media_gop = 0;
                         media_sequence = 0;
                         pending_wss_idr = None;
                         pending_viewport_idr = None;
@@ -2018,21 +1932,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             reason.as_deref().unwrap_or("sharp-viewport"),
                         );
                     }
-                    if valid_stripe_reconnect_recovery_control(
-                        &action,
-                        reason.as_deref(),
-                        protocol,
-                        epoch.as_deref(),
-                        active_wss_epoch.as_deref(),
-                    ) {
-                        if let Some(egress) = wss_media.as_ref() {
-                            let rearmed_lanes = egress.rearm_awaiting_recovery_lanes();
-                            info!(
-                                rearmed_lanes,
-                                "WSS stripe reconnect rearmed lanes awaiting an unreachable recovery ACK"
-                            );
-                        }
-                    }
                     if matches!(action.as_str(), "start" | "keyframe") {
                         if let Some(requested) = requested {
                             if requested != active_codec
@@ -2046,7 +1945,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 );
                                 active_codec = requested;
                                 media_generation = media_generation.wrapping_add(1).max(1);
-                                media_gop = 0;
                                 media_sequence = 0;
                                 encoder = None;
                                 latest_idr = None;
@@ -2112,310 +2010,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         next_idr = Instant::now();
                     }
                 }
-                SignalEvent::MediaAck {
-                    generation,
-                    gop,
-                    sequence,
-                } => {
-                    if let Some(egress) = wss_media.as_ref() {
-                        // ACKs identify GOP/frame globally. The egress tracks
-                        // the owning stripe and resolves it without trusting
-                        // browser-provided routing metadata.
-                        egress.on_frame_ack(generation, gop, sequence);
-                    }
-                    if args.fixed_bitrate_bps.is_none() {
-                        if let Some(delivery_bps) =
-                            wss_ack_rate.acknowledged(Instant::now(), generation, sequence)
-                        {
-                            let encoder_target_bps = quality.target();
-                            let capacity_bps =
-                                wss_capacity_observation(delivery_bps, encoder_target_bps);
-                            let unhealthy_lanes = wss_media
-                                .as_ref()
-                                .map(|egress| {
-                                    egress
-                                        .health()
-                                        .into_iter()
-                                        .filter(|lane| !lane.healthy)
-                                        .count()
-                                })
-                                .unwrap_or_default();
-                            info!(
-                                delivery_bps,
-                                encoder_target_bps,
-                                capacity_bps,
-                                pending_frames = wss_ack_rate.pending.len(),
-                                unhealthy_lanes,
-                                "WSS delivery window"
-                            );
-                        }
-                    }
-                }
-                SignalEvent::MediaAckV2 {
-                    generation,
-                    lanes,
-                    reconstructed,
-                    presented,
-                    recovered_frames,
-                    expired_frames,
-                    decoder_drops,
-                    dependency_losses,
-                    deadline_ms,
-                    reassembly_p95_ms,
-                    recovery_state,
-                } => {
-                    if let Some(egress) = wss_media.as_ref() {
-                        egress.on_v2_ack(generation, lanes);
-                    }
-                    if pending_wss_idr.as_ref().is_some_and(|pending| {
-                        pending.generation == generation
-                            && sequence_reached(reconstructed, pending.sequence)
-                    }) {
-                        let pending = pending_wss_idr.take().expect("checked above");
-                        if is_fallback_reason(pending.reason) {
-                            profiles.pinned = true;
-                        }
-                        profiles.commit_mode(pending.mode, pending.reason);
-                        if let Some((mode, reason)) = profiles.pending_announcement() {
-                            signaling.send_quality(
-                                mode.label,
-                                mode.width,
-                                mode.height,
-                                mode.fps,
-                                encoder
-                                    .as_ref()
-                                    .map(Nvenc::bitrate)
-                                    .unwrap_or(quality.target()),
-                                quality.bwe(),
-                                reason,
-                                stream_mode.label(),
-                            );
-                            profiles.on_idr_admitted();
-                        }
-                    }
-                    if pending_viewport_idr.as_ref().is_some_and(|pending| {
-                        pending.generation == generation
-                            && sequence_reached(reconstructed, pending.sequence)
-                    }) {
-                        if let Some(pending) = pending_viewport_idr.take() {
-                            let state = if pending.crop.x == 0
-                                && pending.crop.y == 0
-                                && pending.crop.width == capture.width()
-                                && pending.crop.height == capture.height()
-                            {
-                                "full"
-                            } else {
-                                "active"
-                            };
-                            signaling.send_media_view(
-                                state,
-                                pending.crop.revision,
-                                pending.generation,
-                                capture.width(),
-                                capture.height(),
-                                pending.crop.x,
-                                pending.crop.y,
-                                pending.crop.width,
-                                pending.crop.height,
-                                "viewport-active",
-                            );
-                            active_viewport = Some((pending.crop.revision, pending.generation));
-                            info!(
-                                revision = pending.crop.revision,
-                                generation = pending.generation,
-                                crop_x = pending.crop.x,
-                                crop_y = pending.crop.y,
-                                crop_width = pending.crop.width,
-                                crop_height = pending.crop.height,
-                                "WSS viewport activated after IDR"
-                            );
-                        }
-                    }
-                    if args.fixed_bitrate_bps.is_none() {
-                        if benchmark_lease.active().is_none_or(|profile| {
-                            !benchmark_mode_matches(profile.stream_mode, stream_mode)
-                        }) && wss_adaptive
-                            && pending_wss_idr.is_none()
-                        {
-                            let now = Instant::now();
-                            wss_quality.observe_preencode_skips(now, wss_preencode_skips_total);
-                            if let Some(adjustment) = wss_quality.sample(
-                                now,
-                                generation,
-                                &quality,
-                                &profiles,
-                                lanes,
-                                reconstructed,
-                                presented,
-                                recovered_frames,
-                                dependency_losses,
-                                decoder_drops,
-                            ) {
-                                let _ = apply_wss_adjustment(
-                                    &mut quality,
-                                    adjustment,
-                                    adjustment.target_bps,
-                                    &mut profiles,
-                                    &mut latest_idr,
-                                    &mut encoder,
-                                    &mut signaling,
-                                );
-                            }
-                        }
-                        if let Some(delivery_bps) =
-                            wss_ack_rate.acknowledged(Instant::now(), generation, reconstructed)
-                        {
-                            let encoder_target_bps = quality.target();
-                            let capacity_bps =
-                                wss_capacity_observation(delivery_bps, encoder_target_bps);
-                            let unhealthy_lanes = wss_media
-                                .as_ref()
-                                .map(|egress| {
-                                    egress
-                                        .health()
-                                        .into_iter()
-                                        .filter(|lane| !lane.healthy)
-                                        .count()
-                                })
-                                .unwrap_or_default();
-                            info!(
-                                delivery_bps,
-                                encoder_target_bps,
-                                capacity_bps,
-                                pending_frames = wss_ack_rate.pending.len(),
-                                unhealthy_lanes,
-                                presented,
-                                recovered_frames,
-                                expired_frames,
-                                dependency_losses,
-                                deadline_ms,
-                                reassembly_p95_ms,
-                                recovery_state = recovery_state.as_deref().unwrap_or("legacy"),
-                                decoder_drops,
-                                "WSS v2 delivery window"
-                            );
-                        }
-                    }
-                }
-                SignalEvent::MediaAckV3 {
-                    generation,
-                    topology,
-                    lanes,
-                    completion_missing_by_lane,
-                    reconstructed,
-                    presented,
-                    recovered_frames,
-                    expired_frames,
-                    decoder_drops,
-                    dependency_losses,
-                    deadline_ms,
-                    reassembly_p95_ms,
-                    recovery_state,
-                } => {
-                    let ack_topology = WssTopology::new(
-                        topology.lane_count as usize,
-                        topology.data_shards as usize,
-                        topology.parity_shards as usize,
-                    );
-                    let valid = wss_media.as_ref().is_some_and(|egress| {
-                        egress.protocol() == 3
-                            && ack_topology
-                                .as_ref()
-                                .is_ok_and(|value| *value == egress.topology())
-                    });
-                    if !valid {
-                        warn!(
-                            ?topology,
-                            lane_count = lanes.len(),
-                            "ignoring mismatched WSS v3 ACK"
-                        );
-                        continue;
-                    }
-                    if let Some(egress) = wss_media.as_ref() {
-                        if let Err(error) =
-                            egress.on_v3_ack(generation, &lanes, &completion_missing_by_lane)
-                        {
-                            warn!(?error, "ignoring invalid WSS v3 ACK lanes");
-                            continue;
-                        }
-                    }
-                    if pending_wss_idr.as_ref().is_some_and(|pending| {
-                        pending.generation == generation
-                            && sequence_reached(reconstructed, pending.sequence)
-                    }) {
-                        let pending = pending_wss_idr.take().expect("checked above");
-                        if is_fallback_reason(pending.reason) {
-                            profiles.pinned = true;
-                        }
-                        profiles.commit_mode(pending.mode, pending.reason);
-                        if let Some((mode, reason)) = profiles.pending_announcement() {
-                            signaling.send_quality(
-                                mode.label,
-                                mode.width,
-                                mode.height,
-                                mode.fps,
-                                encoder
-                                    .as_ref()
-                                    .map(Nvenc::bitrate)
-                                    .unwrap_or(quality.target()),
-                                quality.bwe(),
-                                reason,
-                                stream_mode.label(),
-                            );
-                            profiles.on_idr_admitted();
-                        }
-                    }
-                    if pending_viewport_idr.as_ref().is_some_and(|pending| {
-                        pending.generation == generation
-                            && sequence_reached(reconstructed, pending.sequence)
-                    }) {
-                        if let Some(pending) = pending_viewport_idr.take() {
-                            let state = if pending.crop.x == 0
-                                && pending.crop.y == 0
-                                && pending.crop.width == capture.width()
-                                && pending.crop.height == capture.height()
-                            {
-                                "full"
-                            } else {
-                                "active"
-                            };
-                            signaling.send_media_view(
-                                state,
-                                pending.crop.revision,
-                                pending.generation,
-                                capture.width(),
-                                capture.height(),
-                                pending.crop.x,
-                                pending.crop.y,
-                                pending.crop.width,
-                                pending.crop.height,
-                                "viewport-active",
-                            );
-                            active_viewport = Some((pending.crop.revision, pending.generation));
-                        }
-                    }
-                    if let Some(delivery_bps) =
-                        wss_ack_rate.acknowledged(Instant::now(), generation, reconstructed)
-                    {
-                        info!(
-                            delivery_bps,
-                            encoder_target_bps = quality.target(),
-                            lanes = lanes.len(),
-                            data_shards = topology.data_shards,
-                            parity_shards = topology.parity_shards,
-                            presented,
-                            recovered_frames,
-                            expired_frames,
-                            dependency_losses,
-                            deadline_ms,
-                            reassembly_p95_ms,
-                            recovery_state = recovery_state.as_deref().unwrap_or("unknown"),
-                            decoder_drops,
-                            "WSS v3 delivery window"
-                        );
-                    }
-                }
-                SignalEvent::MediaTopology { .. } => {}
                 _ => {}
             }
         }
@@ -2452,34 +2046,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         let media_ready = ice_connected || wss_media.is_some();
-        let wss_recovery_status = wss_media
-            .as_ref()
-            .map(WssMediaEgress::recovery_snapshot_status);
-        if wss_recovery_snapshot_gate.should_request(
-            now,
-            wss_recovery_status.is_some_and(|status| status.needs_idr),
-            wss_recovery_status.is_some_and(|status| status.awaiting_ack),
-            wss_gop_interval(stream_mode),
-        ) {
-            // Lane recovery can become necessary after the desktop has gone
-            // static. Invalidate any earlier-scene cache and explicitly wake
-            // the idle snapshot path; otherwise the producer never reaches
-            // WSS reservation and the lane cannot receive its recovery IDR.
-            latest_idr = None;
-            capture.request_idle_snapshot();
-            if let Some(enc) = encoder.as_mut() {
-                enc.force_idr();
-            }
-            next_idr = now;
-            info!(
-                retry_ms = wss_gop_interval(stream_mode).as_millis(),
-                "WSS lane recovery requested a fresh idle-desktop snapshot"
-            );
-        }
         let wss_v4_events = wss_media
             .as_ref()
-            .filter(|egress| egress.is_v4())
-            .map(WssMediaEgress::take_v4_events)
+            .map(WssMediaEgress::take_events)
             .unwrap_or_default();
         if let Some(reason) = wss_v4_events.keyframe.as_deref() {
             // The receiver lost (or never had) its reference: encode a fresh
@@ -2540,94 +2109,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
             }
         }
-        if wss_media.is_some()
-            && !wss_is_v4(wss_media.as_ref())
-            && replay.is_due(now, latest_idr.is_some())
-        {
-            if let Some(cached) = latest_idr.as_ref() {
-                let candidate_gop = media_gop.wrapping_add(1).max(1);
-                let candidate_sequence = next_media_sequence(media_sequence);
-                let hybrid_replay = benchmark_lease.active().is_some_and(|profile| {
-                    active_codec == VideoCodec::Hevc
-                        && benchmark_mode_matches(profile.stream_mode, stream_mode)
-                        && profile.transport == BenchmarkTransport::Wss
-                        && matches!(
-                            profile.hybrid_mode,
-                            BenchmarkHybridMode::PngStaticRoi
-                                | BenchmarkHybridMode::PngQuiescentDetail
-                                | BenchmarkHybridMode::HevcQuiescentTiles
-                        )
-                });
-                if benchmark_lease.active().is_some_and(|profile| {
-                    matches!(
-                        profile.hybrid_mode,
-                        BenchmarkHybridMode::PngQuiescentDetail
-                            | BenchmarkHybridMode::HevcQuiescentTiles
-                    )
-                }) {
-                    quiescent_tile_planner.mark_output_stale();
-                }
-                let replay_payload = match cached_wss_replay_payload(
-                    cached,
-                    hybrid_replay,
-                    media_generation,
-                    candidate_sequence,
-                    viewport_revision,
-                ) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        warn!(?error, "hybrid cached IDR replay envelope rejected");
-                        replay.on_not_admitted(now);
-                        continue 'session;
-                    }
-                };
-                let meta = WssAccessUnitMeta {
-                    codec: wss_codec(active_codec),
-                    generation: media_generation,
-                    gop: candidate_gop,
-                    sequence: candidate_sequence,
-                    timestamp90k: (media_clock_start.elapsed().as_secs_f64() * 90_000.0) as u32,
-                    key: true,
-                    lab_roi: None,
-                };
-                if let Some(egress) = wss_media.as_ref() {
-                    match egress.reserve(meta) {
-                        Ok(reservation) => {
-                            if matches!(
-                                reservation.submit(replay_payload),
-                                WssSubmitOutcome::Queued { .. }
-                            ) {
-                                media_gop = candidate_gop;
-                                commit_media_sequence(&mut media_sequence, candidate_sequence);
-                                if let Some(pending) = pending_first_frame.as_mut() {
-                                    let armed_generation = pending.generation;
-                                    if pending.admit_wss_access_unit(media_generation, true) {
-                                        signaling.send_first_frame(
-                                            "admitted",
-                                            &pending.request_id,
-                                            pending.generation,
-                                            Some("wss"),
-                                            pending.epoch.as_deref(),
-                                            Some(active_codec.name()),
-                                        );
-                                        info!(
-                                            armed_generation,
-                                            admitted_generation = pending.generation,
-                                            source = "cached-idr",
-                                            "first-frame WSS IDR admitted"
-                                        );
-                                    }
-                                }
-                                replay.on_replayed();
-                            } else {
-                                replay.on_not_admitted(now);
-                            }
-                        }
-                        Err(_) => replay.on_not_admitted(now),
-                    }
-                }
-            }
-        }
         if media_ready && replay.is_due(now, latest_idr.is_some()) {
             if let Some(cached) = latest_idr.as_ref() {
                 let expected = profiles
@@ -2657,7 +2138,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         // Reserve the RTC queue only when RTC is active. WSS owns a separately
-        // bounded negotiated lane set, so it is never gated by an unused RTC slot.
+        // bounded media socket, so it is never gated by an unused RTC slot.
         let rtc_reservation = if ice_connected && wss_media.is_none() {
             pump.reserve_access_unit()
         } else {
@@ -2697,11 +2178,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     let base_meta = WssAccessUnitMeta {
                         codec: wss_codec(active_codec),
                         generation: media_generation,
-                        gop: media_gop,
                         sequence: media_sequence.wrapping_add(1),
                         timestamp90k: (media_clock_start.elapsed().as_secs_f64() * 90_000.0) as u32,
                         key: force_idr,
-                        lab_roi: None,
                     };
                     match egress.reserve(base_meta) {
                         Ok(reservation) => wss_reservation = Some(reservation),
@@ -2869,7 +2348,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 next_admission = now + Duration::from_secs_f64(1.0 / (access.fps as f64).max(1.0));
                 if force_idr {
                     next_idr = now
-                        + if wss_is_v4(wss_media.as_ref()) {
+                        + if wss_media.is_some() {
                             WSS_V4_PRODUCER_IDR_PARK
                         } else {
                             effective_idr_interval(
@@ -2884,9 +2363,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         data: access.data.clone(),
                         mode,
                     });
-                    if wss_media.is_some() {
-                        media_gop = media_gop.wrapping_add(1).max(1);
-                    }
                 }
                 let id = permit_id;
                 if let Some(mut reservation) = wss_reservation {
@@ -2894,17 +2370,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     let meta = WssAccessUnitMeta {
                         codec: wss_codec(active_codec),
                         generation: media_generation,
-                        gop: media_gop,
                         sequence: media_sequence,
                         timestamp90k: access.timestamp_90khz as u32,
                         key: access.keyframe,
-                        lab_roi: None,
                     };
                     reservation.set_meta(meta);
                     let encoded_len = access.data.len();
                     if matches!(
                         reservation.submit(access.data.clone()),
-                        WssSubmitOutcome::Queued { .. }
+                        WssSubmitOutcome::Queued
                     ) {
                         if benchmark_profile.is_some() {
                             benchmark_wss_payload_bytes = benchmark_wss_payload_bytes
@@ -2914,7 +2388,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                         .map_or(0, |egress| egress.wire_payload_bytes(encoded_len)),
                                 );
                         }
-                        wss_ack_rate.submitted(media_generation, media_sequence, encoded_len);
                         if access.keyframe {
                             wss_idr_count = wss_idr_count.saturating_add(1);
                             if let Some(pending) = pending_first_frame.as_mut() {
@@ -3011,7 +2484,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     capture_available = true;
                     pending_first_frame = None;
                     media_generation = media_generation.wrapping_add(1).max(1);
-                    media_gop = 0;
                     media_sequence = 0;
                     latest_idr = None;
                     pending_transition_idr = None;
@@ -3033,12 +2505,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 // WSS v4 owns keyframes (start / request / 30 s safety), so its
                 // encoder runs without periodic IDRs. NVENC cannot change the
                 // GOP in place: recreate the session when the mode differs.
-                let want_infinite_gop =
-                    wss_is_v4(wss_media.as_ref()) && active_benchmark_profile.is_none();
-                if encoder.as_ref().is_some_and(|e| {
-                    e.is_for_device(dev) && e.infinite_gop() != want_infinite_gop
-                }) {
-                    info!(infinite_gop = want_infinite_gop, "recreating NVENC for the WSS v4 GOP mode");
+                let want_infinite_gop = wss_media.is_some() && active_benchmark_profile.is_none();
+                if encoder
+                    .as_ref()
+                    .is_some_and(|e| e.is_for_device(dev) && e.infinite_gop() != want_infinite_gop)
+                {
+                    info!(
+                        infinite_gop = want_infinite_gop,
+                        "recreating NVENC for the WSS v4 GOP mode"
+                    );
                     encoder = None;
                     latest_idr = None;
                     pending_transition_idr = None;
@@ -3084,8 +2559,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 if (is_new && frame_admission_due(now, next_admission, frame_interval, urgent))
                     || (!is_new && urgent)
                 {
-                    if let Some(egress) = wss_media.as_ref().filter(|egress| egress.is_v4()) {
-                        egress.set_v4_frame_size(mode.width, mode.height);
+                    if let Some(egress) = wss_media.as_ref() {
+                        egress.set_frame_size(mode.width, mode.height);
                     }
                     let mut wss_reservation = None;
                     let mut wss_forced_idr = false;
@@ -3094,12 +2569,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         let base_meta = WssAccessUnitMeta {
                             codec: wss_codec(active_codec),
                             generation: media_generation,
-                            gop: media_gop,
                             sequence: media_sequence.wrapping_add(1),
                             timestamp90k: (media_clock_start.elapsed().as_secs_f64() * 90_000.0)
                                 as u32,
                             key: wants_key,
-                            lab_roi: None,
                         };
                         let reservation: Result<_, WssReserveOutcome> = match egress
                             .reserve(base_meta)
@@ -3108,7 +2581,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             Err(WssReserveOutcome::RequireKeyframe) if !wants_key => {
                                 wants_key = true;
                                 encoder.as_mut().unwrap().force_idr();
-                                next_idr = now + wss_periodic_idr_interval(stream_mode, Some(egress));
+                                next_idr =
+                                    now + wss_periodic_idr_interval(stream_mode, Some(egress));
                                 match egress.reserve(WssAccessUnitMeta {
                                     key: true,
                                     ..base_meta
@@ -3170,7 +2644,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         && !wss_forced_idr
                         && latest_idr.is_some()
                         && !transition
-                        && wss_is_v4(wss_media.as_ref());
+                        && wss_media.is_some();
                     // A fallback is a separate transaction: first prepare a
                     // texture for its exact dimensions, then recreate NVENC
                     // for that same mode, and only commit after its IDR is
@@ -3828,7 +3302,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         let refine_restore_bps = if wss_v4_refine_frame {
                             let enc = encoder.as_mut().unwrap();
                             let base = enc.bitrate();
-                            enc.set_bitrate(wss_v4_refine_bitrate(base)).ok().map(|()| base)
+                            enc.set_bitrate(wss_v4_refine_bitrate(base))
+                                .ok()
+                                .map(|()| base)
                         } else {
                             None
                         };
@@ -4215,18 +3691,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     .sum::<usize>();
                                 let sidecar_budget = active_benchmark_profile
                                     .map(|profile| {
-                                        let topology = profile.wss_topology.unwrap_or(
-                                            benchmark::BenchmarkWssTopology {
-                                                lane_count: 16,
-                                                data_shards: 15,
-                                                parity_shards: 1,
-                                            },
-                                        );
+                                        // One unsharded v4 media socket.
                                         quiescent_wire_budget.begin_frame(
                                             profile.bitrate_bps,
                                             u32::from(profile.fps),
-                                            topology.lane_count,
-                                            topology.data_shards,
+                                            1,
+                                            1,
                                             encoded.data.len(),
                                         )
                                     })
@@ -4623,16 +4093,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                     }
                     if encoded.is_idr {
-                        if wss_media.is_some() {
-                            media_gop = media_gop.wrapping_add(1).max(1);
-                        }
                         latest_idr = Some(CachedIdr {
                             data: encoded.data.clone(),
                             mode,
                         });
                     }
                     capture.cancel_idle_followup_snapshot();
-                    let v4_session = wss_is_v4(wss_media.as_ref());
+                    let v4_session = wss_media.is_some();
                     match idle_snapshot_completion_order(
                         encoded.is_idr && (is_idle_snapshot || v4_session),
                         request_quiescent_transition_followup,
@@ -4649,7 +4116,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             capture.request_idle_followup_snapshot(frame_interval);
                         }
                     }
-                    if wss_is_v4(wss_media.as_ref()) {
+                    if wss_media.is_some() {
                         if wss_v4_refine_frame {
                             wss_v4_refine_armed = false;
                         } else if !is_idle_snapshot {
@@ -4673,12 +4140,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         let meta = WssAccessUnitMeta {
                             codec: wss_codec(active_codec),
                             generation: media_generation,
-                            gop: media_gop,
                             sequence: media_sequence,
                             timestamp90k: (media_clock_start.elapsed().as_secs_f64() * 90_000.0)
                                 as u32,
                             key: encoded.is_idr,
-                            lab_roi: lab_roi_trace(encoded.roi_activity),
                         };
                         let payload = hybrid_wss_payload
                             .take()
@@ -4693,10 +4158,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         if let Some(mut wss_reservation) = wss_reservation.take() {
                             wss_reservation.set_meta(meta);
                             wss_reservation.set_refine(wss_v4_refine_frame && !encoded.is_idr);
-                            if matches!(
-                                wss_reservation.submit(payload),
-                                WssSubmitOutcome::Queued { .. }
-                            ) {
+                            if matches!(wss_reservation.submit(payload), WssSubmitOutcome::Queued) {
                                 if active_benchmark_profile.is_some() {
                                     let wire_payload_bytes = wss_media
                                         .as_ref()
@@ -4730,11 +4192,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                         );
                                     }
                                 }
-                                wss_ack_rate.submitted(
-                                    media_generation,
-                                    media_sequence,
-                                    encoded_len,
-                                );
                                 if encoded.is_idr {
                                     if let Some(request_id) = pending_lab_quality_keyframe.take() {
                                         signaling.send_lab_quality_keyframe_admitted(
@@ -4836,11 +4293,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             skipped_before_encode = 0;
             next_skip_log = Instant::now() + Duration::from_secs(1);
         }
-        if wss_media.is_some() && Instant::now() >= next_wss_stats {
-            let (lane_health, pipeline_stats) = wss_media
-                .as_ref()
-                .map(|egress| (egress.health(), egress.take_window_stats()))
-                .expect("WSS media checked above");
+        if let Some(egress) = wss_media
+            .as_ref()
+            .filter(|_| Instant::now() >= next_wss_stats)
+        {
             let encoded_total = wss_idr_count.saturating_add(wss_delta_count);
             let idr_percent = if encoded_total == 0 {
                 0
@@ -4851,47 +4307,37 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             let capture_acquired = capture_stats.0.saturating_sub(last_capture_stats.0);
             let capture_new = capture_stats.1.saturating_sub(last_capture_stats.1);
             last_capture_stats = capture_stats;
-            info!(wss_preencode_skips, wss_submission_failures, wss_idr_count, wss_delta_count,
-                idr_percent, dependency_losses = wss_quality.last_dependency_losses,
-                producer_loop_iterations, capture_acquired, capture_new,
-                lane_health = ?lane_health, wss_max_access_unit_bytes,
-                reserve_count = pipeline_stats.reserve_count,
-                reserve_us_total = pipeline_stats.reserve_us_total,
-                reserve_us_max = pipeline_stats.reserve_us_max,
-                 reserve_backpressured = pipeline_stats.reserve_backpressured,
-                 reserve_require_keyframe = pipeline_stats.reserve_require_keyframe,
-                 blocked_queued_lanes = pipeline_stats.blocked_queued_lanes,
-                 blocked_ack_window_lanes = pipeline_stats.blocked_ack_window_lanes,
-                 blocked_recovery_lanes = pipeline_stats.blocked_recovery_lanes,
-                unavailable_lanes = pipeline_stats.unavailable_lanes,
-                submit_count = pipeline_stats.submit_count,
-                access_unit_bytes = pipeline_stats.access_unit_bytes,
-                packet_bytes = pipeline_stats.packet_bytes,
-                shard_us_total = pipeline_stats.shard_us_total,
-                shard_us_max = pipeline_stats.shard_us_max,
-                dispatch_us_total = pipeline_stats.dispatch_us_total,
-                dispatch_us_max = pipeline_stats.dispatch_us_max,
-                queue_full = pipeline_stats.queue_full,
-                queue_age_us_total = pipeline_stats.queue_age_us_total,
-                queue_age_us_max = pipeline_stats.queue_age_us_max,
-                send_count = pipeline_stats.send_count,
-                send_us_total = pipeline_stats.send_us_total,
-                send_us_max = pipeline_stats.send_us_max,
-                send_over_10ms = pipeline_stats.send_over_10ms,
-                send_over_frame_budget = pipeline_stats.send_over_frame_budget,
-                send_failures = pipeline_stats.send_failures,
-                "WSS producer window");
-            if let Some(v4) = wss_media.as_ref().and_then(WssMediaEgress::v4_stats) {
-                info!(connected = v4.connected, peer_present = v4.peer_present,
-                    frames_sent = v4.frames_sent, bytes_sent = v4.bytes_sent,
-                    keyframes_sent = v4.keyframes_sent, refines_sent = v4.refines_sent,
-                    skipped_budget = v4.skipped_budget, acks = v4.acks,
-                    heartbeats = v4.heartbeats, reconnects = v4.reconnects,
-                    inflight_frames = v4.inflight_frames, inflight_bytes = v4.inflight_bytes,
-                    bitrate_bps = v4.bitrate_bps, min_rtt_ms = v4.min_rtt_ms,
-                    last_rtt_ms = v4.last_rtt_ms,
-                    "WSS v4 link totals");
-            }
+            info!(
+                wss_preencode_skips,
+                wss_submission_failures,
+                wss_idr_count,
+                wss_delta_count,
+                idr_percent,
+                producer_loop_iterations,
+                capture_acquired,
+                capture_new,
+                wss_max_access_unit_bytes,
+                "WSS producer window"
+            );
+            let v4 = egress.stats();
+            info!(
+                connected = v4.connected,
+                peer_present = v4.peer_present,
+                frames_sent = v4.frames_sent,
+                bytes_sent = v4.bytes_sent,
+                keyframes_sent = v4.keyframes_sent,
+                refines_sent = v4.refines_sent,
+                skipped_budget = v4.skipped_budget,
+                acks = v4.acks,
+                heartbeats = v4.heartbeats,
+                reconnects = v4.reconnects,
+                inflight_frames = v4.inflight_frames,
+                inflight_bytes = v4.inflight_bytes,
+                bitrate_bps = v4.bitrate_bps,
+                min_rtt_ms = v4.min_rtt_ms,
+                last_rtt_ms = v4.last_rtt_ms,
+                "WSS v4 link totals"
+            );
             next_wss_stats = Instant::now() + Duration::from_secs(1);
             producer_loop_iterations = 0;
             wss_preencode_skips = 0;
@@ -4922,7 +4368,9 @@ fn pick_host_ip() -> Result<std::net::IpAddr> {
         std::net::ToSocketAddrs::to_socket_addrs(STUN_SERVER).context("resolve STUN server")?,
     )
     .context("STUN server has no IPv4 address")?;
-    probe.connect(stun_addr).context("connect IPv4 route probe")?;
+    probe
+        .connect(stun_addr)
+        .context("connect IPv4 route probe")?;
     Ok(probe.local_addr()?.ip())
 }
 
@@ -5007,8 +4455,14 @@ mod tests {
     #[test]
     fn wss_v4_refine_bitrate_is_bounded_and_parks_periodic_idr() {
         assert_eq!(super::wss_v4_refine_bitrate(3_000_000), 12_000_000);
-        assert_eq!(super::wss_v4_refine_bitrate(20_000_000), super::MAX_BITRATE_BPS);
-        assert_eq!(super::wss_v4_refine_bitrate(u32::MAX), super::MAX_BITRATE_BPS);
+        assert_eq!(
+            super::wss_v4_refine_bitrate(20_000_000),
+            super::MAX_BITRATE_BPS
+        );
+        assert_eq!(
+            super::wss_v4_refine_bitrate(u32::MAX),
+            super::MAX_BITRATE_BPS
+        );
         assert_eq!(
             super::wss_periodic_idr_interval(super::StreamMode::Work, None),
             super::wss_gop_interval(super::StreamMode::Work)
@@ -5021,11 +4475,10 @@ mod tests {
         active_encoder_dimensions, advance_benchmark_profile_revision, advance_frame_deadline,
         agent_reconnect_delay, benchmark_encoder_options, benchmark_mode_matches,
         benchmark_owned_encoder_bitrate, benchmark_status_retry_delay, cached_replay_transition,
-        cached_wss_replay_payload, capture_admission_ready, coalesce_quiescent_cache_round_trips,
-        commit_matching_transition, commit_media_sequence, effective_idr_interval,
-        encoder_benchmark_contract_changed, encoder_mode_for_capture, fallback_mode,
-        frame_admission_due, full_profile_uses_native_texture, idle_snapshot_completion_order,
-        lab_quality_keyframe_request, next_media_sequence,
+        capture_admission_ready, coalesce_quiescent_cache_round_trips, commit_matching_transition,
+        effective_idr_interval, encoder_benchmark_contract_changed, encoder_mode_for_capture,
+        fallback_mode, frame_admission_due, full_profile_uses_native_texture,
+        idle_snapshot_completion_order, lab_quality_keyframe_request,
         privileged_input_ready_after_presentation, privileged_no_frame_retry_delay,
         producer_poll_interval, quiescent_damage_rects, quiescent_immediate_damage_rects,
         quiescent_transition_followup_needed, quiescent_transition_upsert_allowed,
@@ -5038,13 +4491,10 @@ mod tests {
         should_forward_offer, should_replace_wss_media_session,
         should_reset_lab_encoder_for_keyframe, should_snapshot_idle_desktop,
         take_matching_transition, temporal_readback_policy, valid_lab_quality_request_id,
-        valid_monitor_refresh_control, valid_stripe_reconnect_recovery_control, viewport_from_q16,
-        wss_capacity_observation, CachedIdr, CachedIdrReplay, CaptureSelection,
-        IdleSnapshotCompletionOrder,
-        PendingFirstFrame, PendingSubmittedIdr, PrivilegedDesktopState, ProfileTransition,
-        ReconnectLogGate, TemporalReadbackPolicy, VideoMode, ViewportCrop, WssAckRate,
-        WssQualityController, WssRecoverySnapshotGate, AGENT_RECONNECT_LOG_INTERVAL,
-        REMEMBERED_MONITOR_MAX_ATTEMPTS,
+        valid_monitor_refresh_control, viewport_from_q16, CachedIdr, CachedIdrReplay,
+        CaptureSelection, IdleSnapshotCompletionOrder, PendingFirstFrame, PendingSubmittedIdr,
+        PrivilegedDesktopState, ProfileTransition, ReconnectLogGate, TemporalReadbackPolicy,
+        VideoMode, ViewportCrop, AGENT_RECONNECT_LOG_INTERVAL, REMEMBERED_MONITOR_MAX_ATTEMPTS,
         STATIC_REPLAY_DELAY,
     };
     use crate::encode::{
@@ -5865,11 +5315,6 @@ mod tests {
                 "fps": 30,
                 "bitrateBps": 2_800_000,
                 "gopSeconds": 2,
-                "wssTopology": {
-                    "laneCount": 16,
-                    "dataShards": 15,
-                    "parityShards": 1
-                },
                 "encoder": {
                     "preset": "p3",
                     "tuning": "ultra-low-latency",
@@ -6106,91 +5551,29 @@ mod tests {
     }
 
     #[test]
-    fn monitor_refresh_is_v2_epoch_scoped_and_accepts_pre_wss_refresh() {
+    fn monitor_refresh_is_v4_epoch_scoped_and_accepts_pre_wss_refresh() {
         let epoch = "0123456789abcdef0123456789abcdef";
-        assert!(valid_monitor_refresh_control(Some(2), Some(epoch), None));
         assert!(valid_monitor_refresh_control(Some(4), Some(epoch), None));
+        assert!(!valid_monitor_refresh_control(Some(2), Some(epoch), None));
+        assert!(!valid_monitor_refresh_control(Some(3), Some(epoch), None));
         assert!(!valid_monitor_refresh_control(Some(5), Some(epoch), None));
         assert!(valid_monitor_refresh_control(
-            Some(2),
+            Some(4),
             Some(epoch),
             Some(epoch)
         ));
         assert!(!valid_monitor_refresh_control(Some(1), Some(epoch), None));
-        assert!(!valid_monitor_refresh_control(Some(2), None, None));
+        assert!(!valid_monitor_refresh_control(Some(4), None, None));
         assert!(!valid_monitor_refresh_control(
-            Some(2),
+            Some(4),
             Some("A123456789abcdef0123456789abcdef"),
             None
         ));
         assert!(valid_monitor_refresh_control(
-            Some(2),
+            Some(4),
             Some(epoch),
             Some("ffffffffffffffffffffffffffffffff")
         ));
-    }
-
-    #[test]
-    fn stripe_reconnect_recovery_is_scoped_to_current_protocol_v3_epoch() {
-        let epoch = "0123456789abcdef0123456789abcdef";
-        assert!(valid_stripe_reconnect_recovery_control(
-            "keyframe",
-            Some("stripe-reconnect"),
-            Some(3),
-            Some(epoch),
-            Some(epoch),
-        ));
-        assert!(!valid_stripe_reconnect_recovery_control(
-            "keyframe",
-            Some("stripe-reconnect"),
-            Some(3),
-            Some("fedcba9876543210fedcba9876543210"),
-            Some(epoch),
-        ));
-        assert!(!valid_stripe_reconnect_recovery_control(
-            "keyframe",
-            Some("diagnostic-injected-fault"),
-            Some(3),
-            Some(epoch),
-            Some(epoch),
-        ));
-        assert!(!valid_stripe_reconnect_recovery_control(
-            "keyframe",
-            Some("stripe-reconnect"),
-            Some(2),
-            Some(epoch),
-            Some(epoch),
-        ));
-    }
-
-    #[test]
-    fn wss_delivery_rate_counts_cumulative_acknowledged_frames_and_stays_bounded() {
-        let start = Instant::now();
-        let mut rate = WssAckRate::new(start);
-        rate.submitted(7, 1, 100_000);
-        rate.submitted(7, 2, 200_000);
-        let window = rate.window_started;
-        assert_eq!(
-            rate.acknowledged(window + Duration::from_secs(1), 6, 1),
-            None
-        );
-        assert_eq!(
-            rate.acknowledged(window + Duration::from_secs(1), 7, 2),
-            Some(2_400_000)
-        );
-        assert!(rate.pending.is_empty());
-        for sequence in 3..400 {
-            rate.submitted(7, sequence, 1);
-        }
-        assert!(rate.pending.len() <= 256);
-    }
-
-    #[test]
-    fn wss_delivery_observation_cannot_recursively_shrink_the_encoder_target() {
-        // ACK throughput is application-limited by the encoder target. Feeding
-        // 80% of it back as link capacity would decay on every window.
-        assert_eq!(wss_capacity_observation(350_000, 1_200_000), 1_500_000);
-        assert_eq!(wss_capacity_observation(3_000_000, 1_200_000), 3_000_000);
     }
 
     #[test]
@@ -6298,341 +5681,6 @@ mod tests {
     }
 
     #[test]
-    fn one_short_wss_recovery_event_does_not_change_quality() {
-        let start = Instant::now();
-        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
-        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
-        let mut controller = WssQualityController::new(start);
-        assert!(controller
-            .sample(start, 1, &quality, &profiles, [1; 4], 1, 1, 1, 0, 0)
-            .is_none());
-        assert!(controller
-            .sample(
-                start + Duration::from_secs(1),
-                1,
-                &quality,
-                &profiles,
-                [2; 4],
-                2,
-                2,
-                1,
-                0,
-                0
-            )
-            .is_none());
-    }
-
-    #[test]
-    fn sustained_preencode_pressure_reduces_bitrate_without_marking_every_frame_key() {
-        let start = Instant::now();
-        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
-        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
-        let mut controller = WssQualityController::new(start);
-        controller.observe_preencode_skips(start, 1);
-        assert!(controller
-            .sample(start, 1, &quality, &profiles, [1; 4], 1, 1, 0, 0, 0)
-            .is_none());
-        controller.observe_preencode_skips(start + Duration::from_millis(7_500), 2);
-        assert!(controller
-            .sample(
-                start + Duration::from_millis(7_500),
-                1,
-                &quality,
-                &profiles,
-                [2; 4],
-                2,
-                2,
-                0,
-                0,
-                0
-            )
-            .is_none());
-        let decision = controller
-            .sample(
-                start + Duration::from_secs(8),
-                1,
-                &quality,
-                &profiles,
-                [3; 4],
-                3,
-                3,
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-        assert_eq!(decision.reason, "wss-congestion");
-        assert_eq!(decision.target_bps, 2_550_000);
-    }
-
-    #[test]
-    fn sustained_wss_damage_reduces_bitrate_then_resolution_at_the_floor() {
-        let start = Instant::now();
-        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 1_500_000);
-        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
-        let mut controller = WssQualityController::new(start);
-        assert!(controller
-            .sample(start, 1, &quality, &profiles, [1; 4], 1, 0, 0, 0, 0)
-            .is_none());
-        assert!(controller
-            .sample(
-                start + Duration::from_millis(1),
-                1,
-                &quality,
-                &profiles,
-                [2; 4],
-                2,
-                0,
-                0,
-                1,
-                0
-            )
-            .is_none());
-        assert!(controller
-            .sample(
-                start + Duration::from_millis(8_001),
-                1,
-                &quality,
-                &profiles,
-                [3; 4],
-                3,
-                0,
-                0,
-                2,
-                0
-            )
-            .is_none());
-        let decision = controller
-            .sample(
-                start + Duration::from_millis(12_001),
-                1,
-                &quality,
-                &profiles,
-                [4; 4],
-                4,
-                0,
-                0,
-                3,
-                0,
-            )
-            .unwrap();
-        assert_eq!(
-            decision.mode,
-            VideoMode::for_stream(Profile::Low, StreamMode::Work)
-        );
-        assert_eq!(decision.reason, "wss-sustained-down");
-    }
-
-    #[test]
-    fn clean_wss_requires_long_windows_before_bitrate_or_spatial_probes() {
-        let start = Instant::now();
-        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
-        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
-        let mut controller = WssQualityController::new(start);
-        assert!(controller
-            .sample(start, 1, &quality, &profiles, [1; 4], 1, 1, 0, 0, 0)
-            .is_none());
-        assert!(controller
-            .sample(
-                start + Duration::from_secs(19),
-                1,
-                &quality,
-                &profiles,
-                [2; 4],
-                2,
-                2,
-                0,
-                0,
-                0
-            )
-            .is_none());
-        assert_eq!(
-            controller
-                .sample(
-                    start + Duration::from_secs(20),
-                    1,
-                    &quality,
-                    &profiles,
-                    [3; 4],
-                    3,
-                    3,
-                    0,
-                    0,
-                    0
-                )
-                .unwrap()
-                .reason,
-            "wss-probe"
-        );
-
-        let ceiling = super::Controller::fixed(Profile::Balanced, 40_000_000, 4_000_000);
-        let mut spatial = WssQualityController::new(start);
-        assert!(spatial
-            .sample(start, 1, &ceiling, &profiles, [1; 4], 1, 1, 0, 0, 0)
-            .is_none());
-        let decision = spatial
-            .sample(
-                start + Duration::from_secs(60),
-                1,
-                &ceiling,
-                &profiles,
-                [2; 4],
-                2,
-                2,
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-        assert_eq!(
-            decision.mode,
-            VideoMode::for_stream(Profile::Full, StreamMode::Work)
-        );
-        assert_eq!(decision.reason, "wss-stable-up");
-    }
-
-    #[test]
-    fn parity_recovery_and_staggered_ack_batches_are_not_congestion() {
-        let start = Instant::now();
-        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
-        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
-        let mut controller = WssQualityController::new(start);
-        assert!(controller
-            .sample(start, 1, &quality, &profiles, [1, 1, 1, 0], 1, 1, 1, 0, 0)
-            .is_none());
-        assert!(controller
-            .sample(
-                start + Duration::from_millis(500),
-                1,
-                &quality,
-                &profiles,
-                [2, 1, 2, 1],
-                2,
-                2,
-                2,
-                0,
-                0
-            )
-            .is_none());
-        assert!(controller
-            .sample(
-                start + Duration::from_millis(1_500),
-                1,
-                &quality,
-                &profiles,
-                [2, 2, 3, 2],
-                3,
-                3,
-                3,
-                0,
-                0
-            )
-            .is_none());
-    }
-
-    #[test]
-    fn a_downshift_blocks_immediate_probe_back_up() {
-        let start = Instant::now();
-        let mut quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
-        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
-        let mut controller = WssQualityController::new(start);
-        assert!(controller
-            .sample(start, 1, &quality, &profiles, [1; 4], 1, 1, 0, 0, 0)
-            .is_none());
-        assert!(controller
-            .sample(
-                start + Duration::from_millis(1),
-                1,
-                &quality,
-                &profiles,
-                [2; 4],
-                2,
-                0,
-                0,
-                1,
-                0
-            )
-            .is_none());
-        let down = controller
-            .sample(
-                start + Duration::from_millis(8_002),
-                1,
-                &quality,
-                &profiles,
-                [3; 4],
-                3,
-                0,
-                0,
-                2,
-                0,
-            )
-            .unwrap();
-        quality.apply(
-            start + Duration::from_millis(8_002),
-            super::Decision {
-                profile: down.mode.profile,
-                target_bps: down.target_bps,
-                reason: super::quality::Reason::Bitrate,
-            },
-        );
-        assert!(controller
-            .sample(
-                start + Duration::from_secs(20),
-                1,
-                &quality,
-                &profiles,
-                [3; 4],
-                3,
-                3,
-                0,
-                2,
-                0
-            )
-            .is_none());
-        assert!(controller
-            .sample(
-                start + Duration::from_secs(31),
-                1,
-                &quality,
-                &profiles,
-                [4; 4],
-                4,
-                4,
-                0,
-                2,
-                0
-            )
-            .is_none());
-    }
-
-    #[test]
-    fn new_wss_generation_resets_sequence_and_damage_baselines() {
-        let start = Instant::now();
-        let quality = super::Controller::fixed(Profile::Balanced, 40_000_000, 3_000_000);
-        let profiles = ProfileTransition::new(Profile::Balanced, Profile::Balanced);
-        let mut controller = WssQualityController::new(start);
-        assert!(controller
-            .sample(start, 1, &quality, &profiles, [100; 4], 100, 100, 5, 2, 2)
-            .is_none());
-        assert!(controller
-            .sample(
-                start + Duration::from_secs(2),
-                2,
-                &quality,
-                &profiles,
-                [1; 4],
-                1,
-                1,
-                0,
-                0,
-                0
-            )
-            .is_none());
-        assert_eq!(controller.generation, Some(2));
-        assert_eq!(controller.last_reconstructed, 1);
-    }
-
-    #[test]
     fn rejected_matching_transition_invalidates_cache_and_requests_recovery() {
         let mode = VideoMode::rung(Profile::Balanced);
         let pending = Some(PendingSubmittedIdr {
@@ -6681,57 +5729,11 @@ mod tests {
         assert!(!replay.is_due(start, true));
         assert!(replay.is_due(start + STATIC_REPLAY_DELAY, true));
     }
-
-    #[test]
-    fn rejected_cached_idr_replay_does_not_consume_a_media_sequence() {
-        let mut committed = 41;
-        let candidate = next_media_sequence(committed);
-
-        assert_eq!(candidate, 42);
-        assert_eq!(committed, 41);
-
-        commit_media_sequence(&mut committed, candidate);
-        assert_eq!(committed, 42);
-    }
-
-    #[test]
-    fn hybrid_cached_idr_replay_is_rewrapped_for_the_new_outer_sequence() {
-        let mode = VideoMode::rung(Profile::Full);
-        let cached = CachedIdr {
-            data: vec![0, 0, 0, 1, 38],
-            mode,
-        };
-        let payload = cached_wss_replay_payload(&cached, true, 7, 42, 3).unwrap();
-        let decoded = crate::hybrid::decode_hybrid_frame_v1(&payload).unwrap();
-
-        assert_eq!(decoded.generation, 7);
-        assert_eq!(decoded.sequence, 42);
-        assert_eq!(decoded.crop_revision, 3);
-        assert_eq!(decoded.access_unit, cached.data);
-        assert_eq!(decoded.operations, vec![HybridTileOperation::Clear]);
-    }
-
     #[test]
     fn idle_desktop_snapshot_polling_only_needs_a_connected_peer() {
         assert!(!should_snapshot_idle_desktop(false, true));
         assert!(should_snapshot_idle_desktop(true, false));
         assert!(should_snapshot_idle_desktop(true, true));
-    }
-
-    #[test]
-    fn wss_lane_recovery_snapshot_is_bounded_and_rearms_after_ack() {
-        let start = Instant::now();
-        let retry = Duration::from_secs(2);
-        let mut gate = WssRecoverySnapshotGate::default();
-
-        assert!(gate.should_request(start, true, false, retry));
-        assert!(!gate.should_request(start + Duration::from_millis(500), false, true, retry));
-        assert!(!gate.should_request(start + Duration::from_millis(501), true, false, retry));
-        assert!(!gate.should_request(start + Duration::from_millis(1_999), true, false, retry));
-        assert!(gate.should_request(start + retry, true, false, retry));
-
-        assert!(!gate.should_request(start + retry, false, false, retry));
-        assert!(gate.should_request(start + retry + Duration::from_millis(1), true, false, retry));
     }
 
     #[test]
