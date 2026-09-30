@@ -54,6 +54,8 @@ class Session(
         /** Input became usable after a presented frame (sync the cursor). */
         fun onInputReady()
         fun onSecureDesktop(secure: Boolean)
+        /** The signaling socket carrying input was lost: drop held keys/buttons locally. */
+        fun onInputLost()
     }
 
     enum class State { CONNECTING, CONNECTED, STATIC, RECONNECTING, ERROR }
@@ -80,13 +82,13 @@ class Session(
 
     // Signaling (/ws).
     @Volatile private var sig: WebSocket? = null
-    private var sigId = 0
+    /** Owns the current signaling generation and decides which socket may carry input. */
+    private val link = InputLink<WebSocket>()
+    private val liveness = SignalLiveness(V4.HEARTBEAT_MS)
     @Volatile private var sigOpen = false
     @Volatile private var registered = false
     private var sigBackoff = 0L
     private var sigReconnecting = false
-    private var sigLastSend = 0L
-    private var sigLastInbound = 0L
     private var mediaEpoch: String? = null
 
     // Host state.
@@ -123,6 +125,7 @@ class Session(
 
     // First-frame handshake (host gates input on "presented").
     private var ffRequestId: String? = null
+    private var ffEpoch: String? = null
     private var ffGeneration = 0L
     private var ffAdmitted = false
     private var ffPresented = false
@@ -181,7 +184,7 @@ class Session(
             running = false
             handler.removeCallbacksAndMessages(null)
             closeMedia()
-            sigId++
+            link.reset()
             try { sig?.close(1000, "client-stop") } catch (_: Exception) {}
             sig = null; sigOpen = false; registered = false
             thread.quitSafely()
@@ -200,8 +203,13 @@ class Session(
     }
 
     // ---- RemoteInput.Transport (any thread) ----------------------------------
-    override fun inputOpen() = sigOpen && registered && inputEnabled && desktopAvailable && !awaitingFrame
-    override fun send(bytes: ByteArray): Boolean = sig?.send(bytes.toByteString()) ?: false
+    // Input only ever goes out on the current, hello-completed, first-frame-ready socket.
+    override fun inputOpen() = link.inputSocket() != null && inputEnabled && desktopAvailable && !awaitingFrame
+    override fun send(bytes: ByteArray): Boolean {
+        val socket = link.inputSocket() ?: return false
+        liveness.input(now())
+        return socket.send(bytes.toByteString())
+    }
     override fun queuedBytes(): Long = sig?.queueSize() ?: 0L
     override fun scancodeHost() = scancode
     fun clipboardEnabled() = clipboardEnabled && desktopKind != "secure"
@@ -216,21 +224,25 @@ class Session(
         }
         val cookie = if (config.isLab) null else cookieProvider()
         if (!config.isLab && !ServerConfig.hasSessionCookies(cookie)) { authRequired(); return }
-        val id = ++sigId
+        // The generation is assigned right after newWebSocket returns, on this
+        // thread; callbacks read it on this thread too (via handler.post).
+        var id = 0
         val request = Request.Builder().url(config.signalingUrl()).apply { if (cookie != null) header("Cookie", cookie) }.build()
-        sig = http.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) = post(id) {
+        val socket = http.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) = post({ id }) {
                 sigOpen = true
-                sigLastInbound = now()
+                liveness.opened(now())
                 sendSig(JSONObject().put("type", "hello").put("role", "client"))
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) = post(id) {
-                sigLastInbound = now()
-                handleSignal(text)
+            override fun onMessage(webSocket: WebSocket, text: String) = post({ id }) {
+                liveness.inbound(now())
+                handleSignal(text, id)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (webSocket !== sig) return // a stale socket
+                liveness.inbound(now())
                 val state = CursorState.decode(bytes.toByteArray()) ?: return
                 main.post { listener.onCursor(state) }
             }
@@ -239,26 +251,32 @@ class Session(
                 webSocket.close(1000, null)
             }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = post(id) { signalingDown(null, "closed $code") }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = post({ id }) { signalingDown(id, null, "closed $code") }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 val code = response?.code
-                post(id) { signalingDown(code, t.message ?: "failure") }
+                post({ id }) { signalingDown(id, code, t.message ?: "failure") }
             }
         })
+        sig = socket
+        id = link.connecting(socket)
     }
 
-    private inline fun post(id: Int, crossinline block: () -> Unit) {
-        handler.post { if (running && id == sigId) block() }
+    /** Runs [block] on the session thread only if that socket generation is still current. */
+    private inline fun post(crossinline gen: () -> Int, crossinline block: () -> Unit) {
+        handler.post { if (running && link.isCurrent(gen())) block() }
     }
 
-    private fun signalingDown(httpCode: Int?, why: String) {
+    private fun signalingDown(id: Int, httpCode: Int?, why: String) {
+        if (!link.lost(id)) return
         Log.i(TAG, "signaling down: $why (http=$httpCode)")
         sigOpen = false
         registered = false
         sig = null
-        closeMedia()
-        cancelFirstFrame()
+        // The media socket may keep playing (status: input reconnecting); it is
+        // bound to this signaling epoch and is replaced after the next hello-ok.
+        resetFirstFrame()
+        main.post { listener.onInputLost() }
         if (!config.isLab && httpCode != null && httpCode in listOf(401, 403, 404)) { authRequired(); return }
         scheduleSignalingReconnect(why)
     }
@@ -280,19 +298,25 @@ class Session(
     private fun sendSig(message: JSONObject): Boolean {
         val socket = sig ?: return false
         if (!sigOpen) return false
-        sigLastSend = now()
+        liveness.sent(now())
         return socket.send(message.toString())
     }
 
-    private fun handleSignal(text: String) {
+    private fun handleSignal(text: String, id: Int) {
         val msg = try { JSONObject(text) } catch (_: Exception) { return }
         when (msg.optString("type")) {
             "hello-ok" -> {
+                val epoch = msg.optString("mediaEpoch").takeIf { Regex("^[a-f0-9]{32}$").matches(it) }
+                if (!link.helloOk(id, epoch)) return
                 registered = true
                 sigBackoff = 0
                 sigReconnecting = false
-                val epoch = msg.optString("mediaEpoch")
-                mediaEpoch = if (Regex("^[a-f0-9]{32}$").matches(epoch)) epoch else null
+                // A new signaling epoch: the old media socket belongs to the old
+                // epoch, and the host needs a fresh first-frame handshake before it
+                // accepts input again (it ignores input until then).
+                if (media != null) closeMedia()
+                resetFirstFrame()
+                mediaEpoch = epoch
                 sendSig(JSONObject().put("type", "media-control").put("action", "mode").put("protocol", V4.VERSION)
                     .put("epoch", mediaEpoch).put("streamMode", "work").put("reason", "signaling-start"))
                 startMedia()
@@ -330,11 +354,12 @@ class Session(
             "peer-left" -> {
                 // The host went away: start a fresh signaling epoch, as the browser does.
                 Log.i(TAG, "peer-left: recycling signaling")
-                sigId++
+                link.reset()
                 try { sig?.close(1000, "peer-left") } catch (_: Exception) {}
                 sig = null; sigOpen = false; registered = false
                 closeMedia()
-                cancelFirstFrame()
+                resetFirstFrame()
+                main.post { listener.onInputLost() }
                 sigBackoff = 0
                 scheduleSignalingReconnect("peer-left")
             }
@@ -365,12 +390,12 @@ class Session(
             (state == "active" && reason in listOf("desktop-switched", "capture-recovered", "session-changed", "agent-restarted"))
         if (transition && hasPresented) {
             desktopAvailable = true
-            awaitingFrame = true
+            setAwaiting(true)
             if (state == "active") startFirstFrame("desktop-transition", true)
             return
         }
         desktopAvailable = state == "active"
-        awaitingFrame = true
+        setAwaiting(true)
         if (!desktopAvailable) cancelFirstFrame()
         else startFirstFrame("desktop-state", generationChanged)
     }
@@ -378,13 +403,15 @@ class Session(
     // ---- first-frame handshake -------------------------------------------------
     private fun startFirstFrame(reason: String, forceNew: Boolean) {
         if (!sigOpen || mediaEpoch == null) return
-        if (!forceNew && ffRequestId != null && !ffFailed) return
+        // Like the browser: an existing request only counts for the same media epoch.
+        if (!forceNew && firstFrameRequestReusable(ffRequestId, ffEpoch, mediaEpoch, ffFailed)) return
         cancelFirstFrame()
         val bytes = ByteArray(12).also { random.nextBytes(it) }
         ffRequestId = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+        ffEpoch = mediaEpoch
         ffGeneration = 0; ffAdmitted = false; ffPresented = false; ffRetries = 0; ffFailed = false
         ffRequireAdmission = forceNew || reason == "desktop-transition"
-        awaitingFrame = true
+        setAwaiting(true)
         Log.i(TAG, "first-frame request ($reason)")
         sendFirstFrameRequest()
         armFirstFrameWatchdog()
@@ -421,6 +448,19 @@ class Session(
         ffWatchdog = null
     }
 
+    /** Forget the handshake of a finished signaling epoch; input waits for the next one. */
+    private fun resetFirstFrame() {
+        cancelFirstFrame()
+        ffRequestId = null; ffEpoch = null
+        ffGeneration = 0; ffAdmitted = false; ffPresented = false; ffRetries = 0; ffFailed = false
+        setAwaiting(true)
+    }
+
+    private fun setAwaiting(value: Boolean) {
+        awaitingFrame = value
+        if (value) link.awaitFrame() else link.presented()
+    }
+
     private fun handleFirstFrame(msg: JSONObject) {
         if (msg.optInt("protocol") != 1 || msg.optString("requestId") != ffRequestId) return
         when (msg.optString("phase")) {
@@ -430,7 +470,7 @@ class Session(
                 if (ffPresented) sendPresented()
             }
             "failed" -> {
-                if (ffPresented) { cancelFirstFrame(); awaitingFrame = false; return }
+                if (ffPresented) { cancelFirstFrame(); setAwaiting(false); return }
                 ffFailed = true
                 cancelFirstFrame()
                 recoverStartup(msg.optString("reason").ifEmpty { "host-failure" }.take(96))
@@ -448,7 +488,7 @@ class Session(
         ffPresented = true
         cancelFirstFrame()
         val wasAwaiting = awaitingFrame
-        awaitingFrame = false
+        setAwaiting(false)
         if (ffAdmitted) sendPresented()
         if (wasAwaiting) main.post { listener.onInputReady() }
     }
@@ -529,6 +569,7 @@ class Session(
             "hello-ok" -> {
                 val reconnect = mediaEverOpened
                 mediaOpen = true
+                link.mediaUp = true
                 mediaEverOpened = true
                 mediaReconnecting = false
                 mediaBackoff = 0
@@ -583,6 +624,7 @@ class Session(
     private fun mediaDown(why: String) {
         Log.i(TAG, "media down: $why")
         mediaOpen = false
+        link.mediaUp = false
         hostPresent = false
         media = null
         if (!running || !registered) return
@@ -597,6 +639,7 @@ class Session(
         try { media?.close(1000, "client-close") } catch (_: Exception) {}
         media = null
         mediaOpen = false
+        link.mediaUp = false
         hostPresent = false
         hostStarted = false
         gate.reset("connect")
@@ -625,9 +668,14 @@ class Session(
     private fun heartbeat() {
         val now = now()
         if (sigOpen) {
-            if (now - sigLastSend >= V4.HEARTBEAT_MS) sendSig(JSONObject().put("type", "ping"))
-            // The relay answers every heartbeat; silence means a half-open socket.
-            if (now - sigLastInbound > V4.HEARTBEAT_MS * 2 + 10_000) sig?.cancel()
+            // The relay answers every ping; an unanswered one means a half-open
+            // socket (probed early while input is flowing). Cancelling it runs
+            // the normal signalingDown -> reconnect path.
+            when (liveness.check(now)) {
+                SignalLiveness.Action.PING -> sendSig(JSONObject().put("type", "ping"))
+                SignalLiveness.Action.DEAD -> { Log.w(TAG, "signaling unanswered: reconnecting"); sig?.cancel() }
+                SignalLiveness.Action.NONE -> {}
+            }
         }
         if (mediaOpen) {
             if (now - mediaLastSend >= V4.HEARTBEAT_MS) sendMedia(V4.PING)
@@ -644,6 +692,7 @@ class Session(
 
     private fun computeStatus(): Status {
         terminal?.let { return Status(State.ERROR, "Session ended: $it") }
+        if (link.inputReconnecting && framesPresented > 0) return Status(State.RECONNECTING, "Input reconnecting…")
         if (!sigOpen || !registered) return Status(if (sigReconnecting) State.RECONNECTING else State.CONNECTING, if (sigReconnecting) "Reconnecting…" else "Connecting…")
         if (!desktopAvailable) return Status(State.ERROR, "Desktop unavailable")
         if (mediaOpen && !hostPresent && framesPresented == 0L) return Status(State.CONNECTING, "Waiting for host…")
