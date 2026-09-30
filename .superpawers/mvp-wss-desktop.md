@@ -53,10 +53,19 @@ for production browser sessions once v4 is negotiated.
   BBR-style estimator over ACKs. Each ACK gives a delivery-rate sample
   (delivered bytes / max(send span, ACK span)). A sample counts as
   link-limited evidence when RTT ≥ min RTT + 20 ms, the window was ≥ 4 KB and
-  ACKs spread wider than sends. After ≥ 3 such samples within 2 s the link is
-  *constrained* and capacity = max sample in a 2 s window. The estimate is held
-  through idle and probed ×1.25 after 2 s of busy sending without queue
-  evidence. When constrained, the delay controller's floor and ceiling are
+  ACKs spread wider than sends. After ≥ 3 such samples within 2 s, spanning
+  ≥ 2 separate ACK bursts (a gap > 8 ms between ACKs starts a new burst) and
+  lasting ≥ 250 ms first to last, the link is *constrained* and capacity =
+  max sample in a 2 s window. A receiver stall flushes its backlog in a short
+  flush, so it cannot constrain (the burst rule alone was not enough: in the
+  lab a 570 ms stall flushed in several 8 ms bursts and constrained an
+  unthrottled link twice for 3 s). Each transition logs
+  `WSS v4 link constrained` with evidence count, bursts and span.
+  Phase 2b: a constrained estimate that is not re-confirmed by queue evidence
+  within 3 s expires: the link is no longer constrained (no budget, no
+  pacing), and the estimate only caps the bitrate while it is probed up
+  ×1.25 per second; the cap is released once it passes the profile maximum.
+  Fresh queue evidence constrains the link again. When constrained, the delay controller's floor and ceiling are
   capped at 80 % of capacity (`RateReason::Capacity`, 5 % deadband); this
   overrides the 2.5 Mbps 1080p floor. Unconstrained: no change.
   As in BBR, a frame sent with less than one BDP in flight marks samples
@@ -64,14 +73,22 @@ for production browser sessions once v4 is negotiated.
   lower the estimate (without this a jittery trickle of small frames walked a
   2 Mbps estimate down to ~600 kbps in the lab). A capacity whose 80 % target
   covers the profile maximum does not bind (no budget, no ceiling).
-  Open: a receiver stall (RTT ~500 ms on localhost in the lab) looks like a
-  queue; the resulting low estimate is held until a faster sample, ~28 s once
-  in a 3-minute unconstrained run.
+  (Phase 2 left open that a ~500 ms receiver stall held a low estimate for
+  ~28 s in a 3-minute unconstrained run; the burst rule and expiry above fix
+  it.)
   Lab, 2 Mbps relay throttle, 5 min, phase 1 → phase 2: scroll presented fps
   median 5.5 → 8.8, p10 4.4 → 6.6; median-tile idle PSNR 55.1 → 52.0 dB (the
   encoder now follows 80 % of the link instead of sawtoothing to 6 Mbps),
   worst-decile tile PSNR unchanged (42.5 dB); max relay queue unchanged
   (~705 ms, during scroll bursts).
+  Phase 2b lab (p4 = expiry + 2 bursts + idle full bucket + scroll
+  detection; p5 = p4 + 250 ms evidence span):
+  2 Mbps throttle, scroll fps median 8.8 (p3) → 11.0 (p4, 5 cycles) / 8.9
+  (p5, 3 cycles); settled idle PSNR median of medians 52.0 → 55.05 / 55.05
+  dB. Unthrottled 3 min, time constrained: p4 6.3 s (two stall events),
+  p5 0 s and 2.7 s in two runs. Continuous Chrome scroll on 2 Mbps with the
+  pointer over the page: 82 s classed scroll, pointer_maps 1796, scroll fps
+  median 22.0.
 - Keyframes: first frame of a generation, a new peer / reconnect, or an
   explicit client request (decoder error / seq gap). No periodic or safety
   keyframe, no cached-IDR replay on v4. An ACK stall (3 s) only forgets the
@@ -104,12 +121,24 @@ damage rects and idle snapshots. For v4:
   the encoder has no QP map. Refines ride the idle follow-up snapshot.
 - Budgeted pacing (phase 2, 2026-09-30, `host/src/tile_schedule.rs`,
   `host/src/content_class.rs`; inert unless the link is constrained). A token
-  bucket refills at capacity × 0.8 (150 ms deep). Changed tiles are always
+  bucket refills at capacity × 0.8 (150 ms deep), or × 1.0 on an idle frame
+  (no changed tiles), so settled refines use the whole link. Changed tiles are always
   encoded; a pending refine is paid from what is left, pointer-nearest tiles
   first (per-tile cost is an EWMA of refine frame bytes). A whole-frame refine
   needs budget for every tile, otherwise it becomes a map refine or waits.
   A per-tile classifier (static / text / scroll / video, from DXGI dirty and
-  move rects, 300 ms hysteresis) picks the frame policy:
+  move rects, 300 ms hysteresis) picks the frame policy. A tile that moved in
+  the last 300 ms (a DDA move rect or a detected scroll) is scroll at any
+  capture cadence.
+  Scroll detection (phase 2b, `host/src/scroll_detect.rs`): Chrome repaints a
+  scrolled viewport as plain dirty rects, so the tile hash is built from
+  per-pixel-row hashes (64 px segments). Per tile column, rows unique on both
+  sides vote for the offset at which they appear in the column's last known
+  content; a tile takes an offset with ≥ 4 row votes, and a column scrolled
+  when ≥ 3 tiles agree on the same non-zero dy (any pixel offset, not only
+  multiples of 64). Above 40 % damage only 4 evenly spaced columns are read
+  back for detection, and a match extends along the dirty horizontal runs it
+  touches. The frame policy:
   - text-dominant: NVENC max-QP ceiling 28 (reconfigure in place, no IDR) and
     changes are held while the bucket is empty, never past 100 ms (≥ 10 fps);
   - scroll/video-dominant: full fps, no ceiling, and the QP map lowers the
