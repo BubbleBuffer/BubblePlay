@@ -34,14 +34,17 @@ test("secure text accepts explicit typing one scalar at a time and rejects paste
 test("absolute coalesces and relative/absolute supersede stale motion", () => { const sent=[]; const c=new InputController({sendMotion:p=>(sent.push([...p]),true)}); c.absolute(1,2); c.absolute(3,4); c.flushMotion(); assert.deepEqual(sent.at(-1),[8,0,0,3,0,4,0]); c.motion(5,6); c.absolute(7,8); c.flushMotion(); assert.equal(sent.at(-1)[0],8); c.absolute(7,8); c.motion(9,10); c.flushMotion(); assert.equal(sent.at(-1)[0],7); });
 test("motion sender rejection and bounded backlog drop without advancing sequence", () => { const c=new InputController({sendMotion:()=>false}); c.motion(1,2); assert.equal(c.flushMotion(),false); assert.equal(c.stats.dropped,1); assert.equal(c.seq,0); const b=new InputController({sendMotion:()=>true,motionBuffered:()=>65}); b.motion(1,1); b.flushMotion(); assert.equal(b.stats.dropped,1); const ok=new InputController({sendMotion:()=>true,motionBuffered:()=>64}); ok.motion(1,1); assert.equal(ok.flushMotion(),true); });
 test("release clears held buttons and pending motion", () => { const sent=[]; const c=new InputController({sendControl:p=>(sent.push([...p]),true)}); c.key(65,false); c.buttons(1); c.motion(2,2); c.releaseAll(); assert.deepEqual(sent.at(-1),[6]); assert.equal(c.held.size,0); assert.equal(c.buttonMask,0); assert.deepEqual(c.pending,[0,0,0,0]); });
-test("reliable input telemetry distinguishes accepted and rejected sends", () => {
-  let accept = true;
-  const c = new InputController({ sendControl: () => accept });
+test("reliable input telemetry distinguishes sent, queued and dead-transport control", () => {
+  let accept = true, state = "open";
+  const c = new InputController({ sendControl: () => accept, controlState: () => state, scheduleFlush: () => {} });
   assert.equal(c.key(65, false), true);
   accept = false;
-  assert.equal(c.buttons(1), false);
+  assert.equal(c.buttons(1), true, "a transient send failure queues instead of dropping");
+  assert.equal(c.controlBacklog, 1);
+  state = "down";
+  assert.equal(c.buttons(0), false);
   assert.equal(c.stats.controlSent, 1);
-  assert.equal(c.stats.controlDropped, 1);
+  assert.equal(c.stats.controlDropped, 2, "the queued button and the rejected one");
 });
 test("reliable click warp consumes a motion barrier and clears older pending motion", () => { const sent=[]; const c=new InputController({sendControl:p=>(sent.push([...p]),true)}); c.motion(9,-4); assert.equal(c.buttonsAt(65535,32768,1),true); assert.deepEqual(sent,[ [9,0,0,255,255,0,128,1] ]); assert.equal(c.seq,1); assert.equal(c.buttonMask,1); assert.equal(c.flushMotion(),false); });
 test("viewport retains midpoint content and clamps pan/reset", () => { const v=new Viewport(100,100); v.setZoom(2,{x:25,y:25}); assert.deepEqual(v.snapshot(),{zoom:2,x:-25,y:-25}); v.pan(-1000,1000); assert.deepEqual(v.snapshot(),{zoom:2,x:-100,y:0}); v.setZoom(1); assert.deepEqual(v.snapshot(),{zoom:1,x:0,y:0}); });
