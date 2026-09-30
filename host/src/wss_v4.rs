@@ -55,11 +55,10 @@ pub const V4_MAX_REASON_CHARS: usize = 64;
 /// un-ACKed.
 pub const INFLIGHT_BUDGET: Duration = Duration::from_millis(150);
 pub const INFLIGHT_MAX_FRAMES: usize = 4;
-/// No ACK progress for this long while frames are in flight means the
-/// receiver lost its decoder chain (or vanished); restart from a keyframe.
+/// No ACK progress for this long while frames are in flight: forget the
+/// in-flight frames so sending can resume. This never forces a keyframe; a
+/// receiver whose decoder chain broke asks for one (seq gap / decode error).
 pub const ACK_STALL_LIMIT: Duration = Duration::from_secs(3);
-/// Safety keyframe interval, only while delta frames are being sent.
-pub const SAFETY_KEYFRAME_INTERVAL: Duration = Duration::from_secs(30);
 /// Idle heartbeat on the media socket.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Declare the socket dead after this long without any inbound message
@@ -84,12 +83,6 @@ const RATE_MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
 const RATE_RTT_SLACK_MS: f64 = 60.0;
 const RATE_RTT_FACTOR: f64 = 2.0;
 const WRITE_STALL_LIMIT: Duration = Duration::from_secs(10);
-/// A change covering at least this share of the frame (per mille) earns one
-/// refine; smaller changes (cursor blink, clock) neither earn nor delay it.
-pub const REFINE_LARGE_DAMAGE_PER_MILLE: u64 = 20;
-/// The refine is sent once damage has stayed small this long after the last
-/// large change.
-pub const REFINE_SETTLE: Duration = Duration::from_millis(300);
 const LINK_QUEUE_CAPACITY: usize = INFLIGHT_MAX_FRAMES + 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +201,10 @@ pub fn parse_client_message(text: &str) -> Option<V4Inbound> {
     let object = value.as_object()?;
     match object.get("type")?.as_str()? {
         "ack" => {
-            if !only_keys(object, &["type", "generation", "seq", "recvTsMs", "decodedSeq"]) {
+            if !only_keys(
+                object,
+                &["type", "generation", "seq", "recvTsMs", "decodedSeq"],
+            ) {
                 return None;
             }
             let recv_ts_ms = object.get("recvTsMs")?.as_f64()?;
@@ -286,14 +282,14 @@ pub struct AckOutcome {
 }
 
 /// ACK-based in-flight budget and keyframe policy (latest-wins: frames are
-/// never queued behind the budget, they are simply not encoded).
+/// never queued behind the budget, they are simply not encoded). Keyframes
+/// are required only at start, after a reset (reconnect / new peer) and on an
+/// explicit receiver request; there is no periodic or safety keyframe.
 #[derive(Debug)]
 pub struct SendPolicy {
     inflight: VecDeque<InFlight>,
     inflight_bytes: u64,
     need_key: bool,
-    last_key_sent: Option<Instant>,
-    deltas_since_key: u64,
     last_progress: Instant,
 }
 
@@ -303,8 +299,6 @@ impl SendPolicy {
             inflight: VecDeque::new(),
             inflight_bytes: 0,
             need_key: true,
-            last_key_sent: None,
-            deltas_since_key: 0,
             last_progress: now,
         }
     }
@@ -318,17 +312,10 @@ impl SendPolicy {
             || (!self.inflight.is_empty() && self.inflight_bytes > Self::budget_bytes(bitrate_bps))
     }
 
-    pub fn safety_keyframe_due(&self, now: Instant) -> bool {
-        self.deltas_since_key > 0
-            && self
-                .last_key_sent
-                .is_some_and(|sent| now.saturating_duration_since(sent) >= SAFETY_KEYFRAME_INTERVAL)
-    }
-
-    pub fn admit(&self, now: Instant, key: bool, bitrate_bps: u64) -> Admission {
+    pub fn admit(&self, key: bool, bitrate_bps: u64) -> Admission {
         if self.over_budget(bitrate_bps) {
             Admission::Backpressured
-        } else if !key && (self.need_key || self.safety_keyframe_due(now)) {
+        } else if !key && self.need_key {
             Admission::RequireKeyframe
         } else {
             Admission::Send
@@ -365,17 +352,17 @@ impl SendPolicy {
         self.inflight_bytes += bytes;
         if key {
             self.need_key = false;
-            self.last_key_sent = Some(now);
-            self.deltas_since_key = 0;
-        } else {
-            self.deltas_since_key += 1;
         }
     }
 
     /// Retire every in-flight frame up to and including `seq`. Returns the
     /// RTT of the exact frame when it was still in flight.
     pub fn on_ack(&mut self, now: Instant, generation: u32, seq: u32) -> Option<AckOutcome> {
-        if !self.inflight.iter().any(|frame| frame.generation == generation) {
+        if !self
+            .inflight
+            .iter()
+            .any(|frame| frame.generation == generation)
+        {
             // Late ACK for retired frames, or a generation we never sent.
             return None;
         }
@@ -397,12 +384,15 @@ impl SendPolicy {
         outcome
     }
 
-    /// True once the receiver has stopped ACKing frames in flight.
+    /// True once the receiver has stopped ACKing frames in flight; those
+    /// frames are forgotten (no keyframe is required).
     pub fn expire(&mut self, now: Instant) -> bool {
         if !self.inflight.is_empty()
             && now.saturating_duration_since(self.last_progress) >= ACK_STALL_LIMIT
         {
-            self.reset(now);
+            self.inflight.clear();
+            self.inflight_bytes = 0;
+            self.last_progress = now;
             return true;
         }
         false
@@ -513,7 +503,9 @@ impl DelayRateController {
         self.rtt_samples
             .iter()
             .map(|(_, rtt)| *rtt)
-            .fold(None, |min, rtt| Some(min.map_or(rtt, |min: f64| min.min(rtt))))
+            .fold(None, |min, rtt| {
+                Some(min.map_or(rtt, |min: f64| min.min(rtt)))
+            })
     }
 
     /// Profile change: new cap, and the bitrate the encoder now runs at.
@@ -641,38 +633,6 @@ pub fn damage_per_mille(rects: Option<&[DamageRect]>, width: u32, height: u32) -
     (area.min(total) * 1_000 / total).min(1_000)
 }
 
-/// Settle-by-area refine scheduling: a large change arms one refine, which is
-/// due after `REFINE_SETTLE` without another large change. The next refine
-/// needs another large change.
-#[derive(Debug, Default)]
-pub struct RefineSettle {
-    large_change_at: Option<Instant>,
-}
-
-impl RefineSettle {
-    pub fn on_frame(&mut self, now: Instant, damage_per_mille: u64) {
-        if damage_per_mille >= REFINE_LARGE_DAMAGE_PER_MILLE {
-            self.large_change_at = Some(now);
-        }
-    }
-
-    pub fn deadline(&self) -> Option<Instant> {
-        self.large_change_at.map(|at| at + REFINE_SETTLE)
-    }
-
-    pub fn due(&self, now: Instant) -> bool {
-        self.deadline().is_some_and(|deadline| now >= deadline)
-    }
-
-    pub fn on_refine_sent(&mut self) {
-        self.large_change_at = None;
-    }
-
-    pub fn reset(&mut self) {
-        self.large_change_at = None;
-    }
-}
-
 /// Unwraps the 32-bit 90 kHz media clock into a monotonic microsecond clock.
 #[derive(Debug, Default)]
 pub struct TimestampExtender {
@@ -742,6 +702,8 @@ pub struct V4Stats {
     pub acks: u64,
     pub heartbeats: u64,
     pub reconnects: u64,
+    /// ACK stalls that dropped the in-flight window (no keyframe).
+    pub ack_timeouts: u64,
     pub inflight_frames: usize,
     pub inflight_bytes: u64,
     pub bitrate_bps: u64,
@@ -779,8 +741,7 @@ pub enum V4Submit {
     Stopped,
 }
 
-pub type Connector =
-    Box<dyn Fn() -> Result<WebSocket<MaybeTlsStream<TcpStream>>> + Send + 'static>;
+pub type Connector = Box<dyn Fn() -> Result<WebSocket<MaybeTlsStream<TcpStream>>> + Send + 'static>;
 
 /// Owns the single v4 media socket on a dedicated thread.
 pub struct V4Link {
@@ -820,7 +781,9 @@ impl V4Link {
     }
 
     fn lock(&self) -> MutexGuard<'_, Shared> {
-        self.shared.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     pub fn reserve(&self, key: bool) -> V4Reserve {
@@ -833,7 +796,7 @@ impl V4Link {
             return V4Reserve::Backpressured;
         }
         let bitrate = shared.rate.bitrate_bps();
-        match shared.policy.admit(now, key, bitrate) {
+        match shared.policy.admit(key, bitrate) {
             Admission::Send => V4Reserve::Send,
             Admission::RequireKeyframe => V4Reserve::RequireKeyframe,
             Admission::Backpressured => {
@@ -1153,9 +1116,12 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
                     record_rate_decision(&mut state, decision);
                 }
             }
-            let newer = state.events.latest_ack.is_none_or(|(ack_generation, ack_seq)| {
-                ack_generation != generation || seq_reached(seq, ack_seq)
-            });
+            let newer = state
+                .events
+                .latest_ack
+                .is_none_or(|(ack_generation, ack_seq)| {
+                    ack_generation != generation || seq_reached(seq, ack_seq)
+                });
             if newer {
                 state.events.latest_ack = Some((generation, seq));
             }
@@ -1213,7 +1179,7 @@ fn serve_socket(
         }
         let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
         if state.policy.expire(now) {
-            state.events.keyframe = Some("ack-timeout".into());
+            state.stats.ack_timeouts += 1;
         }
         let decision = state.rate.tick(now);
         record_rate_decision(&mut state, decision);
@@ -1225,7 +1191,12 @@ mod tests {
     use super::*;
 
     fn rect(left: u32, top: u32, right: u32, bottom: u32) -> DamageRect {
-        DamageRect { left, top, right, bottom }
+        DamageRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
     }
 
     #[test]
@@ -1233,43 +1204,24 @@ mod tests {
         assert_eq!(damage_per_mille(None, 1920, 1080), 1_000);
         assert_eq!(damage_per_mille(Some(&[]), 1920, 1080), 0);
         // A 20x20 cursor blink is far below the 2 % large-change share.
-        assert_eq!(damage_per_mille(Some(&[rect(100, 100, 120, 120)]), 1920, 1080), 0);
+        assert_eq!(
+            damage_per_mille(Some(&[rect(100, 100, 120, 120)]), 1920, 1080),
+            0
+        );
         // A quarter of the frame.
-        assert_eq!(damage_per_mille(Some(&[rect(0, 0, 960, 540)]), 1920, 1080), 250);
+        assert_eq!(
+            damage_per_mille(Some(&[rect(0, 0, 960, 540)]), 1920, 1080),
+            250
+        );
         // Rects are clipped to the frame and the total is capped.
         assert_eq!(
-            damage_per_mille(Some(&[rect(0, 0, 4000, 4000), rect(0, 0, 1920, 1080)]), 1920, 1080),
+            damage_per_mille(
+                Some(&[rect(0, 0, 4000, 4000), rect(0, 0, 1920, 1080)]),
+                1920,
+                1080
+            ),
             1_000
         );
-    }
-
-    #[test]
-    fn refine_is_sent_once_after_a_large_change_settles() {
-        let now = Instant::now();
-        let ms = |value| now + Duration::from_millis(value);
-        let mut settle = RefineSettle::default();
-        // Small changes alone never earn a refine.
-        settle.on_frame(now, REFINE_LARGE_DAMAGE_PER_MILLE - 1);
-        assert_eq!(settle.deadline(), None);
-
-        settle.on_frame(now, 300);
-        assert!(!settle.due(ms(299)));
-        // A cursor blink during the settle neither cancels nor extends it.
-        settle.on_frame(ms(150), 1);
-        assert_eq!(settle.deadline(), Some(ms(300)));
-        assert!(settle.due(ms(300)));
-        settle.on_refine_sent();
-        // Further small changes do not arm another refine.
-        settle.on_frame(ms(600), 1);
-        assert!(!settle.due(ms(5_000)));
-
-        // Another large change arms exactly one more, measured from it.
-        settle.on_frame(ms(6_000), 1_000);
-        settle.on_frame(ms(6_200), 40);
-        assert!(!settle.due(ms(6_300)));
-        assert!(settle.due(ms(6_500)));
-        settle.reset();
-        assert!(!settle.due(ms(10_000)));
     }
 
     fn fixture() -> Value {
@@ -1286,7 +1238,10 @@ mod tests {
     #[test]
     fn fixture_packets_round_trip() {
         let contract = fixture();
-        assert_eq!(contract["headerBytes"].as_u64().unwrap() as usize, V4_HEADER_BYTES);
+        assert_eq!(
+            contract["headerBytes"].as_u64().unwrap() as usize,
+            V4_HEADER_BYTES
+        );
         assert_eq!(
             contract["maxPayloadBytes"].as_u64().unwrap() as usize,
             V4_MAX_PAYLOAD_BYTES
@@ -1311,7 +1266,10 @@ mod tests {
                 height: case["height"].as_u64().unwrap() as u16,
             };
             assert_eq!(header, expected);
-            assert_eq!(payload, hex(case["payloadHex"].as_str().unwrap()).as_slice());
+            assert_eq!(
+                payload,
+                hex(case["payloadHex"].as_str().unwrap()).as_slice()
+            );
             assert_eq!(encode_packet(&expected, payload).unwrap(), bytes);
         }
     }
@@ -1322,7 +1280,11 @@ mod tests {
         for case in contract["clientMessages"].as_array().unwrap() {
             let text = case["text"].as_str().unwrap();
             let parsed = parse_client_message(text);
-            assert_eq!(parsed.is_some(), case["accepted"].as_bool().unwrap(), "{text}");
+            assert_eq!(
+                parsed.is_some(),
+                case["accepted"].as_bool().unwrap(),
+                "{text}"
+            );
             if let Some(kind) = case.get("kind").and_then(Value::as_str) {
                 let matches = match (kind, parsed.unwrap()) {
                     ("ack", V4Inbound::Ack { .. }) => true,
@@ -1366,10 +1328,10 @@ mod tests {
     fn policy_requires_key_first_then_admits_deltas() {
         let now = Instant::now();
         let mut policy = SendPolicy::new(now);
-        assert_eq!(policy.admit(now, false, 6_000_000), Admission::RequireKeyframe);
-        assert_eq!(policy.admit(now, true, 6_000_000), Admission::Send);
+        assert_eq!(policy.admit(false, 6_000_000), Admission::RequireKeyframe);
+        assert_eq!(policy.admit(true, 6_000_000), Admission::Send);
         policy.on_sent(now, 1, 1, 10_000, true);
-        assert_eq!(policy.admit(now, false, 6_000_000), Admission::Send);
+        assert_eq!(policy.admit(false, 6_000_000), Admission::Send);
     }
 
     #[test]
@@ -1379,23 +1341,25 @@ mod tests {
         assert_eq!(SendPolicy::budget_bytes(6_000_000), 112_500);
         let mut policy = SendPolicy::new(now);
         policy.on_sent(now, 1, 1, 112_500, true);
-        assert_eq!(policy.admit(now, false, 6_000_000), Admission::Send);
+        assert_eq!(policy.admit(false, 6_000_000), Admission::Send);
         policy.on_sent(now, 1, 2, 1, false);
-        assert_eq!(policy.admit(now, false, 6_000_000), Admission::Backpressured);
+        assert_eq!(policy.admit(false, 6_000_000), Admission::Backpressured);
         policy.on_ack(now, 1, 2);
         assert_eq!(policy.inflight_frames(), 0);
         assert_eq!(policy.inflight_bytes(), 0);
         for seq in 3..7 {
-            assert_eq!(policy.admit(now, false, 6_000_000), Admission::Send);
+            assert_eq!(policy.admit(false, 6_000_000), Admission::Send);
             policy.on_sent(now, 1, seq, 100, false);
         }
         assert_eq!(policy.inflight_frames(), INFLIGHT_MAX_FRAMES);
-        assert_eq!(policy.admit(now, false, 6_000_000), Admission::Backpressured);
-        let outcome = policy.on_ack(now + Duration::from_millis(30), 1, 4).unwrap();
+        assert_eq!(policy.admit(false, 6_000_000), Admission::Backpressured);
+        let outcome = policy
+            .on_ack(now + Duration::from_millis(30), 1, 4)
+            .unwrap();
         assert_eq!(outcome.rtt, Duration::from_millis(30));
         assert!(!outcome.key);
         assert_eq!(policy.inflight_frames(), 2);
-        assert_eq!(policy.admit(now, false, 6_000_000), Admission::Send);
+        assert_eq!(policy.admit(false, 6_000_000), Admission::Send);
     }
 
     #[test]
@@ -1412,30 +1376,33 @@ mod tests {
     }
 
     #[test]
-    fn policy_safety_keyframe_only_while_sending_deltas() {
+    fn policy_has_no_periodic_keyframe() {
         let start = Instant::now();
         let mut policy = SendPolicy::new(start);
+        assert_eq!(policy.admit(false, 6_000_000), Admission::RequireKeyframe);
         policy.on_sent(start, 1, 1, 100, true);
         policy.on_ack(start, 1, 1);
-        let later = start + SAFETY_KEYFRAME_INTERVAL + Duration::from_secs(1);
-        // Static screen: nothing sent since the key, no safety key.
-        assert!(!policy.safety_keyframe_due(later));
-        assert_eq!(policy.admit(later, true, 6_000_000), Admission::Send);
-        policy.on_sent(start + Duration::from_secs(1), 1, 2, 100, false);
-        policy.on_ack(start + Duration::from_secs(1), 1, 2);
-        assert!(!policy.safety_keyframe_due(start + Duration::from_secs(29)));
-        assert_eq!(policy.admit(later, false, 6_000_000), Admission::RequireKeyframe);
+        // Deltas keep flowing for an hour without another keyframe.
+        for seq in 2..3_600u32 {
+            assert_eq!(policy.admit(false, 6_000_000), Admission::Send);
+            let at = start + Duration::from_secs(u64::from(seq));
+            policy.on_sent(at, 1, seq, 100, false);
+            policy.on_ack(at, 1, seq);
+        }
+        policy.request_keyframe();
+        assert_eq!(policy.admit(false, 6_000_000), Admission::RequireKeyframe);
     }
 
     #[test]
-    fn policy_stall_resets_and_requires_key() {
+    fn policy_stall_forgets_inflight_without_requiring_a_key() {
         let start = Instant::now();
         let mut policy = SendPolicy::new(start);
         policy.on_sent(start, 1, 1, 100, true);
         assert!(!policy.expire(start + Duration::from_secs(2)));
         assert!(policy.expire(start + ACK_STALL_LIMIT));
-        assert!(policy.needs_keyframe());
+        assert!(!policy.needs_keyframe());
         assert_eq!(policy.inflight_frames(), 0);
+        assert_eq!(policy.admit(false, 6_000_000), Admission::Send);
     }
 
     fn ms(start: Instant, value: u64) -> Instant {
@@ -1460,7 +1427,10 @@ mod tests {
         assert_eq!(cut.reason, RateReason::RttGrowth);
         // The next cut needs another full sustain window.
         assert_eq!(rate.on_rtt(ms(start, 900), 150.0), None);
-        assert_eq!(rate.on_rtt(ms(start, 1_100), 150.0).map(|d| d.bitrate_bps), Some(3_840_000));
+        assert_eq!(
+            rate.on_rtt(ms(start, 1_100), 150.0).map(|d| d.bitrate_bps),
+            Some(3_840_000)
+        );
     }
 
     #[test]
@@ -1528,9 +1498,15 @@ mod tests {
         assert_eq!((up.bitrate_bps, up.reason), (4_600_000, RateReason::Clean));
         rate.on_rtt(ms(start, 3_500), 20.0);
         assert_eq!(rate.tick(ms(start, 4_000)), None);
-        assert_eq!(rate.tick(ms(start, 4_100)).map(|d| d.bitrate_bps), Some(5_290_000));
+        assert_eq!(
+            rate.tick(ms(start, 4_100)).map(|d| d.bitrate_bps),
+            Some(5_290_000)
+        );
         rate.on_rtt(ms(start, 4_500), 20.0);
-        assert_eq!(rate.tick(ms(start, 5_100)).map(|d| d.bitrate_bps), Some(6_000_000));
+        assert_eq!(
+            rate.tick(ms(start, 5_100)).map(|d| d.bitrate_bps),
+            Some(6_000_000)
+        );
         rate.on_rtt(ms(start, 5_500), 20.0);
         assert_eq!(rate.tick(ms(start, 9_000)), None);
         // A skip restarts the clean window.
@@ -1538,7 +1514,10 @@ mod tests {
         rate.on_skip(ms(start, 10_000));
         rate.on_rtt(ms(start, 10_500), 20.0);
         assert_eq!(rate.tick(ms(start, 10_900)), None);
-        assert_eq!(rate.tick(ms(start, 11_000)).map(|d| d.bitrate_bps), Some(5_750_000));
+        assert_eq!(
+            rate.tick(ms(start, 11_000)).map(|d| d.bitrate_bps),
+            Some(5_750_000)
+        );
     }
 
     #[test]
@@ -1643,10 +1622,13 @@ mod tests {
         assert_eq!(sessions[0].0.width, 1920);
         assert_eq!(sessions[0].0.capture_ts_us, 1_000_000);
         assert_eq!(sessions[1].1, vec![0, 0, 1, 0x40]);
-        assert_eq!(wait_for(|| {
-            let stats = link.stats();
-            (stats.reconnects >= 1).then_some(stats.reconnects)
-        }), 1);
+        assert_eq!(
+            wait_for(|| {
+                let stats = link.stats();
+                (stats.reconnects >= 1).then_some(stats.reconnects)
+            }),
+            1
+        );
         link.shutdown();
     }
 }
