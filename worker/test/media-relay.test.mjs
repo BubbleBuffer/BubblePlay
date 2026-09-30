@@ -190,3 +190,25 @@ test("replacing a signaling host forces the live client to establish a fresh ses
   assert.deepEqual(staleHost.closed, [{ code: 1008, reason: "host replaced" }]);
   assert.equal(replacement.attachment.role, "host");
 });
+
+test("input, clipboard and cursor traffic never crosses the v4 media socket", async () => {
+  const host = new FakeSocket("media-host");
+  const client = new FakeSocket("media-client");
+  const room = new Room({ getWebSockets: () => [host, client] }, {});
+  // Input packets are small binary frames; the media socket drops client binary.
+  await room.webSocketMessage(client, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]).buffer);
+  for (const text of [
+    JSON.stringify({ type: "input", data: [1, 2, 3] }),
+    JSON.stringify({ type: "clipboard", text: "secret" }),
+    JSON.stringify({ type: "cursor", x: 1, y: 2 }),
+    JSON.stringify({ type: "ack", generation: 1, seq: 2, recvTsMs: 3, input: [1] }),
+  ]) await room.webSocketMessage(client, text);
+  // Host-side cursor feedback belongs to signaling, not media.
+  await room.webSocketMessage(host, JSON.stringify({ type: "cursor", x: 1, y: 2 }));
+  assert.deepEqual(host.messages, []);
+  assert.deepEqual(client.messages, []);
+  // Only the v4 control vocabulary is relayed to the host.
+  const ack = JSON.stringify({ type: "ack", generation: 1, seq: 2, recvTsMs: 3 });
+  await room.webSocketMessage(client, ack);
+  assert.deepEqual(host.messages, [ack]);
+});

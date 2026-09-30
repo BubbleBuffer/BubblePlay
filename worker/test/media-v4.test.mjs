@@ -223,3 +223,24 @@ test("receiver wires v4: media-socket keyframes, in-order decode, reconnect back
   // v4 has no deadline expiry timer.
   assert.match(source, /\/\/ v4 decodes every frame in order: there is no deadline expiry\.\s*startWssV4\(\);/);
 });
+
+test("receiver input stays on the signaling socket and the media socket carries only v4 control", () => {
+  const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+  const body = name => {
+    const start = source.indexOf(`function ${name}(`);
+    assert.ok(start >= 0, name);
+    return source.slice(start, source.indexOf("\n}\n", start));
+  };
+  // Input goes to the RTC data channel or, under WSS, to the signaling socket.
+  const sendInput = body("sendInput");
+  assert.match(sendInput, /ws\.send\(data\)/);
+  assert.doesNotMatch(sendInput, /wssV4|sendWssV4/);
+  assert.match(body("inputControlState"), /ws\.bufferedAmount/);
+  assert.doesNotMatch(body("inputControlState"), /wssV4/);
+  // Every media-socket send is an ACK, keyframe request, heartbeat or hello.
+  const calls = [...source.matchAll(/sendWssV4\(([^)]*)/g)].map(match => match[1]).filter(arg => arg !== "text");
+  assert.equal(calls.length, 3);
+  for (const arg of calls) assert.match(arg, /^(ackMessageV4|keyframeMessageV4|'\{"type":"ping"\}')/);
+  assert.equal([...source.matchAll(/(?<!ws)\bsocket\.send\(/g)].length, 2);
+  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-client" \}\)\)/);
+});
