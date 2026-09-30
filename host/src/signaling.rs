@@ -27,6 +27,9 @@ use tungstenite::{client_tls_with_config, Error as WsError, Message, WebSocket};
 const SIGNALING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKER_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// WSS media protocols this host can serve. v4 (single socket) is preferred by
+/// production receivers; v2/v3 remain available for Stream Lab runs.
+pub const HOST_MEDIA_PROTOCOLS: [u8; 3] = [2, 3, 4];
 const BENCH_STATUS_MAX_BYTES: usize = 4_096;
 
 const V2_REDUNDANT_BENCH_FIELDS: [&str; 12] = [
@@ -1648,7 +1651,7 @@ impl Signaling {
             cold_boot,
             secure_desktop,
             secure_text,
-            media_protocols: vec![2, 3],
+            media_protocols: HOST_MEDIA_PROTOCOLS.to_vec(),
             max_wss_lanes: 16,
             wss_fec: vec!["none".into(), "xor-1".into(), "rs-2".into()],
         };
@@ -3026,18 +3029,18 @@ mod tests {
     }
 
     #[test]
-    fn host_capabilities_advertise_bounded_v3_support() {
+    fn host_capabilities_advertise_bounded_v3_and_single_socket_v4_support() {
         let message = SignalMsg::HostCapabilities {
             service_mode: true,
             cold_boot: true,
             secure_desktop: true,
             secure_text: true,
-            media_protocols: vec![2, 3],
+            media_protocols: super::HOST_MEDIA_PROTOCOLS.to_vec(),
             max_wss_lanes: 16,
             wss_fec: vec!["none".into(), "xor-1".into(), "rs-2".into()],
         };
         let encoded = serde_json::to_value(message).unwrap();
-        assert_eq!(encoded["mediaProtocols"], serde_json::json!([2, 3]));
+        assert_eq!(encoded["mediaProtocols"], serde_json::json!([2, 3, 4]));
         assert_eq!(encoded["maxWssLanes"], 16);
         assert_eq!(
             encoded["wssFec"],
