@@ -10,6 +10,7 @@ import {
  import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { AdaptiveFrameDeadline, applyLateShardDeadline, classifyMediaShardV3, CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, OrderedFrameRelease, ParityFrameReassembler, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, selectStaleWssLane, selectWssMediaTopology, shouldDeferWssMediaStart, shouldFallbackToWssOnMissingRtp, shouldRecoverWssStripeReconnect, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY, stripLabEdgeTrace, VariableParityFrameReassembler, validateWssTopology, WssLaneLifecycleTelemetry } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
+import { V4ReceiveGate, V4_HEARTBEAT_MS, ackMessageV4, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, preferWssProtocolV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import { TRANSPORT, createCodecSession, parseAdaptive, parseQualityPreset, parseTransport, rtpCodecMimeTypes } from "/transport.js";
 import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
 
@@ -94,6 +95,8 @@ function parseRequestedWssTopology(searchParams, runId) {
 }
 const requestedWssTopology = parseRequestedWssTopology(params, labRun);
 const V2_WSS_TOPOLOGY = Object.freeze({ laneCount: 4, dataShards: 3, parityShards: 1 });
+// Protocol v4 is one media socket; the topology shape only feeds lane counters.
+const V4_WSS_TOPOLOGY = Object.freeze({ laneCount: 1, dataShards: 1, parityShards: 0 });
 const useWebCodecs = params.get("decoderPath") === "webcodecs";
 const requestedTransport = parseTransport(params);
 let qualityPreset = parseQualityPreset(params, localStorage);
@@ -458,6 +461,14 @@ function renderConnectionStatus() {
   let label = "Connecting…";
   if (terminalSignalingFailure) { state = "error"; label = "Session unavailable"; }
   else if (!desktopAvailable) { state = "error"; label = "Desktop unavailable"; }
+  else if (usingWssMedia && wssProtocol === 4) {
+    // v4 never reports "waiting for stream" for a static desktop: no frames
+    // is the expected steady state while nothing on screen changes.
+    const v4 = wssV4Status();
+    state = v4 === "connected" || v4 === "paused-static" ? "connected" : "connecting";
+    label = v4 === "connected" ? "Connected · WSS" : v4 === "paused-static" ? "Connected · WSS (static)" :
+      v4 === "reconnecting" ? "Reconnecting media…" : v4 === "starting" ? "Starting stream…" : "Connecting…";
+  }
   else if (inputReady && usingWssMedia) { state = "connected"; label = "Connected · WSS"; }
   else if (inputReady && (hudState.ice === "connected" || hudState.ice === "completed" || hudState.ice === "connected/connected")) { state = "connected"; label = "Connected · WebRTC"; }
   else if (hudState.ws.startsWith("reconnecting") || hudState.ws === "closed") { label = "Reconnecting…"; }
@@ -562,6 +573,23 @@ let wssTailDeadlineTelemetry = {
 };
 let wssStartupRecoveries = 0;
 let wssExpiryTimer = null;
+// WSS v4 single-socket session state.
+const wssV4 = {
+  gate: new V4ReceiveGate(), socket: null, socketOpen: false, hostPresent: false, reconnecting: false,
+  backoffMs: 0, reconnects: 0, heartbeatTimer: null, lastSendAt: 0, lastInboundAt: 0,
+  lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity,
+  presentSkips: 0, gateDrops: 0, frames: 0,
+};
+function wssV4Status() {
+  const open = wssV4.socketOpen && wssV4.hostPresent;
+  return wssV4StatusLabel({
+    socketOpen: open,
+    reconnecting: wssV4.reconnecting || (wssV4.socketOpen && !wssV4.hostPresent && hasPresentedFrame),
+    framesPresented: hasPresentedFrame ? 1 : 0,
+    lastFrameAtMs: wssV4.lastFrameAt,
+    nowMs: performance.now(),
+  });
+}
 const mediaAck = createMediaAckScheduler({
   snapshot: () => ({ protocol: wssProtocol, epoch: mediaEpoch, topology: wssTopology,
     reassembler: wssReassembler, presented: wssPresentedSequence, dependencyLosses: wssDependencyLosses,
@@ -719,7 +747,7 @@ function recycleSignaling(reason) {
     laneCount: wssTopology.laneCount,
     openLanes: wssStripeOpened.filter(Boolean).length,
     mediaGeneration: wssReassembler.generation,
-    reconstructed: wssReassembler.highestReconstructed,
+    reconstructed: wssProtocol === 4 ? wssV4.lastSeq : wssReassembler.highestReconstructed,
     presented: wssPresentedSequence,
     receivedPackets: wssMediaReceivedPackets,
     recoveryState: wssRecoveryState,
@@ -825,7 +853,7 @@ async function handleSignal(socket, generation, ev) {
         coldBoot: msg.coldBoot === true,
         secureDesktop: msg.secureDesktop === true,
         secureText: msg.secureText === true,
-        mediaProtocols: Array.isArray(msg.mediaProtocols) ? msg.mediaProtocols.filter(value => value === 2 || value === 3) : [2],
+        mediaProtocols: Array.isArray(msg.mediaProtocols) ? msg.mediaProtocols.filter(value => value === 2 || value === 3 || value === 4) : [2],
         maxWssLanes: Number.isInteger(msg.maxWssLanes) ? Math.max(4, Math.min(16, msg.maxWssLanes)) : 4,
         wssFec: Array.isArray(msg.wssFec) ?
           msg.wssFec.filter(value => value === "none" || value === "xor-1" || value === "rs-2") :
@@ -875,10 +903,10 @@ async function addRemoteIce(candidate, generation, ice) {
   }
 }
 
-// Keep the relay's WebSocket alive.
+// Keep the relay's WebSocket alive (15 s idle heartbeat, same as the host).
 setInterval(() => {
   sendSignal({ type: "ping" });
-}, 25000);
+}, V4_HEARTBEAT_MS);
 
 // ---- WebRTC ----------------------------------------------------------------
 function restartPeer(reason, reconnect = true) {
@@ -945,6 +973,7 @@ function clearWssTimers() {
   clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
   clearWssKeyframeWatchdog();
   clearInterval(wssExpiryTimer); wssExpiryTimer = null;
+  clearInterval(wssV4.heartbeatTimer); wssV4.heartbeatTimer = null;
   mediaAck.clear();
   clearTimeout(wssStartDeadlineTimer); wssStartDeadlineTimer = null;
   clearTimeout(wssCapabilityTimer); wssCapabilityTimer = null;
@@ -956,8 +985,11 @@ function stopWssMedia() {
   usingWssMedia = false;
   clearWssTimers();
   wssDecoderEpoch++;
-  for (const socket of wssMediaSockets) try { socket.close(1000, "switch"); } catch {}
-  wssMediaSockets = []; wssStripeOpened = []; wssStripeEverOpened = []; wssDiagnosticLaneFaultUntil = [];
+  for (const socket of wssMediaSockets) try { socket?.close(1000, "switch"); } catch {}
+  wssMediaSockets = [];
+  Object.assign(wssV4, { socket: null, socketOpen: false, hostPresent: false, reconnecting: false,
+    backoffMs: 0, lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity });
+  wssV4.gate.reset("start"); wssStripeOpened = []; wssStripeEverOpened = []; wssDiagnosticLaneFaultUntil = [];
   wssLaneLifecycle.reset();
   wssStartedHost = false; wssStartDeadlineAt = 0; wssStaleLaneRecycleAt = 0; wssReassembler.reset(); wssOrdered.reset();
   wssPresentedSequence = 0; wssShardPackets = 0; wssDecodeSequenceByTimestamp.clear(); wssFrameMeta = new WeakMap();
@@ -1016,6 +1048,138 @@ function scheduleWssMediaReconnect(stripe, socketGeneration, delayMs, reason) {
     debugTrace("media-lane-reconnect-fired", { stripe, socketGeneration, reason });
     openWssMediaStripe(stripe);
   }, boundedDelayMs);
+}
+
+function sendWssV4(text) {
+  const socket = wssV4.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  try { socket.send(text); } catch { return false; }
+  wssV4.lastSendAt = performance.now();
+  return true;
+}
+
+function scheduleWssV4Reconnect(reason) {
+  clearTimeout(wssReconnectTimers[0]);
+  wssV4.backoffMs = nextBackoffMsV4(wssV4.backoffMs);
+  wssV4.reconnecting = true;
+  debugTrace("media-v4-reconnect-scheduled", { reason, delayMs: wssV4.backoffMs });
+  wssReconnectTimers[0] = setTimeout(() => {
+    if (!usingWssMedia || wssProtocol !== 4) return;
+    wssV4.reconnects++;
+    openWssV4Socket();
+  }, wssV4.backoffMs);
+}
+
+function openWssV4Socket() {
+  if (!usingWssMedia || wssProtocol !== 4 || !mediaEpoch) return;
+  const socket = new WebSocket(mediaSocketUrl(0));
+  socket.binaryType = "arraybuffer";
+  wssV4.socket = socket;
+  wssMediaSockets[0] = socket;
+  wssV4.socketOpen = false;
+  wssV4.hostPresent = false;
+  const current = () => usingWssMedia && wssProtocol === 4 && wssV4.socket === socket;
+  socket.onopen = () => {
+    if (!current()) return;
+    socket.send(JSON.stringify({ type: "hello", role: "media-client" }));
+    wssV4.lastSendAt = wssV4.lastInboundAt = performance.now();
+  };
+  socket.onmessage = (event) => {
+    if (!current()) return;
+    wssV4.lastInboundAt = performance.now();
+    if (typeof event.data !== "string") {
+      onWssV4Packet(event.data);
+      return;
+    }
+    let message;
+    try { message = JSON.parse(event.data); } catch { return; }
+    if (message.type === "hello-ok") {
+      const reconnect = wssStripeEverOpened[0] === true;
+      wssV4.socketOpen = true;
+      wssV4.reconnecting = false;
+      wssV4.backoffMs = 0;
+      wssStripeOpened[0] = true;
+      wssStripeEverOpened[0] = true;
+      // Whatever was in flight on the old socket is gone: the decoder must
+      // restart from the keyframe the host sends when it sees this peer.
+      wssV4.gate.reset(reconnect ? "reconnect" : "connect");
+      debugTrace("media-v4-open", { reconnect, reconnects: wssV4.reconnects });
+      if (reconnect) sendClientLog("info", "wss-v4-reconnected", { reconnects: wssV4.reconnects });
+      maybeStartWssHost();
+    } else if (message.type === "media-peer") {
+      const present = message.present === true;
+      if (present && !wssV4.hostPresent) wssV4.gate.reset("host-joined");
+      wssV4.hostPresent = present;
+    }
+  };
+  socket.onclose = (event) => {
+    if (!current()) return;
+    wssStripeOpened[0] = false;
+    wssV4.socketOpen = false;
+    wssV4.hostPresent = false;
+    wssV4.socket = null;
+    hudState.ice = "wss v4 reconnecting";
+    debugTrace("media-v4-close", { code: event.code, reason: event.reason || "", wasClean: event.wasClean });
+    scheduleWssV4Reconnect("socket-close");
+  };
+  socket.onerror = () => {
+    if (!current()) return;
+    try { socket.close(); } catch {}
+  };
+}
+
+function onWssV4Packet(data) {
+  wssMediaReceivedBytes += data.byteLength;
+  wssMediaReceivedPackets++;
+  const frame = parseFrameV4(data);
+  if (!frame) {
+    recordWssPacketRejection("v4-invalid-packet", 0);
+    return;
+  }
+  const nowMs = performance.now();
+  // ACK on receipt: the host measures delivery delay, not decode time.
+  sendWssV4(ackMessageV4({ generation: frame.generation, seq: frame.seq, recvTsMs: nowMs,
+    decodedSeq: wssV4.decodedSeq }));
+  wssV4.frames++;
+  wssV4.lastFrameAt = nowMs;
+  wssV4.lastSeq = frame.seq;
+  if (!debugFirstMediaPacket) {
+    debugFirstMediaPacket = true;
+    debugTrace("media-first-packet", { stripe: 0, bytes: data.byteLength, protocol: 4 });
+  }
+  const verdict = wssV4.gate.accept(frame);
+  if (verdict.requestKeyframe) requestWssKeyframe(verdict.requestKeyframe);
+  if (!verdict.decode) {
+    wssV4.gateDrops++;
+    hudState.dropped++;
+    return;
+  }
+  if (frame.key) hudState.keyframes++;
+  decodeWssFrame({
+    codec: frame.codec,
+    generation: frame.generation,
+    sequence: frame.seq,
+    timestampUs: Number(frame.captureTsUs % 9_007_199_254_740_991n),
+    key: frame.key,
+    data: frame.data,
+    frameTrace: { sequence: frame.seq, receivedAtMs: nowMs, refine: frame.refine },
+  });
+}
+
+function startWssV4() {
+  wssMediaSockets = [null];
+  clearInterval(wssV4.heartbeatTimer);
+  wssV4.heartbeatTimer = setInterval(() => {
+    if (!usingWssMedia || wssProtocol !== 4) return;
+    const now = performance.now();
+    if (wssV4.socketOpen && now - wssV4.lastSendAt >= V4_HEARTBEAT_MS) sendWssV4('{"type":"ping"}');
+    // The relay answers every heartbeat; silence means a half-open socket.
+    if (wssV4.socketOpen && now - wssV4.lastInboundAt > V4_HEARTBEAT_MS * 2 + 10_000) {
+      sendClientLog("warn", "wss-v4-silent-socket", { silentMs: Math.round(now - wssV4.lastInboundAt) });
+      try { wssV4.socket?.close(4000, "silent"); } catch {}
+    }
+  }, 1_000);
+  openWssV4Socket();
 }
 
 function openWssMediaStripe(stripe) {
@@ -1275,9 +1439,15 @@ function startWssMedia() {
     capabilitiesCurrent: hostCapabilitiesGeneration === signalingGeneration,
     v3Rejected: wssV3Rejected,
   });
-  wssProtocol = selectedTopology ? 3 : 2;
-  wssTopology = selectedTopology || V2_WSS_TOPOLOGY;
-  wssTopologyAccepted = wssProtocol === 2;
+  const useV4 = preferWssProtocolV4({
+    lab: labRun !== null,
+    requestedTopology: requestedWssTopology,
+    hostCapabilities,
+    capabilitiesCurrent: hostCapabilitiesGeneration === signalingGeneration,
+  });
+  wssProtocol = useV4 ? 4 : selectedTopology ? 3 : 2;
+  wssTopology = useV4 ? V4_WSS_TOPOLOGY : selectedTopology || V2_WSS_TOPOLOGY;
+  wssTopologyAccepted = wssProtocol !== 3;
   wssReassembler = wssProtocol === 3
     ? new VariableParityFrameReassembler({ topology: wssTopology })
     : new ParityFrameReassembler();
@@ -1320,6 +1490,11 @@ function startWssMedia() {
   wssStartDeadlineAt = performance.now() + 1_500;
   clearTimeout(wssStartDeadlineTimer);
   wssStartDeadlineTimer = setTimeout(() => { wssStartDeadlineTimer = null; maybeStartWssHost(); }, 1_550);
+  if (wssProtocol === 4) {
+    // v4 decodes every frame in order: there is no deadline expiry.
+    startWssV4();
+    return;
+  }
   wssExpiryTimer = setInterval(() => {
     wssDeadline.tick();
     wssReassembler.setTtlMs(wssDeadline.deadlineMs); wssOrdered.setTtlMs(wssDeadline.deadlineMs);
@@ -1447,6 +1622,7 @@ function requestWssKeyframe(reason, requestId = null) {
   if (!requestId && requestWssKeyframe.lastAt && now - requestWssKeyframe.lastAt < 250) return false;
   requestWssKeyframe.lastAt = now;
   sendClientLog("warn", "wss-keyframe-request", { reason, requestId });
+  if (wssProtocol === 4 && usingWssMedia && !requestId) return sendWssV4(keyframeMessageV4(reason));
   sendSignal({ type: "media-control", action: "keyframe", protocol: wssProtocol, epoch: mediaEpoch, reason,
     ...(requestId ? { requestId } : {}), codec: codecSession.codec });
   return true;
@@ -1484,6 +1660,7 @@ function resyncWssDecoder(reason) {
   });
   clearWssHybridCaches();
   wssReassembler.waitForKeyframe(); wssOrdered.reset(wssReassembler.generation);
+  wssV4.gate.invalidate(reason);
   hudState.dec = `waiting keyframe (${reason})`;
 }
 
@@ -1562,9 +1739,10 @@ function networkRouteHealthSnapshot() {
     openLanes: wssStripeOpened.filter(Boolean).length,
     dataShards: wssTopology.dataShards,
     recoveryState: wssRecoveryState,
-    allowQuiescentIdle: labRun !== null,
+    // A static v4 desktop sends no frames by design; heartbeats cover liveness.
+    allowQuiescentIdle: labRun !== null || wssProtocol === 4,
     receivedPackets: wssMediaReceivedPackets,
-    reconstructed: wssReassembler.highestReconstructed,
+    reconstructed: wssProtocol === 4 ? wssV4.lastSeq : wssReassembler.highestReconstructed,
     presented: wssPresentedSequence,
     renderedAgeMs,
     peerConnectionState: pc?.connectionState ?? null,
@@ -1666,7 +1844,8 @@ function decodeWssFrame(frame) {
       hybrid: activeWssHybridCache().snapshot(),
     });
   }
-  const timestamp = Math.round(frame.timestamp90k * 1_000_000 / 90_000);
+  const timestamp = Number.isFinite(frame.timestampUs)
+    ? frame.timestampUs : Math.round(frame.timestamp90k * 1_000_000 / 90_000);
   hudState.mediaGeneration = frame.generation;
   if (frame.key && wssRecoveryState === "awaiting-keyframe") {
     wssRecoveryPending = true;
@@ -1691,7 +1870,8 @@ function decodeWssFrame(frame) {
     cropRevision: prepared.cropRevision,
     frameTrace,
   });
-  while (wssDecodeSequenceByTimestamp.size > 8) wssDecodeSequenceByTimestamp.delete(wssDecodeSequenceByTimestamp.keys().next().value);
+  const metadataLimit = wssProtocol === 4 ? 64 : 8;
+  while (wssDecodeSequenceByTimestamp.size > metadataLimit) wssDecodeSequenceByTimestamp.delete(wssDecodeSequenceByTimestamp.keys().next().value);
   const chunk = {
     type: frame.key ? "key" : "delta",
     timestamp,
@@ -2106,7 +2286,7 @@ if (diagnosticsEnabled) {
           protocol: wssProtocol, topology: { ...wssTopology },
           topologyAccepted: wssTopologyAccepted,
           openLanes: wssStripeOpened.filter(Boolean).length,
-          reconstructed: wssReassembler.highestReconstructed, presented: wssPresentedSequence,
+          reconstructed: wssProtocol === 4 ? wssV4.lastSeq : wssReassembler.highestReconstructed, presented: wssPresentedSequence,
           highestSequenceByLane: [...wssReassembler.highestSequence],
           recoveredFrames: wssReassembler.stats.recoveredFrames,
           expiredFrames: wssReassembler.stats.expiredFrames,
@@ -2215,6 +2395,14 @@ function onDecodedFrame(frame) {
     if (!Number.isFinite(due)) {
       dropAndResync("missing-media-anchor");
       return;
+    }
+    if (usingWssMedia && wssProtocol === 4) {
+      if (!shouldPresentDecodedV4({ decodeQueueSize: decoder?.decodeQueueSize ?? 0,
+        msSinceLastPresent: now - wssV4.lastPresentAt })) {
+        wssV4.presentSkips++;
+        return;
+      }
+      wssV4.lastPresentAt = now;
     }
     if (presentWssFrameImmediately(frame, usingWssMedia, now, drawFrame, framePresentationTelemetry)) {
       retained = true;
@@ -2758,6 +2946,7 @@ function feedDecoder(chunk, generation) {
           if (metadata !== undefined) {
             metadata.frameTrace.decodedAtMs = performance.now();
             wssFrameMeta.set(frame, metadata);
+            if (wssProtocol === 4) wssV4.decodedSeq = metadata.sequence >>> 0;
           }
           if (metadata?.key && wssRecoveryState === "awaiting-keyframe-output") {
             wssRecoveryPending = false;
@@ -2798,7 +2987,9 @@ function feedDecoder(chunk, generation) {
   decoder.sawKeyframe = decoder.sawKeyframe || isKey;
   const decodeLimit = usingWssMedia ? (streamModeValue() === "game" ? 4 : 8) : 2;
   const decodeHardLimit = usingWssMedia ? decodeLimit + 2 : decodeLimit;
-  if (usingWssMedia && decoder.decodeQueueSize >= decodeLimit) {
+  // v4 never drops a chunk for decoder backpressure: every frame is decoded
+  // and only presentation is skipped while the decoder catches up.
+  if (usingWssMedia && wssProtocol !== 4 && decoder.decodeQueueSize >= decodeLimit) {
     wssBackpressureSince ??= performance.now();
     const graceMs = streamModeValue() === "game" ? 150 : 500;
     if (performance.now() - wssBackpressureSince >= graceMs || decoder.decodeQueueSize >= decodeHardLimit) {
@@ -2809,7 +3000,7 @@ function feedDecoder(chunk, generation) {
   } else {
     wssBackpressureSince = null;
   }
-  if (!latencyGuard.admitDecode(decodeHardLimit)) {
+  if (!latencyGuard.admitDecode(usingWssMedia && wssProtocol === 4 ? Infinity : decodeHardLimit)) {
     if (usingWssMedia) { hudState.dropped++; beginWssRecovery("decoder-backpressure"); }
     else dropAndResync("decoder-backpressure");
     return;
@@ -3427,7 +3618,7 @@ function armViewportTransitionTimeout(revision) {
   }, 1_500);
 }
 function sendViewportRequest(crop, reason, force = false) {
-  if (!usingWssMedia || !wssStartedHost || viewportPending) return false;
+  if (!usingWssMedia || !wssStartedHost || viewportPending || wssProtocol === 4) return false;
   const active = activeViewportCrop();
   if (!force && !cropNeedsUpdate(active, crop, remoteDesktop.width, remoteDesktop.height)) return false;
   const revision = viewportRevision = (viewportRevision + 1) >>> 0;
@@ -3448,7 +3639,7 @@ function flushSharpViewport(reason = "sharp-viewport") {
   sendViewportRequest(viewportDesired, reason);
 }
 function scheduleSharpViewport(reason = "sharp-viewport") {
-  if (!usingWssMedia || !wssStartedHost) return;
+  if (!usingWssMedia || !wssStartedHost || wssProtocol === 4) return;
   viewportDesired = computeDesiredViewport();
   if (viewportPending) return;
   clearTimeout(viewportTimer);

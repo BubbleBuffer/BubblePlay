@@ -12,6 +12,7 @@ import {
   keyframeMessageV4,
   nextBackoffMsV4,
   parseFrameV4,
+  preferWssProtocolV4,
   shouldPresentDecodedV4,
   validateClientMessageV4,
   validateHostTextV4,
@@ -202,10 +203,33 @@ test("v4 reconnect backoff, presentation skipping and status labels", () => {
   let delay = 0;
   for (let i = 0; i < 7; i += 1) { delay = nextBackoffMsV4(delay); delays.push(delay); }
   assert.deepEqual(delays, [250, 500, 1000, 2000, 4000, 5000, 5000]);
-  assert.equal(shouldPresentDecodedV4({ decodeQueueSize: 0, pendingOutputs: 1 }), true);
-  assert.equal(shouldPresentDecodedV4({ decodeQueueSize: 3, pendingOutputs: 1 }), false);
+  assert.equal(shouldPresentDecodedV4({ decodeQueueSize: 0, msSinceLastPresent: 5 }), true);
+  assert.equal(shouldPresentDecodedV4({ decodeQueueSize: 1, msSinceLastPresent: 5 }), true);
+  assert.equal(shouldPresentDecodedV4({ decodeQueueSize: 3, msSinceLastPresent: 5 }), false);
+  assert.equal(shouldPresentDecodedV4({ decodeQueueSize: 3, msSinceLastPresent: 150 }), true);
+  const capable = { mediaProtocols: [2, 3, 4] };
+  assert.equal(preferWssProtocolV4({ hostCapabilities: capable }), true);
+  assert.equal(preferWssProtocolV4({ hostCapabilities: { mediaProtocols: [2, 3] } }), false);
+  assert.equal(preferWssProtocolV4({ hostCapabilities: capable, lab: true }), false);
+  assert.equal(preferWssProtocolV4({ hostCapabilities: capable, requestedTopology: { laneCount: 4 } }), false);
+  assert.equal(preferWssProtocolV4({ hostCapabilities: capable, capabilitiesCurrent: false }), false);
   assert.equal(wssV4StatusLabel({ socketOpen: false, reconnecting: true }), "reconnecting");
   assert.equal(wssV4StatusLabel({ socketOpen: true, framesPresented: 0 }), "starting");
   assert.equal(wssV4StatusLabel({ socketOpen: true, framesPresented: 5, lastFrameAtMs: 0, nowMs: 5_000 }), "paused-static");
   assert.equal(wssV4StatusLabel({ socketOpen: true, framesPresented: 5, lastFrameAtMs: 4_900, nowMs: 5_000 }), "connected");
+});
+
+test("receiver wires v4: media-socket keyframes, in-order decode, reconnect backoff, static status", () => {
+  const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
+  assert.match(source, /from "\/media-v4\.js";/);
+  assert.match(source, /wssProtocol = useV4 \? 4 : selectedTopology \? 3 : 2;/);
+  assert.match(source, /preferWssProtocolV4\(\{\s*lab: labRun !== null,/);
+  assert.match(source, /if \(wssProtocol === 4 && usingWssMedia && !requestId\) return sendWssV4\(keyframeMessageV4\(reason\)\);/);
+  assert.match(source, /wssV4\.backoffMs = nextBackoffMsV4\(wssV4\.backoffMs\);/);
+  assert.match(source, /usingWssMedia && wssProtocol !== 4 && decoder\.decodeQueueSize >= decodeLimit/);
+  assert.match(source, /shouldPresentDecodedV4\(/);
+  assert.match(source, /Connected · WSS \(static\)/);
+  assert.match(source, /sendSignal\(\{ type: "ping" \}\);\s*\}, V4_HEARTBEAT_MS\);/);
+  // v4 has no deadline expiry timer.
+  assert.match(source, /if \(wssProtocol === 4\) \{\s*\/\/ v4 decodes every frame in order: there is no deadline expiry\.\s*startWssV4\(\);\s*return;/);
 });

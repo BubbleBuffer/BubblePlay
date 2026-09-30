@@ -182,11 +182,24 @@ export class V4ReceiveGate {
 }
 
 /**
- * Presentation policy: decode everything, but when the decoder output runs
- * ahead of the display only the newest decoded frame is painted.
+ * Presentation policy: every frame is decoded, but while the decoder is
+ * behind (several chunks still queued) intermediate outputs are not painted.
+ * A frame is still painted at least every `maxSkipMs` so a persistently
+ * slow decoder never freezes the picture.
  */
-export function shouldPresentDecodedV4({ decodeQueueSize = 0, pendingOutputs = 0 } = {}) {
-  return decodeQueueSize === 0 && pendingOutputs <= 1;
+export function shouldPresentDecodedV4({ decodeQueueSize = 0, msSinceLastPresent = Infinity,
+  maxQueued = 1, maxSkipMs = 100 } = {}) {
+  return decodeQueueSize <= maxQueued || msSinceLastPresent >= maxSkipMs;
+}
+
+/**
+ * Production WSS prefers protocol 4 whenever the host advertises it. Stream
+ * Lab runs and explicit topology requests keep the v2/v3 lane protocols.
+ */
+export function preferWssProtocolV4({ lab = false, requestedTopology = null, hostCapabilities = null,
+  capabilitiesCurrent = true } = {}) {
+  if (lab || requestedTopology || !capabilitiesCurrent) return false;
+  return Array.isArray(hostCapabilities?.mediaProtocols) && hostCapabilities.mediaProtocols.includes(V4_VERSION);
 }
 
 /** Receiver status text for v4 (never "waiting for stream" when static). */
