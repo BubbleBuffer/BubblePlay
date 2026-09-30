@@ -462,6 +462,49 @@ fn run_spike(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Host-to-browser clipboard sync for the unprivileged local host. Text
+/// copied while no viewer is live is never sent: each gap re-baselines.
+#[derive(Default)]
+struct LocalClipboardPoll {
+    next_poll: Option<Instant>,
+    live: bool,
+    id: u32,
+}
+
+impl LocalClipboardPoll {
+    const INTERVAL: Duration = Duration::from_millis(300);
+
+    fn poll(
+        &mut self,
+        viewer_live: bool,
+        now: Instant,
+        input: &mut InputSink,
+        signaling: &mut Signaling,
+    ) {
+        if !viewer_live {
+            self.live = false;
+            return;
+        }
+        if self.live && self.next_poll.is_some_and(|at| now < at) {
+            return;
+        }
+        let reset = !std::mem::replace(&mut self.live, true);
+        self.next_poll = Some(now + Self::INTERVAL);
+        let Some(text) = input.poll_clipboard(reset) else {
+            return;
+        };
+        self.id = self.id.wrapping_add(1);
+        let chunks = bubbleplay_host::clipboard::chunk_text(
+            &text,
+            bubbleplay_host::clipboard::HOST_CHUNK_BYTES,
+        );
+        let count = chunks.len() as u16;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            signaling.send_clipboard_chunk(self.id, index as u16, count, chunk);
+        }
+    }
+}
+
 /// Full pipeline: signaling + WebRTC + media + input.
 /// Live producer/session loop.  The transport pump exclusively owns str0m and
 /// the media UDP socket; this thread owns capture, D3D scaling and NVENC.
@@ -538,8 +581,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     };
     let mut profiles =
         ProfileTransition::new_for_mode(Profile::Full, quality.profile(), stream_mode);
-    let mut input_sink = InputSink::new();
+    // Only an unprivileged local host runs as the interactive user; the
+    // service path syncs clipboard inside the input proxy instead.
+    let mut input_sink = InputSink::new().with_clipboard(!capture.is_privileged());
     input_sink.set_absolute_region(capture.region());
+    let mut local_clipboard = LocalClipboardPoll::default();
     let mut cursor_tracker = CursorTracker::for_region(capture.region(), Instant::now());
     let mut next_cursor_poll = Instant::now();
     let mut next_input_log = Instant::now() + Duration::from_secs(1);
@@ -927,6 +973,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     stats.last_error_code,
                     stats.last_sequence,
                 ),
+                PrivilegedEvent::Clipboard {
+                    id,
+                    index,
+                    count,
+                    text,
+                } => signaling.send_clipboard_chunk(id, index, count, &text),
                 PrivilegedEvent::Monitors(monitors) => signaling.send_monitor_list(monitors),
                 PrivilegedEvent::MonitorSwitch {
                     accepted,
@@ -1165,6 +1217,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 pump.publish_cursor_state(state.encode());
             }
             next_cursor_poll = cursor_now + Duration::from_millis(16);
+        }
+        if !capture.is_privileged() {
+            let viewer_live =
+                capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
+            local_clipboard.poll(viewer_live, cursor_now, &mut input_sink, &mut signaling);
         }
         if cursor_now >= next_input_log {
             let stats = input_sink.take_stats();

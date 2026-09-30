@@ -4,6 +4,8 @@ pub const MAGIC: [u8; 4] = *b"BPXP";
 pub const VERSION: u16 = 1;
 pub const HEADER_LEN: usize = 20;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Responses may carry one whole clipboard text (1 MiB cap) plus framing.
+pub const MAX_RESPONSE_PAYLOAD_BYTES: usize = crate::clipboard::MAX_CLIPBOARD_BYTES + 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -20,9 +22,14 @@ pub enum Request {
     },
     ReleaseAll,
     Shutdown,
+    /// Ask for interactive-session clipboard text changed since the last
+    /// poll. `reset` re-baselines without reporting the current contents.
+    PollClipboard {
+        reset: bool,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     Ready {
         session_id: u32,
@@ -49,6 +56,9 @@ pub enum Response {
     Ack,
     Rejected {
         code: u32,
+    },
+    Clipboard {
+        text: Option<String>,
     },
 }
 
@@ -121,6 +131,7 @@ fn encode_request(request: &Request) -> Vec<u8> {
         }
         Request::ReleaseAll => vec![4],
         Request::Shutdown => vec![5],
+        Request::PollClipboard { reset } => vec![6, u8::from(*reset)],
     }
 }
 
@@ -140,6 +151,9 @@ fn decode_request(payload: &[u8]) -> io::Result<Request> {
         }),
         4 if body.is_empty() => Ok(Request::ReleaseAll),
         5 if body.is_empty() => Ok(Request::Shutdown),
+        6 if body.len() == 1 => Ok(Request::PollClipboard {
+            reset: decode_bool(body[0])?,
+        }),
         _ => Err(invalid_payload()),
     }
 }
@@ -147,6 +161,13 @@ fn decode_request(payload: &[u8]) -> io::Result<Request> {
 fn encode_response(response: &Response) -> Vec<u8> {
     match response {
         Response::Ack => vec![3],
+        Response::Clipboard { text } => {
+            let mut payload = vec![6, u8::from(text.is_some())];
+            if let Some(text) = text {
+                payload.extend_from_slice(text.as_bytes());
+            }
+            payload
+        }
         Response::Rejected { code } => {
             let mut payload = vec![4];
             payload.extend_from_slice(&code.to_le_bytes());
@@ -231,6 +252,22 @@ fn decode_response(payload: &[u8]) -> io::Result<Response> {
             })
         }
         3 if body.is_empty() => Ok(Response::Ack),
+        6 if !body.is_empty() => {
+            let has_text = decode_bool(body[0])?;
+            let text = &body[1..];
+            if !has_text {
+                return if text.is_empty() {
+                    Ok(Response::Clipboard { text: None })
+                } else {
+                    Err(invalid_payload())
+                };
+            }
+            if text.is_empty() || text.len() > crate::clipboard::MAX_CLIPBOARD_BYTES {
+                return Err(invalid_payload());
+            }
+            let text = String::from_utf8(text.to_vec()).map_err(|_| invalid_payload())?;
+            Ok(Response::Clipboard { text: Some(text) })
+        }
         4 if body.len() == 4 => Ok(Response::Rejected {
             code: u32::from_le_bytes(body.try_into().unwrap()),
         }),
@@ -266,7 +303,7 @@ fn write_frame<W: Write>(
     family: u16,
     payload: &[u8],
 ) -> io::Result<()> {
-    if payload.len() > MAX_PAYLOAD_BYTES {
+    if payload.len() > max_payload_bytes(family) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "input proxy payload exceeds limit",
@@ -301,7 +338,7 @@ fn read_frame<R: Read>(reader: &mut R) -> io::Result<(u64, u16, Vec<u8>)> {
     let family = u16::from_le_bytes(header[6..8].try_into().unwrap());
     let request_id = u64::from_le_bytes(header[8..16].try_into().unwrap());
     let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-    if payload_len > MAX_PAYLOAD_BYTES {
+    if payload_len > max_payload_bytes(family) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "input proxy payload exceeds limit",
@@ -310,6 +347,14 @@ fn read_frame<R: Read>(reader: &mut R) -> io::Result<(u64, u16, Vec<u8>)> {
     let mut payload = vec![0; payload_len];
     reader.read_exact(&mut payload)?;
     Ok((request_id, family, payload))
+}
+
+fn max_payload_bytes(family: u16) -> usize {
+    if family == 2 {
+        MAX_RESPONSE_PAYLOAD_BYTES
+    } else {
+        MAX_PAYLOAD_BYTES
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +377,8 @@ mod tests {
             },
             Request::ReleaseAll,
             Request::Shutdown,
+            Request::PollClipboard { reset: true },
+            Request::PollClipboard { reset: false },
         ];
         for request in requests {
             let mut wire = Vec::new();
@@ -364,11 +411,38 @@ mod tests {
                 failed_calls: 1,
                 last_error_code: Some(5),
             },
+            Response::Clipboard { text: None },
+            Response::Clipboard {
+                text: Some("héllo\r\nwörld".into()),
+            },
+            Response::Clipboard {
+                text: Some("x".repeat(crate::clipboard::MAX_CLIPBOARD_BYTES)),
+            },
         ];
         for response in responses {
             let mut wire = Vec::new();
             write_response(&mut wire, 52, &response).unwrap();
             assert_eq!(read_response(&mut wire.as_slice()).unwrap(), (52, response));
         }
+    }
+
+    #[test]
+    fn clipboard_responses_are_bounded_and_utf8() {
+        for payload in [
+            vec![6],
+            vec![6, 0, b'x'],
+            vec![6, 1],
+            vec![6, 1, 0xFF],
+            vec![6, 2, b'x'],
+        ] {
+            assert!(decode_response(&payload).is_err(), "{payload:?}");
+        }
+        let too_large = Response::Clipboard {
+            text: Some("x".repeat(crate::clipboard::MAX_CLIPBOARD_BYTES + 1)),
+        };
+        assert!(decode_response(&encode_response(&too_large)).is_err());
+        // Requests keep the small limit even though responses may be larger.
+        let mut wire = Vec::new();
+        assert!(write_request(&mut wire, 1, &Request::Input(vec![0; MAX_PAYLOAD_BYTES])).is_err());
     }
 }

@@ -333,6 +333,12 @@ pub(super) enum PrivilegedEvent {
         monitor: String,
         error_code: i32,
     },
+    Clipboard {
+        id: u32,
+        index: u16,
+        count: u16,
+        text: String,
+    },
 }
 
 /// The display a session must capture: the runtime selection when one exists,
@@ -613,6 +619,17 @@ impl CaptureSource {
                 })
             }
             AgentMessage::InputStats(stats) => Some(PrivilegedEvent::InputStatus(stats)),
+            AgentMessage::ClipboardText {
+                id,
+                index,
+                count,
+                text,
+            } => Some(PrivilegedEvent::Clipboard {
+                id,
+                index,
+                count,
+                text,
+            }),
             AgentMessage::Capabilities(_) | AgentMessage::ConfigAck { .. } => None,
             AgentMessage::RecoverableError(error) => {
                 warn!(

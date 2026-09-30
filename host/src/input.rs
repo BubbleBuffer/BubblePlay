@@ -32,10 +32,11 @@ use crate::clipboard;
 use windows::Win32::Foundation::{SetLastError, POINT, WIN32_ERROR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorInfo, GetCursorPos, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING, SM_CXVIRTUALSCREEN,
@@ -914,7 +915,10 @@ mod tests {
                 (win, true)
             ]
         );
-        assert!(!meta.key(win, true), "the browser's later Win key-up is swallowed");
+        assert!(
+            !meta.key(win, true),
+            "the browser's later Win key-up is swallowed"
+        );
         assert!(meta.key(win, false));
         assert!(meta.key(win, true));
     }
@@ -932,7 +936,10 @@ mod tests {
     #[test]
     fn clipboard_assembly_requires_ordered_complete_utf8() {
         let mut assembly = ClipboardAssembly::default();
-        assert_eq!(assembly.push(chunk(1, 0, 2, &[0xC3])), ClipboardProgress::Pending);
+        assert_eq!(
+            assembly.push(chunk(1, 0, 2, &[0xC3])),
+            ClipboardProgress::Pending
+        );
         assert_eq!(
             assembly.push(chunk(1, 1, 2, &[0xA9])),
             ClipboardProgress::Complete {
@@ -940,11 +947,26 @@ mod tests {
                 paste: true
             }
         );
-        assert_eq!(assembly.push(chunk(2, 1, 2, b"x")), ClipboardProgress::Rejected);
-        assert_eq!(assembly.push(chunk(3, 0, 3, b"a")), ClipboardProgress::Pending);
-        assert_eq!(assembly.push(chunk(3, 2, 3, b"c")), ClipboardProgress::Rejected);
-        assert_eq!(assembly.push(chunk(4, 0, 1, &[0xFF])), ClipboardProgress::Rejected);
-        assert_eq!(assembly.push(chunk(5, 0, 1, b"")), ClipboardProgress::Rejected);
+        assert_eq!(
+            assembly.push(chunk(2, 1, 2, b"x")),
+            ClipboardProgress::Rejected
+        );
+        assert_eq!(
+            assembly.push(chunk(3, 0, 3, b"a")),
+            ClipboardProgress::Pending
+        );
+        assert_eq!(
+            assembly.push(chunk(3, 2, 3, b"c")),
+            ClipboardProgress::Rejected
+        );
+        assert_eq!(
+            assembly.push(chunk(4, 0, 1, &[0xFF])),
+            ClipboardProgress::Rejected
+        );
+        assert_eq!(
+            assembly.push(chunk(5, 0, 1, b"")),
+            ClipboardProgress::Rejected
+        );
         // A new transfer restarts cleanly after an abandoned one.
         assembly.push(chunk(6, 0, 2, b"a"));
         assert_eq!(
@@ -967,7 +989,12 @@ mod tests {
             );
         }
         assert!(matches!(
-            assembly.push(chunk(1, CLIPBOARD_MAX_CHUNKS - 1, CLIPBOARD_MAX_CHUNKS, &full)),
+            assembly.push(chunk(
+                1,
+                CLIPBOARD_MAX_CHUNKS - 1,
+                CLIPBOARD_MAX_CHUNKS,
+                &full
+            )),
             ClipboardProgress::Complete { .. }
         ));
         let mut over = ClipboardAssembly {

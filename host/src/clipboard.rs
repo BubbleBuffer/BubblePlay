@@ -20,7 +20,9 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
     SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 
 use crate::desktop_session::{DesktopKind, InputDesktop};
 
@@ -218,7 +220,9 @@ mod tests {
     fn chunks_respect_byte_limit_and_code_points() {
         let text = "aé€😀".repeat(1000);
         let chunks = chunk_text(&text, 7);
-        assert!(chunks.iter().all(|chunk| chunk.len() <= 7 && !chunk.is_empty()));
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= 7 && !chunk.is_empty()));
         assert_eq!(chunks.concat(), text);
         assert_eq!(chunk_text("", 32), vec![""]);
         assert_eq!(chunk_text("abc", 32), vec!["abc"]);
@@ -228,14 +232,20 @@ mod tests {
 
     #[test]
     fn newlines_are_normalized_without_doubling_crlf() {
-        assert_eq!(normalize_newlines_for_windows("a\nb\r\nc\n"), "a\r\nb\r\nc\r\n");
+        assert_eq!(
+            normalize_newlines_for_windows("a\nb\r\nc\n"),
+            "a\r\nb\r\nc\r\n"
+        );
         assert_eq!(normalize_newlines_for_windows("plain"), "plain");
     }
 
     #[test]
     fn watcher_reports_only_foreign_changes_after_a_baseline() {
         let mut watcher = ClipboardWatcher::default();
-        assert!(!watcher.observe(5, false), "first observation is a baseline");
+        assert!(
+            !watcher.observe(5, false),
+            "first observation is a baseline"
+        );
         assert!(!watcher.observe(5, false));
         assert!(watcher.observe(6, false));
         watcher.note_own_change(9);
