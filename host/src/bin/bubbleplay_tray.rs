@@ -41,14 +41,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use logic::{
-    run_key_command, status_line, unix_ms_now, write_atomic, Heartbeat, HostState, SharedLog,
-    TraySettings,
+    admin_menu_label, is_outdated, run_key_command, status_line, unix_ms_now, write_atomic,
+    Heartbeat, HostState, SharedLog, TraySettings,
 };
 use platform::{
-    acquire_single_instance, create_manual_event, data_dir, elevated_task_exists,
-    end_elevated_task, host_exe_beside, is_signaled, named_mutex_exists, open_event, open_folder,
-    read_run_value, run_elevated_task, set_event, set_run_value, wide, Handle, ELEVATED_STOP_EVENT,
-    TRAY_MUTEX,
+    acquire_single_instance, create_manual_event, current_build_id, data_dir, elevated_task_exists,
+    end_elevated_task, host_exe_beside, is_process_elevated, is_signaled, is_under_program_files,
+    named_mutex_exists, open_event, open_folder, read_run_value, run_elevated_task, set_event,
+    set_run_value, wide, Handle, ELEVATED_STOP_EVENT, TRAY_MUTEX,
 };
 use supervisor::{SupervisorConfig, SupervisorThread};
 
@@ -114,11 +114,12 @@ fn supervisor_config(data: &Path, host_log: SharedLog) -> Result<SupervisorConfi
 // Elevated runner (launched by the \BubblePlay\ElevatedHost scheduled task)
 // ---------------------------------------------------------------------------
 
-fn write_heartbeat(path: &Path, host: HostState) {
+fn write_heartbeat(path: &Path, host: HostState, build: &str) {
     let beat = Heartbeat {
         runner_pid: std::process::id(),
         updated_unix_ms: unix_ms_now(),
         host,
+        build: build.to_string(),
     };
     if let Ok(bytes) = serde_json::to_vec(&beat) {
         let _ = write_atomic(path, &bytes);
@@ -129,6 +130,16 @@ fn run_elevated_host() -> Result<i32> {
     let data = data_dir();
     let log = SharedLog::new(logs_dir(&data).join("host-admin.log"));
     init_tracing(log.clone());
+    // An elevated runner must only ever execute admin-owned binaries: it runs
+    // the host beside its own exe, so that exe must live under Program Files.
+    let exe = std::env::current_exe().context("current_exe")?;
+    if is_process_elevated() && !is_under_program_files(&exe) {
+        tracing::error!(
+            exe = %exe.display(),
+            "refusing to run elevated from a non-Program Files location"
+        );
+        return Ok(1);
+    }
     let Some(_instance) = acquire_single_instance(ELEVATED_RUNNER_MUTEX)? else {
         tracing::info!("elevated runner already active; exiting");
         return Ok(0);
@@ -141,10 +152,11 @@ fn run_elevated_host() -> Result<i32> {
     };
     tracing::info!(pid = std::process::id(), "elevated runner started");
     let heartbeat = data.join(HEARTBEAT_FILE);
+    let build = current_build_id();
     let mut supervisor = SupervisorThread::start(supervisor_config(&data, log)?);
     let mut tray_missing = 0u32;
     loop {
-        write_heartbeat(&heartbeat, supervisor.state());
+        write_heartbeat(&heartbeat, supervisor.state(), &build);
         if is_signaled(&stop_event) {
             tracing::info!("tray requested stop");
             break;
@@ -161,7 +173,7 @@ fn run_elevated_host() -> Result<i32> {
         std::thread::sleep(Duration::from_secs(1));
     }
     supervisor.stop();
-    write_heartbeat(&heartbeat, HostState::Stopped);
+    write_heartbeat(&heartbeat, HostState::Stopped, &build);
     tracing::info!("elevated runner exited");
     Ok(0)
 }
@@ -281,6 +293,7 @@ struct App {
     shown: Option<(IconKind, String)>,
     taskbar_created: u32,
     shut_down: bool,
+    build: String,
 }
 
 impl App {
@@ -438,6 +451,14 @@ impl App {
         }
     }
 
+    /// A live elevated runner built from different binaries than this tray.
+    fn admin_outdated(&self) -> bool {
+        self.admin_active
+            && self
+                .admin_heartbeat()
+                .is_some_and(|beat| is_outdated(&self.build, &beat.build))
+    }
+
     fn missing_task_fallback(&mut self) {
         self.settings.admin_mode = false;
         self.save_settings();
@@ -559,11 +580,12 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 fn show_menu(hwnd: HWND) {
-    let Some((status, admin, login)) = with_app(|app| {
+    let Some((status, admin, login, outdated)) = with_app(|app| {
         (
             status_line(&app.state(), app.admin_active),
             app.settings.admin_mode,
             app.settings.start_at_login,
+            app.admin_outdated(),
         )
     }) else {
         return;
@@ -586,7 +608,7 @@ fn show_menu(hwnd: HWND) {
                 MF_STRING
             },
             CMD_ADMIN,
-            "Admin mode",
+            admin_menu_label(outdated),
         );
         item(
             if login {
@@ -734,6 +756,7 @@ fn run_tray() -> Result<i32> {
         shown: None,
         taskbar_created,
         shut_down: false,
+        build: current_build_id(),
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     with_app(|app| {

@@ -44,13 +44,18 @@ variables.
   first). It copies the tokens out of `%ProgramData%\BubblePlay\transport.json`,
   installs into `%LOCALAPPDATA%\Programs\BubblePlay`, registers the on-demand
   `\BubblePlay\ElevatedHost` task, deletes the three services, sets the HKCU Run
-  entry and starts the tray non-elevated. Program Files/ProgramData copies are
-  kept for recovery.
-- Updates, non-elevated: `host/scripts/update-tray.ps1 [-Build]`.
+  entry and starts the tray non-elevated. Old service binaries in
+  `%ProgramFiles%\BubblePlay` are deleted only if they match
+  `installed-hashes.json`; ProgramData is left as is.
+- Updates, non-elevated: `host/scripts/update-tray.ps1 [-Build]`. It warns
+  when the Admin-mode copy is stale; `-IncludeElevated` refreshes it with one
+  UAC prompt.
 - Admin mode (tray menu, default off) runs the host through the elevated task,
   so input reaches elevated windows. The secure desktop (UAC prompts, lock
-  screen) is still not captured. The task runs a binary from a user-writable
-  folder; use `setup-tray.ps1 -SkipElevatedTask` if that trade-off is unwanted.
+  screen) is still not captured. The task runs an admin-only copy in
+  `%ProgramFiles%\BubblePlay\elevated` (ACL verified by setup), and the runner
+  refuses to run elevated from anywhere else. The menu shows
+  "Admin mode (outdated build)" when that copy differs from the tray's build.
 
 ## Runtime boundaries
 

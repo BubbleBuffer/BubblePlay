@@ -10,6 +10,11 @@
     <name>.previous for manual rollback. Run setup-tray.ps1 once (elevated)
     before the first update.
 
+    Admin mode runs a separate admin-owned copy in
+    %ProgramFiles%\BubblePlay\elevated. When that copy differs from the build,
+    this script reports it as stale; -IncludeElevated refreshes it with one
+    UAC prompt (setup-tray.ps1 -ElevatedBinariesOnly).
+
 .EXAMPLE
     cargo build --offline --locked --release --bins --manifest-path host/Cargo.toml
     powershell -File host/scripts/update-tray.ps1
@@ -18,7 +23,9 @@
 param(
     [string]$SourceDir,
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\BubblePlay'),
+    [string]$ElevatedDir = (Join-Path $env:ProgramFiles 'BubblePlay\elevated'),
     [switch]$Build,
+    [switch]$IncludeElevated,
     [switch]$NoStart
 )
 
@@ -55,20 +62,36 @@ if ($Build) {
 }
 
 $changed = @()
+$staleElevated = @()
+$elevatedInstalled = $false
 foreach ($name in $Binaries) {
     $source = Join-Path $SourceDir $name
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing $source (build first or pass -Build)." }
+    $sourceHash = Get-Sha256 $source
     $target = Join-Path $InstallDir $name
-    if (-not (Test-Path -LiteralPath $target) -or (Get-Sha256 $target) -ne (Get-Sha256 $source)) { $changed += $name }
+    if (-not (Test-Path -LiteralPath $target) -or (Get-Sha256 $target) -ne $sourceHash) { $changed += $name }
+    $elevatedTarget = Join-Path $ElevatedDir $name
+    $elevatedHash = $null
+    try { if (Test-Path -LiteralPath $elevatedTarget) { $elevatedInstalled = $true; $elevatedHash = Get-Sha256 $elevatedTarget } } catch { }
+    if ($elevatedHash -ne $sourceHash) { $staleElevated += $name }
+}
+$refreshElevated = $IncludeElevated -and $staleElevated.Count -gt 0
+if ($staleElevated.Count -gt 0 -and -not $IncludeElevated) {
+    if ($elevatedInstalled) {
+        Write-Warning "Admin-mode binaries in $ElevatedDir are stale ($($staleElevated -join ', ')). Rerun with -IncludeElevated (one UAC prompt) to refresh them; Admin mode keeps working on the old build meanwhile."
+    }
+    else {
+        Write-Warning "Admin-mode binaries are not installed in $ElevatedDir (or not readable). Rerun with -IncludeElevated or run setup-tray.ps1 elevated."
+    }
 }
 $dataDir = if ($env:BUBBLEPLAY_TRAY_DATA_DIR) { $env:BUBBLEPLAY_TRAY_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'BubblePlay' }
 if (-not (Test-Path -LiteralPath (Join-Path $dataDir 'host.json'))) {
     Write-Warning 'host.json is missing: run setup-tray.ps1 (elevated, once) to migrate the host configuration.'
 }
-if ($changed.Count -eq 0) {
+if ($changed.Count -eq 0 -and -not $refreshElevated) {
     Write-Host "Install in $InstallDir is already current."
 }
-elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $($changed -join ', ')")) {
+elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $(@($changed + ($staleElevated | Where-Object { $refreshElevated } | ForEach-Object { "elevated\$_" })) -join ', ')")) {
     $wasRunning = [bool](Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)
     if ($wasRunning -and (Test-Path -LiteralPath $TrayExe)) {
         # Graceful: the tray stops its host and asks the elevated runner to stop.
@@ -96,7 +119,16 @@ elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $($changed -
         Move-Item -Force -LiteralPath $temp -Destination $target
         if ((Get-Sha256 $target) -ne (Get-Sha256 (Join-Path $SourceDir $name))) { throw "Hash mismatch after copying $name." }
     }
-    Write-Host "Updated: $($changed -join ', ')"
+    if ($changed.Count) { Write-Host "Updated: $($changed -join ', ')" }
+    if ($refreshElevated) {
+        # One UAC prompt: setup-tray.ps1 copies the admin-only copy and re-verifies its ACL.
+        $shell = (Get-Process -Id $PID).Path
+        $setup = Join-Path $PSScriptRoot 'setup-tray.ps1'
+        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$setup`"", '-ElevatedBinariesOnly', '-SourceDir', "`"$SourceDir`"")
+        $elevated = Start-Process -FilePath $shell -ArgumentList $arguments -Verb RunAs -Wait -PassThru
+        if ($elevated.ExitCode -ne 0) { throw "Elevated refresh failed with exit code $($elevated.ExitCode); see the receipt in %LOCALAPPDATA%\BubblePlay\receipts." }
+        Write-Host "Refreshed Admin-mode binaries in $ElevatedDir."
+    }
 }
 
 if (-not $NoStart -and -not (Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)) {
