@@ -28,13 +28,11 @@ import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
-import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
-import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import de.bubblebuffer.bubbleplay.R
+import de.bubblebuffer.bubbleplay.input.Chord
 import de.bubblebuffer.bubbleplay.input.GestureAction
 import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.input.TouchGestures
@@ -51,9 +49,9 @@ import kotlin.math.roundToInt
 /**
  * Full-screen remote desktop: SurfaceView video, cursor overlay, touch
  * (trackpad / direct), IME and hardware keyboard, captured mouse, clipboard,
- * and a small overlay bar.
+ * and the quick-action bar ([QuickBar]).
  */
-class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink {
+class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink, QuickBar.Host {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
     private lateinit var config: ServerConfig
@@ -66,16 +64,15 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private lateinit var video: SurfaceView
     private lateinit var cursorView: CursorView
     private lateinit var status: TextView
-    private lateinit var bar: HorizontalScrollView
-    private lateinit var modeButton: Button
     private lateinit var keyboardView: KeyboardInputView
-    private val modifierButtons = HashMap<String, Button>()
+    private lateinit var quickBar: QuickBar
 
     private val viewport = Viewport()
     private val gestures = TouchGestures()
     private val wheel = WheelAccumulator()
     private var videoWidth = 0
     private var videoHeight = 0
+    private var barZoomed = false
 
     // Remote cursor, normalized 0..1 over the streamed display.
     private var cursorX = 0.5f
@@ -84,18 +81,32 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private var cursorSynced = false
     private var localCursorUntil = 0L
 
-    private var latched = LinkedHashSet<String>()
+    private val latchSet = LinkedHashSet<String>()
     private val activeLatched = HashMap<String, Set<String>>()
-    private var keyboardShown = false
     private var lastStatus: Session.Status? = null
-    private var monitorDialogWanted = false
     private var lastClipboardFromHost: String? = null
     private var mouseButtons = 0
     private var mouseActive = false
     private var motionFramePosted = false
 
+    // QuickBar.Host state.
+    override var keyboardShown = false
+        private set
+    override var immersive = true
+        private set
+    override var monitors: List<Session.Monitor> = emptyList()
+        private set
+    override var monitorError: String? = null
+        private set
+    override var switchingMonitor: String? = null
+        private set
+    override val touchMode: TouchMode get() = gestures.mode
+    override val zoomed: Boolean get() = viewport.zoomed
+    override val latched: Set<String> get() = latchSet
+
     private val backgroundDisconnect = Runnable { stopSession() }
     private val longPress = Runnable { apply(gestures.onLongPress(SystemClock.uptimeMillis())) }
+    private val monitorRefresh = Runnable { session?.requestMonitorList() }
     private val motionFrame = Choreographer.FrameCallback {
         motionFramePosted = false
         input?.flushMotion()
@@ -144,50 +155,41 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             topMargin = dp(8); leftMargin = dp(8)
         })
 
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(dp(4), dp(2), dp(4), dp(2)) }
-        modeButton = barButton(row, modeLabel()) { toggleMode() }
-        barButton(row, getString(R.string.key_keyboard)) { toggleKeyboard() }
-        barButton(row, "Esc") { tapKey("Escape") }
-        barButton(row, "Tab") { tapKey("Tab") }
-        modifierButtons["ControlLeft"] = barButton(row, "Ctrl") { toggleLatch("ControlLeft") }
-        modifierButtons["AltLeft"] = barButton(row, "Alt") { toggleLatch("AltLeft") }
-        modifierButtons["MetaLeft"] = barButton(row, "Win") { toggleLatch("MetaLeft") }
-        modifierButtons["ShiftLeft"] = barButton(row, "Shift") { toggleLatch("ShiftLeft") }
-        barButton(row, "←") { tapKey("ArrowLeft") }
-        barButton(row, "↑") { tapKey("ArrowUp") }
-        barButton(row, "↓") { tapKey("ArrowDown") }
-        barButton(row, "→") { tapKey("ArrowRight") }
-        barButton(row, getString(R.string.key_paste)) { pasteToHost() }
-        barButton(row, getString(R.string.key_display)) { requestMonitors() }
-        barButton(row, getString(R.string.key_disconnect)) { finish() }
-        bar = HorizontalScrollView(this).apply {
-            setBackgroundColor(0xB0101418.toInt())
-            isHorizontalScrollBarEnabled = false
-            addView(row)
-        }
-        root.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+        quickBar = QuickBar(this, root, this)
 
-        root.setOnApplyWindowInsetsListener { v, insets ->
-            // Edge-to-edge (targetSdk 35): keep the bar above the soft keyboard.
-            val ime = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) insets.getInsets(WindowInsets.Type.ime()).bottom else 0
-            v.setPadding(0, 0, 0, ime)
-            insets
-        }
+        root.setOnApplyWindowInsetsListener { v, insets -> applyInsets(v, insets); insets }
         setContentView(root)
     }
 
-    private fun barButton(row: LinearLayout, label: String, onClick: () -> Unit): Button {
-        val button = Button(this, null, android.R.attr.borderlessButtonStyle).apply {
-            text = label
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            minWidth = dp(44); minimumWidth = dp(44)
-            setPadding(dp(10), 0, dp(10), 0)
-            isFocusable = false
-            setOnClickListener { onClick() }
+    /**
+     * Edge-to-edge (targetSdk 35): keep the bar above the soft keyboard, and
+     * clear of the system bars when full screen is off.
+     */
+    @Suppress("DEPRECATION")
+    private fun applyInsets(v: View, insets: WindowInsets) {
+        var left = 0; var top = 0; var right = 0; var bottom = 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            bottom = insets.getInsets(WindowInsets.Type.ime()).bottom
+            if (!immersive) {
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                left = bars.left; top = bars.top; right = bars.right; bottom = maxOf(bottom, bars.bottom)
+            }
+            // The user can close the keyboard with the system Back gesture.
+            val imeVisible = insets.isVisible(WindowInsets.Type.ime())
+            if (keyboardShown && !imeVisible && v.isAttachedToWindow && hasWindowFocus()) main.post { onImeClosed() }
+        } else if (!immersive) {
+            left = insets.systemWindowInsetLeft; top = insets.systemWindowInsetTop
+            right = insets.systemWindowInsetRight; bottom = insets.systemWindowInsetBottom
         }
-        row.addView(button, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)))
-        return button
+        v.setPadding(left, top, right, bottom)
+    }
+
+    private fun onImeClosed() {
+        if (!keyboardShown) return
+        keyboardShown = false
+        keyboardView.clearFocus()
+        quickBar.render()
+        quickBar.scheduleHide()
     }
 
     private fun enterImmersive() {
@@ -211,9 +213,19 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         }
     }
 
+    private fun exitImmersive() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.insetsController?.show(WindowInsets.Type.systemBars())
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        }
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) enterImmersive() else if (stage.hasPointerCapture()) stage.releasePointerCapture()
+        if (hasFocus) { if (immersive) enterImmersive() } else if (stage.hasPointerCapture()) stage.releasePointerCapture()
     }
 
     // ---- session lifecycle -----------------------------------------------------
@@ -229,6 +241,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     private fun stopSession() {
+        quickBar.release()
         input?.releaseAll()
         session?.stop()
         session = null
@@ -245,8 +258,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onPause() {
         super.onPause()
+        quickBar.release()
         input?.releaseAll()
-        latched.clear(); renderLatches()
+        latchSet.clear(); activeLatched.clear(); latchesChanged()
     }
 
     override fun onStop() {
@@ -257,15 +271,19 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
-        stopSession()
+        if (::quickBar.isInitialized) {
+            quickBar.onDestroy()
+            stopSession()
+        }
         super.onDestroy()
     }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
+            quickBar.dismiss() -> {}
             keyboardShown -> toggleKeyboard()
-            bar.visibility != View.VISIBLE -> bar.visibility = View.VISIBLE
+            !quickBar.shown -> quickBar.show()
             else -> AlertDialog.Builder(this)
                 .setMessage(R.string.confirm_disconnect)
                 .setPositiveButton(R.string.key_disconnect) { _, _ -> finish() }
@@ -325,34 +343,42 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     override fun onMonitors(monitors: List<Session.Monitor>, error: String?) {
-        if (error != null) { Toast.makeText(this, getString(R.string.monitor_failed, error), Toast.LENGTH_LONG).show(); return }
-        if (!monitorDialogWanted || monitors.isEmpty()) return
-        monitorDialogWanted = false
-        val labels = monitors.map { m -> "${m.name} (${m.width}×${m.height})${if (m.selected) " ✓" else ""}" }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle(R.string.key_display)
-            .setItems(labels) { _, which -> session?.requestMonitor(monitors[which].selector) }
-            .show()
+        if (error != null) {
+            // Only a switch the user asked for gets a toast; the popover shows the error either way.
+            if (switchingMonitor != null) Toast.makeText(this, getString(R.string.monitor_failed, error), Toast.LENGTH_LONG).show()
+            monitorError = error
+            switchingMonitor = null
+        } else {
+            this.monitors = monitors
+            monitorError = null
+            val target = switchingMonitor
+            if (target != null && monitors.any { it.selector == target && it.selected }) switchingMonitor = null
+        }
+        quickBar.monitorsChanged()
     }
 
     override fun onVideoSize(width: Int, height: Int) {
         videoWidth = width; videoHeight = height
         video.holder.setFixedSize(width, height)
         relayout()
+        // A screen switch usually changes the frame; refresh which one is current.
+        if (switchingMonitor != null) session?.requestMonitorList()
     }
 
     override fun onInputReady() {
         input?.cursorSync()
+        session?.requestMonitorList()
     }
 
     override fun onInputLost() {
         // The host drops held input with its session; mirror that locally so
         // nothing stays "down" and the next packet starts with a release-all.
+        quickBar.release()
         input?.releaseAll(send = false)
         gestures.cancel()
         main.removeCallbacks(longPress)
         mouseButtons = 0
-        latched.clear(); activeLatched.clear(); renderLatches()
+        latchSet.clear(); activeLatched.clear(); latchesChanged()
     }
 
     override fun onSecureDesktop(secure: Boolean) {
@@ -379,6 +405,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         video.translationX = viewport.x + viewport.contentX * (z - 1f)
         video.translationY = viewport.y + viewport.contentY * (z - 1f)
         renderCursor()
+        if (viewport.zoomed != barZoomed) { barZoomed = viewport.zoomed; quickBar.render() }
     }
 
     private fun renderCursor() {
@@ -465,7 +492,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             }
             is GestureAction.Pan -> { viewport.pan(action.dx, action.dy); applyViewport() }
             GestureAction.LongPressArmed -> stage.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-            GestureAction.ResetZoom -> { viewport.resetZoom(); applyViewport() }
+            GestureAction.ResetZoom -> resetZoom()
         }
     }
 
@@ -542,7 +569,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val code = KeyMap.ANDROID_TO_CODE[event.keyCode]
         val unicode = event.getUnicodeChar(event.metaState)
         val printable = unicode > 0 && !Character.isISOControl(unicode) && code != "Space"
-        if (printable && latched.isEmpty() && !event.isCtrlPressed && !event.isAltPressed) {
+        if (printable && latchSet.isEmpty() && !event.isCtrlPressed && !event.isAltPressed) {
             // A character from the IME: send the character, not a US-layout key.
             if (event.action == KeyEvent.ACTION_DOWN) input?.text(String(Character.toChars(unicode)))
             return true
@@ -554,22 +581,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     @Suppress("DEPRECATION") // ACTION_MULTIPLE still arrives from some IMEs and HID stacks.
     private fun sendKey(event: KeyEvent): Boolean {
         val code = KeyMap.ANDROID_TO_CODE[event.keyCode] ?: return false
-        val remote = input ?: return true
+        if (input == null) return true
         when (event.action) {
-            KeyEvent.ACTION_DOWN -> {
-                if (code !in KeyMap.MODIFIERS && latched.isNotEmpty() && event.repeatCount == 0) {
-                    val mods = latched.toSet()
-                    activeLatched[code] = mods
-                    mods.forEach { remote.key(it, false) }
-                    latched.clear(); renderLatches()
-                }
-                remote.key(code, false)
-            }
-            KeyEvent.ACTION_UP -> {
-                remote.key(code, true)
-                activeLatched.remove(code)?.forEach { remote.key(it, true) }
-            }
-            KeyEvent.ACTION_MULTIPLE -> event.characters?.let { remote.text(it) }
+            KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) keyDown(code) else keyRepeat(code)
+            KeyEvent.ACTION_UP -> keyUp(code)
+            KeyEvent.ACTION_MULTIPLE -> event.characters?.let { input?.text(it) }
         }
         return true
     }
@@ -578,7 +594,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val remote = input ?: return
         repeat(deleteCount) { remote.tap("Backspace") }
         if (insert.isEmpty()) return
-        if (latched.isNotEmpty() && insert.length == 1) {
+        if (latchSet.isNotEmpty() && insert.length == 1) {
             val code = KeyMap.codeForShortcutChar(insert[0])
             if (code != null) { tapKey(code); return }
         }
@@ -598,39 +614,58 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         repeat(count) { remote.tap("Delete") }
     }
 
-    /** Overlay key: tap with any latched modifiers, then clear the latch. */
-    private fun tapKey(code: String) {
+    // ---- QuickBar.Host: keys ------------------------------------------------------------------
+    /** Tap with any latched modifiers, then clear the latch. */
+    override fun tapKey(code: String) {
+        keyDown(code)
+        keyUp(code)
+    }
+
+    /**
+     * Key press. A non-modifier key takes the latched (sticky) modifiers with
+     * it: they go down first and come up after this key's release.
+     */
+    override fun keyDown(code: String) {
         val remote = input ?: return
-        val mods = latched.toList()
-        mods.forEach { remote.key(it, false) }
-        remote.tap(code)
-        mods.asReversed().forEach { remote.key(it, true) }
-        latched.clear(); renderLatches()
+        if (code !in KeyMap.MODIFIERS && latchSet.isNotEmpty()) {
+            val mods = latchSet.toList()
+            activeLatched[code] = mods.toSet()
+            mods.forEach { remote.key(it, false) }
+            latchSet.clear(); latchesChanged()
+        }
+        remote.key(code, false)
     }
 
-    /** Ctrl/Alt/Win/Shift latch for the next key; tapping a latched one sends it alone (Win opens Start). */
-    private fun toggleLatch(code: String) {
-        if (code in latched) {
-            latched.remove(code)
-            val others = latched.toList()
-            if (others.isEmpty()) input?.tap(code) else tapKeyWith(code, others)
-            latched.clear()
-        } else latched.add(code)
-        renderLatches()
+    /** Typematic repeat: Windows does not auto-repeat injected keys, so resend the press. */
+    override fun keyRepeat(code: String) {
+        input?.key(code, false)
     }
 
-    private fun tapKeyWith(code: String, mods: List<String>) {
+    override fun keyUp(code: String) {
         val remote = input ?: return
-        mods.forEach { remote.key(it, false) }
-        remote.tap(code)
-        mods.asReversed().forEach { remote.key(it, true) }
+        remote.key(code, true)
+        activeLatched.remove(code)?.reversed()?.forEach { remote.key(it, true) }
     }
 
-    private fun renderLatches() {
-        for ((code, button) in modifierButtons) button.setBackgroundColor(if (code in latched) 0xFF2F6FDB.toInt() else Color.TRANSPARENT)
+    /** Sticky Ctrl/Alt/Shift/Win: held for the next key; tapping it again lets go (sends nothing). */
+    override fun toggleLatch(code: String) {
+        if (!latchSet.remove(code)) latchSet.add(code)
+        latchesChanged()
     }
 
-    private fun toggleKeyboard() {
+    /** Shortcut chords are exact: they ignore (and keep) any sticky modifiers. */
+    override fun sendChord(chord: Chord) {
+        val remote = input ?: return
+        chord.mods.forEach { remote.key(it, false) }
+        remote.tap(chord.key)
+        chord.mods.asReversed().forEach { remote.key(it, true) }
+    }
+
+    private fun latchesChanged() {
+        if (::quickBar.isInitialized) quickBar.render()
+    }
+
+    override fun toggleKeyboard() {
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         keyboardShown = !keyboardShown
         if (keyboardShown) {
@@ -641,20 +676,43 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             imm.hideSoftInputFromWindow(keyboardView.windowToken, 0)
             keyboardView.clearFocus()
         }
+        quickBar.render()
+        quickBar.scheduleHide()
     }
 
-    // ---- bar actions ------------------------------------------------------------------------
-    private fun modeLabel() = getString(if (gestures.mode == TouchMode.TRACKPAD) R.string.mode_trackpad else R.string.mode_direct)
-
-    private fun toggleMode() {
+    // ---- QuickBar.Host: everything else --------------------------------------------------------
+    override fun toggleTouchMode() {
         gestures.cancel().let { apply(it) }
         gestures.mode = if (gestures.mode == TouchMode.TRACKPAD) TouchMode.DIRECT else TouchMode.TRACKPAD
         prefs.directTouch = gestures.mode == TouchMode.DIRECT
-        modeButton.text = modeLabel()
         renderCursor()
     }
 
-    private fun pasteToHost() {
+    override fun resetZoom() {
+        viewport.resetZoom()
+        applyViewport()
+    }
+
+    override fun toggleImmersive() {
+        immersive = !immersive
+        if (immersive) enterImmersive() else exitImmersive()
+        root.requestApplyInsets()
+    }
+
+    override fun refreshMonitors() {
+        session?.requestMonitorList()
+    }
+
+    override fun switchMonitor(selector: String) {
+        switchingMonitor = selector
+        monitorError = null
+        session?.requestMonitor(selector)
+        main.removeCallbacks(monitorRefresh)
+        main.postDelayed(monitorRefresh, MONITOR_REFRESH_MS)
+        quickBar.monitorsChanged()
+    }
+
+    override fun pastePhoneClipboard() {
         val manager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val text = manager.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
         if (text.isNullOrEmpty()) { Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show(); return }
@@ -663,16 +721,21 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         if (!ok) Toast.makeText(this, R.string.paste_failed, Toast.LENGTH_SHORT).show()
     }
 
-    private fun requestMonitors() {
-        monitorDialogWanted = true
-        session?.requestMonitorList()
+    override fun disconnect() {
+        finish()
+    }
+
+    /** There is no in-session settings screen: end the session on the connection screen. */
+    override fun openSettings() {
+        startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+        finish()
     }
 
     private fun onStatusTapped() {
         if (lastStatus?.state == Session.State.ERROR || session == null) {
             stopSession(); startSession(); return
         }
-        bar.visibility = if (bar.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        quickBar.toggleShown()
     }
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).roundToInt()
@@ -681,5 +744,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         private const val BACKGROUND_GRACE_MS = 30_000L
         private const val TRACKPAD_GAIN = 1.6f
         private const val SCROLL_DP_PER_NOTCH = 40f
+        private const val MONITOR_REFRESH_MS = 1_500L
     }
 }
