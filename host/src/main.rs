@@ -632,6 +632,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut tile_hasher: Option<TileHasher> = None;
     let mut tile_hashing_failed = false;
     let mut tile_hash_us: u64 = 0;
+    // NVENC frameAvgQP of v4 frames in the current 1 s window: (max, sum, count).
+    let mut wss_v4_qp_window: (u32, u64, u64) = (0, 0, 0);
     let mut wss_v4_key_reason: Option<String> = None;
     let mut wss_v4_keyframes = std::collections::BTreeMap::<String, u64>::new();
     let mut next_wss_stats = Instant::now() + Duration::from_secs(1);
@@ -4365,6 +4367,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                         .unwrap_or_else(|| wss_v4_key_cause.to_string());
                                     *wss_v4_keyframes.entry(reason).or_default() += 1;
                                 }
+                                wss_v4_qp_window.0 = wss_v4_qp_window.0.max(encoded.frame_avg_qp);
+                                wss_v4_qp_window.1 += u64::from(encoded.frame_avg_qp);
+                                wss_v4_qp_window.2 += 1;
                                 if let Some(tracker) = tile_tracker.as_mut() {
                                     let now = Instant::now();
                                     tracker.on_encoded(
@@ -4579,9 +4584,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 hashed_tiles = tiles.hashed_tiles,
                 unhashed_tiles = tiles.unhashed_tiles,
                 tile_hash_us,
+                frame_qp_max = wss_v4_qp_window.0,
+                frame_qp_mean = wss_v4_qp_window.1 / wss_v4_qp_window.2.max(1),
                 "WSS v4 link totals"
             );
             tile_hash_us = 0;
+            wss_v4_qp_window = (0, 0, 0);
             next_wss_stats = Instant::now() + Duration::from_secs(1);
             producer_loop_iterations = 0;
             wss_preencode_skips = 0;
