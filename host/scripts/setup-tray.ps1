@@ -14,19 +14,24 @@
       3. Copy bubbleplay-host.exe and bubbleplay_tray.exe to
          %LOCALAPPDATA%\Programs\BubblePlay (user-writable: later updates via
          update-tray.ps1 need no elevation).
-      4. Register the on-demand task \BubblePlay\ElevatedHost (this user,
-         RunLevel Highest, no triggers) used by the tray's "Admin mode".
+      4. Copy the same two binaries to %ProgramFiles%\BubblePlay\elevated
+         (protected ACL: SYSTEM/Administrators full, Users read+execute; verified)
+         and register the on-demand task \BubblePlay\ElevatedHost (this user,
+         RunLevel Highest, no triggers) that runs THAT admin-owned copy with
+         --run-elevated-host. The elevated runner only starts the host beside
+         itself, never from %LOCALAPPDATA%.
       5. Stop and delete BubblePlayLabHelper, BubblePlayTransport, BubblePlayBroker,
-         stop leftover service-side processes, and remove leftover Stream Lab
-         QoS policies. Files under Program Files / ProgramData are kept for recovery.
+         stop leftover service-side processes, remove leftover Stream Lab QoS
+         policies, and delete old service binaries in %ProgramFiles%\BubblePlay
+         only when their SHA-256 matches %ProgramData%\BubblePlay\installed-hashes.json.
+         ProgramData is left untouched.
       6. Set the HKCU Run entry and tray.json startAtLogin=true.
       7. Launch the tray NON-elevated through a one-shot Limited task.
     A receipt JSON is written to %LOCALAPPDATA%\BubblePlay\receipts.
     Use -WhatIf (works without elevation) to print the plan without changing anything.
 
-    Security note: the elevated task runs a binary from a user-writable folder,
-    so any program running as this user could replace it and gain elevation
-    without a prompt. Pass -SkipElevatedTask to opt out of Admin mode entirely.
+    -ElevatedBinariesOnly refreshes just step 4 (used by update-tray.ps1
+    -IncludeElevated). -SkipElevatedTask opts out of Admin mode entirely.
     Admin mode lets input reach elevated windows (UIPI); the secure desktop
     (UAC prompts, lock screen) is still NOT captured.
 #>
@@ -41,6 +46,7 @@ param(
     [string]$Monitor,
     [switch]$KeepServices,
     [switch]$SkipElevatedTask,
+    [switch]$ElevatedBinariesOnly,
     [switch]$NoLaunch
 )
 
@@ -54,6 +60,13 @@ Add-Type -AssemblyName System.Security
     foreach ($module in 'CimCmdlets', 'ScheduledTasks', 'NetQos') { Import-Module $module -ErrorAction SilentlyContinue }
 }
 
+$ServiceInstallDir = Join-Path $env:ProgramFiles 'BubblePlay'
+$ElevatedDir = Join-Path $ServiceInstallDir 'elevated'
+$ElevatedTrayExe = Join-Path $ElevatedDir 'bubbleplay_tray.exe'
+# Binaries install-service.ps1 placed in $ServiceInstallDir.
+$ServiceBinaries = @('bubbleplay_broker.exe', 'bubbleplay_transport.exe', 'bubbleplay_agent.exe',
+    'bubbleplay_input_proxy.exe', 'bubbleplay_lab_helper.exe', 'bubbleplay-host.exe')
+$TrustedSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
 $ServiceNames = @('BubblePlayLabHelper', 'BubblePlayTransport', 'BubblePlayBroker')
 $ServiceProcessNames = @('bubbleplay_broker', 'bubbleplay_transport', 'bubbleplay_agent',
     'bubbleplay_input_proxy', 'bubbleplay_lab_helper', 'bubbleplay_lab_activity_guard', 'bubbleplay-host')
@@ -90,6 +103,7 @@ $receipt = [ordered]@{
     userSid     = $UserSid
     sourceDir   = $SourceDir
     installDir  = $InstallDir
+    elevatedDir = $ElevatedDir
     dataDir     = $DataDir
     steps       = [Collections.Generic.List[object]]::new()
     result      = 'running'
@@ -302,7 +316,8 @@ function Stop-RunningTray {
     Start-Sleep -Milliseconds 500
     Get-Process bubbleplay_tray -ErrorAction SilentlyContinue | Stop-Process -Force
     Get-Process bubbleplay-host -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) } |
+        Where-Object { $_.Path -and ($_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) -or
+                $_.Path.StartsWith($ElevatedDir, [StringComparison]::OrdinalIgnoreCase)) } |
         Stop-Process -Force
     Add-Step 'stop-tray' 'done' 'Tray and its host stopped.'
 }
@@ -328,7 +343,7 @@ function Remove-BubblePlayServices {
         Add-Step 'services' 'done' "Stopped and deleted: $($present -join ', ')."
     }
     else {
-        Add-Step 'services' 'planned' "Stop and delete: $($present -join ', ') (binaries/config under Program Files and ProgramData are kept)."
+        Add-Step 'services' 'planned' "Stop and delete: $($present -join ', ') (ProgramData is kept)."
     }
 
     $serviceRoot = Join-Path $env:ProgramFiles 'BubblePlay'
@@ -341,6 +356,8 @@ function Remove-BubblePlayServices {
         }
         else { Add-Step 'service-processes' 'planned' "Stop $($leftovers.Count) leftover process(es) under $serviceRoot." }
     }
+
+    Remove-ServiceBinaryLeftovers
 
     $qos = @()
     if (Get-Command Get-NetQosPolicy -ErrorAction SilentlyContinue) {
@@ -361,6 +378,40 @@ function Remove-BubblePlayServices {
         Add-Step 'qos' 'done' "Removed: $($qos.Name -join ', ')."
     }
     else { Add-Step 'qos' 'planned' "Remove: $($qos.Name -join ', ')." }
+}
+
+function Remove-ServiceBinaryLeftovers {
+    try {
+        $present = @($ServiceBinaries | Where-Object { Test-Path -LiteralPath (Join-Path $ServiceInstallDir $_) -PathType Leaf })
+    }
+    catch {
+        if ($IsElevated) { throw }
+        Add-Step 'service-binaries' 'planned' "$ServiceInstallDir is not readable without elevation; known service binaries there will be deleted only if they match installed-hashes.json."
+        return
+    }
+    if ($present.Count -eq 0) { Add-Step 'service-binaries' 'unchanged' "No old service binaries in $ServiceInstallDir."; return }
+    $manifestPath = Join-Path $ServiceDataDir 'installed-hashes.json'
+    $manifest = @{}
+    try {
+        foreach ($entry in @(Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json)) { $manifest[[string]$entry.file] = [string]$entry.sha256 }
+    }
+    catch {
+        $state = if ($IsElevated) { 'kept' } else { 'planned' }
+        Add-Step 'service-binaries' $state "Cannot read $manifestPath; old binaries are only deleted when they match it ($($present -join ', '))."
+        return
+    }
+    $matching = @(); $kept = @()
+    foreach ($name in $present) {
+        $path = Join-Path $ServiceInstallDir $name
+        if ($manifest.ContainsKey($name) -and $manifest[$name] -eq (Get-Sha256 $path)) { $matching += $name } else { $kept += $name }
+    }
+    $keptNote = if ($kept.Count) { " Kept (hash differs from manifest): $($kept -join ', ')." } else { '' }
+    if ($matching.Count -eq 0) { Add-Step 'service-binaries' 'kept' "No binaries match the install manifest.$keptNote"; return }
+    if ($PSCmdlet.ShouldProcess(($matching -join ', '), "Delete old service binaries from $ServiceInstallDir")) {
+        foreach ($name in $matching) { Remove-Item -Force -LiteralPath (Join-Path $ServiceInstallDir $name) }
+        Add-Step 'service-binaries' 'done' "Deleted $($matching -join ', ').$keptNote"
+    }
+    else { Add-Step 'service-binaries' 'planned' "Delete $($matching -join ', ') (hash-matched).$keptNote" }
 }
 
 # --- Step 4: binaries -----------------------------------------------------------
@@ -396,6 +447,102 @@ function Install-Binaries {
     else { Add-Step 'binaries' 'planned' "Copy $($changed -join ', ') from $SourceDir to $InstallDir." }
 }
 
+# --- Step 4a: admin-owned elevated copy -----------------------------------------
+$WriteRights = [int64]([Security.AccessControl.FileSystemRights]::WriteData -bor
+    [Security.AccessControl.FileSystemRights]::AppendData -bor
+    [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+    [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+    [Security.AccessControl.FileSystemRights]::Delete -bor
+    [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+    [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+    [Security.AccessControl.FileSystemRights]::TakeOwnership) -bor 0x40000000 -bor 0x10000000 # GENERIC_WRITE, GENERIC_ALL
+
+function Get-UnsafeAclFindings([string]$Path) {
+    $findings = @()
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $findings += "$Path is a reparse point" }
+    $acl = Get-Acl -LiteralPath $Path
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($TrustedSids -notcontains $owner) { $findings += "$Path owner $owner is not SYSTEM/Administrators/TrustedInstaller" }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow') { continue }
+        $sid = $rule.IdentityReference.Value
+        # CREATOR OWNER only applies to objects owned by the (trusted) creator.
+        if ($TrustedSids -contains $sid -or $sid -eq 'S-1-3-0') { continue }
+        if (([int64]$rule.FileSystemRights -band $WriteRights) -ne 0) {
+            $findings += "$Path grants $($rule.FileSystemRights) to $sid"
+        }
+    }
+    return , $findings
+}
+
+function Assert-ElevatedDirSafe {
+    $findings = @()
+    foreach ($path in @($ElevatedDir) + @($Binaries | ForEach-Object { Join-Path $ElevatedDir $_ })) {
+        if (Test-Path -LiteralPath $path) { $findings += Get-UnsafeAclFindings $path }
+    }
+    if ($findings.Count -gt 0) { throw "Elevated binary folder is not admin-only: $($findings -join '; ')" }
+}
+
+function Set-ElevatedDirAcl {
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
+    $acl.SetAccessRuleProtection($true, $false)
+    $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $none = [Security.AccessControl.PropagationFlags]::None
+    foreach ($entry in @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'), @('S-1-5-32-545', 'ReadAndExecute'))) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]$entry[0], [Security.AccessControl.FileSystemRights]$entry[1],
+                $inherit, $none, [Security.AccessControl.AccessControlType]::Allow))
+    }
+    Set-Acl -LiteralPath $ElevatedDir -AclObject $acl
+}
+
+function Install-ElevatedBinaries {
+    if ($SkipElevatedTask) { Add-Step 'elevated-binaries' 'skipped' '-SkipElevatedTask given.'; return }
+    $changed = @()
+    foreach ($name in $Binaries) {
+        $source = Join-Path $SourceDir $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            if ($IsWhatIf) { Add-Step 'elevated-binaries' 'blocked' "Missing $source (build first)."; return }
+            throw "Missing $source."
+        }
+        $target = Join-Path $ElevatedDir $name
+        $current = $null
+        try { if (Test-Path -LiteralPath $target) { $current = Get-Sha256 $target } } catch { }
+        if ($current -ne (Get-Sha256 $source)) { $changed += $name }
+    }
+    if (-not $PSCmdlet.ShouldProcess($ElevatedDir, "Install admin-only copy of $($Binaries -join ', ')")) {
+        $what = if ($changed.Count) { "Copy $($changed -join ', ')" } else { 'Binaries current' }
+        Add-Step 'elevated-binaries' 'planned' "$what -> $ElevatedDir; set protected ACL (SYSTEM/Administrators full, Users read+execute) and verify no user write access."
+        return
+    }
+    foreach ($dir in @($ServiceInstallDir, $ElevatedDir)) {
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+        if ((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$dir is a reparse point." }
+    }
+    Set-ElevatedDirAcl
+    foreach ($name in $changed) {
+        $target = Join-Path $ElevatedDir $name
+        $temp = "$target.new"
+        Copy-Item -Force -LiteralPath (Join-Path $SourceDir $name) -Destination $temp
+        Move-Item -Force -LiteralPath $temp -Destination $target
+    }
+    # Reset file ACLs to the (protected) folder's inherited entries, then verify.
+    foreach ($name in $Binaries) {
+        $target = Join-Path $ElevatedDir $name
+        $fileAcl = Get-Acl -LiteralPath $target
+        $fileAcl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
+        $fileAcl.SetAccessRuleProtection($false, $false)
+        foreach ($rule in @($fileAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { [void]$fileAcl.RemoveAccessRule($rule) }
+        Set-Acl -LiteralPath $target -AclObject $fileAcl
+        if ((Get-Sha256 $target) -ne (Get-Sha256 (Join-Path $SourceDir $name))) { throw "Hash mismatch after copying $name." }
+    }
+    Assert-ElevatedDirSafe
+    $detail = if ($changed.Count) { "Copied $($changed -join ', ')" } else { 'Binaries current' }
+    Add-Step 'elevated-binaries' 'done' "$detail in $ElevatedDir; ACL verified admin-only."
+}
+
 # --- Step 5: elevated task ------------------------------------------------------
 function Register-ElevatedTask {
     $fullName = "$TaskPath$ElevatedTaskName"
@@ -409,10 +556,12 @@ function Register-ElevatedTask {
         return
     }
     if (-not $PSCmdlet.ShouldProcess($fullName, "Register on-demand RunLevel Highest task for $UserName")) {
-        Add-Step 'elevated-task' 'planned' "Register $fullName -> `"$TrayExe`" --run-elevated-host (user $UserName, Highest, on demand, grant user read+run)."
+        Add-Step 'elevated-task' 'planned' "Register $fullName -> `"$ElevatedTrayExe`" --run-elevated-host (user $UserName, Highest, on demand, grant user read+run)."
         return
     }
-    $action = New-ScheduledTaskAction -Execute $TrayExe -Argument '--run-elevated-host' -WorkingDirectory $InstallDir
+    if (-not (Test-Path -LiteralPath $ElevatedTrayExe)) { throw "Missing $ElevatedTrayExe." }
+    Assert-ElevatedDirSafe
+    $action = New-ScheduledTaskAction -Execute $ElevatedTrayExe -Argument '--run-elevated-host' -WorkingDirectory $ElevatedDir
     $principal = New-ScheduledTaskPrincipal -UserId $UserName -LogonType Interactive -RunLevel Highest
     # Priority 4 = normal; the Task Scheduler default (7) would starve the encoder.
     $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
@@ -502,14 +651,22 @@ try {
     }
     if (-not $IsElevated) { Add-Step 'elevation' 'warning' 'Not elevated: preview only; the real run must be elevated.' }
     Assert-InteractiveUserMatches
-    Update-HostConfig
-    Stop-RunningTray
-    # Binaries and task first: a missing build must fail before the services go away.
-    Install-Binaries
-    Register-ElevatedTask
-    Remove-BubblePlayServices
-    Set-Autostart
-    Start-TrayUnelevated
+    if ($ElevatedBinariesOnly) {
+        Stop-RunningTray
+        Install-ElevatedBinaries
+        Register-ElevatedTask
+    }
+    else {
+        Update-HostConfig
+        Stop-RunningTray
+        # Binaries and task first: a missing build must fail before the services go away.
+        Install-Binaries
+        Install-ElevatedBinaries
+        Register-ElevatedTask
+        Remove-BubblePlayServices
+        Set-Autostart
+        Start-TrayUnelevated
+    }
     $receipt.result = if ($IsWhatIf) { 'planned' } else { 'success' }
 }
 catch {
