@@ -194,12 +194,18 @@ export function shouldPresentDecodedV4({ decodeQueueSize = 0, msSinceLastPresent
 
 /**
  * Production WSS prefers protocol 4 whenever the host advertises it. Stream
- * Lab runs and explicit topology requests keep the v2/v3 lane protocols.
+ * Lab runs and explicit topology requests keep the v2/v3 lane protocols
+ * unless the lab run explicitly opts in (`wssProtocol=4`).
  */
-export function preferWssProtocolV4({ lab = false, requestedTopology = null, hostCapabilities = null,
-  capabilitiesCurrent = true } = {}) {
-  if (lab || requestedTopology || !capabilitiesCurrent) return false;
+export function preferWssProtocolV4({ lab = false, labRequestsV4 = false, requestedTopology = null,
+  hostCapabilities = null, capabilitiesCurrent = true } = {}) {
+  if ((lab && !labRequestsV4) || requestedTopology || !capabilitiesCurrent) return false;
   return Array.isArray(hostCapabilities?.mediaProtocols) && hostCapabilities.mediaProtocols.includes(V4_VERSION);
+}
+
+/** Lab-only opt-in: `?labRun=...&wssProtocol=4`. Ignored outside lab runs. */
+export function labRequestsWssProtocolV4(searchParams, labRun) {
+  return Boolean(labRun) && searchParams?.get?.("wssProtocol") === String(V4_VERSION);
 }
 
 /** Receiver status text for v4 (never "waiting for stream" when static). */

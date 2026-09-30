@@ -84,6 +84,27 @@ mod codec_policy_tests {
     }
 
     #[test]
+    fn v4_infinite_gop_disables_periodic_idr_for_both_codecs() {
+        assert_eq!(super::gop_frames(30, 2, false), 60);
+        assert_eq!(super::gop_frames(60, 4, false), 240);
+        assert_eq!(super::gop_frames(30, 2, true), super::NVENC_INFINITE_GOPLENGTH);
+        for codec in [VideoCodec::Hevc, VideoCodec::H264] {
+            let mut cfg: super::NV_ENC_CONFIG = unsafe { super::zeroed() };
+            super::apply_gop(&mut cfg, codec, super::gop_frames(30, 2, true));
+            assert_eq!(cfg.gopLength, super::NVENC_INFINITE_GOPLENGTH);
+            let idr = unsafe {
+                match codec {
+                    VideoCodec::Hevc => cfg.encodeCodecConfig.hevcConfig.idrPeriod,
+                    VideoCodec::H264 => cfg.encodeCodecConfig.h264Config.idrPeriod,
+                }
+            };
+            assert_eq!(idr, super::NVENC_INFINITE_GOPLENGTH);
+            super::apply_gop(&mut cfg, codec, super::gop_frames(30, 2, false));
+            assert_eq!(cfg.gopLength, 60);
+        }
+    }
+
+    #[test]
     fn production_encoder_options_remain_the_existing_low_latency_defaults() {
         assert_eq!(
             EncoderOptions::production(Preset::P3),
@@ -904,13 +925,36 @@ fn rate_control_label(mode: RateControlMode) -> &'static str {
     }
 }
 
+/// NVENC's "no periodic IDR" GOP length (`NVENC_INFINITE_GOPLENGTH`).
+pub const NVENC_INFINITE_GOPLENGTH: u32 = 0xffff_ffff;
+
+/// GOP / IDR period in frames. WSS v4 owns keyframes itself (start, request,
+/// 30 s safety), so its encoder runs with an infinite GOP.
+fn gop_frames(fps: u32, gop_seconds: u8, infinite: bool) -> u32 {
+    if infinite {
+        NVENC_INFINITE_GOPLENGTH
+    } else {
+        fps.saturating_mul(u32::from(gop_seconds))
+    }
+}
+
+/// Apply the GOP length to the common config and the codec IDR period.
+fn apply_gop(cfg: &mut NV_ENC_CONFIG, codec: VideoCodec, frames: u32) {
+    cfg.gopLength = frames;
+    // Writing a union field is safe; the member matches the session codec.
+    match codec {
+        VideoCodec::Hevc => cfg.encodeCodecConfig.hevcConfig.idrPeriod = frames,
+        VideoCodec::H264 => cfg.encodeCodecConfig.h264Config.idrPeriod = frames,
+    }
+}
+
 fn apply_encoder_options(
     cfg: &mut NV_ENC_CONFIG,
     bitrate_bps: u32,
     fps: u32,
     options: EncoderOptions,
 ) {
-    cfg.gopLength = fps * u32::from(options.gop_seconds);
+    cfg.gopLength = gop_frames(fps, options.gop_seconds, false);
     cfg.frameIntervalP = 1;
     let (average_bitrate_bps, peak_bitrate_bps) =
         encoder_rate_control_bitrates(bitrate_bps, options.rate_control);
@@ -964,6 +1008,7 @@ pub struct Nvenc {
     options: EncoderOptions,
     frame_idx: u64,
     force_idr_next: bool,
+    infinite_gop: bool,
     lab_idr_telemetry: bool,
     last_mapped: Option<*mut c_void>,
     last_recon_mapped: Option<*mut c_void>,
@@ -1086,6 +1131,37 @@ impl Nvenc {
         options: EncoderOptions,
         codec: VideoCodec,
     ) -> Result<Self> {
+        Self::new_with_options_native_codec_gop(
+            device,
+            width,
+            height,
+            max_width,
+            max_height,
+            fps,
+            bitrate_bps,
+            options,
+            codec,
+            false,
+        )
+    }
+
+    /// `infinite_gop` disables periodic IDRs for the session's lifetime
+    /// (WSS v4 owns keyframes). NVENC rejects changing the GOP through
+    /// `NvEncReconfigureEncoder`, so the mode is fixed at creation; switch it
+    /// by recreating the encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options_native_codec_gop(
+        device: *mut c_void,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+        fps: u32,
+        bitrate_bps: u32,
+        options: EncoderOptions,
+        codec: VideoCodec,
+        infinite_gop: bool,
+    ) -> Result<Self> {
         ensure!(!device.is_null(), "null D3D11 device");
         ensure!(
             (1..=15).contains(&options.aq_strength),
@@ -1180,6 +1256,7 @@ impl Nvenc {
         let mut cfg = Box::new(preset_cfg.presetCfg);
         cfg.profileGUID = codec.profile_guid(options.main10);
         apply_encoder_options(&mut cfg, bitrate_bps, fps, options);
+        apply_gop(&mut cfg, codec, gop_frames(fps, options.gop_seconds, infinite_gop));
         cfg.rcParams.qpMapMode = qp_map_mode(options, codec);
 
         // Codec-specific random-access cadence. HEVC emits VPS/SPS/PPS on
@@ -1188,14 +1265,12 @@ impl Nvenc {
             match codec {
                 VideoCodec::Hevc => {
                     let hevc = &mut cfg.encodeCodecConfig.hevcConfig;
-                    hevc.idrPeriod = fps * u32::from(options.gop_seconds);
                     hevc.set_repeatSPSPPS(1);
                     let bit_depth_minus_8 = if options.main10 { 2 } else { 0 };
                     hevc.set_pixelBitDepthMinus8(bit_depth_minus_8);
                 }
                 VideoCodec::H264 => {
                     let h264 = &mut cfg.encodeCodecConfig.h264Config;
-                    h264.idrPeriod = fps * u32::from(options.gop_seconds);
                     h264.set_repeatSPSPPS(1);
                 }
             }
@@ -1260,6 +1335,7 @@ impl Nvenc {
             options,
             frame_idx: 0,
             force_idr_next: true, // first frame must be IDR for the decoder
+            infinite_gop,
             lab_idr_telemetry: std::env::var("BUBBLEPLAY_LAB_IDR_TELEMETRY")
                 .is_ok_and(|value| value == "1"),
             last_mapped: None,
@@ -1318,6 +1394,11 @@ impl Nvenc {
                 Err(e.into())
             }
         }
+    }
+
+    /// Whether this session was created without periodic IDRs.
+    pub fn infinite_gop(&self) -> bool {
+        self.infinite_gop
     }
 
     /// Reset NVENC's rate-control state without changing the active profile.

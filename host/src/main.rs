@@ -556,10 +556,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             .is_ok_and(|value| value == "1");
     let mut capture = CaptureSource::open(args, selection.selector())?;
     let socket = UdpSocket::bind("0.0.0.0:0").context("bind media socket")?;
-    let host_addr = SocketAddr::new(
-        pick_host_ip().context("discover local host IP")?,
-        socket.local_addr()?.port(),
-    );
+    // Host-IP discovery only feeds RTC ICE candidates. WSS media and
+    // signaling do not need it, so a failure (e.g. WSAEAFNOSUPPORT on a
+    // machine without a usable default route) must not end `serve`.
+    let host_addr = match pick_host_ip() {
+        Ok(ip) => Some(SocketAddr::new(ip, socket.local_addr()?.port())),
+        Err(error) => {
+            warn!(?error, "local host IP discovery failed; RTC host candidates disabled, WSS unaffected");
+            None
+        }
+    };
     socket.set_nonblocking(false)?;
     let mapped_addr = stun::discover_mapped_address(&socket, STUN_SERVER).ok();
     let mut signaling = Signaling::connect(&worker, &token, args.host_gate_token.as_deref())?;
@@ -3024,6 +3030,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 let is_idle_snapshot = frame.is_idle_snapshot();
                 let main10 = active_benchmark_profile.is_some_and(|profile| profile.encoder.main10);
                 let dev = frame.device().as_raw() as *mut core::ffi::c_void;
+                // WSS v4 owns keyframes (start / request / 30 s safety), so its
+                // encoder runs without periodic IDRs. NVENC cannot change the
+                // GOP in place: recreate the session when the mode differs.
+                let want_infinite_gop =
+                    wss_is_v4(wss_media.as_ref()) && active_benchmark_profile.is_none();
+                if encoder.as_ref().is_some_and(|e| {
+                    e.is_for_device(dev) && e.infinite_gop() != want_infinite_gop
+                }) {
+                    info!(infinite_gop = want_infinite_gop, "recreating NVENC for the WSS v4 GOP mode");
+                    encoder = None;
+                    latest_idr = None;
+                    pending_transition_idr = None;
+                    next_idr = Instant::now();
+                }
                 if encoder.as_ref().map_or(true, |e| !e.is_for_device(dev)) {
                     if encoder.is_some() {
                         warn!("capture D3D11 device changed; invalidating scaler and IDR state");
@@ -3045,6 +3065,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         preset,
                         active_codec,
                         active_benchmark_profile,
+                        want_infinite_gop,
                     )?);
                     encoder_benchmark_profile_revision = desired_encoder_benchmark_profile_revision;
                 }
@@ -3063,6 +3084,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 if (is_new && frame_admission_due(now, next_admission, frame_interval, urgent))
                     || (!is_new && urgent)
                 {
+                    if let Some(egress) = wss_media.as_ref().filter(|egress| egress.is_v4()) {
+                        egress.set_v4_frame_size(mode.width, mode.height);
+                    }
                     let mut wss_reservation = None;
                     let mut wss_forced_idr = false;
                     if let Some(egress) = wss_media.as_ref() {
@@ -4608,8 +4632,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         });
                     }
                     capture.cancel_idle_followup_snapshot();
+                    let v4_session = wss_is_v4(wss_media.as_ref());
                     match idle_snapshot_completion_order(
-                        encoded.is_idr && is_idle_snapshot,
+                        encoded.is_idr && (is_idle_snapshot || v4_session),
                         request_quiescent_transition_followup,
                     ) {
                         IdleSnapshotCompletionOrder::None => {}
@@ -4893,16 +4918,18 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
 /// no packets are sent).
 fn pick_host_ip() -> Result<std::net::IpAddr> {
     let probe = UdpSocket::bind("0.0.0.0:0")?;
-    let stun_addr: SocketAddr =
-        format!("{STUN_SERVER}")
-            .parse()
-            .or_else(|_| -> Result<SocketAddr> {
-                Ok(std::net::ToSocketAddrs::to_socket_addrs(STUN_SERVER)?
-                    .next()
-                    .context("no stun addr")?)
-            })?;
-    probe.connect(stun_addr)?;
+    let stun_addr = ipv4_probe_target(
+        std::net::ToSocketAddrs::to_socket_addrs(STUN_SERVER).context("resolve STUN server")?,
+    )
+    .context("STUN server has no IPv4 address")?;
+    probe.connect(stun_addr).context("connect IPv4 route probe")?;
     Ok(probe.local_addr()?.ip())
+}
+
+/// The route probe is bound to an IPv4 socket; connecting it to an IPv6
+/// resolution result fails with WSAEAFNOSUPPORT (10047). Use IPv4 only.
+fn ipv4_probe_target(addrs: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    addrs.into_iter().find(SocketAddr::is_ipv4)
 }
 
 /// Start the inline VDD keepalive when the capture target needs a virtual
@@ -4968,6 +4995,15 @@ fn physical_monitor_count() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_ip_probe_skips_ipv6_resolution_results() {
+        let v6: std::net::SocketAddr = "[2001:4860:4864:5:8000::1]:19302".parse().unwrap();
+        let v4: std::net::SocketAddr = "74.125.250.129:19302".parse().unwrap();
+        assert_eq!(super::ipv4_probe_target([v6, v4]), Some(v4));
+        assert_eq!(super::ipv4_probe_target([v6]), None);
+        assert_eq!(super::ipv4_probe_target([]), None);
+    }
+
     #[test]
     fn wss_v4_refine_bitrate_is_bounded_and_parks_periodic_idr() {
         assert_eq!(super::wss_v4_refine_bitrate(3_000_000), 12_000_000);
