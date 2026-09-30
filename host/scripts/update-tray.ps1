@@ -1,24 +1,29 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Non-elevated update of the BubblePlay tray install (no UAC prompt).
+    Non-elevated update of the BubblePlay per-user install (no UAC prompt
+    unless -IncludeAgent).
 
 .DESCRIPTION
     Copies bubbleplay-host.exe and bubbleplay_tray.exe from the build output
-    into %LOCALAPPDATA%\Programs\BubblePlay, restarting the tray (and with it
-    the user or elevated host). The replaced binaries are moved to
-    <install>\previous\ (exactly one previous of each). Run setup-tray.ps1
-    once (elevated) before the first update.
+    into %LOCALAPPDATA%\Programs\BubblePlay, restarting the tray and its host.
+    The replaced binaries are moved to <install>\previous\ (exactly one
+    previous of each). Also refreshes the staged admin agent
+    (bubbleplay_admin_agent.exe) and the setup/uninstall scripts beside them.
+    Run setup-tray.ps1 once before the first update.
 
     When the host changes, update-state.json in the tray data dir records it
     as "pending": the tray rolls back to previous\bubbleplay-host.exe if the
     new host does not register with signaling within 120 s or crash-loops, and
     marks it "good" after 10 healthy minutes. Honors BUBBLEPLAY_TRAY_DATA_DIR.
 
-    Admin mode runs a separate admin-owned copy in
-    %ProgramFiles%\BubblePlay\elevated. When that copy differs from the build,
-    this script reports it as stale; -IncludeElevated refreshes it with one
-    UAC prompt (setup-tray.ps1 -ElevatedBinariesOnly).
+    The admin input agent in %ProgramFiles%\BubblePlay\agent is a separate,
+    rarely changing component with a versioned pipe protocol: host updates
+    never require it to change. When the staged agent differs from the
+    installed one this script only reports it; -IncludeAgent installs it with
+    one UAC prompt (setup-tray.ps1 -AgentOnly). If the host ever needs a newer
+    agent protocol, the tray itself offers "Admin agent needs update (one
+    admin prompt)" and injects at user level until then.
 
 .EXAMPLE
     cargo build --offline --locked --release --bins --manifest-path host/Cargo.toml
@@ -28,19 +33,27 @@
 param(
     [string]$SourceDir,
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\BubblePlay'),
-    [string]$ElevatedDir = (Join-Path $env:ProgramFiles 'BubblePlay\elevated'),
+    [string]$AgentDir,
     [switch]$Build,
-    [switch]$IncludeElevated,
+    [Alias('IncludeElevated')]
+    [switch]$IncludeAgent,
     [switch]$NoStart
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Rollback-tracked binaries (kept in previous\) and plain staged files.
 $Binaries = @('bubbleplay-host.exe', 'bubbleplay_tray.exe')
+$AgentExeName = 'bubbleplay_admin_agent.exe'
+$Scripts = @('setup-tray.ps1', 'uninstall-tray.ps1')
 if (-not $SourceDir) { $SourceDir = Join-Path $PSScriptRoot '..\target\release' }
 $SourceDir = [IO.Path]::GetFullPath($SourceDir)
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
+if (-not $AgentDir) {
+    $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+    $AgentDir = Join-Path $programFiles 'BubblePlay\agent'
+}
 $TrayExe = Join-Path $InstallDir 'bubbleplay_tray.exe'
 
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -57,63 +70,69 @@ function Get-Sha256([string]$Path) {
     finally { $stream.Dispose() }
 }
 
+function Get-Sha256OrNull([string]$Path) {
+    try { if (Test-Path -LiteralPath $Path -PathType Leaf) { return Get-Sha256 $Path } } catch { }
+    return $null
+}
+
 if ($Build) {
     $manifest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Cargo.toml'))
     if (-not $env:NVIDIA_VIDEO_CODEC_SDK_PATH) { $env:NVIDIA_VIDEO_CODEC_SDK_PATH = Join-Path $PSScriptRoot '..\sdk-stub' }
-    if ($PSCmdlet.ShouldProcess($manifest, 'cargo build --release (host + tray)')) {
-        & cargo build --offline --locked --release --manifest-path $manifest --bin bubbleplay-host --bin bubbleplay_tray
+    if ($PSCmdlet.ShouldProcess($manifest, 'cargo build --release (host + tray + admin agent)')) {
+        & cargo build --offline --locked --release --manifest-path $manifest --bin bubbleplay-host --bin bubbleplay_tray --bin bubbleplay_admin_agent
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed with $LASTEXITCODE" }
     }
 }
 
+$sources = @{}
+foreach ($name in @($Binaries + $AgentExeName)) { $sources[$name] = Join-Path $SourceDir $name }
+foreach ($name in $Scripts) { $sources[$name] = Join-Path $PSScriptRoot $name }
 $changed = @()
-$staleElevated = @()
-$elevatedInstalled = $false
-foreach ($name in $Binaries) {
-    $source = Join-Path $SourceDir $name
+foreach ($name in @($Binaries + $AgentExeName + $Scripts)) {
+    $source = $sources[$name]
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing $source (build first or pass -Build)." }
-    $sourceHash = Get-Sha256 $source
-    $target = Join-Path $InstallDir $name
-    if (-not (Test-Path -LiteralPath $target) -or (Get-Sha256 $target) -ne $sourceHash) { $changed += $name }
-    $elevatedTarget = Join-Path $ElevatedDir $name
-    $elevatedHash = $null
-    try { if (Test-Path -LiteralPath $elevatedTarget) { $elevatedInstalled = $true; $elevatedHash = Get-Sha256 $elevatedTarget } } catch { }
-    if ($elevatedHash -ne $sourceHash) { $staleElevated += $name }
+    if ((Get-Sha256OrNull (Join-Path $InstallDir $name)) -ne (Get-Sha256 $source)) { $changed += $name }
 }
-$refreshElevated = $IncludeElevated -and $staleElevated.Count -gt 0
-if ($staleElevated.Count -gt 0 -and -not $IncludeElevated) {
-    if ($elevatedInstalled) {
-        Write-Warning "Admin-mode binaries in $ElevatedDir are stale ($($staleElevated -join ', ')). Rerun with -IncludeElevated (one UAC prompt) to refresh them; Admin mode keeps working on the old build meanwhile."
+$agentSourceHash = Get-Sha256 $sources[$AgentExeName]
+$agentInstalledHash = Get-Sha256OrNull (Join-Path $AgentDir $AgentExeName)
+$agentStale = $agentInstalledHash -ne $agentSourceHash
+if ($agentStale -and -not $IncludeAgent) {
+    if ($agentInstalledHash) {
+        Write-Host "Note: the installed admin agent differs from this build's agent. That is fine: the host negotiates the agent protocol and the tray asks for an agent update only when one is required. Pass -IncludeAgent (one UAC prompt) to install it anyway."
     }
     else {
-        Write-Warning "Admin-mode binaries are not installed in $ElevatedDir (or not readable). Rerun with -IncludeElevated or run setup-tray.ps1 elevated."
+        Write-Host 'Note: the admin agent is not installed (Admin mode unavailable). Pass -IncludeAgent (one UAC prompt) or use the tray menu to install it.'
     }
 }
+$refreshAgent = $IncludeAgent -and $agentStale
 $dataDir = if ($env:BUBBLEPLAY_TRAY_DATA_DIR) { $env:BUBBLEPLAY_TRAY_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'BubblePlay' }
 if (-not (Test-Path -LiteralPath (Join-Path $dataDir 'host.json'))) {
-    Write-Warning 'host.json is missing: run setup-tray.ps1 (elevated, once) to migrate the host configuration.'
+    Write-Warning 'host.json is missing: run setup-tray.ps1 once to write the host configuration.'
 }
-if ($changed.Count -eq 0 -and -not $refreshElevated) {
+$binariesChanged = @($changed | Where-Object { $Binaries -contains $_ })
+if ($changed.Count -eq 0) {
     Write-Host "Install in $InstallDir is already current."
 }
-elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $(@($changed + ($staleElevated | Where-Object { $refreshElevated } | ForEach-Object { "elevated\$_" })) -join ', ')")) {
-    $wasRunning = [bool](Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)
-    if ($wasRunning -and (Test-Path -LiteralPath $TrayExe)) {
-        # Graceful: the tray stops its host and asks the elevated runner to stop.
-        $quit = Start-Process -FilePath $TrayExe -ArgumentList '--quit' -PassThru -Wait -WindowStyle Hidden
-        if ($quit.ExitCode -ne 0) { Write-Warning 'Tray did not confirm shutdown in time.' }
-    }
-    $deadline = [DateTime]::UtcNow.AddSeconds(15)
-    do {
-        $busy = @(Get-Process bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
-                Where-Object { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) })
-        if ($busy.Count -eq 0) { break }
-        Start-Sleep -Milliseconds 300
-    } while ([DateTime]::UtcNow -lt $deadline)
-    if ($busy.Count -gt 0) {
-        # Only our own non-elevated processes can be stopped here.
-        $busy | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 500
+elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $($changed -join ', ')")) {
+    if ($binariesChanged.Count) {
+        $wasRunning = [bool](Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)
+        if ($wasRunning -and (Test-Path -LiteralPath $TrayExe)) {
+            # Graceful: the tray stops its host and the admin agent.
+            $quit = Start-Process -FilePath $TrayExe -ArgumentList '--quit' -PassThru -Wait -WindowStyle Hidden
+            if ($quit.ExitCode -ne 0) { Write-Warning 'Tray did not confirm shutdown in time.' }
+        }
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        do {
+            $busy = @(Get-Process bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) })
+            if ($busy.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 300
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if ($busy.Count -gt 0) {
+            # Only our own non-elevated processes can be stopped here.
+            $busy | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+        }
     }
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $previousDir = Join-Path $InstallDir 'previous'
@@ -122,8 +141,8 @@ elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $(@($changed
     foreach ($name in $changed) {
         $target = Join-Path $InstallDir $name
         $temp = "$target.new"
-        Copy-Item -Force -LiteralPath (Join-Path $SourceDir $name) -Destination $temp
-        if (Test-Path -LiteralPath $target) {
+        Copy-Item -Force -LiteralPath $sources[$name] -Destination $temp
+        if ((Test-Path -LiteralPath $target) -and $Binaries -contains $name) {
             # Keep exactly one previous build of each binary.
             $previous = Join-Path $previousDir $name
             Move-Item -Force -LiteralPath $target -Destination $previous
@@ -132,7 +151,7 @@ elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $(@($changed
         # Pre-rollback-scheme leftovers.
         Remove-Item -Force -LiteralPath "$target.previous" -ErrorAction SilentlyContinue
         Move-Item -Force -LiteralPath $temp -Destination $target
-        if ((Get-Sha256 $target) -ne (Get-Sha256 (Join-Path $SourceDir $name))) { throw "Hash mismatch after copying $name." }
+        if ((Get-Sha256 $target) -ne (Get-Sha256 $sources[$name])) { throw "Hash mismatch after copying $name." }
     }
     if ($changed -contains 'bubbleplay-host.exe') {
         # The tray puts a pending host on probation and rolls back on failure.
@@ -148,15 +167,18 @@ elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $(@($changed
         [IO.File]::WriteAllText((Join-Path $dataDir 'update-state.json'), $json, (New-Object Text.UTF8Encoding($false)))
         if (-not $hostPreviousHash) { Write-Warning 'No previous host to roll back to; this update cannot be rolled back automatically.' }
     }
-    if ($changed.Count) { Write-Host "Updated: $($changed -join ', ')" }
-    if ($refreshElevated) {
-        # One UAC prompt: setup-tray.ps1 copies the admin-only copy and re-verifies its ACL.
-        $shell = (Get-Process -Id $PID).Path
-        $setup = Join-Path $PSScriptRoot 'setup-tray.ps1'
-        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$setup`"", '-ElevatedBinariesOnly', '-SourceDir', "`"$SourceDir`"")
-        $elevated = Start-Process -FilePath $shell -ArgumentList $arguments -Verb RunAs -Wait -PassThru
-        if ($elevated.ExitCode -ne 0) { throw "Elevated refresh failed with exit code $($elevated.ExitCode); see the receipt in %LOCALAPPDATA%\BubblePlay\receipts." }
-        Write-Host "Refreshed Admin-mode binaries in $ElevatedDir."
+    Write-Host "Updated: $($changed -join ', ')"
+}
+
+if ($refreshAgent) {
+    $setup = Join-Path $InstallDir 'setup-tray.ps1'
+    if ($PSCmdlet.ShouldProcess($AgentDir, 'Install the staged admin agent (one UAC prompt: setup-tray.ps1 -AgentOnly)')) {
+        $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$setup`"", '-AgentOnly',
+            '-SourceDir', "`"$($InstallDir.TrimEnd('\'))`"", '-InstallDir', "`"$($InstallDir.TrimEnd('\'))`"")
+        $elevated = Start-Process -FilePath $shell -ArgumentList $arguments -Verb RunAs -Wait -PassThru -WindowStyle Hidden
+        if ($elevated.ExitCode -ne 0) { throw "Agent install failed with exit code $($elevated.ExitCode); see setup-tray-machine-*.json in %LOCALAPPDATA%\BubblePlay\receipts." }
+        Write-Host "Installed the admin agent in $AgentDir."
     }
 }
 

@@ -1,5 +1,5 @@
-//! Host child supervision shared by the tray (user mode) and the elevated
-//! runner (admin mode): load config, decrypt secrets into env vars, spawn
+//! Host child supervision for the tray: load config, decrypt secrets into
+//! env vars, spawn
 //! `bubbleplay-host.exe` in a kill-on-close job, pipe its output into a
 //! rotating log, restart with backoff.
 
@@ -29,6 +29,8 @@ pub struct SupervisorConfig {
     pub host_log: SharedLog,
     /// Optional lifecycle events for update probation.
     pub events: Option<Sender<HostEvent>>,
+    /// Extra environment for the host (the admin agent's pipe name).
+    pub extra_env: Vec<(String, String)>,
 }
 
 /// Host lifecycle events observed by the supervisor.
@@ -129,6 +131,9 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
         // Panics keep backtraces; anyhow errors (logged on every retry) do not.
         .env("RUST_LIB_BACKTRACE", "0")
         .env_remove("BUBBLEPLAY_HOST_GATE_TOKEN")
+        .env_remove("BUBBLEPLAY_ADMIN_AGENT_PIPE")
+        .env_remove("BUBBLEPLAY_ADMIN_AGENT_ALLOW_DEV")
+        .envs(config.extra_env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
