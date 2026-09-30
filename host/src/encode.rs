@@ -84,6 +84,27 @@ mod codec_policy_tests {
     }
 
     #[test]
+    fn v4_infinite_gop_disables_periodic_idr_for_both_codecs() {
+        assert_eq!(super::gop_frames(30, 2, false), 60);
+        assert_eq!(super::gop_frames(60, 4, false), 240);
+        assert_eq!(super::gop_frames(30, 2, true), super::NVENC_INFINITE_GOPLENGTH);
+        for codec in [VideoCodec::Hevc, VideoCodec::H264] {
+            let mut cfg: super::NV_ENC_CONFIG = unsafe { super::zeroed() };
+            super::apply_gop(&mut cfg, codec, super::gop_frames(30, 2, true));
+            assert_eq!(cfg.gopLength, super::NVENC_INFINITE_GOPLENGTH);
+            let idr = unsafe {
+                match codec {
+                    VideoCodec::Hevc => cfg.encodeCodecConfig.hevcConfig.idrPeriod,
+                    VideoCodec::H264 => cfg.encodeCodecConfig.h264Config.idrPeriod,
+                }
+            };
+            assert_eq!(idr, super::NVENC_INFINITE_GOPLENGTH);
+            super::apply_gop(&mut cfg, codec, super::gop_frames(30, 2, false));
+            assert_eq!(cfg.gopLength, 60);
+        }
+    }
+
+    #[test]
     fn production_encoder_options_remain_the_existing_low_latency_defaults() {
         assert_eq!(
             EncoderOptions::production(Preset::P3),
@@ -904,13 +925,36 @@ fn rate_control_label(mode: RateControlMode) -> &'static str {
     }
 }
 
+/// NVENC's "no periodic IDR" GOP length (`NVENC_INFINITE_GOPLENGTH`).
+pub const NVENC_INFINITE_GOPLENGTH: u32 = 0xffff_ffff;
+
+/// GOP / IDR period in frames. WSS v4 owns keyframes itself (start, request,
+/// 30 s safety), so its encoder runs with an infinite GOP.
+fn gop_frames(fps: u32, gop_seconds: u8, infinite: bool) -> u32 {
+    if infinite {
+        NVENC_INFINITE_GOPLENGTH
+    } else {
+        fps.saturating_mul(u32::from(gop_seconds))
+    }
+}
+
+/// Apply the GOP length to the common config and the codec IDR period.
+fn apply_gop(cfg: &mut NV_ENC_CONFIG, codec: VideoCodec, frames: u32) {
+    cfg.gopLength = frames;
+    // Writing a union field is safe; the member matches the session codec.
+    match codec {
+        VideoCodec::Hevc => cfg.encodeCodecConfig.hevcConfig.idrPeriod = frames,
+        VideoCodec::H264 => cfg.encodeCodecConfig.h264Config.idrPeriod = frames,
+    }
+}
+
 fn apply_encoder_options(
     cfg: &mut NV_ENC_CONFIG,
     bitrate_bps: u32,
     fps: u32,
     options: EncoderOptions,
 ) {
-    cfg.gopLength = fps * u32::from(options.gop_seconds);
+    cfg.gopLength = gop_frames(fps, options.gop_seconds, false);
     cfg.frameIntervalP = 1;
     let (average_bitrate_bps, peak_bitrate_bps) =
         encoder_rate_control_bitrates(bitrate_bps, options.rate_control);
@@ -964,6 +1008,7 @@ pub struct Nvenc {
     options: EncoderOptions,
     frame_idx: u64,
     force_idr_next: bool,
+    infinite_gop: bool,
     lab_idr_telemetry: bool,
     last_mapped: Option<*mut c_void>,
     last_recon_mapped: Option<*mut c_void>,
@@ -1188,14 +1233,14 @@ impl Nvenc {
             match codec {
                 VideoCodec::Hevc => {
                     let hevc = &mut cfg.encodeCodecConfig.hevcConfig;
-                    hevc.idrPeriod = fps * u32::from(options.gop_seconds);
+                    hevc.idrPeriod = gop_frames(fps, options.gop_seconds, false);
                     hevc.set_repeatSPSPPS(1);
                     let bit_depth_minus_8 = if options.main10 { 2 } else { 0 };
                     hevc.set_pixelBitDepthMinus8(bit_depth_minus_8);
                 }
                 VideoCodec::H264 => {
                     let h264 = &mut cfg.encodeCodecConfig.h264Config;
-                    h264.idrPeriod = fps * u32::from(options.gop_seconds);
+                    h264.idrPeriod = gop_frames(fps, options.gop_seconds, false);
                     h264.set_repeatSPSPPS(1);
                 }
             }
@@ -1260,6 +1305,7 @@ impl Nvenc {
             options,
             frame_idx: 0,
             force_idr_next: true, // first frame must be IDR for the decoder
+            infinite_gop: false,
             lab_idr_telemetry: std::env::var("BUBBLEPLAY_LAB_IDR_TELEMETRY")
                 .is_ok_and(|value| value == "1"),
             last_mapped: None,
@@ -1320,6 +1366,38 @@ impl Nvenc {
         }
     }
 
+    /// Switch between the configured periodic-IDR GOP and an infinite GOP
+    /// (WSS v4: keyframes only on start, request or safety interval). No-op
+    /// when already in the requested mode; the next picture is an IDR.
+    pub fn set_infinite_gop(&mut self, infinite: bool) -> Result<()> {
+        if infinite == self.infinite_gop {
+            return Ok(());
+        }
+        let mut cfg = *self.cfg;
+        apply_gop(&mut cfg, self.codec, gop_frames(self.fps, self.options.gop_seconds, infinite));
+        let mut init = *self.init_params;
+        init.encodeConfig = &mut cfg;
+        let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
+        reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+        reconf.reInitEncodeParams = init;
+        reconf.set_resetEncoder(1);
+        reconf.set_forceIDR(1);
+        unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) }
+            .result_without_string()
+            .context("NvEncReconfigureEncoder GOP")?;
+        *self.cfg = cfg;
+        *self.init_params = init;
+        self.init_params.encodeConfig = self.cfg.as_mut();
+        self.infinite_gop = infinite;
+        self.force_idr_next = true;
+        info!(infinite, "NVENC GOP reconfigured");
+        Ok(())
+    }
+
+    pub fn infinite_gop(&self) -> bool {
+        self.infinite_gop
+    }
+
     /// Reset NVENC's rate-control state without changing the active profile.
     /// Stream Lab uses this only for explicitly gated source-quality captures.
     pub fn reset_rate_control(&mut self) -> Result<()> {
@@ -1352,6 +1430,7 @@ impl Nvenc {
             return Ok(());
         }
         let mut cfg = *self.cfg;
+        apply_gop(&mut cfg, self.codec, gop_frames(fps, self.options.gop_seconds, self.infinite_gop));
         let (average_bitrate_bps, _) =
             encoder_rate_control_bitrates(self.bitrate_bps, self.options.rate_control);
         cfg.rcParams.vbvBufferSize =
