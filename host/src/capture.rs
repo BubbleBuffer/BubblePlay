@@ -213,7 +213,11 @@ impl IdleSnapshotState {
 pub enum CapturedFrame<'a> {
     Desktop {
         frame: DxgiDuplicationFrame<'a>,
+        /// Dirty rects plus both ends of every move rect.
         damage: Option<Vec<DamageRect>>,
+        /// Destinations of DDA move rects (content that was moved, e.g. a
+        /// scroll the compositor reported as a move).
+        moved: Vec<DamageRect>,
     },
     IdleSnapshot {
         device: &'a ID3D11Device,
@@ -266,6 +270,14 @@ impl CapturedFrame<'_> {
         match self {
             Self::Desktop { damage, .. } => damage.as_deref(),
             Self::IdleSnapshot { .. } | Self::SecureSnapshot { .. } => None,
+        }
+    }
+
+    /// Destinations of this frame's DDA move rects.
+    pub fn moved(&self) -> &[DamageRect] {
+        match self {
+            Self::Desktop { moved, .. } => moved,
+            Self::IdleSnapshot { .. } | Self::SecureSnapshot { .. } => &[],
         }
     }
 
@@ -409,10 +421,14 @@ fn move_damage_rects(
     .flatten()
 }
 
-fn duplication_damage(frame: &DxgiDuplicationFrame<'_>) -> Result<Vec<DamageRect>> {
+/// The frame's damage (dirty rects and both ends of each move) and the move
+/// destinations on their own.
+fn duplication_damage(
+    frame: &DxgiDuplicationFrame<'_>,
+) -> Result<(Vec<DamageRect>, Vec<DamageRect>)> {
     let metadata_bytes = frame.frame_info().TotalMetadataBufferSize;
     if metadata_bytes == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let duplication = frame.duplication();
     let mut damage = Vec::new();
@@ -451,12 +467,18 @@ fn duplication_damage(frame: &DxgiDuplicationFrame<'_>) -> Result<Vec<DamageRect
     }
     .context("IDXGIOutputDuplication::GetFrameMoveRects")?;
     moves.truncate(move_bytes as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>());
+    let moved = moves
+        .iter()
+        .filter_map(|movement| {
+            clipped_damage_rect(movement.DestinationRect, frame.width(), frame.height())
+        })
+        .collect();
     damage.extend(
         moves
             .into_iter()
             .flat_map(|movement| move_damage_rects(movement, frame.width(), frame.height())),
     );
-    Ok(damage)
+    Ok((damage, moved))
 }
 
 /// GDI-backed capture source used on the Winlogon/UAC desktop where desktop
@@ -1009,19 +1031,23 @@ impl Capture {
             info!("DDA capture produced a verified recovery frame");
         }
 
-        let damage = if is_new {
+        let (damage, moved) = if is_new {
             match duplication_damage(&frame) {
-                Ok(damage) => Some(damage),
+                Ok((damage, moved)) => (Some(damage), moved),
                 Err(error) => {
                     debug!(?error, "DDA frame damage metadata unavailable");
-                    None
+                    (None, Vec::new())
                 }
             }
         } else {
-            None
+            (None, Vec::new())
         };
         Ok(Some((
-            CapturedFrame::Desktop { frame, damage },
+            CapturedFrame::Desktop {
+                frame,
+                damage,
+                moved,
+            },
             is_new,
             recovered,
         )))
