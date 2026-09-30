@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -345,6 +345,9 @@ impl HostState {
 pub enum AgentStatus {
     /// Admin mode is off: the host injects at user level.
     Off,
+    /// Admin mode is on but no viewer is connected: the agent is not running
+    /// and starts when a viewer session starts.
+    Armed,
     /// The agent task was started; waiting for it to answer.
     Starting,
     /// The agent answered the probe: the host injects through it.
@@ -367,11 +370,73 @@ pub const AGENT_UPDATE_LABEL: &str = "Admin agent needs update (one admin prompt
 pub fn status_line(state: &HostState, agent: &AgentStatus) -> String {
     let input = match agent {
         AgentStatus::Off => "user",
+        AgentStatus::Armed => "user input, Admin mode armed",
         AgentStatus::Starting => "user input, admin agent starting",
         AgentStatus::Ready => "admin input",
         AgentStatus::NeedsUpdate { .. } => "user input, admin agent needs update",
     };
     format!("BubblePlay: {} ({input})", state.label())
+}
+
+/// The Admin mode line shown under the "Admin mode" menu item.
+pub fn admin_mode_line(agent: &AgentStatus) -> Option<&'static str> {
+    match agent {
+        AgentStatus::Off => None,
+        AgentStatus::Armed => Some("Admin mode: armed (starts when a viewer connects)"),
+        AgentStatus::Starting => Some("Admin mode: starting (viewer connected)"),
+        AgentStatus::Ready => Some("Admin mode: active"),
+        AgentStatus::NeedsUpdate { .. } => Some("Admin mode: agent needs update"),
+    }
+}
+
+/// How long the agent keeps running after the last viewer session ended, so
+/// a reconnect or page reload does not restart it.
+pub const AGENT_IDLE_GRACE: Duration = Duration::from_secs(30);
+
+/// Decides when the Admin mode agent should run: while a viewer session is
+/// active, and for [`AGENT_IDLE_GRACE`] after the last one ended. Fed from
+/// the host's "viewer session started/ended" log lines; a host exit ends
+/// every session.
+#[derive(Debug, Clone, Default)]
+pub struct ViewerGate {
+    sessions: u32,
+    idle_since: Option<Instant>,
+}
+
+impl ViewerGate {
+    pub fn on_started(&mut self) {
+        self.sessions = self.sessions.saturating_add(1);
+        self.idle_since = None;
+    }
+
+    pub fn on_ended(&mut self, now: Instant) {
+        if self.sessions > 0 {
+            self.sessions -= 1;
+            if self.sessions == 0 {
+                self.idle_since = Some(now);
+            }
+        }
+    }
+
+    /// The host exited: its sessions are gone (it logs no end line then).
+    pub fn on_host_exited(&mut self, now: Instant) {
+        if self.sessions > 0 {
+            self.sessions = 0;
+            self.idle_since = Some(now);
+        }
+    }
+
+    pub fn viewer_connected(&self) -> bool {
+        self.sessions > 0
+    }
+
+    /// True while a session is active or the idle grace has not run out.
+    pub fn wants_agent(&self, now: Instant) -> bool {
+        self.sessions > 0
+            || self
+                .idle_since
+                .is_some_and(|since| now.saturating_duration_since(since) < AGENT_IDLE_GRACE)
+    }
 }
 
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -584,6 +649,19 @@ mod tests {
             status_line(&HostState::Stopped, &AgentStatus::Off),
             "BubblePlay: Stopped (user)"
         );
+        assert_eq!(
+            status_line(&HostState::Running { pid: 1 }, &AgentStatus::Armed),
+            "BubblePlay: Running (user input, Admin mode armed)"
+        );
+        assert_eq!(admin_mode_line(&AgentStatus::Off), None);
+        assert_eq!(
+            admin_mode_line(&AgentStatus::Armed),
+            Some("Admin mode: armed (starts when a viewer connects)")
+        );
+        assert_eq!(
+            admin_mode_line(&AgentStatus::Ready),
+            Some("Admin mode: active")
+        );
         let stale = AgentStatus::NeedsUpdate { reason: "x".into() };
         assert!(stale.needs_update());
         assert!(!AgentStatus::Starting.needs_update());
@@ -595,6 +673,76 @@ mod tests {
             AGENT_UPDATE_LABEL,
             "Admin agent needs update (one admin prompt)"
         );
+    }
+
+    #[test]
+    fn viewer_gate_runs_agent_only_around_sessions() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut gate = ViewerGate::default();
+        // Armed: nothing connected, nothing wanted.
+        assert!(!gate.wants_agent(t0));
+        assert!(!gate.viewer_connected());
+        // A stray end line (no session) changes nothing.
+        gate.on_ended(at(1));
+        assert!(!gate.wants_agent(at(1)));
+        // First session starts the agent.
+        gate.on_started();
+        assert!(gate.viewer_connected());
+        assert!(gate.wants_agent(at(2)));
+        // Still wanted long into the session.
+        assert!(gate.wants_agent(at(3600)));
+        // Session ends at 100 s: kept through the grace, stopped after it.
+        gate.on_ended(at(100));
+        assert!(!gate.viewer_connected());
+        assert!(gate.wants_agent(at(100)));
+        assert!(gate.wants_agent(at(129)));
+        assert!(!gate.wants_agent(at(130)));
+        assert!(!gate.wants_agent(at(500)));
+    }
+
+    #[test]
+    fn viewer_gate_reconnect_within_grace_keeps_agent() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut gate = ViewerGate::default();
+        gate.on_started();
+        gate.on_ended(at(10));
+        // Page reload: the viewer is back 5 s later.
+        assert!(gate.wants_agent(at(15)));
+        gate.on_started();
+        // The old grace deadline (40 s) no longer applies.
+        assert!(gate.wants_agent(at(41)));
+        assert!(gate.wants_agent(at(300)));
+        // The new session's end starts a fresh grace.
+        gate.on_ended(at(300));
+        assert!(gate.wants_agent(at(329)));
+        assert!(!gate.wants_agent(at(330)));
+    }
+
+    #[test]
+    fn viewer_gate_counts_overlapping_sessions_and_host_exit() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut gate = ViewerGate::default();
+        // A new session logged before the old one's end line.
+        gate.on_started();
+        gate.on_started();
+        gate.on_ended(at(5));
+        assert!(gate.viewer_connected());
+        assert!(gate.wants_agent(at(1000)));
+        gate.on_ended(at(1000));
+        assert!(!gate.wants_agent(at(1030)));
+        // A host that exits mid-session logs no end line: the exit ends it.
+        gate.on_started();
+        gate.on_host_exited(at(2000));
+        assert!(!gate.viewer_connected());
+        assert!(gate.wants_agent(at(2029)));
+        assert!(!gate.wants_agent(at(2030)));
+        // An exit with no session does not open a grace window.
+        let mut idle = ViewerGate::default();
+        idle.on_host_exited(at(1));
+        assert!(!idle.wants_agent(at(1)));
     }
 
     #[test]

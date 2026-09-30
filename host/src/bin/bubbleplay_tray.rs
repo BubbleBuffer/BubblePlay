@@ -50,8 +50,8 @@ use bubbleplay_host::admin_agent::protocol::{
 };
 use bubbleplay_host::admin_agent::trust::current_session_id;
 use logic::{
-    run_key_command, status_line, unix_ms_now, AgentStatus, HostState, SharedLog, TraySettings,
-    AGENT_UPDATE_LABEL,
+    admin_mode_line, run_key_command, status_line, unix_ms_now, AgentStatus, HostState, SharedLog,
+    TraySettings, ViewerGate, AGENT_UPDATE_LABEL,
 };
 use platform::{
     acquire_single_instance, agent_task_exists, create_manual_event, data_dir, end_agent_task,
@@ -266,6 +266,8 @@ struct App {
     host_log: SharedLog,
     user: Option<SupervisorThread>,
     agent: AgentStatus,
+    /// Viewer sessions seen in the host log: the agent runs only around them.
+    viewers: ViewerGate,
     /// When the agent task was last started.
     agent_started: Option<Instant>,
     last_probe: Option<Instant>,
@@ -491,18 +493,52 @@ impl App {
     }
 
     fn stop_agent(&mut self) {
-        if self.agent == AgentStatus::Off && self.agent_started.is_none() {
+        if self.agent_started.is_some() || self.agent_child.is_some() {
+            tracing::info!("stopping admin agent");
+            self.stop_agent_process();
+        }
+        self.set_agent(AgentStatus::Off);
+    }
+
+    /// Admin mode is on and a viewer session is active (or ended less than
+    /// the idle grace ago).
+    fn agent_wanted(&self) -> bool {
+        self.settings.admin_mode && self.viewers.wants_agent(Instant::now())
+    }
+
+    /// Run the agent only while Admin mode is on and a viewer is connected:
+    /// start it on the first viewer session, stop it once the last one ended
+    /// more than the idle grace ago. Until it answers (and while it is not
+    /// running) the host injects at user level.
+    fn gate_agent(&mut self) {
+        if !self.settings.admin_mode {
+            self.stop_agent();
             return;
         }
-        tracing::info!("stopping admin agent");
-        self.stop_agent_process();
-        self.set_agent(AgentStatus::Off);
+        if self.agent_update_running {
+            return;
+        }
+        if self.agent_wanted() {
+            if matches!(self.agent, AgentStatus::Off | AgentStatus::Armed) {
+                tracing::info!("viewer session active: starting admin agent");
+                self.start_agent();
+            }
+            return;
+        }
+        if self.agent_started.is_some() || self.agent_child.is_some() {
+            tracing::info!("no viewer session: stopping admin agent");
+            self.stop_agent_process();
+        }
+        // A pending "needs update" stays until the user runs the update.
+        if !self.agent.needs_update() {
+            self.set_agent(AgentStatus::Armed);
+        }
     }
 
     /// Track the agent: probe it (version + trust), re-run it if it died,
     /// and flag it for update when it is missing, incompatible or silent.
     fn check_agent(&mut self, force_probe: bool) {
-        if !self.settings.admin_mode || self.agent_update_running {
+        if !self.agent_wanted() || self.agent_update_running {
             return;
         }
         let in_grace = self
@@ -556,7 +592,7 @@ impl App {
             return;
         }
         match &self.agent {
-            AgentStatus::NeedsUpdate { .. } | AgentStatus::Off => {}
+            AgentStatus::NeedsUpdate { .. } | AgentStatus::Off | AgentStatus::Armed => {}
             AgentStatus::Starting if in_grace => {}
             AgentStatus::Starting => self.set_agent(AgentStatus::NeedsUpdate {
                 reason: "the admin agent did not start".into(),
@@ -641,9 +677,12 @@ impl App {
         self.agent_update_running = false;
         if code == 0 {
             tracing::info!("admin agent update finished");
-            if self.settings.admin_mode {
+            if self.agent_wanted() {
                 self.announce_ready = true;
                 self.start_agent();
+            } else if self.settings.admin_mode {
+                self.announce_ready = true;
+                self.set_agent(AgentStatus::Armed);
             } else {
                 self.set_agent(AgentStatus::Off);
             }
@@ -660,13 +699,7 @@ impl App {
 
     fn apply_mode(&mut self) {
         self.start_user();
-        if self.settings.admin_mode {
-            if matches!(self.agent, AgentStatus::Off) {
-                self.start_agent();
-            }
-        } else {
-            self.stop_agent();
-        }
+        self.gate_agent();
     }
 
     fn update_state_path(&self) -> PathBuf {
@@ -848,7 +881,23 @@ impl App {
                     }
                     self.host_error = None;
                 }
+                HostEvent::ViewerStarted => {
+                    tracing::info!("viewer session started");
+                    self.viewers.on_started();
+                }
+                HostEvent::ViewerEnded => {
+                    self.viewers.on_ended(Instant::now());
+                    if self.viewers.viewer_connected() {
+                        tracing::info!("viewer session ended; another is still active");
+                    } else {
+                        tracing::info!(
+                            grace_s = logic::AGENT_IDLE_GRACE.as_secs(),
+                            "viewer session ended; admin agent stops after the grace"
+                        );
+                    }
+                }
                 HostEvent::Exited => {
+                    self.viewers.on_host_exited(Instant::now());
                     if let Some(probation) = self.probation.as_mut() {
                         probation.on_exit(now);
                     }
@@ -888,6 +937,7 @@ impl App {
 
     fn tick(&mut self) {
         self.watch_update();
+        self.gate_agent();
         self.check_agent(false);
         let state = self.state();
         let kind = icon_kind(&state);
@@ -960,25 +1010,28 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 fn show_menu(hwnd: HWND) {
-    let Some((status, admin, login, agent_update, build, error, can_roll_back)) = with_app(|app| {
-        app.check_agent(true);
-        let agent_update = if app.agent_update_running {
-            Some((MF_STRING | MF_GRAYED, "Admin agent update running..."))
-        } else if app.settings.admin_mode && app.agent.needs_update() {
-            Some((MF_STRING, AGENT_UPDATE_LABEL))
-        } else {
-            None
-        };
-        (
-            status_line(&app.state(), &app.agent),
-            app.settings.admin_mode,
-            app.settings.start_at_login,
-            agent_update,
-            app.build_line(),
-            app.host_error.clone(),
-            app.can_roll_back(),
-        )
-    }) else {
+    let Some((status, admin, admin_line, login, agent_update, build, error, can_roll_back)) =
+        with_app(|app| {
+            app.check_agent(true);
+            let agent_update = if app.agent_update_running {
+                Some((MF_STRING | MF_GRAYED, "Admin agent update running..."))
+            } else if app.settings.admin_mode && app.agent.needs_update() {
+                Some((MF_STRING, AGENT_UPDATE_LABEL))
+            } else {
+                None
+            };
+            (
+                status_line(&app.state(), &app.agent),
+                app.settings.admin_mode,
+                admin_mode_line(&app.agent),
+                app.settings.start_at_login,
+                agent_update,
+                app.build_line(),
+                app.host_error.clone(),
+                app.can_roll_back(),
+            )
+        })
+    else {
         return;
     };
     // SAFETY: standard popup-menu sequence on our own window.
@@ -1005,6 +1058,9 @@ fn show_menu(hwnd: HWND) {
             CMD_ADMIN,
             "Admin mode",
         );
+        if let Some(line) = admin_line {
+            item(MF_STRING | MF_GRAYED, CMD_STATUS, line);
+        }
         if let Some((flags, label)) = agent_update {
             item(flags, CMD_AGENT_UPDATE, label);
         }
@@ -1155,6 +1211,7 @@ fn run_tray() -> Result<i32> {
         host_log: SharedLog::new(logs.join("host.log")),
         user: None,
         agent: AgentStatus::Off,
+        viewers: ViewerGate::default(),
         agent_started: None,
         last_probe: None,
         agent_child: None,

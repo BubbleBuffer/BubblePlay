@@ -68,13 +68,23 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   marks it `good` after 10 healthy minutes. The menu shows the host build and
   status, plus "Roll back host" while a different previous build exists. This
   works the same with Admin mode on, since the host always runs as the user.
-- Admin mode (tray menu, default off) starts the admin input agent
+- Admin mode (tray menu, default off) runs the admin input agent
   (`bubbleplay_admin_agent.exe`) through the on-demand `\BubblePlay\AdminAgent`
   task. The agent is a small elevated pipe server that only calls SendInput.
   The host sends it validated input records over a local named pipe, so input
   reaches elevated windows. The secure desktop (UAC prompts, lock screen) is
-  still not captured. The agent exits when Admin mode is turned off or the
-  tray goes away.
+  still not captured.
+- The agent runs only while Admin mode is on and a viewer is connected. The
+  host logs "viewer session started" once a viewer's media transport (RTC or
+  WSS) is up and "viewer session ended" when that session ends. The tray
+  starts the task on the first session. It stops the agent 30 s after the last
+  session ended (a reconnect or page reload within that time keeps it
+  running), when Admin mode is turned off, or when the tray goes away. A host
+  exit counts as the session ending. The menu shows "Admin mode: armed (starts
+  when a viewer connects)", "starting" or "active". Until the agent answers
+  (about 1 s after start, plus up to 2 s until the host's next connection
+  attempt), the host injects at user level, so no input is dropped, but it
+  does not reach elevated windows yet.
 - Agent versioning: the pipe protocol is versioned (`host/src/admin_agent`).
   If the agent is missing, does not start, or speaks another protocol version,
   the host injects at user level and the tray offers "Admin agent needs update
@@ -93,8 +103,9 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
 
   The host connects only to a server whose image is the Program Files agent.
   `--dev` (tests) works only unelevated.
-- Residual risk: while Admin mode is on, any process running as the same user
-  at medium integrity can connect to the pipe and drive elevated windows.
+- Residual risk: while the agent runs (Admin mode on and a viewer connected,
+  plus the 30 s grace), any process running as the same user at medium
+  integrity can connect to the pipe and drive elevated windows.
   Turn Admin mode on only when you need it.
 
 ## Runtime boundaries
