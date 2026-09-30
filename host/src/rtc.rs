@@ -20,10 +20,11 @@ use crate::encode::VideoCodec;
 
 /// Keep Windows timed channel waits usable for the RTP pacer's deadlines.
 /// Acquire only for a negotiated RTC epoch; Drop also covers errors/teardown.
-struct RtcTimerPeriod;
+/// RAII `timeBeginPeriod(1)` guard, shared by the RTC and WSS v4 media paths.
+pub struct RtcTimerPeriod;
 
 impl RtcTimerPeriod {
-    fn acquire() -> Option<Self> {
+    pub fn acquire() -> Option<Self> {
         // No pointer arguments; pair each successful request with timeEndPeriod.
         let status = unsafe { windows::Win32::Media::timeBeginPeriod(1) };
         if status == 0 {

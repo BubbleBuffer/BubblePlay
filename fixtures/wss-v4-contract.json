@@ -1,0 +1,50 @@
+{
+  "headerBytes": 28,
+  "maxPayloadBytes": 8388608,
+  "packets": [
+    {
+      "name": "hevc-key",
+      "hex": "42505634040101001122334455667788010203040506070807800438deadbeef",
+      "accepted": true,
+      "key": true, "refine": false, "codec": 1,
+      "generation": 287454020, "seq": 1432778632,
+      "captureTsUs": "72623859790382856", "width": 1920, "height": 1080,
+      "payloadHex": "deadbeef"
+    },
+    {
+      "name": "h264-refine-delta",
+      "hex": "4250563404020200000000070000002a00000000000f424005000320aa",
+      "accepted": true,
+      "key": false, "refine": true, "codec": 2,
+      "generation": 7, "seq": 42,
+      "captureTsUs": "1000000", "width": 1280, "height": 800,
+      "payloadHex": "aa"
+    },
+    { "name": "bad-magic", "hex": "42505633040101001122334455667788010203040506070807800438deadbeef", "accepted": false },
+    { "name": "bad-version", "hex": "42505634030101001122334455667788010203040506070807800438deadbeef", "accepted": false },
+    { "name": "unknown-flags", "hex": "42505634040401001122334455667788010203040506070807800438deadbeef", "accepted": false },
+    { "name": "bad-codec", "hex": "42505634040103001122334455667788010203040506070807800438deadbeef", "accepted": false },
+    { "name": "nonzero-reserved", "hex": "42505634040101011122334455667788010203040506070807800438deadbeef", "accepted": false },
+    { "name": "empty-payload", "hex": "42505634040101001122334455667788010203040506070807800438", "accepted": false },
+    { "name": "truncated-header", "hex": "425056340401010011223344", "accepted": false }
+  ],
+  "clientMessages": [
+    { "text": "{\"type\":\"ack\",\"generation\":7,\"seq\":42,\"recvTsMs\":1234.5,\"decodedSeq\":41}", "accepted": true, "kind": "ack" },
+    { "text": "{\"type\":\"ack\",\"generation\":7,\"seq\":42,\"recvTsMs\":1234.5}", "accepted": true, "kind": "ack" },
+    { "text": "{\"type\":\"keyframe\",\"reason\":\"sequence-gap\"}", "accepted": true, "kind": "keyframe" },
+    { "text": "{\"type\":\"ping\"}", "accepted": true, "kind": "ping" },
+    { "text": "{\"type\":\"ack\",\"generation\":-1,\"seq\":42,\"recvTsMs\":1}", "accepted": false },
+    { "text": "{\"type\":\"ack\",\"generation\":7,\"seq\":4294967296,\"recvTsMs\":1}", "accepted": false },
+    { "text": "{\"type\":\"ack\",\"generation\":7,\"seq\":1.5,\"recvTsMs\":1}", "accepted": false },
+    { "text": "{\"type\":\"ack\",\"generation\":7,\"seq\":1,\"recvTsMs\":1,\"lanes\":[1]}", "accepted": false },
+    { "text": "{\"type\":\"keyframe\",\"reason\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}", "accepted": false },
+    { "text": "{\"type\":\"keyframe\",\"reason\":\"bad reason!\"}", "accepted": false },
+    { "text": "{\"type\":\"viewport\"}", "accepted": false },
+    { "text": "not json", "accepted": false }
+  ],
+  "hostMessages": [
+    { "text": "{\"type\":\"ping\"}", "accepted": true },
+    { "text": "{\"type\":\"hello\",\"role\":\"media-host\"}", "accepted": true },
+    { "text": "{\"type\":\"ack\",\"generation\":1,\"seq\":1,\"recvTsMs\":1}", "accepted": false }
+  ]
+}

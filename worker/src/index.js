@@ -32,6 +32,12 @@ import {
   V2_MAX_PACKET_BYTES,
   V3_MAX_PACKET_BYTES,
 } from "../public/media.js";
+import {
+  V4_HEADER_BYTES,
+  V4_MAX_PACKET_BYTES,
+  validateClientMessageV4,
+  validateHostTextV4,
+} from "../public/media-v4.js";
 
 export { ApprovalGate };
 
@@ -136,7 +142,7 @@ function validSocketRoute(url) {
   if (isLabSocketPath(url.pathname) && !validLabRun(url)) return false;
   if (!isMediaSocketPath(url.pathname)) return true;
   if (!validStripe(url) || !validMediaSession(url)) return false;
-  return !isLabSocketPath(url.pathname) || ["2", "3"].includes(url.searchParams.get("v"));
+  return !isLabSocketPath(url.pathname) || ["2", "3", "4"].includes(url.searchParams.get("v"));
 }
 function validLabRun(url) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -145,12 +151,16 @@ function validLabRun(url) {
 }
 function validStripe(url) {
   const value = url.searchParams.get("stripe") || "";
-  return url.searchParams.get("v") === "3" ? /^(?:[0-9]|1[0-5])$/.test(value) : /^(0|1|2|3)$/.test(value);
+  const version = url.searchParams.get("v");
+  // Protocol v4 multiplexes media, ACKs and keyframe requests on one socket.
+  if (version === "4") return value === "0";
+  return version === "3" ? /^(?:[0-9]|1[0-5])$/.test(value) : /^(0|1|2|3)$/.test(value);
 }
 function validMediaSession(url) {
   const version = url.searchParams.get("v");
   if (version === null || version === "1") return true;
-  return (version === "2" || version === "3") && /^[a-f0-9]{32}$/.test(url.searchParams.get("epoch") || "");
+  return (version === "2" || version === "3" || version === "4") &&
+    /^[a-f0-9]{32}$/.test(url.searchParams.get("epoch") || "");
 }
 function badStripe() { return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } }); }
 
@@ -195,6 +205,10 @@ export class Room {
 
   async webSocketMessage(ws, message) {
     const att = ws.deserializeAttachment() || {};
+    if (att.version === 4 && (att.role === "media-host" || att.role === "media-client")) {
+      this.relayMediaV4(ws, att, message);
+      return;
+    }
     if (att.role === "media-host") {
       const limit = att.version === 3
         ? V3_MAX_PACKET_BYTES + (att.run ? LAB_HOST_TRACE_BYTES : 0)
@@ -312,6 +326,14 @@ export class Room {
             ...(role === "media-client" ? { registeredAtMs } : {}),
             ...(workerVersionId ? { workerVersionId } : {}) };
       ws.send(JSON.stringify(hello));
+      if (att.version === 4 && (role === "media-host" || role === "media-client")) {
+        // v4 peers learn about each other from the relay: the host needs a
+        // fresh keyframe for every new receiver and must not encode for an
+        // empty room.
+        const other = this.findPeer(role === "media-host" ? "media-client" : "media-host", att.stripe);
+        ws.send(JSON.stringify({ type: "media-peer", present: !!other }));
+        try { other?.send(JSON.stringify({ type: "media-peer", present: true })); } catch { /* closing */ }
+      }
       console.log(`[room] ${role} registered run=${att.run || "-"} stripe=${att.stripe ?? "-"} target=${registeredAtMs}, hello-ok sent`);
       if (role === "client") {
         const hostCapabilities = this.findPeer("host")?.deserializeAttachment()?.hostCapabilities;
@@ -404,7 +426,8 @@ export class Room {
         (att.role !== "client" || typeof message !== "string" || utf8Length(message) > 2_048)) {
       return;
     }
-    if (msg.type === "media-control" && msg.protocol === 3 && !validCurrentMediaEpoch(msg.epoch, att)) return;
+    if (msg.type === "media-control" && (msg.protocol === 3 || msg.protocol === 4) &&
+        !validCurrentMediaEpoch(msg.epoch, att)) return;
     if (msg.type === "media-control" && msg.protocol === 3 && msg.action === "start" &&
         !validWssTopology(msg.topology)) return;
     if (msg.type === "media-ack-v3" && !validMediaAckV3(msg, att)) return;
@@ -419,7 +442,7 @@ export class Room {
       return;
     }
     if (msg.type === "media-control" && msg.action === "monitors" &&
-        (att.role !== "client" || (msg.protocol !== 2 && msg.protocol !== 3) || typeof msg.epoch !== "string" ||
+        (att.role !== "client" || ![2, 3, 4].includes(msg.protocol) || typeof msg.epoch !== "string" ||
          !/^[a-f0-9]{32}$/.test(msg.epoch) || msg.epoch !== att.mediaEpoch)) {
       return;
     }
@@ -475,6 +498,11 @@ export class Room {
     if (att.replaced) return; // replaced sockets get no farewell
     // Media stripe churn is isolated from the signaling session. Losing one
     // TCP lane must not tell the host/browser that the application peer left.
+    if (att.version === 4 && (role === "media-host" || role === "media-client")) {
+      const other = this.findPeer(role === "media-host" ? "media-client" : "media-host", att.stripe);
+      try { other?.send(JSON.stringify({ type: "media-peer", present: false })); } catch { /* closing */ }
+      return;
+    }
     if (role === "media-host" || role === "media-client") return;
     const peer = role === "host" ? this.findPeer("client") : this.findPeer("host");
     if (peer) {
@@ -483,6 +511,35 @@ export class Room {
       } catch {
         // peer already gone
       }
+    }
+  }
+
+  /**
+   * Protocol v4: one socket per side. Binary frames flow host -> client;
+   * validated JSON ACK / keyframe messages flow client -> host; heartbeats
+   * are answered here and never relayed. Nothing is buffered: a message
+   * without a live peer is dropped.
+   */
+  relayMediaV4(ws, att, message) {
+    const length = binaryLength(message);
+    if (typeof message !== "string") {
+      if (att.role !== "media-host" || length <= V4_HEADER_BYTES || length > V4_MAX_PACKET_BYTES) return;
+      const target = this.findPeer("media-client", att.stripe);
+      if (target) {
+        try { target.send(message); } catch { /* receiver closing */ }
+      }
+      return;
+    }
+    const parsed = att.role === "media-client" ? validateClientMessageV4(message) : validateHostTextV4(message);
+    if (!parsed) return;
+    if (parsed.type === "ping") {
+      ws.send(JSON.stringify({ type: "pong" }));
+      return;
+    }
+    if (att.role !== "media-client") return;
+    const target = this.findPeer("media-host", att.stripe);
+    if (target) {
+      try { target.send(message); } catch { /* host closing */ }
     }
   }
 

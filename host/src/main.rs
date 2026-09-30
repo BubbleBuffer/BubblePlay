@@ -110,6 +110,16 @@ const WSS_GOP_INTERVAL: Duration = Duration::from_secs(1);
 const WSS_HIGH_BITRATE_BPS: u32 = 6_000_000;
 const WSS_BALANCED_BITRATE_BPS: u32 = 3_000_000;
 const WSS_SAVER_BITRATE_BPS: u32 = 1_500_000;
+/// Idle heartbeat on the signaling socket (the browser uses the same period).
+const SIGNALING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// v4 static-screen refine: one high-quality P frame this long after the
+/// last damage-driven frame.
+const WSS_V4_REFINE_DELAY: Duration = Duration::from_millis(300);
+/// v4 refine frames are encoded at this multiple of the live bitrate.
+const WSS_V4_REFINE_BITRATE_FACTOR: u32 = 4;
+/// v4 keyframes are owned by the media link (start / request / 30 s safety),
+/// so the producer's own periodic-IDR clock is parked this far ahead.
+const WSS_V4_PRODUCER_IDR_PARK: Duration = Duration::from_secs(3_600);
 
 fn wss_gop_interval(mode: StreamMode) -> Duration {
     if mode == StreamMode::Work {
@@ -117,6 +127,25 @@ fn wss_gop_interval(mode: StreamMode) -> Duration {
     } else {
         WSS_GOP_INTERVAL
     }
+}
+
+fn wss_is_v4(egress: Option<&WssMediaEgress>) -> bool {
+    egress.is_some_and(WssMediaEgress::is_v4)
+}
+
+/// Periodic IDR interval for the WSS producer; v4 has none.
+fn wss_periodic_idr_interval(mode: StreamMode, egress: Option<&WssMediaEgress>) -> Duration {
+    if wss_is_v4(egress) {
+        WSS_V4_PRODUCER_IDR_PARK
+    } else {
+        wss_gop_interval(mode)
+    }
+}
+
+fn wss_v4_refine_bitrate(current_bps: u32) -> u32 {
+    current_bps
+        .saturating_mul(WSS_V4_REFINE_BITRATE_FACTOR)
+        .min(MAX_BITRATE_BPS)
 }
 
 fn cached_wss_replay_payload(
@@ -597,7 +626,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut pending_candidates = VecDeque::new();
     let mut next_admission = Instant::now();
     let mut next_idr = Instant::now();
-    let mut next_ping = Instant::now() + Duration::from_secs(20);
+    let mut next_ping = Instant::now() + SIGNALING_HEARTBEAT_INTERVAL;
+    // v4: a static-screen refine frame is pending after damage-driven frames.
+    let mut wss_v4_refine_armed = false;
     let mut next_wss_stats = Instant::now() + Duration::from_secs(1);
     let mut next_quality_tick = Instant::now() + Duration::from_secs(1);
     let mut benchmark_lease = args
@@ -1238,7 +1269,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }
         if Instant::now() >= next_ping {
             signaling.send_ping();
-            next_ping = Instant::now() + Duration::from_secs(20);
+            next_ping = Instant::now() + SIGNALING_HEARTBEAT_INTERVAL;
         }
         if args.fixed_bitrate_bps.is_none()
             && wss_media.is_none()
@@ -1689,6 +1720,22 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                         WssMediaEgress::connect_v3(&worker, bearer, epoch, topology)
                                     })
                                 }),
+                            Some(4) if topology.is_none() => {
+                                // The preset is the controller's ceiling; the
+                                // delay controller only ever lowers from it.
+                                let preset = wss_preset(
+                                    requested_quality.as_deref(),
+                                    args.max_bitrate_bps,
+                                    stream_mode,
+                                );
+                                WssMediaEgress::connect_v4(
+                                    &worker,
+                                    bearer,
+                                    epoch,
+                                    u64::from(preset.target_bps),
+                                    u64::from(preset.target_bps),
+                                )
+                            }
                             _ => Err(anyhow::anyhow!("unsupported WSS media protocol")),
                         };
                         match connect_result {
@@ -1763,6 +1810,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     &mut encoder,
                                     &mut signaling,
                                 );
+                                if let Some(egress) = wss_media.as_ref() {
+                                    egress.set_v4_bitrate_bounds(
+                                        u64::from(encoder_bitrate_bps),
+                                        u64::from(adjustment.target_bps),
+                                    );
+                                }
+                                wss_v4_refine_armed = false;
                                 if staged {
                                     // Announce intent immediately; a second quality
                                     // message after the IDR ACK confirms activation.
@@ -1825,6 +1879,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             &mut encoder,
                             &mut signaling,
                         );
+                        if let Some(egress) = wss_media.as_ref() {
+                            egress.set_v4_bitrate_bounds(
+                                u64::from(encoder_bitrate_bps),
+                                u64::from(adjustment.target_bps),
+                            );
+                        }
                         if staged {
                             signaling.send_quality(
                                 adjustment.mode.label,
@@ -1844,6 +1904,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         next_idr = Instant::now();
                     }
                     if action == "viewport" && wss_media.is_some() {
+                        // v4 always streams the full desktop.
                         if !matches!(protocol, Some(2 | 3)) || epoch.is_none() {
                             warn!(?protocol, "WSS viewport request missing session metadata");
                             continue;
@@ -2409,7 +2470,74 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 "WSS lane recovery requested a fresh idle-desktop snapshot"
             );
         }
-        if wss_media.is_some() && replay.is_due(now, latest_idr.is_some()) {
+        let wss_v4_events = wss_media
+            .as_ref()
+            .filter(|egress| egress.is_v4())
+            .map(WssMediaEgress::take_v4_events)
+            .unwrap_or_default();
+        if let Some(reason) = wss_v4_events.keyframe.as_deref() {
+            // The receiver lost (or never had) its reference: encode a fresh
+            // IDR even when the desktop is static. v4 never replays a cached
+            // IDR, whose sequence would not match the receiver's chain.
+            latest_idr = None;
+            capture.request_idle_snapshot();
+            if let Some(enc) = encoder.as_mut() {
+                enc.force_idr();
+            }
+            next_idr = now;
+            wss_v4_refine_armed = false;
+            info!(reason, "WSS v4 keyframe requested");
+        }
+        if let Some(bitrate_bps) = wss_v4_events.bitrate_bps {
+            let bitrate_bps = u32::try_from(bitrate_bps).unwrap_or(u32::MAX);
+            if args.fixed_bitrate_bps.is_none() && pending_wss_idr.is_none() {
+                let _ = apply_wss_adjustment(
+                    &mut quality,
+                    WssAdjustment {
+                        mode: profiles.active,
+                        target_bps: bitrate_bps,
+                        reason: "wss-v4-delay",
+                    },
+                    bitrate_bps,
+                    &mut profiles,
+                    &mut latest_idr,
+                    &mut encoder,
+                    &mut signaling,
+                );
+                info!(bitrate_bps, "WSS v4 delay controller adjusted bitrate");
+            }
+        }
+        if let Some((generation, sequence)) = wss_v4_events.latest_ack {
+            if pending_wss_idr.as_ref().is_some_and(|pending| {
+                pending.generation == generation && sequence_reached(sequence, pending.sequence)
+            }) {
+                let pending = pending_wss_idr.take().expect("checked above");
+                if is_fallback_reason(pending.reason) {
+                    profiles.pinned = true;
+                }
+                profiles.commit_mode(pending.mode, pending.reason);
+                if let Some((mode, reason)) = profiles.pending_announcement() {
+                    signaling.send_quality(
+                        mode.label,
+                        mode.width,
+                        mode.height,
+                        mode.fps,
+                        encoder
+                            .as_ref()
+                            .map(Nvenc::bitrate)
+                            .unwrap_or(quality.target()),
+                        quality.bwe(),
+                        reason,
+                        stream_mode.label(),
+                    );
+                    profiles.on_idr_admitted();
+                }
+            }
+        }
+        if wss_media.is_some()
+            && !wss_is_v4(wss_media.as_ref())
+            && replay.is_due(now, latest_idr.is_some())
+        {
             if let Some(cached) = latest_idr.as_ref() {
                 let candidate_gop = media_gop.wrapping_add(1).max(1);
                 let candidate_sequence = next_media_sequence(media_sequence);
@@ -2735,11 +2863,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 next_admission = now + Duration::from_secs_f64(1.0 / (access.fps as f64).max(1.0));
                 if force_idr {
                     next_idr = now
-                        + effective_idr_interval(
-                            stream_mode,
-                            wss_media.is_some(),
-                            benchmark_profile.map(|profile| profile.gop_seconds),
-                        );
+                        + if wss_is_v4(wss_media.as_ref()) {
+                            WSS_V4_PRODUCER_IDR_PARK
+                        } else {
+                            effective_idr_interval(
+                                stream_mode,
+                                wss_media.is_some(),
+                                benchmark_profile.map(|profile| profile.gop_seconds),
+                            )
+                        };
                 }
                 if access.keyframe {
                     latest_idr = Some(CachedIdr {
@@ -2952,7 +3084,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             Err(WssReserveOutcome::RequireKeyframe) if !wants_key => {
                                 wants_key = true;
                                 encoder.as_mut().unwrap().force_idr();
-                                next_idr = now + wss_gop_interval(stream_mode);
+                                next_idr = now + wss_periodic_idr_interval(stream_mode, Some(egress));
                                 match egress.reserve(WssAccessUnitMeta {
                                     key: true,
                                     ..base_meta
@@ -3001,11 +3133,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         };
                         if wants_key {
                             encoder.as_mut().unwrap().force_idr();
-                            next_idr = now + wss_gop_interval(stream_mode);
+                            next_idr = now + wss_periodic_idr_interval(stream_mode, Some(egress));
                             wss_forced_idr = true;
                         }
                         wss_reservation = Some(reservation);
                     }
+                    // v4 static-screen refine: the delayed follow-up snapshot
+                    // after the last damage frame is encoded once, as a
+                    // high-bitrate P frame flagged `refine` on the wire.
+                    let wss_v4_refine_frame = wss_v4_refine_armed
+                        && is_idle_snapshot
+                        && !wss_forced_idr
+                        && latest_idr.is_some()
+                        && !transition
+                        && wss_is_v4(wss_media.as_ref());
                     // A fallback is a separate transaction: first prepare a
                     // texture for its exact dimensions, then recreate NVENC
                     // for that same mode, and only commit after its IDR is
@@ -3138,7 +3279,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         encoder.as_mut().unwrap().force_idr();
                         next_idr = now
                             + if wss_media.is_some() {
-                                wss_gop_interval(stream_mode)
+                                wss_periodic_idr_interval(stream_mode, wss_media.as_ref())
                             } else {
                                 IDR_INTERVAL
                             };
@@ -3660,6 +3801,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         } else {
                             encode_frame_damage(&frame, viewport_crop, mode)
                         };
+                        let refine_restore_bps = if wss_v4_refine_frame {
+                            let enc = encoder.as_mut().unwrap();
+                            let base = enc.bitrate();
+                            enc.set_bitrate(wss_v4_refine_bitrate(base)).ok().map(|()| base)
+                        } else {
+                            None
+                        };
                         let encode_result =
                             if let Some(reconstruction_texture) = feedback_reconstruction_texture {
                                 encoder.as_mut().unwrap().encode_texture_with_feedback(
@@ -3673,6 +3821,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     .unwrap()
                                     .encode_texture_with_damage(scaled.texture, frame_damage)
                             };
+                        if let Some(base) = refine_restore_bps {
+                            if let Err(error) = encoder.as_mut().unwrap().set_bitrate(base) {
+                                warn!(?error, "WSS v4 refine bitrate restore failed");
+                            }
+                        }
                         match encode_result {
                             Ok(encoded) if !transition || encoded.is_idr => encoded,
                             Ok(_) | Err(_) => {
@@ -4471,6 +4624,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             capture.request_idle_followup_snapshot(frame_interval);
                         }
                     }
+                    if wss_is_v4(wss_media.as_ref()) {
+                        if wss_v4_refine_frame {
+                            wss_v4_refine_armed = false;
+                        } else if !is_idle_snapshot {
+                            // Each damage frame pushes the refine out again,
+                            // so it lands once the screen has settled.
+                            wss_v4_refine_armed = true;
+                            capture.request_idle_followup_snapshot(WSS_V4_REFINE_DELAY);
+                        }
+                    }
                     next_admission = advance_frame_deadline(next_admission, now, frame_interval);
                     let id = next_au_id;
                     next_au_id += 1;
@@ -4504,6 +4667,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                         if let Some(mut wss_reservation) = wss_reservation.take() {
                             wss_reservation.set_meta(meta);
+                            wss_reservation.set_refine(wss_v4_refine_frame && !encoded.is_idr);
                             if matches!(
                                 wss_reservation.submit(payload),
                                 WssSubmitOutcome::Queued { .. }
@@ -4692,6 +4856,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 send_over_frame_budget = pipeline_stats.send_over_frame_budget,
                 send_failures = pipeline_stats.send_failures,
                 "WSS producer window");
+            if let Some(v4) = wss_media.as_ref().and_then(WssMediaEgress::v4_stats) {
+                info!(connected = v4.connected, peer_present = v4.peer_present,
+                    frames_sent = v4.frames_sent, bytes_sent = v4.bytes_sent,
+                    keyframes_sent = v4.keyframes_sent, refines_sent = v4.refines_sent,
+                    skipped_budget = v4.skipped_budget, acks = v4.acks,
+                    heartbeats = v4.heartbeats, reconnects = v4.reconnects,
+                    inflight_frames = v4.inflight_frames, inflight_bytes = v4.inflight_bytes,
+                    bitrate_bps = v4.bitrate_bps, min_rtt_ms = v4.min_rtt_ms,
+                    last_rtt_ms = v4.last_rtt_ms,
+                    "WSS v4 link totals");
+            }
             next_wss_stats = Instant::now() + Duration::from_secs(1);
             producer_loop_iterations = 0;
             wss_preencode_skips = 0;
@@ -4793,6 +4968,19 @@ fn physical_monitor_count() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wss_v4_refine_bitrate_is_bounded_and_parks_periodic_idr() {
+        assert_eq!(super::wss_v4_refine_bitrate(3_000_000), 12_000_000);
+        assert_eq!(super::wss_v4_refine_bitrate(20_000_000), super::MAX_BITRATE_BPS);
+        assert_eq!(super::wss_v4_refine_bitrate(u32::MAX), super::MAX_BITRATE_BPS);
+        assert_eq!(
+            super::wss_periodic_idr_interval(super::StreamMode::Work, None),
+            super::wss_gop_interval(super::StreamMode::Work)
+        );
+        assert!(super::WSS_V4_PRODUCER_IDR_PARK > std::time::Duration::from_secs(60));
+        assert_eq!(super::SIGNALING_HEARTBEAT_INTERVAL.as_secs(), 15);
+    }
+
     use super::{
         active_encoder_dimensions, advance_benchmark_profile_revision, advance_frame_deadline,
         agent_reconnect_delay, benchmark_encoder_options, benchmark_mode_matches,
@@ -5885,6 +6073,8 @@ mod tests {
     fn monitor_refresh_is_v2_epoch_scoped_and_accepts_pre_wss_refresh() {
         let epoch = "0123456789abcdef0123456789abcdef";
         assert!(valid_monitor_refresh_control(Some(2), Some(epoch), None));
+        assert!(valid_monitor_refresh_control(Some(4), Some(epoch), None));
+        assert!(!valid_monitor_refresh_control(Some(5), Some(epoch), None));
         assert!(valid_monitor_refresh_control(
             Some(2),
             Some(epoch),
