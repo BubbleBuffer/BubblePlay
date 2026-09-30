@@ -637,9 +637,9 @@ pub type Connector =
 /// Owns the single v4 media socket on a dedicated thread.
 pub struct V4Link {
     shared: Arc<Mutex<Shared>>,
-    tx: Option<SyncSender<Outgoing>>,
+    tx: SyncSender<Outgoing>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    join: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl V4Link {
@@ -665,9 +665,9 @@ impl V4Link {
             .context("spawn v4 media link")?;
         Ok(Self {
             shared,
-            tx: Some(tx),
+            tx,
             stop,
-            join: Some(join),
+            join: Mutex::new(Some(join)),
         })
     }
 
@@ -713,9 +713,10 @@ impl V4Link {
         refine: bool,
         payload: &[u8],
     ) -> V4Submit {
-        let Some(tx) = self.tx.as_ref() else {
+        if self.stop.load(Ordering::Acquire) {
             return V4Submit::Stopped;
-        };
+        }
+        let tx = &self.tx;
         let now = Instant::now();
         let mut shared = self.lock();
         if !shared.connected || !shared.peer_present || (!key && shared.policy.needs_keyframe()) {
@@ -799,10 +800,14 @@ impl V4Link {
         }
     }
 
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
-        self.tx = None;
-        if let Some(join) = self.join.take() {
+        let join = self
+            .join
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(join) = join {
             let _ = join.join();
         }
     }
@@ -1289,5 +1294,85 @@ mod tests {
         assert_eq!(delays, vec![250, 500, 1_000, 2_000, 4_000, 5_000, 5_000]);
         backoff.reset();
         assert_eq!(backoff.next_delay(), RECONNECT_BACKOFF_MIN);
+    }
+
+    fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(value) = probe() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// End-to-end link over a loopback relay stand-in: peer notice ->
+    /// keyframe gate -> binary frame -> ACK on the same socket -> socket
+    /// drop -> automatic reconnect.
+    #[test]
+    fn link_sends_frames_reads_acks_and_reconnects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut sessions = Vec::new();
+            for round in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                ws.send(Message::text(r#"{"type":"media-peer","present":true}"#))
+                    .unwrap();
+                let packet = loop {
+                    match ws.read().unwrap() {
+                        Message::Binary(bytes) => break bytes.to_vec(),
+                        _ => continue,
+                    }
+                };
+                let (header, payload) = decode_packet(&packet).unwrap();
+                sessions.push((header, payload.to_vec()));
+                ws.send(Message::text(format!(
+                    r#"{{"type":"ack","generation":{},"seq":{},"recvTsMs":1}}"#,
+                    header.generation, header.seq
+                )))
+                .unwrap();
+                if round == 0 {
+                    // Wait for the host to observe the ACK, then drop.
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            sessions
+        });
+        let connector: Connector = Box::new(move || {
+            let (ws, _) = tungstenite::connect(url.as_str())?;
+            Ok(ws)
+        });
+        let link = V4Link::spawn(connector, 6_000_000, 6_000_000).unwrap();
+        link.set_frame_size(1920, 1080);
+        for round in 0..2u32 {
+            let events = wait_for(|| {
+                let events = link.take_events();
+                events.keyframe.is_some().then_some(events)
+            });
+            assert_eq!(events.keyframe.as_deref(), Some("peer-joined"));
+            assert_eq!(link.reserve(false), V4Reserve::RequireKeyframe);
+            assert_eq!(link.reserve(true), V4Reserve::Send);
+            assert_eq!(
+                link.submit(1, round + 1, 10, 90_000, true, false, &[0, 0, 1, 0x40]),
+                V4Submit::Queued
+            );
+            let ack = wait_for(|| link.take_events().latest_ack);
+            assert_eq!(ack, (round + 1, 10));
+            assert_eq!(link.stats().inflight_frames, 0);
+        }
+        let sessions = server.join().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions[0].0.key);
+        assert_eq!(sessions[0].0.width, 1920);
+        assert_eq!(sessions[0].0.capture_ts_us, 1_000_000);
+        assert_eq!(sessions[1].1, vec![0, 0, 1, 0x40]);
+        assert_eq!(wait_for(|| {
+            let stats = link.stats();
+            (stats.reconnects >= 1).then_some(stats.reconnects)
+        }), 1);
+        link.shutdown();
     }
 }

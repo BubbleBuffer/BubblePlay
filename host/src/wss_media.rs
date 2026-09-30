@@ -13,6 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::quality::StreamMode;
+use crate::wss_v4::{V4Events, V4Link, V4Reserve, V4Stats, V4Submit, V4_HEADER_BYTES, V4_VERSION};
 use anyhow::{anyhow, bail, Context, Result};
 use tracing::{debug, warn};
 use tungstenite::client::IntoClientRequest;
@@ -417,9 +418,15 @@ pub struct MediaReservation {
     topology: WssTopology,
     stats: Arc<MediaWindowStats>,
     active: bool,
+    v4: Option<Arc<V4Link>>,
+    refine: bool,
 }
 
 impl MediaReservation {
+    /// Marks the access unit as a static-screen quality refine (v4 only).
+    pub fn set_refine(&mut self, refine: bool) {
+        self.refine = refine;
+    }
     pub fn stripe(&self) -> u8 {
         self.stripes.first().copied().unwrap_or(0) as u8
     }
@@ -427,6 +434,27 @@ impl MediaReservation {
         self.meta = meta;
     }
     pub fn submit(mut self, bytes: Vec<u8>) -> SubmitOutcome {
+        if let Some(link) = self.v4.take() {
+            self.active = false;
+            self.stats.submit_count.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .access_unit_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            let meta = self.meta;
+            return match link.submit(
+                meta.codec.wire(),
+                meta.generation,
+                meta.sequence,
+                meta.timestamp90k,
+                meta.key,
+                self.refine,
+                &bytes,
+            ) {
+                V4Submit::Queued => SubmitOutcome::Queued { stripe: 0 },
+                V4Submit::DroppedRequireIdr => SubmitOutcome::DroppedRequireIdr,
+                V4Submit::Stopped => SubmitOutcome::Stopped,
+            };
+        }
         self.stats.submit_count.fetch_add(1, Ordering::Relaxed);
         self.stats
             .access_unit_bytes
@@ -742,9 +770,86 @@ pub struct WssMediaEgress {
     joins: Vec<JoinHandle<()>>,
     protocol: u8,
     topology: WssTopology,
+    v4: Option<Arc<V4Link>>,
 }
 
 impl WssMediaEgress {
+    /// Protocol v4: one media socket (`stripe=0`) carrying frames host->client
+    /// and ACK / keyframe / heartbeat messages client->host. The link owns
+    /// the in-flight budget and the delay-based bitrate controller.
+    pub fn connect_v4(
+        worker_url: &str,
+        bearer: &str,
+        epoch: &str,
+        bitrate_bps: u64,
+        max_bitrate_bps: u64,
+    ) -> Result<Self> {
+        if !valid_epoch(epoch) {
+            bail!("invalid WSS media epoch");
+        }
+        // Validate the route before the link thread starts retrying it.
+        media_request(worker_url, bearer, epoch, 0, V4_VERSION)?;
+        let topology = WssTopology::new(1, 1, 0)?;
+        let stats = Arc::new(MediaWindowStats::default());
+        let coordinator = Arc::new(Coordinator {
+            lanes: Arc::new(vec![Arc::new(LaneState::new())]),
+            stopped: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(),
+            game_mode: AtomicBool::new(false),
+            topology,
+            required_shards: 1,
+            stats,
+        });
+        let (url, bearer, epoch) = (worker_url.to_owned(), bearer.to_owned(), epoch.to_owned());
+        let link = V4Link::spawn(
+            Box::new(move || connect_media_socket(&url, &bearer, &epoch, 0, V4_VERSION)),
+            bitrate_bps,
+            max_bitrate_bps,
+        )?;
+        Ok(Self {
+            coordinator,
+            senders: Vec::new(),
+            joins: Vec::new(),
+            protocol: V4_VERSION,
+            topology,
+            v4: Some(Arc::new(link)),
+        })
+    }
+
+    pub fn is_v4(&self) -> bool {
+        self.v4.is_some()
+    }
+
+    /// Drain v4 link events (keyframe requests, bitrate changes, ACKs).
+    pub fn take_v4_events(&self) -> V4Events {
+        self.v4
+            .as_ref()
+            .map(|link| link.take_events())
+            .unwrap_or_default()
+    }
+
+    pub fn v4_stats(&self) -> Option<V4Stats> {
+        self.v4.as_ref().map(|link| link.stats())
+    }
+
+    pub fn set_v4_bitrate_bounds(&self, bitrate_bps: u64, max_bitrate_bps: u64) {
+        if let Some(link) = self.v4.as_ref() {
+            link.set_bitrate_bounds(bitrate_bps, max_bitrate_bps);
+        }
+    }
+
+    pub fn set_v4_frame_size(&self, width: u32, height: u32) {
+        if let Some(link) = self.v4.as_ref() {
+            link.set_frame_size(width, height);
+        }
+    }
+
+    pub fn request_v4_keyframe(&self) {
+        if let Some(link) = self.v4.as_ref() {
+            link.request_keyframe();
+        }
+    }
+
     /// Connect `worker_url` on `/host-media-ws?stripe=0..3`, authenticating the
     /// HTTP upgrade with `Authorization: Bearer <bearer>`.
     pub fn connect(worker_url: &str, bearer: &str, epoch: &str) -> Result<Self> {
@@ -773,11 +878,7 @@ impl WssMediaEgress {
         if protocol == FRAME_VERSION && topology != WssTopology::V2 {
             bail!("protocol v2 requires fixed 3+1 topology");
         }
-        if epoch.len() != 32
-            || !epoch
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
+        if !valid_epoch(epoch) {
             bail!("invalid WSS media epoch");
         }
         let started = Instant::now();
@@ -847,12 +948,37 @@ impl WssMediaEgress {
             joins,
             protocol,
             topology,
+            v4: None,
         })
     }
 
     /// Returns a pre-encode reservation.  The metadata is updated after the
     /// encoder has classified the access unit, immediately before submit.
     pub fn reserve(&self, meta: AccessUnitMeta) -> Result<MediaReservation, ReserveOutcome> {
+        if let Some(link) = self.v4.as_ref() {
+            let stats = &self.coordinator.stats;
+            stats.reserve_count.fetch_add(1, Ordering::Relaxed);
+            return match link.reserve(meta.key) {
+                V4Reserve::Send => Ok(MediaReservation {
+                    stripes: Vec::new(),
+                    meta,
+                    lanes: self.coordinator.lanes.clone(),
+                    senders: Vec::new(),
+                    protocol: self.protocol,
+                    topology: self.topology,
+                    stats: stats.clone(),
+                    active: false,
+                    v4: Some(link.clone()),
+                    refine: false,
+                }),
+                V4Reserve::RequireKeyframe => Err(ReserveOutcome::RequireKeyframe),
+                V4Reserve::Backpressured => {
+                    stats.reserve_backpressured.fetch_add(1, Ordering::Relaxed);
+                    Err(ReserveOutcome::Backpressured)
+                }
+                V4Reserve::Stopped => Err(ReserveOutcome::Stopped),
+            };
+        }
         let started = Instant::now();
         let result = self
             .coordinator
@@ -866,6 +992,8 @@ impl WssMediaEgress {
                 topology: self.topology,
                 stats: self.coordinator.stats.clone(),
                 active: true,
+                v4: None,
+                refine: false,
             });
         self.coordinator
             .stats
@@ -879,6 +1007,10 @@ impl WssMediaEgress {
         result
     }
     pub fn on_ack(&self, ack: LaneAck) {
+        if self.v4.is_some() {
+            // v4 ACKs arrive on the media socket itself.
+            return;
+        }
         self.coordinator.on_ack(ack, Instant::now());
     }
     pub fn rearm_awaiting_recovery_lanes(&self) -> usize {
@@ -946,6 +1078,9 @@ impl WssMediaEgress {
         self.topology
     }
     pub fn wire_payload_bytes(&self, access_unit_bytes: usize) -> u64 {
+        if self.v4.is_some() {
+            return (V4_HEADER_BYTES + access_unit_bytes) as u64;
+        }
         let header = if self.protocol == V3_FRAME_VERSION {
             V3_FRAME_HEADER_BYTES
         } else {
@@ -955,6 +1090,23 @@ impl WssMediaEgress {
         self.topology.lane_count() as u64 * (shard + header) as u64
     }
     pub fn health(&self) -> Vec<LaneHealth> {
+        if let Some(stats) = self.v4_stats() {
+            return vec![LaneHealth {
+                stripe: 0,
+                queued: stats.inflight_frames > 0,
+                healthy: stats.connected,
+                awaiting_ack: stats.inflight_frames > 0,
+                require_idr: false,
+                recovery_pending: false,
+                recovery_sequence: None,
+                ack_lag: stats.inflight_frames as u32,
+                state: if stats.connected {
+                    LaneRecoveryState::Ready
+                } else {
+                    LaneRecoveryState::Unavailable
+                },
+            }];
+        }
         self.coordinator.expire_stalled(Instant::now());
         self.coordinator
             .lanes
@@ -979,18 +1131,35 @@ impl WssMediaEgress {
             .collect()
     }
     pub fn recovery_snapshot_status(&self) -> RecoverySnapshotStatus {
+        if self.v4.is_some() {
+            // v4 recovery is driven by explicit keyframe requests.
+            return RecoverySnapshotStatus {
+                needs_idr: false,
+                awaiting_ack: false,
+            };
+        }
         self.coordinator.recovery_snapshot_status(Instant::now())
     }
     pub fn take_window_stats(&self) -> WssMediaWindowStats {
         self.coordinator.stats.take()
     }
     pub fn shutdown(mut self) {
+        if let Some(link) = self.v4.take() {
+            link.shutdown();
+        }
         self.coordinator.stopped.store(true, Ordering::Release);
         self.senders.clear();
         for join in self.joins.drain(..) {
             let _ = join.join();
         }
     }
+}
+
+fn valid_epoch(epoch: &str) -> bool {
+    epoch.len() == 32
+        && epoch
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn set_socket_timeouts(
@@ -1212,13 +1381,11 @@ fn media_request_with_worker_version(
     protocol: u8,
     worker_version: Option<(&str, &str)>,
 ) -> Result<Request<()>> {
-    if protocol != FRAME_VERSION && protocol != V3_FRAME_VERSION {
-        bail!("unsupported WSS media protocol");
-    }
-    let lane_limit = if protocol == FRAME_VERSION {
-        STRIPE_COUNT
-    } else {
-        MAX_V3_LANES
+    let lane_limit = match protocol {
+        FRAME_VERSION => STRIPE_COUNT,
+        V3_FRAME_VERSION => MAX_V3_LANES,
+        V4_VERSION => 1,
+        _ => bail!("unsupported WSS media protocol"),
     };
     if stripe >= lane_limit {
         bail!("invalid WSS media stripe");
@@ -1664,6 +1831,38 @@ mod tests {
     }
 
     #[test]
+    fn derives_single_protocol_v4_endpoint() {
+        let request = media_request(
+            "https://worker.example/host-ws",
+            "host-bearer",
+            "0123456789abcdef0123456789abcdef",
+            0,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            request.uri().to_string(),
+            "wss://worker.example/host-media-ws?v=4&epoch=0123456789abcdef0123456789abcdef&stripe=0"
+        );
+        assert!(media_request(
+            "https://worker.example/host-ws",
+            "host-bearer",
+            "0123456789abcdef0123456789abcdef",
+            1,
+            4,
+        )
+        .is_err());
+        assert!(media_request(
+            "https://worker.example/host-ws",
+            "host-bearer",
+            "0123456789abcdef0123456789abcdef",
+            0,
+            5,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn derives_run_scoped_lab_media_endpoints_from_lab_signaling_url() {
         let request = media_request(
             "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15",
@@ -1895,6 +2094,7 @@ mod tests {
             senders,
             joins: Vec::new(),
             protocol: V3_FRAME_VERSION,
+            v4: None,
             topology,
         };
 
