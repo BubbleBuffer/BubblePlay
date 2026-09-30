@@ -49,6 +49,16 @@ for production browser sessions once v4 is negotiated.
   grows > 1.5× min + 40 ms or skips happen, step NVENC bitrate down (×0.8, floor
   ~1 Mbps); when clean for ~2 s, step up (×1.1, cap = profile max). Use
   `Nvenc::set_bitrate` (reconfigure, no IDR).
+- Link capacity (phase 2, 2026-09-30, `host/src/link_capacity.rs`): a
+  BBR-style estimator over ACKs. Each ACK gives a delivery-rate sample
+  (delivered bytes / max(send span, ACK span)). A sample counts as
+  link-limited evidence when RTT ≥ min RTT + 20 ms, the window was ≥ 4 KB and
+  ACKs spread wider than sends. After ≥ 3 such samples within 2 s the link is
+  *constrained* and capacity = max sample in a 2 s window. The estimate is held
+  through idle and probed ×1.25 after 2 s of busy sending without queue
+  evidence. When constrained, the delay controller's floor and ceiling are
+  capped at 80 % of capacity (`RateReason::Capacity`, 5 % deadband); this
+  overrides the 2.5 Mbps 1080p floor. Unconstrained: no change.
 - Keyframes: first frame of a generation, a new peer / reconnect, or an
   explicit client request (decoder error / seq gap). No periodic or safety
   keyframe, no cached-IDR replay on v4. An ACK stall (3 s) only forgets the
@@ -79,6 +89,21 @@ damage rects and idle snapshots. For v4:
   tiles, +2 elsewhere, 4× bitrate), at most every 500 ms and never during large
   motion. A whole-frame refine happens only when ≥ 50 % of tiles are in debt or
   the encoder has no QP map. Refines ride the idle follow-up snapshot.
+- Budgeted pacing (phase 2, 2026-09-30, `host/src/tile_schedule.rs`,
+  `host/src/content_class.rs`; inert unless the link is constrained). A token
+  bucket refills at capacity × 0.8 (150 ms deep). Changed tiles are always
+  encoded; a pending refine is paid from what is left, pointer-nearest tiles
+  first (per-tile cost is an EWMA of refine frame bytes). A whole-frame refine
+  needs budget for every tile, otherwise it becomes a map refine or waits.
+  A per-tile classifier (static / text / scroll / video, from DXGI dirty and
+  move rects, 300 ms hysteresis) picks the frame policy:
+  - text-dominant: NVENC max-QP ceiling 28 (reconfigure in place, no IDR) and
+    changes are held while the bucket is empty, never past 100 ms (≥ 10 fps);
+  - scroll/video-dominant: full fps, no ceiling, and the QP map lowers the
+    changed tiles within 192 px of the pointer;
+  - ties go to text.
+  Measured on this GPU (`probe_nvenc_max_qp`): the ceiling applies without an
+  IDR, but `enableMaxQP = 0` does not lift it, so lifting sets maxQP = 51.
 - Cap: work mode 30 fps max; nothing sent when idle.
 
 ## Receiver
