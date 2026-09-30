@@ -11,7 +11,7 @@ import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
  import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { AdaptiveFrameDeadline, applyLateShardDeadline, classifyMediaShardV3, CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, OrderedFrameRelease, ParityFrameReassembler, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, selectStaleWssLane, selectWssMediaTopology, shouldDeferWssMediaStart, shouldFallbackToWssOnMissingRtp, shouldRecoverWssStripeReconnect, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY, stripLabEdgeTrace, VariableParityFrameReassembler, validateWssTopology, WssLaneLifecycleTelemetry } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
-import { V4ReceiveGate, V4_HEARTBEAT_MS, ackMessageV4, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, preferWssProtocolV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
+import { V4ReceiveGate, V4_HEARTBEAT_MS, ackMessageV4, keyframeMessageV4, labRequestsWssProtocolV4, nextBackoffMsV4, parseFrameV4, preferWssProtocolV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import { TRANSPORT, createCodecSession, parseAdaptive, parseQualityPreset, parseTransport, rtpCodecMimeTypes } from "/transport.js";
 import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
 
@@ -95,6 +95,7 @@ function parseRequestedWssTopology(searchParams, runId) {
   return validateWssTopology(topology) ? topology : null;
 }
 const requestedWssTopology = parseRequestedWssTopology(params, labRun);
+const labRequestsV4 = labRequestsWssProtocolV4(params, labRun);
 const V2_WSS_TOPOLOGY = Object.freeze({ laneCount: 4, dataShards: 3, parityShards: 1 });
 // Protocol v4 is one media socket; the topology shape only feeds lane counters.
 const V4_WSS_TOPOLOGY = Object.freeze({ laneCount: 1, dataShards: 1, parityShards: 0 });
@@ -1460,6 +1461,7 @@ function startWssMedia() {
   });
   const useV4 = preferWssProtocolV4({
     lab: labRun !== null,
+    labRequestsV4,
     requestedTopology: requestedWssTopology,
     hostCapabilities,
     capabilitiesCurrent: hostCapabilitiesGeneration === signalingGeneration,
@@ -2164,6 +2166,13 @@ if (diagnosticsEnabled) {
       );
       return true;
     },
+    // Lab-only: drop the v4 media socket to exercise backoff reconnect.
+    dropWssV4Socket() {
+      if (!labRun || !usingWssMedia || wssProtocol !== 4 || !wssV4.socket) return false;
+      sendClientLog("warn", "wss-v4-diagnostic-drop", {});
+      try { wssV4.socket.close(4000, "diagnostic-drop"); } catch { return false; }
+      return true;
+    },
     injectWssLaneLoss(stripe = 0, durationMs = 1_000) {
       if (!labRun || !usingWssMedia || wssProtocol !== 3 || wssTopology.parityShards < 1) return false;
       stripe = Number(stripe);
@@ -2306,6 +2315,12 @@ if (diagnosticsEnabled) {
           topologyAccepted: wssTopologyAccepted,
           openLanes: wssStripeOpened.filter(Boolean).length,
           reconstructed: wssProtocol === 4 ? wssV4.lastSeq : wssReassembler.highestReconstructed, presented: wssPresentedSequence,
+          v4: wssProtocol === 4 ? {
+            status: wssV4Status(), socketOpen: wssV4.socketOpen, hostPresent: wssV4.hostPresent,
+            frames: wssV4.frames, lastSeq: wssV4.lastSeq, decodedSeq: wssV4.decodedSeq ?? null,
+            gateDrops: wssV4.gateDrops, presentSkips: wssV4.presentSkips, reconnects: wssV4.reconnects,
+            waitingForKey: wssV4.gate.waitingForKey,
+          } : null,
           highestSequenceByLane: [...wssReassembler.highestSequence],
           recoveredFrames: wssReassembler.stats.recoveredFrames,
           expiredFrames: wssReassembler.stats.expiredFrames,

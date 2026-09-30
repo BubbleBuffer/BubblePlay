@@ -475,6 +475,14 @@ export function buildReceiverUrl(baseUrl, transport, options = {}) {
     url.searchParams.set("labRun", options.labRun);
     url.searchParams.set("labCompat", STREAM_LAB_COMPATIBILITY.id);
   }
+  // Explicit lab opt-in to the single-socket v4 protocol. v4 has no lane
+  // topology and no host/edge packet traces, so the v3 default is skipped.
+  if (options.mediaProtocol !== undefined) {
+    if (options.mediaProtocol !== 4 || !options.labRun || transport !== "wss" || options.wssTopology !== undefined)
+      throw new RangeError("Stream Lab media protocol 4 requires a WSS lab run without a topology");
+    url.searchParams.set("wssProtocol", "4");
+    return url;
+  }
   // Lab packets require protocol-v3 host/edge traces. Pin the lab default so
   // a slow host reconnect cannot make capability discovery fall back to v2.
   const topology = options.wssTopology === undefined && options.labRun && transport === "wss"
@@ -2138,7 +2146,7 @@ function validLatency(value) {
   return Number.isFinite(value) && value >= 0 && value < 10_000;
 }
 
-class CdpPage {
+export class CdpPage {
   constructor(port) { this.port = port; this.socket = null; }
   async open(timeoutMs = 15_000) {
     const target = await pageTarget(this.port, timeoutMs);

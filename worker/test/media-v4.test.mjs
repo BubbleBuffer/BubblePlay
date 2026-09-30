@@ -219,6 +219,24 @@ test("v4 reconnect backoff, presentation skipping and status labels", () => {
   assert.equal(wssV4StatusLabel({ socketOpen: true, framesPresented: 5, lastFrameAtMs: 4_900, nowMs: 5_000 }), "connected");
 });
 
+test("lab runs use v4 only on an explicit opt-in", async () => {
+  const { buildReceiverUrl } = await import("../tools/stream-lab-live.mjs");
+  const { labRequestsWssProtocolV4 } = await import("../public/media-v4.js");
+  const run = "123e4567-e89b-42d3-a456-426614174000";
+  const url = buildReceiverUrl("http://127.0.0.1:8787/", "wss", { labRun: run, mediaProtocol: 4 });
+  assert.equal(url.searchParams.get("wssProtocol"), "4");
+  assert.equal(url.searchParams.get("wssLanes"), null);
+  assert.equal(buildReceiverUrl("http://127.0.0.1:8787/", "wss", { labRun: run }).searchParams.get("wssProtocol"), null);
+  assert.throws(() => buildReceiverUrl("http://127.0.0.1:8787/", "wss", { mediaProtocol: 4 }), RangeError);
+  assert.throws(() => buildReceiverUrl("http://127.0.0.1:8787/", "webrtc", { labRun: run, mediaProtocol: 4 }), RangeError);
+  assert.throws(() => buildReceiverUrl("http://127.0.0.1:8787/", "wss", { labRun: run, mediaProtocol: 3 }), RangeError);
+  assert.equal(labRequestsWssProtocolV4(url.searchParams, run), true);
+  assert.equal(labRequestsWssProtocolV4(url.searchParams, null), false);
+  const capable = { mediaProtocols: [2, 3, 4] };
+  assert.equal(preferWssProtocolV4({ lab: true, labRequestsV4: true, hostCapabilities: capable }), true);
+  assert.equal(preferWssProtocolV4({ lab: true, labRequestsV4: true, hostCapabilities: { mediaProtocols: [2, 3] } }), false);
+});
+
 test("receiver wires v4: media-socket keyframes, in-order decode, reconnect backoff, static status", () => {
   const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   assert.match(source, /from "\/media-v4\.js";/);

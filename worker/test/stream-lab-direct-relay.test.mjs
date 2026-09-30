@@ -163,3 +163,75 @@ test("direct Stream Lab relay rejects missing or stale compatibility identifiers
     socket.terminate();
   }
 });
+
+function queued(socket) {
+  const items = [];
+  const waiters = [];
+  socket.on("message", (data, isBinary) => {
+    const item = { data, isBinary };
+    const waiter = waiters.shift();
+    if (waiter) waiter(item); else items.push(item);
+  });
+  return () => items.length ? Promise.resolve(items.shift()) : new Promise(resolve => waiters.push(resolve));
+}
+
+function v4Url(relay, path, stripe = 0) {
+  return `${relay.url.replace(/^http/, "ws")}${path}?v=4&epoch=${EPOCH}&stripe=${stripe}&run=${RUN_ID}&${COMPAT}`;
+}
+
+async function openV4(relay, role) {
+  const socket = new WebSocket(v4Url(relay, role === "media-host" ? "lab-host-media-ws" : "lab-media-ws"));
+  const next = queued(socket);
+  await new Promise((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+  socket.send(JSON.stringify({ type: "hello", role }));
+  assert.equal(JSON.parse(String((await next()).data)).type, "hello-ok");
+  return { socket, next, json: async () => JSON.parse(String((await next()).data)) };
+}
+
+test("direct Stream Lab relay carries protocol v4 media, control, heartbeats and presence on one socket", async (t) => {
+  const relay = await startDirectLabRelay({ port: 0 });
+  t.after(() => relay.close());
+  const { encodeFrameV4 } = await import("../public/media-v4.js");
+
+  const client = await openV4(relay, "media-client");
+  assert.deepEqual(await client.json(), { type: "media-peer", present: false });
+  const host = await openV4(relay, "media-host");
+  assert.deepEqual(await host.json(), { type: "media-peer", present: true });
+  assert.deepEqual(await client.json(), { type: "media-peer", present: true });
+
+  const packet = encodeFrameV4({ key: true, codec: 1, generation: 1, seq: 1, data: new Uint8Array([0, 0, 0, 1, 0x40]) });
+  host.socket.send(packet);
+  const media = await client.next();
+  assert.equal(media.isBinary, true);
+  assert.deepEqual([...new Uint8Array(media.data)], [...packet]);
+
+  const ack = JSON.stringify({ type: "ack", generation: 1, seq: 1, recvTsMs: 5 });
+  client.socket.send(ack);
+  assert.equal(String((await host.next()).data), ack);
+  client.socket.send("{\"type\":\"bogus\"}");
+  client.socket.send(JSON.stringify({ type: "keyframe", reason: "sequence-gap" }));
+  assert.deepEqual(await host.json(), { type: "keyframe", reason: "sequence-gap" });
+
+  client.socket.send(JSON.stringify({ type: "ping" }));
+  assert.deepEqual(await client.json(), { type: "pong" });
+  host.socket.send(JSON.stringify({ type: "ping" }));
+  assert.deepEqual(await host.json(), { type: "pong" });
+
+  host.socket.close();
+  assert.deepEqual(await client.json(), { type: "media-peer", present: false });
+  client.socket.close();
+});
+
+test("direct Stream Lab relay rejects v4 media stripes other than zero", async (t) => {
+  const relay = await startDirectLabRelay({ port: 0 });
+  t.after(() => relay.close());
+  const socket = new WebSocket(v4Url(relay, "lab-media-ws", 1));
+  await assert.rejects(new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+    socket.once("unexpected-response", (_request, response) => {
+      reject(new Error(`unexpected response ${response.statusCode}`));
+    });
+  }), /404|unexpected response/i);
+  socket.terminate();
+});
