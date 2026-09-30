@@ -8,6 +8,7 @@
 //   node worker/tools/stream-lab-v4-desktop.mjs [--candidate-host <exe>]
 //     [--label candidate] [--cycles 10] [--cycle-seconds 60] [--monitor DISPLAY2]
 //     [--window 1480x960] [--host-args="--fixed-bitrate 1500000"]
+//     [--throttle-kbps 2000] [--throttle-delay-ms 20]
 //
 // A browser window with a long article is opened on the captured monitor.
 // Each cycle is half reading (a smooth scroll burst every 5 s) and half idle
@@ -17,6 +18,10 @@
 // and, during idle, per-tile luma PSNR against a host screenshot taken once
 // the screen has settled. Media frames and flags are counted from CDP
 // WebSocket frames on the v4 media socket.
+//
+// --throttle-kbps puts a FIFO bottleneck on the relay's host->client media
+// path for the whole session (a slow link with a deep buffer). Each smooth
+// scroll burst then reports the presented fps while it runs.
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
@@ -183,6 +188,24 @@ if (-not $s) { $s = [System.Windows.Forms.Screen]::PrimaryScreen }
   return { x, y, width, height };
 }
 
+/// Presented fps while each smooth scroll burst runs: the receiver probe
+/// records one entry per presented change, so this is what the viewer saw.
+/// Media fps counts v4 frames that arrived in the same window.
+function summarizeBursts(bursts, frames, quality) {
+  const per = bursts.map(b => {
+    const seconds = (b.end - b.start) / 1000;
+    const presented = quality.filter(q => q.t >= b.start && q.t < b.end).length;
+    const media = frames.filter(f => f.t >= b.start && f.t < b.end);
+    return { presentedFps: presented / seconds, mediaFps: media.length / seconds,
+      kbps: media.reduce((s, f) => s + f.bytes, 0) * 8 / 1000 / seconds };
+  });
+  const pick = key => per.map(b => b[key]);
+  return { bursts: per.length,
+    presentedFps: { min: percentile(pick("presentedFps"), 0), p10: percentile(pick("presentedFps"), 0.1), median: percentile(pick("presentedFps"), 0.5) },
+    mediaFps: { min: percentile(pick("mediaFps"), 0), median: percentile(pick("mediaFps"), 0.5) },
+    kbpsMedian: percentile(pick("kbps"), 0.5) };
+}
+
 function hostTotals(log) {
   const lines = log.split("\n").filter(line => line.includes("WSS v4 link totals"));
   const last = lines.at(-1);
@@ -209,6 +232,8 @@ async function main() {
     window: { type: "string", default: "1480x960" },
     // Extra host arguments, e.g. "--fixed-bitrate 1500000" for a constrained link.
     "host-args": { type: "string", default: "" },
+    "throttle-kbps": { type: "string", default: "" },
+    "throttle-delay-ms": { type: "string", default: "20" },
   } });
   const cycles = Number(values.cycles), cycleSeconds = Number(values["cycle-seconds"]);
   if (!Number.isInteger(cycles) || cycles < 1 || !Number.isInteger(cycleSeconds) || cycleSeconds < 20)
@@ -221,7 +246,11 @@ async function main() {
   mkdirSync(dir, { recursive: true });
   const report = { runId, label: values.label, startedAt: new Date().toISOString(), candidateHost: values["candidate-host"], cycles, cycleSeconds };
   const save = () => writeFileSync(resolve(dir, "report.json"), JSON.stringify(report, null, 2));
-  const relay = await startDirectLabRelay({ port: 0, publicDir: resolve(root, "worker/public") });
+  const throttle = values["throttle-kbps"]
+    ? { kbps: Number(values["throttle-kbps"]), delayMs: Number(values["throttle-delay-ms"]) }
+    : null;
+  report.throttle = throttle;
+  const relay = await startDirectLabRelay({ port: 0, publicDir: resolve(root, "worker/public"), throttle });
   let host, receiverProcess, stimulusProcess, receiver, stimulus;
   try {
     const out = openSync(resolve(dir, "host.stdout.log"), "a"), err = openSync(resolve(dir, "host.stderr.log"), "a");
@@ -292,6 +321,7 @@ async function main() {
     const setupFrames = frames.length;
     const setupKeys = frames.filter(f => f.key).length;
     const windows = [];
+    const bursts = [];
     const quality = [];
     const measureStart = performance.now();
     for (let cycle = 0; cycle < cycles; cycle++) {
@@ -302,7 +332,9 @@ async function main() {
       // replaces the article view without motion to predict from.
       for (let at = 1_000, burst = 0; at + 1_000 <= half; at += 5_000, burst++) {
         await delay(Math.max(0, readingStart + at - performance.now()));
+        const burstStart = performance.now();
         await stimulus.evaluate(burst === 2 ? "window.lab.jump(2400)" : "window.lab.scrollBurst(420, 900)");
+        if (burst !== 2) bursts.push({ start: burstStart, end: performance.now() });
       }
       await delay(Math.max(0, readingStart + half - performance.now()));
       const idleStart = performance.now();
@@ -356,6 +388,8 @@ async function main() {
       presentedChanges: quality.length,
       idleSettledWholeFrameEvents: wholeFrameIdle.length,
       idleSettledWholeFrameShares: wholeFrameIdle.slice(0, 20).map(q => +q.changedShare.toFixed(2)),
+      scroll: summarizeBursts(bursts, frames, quality),
+      throttle: relay.throttleStats(),
       idlePsnr: {
         samples: referenced.length,
         minMedian: percentile(referenced.map(q => q.psnrMedian), 0),

@@ -38,6 +38,7 @@ export async function startDirectLabRelay(options = {}) {
       try { options.onEvent({ at: new Date().toISOString(), ...event }); } catch { /* diagnostics must not disrupt relay */ }
     }
     : () => {};
+  const shaper = createMediaShaper(options.throttle);
   const signalingRooms = new Map();
   const mediaRooms = new Map();
   const sockets = new Set();
@@ -63,7 +64,7 @@ export async function startDirectLabRelay(options = {}) {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     if (route.kind === "signal") attachSignalingSocket(socket, route, signalingRooms, emit);
-    else attachMediaSocket(socket, route, mediaRooms, emit);
+    else attachMediaSocket(socket, route, mediaRooms, emit, shaper);
   });
   await new Promise((resolveListen, reject) => {
     server.once("error", reject);
@@ -76,6 +77,10 @@ export async function startDirectLabRelay(options = {}) {
   const actualHost = address.address === "::1" ? "[::1]" : address.address;
   return {
     url: `http://${actualHost}:${address.port}/`,
+    /// Lab-only bottleneck on host->client media: `{ kbps, delayMs }`, or
+    /// null for none. Applies to packets forwarded from now on.
+    setThrottle: throttle => shaper.set(throttle),
+    throttleStats: () => shaper.stats(),
     async close() {
       for (const socket of sockets) socket.terminate();
       await new Promise(resolveClose => webSockets.close(() => resolveClose()));
@@ -168,7 +173,7 @@ function attachSignalingSocket(socket, route, rooms, emit) {
 // Protocol v4: one socket per side. Host binary frames go to the client;
 // client ACK/keyframe text goes to the host; heartbeats are answered here
 // and each side is told whether its peer is present (mirrors worker/src).
-function attachMediaSocket(socket, route, rooms, emit) {
+function attachMediaSocket(socket, route, rooms, emit, shaper) {
   const room = getRoom(rooms, route.key, () => ({ "media-host": null, "media-client": null }));
   let role = null;
   const peerRole = () => (role === "media-host" ? "media-client" : "media-host");
@@ -194,7 +199,7 @@ function attachMediaSocket(socket, route, rooms, emit) {
     const peer = room[peerRole()];
     if (isBinary) {
       if (role !== "media-host" || data.byteLength <= V4_HEADER_BYTES || data.byteLength > V4_MAX_PACKET_BYTES) return;
-      if (peer?.readyState === WebSocket.OPEN) peer.send(data, { binary: true });
+      if (peer?.readyState === WebSocket.OPEN) shaper.forward(peer, data);
       return;
     }
     const text = String(data);
@@ -216,6 +221,53 @@ function attachMediaSocket(socket, route, rooms, emit) {
   });
   socket.on("error", error => emit({ type: "socket-error", kind: route.kind, run: route.run,
     role, message: String(error?.message || error) }));
+}
+
+// A single FIFO bottleneck for host->client media (lab only): each packet is
+// serialized at `kbps` behind the ones before it, then delayed `delayMs`.
+// Nothing is dropped, like a deep buffer in front of a slow link; the host
+// sees the queue as growing ACK RTT.
+export function createMediaShaper(initial, clock = () => performance.now(), schedule = setTimeout) {
+  let config = null;
+  let busyUntil = 0;
+  let queuedBytes = 0;
+  let maxQueueMs = 0;
+  let packets = 0;
+  const set = throttle => {
+    if (!throttle) { config = null; return; }
+    const kbps = Number(throttle.kbps);
+    const delayMs = Number(throttle.delayMs ?? 0);
+    if (!(kbps > 0) || !(delayMs >= 0)) throw new RangeError("throttle needs kbps > 0 and delayMs >= 0");
+    config = { kbps, delayMs };
+  };
+  set(initial);
+  return {
+    set,
+    stats: () => ({ ...config, packets, queuedBytes, maxQueueMs: +maxQueueMs.toFixed(1) }),
+    /// Release time (ms, on `clock`) of a packet of `bytes` offered now.
+    admit(bytes) {
+      const now = clock();
+      if (!config) return now;
+      const start = Math.max(now, busyUntil);
+      busyUntil = start + bytes * 8 / config.kbps;
+      maxQueueMs = Math.max(maxQueueMs, busyUntil - now);
+      packets++;
+      return busyUntil + config.delayMs;
+    },
+    forward(peer, data) {
+      const now = clock();
+      if (!config) {
+        peer.send(data, { binary: true });
+        return;
+      }
+      const at = this.admit(data.byteLength);
+      queuedBytes += data.byteLength;
+      schedule(() => {
+        queuedBytes -= data.byteLength;
+        if (peer.readyState === WebSocket.OPEN) peer.send(data, { binary: true });
+      }, Math.max(0, at - now));
+    },
+  };
 }
 
 function getRoom(rooms, key, create) {
