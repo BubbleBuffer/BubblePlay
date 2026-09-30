@@ -50,6 +50,14 @@ variables.
 - Updates, non-elevated: `host/scripts/update-tray.ps1 [-Build]`. It warns
   when the Admin-mode copy is stale; `-IncludeElevated` refreshes it with one
   UAC prompt.
+- Host rollback: update-tray moves the replaced binaries to
+  `<install>\previous\` and marks a new host `pending` in
+  `%LOCALAPPDATA%\BubblePlay\update-state.json`. The tray restores the
+  previous host (once, never twice in a row) if the new one does not log
+  "signaling registered as host" within 120 s or exits 3 times in 5 min, and
+  marks it `good` after 10 healthy minutes. The menu shows the host build and
+  status, plus "Roll back host" while a different previous build exists.
+  Probation applies to the user-level host only, not Admin mode.
 - Admin mode (tray menu, default off) runs the host through the elevated task,
   so input reaches elevated windows. The secure desktop (UAC prompts, lock
   screen) is still not captured. The task runs an admin-only copy in
