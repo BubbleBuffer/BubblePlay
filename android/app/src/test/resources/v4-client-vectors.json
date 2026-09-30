@@ -1,0 +1,299 @@
+{
+  "generatedBy": "android/tools/gen-v4-vectors.mjs from worker/public/media-v4.js",
+  "ping": "{\"type\":\"ping\"}",
+  "acks": [
+    {
+      "generation": 7,
+      "seq": 42,
+      "recvTsMs": 1234.5,
+      "decodedSeq": 41,
+      "text": "{\"type\":\"ack\",\"generation\":7,\"seq\":42,\"recvTsMs\":1234.5,\"decodedSeq\":41}"
+    },
+    {
+      "generation": 7,
+      "seq": 42,
+      "recvTsMs": 1234.5,
+      "text": "{\"type\":\"ack\",\"generation\":7,\"seq\":42,\"recvTsMs\":1234.5}"
+    },
+    {
+      "generation": 0,
+      "seq": 0,
+      "recvTsMs": 0,
+      "text": "{\"type\":\"ack\",\"generation\":0,\"seq\":0,\"recvTsMs\":0}"
+    },
+    {
+      "generation": 1,
+      "seq": 2,
+      "recvTsMs": -3.2,
+      "text": "{\"type\":\"ack\",\"generation\":1,\"seq\":2,\"recvTsMs\":0}"
+    },
+    {
+      "generation": 4294967295,
+      "seq": 4294967295,
+      "recvTsMs": 99.94,
+      "decodedSeq": 4294967295,
+      "text": "{\"type\":\"ack\",\"generation\":4294967295,\"seq\":4294967295,\"recvTsMs\":99.9,\"decodedSeq\":4294967295}"
+    },
+    {
+      "generation": 3,
+      "seq": 9,
+      "recvTsMs": 12.35,
+      "text": "{\"type\":\"ack\",\"generation\":3,\"seq\":9,\"recvTsMs\":12.4}"
+    },
+    {
+      "generation": 3,
+      "seq": 9,
+      "recvTsMs": 12.349999,
+      "text": "{\"type\":\"ack\",\"generation\":3,\"seq\":9,\"recvTsMs\":12.3}"
+    },
+    {
+      "generation": 3,
+      "seq": 9,
+      "recvTsMs": 0.04,
+      "text": "{\"type\":\"ack\",\"generation\":3,\"seq\":9,\"recvTsMs\":0}"
+    },
+    {
+      "generation": 3,
+      "seq": 9,
+      "recvTsMs": 0.05,
+      "text": "{\"type\":\"ack\",\"generation\":3,\"seq\":9,\"recvTsMs\":0.1}"
+    },
+    {
+      "generation": 3,
+      "seq": 9,
+      "recvTsMs": 10000000.26,
+      "text": "{\"type\":\"ack\",\"generation\":3,\"seq\":9,\"recvTsMs\":10000000.3}"
+    },
+    {
+      "generation": 3,
+      "seq": 9,
+      "recvTsMs": 123456789.123,
+      "text": "{\"type\":\"ack\",\"generation\":3,\"seq\":9,\"recvTsMs\":123456789.1}"
+    },
+    {
+      "generation": 3,
+      "seq": 9,
+      "recvTsMs": 5,
+      "decodedSeq": 0,
+      "text": "{\"type\":\"ack\",\"generation\":3,\"seq\":9,\"recvTsMs\":5,\"decodedSeq\":0}"
+    }
+  ],
+  "keyframes": [
+    {
+      "reason": "sequence-gap",
+      "text": "{\"type\":\"keyframe\",\"reason\":\"sequence-gap\"}"
+    },
+    {
+      "reason": "",
+      "text": "{\"type\":\"keyframe\",\"reason\":\"receiver\"}"
+    },
+    {
+      "reason": null,
+      "text": "{\"type\":\"keyframe\",\"reason\":\"receiver\"}"
+    },
+    {
+      "reason": "decoder error: bad NAL",
+      "text": "{\"type\":\"keyframe\",\"reason\":\"decoder-error:-bad-NAL\"}"
+    },
+    {
+      "reason": "reconnect",
+      "text": "{\"type\":\"keyframe\",\"reason\":\"reconnect\"}"
+    },
+    {
+      "reason": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "text": "{\"type\":\"keyframe\",\"reason\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+    },
+    {
+      "reason": "héllo wörld",
+      "text": "{\"type\":\"keyframe\",\"reason\":\"h-llo-w-rld\"}"
+    },
+    {
+      "reason": "generation-change",
+      "text": "{\"type\":\"keyframe\",\"reason\":\"generation-change\"}"
+    },
+    {
+      "reason": "client/start",
+      "text": "{\"type\":\"keyframe\",\"reason\":\"client-start\"}"
+    },
+    {
+      "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxé",
+      "text": "{\"type\":\"keyframe\",\"reason\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-\"}"
+    }
+  ],
+  "backoff": [
+    {
+      "previous": 0,
+      "next": 250
+    },
+    {
+      "previous": -1,
+      "next": 250
+    },
+    {
+      "previous": 100,
+      "next": 250
+    },
+    {
+      "previous": 249,
+      "next": 250
+    },
+    {
+      "previous": 250,
+      "next": 500
+    },
+    {
+      "previous": 400,
+      "next": 800
+    },
+    {
+      "previous": 2500,
+      "next": 5000
+    },
+    {
+      "previous": 4000,
+      "next": 5000
+    },
+    {
+      "previous": 5000,
+      "next": 5000
+    },
+    {
+      "previous": 9000,
+      "next": 5000
+    }
+  ],
+  "gate": [
+    {
+      "key": false,
+      "generation": 1,
+      "seq": 0,
+      "verdict": {
+        "decode": false,
+        "requestKeyframe": "connect"
+      }
+    },
+    {
+      "key": true,
+      "generation": 1,
+      "seq": 10,
+      "verdict": {
+        "decode": true,
+        "requestKeyframe": null
+      }
+    },
+    {
+      "key": false,
+      "generation": 1,
+      "seq": 11,
+      "verdict": {
+        "decode": true,
+        "requestKeyframe": null
+      }
+    },
+    {
+      "key": false,
+      "generation": 1,
+      "seq": 13,
+      "verdict": {
+        "decode": false,
+        "requestKeyframe": "sequence-gap"
+      }
+    },
+    {
+      "key": false,
+      "generation": 1,
+      "seq": 14,
+      "verdict": {
+        "decode": false,
+        "requestKeyframe": "sequence-gap"
+      }
+    },
+    {
+      "key": true,
+      "generation": 1,
+      "seq": 15,
+      "verdict": {
+        "decode": true,
+        "requestKeyframe": null
+      }
+    },
+    {
+      "key": false,
+      "generation": 2,
+      "seq": 16,
+      "verdict": {
+        "decode": false,
+        "requestKeyframe": "generation-change"
+      }
+    },
+    {
+      "key": true,
+      "generation": 2,
+      "seq": 4294967295,
+      "verdict": {
+        "decode": true,
+        "requestKeyframe": null
+      }
+    },
+    {
+      "key": false,
+      "generation": 2,
+      "seq": 0,
+      "verdict": {
+        "decode": true,
+        "requestKeyframe": null
+      }
+    },
+    {
+      "invalidate": "decoder-error"
+    },
+    {
+      "key": false,
+      "generation": 2,
+      "seq": 1,
+      "verdict": {
+        "decode": false,
+        "requestKeyframe": "decoder-error"
+      }
+    },
+    {
+      "key": true,
+      "generation": 2,
+      "seq": 2,
+      "verdict": {
+        "decode": true,
+        "requestKeyframe": null
+      }
+    },
+    {
+      "reset": "reconnect"
+    },
+    {
+      "key": false,
+      "generation": 2,
+      "seq": 3,
+      "verdict": {
+        "decode": false,
+        "requestKeyframe": "reconnect"
+      }
+    },
+    {
+      "key": true,
+      "generation": 3,
+      "seq": 0,
+      "verdict": {
+        "decode": true,
+        "requestKeyframe": null
+      }
+    },
+    {
+      "key": false,
+      "generation": 3,
+      "seq": 1,
+      "verdict": {
+        "decode": true,
+        "requestKeyframe": null
+      }
+    }
+  ]
+}
