@@ -49,9 +49,12 @@ for production browser sessions once v4 is negotiated.
   grows > 1.5× min + 40 ms or skips happen, step NVENC bitrate down (×0.8, floor
   ~1 Mbps); when clean for ~2 s, step up (×1.1, cap = profile max). Use
   `Nvenc::set_bitrate` (reconfigure, no IDR).
-- Keyframes: first frame of a generation, explicit client request (decoder
-  error / reconnect), or safety interval ≥ 30 s *only while frames are being
-  sent*. No periodic 1 s IDRs, no cached-IDR replay on v4.
+- Keyframes: first frame of a generation, a new peer / reconnect, or an
+  explicit client request (decoder error / seq gap). No periodic or safety
+  keyframe, no cached-IDR replay on v4. An ACK stall (3 s) only forgets the
+  in-flight window. A v4 IDR is encoded at 4× the live bitrate (the one-frame
+  VBV grows with it) so it is not blocky. (Decided 2026-09-30: the 30 s safety
+  IDR caused the whole-screen "flicker" the owner reported.)
 - Timer: WSS epochs take the same 1 ms timer period RAII as RTC epochs (the
   ~15 ms Windows wait otherwise caps fps and adds latency).
 
@@ -65,11 +68,17 @@ damage rects and idle snapshots. For v4:
 - Damage-aware encode: pass damage to the existing damage/QP-map path so
   unchanged macroblocks are skipped cheaply (verify what `FrameDamage` does
   today; use it if it's production-safe, otherwise rely on NVENC's own skip).
-- Refinement: when the screen has been damage-free for ~300 ms after motion,
-  send ONE refine frame of the last image at low QP / high bitrate budget (flag
-  `refine`), so text becomes crisp. Don't repeat it until new damage arrives.
-  Existing idle-snapshot / quiescent-followup machinery may already do this;
-  reuse it rather than adding a parallel mechanism.
+- Refinement (current, 2026-09-30, supersedes one whole-frame refine per
+  settle): a 64×64 tile tracker (`host/src/tile_quality.rs`). Dirty tiles come
+  from the DXGI dirty/move rects, accumulated until a frame is encoded; up to
+  40 % of the frame they are read back (damage-sized copies into a reused
+  staging texture) and hashed (`host/src/tile_hash.rs`). A repaint whose
+  hashes all match what was last encoded is skipped. Tiles encoded while
+  NVENC's frameAvgQP > 28 carry debt; debt tiles unchanged for 300 ms are
+  refined together in one P frame through the HEVC delta-QP map (−6 on debt
+  tiles, +2 elsewhere, 4× bitrate), at most every 500 ms and never during large
+  motion. A whole-frame refine happens only when ≥ 50 % of tiles are in debt or
+  the encoder has no QP map. Refines ride the idle follow-up snapshot.
 - Cap: work mode 30 fps max; nothing sent when idle.
 
 ## Receiver
