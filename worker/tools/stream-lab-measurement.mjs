@@ -42,29 +42,14 @@ function wssCohortResyncs(snapshot) {
   return Number(snapshot?.resyncs ?? snapshot?.worker?.resyncs);
 }
 
-function sameWssTopology(left, right) {
-  return Number(left?.laneCount) === Number(right?.laneCount) &&
-    Number(left?.dataShards) === Number(right?.dataShards) &&
-    Number(left?.parityShards) === Number(right?.parityShards);
-}
-
 function wssCohortContinuityReasons(admitted, current, options = {}) {
   const reasons = [];
   const admittedMedia = admitted?.wssMedia;
   const currentMedia = current?.wssMedia;
-  const topology = currentMedia?.topology;
   if (current?.route !== "wss") reasons.push("route-not-wss");
   if (current?.signaling?.registered !== true) reasons.push("signaling-unregistered");
-  if (Number(currentMedia?.protocol) !== 3 || !Number.isInteger(Number(topology?.laneCount)) ||
-      !Number.isInteger(Number(topology?.dataShards)) ||
-      Number(topology?.laneCount) !== Number(topology?.dataShards) + Number(topology?.parityShards))
-    reasons.push("topology-unavailable");
-  else if (!sameWssTopology(admittedMedia?.topology, topology))
-    reasons.push("topology-changed");
-  const openLanes = Number(currentMedia?.openLanes);
-  if (!Number.isInteger(openLanes) || openLanes < Number(topology?.dataShards) ||
-      openLanes > Number(topology?.laneCount))
-    reasons.push("insufficient-open-lanes");
+  if (Number(currentMedia?.protocol) !== 4) reasons.push("protocol-not-v4");
+  if (currentMedia?.v4?.socketOpen !== true) reasons.push("media-socket-closed");
   if (currentMedia?.recoveryState !== "healthy") reasons.push("recovery-state-unhealthy");
   if (Number(current?.signaling?.registeredAtMs) !== Number(admitted?.signaling?.registeredAtMs))
     reasons.push("signaling-epoch-changed");
@@ -74,7 +59,7 @@ function wssCohortContinuityReasons(admitted, current, options = {}) {
   if (options.allowResyncChange !== true &&
       wssCohortResyncs(current) !== wssCohortResyncs(admitted))
     reasons.push("decoder-resync");
-  if (Number(currentMedia?.dependencyLosses) !== Number(admittedMedia?.dependencyLosses))
+  if (Number(currentMedia?.v4?.gateDrops) !== Number(admittedMedia?.v4?.gateDrops))
     reasons.push("dependency-loss");
   if (options.requireFreshPresentation === true) {
     const renderedAgeMs = Number(current?.renderedAgeMs);
@@ -90,7 +75,7 @@ export function evaluateWssCohortContinuity(admitted, current, options = {}) {
   return {
     accepted: reasons.length === 0,
     reasons,
-    openLanes: Number(current?.wssMedia?.openLanes),
+    mediaSocketOpen: current?.wssMedia?.v4?.socketOpen === true,
     resyncs: wssCohortResyncs(current),
     renderedAgeMs: Number(current?.renderedAgeMs),
     mediaGeneration: Number(current?.mediaGeneration),
@@ -105,39 +90,6 @@ export function evaluateWssCohortProgress(previous, current, options = {}) {
   });
   const previousMedia = previous?.wssMedia;
   const currentMedia = current?.wssMedia;
-  const topology = currentMedia?.topology;
-  const laneCount = Number(topology?.laneCount);
-  const openLanes = Number(currentMedia?.openLanes);
-  const previousSequences = previousMedia?.highestSequenceByLane;
-  const currentSequences = currentMedia?.highestSequenceByLane;
-  let advancedLanes = 0;
-  let maxLaneLagFrames = null;
-  if (!Number.isInteger(laneCount) || !Array.isArray(previousSequences) ||
-      !Array.isArray(currentSequences) || previousSequences.length !== laneCount ||
-      currentSequences.length !== laneCount ||
-      !previousSequences.every(Number.isInteger) || !currentSequences.every(Number.isInteger)) {
-    reasons.push("sequence-telemetry-unavailable");
-  } else {
-    const advancedSequences = [];
-    for (let lane = 0; lane < laneCount; lane++) {
-      if (u32SequenceAfter(currentSequences[lane], previousSequences[lane])) {
-        advancedLanes++;
-        advancedSequences.push(currentSequences[lane] >>> 0);
-      }
-    }
-    if (!Number.isInteger(openLanes) || advancedLanes < openLanes)
-      reasons.push("lane-progress-stalled");
-    if (advancedSequences.length) {
-      const highest = Math.max(...advancedSequences);
-      const lowest = Math.min(...advancedSequences);
-      if (highest - lowest >= 0x8000_0000) reasons.push("lane-sequence-wrap-ambiguous");
-      else {
-        maxLaneLagFrames = highest - lowest;
-        if (maxLaneLagFrames > Number(options.maxLaneLagFrames ?? 8))
-          reasons.push("lane-sequence-lag");
-      }
-    }
-  }
   if (!u32SequenceAfter(Number(currentMedia?.reconstructed), Number(previousMedia?.reconstructed)))
     reasons.push("reconstruction-stalled");
   if (!u32SequenceAfter(Number(currentMedia?.presented), Number(previousMedia?.presented)))
@@ -146,10 +98,7 @@ export function evaluateWssCohortProgress(previous, current, options = {}) {
   return {
     accepted: uniqueReasons.length === 0,
     reasons: uniqueReasons,
-    advancedLanes,
-    requiredLanes: openLanes,
-    maxLaneLagFrames,
-    openLanes,
+    mediaSocketOpen: currentMedia?.v4?.socketOpen === true,
     resyncs: wssCohortResyncs(current),
     renderedAgeMs: Number(current?.renderedAgeMs),
   };
@@ -165,8 +114,7 @@ export function advanceWssCohortAdmission(state, current, options = {}) {
       observation: {
         accepted: false,
         reasons: ["baseline-required"],
-        advancedLanes: 0,
-        requiredLanes: Number(current?.wssMedia?.openLanes),
+        mediaSocketOpen: current?.wssMedia?.v4?.socketOpen === true,
       },
       lastSnapshot: current,
     };
@@ -200,29 +148,6 @@ function frameStageTrace(diagnostics, phase, capture = {}) {
     Number.isFinite(diagnostics?.clock?.epochMs) && Number.isFinite(diagnostics?.clock?.performanceMs)
       ? diagnostics.clock.epochMs - diagnostics.clock.performanceMs
       : null;
-  const sourceToFirstShardMs = boundedStageDuration(
-    performanceOriginEpochMs + Number(workerTrace.firstShardAtMs) - capturedAtEpochMs,
-  );
-  const firstShardHostSentAtEpochMs = finiteOrNull(workerTrace.firstShardHostSentAtEpochMs);
-  const firstShardEdgeAtEpochMs = finiteOrNull(workerTrace.firstShardEdgeAtEpochMs);
-  const firstShardBrowserAtEpochMs = performanceOriginEpochMs === null ? null :
-    performanceOriginEpochMs + Number(workerTrace.firstShardEventAtMs ?? workerTrace.firstShardAtMs);
-  const sourceToHostEgressMs = firstShardHostSentAtEpochMs === null || capturedAtEpochMs === null
-    ? null
-    : boundedStageDuration(firstShardHostSentAtEpochMs - capturedAtEpochMs);
-  const hostEgressToEdgeMs = firstShardHostSentAtEpochMs === null || firstShardEdgeAtEpochMs === null
-    ? null
-    : boundedStageDuration(firstShardEdgeAtEpochMs - firstShardHostSentAtEpochMs);
-  const hostEgressToFirstShardMs = firstShardHostSentAtEpochMs === null ||
-      !Number.isFinite(firstShardBrowserAtEpochMs)
-    ? null
-    : boundedStageDuration(firstShardBrowserAtEpochMs - firstShardHostSentAtEpochMs);
-  const sourceToEdgeMs = firstShardEdgeAtEpochMs === null || capturedAtEpochMs === null
-    ? null
-    : boundedStageDuration(firstShardEdgeAtEpochMs - capturedAtEpochMs);
-  const edgeToFirstShardMs = firstShardEdgeAtEpochMs === null || !Number.isFinite(firstShardBrowserAtEpochMs)
-    ? null
-    : boundedStageDuration(firstShardBrowserAtEpochMs - firstShardEdgeAtEpochMs);
   const sourceToPresentedMs = boundedStageDuration(
     performanceOriginEpochMs +
       Number(workerTrace.presentedAtMs ?? diagnostics?.renderedTimestamp ?? diagnostics?.nativePresentation?.lastFrameAtMs) -
@@ -246,24 +171,7 @@ function frameStageTrace(diagnostics, phase, capture = {}) {
     },
     network: {
       sequence: finiteOrNull(workerTrace.sequence),
-      recovered: typeof workerTrace.recovered === "boolean" ? workerTrace.recovered : null,
-      sourceToFirstShardMs,
-      sourceToHostEgressMs,
-      hostEgressToEdgeMs,
-      hostEgressToFirstShardMs,
-      sourceToEdgeMs,
-      edgeToFirstShardMs,
-      firstShardHostSentAtEpochMs,
-      firstShardEdgeAtEpochMs,
-      firstShardAtMs: finiteOrNull(workerTrace.firstShardAtMs),
-      firstShardEventAtMs: finiteOrNull(workerTrace.firstShardEventAtMs),
-      firstShardHandlerAtMs: finiteOrNull(workerTrace.firstShardHandlerAtMs),
-      firstShardQueueDelayMs: finiteOrNull(workerTrace.firstShardQueueDelayMs),
-      reconstructingShardAtMs: finiteOrNull(workerTrace.reconstructingShardAtMs ?? workerTrace.thirdShardAtMs),
-      completingShardEventAtMs: finiteOrNull(workerTrace.completingShardEventAtMs),
-      completingShardHandlerAtMs: finiteOrNull(workerTrace.completingShardHandlerAtMs),
-      completingShardQueueDelayMs: finiteOrNull(workerTrace.completingShardQueueDelayMs),
-      reconstructedAtMs: finiteOrNull(workerTrace.reconstructedAtMs),
+      receivedAtMs: finiteOrNull(workerTrace.receivedAtMs),
     },
     decode: {
       queuedAtMs: finiteOrNull(workerTrace.decodeQueuedAtMs),
@@ -309,72 +217,6 @@ export function qualityAnchorAlignmentOptions(mode, scene, acknowledgedSequence)
     return { presentedNetworkSequence: acknowledgedSequence >>> 0 };
   void scene;
   return { exactNetworkSequence: acknowledgedSequence >>> 0 };
-}
-
-export function qualityAnchorLaneDelivery(snapshot, acknowledgedSequence) {
-  if (!Number.isSafeInteger(acknowledgedSequence) ||
-      acknowledgedSequence < 0 || acknowledgedSequence > 0xffff_ffff)
-    throw new RangeError("acknowledged quality sequence must be an unsigned 32-bit integer");
-  const media = snapshot?.wssMedia;
-  const topology = media?.topology;
-  const laneCount = Number(topology?.laneCount);
-  const openLanes = Number(media?.openLanes);
-  const sequences = media?.highestSequenceByLane;
-  const reasons = [];
-  const laggingLanes = [];
-  let deliveredLanes = 0;
-  if (snapshot?.route !== "wss") reasons.push("route-not-wss");
-  if (Number(media?.protocol) !== 3) reasons.push("protocol-not-v3");
-  if (!Number.isInteger(laneCount) || laneCount < 1 ||
-      laneCount !== Number(topology?.dataShards) + Number(topology?.parityShards))
-    reasons.push("topology-invalid");
-  if (!Number.isInteger(openLanes) || openLanes !== laneCount)
-    reasons.push("lane-cohort-not-open");
-  if (!Array.isArray(sequences) || sequences.length !== laneCount ||
-      !sequences.every(sequence => Number.isSafeInteger(sequence) &&
-        sequence >= 0 && sequence <= 0xffff_ffff)) {
-    reasons.push("lane-sequence-telemetry-unavailable");
-  } else {
-    for (let lane = 0; lane < sequences.length; lane++) {
-      const sequence = sequences[lane] >>> 0;
-      const delta = (sequence - (acknowledgedSequence >>> 0)) >>> 0;
-      if (delta < 0x8000_0000) deliveredLanes++;
-      else laggingLanes.push({
-        lane,
-        sequence,
-        lag: ((acknowledgedSequence >>> 0) - sequence) >>> 0,
-      });
-    }
-    if (laggingLanes.length) reasons.push("quality-anchor-not-delivered-on-all-lanes");
-  }
-  return {
-    accepted: reasons.length === 0,
-    reasons: [...new Set(reasons)],
-    acknowledgedSequence: acknowledgedSequence >>> 0,
-    requiredLanes: Number.isInteger(laneCount) ? laneCount : null,
-    deliveredLanes,
-    laggingLanes,
-  };
-}
-
-export function exactQualityAnchorAlignment(
-  source,
-  diagnostics,
-  phase,
-  alignmentOptions,
-  acknowledgedSequence,
-) {
-  const alignment = exactFrameAlignment(source, diagnostics, phase, alignmentOptions);
-  if (diagnostics?.route !== "wss") return alignment;
-  const laneDelivery = qualityAnchorLaneDelivery(diagnostics, acknowledgedSequence);
-  if (!laneDelivery.accepted) {
-    throw new StreamLabUnavailable(
-      "quality-anchor-lane-delivery-pending",
-      "The acknowledged quality IDR has not reached every WSS lane.",
-      { phase, ...laneDelivery },
-    );
-  }
-  return { ...alignment, laneDelivery };
 }
 
 export function quiescentInteractionReady(snapshot, sourceMetadata, baselineHybrid) {
@@ -634,8 +476,7 @@ export function performanceFrameTrace(source, diagnostics) {
     const trace = frameStageTrace(diagnostics, "performance-unmatched");
     const hasReceiverStage = [
       trace.network.sequence,
-      trace.network.firstShardAtMs,
-      trace.network.reconstructedAtMs,
+      trace.network.receivedAtMs,
       trace.decode.queuedAtMs,
       trace.decode.decodedAtMs,
       trace.presentation.presentedAtMs,

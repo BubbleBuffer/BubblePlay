@@ -15,8 +15,6 @@
     "lab:sweep": "node tools/stream-lab.mjs sweep",
     "lab:campaign": "node tools/stream-lab.mjs campaign",
     "lab:optimize": "node tools/stream-lab.mjs optimize",
-    "lab:topology-sweep": "node tools/stream-lab.mjs topology-sweep",
-    "lab:lane-recovery": "node tools/stream-lab.mjs lane-recovery",
     "lab:compare": "node tools/stream-lab.mjs compare",
     "lab:cleanup": "node tools/stream-lab.mjs cleanup",
     "lab:diagnostics": "powershell -NoProfile -ExecutionPolicy Bypass -File ../host/scripts/collect-diagnostics.ps1",

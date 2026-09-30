@@ -175,8 +175,6 @@ struct BenchmarkProfile {
     #[serde(default = "default_gop_seconds")]
     gop_seconds: u8,
     #[serde(default)]
-    wss_topology: Option<WssTopology>,
-    #[serde(default)]
     hybrid_mode: HybridMode,
     #[serde(default)]
     hybrid_cache_mode: HybridCacheMode,
@@ -286,28 +284,6 @@ enum HybridCacheMode {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WssTopology {
-    lane_count: u8,
-    data_shards: u8,
-    parity_shards: u8,
-}
-
-impl WssTopology {
-    const fn is_valid(self) -> bool {
-        self.lane_count >= 1
-            && self.lane_count <= 16
-            && self.data_shards >= 1
-            && self.parity_shards <= 2
-            && self.lane_count == self.data_shards + self.parity_shards
-    }
-
-    const fn is_production_control(self) -> bool {
-        self.lane_count == 16 && self.data_shards == 15 && self.parity_shards == 1
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum Transport {
     Wss,
@@ -365,8 +341,6 @@ struct StoredProfile {
     #[serde(default = "default_gop_seconds")]
     gop_seconds: u8,
     #[serde(default)]
-    wss_topology: Option<WssTopology>,
-    #[serde(default)]
     hybrid_mode: HybridMode,
     #[serde(default)]
     hybrid_cache_mode: HybridCacheMode,
@@ -393,7 +367,6 @@ impl StoredProfile {
             fps: profile.fps,
             bitrate_bps: profile.bitrate_bps,
             gop_seconds: profile.gop_seconds,
-            wss_topology: profile.wss_topology,
             hybrid_mode: profile.hybrid_mode,
             hybrid_cache_mode: profile.hybrid_cache_mode,
             encoder,
@@ -417,7 +390,6 @@ impl StoredProfile {
             fps: 30,
             bitrate_bps: 4_000_000,
             gop_seconds: 2,
-            wss_topology: None,
             hybrid_mode: HybridMode::Off,
             hybrid_cache_mode: HybridCacheMode::SuppressReactivate,
             encoder: BenchmarkEncoder {
@@ -474,9 +446,6 @@ impl BenchmarkProfile {
             && self.height == 1080
             && self.fps == 30
             && self.bitrate_bps == 6_000_000
-            && self
-                .wss_topology
-                .is_some_and(WssTopology::is_production_control)
             && !self.encoder.main10
             && active_axes == 1
             && self.encoder.async_depth <= 1
@@ -556,7 +525,6 @@ fn validate_command(command: &LabCommand) -> Result<()> {
                     || profile.encoder.async_depth != 0
                     || profile.hybrid_mode != HybridMode::Off
                     || profile.hybrid_cache_mode != HybridCacheMode::SuppressReactivate
-                    || profile.wss_topology.is_some()
                     || !(500_000..=40_000_000).contains(&profile.bitrate_bps)
                 {
                     bail!("v1 profile contains v2 controls or an invalid bitrate");
@@ -573,9 +541,6 @@ fn validate_command(command: &LabCommand) -> Result<()> {
                         StreamMode::Work => 2,
                         StreamMode::Game => 1,
                     }
-                || profile.wss_topology.is_some_and(|topology| {
-                    profile.transport != Transport::Wss || !topology.is_valid()
-                })
                 || (profile.encoder.main10
                     && (profile.implementation_variant != ImplementationVariant::Candidate
                         || profile.transport != Transport::Wss
@@ -2137,7 +2102,6 @@ mod tests {
             fps: 30,
             bitrate_bps: 4_000_000,
             gop_seconds: 2,
-            wss_topology: None,
             hybrid_mode: HybridMode::Off,
             hybrid_cache_mode: HybridCacheMode::SuppressReactivate,
             encoder: BenchmarkEncoder {
@@ -2264,7 +2228,7 @@ mod tests {
 
     #[test]
     fn v2_pipeline_controls_round_trip_into_a_host_accepted_normalized_lease() {
-        let json = r#"{"command":"apply","runId":"bb66c7b7-0981-44cf-8122-3d3449e5fd47","leaseSeconds":60,"bandwidthMbps":null,"profile":{"schemaVersion":2,"implementationVariant":"candidate","experimentId":"roi-text-edge","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"off","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"dirtyQpMap":false,"main10":false,"roiMode":"text-edge","resourceMode":"per-frame","asyncDepth":0}}}"#;
+        let json = r#"{"command":"apply","runId":"bb66c7b7-0981-44cf-8122-3d3449e5fd47","leaseSeconds":60,"bandwidthMbps":null,"profile":{"schemaVersion":2,"implementationVariant":"candidate","experimentId":"roi-text-edge","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"hybridMode":"off","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"dirtyQpMap":false,"main10":false,"roiMode":"text-edge","resourceMode":"per-frame","asyncDepth":0}}}"#;
         let command = serde_json::from_str::<LabCommand>(json).expect("pipeline apply command");
         assert!(validate_command(&command).is_ok());
         let LabCommand::Apply { profile, .. } = command else {
@@ -2296,7 +2260,7 @@ mod tests {
 
     #[test]
     fn quiescent_cache_policy_round_trips_through_the_helper_contract() {
-        let json = r#"{"command":"apply","runId":"bb66c7b7-0981-44cf-8122-3d3449e5fd47","leaseSeconds":60,"bandwidthMbps":null,"profile":{"schemaVersion":2,"implementationVariant":"candidate","experimentId":"hybrid-png-quiescent-detail-dda-gated","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"png-quiescent-detail","hybridCacheMode":"dda-gated","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"dirtyQpMap":false,"main10":false,"roiMode":"off","resourceMode":"per-frame","asyncDepth":0}}}"#;
+        let json = r#"{"command":"apply","runId":"bb66c7b7-0981-44cf-8122-3d3449e5fd47","leaseSeconds":60,"bandwidthMbps":null,"profile":{"schemaVersion":2,"implementationVariant":"candidate","experimentId":"hybrid-png-quiescent-detail-dda-gated","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"hybridMode":"png-quiescent-detail","hybridCacheMode":"dda-gated","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"dirtyQpMap":false,"main10":false,"roiMode":"off","resourceMode":"per-frame","asyncDepth":0}}}"#;
         let invalid_static = json.replace(
             r#""hybridMode":"png-quiescent-detail""#,
             r#""hybridMode":"png-static-roi""#,

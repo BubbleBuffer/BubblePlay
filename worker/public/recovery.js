@@ -11,6 +11,13 @@ export function shouldRecycleSignalingForPeerState(connectionState) {
   return connectionState === "failed";
 }
 
+// Once WSS carries media and input, the RTC peer is only a lifecycle anchor.
+// Its failure or a closed data channel must end that peer, never the session.
+export function rtcPeerEndAction({ usingWssMedia, connectionState = null, laneClosed = false } = {}) {
+  if (!laneClosed && !shouldRecycleSignalingForPeerState(connectionState)) return "none";
+  return usingWssMedia ? "end-peer" : "recycle";
+}
+
 // NetworkInformation.change is a broad estimate-change signal: Chrome may fire
 // it when only RTT, downlink, or effectiveType changes. Treat it as a probe
 // trigger, not proof that the active route is dead.
@@ -27,7 +34,7 @@ export function shouldRecoverAfterNetworkRouteProbe(before = {}, after = {}, {
   if (!after.signalingRegistered || !after.signalingSocketOpen) return true;
 
   if (after.usingWssMedia) {
-    if (Number(after.openLanes) < Number(after.dataShards) || after.recoveryState !== "healthy") return true;
+    if (after.mediaSocketOpen !== true || after.recoveryState !== "healthy") return true;
     if (after.allowQuiescentIdle === true) return false;
     return Number.isFinite(after.renderedAgeMs) && after.renderedAgeMs > maxRenderedAgeMs;
   }

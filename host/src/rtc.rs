@@ -69,6 +69,8 @@ pub struct RtcSession {
     pub video_pt: Option<Pt>,
     pub video_codec: Option<VideoCodec>,
     pub ice_connected: bool,
+    /// ICE reported Disconnected; a later Connected is a recovery.
+    ice_lost: bool,
     /// Base instant for the 90 kHz RTP clock.
     clock_start: Instant,
     frames_written: u64,
@@ -92,6 +94,7 @@ impl RtcSession {
             video_pt: None,
             video_codec: None,
             ice_connected: false,
+            ice_lost: false,
             clock_start: now,
             frames_written: 0,
             input_control: None,
@@ -164,8 +167,15 @@ impl RtcSession {
                     // Disconnected is the terminal "lost the peer" signal here.
                     Disconnected => {
                         self.ice_connected = false;
+                        self.ice_lost = true;
                         warn!(?state, "ICE disconnected");
                         Some(RtcAction::IceDisconnected)
+                    }
+                    Connected | Completed if self.ice_lost => {
+                        self.ice_lost = false;
+                        self.ice_connected = true;
+                        info!(?state, "ICE reconnected");
+                        Some(RtcAction::IceConnected)
                     }
                     _ => None,
                 }

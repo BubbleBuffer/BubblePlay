@@ -130,24 +130,6 @@ pub enum BenchmarkHybridCacheMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct BenchmarkWssTopology {
-    pub lane_count: u8,
-    pub data_shards: u8,
-    pub parity_shards: u8,
-}
-
-impl BenchmarkWssTopology {
-    const fn is_valid(self) -> bool {
-        self.lane_count >= 1
-            && self.lane_count <= 16
-            && self.data_shards >= 1
-            && self.parity_shards <= 2
-            && self.lane_count == self.data_shards + self.parity_shards
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BenchmarkEncoder {
     pub preset: BenchmarkPreset,
     pub tuning: BenchmarkTuning,
@@ -208,8 +190,6 @@ pub struct BenchmarkProfile {
     #[serde(default = "default_gop_seconds")]
     pub gop_seconds: u8,
     #[serde(default)]
-    pub wss_topology: Option<BenchmarkWssTopology>,
-    #[serde(default)]
     pub hybrid_mode: BenchmarkHybridMode,
     #[serde(default)]
     pub hybrid_cache_mode: BenchmarkHybridCacheMode,
@@ -237,7 +217,6 @@ impl PartialEq for BenchmarkProfile {
             && self.requested_bitrate_bps == other.requested_bitrate_bps
             && self.total_media_cap_bps == other.total_media_cap_bps
             && self.gop_seconds == other.gop_seconds
-            && self.wss_topology == other.wss_topology
             && self.hybrid_mode == other.hybrid_mode
             && self.hybrid_cache_mode == other.hybrid_cache_mode
             && self.encoder == other.encoder
@@ -296,8 +275,6 @@ impl BenchmarkProfile {
             + u8::from(hybrid_active)
             + u8::from(resource_active)
             + u8::from(rate_control_active);
-        let topology = self.wss_topology;
-
         self.schema_version == 2
             && self.implementation_variant == BenchmarkImplementationVariant::Candidate
             && self.transport == BenchmarkTransport::Wss
@@ -309,9 +286,6 @@ impl BenchmarkProfile {
             && self.total_media_cap_bps.unwrap_or(self.bitrate_bps) == 6_000_000
             && self.bitrate_bps <= self.requested_bitrate_bps.unwrap_or(self.bitrate_bps)
             && self.bitrate_bps <= self.total_media_cap_bps.unwrap_or(self.bitrate_bps)
-            && topology.is_some_and(|value| {
-                value.lane_count == 16 && value.data_shards == 15 && value.parity_shards == 1
-            })
             && !self.encoder.main10
             && active_axes == 1
             && self.encoder.async_depth <= 1
@@ -353,7 +327,6 @@ impl BenchmarkProfile {
                     && self.encoder.peak_bitrate_multiplier.is_none()
                     && self.hybrid_mode == BenchmarkHybridMode::Off
                     && self.hybrid_cache_mode == BenchmarkHybridCacheMode::SuppressReactivate
-                    && self.wss_topology.is_none()
                     && self.requested_bitrate_bps.is_none()
                     && self.total_media_cap_bps.is_none()
                     && (500_000..=40_000_000).contains(&self.bitrate_bps)
@@ -375,9 +348,6 @@ impl BenchmarkProfile {
                             BenchmarkStreamMode::Work => 2,
                             BenchmarkStreamMode::Game => 1,
                         }
-                    && self.wss_topology.is_none_or(|topology| {
-                        self.transport == BenchmarkTransport::Wss && topology.is_valid()
-                    })
                     && (!self.encoder.main10
                         || (self.implementation_variant
                             == BenchmarkImplementationVariant::Candidate
@@ -530,17 +500,16 @@ mod tests {
     #[test]
     fn accepts_bounded_v2_candidate_profile_with_expanded_encoder_controls() {
         let path = temp_profile(
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"nvenc-aq_01","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":12000000,"gopSeconds":4,"wssTopology":{"laneCount":9,"dataShards":8,"parityShards":1},"encoder":{"preset":"p7","tuning":"low-latency","multipass":"full","aqMode":"spatial","aqStrength":15,"vbvFrames":4,"lookaheadDepth":2,"weightedPrediction":true}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"nvenc-aq_01","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":12000000,"gopSeconds":4,"encoder":{"preset":"p7","tuning":"low-latency","multipass":"full","aqMode":"spatial","aqStrength":15,"vbvFrames":4,"lookaheadDepth":2,"weightedPrediction":true}}"#,
         );
-        let profile = load_profile(&path, 1_000_000).expect("valid topology profile");
-        assert_eq!(profile.wss_topology.expect("topology").lane_count, 9);
+        load_profile(&path, 1_000_000).expect("valid candidate profile");
         fs::remove_file(path).ok();
     }
 
     #[test]
     fn accepts_dirty_qp_map_only_as_an_explicit_v2_candidate_control() {
         let path = temp_profile(
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"dirty-qp-map","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"dirtyQpMap":true}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"dirty-qp-map","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"dirtyQpMap":true}}"#,
         );
         let profile = load_profile(&path, 1_000_000).expect("valid dirty-QP candidate");
         assert_eq!(profile.experiment_id.as_deref(), Some("dirty-qp-map"));
@@ -551,11 +520,11 @@ mod tests {
     #[test]
     fn accepts_additive_v2_pipeline_candidate_controls() {
         for json in [
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"roi-text-edge","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"off","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"text-edge","resourceMode":"per-frame","asyncDepth":0}}"#,
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"roi-feedback-headroom","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"off","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"feedback-headroom","resourceMode":"per-frame","asyncDepth":0}}"#,
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hybrid-png","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"png-static-roi","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false}}"#,
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hybrid-quiescent","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"png-quiescent-detail","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false}}"#,
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"nvenc-persistent","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"resourceMode":"persistent","asyncDepth":0}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"roi-text-edge","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"hybridMode":"off","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"text-edge","resourceMode":"per-frame","asyncDepth":0}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"roi-feedback-headroom","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"hybridMode":"off","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"feedback-headroom","resourceMode":"per-frame","asyncDepth":0}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hybrid-png","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"hybridMode":"png-static-roi","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hybrid-quiescent","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"hybridMode":"png-quiescent-detail","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"nvenc-persistent","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"resourceMode":"persistent","asyncDepth":0}}"#,
         ] {
             let path = temp_profile(json);
             assert!(
@@ -569,7 +538,7 @@ mod tests {
     #[test]
     fn accepts_default_off_lab_only_hevc_quiescent_tiles_profile() {
         let path = temp_profile(
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hevc-quiescent-tiles","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"requestedBitrateBps":6000000,"totalMediaCapBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"hevc-quiescent-tiles","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"off","resourceMode":"per-frame","asyncDepth":0}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hevc-quiescent-tiles","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"requestedBitrateBps":6000000,"totalMediaCapBps":6000000,"gopSeconds":2,"hybridMode":"hevc-quiescent-tiles","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"off","resourceMode":"per-frame","asyncDepth":0}}"#,
         );
 
         load_profile(&path, 1_000_000)
@@ -579,7 +548,7 @@ mod tests {
 
     #[test]
     fn accepts_cq23_external_budget_vbr_as_one_bounded_pipeline_axis() {
-        let valid = r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"external-budget-vbr-cq23","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"requestedBitrateBps":6000000,"totalMediaCapBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"off","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":4,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"off","resourceMode":"per-frame","asyncDepth":0,"rateControlMode":"external-budget-vbr","targetQuality":23,"peakBitrateMultiplier":4}}"#;
+        let valid = r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"external-budget-vbr-cq23","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"requestedBitrateBps":6000000,"totalMediaCapBps":6000000,"gopSeconds":2,"hybridMode":"off","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":4,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"off","resourceMode":"per-frame","asyncDepth":0,"rateControlMode":"external-budget-vbr","targetQuality":23,"peakBitrateMultiplier":4}}"#;
         let path = temp_profile(valid);
         assert!(
             load_profile(&path, 1_000_000).is_some(),
@@ -603,7 +572,7 @@ mod tests {
     #[test]
     fn accepts_explicit_quiescent_cache_policy_control() {
         let path = temp_profile(
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hybrid-quiescent-dda-gated","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"png-quiescent-detail","hybridCacheMode":"dda-gated","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hybrid-quiescent-dda-gated","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"hybridMode":"png-quiescent-detail","hybridCacheMode":"dda-gated","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false}}"#,
         );
 
         assert!(
@@ -615,7 +584,7 @@ mod tests {
 
     #[test]
     fn accepts_a_calibrated_pipeline_target_only_under_the_six_megabit_control_cap() {
-        let valid = r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hybrid-cache-calibrated","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":5400000,"requestedBitrateBps":6000000,"totalMediaCapBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"png-quiescent-detail","hybridCacheMode":"suppress-reactivate","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false}}"#;
+        let valid = r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hybrid-cache-calibrated","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":5400000,"requestedBitrateBps":6000000,"totalMediaCapBps":6000000,"gopSeconds":2,"hybridMode":"png-quiescent-detail","hybridCacheMode":"suppress-reactivate","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false}}"#;
         let path = temp_profile(valid);
         let profile = load_profile(&path, 1_000_000).expect("calibrated six-megabit candidate");
         assert_eq!(profile.bitrate_bps, 5_400_000);
@@ -646,7 +615,7 @@ mod tests {
     #[test]
     fn rejects_candidates_that_mix_independent_pipeline_axes() {
         let path = temp_profile(
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"mixed","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"hybridMode":"png-static-roi","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"damage","resourceMode":"persistent","asyncDepth":1}}"#,
+            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"mixed","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"hybridMode":"png-static-roi","encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"roiMode":"damage","resourceMode":"persistent","asyncDepth":1}}"#,
         );
         assert!(load_profile(&path, 1_000_000).is_none());
         fs::remove_file(path).ok();
@@ -654,7 +623,7 @@ mod tests {
 
     #[test]
     fn accepts_main10_only_for_an_explicit_1080p_v2_candidate() {
-        let valid = r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hevc-main10","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":15,"parityShards":1},"encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"dirtyQpMap":false,"main10":true}}"#;
+        let valid = r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"hevc-main10","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":6000000,"gopSeconds":2,"encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false,"dirtyQpMap":false,"main10":true}}"#;
         let path = temp_profile(valid);
         let profile = load_profile(&path, 1_000_000).expect("valid Main10 candidate");
         assert_eq!(profile.experiment_id.as_deref(), Some("hevc-main10"));
@@ -672,16 +641,6 @@ mod tests {
             );
             fs::remove_file(path).ok();
         }
-    }
-
-    #[test]
-    fn accepts_a_bounded_two_parity_candidate_topology() {
-        let path = temp_profile(
-            r#"{"schemaVersion":2,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"implementationVariant":"candidate","experimentId":"fec-pq-14plus2","transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":4000000,"gopSeconds":2,"wssTopology":{"laneCount":16,"dataShards":14,"parityShards":2},"encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqMode":"spatial","aqStrength":8,"vbvFrames":1,"lookaheadDepth":0,"weightedPrediction":false}}"#,
-        );
-        let profile = load_profile(&path, 1_000_000).expect("valid two-parity topology");
-        assert_eq!(profile.wss_topology.expect("topology").parity_shards, 2);
-        fs::remove_file(path).ok();
     }
 
     #[test]

@@ -18,6 +18,85 @@ use crate::rtc::{RtcAction, RtcSession};
 
 pub const AU_QUEUE_BOUND: usize = 1;
 const UDP_POLL_CEILING: Duration = Duration::from_millis(4);
+/// How long a media-carrying RTC peer may sit in ICE Disconnected before the
+/// session gives up on it. Short Wi-Fi hiccups recover inside this window.
+pub const RTC_DISCONNECT_GRACE: Duration = Duration::from_secs(5);
+
+/// What the session loop does after an RTC peer lifecycle change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RtcPeerDecision {
+    /// Keep the session and the peer; wait for ICE to come back.
+    Continue,
+    /// WSS carries the session: stop only the RTC transport.
+    EndPeer,
+    /// The RTC peer was the session's media path and it is gone.
+    EndSession,
+}
+
+/// Tracks whether the RTC peer is healthy, in its disconnect grace, or ended.
+/// The RTC peer ends the session only while it carries media; once WSS is the
+/// active transport, losing the peer tears down just the peer.
+#[derive(Debug, Default)]
+pub struct RtcPeerLifecycle {
+    disconnected_since: Option<Instant>,
+    ended: bool,
+}
+
+impl RtcPeerLifecycle {
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+
+    pub fn on_connected(&mut self) {
+        self.disconnected_since = None;
+    }
+
+    /// ICE reported Disconnected; this can still recover.
+    pub fn on_disconnected(&mut self, now: Instant, wss_active: bool) -> RtcPeerDecision {
+        if self.ended {
+            return RtcPeerDecision::Continue;
+        }
+        if wss_active {
+            return self.end_peer();
+        }
+        self.disconnected_since.get_or_insert(now);
+        RtcPeerDecision::Continue
+    }
+
+    /// The RTC epoch closed or its transport thread stopped; it cannot recover.
+    pub fn on_closed(&mut self, wss_active: bool) -> RtcPeerDecision {
+        if self.ended {
+            return RtcPeerDecision::Continue;
+        }
+        if wss_active {
+            return self.end_peer();
+        }
+        RtcPeerDecision::EndSession
+    }
+
+    /// Checked every loop: the grace ends the peer (WSS) or the session (RTC).
+    pub fn poll(&mut self, now: Instant, wss_active: bool) -> RtcPeerDecision {
+        let Some(since) = self.disconnected_since else {
+            return RtcPeerDecision::Continue;
+        };
+        if self.ended {
+            return RtcPeerDecision::Continue;
+        }
+        if wss_active {
+            return self.end_peer();
+        }
+        if now.duration_since(since) >= RTC_DISCONNECT_GRACE {
+            return RtcPeerDecision::EndSession;
+        }
+        RtcPeerDecision::Continue
+    }
+
+    fn end_peer(&mut self) -> RtcPeerDecision {
+        self.ended = true;
+        self.disconnected_since = None;
+        RtcPeerDecision::EndPeer
+    }
+}
 
 #[derive(Default)]
 struct TransportCounters {
@@ -645,9 +724,10 @@ fn transport_loop(
 mod tests {
     use super::{
         dead_epoch_action, emit, replace_latest_cursor, schedule_timeout, stop_takes_priority,
-        try_admit_access_unit, try_send_command, DeadEpochAction, TransportCounters,
-        TransportEvent,
+        try_admit_access_unit, try_send_command, DeadEpochAction, RtcPeerDecision,
+        RtcPeerLifecycle, TransportCounters, TransportEvent, RTC_DISCONNECT_GRACE,
     };
+    use std::time::{Duration, Instant};
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{channel, sync_channel},
@@ -658,6 +738,55 @@ mod tests {
     fn rtc_epoch_without_a_host_address_starts_without_candidates() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         assert!(super::fresh_epoch(&socket, None, None, 2_000_000).is_ok());
+    }
+
+    #[test]
+    fn rtc_peer_loss_under_wss_ends_only_the_peer() {
+        let now = Instant::now();
+        let mut peer = RtcPeerLifecycle::default();
+        assert_eq!(peer.on_closed(true), RtcPeerDecision::EndPeer);
+        assert!(peer.ended());
+        // Later RTC events (Stopped after the shutdown) are ignored.
+        assert_eq!(peer.on_closed(true), RtcPeerDecision::Continue);
+        assert_eq!(peer.on_disconnected(now, true), RtcPeerDecision::Continue);
+
+        let mut peer = RtcPeerLifecycle::default();
+        assert_eq!(peer.on_disconnected(now, true), RtcPeerDecision::EndPeer);
+    }
+
+    #[test]
+    fn media_carrying_rtc_peer_gets_a_disconnect_grace() {
+        let now = Instant::now();
+        let mut peer = RtcPeerLifecycle::default();
+        assert_eq!(peer.on_disconnected(now, false), RtcPeerDecision::Continue);
+        assert_eq!(
+            peer.poll(now + Duration::from_millis(4_900), false),
+            RtcPeerDecision::Continue
+        );
+        peer.on_connected();
+        assert_eq!(
+            peer.poll(now + Duration::from_secs(60), false),
+            RtcPeerDecision::Continue
+        );
+
+        assert_eq!(peer.on_disconnected(now, false), RtcPeerDecision::Continue);
+        assert_eq!(
+            peer.poll(now + RTC_DISCONNECT_GRACE, false),
+            RtcPeerDecision::EndSession
+        );
+        assert_eq!(peer.on_closed(false), RtcPeerDecision::EndSession);
+    }
+
+    #[test]
+    fn a_switch_to_wss_during_the_grace_ends_only_the_peer() {
+        let now = Instant::now();
+        let mut peer = RtcPeerLifecycle::default();
+        assert_eq!(peer.on_disconnected(now, false), RtcPeerDecision::Continue);
+        assert_eq!(
+            peer.poll(now + Duration::from_secs(1), true),
+            RtcPeerDecision::EndPeer
+        );
+        assert!(peer.ended());
     }
 
     #[test]

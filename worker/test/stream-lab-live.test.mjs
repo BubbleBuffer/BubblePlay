@@ -23,18 +23,14 @@ import {
   buildLabHostUrl,
   buildCandidateHostLaunch,
   buildReceiverChromeArgs,
-  buildProductionProbeUrl,
-  buildTopologyTrialPlan,
   buildCandidateProfileLease,
   captureReceiverFrame,
   candidateStartupRejection,
   classifyCandidateProfileFailure,
   classifyMonitorSelectionFailure,
   chooseOptimizationFinalists,
-  collectLaneRecoveryQualitySequence,
   collectQualityRepetitions,
   combinePerformanceAndQuality,
-  defaultTopologyFrontier,
   exactFrameAlignment,
   performanceFrameTrace,
   firstFrameReadiness,
@@ -44,13 +40,10 @@ import {
   NATIVE_RENDERED_AGE_LIMIT_MS,
   shouldRetryMeasuredFrame,
   effectiveEncoderBitrateMbps,
-  evaluateLaneRecoveryQuality,
-  evaluateWssLaneRecovery,
   evaluateOptimizationRun,
   initialEncoderTargetMbps,
   installTerminationCleanup,
   interruptedCampaignState,
-  laneRecoveryTopology,
   measureOptimizationScreenCandidate,
   inspectCleanupResources,
   nextStabilizedBitrateMbps,
@@ -79,7 +72,6 @@ import {
   shapingFailureReasons,
   stabilizeEncoderForCap,
   summarizePerformance,
-  summarizeProductionProbe,
 } from "../tools/stream-lab-live.mjs";
 import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
 
@@ -123,106 +115,6 @@ test("HEVC tile admission classifies an unsupported browser before quality waits
     state: null,
     codec: null,
   });
-});
-
-test("production probe stays off lab routes and identifies a recovered presentation stall", () => {
-  assert.equal(
-    buildProductionProbeUrl("https://play.example/special?diagnostics=1&labRun=old#state").href,
-    "https://play.example/?diag=1",
-  );
-  const summary = summarizeProductionProbe([
-    { atMs: 0, presented: 10, reconstructed: 10, receivedPackets: 100, signalingRegistered: true },
-    { atMs: 250, presented: 11, reconstructed: 11, receivedPackets: 116, signalingRegistered: true },
-    { atMs: 500, presented: 12, reconstructed: 12, receivedPackets: 132, signalingRegistered: true },
-    { atMs: 750, presented: 12, reconstructed: 12, receivedPackets: 148, signalingRegistered: true },
-    { atMs: 1_250, presented: 12, reconstructed: 12, receivedPackets: 180, signalingRegistered: true },
-    { atMs: 1_750, presented: 12, reconstructed: 12, receivedPackets: 212, signalingRegistered: true },
-    {
-      atMs: 2_250,
-      presented: 13,
-      reconstructed: 13,
-      receivedPackets: 244,
-      signalingRegistered: true,
-      hostCapabilitiesCurrent: true,
-      hostCapabilities: { mediaProtocols: [2, 3], maxWssLanes: 16, wssFec: ["none", "xor-1"] },
-      protocol: 3,
-      topology: { laneCount: 16, dataShards: 15, parityShards: 1 },
-      topologyAccepted: true,
-      openLanes: 16,
-      highestSequenceByLane: Array(16).fill(13),
-    },
-  ], { stallThresholdMs: 750 });
-  assert.equal(summary.result, "complete");
-  assert.equal(summary.admission.admitted, true);
-  assert.equal(summary.inputAutomation, false);
-  assert.equal(summary.candidateHostStarted, false);
-  assert.equal(summary.presentationStalls.length, 1);
-  assert.deepEqual(summary.presentationStalls[0], {
-    startedAtMs: 500,
-    endedAtMs: 2_250,
-    durationMs: 1_750,
-    receivedPacketsDelta: 112,
-    recovered: true,
-  });
-});
-
-test("production probe can exercise real public assets with a lab-scoped topology", () => {
-  const labRun = "123e4567-e89b-42d3-a456-426614174000";
-  const topology = { laneCount: 8, dataShards: 7, parityShards: 1 };
-  assert.equal(
-    buildProductionProbeUrl("https://play.example/special?old=1#state", { labRun, wssTopology: topology }).href,
-    `https://play.example/?diag=1&labRun=${labRun}&wssLanes=8&wssParity=1`,
-  );
-
-  const admitted = summarizeProductionProbe([{
-    atMs: 500,
-    presented: 1,
-    reconstructed: 1,
-    receivedPackets: 8,
-    signalingRegistered: true,
-    hostCapabilitiesCurrent: true,
-    hostCapabilities: { mediaProtocols: [2, 3], maxWssLanes: 16, wssFec: ["none", "xor-1"] },
-    protocol: 3,
-    topology,
-    topologyAccepted: true,
-    openLanes: 8,
-    highestSequenceByLane: Array(8).fill(1),
-  }], { wssTopology: topology });
-  assert.equal(admitted.result, "complete");
-  assert.deepEqual(admitted.admission.requiredTopology, topology);
-});
-
-test("production probe fails admission when signaling has no host or media evidence", () => {
-  const summary = summarizeProductionProbe([
-    {
-      atMs: 0,
-      presented: 0,
-      reconstructed: 0,
-      receivedPackets: 0,
-      signalingRegistered: true,
-      hostCapabilitiesCurrent: false,
-      hostCapabilities: null,
-      protocol: 2,
-      topology: { laneCount: 4, dataShards: 3, parityShards: 1 },
-      topologyAccepted: true,
-      openLanes: 4,
-      highestSequenceByLane: [0, 0, 0, 0],
-    },
-  ]);
-  assert.equal(summary.result, "fail");
-  assert.equal(summary.admission.admitted, false);
-  assert.equal(summary.error.code, "production-probe-admission-failed");
-  assert.deepEqual(summary.admission.reasons, [
-    "host-capabilities-not-current",
-    "host-capability-mismatch",
-    "topology-mismatch",
-    "topology-not-accepted",
-    "lanes-not-open",
-    "lane-sequences-missing",
-    "no-media-packets",
-    "no-reconstructed-frames",
-    "no-presented-frames",
-  ]);
 });
 
 test("Stream Lab rejects stale Worker and receiver compatibility before host launch", () => {
@@ -284,60 +176,6 @@ test("quiescent quality anchors bind the acknowledged clean IDR before tile warm
     qualityAnchorAlignmentOptions("png-quiescent-detail", "source-code", 0xffff_ffff),
     { presentedNetworkSequence: 0xffff_ffff },
   );
-});
-
-test("delta quality waits until every WSS lane has delivered the acknowledged IDR anchor", () => {
-  assert.equal(typeof liveModule.exactQualityAnchorAlignment, "function");
-  const source = {
-    generation: 7,
-    scene: "thin-lines",
-    seed: 469,
-    frameId: 0,
-    epochMs: 1_788_284_549_442,
-  };
-  const diagnostics = {
-    route: "wss",
-    glassToGlass: {
-      sequence: 0,
-      timestamp: source.epochMs >>> 0,
-    },
-    frameTrace: {
-      sequence: 802,
-      key: true,
-      encodedBytes: 13_506,
-      recovered: true,
-    },
-    wssMedia: {
-      protocol: 3,
-      topology: { laneCount: 16, dataShards: 15, parityShards: 1 },
-      openLanes: 16,
-      highestSequenceByLane: Array(16).fill(802),
-    },
-  };
-  diagnostics.wssMedia.highestSequenceByLane[14] = 799;
-
-  assert.throws(() => liveModule.exactQualityAnchorAlignment(
-    source,
-    diagnostics,
-    "quality",
-    qualityAnchorAlignmentOptions("png-quiescent-detail", source.scene, 802),
-    802,
-  ), error => error?.code === "quality-anchor-lane-delivery-pending" &&
-    error?.detail?.deliveredLanes === 15 &&
-    error?.detail?.laggingLanes?.[0]?.lane === 14 &&
-    error?.detail?.laggingLanes?.[0]?.sequence === 799);
-
-  diagnostics.wssMedia.highestSequenceByLane[14] = 802;
-  const aligned = liveModule.exactQualityAnchorAlignment(
-    source,
-    diagnostics,
-    "quality",
-    qualityAnchorAlignmentOptions("png-quiescent-detail", source.scene, 802),
-    802,
-  );
-  assert.equal(aligned.trace.network.sequence, 802);
-  assert.equal(aligned.laneDelivery.deliveredLanes, 16);
-  assert.deepEqual(aligned.laneDelivery.laggingLanes, []);
 });
 
 test("quiescent interaction readiness rejects tiles from the previous source frame", () => {
@@ -635,10 +473,9 @@ test("quality capture retries one healthy stale static frame after the paint bar
     route: "wss",
     signaling: { registered: true },
     wssMedia: {
-      openLanes: 6,
-      topology: { laneCount: 6, dataShards: 5, parityShards: 1 },
+      protocol: 4,
+      v4: { socketOpen: true, gateDrops: 0 },
       receivedBytes: 1_000,
-      dependencyLosses: 0,
       recoveryState: "healthy",
     },
   };
@@ -647,15 +484,15 @@ test("quality capture retries one healthy stale static frame after the paint bar
   assert.equal(shouldRetryQualityFrameMatch(healthy, 2_000, 1), false);
   assert.equal(shouldRetryQualityFrameMatch({
     ...healthy,
-    wssMedia: { ...healthy.wssMedia, openLanes: 4 },
+    wssMedia: { ...healthy.wssMedia, v4: { socketOpen: false, gateDrops: 0 } },
   }, 750, 0), false);
   assert.equal(shouldRetryQualityFrameMatch({
     ...healthy,
-    wssMedia: { ...healthy.wssMedia, dependencyLosses: 1 },
+    wssMedia: { ...healthy.wssMedia, v4: { socketOpen: true, gateDrops: 1 } },
   }, 750, 0), true);
   assert.equal(shouldRetryQualityFrameMatch({
     ...healthy,
-    wssMedia: { ...healthy.wssMedia, dependencyLosses: 1, recoveryState: "awaiting-keyframe" },
+    wssMedia: { ...healthy.wssMedia, recoveryState: "awaiting-keyframe" },
   }, 750, 0), false);
 });
 
@@ -733,32 +570,6 @@ test("quality capture retries an atomic same-identity frame until its detail til
   }
 });
 
-test("lane recovery quality is preservation-gated with source identity mandatory", () => {
-  const control = {
-    vmafP5: 88, ssimP5: 0.94, worstTileSsim: 0.81, edgeFidelity: 0.72,
-    colorError: 2, ocrCer: 0.08, blockArtifactSeverity: 4, exactFrameRatio: 1,
-  };
-  assert.equal(evaluateLaneRecoveryQuality(control, {
-    ...control, vmafP5: 87.5, worstTileSsim: 0.805,
-  }).accepted, true);
-  const regressed = evaluateLaneRecoveryQuality(control, {
-    ...control, vmafP5: 84, exactFrameRatio: 0.99,
-  });
-  assert.equal(regressed.accepted, false);
-  assert.deepEqual(regressed.reasons.sort(), ["exact-frame-regression", "vmafP5-regression"]);
-});
-
-test("lane recovery accepts any validated parity-protected WSS v3 topology", () => {
-  assert.deepEqual(laneRecoveryTopology({ laneCount: 6, dataShards: 5, parityShards: 1 }),
-    { laneCount: 6, dataShards: 5, parityShards: 1 });
-  assert.deepEqual(laneRecoveryTopology(),
-    { laneCount: 16, dataShards: 15, parityShards: 1 });
-  assert.throws(() => laneRecoveryTopology({ laneCount: 4, dataShards: 4, parityShards: 0 }),
-    /parity-protected/);
-  assert.throws(() => laneRecoveryTopology({ laneCount: 17, dataShards: 16, parityShards: 1 }),
-    /parity-protected/);
-});
-
 test("lane recovery quality repetitions use unique artifacts and robust fixed-control aggregates", async () => {
   const calls = [];
   const captures = [
@@ -790,237 +601,8 @@ test("lane recovery quality repetitions use unique artifacts and robust fixed-co
   assert.equal(result.noise.vmafP5, 1);
 });
 
-test("lane recovery quality uses an interleaved sham-loss-loss-sham comparison", async () => {
-  const calls = [];
-  const quality = [95, 90, 89, 88, 87, 86].map((vmafP5, index) => ({
-    id: `q${index}`,
-    vmafP5,
-    ssimP5: 0.95 - index * 0.001,
-    worstTileSsim: 0.82 - index * 0.001,
-    edgeFidelity: 0.74 - index * 0.001,
-    colorError: 2 + index * 0.1,
-    ocrCer: 0.05 + index * 0.001,
-    blockArtifactSeverity: 3 + index * 0.1,
-    exactFrameRatio: 1,
-  }));
-  const session = {
-    async collectQuality(id, scenes, options) {
-      calls.push({ type: "quality", id, scenes, options });
-      return quality.shift();
-    },
-    async collectWssLaneRecovery(options) {
-      calls.push({ type: "loss", options });
-      return { accepted: true, reasons: [], recoveryMs: 1_700 };
-    },
-  };
-  const waits = [];
-  const result = await collectLaneRecoveryQualitySequence(session, ["source-code"], {
-    qualityRepetitions: 2,
-    maxSamples: 1,
-    lossDurationMs: 1_500,
-    maxRecoveryMs: 5_000,
-    waiter: async durationMs => waits.push(durationMs),
-  });
-  assert.deepEqual(result.order, ["sham", "loss", "loss", "sham"]);
-  assert.deepEqual(calls.map(call => call.type), [
-    "quality", "quality", "quality", "loss", "quality", "loss", "quality", "quality",
-  ]);
-  assert.deepEqual(calls.filter(call => call.type === "quality").map(call => call.id), [
-    "lane-recovery-warmup",
-    "lane-recovery-q0",
-    "lane-recovery-q1-sham",
-    "lane-recovery-q2-loss",
-    "lane-recovery-q3-loss",
-    "lane-recovery-q4-sham",
-  ]);
-  assert.deepEqual(waits, [3_500, 3_500]);
-  assert.equal(result.sham.quality.accepted, true);
-  assert.equal(result.loss.quality.accepted, true);
-  assert.equal(result.accepted, true);
-  assert.deepEqual(result.reasons, []);
-  assert.equal(result.warmup.vmafP5, 95);
-  assert.equal(result.captures.includes(result.warmup), false);
-});
-
-test("lane recovery quality fails closed when the sham comparison is unstable", async () => {
-  const captures = [95, 90, 85, 84, 83, 78].map(vmafP5 => ({
-    vmafP5,
-    ssimP5: 0.95,
-    worstTileSsim: 0.82,
-    edgeFidelity: 0.74,
-    colorError: 2,
-    ocrCer: 0.05,
-    blockArtifactSeverity: 3,
-    exactFrameRatio: 1,
-  }));
-  const session = {
-    async collectQuality() { return captures.shift(); },
-    async collectWssLaneRecovery() {
-      return { accepted: true, reasons: [], recoveryMs: 1_700 };
-    },
-  };
-  const result = await collectLaneRecoveryQualitySequence(session, ["source-code"], {
-    qualityRepetitions: 2,
-    waiter: async () => {},
-  });
-  assert.equal(result.accepted, false);
-  assert.ok(result.reasons.includes("sham-unstable:vmafP5-regression"));
-});
-
-test("single-lane recovery requires live parity reconstruction and a healthy bounded return", () => {
-  const before = {
-    resyncs: 4,
-    mediaGeneration: 12,
-    wssMedia: {
-      protocol: 3,
-      topology: { laneCount: 16, dataShards: 15, parityShards: 1 },
-      openLanes: 16,
-      reconstructed: 100,
-      presented: 100,
-      recoveredFrames: 10,
-      dependencyLosses: 0,
-      recoveryState: "healthy",
-      highestSequenceByLane: Array(16).fill(100),
-    },
-  };
-  const during = {
-    ...before,
-    wssMedia: {
-      ...before.wssMedia,
-      openLanes: 15,
-      reconstructed: 120,
-      presented: 120,
-      recoveredFrames: 30,
-      highestSequenceByLane: [100, ...Array(15).fill(120)],
-    },
-  };
-  const after = {
-    ...before,
-    wssMedia: {
-      ...before.wssMedia,
-      reconstructed: 140,
-      presented: 140,
-      recoveredFrames: 31,
-      highestSequenceByLane: [139, ...Array(15).fill(140)],
-    },
-  };
-  const result = evaluateWssLaneRecovery(before, during, after, { recoveryMs: 1_240, maxRecoveryMs: 5_000 });
-  assert.equal(result.accepted, true);
-  assert.equal(result.reconstructedDuringLoss, 20);
-  assert.equal(result.presentedDuringLoss, 20);
-  assert.equal(result.recoveredFramesDuringLoss, 20);
-  assert.deepEqual(result.reasons, []);
-  const duplicateParity = { laneCount: 16, dataShards: 14, parityShards: 2 };
-  assert.equal(evaluateWssLaneRecovery(
-    { ...before, wssMedia: { ...before.wssMedia, topology: duplicateParity } },
-    { ...during, wssMedia: { ...during.wssMedia, topology: duplicateParity } },
-    { ...after, wssMedia: { ...after.wssMedia, topology: duplicateParity } },
-    { recoveryMs: 1_240, maxRecoveryMs: 5_000 },
-  ).accepted, true);
-});
-
-test("single-lane recovery rejects decoder resets, dependency loss, and missing parity use", () => {
-  const before = {
-    resyncs: 1,
-    mediaGeneration: 7,
-    wssMedia: {
-      protocol: 3,
-      topology: { laneCount: 16, dataShards: 15, parityShards: 1 },
-      openLanes: 16,
-      reconstructed: 10,
-      presented: 10,
-      recoveredFrames: 2,
-      dependencyLosses: 0,
-      recoveryState: "healthy",
-      highestSequenceByLane: Array(16).fill(10),
-    },
-  };
-  const during = {
-    ...before,
-    wssMedia: {
-      ...before.wssMedia,
-      openLanes: 15,
-      reconstructed: 10,
-      presented: 10,
-      highestSequenceByLane: [10, ...Array(15).fill(11)],
-    },
-  };
-  const after = {
-    ...before,
-    resyncs: 2,
-    mediaGeneration: 8,
-    wssMedia: {
-      ...before.wssMedia,
-      reconstructed: 11,
-      presented: 11,
-      dependencyLosses: 1,
-      highestSequenceByLane: Array(16).fill(12),
-    },
-  };
-  const result = evaluateWssLaneRecovery(before, during, after, { recoveryMs: 6_000, maxRecoveryMs: 5_000 });
-  assert.equal(result.accepted, false);
-  assert.deepEqual(result.reasons.sort(), [
-    "decoder-reset",
-    "dependency-loss",
-    "media-generation-changed",
-    "no-parity-reconstruction-during-loss",
-    "no-presented-frame-during-loss",
-    "recovery-timeout",
-  ]);
-});
-
-test("single-lane recovery rejects a reopened lane that never rejoins the sequence frontier", () => {
-  const topology = { laneCount: 6, dataShards: 5, parityShards: 1 };
-  const before = {
-    resyncs: 0,
-    mediaGeneration: 2,
-    wssMedia: {
-      protocol: 3,
-      topology,
-      openLanes: 6,
-      reconstructed: 100,
-      presented: 100,
-      recoveredFrames: 80,
-      dependencyLosses: 0,
-      recoveryState: "healthy",
-      highestSequenceByLane: [100, 100, 100, 100, 100, 100],
-    },
-  };
-  const during = {
-    ...before,
-    wssMedia: {
-      ...before.wssMedia,
-      openLanes: 5,
-      reconstructed: 120,
-      presented: 120,
-      recoveredFrames: 100,
-      highestSequenceByLane: [100, 120, 120, 120, 120, 120],
-    },
-  };
-  const after = {
-    ...before,
-    wssMedia: {
-      ...before.wssMedia,
-      reconstructed: 140,
-      presented: 140,
-      recoveredFrames: 120,
-      highestSequenceByLane: [100, 140, 140, 140, 140, 140],
-    },
-  };
-
-  const result = evaluateWssLaneRecovery(before, during, after, {
-    stripe: 0,
-    recoveryMs: 1_700,
-    maxRecoveryMs: 5_000,
-  });
-
-  assert.equal(result.accepted, false);
-  assert.ok(result.reasons.includes("returning-lane-stalled"));
-});
-
 test("WSS cohort admission requires consecutive recovery-free quorum progress", () => {
   assert.equal(typeof liveModule.advanceWssCohortAdmission, "function");
-  const topology = { laneCount: 16, dataShards: 15, parityShards: 1 };
   const snapshot = (sequence, options = {}) => ({
     route: "wss",
     resyncs: options.resyncs ?? 2,
@@ -1031,17 +613,11 @@ test("WSS cohort admission requires consecutive recovery-free quorum progress", 
       registeredAtMs: options.registeredAtMs ?? 1_000,
     },
     wssMedia: {
-      protocol: 3,
-      topology,
-      openLanes: options.openLanes ?? 15,
+      protocol: 4,
+      v4: { socketOpen: options.socketOpen ?? true, gateDrops: options.gateDrops ?? 0 },
       reconstructed: options.reconstructed ?? sequence,
       presented: options.presented ?? sequence,
-      dependencyLosses: options.dependencyLosses ?? 0,
       recoveryState: options.recoveryState ?? "healthy",
-      highestSequenceByLane: [
-        ...Array(15).fill(sequence),
-        options.paritySequence ?? 0,
-      ],
     },
   });
 
@@ -1074,7 +650,7 @@ test("WSS cohort admission requires consecutive recovery-free quorum progress", 
   });
   assert.equal(state.accepted, true);
   assert.equal(state.consecutiveProgressSamples, 3);
-  assert.equal(state.observation.advancedLanes, 15);
+  assert.equal(state.observation.mediaSocketOpen, true);
 
   const staleProgress = liveModule.evaluateWssCohortProgress(
     snapshot(150, { resyncs: 3 }),
@@ -1086,7 +662,6 @@ test("WSS cohort admission requires consecutive recovery-free quorum progress", 
 
 test("WSS cohort continuity classifies a post-admission recovery as infrastructure loss", () => {
   assert.equal(typeof liveModule.evaluateWssCohortContinuity, "function");
-  const topology = { laneCount: 16, dataShards: 15, parityShards: 1 };
   const admitted = {
     route: "wss",
     resyncs: 4,
@@ -1094,14 +669,11 @@ test("WSS cohort continuity classifies a post-admission recovery as infrastructu
     mediaGeneration: 9,
     signaling: { registered: true, registeredAtMs: 2_000 },
     wssMedia: {
-      protocol: 3,
-      topology,
-      openLanes: 16,
+      protocol: 4,
+      v4: { socketOpen: true, gateDrops: 0 },
       reconstructed: 200,
       presented: 200,
-      dependencyLosses: 0,
       recoveryState: "healthy",
-      highestSequenceByLane: Array(16).fill(200),
     },
   };
   const recovered = {
@@ -1113,8 +685,7 @@ test("WSS cohort continuity classifies a post-admission recovery as infrastructu
       ...admitted.wssMedia,
       reconstructed: 210,
       presented: 205,
-      dependencyLosses: 1,
-      highestSequenceByLane: Array(16).fill(210),
+      v4: { socketOpen: true, gateDrops: 1 },
     },
   };
 
@@ -1129,7 +700,6 @@ test("WSS cohort continuity classifies a post-admission recovery as infrastructu
 
 test("WSS cohort continuity accepts an intentionally paused static frame", () => {
   assert.equal(typeof liveModule.evaluateWssCohortContinuity, "function");
-  const topology = { laneCount: 16, dataShards: 15, parityShards: 1 };
   const admitted = {
     route: "wss",
     resyncs: 2,
@@ -1137,14 +707,11 @@ test("WSS cohort continuity accepts an intentionally paused static frame", () =>
     mediaGeneration: 7,
     signaling: { registered: true, registeredAtMs: 1_000 },
     wssMedia: {
-      protocol: 3,
-      topology,
-      openLanes: 16,
+      protocol: 4,
+      v4: { socketOpen: true, gateDrops: 0 },
       reconstructed: 415,
       presented: 415,
-      dependencyLosses: 0,
       recoveryState: "healthy",
-      highestSequenceByLane: Array(16).fill(415),
     },
   };
   const paused = {
@@ -1159,7 +726,6 @@ test("WSS cohort continuity accepts an intentionally paused static frame", () =>
 });
 
 test("WSS cohort continuity permits only an explicitly expected media generation transition", () => {
-  const topology = { laneCount: 16, dataShards: 15, parityShards: 1 };
   const admitted = {
     route: "wss",
     resyncs: 2,
@@ -1167,14 +733,11 @@ test("WSS cohort continuity permits only an explicitly expected media generation
     mediaGeneration: 7,
     signaling: { registered: true, registeredAtMs: 1_000 },
     wssMedia: {
-      protocol: 3,
-      topology,
-      openLanes: 16,
+      protocol: 4,
+      v4: { socketOpen: true, gateDrops: 0 },
       reconstructed: 415,
       presented: 415,
-      dependencyLosses: 0,
       recoveryState: "healthy",
-      highestSequenceByLane: Array(16).fill(415),
     },
   };
   const transitioned = {
@@ -1183,7 +746,6 @@ test("WSS cohort continuity permits only an explicitly expected media generation
     wssMedia: {
       ...admitted.wssMedia,
       reconstructed: 2,
-      highestSequenceByLane: Array(16).fill(2),
     },
   };
 
@@ -1196,7 +758,7 @@ test("WSS cohort continuity permits only an explicitly expected media generation
   }).accepted, true);
   assert.equal(liveModule.evaluateWssCohortContinuity(admitted, {
     ...transitioned,
-    wssMedia: { ...transitioned.wssMedia, dependencyLosses: 1 },
+    wssMedia: { ...transitioned.wssMedia, v4: { socketOpen: true, gateDrops: 1 } },
   }, {
     allowMediaGenerationChange: true,
   }).accepted, false);
@@ -1939,16 +1501,7 @@ test("quality capture fails closed unless source and decoded identities match ex
       sequence: 91,
       encodedBytes: 65_432,
       key: true,
-      recovered: false,
-      firstShardAtMs: 800,
-      firstShardEventAtMs: 797,
-      firstShardHandlerAtMs: 800,
-      firstShardQueueDelayMs: 3,
-      reconstructingShardAtMs: 820,
-      completingShardEventAtMs: 815,
-      completingShardHandlerAtMs: 820,
-      completingShardQueueDelayMs: 5,
-      reconstructedAtMs: 830,
+      receivedAtMs: 830,
       decodeQueuedAtMs: 850,
       decodedAtMs: 880,
       presentedAtMs: 900,
@@ -1962,14 +1515,7 @@ test("quality capture fails closed unless source and decoded identities match ex
   assert.equal(aligned.trace.phase, "quality");
   assert.equal(aligned.trace.encode.encodedBytes, 65_432);
   assert.equal(aligned.trace.encode.key, true);
-  assert.equal(aligned.trace.network.recovered, false);
-  assert.equal(aligned.trace.network.sequence, 91);
-  assert.equal(aligned.trace.network.firstShardAtMs, 800);
-  assert.equal(aligned.trace.network.firstShardEventAtMs, 797);
-  assert.equal(aligned.trace.network.firstShardQueueDelayMs, 3);
-  assert.equal(aligned.trace.network.reconstructingShardAtMs, 820);
-  assert.equal(aligned.trace.network.completingShardEventAtMs, 815);
-  assert.equal(aligned.trace.network.completingShardQueueDelayMs, 5);
+  assert.deepEqual(aligned.trace.network, { sequence: 91, receivedAtMs: 830 });
   assert.equal(aligned.trace.decode.queuedAtMs, 850);
   assert.equal(aligned.trace.presentation.presentedAtMs, 900);
   assert.throws(() => exactFrameAlignment(source, diagnostics, "quality", { afterNetworkSequence: 91 }),
@@ -2219,12 +1765,7 @@ test("performance tracing preserves receiver stages when the independently sampl
       sequence: 451,
       encodedBytes: 12_345,
       key: false,
-      recovered: true,
-      firstShardHostSentAtEpochMs: 1_699_999_999_868,
-      firstShardEdgeAtEpochMs: 1_699_999_999_870,
-      firstShardAtMs: 800,
-      reconstructingShardAtMs: 824,
-      reconstructedAtMs: 824.2,
+      receivedAtMs: 824.2,
       decodeQueuedAtMs: 824.4,
       decodedAtMs: 830,
       presentedAtMs: 832,
@@ -2234,16 +1775,7 @@ test("performance tracing preserves receiver stages when the independently sampl
   const trace = performanceFrameTrace(source, diagnostics);
   assert.equal(trace.identity, null);
   assert.equal(trace.trace.phase, "performance-unmatched");
-  assert.equal(trace.trace.network.sequence, 451);
-  assert.equal(trace.trace.network.recovered, true);
-  assert.equal(trace.trace.network.firstShardAtMs, 800);
-  assert.equal(trace.trace.network.sourceToHostEgressMs, 10);
-  assert.equal(trace.trace.network.hostEgressToEdgeMs, 2);
-  assert.equal(trace.trace.network.hostEgressToFirstShardMs, 32);
-  assert.equal(trace.trace.network.sourceToEdgeMs, 12);
-  assert.equal(trace.trace.network.edgeToFirstShardMs, 30);
-  assert.equal(trace.trace.network.sourceToFirstShardMs, 42);
-  assert.equal(trace.trace.network.reconstructedAtMs, 824.2);
+  assert.deepEqual(trace.trace.network, { sequence: 451, receivedAtMs: 824.2 });
   assert.equal(trace.trace.decode.decodedAtMs, 830);
   assert.equal(trace.trace.presentation.presentedAtMs, 832);
   assert.equal(trace.trace.presentation.sourceToPresentedMs, 74);
@@ -2440,32 +1972,15 @@ test("session receiver options keep the decoder path across partial transport sw
   assert.equal(sameReceiverOptions(normalizeReceiverOptions({ relay: true }, current), current), false);
 });
 
-test("receiver URL carries only validated protocol-v3 topology controls", () => {
-  const labRun = "123e4567-e89b-42d3-a456-426614174000";
-  const url = buildReceiverUrl("https://play.example/", "wss", {
-    labRun, wssTopology: { laneCount: 9, dataShards: 8, parityShards: 1 },
-  });
-  assert.equal(url.searchParams.get("wssLanes"), "9");
-  assert.equal(url.searchParams.get("wssParity"), "1");
-  const duplicateParity = buildReceiverUrl("https://play.example/", "wss", {
-    labRun, wssTopology: { laneCount: 16, dataShards: 14, parityShards: 2 },
-  });
-  assert.equal(duplicateParity.searchParams.get("wssLanes"), "16");
-  assert.equal(duplicateParity.searchParams.get("wssParity"), "2");
-  assert.throws(() => buildReceiverUrl("https://play.example/", "wss", {
-    labRun, wssTopology: { laneCount: 17, dataShards: 16, parityShards: 1 },
-  }), /topology/i);
-});
-
 test("candidate host launch reuses the broker-owned VDD and reads only its scratch profile", () => {
   const runId = "123e4567-e89b-42d3-a456-426614174000";
   const profilePath = "C:\\lab\\candidate-profile.json";
   assert.equal(buildLabHostUrl("https://play.example/something", runId).href,
-    `wss://play.example/lab-host-ws?run=${runId}&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15`);
+    `wss://play.example/lab-host-ws?run=${runId}&compat=wss-v4-bench2-hevc-tiles-bpip4-v16`);
   const launch = buildCandidateHostLaunch("C:\\lab\\bubbleplay-host.exe", "https://play.example/", runId, profilePath);
   assert.equal(launch.command, "C:\\lab\\bubbleplay-host.exe");
   assert.deepEqual(launch.args.slice(0, 4), ["--mode", "serve", "--worker",
-    `wss://play.example/lab-host-ws?run=${runId}&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15`]);
+    `wss://play.example/lab-host-ws?run=${runId}&compat=wss-v4-bench2-hevc-tiles-bpip4-v16`]);
   assert.deepEqual(launch.args.slice(-2), ["--benchmark-profile", profilePath]);
   assert.deepEqual(launch.env, {
     BUBBLEPLAY_LAB_IDR_TELEMETRY: "1",
@@ -2520,50 +2035,8 @@ test("persistent lab display is resolved from the host's Parsec monitor identity
   assert.throws(() => selectPersistentVirtualDisplay(displays.slice(0, 2), monitors), /not attached/i);
 });
 
-test("topology parity trials alternate order and repeat every candidate", () => {
-  const topologies = [null,
-    { laneCount: 5, dataShards: 4, parityShards: 1 },
-    { laneCount: 9, dataShards: 8, parityShards: 1 },
-  ];
-  const trials = buildTopologyTrialPlan(topologies, 3);
-  assert.equal(trials.length, 9);
-  assert.deepEqual(trials.slice(0, 3).map(trial => trial.id), ["v2-3+1", "v3-4+1", "v3-8+1"]);
-  assert.deepEqual(trials.slice(3, 6).map(trial => trial.id), ["v2-3+1", "v3-8+1", "v3-4+1"]);
-  assert.deepEqual(trials.slice(6).map(trial => trial.id), ["v2-3+1", "v3-4+1", "v3-8+1"]);
-  assert.throws(() => buildTopologyTrialPlan(topologies, 0), /repetitions/);
-});
-
-test("corrected-score quality topology frontier retains the measured 5+1, 8+1, and 15+1 comparison", () => {
-  assert.deepEqual(defaultTopologyFrontier({ quality: true }), [
-    { laneCount: 6, dataShards: 5, parityShards: 1 },
-    { laneCount: 9, dataShards: 8, parityShards: 1 },
-    { laneCount: 16, dataShards: 15, parityShards: 1 },
-  ]);
-});
-
 test("live sessions expose a bounded transport restart for topology first-frame recovery", () => {
   assert.equal(typeof LiveStreamLabSession.prototype.restartTransport, "function");
-});
-
-test("topology apply retries one first-frame timeout and no other failure", async () => {
-  const events = [];
-  const session = {
-    receiverOptions: { wssTopology: { laneCount: 5, dataShards: 4, parityShards: 1 } },
-    store: { appendTelemetry: event => events.push(event.phase) },
-    async apply() {
-      events.push("apply");
-      if (events.filter(event => event === "apply").length === 1)
-        throw Object.assign(new Error("startup"), { code: "first-frame-timeout" });
-      return "ready";
-    },
-    async restartTransport() { events.push("restart"); },
-  };
-  assert.equal(await applyWithFirstFrameRetry(session, { id: "candidate" }, 4), "ready");
-  assert.deepEqual(events, ["apply", "topology-first-frame-retry", "restart", "apply"]);
-  const broken = { ...session, async apply() { throw Object.assign(new Error("decode"), { code: "decoder-failed" }); } };
-  await assert.rejects(applyWithFirstFrameRetry(broken, { id: "candidate" }, 4), /decode/);
-  const source = readFileSync(new URL("../tools/stream-lab-live.mjs", import.meta.url), "utf8");
-  assert.match(source, /runLiveTopologySweep[\s\S]*?applyWithFirstFrameRetry\(session, effective, bandwidthMbps\)/);
 });
 
 test("receiver Chrome starts minimized until it can be moved behind the lab source", () => {
@@ -2801,13 +2274,12 @@ test("benchmark profile v2 normalizes pipeline controls and preserves exact appl
   const profile = benchmarkProfile({ schemaVersion: 2, implementationVariant: "candidate", experimentId: "enc-work-001",
     preset: "p7", tuning: "ultra-low-latency", multipass: "full", aqMode: "spatial", aqStrength: 15,
     vbvFrames: 4, lookaheadFrames: 2, weightedPrediction: true, dirtyQpMap: true, main10: false,
-    bitrateMbps: 6, gopSeconds: 2,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 } }, "wss");
+    bitrateMbps: 6, gopSeconds: 2, }, "wss");
   assert.deepEqual(profile, {
     schemaVersion: 2, implementationVariant: "candidate", experimentId: "enc-work-001",
     transport: "wss", codec: "hevc", streamMode: "work", adaptive: false,
     width: 1920, height: 1080, fps: 30, bitrateBps: 6_000_000, gopSeconds: 2,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 }, hybridMode: "off",
+    hybridMode: "off",
     hybridCacheMode: "suppress-reactivate",
     encoder: { preset: "p7", tuning: "ultra-low-latency", multipass: "full", aqMode: "spatial",
       aqStrength: 15, vbvFrames: 4, lookaheadDepth: 2, weightedPrediction: true, dirtyQpMap: true,
@@ -2826,7 +2298,6 @@ test("benchmark profile v2 normalizes pipeline controls and preserves exact appl
   assert.throws(() => benchmarkProfile({ schemaVersion: 2, implementationVariant: "candidate", experimentId: "mixed",
     preset: "p3", multipass: "disabled", aqMode: "spatial", aqStrength: 8, vbvFrames: 1,
     lookaheadFrames: 0, weightedPrediction: false, bitrateMbps: 6, gopSeconds: 2,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
     roiMode: "damage", hybridMode: "png-static-roi" }), /experiment|axis|controls/i);
 });
 
@@ -2838,7 +2309,6 @@ test("benchmark profile v2 preserves the bounded external-budget VBR contract", 
     dirtyQpMap: false, main10: false, roiMode: "off", resourceMode: "per-frame", asyncDepth: 0,
     hybridMode: "off", rateControlMode: "external-budget-vbr", targetQuality: 23,
     peakBitrateMultiplier: 4, requestedBitrateMbps: 6, totalMediaCapMbps: 6,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
   };
   const profile = benchmarkProfile(candidate, "wss");
   assert.equal(profile.encoder.rateControlMode, "external-budget-vbr");
@@ -2863,7 +2333,6 @@ test("a shaped pipeline candidate retains its six-megabit cohort while lowering 
     preset: "p3", tuning: "ultra-low-latency", multipass: "disabled", aqMode: "spatial",
     aqStrength: 8, vbvFrames: 1, lookaheadFrames: 0, weightedPrediction: false,
     bitrateMbps: 5.4, requestedBitrateMbps: 6, totalMediaCapMbps: 6, gopSeconds: 2,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
     hybridMode: "png-quiescent-detail", hybridCacheMode: "dda-gated",
   };
 
@@ -3120,146 +2589,22 @@ test("performance summary preserves exact WSS immediate-presentation counter del
   });
 });
 
-test("performance summary reports continuous WSS stage and per-lane arrival distributions", () => {
-  const windowMetrics = { windowDurationMs: 1_000, encodedBytes: 100_000, wssPayloadBytes: 110_000,
-    encodeCount: 30, encodeUsTotal: 90_000, encodeUsMax: 5_000, idrCount: 1, deltaCount: 29 };
-  const topology = { laneCount: 6, dataShards: 5, parityShards: 1 };
-  const withTrace = (elapsedMs, frames, sequence, firstShardAtMs, reconstructedAtMs, decodedAtMs,
-    presentedAtMs, firstQueueDelayMs, completingQueueDelayMs, laneTelemetry) => ({
-    ...sample(elapsedMs, frames, sequence, windowMetrics),
-    wssMedia: {
-      receivedBytes: elapsedMs * 100 + 10_000,
-      receivedPackets: sequence,
-      protocol: 3,
-      topology,
-      ...laneTelemetry,
-    },
-    frameTrace: {
-      identity: null,
-      trace: {
-        phase: "performance-unmatched",
-        encode: { encodedBytes: 5_000 },
-        network: {
-          sequence,
-          sourceToFirstShardMs: firstShardAtMs / 10,
-          sourceToHostEgressMs: firstShardAtMs / 25,
-          hostEgressToEdgeMs: firstShardAtMs / 100,
-          hostEgressToFirstShardMs: firstShardAtMs / 20,
-          sourceToEdgeMs: firstShardAtMs / 20,
-          edgeToFirstShardMs: firstShardAtMs / 25,
-          firstShardAtMs,
-          firstShardEventAtMs: firstShardAtMs - firstQueueDelayMs,
-          firstShardHandlerAtMs: firstShardAtMs,
-          firstShardQueueDelayMs: firstQueueDelayMs,
-          reconstructingShardAtMs: reconstructedAtMs,
-          completingShardEventAtMs: reconstructedAtMs - completingQueueDelayMs,
-          completingShardHandlerAtMs: reconstructedAtMs,
-          completingShardQueueDelayMs: completingQueueDelayMs,
-          reconstructedAtMs,
-          recovered: false,
-        },
-        decode: { queuedAtMs: reconstructedAtMs, decodedAtMs },
-        presentation: { presentedAtMs, sourceToPresentedMs: presentedAtMs / 2 },
-      },
-    },
-  });
-  const samples = [
-    withTrace(0, 0, 1, 100, 110, 114, 116, 1, 2, {
-      reconstructed: 100,
-      recoveredFrames: 80,
-      highestSequenceByLane: [100, 100, 100, 100, 100, 100],
-      completionMissingByLane: [50, 10, 5, 5, 0, 10],
-      lateShardCountByLane: [50, 10, 5, 5, 0, 10],
-      lateShardDelayMsTotalByLane: [100, 20, 5, 10, 0, 40],
-    }),
-    withTrace(1_000, 30, 2, 200, 220, 225, 228, 2, 4, {
-      reconstructed: 130,
-      recoveredFrames: 105,
-      highestSequenceByLane: [130, 126, 130, 129, 130, 130],
-      completionMissingByLane: [65, 12, 8, 8, 2, 15],
-      lateShardCountByLane: [65, 12, 8, 8, 2, 15],
-      lateShardDelayMsTotalByLane: [145, 24, 14, 16, 4, 50],
-    }),
-    withTrace(2_000, 60, 3, 300, 330, 336, 340, 3, 6, {
-      reconstructed: 160,
-      recoveredFrames: 130,
-      highestSequenceByLane: [160, 152, 160, 158, 160, 160],
-      completionMissingByLane: [80, 15, 10, 10, 5, 20],
-      lateShardCountByLane: [80, 15, 10, 10, 5, 20],
-      lateShardDelayMsTotalByLane: [190, 30, 20, 20, 10, 60],
-    }),
-  ];
-
-  const metrics = summarizePerformance(samples, { transport: "wss", bandwidthMbps: 4 });
-  assert.equal(metrics.performanceTraceSamples, 3);
-  assert.equal(metrics.sourceToFirstShardP50Ms, 20);
-  assert.equal(metrics.sourceToFirstShardP95Ms, 30);
-  assert.equal(metrics.sourceToHostEgressP50Ms, 8);
-  assert.equal(metrics.sourceToHostEgressP95Ms, 12);
-  assert.equal(metrics.hostEgressToEdgeP50Ms, 2);
-  assert.equal(metrics.hostEgressToEdgeP95Ms, 3);
-  assert.equal(metrics.hostEgressToFirstShardP50Ms, 10);
-  assert.equal(metrics.hostEgressToFirstShardP95Ms, 15);
-  assert.equal(metrics.sourceToEdgeP50Ms, 10);
-  assert.equal(metrics.sourceToEdgeP95Ms, 15);
-  assert.equal(metrics.edgeToFirstShardP50Ms, 8);
-  assert.equal(metrics.edgeToFirstShardP95Ms, 12);
-  assert.equal(metrics.sourceToPresentedP50Ms, 114);
-  assert.equal(metrics.sourceToPresentedP95Ms, 170);
-  assert.equal(metrics.networkAssemblyP50Ms, 20);
-  assert.equal(metrics.networkAssemblyP95Ms, 30);
-  assert.equal(metrics.networkSerializationEstimateP50Ms, 8);
-  assert.equal(metrics.networkSerializationEstimateP95Ms, 8);
-  assert.equal(metrics.networkAssemblyResidualP50Ms, 12);
-  assert.equal(metrics.networkAssemblyResidualP95Ms, 22);
-  assert.equal(metrics.browserEventQueueDelayP50Ms, 2);
-  assert.equal(metrics.browserEventQueueDelayP95Ms, 6);
-  assert.equal(metrics.browserFirstShardQueueP50Ms, 2);
-  assert.equal(metrics.browserFirstShardQueueP95Ms, 3);
-  assert.equal(metrics.browserCompletingShardQueueP50Ms, 4);
-  assert.equal(metrics.browserCompletingShardQueueP95Ms, 6);
-  assert.equal(metrics.decodeP50Ms, 5);
-  assert.equal(metrics.decodeP95Ms, 6);
-  assert.equal(metrics.presentationP50Ms, 3);
-  assert.equal(metrics.presentationP95Ms, 4);
-  assert.equal(metrics.shardToPresentP50Ms, 28);
-  assert.equal(metrics.shardToPresentP95Ms, 40);
-  assert.deepEqual(metrics.wssLaneTelemetry, {
-    topology,
-    reconstructedFrames: 60,
-    parityRecoveredFrames: 50,
-    parityRecoveryRatio: 5 / 6,
-    sequenceLagSampleCount: 3,
-    sequenceLagMeanByLane: [0, 4, 0, 1, 0, 0],
-    sequenceLagP95ByLane: [0, 8, 0, 2, 0, 0],
-    sequenceLagMaxByLane: [0, 8, 0, 2, 0, 0],
-    sequenceLagPositiveShareByLane: [0, 2 / 3, 0, 2 / 3, 0, 0],
-    completionMissingByLane: [30, 5, 5, 5, 5, 10],
-    completionShareByLane: [0.5, 1 / 12, 1 / 12, 1 / 12, 1 / 12, 1 / 6],
-    lateShardCountByLane: [30, 5, 5, 5, 5, 10],
-    lateShardDelayMsTotalByLane: [90, 10, 15, 10, 10, 20],
-    lateShardDelayMsMeanByLane: [3, 2, 3, 2, 2, 2],
-  });
-});
-
 test("wire budgeting can go below the experiment floor and converges toward ninety percent of the cap", () => {
-  const v2 = { laneCount: 4, dataShards: 3, parityShards: 1 };
-  assert.equal(initialEncoderTargetMbps(6, 2, v2), 1.1);
+  assert.equal(initialEncoderTargetMbps(6, 2), 1.5);
   assert.equal(nextStabilizedBitrateMbps(1.1, 2.2, 2), 0.9);
   assert.equal(nextStabilizedBitrateMbps(1, 0.5, 2), 1.8);
   assert.equal(nextStabilizedBitrateMbps(0.5, 4, 2), 0.5);
 });
 
 test("a matching six-megabit total cap starts from the unchanged encoder target", () => {
-  const control = { laneCount: 16, dataShards: 15, parityShards: 1 };
-  assert.equal(initialEncoderTargetMbps(6, 6, control), 6);
-  assert.equal(initialEncoderTargetMbps(6, 4, control), 2.8);
+  assert.equal(initialEncoderTargetMbps(6, 6), 6);
+  assert.equal(initialEncoderTargetMbps(6, 4), 3);
 });
 
 test("a verified six-megabit candidate does not drift below its control target", async () => {
   const applied = [];
   const session = {
-    receiverOptions: { wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 } },
+    receiverOptions: {},
     qosPolicy: { active: true, bandwidthMbps: 6 },
     lastFirstFrameMs: 100,
     async apply(configuration) { applied.push(configuration.bitrateMbps); },
@@ -3297,7 +2642,6 @@ test("a verified six-megabit candidate does not drift below its control target",
     bitrateMbps: 6,
     gopSeconds: 2,
     hybridMode: "png-quiescent-detail",
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
   };
 
   const result = await stabilizeEncoderForCap(session, configuration, 6, { stabilizationSeconds: 5 });
@@ -3310,7 +2654,7 @@ test("a pipeline candidate survives a cap-driven encoder correction without leav
   const applied = [];
   let target = 6;
   const session = {
-    receiverOptions: { wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 } },
+    receiverOptions: {},
     qosPolicy: { active: true, bandwidthMbps: 6 },
     lastFirstFrameMs: 100,
     async apply(configuration) {
@@ -3344,7 +2688,6 @@ test("a pipeline candidate survives a cap-driven encoder correction without leav
     aqStrength: 8, vbvFrames: 1, lookaheadFrames: 0, weightedPrediction: false,
     bitrateMbps: 6, gopSeconds: 2,
     hybridMode: "png-quiescent-detail", hybridCacheMode: "suppress-reactivate",
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
   };
 
   const result = await stabilizeEncoderForCap(session, configuration, 6, { stabilizationSeconds: 5 });
@@ -3380,7 +2723,7 @@ test("verified shaping reports decoder resets as a runtime hard-gate failure", a
   let performancePass = 0;
   let qualityStarted = false;
   const session = {
-    receiverOptions: { wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 } },
+    receiverOptions: {},
     qosPolicy,
     lastFirstFrameMs: 100,
     async apply() {},
@@ -3419,7 +2762,7 @@ test("verified shaping reports decoder resets as a runtime hard-gate failure", a
 test("shaped encoder stabilization makes at most two corrections and never captures quality on failure", async () => {
   const applied = [];
   const session = {
-    receiverOptions: { wssTopology: { laneCount: 4, dataShards: 3, parityShards: 1 } },
+    receiverOptions: {},
     qosPolicy: { active: true, bandwidthMbps: 2 },
     lastFirstFrameMs: 500,
     async apply(configuration) { applied.push(configuration.bitrateMbps); },
@@ -3444,7 +2787,7 @@ test("shaped encoder stabilization makes at most two corrections and never captu
     bitrateMbps: 6, gopSeconds: 2,
   }, 2, { stabilizationSeconds: 5 }), error => error?.code === "bandwidth-shaping-unverified");
   assert.equal(applied.length, 3);
-  assert.equal(applied[0], 1.1);
+  assert.equal(applied[0], 1.5);
   assert.ok(applied.every(value => value >= 0.5));
 });
 
@@ -3452,12 +2795,12 @@ test("a repeated cap starts from the session's previously proven safe encoder ta
   const applied = [];
   let target = null;
   const session = {
-    receiverOptions: { wssTopology: { laneCount: 4, dataShards: 3, parityShards: 1 } },
+    receiverOptions: {},
     qosPolicy: { active: true, bandwidthMbps: 2 },
     lastFirstFrameMs: 100,
     async apply(configuration) { target = configuration.bitrateMbps; applied.push(target); },
     async collectPerformance() {
-      const offered = target === 1.1 ? 1.92 : target === 1 ? 1.91 : 1.55;
+      const offered = target === 1.5 ? 2.7 : target === 1 ? 1.91 : 1.55;
       const delivered = Math.min(1.9, offered);
       const samples = [];
       for (let second = 0; second <= 5; second++) samples.push({
@@ -3483,19 +2826,19 @@ test("a repeated cap starts from the session's previously proven safe encoder ta
   const second = await stabilizeEncoderForCap(session, configuration, 2, { stabilizationSeconds: 5 });
   assert.equal(first.stabilizedEncoderBitrateMbps, 0.9);
   assert.equal(second.initialEncoderBitrateMbps, 0.9);
-  assert.deepEqual(applied, [1.1, 1, 0.9, 0.9]);
+  assert.deepEqual(applied, [1.5, 1, 0.9, 0.9]);
 });
 
 test("a repeated cap reuses an upward-stabilized encoder target without drifting back down", async () => {
   const applied = [];
   let target = null;
   const session = {
-    receiverOptions: { wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 } },
+    receiverOptions: {},
     qosPolicy: { active: true, bandwidthMbps: 4 },
     lastFirstFrameMs: 100,
     async apply(configuration) { target = configuration.bitrateMbps; applied.push(target); },
     async collectPerformance() {
-      const offered = target === 2.8 ? 3.34 : 3.55;
+      const offered = target === 3 ? 3.2 : 3.55;
       const samples = [];
       for (let second = 0; second <= 5; second++) samples.push({
         ...sample(second * 1_000, second * 30, second + 1, {
@@ -3515,13 +2858,12 @@ test("a repeated cap reuses an upward-stabilized encoder target without drifting
     preset: "p3", tuning: "ultra-low-latency", multipass: "disabled", aqMode: "spatial",
     aqStrength: 8, vbvFrames: 1, lookaheadFrames: 0, weightedPrediction: false,
     bitrateMbps: 6, gopSeconds: 2,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
   };
   const first = await stabilizeEncoderForCap(session, configuration, 4, { stabilizationSeconds: 5 });
   const second = await stabilizeEncoderForCap(session, configuration, 4, { stabilizationSeconds: 5 });
-  assert.equal(first.stabilizedEncoderBitrateMbps, 3);
-  assert.equal(second.initialEncoderBitrateMbps, 3);
-  assert.deepEqual(applied, [2.8, 3, 3]);
+  assert.equal(first.stabilizedEncoderBitrateMbps, 3.4);
+  assert.equal(second.initialEncoderBitrateMbps, 3.4);
+  assert.deepEqual(applied, [3, 3.4, 3.4]);
 });
 
 test("post-apply readiness requires a newer full effective benchmark profile", () => {
@@ -3540,41 +2882,12 @@ test("post-apply readiness requires a newer full effective benchmark profile", (
     { ...status, profileRevision: undefined, sequence: 2 }, expected, status.runId), false);
 });
 
-test("post-apply readiness treats reordered WSS topology fields as the same profile", () => {
-  const expected = benchmarkProfile({ schemaVersion: 2, implementationVariant: "candidate",
-    experimentId: "dirty-qp-map", preset: "p3", tuning: "ultra-low-latency",
-    multipass: "disabled", aqMode: "spatial", aqStrength: 8, vbvFrames: 1,
-    lookaheadFrames: 0, weightedPrediction: false, dirtyQpMap: true, main10: false,
-    bitrateMbps: 6, gopSeconds: 2,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 } }, "wss");
-  const runId = "ee1d494a-541f-430e-a9a6-2d82e6125cc7";
-  const { schemaVersion, adaptive, wssTopology, ...effective } = expected;
-  const status = {
-    protocol: 2,
-    runId,
-    profileRevision: 1,
-    sequence: 3,
-    phase: "sample",
-    effective: {
-      ...effective,
-      wssTopology: {
-        dataShards: wssTopology.dataShards,
-        laneCount: wssTopology.laneCount,
-        parityShards: wssTopology.parityShards,
-      },
-    },
-  };
-
-  assert.equal(benchStatusConfirmsApply(null, status, expected, runId), true);
-});
-
 test("feedback profile admission waits for an active reconstruction analyzer", () => {
   const expected = benchmarkProfile({ schemaVersion: 2, implementationVariant: "candidate",
     experimentId: "feedback-roi", preset: "p3", tuning: "ultra-low-latency",
     multipass: "disabled", aqMode: "spatial", aqStrength: 8, vbvFrames: 1,
     lookaheadFrames: 0, weightedPrediction: false, roiMode: "feedback", main10: false,
-    bitrateMbps: 6, gopSeconds: 2,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 } }, "wss");
+    bitrateMbps: 6, gopSeconds: 2, }, "wss");
   const runId = "ee1d494a-541f-430e-a9a6-2d82e6125cc7";
   const { schemaVersion, adaptive, ...effective } = expected;
   const status = { protocol: 2, runId, profileRevision: 1, sequence: 3, phase: "sample",
@@ -3787,121 +3100,10 @@ test("native readiness proves presented HEVC frames instead of the HUD label", (
   assert.equal(wss.decoderOkay, true);
 });
 
-test("native-to-WSS navigation retains the lab v3 contract before host capabilities arrive", async () => {
-  const urls = [];
-  const session = {
-    transport: "wss", receiverOptions: normalizeReceiverOptions(),
-    runId: "123e4567-e89b-42d3-a456-426614174000", baseUrl: "https://play.example/",
-    assertLeaseHealthy() {}, async waitForAuthentication() {},
-    receiver: { async navigate(url) { urls.push(new URL(url)); } },
-  };
-  await liveModule.LiveStreamLabSession.prototype.switchTransport.call(session, "webrtc",
-    { relay: false, decoderPath: "native" });
-  await liveModule.LiveStreamLabSession.prototype.switchTransport.call(session, "wss", { adaptive: false });
-  assert.equal(urls[0].searchParams.get("decoderPath"), "native");
-  assert.equal(urls[0].searchParams.has("wssLanes"), false);
-  assert.equal(urls[1].searchParams.get("wssLanes"), "16");
-  assert.equal(urls[1].searchParams.get("wssParity"), "1");
-  assert.equal(urls[1].searchParams.get("decoderPath"), "webcodecs");
-  assert.equal(session.receiverOptions.decoderPath, "native");
-});
-
 test("native playback cannot enter the source-barcode benchmark", async () => {
   await assert.rejects(() => liveModule.LiveStreamLabSession.prototype.applyCandidateProfile.call(
     { receiverOptions: { decoderPath: "native" }, transport: "webrtc" }, { codec: "hevc" }),
     error => error.code === "native-benchmark-unavailable");
-});
-
-test("startup classification distinguishes a missing recovery ACK from a silent DDA session", () => {
-  assert.equal(typeof liveModule.classifySilentDdaFailure, "function");
-  const state = {
-    rendered: true,
-    routeOkay: true,
-    decoderOkay: true,
-    benchOkay: true,
-    fresh: false,
-    ready: false,
-  };
-  const diagnostics = {
-    renderedAgeMs: 1_600,
-    benchStatus: { encodeCount: 0, encodedBytes: 0, wssPayloadBytes: 0 },
-    wssMedia: {
-      openLanes: 16,
-      receivedPackets: 32,
-      reconstructed: 2,
-      presented: 2,
-      highestSequenceByLane: Array(16).fill(2),
-      acknowledgements: {
-        attempts: 1,
-        sent: 1,
-        failed: 0,
-        last: { generation: 2, reconstructed: 2, sent: true },
-      },
-      dependencyLosses: 0,
-      packetRejects: { total: 0 },
-      topology: { laneCount: 16, dataShards: 15, parityShards: 1 },
-    },
-  };
-  const expectedSource = { frameId: 613, epochMs: 1_000 };
-  const movingSource = { frameId: 690, epochMs: 2_000, paused: false };
-
-  assert.deepEqual(liveModule.classifySilentDdaFailure(
-    state, diagnostics, expectedSource, movingSource, 1_500), {
-    code: "dda-session-stalled",
-    sourceFrameDelta: 77,
-    renderedAgeMs: 1_600,
-    openLanes: 16,
-    receivedPackets: 32,
-  });
-  const legacyRecoveryAckBlocked = {
-    ...diagnostics,
-    wssMedia: {
-      ...diagnostics.wssMedia,
-      receivedPackets: 16,
-      reconstructed: 1,
-      presented: 1,
-      highestSequenceByLane: Array(16).fill(1),
-      acknowledgements: null,
-    },
-  };
-  assert.deepEqual(liveModule.classifySilentDdaFailure(
-    state, legacyRecoveryAckBlocked, expectedSource, movingSource, 1_500), {
-    code: "wss-recovery-ack-stalled",
-    sourceFrameDelta: 77,
-    renderedAgeMs: 1_600,
-    openLanes: 16,
-    receivedPackets: 16,
-    reconstructed: 1,
-    presented: 1,
-    ackDisposition: "uninstrumented",
-    acknowledgements: null,
-  });
-  const recoveryAckNotAttempted = {
-    ...legacyRecoveryAckBlocked,
-    wssMedia: {
-      ...legacyRecoveryAckBlocked.wssMedia,
-      acknowledgements: { attempts: 0, sent: 0, failed: 0, last: null },
-    },
-  };
-  assert.deepEqual(liveModule.classifySilentDdaFailure(
-    state, recoveryAckNotAttempted, expectedSource, movingSource, 1_500), {
-    code: "wss-recovery-ack-stalled",
-    sourceFrameDelta: 77,
-    renderedAgeMs: 1_600,
-    openLanes: 16,
-    receivedPackets: 16,
-    reconstructed: 1,
-    presented: 1,
-    ackDisposition: "not-attempted",
-    acknowledgements: { attempts: 0, sent: 0, failed: 0, last: null },
-  });
-  assert.equal(liveModule.classifySilentDdaFailure(
-    state, diagnostics, expectedSource, movingSource, 1_249), null);
-  assert.equal(liveModule.classifySilentDdaFailure(
-    state, diagnostics, expectedSource, { ...movingSource, frameId: 613 }, 1_500), null);
-  assert.equal(liveModule.classifySilentDdaFailure(
-    state, { ...diagnostics, benchStatus: { ...diagnostics.benchStatus, encodeCount: 1 } },
-    expectedSource, movingSource, 1_500), null);
 });
 
 test("a confirmed zero-output candidate startup is rejected without masking infrastructure failures", () => {
@@ -4220,3 +3422,22 @@ function sample(elapsedMs, frames, sequence, benchMetrics) {
     },
   };
 }
+
+test("candidate apply retries one first-frame timeout and no other failure", async () => {
+  const events = [];
+  const session = {
+    receiverOptions: {},
+    store: { appendTelemetry: event => events.push(event.phase) },
+    async apply() {
+      events.push("apply");
+      if (events.filter(event => event === "apply").length === 1)
+        throw Object.assign(new Error("startup"), { code: "first-frame-timeout" });
+      return "ready";
+    },
+    async restartTransport() { events.push("restart"); },
+  };
+  assert.equal(await applyWithFirstFrameRetry(session, { id: "candidate" }, 4), "ready");
+  assert.deepEqual(events, ["apply", "first-frame-retry", "restart", "apply"]);
+  const broken = { ...session, async apply() { throw Object.assign(new Error("decode"), { code: "decoder-failed" }); } };
+  await assert.rejects(applyWithFirstFrameRetry(broken, { id: "candidate" }, 4), /decode/);
+});

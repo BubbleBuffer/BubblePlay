@@ -4,10 +4,10 @@ use super::{
     BenchStageTiming, BenchmarkHybridMode, BenchmarkRoiMode, BenchmarkStreamMode,
     BenchmarkTransport, DamageCoverageAudit, DeferredReadbackActivity, Duration,
     EncodeStageTimings, FeedbackBudgetPolicy, FeedbackPlan, FeedbackPlanReason,
-    FeedbackWireDecision, HybridTileOperation, HybridWireBudget, LabRoiReason, LabRoiTrace,
-    QuiescentTilePlan, QuiescentTilePlanner, QuiescentValidationStatus,
-    ReconstructionFeedbackSubmission, RoiMapReason, RoiMapTelemetry, StreamMode,
-    TemporalDiffResult, TemporalMaskDecision, VideoCodec, IDR_INTERVAL,
+    FeedbackWireDecision, HybridTileOperation, HybridWireBudget, QuiescentTilePlan,
+    QuiescentTilePlanner, QuiescentValidationStatus, ReconstructionFeedbackSubmission,
+    RoiMapReason, RoiMapTelemetry, StreamMode, TemporalDiffResult, TemporalMaskDecision,
+    VideoCodec, IDR_INTERVAL,
 };
 
 pub(super) fn benchmark_mode_matches(
@@ -352,21 +352,6 @@ pub(super) fn record_benchmark_roi_activity(
     window.last_total_ctbs = Some(frame.total_ctbs);
     window.last_min_delta = frame.min_delta;
     window.last_max_delta = frame.max_delta;
-}
-
-pub(super) fn lab_roi_trace(frame: Option<RoiMapTelemetry>) -> Option<LabRoiTrace> {
-    frame.map(|frame| LabRoiTrace {
-        reason: match frame.reason {
-            RoiMapReason::Applied => LabRoiReason::Applied,
-            RoiMapReason::MissingDamage => LabRoiReason::MissingDamage,
-            RoiMapReason::EmptyDamage => LabRoiReason::EmptyDamage,
-            RoiMapReason::Idr => LabRoiReason::Idr,
-            RoiMapReason::CoverageAtLeastHalf => LabRoiReason::CoverageAtLeastHalf,
-            RoiMapReason::UnsupportedEncoderState => LabRoiReason::UnsupportedEncoderState,
-        },
-        changed_ctbs: frame.changed_ctbs.min(u32::from(u16::MAX)) as u16,
-        total_ctbs: frame.total_ctbs.min(u32::from(u16::MAX)) as u16,
-    })
 }
 
 pub(super) fn record_benchmark_temporal_activity(

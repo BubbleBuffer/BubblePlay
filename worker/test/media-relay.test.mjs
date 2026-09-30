@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Room } from "../src/index.js";
+import { V4_HEADER_BYTES, V4_MAX_PACKET_BYTES } from "../public/media-v4.js";
 
 class FakeSocket {
-  constructor(role, stripe, extra = {}) {
+  constructor(role, extra = {}) {
     const { throwOnSend = false, ...attachment } = extra;
-    this.attachment = { role, stripe, ...attachment };
+    this.attachment = { role, ...attachment };
     this.readyState = 1;
     this.messages = [];
     this.closed = [];
@@ -20,92 +21,31 @@ class FakeSocket {
   close(code, reason) { this.closed.push({ code, reason }); }
 }
 
-test("a media host forwards only bounded binary packets to the matching client stripe", async () => {
-  const host = new FakeSocket("media-host", 2);
-  const client = new FakeSocket("media-client", 2);
-  const wrongStripe = new FakeSocket("media-client", 1);
-  const room = new Room({ getWebSockets: () => [host, client, wrongStripe] }, {});
-  const frame = new Uint8Array(49_176).buffer;
+function packet(marker) {
+  const bytes = new Uint8Array(V4_HEADER_BYTES + 4);
+  bytes[0] = marker;
+  return bytes.buffer;
+}
+
+test("a media host forwards bounded v4 binary packets to the media client unchanged", async () => {
+  const host = new FakeSocket("media-host");
+  const client = new FakeSocket("media-client");
+  const room = new Room({ getWebSockets: () => [host, client] }, {});
+  const frame = new Uint8Array(V4_MAX_PACKET_BYTES).buffer;
   await room.webSocketMessage(host, frame);
   assert.deepEqual(client.messages, [frame]);
-  assert.deepEqual(wrongStripe.messages, []);
 });
 
-test("lab v3 media appends one bounded edge-arrival timestamp without changing production packets", async () => {
-  const run = "123e4567-e89b-42d3-a456-426614174000";
-  const host = new FakeSocket("media-host", 2, { run, version: 3 });
-  const client = new FakeSocket("media-client", 2, { run, version: 3, registeredAtMs: 123_456 });
-  const room = new Room({ getWebSockets: () => [host, client] }, {});
-  const packetBytes = new Uint8Array(19);
-  packetBytes.set([3, 1, 0, 2, 9, 8, 7]);
-  const hostTrailer = new DataView(packetBytes.buffer, 7, 12);
-  hostTrailer.setUint32(0, 0x42504854);
-  hostTrailer.setFloat64(4, 1_787_940_000_123);
-  const packet = packetBytes.buffer;
-  const earliest = Date.now();
-
-  await room.webSocketMessage(host, packet);
-
-  const latest = Date.now();
-  assert.equal(client.messages.length, 2);
-  assert.deepEqual(JSON.parse(client.messages[0]), {
-    type: "media-forward",
-    registeredAtMs: 123_456,
-  });
-  const forwarded = new Uint8Array(client.messages[1]);
-  assert.deepEqual([...forwarded.subarray(0, 19)], [...packetBytes]);
-  assert.equal(forwarded.byteLength, 31);
-  const edgeTrailer = new DataView(forwarded.buffer, forwarded.byteOffset + 19, 12);
-  assert.equal(edgeTrailer.getUint32(0), 0x42504554);
-  assert.ok(edgeTrailer.getFloat64(4) >= earliest);
-  assert.ok(edgeTrailer.getFloat64(4) <= latest);
-
-  const productionHost = new FakeSocket("media-host", 2, { version: 3 });
-  const productionClient = new FakeSocket("media-client", 2, { version: 3 });
-  const productionRoom = new Room({ getWebSockets: () => [productionHost, productionClient] }, {});
-  await productionRoom.webSocketMessage(productionHost, packet);
-  assert.equal(productionClient.messages[0], packet);
-});
-
-test("lab forwarding announces a replacement media-client registration before its first packet", async () => {
-  const run = "123e4567-e89b-42d3-a456-426614174000";
-  const host = new FakeSocket("media-host", 12, { run, version: 3 });
-  const first = new FakeSocket("media-client", 12, { run, version: 3, registeredAtMs: 10_001 });
-  let sockets = [host, first];
-  const room = new Room({ getWebSockets: () => sockets }, {});
-  const firstPacket = Uint8Array.of(1).buffer;
-  await room.webSocketMessage(host, firstPacket);
-
-  first.readyState = 3;
-  const replacement = new FakeSocket("media-client", 12, { run, version: 3, registeredAtMs: 10_002 });
-  sockets = [host, first, replacement];
-  const replacementPacket = Uint8Array.of(2).buffer;
-  await room.webSocketMessage(host, replacementPacket);
-
-  assert.deepEqual(JSON.parse(first.messages[0]), {
-    type: "media-forward",
-    registeredAtMs: 10_001,
-  });
-  assert.equal(first.messages[1] instanceof ArrayBuffer, true);
-  assert.deepEqual(JSON.parse(replacement.messages[0]), {
-    type: "media-forward",
-    registeredAtMs: 10_002,
-  });
-  const forwardedReplacement = new Uint8Array(replacement.messages[1]);
-  assert.equal(forwardedReplacement.byteLength, 13);
-  assert.equal(forwardedReplacement[0], 2);
-});
-
-test("repeated media packets reuse the validated stripe peer without rescanning room sockets", async () => {
-  const host = new FakeSocket("media-host", 2);
-  const client = new FakeSocket("media-client", 2);
+test("repeated media packets reuse the validated peer without rescanning room sockets", async () => {
+  const host = new FakeSocket("media-host");
+  const client = new FakeSocket("media-client");
   let enumerations = 0;
   const room = new Room({ getWebSockets: () => {
     enumerations += 1;
     return [host, client];
   } }, {});
-  const first = Uint8Array.of(1).buffer;
-  const second = Uint8Array.of(2).buffer;
+  const first = packet(1);
+  const second = packet(2);
 
   await room.webSocketMessage(host, first);
   await room.webSocketMessage(host, second);
@@ -114,26 +54,26 @@ test("repeated media packets reuse the validated stripe peer without rescanning 
   assert.equal(enumerations, 1);
 });
 
-test("a closed or replaced cached stripe peer is never reused", async () => {
-  const host = new FakeSocket("media-host", 2);
-  const firstClient = new FakeSocket("media-client", 2);
-  const replacement = new FakeSocket("media-client", 2);
+test("a closed or replaced cached media peer is never reused", async () => {
+  const host = new FakeSocket("media-host");
+  const firstClient = new FakeSocket("media-client");
+  const replacement = new FakeSocket("media-client");
   let sockets = [host, firstClient];
   const state = {
     getWebSockets: () => sockets,
     storage: { delete: async () => {} },
   };
   const room = new Room(state, {});
-  const first = Uint8Array.of(1).buffer;
-  const second = Uint8Array.of(2).buffer;
-  const third = Uint8Array.of(3).buffer;
+  const first = packet(1);
+  const second = packet(2);
+  const third = packet(3);
 
   await room.webSocketMessage(host, first);
   await room.webSocketClose(firstClient, 1006, "lost", false);
   sockets = [host, replacement];
   await room.webSocketMessage(host, second);
   room.reject(replacement, "media-client replaced");
-  const latest = new FakeSocket("media-client", 2);
+  const latest = new FakeSocket("media-client");
   sockets = [host, replacement, latest];
   await room.webSocketMessage(host, third);
 
@@ -143,18 +83,18 @@ test("a closed or replaced cached stripe peer is never reused", async () => {
 });
 
 test("a re-instantiated room rebuilds its peer cache from hibernated sockets", async () => {
-  const host = new FakeSocket("media-host", 2);
-  const firstClient = new FakeSocket("media-client", 2);
+  const host = new FakeSocket("media-host");
+  const firstClient = new FakeSocket("media-client");
   let sockets = [host, firstClient];
   const state = { getWebSockets: () => sockets };
   const firstRoom = new Room(state, {});
-  const first = Uint8Array.of(1).buffer;
+  const first = packet(1);
   await firstRoom.webSocketMessage(host, first);
 
-  const resumedClient = new FakeSocket("media-client", 2);
+  const resumedClient = new FakeSocket("media-client");
   sockets = [host, resumedClient];
   const resumedRoom = new Room(state, {});
-  const second = Uint8Array.of(2).buffer;
+  const second = packet(2);
   await resumedRoom.webSocketMessage(host, second);
 
   assert.deepEqual(firstClient.messages, [first]);
@@ -162,9 +102,9 @@ test("a re-instantiated room rebuilds its peer cache from hibernated sockets", a
 });
 
 test("a replacement remains authoritative when rejecting the stale socket cannot send", async () => {
-  const host = new FakeSocket("media-host", 14);
-  const staleClient = new FakeSocket("media-client", 14, { throwOnSend: true });
-  const replacement = new FakeSocket(null, 14, { expectedRole: "media-client" });
+  const host = new FakeSocket("media-host");
+  const staleClient = new FakeSocket("media-client", { throwOnSend: true });
+  const replacement = new FakeSocket(null, { expectedRole: "media-client" });
   const sockets = [host, staleClient, replacement];
   const state = {
     getWebSockets: () => sockets,
@@ -182,39 +122,27 @@ test("a replacement remains authoritative when rejecting the stale socket cannot
   assert.equal(Number.isSafeInteger(parsedHello.registeredAtMs), true);
 
   const resumedRoom = new Room(state, {});
-  const frame = Uint8Array.of(7).buffer;
+  const frame = packet(7);
   await resumedRoom.webSocketMessage(host, frame);
 
   assert.equal(staleClient.attachment.replaced, true);
-  assert.deepEqual(replacement.messages, [replacementHello, frame]);
+  assert.deepEqual(replacement.messages, [replacementHello, JSON.stringify({ type: "media-peer", present: true }), frame]);
 });
 
-test("media clients cannot inject video and oversized host frames are discarded", async () => {
-  const host = new FakeSocket("media-host", 0);
-  const client = new FakeSocket("media-client", 0);
+test("media clients cannot inject video and header-only or oversized host frames are discarded", async () => {
+  const host = new FakeSocket("media-host");
+  const client = new FakeSocket("media-client");
   const room = new Room({ getWebSockets: () => [host, client] }, {});
-  await room.webSocketMessage(client, new Uint8Array(8).buffer);
-  await room.webSocketMessage(host, new Uint8Array(49_177).buffer);
+  await room.webSocketMessage(client, packet(1));
+  await room.webSocketMessage(host, new Uint8Array(V4_HEADER_BYTES).buffer);
+  await room.webSocketMessage(host, new Uint8Array(V4_MAX_PACKET_BYTES + 1).buffer);
   assert.deepEqual(host.messages, []);
   assert.deepEqual(client.messages, []);
 });
 
-test("v3 relay accepts a bounded one-data-lane packet larger than the fixed v2 shard cap", async () => {
-  const epoch = "0123456789abcdef0123456789abcdef";
-  const host = new FakeSocket("media-host", 0, { epoch, version: 3 });
-  const client = new FakeSocket("media-client", 0, { epoch, version: 3 });
-  const room = new Room({ getWebSockets: () => [host, client] }, {});
-  const packet = new Uint8Array(3 * 1024 * 1024).buffer;
-  await room.webSocketMessage(host, packet);
-  assert.equal(client.messages.length, 1);
-  assert.equal(client.messages[0], packet);
-  await room.webSocketMessage(host, new Uint8Array(8 * 1024 * 1024 + 29).buffer);
-  assert.equal(client.messages.length, 1);
-});
-
-test("closing a media stripe does not tear down the signaling peer", async () => {
-  const media = new FakeSocket("media-client", 3);
-  const host = new FakeSocket("host", null);
+test("closing the media socket does not tear down the signaling peer", async () => {
+  const media = new FakeSocket("media-client");
+  const host = new FakeSocket("host");
   const state = { getWebSockets: () => [media, host], storage: { delete: async () => {} } };
   const room = new Room(state, {});
   await room.webSocketClose(media, 1006, "lost", false);
@@ -222,7 +150,7 @@ test("closing a media stripe does not tear down the signaling peer", async () =>
 });
 
 test("a WSS start command waits for a temporarily absent host", async () => {
-  const client = new FakeSocket("client", null);
+  const client = new FakeSocket("client");
   let pending = [];
   const state = {
     getWebSockets: () => [client],
@@ -239,9 +167,9 @@ test("a WSS start command waits for a temporarily absent host", async () => {
 });
 
 test("replacing a signaling host forces the live client to establish a fresh session", async () => {
-  const staleHost = new FakeSocket("host", null, { registeredAtMs: 10_001 });
-  const client = new FakeSocket("client", null, { registeredAtMs: 10_002 });
-  const replacement = new FakeSocket(null, null, { expectedRole: "host" });
+  const staleHost = new FakeSocket("host", { registeredAtMs: 10_001 });
+  const client = new FakeSocket("client", { registeredAtMs: 10_002 });
+  const replacement = new FakeSocket(null, { expectedRole: "host" });
   const sockets = [staleHost, client, replacement];
   const state = {
     getWebSockets: () => sockets,
@@ -261,4 +189,26 @@ test("replacing a signaling host forces the live client to establish a fresh ses
   assert.deepEqual(client.messages, [JSON.stringify({ type: "peer-left" })]);
   assert.deepEqual(staleHost.closed, [{ code: 1008, reason: "host replaced" }]);
   assert.equal(replacement.attachment.role, "host");
+});
+
+test("input, clipboard and cursor traffic never crosses the v4 media socket", async () => {
+  const host = new FakeSocket("media-host");
+  const client = new FakeSocket("media-client");
+  const room = new Room({ getWebSockets: () => [host, client] }, {});
+  // Input packets are small binary frames; the media socket drops client binary.
+  await room.webSocketMessage(client, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]).buffer);
+  for (const text of [
+    JSON.stringify({ type: "input", data: [1, 2, 3] }),
+    JSON.stringify({ type: "clipboard", text: "secret" }),
+    JSON.stringify({ type: "cursor", x: 1, y: 2 }),
+    JSON.stringify({ type: "ack", generation: 1, seq: 2, recvTsMs: 3, input: [1] }),
+  ]) await room.webSocketMessage(client, text);
+  // Host-side cursor feedback belongs to signaling, not media.
+  await room.webSocketMessage(host, JSON.stringify({ type: "cursor", x: 1, y: 2 }));
+  assert.deepEqual(host.messages, []);
+  assert.deepEqual(client.messages, []);
+  // Only the v4 control vocabulary is relayed to the host.
+  const ack = JSON.stringify({ type: "ack", generation: 1, seq: 2, recvTsMs: 3 });
+  await room.webSocketMessage(client, ack);
+  assert.deepEqual(host.messages, [ack]);
 });

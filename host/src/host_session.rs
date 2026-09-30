@@ -1,7 +1,7 @@
 //! Binary-owned session boundary; preserves existing streaming policy.
 use super::{
-    BTreeMap, Controller, Duration, Instant, MediaCodec, Profile, StreamMode, VideoCodec,
-    WSS_BALANCED_BITRATE_BPS, WSS_HIGH_BITRATE_BPS, WSS_SAVER_BITRATE_BPS,
+    Duration, Instant, MediaCodec, Profile, StreamMode, VideoCodec, WSS_BALANCED_BITRATE_BPS,
+    WSS_HIGH_BITRATE_BPS, WSS_SAVER_BITRATE_BPS,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -9,215 +9,6 @@ pub(super) struct WssAdjustment {
     pub(super) mode: VideoMode,
     pub(super) target_bps: u32,
     pub(super) reason: &'static str,
-}
-
-#[derive(Debug)]
-pub(super) struct WssQualityController {
-    pub(super) generation: Option<u32>,
-    pub(super) last_sample: Instant,
-    pub(super) last_recovered: u64,
-    pub(super) last_dependency_losses: u64,
-    pub(super) last_decoder_drops: u64,
-    pub(super) last_lanes: [u32; 4],
-    pub(super) lane_progress_at: [Instant; 4],
-    pub(super) last_reconstructed: u32,
-    pub(super) unhealthy_since: Option<Instant>,
-    pub(super) floor_since: Option<Instant>,
-    pub(super) clean_since: Option<Instant>,
-    pub(super) last_bitrate_change: Instant,
-    pub(super) upgrade_blocked_until: Instant,
-    pub(super) last_preencode_skips: u64,
-    pub(super) preencode_pressure_until: Option<Instant>,
-}
-
-impl WssQualityController {
-    pub(super) fn new(now: Instant) -> Self {
-        Self {
-            last_sample: now,
-            last_recovered: 0,
-            last_dependency_losses: 0,
-            last_decoder_drops: 0,
-            generation: None,
-            last_lanes: [0; 4],
-            lane_progress_at: [now; 4],
-            last_reconstructed: 0,
-            unhealthy_since: None,
-            floor_since: None,
-            clean_since: None,
-            last_bitrate_change: now,
-            upgrade_blocked_until: now,
-            last_preencode_skips: 0,
-            preencode_pressure_until: None,
-        }
-    }
-    pub(super) fn observe_preencode_skips(&mut self, now: Instant, total: u64) {
-        if total > self.last_preencode_skips {
-            self.last_preencode_skips = total;
-            self.preencode_pressure_until = Some(now + Duration::from_millis(600));
-        }
-    }
-    pub(super) fn sample(
-        &mut self,
-        now: Instant,
-        generation: u32,
-        quality: &Controller,
-        profiles: &ProfileTransition,
-        lanes: [u32; 4],
-        reconstructed: u32,
-        presented: u32,
-        recovered: u64,
-        dependency_losses: u64,
-        decoder_drops: u64,
-    ) -> Option<WssAdjustment> {
-        if self.generation != Some(generation) {
-            self.generation = Some(generation);
-            self.last_lanes = [0; 4];
-            self.lane_progress_at = [now; 4];
-            self.last_reconstructed = 0;
-            self.last_recovered = recovered;
-            self.last_dependency_losses = dependency_losses;
-            self.last_decoder_drops = decoder_drops;
-            self.unhealthy_since = None;
-            self.floor_since = None;
-            self.clean_since = None;
-        }
-        for index in 0..lanes.len() {
-            if lanes[index] != self.last_lanes[index]
-                && sequence_reached(lanes[index], self.last_lanes[index])
-            {
-                self.lane_progress_at[index] = now;
-            }
-        }
-        // ACKs are batched and four TCP lanes naturally report at different
-        // instants. Judge lane health over a real window, never one message.
-        let healthy_lanes = self
-            .lane_progress_at
-            .iter()
-            .filter(|&&at| now.saturating_duration_since(at) <= Duration::from_secs(2))
-            .count();
-        let stream_progressed = reconstructed != self.last_reconstructed
-            && sequence_reached(reconstructed, self.last_reconstructed);
-        let presentation_lag = reconstructed.wrapping_sub(presented);
-        let presentation_backlogged = presentation_lag < (1 << 31) && presentation_lag > 4;
-        let preencode_pressure = self
-            .preencode_pressure_until
-            .is_some_and(|until| now <= until);
-        let emergency = dependency_losses > self.last_dependency_losses
-            || decoder_drops > self.last_decoder_drops
-            || presentation_backlogged
-            || preencode_pressure;
-        // Reconstructing from parity is a successful delivery, not loss. It is
-        // intentionally diagnostic only; expiry/backlog/decoder drops are the
-        // signals that the recovered stream failed to stay healthy.
-        let degraded = stream_progressed && healthy_lanes < 3;
-        let unhealthy = emergency || degraded;
-        self.last_sample = now;
-        self.last_recovered = recovered;
-        self.last_dependency_losses = dependency_losses;
-        self.last_lanes = lanes;
-        self.last_reconstructed = reconstructed;
-        self.last_decoder_drops = decoder_drops;
-        if unhealthy {
-            self.clean_since = None;
-            let since = self.unhealthy_since.get_or_insert(now);
-            let stream_mode = profiles.stream_mode();
-            let floor = wss_mode_range(profiles.active, stream_mode).0;
-            if quality.target() <= floor {
-                self.floor_since.get_or_insert(now);
-            }
-            let bitrate_hold = Duration::from_secs(match stream_mode {
-                StreamMode::Work => 8,
-                StreamMode::Game => 3,
-            });
-            if now.duration_since(*since) >= bitrate_hold {
-                let target = (quality.target().saturating_mul(85) / 100).max(floor);
-                if target < quality.target() {
-                    self.unhealthy_since = None;
-                    self.last_bitrate_change = now;
-                    self.upgrade_blocked_until = now
-                        + Duration::from_secs(match stream_mode {
-                            StreamMode::Work => 60,
-                            StreamMode::Game => 30,
-                        });
-                    self.floor_since = None;
-                    return Some(WssAdjustment {
-                        mode: profiles.active,
-                        target_bps: target,
-                        reason: "wss-congestion",
-                    });
-                }
-                if self.floor_since.is_some_and(|floor_since| {
-                    now.duration_since(floor_since)
-                        >= Duration::from_secs(match stream_mode {
-                            StreamMode::Work => 12,
-                            StreamMode::Game => 6,
-                        })
-                }) {
-                    let mode = wss_mode_down(profiles.active, stream_mode);
-                    if mode != profiles.active {
-                        self.floor_since = None;
-                        self.unhealthy_since = None;
-                        self.clean_since = None;
-                        self.upgrade_blocked_until = now
-                            + Duration::from_secs(match stream_mode {
-                                StreamMode::Work => 60,
-                                StreamMode::Game => 30,
-                            });
-                        return Some(WssAdjustment {
-                            mode,
-                            target_bps: wss_mode_range(mode, stream_mode).1.min(quality.target()),
-                            reason: "wss-sustained-down",
-                        });
-                    }
-                }
-            }
-            return None;
-        }
-        self.unhealthy_since = None;
-        self.floor_since = None;
-        let clean = self.clean_since.get_or_insert(now);
-        if now >= self.upgrade_blocked_until
-            && now.duration_since(*clean)
-                >= Duration::from_secs(match profiles.stream_mode() {
-                    StreamMode::Work => 20,
-                    StreamMode::Game => 10,
-                })
-            && now.duration_since(self.last_bitrate_change) >= Duration::from_secs(10)
-        {
-            let ceiling = wss_mode_range(profiles.active, profiles.stream_mode()).1;
-            let target = (quality.target().saturating_mul(110) / 100).min(ceiling);
-            if target > quality.target() {
-                self.last_bitrate_change = now;
-                return Some(WssAdjustment {
-                    mode: profiles.active,
-                    target_bps: target,
-                    reason: "wss-probe",
-                });
-            }
-        }
-        if now >= self.upgrade_blocked_until
-            && now.duration_since(*clean)
-                >= Duration::from_secs(match profiles.stream_mode() {
-                    StreamMode::Work => 60,
-                    StreamMode::Game => 30,
-                })
-        {
-            let mode = wss_mode_up(profiles.active, profiles.stream_mode());
-            if mode != profiles.active
-                && quality.target() >= wss_mode_range(mode, profiles.stream_mode()).0
-            {
-                self.clean_since = None;
-                return Some(WssAdjustment {
-                    mode,
-                    target_bps: quality
-                        .target()
-                        .max(wss_mode_range(mode, profiles.stream_mode()).0),
-                    reason: "wss-stable-up",
-                });
-            }
-        }
-        None
-    }
 }
 
 pub(super) fn wss_codec(codec: VideoCodec) -> MediaCodec {
@@ -235,7 +26,7 @@ pub(super) fn parse_media_codec(value: Option<&str>) -> Option<VideoCodec> {
     }
 }
 
-pub(super) fn valid_v2_epoch(value: &str) -> bool {
+pub(super) fn valid_media_epoch(value: &str) -> bool {
     value.len() == 32
         && value
             .bytes()
@@ -255,102 +46,11 @@ pub(super) fn valid_monitor_refresh_control(
     epoch: Option<&str>,
     _active_wss_epoch: Option<&str>,
 ) -> bool {
-    matches!(protocol, Some(2..=4)) && epoch.is_some_and(valid_v2_epoch)
-}
-
-pub(super) fn valid_stripe_reconnect_recovery_control(
-    action: &str,
-    reason: Option<&str>,
-    protocol: Option<u8>,
-    epoch: Option<&str>,
-    active_wss_epoch: Option<&str>,
-) -> bool {
-    action == "keyframe"
-        && reason == Some("stripe-reconnect")
-        && protocol == Some(3)
-        && epoch.is_some_and(|value| {
-            valid_v2_epoch(value) && active_wss_epoch.is_some_and(|active| active == value)
-        })
+    protocol == Some(4) && epoch.is_some_and(valid_media_epoch)
 }
 
 pub(super) fn accept_session_codec(current: VideoCodec, requested: VideoCodec) -> bool {
     current == requested || matches!((current, requested), (VideoCodec::Hevc, VideoCodec::H264))
-}
-
-pub(super) struct WssAckRate {
-    pub(super) generation: u32,
-    pub(super) pending: BTreeMap<u32, usize>,
-    pub(super) window_started: Instant,
-    pub(super) acked_bytes: u64,
-}
-
-impl WssAckRate {
-    pub(super) fn new(now: Instant) -> Self {
-        Self {
-            generation: 0,
-            pending: BTreeMap::new(),
-            window_started: now,
-            acked_bytes: 0,
-        }
-    }
-    pub(super) fn submitted(&mut self, generation: u32, sequence: u32, bytes: usize) {
-        if generation != self.generation {
-            self.generation = generation;
-            self.pending.clear();
-            self.acked_bytes = 0;
-            self.window_started = Instant::now();
-        }
-        self.pending.insert(sequence, bytes);
-        while self.pending.len() > 256 {
-            if let Some(oldest) = self.pending.keys().next().copied() {
-                self.pending.remove(&oldest);
-            }
-        }
-    }
-    pub(super) fn acknowledged(
-        &mut self,
-        now: Instant,
-        generation: u32,
-        sequence: u32,
-    ) -> Option<u32> {
-        if generation != self.generation {
-            return None;
-        }
-        let acknowledged: Vec<u32> = self
-            .pending
-            .range(..=sequence)
-            .map(|(&key, _)| key)
-            .collect();
-        if acknowledged.is_empty() {
-            return None;
-        }
-        for key in acknowledged {
-            if let Some(bytes) = self.pending.remove(&key) {
-                self.acked_bytes = self.acked_bytes.saturating_add(bytes as u64);
-            }
-        }
-        let elapsed = now.duration_since(self.window_started);
-        if elapsed < Duration::from_secs(1) {
-            return None;
-        }
-        let bps = ((self.acked_bytes as f64 * 8.0) / elapsed.as_secs_f64()) as u64;
-        self.window_started = now;
-        self.acked_bytes = 0;
-        Some(bps.min(u32::MAX as u64) as u32)
-    }
-}
-
-/// WSS ACK throughput is capped by the bytes the encoder chose to produce, so
-/// it is not a direct bandwidth estimate. The adaptive controller keeps 20%
-/// headroom (`target = capacity * 0.8`); report at least the inverse of the
-/// current target or that headroom would recursively reduce the target even
-/// while every submitted frame is arriving.
-pub(super) fn wss_capacity_observation(delivery_bps: u32, encoder_target_bps: u32) -> u32 {
-    let target_with_headroom = (encoder_target_bps as u64)
-        .saturating_mul(5)
-        .div_ceil(4)
-        .min(u32::MAX as u64) as u32;
-    delivery_bps.max(target_with_headroom)
 }
 
 /// Poll the one-shot idle snapshot state only after a peer can receive it.
@@ -358,37 +58,6 @@ pub(super) fn wss_capacity_observation(delivery_bps: u32, encoder_target_bps: u3
 /// viewport transitions can explicitly re-arm one activation frame.
 pub(super) fn should_snapshot_idle_desktop(ice_connected: bool, _latest_idr_missing: bool) -> bool {
     ice_connected
-}
-
-#[derive(Debug, Default)]
-pub(super) struct WssRecoverySnapshotGate {
-    pub(super) last_request: Option<Instant>,
-}
-
-impl WssRecoverySnapshotGate {
-    pub(super) fn should_request(
-        &mut self,
-        now: Instant,
-        needs_recovery_idr: bool,
-        awaiting_recovery_ack: bool,
-        retry_interval: Duration,
-    ) -> bool {
-        if !needs_recovery_idr && !awaiting_recovery_ack {
-            self.last_request = None;
-            return false;
-        }
-        if !needs_recovery_idr {
-            return false;
-        }
-        if self
-            .last_request
-            .is_some_and(|requested| now.duration_since(requested) < retry_interval)
-        {
-            return false;
-        }
-        self.last_request = Some(now);
-        true
-    }
 }
 
 pub(super) fn capture_admission_ready(
@@ -561,14 +230,6 @@ pub(super) struct PendingWssIdr {
 
 pub(super) fn sequence_reached(current: u32, target: u32) -> bool {
     current.wrapping_sub(target) < (1 << 31)
-}
-
-pub(super) fn next_media_sequence(current: u32) -> u32 {
-    current.wrapping_add(1)
-}
-
-pub(super) fn commit_media_sequence(current: &mut u32, admitted: u32) {
-    *current = admitted;
 }
 
 pub(super) fn take_matching_transition(
@@ -894,35 +555,6 @@ pub(super) fn wss_preset(
     }
 }
 
-pub(super) fn wss_mode_range(mode: VideoMode, stream_mode: StreamMode) -> (u32, u32) {
-    match (stream_mode, mode.profile) {
-        (_, Profile::Mobile) => (350_000, 1_000_000),
-        (_, Profile::Low) => (800_000, 2_000_000),
-        (StreamMode::Work, Profile::Balanced) => (1_500_000, 4_000_000),
-        (StreamMode::Work, Profile::Full) => (3_200_000, 8_000_000),
-        (StreamMode::Game, Profile::Balanced) => (3_000_000, 7_000_000),
-        (StreamMode::Game, Profile::Full) => (6_000_000, 12_000_000),
-    }
-}
-
-pub(super) fn wss_mode_down(mode: VideoMode, stream_mode: StreamMode) -> VideoMode {
-    match mode.profile {
-        Profile::Full => VideoMode::for_stream(Profile::Balanced, stream_mode),
-        Profile::Balanced => VideoMode::for_stream(Profile::Low, stream_mode),
-        Profile::Low => VideoMode::for_stream(Profile::Mobile, stream_mode),
-        Profile::Mobile => mode,
-    }
-}
-
-pub(super) fn wss_mode_up(mode: VideoMode, stream_mode: StreamMode) -> VideoMode {
-    match mode.profile {
-        Profile::Mobile => VideoMode::for_stream(Profile::Low, stream_mode),
-        Profile::Low => VideoMode::for_stream(Profile::Balanced, stream_mode),
-        Profile::Balanced => VideoMode::for_stream(Profile::Full, stream_mode),
-        Profile::Full => mode,
-    }
-}
-
 #[cfg(test)]
 pub(super) fn active_encoder_dimensions(profiles: &ProfileTransition) -> (u32, u32, u32) {
     (
@@ -964,7 +596,7 @@ mod contract_tests {
             serde_json::from_str(include_str!("../../fixtures/wss-contract.json")).unwrap();
         for case in contract["epochs"].as_array().unwrap() {
             assert_eq!(
-                valid_v2_epoch(case["value"].as_str().unwrap()),
+                valid_media_epoch(case["value"].as_str().unwrap()),
                 case["accepted"].as_bool().unwrap()
             );
         }

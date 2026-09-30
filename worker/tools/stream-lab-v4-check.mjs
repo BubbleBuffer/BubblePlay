@@ -8,12 +8,18 @@
 //
 //   node worker/tools/stream-lab-v4-check.mjs [--candidate-host <exe>]
 //     [--static-seconds 60] [--motion-seconds 20] [--soak-seconds 600]
+//     [--rtc-hold-seconds 45]
+//
+// The last phase opens the receiver in auto mode with relay-only ICE and no
+// TURN server (the direct relay offers none), so ICE times out, the session runs on v4 with the RTC peer kept as a
+// lifecycle anchor, and that peer then fails (host and browser side). The v4
+// session must survive, and a reload must come straight back on v4.
 //
 // Media-socket traffic is counted from CDP WebSocket frame events, so the
 // numbers are what the browser actually received/sent on the v4 socket.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { startDirectLabRelay } from "./stream-lab-direct-relay.mjs";
@@ -90,6 +96,8 @@ async function snapshot(page) {
     return { framesDrawn: s.framesDrawn, renderedAgeMs: s.renderedAgeMs, fps: s.fps, resyncs: s.resyncs,
       dropped: s.dropped, keyframes: s.keyframes, maxFrameGap: s.maxFrameGap, dec: s.dec,
       protocol: s.wssMedia?.protocol, v4: s.wssMedia?.v4, route: s.route,
+      registeredAtMs: s.signaling?.registeredAtMs ?? null, lastRecycle: s.signaling?.lastRecycle?.reason ?? null,
+      rtcPeer: window.__bubbleplayDiagnostics?.rtcPeerState?.() ?? null,
       status: document.querySelector('#connection-status, [data-connection-status]')?.textContent?.trim() ?? null }; })()`);
 }
 
@@ -112,6 +120,7 @@ async function main() {
     "static-seconds": { type: "string", default: "60" },
     "motion-seconds": { type: "string", default: "20" },
     "soak-seconds": { type: "string", default: "600" },
+    "rtc-hold-seconds": { type: "string", default: "45" },
     "cdp-port": { type: "string", default: "9337" },
     // Capture this monitor during the static phase (selector suffix, e.g. "DISPLAY2")
     // when the primary display has live content; motion runs on the primary.
@@ -123,6 +132,7 @@ async function main() {
     return value;
   };
   const staticSeconds = seconds("static-seconds"), motionSeconds = seconds("motion-seconds"), soakSeconds = seconds("soak-seconds");
+  const rtcHoldSeconds = seconds("rtc-hold-seconds");
   const chrome = findChrome();
   if (!chrome) throw new Error("Chrome or Edge was not found");
   if (!existsSync(values["candidate-host"])) throw new Error(`candidate host missing: ${values["candidate-host"]}`);
@@ -144,7 +154,7 @@ async function main() {
     closeSync(out); closeSync(err);
     host.once("exit", code => { report.hostExit = code; });
 
-    const url = buildReceiverUrl(relay.url, "wss", { labRun: runId, mediaProtocol: 4, adaptive: true });
+    const url = buildReceiverUrl(relay.url, "wss", { labRun: runId, adaptive: true });
     const port = Number(values["cdp-port"]);
     const args = buildReceiverChromeArgs(resolve(dir, "receiver-profile"), port, "about:blank", { startMinimized: false });
     receiverProcess = spawn(chrome, ["--headless=new", ...args], { stdio: "ignore", windowsHide: true });
@@ -248,6 +258,55 @@ async function main() {
       samples };
     save();
     console.log("soak", JSON.stringify({ ...report.phases.soak, samples: samples.length }));
+
+    // 6. RTC failure during a v4 session, then a reconnect.
+    const autoUrl = new URL(url);
+    autoUrl.searchParams.set("transport", "auto");
+    autoUrl.searchParams.set("decoderPath", "native");
+    // Relay-only ICE without a TURN server can never connect: a stand-in for
+    // a network that blocks WebRTC.
+    autoUrl.searchParams.set("ice", "relay");
+    const autoStartedAt = performance.now();
+    await receiver.navigate(autoUrl.href);
+    const onV4 = await waitFor(receiver, s => s.framesDrawn > 0 && s.route === "wss" && s.protocol === 4, 30_000);
+    const rtcFallbackMs = Math.round(performance.now() - autoStartedAt);
+    const remembered = await receiver.evaluate("localStorage.getItem('bp_rtc_failed_at')");
+    const holdSamples = [];
+    for (let elapsed = 0; elapsed < rtcHoldSeconds; elapsed += 5) {
+      await delay(5_000);
+      const sample = await snapshot(receiver);
+      holdSamples.push({ t: elapsed + 5, framesDrawn: sample.framesDrawn, rtcPeer: sample.rtcPeer,
+        registeredAtMs: sample.registeredAtMs, protocol: sample.protocol, status: sample.v4?.status });
+    }
+    const beforeFailure = await snapshot(receiver);
+    const simulated = await receiver.evaluate("window.__bubbleplayDiagnostics?.simulateRtcPeerFailure?.() ?? false");
+    await delay(5_000);
+    const afterFailure = await snapshot(receiver);
+    const hostLog = [resolve(dir, "host.stdout.log"), resolve(dir, "host.stderr.log")]
+      .map(path => { try { return readFileSync(path, "utf8"); } catch { return ""; } }).join("\n");
+    const hostRtcOnlyTeardowns = hostLog.split("\n").filter(line => line.includes("RTC peer ended; the WSS session continues"));
+    const survived = afterFailure.route === "wss" && afterFailure.protocol === 4 && afterFailure.framesDrawn > beforeFailure.framesDrawn &&
+      afterFailure.registeredAtMs === onV4.registeredAtMs && afterFailure.v4?.socketOpen === true &&
+      afterFailure.rtcPeer === null && report.hostExit === undefined;
+    const reloadStartedAt = performance.now();
+    await receiver.navigate(autoUrl.href);
+    const reconnected = await waitFor(receiver, s => s.framesDrawn > 0 && s.route === "wss" && s.protocol === 4, 30_000);
+    const reconnectMs = Math.round(performance.now() - reloadStartedAt);
+    await delay(2_000);
+    const reconnectedLater = await snapshot(receiver);
+    report.phases.rtcFailure = {
+      rtcFallbackMs, rememberedRtcFailure: remembered !== null, holdSamples,
+      simulatedBrowserFailure: simulated, beforeFailure, afterFailure,
+      hostRtcOnlyTeardowns: hostRtcOnlyTeardowns.map(line => line.slice(0, 240)),
+      survived,
+      reconnect: { msToFirstFrame: reconnectMs, protocol: reconnected.protocol, rtcPeer: reconnectedLater.rtcPeer,
+        framesAdvanced: reconnectedLater.framesDrawn > reconnected.framesDrawn, snapshot: reconnectedLater },
+    };
+    save();
+    console.log("rtc-failure", JSON.stringify({ rtcFallbackMs, remembered: remembered !== null, simulated, survived,
+      hostRtcOnlyTeardowns: hostRtcOnlyTeardowns.length, reconnectMs, reconnectProtocol: reconnected.protocol,
+      reconnectRtcPeer: reconnectedLater.rtcPeer }));
+    if (!survived || reconnected.route !== "wss" || reconnectedLater.rtcPeer !== null) process.exitCode = 1;
   } catch (error) {
     report.error = { message: error.message, last: error.last ?? null };
     try { report.errorSnapshot = await snapshot(receiver); } catch {}

@@ -17,15 +17,12 @@ test("live collector attaches to a page target and collects rendered and barcode
 test("receiver diagnostics identify both index and media asset capabilities", () => {
   const client = readClientSource();
   const media = readFileSync(new URL("../public/media.js", import.meta.url), "utf8");
-  assert.match(media, /export const STREAM_LAB_ASSET_BUILD = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15"/);
+  assert.match(media, /export const STREAM_LAB_ASSET_BUILD = "wss-v4-bench2-hevc-tiles-bpip4-v16"/);
   assert.match(client, /STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD/);
   assert.match(client, /const INDEX_ASSET_BUILD = STREAM_LAB_COMPATIBILITY\.receiverBuild/);
   assert.match(client, /compatibility:\s*STREAM_LAB_COMPATIBILITY/);
   assert.match(client, /assetBuild:\s*\{\s*index:\s*INDEX_ASSET_BUILD,\s*media:\s*MEDIA_ASSET_BUILD\s*\}/);
   assert.match(client, /hostCapabilities:\s*\{\s*\.\.\.hostCapabilities,\s*current:\s*hostCapabilitiesGeneration === signalingGeneration/);
-  assert.match(client, /topologyAccepted:\s*wssTopologyAccepted/);
-  assert.match(client, /applyLateShardDeadline\(\{\s*reassembler:\s*wssReassembler,\s*ordered:\s*wssOrdered,\s*deadline:\s*wssDeadline,?\s*\}\)/);
-  assert.match(client, /tailDeadline:\s*\{\s*\.\.\.wssTailDeadlineTelemetry\s*\}/);
   assert.match(client, /captureFrame\(\)\s*\{[\s\S]*?toDataURL\("image\/png"\)/);
   assert.match(client, /clock:\s*\{\s*performanceMs:\s*snapshotAtMs,\s*epochMs:\s*snapshotAtEpochMs\s*\}/);
 });
@@ -42,8 +39,8 @@ test("external debug attempts report before module imports and across the WSS pr
   assert.match(client, /trace\("bootstrap-inline"/);
   for (const stage of [
     "module-ready", "signaling-construct", "signaling-open",
-    "signaling-hello-ok", "media-lane-open", "media-first-packet",
-    "media-first-reconstructed", "decoder-configured", "decoder-first-output", "first-presented",
+    "signaling-hello-ok", "media-v4-open", "media-first-packet",
+    "decoder-configured", "decoder-first-output", "first-presented",
   ]) assert.match(client, new RegExp(`debugTrace\\(\"${stage}\"`));
 });
 
@@ -114,27 +111,17 @@ test("modern transform keeps canvas/decode/render in the DedicatedWorker", () =>
 test("automatic WSS fallback releases the WebRTC video sink before reclaiming its canvas", () => {
   const client = readClientSource();
   assert.match(client, /function releaseWebRtcVideoSink\(\)[\s\S]*encodedWorker\.terminate\(\)[\s\S]*replaceTransferredCanvas\(\)/);
-  assert.match(client, /function startWssMedia\(\)[\s\S]*releaseWebRtcVideoSink\(\);[\s\S]*ensureMainCanvas\(\);/);
+  assert.match(client, /function requestWssMediaStart\(\)[\s\S]*releaseWebRtcVideoSink\(\);[\s\S]*ensureMainCanvas\(\);/);
   assert.match(client, /const updateDimensions = \(\) => \{\s*if \(generation !== peerGeneration \|\| activeVideo !== video \|\| !nativePresentation\) return;/);
   const release = client.match(/function releaseWebRtcVideoSink\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
   assert.doesNotMatch(release, /\bpc\?*\.close|\bdc\?*\.close|\bmotionDc\?*\.close/);
 });
 
-test("automatic WSS negotiation waits briefly for current host capabilities before v2 fallback", () => {
+test("WSS diagnostics count media bytes and packets and reset them atomically", () => {
   const client = readClientSource();
-  assert.match(client, /case "host-capabilities":[\s\S]*hostCapabilitiesGeneration = generation;[\s\S]*requestWssMediaStart\(\)/);
-  assert.match(client, /function requestWssMediaStart\(\)[\s\S]*shouldDeferWssMediaStart[\s\S]*setTimeout\([\s\S]*500\)/);
-  assert.match(client, /case "hello-ok":[\s\S]*if \(wssSelected\) requestWssMediaStart\(\)/);
-});
-
-test("WSS diagnostics exclude lab trace trailers before reassembly and reset them atomically", () => {
-  const client = readClientSource();
-  assert.match(client, /stripLabEdgeTrace\(event\.data,\s*\{\s*requireEdgeTrace:\s*true,\s*requireHostTrace:\s*true\s*\}\)/);
-  assert.match(client, /wssMediaReceivedBytes\s*\+=\s*event\.data\.byteLength/);
+  assert.match(client, /wssMediaReceivedBytes\s*\+=\s*data\.byteLength/);
   assert.match(client, /wssMediaReceivedPackets\+\+/);
-  assert.match(client, /wssReassembler\.push\([\s\S]*?packet,[\s\S]*?stripe,[\s\S]*?event\.timeStamp,[\s\S]*?edgeReceivedAtEpochMs,[\s\S]*?hostSentAtEpochMs,[\s\S]*?hostRoiTrace,[\s\S]*?\)/);
   assert.match(client, /wssMedia:\s*\{[\s\S]*receivedBytes:\s*wssMediaReceivedBytes[\s\S]*receivedPackets:\s*wssMediaReceivedPackets/);
-  assert.match(client, /highestSequenceByLane:\s*\[\.\.\.wssReassembler\.highestSequence\]/);
   assert.match(client, /resetPresentationCounters\(\)[\s\S]*wssMediaReceivedBytes\s*=\s*0[\s\S]*wssMediaReceivedPackets\s*=\s*0/);
 });
 
@@ -149,25 +136,6 @@ test("WSS presentation diagnostics prove immediate draws and expose every RAF co
   assert.match(client, /framePresentationTelemetry\.noteRafLateDrop\(\)/);
   assert.match(client, /presentation:\s*framePresentationTelemetry\.snapshot\(\)/);
   assert.match(client, /resetPresentationCounters\(\)[\s\S]*framePresentationTelemetry\.reset\(\)/);
-});
-
-test("Stream Lab can hold one WSS v3 data lane down and observes its bounded reconnect", () => {
-  const client = readClientSource();
-  assert.match(client, /injectWssLaneLoss\(stripe = 0, durationMs = 1_000\)/);
-  assert.match(client, /if \(!labRun \|\| !usingWssMedia \|\| wssProtocol !== 3/);
-  assert.match(client, /stripe >= wssTopology\.dataShards/);
-  assert.match(client, /wssDiagnosticLaneFaultUntil\[stripe\]/);
-  assert.match(client, /wssStripeOpened\[stripe\] = false/);
-  assert.match(client, /wssMediaSockets\[stripe\] = null/);
-  assert.match(client, /scheduleWssMediaReconnect\([\s\S]*?durationMs,[\s\S]*?"diagnostic-lane-loss"/);
-  assert.match(client, /lanes:\s*wssLaneLifecycle\.snapshot\(\)/);
-  assert.match(client, /openLanes:\s*wssStripeOpened\.filter\(Boolean\)\.length/);
-});
-
-test("stale WSS lane recycling schedules a replacement without waiting for onclose", () => {
-  const client = readClientSource();
-  const recycle = client.match(/function recycleStaleWssLane\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
-  assert.match(recycle, /scheduleWssMediaReconnect\(\s*stripe,\s*wssLaneLifecycle\.currentGeneration\(stripe\),\s*0,\s*"stale-lane"\s*\)/);
 });
 
 test("native video is the default path and WebCodecs is opt-in", () => {
@@ -241,7 +209,6 @@ test("first-frame startup uses one bounded retry and clears on native or decoded
   assert.match(client, /function resetPresentationCounters\(\)/);
   assert.match(client, /function cleanupPeer\(\)[\s\S]*resetPresentationCounters\(\)/);
   assert.match(client, /recoverWssStartup/);
-  assert.match(client, /wssStartDeadlineAt/);
   assert.match(client, /monitorTransition/);
   assert.match(client, /monitor-switched/);
   assert.match(client, /function startFirstFrameHandshake\(reason, forceNew = false\)/);
@@ -316,21 +283,16 @@ test("browser signaling uses the remembered server session and never stores an a
   assert.doesNotThrow(() => new Function(inlineScript));
 });
 
-test("WSS fallback keeps v2 compatibility and negotiates bounded v3 media lanes", () => {
+test("WSS fallback negotiates the v4 media socket and keeps the control surface", () => {
   const client = readClientSource();
   assert.match(client, /parseTransport\(params\)/);
   assert.match(client, /parseQualityPreset\(params, localStorage\)/);
   assert.match(client, /<select id="quality"/);
   assert.match(client, /action: "quality"/);
-  assert.match(client, /quality: qualityPreset === "auto" \? "high" : qualityPreset, adaptive: wssAdaptive/);
+  assert.match(client, /quality: qualityPreset === "auto" \? "high" : qualityPreset }\);/);
   assert.match(client, /streamMode: streamModeValue\(\)/);
   assert.match(client, /<option value="auto">Auto<\/option>/);
-  assert.match(client, /VariableParityFrameReassembler/);
-  assert.match(client, /validateWssTopology/);
-  assert.match(client, /case "media-topology"/);
-  assert.match(client, /laneCount: wssTopology\.laneCount/);
-  assert.match(client, /wssMediaSockets = Array\(wssTopology\.laneCount\)/);
-  assert.match(client, /function mediaSocketUrl\(stripe\)/);
+  assert.match(client, /function mediaSocketUrl\(\)/);
   assert.match(client, /role: "media-client"/);
   assert.match(client, /hev1\.1\.6\.L120\.B0/);
   assert.match(client, /media-control/);
@@ -362,19 +324,13 @@ test("WSS fallback keeps v2 compatibility and negotiates bounded v3 media lanes"
   assert.match(client, /if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false/);
   assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
   assert.doesNotMatch(client, /sharpZoomEnabled\s*&&\s*pointerMode\s*===\s*"desktop"/);
-  assert.match(client, /function startWssMedia\(\) \{\s*if \(usingWssMedia\) return;\s*if \(!mediaEpoch\)[\s\S]*ensureMainCanvas\(\);/);
-  assert.match(client, /wssStripeOpened\.filter\(Boolean\)\.length[\s\S]*open < wssTopology\.dataShards/);
-  assert.match(client, /new ParityFrameReassembler\(\)/);
-  assert.match(client, /new OrderedFrameRelease\(\)/);
-  assert.match(client, /function startWssMedia\(\)[\s\S]*stage\.classList\.remove\("native-video-input"\)/);
+  assert.match(client, /function requestWssMediaStart\(\) \{\s*if \(usingWssMedia\) return;\s*if \(!mediaEpoch\)[\s\S]*ensureMainCanvas\(\);/);
+  assert.match(client, /function requestWssMediaStart\(\)[\s\S]*stage\.classList\.remove\("native-video-input"\)/);
   assert.match(client, /function recoverNetworkRoute\(reason\)/);
   assert.match(client, /addEventListener\("online", \(\) => recoverNetworkRoute\("online"\)\)/);
   assert.match(client, /function probeNetworkRouteChange\(\)/);
   assert.match(client, /routeConnection\?\.addEventListener\("change", probeNetworkRouteChange\)/);
   assert.doesNotMatch(client, /routeConnection\?\.addEventListener\("change", \(\) => recoverNetworkRoute/);
-  assert.match(client, /function openWssMediaStripe\(stripe\)/);
-  assert.match(client, /wssMediaSockets\[stripe\] !== socket/);
-  assert.match(client, /function scheduleWssMediaReconnect\([\s\S]*?setTimeout\(\(\) => \{[\s\S]*?openWssMediaStripe\(stripe\)/);
   assert.match(client, /4_000/);
   assert.match(client, /2_000/);
   assert.doesNotMatch(client, /localStorage\.setItem\([^\n]*codec/);
@@ -387,8 +343,6 @@ test("WSS fallback keeps v2 compatibility and negotiates bounded v3 media lanes"
   assert.match(client, /armPresentedIdentityHistory\(frameCount = 16\)/);
   assert.match(client, /wssPresentedIdentityFramesRemaining > 0\s*\?\s*readTimestampPattern\(presentedCanvas, presentedContext\)/);
   assert.match(client, /wssPresentedIdentityFramesRemaining--/);
-  assert.match(client, /stripLabEdgeTrace\(event\.data,\s*\{\s*requireEdgeTrace:\s*true,\s*requireHostTrace:\s*true\s*\}\)/);
-  assert.match(client, /wssReassembler\.push\([\s\S]*?packet,[\s\S]*?stripe,[\s\S]*?event\.timeStamp,[\s\S]*?edgeReceivedAtEpochMs,[\s\S]*?hostSentAtEpochMs,[\s\S]*?hostRoiTrace,[\s\S]*?\)/);
   assert.match(client, /decodeQueuedAtMs/);
   assert.match(client, /decodedAtMs/);
   assert.match(client, /presentedAtMs/);
@@ -470,7 +424,7 @@ test("intentional signaling recycle retains its initiator before invalidating th
   assert.match(recycle, /createSignalingRecycleDiagnostic\(\{/);
   assert.match(recycle, /reason,[\s\S]*signalingGeneration,[\s\S]*signalingRegistered,/);
   assert.match(recycle, /socketReadyState:\s*ws\?\.readyState\s*\?\?\s*null/);
-  assert.match(recycle, /usingWssMedia,[\s\S]*wssProtocol,[\s\S]*laneCount:[\s\S]*openLanes:/);
+  assert.match(recycle, /usingWssMedia,[\s\S]*mediaSocketOpen:/);
   assert.match(recycle, /mediaGeneration:[\s\S]*reconstructed:[\s\S]*presented:[\s\S]*receivedPackets:/);
   assert.match(recycle, /lastSignalingRecycle\s*=\s*\{\s*\.\.\.diagnostic,\s*atMs:\s*Date\.now\(\)\s*\}/);
   const emittedAt = recycle.indexOf('sendClientLog("warn", "signaling-recycle", diagnostic)');

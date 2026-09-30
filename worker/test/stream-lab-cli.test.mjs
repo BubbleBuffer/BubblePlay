@@ -25,7 +25,6 @@ import {
   reportExitCode,
   parseDeltaTriggerFrames,
   parseSceneOptions,
-  parseWssTopologyOptions,
   parseWorkerVersionOptions,
   isLoopbackLabUrl,
   performanceActionProbeEnabled,
@@ -48,20 +47,9 @@ test("screening exposes CQ23 external-budget VBR as one default-off axis", () =>
   assert.equal(candidate.targetQuality, 23);
   assert.equal(candidate.peakBitrateMultiplier, 4);
   assert.equal(candidate.vbvFrames, 4);
-  assert.deepEqual(candidate.wssTopology, { laneCount: 16, dataShards: 15, parityShards: 1 });
   assert.throws(() => buildScreeningCandidate([
     "--rate-control", "external-budget-vbr", "--roi-mode", "feedback",
   ]), /separate hypotheses/i);
-});
-
-test("lane-recovery propagates the no-action-probe policy to both performance windows", () => {
-  const cli = readFileSync(new URL("../tools/stream-lab.mjs", import.meta.url), "utf8");
-  const live = readFileSync(new URL("../tools/stream-lab-live.mjs", import.meta.url), "utf8");
-  assert.match(cli,
-    /runLiveLaneRecovery\(\{[\s\S]*?actionProbe:\s*performanceActionProbeEnabled\(args, false, false\)/);
-  const recovery = live.slice(live.indexOf("export async function runLiveLaneRecovery"),
-    live.indexOf("export function laneRecoveryTopology"));
-  assert.equal((recovery.match(/collectPerformance\([\s\S]*?\{\s*actionProbe:\s*options\.actionProbe\s*\}/g) || []).length, 2);
 });
 
 test("candidate Worker version options are explicit, canonical, and pairwise", () => {
@@ -135,18 +123,6 @@ test("quality scene CLI flags select a bounded comma-separated subset", () => {
   assert.throws(() => parseSceneOptions(["--scenes", ""]), /scene/i);
 });
 
-test("topology CLI flags are bounded and derive the data-lane quorum", () => {
-  assert.deepEqual(parseWssTopologyOptions(["--wss-lanes", "9", "--wss-parity", "1"]),
-    { laneCount: 9, dataShards: 8, parityShards: 1 });
-  assert.deepEqual(parseWssTopologyOptions(["--wss-lanes", "4", "--wss-parity", "0"]),
-    { laneCount: 4, dataShards: 4, parityShards: 0 });
-  assert.deepEqual(parseWssTopologyOptions(["--wss-lanes", "16", "--wss-parity", "2"]),
-    { laneCount: 16, dataShards: 14, parityShards: 2 });
-  assert.equal(parseWssTopologyOptions([]), null);
-  assert.throws(() => parseWssTopologyOptions(["--wss-lanes", "17"]), /lanes/i);
-  assert.throws(() => parseWssTopologyOptions(["--wss-lanes", "1", "--wss-parity", "1"]), /topology/i);
-});
-
 test("persistent-resource smoke profiles change only the NVENC resource axis", () => {
   const candidate = buildScreeningCandidate(["--resource-mode", "persistent"]);
   assert.deepEqual(candidate, {
@@ -170,7 +146,6 @@ test("persistent-resource smoke profiles change only the NVENC resource axis", (
     hybridMode: "off",
     gopSeconds: 2,
     bitrateMbps: 6,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
   });
   assert.deepEqual(buildScreeningCandidate([]), {
     id: "quality-latency-control",
@@ -193,7 +168,6 @@ test("persistent-resource smoke profiles change only the NVENC resource axis", (
     hybridMode: "off",
     gopSeconds: 2,
     bitrateMbps: 6,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
   });
   assert.deepEqual(buildScreeningCandidate(["--resource-mode", "per-frame"]), {
     id: "nvenc-per-frame-control",
@@ -216,15 +190,12 @@ test("persistent-resource smoke profiles change only the NVENC resource axis", (
     hybridMode: "off",
     gopSeconds: 2,
     bitrateMbps: 6,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
   });
   assert.throws(() => buildScreeningCandidate(["--resource-mode", "rotating"]), /resource-mode/i);
   assert.throws(() => buildScreeningCandidate(["--resource-mode", "persistent", "--dirty-qp-map"]),
     /separate hypotheses/i);
   assert.throws(() => buildScreeningCandidate(["--resource-mode", "persistent", "--main10"]),
     /separate hypotheses/i);
-  assert.throws(() => buildScreeningCandidate(["--resource-mode", "persistent", "--wss-lanes", "8"]),
-    /15\+1|topology/i);
 });
 
 test("quiescent-detail screening selects exactly the default-off hybrid axis", () => {
@@ -235,7 +206,6 @@ test("quiescent-detail screening selects exactly the default-off hybrid axis", (
   assert.equal(candidate.hybridCacheMode, "suppress-reactivate");
   assert.equal(candidate.roiMode, "off");
   assert.equal(candidate.resourceMode, "per-frame");
-  assert.deepEqual(candidate.wssTopology, { laneCount: 16, dataShards: 15, parityShards: 1 });
   assert.throws(() => buildScreeningCandidate(["--hybrid-mode", "png-future"]), /hybrid-mode/i);
   const control = buildScreeningCandidate([
     "--hybrid-mode", "png-quiescent-detail", "--hybrid-cache-mode", "dda-gated",
@@ -273,7 +243,6 @@ test("HEVC quiescent tile screening selects exactly one default-off experiment a
     asyncDepth: 0,
     hybridMode: "hevc-quiescent-tiles",
     hybridCacheMode: "suppress-reactivate",
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
   });
 });
 
@@ -282,7 +251,6 @@ test("manual use defaults to the latest quiescent-detail candidate and rejects c
   assert.equal(candidate.id, "hybrid-png-quiescent-detail");
   assert.equal(candidate.hybridMode, "png-quiescent-detail");
   assert.equal(candidate.implementationVariant, "candidate");
-  assert.deepEqual(candidate.wssTopology, { laneCount: 16, dataShards: 15, parityShards: 1 });
   assert.throws(() => buildManualCandidate(["--resource-mode", "per-frame"]), /candidate experiment/i);
 });
 
@@ -653,7 +621,6 @@ test("text-edge screening selects exactly one default-off ROI experiment axis", 
     hybridMode: "off",
     gopSeconds: 2,
     bitrateMbps: 6,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
   });
   assert.throws(() => buildScreeningCandidate(["--roi-mode", "text-edge", "--dirty-qp-map"]),
     /separate hypotheses/i);
@@ -665,7 +632,6 @@ test("feedback-headroom screening selects a distinct default-off ROI policy", ()
   assert.equal(candidate.experimentId, "roi-feedback-headroom");
   assert.equal(candidate.roiMode, "feedback-headroom");
   assert.equal(candidate.bitrateMbps, 6);
-  assert.deepEqual(candidate.wssTopology, { laneCount: 16, dataShards: 15, parityShards: 1 });
 });
 
 test("hybrid screening selects only the PNG static-detail experiment axis", () => {
@@ -676,7 +642,6 @@ test("hybrid screening selects only the PNG static-detail experiment axis", () =
   assert.equal(candidate.roiMode, "off");
   assert.equal(candidate.resourceMode, "per-frame");
   assert.equal(candidate.asyncDepth, 0);
-  assert.deepEqual(candidate.wssTopology, { laneCount: 16, dataShards: 15, parityShards: 1 });
   assert.throws(() => buildScreeningCandidate([
     "--hybrid-mode", "png-static-roi", "--roi-mode", "damage",
   ]), /separate hypotheses/i);
@@ -708,24 +673,6 @@ test("aggressive optimization plan uses repeated baselines and a parity frontier
   assert.equal(plan.autoPauseOnPhysicalActivity, true);
   assert.equal(plan.parameterCandidates, 96);
   assert.deepEqual(plan.abbaOrder, ["production", "candidate", "candidate", "production"]);
-});
-
-test("package and CLI expose manual, optimize, topology, and lane-recovery commands", () => {
-  const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  const cli = readFileSync(new URL("../tools/stream-lab.mjs", import.meta.url), "utf8");
-  assert.equal(packageJson.scripts["lab:manual"], "node tools/stream-lab.mjs manual");
-  assert.equal(packageJson.scripts["lab:optimize"], "node tools/stream-lab.mjs optimize");
-  assert.equal(packageJson.scripts["lab:topology-sweep"], "node tools/stream-lab.mjs topology-sweep");
-  assert.equal(packageJson.scripts["lab:lane-recovery"], "node tools/stream-lab.mjs lane-recovery");
-  assert.match(cli, /\["manual", "baseline", "smoke", "sweep", "campaign", "optimize", "topology-sweep", "lane-recovery"\]/);
-  assert.match(cli, /createCampaignStateV2\(\{ runId \}\)/);
-  assert.match(cli, /runLiveOptimize/);
-  assert.match(cli, /runLiveManual/);
-  assert.match(cli, /runLiveTopologySweep/);
-  assert.match(cli, /runLiveLaneRecovery/);
-  assert.match(cli, /runLiveTopologySweep\(\{[\s\S]*?quality: args\.includes\("--quality"\)[\s\S]*?repetitions:/);
-  assert.match(cli, /args\.includes\("--main10"\)/);
-  assert.match(cli, /experimentId:\s*"hevc-main10"/);
 });
 
 test("helper messages match the bounded NDJSON lease protocol", () => {
@@ -862,3 +809,16 @@ function fixture(overrides = {}) {
     worstTileSsim: 0.8, vmaf: 80, wireBitrateMbps: 4, ...overrides,
   };
 }
+
+test("package and CLI expose the manual and optimize commands", () => {
+  const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const cli = readFileSync(new URL("../tools/stream-lab.mjs", import.meta.url), "utf8");
+  assert.equal(packageJson.scripts["lab:manual"], "node tools/stream-lab.mjs manual");
+  assert.equal(packageJson.scripts["lab:optimize"], "node tools/stream-lab.mjs optimize");
+  assert.match(cli, /\["manual", "baseline", "smoke", "sweep", "campaign", "optimize"\]/);
+  assert.match(cli, /createCampaignStateV2\(\{ runId \}\)/);
+  assert.match(cli, /runLiveOptimize/);
+  assert.match(cli, /runLiveManual/);
+  assert.match(cli, /args\.includes\("--main10"\)/);
+  assert.match(cli, /experimentId:\s*"hevc-main10"/);
+});
