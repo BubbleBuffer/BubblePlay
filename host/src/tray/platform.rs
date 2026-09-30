@@ -1,5 +1,6 @@
 //! Win32 helpers for the tray: DPAPI, kill-on-close job, HKCU Run key,
-//! named kernel objects and the `\BubblePlay\ElevatedHost` scheduled task.
+//! named kernel objects, the `\BubblePlay\AdminAgent` scheduled task and the
+//! one-UAC agent update.
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -11,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE,
-    HLOCAL, WAIT_OBJECT_0,
+    HLOCAL,
 };
 use windows::Win32::Security::Cryptography::{
     CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
@@ -26,17 +27,16 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, OpenEventW, OpenMutexW, ResetEvent, SetEvent, WaitForSingleObject,
+    CreateEventW, CreateMutexW, OpenMutexW, ResetEvent, SetEvent, WaitForSingleObject,
     SYNCHRONIZATION_SYNCHRONIZE,
 };
 
 use super::logic::decode_hex;
 
-pub const TRAY_MUTEX: &str = r"Local\BubblePlayTray.SingleInstance";
-/// Manual-reset event owned by the tray; signaled to ask the elevated runner
-/// to stop. Its absence also tells the runner that the tray is gone.
-pub const ELEVATED_STOP_EVENT: &str = r"Local\BubblePlayTray.ElevatedStop";
-pub const ELEVATED_TASK: &str = r"\BubblePlay\ElevatedHost";
+pub use bubbleplay_host::admin_agent::protocol::{AGENT_MUTEX, AGENT_STOP_EVENT, TRAY_MUTEX};
+/// On-demand task that starts the elevated admin input agent
+/// (`%ProgramFiles%\BubblePlay\agent\bubbleplay_admin_agent.exe`).
+pub const AGENT_TASK: &str = r"\BubblePlay\AdminAgent";
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const RUN_VALUE: &str = "BubblePlayTray";
 
@@ -152,7 +152,8 @@ pub fn named_mutex_exists(name: &str) -> bool {
             drop(Handle(handle));
             true
         }
-        Err(_) => false,
+        // Exists, but its (e.g. elevated) owner did not grant us SYNCHRONIZE.
+        Err(error) => error.code() == windows::Win32::Foundation::E_ACCESSDENIED,
     }
 }
 
@@ -173,19 +174,6 @@ pub fn set_event(event: &Handle, signaled: bool) {
             ResetEvent(event.0)
         }
     };
-}
-
-pub fn open_event(name: &str) -> Option<Handle> {
-    let name = wide(name);
-    // SAFETY: name is NUL-terminated.
-    unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) }
-        .ok()
-        .map(Handle)
-}
-
-pub fn is_signaled(handle: &Handle) -> bool {
-    // SAFETY: valid waitable handle; zero timeout.
-    (unsafe { WaitForSingleObject(handle.0, 0) }) == WAIT_OBJECT_0
 }
 
 fn open_run_key(access: windows::Win32::System::Registry::REG_SAM_FLAGS) -> Result<HKEY> {
@@ -270,14 +258,14 @@ fn schtasks(args: &[&str]) -> Result<std::process::Output> {
         .context("running schtasks.exe")
 }
 
-pub fn elevated_task_exists() -> bool {
-    schtasks(&["/query", "/tn", ELEVATED_TASK])
+pub fn agent_task_exists() -> bool {
+    schtasks(&["/query", "/tn", AGENT_TASK])
         .map(|out| out.status.success())
         .unwrap_or(false)
 }
 
-pub fn run_elevated_task() -> Result<()> {
-    let out = schtasks(&["/run", "/tn", ELEVATED_TASK])?;
+pub fn run_agent_task() -> Result<()> {
+    let out = schtasks(&["/run", "/tn", AGENT_TASK])?;
     if !out.status.success() {
         bail!(
             "schtasks /run failed: {}",
@@ -287,8 +275,42 @@ pub fn run_elevated_task() -> Result<()> {
     Ok(())
 }
 
-pub fn end_elevated_task() {
-    let _ = schtasks(&["/end", "/tn", ELEVATED_TASK]);
+pub fn end_agent_task() {
+    let _ = schtasks(&["/end", "/tn", AGENT_TASK]);
+}
+
+/// Run `program params` elevated (one UAC prompt) and wait for it. Returns
+/// the exit code; an error when the prompt was declined or the start failed.
+pub fn run_elevated_and_wait(program: &Path, params: &str, dir: &Path) -> Result<u32> {
+    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let verb = wide("runas");
+    let file = wide(program.as_os_str());
+    let parameters = wide(params);
+    let directory = wide(dir.as_os_str());
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        lpDirectory: PCWSTR(directory.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    // SAFETY: all strings outlive the call; hProcess is closed by Handle.
+    unsafe { ShellExecuteExW(&mut info) }.context("elevated start declined or failed")?;
+    if info.hProcess.is_invalid() {
+        bail!("elevated start returned no process");
+    }
+    let process = Handle(info.hProcess);
+    // SAFETY: valid process handle.
+    unsafe { WaitForSingleObject(process.0, INFINITE) };
+    let mut code = 0u32;
+    // SAFETY: valid process handle and out-pointer.
+    unsafe { GetExitCodeProcess(process.0, &mut code) }.context("GetExitCodeProcess")?;
+    Ok(code)
 }
 
 pub fn local_app_data() -> PathBuf {
@@ -315,59 +337,6 @@ pub fn sha256_file(path: &Path) -> Option<String> {
         return None;
     }
     Some(digest.iter().map(|b| format!("{b:02X}")).collect())
-}
-
-/// Build identity of the running tray binary plus the host beside it.
-pub fn current_build_id() -> String {
-    let Ok(exe) = std::env::current_exe() else {
-        return String::new();
-    };
-    let tray = std::fs::read(&exe).unwrap_or_default();
-    let host = std::fs::read(host_exe_beside(&exe)).unwrap_or_default();
-    if tray.is_empty() {
-        return String::new();
-    }
-    super::logic::build_id(&tray, &host)
-}
-
-/// Whether this process runs with an elevated (full administrator) token.
-pub fn is_process_elevated() -> bool {
-    use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let mut token = HANDLE::default();
-    // SAFETY: out-pointer valid; token closed by Handle.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
-        return false;
-    }
-    let token = Handle(token);
-    let mut elevation = TOKEN_ELEVATION::default();
-    let mut returned = 0u32;
-    // SAFETY: buffer is a TOKEN_ELEVATION of the stated size.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenElevation,
-            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut returned,
-        )
-    }
-    .is_ok();
-    ok && elevation.TokenIsElevated != 0
-}
-
-/// True when `path` lies below `%ProgramFiles%` (admin-only by default).
-pub fn is_under_program_files(path: &Path) -> bool {
-    let Some(root) = std::env::var_os("ProgramW6432").or_else(|| std::env::var_os("ProgramFiles"))
-    else {
-        return false;
-    };
-    let (Ok(path), Ok(root)) = (std::fs::canonicalize(path), std::fs::canonicalize(root)) else {
-        return false;
-    };
-    path.starts_with(root)
 }
 
 pub fn host_exe_beside(current_exe: &Path) -> PathBuf {

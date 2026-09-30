@@ -20,8 +20,8 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, PeekNamedPipe, WaitNamedPipeW};
 
 use super::protocol::{
-    read_frame, write_client, AgentMessage, ClientMessage, Record, RefuseCode, Role, ENV_ALLOW_DEV_AGENT,
-    ENV_PIPE, HEADER_LEN, MAX_RECORDS_PER_FRAME, PROTOCOL_MAX, PROTOCOL_MIN,
+    read_frame, write_client, AgentMessage, ClientMessage, Record, RefuseCode, Role,
+    ENV_ALLOW_DEV_AGENT, ENV_PIPE, HEADER_LEN, MAX_RECORDS_PER_FRAME, PROTOCOL_MAX, PROTOCOL_MIN,
 };
 use super::trust;
 
@@ -249,7 +249,9 @@ impl Connection {
                 agent_min,
                 agent_max,
             }),
-            Ok(other) => Err(LinkError::Failed(format!("unexpected hello reply {other:?}"))),
+            Ok(other) => Err(LinkError::Failed(format!(
+                "unexpected hello reply {other:?}"
+            ))),
             Err(error) => Err(LinkError::Failed(format!("hello reply: {error}"))),
         }
     }
@@ -420,7 +422,10 @@ impl AdminAgentLink {
                 }) => return Some((applied_total, ERROR_AGENT_RATE_LIMITED)),
                 // The frame may have been applied: never repeat it locally.
                 Ok(other) => {
-                    self.fail(LinkError::Failed(format!("unexpected reply {other:?}")), now);
+                    self.fail(
+                        LinkError::Failed(format!("unexpected reply {other:?}")),
+                        now,
+                    );
                     return Some((applied_total, ERROR_AGENT_LOST));
                 }
                 Err(error) => {

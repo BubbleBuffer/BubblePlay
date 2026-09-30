@@ -48,22 +48,24 @@ use windows::Win32::Security::{
     TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
-use windows::Win32::System::IO::CancelIoEx;
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcess, GetCurrentProcessId, OpenEventW, OpenMutexW,
-    OpenProcessToken, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE,
+    CreateMutexW, GetCurrentProcess, GetCurrentProcessId, OpenEventW, OpenMutexW, OpenProcessToken,
+    WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE,
 };
+use windows::Win32::System::IO::CancelIoEx;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 
 use logic::SharedLog;
-use protocol::{read_frame, scoped_name, write_agent, Record, AGENT_MUTEX, AGENT_STOP_EVENT, TRAY_MUTEX};
+use protocol::{
+    read_frame, scoped_name, write_agent, Record, AGENT_MUTEX, AGENT_STOP_EVENT, TRAY_MUTEX,
+};
 use session::{Injector, Outcome, Session};
 
 /// Pipe instances: one listening plus up to three clients (host, probe, spare).
@@ -292,7 +294,9 @@ struct Agent {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Agent {
@@ -368,7 +372,11 @@ impl Agent {
             let image = trust::process_image_path(client_pid);
             let client_session = trust::process_session_id(client_pid);
             if client_session != Some(trust::current_session_id()) {
-                tracing::warn!(client_pid, ?client_session, "rejecting client from another session");
+                tracing::warn!(
+                    client_pid,
+                    ?client_session,
+                    "rejecting client from another session"
+                );
                 // SAFETY: connected pipe handle.
                 let _ = unsafe { DisconnectNamedPipe(instance.0) };
                 continue;
@@ -594,14 +602,14 @@ fn run() -> i32 {
     let mutex_name = wide(scoped(AGENT_MUTEX));
     let attributes = mutex_security.attributes();
     // SAFETY: NUL-terminated name; attributes outlive the call.
-    let instance = match unsafe { CreateMutexW(Some(&attributes), true, PCWSTR(mutex_name.as_ptr())) }
-    {
-        Ok(handle) => Handle(handle),
-        Err(error) => {
-            tracing::error!(%error, "cannot create the agent mutex");
-            return 1;
-        }
-    };
+    let instance =
+        match unsafe { CreateMutexW(Some(&attributes), true, PCWSTR(mutex_name.as_ptr())) } {
+            Ok(handle) => Handle(handle),
+            Err(error) => {
+                tracing::error!(%error, "cannot create the agent mutex");
+                return 1;
+            }
+        };
     // SAFETY: reads the error left by CreateMutexW.
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         tracing::info!("agent already running; exiting");

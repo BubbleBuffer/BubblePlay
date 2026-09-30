@@ -1,37 +1,42 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    One-time elevated migration from the BubblePlay Windows services to the
-    user-space tray app (bubbleplay_tray.exe).
+    Install BubblePlay as a per-user app (tray + host), plus the optional
+    elevated admin input agent, with at most one UAC prompt.
 
 .DESCRIPTION
-    Run once from an elevated PowerShell window signed in as the desktop user
-    that BubblePlay should control. Steps (each idempotent):
-      1. Migrate worker URL + tokens from %ProgramData%\BubblePlay\transport.json
-         (machine DPAPI, service-only ACL) into %LOCALAPPDATA%\BubblePlay\host.json
-         with the secrets re-protected by CurrentUser DPAPI.
-      2. Quit a running tray / elevated host so binaries can be replaced.
-      3. Copy bubbleplay-host.exe and bubbleplay_tray.exe to
-         %LOCALAPPDATA%\Programs\BubblePlay (user-writable: later updates via
-         update-tray.ps1 need no elevation).
-      4. Copy the same two binaries to %ProgramFiles%\BubblePlay\elevated
-         (protected ACL: SYSTEM/Administrators full, Users read+execute; verified)
-         and register the on-demand task \BubblePlay\ElevatedHost (this user,
-         RunLevel Highest, no triggers) that runs THAT admin-owned copy with
-         --run-elevated-host. The elevated runner only starts the host beside
-         itself, never from %LOCALAPPDATA%.
-      5. Stop and delete BubblePlayLabHelper, BubblePlayTransport, BubblePlayBroker,
-         stop leftover service-side processes, remove leftover Stream Lab QoS
-         policies, and delete old service binaries in %ProgramFiles%\BubblePlay
-         only when their SHA-256 matches %ProgramData%\BubblePlay\installed-hashes.json.
-         ProgramData is left untouched.
-      6. Set the HKCU Run entry and tray.json startAtLogin=true.
-      7. Launch the tray NON-elevated through a one-shot Limited task.
-    A receipt JSON is written to %LOCALAPPDATA%\BubblePlay\receipts.
-    Use -WhatIf (works without elevation) to print the plan without changing anything.
+    Run from a normal (non-elevated) PowerShell as the desktop user.
 
-    -ElevatedBinariesOnly refreshes just step 4 (used by update-tray.ps1
-    -IncludeElevated). -SkipElevatedTask opts out of Admin mode entirely.
+    User part (no elevation):
+      - Quit a running tray (its host and admin agent exit with it).
+      - Copy bubbleplay-host.exe, bubbleplay_tray.exe, the staged
+        bubbleplay_admin_agent.exe, setup-tray.ps1 and uninstall-tray.ps1 to
+        %LOCALAPPDATA%\Programs\BubblePlay.
+      - Write %LOCALAPPDATA%\BubblePlay\host.json (worker URL + tokens,
+        CurrentUser DPAPI) from -WorkerUrl/-Token or an existing host.json.
+      - HKCU Run autostart, a Start-menu shortcut, an HKCU "Apps" uninstall
+        entry (uninstall-tray.ps1) and tray.json.
+      - Start the tray.
+
+    Machine part (ONE UAC prompt, only when something needs it):
+      - Install the admin input agent to %ProgramFiles%\BubblePlay\agent
+        (protected ACL: SYSTEM/Administrators full, Users read+execute;
+        verified) and register the on-demand task \BubblePlay\AdminAgent
+        (this user, RunLevel Highest, no triggers; the user may only query,
+        run and end it). The tray starts it while Admin mode is on.
+      - Remove the old elevated whole-host path: the \BubblePlay\ElevatedHost
+        task and %ProgramFiles%\BubblePlay\elevated.
+      - Remove the old BubblePlay services, their hash-matched binaries and
+        Stream Lab QoS policies; migrate the service config into host.json
+        when no host.json exists yet (ProgramData is left untouched).
+
+    -AgentOnly runs just the agent install + old elevated cleanup (used by
+    the tray's "Admin agent needs update" item and update-tray.ps1
+    -IncludeAgent). -SkipAgent installs no agent (Admin mode unavailable)
+    and removes an installed one. -WhatIf previews everything (no
+    elevation, nothing written). A receipt JSON is written per run to
+    %LOCALAPPDATA%\BubblePlay\receipts.
+
     Admin mode lets input reach elevated windows (UIPI); the secure desktop
     (UAC prompts, lock screen) is still NOT captured.
 #>
@@ -45,8 +50,12 @@ param(
     [Security.SecureString]$HostGateToken,
     [string]$Monitor,
     [switch]$KeepServices,
-    [switch]$SkipElevatedTask,
-    [switch]$ElevatedBinariesOnly,
+    [Alias('SkipElevatedTask')]
+    [switch]$SkipAgent,
+    [Alias('ElevatedBinariesOnly')]
+    [switch]$AgentOnly,
+    # Internal: the elevated half, started by this script through one UAC prompt.
+    [switch]$MachinePhase,
     [switch]$NoLaunch
 )
 
@@ -60,22 +69,29 @@ Add-Type -AssemblyName System.Security
     foreach ($module in 'CimCmdlets', 'ScheduledTasks', 'NetQos') { Import-Module $module -ErrorAction SilentlyContinue }
 }
 
-$ServiceInstallDir = Join-Path $env:ProgramFiles 'BubblePlay'
-$ElevatedDir = Join-Path $ServiceInstallDir 'elevated'
-$ElevatedTrayExe = Join-Path $ElevatedDir 'bubbleplay_tray.exe'
-# Binaries install-service.ps1 placed in $ServiceInstallDir.
+$ProgramFilesRoot = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+$MachineDir = Join-Path $ProgramFilesRoot 'BubblePlay'
+$AgentDir = Join-Path $MachineDir 'agent'
+$AgentExeName = 'bubbleplay_admin_agent.exe'
+$AgentExe = Join-Path $AgentDir $AgentExeName
+$LegacyElevatedDir = Join-Path $MachineDir 'elevated'
+# Binaries install-service.ps1 placed in $MachineDir.
 $ServiceBinaries = @('bubbleplay_broker.exe', 'bubbleplay_transport.exe', 'bubbleplay_agent.exe',
     'bubbleplay_input_proxy.exe', 'bubbleplay_lab_helper.exe', 'bubbleplay-host.exe')
 $TrustedSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
 $ServiceNames = @('BubblePlayLabHelper', 'BubblePlayTransport', 'BubblePlayBroker')
 $ServiceProcessNames = @('bubbleplay_broker', 'bubbleplay_transport', 'bubbleplay_agent',
     'bubbleplay_input_proxy', 'bubbleplay_lab_helper', 'bubbleplay_lab_activity_guard', 'bubbleplay-host')
-$Binaries = @('bubbleplay-host.exe', 'bubbleplay_tray.exe')
+$UserBinaries = @('bubbleplay-host.exe', 'bubbleplay_tray.exe', $AgentExeName)
+$UserScripts = @('setup-tray.ps1', 'uninstall-tray.ps1')
 $TaskPath = '\BubblePlay\'
-$ElevatedTaskName = 'ElevatedHost'
+$AgentTaskName = 'AdminAgent'
+$LegacyTaskName = 'ElevatedHost'
 $LaunchTaskName = 'LaunchTray'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValue = 'BubblePlayTray'
+$UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BubblePlay'
+$StartMenuShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'BubblePlay.lnk'
 
 if (-not $SourceDir) { $SourceDir = Join-Path $PSScriptRoot '..\target\release' }
 $SourceDir = [IO.Path]::GetFullPath($SourceDir)
@@ -84,6 +100,7 @@ $DataDir = Join-Path $env:LOCALAPPDATA 'BubblePlay'
 $HostConfigPath = Join-Path $DataDir 'host.json'
 $TraySettingsPath = Join-Path $DataDir 'tray.json'
 $TrayExe = Join-Path $InstallDir 'bubbleplay_tray.exe'
+$PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $IsWhatIf = [bool]$WhatIfPreference
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -92,9 +109,11 @@ $IsElevated = ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
 $UserSid = $identity.User.Value
 $UserName = $identity.Name
 
+$phase = if ($MachinePhase) { 'machine' } elseif ($AgentOnly) { 'agent-only' } else { 'full' }
 $refused = $false
 $receipt = [ordered]@{
-    schema      = 'bubbleplay.setup-tray.v1'
+    schema      = 'bubbleplay.setup-tray.v2'
+    phase       = $phase
     startedUtc  = [DateTimeOffset]::UtcNow.ToString('o')
     finishedUtc = $null
     whatIf      = $IsWhatIf
@@ -103,7 +122,7 @@ $receipt = [ordered]@{
     userSid     = $UserSid
     sourceDir   = $SourceDir
     installDir  = $InstallDir
-    elevatedDir = $ElevatedDir
+    agentDir    = $AgentDir
     dataDir     = $DataDir
     steps       = [Collections.Generic.List[object]]::new()
     result      = 'running'
@@ -124,6 +143,16 @@ function Get-Sha256([string]$Path) {
         try { return ConvertTo-Hex $sha.ComputeHash($stream) } finally { $sha.Dispose() }
     }
     finally { $stream.Dispose() }
+}
+
+function Get-Sha256OrNull([string]$Path) {
+    try { if (Test-Path -LiteralPath $Path -PathType Leaf) { return Get-Sha256 $Path } } catch { }
+    return $null
+}
+
+function Test-SamePath([string]$A, [string]$B) {
+    [string]::Equals([IO.Path]::GetFullPath($A).TrimEnd('\'), [IO.Path]::GetFullPath($B).TrimEnd('\'),
+        [StringComparison]::OrdinalIgnoreCase)
 }
 
 function Get-RunValue {
@@ -168,8 +197,14 @@ function ConvertFrom-Secure([Security.SecureString]$Secret) {
 
 function Invoke-Schtasks([string[]]$Arguments) {
     $exe = Join-Path $env:SystemRoot 'System32\schtasks.exe'
+    # Native stderr ("task not found") must not become a terminating error.
+    $ErrorActionPreference = 'Continue'
     $output = & $exe @Arguments 2>&1
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($output | Out-String).Trim() }
+}
+
+function Test-Task([string]$Name) {
+    (Invoke-Schtasks @('/query', '/tn', "$TaskPath$Name")).ExitCode -eq 0
 }
 
 function Assert-InteractiveUserMatches {
@@ -181,13 +216,13 @@ function Assert-InteractiveUserMatches {
         return
     }
     if ($owners -notcontains $UserSid) {
-        throw "This elevated session runs as $UserName ($UserSid) but the desktop belongs to $($owners -join ', '). " +
-        'Elevate from the desktop user''s own account (UAC consent, not a different admin login) so CurrentUser DPAPI, HKCU and %LOCALAPPDATA% belong to that user.'
+        throw "This session runs as $UserName ($UserSid) but the desktop belongs to $($owners -join ', '). " +
+        'Run as the desktop user (and approve UAC with consent, not a different admin login) so CurrentUser DPAPI, HKCU, %LOCALAPPDATA% and the agent task belong to that user.'
     }
     Add-Step 'identity' 'ok' "$UserName owns the interactive desktop."
 }
 
-# --- Step 1: configuration ------------------------------------------------------
+# --- Configuration ----------------------------------------------------------------
 function Get-ServiceConfig {
     $path = Join-Path $ServiceDataDir 'transport.json'
     $visible = $false
@@ -237,6 +272,8 @@ function Get-ExistingHostConfig {
     }
 }
 
+# Returns 'machine' when only the elevated part can read the config (the old
+# service config under ProgramData); otherwise writes/plans host.json itself.
 function Update-HostConfig {
     $existing = Get-ExistingHostConfig
     $service = Get-ServiceConfig
@@ -250,25 +287,21 @@ function Update-HostConfig {
         $tok = if ($explicitToken) { $explicitToken } elseif ($existing) { $existing.Token } elseif ($service -and $service.Readable) { $service.Token } else { $null }
         $gate = if ($explicitGate) { $explicitGate } elseif ($existing) { $existing.HostGateToken } elseif ($service -and $service.Readable) { $service.HostGateToken } else { $null }
     }
-    elseif ($service -and $service.Readable) {
-        $source = "service config $($service.Path)"
-        $worker = $service.Worker; $tok = $service.Token; $gate = $service.HostGateToken
-    }
     elseif ($existing) {
         $source = 'existing host.json'
         $worker = $existing.Worker; $tok = $existing.Token; $gate = $existing.HostGateToken
     }
+    elseif ($service -and $service.Readable) {
+        $source = "service config $($service.Path)"
+        $worker = $service.Worker; $tok = $service.Token; $gate = $service.HostGateToken
+    }
     elseif ($service -and -not $service.Readable) {
-        if ($IsWhatIf) {
-            Add-Step 'config' 'planned' "Would migrate $($service.Path) (not readable without elevation) -> $HostConfigPath (CurrentUser DPAPI)."
-            return
-        }
-        throw "Cannot read $($service.Path): $($service.Error)"
+        return 'machine'
     }
     else {
         if ($IsWhatIf) {
             Add-Step 'config' 'blocked' 'No service config or host.json found; the real run needs -WorkerUrl and -Token.'
-            return
+            return 'none'
         }
         throw 'No existing configuration found. Pass -WorkerUrl wss://.../host-ws and -Token (SecureString).'
     }
@@ -279,7 +312,7 @@ function Update-HostConfig {
     if ($existing -and $existing.Worker -eq $worker -and $existing.Token -eq $tok -and
         $existing.HostGateToken -eq $gate -and $existing.Monitor -eq $monitorValue) {
         Add-Step 'config' 'unchanged' "$HostConfigPath already matches ($source)."
-        return
+        return 'done'
     }
     if ($PSCmdlet.ShouldProcess($HostConfigPath, "Write host config from $source (secrets CurrentUser-DPAPI)")) {
         $config = [ordered]@{
@@ -300,154 +333,158 @@ function Update-HostConfig {
     else {
         Add-Step 'config' 'planned' "Write $HostConfigPath from $source (worker $worker, gate token: $([bool]$gate))."
     }
+    return 'done'
 }
 
-# --- Step 2: stop the running tray ---------------------------------------------
+# --- Stop the running tray ---------------------------------------------------------
 function Stop-RunningTray {
     $running = @(Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)
     if ($running.Count -eq 0) { Add-Step 'stop-tray' 'skipped' 'Tray is not running.'; return }
-    if (-not $PSCmdlet.ShouldProcess('bubbleplay_tray', 'Quit running tray and elevated host')) {
-        Add-Step 'stop-tray' 'planned' "Quit $($running.Count) running tray process(es)."
+    if (-not $PSCmdlet.ShouldProcess('bubbleplay_tray', 'Quit running tray (its host and admin agent exit with it)')) {
+        Add-Step 'stop-tray' 'planned' "Quit $($running.Count) running tray process(es); the host and admin agent exit with the tray."
         return
     }
     $quitter = if (Test-Path -LiteralPath $TrayExe) { $TrayExe } else { $running[0].Path }
     if ($quitter) { Start-Process -FilePath $quitter -ArgumentList '--quit' -Wait -WindowStyle Hidden }
-    [void](Invoke-Schtasks @('/end', '/tn', "$TaskPath$ElevatedTaskName"))
     Start-Sleep -Milliseconds 500
-    Get-Process bubbleplay_tray -ErrorAction SilentlyContinue | Stop-Process -Force
-    Get-Process bubbleplay-host -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -and ($_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) -or
-                $_.Path.StartsWith($ElevatedDir, [StringComparison]::OrdinalIgnoreCase)) } |
-        Stop-Process -Force
+    Get-Process bubbleplay_tray -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process bubbleplay-host, bubbleplay_admin_agent -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
     Add-Step 'stop-tray' 'done' 'Tray and its host stopped.'
 }
 
-# --- Step 3: remove services ----------------------------------------------------
-function Remove-BubblePlayServices {
-    if ($KeepServices) { Add-Step 'services' 'skipped' '-KeepServices given.'; return }
-    $present = @($ServiceNames | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
-    if ($present.Count -eq 0) {
-        Add-Step 'services' 'unchanged' 'No BubblePlay services registered.'
-    }
-    elseif ($PSCmdlet.ShouldProcess(($present -join ', '), 'Stop and delete service registrations')) {
-        $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
-        foreach ($name in $present) {
-            $service = Get-Service -Name $name
-            if ($service.Status -ne 'Stopped') {
-                Stop-Service -Name $name -Force
-                $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
-            }
-            & $sc delete $name | Out-Null
-            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1072) { throw "sc.exe delete $name failed with $LASTEXITCODE" }
-        }
-        Add-Step 'services' 'done' "Stopped and deleted: $($present -join ', ')."
-    }
-    else {
-        Add-Step 'services' 'planned' "Stop and delete: $($present -join ', ') (ProgramData is kept)."
-    }
-
-    $serviceRoot = Join-Path $env:ProgramFiles 'BubblePlay'
-    $leftovers = @(Get-Process -Name $ServiceProcessNames -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -and $_.Path.StartsWith($serviceRoot, [StringComparison]::OrdinalIgnoreCase) })
-    if ($leftovers.Count -gt 0) {
-        if ($PSCmdlet.ShouldProcess(($leftovers | ForEach-Object { "$($_.Name):$($_.Id)" }) -join ', ', 'Stop leftover service processes')) {
-            $leftovers | Stop-Process -Force
-            Add-Step 'service-processes' 'done' "Stopped $($leftovers.Count) leftover process(es)."
-        }
-        else { Add-Step 'service-processes' 'planned' "Stop $($leftovers.Count) leftover process(es) under $serviceRoot." }
-    }
-
-    Remove-ServiceBinaryLeftovers
-
-    $qos = @()
-    if (Get-Command Get-NetQosPolicy -ErrorAction SilentlyContinue) {
-        foreach ($store in @('ActiveStore', $null)) {
-            $query = @{ ErrorAction = 'SilentlyContinue' }
-            if ($store) { $query.PolicyStore = $store }
-            $qos += @(Get-NetQosPolicy @query | Where-Object { $_.Name -like 'BubblePlay-StreamLab-*' -or $_.Name -like 'BubblePlayLab-*' } |
-                    ForEach-Object { [pscustomobject]@{ Name = $_.Name; Store = $store } })
-        }
-    }
-    if ($qos.Count -eq 0) { Add-Step 'qos' 'unchanged' 'No Stream Lab QoS policies present.'; return }
-    if ($PSCmdlet.ShouldProcess(($qos.Name -join ', '), 'Remove leftover Stream Lab QoS policies')) {
-        foreach ($policy in $qos) {
-            $remove = @{ Name = $policy.Name; Confirm = $false; ErrorAction = 'SilentlyContinue' }
-            if ($policy.Store) { $remove.PolicyStore = $policy.Store }
-            Remove-NetQosPolicy @remove
-        }
-        Add-Step 'qos' 'done' "Removed: $($qos.Name -join ', ')."
-    }
-    else { Add-Step 'qos' 'planned' "Remove: $($qos.Name -join ', ')." }
-}
-
-function Remove-ServiceBinaryLeftovers {
-    try {
-        $present = @($ServiceBinaries | Where-Object { Test-Path -LiteralPath (Join-Path $ServiceInstallDir $_) -PathType Leaf })
-    }
-    catch {
-        if ($IsElevated) { throw }
-        Add-Step 'service-binaries' 'planned' "$ServiceInstallDir is not readable without elevation; known service binaries there will be deleted only if they match installed-hashes.json."
-        return
-    }
-    if ($present.Count -eq 0) { Add-Step 'service-binaries' 'unchanged' "No old service binaries in $ServiceInstallDir."; return }
-    $manifestPath = Join-Path $ServiceDataDir 'installed-hashes.json'
-    $manifest = @{}
-    try {
-        foreach ($entry in @(Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json)) { $manifest[[string]$entry.file] = [string]$entry.sha256 }
-    }
-    catch {
-        $state = if ($IsElevated) { 'kept' } else { 'planned' }
-        Add-Step 'service-binaries' $state "Cannot read $manifestPath; old binaries are only deleted when they match it ($($present -join ', '))."
-        return
-    }
-    $matching = @(); $kept = @()
-    foreach ($name in $present) {
-        $path = Join-Path $ServiceInstallDir $name
-        if ($manifest.ContainsKey($name) -and $manifest[$name] -eq (Get-Sha256 $path)) { $matching += $name } else { $kept += $name }
-    }
-    $keptNote = if ($kept.Count) { " Kept (hash differs from manifest): $($kept -join ', ')." } else { '' }
-    if ($matching.Count -eq 0) { Add-Step 'service-binaries' 'kept' "No binaries match the install manifest.$keptNote"; return }
-    if ($PSCmdlet.ShouldProcess(($matching -join ', '), "Delete old service binaries from $ServiceInstallDir")) {
-        foreach ($name in $matching) { Remove-Item -Force -LiteralPath (Join-Path $ServiceInstallDir $name) }
-        Add-Step 'service-binaries' 'done' "Deleted $($matching -join ', ').$keptNote"
-    }
-    else { Add-Step 'service-binaries' 'planned' "Delete $($matching -join ', ') (hash-matched).$keptNote" }
-}
-
-# --- Step 4: binaries -----------------------------------------------------------
-function Install-Binaries {
+# --- Per-user install ----------------------------------------------------------------
+function Install-UserFiles {
     $hashes = [ordered]@{}
     $changed = @()
-    foreach ($name in $Binaries) {
-        $source = Join-Path $SourceDir $name
+    $sources = @{}
+    foreach ($name in $UserBinaries) { $sources[$name] = Join-Path $SourceDir $name }
+    foreach ($name in $UserScripts) { $sources[$name] = Join-Path $PSScriptRoot $name }
+    foreach ($name in @($UserBinaries + $UserScripts)) {
+        $source = $sources[$name]
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-            if ($IsWhatIf) { Add-Step 'binaries' 'blocked' "Missing $source (build first)."; return }
+            if ($IsWhatIf) { Add-Step 'user-files' 'blocked' "Missing $source (build first)."; return }
             throw "Missing $source. Build first: cargo build --offline --locked --release --bins --manifest-path host/Cargo.toml"
         }
+        $target = Join-Path $InstallDir $name
+        if (Test-SamePath $source $target) { continue }
         $hash = Get-Sha256 $source
         $hashes[$name] = $hash
-        $target = Join-Path $InstallDir $name
-        if (-not (Test-Path -LiteralPath $target) -or (Get-Sha256 $target) -ne $hash) {
-            $changed += $name
-        }
+        if ((Get-Sha256OrNull $target) -ne $hash) { $changed += $name }
     }
-    $receipt.binaries = $hashes
-    if ($changed.Count -eq 0) { Add-Step 'binaries' 'unchanged' "$InstallDir is current."; return }
+    $receipt.files = $hashes
+    if ($changed.Count -eq 0) { Add-Step 'user-files' 'unchanged' "$InstallDir is current."; return }
     if ($PSCmdlet.ShouldProcess($InstallDir, "Copy $($changed -join ', ')")) {
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
         foreach ($name in $changed) {
             $target = Join-Path $InstallDir $name
             $temp = "$target.new"
-            Copy-Item -Force -LiteralPath (Join-Path $SourceDir $name) -Destination $temp
+            Copy-Item -Force -LiteralPath $sources[$name] -Destination $temp
             Move-Item -Force -LiteralPath $temp -Destination $target
             if ((Get-Sha256 $target) -ne $hashes[$name]) { throw "Hash mismatch after copying $name." }
         }
-        Add-Step 'binaries' 'done' "Copied $($changed -join ', ') to $InstallDir."
+        Add-Step 'user-files' 'done' "Copied $($changed -join ', ') to $InstallDir."
     }
-    else { Add-Step 'binaries' 'planned' "Copy $($changed -join ', ') from $SourceDir to $InstallDir." }
+    else { Add-Step 'user-files' 'planned' "Copy $($changed -join ', ') to $InstallDir (per-user, no admin rights)." }
 }
 
-# --- Step 4a: admin-owned elevated copy -----------------------------------------
+function Set-UserRegistration {
+    # Autostart
+    $command = "`"$TrayExe`""
+    if ((Get-RunValue) -eq $command) { Add-Step 'autostart' 'unchanged' "HKCU Run\$RunValue already set." }
+    elseif ($PSCmdlet.ShouldProcess("$RunKey\$RunValue", "Set to $command")) {
+        New-Item -Path $RunKey -Force -ErrorAction SilentlyContinue | Out-Null
+        Set-ItemProperty -Path $RunKey -Name $RunValue -Value $command
+        Add-Step 'autostart' 'done' "HKCU Run\$RunValue = $command"
+    }
+    else { Add-Step 'autostart' 'planned' "Set HKCU Run\$RunValue = $command" }
+
+    # Start-menu shortcut
+    if ($PSCmdlet.ShouldProcess($StartMenuShortcut, "Create shortcut to $TrayExe")) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $StartMenuShortcut) | Out-Null
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut($StartMenuShortcut)
+        $link.TargetPath = $TrayExe
+        $link.WorkingDirectory = $InstallDir
+        $link.Description = 'BubblePlay tray'
+        $link.IconLocation = "$TrayExe,0"
+        $link.Save()
+        Add-Step 'start-menu' 'done' $StartMenuShortcut
+    }
+    else { Add-Step 'start-menu' 'planned' "Create $StartMenuShortcut -> $TrayExe" }
+
+    # Apps & features entry (per user)
+    $uninstallScript = Join-Path $InstallDir 'uninstall-tray.ps1'
+    $uninstallCommand = "`"$PowerShellExe`" -NoProfile -ExecutionPolicy Bypass -File `"$uninstallScript`""
+    if ($PSCmdlet.ShouldProcess($UninstallKey, 'Register per-user uninstall entry')) {
+        New-Item -Path $UninstallKey -Force | Out-Null
+        $sizeKb = 0
+        try { $sizeKb = [int](((Get-ChildItem -LiteralPath $InstallDir -Recurse -File | Measure-Object Length -Sum).Sum) / 1KB) } catch { }
+        $values = [ordered]@{
+            DisplayName     = 'BubblePlay'
+            Publisher       = 'BubblePlay'
+            DisplayIcon     = "$TrayExe,0"
+            InstallLocation = $InstallDir
+            UninstallString = $uninstallCommand
+            InstallDate     = [DateTime]::Now.ToString('yyyyMMdd')
+        }
+        foreach ($entry in $values.GetEnumerator()) { Set-ItemProperty -Path $UninstallKey -Name $entry.Key -Value $entry.Value }
+        foreach ($name in 'NoModify', 'NoRepair') { New-ItemProperty -Path $UninstallKey -Name $name -PropertyType DWord -Value 1 -Force | Out-Null }
+        New-ItemProperty -Path $UninstallKey -Name EstimatedSize -PropertyType DWord -Value $sizeKb -Force | Out-Null
+        Add-Step 'uninstall-entry' 'done' "$UninstallKey -> $uninstallCommand"
+    }
+    else { Add-Step 'uninstall-entry' 'planned' "Register $UninstallKey (UninstallString: $uninstallCommand)" }
+
+    # tray.json
+    $settings = [ordered]@{ adminMode = $false; startAtLogin = $true }
+    if (Test-Path -LiteralPath $TraySettingsPath) {
+        try {
+            $old = Get-Content -Raw -LiteralPath $TraySettingsPath | ConvertFrom-Json
+            if ($old.PSObject.Properties['adminMode']) { $settings.adminMode = [bool]$old.adminMode }
+        }
+        catch { }
+    }
+    if ($SkipAgent) { $settings.adminMode = $false }
+    if ($PSCmdlet.ShouldProcess($TraySettingsPath, 'Write startAtLogin=true')) {
+        New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+        [IO.File]::WriteAllText($TraySettingsPath, ($settings | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        Add-Step 'tray-settings' 'done' "adminMode=$($settings.adminMode), startAtLogin=true"
+    }
+    else { Add-Step 'tray-settings' 'planned' "Write $TraySettingsPath (adminMode=$($settings.adminMode), startAtLogin=true)." }
+}
+
+function Start-Tray {
+    if ($NoLaunch) { Add-Step 'launch' 'skipped' '-NoLaunch given.'; return }
+    if (-not $IsElevated) {
+        if (-not $PSCmdlet.ShouldProcess($TrayExe, 'Start tray')) { Add-Step 'launch' 'planned' "Start $TrayExe."; return }
+        Start-Process -FilePath $TrayExe -WorkingDirectory $InstallDir
+    }
+    else {
+        # Run elevated: start the tray NON-elevated through a one-shot Limited task.
+        if (-not $PSCmdlet.ShouldProcess($TrayExe, 'Launch tray non-elevated via one-shot Limited task')) {
+            Add-Step 'launch' 'planned' "Start $TrayExe as $UserName (RunLevel Limited) through a temporary task, then delete the task."
+            return
+        }
+        $action = New-ScheduledTaskAction -Execute $TrayExe -WorkingDirectory $InstallDir
+        $principal = New-ScheduledTaskPrincipal -UserId $UserName -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Priority 4
+        Register-ScheduledTask -TaskPath $TaskPath -TaskName $LaunchTaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        try { Start-ScheduledTask -TaskPath $TaskPath -TaskName $LaunchTaskName }
+        finally {
+            Start-Sleep -Seconds 2
+            # Deleting the task definition does not stop the process it started.
+            Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $LaunchTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do { Start-Sleep -Milliseconds 500 } until ((Get-Process bubbleplay_tray -ErrorAction SilentlyContinue) -or [DateTime]::UtcNow -gt $deadline)
+    $tray = Get-Process bubbleplay_tray -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $tray) { throw 'The tray did not start. Start it from the Start menu (BubblePlay) or sign out and back in.' }
+    Add-Step 'launch' 'done' "Tray running (pid $($tray.Id))."
+}
+
+# --- Machine part: what needs the (single) elevation ---------------------------------
 $WriteRights = [int64]([Security.AccessControl.FileSystemRights]::WriteData -bor
     [Security.AccessControl.FileSystemRights]::AppendData -bor
     [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
@@ -476,15 +513,66 @@ function Get-UnsafeAclFindings([string]$Path) {
     return , $findings
 }
 
-function Assert-ElevatedDirSafe {
+function Get-AgentAclFindings {
     $findings = @()
-    foreach ($path in @($ElevatedDir) + @($Binaries | ForEach-Object { Join-Path $ElevatedDir $_ })) {
-        if (Test-Path -LiteralPath $path) { $findings += Get-UnsafeAclFindings $path }
+    foreach ($path in @($AgentDir, $AgentExe, (Join-Path $AgentDir 'logs'))) {
+        try { if (Test-Path -LiteralPath $path) { $findings += Get-UnsafeAclFindings $path } }
+        catch { $findings += "$path is not inspectable: $($_.Exception.Message)" }
     }
-    if ($findings.Count -gt 0) { throw "Elevated binary folder is not admin-only: $($findings -join '; ')" }
+    return , $findings
 }
 
-function Set-ElevatedDirAcl {
+# Everything the elevated part would change, as short descriptions.
+function Get-MachineWork([bool]$ConfigNeedsMachine) {
+    $work = [Collections.Generic.List[string]]::new()
+    if ($SkipAgent) {
+        if ((Test-Task $AgentTaskName) -or (Test-Path -LiteralPath $AgentDir)) {
+            $work.Add("remove the admin agent (task $TaskPath$AgentTaskName, $AgentDir) because of -SkipAgent")
+        }
+    }
+    else {
+        $source = Join-Path $SourceDir $AgentExeName
+        $sourceHash = Get-Sha256OrNull $source
+        $installedHash = Get-Sha256OrNull $AgentExe
+        if (-not $sourceHash) { $work.Add("install the admin agent (source $source is missing: build first)") }
+        elseif ($installedHash -ne $sourceHash) {
+            $what = if ($installedHash) { 'update' } else { 'install' }
+            $work.Add("$what the admin agent -> $AgentExe (protected ACL: SYSTEM/Administrators full, Users read+execute; verified)")
+        }
+        elseif ((Get-AgentAclFindings).Count -gt 0) { $work.Add("repair the admin agent folder ACL in $AgentDir") }
+        if (-not (Test-Task $AgentTaskName)) { $work.Add("register on-demand task $TaskPath$AgentTaskName (user $UserName, RunLevel Highest, user may only query/run/end it)") }
+    }
+    if (Test-Task $LegacyTaskName) { $work.Add("remove the old elevated-host task $TaskPath$LegacyTaskName") }
+    if (Test-Path -LiteralPath $LegacyElevatedDir) { $work.Add("remove the old elevated host copy $LegacyElevatedDir") }
+    if (-not $AgentOnly) {
+        if ($ConfigNeedsMachine) { $work.Add("migrate $ServiceDataDir\transport.json into $HostConfigPath (CurrentUser DPAPI)") }
+        if (-not $KeepServices) {
+            $services = @($ServiceNames | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
+            if ($services.Count) { $work.Add("stop and delete services $($services -join ', ') (ProgramData is kept)") }
+            $binaries = @()
+            try { $binaries = @($ServiceBinaries | Where-Object { Test-Path -LiteralPath (Join-Path $MachineDir $_) -PathType Leaf }) } catch { }
+            if ($binaries.Count) { $work.Add("delete old service binaries in $MachineDir that match installed-hashes.json ($($binaries -join ', '))") }
+        }
+    }
+    return , $work
+}
+
+function Stop-AgentProcesses {
+    foreach ($name in @($AgentTaskName, $LegacyTaskName)) {
+        if (Test-Task $name) { [void](Invoke-Schtasks @('/end', '/tn', "$TaskPath$name")) }
+    }
+    $roots = @($AgentDir, $LegacyElevatedDir)
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $busy = @(Get-Process bubbleplay_admin_agent, bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
+                Where-Object { $p = $_.Path; $p -and @($roots | Where-Object { $p.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count })
+        if ($busy.Count -eq 0) { return }
+        $busy | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
+    } while ([DateTime]::UtcNow -lt $deadline)
+}
+
+function Set-ProtectedDirAcl([string]$Path) {
     $acl = New-Object Security.AccessControl.DirectorySecurity
     $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
     $acl.SetAccessRuleProtection($true, $false)
@@ -495,138 +583,224 @@ function Set-ElevatedDirAcl {
                 [Security.Principal.SecurityIdentifier]$entry[0], [Security.AccessControl.FileSystemRights]$entry[1],
                 $inherit, $none, [Security.AccessControl.AccessControlType]::Allow))
     }
-    Set-Acl -LiteralPath $ElevatedDir -AclObject $acl
+    Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
-function Install-ElevatedBinaries {
-    if ($SkipElevatedTask) { Add-Step 'elevated-binaries' 'skipped' '-SkipElevatedTask given.'; return }
-    $changed = @()
-    foreach ($name in $Binaries) {
-        $source = Join-Path $SourceDir $name
-        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-            if ($IsWhatIf) { Add-Step 'elevated-binaries' 'blocked' "Missing $source (build first)."; return }
-            throw "Missing $source."
+function Reset-ToInheritedAcl([string]$Path) {
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
+    $acl.SetAccessRuleProtection($false, $false)
+    foreach ($rule in @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRule($rule) }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Install-Agent {
+    if ($SkipAgent) {
+        if ((Test-Task $AgentTaskName) -and $PSCmdlet.ShouldProcess("$TaskPath$AgentTaskName", 'Unregister (because -SkipAgent)')) {
+            Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $AgentTaskName -Confirm:$false
         }
-        $target = Join-Path $ElevatedDir $name
-        $current = $null
-        try { if (Test-Path -LiteralPath $target) { $current = Get-Sha256 $target } } catch { }
-        if ($current -ne (Get-Sha256 $source)) { $changed += $name }
-    }
-    if (-not $PSCmdlet.ShouldProcess($ElevatedDir, "Install admin-only copy of $($Binaries -join ', ')")) {
-        $what = if ($changed.Count) { "Copy $($changed -join ', ')" } else { 'Binaries current' }
-        Add-Step 'elevated-binaries' 'planned' "$what -> $ElevatedDir; set protected ACL (SYSTEM/Administrators full, Users read+execute) and verify no user write access."
+        if ((Test-Path -LiteralPath $AgentDir) -and $PSCmdlet.ShouldProcess($AgentDir, 'Remove (because -SkipAgent)')) {
+            Remove-Item -Recurse -Force -LiteralPath $AgentDir
+        }
+        Add-Step 'agent' 'skipped' '-SkipAgent given; Admin mode is unavailable.'
         return
     }
-    foreach ($dir in @($ServiceInstallDir, $ElevatedDir)) {
+    $source = Join-Path $SourceDir $AgentExeName
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing $source." }
+    $sourceHash = Get-Sha256 $source
+    $changed = (Get-Sha256OrNull $AgentExe) -ne $sourceHash
+    if (-not $PSCmdlet.ShouldProcess($AgentDir, "Install admin input agent ($AgentExeName)")) {
+        Add-Step 'agent' 'planned' "Copy $AgentExeName -> $AgentDir; set protected ACL and verify no user write access."
+        return
+    }
+    foreach ($dir in @($MachineDir, $AgentDir)) {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
         if ((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$dir is a reparse point." }
     }
-    Set-ElevatedDirAcl
-    foreach ($name in $changed) {
-        $target = Join-Path $ElevatedDir $name
-        $temp = "$target.new"
-        Copy-Item -Force -LiteralPath (Join-Path $SourceDir $name) -Destination $temp
-        Move-Item -Force -LiteralPath $temp -Destination $target
+    Set-ProtectedDirAcl $AgentDir
+    if ($changed) {
+        $temp = "$AgentExe.new"
+        Copy-Item -Force -LiteralPath $source -Destination $temp
+        Move-Item -Force -LiteralPath $temp -Destination $AgentExe
     }
-    # Reset file ACLs to the (protected) folder's inherited entries, then verify.
-    foreach ($name in $Binaries) {
-        $target = Join-Path $ElevatedDir $name
-        $fileAcl = Get-Acl -LiteralPath $target
-        $fileAcl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
-        $fileAcl.SetAccessRuleProtection($false, $false)
-        foreach ($rule in @($fileAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { [void]$fileAcl.RemoveAccessRule($rule) }
-        Set-Acl -LiteralPath $target -AclObject $fileAcl
-        if ((Get-Sha256 $target) -ne (Get-Sha256 (Join-Path $SourceDir $name))) { throw "Hash mismatch after copying $name." }
-    }
-    Assert-ElevatedDirSafe
-    $detail = if ($changed.Count) { "Copied $($changed -join ', ')" } else { 'Binaries current' }
-    Add-Step 'elevated-binaries' 'done' "$detail in $ElevatedDir; ACL verified admin-only."
+    $logs = Join-Path $AgentDir 'logs'
+    if (-not (Test-Path -LiteralPath $logs)) { New-Item -ItemType Directory -Path $logs | Out-Null }
+    Reset-ToInheritedAcl $AgentExe
+    Reset-ToInheritedAcl $logs
+    if ((Get-Sha256 $AgentExe) -ne $sourceHash) { throw "Hash mismatch after copying $AgentExeName." }
+    $findings = Get-AgentAclFindings
+    if ($findings.Count -gt 0) { throw "Agent folder is not admin-only: $($findings -join '; ')" }
+    $receipt.agentSha256 = $sourceHash
+    $detail = if ($changed) { 'Installed' } else { 'Already current' }
+    Add-Step 'agent' 'done' "$detail $AgentExe; ACL verified admin-only."
 }
 
-# --- Step 5: elevated task ------------------------------------------------------
-function Register-ElevatedTask {
-    $fullName = "$TaskPath$ElevatedTaskName"
-    if ($SkipElevatedTask) {
-        $exists = (Invoke-Schtasks @('/query', '/tn', $fullName)).ExitCode -eq 0
-        if ($exists -and $PSCmdlet.ShouldProcess($fullName, 'Unregister (because -SkipElevatedTask)')) {
-            Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $ElevatedTaskName -Confirm:$false
-            Add-Step 'elevated-task' 'done' "Removed $fullName (-SkipElevatedTask)."
-        }
-        else { Add-Step 'elevated-task' 'skipped' '-SkipElevatedTask given; Admin mode will be unavailable.' }
-        return
-    }
+function Register-AgentTask {
+    if ($SkipAgent) { return }
+    $fullName = "$TaskPath$AgentTaskName"
     if (-not $PSCmdlet.ShouldProcess($fullName, "Register on-demand RunLevel Highest task for $UserName")) {
-        Add-Step 'elevated-task' 'planned' "Register $fullName -> `"$ElevatedTrayExe`" --run-elevated-host (user $UserName, Highest, on demand, grant user read+run)."
+        Add-Step 'agent-task' 'planned' "Register $fullName -> `"$AgentExe`" (user $UserName, Highest, on demand, grant user read+run)."
         return
     }
-    if (-not (Test-Path -LiteralPath $ElevatedTrayExe)) { throw "Missing $ElevatedTrayExe." }
-    Assert-ElevatedDirSafe
-    $action = New-ScheduledTaskAction -Execute $ElevatedTrayExe -Argument '--run-elevated-host' -WorkingDirectory $ElevatedDir
+    if (-not (Test-Path -LiteralPath $AgentExe)) { throw "Missing $AgentExe." }
+    $findings = Get-AgentAclFindings
+    if ($findings.Count -gt 0) { throw "Agent folder is not admin-only: $($findings -join '; ')" }
+    $action = New-ScheduledTaskAction -Execute $AgentExe -WorkingDirectory $AgentDir
     $principal = New-ScheduledTaskPrincipal -UserId $UserName -LogonType Interactive -RunLevel Highest
-    # Priority 4 = normal; the Task Scheduler default (7) would starve the encoder.
     $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Priority 4
-    Register-ScheduledTask -TaskPath $TaskPath -TaskName $ElevatedTaskName -Action $action -Principal $principal `
-        -Settings $settings -Description 'BubblePlay host with administrator rights (started by the tray in Admin mode).' -Force | Out-Null
+    Register-ScheduledTask -TaskPath $TaskPath -TaskName $AgentTaskName -Action $action -Principal $principal `
+        -Settings $settings -Description 'BubblePlay admin input agent (started by the tray while Admin mode is on).' -Force | Out-Null
     # Let the (non-elevated) user query, run and end it; only admins may change it.
     $scheduler = New-Object -ComObject Schedule.Service
     $scheduler.Connect()
-    $task = $scheduler.GetFolder($TaskPath.TrimEnd('\')).GetTask($ElevatedTaskName)
+    $task = $scheduler.GetFolder($TaskPath.TrimEnd('\')).GetTask($AgentTaskName)
     $task.SetSecurityDescriptor("D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;$UserSid)", 0)
-    Add-Step 'elevated-task' 'done' "Registered $fullName for $UserName."
+    Add-Step 'agent-task' 'done' "Registered $fullName for $UserName."
 }
 
-# --- Step 6: autostart ------------------------------------------------------------
-function Set-Autostart {
-    $command = "`"$TrayExe`""
-    $current = Get-RunValue
-    $settings = [ordered]@{ adminMode = $false; startAtLogin = $true }
-    if (Test-Path -LiteralPath $TraySettingsPath) {
-        try {
-            $old = Get-Content -Raw -LiteralPath $TraySettingsPath | ConvertFrom-Json
-            if ($old.PSObject.Properties['adminMode']) { $settings.adminMode = [bool]$old.adminMode }
+function Remove-LegacyElevated {
+    $fullName = "$TaskPath$LegacyTaskName"
+    if (Test-Task $LegacyTaskName) {
+        if ($PSCmdlet.ShouldProcess($fullName, 'Unregister old elevated-host task')) {
+            Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $LegacyTaskName -Confirm:$false
+            Add-Step 'legacy-task' 'done' "Removed $fullName."
         }
-        catch { }
+        else { Add-Step 'legacy-task' 'planned' "Remove $fullName." }
     }
-    if ($SkipElevatedTask) { $settings.adminMode = $false }
-    if ($current -eq $command) { Add-Step 'autostart' 'unchanged' "HKCU Run\$RunValue already set." }
-    elseif ($PSCmdlet.ShouldProcess("$RunKey\$RunValue", "Set to $command")) {
-        New-Item -Path $RunKey -Force -ErrorAction SilentlyContinue | Out-Null
-        Set-ItemProperty -Path $RunKey -Name $RunValue -Value $command
-        Add-Step 'autostart' 'done' "HKCU Run\$RunValue = $command"
+    if (Test-Path -LiteralPath $LegacyElevatedDir) {
+        if ($PSCmdlet.ShouldProcess($LegacyElevatedDir, 'Delete old elevated host copy')) {
+            $deadline = [DateTime]::UtcNow.AddSeconds(10)
+            while ($true) {
+                try { Remove-Item -Recurse -Force -LiteralPath $LegacyElevatedDir; break }
+                catch { if ([DateTime]::UtcNow -gt $deadline) { throw }; Start-Sleep -Milliseconds 500 }
+            }
+            Add-Step 'legacy-dir' 'done' "Deleted $LegacyElevatedDir."
+        }
+        else { Add-Step 'legacy-dir' 'planned' "Delete $LegacyElevatedDir." }
     }
-    else { Add-Step 'autostart' 'planned' "Set HKCU Run\$RunValue = $command" }
-    if ($PSCmdlet.ShouldProcess($TraySettingsPath, 'Write startAtLogin=true')) {
-        New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
-        [IO.File]::WriteAllText($TraySettingsPath, ($settings | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-        Add-Step 'tray-settings' 'done' "adminMode=$($settings.adminMode), startAtLogin=true"
-    }
-    else { Add-Step 'tray-settings' 'planned' "Write $TraySettingsPath (adminMode=$($settings.adminMode), startAtLogin=true)." }
+    $stale = Join-Path $DataDir 'elevated-runner.json'
+    if ((Test-Path -LiteralPath $stale) -and $PSCmdlet.ShouldProcess($stale, 'Delete stale heartbeat')) { Remove-Item -Force -LiteralPath $stale }
 }
 
-# --- Step 7: launch non-elevated -------------------------------------------------
-function Start-TrayUnelevated {
-    if ($NoLaunch) { Add-Step 'launch' 'skipped' '-NoLaunch given.'; return }
-    if (-not $PSCmdlet.ShouldProcess($TrayExe, 'Launch tray non-elevated via one-shot Limited task')) {
-        Add-Step 'launch' 'planned' "Start $TrayExe as $UserName (RunLevel Limited) through a temporary task, then delete the task."
+function Remove-BubblePlayServices {
+    if ($KeepServices) { Add-Step 'services' 'skipped' '-KeepServices given.'; return }
+    $present = @($ServiceNames | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
+    if ($present.Count -eq 0) {
+        Add-Step 'services' 'unchanged' 'No BubblePlay services registered.'
+    }
+    elseif ($PSCmdlet.ShouldProcess(($present -join ', '), 'Stop and delete service registrations')) {
+        $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
+        foreach ($name in $present) {
+            $service = Get-Service -Name $name
+            if ($service.Status -ne 'Stopped') {
+                Stop-Service -Name $name -Force
+                $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+            }
+            & $sc delete $name | Out-Null
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1072) { throw "sc.exe delete $name failed with $LASTEXITCODE" }
+        }
+        Add-Step 'services' 'done' "Stopped and deleted: $($present -join ', ')."
+    }
+    else {
+        Add-Step 'services' 'planned' "Stop and delete: $($present -join ', ') (ProgramData is kept)."
+    }
+
+    $leftovers = @(Get-Process -Name $ServiceProcessNames -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path.StartsWith($MachineDir, [StringComparison]::OrdinalIgnoreCase) })
+    if ($leftovers.Count -gt 0) {
+        if ($PSCmdlet.ShouldProcess(($leftovers | ForEach-Object { "$($_.Name):$($_.Id)" }) -join ', ', 'Stop leftover service processes')) {
+            $leftovers | Stop-Process -Force
+            Add-Step 'service-processes' 'done' "Stopped $($leftovers.Count) leftover process(es)."
+        }
+        else { Add-Step 'service-processes' 'planned' "Stop $($leftovers.Count) leftover process(es) under $MachineDir." }
+    }
+
+    Remove-ServiceBinaryLeftovers
+
+    $qos = @()
+    if (Get-Command Get-NetQosPolicy -ErrorAction SilentlyContinue) {
+        foreach ($store in @('ActiveStore', $null)) {
+            $query = @{ ErrorAction = 'SilentlyContinue' }
+            if ($store) { $query.PolicyStore = $store }
+            $qos += @(Get-NetQosPolicy @query | Where-Object { $_.Name -like 'BubblePlay-StreamLab-*' -or $_.Name -like 'BubblePlayLab-*' } |
+                    ForEach-Object { [pscustomobject]@{ Name = $_.Name; Store = $store } })
+        }
+    }
+    if ($qos.Count -eq 0) { Add-Step 'qos' 'unchanged' 'No Stream Lab QoS policies present.'; return }
+    if ($PSCmdlet.ShouldProcess(($qos.Name -join ', '), 'Remove leftover Stream Lab QoS policies')) {
+        foreach ($policy in $qos) {
+            $remove = @{ Name = $policy.Name; Confirm = $false; ErrorAction = 'SilentlyContinue' }
+            if ($policy.Store) { $remove.PolicyStore = $policy.Store }
+            Remove-NetQosPolicy @remove
+        }
+        Add-Step 'qos' 'done' "Removed: $($qos.Name -join ', ')."
+    }
+    else { Add-Step 'qos' 'planned' "Remove: $($qos.Name -join ', ')." }
+}
+
+function Remove-ServiceBinaryLeftovers {
+    try {
+        $present = @($ServiceBinaries | Where-Object { Test-Path -LiteralPath (Join-Path $MachineDir $_) -PathType Leaf })
+    }
+    catch {
+        if ($IsElevated) { throw }
+        Add-Step 'service-binaries' 'planned' "$MachineDir is not readable without elevation; known service binaries there will be deleted only if they match installed-hashes.json."
         return
     }
-    $action = New-ScheduledTaskAction -Execute $TrayExe -WorkingDirectory $InstallDir
-    $principal = New-ScheduledTaskPrincipal -UserId $UserName -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Priority 4
-    Register-ScheduledTask -TaskPath $TaskPath -TaskName $LaunchTaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    if ($present.Count -eq 0) { Add-Step 'service-binaries' 'unchanged' "No old service binaries in $MachineDir."; return }
+    $manifestPath = Join-Path $ServiceDataDir 'installed-hashes.json'
+    $manifest = @{}
     try {
-        Start-ScheduledTask -TaskPath $TaskPath -TaskName $LaunchTaskName
-        $deadline = [DateTime]::UtcNow.AddSeconds(15)
-        do { Start-Sleep -Milliseconds 500 } until ((Get-Process bubbleplay_tray -ErrorAction SilentlyContinue) -or [DateTime]::UtcNow -gt $deadline)
+        foreach ($entry in @(Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json)) { $manifest[[string]$entry.file] = [string]$entry.sha256 }
     }
-    finally {
-        # Deleting the task definition does not stop the process it started.
-        Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $LaunchTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    catch {
+        $state = if ($IsElevated) { 'kept' } else { 'planned' }
+        Add-Step 'service-binaries' $state "Cannot read $manifestPath; old binaries are only deleted when they match it ($($present -join ', '))."
+        return
     }
-    $tray = Get-Process bubbleplay_tray -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $tray) { throw 'The tray did not start. Start it from the Start menu Run entry or sign out and back in.' }
-    Add-Step 'launch' 'done' "Tray running (pid $($tray.Id))."
+    $matching = @(); $kept = @()
+    foreach ($name in $present) {
+        $path = Join-Path $MachineDir $name
+        if ($manifest.ContainsKey($name) -and $manifest[$name] -eq (Get-Sha256 $path)) { $matching += $name } else { $kept += $name }
+    }
+    $keptNote = if ($kept.Count) { " Kept (hash differs from manifest): $($kept -join ', ')." } else { '' }
+    if ($matching.Count -eq 0) { Add-Step 'service-binaries' 'kept' "No binaries match the install manifest.$keptNote"; return }
+    if ($PSCmdlet.ShouldProcess(($matching -join ', '), "Delete old service binaries from $MachineDir")) {
+        foreach ($name in $matching) { Remove-Item -Force -LiteralPath (Join-Path $MachineDir $name) }
+        Add-Step 'service-binaries' 'done' "Deleted $($matching -join ', ').$keptNote"
+    }
+    else { Add-Step 'service-binaries' 'planned' "Delete $($matching -join ', ') (hash-matched).$keptNote" }
+}
+
+# The elevated part, run inline (already elevated) or in the UAC child.
+function Invoke-MachineSteps([bool]$ConfigNeedsMachine) {
+    Stop-AgentProcesses
+    if ($ConfigNeedsMachine) { [void](Update-HostConfig) }
+    Install-Agent
+    Register-AgentTask
+    Remove-LegacyElevated
+    if (-not $AgentOnly) { Remove-BubblePlayServices }
+}
+
+# One UAC prompt: re-run this script elevated for the machine part only.
+function Invoke-ElevatedMachinePhase([Collections.Generic.List[string]]$Work) {
+    $summary = "one UAC prompt runs setup-tray.ps1 -MachinePhase to: " + ($Work -join '; ')
+    if (-not $PSCmdlet.ShouldProcess('setup-tray.ps1 -MachinePhase', 'Elevate once (UAC)')) {
+        Add-Step 'elevate' 'planned' $summary
+        return
+    }
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-MachinePhase',
+        '-SourceDir', "`"$($SourceDir.TrimEnd('\'))`"", '-InstallDir', "`"$($InstallDir.TrimEnd('\'))`"",
+        '-ServiceDataDir', "`"$($ServiceDataDir.TrimEnd('\'))`"")
+    if ($AgentOnly) { $arguments += '-AgentOnly' }
+    if ($SkipAgent) { $arguments += '-SkipAgent' }
+    if ($KeepServices) { $arguments += '-KeepServices' }
+    Add-Step 'elevate' 'running' $summary
+    try { $child = Start-Process -FilePath $PowerShellExe -ArgumentList $arguments -Verb RunAs -Wait -PassThru -WindowStyle Hidden }
+    catch { throw "The administrator prompt was declined or failed: $($_.Exception.Message)" }
+    if ($child.ExitCode -ne 0) { throw "The elevated part failed with exit code $($child.ExitCode); see setup-tray-machine-*.json in $DataDir\receipts." }
+    Add-Step 'elevate' 'done' 'Elevated part finished (receipt setup-tray-machine-*.json).'
 }
 
 function Write-Receipt {
@@ -639,33 +813,46 @@ function Write-Receipt {
     }
     $dir = Join-Path $DataDir 'receipts'
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $path = Join-Path $dir ("setup-tray-{0}.json" -f [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))
+    $kind = if ($MachinePhase) { 'setup-tray-machine' } else { 'setup-tray' }
+    $path = Join-Path $dir ("{0}-{1}.json" -f $kind, [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'))
     [IO.File]::WriteAllText($path, $json, [Text.UTF8Encoding]::new($false))
     Write-Host "Receipt: $path"
 }
 
 try {
-    if (-not $IsElevated -and -not $IsWhatIf) {
-        $refused = $true
-        throw 'setup-tray.ps1 makes machine-level changes (services, scheduled task). Run it from an elevated PowerShell, or add -WhatIf to preview the plan.'
+    if ($MachinePhase) {
+        if (-not $IsElevated -and -not $IsWhatIf) {
+            $refused = $true
+            throw '-MachinePhase must run elevated (setup-tray.ps1 starts it through one UAC prompt).'
+        }
+        Assert-InteractiveUserMatches
+        $configNeedsMachine = (-not $AgentOnly) -and -not (Test-Path -LiteralPath $HostConfigPath -PathType Leaf)
+        Invoke-MachineSteps $configNeedsMachine
     }
-    if (-not $IsElevated) { Add-Step 'elevation' 'warning' 'Not elevated: preview only; the real run must be elevated.' }
-    Assert-InteractiveUserMatches
-    if ($ElevatedBinariesOnly) {
-        Stop-RunningTray
-        Install-ElevatedBinaries
-        Register-ElevatedTask
+    elseif ($AgentOnly) {
+        Assert-InteractiveUserMatches
+        $work = Get-MachineWork $false
+        if ($work.Count -eq 0) { Add-Step 'agent' 'unchanged' 'Admin agent, its task and the old elevated cleanup are already current.' }
+        elseif ($IsElevated) { Invoke-MachineSteps $false }
+        else { Invoke-ElevatedMachinePhase $work }
     }
     else {
-        Update-HostConfig
+        if ($IsElevated) { Add-Step 'elevation' 'warning' 'Run elevated: machine steps run inline; the tray is started non-elevated.' }
+        Assert-InteractiveUserMatches
+        $configState = Update-HostConfig
+        $configNeedsMachine = $configState -eq 'machine'
+        $work = Get-MachineWork $configNeedsMachine
         Stop-RunningTray
-        # Binaries and task first: a missing build must fail before the services go away.
-        Install-Binaries
-        Install-ElevatedBinaries
-        Register-ElevatedTask
-        Remove-BubblePlayServices
-        Set-Autostart
-        Start-TrayUnelevated
+        # User files first: a missing build fails before anything machine-wide changes.
+        Install-UserFiles
+        if ($work.Count -eq 0) { Add-Step 'machine' 'unchanged' 'Nothing needs administrator rights (no UAC prompt).' }
+        elseif ($IsElevated) { Invoke-MachineSteps $configNeedsMachine }
+        else { Invoke-ElevatedMachinePhase $work }
+        if ($configNeedsMachine -and -not $IsWhatIf -and -not (Test-Path -LiteralPath $HostConfigPath -PathType Leaf)) {
+            throw "The service config could not be migrated to $HostConfigPath; pass -WorkerUrl and -Token."
+        }
+        Set-UserRegistration
+        Start-Tray
     }
     $receipt.result = if ($IsWhatIf) { 'planned' } else { 'success' }
 }
@@ -675,6 +862,6 @@ catch {
     throw
 }
 finally {
-    # A refused non-elevated run changes nothing, not even the receipt folder.
+    # A refused run changes nothing, not even the receipt folder.
     if (-not $refused) { Write-Receipt }
 }

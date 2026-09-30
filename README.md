@@ -29,41 +29,73 @@ Missing dependencies fail the offline check rather than triggering installation.
 
 ## Desktop tray deployment
 
-`bubbleplay_tray.exe` replaces the BubblePlay Windows services. It runs as the
-signed-in user and supervises `bubbleplay-host.exe --mode serve --worker <url>`
-(local DXGI capture + SendInput, no privileged agent or broker). Tokens reach
-the host only as `BUBBLEPLAY_TOKEN` / `BUBBLEPLAY_HOST_GATE_TOKEN` environment
-variables.
+BubblePlay is a per-user app. `bubbleplay_tray.exe` runs as the signed-in user
+and always supervises `bubbleplay-host.exe --mode serve --worker <url>` as that
+user (local DXGI capture + SendInput). Tokens reach the host only as
+`BUBBLEPLAY_TOKEN` / `BUBBLEPLAY_HOST_GATE_TOKEN` environment variables.
 
+- Install: `%LOCALAPPDATA%\Programs\BubblePlay` (host, tray, staged admin
+  agent, `setup-tray.ps1`, `uninstall-tray.ps1`), HKCU Run autostart, a
+  Start-menu shortcut and a per-user "Apps" entry (HKCU `...\Uninstall\BubblePlay`).
 - Config: `%LOCALAPPDATA%\BubblePlay\host.json` (`worker`, `tokenDpapiHex`,
   `hostGateTokenDpapiHex`, optional `monitor`; secrets CurrentUser DPAPI) and
   `tray.json` (`adminMode`, `startAtLogin`).
-- Logs: `%LOCALAPPDATA%\BubblePlay\logs` (`tray.log`, `host.log`,
-  `host-admin.log`), each capped at 5 x 5 MiB.
-- One-time migration, elevated: `host/scripts/setup-tray.ps1` (use `-WhatIf`
-  first). It copies the tokens out of `%ProgramData%\BubblePlay\transport.json`,
-  installs into `%LOCALAPPDATA%\Programs\BubblePlay`, registers the on-demand
-  `\BubblePlay\ElevatedHost` task, deletes the three services, sets the HKCU Run
-  entry and starts the tray non-elevated. Old service binaries in
-  `%ProgramFiles%\BubblePlay` are deleted only if they match
-  `installed-hashes.json`; ProgramData is left as is.
-- Updates, non-elevated: `host/scripts/update-tray.ps1 [-Build]`. It warns
-  when the Admin-mode copy is stale; `-IncludeElevated` refreshes it with one
-  UAC prompt.
+- Logs: `%LOCALAPPDATA%\BubblePlay\logs` (`tray.log`, `host.log`), each capped
+  at 5 x 5 MiB; the elevated agent logs to
+  `%ProgramFiles%\BubblePlay\agent\logs\admin-agent.log`.
+- Setup, from a normal PowerShell: `host/scripts/setup-tray.ps1` (use
+  `-WhatIf` first). The user part needs no admin rights. Everything
+  machine-wide runs in one elevated child (one UAC prompt, only when needed):
+  install the admin agent and its `\BubblePlay\AdminAgent` task, remove the old
+  `\BubblePlay\ElevatedHost` task and `%ProgramFiles%\BubblePlay\elevated`,
+  delete the old services and QoS policies, and migrate
+  `%ProgramData%\BubblePlay\transport.json` into `host.json` when no
+  `host.json` exists. Old service binaries in `%ProgramFiles%\BubblePlay` are
+  deleted only if they match `installed-hashes.json`; ProgramData is left as
+  is. `-SkipAgent` installs no agent; `-AgentOnly` does just the agent part.
+- Updates, non-elevated: `host/scripts/update-tray.ps1 [-Build]`. It never
+  prompts for UAC; `-IncludeAgent` also installs the staged agent (one UAC
+  prompt). Host changes never need a new agent.
+- Uninstall: Settings > Apps > BubblePlay, or `uninstall-tray.ps1` in the
+  install folder. It removes the agent and old elevated leftovers first (one
+  UAC prompt, only if present), then the per-user install. `%LOCALAPPDATA%\BubblePlay`
+  is kept unless `-RemoveData` is given.
 - Host rollback: update-tray moves the replaced binaries to
   `<install>\previous\` and marks a new host `pending` in
   `%LOCALAPPDATA%\BubblePlay\update-state.json`. The tray restores the
   previous host (once, never twice in a row) if the new one does not log
   "signaling registered as host" within 120 s or exits 3 times in 5 min, and
   marks it `good` after 10 healthy minutes. The menu shows the host build and
-  status, plus "Roll back host" while a different previous build exists.
-  Probation applies to the user-level host only, not Admin mode.
-- Admin mode (tray menu, default off) runs the host through the elevated task,
-  so input reaches elevated windows. The secure desktop (UAC prompts, lock
-  screen) is still not captured. The task runs an admin-only copy in
-  `%ProgramFiles%\BubblePlay\elevated` (ACL verified by setup), and the runner
-  refuses to run elevated from anywhere else. The menu shows
-  "Admin mode (outdated build)" when that copy differs from the tray's build.
+  status, plus "Roll back host" while a different previous build exists. This
+  works the same with Admin mode on, since the host always runs as the user.
+- Admin mode (tray menu, default off) starts the admin input agent
+  (`bubbleplay_admin_agent.exe`) through the on-demand `\BubblePlay\AdminAgent`
+  task. The agent is a small elevated pipe server that only calls SendInput.
+  The host sends it validated input records over a local named pipe, so input
+  reaches elevated windows. The secure desktop (UAC prompts, lock screen) is
+  still not captured. The agent exits when Admin mode is turned off or the
+  tray goes away.
+- Agent versioning: the pipe protocol is versioned (`host/src/admin_agent`).
+  If the agent is missing, does not start, or speaks another protocol version,
+  the host injects at user level and the tray offers "Admin agent needs update
+  (one admin prompt)", which reruns `setup-tray.ps1 -AgentOnly` elevated.
+- Agent security: only the admin-owned copy in `%ProgramFiles%\BubblePlay\agent`
+  (protected ACL, verified by setup) runs elevated; the agent refuses to run
+  elevated from anywhere else. Its pipe:
+  - allows only the interactive user, SYSTEM and Administrators, gives the
+    user no right to create pipe instances, and carries a medium-integrity
+    label;
+  - rejects remote clients and clients from other sessions, and is created
+    with `FILE_FLAG_FIRST_PIPE_INSTANCE`;
+  - requires a versioned hello first, validates every record, rate-limits
+    clients, logs each connect, and releases held keys and buttons on
+    disconnect.
+
+  The host connects only to a server whose image is the Program Files agent.
+  `--dev` (tests) works only unelevated.
+- Residual risk: while Admin mode is on, any process running as the same user
+  at medium integrity can connect to the pipe and drive elevated windows.
+  Turn Admin mode on only when you need it.
 
 ## Runtime boundaries
 

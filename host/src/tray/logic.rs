@@ -21,9 +21,6 @@ pub const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// Total files kept per log: the live file plus `LOG_KEEP - 1` rotations.
 pub const LOG_KEEP: usize = 5;
 
-/// Heartbeats older than this mean the elevated runner is gone.
-pub const HEARTBEAT_STALE: Duration = Duration::from_secs(10);
-
 /// Exponential restart backoff: 1 s doubling to 30 s, reset after a healthy run.
 #[derive(Debug, Clone)]
 pub struct Backoff {
@@ -318,7 +315,7 @@ pub fn decode_hex(value: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// State published by a supervisor (user child or elevated runner).
+/// State published by the host supervisor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "state")]
 pub enum HostState {
@@ -343,58 +340,38 @@ impl HostState {
     }
 }
 
-/// Heartbeat the elevated runner writes for the non-elevated tray.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Heartbeat {
-    pub runner_pid: u32,
-    pub updated_unix_ms: u64,
-    pub host: HostState,
-    /// Build identity of the elevated runner's tray + host binaries.
-    #[serde(default)]
-    pub build: String,
+/// Admin-mode input path, as the tray sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStatus {
+    /// Admin mode is off: the host injects at user level.
+    Off,
+    /// The agent task was started; waiting for it to answer.
+    Starting,
+    /// The agent answered the probe: the host injects through it.
+    Ready,
+    /// The agent is missing, speaks another protocol, or does not start: the
+    /// host injects at user level until the (one-UAC) agent update ran.
+    NeedsUpdate { reason: String },
 }
 
-impl Heartbeat {
-    pub fn is_fresh(&self, now_unix_ms: u64) -> bool {
-        now_unix_ms.saturating_sub(self.updated_unix_ms) <= HEARTBEAT_STALE.as_millis() as u64
+impl AgentStatus {
+    pub fn needs_update(&self) -> bool {
+        matches!(self, AgentStatus::NeedsUpdate { .. })
     }
 }
 
-/// Stable 64-bit FNV-1a; used only to tell builds apart, not for security.
-pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// Identity of a tray + host binary pair, compared between the user tray and
-/// the elevated runner to flag stale Admin-mode binaries.
-pub fn build_id(tray: &[u8], host: &[u8]) -> String {
-    format!("{:016x}-{:016x}", fnv1a64(tray), fnv1a64(host))
-}
-
-/// True when a live elevated runner reports a build different from ours.
-/// An empty id on either side (unknown) never counts as outdated.
-pub fn is_outdated(own_build: &str, runner_build: &str) -> bool {
-    !own_build.is_empty() && !runner_build.is_empty() && own_build != runner_build
-}
-
-pub fn admin_menu_label(outdated: bool) -> &'static str {
-    if outdated {
-        "Admin mode (outdated build)"
-    } else {
-        "Admin mode"
-    }
-}
+/// Menu item that runs the elevated agent install/update.
+pub const AGENT_UPDATE_LABEL: &str = "Admin agent needs update (one admin prompt)";
 
 /// The status line shown at the top of the tray menu and in the tooltip.
-pub fn status_line(state: &HostState, admin: bool) -> String {
-    let who = if admin { "admin" } else { "user" };
-    format!("BubblePlay: {} ({who})", state.label())
+pub fn status_line(state: &HostState, agent: &AgentStatus) -> String {
+    let input = match agent {
+        AgentStatus::Off => "user",
+        AgentStatus::Starting => "user input, admin agent starting",
+        AgentStatus::Ready => "admin input",
+        AgentStatus::NeedsUpdate { .. } => "user input, admin agent needs update",
+    };
+    format!("BubblePlay: {} ({input})", state.label())
 }
 
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -588,21 +565,10 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_freshness_and_status_text() {
-        let beat = Heartbeat {
-            runner_pid: 7,
-            updated_unix_ms: 100_000,
-            host: HostState::Running { pid: 9 },
-            build: "a-b".into(),
-        };
-        assert!(beat.is_fresh(100_000 + 10_000));
-        assert!(!beat.is_fresh(100_000 + 10_001));
-        assert!(beat.is_fresh(50_000)); // clock went backwards: treat as fresh
-        let json = serde_json::to_string(&beat).unwrap();
-        assert_eq!(serde_json::from_str::<Heartbeat>(&json).unwrap(), beat);
+    fn status_text_names_the_input_path() {
         assert_eq!(
-            status_line(&HostState::Running { pid: 1 }, true),
-            "BubblePlay: Running (admin)"
+            status_line(&HostState::Running { pid: 1 }, &AgentStatus::Ready),
+            "BubblePlay: Running (admin input)"
         );
         assert_eq!(
             status_line(
@@ -610,38 +576,25 @@ mod tests {
                     delay_ms: 1500,
                     reason: String::new()
                 },
-                false
+                &AgentStatus::Off
             ),
             "BubblePlay: Restarting in 2s (user)"
         );
         assert_eq!(
-            status_line(&HostState::Stopped, false),
+            status_line(&HostState::Stopped, &AgentStatus::Off),
             "BubblePlay: Stopped (user)"
         );
-    }
-
-    #[test]
-    fn heartbeat_without_build_field_still_parses() {
-        let beat: Heartbeat =
-            serde_json::from_str(r#"{"runnerPid":1,"updatedUnixMs":2,"host":{"state":"stopped"}}"#)
-                .unwrap();
-        assert_eq!(beat.build, "");
-    }
-
-    #[test]
-    fn build_identity_and_outdated_label() {
-        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
-        let one = build_id(b"tray", b"host");
-        assert_eq!(one, build_id(b"tray", b"host"));
-        assert_ne!(one, build_id(b"tray", b"host2"));
-        assert_ne!(one, build_id(b"tray2", b"host"));
-        assert!(!is_outdated(&one, &one));
-        assert!(is_outdated(&one, &build_id(b"x", b"y")));
-        assert!(!is_outdated(&one, ""));
-        assert!(!is_outdated("", &one));
-        assert_eq!(admin_menu_label(false), "Admin mode");
-        assert_eq!(admin_menu_label(true), "Admin mode (outdated build)");
+        let stale = AgentStatus::NeedsUpdate { reason: "x".into() };
+        assert!(stale.needs_update());
+        assert!(!AgentStatus::Starting.needs_update());
+        assert_eq!(
+            status_line(&HostState::Running { pid: 1 }, &stale),
+            "BubblePlay: Running (user input, admin agent needs update)"
+        );
+        assert_eq!(
+            AGENT_UPDATE_LABEL,
+            "Admin agent needs update (one admin prompt)"
+        );
     }
 
     #[test]

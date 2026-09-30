@@ -79,7 +79,11 @@ impl HeldInput {
                 if flags & KEYEVENTF_UNICODE != 0 {
                     return;
                 }
-                let id = (vk, scan, flags & (KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY));
+                let id = (
+                    vk,
+                    scan,
+                    flags & (KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY),
+                );
                 if flags & KEYEVENTF_KEYUP != 0 {
                     self.keys.remove(&id);
                 } else {
@@ -187,7 +191,13 @@ impl<I: Injector> Session<I> {
 
     /// `range` other than the build's own is only used by the non-elevated
     /// dev agent to emulate a newer or older agent in tests.
-    pub fn with_range(injector: I, elevated: bool, pid: u32, now: Instant, range: (u16, u16)) -> Self {
+    pub fn with_range(
+        injector: I,
+        elevated: bool,
+        pid: u32,
+        now: Instant,
+        range: (u16, u16),
+    ) -> Self {
         Self {
             injector,
             state: State::AwaitHello,
@@ -307,9 +317,9 @@ mod tests {
     impl Injector for &mut Recorder {
         fn inject(&mut self, records: &[Record]) -> (u32, i32) {
             self.sent.push(records.to_vec());
-            let applied = self
-                .apply_limit
-                .map_or(records.len() as u32, |limit| limit.min(records.len() as u32));
+            let applied = self.apply_limit.map_or(records.len() as u32, |limit| {
+                limit.min(records.len() as u32)
+            });
             (applied, 0)
         }
     }

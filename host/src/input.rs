@@ -1333,7 +1333,10 @@ impl InputSink {
         }
         let expected = inputs.len().min(u32::MAX as usize) as u32;
         let via_agent = self.admin_agent.as_mut().and_then(|link| {
-            let records = inputs.iter().map(input_record).collect::<Option<Vec<_>>>()?;
+            let records = inputs
+                .iter()
+                .map(input_record)
+                .collect::<Option<Vec<_>>>()?;
             link.inject(&records)
         });
         let (sent, error_code) = match via_agent {

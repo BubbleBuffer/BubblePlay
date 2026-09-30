@@ -98,7 +98,9 @@ fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Optio
 }
 
 fn wait_exit(child: &mut Child, timeout: Duration) -> Option<i32> {
-    wait_for(timeout, || child.try_wait().unwrap().map(|s| s.code().unwrap_or(-1)))
+    wait_for(timeout, || {
+        child.try_wait().unwrap().map(|s| s.code().unwrap_or(-1))
+    })
 }
 
 fn log_text(dir: &Path) -> String {
@@ -168,7 +170,12 @@ fn dev_agent_receives_host_input_over_the_pipe() {
         let log = log_text(&dir);
         log.contains("records=2").then_some(log)
     })
-    .unwrap_or_else(|| panic!("agent did not report the host's records:\n{}", log_text(&dir)));
+    .unwrap_or_else(|| {
+        panic!(
+            "agent did not report the host's records:\n{}",
+            log_text(&dir)
+        )
+    });
     assert!(log.contains("client connected"));
     assert!(log.contains("hello accepted"));
 
@@ -238,7 +245,10 @@ fn incompatible_agent_makes_the_host_fall_back() {
     // None: the caller (InputSink) injects at user level instead.
     assert_eq!(link.inject(&[one]), None);
     assert!(
-        matches!(link.state(), LinkState::Fallback(LinkError::Incompatible { .. })),
+        matches!(
+            link.state(),
+            LinkState::Fallback(LinkError::Incompatible { .. })
+        ),
         "{:?}",
         link.state()
     );

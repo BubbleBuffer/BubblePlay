@@ -650,8 +650,7 @@ mod tests {
         payload.extend_from_slice(&[0; 16]);
         assert!(ClientMessage::decode(KIND_INJECT, &payload).is_err());
         // Reserved key bytes must be zero.
-        let (_, mut payload) =
-            ClientMessage::Inject(vec![key(0x41, 0, 0)]).encode();
+        let (_, mut payload) = ClientMessage::Inject(vec![key(0x41, 0, 0)]).encode();
         *payload.last_mut().unwrap() = 1;
         assert!(ClientMessage::decode(KIND_INJECT, &payload).is_err());
         // One bad record rejects the whole frame.

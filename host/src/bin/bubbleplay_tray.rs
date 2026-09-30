@@ -1,13 +1,15 @@
-//! BubblePlay notification-area app. Replaces the Windows services: it runs
+//! BubblePlay notification-area app. It always runs
 //! `bubbleplay-host.exe --mode serve` as the signed-in user (local DXGI
-//! capture + local SendInput), restarts it with backoff, and can hand off to
-//! the on-demand `\BubblePlay\ElevatedHost` scheduled task ("Admin mode") so
-//! input reaches elevated windows without a UAC prompt each time.
+//! capture + local SendInput) and restarts it with backoff. "Admin mode"
+//! additionally starts the small elevated admin input agent through the
+//! on-demand `\BubblePlay\AdminAgent` scheduled task; the host then sends its
+//! input records to the agent over a local named pipe so input reaches
+//! elevated windows, and falls back to user-level SendInput whenever the
+//! agent is missing or speaks another protocol version.
 //!
 //! Modes:
-//!   bubbleplay_tray.exe                      tray (single instance)
-//!   bubbleplay_tray.exe --run-elevated-host  runner used by the scheduled task
-//!   bubbleplay_tray.exe --quit               ask a running tray to exit
+//!   bubbleplay_tray.exe          tray (single instance)
+//!   bubbleplay_tray.exe --quit   ask a running tray to exit
 #![windows_subsystem = "windows"]
 
 #[path = "../tray/logic.rs"]
@@ -42,15 +44,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
+use bubbleplay_host::admin_agent::client::{probe, ProbeResult, AGENT_EXE};
+use bubbleplay_host::admin_agent::protocol::{
+    pipe_name, scoped_name, ENV_ALLOW_DEV_AGENT, ENV_PIPE, PROTOCOL_MAX, PROTOCOL_MIN,
+};
+use bubbleplay_host::admin_agent::trust::current_session_id;
 use logic::{
-    admin_menu_label, is_outdated, run_key_command, status_line, unix_ms_now, write_atomic,
-    Heartbeat, HostState, SharedLog, TraySettings,
+    run_key_command, status_line, unix_ms_now, AgentStatus, HostState, SharedLog, TraySettings,
+    AGENT_UPDATE_LABEL,
 };
 use platform::{
-    acquire_single_instance, create_manual_event, current_build_id, data_dir, elevated_task_exists,
-    end_elevated_task, host_exe_beside, is_process_elevated, is_signaled, is_under_program_files,
-    named_mutex_exists, open_event, open_folder, read_run_value, run_elevated_task, set_event,
-    set_run_value, sha256_file, wide, Handle, ELEVATED_STOP_EVENT, TRAY_MUTEX,
+    acquire_single_instance, agent_task_exists, create_manual_event, data_dir, end_agent_task,
+    host_exe_beside, named_mutex_exists, open_folder, read_run_value, run_agent_task,
+    run_elevated_and_wait, set_event, set_run_value, sha256_file, wide, Handle, AGENT_MUTEX,
+    AGENT_STOP_EVENT, TRAY_MUTEX,
 };
 use supervisor::{HostEvent, SupervisorConfig, SupervisorThread};
 use update::{
@@ -60,6 +67,8 @@ use update::{
 const WINDOW_CLASS: &str = "BubblePlayTrayWindow";
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_QUIT_REQUEST: u32 = WM_APP + 2;
+/// Posted when the elevated agent update finished; WPARAM = exit code.
+const WM_AGENT_UPDATED: u32 = WM_APP + 3;
 const TIMER_ID: usize = 1;
 
 const CMD_STATUS: usize = 1;
@@ -70,20 +79,21 @@ const CMD_LOGS: usize = 5;
 const CMD_QUIT: usize = 6;
 const CMD_ROLLBACK: usize = 7;
 const CMD_BUILD: usize = 8;
+const CMD_AGENT_UPDATE: usize = 9;
 
-/// Admin-mode grace period before a missing heartbeat means "not running".
-const ADMIN_START_GRACE: Duration = Duration::from_secs(20);
-/// Minimum spacing between automatic re-runs of the elevated task.
-const ADMIN_RERUN_INTERVAL: Duration = Duration::from_secs(30);
-
-const ELEVATED_RUNNER_MUTEX: &str = r"Local\BubblePlayTray.ElevatedRunner";
-const HEARTBEAT_FILE: &str = "elevated-runner.json";
+/// Time the agent gets to answer after its task was started.
+const AGENT_START_GRACE: Duration = Duration::from_secs(15);
+/// Minimum spacing between automatic re-runs of the agent task.
+const AGENT_RERUN_INTERVAL: Duration = Duration::from_secs(30);
+/// How often a running agent is re-probed (version + trust).
+const AGENT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// Left behind by the removed elevated-host runner.
+const STALE_HEARTBEAT_FILE: &str = "elevated-runner.json";
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let code = match args.next().as_deref() {
         None => run_tray(),
-        Some("--run-elevated-host") => run_elevated_host(),
         Some("--quit") => quit_running_tray(),
         Some(_) => Ok(2),
     };
@@ -97,13 +107,18 @@ fn main() {
 /// `BUBBLEPLAY_TRAY_DATA_DIR` set (test mode) names are suffixed by the data
 /// dir, so a test tray never collides with (or `--quit`s) the real one.
 fn scoped(base: &str) -> String {
-    match std::env::var_os("BUBBLEPLAY_TRAY_DATA_DIR") {
-        Some(dir) => {
-            let key = dir.to_string_lossy().to_lowercase();
-            format!("{base}.test-{:016x}", logic::fnv1a64(key.as_bytes()))
-        }
-        None => base.to_string(),
-    }
+    scoped_name(
+        base,
+        std::env::var_os("BUBBLEPLAY_TRAY_DATA_DIR").as_deref(),
+    )
+}
+
+/// The admin agent's pipe for this session (scoped like the other names).
+fn agent_pipe() -> String {
+    pipe_name(
+        current_session_id(),
+        std::env::var_os("BUBBLEPLAY_TRAY_DATA_DIR").as_deref(),
+    )
 }
 
 fn logs_dir(data: &Path) -> PathBuf {
@@ -125,82 +140,21 @@ fn supervisor_config(
     data: &Path,
     host_log: SharedLog,
     events: Option<std::sync::mpsc::Sender<HostEvent>>,
+    test_mode: bool,
 ) -> Result<SupervisorConfig> {
     let exe = std::env::current_exe().context("current_exe")?;
+    let mut extra_env = vec![(ENV_PIPE.to_string(), agent_pipe())];
+    if test_mode {
+        // Isolated test instance: its agent is an unelevated --dev build.
+        extra_env.push((ENV_ALLOW_DEV_AGENT.to_string(), "1".to_string()));
+    }
     Ok(SupervisorConfig {
         host_exe: host_exe_beside(&exe),
         host_config: data.join("host.json"),
         host_log,
         events,
+        extra_env,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Elevated runner (launched by the \BubblePlay\ElevatedHost scheduled task)
-// ---------------------------------------------------------------------------
-
-fn write_heartbeat(path: &Path, host: HostState, build: &str) {
-    let beat = Heartbeat {
-        runner_pid: std::process::id(),
-        updated_unix_ms: unix_ms_now(),
-        host,
-        build: build.to_string(),
-    };
-    if let Ok(bytes) = serde_json::to_vec(&beat) {
-        let _ = write_atomic(path, &bytes);
-    }
-}
-
-fn run_elevated_host() -> Result<i32> {
-    let data = data_dir();
-    let log = SharedLog::new(logs_dir(&data).join("host-admin.log"));
-    init_tracing(log.clone());
-    // An elevated runner must only ever execute admin-owned binaries: it runs
-    // the host beside its own exe, so that exe must live under Program Files.
-    let exe = std::env::current_exe().context("current_exe")?;
-    if is_process_elevated() && !is_under_program_files(&exe) {
-        tracing::error!(
-            exe = %exe.display(),
-            "refusing to run elevated from a non-Program Files location"
-        );
-        return Ok(1);
-    }
-    let Some(_instance) = acquire_single_instance(&scoped(ELEVATED_RUNNER_MUTEX))? else {
-        tracing::info!("elevated runner already active; exiting");
-        return Ok(0);
-    };
-    // The tray creates this event before running the task; without it the
-    // tray is gone and an elevated host must not linger.
-    let Some(stop_event) = open_event(&scoped(ELEVATED_STOP_EVENT)) else {
-        tracing::warn!("tray is not running; elevated runner exiting");
-        return Ok(0);
-    };
-    tracing::info!(pid = std::process::id(), "elevated runner started");
-    let heartbeat = data.join(HEARTBEAT_FILE);
-    let build = current_build_id();
-    let mut supervisor = SupervisorThread::start(supervisor_config(&data, log, None)?);
-    let mut tray_missing = 0u32;
-    loop {
-        write_heartbeat(&heartbeat, supervisor.state(), &build);
-        if is_signaled(&stop_event) {
-            tracing::info!("tray requested stop");
-            break;
-        }
-        if named_mutex_exists(&scoped(TRAY_MUTEX)) {
-            tray_missing = 0;
-        } else {
-            tray_missing += 1;
-            if tray_missing >= 3 {
-                tracing::warn!("tray disappeared; stopping elevated host");
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    supervisor.stop();
-    write_heartbeat(&heartbeat, HostState::Stopped, &build);
-    tracing::info!("elevated runner exited");
-    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -311,14 +265,21 @@ struct App {
     test_mode: bool,
     host_log: SharedLog,
     user: Option<SupervisorThread>,
-    admin_active: bool,
-    admin_started: Option<Instant>,
+    agent: AgentStatus,
+    /// When the agent task was last started.
+    agent_started: Option<Instant>,
+    last_probe: Option<Instant>,
+    /// Test mode only: the unelevated `--dev` agent the tray spawned.
+    agent_child: Option<std::process::Child>,
+    agent_update_running: bool,
+    /// Show the "Admin mode on" balloon once the agent is ready.
+    announce_ready: bool,
+    agent_pipe: String,
     stop_event: Handle,
     icons: [HICON; 3],
     shown: Option<(IconKind, String)>,
     taskbar_created: u32,
     shut_down: bool,
-    build: String,
     events_tx: std::sync::mpsc::Sender<HostEvent>,
     events_rx: std::sync::mpsc::Receiver<HostEvent>,
     /// Active while update-state.json says the installed host is pending.
@@ -346,7 +307,7 @@ impl App {
     fn add_icon(&mut self) {
         let state = self.state();
         let kind = icon_kind(&state);
-        let tip = status_line(&state, self.admin_active);
+        let tip = status_line(&state, &self.agent);
         let mut data = self.notify_data();
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
@@ -412,6 +373,7 @@ impl App {
             &self.data,
             self.host_log.clone(),
             Some(self.events_tx.clone()),
+            self.test_mode,
         ) {
             Ok(config) => {
                 tracing::info!(exe = %config.host_exe.display(), "starting user-level host");
@@ -430,94 +392,280 @@ impl App {
         }
     }
 
-    fn start_admin(&mut self) -> bool {
-        if !elevated_task_exists() {
-            return false;
-        }
-        set_event(&self.stop_event, false);
-        match run_elevated_task() {
-            Ok(()) => {
-                tracing::info!("elevated host task started");
-                self.admin_active = true;
-                self.admin_started = Some(Instant::now());
-                true
-            }
-            Err(error) => {
-                tracing::warn!(?error, "running elevated task failed");
-                false
-            }
-        }
-    }
-
-    fn stop_admin(&mut self) {
-        if !self.admin_active {
-            return;
-        }
-        tracing::info!("stopping elevated host task");
-        set_event(&self.stop_event, true);
-        // Give the runner a moment to stop its child cleanly, then make sure.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && named_mutex_exists(&scoped(ELEVATED_RUNNER_MUTEX)) {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        end_elevated_task();
-        self.admin_active = false;
-        self.admin_started = None;
-    }
-
-    fn admin_heartbeat(&self) -> Option<Heartbeat> {
-        let bytes = std::fs::read(self.data.join(HEARTBEAT_FILE)).ok()?;
-        let beat: Heartbeat = serde_json::from_slice(&bytes).ok()?;
-        beat.is_fresh(unix_ms_now()).then_some(beat)
-    }
-
     fn state(&self) -> HostState {
-        if self.admin_active {
-            if let Some(beat) = self.admin_heartbeat() {
-                return beat.host;
-            }
-            if self
-                .admin_started
-                .is_some_and(|started| started.elapsed() < ADMIN_START_GRACE)
-            {
-                return HostState::Starting;
-            }
-            return HostState::Stopped;
-        }
         match &self.user {
             Some(user) => user.state(),
             None => HostState::Stopped,
         }
     }
 
-    /// A live elevated runner built from different binaries than this tray.
-    fn admin_outdated(&self) -> bool {
-        self.admin_active
-            && self
-                .admin_heartbeat()
-                .is_some_and(|beat| is_outdated(&self.build, &beat.build))
+    fn agent_running(&self) -> bool {
+        named_mutex_exists(&scoped(AGENT_MUTEX))
     }
 
-    fn missing_task_fallback(&mut self) {
-        self.settings.admin_mode = false;
-        self.save_settings();
-        self.balloon(
-            "BubblePlay",
-            "Admin mode needs one-time setup (run setup-tray.ps1 as administrator).",
-            NIIF_WARNING,
+    /// Start the agent: the scheduled task normally, or (test mode) an
+    /// unelevated `--dev` agent beside the tray.
+    fn launch_agent(&mut self) -> std::result::Result<(), String> {
+        set_event(&self.stop_event, false);
+        if self.test_mode {
+            if let Some(child) = self.agent_child.as_mut() {
+                if matches!(child.try_wait(), Ok(None)) {
+                    return Ok(());
+                }
+            }
+            let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+            let agent = exe.with_file_name(AGENT_EXE);
+            let child = std::process::Command::new(&agent)
+                .arg("--dev")
+                .spawn()
+                .map_err(|error| format!("starting {}: {error}", agent.display()))?;
+            self.agent_child = Some(child);
+            return Ok(());
+        }
+        if !agent_task_exists() {
+            return Err("the admin agent is not installed".into());
+        }
+        run_agent_task().map_err(|error| format!("{error:#}"))
+    }
+
+    fn set_agent(&mut self, status: AgentStatus) {
+        if self.agent == status {
+            return;
+        }
+        match &status {
+            AgentStatus::NeedsUpdate { reason } => {
+                tracing::warn!(%reason, "admin agent needs update; host input stays at user level");
+                self.balloon(
+                    "BubblePlay",
+                    &format!(
+                        "Admin mode: {reason}. Input stays at user level until you choose \"{AGENT_UPDATE_LABEL}\"."
+                    ),
+                    NIIF_WARNING,
+                );
+            }
+            AgentStatus::Ready if self.announce_ready => {
+                self.announce_ready = false;
+                self.balloon(
+                    "BubblePlay",
+                    "Admin mode on: input can reach elevated windows. The secure desktop (UAC prompts, lock screen) is still not captured.",
+                    NIIF_INFO,
+                );
+            }
+            _ => {}
+        }
+        self.agent = status;
+    }
+
+    fn start_agent(&mut self) {
+        match self.launch_agent() {
+            Ok(()) => {
+                tracing::info!(pipe = %self.agent_pipe, "admin agent started");
+                self.agent_started = Some(Instant::now());
+                self.last_probe = None;
+                self.set_agent(AgentStatus::Starting);
+            }
+            Err(reason) => {
+                self.agent_started = None;
+                self.set_agent(AgentStatus::NeedsUpdate { reason });
+            }
+        }
+    }
+
+    /// Stop a running agent; the host falls back to user-level input.
+    fn stop_agent_process(&mut self) {
+        set_event(&self.stop_event, true);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && self.agent_running() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Some(mut child) = self.agent_child.take() {
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        } else if !self.test_mode && self.agent_started.is_some() {
+            end_agent_task();
+        }
+        self.agent_started = None;
+        self.last_probe = None;
+    }
+
+    fn stop_agent(&mut self) {
+        if self.agent == AgentStatus::Off && self.agent_started.is_none() {
+            return;
+        }
+        tracing::info!("stopping admin agent");
+        self.stop_agent_process();
+        self.set_agent(AgentStatus::Off);
+    }
+
+    /// Track the agent: probe it (version + trust), re-run it if it died,
+    /// and flag it for update when it is missing, incompatible or silent.
+    fn check_agent(&mut self, force_probe: bool) {
+        if !self.settings.admin_mode || self.agent_update_running {
+            return;
+        }
+        let in_grace = self
+            .agent_started
+            .is_some_and(|started| started.elapsed() < AGENT_START_GRACE);
+        if self.agent_running() {
+            let due = force_probe
+                || self.agent == AgentStatus::Starting
+                || self
+                    .last_probe
+                    .is_none_or(|at| at.elapsed() >= AGENT_PROBE_INTERVAL);
+            if !due {
+                return;
+            }
+            self.last_probe = Some(Instant::now());
+            match probe(&self.agent_pipe, self.test_mode) {
+                ProbeResult::Ready(handshake) => {
+                    if self.agent != AgentStatus::Ready {
+                        tracing::info!(
+                            version = handshake.version,
+                            agent_pid = handshake.agent_pid,
+                            elevated = handshake.elevated,
+                            "admin agent ready"
+                        );
+                    }
+                    self.set_agent(AgentStatus::Ready);
+                }
+                ProbeResult::Incompatible {
+                    agent_min,
+                    agent_max,
+                } => {
+                    // Useless to the host: stop it rather than keep an
+                    // elevated process around.
+                    self.stop_agent_process();
+                    self.set_agent(AgentStatus::NeedsUpdate {
+                        reason: format!(
+                            "the admin agent speaks protocol {agent_min}-{agent_max}, the host needs {PROTOCOL_MIN}-{PROTOCOL_MAX}"
+                        ),
+                    });
+                }
+                ProbeResult::Unavailable(error) => {
+                    if self.agent == AgentStatus::Starting && !in_grace {
+                        self.set_agent(AgentStatus::NeedsUpdate {
+                            reason: format!("the admin agent does not answer ({error})"),
+                        });
+                    } else {
+                        tracing::debug!(%error, "admin agent probe failed");
+                    }
+                }
+            }
+            return;
+        }
+        match &self.agent {
+            AgentStatus::NeedsUpdate { .. } | AgentStatus::Off => {}
+            AgentStatus::Starting if in_grace => {}
+            AgentStatus::Starting => self.set_agent(AgentStatus::NeedsUpdate {
+                reason: "the admin agent did not start".into(),
+            }),
+            AgentStatus::Ready => {
+                let due = self
+                    .agent_started
+                    .is_none_or(|started| started.elapsed() >= AGENT_RERUN_INTERVAL);
+                if due {
+                    tracing::warn!("admin agent is gone; re-running its task");
+                    self.start_agent();
+                }
+            }
+        }
+    }
+
+    /// Install/update the agent with one elevated setup run (one UAC).
+    fn update_agent(&mut self) {
+        if self.agent_update_running {
+            return;
+        }
+        self.stop_agent_process();
+        let hwnd = self.hwnd.0 as isize;
+        let post = move |code: u32| {
+            // SAFETY: posting to our own window (it outlives the process's
+            // message loop; a failed post only loses the notification).
+            let _ = unsafe {
+                PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    WM_AGENT_UPDATED,
+                    WPARAM(code as usize),
+                    LPARAM(0),
+                )
+            };
+        };
+        if self.test_mode {
+            tracing::info!("test mode: skipping the elevated agent update");
+            post(0);
+            return;
+        }
+        let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        else {
+            return;
+        };
+        let script = dir.join("setup-tray.ps1");
+        if !script.is_file() {
+            self.set_agent(AgentStatus::NeedsUpdate {
+                reason: format!("{} is missing; run setup-tray.ps1 again", script.display()),
+            });
+            return;
+        }
+        let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let powershell =
+            PathBuf::from(system).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let params = format!(
+            "-NoProfile -ExecutionPolicy Bypass -File \"{}\" -AgentOnly -SourceDir \"{}\"",
+            script.display(),
+            dir.display()
         );
+        tracing::info!(%params, "running the elevated admin agent update");
+        self.agent_update_running = true;
+        let spawned = std::thread::Builder::new()
+            .name("agent-update".into())
+            .spawn(move || {
+                let code = match run_elevated_and_wait(&powershell, &params, &dir) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        tracing::warn!(?error, "elevated agent update did not run");
+                        u32::MAX
+                    }
+                };
+                post(code);
+            });
+        if spawned.is_err() {
+            self.agent_update_running = false;
+        }
+    }
+
+    fn agent_updated(&mut self, code: u32) {
+        self.agent_update_running = false;
+        if code == 0 {
+            tracing::info!("admin agent update finished");
+            if self.settings.admin_mode {
+                self.announce_ready = true;
+                self.start_agent();
+            } else {
+                self.set_agent(AgentStatus::Off);
+            }
+        } else {
+            let reason = if code == u32::MAX {
+                "the admin prompt was declined or failed".to_string()
+            } else {
+                format!("the agent update failed (exit {code}; see receipts\\setup-tray-machine-*.json)")
+            };
+            self.set_agent(AgentStatus::NeedsUpdate { reason });
+        }
+        self.tick();
     }
 
     fn apply_mode(&mut self) {
+        self.start_user();
         if self.settings.admin_mode {
-            self.stop_user();
-            if !self.admin_active && !self.start_admin() {
-                self.missing_task_fallback();
-                self.start_user();
+            if matches!(self.agent, AgentStatus::Off) {
+                self.start_agent();
             }
         } else {
-            self.stop_admin();
-            self.start_user();
+            self.stop_agent();
         }
     }
 
@@ -710,7 +858,7 @@ impl App {
         }
         self.exits
             .retain(|&at| now.saturating_sub(at) < update::CRASH_LOOP_WINDOW_MS);
-        if self.admin_active || self.user.is_none() {
+        if self.user.is_none() {
             return;
         }
         if let Some(probation) = self.probation.as_mut() {
@@ -740,23 +888,10 @@ impl App {
 
     fn tick(&mut self) {
         self.watch_update();
-        // Re-run the elevated task if it died (e.g. ended externally).
-        if self.admin_active && self.admin_heartbeat().is_none() {
-            let due = self
-                .admin_started
-                .is_none_or(|started| started.elapsed() >= ADMIN_RERUN_INTERVAL);
-            if due && !named_mutex_exists(&scoped(ELEVATED_RUNNER_MUTEX)) {
-                tracing::warn!("elevated host is not reporting; re-running task");
-                self.admin_active = false;
-                if !self.start_admin() {
-                    self.missing_task_fallback();
-                    self.start_user();
-                }
-            }
-        }
+        self.check_agent(false);
         let state = self.state();
         let kind = icon_kind(&state);
-        let tip = status_line(&state, self.admin_active);
+        let tip = status_line(&state, &self.agent);
         if self.shown.as_ref() != Some(&(kind, tip.clone())) {
             let mut data = self.notify_data();
             data.uFlags = NIF_ICON | NIF_TIP;
@@ -769,16 +904,8 @@ impl App {
     }
 
     fn restart_host(&mut self) {
-        if self.admin_active {
-            self.stop_admin();
-            if !self.start_admin() {
-                self.missing_task_fallback();
-                self.start_user();
-            }
-        } else {
-            self.stop_user();
-            self.start_user();
-        }
+        self.stop_user();
+        self.start_user();
     }
 
     fn shutdown(&mut self) {
@@ -788,7 +915,7 @@ impl App {
         self.shut_down = true;
         tracing::info!("tray shutting down");
         self.stop_user();
-        self.stop_admin();
+        self.stop_agent();
         self.remove_icon();
     }
 
@@ -797,15 +924,10 @@ impl App {
             CMD_ADMIN => {
                 self.settings.admin_mode = !self.settings.admin_mode;
                 self.save_settings();
+                self.announce_ready = self.settings.admin_mode;
                 self.apply_mode();
-                if self.settings.admin_mode && self.admin_active {
-                    self.balloon(
-                        "BubblePlay",
-                        "Admin mode on: input can reach elevated windows. The secure desktop (UAC prompts, lock screen) is still not captured.",
-                        NIIF_INFO,
-                    );
-                }
             }
+            CMD_AGENT_UPDATE => self.update_agent(),
             CMD_LOGIN => {
                 self.settings.start_at_login = !self.settings.start_at_login;
                 self.save_settings();
@@ -838,15 +960,23 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 fn show_menu(hwnd: HWND) {
-    let Some((status, admin, login, outdated, build, error, can_roll_back)) = with_app(|app| {
+    let Some((status, admin, login, agent_update, build, error, can_roll_back)) = with_app(|app| {
+        app.check_agent(true);
+        let agent_update = if app.agent_update_running {
+            Some((MF_STRING | MF_GRAYED, "Admin agent update running..."))
+        } else if app.settings.admin_mode && app.agent.needs_update() {
+            Some((MF_STRING, AGENT_UPDATE_LABEL))
+        } else {
+            None
+        };
         (
-            status_line(&app.state(), app.admin_active),
+            status_line(&app.state(), &app.agent),
             app.settings.admin_mode,
             app.settings.start_at_login,
-            app.admin_outdated(),
+            agent_update,
             app.build_line(),
             app.host_error.clone(),
-            !app.admin_active && app.can_roll_back(),
+            app.can_roll_back(),
         )
     }) else {
         return;
@@ -873,8 +1003,11 @@ fn show_menu(hwnd: HWND) {
                 MF_STRING
             },
             CMD_ADMIN,
-            admin_menu_label(outdated),
+            "Admin mode",
         );
+        if let Some((flags, label)) = agent_update {
+            item(flags, CMD_AGENT_UPDATE, label);
+        }
         item(
             if login {
                 MF_STRING | MF_CHECKED
@@ -930,6 +1063,10 @@ unsafe extern "system" fn window_proc(
             with_app(|app| app.tick());
             LRESULT(0)
         }
+        WM_AGENT_UPDATED => {
+            with_app(|app| app.agent_updated(wparam.0 as u32));
+            LRESULT(0)
+        }
         WM_QUIT_REQUEST => {
             with_app(|app| app.handle_command(CMD_QUIT));
             LRESULT(0)
@@ -967,7 +1104,10 @@ fn run_tray() -> Result<i32> {
         return Ok(0);
     };
     tracing::info!(pid = std::process::id(), data = %data.display(), "tray starting");
-    let stop_event = create_manual_event(&scoped(ELEVATED_STOP_EVENT))?;
+    // Signaled to ask the admin agent to exit; the agent also exits when
+    // this tray's mutex disappears.
+    let stop_event = create_manual_event(&scoped(AGENT_STOP_EVENT))?;
+    let _ = std::fs::remove_file(data.join(STALE_HEARTBEAT_FILE));
 
     // SAFETY: standard window-class registration and hidden window creation.
     let hwnd = unsafe {
@@ -1014,8 +1154,13 @@ fn run_tray() -> Result<i32> {
         test_mode,
         host_log: SharedLog::new(logs.join("host.log")),
         user: None,
-        admin_active: false,
-        admin_started: None,
+        agent: AgentStatus::Off,
+        agent_started: None,
+        last_probe: None,
+        agent_child: None,
+        agent_update_running: false,
+        announce_ready: false,
+        agent_pipe: agent_pipe(),
         stop_event,
         icons: [
             make_icon(IconKind::Running),
@@ -1025,7 +1170,6 @@ fn run_tray() -> Result<i32> {
         shown: None,
         taskbar_created,
         shut_down: false,
-        build: current_build_id(),
         events_tx,
         events_rx,
         probation: None,
