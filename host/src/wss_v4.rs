@@ -67,17 +67,22 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub const INBOUND_SILENCE_LIMIT: Duration = Duration::from_secs(40);
 pub const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(250);
 pub const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
-pub const RATE_FLOOR_BPS: u64 = 1_000_000;
-/// x0.8 on congestion, x1.1 after a clean interval (tenths).
-const RATE_DECREASE_NUM: u64 = 8;
-const RATE_INCREASE_NUM: u64 = 11;
-const RATE_CLEAN_INTERVAL: Duration = Duration::from_secs(2);
-/// A decrease holds off further decreases for this long so one congestion
-/// episode (many late ACKs) is not counted as many.
-const RATE_DECREASE_HOLD: Duration = Duration::from_millis(500);
-const RATE_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
-const RATE_RTT_SLACK_MS: f64 = 40.0;
-const RATE_RTT_FACTOR: f64 = 1.5;
+/// Bitrate floor at 1080p; other frame sizes scale it by pixel count.
+pub const RATE_FLOOR_1080P_BPS: u64 = 2_500_000;
+/// Absolute floor for tiny frames (and profiles capped below the floor).
+pub const RATE_FLOOR_MIN_BPS: u64 = 500_000;
+const PIXELS_1080P: u64 = 1920 * 1080;
+/// x0.8 on sustained congestion, x1.15 after a clean interval (percent).
+const RATE_DECREASE_PCT: u64 = 80;
+const RATE_INCREASE_PCT: u64 = 115;
+const RATE_CLEAN_INTERVAL: Duration = Duration::from_secs(1);
+/// RTT growth (or ACK-less skipping) must persist this long before a cut;
+/// after a cut the next one needs another full window.
+const RATE_SUSTAIN: Duration = Duration::from_millis(500);
+/// Baseline = minimum delta-frame ACK RTT over this window.
+const RATE_MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
+const RATE_RTT_SLACK_MS: f64 = 60.0;
+const RATE_RTT_FACTOR: f64 = 2.0;
 const WRITE_STALL_LIMIT: Duration = Duration::from_secs(10);
 /// A change covering at least this share of the frame (per mille) earns one
 /// refine; smaller changes (cursor blink, clock) neither earn nor delay it.
@@ -416,18 +421,59 @@ impl SendPolicy {
     }
 }
 
+/// Why the delay controller changed the bitrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateReason {
+    /// ACK RTT stayed above `2 x min + 60 ms` for the sustain window.
+    RttGrowth,
+    /// Frames were skipped for the sustain window without a clean ACK.
+    SustainedSkips,
+    /// A clean interval with ACK traffic: step up.
+    Clean,
+}
+
+impl RateReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RttGrowth => "rtt-growth",
+            Self::SustainedSkips => "sustained-skips",
+            Self::Clean => "clean",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateDecision {
+    pub bitrate_bps: u64,
+    pub previous_bps: u64,
+    pub reason: RateReason,
+}
+
+/// Bitrate floor for a frame size: 2.5 Mbps at 1080p, scaled by pixels.
+pub fn rate_floor_for_pixels(width: u32, height: u32) -> u64 {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels == 0 {
+        return RATE_FLOOR_1080P_BPS;
+    }
+    (RATE_FLOOR_1080P_BPS * pixels / PIXELS_1080P).max(RATE_FLOOR_MIN_BPS)
+}
+
 /// Delay-based bitrate controller.
 ///
-/// Congested when an ACK RTT exceeds `1.5 x min + 40 ms` or when the send
-/// policy had to skip a frame; congestion multiplies the bitrate by 0.8
-/// (floor 1 Mbps). Two clean seconds with ACK traffic multiply it by 1.1,
-/// capped at the profile maximum.
+/// The baseline is the minimum delta-frame ACK RTT over 10 s. Only sustained
+/// growth reacts: RTT above `2 x min + 60 ms` for 500 ms multiplies the
+/// bitrate by 0.8, never below a floor of 2.5 Mbps at 1080p (scaled by
+/// pixels). Budget skips are the first response to a burst; they cut the
+/// bitrate only when they persist for 500 ms without a clean ACK. One clean
+/// second with ACK traffic steps up by x1.15, capped at the profile maximum.
 #[derive(Debug)]
 pub struct DelayRateController {
     bitrate_bps: u64,
     max_bps: u64,
+    floor_for_frame_bps: u64,
     rtt_samples: VecDeque<(Instant, f64)>,
-    last_decrease: Option<Instant>,
+    high_rtt_since: Option<Instant>,
+    skipping_since: Option<Instant>,
     clean_since: Instant,
     last_increase: Instant,
     clean_samples: u32,
@@ -435,16 +481,19 @@ pub struct DelayRateController {
 
 impl DelayRateController {
     pub fn new(now: Instant, bitrate_bps: u64, max_bps: u64) -> Self {
-        let max_bps = max_bps.max(RATE_FLOOR_BPS);
-        Self {
-            bitrate_bps: bitrate_bps.clamp(RATE_FLOOR_BPS, max_bps),
+        let mut controller = Self {
+            bitrate_bps,
             max_bps,
+            floor_for_frame_bps: RATE_FLOOR_1080P_BPS,
             rtt_samples: VecDeque::new(),
-            last_decrease: None,
+            high_rtt_since: None,
+            skipping_since: None,
             clean_since: now,
             last_increase: now,
             clean_samples: 0,
-        }
+        };
+        controller.set_bounds(now, bitrate_bps, max_bps);
+        controller
     }
 
     pub fn bitrate_bps(&self) -> u64 {
@@ -453,6 +502,11 @@ impl DelayRateController {
 
     pub fn max_bps(&self) -> u64 {
         self.max_bps
+    }
+
+    /// The effective floor: the frame-size floor, but never above the cap.
+    pub fn floor_bps(&self) -> u64 {
+        self.floor_for_frame_bps.min(self.max_bps)
     }
 
     pub fn min_rtt_ms(&self) -> Option<f64> {
@@ -464,18 +518,25 @@ impl DelayRateController {
 
     /// Profile change: new cap, and the bitrate the encoder now runs at.
     pub fn set_bounds(&mut self, now: Instant, bitrate_bps: u64, max_bps: u64) {
-        self.max_bps = max_bps.max(RATE_FLOOR_BPS);
-        self.bitrate_bps = bitrate_bps.clamp(RATE_FLOOR_BPS, self.max_bps);
+        self.max_bps = max_bps.max(RATE_FLOOR_MIN_BPS);
+        self.bitrate_bps = bitrate_bps.clamp(self.floor_bps(), self.max_bps);
         self.clean_since = now;
         self.last_increase = now;
         self.clean_samples = 0;
+        self.high_rtt_since = None;
+        self.skipping_since = None;
+    }
+
+    /// The coded frame size sets the floor (2.5 Mbps at 1080p).
+    pub fn set_frame_pixels(&mut self, width: u32, height: u32) {
+        self.floor_for_frame_bps = rate_floor_for_pixels(width, height);
     }
 
     pub fn is_congested_rtt(min_rtt_ms: f64, rtt_ms: f64) -> bool {
         rtt_ms > RATE_RTT_FACTOR * min_rtt_ms + RATE_RTT_SLACK_MS
     }
 
-    pub fn on_rtt(&mut self, now: Instant, rtt_ms: f64) -> Option<u64> {
+    pub fn on_rtt(&mut self, now: Instant, rtt_ms: f64) -> Option<RateDecision> {
         if !rtt_ms.is_finite() || rtt_ms < 0.0 {
             return None;
         }
@@ -488,36 +549,53 @@ impl DelayRateController {
         }
         self.rtt_samples.push_back((now, rtt_ms));
         let min = self.min_rtt_ms().unwrap_or(rtt_ms);
-        if Self::is_congested_rtt(min, rtt_ms) {
-            self.congested(now)
-        } else {
+        if !Self::is_congested_rtt(min, rtt_ms) {
+            // A clean ACK ends both congestion episodes.
+            self.high_rtt_since = None;
+            self.skipping_since = None;
             self.clean_samples = self.clean_samples.saturating_add(1);
-            None
-        }
-    }
-
-    pub fn on_skip(&mut self, now: Instant) -> Option<u64> {
-        self.congested(now)
-    }
-
-    fn congested(&mut self, now: Instant) -> Option<u64> {
-        self.clean_since = now;
-        self.clean_samples = 0;
-        if self
-            .last_decrease
-            .is_some_and(|at| now.saturating_duration_since(at) < RATE_DECREASE_HOLD)
-        {
             return None;
         }
-        self.last_decrease = Some(now);
-        let next = (self.bitrate_bps * RATE_DECREASE_NUM / 10).max(RATE_FLOOR_BPS);
-        (next != self.bitrate_bps).then(|| {
+        self.hold_clean(now);
+        let since = *self.high_rtt_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < RATE_SUSTAIN {
+            return None;
+        }
+        self.high_rtt_since = Some(now);
+        self.decrease(RateReason::RttGrowth)
+    }
+
+    /// The send policy skipped a frame behind the in-flight budget. Skipping
+    /// is the first response; the bitrate is cut only if it is sustained.
+    pub fn on_skip(&mut self, now: Instant) -> Option<RateDecision> {
+        self.hold_clean(now);
+        let since = *self.skipping_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < RATE_SUSTAIN {
+            return None;
+        }
+        self.skipping_since = Some(now);
+        self.decrease(RateReason::SustainedSkips)
+    }
+
+    fn hold_clean(&mut self, now: Instant) {
+        self.clean_since = now;
+        self.clean_samples = 0;
+    }
+
+    fn decrease(&mut self, reason: RateReason) -> Option<RateDecision> {
+        let previous_bps = self.bitrate_bps;
+        let next = (previous_bps * RATE_DECREASE_PCT / 100).max(self.floor_bps());
+        (next < previous_bps).then(|| {
             self.bitrate_bps = next;
-            next
+            RateDecision {
+                bitrate_bps: next,
+                previous_bps,
+                reason,
+            }
         })
     }
 
-    pub fn tick(&mut self, now: Instant) -> Option<u64> {
+    pub fn tick(&mut self, now: Instant) -> Option<RateDecision> {
         if self.bitrate_bps >= self.max_bps
             || self.clean_samples == 0
             || now.saturating_duration_since(self.clean_since) < RATE_CLEAN_INTERVAL
@@ -527,10 +605,17 @@ impl DelayRateController {
         }
         self.last_increase = now;
         self.clean_samples = 0;
-        let next = (self.bitrate_bps * RATE_INCREASE_NUM / 10).min(self.max_bps);
-        (next != self.bitrate_bps).then(|| {
+        let previous_bps = self.bitrate_bps;
+        let next = (previous_bps * RATE_INCREASE_PCT / 100)
+            .max(self.floor_bps())
+            .min(self.max_bps);
+        (next > previous_bps).then(|| {
             self.bitrate_bps = next;
-            next
+            RateDecision {
+                bitrate_bps: next,
+                previous_bps,
+                reason: RateReason::Clean,
+            }
         })
     }
 }
@@ -639,6 +724,8 @@ pub struct V4Events {
     pub keyframe: Option<String>,
     /// New encoder bitrate from the delay controller.
     pub bitrate_bps: Option<u64>,
+    /// Why the delay controller chose `bitrate_bps`.
+    pub bitrate_reason: Option<&'static str>,
     /// Highest (generation, seq) ACKed by the receiver since the last poll.
     pub latest_ack: Option<(u32, u32)>,
 }
@@ -754,9 +841,8 @@ impl V4Link {
                 // A keyframe in flight legitimately exceeds the airtime
                 // budget; only count skips behind delta frames as congestion.
                 if !shared.policy.key_in_flight() {
-                    if let Some(next) = shared.rate.on_skip(now) {
-                        shared.events.bitrate_bps = Some(next);
-                    }
+                    let decision = shared.rate.on_skip(now);
+                    record_rate_decision(&mut shared, decision);
                 }
                 V4Reserve::Backpressured
             }
@@ -842,7 +928,9 @@ impl V4Link {
     }
 
     pub fn set_frame_size(&self, width: u32, height: u32) {
-        self.lock().frame_size = (
+        let mut shared = self.lock();
+        shared.rate.set_frame_pixels(width, height);
+        shared.frame_size = (
             u16::try_from(width).unwrap_or(0),
             u16::try_from(height).unwrap_or(0),
         );
@@ -878,6 +966,24 @@ impl Drop for V4Link {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Publish a controller decision to the producer and log it with its reason.
+fn record_rate_decision(shared: &mut Shared, decision: Option<RateDecision>) {
+    let Some(decision) = decision else {
+        return;
+    };
+    info!(
+        bitrate_bps = decision.bitrate_bps,
+        previous_bps = decision.previous_bps,
+        reason = decision.reason.as_str(),
+        last_rtt_ms = shared.stats.last_rtt_ms,
+        min_rtt_ms = shared.rate.min_rtt_ms().unwrap_or(0.0),
+        floor_bps = shared.rate.floor_bps(),
+        "WSS v4 rate decision"
+    );
+    shared.events.bitrate_bps = Some(decision.bitrate_bps);
+    shared.events.bitrate_reason = Some(decision.reason.as_str());
 }
 
 fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<()> {
@@ -1043,9 +1149,8 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
                 // Keyframes carry their own serialization delay; only deltas
                 // are representative delay samples.
                 if !outcome.key {
-                    if let Some(next) = state.rate.on_rtt(now, rtt_ms) {
-                        state.events.bitrate_bps = Some(next);
-                    }
+                    let decision = state.rate.on_rtt(now, rtt_ms);
+                    record_rate_decision(&mut state, decision);
                 }
             }
             let newer = state.events.latest_ack.is_none_or(|(ack_generation, ack_seq)| {
@@ -1110,9 +1215,8 @@ fn serve_socket(
         if state.policy.expire(now) {
             state.events.keyframe = Some("ack-timeout".into());
         }
-        if let Some(next) = state.rate.tick(now) {
-            state.events.bitrate_bps = Some(next);
-        }
+        let decision = state.rate.tick(now);
+        record_rate_decision(&mut state, decision);
     }
 }
 
@@ -1334,53 +1438,114 @@ mod tests {
         assert_eq!(policy.inflight_frames(), 0);
     }
 
-    #[test]
-    fn rate_decreases_on_delay_and_skip_with_floor() {
-        let start = Instant::now();
-        let mut rate = DelayRateController::new(start, 6_000_000, 6_000_000);
-        assert_eq!(rate.on_rtt(start, 20.0), None);
-        // 1.5 x 20 + 40 = 70 ms threshold.
-        assert_eq!(rate.on_rtt(start + Duration::from_millis(10), 70.0), None);
-        assert_eq!(
-            rate.on_rtt(start + Duration::from_millis(20), 71.0),
-            Some(4_800_000)
-        );
-        // Held for 500 ms.
-        assert_eq!(rate.on_skip(start + Duration::from_millis(100)), None);
-        assert_eq!(rate.on_skip(start + Duration::from_millis(600)), Some(3_840_000));
-        let mut at = start + Duration::from_millis(600);
-        for _ in 0..20 {
-            at += Duration::from_secs(1);
-            rate.on_skip(at);
-        }
-        assert_eq!(rate.bitrate_bps(), RATE_FLOOR_BPS);
+    fn ms(start: Instant, value: u64) -> Instant {
+        start + Duration::from_millis(value)
     }
 
     #[test]
-    fn rate_increases_after_two_clean_seconds_capped() {
+    fn rate_reacts_only_to_sustained_rtt_growth() {
         let start = Instant::now();
-        let mut rate = DelayRateController::new(start, 5_000_000, 6_000_000);
+        let mut rate = DelayRateController::new(start, 6_000_000, 6_000_000);
+        assert_eq!(rate.on_rtt(start, 20.0), None);
+        // Threshold: 2 x 20 + 60 = 100 ms. A single spike is ignored.
+        assert_eq!(rate.on_rtt(ms(start, 10), 100.0), None);
+        assert_eq!(rate.on_rtt(ms(start, 20), 150.0), None);
+        assert_eq!(rate.on_rtt(ms(start, 40), 25.0), None);
+        // Growth sustained for 500 ms cuts once, with its reason.
+        assert_eq!(rate.on_rtt(ms(start, 100), 150.0), None);
+        assert_eq!(rate.on_rtt(ms(start, 400), 150.0), None);
+        let cut = rate.on_rtt(ms(start, 600), 150.0).unwrap();
+        assert_eq!(cut.bitrate_bps, 4_800_000);
+        assert_eq!(cut.previous_bps, 6_000_000);
+        assert_eq!(cut.reason, RateReason::RttGrowth);
+        // The next cut needs another full sustain window.
+        assert_eq!(rate.on_rtt(ms(start, 900), 150.0), None);
+        assert_eq!(rate.on_rtt(ms(start, 1_100), 150.0).map(|d| d.bitrate_bps), Some(3_840_000));
+    }
+
+    #[test]
+    fn rtt_baseline_is_the_minimum_over_ten_seconds() {
+        let start = Instant::now();
+        let mut rate = DelayRateController::new(start, 6_000_000, 6_000_000);
+        rate.on_rtt(start, 20.0);
+        rate.on_rtt(ms(start, 5_000), 80.0);
+        assert_eq!(rate.min_rtt_ms(), Some(20.0));
+        // Past the window the old minimum ages out and the route's new RTT
+        // becomes the baseline (2 x 80 + 60 = 220 ms threshold).
+        rate.on_rtt(ms(start, 10_500), 80.0);
+        assert_eq!(rate.min_rtt_ms(), Some(80.0));
+        assert_eq!(rate.on_rtt(ms(start, 10_600), 200.0), None);
+        assert_eq!(rate.on_rtt(ms(start, 11_200), 200.0), None);
+    }
+
+    #[test]
+    fn skips_come_before_bitrate_cuts() {
+        let start = Instant::now();
+        let mut rate = DelayRateController::new(start, 6_000_000, 6_000_000);
+        rate.on_rtt(start, 20.0);
+        // Budget skips around a burst do not cut the bitrate while ACKs stay
+        // clean.
+        assert_eq!(rate.on_skip(ms(start, 100)), None);
+        assert_eq!(rate.on_rtt(ms(start, 300), 22.0), None);
+        assert_eq!(rate.on_skip(ms(start, 700)), None);
+        assert_eq!(rate.bitrate_bps(), 6_000_000);
+        // Skipping for 500 ms with no clean ACK does.
+        let cut = rate.on_skip(ms(start, 1_200)).unwrap();
+        assert_eq!(cut.reason, RateReason::SustainedSkips);
+        assert_eq!(cut.bitrate_bps, 4_800_000);
+    }
+
+    #[test]
+    fn rate_floor_is_two_and_a_half_megabits_at_1080p_scaled_by_pixels() {
+        assert_eq!(rate_floor_for_pixels(1920, 1080), 2_500_000);
+        assert_eq!(rate_floor_for_pixels(3840, 2160), 10_000_000);
+        assert_eq!(rate_floor_for_pixels(1280, 720), 1_111_111);
+        assert_eq!(rate_floor_for_pixels(320, 180), RATE_FLOOR_MIN_BPS);
+        let start = Instant::now();
+        let mut rate = DelayRateController::new(start, 3_000_000, 6_000_000);
+        rate.set_frame_pixels(1920, 1080);
+        let mut at = start;
+        rate.on_rtt(at, 20.0);
+        for _ in 0..20 {
+            at += Duration::from_millis(600);
+            rate.on_rtt(at, 500.0);
+        }
+        assert_eq!(rate.bitrate_bps(), 2_500_000);
+        // A profile capped below the floor keeps its cap.
+        rate.set_bounds(at, 1_500_000, 1_500_000);
+        assert_eq!(rate.floor_bps(), 1_500_000);
+        assert_eq!(rate.bitrate_bps(), 1_500_000);
+    }
+
+    #[test]
+    fn rate_steps_up_after_one_clean_second_capped() {
+        let start = Instant::now();
+        let mut rate = DelayRateController::new(start, 4_000_000, 6_000_000);
         // No ACK traffic: no probing upward.
-        assert_eq!(rate.tick(start + Duration::from_secs(3)), None);
-        rate.on_rtt(start + Duration::from_secs(3), 20.0);
-        assert_eq!(rate.tick(start + Duration::from_millis(3_500)), Some(5_500_000));
-        rate.on_rtt(start + Duration::from_secs(4), 20.0);
-        assert_eq!(rate.tick(start + Duration::from_secs(5)), None);
-        assert_eq!(rate.tick(start + Duration::from_millis(5_500)), Some(6_000_000));
-        rate.on_rtt(start + Duration::from_secs(6), 20.0);
-        assert_eq!(rate.tick(start + Duration::from_secs(9)), None);
-        // Congestion restarts the clean window.
-        rate.on_skip(start + Duration::from_secs(10));
-        rate.on_rtt(start + Duration::from_secs(11), 20.0);
-        assert_eq!(rate.tick(start + Duration::from_millis(11_900)), None);
-        assert_eq!(rate.tick(start + Duration::from_secs(12)), Some(5_280_000));
+        assert_eq!(rate.tick(ms(start, 3_000)), None);
+        rate.on_rtt(ms(start, 3_000), 20.0);
+        let up = rate.tick(ms(start, 3_100)).unwrap();
+        assert_eq!((up.bitrate_bps, up.reason), (4_600_000, RateReason::Clean));
+        rate.on_rtt(ms(start, 3_500), 20.0);
+        assert_eq!(rate.tick(ms(start, 4_000)), None);
+        assert_eq!(rate.tick(ms(start, 4_100)).map(|d| d.bitrate_bps), Some(5_290_000));
+        rate.on_rtt(ms(start, 4_500), 20.0);
+        assert_eq!(rate.tick(ms(start, 5_100)).map(|d| d.bitrate_bps), Some(6_000_000));
+        rate.on_rtt(ms(start, 5_500), 20.0);
+        assert_eq!(rate.tick(ms(start, 9_000)), None);
+        // A skip restarts the clean window.
+        rate.set_bounds(ms(start, 9_000), 5_000_000, 6_000_000);
+        rate.on_skip(ms(start, 10_000));
+        rate.on_rtt(ms(start, 10_500), 20.0);
+        assert_eq!(rate.tick(ms(start, 10_900)), None);
+        assert_eq!(rate.tick(ms(start, 11_000)).map(|d| d.bitrate_bps), Some(5_750_000));
     }
 
     #[test]
     fn rate_bounds_clamp() {
         let start = Instant::now();
         let mut rate = DelayRateController::new(start, 500_000, 800_000);
-        assert_eq!(rate.bitrate_bps(), RATE_FLOOR_BPS);
+        assert_eq!(rate.bitrate_bps(), 800_000);
         rate.set_bounds(start, 9_000_000, 3_000_000);
         assert_eq!(rate.bitrate_bps(), 3_000_000);
         assert_eq!(rate.max_bps(), 3_000_000);

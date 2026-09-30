@@ -2139,7 +2139,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     &mut encoder,
                     &mut signaling,
                 );
-                info!(bitrate_bps, "WSS v4 delay controller adjusted bitrate");
+                info!(
+                    bitrate_bps,
+                    reason = wss_v4_events.bitrate_reason.unwrap_or("unknown"),
+                    "WSS v4 delay controller adjusted bitrate"
+                );
             }
         }
         if let Some((generation, sequence)) = wss_v4_events.latest_ack {
