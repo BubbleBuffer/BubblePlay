@@ -6,10 +6,11 @@
 //! - static: no change for `STATIC_AFTER`;
 //! - text: changes, but slower than `MOTION_CHANGES` within `CADENCE_WINDOW`
 //!   (typing, a caret, a status line);
-//! - scroll: motion-rate changes and a DDA move rect covered the tile within
-//!   the cadence window;
-//! - video: motion-rate changes without a move (animation, video, and scrolls
-//!   the compositor reports as dirty rects only; both get the same treatment).
+//! - scroll: the tile's content moved within the cadence window, by a DDA
+//!   move rect or by the shifted-hash scroll detector
+//!   (`crate::scroll_detect`); a scroll is motion whatever the capture
+//!   cadence (on a constrained link fewer frames are captured);
+//! - video: motion-rate changes without a move (animation, video).
 //!
 //! A tile takes a new class only after it has been the candidate for
 //! `HYSTERESIS`. The dominant class is the larger of the text and motion
@@ -186,6 +187,15 @@ impl ContentClassifier {
     pub fn dominant(&self) -> ContentClass {
         self.counts().dominant()
     }
+
+    /// Tiles whose content was found shifted (a scroll without move rects).
+    pub fn on_scrolled(&mut self, now: Instant, tiles: &[usize]) {
+        for &tile in tiles {
+            if let Some(history) = self.tiles.get_mut(tile) {
+                history.moved_at = Some(now);
+            }
+        }
+    }
 }
 
 fn candidate_class(tile: &TileHistory, now: Instant) -> ContentClass {
@@ -195,19 +205,19 @@ fn candidate_class(tile: &TileHistory, now: Instant) -> ContentClass {
     if now.saturating_duration_since(last) >= STATIC_AFTER {
         return ContentClass::Static;
     }
+    if tile
+        .moved_at
+        .is_some_and(|at| now.saturating_duration_since(at) < CADENCE_WINDOW)
+    {
+        return ContentClass::Scroll;
+    }
     let recent = tile
         .changes
         .iter()
         .filter(|at| now.saturating_duration_since(**at) < CADENCE_WINDOW)
         .count();
     if recent < MOTION_CHANGES {
-        return ContentClass::Text;
-    }
-    if tile
-        .moved_at
-        .is_some_and(|at| now.saturating_duration_since(at) < CADENCE_WINDOW)
-    {
-        ContentClass::Scroll
+        ContentClass::Text
     } else {
         ContentClass::Video
     }

@@ -165,7 +165,10 @@ pub fn pointer_pixels(x: u16, y: u16, width: u32, height: u32) -> (u32, u32) {
 }
 
 /// Per-frame byte budget: a token bucket filled at the capacity target, at
-/// most `BUDGET_DEPTH` deep. Empty (and inert) while unconstrained.
+/// most `BUDGET_DEPTH` deep. Empty (and inert) while unconstrained. While
+/// the screen is idle (no changed tiles) it fills at the full capacity: the
+/// 20 % headroom exists for changes that may arrive, and debt refines are
+/// the only traffic then.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FrameBudget {
     tokens: i64,
@@ -174,12 +177,16 @@ pub struct FrameBudget {
 }
 
 impl FrameBudget {
-    pub fn refill(&mut self, now: Instant, capacity: Option<Capacity>) {
+    pub fn refill(&mut self, now: Instant, capacity: Option<Capacity>, idle: bool) {
         let Some(capacity) = capacity else {
             *self = Self::default();
             return;
         };
-        self.rate_bps = capacity.target_bps();
+        self.rate_bps = if idle {
+            capacity.bps
+        } else {
+            capacity.target_bps()
+        };
         if let Some(last) = self.last {
             let elapsed = now.saturating_duration_since(last);
             let earned = (u128::from(self.rate_bps) * elapsed.as_micros() / 8_000_000) as i64;
@@ -279,9 +286,10 @@ impl V4Pacer {
     }
 
     /// Start an admission: refill the budget and settle the classifier.
-    pub fn begin_frame(&mut self, now: Instant, capacity: Option<Capacity>) {
+    /// `idle`: no tile changed (only a refine can go out).
+    pub fn begin_frame(&mut self, now: Instant, capacity: Option<Capacity>, idle: bool) {
         self.capacity = capacity;
-        self.budget.refill(now, capacity);
+        self.budget.refill(now, capacity, idle);
         if let Some(classes) = self.classes.as_mut() {
             classes.update(now);
         }
@@ -296,6 +304,13 @@ impl V4Pacer {
 
     pub fn dominant(&self) -> ContentClass {
         self.counts().dominant()
+    }
+
+    /// Tiles the scroll detector found shifted.
+    pub fn on_scrolled(&mut self, now: Instant, tiles: &[usize]) {
+        if let Some(classes) = self.classes.as_mut() {
+            classes.on_scrolled(now, tiles);
+        }
     }
 
     fn text_constrained(&self) -> bool {
@@ -581,17 +596,30 @@ mod tests {
         let start = Instant::now();
         let capacity = Some(Capacity { bps: 2_000_000 });
         let mut budget = FrameBudget::default();
-        budget.refill(start, capacity);
+        budget.refill(start, capacity, false);
         assert_eq!(budget.tokens(), 0);
         // 1.6 Mbps for 100 ms = 20 000 bytes; depth 150 ms = 30 000.
-        budget.refill(start + Duration::from_millis(100), capacity);
+        budget.refill(start + Duration::from_millis(100), capacity, false);
         assert_eq!(budget.tokens(), 20_000);
-        budget.refill(start + Duration::from_secs(5), capacity);
+        budget.refill(start + Duration::from_secs(5), capacity, false);
         assert_eq!(budget.tokens(), 30_000);
         budget.spend(40_000);
         assert_eq!(budget.time_until(0), Duration::from_millis(50));
-        budget.refill(start + Duration::from_secs(6), None);
+        budget.refill(start + Duration::from_secs(6), None, false);
         assert_eq!(budget, FrameBudget::default());
+    }
+
+    #[test]
+    fn an_idle_screen_fills_the_budget_at_the_full_capacity() {
+        let start = Instant::now();
+        let capacity = Some(Capacity { bps: 2_000_000 });
+        let mut budget = FrameBudget::default();
+        budget.refill(start, capacity, true);
+        // 2 Mbps for 100 ms = 25 000 bytes; depth 150 ms = 37 500.
+        budget.refill(start + Duration::from_millis(100), capacity, true);
+        assert_eq!(budget.tokens(), 25_000);
+        budget.refill(start + Duration::from_secs(5), capacity, true);
+        assert_eq!(budget.tokens(), 37_500);
     }
 
     #[test]
@@ -599,7 +627,7 @@ mod tests {
         let start = Instant::now();
         let mut pacer = V4Pacer::default();
         let now = feed(&mut pacer, start, 3, &[typing()]);
-        pacer.begin_frame(now + Duration::from_millis(400), None);
+        pacer.begin_frame(now + Duration::from_millis(400), None, false);
         assert_eq!(pacer.dominant(), ContentClass::Text);
         assert_eq!(pacer.max_qp(), None);
         pacer.on_encoded(now, 1_000_000, false, 0, true);
@@ -627,13 +655,13 @@ mod tests {
             now = start + Duration::from_millis(200) * n;
             pacer.on_capture(now, 512, 256, Some(&[typing()]), &[]);
         }
-        pacer.begin_frame(now, capacity);
+        pacer.begin_frame(now, capacity, false);
         assert_eq!(pacer.dominant(), ContentClass::Text);
         assert_eq!(pacer.max_qp(), Some(TEXT_MAX_QP));
         // A frame far over the budget: the next changes wait for tokens...
         pacer.on_encoded(now, 40_000, false, 0, true);
         let next = now + FRAME;
-        pacer.begin_frame(next, capacity);
+        pacer.begin_frame(next, capacity, false);
         let PaceDecision::Skip { retry_after } = pacer.pace(next, false) else {
             panic!("expected a paced skip");
         };
@@ -641,7 +669,7 @@ mod tests {
         // ...but a keyframe never waits, and no change waits past 100 ms.
         assert_eq!(pacer.pace(next, true), PaceDecision::Encode);
         let late = now + MAX_PACED_INTERVAL;
-        pacer.begin_frame(late, capacity);
+        pacer.begin_frame(late, capacity, false);
         assert_eq!(pacer.pace(late, false), PaceDecision::Encode);
         assert_eq!(pacer.stats().paced_skips, 1);
     }
@@ -652,11 +680,11 @@ mod tests {
         let capacity = Some(Capacity { bps: 2_000_000 });
         let mut pacer = V4Pacer::default();
         let now = feed(&mut pacer, start, 20, &[video()]);
-        pacer.begin_frame(now, capacity);
+        pacer.begin_frame(now, capacity, false);
         assert!(pacer.dominant().is_motion());
         assert_eq!(pacer.max_qp(), None);
         pacer.on_encoded(now, 100_000, false, 0, true);
-        pacer.begin_frame(now + FRAME, capacity);
+        pacer.begin_frame(now + FRAME, capacity, false);
         assert_eq!(pacer.pace(now + FRAME, false), PaceDecision::Encode);
         let grid = TileGrid::new(512, 256);
         let all: Vec<usize> = (0..32).collect();
@@ -671,7 +699,7 @@ mod tests {
         let start = Instant::now();
         let capacity = Some(Capacity { bps: 2_000_000 });
         let mut pacer = V4Pacer::default();
-        pacer.begin_frame(start, capacity);
+        pacer.begin_frame(start, capacity, true);
         let grid = TileGrid::new(1024, 512);
         let plan = RefinePlan {
             tiles: (0..128).collect(),
@@ -682,16 +710,45 @@ mod tests {
             None
         );
         assert!(pacer.refine_retry_after() > Duration::ZERO);
-        // 100 ms later: 20 000 bytes, 33 of 128 tiles at 600 bytes.
-        pacer.begin_frame(start + Duration::from_millis(100), capacity);
+        // 100 ms of an idle screen later: 25 000 bytes (full capacity), 41 of
+        // 128 tiles at 600 bytes.
+        pacer.begin_frame(start + Duration::from_millis(100), capacity, true);
         let fitted = pacer
             .fit_refine(&grid, plan, Some((1000, 500)), false, true)
             .unwrap();
         assert!(!fitted.whole_frame);
-        assert_eq!(fitted.tiles.len(), 20_000 / 600);
+        assert_eq!(fitted.tiles.len(), 25_000 / 600);
         assert_eq!(fitted.tiles[0], 127);
         assert_eq!(pacer.stats().refines_deferred, 1);
         assert_eq!(pacer.stats().refines_trimmed, 1);
+    }
+
+    #[test]
+    fn a_detected_scroll_is_motion_at_any_capture_cadence() {
+        // A constrained link captures a scroll at ~8 fps: below the motion
+        // cadence, so by damage alone it looks like text.
+        let start = Instant::now();
+        let capacity = Some(Capacity { bps: 2_000_000 });
+        let mut pacer = V4Pacer::default();
+        let mut now = start;
+        for n in 0..8u32 {
+            now = start + Duration::from_millis(125) * n;
+            pacer.on_capture(now, 512, 256, Some(&[video()]), &[]);
+        }
+        pacer.begin_frame(now, capacity, false);
+        assert_eq!(pacer.dominant(), ContentClass::Text);
+        let grid = TileGrid::new(512, 256);
+        let all: Vec<usize> = (0..grid.tile_count()).collect();
+        for n in 8..14u32 {
+            now = start + Duration::from_millis(125) * n;
+            pacer.on_capture(now, 512, 256, Some(&[video()]), &[]);
+            pacer.on_scrolled(now, &all);
+        }
+        pacer.begin_frame(now, capacity, false);
+        assert_eq!(pacer.dominant(), ContentClass::Scroll);
+        assert_eq!(pacer.max_qp(), None);
+        assert!(!pacer.pointer_tiles(&grid, Some((32, 32)), &all).is_empty());
+        assert_eq!(pacer.stats().pointer_maps, 1);
     }
 
     #[test]
