@@ -59,6 +59,19 @@ for production browser sessions once v4 is negotiated.
   evidence. When constrained, the delay controller's floor and ceiling are
   capped at 80 % of capacity (`RateReason::Capacity`, 5 % deadband); this
   overrides the 2.5 Mbps 1080p floor. Unconstrained: no change.
+  As in BBR, a frame sent with less than one BDP in flight marks samples
+  app-limited until it is delivered; those are never queue evidence and never
+  lower the estimate (without this a jittery trickle of small frames walked a
+  2 Mbps estimate down to ~600 kbps in the lab). A capacity whose 80 % target
+  covers the profile maximum does not bind (no budget, no ceiling).
+  Open: a receiver stall (RTT ~500 ms on localhost in the lab) looks like a
+  queue; the resulting low estimate is held until a faster sample, ~28 s once
+  in a 3-minute unconstrained run.
+  Lab, 2 Mbps relay throttle, 5 min, phase 1 → phase 2: scroll presented fps
+  median 5.5 → 8.8, p10 4.4 → 6.6; median-tile idle PSNR 55.1 → 52.0 dB (the
+  encoder now follows 80 % of the link instead of sawtoothing to 6 Mbps),
+  worst-decile tile PSNR unchanged (42.5 dB); max relay queue unchanged
+  (~705 ms, during scroll bursts).
 - Keyframes: first frame of a generation, a new peer / reconnect, or an
   explicit client request (decoder error / seq gap). No periodic or safety
   keyframe, no cached-IDR replay on v4. An ACK stall (3 s) only forgets the
