@@ -30,6 +30,7 @@ use bubbleplay_host::quality;
 use bubbleplay_host::reconstruction_feedback;
 use bubbleplay_host::rtc;
 use bubbleplay_host::scale;
+use bubbleplay_host::scroll_detect::{extend_to_runs, sample_tiles, ScrollDetector};
 use bubbleplay_host::signaling;
 use bubbleplay_host::stun;
 use bubbleplay_host::temporal_diff;
@@ -631,6 +632,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     // v4: per-tile quality debt, no-op repaint skipping and tile refines.
     let mut tile_tracker: Option<TileQualityTracker> = None;
     let mut tile_hasher: Option<TileHasher> = None;
+    // v4: scrolls found by shifted tile content (no DDA move rects).
+    let mut scroll_detector: Option<ScrollDetector> = None;
+    let mut scroll_detections: u64 = 0;
+    let mut scroll_dy: i32 = 0;
     let mut tile_hashing_failed = false;
     let mut tile_hash_us: u64 = 0;
     // v4 on a constrained link: per-frame byte budget, content-aware pacing
@@ -2594,6 +2599,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 if wss_media.is_none() || active_benchmark_profile.is_some() {
                     tile_tracker = None;
                     tile_hasher = None;
+                    scroll_detector = None;
                     v4_pacer = V4Pacer::default();
                 } else {
                     if recovered
@@ -2603,6 +2609,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     {
                         tile_tracker = None;
                         tile_hasher = None;
+                        scroll_detector = None;
                         tile_hashing_failed = false;
                     }
                     let tracker = tile_tracker.get_or_insert_with(|| {
@@ -2689,11 +2696,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     if let Some(tracker) = tile_tracker.as_mut() {
                         let dirty = tracker.dirty_tiles();
                         let mut hashed = None;
-                        if !dirty.is_empty()
-                            && !tile_hashing_failed
-                            && frame.damage().is_some()
-                            && tracker.dirty_per_mille() <= MAX_HASHED_PER_MILLE
-                        {
+                        // Damage too large to hash in full: read back a few
+                        // columns only, for scroll detection.
+                        let hash_all = tracker.dirty_per_mille() <= MAX_HASHED_PER_MILLE;
+                        let to_hash = if hash_all {
+                            dirty.clone()
+                        } else {
+                            sample_tiles(tracker.grid(), &dirty)
+                        };
+                        let mut row_hashes = None;
+                        if !to_hash.is_empty() && !tile_hashing_failed && frame.damage().is_some() {
                             if tile_hasher.as_ref().is_none_or(|hasher| {
                                 !hasher.is_for(frame.device(), frame.texture())
                             }) {
@@ -2711,10 +2723,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 };
                             }
                             if let Some(hasher) = tile_hasher.as_mut() {
-                                match hasher.hash_tiles(frame.texture(), tracker.grid(), &dirty) {
-                                    Ok((hashes, elapsed_us)) => {
+                                match hasher.hash_tiles(frame.texture(), tracker.grid(), &to_hash) {
+                                    Ok((hashes, rows, elapsed_us)) => {
                                         tile_hash_us = tile_hash_us.saturating_add(elapsed_us);
-                                        hashed = Some(hashes);
+                                        if hash_all {
+                                            hashed = Some(hashes);
+                                        }
+                                        row_hashes = Some(rows);
                                     }
                                     Err(error) => {
                                         warn!(
@@ -2727,6 +2742,19 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 }
                             }
                         }
+                        if let Some(rows) = row_hashes {
+                            let grid = tracker.grid();
+                            let detector = match scroll_detector.as_mut() {
+                                Some(detector) if detector.is_for(grid) => detector,
+                                _ => scroll_detector.insert(ScrollDetector::new(grid)),
+                            };
+                            if let Some(found) = detector.detect(&rows) {
+                                scroll_detections += 1;
+                                scroll_dy = found.dy;
+                                v4_pacer
+                                    .on_scrolled(now, &extend_to_runs(grid, &dirty, &found.tiles));
+                            }
+                        }
                         tile_hashes = hashed
                             .unwrap_or_else(|| dirty.iter().map(|&tile| (tile, None)).collect());
                         let classification = tracker.classify(&tile_hashes);
@@ -2735,6 +2763,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         v4_pacer.begin_frame(
                             now,
                             wss_media.as_ref().and_then(|egress| egress.capacity()),
+                            tile_changed.is_empty(),
                         );
                         // Changed tiles go in any case; a refine is paid from
                         // the budget they leave (constrained link only).
@@ -4681,6 +4710,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 frame_qp_max = wss_v4_qp_window.0,
                 frame_qp_mean = wss_v4_qp_window.1 / wss_v4_qp_window.2.max(1),
                 capacity_bps = v4.capacity_bps,
+                rate_cap_bps = v4.rate_cap_bps,
+                constrained_ms = v4.constrained_ms,
                 budget_tokens = v4_pacer.tokens(),
                 content = classes.dominant().as_str(),
                 text_tiles = classes.text,
@@ -4691,6 +4722,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 refines_deferred = pacing.refines_deferred,
                 refines_trimmed = pacing.refines_trimmed,
                 pointer_maps = pacing.pointer_maps,
+                scroll_detections,
+                scroll_dy,
                 "WSS v4 link totals"
             );
             tile_hash_us = 0;

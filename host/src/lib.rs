@@ -23,6 +23,7 @@ pub mod quality;
 pub mod reconstruction_feedback;
 pub mod rtc;
 pub mod scale;
+pub mod scroll_detect;
 pub mod service_runtime;
 pub mod signaling;
 pub mod stun;
