@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BubblePlay</string>
+    <string name="main_intro">Use your home desktop through the BubblePlay relay.</string>
+    <string name="server_label">Server</string>
+    <string name="lab_label">Lab run (testing only)</string>
+    <string name="lab_hint">Leave empty for the normal relay</string>
+    <string name="codec_label">Video codec</string>
+    <string name="codec_auto">Auto</string>
+    <string name="codec_hevc">HEVC</string>
+    <string name="codec_h264">H.264</string>
+    <string name="connect">Connect</string>
+    <string name="sign_in_again">Sign in again</string>
+    <string name="forget_browser">Forget this device\'s sign-in</string>
+    <string name="forgot_browser">Sign-in cookies cleared. The next connect asks for approval again.</string>
+    <string name="auth_expired">Your sign-in expired. Sign in again.</string>
+    <string name="bad_server">Enter an https:// server address.</string>
+    <string name="bad_lab_run">The lab run must be a UUID.</string>
+    <string name="login_waiting">Waiting for approval on your phone notification…</string>
+    <string name="login_password">Enter the BubblePlay password.</string>
+    <string name="retry">Retry</string>
+    <string name="key_keyboard">Keys</string>
+    <string name="key_paste">Paste</string>
+    <string name="key_display">Display</string>
+    <string name="key_disconnect">Disconnect</string>
+    <string name="mode_trackpad">Trackpad</string>
+    <string name="mode_direct">Direct</string>
+    <string name="confirm_disconnect">Disconnect from the desktop?</string>
+    <string name="status_paused">Paused. Tap to reconnect.</string>
+    <string name="monitor_failed">Display switch failed: %1$s</string>
+    <string name="secure_desktop">Windows secure desktop: clipboard is off</string>
+    <string name="clipboard_empty">The phone clipboard is empty</string>
+    <string name="paste_failed">Paste did not go through (not connected or too large)</string>
+</resources>
