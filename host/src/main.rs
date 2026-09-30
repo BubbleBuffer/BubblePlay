@@ -92,7 +92,9 @@ use temporal_diff::{
     DamageCoverageAudit, DeferredReadbackActivity, QuiescentValidationStatus, TemporalDiffAnalyzer,
     TemporalDiffResult, TemporalMaskDecision,
 };
-use transport::{AccessUnit, TransportCommand, TransportEvent, TransportPump};
+use transport::{
+    AccessUnit, RtcPeerDecision, RtcPeerLifecycle, TransportCommand, TransportEvent, TransportPump,
+};
 use wss_media::{
     AccessUnitMeta as WssAccessUnitMeta, MediaCodec, ReserveOutcome as WssReserveOutcome,
     SubmitOutcome as WssSubmitOutcome, WssMediaEgress,
@@ -511,6 +513,20 @@ impl LocalClipboardPoll {
 }
 
 /// Full pipeline: signaling + WebRTC + media + input.
+/// WSS carries the session: stop the RTC transport thread and forget its
+/// state, leaving signaling, input and the WSS media path untouched.
+fn end_rtc_peer(
+    pump: &TransportPump,
+    ice_connected: &mut bool,
+    pending_candidates: &mut VecDeque<String>,
+    reason: &str,
+) {
+    *ice_connected = false;
+    pending_candidates.clear();
+    let _ = pump.command(TransportCommand::Shutdown);
+    info!(reason, "RTC peer ended; the WSS session continues");
+}
+
 /// Live producer/session loop.  The transport pump exclusively owns str0m and
 /// the media UDP socket; this thread owns capture, D3D scaling and NVENC.
 fn unix_time_ms() -> u64 {
@@ -601,6 +617,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut latest_idr: Option<CachedIdr> = None;
     let mut replay = CachedIdrReplay::default();
     let mut ice_connected = false;
+    let mut rtc_peer = RtcPeerLifecycle::default();
     let mut offer_accepted = false;
     let mut offer_in_flight = false;
     let mut pending_candidates = VecDeque::new();
@@ -1071,6 +1088,39 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         while let Some(event) = pump.try_event() {
+            // After an RTC-only teardown the pump's trailing events (Closed,
+            // Stopped) belong to the dead peer, not to the WSS session.
+            if rtc_peer.ended() {
+                continue;
+            }
+            let rtc_decision = match &event {
+                TransportEvent::Action(RtcAction::IceDisconnected) => {
+                    ice_connected = false;
+                    Some((rtc_peer.on_disconnected(Instant::now(), wss_media.is_some()), "ice-disconnected"))
+                }
+                TransportEvent::Action(RtcAction::Closed) => {
+                    Some((rtc_peer.on_closed(wss_media.is_some()), "rtc-closed"))
+                }
+                TransportEvent::Stopped => {
+                    Some((rtc_peer.on_closed(wss_media.is_some()), "rtc-transport-stopped"))
+                }
+                _ => None,
+            };
+            if let Some((decision, reason)) = rtc_decision {
+                match decision {
+                    RtcPeerDecision::Continue => {
+                        warn!(reason, "RTC peer disconnected; waiting for ICE to recover");
+                    }
+                    RtcPeerDecision::EndPeer => {
+                        end_rtc_peer(&pump, &mut ice_connected, &mut pending_candidates, reason);
+                    }
+                    RtcPeerDecision::EndSession => {
+                        warn!(reason, "RTC peer ended the RTC-carried session");
+                        break 'session;
+                    }
+                }
+                continue;
+            }
             match event {
                 TransportEvent::Answer(answer) => {
                     signaling.send_answer(&answer)?;
@@ -1079,12 +1129,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
                 TransportEvent::OfferRejected => break 'session,
                 TransportEvent::Action(RtcAction::IceConnected) => {
+                    rtc_peer.on_connected();
                     ice_connected = true;
                     replay.on_ice_connected();
                     next_idr = Instant::now();
                 }
-                TransportEvent::Action(RtcAction::IceDisconnected | RtcAction::Closed)
-                | TransportEvent::Stopped => break 'session,
                 TransportEvent::Action(RtcAction::VideoCodecSelected(codec)) => {
                     if codec != active_codec && accept_session_codec(active_codec, codec) {
                         info!(
@@ -1295,7 +1344,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         media_generation,
                         "offer-state-replay",
                     );
-                    if should_forward_offer(ice_connected, offer_accepted, offer_in_flight) {
+                    if rtc_peer.ended() {
+                        warn!("ignoring an RTC offer after the RTC peer ended under WSS");
+                    } else if should_forward_offer(ice_connected, offer_accepted, offer_in_flight) {
                         if !pump.command(TransportCommand::Offer(sdp)) {
                             break 'session;
                         }
@@ -1424,6 +1475,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         info!(seq, at_ms, client_event = %event, client_detail = %detail, "client log")
                     }
                 },
+                SignalEvent::RemoteCandidate(_) if rtc_peer.ended() => {}
                 SignalEvent::RemoteCandidate(c) if offer_accepted => {
                     let _ = pump.command(TransportCommand::RemoteCandidate(c));
                 }
@@ -2013,7 +2065,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 _ => {}
             }
         }
-        if offer_accepted {
+        match rtc_peer.poll(Instant::now(), wss_media.is_some()) {
+            RtcPeerDecision::Continue => {}
+            RtcPeerDecision::EndPeer => {
+                end_rtc_peer(&pump, &mut ice_connected, &mut pending_candidates, "wss-during-rtc-grace");
+            }
+            RtcPeerDecision::EndSession => {
+                warn!("RTC peer did not reconnect within the disconnect grace");
+                break 'session;
+            }
+        }
+        if offer_accepted && !rtc_peer.ended() {
             // Retain an early candidate until the bounded control queue has
             // accepted it; a saturated pump must not silently lose ICE.
             while let Some(candidate) = pending_candidates.front() {

@@ -5,6 +5,7 @@ import {
   shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
   shouldRecycleSignalingForPeerState,
+  rtcPeerEndAction,
 } from "../public/recovery.js";
 
 function socket(role, { replaced = false, readyState = 1 } = {}) {
@@ -29,6 +30,16 @@ test("a failed peer transport recycles signaling so both ends get a fresh epoch"
   assert.equal(shouldRecycleSignalingForPeerState("failed"), true);
   assert.equal(shouldRecycleSignalingForPeerState("connected"), false);
   assert.equal(shouldRecycleSignalingForPeerState("closed"), false);
+});
+
+test("an RTC peer ending under WSS ends only the peer", () => {
+  assert.equal(rtcPeerEndAction({ usingWssMedia: true, connectionState: "failed" }), "end-peer");
+  assert.equal(rtcPeerEndAction({ usingWssMedia: true, laneClosed: true }), "end-peer");
+  assert.equal(rtcPeerEndAction({ usingWssMedia: false, connectionState: "failed" }), "recycle");
+  assert.equal(rtcPeerEndAction({ usingWssMedia: false, laneClosed: true }), "recycle");
+  // Disconnected is left to recover: the host allows a grace before ending RTC.
+  assert.equal(rtcPeerEndAction({ usingWssMedia: false, connectionState: "disconnected" }), "none");
+  assert.equal(rtcPeerEndAction({ usingWssMedia: true, connectionState: "connected" }), "none");
 });
 
 test("Network Information estimate changes do not tear down a healthy WSS cohort", () => {

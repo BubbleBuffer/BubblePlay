@@ -4,7 +4,7 @@ import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateI
 import {
   shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
-  shouldRecycleSignalingForPeerState,
+  rtcPeerEndAction,
 } from "/recovery.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
  import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
@@ -1306,6 +1306,24 @@ function beginWssRecovery(reason, requestId = null) {
   return requested;
 }
 
+// WSS carries this session: close only the RTC peer and its data channels.
+// Input already falls back to the signaling socket when the lanes are gone.
+function endRtcPeerOnly(reason) {
+  if (!pc) return;
+  closingPeer = true;
+  try { dc?.close(); } catch {}
+  try { motionDc?.close(); } catch {}
+  dc = null;
+  motionDc = null;
+  try { pc.close(); } catch {}
+  pc = null;
+  closingPeer = false;
+  clearTimeout(iceFallbackTimer); iceFallbackTimer = null;
+  clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
+  debugTrace("rtc-peer-ended", { reason });
+  sendClientLog("warn", "rtc-peer-ended", { reason, transport: "wss" });
+}
+
 function switchToWss(reason) {
   if (usingWssMedia) return;
   wssSelected = true;
@@ -1548,7 +1566,11 @@ async function startPeer(generation = peerGeneration) {
   channel.binaryType = "arraybuffer";
   motionChannel.binaryType = "arraybuffer";
   const updateInputReady = () => { const wasReady=inputReady; inputReady = dc?.readyState === "open" && motionDc?.readyState === "open"; hudState.control = dc?.readyState || "closed"; hudState.motion = motionDc?.readyState || "closed"; hudState.dc = inputReady ? "open" : "closed"; if (!wasReady && inputReady) onInputReady(); };
-  const laneClosed = () => { if (!isCurrentPeer(generation, candidate) || closingPeer) return; releaseInput(false); recycleSignaling("input-lane-closed"); restartPeer("input-lane-closed", false); };
+  const laneClosed = () => {
+    if (!isCurrentPeer(generation, candidate) || closingPeer) return;
+    if (rtcPeerEndAction({ usingWssMedia, laneClosed: true }) === "end-peer") return endRtcPeerOnly("input-lane-closed");
+    releaseInput(false); recycleSignaling("input-lane-closed"); restartPeer("input-lane-closed", false);
+  };
   channel.onopen = () => { if (isCurrentPeer(generation, candidate)) updateInputReady(); };
   channel.onclose = laneClosed;
   motionChannel.onopen = () => { if (isCurrentPeer(generation, candidate)) updateInputReady(); };
@@ -1600,7 +1622,9 @@ async function startPeer(generation = peerGeneration) {
   candidate.ontrack = (ev) => { if (isCurrentPeer(generation, candidate)) onTrack(ev, generation); };
   candidate.onconnectionstatechange = () => {
     if (!isCurrentPeer(generation, candidate)) return;
-    if (shouldRecycleSignalingForPeerState(candidate.connectionState)) {
+    const action = rtcPeerEndAction({ usingWssMedia, connectionState: candidate.connectionState });
+    if (action === "end-peer") endRtcPeerOnly(`rtc-${candidate.connectionState}`);
+    else if (action === "recycle") {
       hudState.ice = candidate.connectionState;
       hud.classList.add("bad");
       if (ws?.readyState === WebSocket.OPEN) ws.close(1000, "rtc-failed");
