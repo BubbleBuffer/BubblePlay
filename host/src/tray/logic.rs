@@ -350,11 +350,44 @@ pub struct Heartbeat {
     pub runner_pid: u32,
     pub updated_unix_ms: u64,
     pub host: HostState,
+    /// Build identity of the elevated runner's tray + host binaries.
+    #[serde(default)]
+    pub build: String,
 }
 
 impl Heartbeat {
     pub fn is_fresh(&self, now_unix_ms: u64) -> bool {
         now_unix_ms.saturating_sub(self.updated_unix_ms) <= HEARTBEAT_STALE.as_millis() as u64
+    }
+}
+
+/// Stable 64-bit FNV-1a; used only to tell builds apart, not for security.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Identity of a tray + host binary pair, compared between the user tray and
+/// the elevated runner to flag stale Admin-mode binaries.
+pub fn build_id(tray: &[u8], host: &[u8]) -> String {
+    format!("{:016x}-{:016x}", fnv1a64(tray), fnv1a64(host))
+}
+
+/// True when a live elevated runner reports a build different from ours.
+/// An empty id on either side (unknown) never counts as outdated.
+pub fn is_outdated(own_build: &str, runner_build: &str) -> bool {
+    !own_build.is_empty() && !runner_build.is_empty() && own_build != runner_build
+}
+
+pub fn admin_menu_label(outdated: bool) -> &'static str {
+    if outdated {
+        "Admin mode (outdated build)"
+    } else {
+        "Admin mode"
     }
 }
 
@@ -560,6 +593,7 @@ mod tests {
             runner_pid: 7,
             updated_unix_ms: 100_000,
             host: HostState::Running { pid: 9 },
+            build: "a-b".into(),
         };
         assert!(beat.is_fresh(100_000 + 10_000));
         assert!(!beat.is_fresh(100_000 + 10_001));
@@ -584,6 +618,30 @@ mod tests {
             status_line(&HostState::Stopped, false),
             "BubblePlay: Stopped (user)"
         );
+    }
+
+    #[test]
+    fn heartbeat_without_build_field_still_parses() {
+        let beat: Heartbeat =
+            serde_json::from_str(r#"{"runnerPid":1,"updatedUnixMs":2,"host":{"state":"stopped"}}"#)
+                .unwrap();
+        assert_eq!(beat.build, "");
+    }
+
+    #[test]
+    fn build_identity_and_outdated_label() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        let one = build_id(b"tray", b"host");
+        assert_eq!(one, build_id(b"tray", b"host"));
+        assert_ne!(one, build_id(b"tray", b"host2"));
+        assert_ne!(one, build_id(b"tray2", b"host"));
+        assert!(!is_outdated(&one, &one));
+        assert!(is_outdated(&one, &build_id(b"x", b"y")));
+        assert!(!is_outdated(&one, ""));
+        assert!(!is_outdated("", &one));
+        assert_eq!(admin_menu_label(false), "Admin mode");
+        assert_eq!(admin_menu_label(true), "Admin mode (outdated build)");
     }
 
     #[test]

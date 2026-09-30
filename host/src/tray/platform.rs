@@ -304,6 +304,59 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|| local_app_data().join("BubblePlay"))
 }
 
+/// Build identity of the running tray binary plus the host beside it.
+pub fn current_build_id() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return String::new();
+    };
+    let tray = std::fs::read(&exe).unwrap_or_default();
+    let host = std::fs::read(host_exe_beside(&exe)).unwrap_or_default();
+    if tray.is_empty() {
+        return String::new();
+    }
+    super::logic::build_id(&tray, &host)
+}
+
+/// Whether this process runs with an elevated (full administrator) token.
+pub fn is_process_elevated() -> bool {
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
+    // SAFETY: out-pointer valid; token closed by Handle.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    let token = Handle(token);
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    // SAFETY: buffer is a TOKEN_ELEVATION of the stated size.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    }
+    .is_ok();
+    ok && elevation.TokenIsElevated != 0
+}
+
+/// True when `path` lies below `%ProgramFiles%` (admin-only by default).
+pub fn is_under_program_files(path: &Path) -> bool {
+    let Some(root) = std::env::var_os("ProgramW6432").or_else(|| std::env::var_os("ProgramFiles"))
+    else {
+        return false;
+    };
+    let (Ok(path), Ok(root)) = (std::fs::canonicalize(path), std::fs::canonicalize(root)) else {
+        return false;
+    };
+    path.starts_with(root)
+}
+
 pub fn host_exe_beside(current_exe: &Path) -> PathBuf {
     current_exe
         .parent()
