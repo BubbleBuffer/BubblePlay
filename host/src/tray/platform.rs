@@ -304,6 +304,19 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|| local_app_data().join("BubblePlay"))
 }
 
+/// SHA-256 (uppercase hex, like PowerShell) of a file, via CNG.
+pub fn sha256_file(path: &Path) -> Option<String> {
+    use windows::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE};
+    let data = std::fs::read(path).ok()?;
+    let mut digest = [0u8; 32];
+    // SAFETY: slices are valid for the call; pseudo-handle needs no cleanup.
+    let status = unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, &data, &mut digest) };
+    if status.0 != 0 {
+        return None;
+    }
+    Some(digest.iter().map(|b| format!("{b:02X}")).collect())
+}
+
 /// Build identity of the running tray binary plus the host beside it.
 pub fn current_build_id() -> String {
     let Ok(exe) = std::env::current_exe() else {

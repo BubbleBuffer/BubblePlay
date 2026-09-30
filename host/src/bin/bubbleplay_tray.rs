@@ -16,6 +16,8 @@ mod logic;
 mod platform;
 #[path = "../tray/supervisor.rs"]
 mod supervisor;
+#[path = "../tray/update.rs"]
+mod update;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -48,9 +50,12 @@ use platform::{
     acquire_single_instance, create_manual_event, current_build_id, data_dir, elevated_task_exists,
     end_elevated_task, host_exe_beside, is_process_elevated, is_signaled, is_under_program_files,
     named_mutex_exists, open_event, open_folder, read_run_value, run_elevated_task, set_event,
-    set_run_value, wide, Handle, ELEVATED_STOP_EVENT, TRAY_MUTEX,
+    set_run_value, sha256_file, wide, Handle, ELEVATED_STOP_EVENT, TRAY_MUTEX,
 };
-use supervisor::{SupervisorConfig, SupervisorThread};
+use supervisor::{HostEvent, SupervisorConfig, SupervisorThread};
+use update::{
+    plan_rollback, short_hash, Probation, RollbackPlan, UpdateState, UpdateStatus, Verdict,
+};
 
 const WINDOW_CLASS: &str = "BubblePlayTrayWindow";
 const WM_TRAY: u32 = WM_APP + 1;
@@ -63,6 +68,8 @@ const CMD_LOGIN: usize = 3;
 const CMD_RESTART: usize = 4;
 const CMD_LOGS: usize = 5;
 const CMD_QUIT: usize = 6;
+const CMD_ROLLBACK: usize = 7;
+const CMD_BUILD: usize = 8;
 
 /// Admin-mode grace period before a missing heartbeat means "not running".
 const ADMIN_START_GRACE: Duration = Duration::from_secs(20);
@@ -86,6 +93,19 @@ fn main() {
     });
 }
 
+/// Named-object / window-class name for this instance. With
+/// `BUBBLEPLAY_TRAY_DATA_DIR` set (test mode) names are suffixed by the data
+/// dir, so a test tray never collides with (or `--quit`s) the real one.
+fn scoped(base: &str) -> String {
+    match std::env::var_os("BUBBLEPLAY_TRAY_DATA_DIR") {
+        Some(dir) => {
+            let key = dir.to_string_lossy().to_lowercase();
+            format!("{base}.test-{:016x}", logic::fnv1a64(key.as_bytes()))
+        }
+        None => base.to_string(),
+    }
+}
+
 fn logs_dir(data: &Path) -> PathBuf {
     data.join("logs")
 }
@@ -101,12 +121,17 @@ fn init_tracing(log: SharedLog) {
         .try_init();
 }
 
-fn supervisor_config(data: &Path, host_log: SharedLog) -> Result<SupervisorConfig> {
+fn supervisor_config(
+    data: &Path,
+    host_log: SharedLog,
+    events: Option<std::sync::mpsc::Sender<HostEvent>>,
+) -> Result<SupervisorConfig> {
     let exe = std::env::current_exe().context("current_exe")?;
     Ok(SupervisorConfig {
         host_exe: host_exe_beside(&exe),
         host_config: data.join("host.json"),
         host_log,
+        events,
     })
 }
 
@@ -140,20 +165,20 @@ fn run_elevated_host() -> Result<i32> {
         );
         return Ok(1);
     }
-    let Some(_instance) = acquire_single_instance(ELEVATED_RUNNER_MUTEX)? else {
+    let Some(_instance) = acquire_single_instance(&scoped(ELEVATED_RUNNER_MUTEX))? else {
         tracing::info!("elevated runner already active; exiting");
         return Ok(0);
     };
     // The tray creates this event before running the task; without it the
     // tray is gone and an elevated host must not linger.
-    let Some(stop_event) = open_event(ELEVATED_STOP_EVENT) else {
+    let Some(stop_event) = open_event(&scoped(ELEVATED_STOP_EVENT)) else {
         tracing::warn!("tray is not running; elevated runner exiting");
         return Ok(0);
     };
     tracing::info!(pid = std::process::id(), "elevated runner started");
     let heartbeat = data.join(HEARTBEAT_FILE);
     let build = current_build_id();
-    let mut supervisor = SupervisorThread::start(supervisor_config(&data, log)?);
+    let mut supervisor = SupervisorThread::start(supervisor_config(&data, log, None)?);
     let mut tray_missing = 0u32;
     loop {
         write_heartbeat(&heartbeat, supervisor.state(), &build);
@@ -161,7 +186,7 @@ fn run_elevated_host() -> Result<i32> {
             tracing::info!("tray requested stop");
             break;
         }
-        if named_mutex_exists(TRAY_MUTEX) {
+        if named_mutex_exists(&scoped(TRAY_MUTEX)) {
             tray_missing = 0;
         } else {
             tray_missing += 1;
@@ -183,7 +208,7 @@ fn run_elevated_host() -> Result<i32> {
 // ---------------------------------------------------------------------------
 
 fn quit_running_tray() -> Result<i32> {
-    let class = wide(WINDOW_CLASS);
+    let class = wide(&scoped(WINDOW_CLASS));
     // SAFETY: class is NUL-terminated.
     let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }) else {
         return Ok(0);
@@ -192,7 +217,7 @@ fn quit_running_tray() -> Result<i32> {
     let _ = unsafe { PostMessageW(Some(hwnd), WM_QUIT_REQUEST, WPARAM(0), LPARAM(0)) };
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if !named_mutex_exists(TRAY_MUTEX) {
+        if !named_mutex_exists(&scoped(TRAY_MUTEX)) {
             return Ok(0);
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -294,6 +319,14 @@ struct App {
     taskbar_created: u32,
     shut_down: bool,
     build: String,
+    events_tx: std::sync::mpsc::Sender<HostEvent>,
+    events_rx: std::sync::mpsc::Receiver<HostEvent>,
+    /// Active while update-state.json says the installed host is pending.
+    probation: Option<Probation>,
+    /// Exit times of the user host, to flag a failing rolled-back build.
+    exits: Vec<u64>,
+    host_hash: Option<String>,
+    host_error: Option<String>,
 }
 
 impl App {
@@ -375,9 +408,15 @@ impl App {
         if self.user.is_some() {
             return;
         }
-        match supervisor_config(&self.data, self.host_log.clone()) {
+        match supervisor_config(
+            &self.data,
+            self.host_log.clone(),
+            Some(self.events_tx.clone()),
+        ) {
             Ok(config) => {
                 tracing::info!(exe = %config.host_exe.display(), "starting user-level host");
+                self.host_hash = sha256_file(&config.host_exe);
+                self.begin_probation_if_pending();
                 self.user = Some(SupervisorThread::start(config));
             }
             Err(error) => tracing::error!(?error, "cannot start host supervisor"),
@@ -418,7 +457,7 @@ impl App {
         set_event(&self.stop_event, true);
         // Give the runner a moment to stop its child cleanly, then make sure.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && named_mutex_exists(ELEVATED_RUNNER_MUTEX) {
+        while Instant::now() < deadline && named_mutex_exists(&scoped(ELEVATED_RUNNER_MUTEX)) {
             std::thread::sleep(Duration::from_millis(100));
         }
         end_elevated_task();
@@ -482,13 +521,231 @@ impl App {
         }
     }
 
+    fn update_state_path(&self) -> PathBuf {
+        self.data.join("update-state.json")
+    }
+
+    fn host_paths(&self) -> Option<(PathBuf, PathBuf, PathBuf)> {
+        let exe = std::env::current_exe().ok()?;
+        let host = host_exe_beside(&exe);
+        let previous_dir = host.parent()?.join("previous");
+        Some((
+            host,
+            previous_dir.join("bubbleplay-host.exe"),
+            previous_dir.join("bubbleplay-host.failed.exe"),
+        ))
+    }
+
+    fn previous_hash(&self) -> Option<String> {
+        let (_, previous, _) = self.host_paths()?;
+        sha256_file(&previous)
+    }
+
+    /// A previous host exists and differs from the installed one.
+    fn can_roll_back(&self) -> bool {
+        match (self.previous_hash(), self.host_hash.as_deref()) {
+            (Some(previous), Some(current)) => !previous.eq_ignore_ascii_case(current),
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    fn begin_probation_if_pending(&mut self) {
+        if self.probation.is_some() {
+            return;
+        }
+        let Some(hash) = self.host_hash.as_deref() else {
+            return;
+        };
+        if let Some(state) = UpdateState::load(&self.update_state_path()) {
+            if state.needs_probation(hash) {
+                tracing::info!(
+                    build = short_hash(hash),
+                    "host update pending: probation started"
+                );
+                self.probation = Some(Probation::new(unix_ms_now()));
+            }
+        }
+    }
+
+    fn build_line(&self) -> String {
+        let build = self
+            .host_hash
+            .as_deref()
+            .map(short_hash)
+            .unwrap_or("unknown");
+        let status = match UpdateState::load(&self.update_state_path()) {
+            Some(state) => match state.status {
+                UpdateStatus::Pending if self.probation.is_some() => "pending (probation)",
+                UpdateStatus::Pending => "pending",
+                UpdateStatus::Good => "good",
+                UpdateStatus::RolledBack => "rolled back",
+                UpdateStatus::Failed => "update failed",
+            },
+            None => "no update record",
+        };
+        format!("Host build {build}: {status}")
+    }
+
+    fn save_update_state(&self, state: &UpdateState) {
+        if let Err(error) = state.save(&self.update_state_path()) {
+            tracing::warn!(?error, "writing update-state.json failed");
+        }
+    }
+
+    /// Swap the installed host with `previous\bubbleplay-host.exe`; the
+    /// replaced binary is kept as `previous\bubbleplay-host.failed.exe`.
+    fn restore_previous_host(&mut self) -> Result<()> {
+        let (host, previous, failed) = self.host_paths().context("host paths")?;
+        if !previous.is_file() {
+            anyhow::bail!("{} is missing", previous.display());
+        }
+        self.stop_user();
+        let _ = std::fs::remove_file(&failed);
+        std::fs::rename(&host, &failed)
+            .with_context(|| format!("moving {} aside", host.display()))?;
+        if let Err(error) = std::fs::copy(&previous, &host) {
+            let _ = std::fs::rename(&failed, &host);
+            return Err(error).context("restoring previous host");
+        }
+        self.host_hash = sha256_file(&host);
+        Ok(())
+    }
+
+    fn roll_back(&mut self, reason: &str, automatic: bool) {
+        let now = unix_ms_now();
+        let path = self.update_state_path();
+        let state = UpdateState::load(&path).unwrap_or_else(|| UpdateState {
+            status: UpdateStatus::Pending,
+            new_hash: self.host_hash.clone().unwrap_or_default(),
+            previous_hash: None,
+            updated_unix_ms: now,
+            reason: None,
+        });
+        self.probation = None;
+        if automatic {
+            if let RollbackPlan::GiveUp(why) =
+                plan_rollback(&state, self.previous_hash().as_deref())
+            {
+                let message = format!("{reason}; {why}");
+                tracing::error!(%message, "host update failed and cannot be rolled back");
+                if state.status == UpdateStatus::Pending {
+                    self.save_update_state(&state.with_status(
+                        UpdateStatus::Failed,
+                        Some(message.clone()),
+                        now,
+                    ));
+                }
+                self.host_error = Some(format!("Host update failed: {message}"));
+                self.balloon(
+                    "BubblePlay",
+                    &format!("Host update failed: {message}"),
+                    NIIF_WARNING,
+                );
+                return;
+            }
+        }
+        tracing::warn!(%reason, automatic, "rolling back host");
+        match self.restore_previous_host() {
+            Ok(()) => {
+                let reason = if automatic {
+                    reason.to_string()
+                } else {
+                    format!("manual: {reason}")
+                };
+                self.save_update_state(&state.with_status(
+                    UpdateStatus::RolledBack,
+                    Some(reason.clone()),
+                    now,
+                ));
+                self.host_error = None;
+                self.exits.clear();
+                self.balloon(
+                    "BubblePlay",
+                    &format!("Host update rolled back: {reason}"),
+                    NIIF_WARNING,
+                );
+            }
+            Err(error) => {
+                let message = format!("{reason}; rollback failed: {error:#}");
+                tracing::error!(%message, "host rollback failed");
+                self.save_update_state(&state.with_status(
+                    UpdateStatus::Failed,
+                    Some(message.clone()),
+                    now,
+                ));
+                self.host_error = Some(message.clone());
+                self.balloon(
+                    "BubblePlay",
+                    &format!("Host rollback failed: {message}"),
+                    NIIF_WARNING,
+                );
+            }
+        }
+        self.start_user();
+    }
+
+    /// Feed host events into probation and act on its verdict.
+    fn watch_update(&mut self) {
+        let now = unix_ms_now();
+        while let Ok(event) = self.events_rx.try_recv() {
+            match event {
+                HostEvent::Started => {}
+                HostEvent::Registered => {
+                    if let Some(probation) = self.probation.as_mut() {
+                        if !probation.registered() {
+                            tracing::info!("pending host registered with signaling");
+                        }
+                        probation.on_registered(now);
+                    }
+                    self.host_error = None;
+                }
+                HostEvent::Exited => {
+                    if let Some(probation) = self.probation.as_mut() {
+                        probation.on_exit(now);
+                    }
+                    self.exits.push(now);
+                }
+            }
+        }
+        self.exits
+            .retain(|&at| now.saturating_sub(at) < update::CRASH_LOOP_WINDOW_MS);
+        if self.admin_active || self.user.is_none() {
+            return;
+        }
+        if let Some(probation) = self.probation.as_mut() {
+            match probation.evaluate(now) {
+                Verdict::Wait => {}
+                Verdict::Good => {
+                    self.probation = None;
+                    if let Some(state) = UpdateState::load(&self.update_state_path()) {
+                        self.save_update_state(&state.with_status(UpdateStatus::Good, None, now));
+                    }
+                    tracing::info!("host update marked good");
+                }
+                Verdict::RollBack(reason) => self.roll_back(&reason, true),
+            }
+        } else if self.exits.len() >= update::CRASH_LOOP_EXITS && self.host_error.is_none() {
+            let rolled_back = UpdateState::load(&self.update_state_path())
+                .is_some_and(|state| state.status == UpdateStatus::RolledBack);
+            let message = if rolled_back {
+                "Rolled-back host keeps exiting; retrying with backoff (see host.log)"
+            } else {
+                "Host keeps exiting; retrying with backoff (see host.log)"
+            };
+            tracing::error!(message);
+            self.host_error = Some(message.to_string());
+        }
+    }
+
     fn tick(&mut self) {
+        self.watch_update();
         // Re-run the elevated task if it died (e.g. ended externally).
         if self.admin_active && self.admin_heartbeat().is_none() {
             let due = self
                 .admin_started
                 .is_none_or(|started| started.elapsed() >= ADMIN_RERUN_INTERVAL);
-            if due && !named_mutex_exists(ELEVATED_RUNNER_MUTEX) {
+            if due && !named_mutex_exists(&scoped(ELEVATED_RUNNER_MUTEX)) {
                 tracing::warn!("elevated host is not reporting; re-running task");
                 self.admin_active = false;
                 if !self.start_admin() {
@@ -555,6 +812,7 @@ impl App {
                 self.sync_run_key();
             }
             CMD_RESTART => self.restart_host(),
+            CMD_ROLLBACK => self.roll_back("requested from tray menu", false),
             CMD_LOGS => open_folder(&logs_dir(&self.data)),
             CMD_QUIT => {
                 self.shutdown();
@@ -580,12 +838,15 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 fn show_menu(hwnd: HWND) {
-    let Some((status, admin, login, outdated)) = with_app(|app| {
+    let Some((status, admin, login, outdated, build, error, can_roll_back)) = with_app(|app| {
         (
             status_line(&app.state(), app.admin_active),
             app.settings.admin_mode,
             app.settings.start_at_login,
             app.admin_outdated(),
+            app.build_line(),
+            app.host_error.clone(),
+            !app.admin_active && app.can_roll_back(),
         )
     }) else {
         return;
@@ -600,6 +861,10 @@ fn show_menu(hwnd: HWND) {
             let _ = AppendMenuW(menu, flags, id, PCWSTR(text.as_ptr()));
         };
         item(MF_STRING | MF_GRAYED, CMD_STATUS, &status);
+        item(MF_STRING | MF_GRAYED, CMD_BUILD, &build);
+        if let Some(error) = error {
+            item(MF_STRING | MF_GRAYED, CMD_BUILD, &error);
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         item(
             if admin {
@@ -621,6 +886,9 @@ fn show_menu(hwnd: HWND) {
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING, CMD_RESTART, "Restart host");
+        if can_roll_back {
+            item(MF_STRING, CMD_ROLLBACK, "Roll back host");
+        }
         item(MF_STRING, CMD_LOGS, "Open logs folder");
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING, CMD_QUIT, "Quit");
@@ -695,16 +963,16 @@ fn run_tray() -> Result<i32> {
     let test_mode = std::env::var_os("BUBBLEPLAY_TRAY_DATA_DIR").is_some();
     let logs = logs_dir(&data);
     init_tracing(SharedLog::new(logs.join("tray.log")));
-    let Some(_instance) = acquire_single_instance(TRAY_MUTEX)? else {
+    let Some(_instance) = acquire_single_instance(&scoped(TRAY_MUTEX))? else {
         return Ok(0);
     };
     tracing::info!(pid = std::process::id(), data = %data.display(), "tray starting");
-    let stop_event = create_manual_event(ELEVATED_STOP_EVENT)?;
+    let stop_event = create_manual_event(&scoped(ELEVATED_STOP_EVENT))?;
 
     // SAFETY: standard window-class registration and hidden window creation.
     let hwnd = unsafe {
         let instance = GetModuleHandleW(PCWSTR::null()).context("GetModuleHandleW")?;
-        let class = wide(WINDOW_CLASS);
+        let class = wide(&scoped(WINDOW_CLASS));
         let wc = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
@@ -737,6 +1005,7 @@ fn run_tray() -> Result<i32> {
 
     let settings_path = data.join("tray.json");
     let settings = TraySettings::load(&settings_path);
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
     let app = App {
         hwnd,
         data: data.clone(),
@@ -757,6 +1026,12 @@ fn run_tray() -> Result<i32> {
         taskbar_created,
         shut_down: false,
         build: current_build_id(),
+        events_tx,
+        events_rx,
+        probation: None,
+        exits: Vec::new(),
+        host_hash: None,
+        host_error: None,
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     with_app(|app| {
