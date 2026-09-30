@@ -6,9 +6,14 @@
 .DESCRIPTION
     Copies bubbleplay-host.exe and bubbleplay_tray.exe from the build output
     into %LOCALAPPDATA%\Programs\BubblePlay, restarting the tray (and with it
-    the user or elevated host). The previous binaries are kept as
-    <name>.previous for manual rollback. Run setup-tray.ps1 once (elevated)
-    before the first update.
+    the user or elevated host). The replaced binaries are moved to
+    <install>\previous\ (exactly one previous of each). Run setup-tray.ps1
+    once (elevated) before the first update.
+
+    When the host changes, update-state.json in the tray data dir records it
+    as "pending": the tray rolls back to previous\bubbleplay-host.exe if the
+    new host does not register with signaling within 120 s or crash-loops, and
+    marks it "good" after 10 healthy minutes. Honors BUBBLEPLAY_TRAY_DATA_DIR.
 
     Admin mode runs a separate admin-owned copy in
     %ProgramFiles%\BubblePlay\elevated. When that copy differs from the build,
@@ -111,13 +116,37 @@ elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $(@($changed
         Start-Sleep -Milliseconds 500
     }
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    $previousDir = Join-Path $InstallDir 'previous'
+    New-Item -ItemType Directory -Force -Path $previousDir | Out-Null
+    $hostPreviousHash = $null
     foreach ($name in $changed) {
         $target = Join-Path $InstallDir $name
         $temp = "$target.new"
         Copy-Item -Force -LiteralPath (Join-Path $SourceDir $name) -Destination $temp
-        if (Test-Path -LiteralPath $target) { Copy-Item -Force -LiteralPath $target -Destination "$target.previous" }
+        if (Test-Path -LiteralPath $target) {
+            # Keep exactly one previous build of each binary.
+            $previous = Join-Path $previousDir $name
+            Move-Item -Force -LiteralPath $target -Destination $previous
+            if ($name -eq 'bubbleplay-host.exe') { $hostPreviousHash = Get-Sha256 $previous }
+        }
+        # Pre-rollback-scheme leftovers.
+        Remove-Item -Force -LiteralPath "$target.previous" -ErrorAction SilentlyContinue
         Move-Item -Force -LiteralPath $temp -Destination $target
         if ((Get-Sha256 $target) -ne (Get-Sha256 (Join-Path $SourceDir $name))) { throw "Hash mismatch after copying $name." }
+    }
+    if ($changed -contains 'bubbleplay-host.exe') {
+        # The tray puts a pending host on probation and rolls back on failure.
+        New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+        $state = [ordered]@{
+            status        = 'pending'
+            newHash       = Get-Sha256 (Join-Path $InstallDir 'bubbleplay-host.exe')
+            previousHash  = $hostPreviousHash
+            updatedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            reason        = $null
+        }
+        $json = $state | ConvertTo-Json
+        [IO.File]::WriteAllText((Join-Path $dataDir 'update-state.json'), $json, (New-Object Text.UTF8Encoding($false)))
+        if (-not $hostPreviousHash) { Write-Warning 'No previous host to roll back to; this update cannot be rolled back automatically.' }
     }
     if ($changed.Count) { Write-Host "Updated: $($changed -join ', ')" }
     if ($refreshElevated) {
