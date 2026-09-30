@@ -273,12 +273,24 @@ class Viewport {
 
     fun pan(dx: Float, dy: Float) { x += dx; y += dy; clamp() }
 
-    /** Keeps a normalized remote point visible (cursor follow while zoomed). */
-    fun keepVisible(nx: Float, ny: Float, marginPx: Float = 48f) {
-        if (zoom <= 1f) return
+    /**
+     * Zoom anchored on a normalized frame point (trackpad mode: the cursor):
+     * that point keeps its screen position unless clamping has to move it.
+     */
+    fun zoomAround(factor: Float, nx: Float, ny: Float) {
         val (sx, sy) = toScreen(nx, ny)
-        if (sx < marginPx) x += marginPx - sx else if (sx > viewW - marginPx) x -= sx - (viewW - marginPx)
-        if (sy < marginPx) y += marginPx - sy else if (sy > viewH - marginPx) y -= sy - (viewH - marginPx)
+        zoomBy(factor, sx, sy)
+    }
+
+    /**
+     * Cursor follow while zoomed: puts the normalized point in the middle of
+     * the view, clamped so the view never shows outside the frame (near an
+     * edge the point ends up off-centre instead).
+     */
+    fun centerOn(nx: Float, ny: Float) {
+        if (zoom <= 1f) return
+        x = viewW / 2f - (contentX + nx * contentW) * zoom
+        y = viewH / 2f - (contentY + ny * contentH) * zoom
         clamp()
     }
 

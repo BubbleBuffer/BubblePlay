@@ -90,6 +90,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private var monitorDialogWanted = false
     private var lastClipboardFromHost: String? = null
     private var mouseButtons = 0
+    private var mouseActive = false
     private var motionFramePosted = false
 
     private val backgroundDisconnect = Runnable { stopSession() }
@@ -371,13 +372,27 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     private fun renderCursor() {
         val (sx, sy) = viewport.toScreen(cursorX, cursorY)
-        cursorView.update(sx, sy, (cursorVisible || gestures.mode == TouchMode.TRACKPAD) && session != null)
+        // Direct touch: the finger is the pointer, so no drawn cursor unless a
+        // physical mouse is driving it. Trackpad mode always draws it.
+        val show = when {
+            session == null -> false
+            gestures.mode == TouchMode.TRACKPAD -> true
+            else -> mouseActive && cursorVisible
+        }
+        cursorView.update(sx, sy, show)
+    }
+
+    private fun setMouseActive(active: Boolean) {
+        if (mouseActive == active) return
+        mouseActive = active
+        renderCursor()
     }
 
     // ---- touch ------------------------------------------------------------------------
     private fun onStageTouch(event: MotionEvent): Boolean {
         if (event.isFromSource(InputDevice.SOURCE_MOUSE)) return onMouseEvent(event)
         if (stage.hasPointerCapture()) stage.releasePointerCapture()
+        setMouseActive(false)
         val now = event.eventTime
         val actions = ArrayList<GestureAction>()
         when (event.actionMasked) {
@@ -405,7 +420,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
                 cursorX = (cursorX + dx).coerceIn(0f, 1f); cursorY = (cursorY + dy).coerceIn(0f, 1f)
                 localCursorUntil = SystemClock.uptimeMillis() + 300
                 remote.absoluteNormalized(cursorX, cursorY)
-                viewport.keepVisible(cursorX, cursorY)
+                // Zoomed trackpad: the view follows the cursor (re-centres after a two-finger nudge).
+                viewport.centerOn(cursorX, cursorY)
                 applyViewport()
                 scheduleMotionFlush()
             }
@@ -430,7 +446,12 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
                 val (wx, wy) = wheel.add(-action.dx * 120f / perNotch, action.dy * 120f / perNotch)
                 if (wx != 0 || wy != 0) { remote.motion(0, 0, wx, wy); scheduleMotionFlush() }
             }
-            is GestureAction.Zoom -> { viewport.zoomBy(action.scale, action.focusX, action.focusY); applyViewport() }
+            is GestureAction.Zoom -> {
+                // Trackpad zoom anchors on the cursor; direct zoom on the pinch focus.
+                if (gestures.mode == TouchMode.TRACKPAD) viewport.zoomAround(action.scale, cursorX, cursorY)
+                else viewport.zoomBy(action.scale, action.focusX, action.focusY)
+                applyViewport()
+            }
             is GestureAction.Pan -> { viewport.pan(action.dx, action.dy); applyViewport() }
         }
     }
@@ -459,6 +480,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     private fun onCapturedPointer(event: MotionEvent): Boolean {
+        setMouseActive(true)
         val remote = input ?: return true
         when (event.actionMasked) {
             MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE -> {
