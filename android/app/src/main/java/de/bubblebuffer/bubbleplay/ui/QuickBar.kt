@@ -1,6 +1,5 @@
 package de.bubblebuffer.bubbleplay.ui
 
-import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
@@ -20,7 +19,6 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
-import android.view.accessibility.AccessibilityManager
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
@@ -35,10 +33,11 @@ import de.bubblebuffer.bubbleplay.net.Session
 import kotlin.math.roundToInt
 
 /**
- * The stream screen's quick-action bar: a flat icon strip on the bottom edge
- * with in-window popovers (screens, shortcuts, keys, arrows, more). The
- * remote canvas owns the field, so the bar hides itself after a few seconds
- * without use and a small handle brings it back.
+ * The stream screen's quick-action bar: a flat icon strip docked on the bottom
+ * edge (above the soft keyboard when it is open) with in-window popovers
+ * (screens, shortcuts, keys, arrows, more). It is always visible and never
+ * overlays the video: the stream is laid out in the area above it
+ * ([height]).
  *
  * Popovers are views inside the activity window, not PopupWindows: a
  * transparent scrim under them eats the outside tap (it never reaches the
@@ -82,7 +81,6 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
 
     private val bar: LinearLayout
     private val row: LinearLayout
-    private val handle: FrameLayout
     private val scrim: View
     private val keyboardItem: ImageButton
     private val screenItem: ImageButton
@@ -99,11 +97,9 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
     private var openKind: Kind? = null
     private val modifierKeys = HashMap<String, TextView>()
 
-    /** False while the bar is tucked away (the handle shows instead). */
-    var shown = true
-        private set
+    /** The docked bar's height in px (hairline plus one row of 48 dp targets). */
+    val height: Int get() = dp(1) + dp(BAR_ITEM_DP)
 
-    private val autoHide = Runnable { if (canAutoHide()) hide() }
     private var repeating: String? = null
     private val repeatTick = object : Runnable {
         override fun run() {
@@ -122,19 +118,6 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         scrim.setOnTouchListener(ScrimTouch())
         root.addView(scrim, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
-        handle = FrameLayout(activity).apply {
-            visibility = View.GONE
-            isClickable = true
-            contentDescription = activity.getString(R.string.bar_show)
-            tooltipText = contentDescription
-            addView(View(activity).apply {
-                background = GradientDrawable().apply { cornerRadius = dpf(2f); setColor(THREAD_STRONG) }
-            }, FrameLayout.LayoutParams(dp(36), dp(4), Gravity.CENTER))
-            setOnClickListener { show() }
-        }
-        handle.setOnTouchListener(HandleSwipe())
-        root.addView(handle, FrameLayout.LayoutParams(dp(96), dp(28), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
-
         bar = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(DUVET)
@@ -144,11 +127,11 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(4), dp(3), dp(4), dp(3))
+            setPadding(dp(4), 0, dp(4), 0)
         }
         bar.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        keyboardItem = item(R.drawable.ic_bar_keyboard, R.string.bar_keyboard_show) { host.toggleKeyboard(); render(); scheduleHide() }
+        keyboardItem = item(R.drawable.ic_bar_keyboard, R.string.bar_keyboard_show) { host.toggleKeyboard(); render() }
         screenItem = item(R.drawable.ic_bar_monitor, R.string.bar_screen) { toggle(Kind.SCREEN) }
         modeItem = item(R.drawable.ic_bar_trackpad, R.string.bar_shortcuts) { host.toggleTouchMode(); render() }
         shortcutsItem = item(R.drawable.ic_bar_shortcuts, R.string.bar_shortcuts) { toggle(Kind.SHORTCUTS) }
@@ -171,7 +154,6 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
 
         root.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         render()
-        scheduleHide()
     }
 
     // ---- bar -----------------------------------------------------------------------
@@ -186,8 +168,8 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         tooltipText = contentDescription
         // Hardware keys go to the remote desktop, so the hidden keyboard sink keeps focus.
         isFocusable = false
-        setOnClickListener { onClick(); scheduleHide() }
-        row.addView(this, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginStart = dp(1); marginEnd = dp(1) })
+        setOnClickListener { onClick() }
+        row.addView(this, LinearLayout.LayoutParams(dp(BAR_ITEM_DP), dp(BAR_ITEM_DP)))
     }
 
     /** Re-reads every state from the host. Cheap; call after any change. */
@@ -219,49 +201,6 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         if (view.contentDescription == text) return
         view.contentDescription = text
         view.tooltipText = text
-    }
-
-    /** Any use of the bar: keep it up and restart the hide timer. */
-    fun poke() { if (!shown) show() else scheduleHide() }
-
-    fun show() {
-        if (shown) { scheduleHide(); return }
-        shown = true
-        handle.visibility = View.GONE
-        bar.visibility = View.VISIBLE
-        if (ValueAnimator.areAnimatorsEnabled()) bar.animate().translationY(0f).setDuration(ANIM_MS).start()
-        else bar.translationY = 0f
-        scheduleHide()
-    }
-
-    fun hide() {
-        if (!shown) return
-        dismiss()
-        shown = false
-        timers.removeCallbacks(autoHide)
-        val tucked = Runnable { if (!shown) { bar.visibility = View.INVISIBLE; handle.visibility = View.VISIBLE } }
-        if (ValueAnimator.areAnimatorsEnabled() && bar.height > 0) {
-            bar.animate().translationY(bar.height.toFloat()).setDuration(ANIM_MS).withEndAction(tucked).start()
-        } else {
-            bar.translationY = bar.height.toFloat()
-            tucked.run()
-        }
-    }
-
-    fun toggleShown() { if (shown) hide() else show() }
-
-    /** The soft keyboard or an accessibility service changed: re-evaluate auto-hide. */
-    fun scheduleHide() {
-        timers.removeCallbacks(autoHide)
-        if (shown && canAutoHide()) timers.postDelayed(autoHide, AUTO_HIDE_MS)
-    }
-
-    // Stays up while a popover is open, while typing, and for TalkBack users
-    // (a disappearing target is hard to find by touch exploration).
-    private fun canAutoHide(): Boolean {
-        if (panel != null || host.keyboardShown) return false
-        val a11y = activity.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
-        return !a11y.isTouchExplorationEnabled
     }
 
     /** Activity paused or input lost: let go of a held key and close popovers. */
@@ -310,7 +249,6 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         scrim.visibility = View.VISIBLE
         root.addView(frame, root.indexOfChild(bar), FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START))
         position(frame, anchor)
-        timers.removeCallbacks(autoHide)
         render()
     }
 
@@ -345,7 +283,6 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         modifierKeys.clear()
         scrim.visibility = View.GONE
         render()
-        scheduleHide()
         return true
     }
 
@@ -640,19 +577,6 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         }
     }
 
-    /** Tap or swipe up on the handle brings the bar back. */
-    private inner class HandleSwipe : View.OnTouchListener {
-        private var downY = 0f
-        @SuppressLint("ClickableViewAccessibility")
-        override fun onTouch(v: View, event: MotionEvent): Boolean {
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> downY = event.rawY
-                MotionEvent.ACTION_MOVE -> if (downY - event.rawY > dp(12)) { show(); return true }
-            }
-            return false
-        }
-    }
-
     /** A ScrollView that grows with its content up to [maxHeight]. */
     private class CappedScroll(context: Context) : ScrollView(context) {
         var maxHeight = Int.MAX_VALUE
@@ -685,8 +609,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
             intArrayOf(DUVET, MILK),
         )
 
-        const val AUTO_HIDE_MS = 3_000L
-        const val ANIM_MS = 160L
+        const val BAR_ITEM_DP = 48
         const val REPEAT_DELAY_MS = 350L
         const val REPEAT_INTERVAL_MS = 40L
     }
