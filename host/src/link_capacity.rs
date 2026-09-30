@@ -12,9 +12,10 @@
 //! case on a desktop stream) only say "at least this much". A link becomes
 //! constrained once ACKs show a queue: several samples within a short hold
 //! whose RTT exceeds the minimum by `QUEUE_EVIDENCE` and whose delivery was
-//! slower than the sending, arriving in at least two separate ACK bursts (a
-//! receiver that stalls and then ACKs its backlog at once is one burst, not
-//! a slow link). An unconstrained link has no estimate and so no budget (no
+//! slower than the sending, arriving in at least two separate ACK bursts
+//! spread over at least `EVIDENCE_MIN_SPAN` (a receiver that stalls and then
+//! ACKs its backlog is one short flush, not a slow link; in the lab a 570 ms
+//! stall on an unthrottled link flushed in more than one 8 ms burst). An unconstrained link has no estimate and so no budget (no
 //! behaviour change).
 //!
 //! As in BBR, a frame sent while less than one BDP (estimate x min RTT) was
@@ -50,6 +51,8 @@ pub const CONSTRAINED_MIN_SAMPLES: usize = 3;
 pub const CONSTRAINED_MIN_BURSTS: usize = 2;
 /// ACKs closer than this belong to one burst.
 pub const ACK_BURST_GAP: Duration = Duration::from_millis(8);
+/// ...and persist at least this long, first to last sample.
+pub const EVIDENCE_MIN_SPAN: Duration = Duration::from_millis(250);
 /// A constrained link whose queue evidence is this old is released.
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
 /// Shorter sample intervals are dominated by timer and ACK jitter.
@@ -272,7 +275,8 @@ impl CapacityEstimator {
         })
     }
 
-    /// Enough recent queue evidence, from more than one ACK burst.
+    /// Enough recent queue evidence, from more than one ACK burst and
+    /// lasting longer than a stalled receiver's flush.
     fn evidence_qualifies(&self) -> bool {
         let mut bursts = self
             .queue_evidence
@@ -282,6 +286,14 @@ impl CapacityEstimator {
         bursts.dedup();
         self.queue_evidence.len() >= CONSTRAINED_MIN_SAMPLES
             && bursts.len() >= CONSTRAINED_MIN_BURSTS
+            && self.evidence_span() >= EVIDENCE_MIN_SPAN
+    }
+
+    fn evidence_span(&self) -> Duration {
+        match (self.queue_evidence.front(), self.queue_evidence.back()) {
+            (Some((first, _)), Some((last, _))) => last.saturating_duration_since(*first),
+            _ => Duration::ZERO,
+        }
     }
 
     fn update_capacity(&mut self, now: Instant, bps: u64, link_limited: bool) {
@@ -299,6 +311,21 @@ impl CapacityEstimator {
                 .max()
                 .unwrap_or(bps);
             self.capacity_bps = Some(window_max);
+            if !self.constrained {
+                let mut bursts = self
+                    .queue_evidence
+                    .iter()
+                    .map(|(_, burst)| *burst)
+                    .collect::<Vec<_>>();
+                bursts.dedup();
+                tracing::info!(
+                    capacity_bps = window_max,
+                    evidence = self.queue_evidence.len(),
+                    bursts = bursts.len(),
+                    span_ms = self.evidence_span().as_millis() as u64,
+                    "WSS v4 link constrained"
+                );
+            }
             self.constrained = true;
             self.last_evidence = now;
             return;
@@ -610,6 +637,36 @@ mod tests {
         let release = stall + Duration::from_millis(520);
         for (n, acked) in backlog.into_iter().enumerate() {
             estimator.on_ack(release + Duration::from_micros(200 * n as u64), 1, acked);
+        }
+        assert!(!estimator.is_constrained());
+        assert_eq!(estimator.capacity(), None);
+    }
+
+    #[test]
+    fn a_stall_flushed_in_several_bursts_is_not_a_constrained_link() {
+        // As on the unthrottled lab link: a 570 ms stall whose backlog comes
+        // back in a few bursts over ~100 ms.
+        let start = Instant::now();
+        let mut estimator = CapacityEstimator::new(start);
+        let mut seq = 0u32;
+        for n in 0..30u32 {
+            let at = start + FRAME * n;
+            estimator.on_sent(at, 1, seq, 20_000);
+            estimator.on_ack(at + Duration::from_millis(3), 1, seq);
+            seq += 1;
+        }
+        let stall = start + FRAME * 30;
+        let mut backlog = Vec::new();
+        for n in 0..17u32 {
+            estimator.on_sent(stall + FRAME * n, 1, seq, 20_000);
+            backlog.push(seq);
+            seq += 1;
+        }
+        let release = stall + Duration::from_millis(570);
+        for (n, acked) in backlog.into_iter().enumerate() {
+            let burst = Duration::from_millis(20 * (n as u64 / 4));
+            let at = release + burst + Duration::from_micros(300 * n as u64);
+            estimator.on_ack(at, 1, acked);
         }
         assert!(!estimator.is_constrained());
         assert_eq!(estimator.capacity(), None);
