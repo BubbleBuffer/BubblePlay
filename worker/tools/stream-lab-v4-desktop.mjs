@@ -9,6 +9,7 @@
 //     [--label candidate] [--cycles 10] [--cycle-seconds 60] [--monitor DISPLAY2]
 //     [--window 1480x960] [--host-args="--fixed-bitrate 1500000"]
 //     [--throttle-kbps 2000] [--throttle-delay-ms 20]
+//     [--scenario reading|scroll] [--pointer-over-stimulus]
 //
 // A browser window with a long article is opened on the captured monitor.
 // Each cycle is half reading (a smooth scroll burst every 5 s) and half idle
@@ -22,6 +23,13 @@
 // --throttle-kbps puts a FIFO bottleneck on the relay's host->client media
 // path for the whole session (a slow link with a deep buffer). Each smooth
 // scroll burst then reports the presented fps while it runs.
+//
+// --scenario scroll makes the reading half one continuous Chrome scroll of
+// the article (back-to-back smooth bursts, no jump), so scroll dominates the
+// screen; the report counts the host's per-second content class and the
+// scroll detector / pointer-map totals. --pointer-over-stimulus parks the
+// OS cursor over the article for the run (the host reads the real cursor)
+// and puts it back afterwards.
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
@@ -206,6 +214,27 @@ function summarizeBursts(bursts, frames, quality) {
     kbpsMedian: percentile(pick("kbps"), 0.5) };
 }
 
+/// Seconds per dominant content class, from the host's per-second totals.
+function contentSeconds(log) {
+  const counts = {};
+  for (const line of log.split("\n")) {
+    if (!line.includes("WSS v4 link totals")) continue;
+    const match = line.match(/content="?(\w+)/);
+    if (match) counts[match[1]] = (counts[match[1]] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/// Move the OS cursor; returns where it was.
+function moveCursor(x, y) {
+  const script = `Add-Type -Namespace Lab -Name Cursor -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);';
+Add-Type -AssemblyName System.Windows.Forms; $p = [System.Windows.Forms.Cursor]::Position; "$($p.X),$($p.Y)";
+[void][Lab.Cursor]::SetCursorPos(${Math.round(x)}, ${Math.round(y)})`;
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true });
+  const [px, py] = result.stdout.trim().split(",").map(Number);
+  return Number.isFinite(px) && Number.isFinite(py) ? { x: px, y: py } : null;
+}
+
 function hostTotals(log) {
   const lines = log.split("\n").filter(line => line.includes("WSS v4 link totals"));
   const last = lines.at(-1);
@@ -234,7 +263,10 @@ async function main() {
     "host-args": { type: "string", default: "" },
     "throttle-kbps": { type: "string", default: "" },
     "throttle-delay-ms": { type: "string", default: "20" },
+    scenario: { type: "string", default: "reading" },
+    "pointer-over-stimulus": { type: "boolean", default: false },
   } });
+  if (!["reading", "scroll"].includes(values.scenario)) throw new RangeError("--scenario reading|scroll");
   const cycles = Number(values.cycles), cycleSeconds = Number(values["cycle-seconds"]);
   if (!Number.isInteger(cycles) || cycles < 1 || !Number.isInteger(cycleSeconds) || cycleSeconds < 20)
     throw new RangeError("--cycles >= 1 and --cycle-seconds >= 20 are required");
@@ -244,14 +276,15 @@ async function main() {
   const runId = randomUUID();
   const dir = resolve(root, "artifacts/stream-lab-v4-desktop", `${values.label}-${runId}`);
   mkdirSync(dir, { recursive: true });
-  const report = { runId, label: values.label, startedAt: new Date().toISOString(), candidateHost: values["candidate-host"], cycles, cycleSeconds };
+  const report = { runId, label: values.label, startedAt: new Date().toISOString(), candidateHost: values["candidate-host"], cycles, cycleSeconds,
+    scenario: values.scenario, pointerOverStimulus: values["pointer-over-stimulus"] };
   const save = () => writeFileSync(resolve(dir, "report.json"), JSON.stringify(report, null, 2));
   const throttle = values["throttle-kbps"]
     ? { kbps: Number(values["throttle-kbps"]), delayMs: Number(values["throttle-delay-ms"]) }
     : null;
   report.throttle = throttle;
   const relay = await startDirectLabRelay({ port: 0, publicDir: resolve(root, "worker/public"), throttle });
-  let host, receiverProcess, stimulusProcess, receiver, stimulus;
+  let host, receiverProcess, stimulusProcess, receiver, stimulus, cursorWas = null;
   try {
     const out = openSync(resolve(dir, "host.stdout.log"), "a"), err = openSync(resolve(dir, "host.stderr.log"), "a");
     host = spawn(values["candidate-host"], ["--mode", "serve", "--worker", buildLabHostUrl(relay.url, runId).href,
@@ -314,6 +347,10 @@ async function main() {
     stimulus = await new CdpPage(stimulusPort).open(20_000);
     await delay(1_500);
     await stimulus.evaluate("window.lab.top()");
+    if (values["pointer-over-stimulus"]) {
+      cursorWas = moveCursor(bounds.x + 40 + 400, bounds.y + 30 + 480);
+      report.pointer = { x: bounds.x + 440, y: bounds.y + 510 };
+    }
     await receiver.evaluate(PROBE);
     await delay(5_000);
     await receiver.evaluate("window.__labQuality.take()");
@@ -330,11 +367,13 @@ async function main() {
       await stimulus.evaluate("window.lab.spinner(false)");
       // Smooth scroll bursts, and one instant jump (a link / Page Down) that
       // replaces the article view without motion to predict from.
-      for (let at = 1_000, burst = 0; at + 1_000 <= half; at += 5_000, burst++) {
+      const continuous = values.scenario === "scroll";
+      for (let at = 1_000, burst = 0; at + 1_000 <= half; at += continuous ? 1_000 : 5_000, burst++) {
         await delay(Math.max(0, readingStart + at - performance.now()));
         const burstStart = performance.now();
-        await stimulus.evaluate(burst === 2 ? "window.lab.jump(2400)" : "window.lab.scrollBurst(420, 900)");
-        if (burst !== 2) bursts.push({ start: burstStart, end: performance.now() });
+        const jump = !continuous && burst === 2;
+        await stimulus.evaluate(jump ? "window.lab.jump(2400)" : "window.lab.scrollBurst(420, 900)");
+        if (!jump) bursts.push({ start: burstStart, end: performance.now() });
       }
       await delay(Math.max(0, readingStart + half - performance.now()));
       const idleStart = performance.now();
@@ -399,6 +438,7 @@ async function main() {
         medianP10: percentile(referenced.map(q => q.psnrP10), 0.5),
       },
       hostTotals: hostTotals(log),
+      contentSeconds: contentSeconds(log),
       hostKeyRequests: log.split("\n").filter(line => line.includes("WSS v4 keyframe requested")).map(line => line.slice(0, 200)),
     };
     report.windows = windows.map(w => ({ ...w, start: Math.round(w.start - measureStart), end: Math.round(w.end - measureStart),
@@ -413,6 +453,7 @@ async function main() {
     process.exitCode = 1;
   } finally {
     try { await receiver?.call("Browser.close"); } catch {}
+    if (cursorWas) moveCursor(cursorWas.x, cursorWas.y);
     try { await stimulus?.call("Browser.close"); } catch {}
     for (const child of [stimulusProcess, receiverProcess, host]) {
       if (child?.pid) spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
