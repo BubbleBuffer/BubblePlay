@@ -777,6 +777,11 @@ pub struct V4Stats {
     pub last_rtt_ms: f64,
     /// Measured capacity of a constrained link (0: unconstrained).
     pub capacity_bps: u64,
+    /// The estimate capping the bitrate: the constrained capacity, or a
+    /// released one being probed up (0: none).
+    pub rate_cap_bps: u64,
+    /// Total time the capacity bound the producer (budget, pacing, ceiling).
+    pub constrained_ms: u64,
 }
 
 struct Shared {
@@ -785,6 +790,8 @@ struct Shared {
     policy: SendPolicy,
     rate: DelayRateController,
     capacity: CapacityEstimator,
+    /// Last capacity update, for `constrained_ms`.
+    capacity_tick: Option<Instant>,
     events: V4Events,
     timestamps: TimestampExtender,
     frame_size: (u16, u16),
@@ -829,6 +836,7 @@ impl V4Link {
             policy: SendPolicy::new(now),
             rate: DelayRateController::new(now, bitrate_bps, max_bps),
             capacity: CapacityEstimator::new(now),
+            capacity_tick: None,
             events: V4Events::default(),
             timestamps: TimestampExtender::default(),
             frame_size: (0, 0),
@@ -991,6 +999,10 @@ impl V4Link {
                 .capacity
                 .capacity()
                 .map_or(0, |capacity| capacity.bps),
+            rate_cap_bps: shared
+                .capacity
+                .rate_cap()
+                .map_or(0, |capacity| capacity.bps),
             ..shared.stats
         }
     }
@@ -1020,6 +1032,34 @@ fn binding_capacity(capacity: Option<Capacity>, max_bps: u64) -> Option<Capacity
     capacity.filter(|capacity| capacity.target_bps() < max_bps)
 }
 
+/// Advance the capacity estimate and let the bitrate follow it: capped by a
+/// constrained capacity, or by a released one while it is probed up (dropped
+/// once its target reaches the profile maximum).
+fn apply_capacity(shared: &mut Shared, now: Instant) {
+    shared.capacity.advance(now);
+    let max_bps = shared.rate.max_bps();
+    if !shared.capacity.is_constrained()
+        && shared
+            .capacity
+            .rate_cap()
+            .is_some_and(|cap| cap.target_bps() >= max_bps)
+    {
+        shared.capacity.release();
+    }
+    if let Some(previous) = shared.capacity_tick {
+        if binding_capacity(shared.capacity.capacity(), max_bps).is_some() {
+            let elapsed = now
+                .saturating_duration_since(previous)
+                .min(Duration::from_secs(1));
+            shared.stats.constrained_ms += elapsed.as_millis() as u64;
+        }
+    }
+    shared.capacity_tick = Some(now);
+    let target = shared.capacity.rate_cap().map(Capacity::target_bps);
+    let decision = shared.rate.set_capacity_target(now, target);
+    record_rate_decision(shared, decision);
+}
+
 /// Publish a controller decision to the producer and log it with its reason.
 fn record_rate_decision(shared: &mut Shared, decision: Option<RateDecision>) {
     let Some(decision) = decision else {
@@ -1032,6 +1072,10 @@ fn record_rate_decision(shared: &mut Shared, decision: Option<RateDecision>) {
         capacity_bps = shared
             .capacity
             .capacity()
+            .map_or(0, |capacity| capacity.bps),
+        rate_cap_bps = shared
+            .capacity
+            .rate_cap()
             .map_or(0, |capacity| capacity.bps),
         last_rtt_ms = shared.stats.last_rtt_ms,
         min_rtt_ms = shared.rate.min_rtt_ms().unwrap_or(0.0),
@@ -1202,9 +1246,7 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
         } => {
             state.stats.acks += 1;
             state.capacity.on_ack(now, generation, seq);
-            let target = state.capacity.capacity().map(Capacity::target_bps);
-            let decision = state.rate.set_capacity_target(now, target);
-            record_rate_decision(&mut state, decision);
+            apply_capacity(&mut state, now);
             if let Some(outcome) = state.policy.on_ack(now, generation, seq) {
                 let rtt_ms = outcome.rtt.as_secs_f64() * 1_000.0;
                 state.stats.last_rtt_ms = rtt_ms;
@@ -1282,6 +1324,7 @@ fn serve_socket(
             state.stats.ack_timeouts += 1;
             state.capacity.forget_inflight();
         }
+        apply_capacity(&mut state, now);
         let decision = state.rate.tick(now);
         record_rate_decision(&mut state, decision);
     }
