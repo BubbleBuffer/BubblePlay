@@ -27,6 +27,31 @@ working global npm launcher. On the investigation machine that launcher pointed
 to a missing user-profile npm installation; this is an environment setup issue.
 Missing dependencies fail the offline check rather than triggering installation.
 
+## Desktop tray deployment
+
+`bubbleplay_tray.exe` replaces the BubblePlay Windows services. It runs as the
+signed-in user and supervises `bubbleplay-host.exe --mode serve --worker <url>`
+(local DXGI capture + SendInput, no privileged agent or broker). Tokens reach
+the host only as `BUBBLEPLAY_TOKEN` / `BUBBLEPLAY_HOST_GATE_TOKEN` environment
+variables.
+
+- Config: `%LOCALAPPDATA%\BubblePlay\host.json` (`worker`, `tokenDpapiHex`,
+  `hostGateTokenDpapiHex`, optional `monitor`; secrets CurrentUser DPAPI) and
+  `tray.json` (`adminMode`, `startAtLogin`).
+- Logs: `%LOCALAPPDATA%\BubblePlay\logs` (`tray.log`, `host.log`,
+  `host-admin.log`), each capped at 5 x 5 MiB.
+- One-time migration, elevated: `host/scripts/setup-tray.ps1` (use `-WhatIf`
+  first). It copies the tokens out of `%ProgramData%\BubblePlay\transport.json`,
+  installs into `%LOCALAPPDATA%\Programs\BubblePlay`, registers the on-demand
+  `\BubblePlay\ElevatedHost` task, deletes the three services, sets the HKCU Run
+  entry and starts the tray non-elevated. Program Files/ProgramData copies are
+  kept for recovery.
+- Updates, non-elevated: `host/scripts/update-tray.ps1 [-Build]`.
+- Admin mode (tray menu, default off) runs the host through the elevated task,
+  so input reaches elevated windows. The secure desktop (UAC prompts, lock
+  screen) is still not captured. The task runs a binary from a user-writable
+  folder; use `setup-tray.ps1 -SkipElevatedTask` if that trade-off is unwanted.
+
 ## Runtime boundaries
 
 - `host/src/lib.rs` owns modules shared by services, probes, and the host binary.
