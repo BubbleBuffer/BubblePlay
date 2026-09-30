@@ -54,6 +54,9 @@ pub fn tile_runs(grid: TileGrid, tiles: &[usize]) -> Vec<(u32, u32, u32)> {
     runs
 }
 
+/// `(tile, hash)` pairs for the dirty tiles.
+pub type TileHashes = Vec<(usize, Option<u64>)>;
+
 pub struct TileHasher {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -69,7 +72,10 @@ impl TileHasher {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc) };
         let Some(bytes_per_pixel) = bytes_per_pixel(desc.Format) else {
-            bail!("tile hashing does not support capture format {:?}", desc.Format);
+            bail!(
+                "tile hashing does not support capture format {:?}",
+                desc.Format
+            );
         };
         if desc.SampleDesc.Count != 1 {
             bail!("tile hashing needs a single-sample capture texture");
@@ -121,7 +127,7 @@ impl TileHasher {
         texture: &ID3D11Texture2D,
         grid: TileGrid,
         tiles: &[usize],
-    ) -> Result<(Vec<(usize, Option<u64>)>, u64)> {
+    ) -> Result<(TileHashes, u64)> {
         let started = Instant::now();
         if grid.width != self.width || grid.height != self.height {
             bail!("tile grid does not match the capture texture");
@@ -187,7 +193,10 @@ mod tests {
     #[test]
     fn dirty_tiles_are_copied_as_horizontal_runs() {
         let grid = TileGrid::new(256, 128);
-        assert_eq!(tile_runs(grid, &[5, 0, 1, 3, 4, 1]), vec![(0, 0, 1), (0, 3, 3), (1, 0, 1)]);
+        assert_eq!(
+            tile_runs(grid, &[5, 0, 1, 3, 4, 1]),
+            vec![(0, 0, 1), (0, 3, 3), (1, 0, 1)]
+        );
         assert!(tile_runs(grid, &[]).is_empty());
     }
 }

@@ -22,19 +22,36 @@ pub(super) fn create_encoder_with_fallback(
     codec: VideoCodec,
     infinite_gop: bool,
 ) -> Result<Nvenc> {
-    Nvenc::new_with_options_native_codec_gop(
-        device,
-        width,
-        height,
-        native_width,
-        native_height,
-        fps,
-        bitrate_bps,
-        EncoderOptions::production(requested),
-        codec,
-        infinite_gop,
-    )
-    .or_else(|first| {
+    let create = |options| {
+        Nvenc::new_with_options_native_codec_gop(
+            device,
+            width,
+            height,
+            native_width,
+            native_height,
+            fps,
+            bitrate_bps,
+            options,
+            codec,
+            infinite_gop,
+        )
+    };
+    // WSS v4 (infinite GOP) refines debt tiles through an HEVC delta-QP map.
+    // Without it, refines fall back to whole frames.
+    let primary = if infinite_gop && codec == VideoCodec::Hevc {
+        let mut options = EncoderOptions::production(requested);
+        options.roi_mode = RoiMode::Refine;
+        create(options).or_else(|error| {
+            warn!(
+                ?error,
+                "NVENC refused the refine QP map; v4 refines use whole frames"
+            );
+            create(EncoderOptions::production(requested))
+        })
+    } else {
+        create(EncoderOptions::production(requested))
+    };
+    primary.or_else(|first| {
         if matches!(requested, Preset::P3) {
             warn!(
                 ?first,
@@ -112,42 +129,50 @@ pub(super) fn benchmark_encoder_options(profile: &benchmark::BenchmarkProfile) -
     }
 }
 
+/// Source rectangle the encoder scales to its output for `mode`.
+pub(super) fn encode_crop(
+    source_width: u32,
+    source_height: u32,
+    viewport_crop: Option<ViewportCrop>,
+    mode: VideoMode,
+) -> frame_damage::DamageRect {
+    let full = frame_damage::DamageRect {
+        left: 0,
+        top: 0,
+        right: source_width,
+        bottom: source_height,
+    };
+    if mode.label == "native" {
+        return full;
+    }
+    viewport_crop.map_or(full, |crop| frame_damage::DamageRect {
+        left: crop.x,
+        top: crop.y,
+        right: crop.x + crop.width,
+        bottom: crop.y + crop.height,
+    })
+}
+
+/// Capture damage for the encoder, plus a prepared v4 refine QP map. A refine
+/// frame carries its map even without capture damage (idle follow-up).
 pub(super) fn encode_frame_damage<'a>(
     frame: &'a CapturedFrame<'_>,
     viewport_crop: Option<ViewportCrop>,
     mode: VideoMode,
+    refine_map: Option<&'a frame_damage::HevcQpDeltaMap>,
 ) -> Option<FrameDamage<'a>> {
-    let rects = frame.damage()?;
-    let crop = if mode.label != "native" {
-        viewport_crop.map_or(
-            frame_damage::DamageRect {
-                left: 0,
-                top: 0,
-                right: frame.width(),
-                bottom: frame.height(),
-            },
-            |crop| frame_damage::DamageRect {
-                left: crop.x,
-                top: crop.y,
-                right: crop.x + crop.width,
-                bottom: crop.y + crop.height,
-            },
-        )
-    } else {
-        frame_damage::DamageRect {
-            left: 0,
-            top: 0,
-            right: frame.width(),
-            bottom: frame.height(),
-        }
+    let rects = match (frame.damage(), refine_map) {
+        (Some(rects), _) => rects,
+        (None, Some(_)) => &[],
+        (None, None) => return None,
     };
     Some(FrameDamage {
         source_width: frame.width(),
         source_height: frame.height(),
-        crop,
+        crop: encode_crop(frame.width(), frame.height(), viewport_crop, mode),
         rects,
         edge_scores: None,
-        prepared_qp_map: None,
+        prepared_qp_map: refine_map,
     })
 }
 

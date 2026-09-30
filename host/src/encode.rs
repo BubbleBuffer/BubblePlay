@@ -87,7 +87,10 @@ mod codec_policy_tests {
     fn v4_infinite_gop_disables_periodic_idr_for_both_codecs() {
         assert_eq!(super::gop_frames(30, 2, false), 60);
         assert_eq!(super::gop_frames(60, 4, false), 240);
-        assert_eq!(super::gop_frames(30, 2, true), super::NVENC_INFINITE_GOPLENGTH);
+        assert_eq!(
+            super::gop_frames(30, 2, true),
+            super::NVENC_INFINITE_GOPLENGTH
+        );
         for codec in [VideoCodec::Hevc, VideoCodec::H264] {
             let mut cfg: super::NV_ENC_CONFIG = unsafe { super::zeroed() };
             super::apply_gop(&mut cfg, codec, super::gop_frames(30, 2, true));
@@ -244,20 +247,56 @@ mod codec_policy_tests {
             edge_scores: None,
             prepared_qp_map: map,
         };
-        let applied = evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, Some(damage(Some(&map))));
+        let applied = evaluate_roi_map(
+            options,
+            VideoCodec::Hevc,
+            false,
+            128,
+            64,
+            Some(damage(Some(&map))),
+        );
         assert_eq!(applied.map.as_ref(), Some(&map));
         assert!(applied.telemetry.is_none());
         for (codec, idr) in [(VideoCodec::Hevc, true), (VideoCodec::H264, false)] {
             let skipped = evaluate_roi_map(options, codec, idr, 128, 64, Some(damage(Some(&map))));
             assert!(skipped.map.is_none() && skipped.telemetry.is_none());
         }
-        assert!(evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, Some(damage(None))).map.is_none());
-        assert!(evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, None).map.is_none());
-        let wrong_size = evaluate_roi_map(options, VideoCodec::Hevc, false, 160, 64, Some(damage(Some(&map))));
+        assert!(evaluate_roi_map(
+            options,
+            VideoCodec::Hevc,
+            false,
+            128,
+            64,
+            Some(damage(None))
+        )
+        .map
+        .is_none());
+        assert!(
+            evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, None)
+                .map
+                .is_none()
+        );
+        let wrong_size = evaluate_roi_map(
+            options,
+            VideoCodec::Hevc,
+            false,
+            160,
+            64,
+            Some(damage(Some(&map))),
+        );
         assert!(wrong_size.map.is_none());
         let mut out_of_range = map.clone();
         out_of_range.values[0] = -20;
-        assert!(evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, Some(damage(Some(&out_of_range)))).map.is_none());
+        assert!(evaluate_roi_map(
+            options,
+            VideoCodec::Hevc,
+            false,
+            128,
+            64,
+            Some(damage(Some(&out_of_range)))
+        )
+        .map
+        .is_none());
     }
 
     #[test]
@@ -1010,8 +1049,8 @@ fn rate_control_label(mode: RateControlMode) -> &'static str {
 /// NVENC's "no periodic IDR" GOP length (`NVENC_INFINITE_GOPLENGTH`).
 pub const NVENC_INFINITE_GOPLENGTH: u32 = 0xffff_ffff;
 
-/// GOP / IDR period in frames. WSS v4 owns keyframes itself (start, request,
-/// 30 s safety), so its encoder runs with an infinite GOP.
+/// GOP / IDR period in frames. WSS v4 owns keyframes itself (start, new peer,
+/// receiver request), so its encoder runs with an infinite GOP.
 fn gop_frames(fps: u32, gop_seconds: u8, infinite: bool) -> u32 {
     if infinite {
         NVENC_INFINITE_GOPLENGTH
@@ -1338,7 +1377,11 @@ impl Nvenc {
         let mut cfg = Box::new(preset_cfg.presetCfg);
         cfg.profileGUID = codec.profile_guid(options.main10);
         apply_encoder_options(&mut cfg, bitrate_bps, fps, options);
-        apply_gop(&mut cfg, codec, gop_frames(fps, options.gop_seconds, infinite_gop));
+        apply_gop(
+            &mut cfg,
+            codec,
+            gop_frames(fps, options.gop_seconds, infinite_gop),
+        );
         cfg.rcParams.qpMapMode = qp_map_mode(options, codec);
 
         // Codec-specific random-access cadence. HEVC emits VPS/SPS/PPS on

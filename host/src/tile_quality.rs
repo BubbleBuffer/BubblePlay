@@ -304,8 +304,8 @@ impl TileQualityTracker {
         if tiles.is_empty() {
             return None;
         }
-        let whole_frame = tiles.len() as u64 * 1_000
-            >= WHOLE_FRAME_REFINE_PER_MILLE * self.tiles.len() as u64;
+        let whole_frame =
+            tiles.len() as u64 * 1_000 >= WHOLE_FRAME_REFINE_PER_MILLE * self.tiles.len() as u64;
         Some(RefinePlan { tiles, whole_frame })
     }
 
@@ -390,7 +390,8 @@ impl TileQualityTracker {
             self.stats.tiles_refined += plan.tiles.len() as u64;
         }
         self.stats.hashed_tiles += hashes.iter().filter(|(_, hash)| hash.is_some()).count() as u64;
-        self.stats.unhashed_tiles += hashes.iter().filter(|(_, hash)| hash.is_none()).count() as u64;
+        self.stats.unhashed_tiles +=
+            hashes.iter().filter(|(_, hash)| hash.is_none()).count() as u64;
         self.pending.fill(false);
         self.pending_any = false;
     }
@@ -428,8 +429,10 @@ pub fn refine_qp_map(
     let rows = output_height.div_ceil(QP_MAP_CTB);
     let crop_width = u64::from(crop.right - crop.left);
     let crop_height = u64::from(crop.bottom - crop.top);
-    let to_source_x = |x: u32| crop.left + (u64::from(x) * crop_width / u64::from(output_width)) as u32;
-    let to_source_y = |y: u32| crop.top + (u64::from(y) * crop_height / u64::from(output_height)) as u32;
+    let to_source_x =
+        |x: u32| crop.left + (u64::from(x) * crop_width / u64::from(output_width)) as u32;
+    let to_source_y =
+        |y: u32| crop.top + (u64::from(y) * crop_height / u64::from(output_height)) as u32;
     let mut values = Vec::with_capacity((columns * rows) as usize);
     for row in 0..rows {
         let top = to_source_y(row * QP_MAP_CTB);
@@ -489,7 +492,11 @@ pub fn hash_rows<'a>(rows: impl IntoIterator<Item = &'a [u8]>) -> u64 {
         let tail = chunks.remainder();
         if !tail.is_empty() {
             let a = read_u64(&tail[..tail.len().min(8)]);
-            let b = if tail.len() > 8 { read_u64(&tail[8..]) } else { 0 };
+            let b = if tail.len() > 8 {
+                read_u64(&tail[8..])
+            } else {
+                0
+            };
             state = fold_mul(a ^ HASH_P1, b ^ state ^ tail.len() as u64);
         }
         length = length.wrapping_add(row.len() as u64);
@@ -533,7 +540,10 @@ mod tests {
     fn grid_covers_partial_edge_tiles() {
         let grid = TileGrid::new(1920, 1080);
         assert_eq!((grid.columns, grid.rows), (30, 17));
-        assert_eq!(grid.tile_rect(grid.tile_count() - 1), rect(1856, 1024, 1920, 1080));
+        assert_eq!(
+            grid.tile_rect(grid.tile_count() - 1),
+            rect(1856, 1024, 1920, 1080)
+        );
         let mut marks = vec![false; grid.tile_count()];
         grid.mark(&rect(60, 60, 70, 70), &mut marks);
         assert_eq!(marks.iter().filter(|mark| **mark).count(), 4);
@@ -574,7 +584,13 @@ mod tests {
         // One tile really changed.
         tracker.note_damage(start + ms(200), Some(&[rect(0, 0, 128, 64)]));
         let verdict = tracker.classify(&[(0, Some(10)), (1, Some(99))]);
-        assert_eq!(verdict, Classification { noop: false, changed: vec![1] });
+        assert_eq!(
+            verdict,
+            Classification {
+                noop: false,
+                changed: vec![1]
+            }
+        );
         // Tiles that were not hashed are never a no-op.
         assert!(!tracker.classify(&[(0, None)]).noop);
         // A frame with empty damage changed nothing.
@@ -595,8 +611,17 @@ mod tests {
         assert_eq!(tracker.tile(0).quality, TileQuality::Debt);
         assert_eq!(tracker.tile(1).quality, TileQuality::Sharp);
         // A damaged tile whose hash did not change was not coded again.
-        tracker.note_damage(start + ms(20), Some(&[rect(0, 0, 64, 64), rect(64, 0, 128, 64)]));
-        tracker.on_encoded(start + ms(20), &[(0, Some(1)), (1, Some(3))], DEBT_QP + 5, false, None);
+        tracker.note_damage(
+            start + ms(20),
+            Some(&[rect(0, 0, 64, 64), rect(64, 0, 128, 64)]),
+        );
+        tracker.on_encoded(
+            start + ms(20),
+            &[(0, Some(1)), (1, Some(3))],
+            DEBT_QP + 5,
+            false,
+            None,
+        );
         assert_eq!(tracker.tile(0).stable_since, start);
         assert_eq!(tracker.tile(1).quality, TileQuality::Debt);
         assert_eq!(tracker.debt_tiles(), 2);
@@ -621,7 +646,13 @@ mod tests {
         assert_eq!(tracker.next_refine_at(), Some(start + REFINE_STABLE));
         assert_eq!(tracker.refine_plan(start + ms(299)), None);
         let plan = tracker.refine_plan(start + ms(300)).expect("due");
-        assert_eq!(plan, RefinePlan { tiles: vec![0], whole_frame: false });
+        assert_eq!(
+            plan,
+            RefinePlan {
+                tiles: vec![0],
+                whole_frame: false
+            }
+        );
         tracker.on_encoded(start + ms(300), &[], 22, false, Some(&plan));
         assert_eq!(tracker.tile(0).quality, TileQuality::Sharp);
         assert_eq!(tracker.stats().refine_frames, 1);
@@ -643,7 +674,9 @@ mod tests {
         // Tile 1 keeps changing (a spinner) at a small damage share.
         tracker.note_damage(start + ms(200), Some(&[rect(64, 0, 80, 16)]));
         tracker.on_encoded(start + ms(200), &[(1, Some(3))], 40, false, None);
-        let plan = tracker.refine_plan(start + ms(350)).expect("tile 0 is stable");
+        let plan = tracker
+            .refine_plan(start + ms(350))
+            .expect("tile 0 is stable");
         assert_eq!(plan.tiles, vec![0]);
         // Damage noted but not encoded yet: tile 0 is not eligible, and tile 1
         // has been stable for only 250 ms.
@@ -666,7 +699,9 @@ mod tests {
         }
         tracker.on_encoded(start + ms(330), &[], 40, false, None);
         assert_eq!(tracker.refine_plan(start + ms(500)), None);
-        let plan = tracker.refine_plan(start + ms(630)).expect("motion stopped");
+        let plan = tracker
+            .refine_plan(start + ms(630))
+            .expect("motion stopped");
         assert_eq!(plan.tiles, vec![0]);
     }
 
@@ -716,7 +751,15 @@ mod tests {
         let map = refine_qp_map(grid, &[0], &[3], full, 256, 128).expect("map");
         assert_eq!((map.columns, map.rows), (8, 4));
         // Tile 0 = CTBs (0..2, 0..2).
-        assert_eq!(&map.values[0..4], &[REFINE_DELTA_QP, REFINE_DELTA_QP, UNCHANGED_DELTA_QP, UNCHANGED_DELTA_QP]);
+        assert_eq!(
+            &map.values[0..4],
+            &[
+                REFINE_DELTA_QP,
+                REFINE_DELTA_QP,
+                UNCHANGED_DELTA_QP,
+                UNCHANGED_DELTA_QP
+            ]
+        );
         assert_eq!(map.values[8], REFINE_DELTA_QP);
         // Tile 3 = CTB columns 6..8 of rows 0..2.
         assert_eq!(&map.values[6..8], &[CHANGED_DELTA_QP, CHANGED_DELTA_QP]);
@@ -725,7 +768,13 @@ mod tests {
         let map = refine_qp_map(grid, &[5], &[], full, 128, 64).expect("map");
         assert_eq!((map.columns, map.rows), (4, 2));
         assert_eq!(map.values[5], REFINE_DELTA_QP);
-        assert_eq!(map.values.iter().filter(|value| **value == REFINE_DELTA_QP).count(), 1);
+        assert_eq!(
+            map.values
+                .iter()
+                .filter(|value| **value == REFINE_DELTA_QP)
+                .count(),
+            1
+        );
         // A crop maps output CTBs into the cropped source.
         let map = refine_qp_map(grid, &[7], &[], rect(128, 64, 256, 128), 64, 32).expect("map");
         assert_eq!(map.values, vec![UNCHANGED_DELTA_QP, REFINE_DELTA_QP]);
@@ -747,6 +796,9 @@ mod tests {
         let narrow = vec![1u8; 20 * 4];
         let mut narrow_changed = narrow.clone();
         narrow_changed[79] = 2;
-        assert_ne!(hash_rows([narrow.as_slice()]), hash_rows([narrow_changed.as_slice()]));
+        assert_ne!(
+            hash_rows([narrow.as_slice()]),
+            hash_rows([narrow_changed.as_slice()])
+        );
     }
 }
