@@ -170,8 +170,89 @@ class TouchGesturesTest {
         v.layout(0, 0, 0, 0)
         v.zoomBy(3f, 0f, 0f)
         v.pan(10f, 10f)
-        v.keepVisible(1f, 1f)
+        v.centerOn(1f, 1f)
+        v.zoomAround(2f, 0.5f, 0.5f)
         assertTrue(v.x.isFinite() && v.y.isFinite())
+    }
+
+    private fun fitted() = Viewport().apply { layout(1000, 500, 1920, 1080) } // content 888.9 x 500, centred horizontally
+
+    /** The visible area never goes outside the frame: every screen edge maps into 0..1 (or the letterbox when not zoomed enough). */
+    private fun assertInsideFrame(v: Viewport) {
+        val (l, t) = v.toNormalized(0f, 0f)
+        val (r, b) = v.toNormalized(v.viewW, v.viewH)
+        val eps = 1e-4f
+        if (v.contentW * v.zoom >= v.viewW) { assertTrue("left $l", l >= -eps); assertTrue("right $r", r <= 1f + eps) }
+        if (v.contentH * v.zoom >= v.viewH) { assertTrue("top $t", t >= -eps); assertTrue("bottom $b", b <= 1f + eps) }
+    }
+
+    @Test
+    fun zoomAroundKeepsTheCursorWhereItIs() {
+        val v = fitted()
+        val before = v.toScreen(0.4f, 0.45f)
+        v.zoomAround(2f, 0.4f, 0.45f)
+        assertEquals(2f, v.zoom)
+        val after = v.toScreen(0.4f, 0.45f)
+        assertEquals(before.first, after.first, 1e-3f)
+        assertEquals(before.second, after.second, 1e-3f)
+        assertInsideFrame(v)
+    }
+
+    @Test
+    fun zoomAroundAnEdgeCursorIsClampedToTheFrame() {
+        val v = fitted()
+        v.zoomAround(3f, 0f, 0f)
+        assertEquals(3f, v.zoom)
+        assertInsideFrame(v)
+        // Top-left corner of the frame sits at the top-left of the view.
+        val (sx, sy) = v.toScreen(0f, 0f)
+        assertEquals(0f, sx, 1e-3f)
+        assertEquals(0f, sy, 1e-3f)
+    }
+
+    @Test
+    fun centerOnPutsTheCursorInTheMiddleWhenThereIsRoom() {
+        val v = fitted()
+        v.zoomAround(3f, 0.5f, 0.5f)
+        v.centerOn(0.3f, 0.6f)
+        val (sx, sy) = v.toScreen(0.3f, 0.6f)
+        assertEquals(500f, sx, 1e-3f)
+        assertEquals(250f, sy, 1e-3f)
+        assertInsideFrame(v)
+    }
+
+    @Test
+    fun centerOnNearAnEdgeLetsTheCursorGoOffCentre() {
+        val v = fitted()
+        v.zoomAround(2f, 0.5f, 0.5f)
+        v.centerOn(0.98f, 0.02f)
+        assertInsideFrame(v)
+        val (sx, sy) = v.toScreen(0.98f, 0.02f)
+        assertTrue("cursor right of centre: $sx", sx > 500f)
+        assertTrue("cursor above centre: $sy", sy < 250f)
+        // The frame's right and top edges are flush with the view.
+        assertEquals(v.viewW, v.toScreen(1f, 0f).first, 1e-2f)
+        assertEquals(0f, v.toScreen(1f, 0f).second, 1e-2f)
+    }
+
+    @Test
+    fun nudgeThenCursorMoveReCentres() {
+        val v = fitted()
+        v.zoomAround(2f, 0.5f, 0.5f)
+        v.centerOn(0.5f, 0.5f)
+        v.pan(-120f, 40f) // two-finger nudge
+        assertEquals(380f, v.toScreen(0.5f, 0.5f).first, 1e-3f)
+        v.centerOn(0.51f, 0.5f) // next cursor move
+        assertEquals(500f, v.toScreen(0.51f, 0.5f).first, 1e-3f)
+        assertEquals(250f, v.toScreen(0.51f, 0.5f).second, 1e-3f)
+    }
+
+    @Test
+    fun centerOnDoesNothingAtZoomOne() {
+        val v = fitted()
+        val x = v.x; val y = v.y
+        v.centerOn(0.9f, 0.1f)
+        assertEquals(x, v.x); assertEquals(y, v.y)
     }
 
     @Test
