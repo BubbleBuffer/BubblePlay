@@ -33,10 +33,11 @@ use bubbleplay_host::scale;
 use bubbleplay_host::signaling;
 use bubbleplay_host::stun;
 use bubbleplay_host::temporal_diff;
+use bubbleplay_host::tile_hash::{TileHasher, MAX_HASHED_PER_MILLE};
+use bubbleplay_host::tile_quality::{refine_qp_map, RefinePlan, TileQualityTracker};
 use bubbleplay_host::transport;
 use bubbleplay_host::vdd;
 use bubbleplay_host::wss_media;
-use bubbleplay_host::wss_v4::{damage_per_mille, RefineSettle, REFINE_LARGE_DAMAGE_PER_MILLE};
 
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
@@ -114,11 +115,10 @@ const WSS_BALANCED_BITRATE_BPS: u32 = 3_000_000;
 const WSS_SAVER_BITRATE_BPS: u32 = 1_500_000;
 /// Idle heartbeat on the signaling socket (the browser uses the same period).
 const SIGNALING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-/// v4 refine frames are encoded at this multiple of the live bitrate.
+/// v4 refine frames and keyframes are encoded at this multiple of the live
+/// bitrate (NVENC grows the one-frame VBV with it), so a keyframe is not
+/// starved into a blocky whole-frame dip.
 const WSS_V4_REFINE_BITRATE_FACTOR: u32 = 4;
-/// v4 keyframes are owned by the media link (start / request / 30 s safety),
-/// so the producer's own periodic-IDR clock is parked this far ahead.
-const WSS_V4_PRODUCER_IDR_PARK: Duration = Duration::from_secs(3_600);
 
 fn wss_gop_interval(mode: StreamMode) -> Duration {
     if mode == StreamMode::Work {
@@ -128,13 +128,18 @@ fn wss_gop_interval(mode: StreamMode) -> Duration {
     }
 }
 
-/// Periodic IDR interval for the WSS producer; v4 has none.
-fn wss_periodic_idr_interval(mode: StreamMode, egress: Option<&WssMediaEgress>) -> Duration {
-    if egress.is_some() {
-        WSS_V4_PRODUCER_IDR_PARK
-    } else {
-        wss_gop_interval(mode)
-    }
+/// v4 has no periodic keyframe: only start, a new peer / reconnect, a
+/// transition and an explicit receiver request produce one.
+fn periodic_idr_due(now: Instant, next_idr: Instant, v4: bool) -> bool {
+    !v4 && now >= next_idr
+}
+
+fn format_keyframe_reasons(reasons: &std::collections::BTreeMap<String, u64>) -> String {
+    reasons
+        .iter()
+        .map(|(reason, count)| format!("{reason}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn wss_v4_refine_bitrate(current_bps: u32) -> u32 {
@@ -622,8 +627,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut next_admission = Instant::now();
     let mut next_idr = Instant::now();
     let mut next_ping = Instant::now() + SIGNALING_HEARTBEAT_INTERVAL;
-    // v4: one static-screen refine after a large change settles.
-    let mut wss_v4_refine = RefineSettle::default();
+    // v4: per-tile quality debt, no-op repaint skipping and tile refines.
+    let mut tile_tracker: Option<TileQualityTracker> = None;
+    let mut tile_hasher: Option<TileHasher> = None;
+    let mut tile_hashing_failed = false;
+    let mut tile_hash_us: u64 = 0;
+    // NVENC frameAvgQP of v4 frames in the current 1 s window: (max, sum, count).
+    let mut wss_v4_qp_window: (u32, u64, u64) = (0, 0, 0);
+    let mut wss_v4_key_reason: Option<String> = None;
+    let mut wss_v4_keyframes = std::collections::BTreeMap::<String, u64>::new();
     let mut next_wss_stats = Instant::now() + Duration::from_secs(1);
     let mut next_quality_tick = Instant::now() + Duration::from_secs(1);
     let mut benchmark_lease = args
@@ -1094,14 +1106,18 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             let rtc_decision = match &event {
                 TransportEvent::Action(RtcAction::IceDisconnected) => {
                     ice_connected = false;
-                    Some((rtc_peer.on_disconnected(Instant::now(), wss_media.is_some()), "ice-disconnected"))
+                    Some((
+                        rtc_peer.on_disconnected(Instant::now(), wss_media.is_some()),
+                        "ice-disconnected",
+                    ))
                 }
                 TransportEvent::Action(RtcAction::Closed) => {
                     Some((rtc_peer.on_closed(wss_media.is_some()), "rtc-closed"))
                 }
-                TransportEvent::Stopped => {
-                    Some((rtc_peer.on_closed(wss_media.is_some()), "rtc-transport-stopped"))
-                }
+                TransportEvent::Stopped => Some((
+                    rtc_peer.on_closed(wss_media.is_some()),
+                    "rtc-transport-stopped",
+                )),
                 _ => None,
             };
             if let Some((decision, reason)) = rtc_decision {
@@ -1800,7 +1816,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                         u64::from(adjustment.target_bps),
                                     );
                                 }
-                                wss_v4_refine.reset();
                                 if staged {
                                     // Announce intent immediately; a second quality
                                     // message after the IDR ACK confirms activation.
@@ -2066,7 +2081,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         match rtc_peer.poll(Instant::now(), wss_media.is_some()) {
             RtcPeerDecision::Continue => {}
             RtcPeerDecision::EndPeer => {
-                end_rtc_peer(&pump, &mut ice_connected, &mut pending_candidates, "wss-during-rtc-grace");
+                end_rtc_peer(
+                    &pump,
+                    &mut ice_connected,
+                    &mut pending_candidates,
+                    "wss-during-rtc-grace",
+                );
             }
             RtcPeerDecision::EndSession => {
                 warn!("RTC peer did not reconnect within the disconnect grace");
@@ -2120,7 +2140,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 enc.force_idr();
             }
             next_idr = now;
-            wss_v4_refine.reset();
+            wss_v4_key_reason = Some(reason.to_string());
             info!(reason, "WSS v4 keyframe requested");
         }
         if let Some(bitrate_bps) = wss_v4_events.bitrate_bps {
@@ -2236,7 +2256,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 if now < next_admission {
                     continue 'session;
                 }
-                let mut force_idr = now >= next_idr || latest_idr.is_none() || transition;
+                let mut force_idr = periodic_idr_due(now, next_idr, wss_media.is_some())
+                    || latest_idr.is_none()
+                    || transition;
                 let mut wss_reservation = None;
                 if let Some(egress) = wss_media.as_ref() {
                     let base_meta = WssAccessUnitMeta {
@@ -2412,15 +2434,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 next_admission = now + Duration::from_secs_f64(1.0 / (access.fps as f64).max(1.0));
                 if force_idr {
                     next_idr = now
-                        + if wss_media.is_some() {
-                            WSS_V4_PRODUCER_IDR_PARK
-                        } else {
-                            effective_idr_interval(
-                                stream_mode,
-                                wss_media.is_some(),
-                                benchmark_profile.map(|profile| profile.gop_seconds),
-                            )
-                        };
+                        + effective_idr_interval(
+                            stream_mode,
+                            wss_media.is_some(),
+                            benchmark_profile.map(|profile| profile.gop_seconds),
+                        );
                 }
                 if access.keyframe {
                     latest_idr = Some(CachedIdr {
@@ -2564,9 +2582,31 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     );
                 }
                 let is_idle_snapshot = frame.is_idle_snapshot();
+                // v4 tile quality: accumulate every captured frame's damage
+                // until a frame is encoded, so no change is ever missed.
+                if wss_media.is_none() || active_benchmark_profile.is_some() {
+                    tile_tracker = None;
+                    tile_hasher = None;
+                } else {
+                    if recovered
+                        || tile_tracker
+                            .as_ref()
+                            .is_some_and(|tracker| !tracker.is_for(frame.width(), frame.height()))
+                    {
+                        tile_tracker = None;
+                        tile_hasher = None;
+                        tile_hashing_failed = false;
+                    }
+                    let tracker = tile_tracker.get_or_insert_with(|| {
+                        TileQualityTracker::new(now, frame.width(), frame.height())
+                    });
+                    if is_new && !is_idle_snapshot {
+                        tracker.note_damage(now, frame.damage());
+                    }
+                }
                 let main10 = active_benchmark_profile.is_some_and(|profile| profile.encoder.main10);
                 let dev = frame.device().as_raw() as *mut core::ffi::c_void;
-                // WSS v4 owns keyframes (start / request / 30 s safety), so its
+                // WSS v4 owns keyframes (start / peer / request), so its
                 // encoder runs without periodic IDRs. NVENC cannot change the
                 // GOP in place: recreate the session when the mode differs.
                 let want_infinite_gop = wss_media.is_some() && active_benchmark_profile.is_none();
@@ -2623,13 +2663,90 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 if (is_new && frame_admission_due(now, next_admission, frame_interval, urgent))
                     || (!is_new && urgent)
                 {
+                    // v4 tile quality: hash the dirty tiles (damage-sized
+                    // readback), skip a repaint that changes nothing the
+                    // receiver shows, and plan a refine of settled debt tiles.
+                    let mut tile_hashes: Vec<(usize, Option<u64>)> = Vec::new();
+                    let mut tile_changed: Vec<usize> = Vec::new();
+                    let mut wss_v4_refine_plan: Option<RefinePlan> = None;
+                    if let Some(tracker) = tile_tracker.as_mut() {
+                        let dirty = tracker.dirty_tiles();
+                        let mut hashed = None;
+                        if !dirty.is_empty()
+                            && !tile_hashing_failed
+                            && frame.damage().is_some()
+                            && tracker.dirty_per_mille() <= MAX_HASHED_PER_MILLE
+                        {
+                            if tile_hasher.as_ref().is_none_or(|hasher| {
+                                !hasher.is_for(frame.device(), frame.texture())
+                            }) {
+                                tile_hasher = match TileHasher::new(frame.device(), frame.texture())
+                                {
+                                    Ok(hasher) => Some(hasher),
+                                    Err(error) => {
+                                        warn!(
+                                            ?error,
+                                            "tile hashing unavailable; no-op repaints are encoded"
+                                        );
+                                        tile_hashing_failed = true;
+                                        None
+                                    }
+                                };
+                            }
+                            if let Some(hasher) = tile_hasher.as_mut() {
+                                match hasher.hash_tiles(frame.texture(), tracker.grid(), &dirty) {
+                                    Ok((hashes, elapsed_us)) => {
+                                        tile_hash_us = tile_hash_us.saturating_add(elapsed_us);
+                                        hashed = Some(hashes);
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            ?error,
+                                            "tile hashing failed; no-op repaints are encoded"
+                                        );
+                                        tile_hasher = None;
+                                        tile_hashing_failed = true;
+                                    }
+                                }
+                            }
+                        }
+                        tile_hashes = hashed
+                            .unwrap_or_else(|| dirty.iter().map(|&tile| (tile, None)).collect());
+                        let classification = tracker.classify(&tile_hashes);
+                        tile_changed = classification.changed;
+                        let key_due = urgent || encoder.as_ref().is_some_and(Nvenc::idr_pending);
+                        if !key_due {
+                            wss_v4_refine_plan = tracker.refine_plan(now);
+                        }
+                        if is_new
+                            && !is_idle_snapshot
+                            && !key_due
+                            && wss_v4_refine_plan.is_none()
+                            && classification.noop
+                        {
+                            tracker.on_noop_skipped();
+                            if let Some(at) = tracker.next_refine_at() {
+                                capture.request_idle_followup_snapshot(
+                                    at.saturating_duration_since(Instant::now()),
+                                );
+                            }
+                            continue 'session;
+                        }
+                    }
                     if let Some(egress) = wss_media.as_ref() {
                         egress.set_frame_size(mode.width, mode.height);
                     }
                     let mut wss_reservation = None;
                     let mut wss_forced_idr = false;
+                    let mut wss_v4_key_cause = if transition {
+                        "transition"
+                    } else if latest_idr.is_none() {
+                        "start"
+                    } else {
+                        "forced"
+                    };
                     if let Some(egress) = wss_media.as_ref() {
-                        let mut wants_key = now >= next_idr || latest_idr.is_none() || transition;
+                        let mut wants_key = latest_idr.is_none() || transition;
                         let base_meta = WssAccessUnitMeta {
                             codec: wss_codec(active_codec),
                             generation: media_generation,
@@ -2644,9 +2761,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             Ok(reservation) => Ok(reservation),
                             Err(WssReserveOutcome::RequireKeyframe) if !wants_key => {
                                 wants_key = true;
+                                wss_v4_key_cause = "link";
                                 encoder.as_mut().unwrap().force_idr();
-                                next_idr =
-                                    now + wss_periodic_idr_interval(stream_mode, Some(egress));
                                 match egress.reserve(WssAccessUnitMeta {
                                     key: true,
                                     ..base_meta
@@ -2695,27 +2811,21 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         };
                         if wants_key {
                             encoder.as_mut().unwrap().force_idr();
-                            next_idr = now + wss_periodic_idr_interval(stream_mode, Some(egress));
                             wss_forced_idr = true;
                         }
                         wss_reservation = Some(reservation);
                     }
-                    // v4 static-screen refine: once damage has stayed below
-                    // the large-change share for the settle time, the next
-                    // quiet frame (idle follow-up snapshot or small-damage
-                    // frame) is encoded once as a high-bitrate P frame
-                    // flagged `refine` on the wire.
-                    let wss_v4_damage_per_mille = if is_idle_snapshot {
-                        0
-                    } else {
-                        damage_per_mille(frame.damage(), frame.width(), frame.height())
-                    };
-                    let wss_v4_refine_frame = wss_v4_refine.due(Instant::now())
-                        && wss_v4_damage_per_mille < REFINE_LARGE_DAMAGE_PER_MILLE
-                        && !wss_forced_idr
-                        && latest_idr.is_some()
-                        && !transition
-                        && wss_media.is_some();
+                    // v4 refine: settled debt tiles ride on this P frame
+                    // (lower QP through the delta-QP map, or the whole frame
+                    // without one), flagged `refine` on the wire.
+                    if wss_forced_idr
+                        || latest_idr.is_none()
+                        || transition
+                        || encoder.as_ref().is_some_and(Nvenc::idr_pending)
+                    {
+                        wss_v4_refine_plan = None;
+                    }
+                    let wss_v4_refine_frame = wss_v4_refine_plan.is_some();
                     // A fallback is a separate transaction: first prepare a
                     // texture for its exact dimensions, then recreate NVENC
                     // for that same mode, and only commit after its IDR is
@@ -2843,15 +2953,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                     if fallback_reason.is_none()
                         && !wss_forced_idr
-                        && (now >= next_idr || latest_idr.is_none() || transition)
+                        && (periodic_idr_due(now, next_idr, wss_media.is_some())
+                            || latest_idr.is_none()
+                            || transition)
                     {
                         encoder.as_mut().unwrap().force_idr();
-                        next_idr = now
-                            + if wss_media.is_some() {
-                                wss_periodic_idr_interval(stream_mode, wss_media.as_ref())
-                            } else {
-                                IDR_INTERVAL
-                            };
+                        next_idr = now + IDR_INTERVAL;
                     }
                     let static_hybrid_enabled = active_benchmark_profile.is_some_and(|profile| {
                         profile.schema_version == 2
@@ -3130,6 +3237,37 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             mode,
                         );
                         let mut temporal_result = None;
+                        let wss_v4_qp_map = if wss_v4_refine_frame
+                            && encoder.as_ref().is_some_and(Nvenc::refine_qp_map_enabled)
+                        {
+                            wss_v4_refine_plan
+                                .as_ref()
+                                .filter(|plan| !plan.whole_frame)
+                                .zip(tile_tracker.as_ref())
+                                .and_then(|(plan, tracker)| {
+                                    refine_qp_map(
+                                        tracker.grid(),
+                                        &plan.tiles,
+                                        &tile_changed,
+                                        encode_crop(
+                                            frame.width(),
+                                            frame.height(),
+                                            viewport_crop,
+                                            mode,
+                                        ),
+                                        scaled.width,
+                                        scaled.height,
+                                    )
+                                })
+                        } else {
+                            None
+                        };
+                        if wss_v4_qp_map.is_none() {
+                            // No per-region QP: the refine covers the frame.
+                            if let Some(plan) = wss_v4_refine_plan.as_mut() {
+                                plan.whole_frame = true;
+                            }
+                        }
                         let frame_damage = if temporal_analysis_enabled {
                             let analyzer_matches =
                                 temporal_diff_analyzer.as_ref().is_some_and(|analyzer| {
@@ -3368,9 +3506,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 })
                                 .flatten()
                         } else {
-                            encode_frame_damage(&frame, viewport_crop, mode)
+                            encode_frame_damage(&frame, viewport_crop, mode, wss_v4_qp_map.as_ref())
                         };
-                        let refine_restore_bps = if wss_v4_refine_frame {
+                        let wss_v4_boost = wss_v4_refine_frame
+                            || (tile_tracker.is_some()
+                                && encoder.as_ref().is_some_and(Nvenc::idr_pending));
+                        let refine_restore_bps = if wss_v4_boost {
                             let enc = encoder.as_mut().unwrap();
                             let base = enc.bitrate();
                             enc.set_bitrate(wss_v4_refine_bitrate(base))
@@ -4187,21 +4328,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             capture.request_idle_followup_snapshot(frame_interval);
                         }
                     }
-                    if wss_media.is_some() {
-                        if wss_v4_refine_frame {
-                            wss_v4_refine.on_refine_sent();
-                            tracing::debug!("WSS v4 refine sent after the screen settled");
-                        } else {
-                            wss_v4_refine.on_frame(Instant::now(), wss_v4_damage_per_mille);
-                        }
-                        // Only a large change moves the deadline; small
-                        // changes neither cancel nor extend it.
-                        if let Some(deadline) = wss_v4_refine.deadline() {
-                            capture.request_idle_followup_snapshot(
-                                deadline.saturating_duration_since(Instant::now()),
-                            );
-                        }
-                    }
                     next_admission = advance_frame_deadline(next_admission, now, frame_interval);
                     let id = next_au_id;
                     next_au_id += 1;
@@ -4235,6 +4361,34 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             wss_reservation.set_meta(meta);
                             wss_reservation.set_refine(wss_v4_refine_frame && !encoded.is_idr);
                             if matches!(wss_reservation.submit(payload), WssSubmitOutcome::Queued) {
+                                if encoded.is_idr {
+                                    let reason = wss_v4_key_reason
+                                        .take()
+                                        .unwrap_or_else(|| wss_v4_key_cause.to_string());
+                                    *wss_v4_keyframes.entry(reason).or_default() += 1;
+                                }
+                                wss_v4_qp_window.0 = wss_v4_qp_window.0.max(encoded.frame_avg_qp);
+                                wss_v4_qp_window.1 += u64::from(encoded.frame_avg_qp);
+                                wss_v4_qp_window.2 += 1;
+                                if let Some(tracker) = tile_tracker.as_mut() {
+                                    let now = Instant::now();
+                                    tracker.on_encoded(
+                                        now,
+                                        &tile_hashes,
+                                        encoded.frame_avg_qp,
+                                        encoded.is_idr,
+                                        wss_v4_refine_plan.as_ref().filter(|_| wss_v4_refine_frame),
+                                    );
+                                    // An IDR's own follow-up comes first; the
+                                    // refine is scheduled after that frame.
+                                    if !encoded.is_idr {
+                                        if let Some(at) = tracker.next_refine_at() {
+                                            capture.request_idle_followup_snapshot(
+                                                at.saturating_duration_since(now),
+                                            );
+                                        }
+                                    }
+                                }
                                 if active_benchmark_profile.is_some() {
                                     let wire_payload_bytes = wss_media
                                         .as_ref()
@@ -4304,6 +4458,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 }
                             } else {
                                 wss_submission_failures = wss_submission_failures.saturating_add(1);
+                                wss_v4_key_reason = Some("submit-failure".into());
                                 pending_wss_idr = None;
                                 pending_viewport_idr = None;
                                 if quiescent_hybrid_enabled {
@@ -4396,6 +4551,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 "WSS producer window"
             );
             let v4 = egress.stats();
+            let tiles = tile_tracker
+                .as_ref()
+                .map(TileQualityTracker::stats)
+                .unwrap_or_default();
+            let debt_tiles = tile_tracker
+                .as_ref()
+                .map_or(0, TileQualityTracker::debt_tiles);
             info!(
                 connected = v4.connected,
                 peer_present = v4.peer_present,
@@ -4412,8 +4574,22 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 bitrate_bps = v4.bitrate_bps,
                 min_rtt_ms = v4.min_rtt_ms,
                 last_rtt_ms = v4.last_rtt_ms,
+                ack_timeouts = v4.ack_timeouts,
+                keyframes = %format_keyframe_reasons(&wss_v4_keyframes),
+                noop_skipped = tiles.noop_repaints_skipped,
+                debt_tiles,
+                tiles_refined = tiles.tiles_refined,
+                refine_frames = tiles.refine_frames,
+                whole_frame_refines = tiles.whole_frame_refines,
+                hashed_tiles = tiles.hashed_tiles,
+                unhashed_tiles = tiles.unhashed_tiles,
+                tile_hash_us,
+                frame_qp_max = wss_v4_qp_window.0,
+                frame_qp_mean = wss_v4_qp_window.1 / wss_v4_qp_window.2.max(1),
                 "WSS v4 link totals"
             );
+            tile_hash_us = 0;
+            wss_v4_qp_window = (0, 0, 0);
             next_wss_stats = Instant::now() + Duration::from_secs(1);
             producer_loop_iterations = 0;
             wss_preencode_skips = 0;
@@ -4529,7 +4705,7 @@ mod tests {
     }
 
     #[test]
-    fn wss_v4_refine_bitrate_is_bounded_and_parks_periodic_idr() {
+    fn wss_v4_refine_bitrate_is_bounded_and_v4_has_no_periodic_idr() {
         assert_eq!(super::wss_v4_refine_bitrate(3_000_000), 12_000_000);
         assert_eq!(
             super::wss_v4_refine_bitrate(20_000_000),
@@ -4539,11 +4715,14 @@ mod tests {
             super::wss_v4_refine_bitrate(u32::MAX),
             super::MAX_BITRATE_BPS
         );
-        assert_eq!(
-            super::wss_periodic_idr_interval(super::StreamMode::Work, None),
-            super::wss_gop_interval(super::StreamMode::Work)
-        );
-        assert!(super::WSS_V4_PRODUCER_IDR_PARK > std::time::Duration::from_secs(60));
+        let now = std::time::Instant::now();
+        assert!(super::periodic_idr_due(now, now, false));
+        assert!(!super::periodic_idr_due(now, now, true));
+        assert!(!super::periodic_idr_due(
+            now + std::time::Duration::from_secs(86_400),
+            now,
+            true
+        ));
         assert_eq!(super::SIGNALING_HEARTBEAT_INTERVAL.as_secs(), 15);
     }
 
