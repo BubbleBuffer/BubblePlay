@@ -3213,7 +3213,7 @@ document.addEventListener("mousemove", (e) => {
     const x = clamp((e.clientX - r.left) / r.width, 0, 1);
     const y = clamp((e.clientY - r.top) / r.height, 0, 1);
     updateRemoteCursor(cursor => cursor.setNormalized(x, y));
-    locallyAuthoritativeCursor = true; queueAbsolute(x * 65535, y * 65535); showTouchCursor();
+    locallyAuthoritativeCursor = true; mousePointerActive = true; queueAbsolute(x * 65535, y * 65535); showTouchCursor();
   }
 });
 document.addEventListener("mousedown", (e) => {
@@ -3512,6 +3512,8 @@ const remoteDesktop = {
   height: clamp(Number(params.get("remoteHeight")) || 1080, 240, 16384),
 };
 let touchCursorVisible = false;
+// A real mouse uses the native pointer; the drawn overlay is for touch/pen.
+let mousePointerActive = false;
 const coarsePointerQuery = matchMedia("(any-pointer:coarse)");
 let chromeIdleTimer = null;
 const contextHint = document.getElementById("context-hint");
@@ -3640,9 +3642,9 @@ function sendStreamMode(reason) {
   sendSignal({ type: "media-control", action: "mode", protocol: wssSelected ? wssProtocol : 2, epoch: mediaEpoch,
     streamMode: streamModeValue(), reason });
 }
-function containedContentRect() { const mediaWidth = activeVideo?.videoWidth || screen.width, mediaHeight = activeVideo?.videoHeight || screen.height; if (!mediaWidth || !mediaHeight) return {x:0,y:0,width:innerWidth,height:innerHeight}; const scale=Math.min(innerWidth/mediaWidth,innerHeight/mediaHeight), width=mediaWidth*scale, height=mediaHeight*scale; return {x:(innerWidth-width)/2,y:(innerHeight-height)/2,width,height}; }
+function containedContentRect() { const area = visual.getBoundingClientRect(), areaWidth = area.width || innerWidth, areaHeight = area.height || innerHeight, mediaWidth = activeVideo?.videoWidth || screen.width, mediaHeight = activeVideo?.videoHeight || screen.height; if (!mediaWidth || !mediaHeight) return {x:area.left,y:area.top,width:areaWidth,height:areaHeight}; const scale=Math.min(areaWidth/mediaWidth,areaHeight/mediaHeight), width=mediaWidth*scale, height=mediaHeight*scale; return {x:area.left+(areaWidth-width)/2,y:area.top+(areaHeight-height)/2,width,height}; }
 function syncViewport() { viewport.resize(innerWidth,innerHeight); viewport.setContent(containedContentRect()); renderTouchCursor(); }
-function renderTouchCursor() { const p=remoteCursor.screenPoint(viewport); touchCursor.style.transform=`translate3d(${p.x}px,${p.y}px,0)`; touchCursor.classList.toggle("visible",touchCursorVisible); }
+function renderTouchCursor() { const p=remoteCursor.screenPoint(viewport); touchCursor.style.transform=`translate3d(${p.x}px,${p.y}px,0)`; touchCursor.classList.toggle("visible",touchCursorVisible && !mousePointerActive); }
 function centerCameraOnCursor() { if (shouldCenterCameraOnCursor({ zoom: viewport.zoom, pointerMode, synced: cursorReconciler.synced, locallyAuthoritative: locallyAuthoritativeCursor })) viewport.centerOnNormalized(remoteCursor.snapshot()); }
 function syncViewportAndFollow() { syncViewport(); centerCameraOnCursor(); renderViewport(); }
 function updateRemoteCursor(update) { update(remoteCursor); if (pointerMode === "desktop") locallyAuthoritativeCursor=true; centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("cursor-follow"); }
@@ -3787,7 +3789,7 @@ function dispatchGesture(actions) {
   }
   hudState.touch = gestures.cancelled ? "cancelled" : (gestures.dragActive ? "drag" : gestures.mode || (gestures.points.size > 1 ? "two-finger" : gestures.points.size ? "touch" : "…"));
 }
-inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); showTouchCursor(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY},e.timeStamp)); e.preventDefault(); });
+inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "mouse") mousePointerActive = false; if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); showTouchCursor(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY},e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointermove", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.move(e.pointerId,{x:e.clientX,y:e.clientY})); e.preventDefault(); });
 inputSurface.addEventListener("pointerup", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.up(e.pointerId,e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointercancel", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.cancel(e.pointerId)); releaseInput(); resetTouchCursor(); hudState.touch = "cancelled"; e.preventDefault(); });
@@ -3811,8 +3813,18 @@ qualitySelect.onchange = e => {
 document.getElementById("zoom-out").onclick = e => { e.stopPropagation(); setZoom(viewport.zoom-.25); };
 document.getElementById("zoom-in").onclick = e => { e.stopPropagation(); setZoom(viewport.zoom+.25); };
 document.getElementById("zoom-reset").onclick = e => { e.stopPropagation(); setZoom(1); };
-document.getElementById("fullscreen").onclick = e => { e.stopPropagation(); if (document.fullscreenElement) document.exitFullscreen?.(); else document.documentElement.requestFullscreen?.(); };
-document.addEventListener("fullscreenchange", () => { document.getElementById("fullscreen").textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen"; });
+function toggleFullscreen(e) { e?.stopPropagation(); if (document.fullscreenElement) document.exitFullscreen?.(); else document.documentElement.requestFullscreen?.(); }
+document.getElementById("fullscreen").onclick = toggleFullscreen;
+document.getElementById("seam-fullscreen").onclick = toggleFullscreen;
+document.addEventListener("fullscreenchange", () => {
+  const full = Boolean(document.fullscreenElement);
+  document.body.classList.toggle("is-fullscreen", full);
+  document.getElementById("fullscreen").textContent = full ? "Exit fullscreen" : "Fullscreen";
+  const seamButton = document.getElementById("seam-fullscreen");
+  seamButton.setAttribute("aria-pressed", String(full));
+  seamButton.title = full ? "Exit fullscreen" : "Fullscreen";
+  requestAnimationFrame(syncViewportAndFollow);
+});
 const controlSheet = document.getElementById("control-sheet");
 const openControls = document.getElementById("open-controls");
 let diagnosticsVisible = diagnosticsEnabled;

@@ -585,3 +585,31 @@ body.has-presented-frame #desktop-state span { font-size: 12px; color: var(--mut
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.001ms !important; animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* Windowed: the stream starts below the top seam so the bar never covers the
+   remote desktop. Fullscreen: the seam hides and the stream uses the screen. */
+body.session-page #visual,
+body.session-page #stage,
+body.session-page #input-surface { top: calc(var(--top-seam-height) + env(safe-area-inset-top)); }
+body.session-page.is-fullscreen #visual,
+body.session-page.is-fullscreen #stage,
+body.session-page.is-fullscreen #input-surface { top: 0; }
+body.is-fullscreen #top-seam { transform: translateY(-105%); opacity: 0; pointer-events: none; }
+body.is-fullscreen #controls { top: env(safe-area-inset-top) !important; }
+body.is-fullscreen #chrome-reveal { top: max(0px, env(safe-area-inset-top)); opacity: 0.88; }
+
+#seam-fullscreen {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 30px;
+  padding: 0;
+  color: var(--milk-cloth);
+  background: transparent;
+  border: 1px solid var(--thread);
+  border-radius: 8px;
+  cursor: pointer;
+}
+#seam-fullscreen:hover,
+#seam-fullscreen:focus-visible { background: color-mix(in srgb, var(--milk-cloth) 12%, transparent); }
+#seam-fullscreen svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
