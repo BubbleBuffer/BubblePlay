@@ -36,9 +36,12 @@ export function validHostMediaCapabilities(message) {
     (message.wssFec.length === 2 || message.wssFec.length === 3) &&
     message.wssFec[0] === "none" && message.wssFec[1] === "xor-1" &&
     (message.wssFec.length === 2 || message.wssFec[2] === "rs-2");
-  return Array.isArray(message.mediaProtocols) && message.mediaProtocols.length === 2 &&
-    message.mediaProtocols[0] === 2 && message.mediaProtocols[1] === 3 &&
-    message.maxWssLanes === 16 && validFec;
+  // Protocol 4 (single-socket WSS) is an optional, additive capability.
+  const protocols = message.mediaProtocols;
+  const validProtocols = Array.isArray(protocols) &&
+    (protocols.length === 2 || protocols.length === 3) &&
+    protocols[0] === 2 && protocols[1] === 3 && (protocols.length === 2 || protocols[2] === 4);
+  return validProtocols && message.maxWssLanes === 16 && validFec;
 }
 
 export function validInputStatus(message, role, raw) {
