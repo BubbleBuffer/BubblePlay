@@ -4,6 +4,7 @@ pub mod agent_runtime;
 pub mod benchmark;
 pub mod capture;
 pub mod clipboard;
+pub mod content_class;
 pub mod desktop_session;
 pub mod encode;
 pub mod feedback_roi;

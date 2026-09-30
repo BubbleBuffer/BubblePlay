@@ -95,7 +95,7 @@ impl TileGrid {
     }
 
     /// Marks every tile `rect` touches.
-    fn mark(&self, rect: &DamageRect, marks: &mut [bool]) {
+    pub fn mark(&self, rect: &DamageRect, marks: &mut [bool]) {
         let right = rect.right.min(self.width);
         let bottom = rect.bottom.min(self.height);
         if rect.left >= right || rect.top >= bottom {
