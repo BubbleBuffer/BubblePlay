@@ -517,6 +517,38 @@ impl LocalClipboardPoll {
     }
 }
 
+/// Logs the tray's viewer markers: "viewer session started" once a viewer's
+/// media transport (RTC or WSS) is first up in this session, and "viewer
+/// session ended" when the session ends by any path (peer left, error). The
+/// tray runs the Admin mode agent only between the two.
+#[derive(Default)]
+struct ViewerSessionLog {
+    live: bool,
+}
+
+impl ViewerSessionLog {
+    fn observe(&mut self, connected: bool) {
+        if connected && !self.live {
+            self.live = true;
+            info!(
+                "{}",
+                bubbleplay_host::admin_agent::client::VIEWER_STARTED_MARKER
+            );
+        }
+    }
+}
+
+impl Drop for ViewerSessionLog {
+    fn drop(&mut self) {
+        if self.live {
+            info!(
+                "{}",
+                bubbleplay_host::admin_agent::client::VIEWER_ENDED_MARKER
+            );
+        }
+    }
+}
+
 /// Full pipeline: signaling + WebRTC + media + input.
 /// WSS carries the session: stop the RTC transport thread and forget its
 /// state, leaving signaling, input and the WSS media path untouched.
@@ -736,6 +768,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut last_logged_bwe: Option<u32> = None;
     let mut producer_loop_iterations = 0u64;
     let mut last_capture_stats = (0u64, 0u64);
+    let mut viewer_session = ViewerSessionLog::default();
     'session: loop {
         producer_loop_iterations = producer_loop_iterations.saturating_add(1);
         let loop_now = Instant::now();
@@ -1307,6 +1340,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
             next_cursor_poll = cursor_now + Duration::from_millis(16);
         }
+        viewer_session.observe(ice_connected || wss_media.is_some());
         if !capture.is_privileged() {
             let viewer_live =
                 capture_available && remote_input_ready && (ice_connected || wss_media.is_some());

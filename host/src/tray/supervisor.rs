@@ -39,7 +39,24 @@ pub enum HostEvent {
     Started,
     /// The host logged its signaling registration line.
     Registered,
+    /// The host logged that a viewer's media transport is up.
+    ViewerStarted,
+    /// The host logged that the viewer session ended.
+    ViewerEnded,
     Exited,
+}
+
+/// The event a host output line signals, if any.
+pub fn line_event(line: &[u8]) -> Option<HostEvent> {
+    use bubbleplay_host::admin_agent::client::{VIEWER_ENDED_MARKER, VIEWER_STARTED_MARKER};
+    [
+        (super::update::REGISTERED_MARKER, HostEvent::Registered),
+        (VIEWER_STARTED_MARKER, HostEvent::ViewerStarted),
+        (VIEWER_ENDED_MARKER, HostEvent::ViewerEnded),
+    ]
+    .into_iter()
+    .find(|(marker, _)| contains(line, marker.as_bytes()))
+    .map(|(_, event)| event)
 }
 
 fn emit(events: &Option<Sender<HostEvent>>, event: HostEvent) {
@@ -72,7 +89,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog, events: Option<Sender<HostEvent>>) {
-    let marker = super::update::REGISTERED_MARKER.as_bytes();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut line = Vec::with_capacity(512);
@@ -84,8 +100,8 @@ fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog, events: Option<Send
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     log.append(&line);
-                    if contains(&line, marker) {
-                        emit(&events, HostEvent::Registered);
+                    if let Some(event) = line_event(&line) {
+                        emit(&events, event);
                     }
                 }
             }
@@ -299,5 +315,29 @@ impl SupervisorThread {
 impl Drop for SupervisorThread {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_lines_map_to_events() {
+        let line = |text: &str| line_event(text.as_bytes());
+        assert_eq!(
+            line("2026-09-30T10:00:00Z  INFO bubbleplay_host::signaling: signaling registered as host\n"),
+            Some(HostEvent::Registered)
+        );
+        assert_eq!(
+            line("2026-09-30T10:00:01Z  INFO bubbleplay_host: viewer session started\n"),
+            Some(HostEvent::ViewerStarted)
+        );
+        assert_eq!(
+            line("2026-09-30T10:00:02Z  INFO bubbleplay_host: viewer session ended\n"),
+            Some(HostEvent::ViewerEnded)
+        );
+        assert_eq!(line("INFO session ended - waiting for next client\n"), None);
+        assert_eq!(line(""), None);
     }
 }

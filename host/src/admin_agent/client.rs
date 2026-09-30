@@ -27,6 +27,11 @@ use super::trust;
 
 /// Agent binary name; the host only talks to a server running this image.
 pub const AGENT_EXE: &str = "bubbleplay_admin_agent.exe";
+/// Host log line once a viewer's media transport is up. The tray runs the
+/// agent (Admin mode) only between this line and [`VIEWER_ENDED_MARKER`].
+pub const VIEWER_STARTED_MARKER: &str = "viewer session started";
+/// Host log line when that viewer session ends (peer left, error or exit).
+pub const VIEWER_ENDED_MARKER: &str = "viewer session ended";
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const INJECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// Error code reported for a batch the agent refused under its rate limit.
