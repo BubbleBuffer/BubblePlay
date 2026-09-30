@@ -215,6 +215,52 @@ mod codec_policy_tests {
     }
 
     #[test]
+    fn refine_mode_applies_only_a_valid_prepared_map_and_never_on_keyframes() {
+        let mut options = EncoderOptions::production(Preset::P3);
+        options.roi_mode = RoiMode::Refine;
+        assert_eq!(
+            super::qp_map_mode(options, VideoCodec::Hevc),
+            super::NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DELTA
+        );
+        let mut init = NV_ENC_INITIALIZE_PARAMS::default();
+        apply_initialization_options(&mut init, options);
+        assert_eq!(init.enableReconFrameOutput(), 0);
+        let full = DamageRect {
+            left: 0,
+            top: 0,
+            right: 128,
+            bottom: 64,
+        };
+        let map = crate::frame_damage::HevcQpDeltaMap {
+            columns: 4,
+            rows: 2,
+            values: vec![-6, 2, 2, 2, 2, 2, 2, 0],
+        };
+        let damage = |map| FrameDamage {
+            source_width: 128,
+            source_height: 64,
+            crop: full,
+            rects: &[],
+            edge_scores: None,
+            prepared_qp_map: map,
+        };
+        let applied = evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, Some(damage(Some(&map))));
+        assert_eq!(applied.map.as_ref(), Some(&map));
+        assert!(applied.telemetry.is_none());
+        for (codec, idr) in [(VideoCodec::Hevc, true), (VideoCodec::H264, false)] {
+            let skipped = evaluate_roi_map(options, codec, idr, 128, 64, Some(damage(Some(&map))));
+            assert!(skipped.map.is_none() && skipped.telemetry.is_none());
+        }
+        assert!(evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, Some(damage(None))).map.is_none());
+        assert!(evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, None).map.is_none());
+        let wrong_size = evaluate_roi_map(options, VideoCodec::Hevc, false, 160, 64, Some(damage(Some(&map))));
+        assert!(wrong_size.map.is_none());
+        let mut out_of_range = map.clone();
+        out_of_range.values[0] = -20;
+        assert!(evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, Some(damage(Some(&out_of_range)))).map.is_none());
+    }
+
+    #[test]
     fn damage_roi_reports_each_activity_gate_without_touching_nvenc() {
         let mut options = EncoderOptions::production(Preset::P3);
         options.roi_mode = RoiMode::Damage;
@@ -567,6 +613,8 @@ pub struct EncodedFrame {
     pub roi_activity: Option<RoiMapTelemetry>,
     /// Synchronous NVENC stage timings for default-off resource experiments.
     pub stage_timings: EncodeStageTimings,
+    /// NVENC's average QP for the picture (`frameAvgQP`).
+    pub frame_avg_qp: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -661,6 +709,34 @@ fn evaluate_roi_map(
             telemetry: None,
         };
     }
+    if options.roi_mode == RoiMode::Refine {
+        // Production refine frames carry a prepared map; every other frame
+        // (and any keyframe) is encoded without one and reports nothing.
+        let none = RoiMapEvaluation {
+            map: None,
+            telemetry: None,
+        };
+        if codec != VideoCodec::Hevc || force_idr {
+            return none;
+        }
+        let Some(map) = damage.and_then(|damage| damage.prepared_qp_map) else {
+            return none;
+        };
+        let valid = map.columns == output_width.div_ceil(32)
+            && map.rows == output_height.div_ceil(32)
+            && map.values.len() == (map.columns * map.rows) as usize
+            && map
+                .values
+                .iter()
+                .all(|delta| REFINE_QP_DELTA_RANGE.contains(delta));
+        if !valid {
+            return none;
+        }
+        return RoiMapEvaluation {
+            map: Some(map.clone()),
+            telemetry: None,
+        };
+    }
     if codec != VideoCodec::Hevc {
         return rejected(RoiMapReason::UnsupportedEncoderState, 0, 0);
     }
@@ -712,7 +788,7 @@ fn evaluate_roi_map(
             }
             HevcQpMapDecision::Applied(map.clone())
         }
-        RoiMode::Off => {
+        RoiMode::Off | RoiMode::Refine => {
             return rejected(RoiMapReason::UnsupportedEncoderState, 0, 0);
         }
     };
@@ -807,7 +883,13 @@ pub enum RoiMode {
     Damage,
     TextEdge,
     Feedback,
+    /// WSS v4 production: the QP map is enabled, and a map is supplied only
+    /// on refine frames (debt tiles at a lower QP).
+    Refine,
 }
+
+/// Delta-QP range accepted from a prepared v4 refine map.
+pub const REFINE_QP_DELTA_RANGE: std::ops::RangeInclusive<i8> = -12..=6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceMode {
@@ -1352,6 +1434,16 @@ impl Nvenc {
         self.force_idr_next = true;
     }
 
+    /// Whether the next encoded picture will be a forced IDR.
+    pub fn idr_pending(&self) -> bool {
+        self.force_idr_next
+    }
+
+    /// Whether refine frames can carry a per-CTB delta-QP map.
+    pub fn refine_qp_map_enabled(&self) -> bool {
+        self.options.roi_mode == RoiMode::Refine && self.codec == VideoCodec::Hevc
+    }
+
     pub fn codec(&self) -> VideoCodec {
         self.codec
     }
@@ -1721,6 +1813,7 @@ impl Nvenc {
             qp_map: qp_map_stats,
             roi_activity: roi_evaluation.telemetry,
             stage_timings,
+            frame_avg_qp: lock.frameAvgQP,
         })
     }
 
