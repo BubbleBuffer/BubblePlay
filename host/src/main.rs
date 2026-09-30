@@ -635,7 +635,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut next_ping = Instant::now() + SIGNALING_HEARTBEAT_INTERVAL;
     // v4: a static-screen refine frame is pending after damage-driven frames.
     let mut wss_v4_refine_armed = false;
-    let mut infinite_gop_unsupported = false;
     let mut next_wss_stats = Instant::now() + Duration::from_secs(1);
     let mut next_quality_tick = Instant::now() + Duration::from_secs(1);
     let mut benchmark_lease = args
@@ -3031,6 +3030,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 let is_idle_snapshot = frame.is_idle_snapshot();
                 let main10 = active_benchmark_profile.is_some_and(|profile| profile.encoder.main10);
                 let dev = frame.device().as_raw() as *mut core::ffi::c_void;
+                // WSS v4 owns keyframes (start / request / 30 s safety), so its
+                // encoder runs without periodic IDRs. NVENC cannot change the
+                // GOP in place: recreate the session when the mode differs.
+                let want_infinite_gop =
+                    wss_is_v4(wss_media.as_ref()) && active_benchmark_profile.is_none();
+                if encoder.as_ref().is_some_and(|e| {
+                    e.is_for_device(dev) && e.infinite_gop() != want_infinite_gop
+                }) {
+                    info!(infinite_gop = want_infinite_gop, "recreating NVENC for the WSS v4 GOP mode");
+                    encoder = None;
+                    latest_idr = None;
+                    pending_transition_idr = None;
+                    next_idr = Instant::now();
+                }
                 if encoder.as_ref().map_or(true, |e| !e.is_for_device(dev)) {
                     if encoder.is_some() {
                         warn!("capture D3D11 device changed; invalidating scaler and IDR state");
@@ -3052,6 +3065,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         preset,
                         active_codec,
                         active_benchmark_profile,
+                        want_infinite_gop,
                     )?);
                     encoder_benchmark_profile_revision = desired_encoder_benchmark_profile_revision;
                 }
@@ -3070,20 +3084,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 if (is_new && frame_admission_due(now, next_admission, frame_interval, urgent))
                     || (!is_new && urgent)
                 {
-                    // WSS v4 owns keyframes (start / request / 30 s safety):
-                    // run NVENC with an infinite GOP while it is active.
-                    let want_infinite_gop = wss_is_v4(wss_media.as_ref());
-                    if let Some(enc) = encoder.as_mut() {
-                        if enc.infinite_gop() != want_infinite_gop && !infinite_gop_unsupported {
-                            match enc.set_infinite_gop(want_infinite_gop) {
-                                Ok(()) => next_idr = now,
-                                Err(error) => {
-                                    infinite_gop_unsupported = true;
-                                    warn!(?error, "NVENC GOP switch failed; keeping periodic IDR");
-                                }
-                            }
-                        }
-                    }
                     if let Some(egress) = wss_media.as_ref().filter(|egress| egress.is_v4()) {
                         egress.set_v4_frame_size(mode.width, mode.height);
                     }
@@ -4632,8 +4632,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         });
                     }
                     capture.cancel_idle_followup_snapshot();
+                    let v4_session = wss_is_v4(wss_media.as_ref());
                     match idle_snapshot_completion_order(
-                        encoded.is_idr && is_idle_snapshot,
+                        encoded.is_idr && (is_idle_snapshot || v4_session),
                         request_quiescent_transition_followup,
                     ) {
                         IdleSnapshotCompletionOrder::None => {}

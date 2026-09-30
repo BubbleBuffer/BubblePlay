@@ -9,6 +9,7 @@ use super::{
     ViewportGeometry, WssAdjustment, RECT, STATIC_REPLAY_DELAY,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn create_encoder_with_fallback(
     device: *mut core::ffi::c_void,
     width: u32,
@@ -19,8 +20,9 @@ pub(super) fn create_encoder_with_fallback(
     bitrate_bps: u32,
     requested: Preset,
     codec: VideoCodec,
+    infinite_gop: bool,
 ) -> Result<Nvenc> {
-    Nvenc::new_with_preset_native_codec(
+    Nvenc::new_with_options_native_codec_gop(
         device,
         width,
         height,
@@ -28,8 +30,9 @@ pub(super) fn create_encoder_with_fallback(
         native_height,
         fps,
         bitrate_bps,
-        requested,
+        EncoderOptions::production(requested),
         codec,
+        infinite_gop,
     )
     .or_else(|first| {
         if matches!(requested, Preset::P3) {
@@ -37,7 +40,7 @@ pub(super) fn create_encoder_with_fallback(
                 ?first,
                 width, height, fps, "P3 initialization failed; retrying P1"
             );
-            Nvenc::new_with_preset_native_codec(
+            Nvenc::new_with_options_native_codec_gop(
                 device,
                 width,
                 height,
@@ -45,8 +48,9 @@ pub(super) fn create_encoder_with_fallback(
                 native_height,
                 fps,
                 bitrate_bps,
-                Preset::P1,
+                EncoderOptions::production(Preset::P1),
                 codec,
+                infinite_gop,
             )
         } else {
             Err(first)
@@ -200,6 +204,7 @@ pub(super) fn create_local_encoder(
     requested: Preset,
     codec: VideoCodec,
     benchmark_profile: Option<&benchmark::BenchmarkProfile>,
+    infinite_gop: bool,
 ) -> Result<Nvenc> {
     if let Some(profile) = benchmark_profile {
         return Nvenc::new_with_options_native_codec(
@@ -224,6 +229,7 @@ pub(super) fn create_local_encoder(
         bitrate_bps,
         requested,
         codec,
+        infinite_gop,
     )
 }
 
@@ -238,6 +244,7 @@ pub(super) fn configure_encoder_profile(
     codec: VideoCodec,
     benchmark_profile: Option<&benchmark::BenchmarkProfile>,
 ) -> Result<()> {
+    let infinite_gop = encoder.as_ref().is_some_and(Nvenc::infinite_gop);
     let reconfigure = encoder
         .as_mut()
         .context("encoder unavailable")?
@@ -261,6 +268,7 @@ pub(super) fn configure_encoder_profile(
                 requested,
                 codec,
                 benchmark_profile,
+                infinite_gop,
             )
             .with_context(|| format!("recreate NVENC for {}", mode.label))?,
         );
@@ -285,6 +293,7 @@ pub(super) fn recreate_and_encode_profile(
     texture: *mut core::ffi::c_void,
     reconstruction_texture: Option<*mut core::ffi::c_void>,
 ) -> Result<EncodedFrame> {
+    let infinite_gop = encoder.as_ref().is_some_and(Nvenc::infinite_gop);
     *encoder = None;
     let mut replacement = create_local_encoder(
         device,
@@ -297,6 +306,7 @@ pub(super) fn recreate_and_encode_profile(
         preset,
         codec,
         benchmark_profile,
+        infinite_gop,
     )?;
     replacement.force_idr();
     let encoded = if let Some(reconstruction_texture) = reconstruction_texture {
