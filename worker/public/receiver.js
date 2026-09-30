@@ -1314,6 +1314,18 @@ function beginWssRecovery(reason, requestId = null) {
   return requested;
 }
 
+function handleRtcPeerConnectionState(generation, candidate, state) {
+  if (!isCurrentPeer(generation, candidate)) return;
+  const action = rtcPeerEndAction({ usingWssMedia, connectionState: state });
+  if (action === "end-peer") endRtcPeerOnly(`rtc-${state}`);
+  else if (action === "recycle") {
+    hudState.ice = state;
+    hud.classList.add("bad");
+    if (ws?.readyState === WebSocket.OPEN) ws.close(1000, "rtc-failed");
+    else restartPeer(state);
+  }
+}
+
 // WSS carries this session: close only the RTC peer and its data channels.
 // Input already falls back to the signaling socket when the lanes are gone.
 function endRtcPeerOnly(reason) {
@@ -1633,17 +1645,7 @@ async function startPeer(generation = peerGeneration) {
     }
   };
   candidate.ontrack = (ev) => { if (isCurrentPeer(generation, candidate)) onTrack(ev, generation); };
-  candidate.onconnectionstatechange = () => {
-    if (!isCurrentPeer(generation, candidate)) return;
-    const action = rtcPeerEndAction({ usingWssMedia, connectionState: candidate.connectionState });
-    if (action === "end-peer") endRtcPeerOnly(`rtc-${candidate.connectionState}`);
-    else if (action === "recycle") {
-      hudState.ice = candidate.connectionState;
-      hud.classList.add("bad");
-      if (ws?.readyState === WebSocket.OPEN) ws.close(1000, "rtc-failed");
-      else restartPeer(candidate.connectionState);
-    }
-  };
+  candidate.onconnectionstatechange = () => handleRtcPeerConnectionState(generation, candidate, candidate.connectionState);
 
   try {
     const offer = await candidate.createOffer();
@@ -1767,6 +1769,16 @@ if (diagnosticsEnabled) {
         frameCount,
       );
       return true;
+    },
+    // Lab-only: fail the RTC peer as the browser reports it, to prove that a
+    // WSS session outlives its RTC lifecycle anchor.
+    simulateRtcPeerFailure() {
+      if (!labRun || !pc) return false;
+      handleRtcPeerConnectionState(peerGeneration, pc, "failed");
+      return true;
+    },
+    rtcPeerState() {
+      return pc ? pc.connectionState : null;
     },
     // Lab-only: drop the v4 media socket to exercise backoff reconnect.
     dropWssV4Socket() {
