@@ -955,9 +955,12 @@ impl V4Link {
         self.lock().rate.bitrate_bps()
     }
 
-    /// Measured capacity of a constrained link; `None` when unconstrained.
+    /// Measured capacity of a constrained link; `None` when unconstrained,
+    /// including a measured link whose 80 % target already covers the
+    /// profile's maximum bitrate (nothing to budget).
     pub fn capacity(&self) -> Option<Capacity> {
-        self.lock().capacity.capacity()
+        let state = self.lock();
+        binding_capacity(state.capacity.capacity(), state.rate.max_bps())
     }
 
     pub fn set_bitrate_bounds(&self, bitrate_bps: u64, max_bps: u64) {
@@ -1009,6 +1012,12 @@ impl Drop for V4Link {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// A capacity only binds (budget, pacing, QP ceiling) when its 80 % target is
+/// below the most the encoder would send anyway.
+fn binding_capacity(capacity: Option<Capacity>, max_bps: u64) -> Option<Capacity> {
+    capacity.filter(|capacity| capacity.target_bps() < max_bps)
 }
 
 /// Publish a controller decision to the producer and log it with its reason.
@@ -1651,6 +1660,16 @@ mod tests {
         assert_eq!(rate.bitrate_bps(), 3_000_000);
         assert_eq!(rate.floor_bps(), RATE_FLOOR_1080P_BPS);
         assert_eq!(rate.ceiling_bps(), 6_000_000);
+    }
+
+    #[test]
+    fn capacity_above_the_profile_maximum_does_not_bind() {
+        let fast = Some(Capacity { bps: 7_500_000 });
+        let slow = Some(Capacity { bps: 2_000_000 });
+        // 80 % of 7.5 Mbps = 6 Mbps: the encoder never sends more anyway.
+        assert_eq!(binding_capacity(fast, 6_000_000), None);
+        assert_eq!(binding_capacity(slow, 6_000_000), slow);
+        assert_eq!(binding_capacity(None, 6_000_000), None);
     }
 
     #[test]
