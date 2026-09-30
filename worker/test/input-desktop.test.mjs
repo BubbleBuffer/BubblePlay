@@ -179,6 +179,25 @@ test("relay validates host clipboard chunks and input capabilities", () => {
   assert.equal(capsOk({ ...caps, extra: 1 }), false);
 });
 
+test("receiver wires physical keys, keyboard lock, wheel accumulation and clipboard", () => {
+  const client = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(client, /controlState: inputControlState/);
+  assert.match(client, /function inputControlState\(\) \{\s*if \(desktopInputState !== "enabled" \|\| !desktopAvailable \|\| desktopAwaitingFrame\) return "down";/);
+  assert.match(client, /function releaseInput\(send = true\)/);
+  assert.match(client, /input\.physicalKey\(e\.code, false\)/);
+  assert.match(client, /input\.physicalKey\(e\.code, true\)/);
+  assert.doesNotMatch(client, /const KEY = \{/);
+  assert.match(client, /wheelAccumulator\.add\(e\.deltaX, e\.deltaY, e\.deltaMode\)/);
+  assert.match(client, /if \(document\.fullscreenElement\) keyboard\.lock\(\)\.catch\(\(\) => \{\}\); else keyboard\.unlock\?\.\(\);/);
+  assert.match(client, /document\.addEventListener\("fullscreenchange", updateKeyboardLock\)/);
+  assert.match(client, /case "clipboard":\s*receiveRemoteClipboard\(msg\);/);
+  assert.match(client, /case "host-capabilities":\s*applyInputCapabilities\(null\);/, "stale capabilities reset when a host (re)announces");
+  assert.match(client, /clipboardSyncEnabled\(\) \{ return hostInputCapabilities\.clipboard && desktopKind !== "secure"/);
+  assert.match(client, /if \(document\.hasFocus\(\)\) writeRemoteClipboard\(text\); else remoteClipboardButton\.hidden = false;/);
+  assert.match(html, /<button id="remote-clipboard" type="button" hidden[^>]*>Copy remote clipboard<\/button>/);
+});
+
 test("relay wires clipboard validation and replays input capabilities to new clients", () => {
   const source = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
   assert.match(source, /msg\.type === "clipboard" && !validClipboardMessage\(msg, att\.role, message\)\) return;/);
