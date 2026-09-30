@@ -87,7 +87,7 @@ async function authenticatedBrowser(f, remember = true) {
 
 const DEBUG_ATTEMPT = "123e4567-e89b-42d3-a456-426614174000";
 const DEBUG_RUN = "cab5bd95-81a3-4ef6-9fc6-8566abbb17d5";
-const DEBUG_COMPATIBILITY = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
+const DEBUG_COMPATIBILITY = "wss-v4-bench2-hevc-tiles-bpip4-v16";
 
 function diagnosticRequest(cookie, payload, origin = "https://playfull-cat.example") {
   return new Request("https://playfull-cat.example/__diag/client", {
@@ -490,7 +490,7 @@ test("pinned browser sockets preserve the Worker version override across the int
     ROOM: { idFromName: name => name, get: () => ({ fetch: async () => signalResponse }) },
   };
   const run = "123e4567-e89b-42d3-a456-426614174000";
-  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
+  const compat = "wss-v4-bench2-hevc-tiles-bpip4-v16";
   const response = await worker.fetch(new Request(
     `https://playfull-cat.example/lab-ws?run=${run}&compat=${compat}`,
     {
@@ -532,7 +532,7 @@ test("explicit local Stream Lab mode bypasses auth only for valid loopback lab s
     },
   };
   const run = "123e4567-e89b-42d3-a456-426614174000";
-  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
+  const compat = "wss-v4-bench2-hevc-tiles-bpip4-v16";
 
   assert.equal(await worker.fetch(new Request("http://127.0.0.1:8787/"), env), assetResponse);
   assert.equal(await worker.fetch(
@@ -570,11 +570,18 @@ test("media websocket routing uses an isolated Durable Object namespace", async 
     ROOM: { idFromName: (name) => { selected.push(`signal:${name}`); return name; }, get: () => ({ fetch: async () => new Response("signal") }) },
     MEDIA_ROOM: { idFromName: (name) => { selected.push(`media:${name}`); return name; }, get: () => ({ fetch: async () => mediaResponse }) },
   };
-  const response = await worker.fetch(new Request("https://playfull-cat.example/media-ws?stripe=2", {
+  const epoch = "0123456789abcdef0123456789abcdef";
+  const response = await worker.fetch(new Request(`https://playfull-cat.example/media-ws?epoch=${epoch}`, {
     headers: { Upgrade: "websocket", Cookie: "remembered=1" },
   }), env);
   assert.equal(response, mediaResponse);
-  assert.deepEqual(selected, ["media:media-v1"]);
+  assert.deepEqual(selected, [`media:media-v4:${epoch}`]);
+  // One media Durable Object per epoch: a media socket without an epoch is not routed.
+  const missing = await worker.fetch(new Request("https://playfull-cat.example/media-ws", {
+    headers: { Upgrade: "websocket", Cookie: "remembered=1" },
+  }), env);
+  assert.equal(missing.status, 404);
+  assert.equal(selected.length, 1);
 });
 
 test("lab websocket routing is isolated by canonical run id without changing production rooms", async () => {
@@ -590,59 +597,26 @@ test("lab websocket routing is isolated by canonical run id without changing pro
   const runA = "123e4567-e89b-42d3-a456-426614174000";
   const runB = "123e4567-e89b-42d3-a456-426614174001";
   const epoch = "0123456789abcdef0123456789abcdef";
-  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
+  const compat = "wss-v4-bench2-hevc-tiles-bpip4-v16";
   const browserHeaders = { Upgrade: "websocket", Cookie: "remembered=1" };
   const hostHeaders = { Upgrade: "websocket", Authorization: "Bearer host-only" };
 
   assert.equal(await worker.fetch(new Request(`https://playfull-cat.example/lab-ws?run=${runA}&compat=${compat}`, { headers: browserHeaders }), env), signalResponse);
   assert.equal(await worker.fetch(new Request(`https://playfull-cat.example/lab-host-ws?run=${runA}&compat=${compat}`, { headers: hostHeaders }), env), signalResponse);
-  assert.equal(await worker.fetch(new Request(`https://playfull-cat.example/lab-media-ws?v=2&run=${runA}&compat=${compat}&epoch=${epoch}&stripe=2`, { headers: browserHeaders }), env), mediaResponse);
-  assert.equal(await worker.fetch(new Request(`https://playfull-cat.example/lab-host-media-ws?v=2&run=${runA}&compat=${compat}&epoch=${epoch}&stripe=2`, { headers: hostHeaders }), env), mediaResponse);
+  assert.equal(await worker.fetch(new Request(`https://playfull-cat.example/lab-media-ws?run=${runA}&compat=${compat}&epoch=${epoch}`, { headers: browserHeaders }), env), mediaResponse);
+  assert.equal(await worker.fetch(new Request(`https://playfull-cat.example/lab-host-media-ws?run=${runA}&compat=${compat}&epoch=${epoch}`, { headers: hostHeaders }), env), mediaResponse);
   assert.equal(await worker.fetch(new Request(`https://playfull-cat.example/lab-ws?run=${runB}&compat=${compat}`, { headers: browserHeaders }), env), signalResponse);
 
   assert.deepEqual(selected, [
     `signal:lab-signal-v1:${runA}`,
     `signal:lab-signal-v1:${runA}`,
-    `media:lab-media-v2:${runA}:${epoch}:2`,
-    `media:lab-media-v2:${runA}:${epoch}:2`,
+    `media:lab-media-v4:${runA}:${epoch}`,
+    `media:lab-media-v4:${runA}:${epoch}`,
     `signal:lab-signal-v1:${runB}`,
   ]);
 
   const beforeInvalid = selected.length;
   assert.equal((await worker.fetch(new Request("https://playfull-cat.example/lab-ws?run=not-a-uuid", { headers: browserHeaders }), env)).status, 404);
-  assert.equal((await worker.fetch(new Request(`https://playfull-cat.example/lab-media-ws?v=2&run=${runA}&epoch=bad&stripe=2`, { headers: browserHeaders }), env)).status, 404);
+  assert.equal((await worker.fetch(new Request(`https://playfull-cat.example/lab-media-ws?run=${runA}&compat=${compat}&epoch=bad`, { headers: browserHeaders }), env)).status, 404);
   assert.equal(selected.length, beforeInvalid);
-});
-
-test("media protocol v3 admits bounded lane ids without relaxing v2", async () => {
-  const selected = [];
-  const mediaResponse = new Response("media", { status: 200 });
-  const env = {
-    HOST_GATE_TOKEN: "host-only",
-    GATE: { idFromName: () => "gate", get: () => ({ fetch: async () => new Response(null, { status: 204 }) }) },
-    ROOM: { idFromName: name => name, get: () => ({ fetch: async () => new Response("signal") }) },
-    MEDIA_ROOM: { idFromName: name => { selected.push(name); return name; }, get: () => ({ fetch: async () => mediaResponse }) },
-  };
-  const run = "123e4567-e89b-42d3-a456-426614174000";
-  const epoch = "0123456789abcdef0123456789abcdef";
-  const compat = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
-  const headers = { Upgrade: "websocket", Authorization: "Bearer host-only" };
-
-  const lane15 = await worker.fetch(new Request(
-    `https://playfull-cat.example/lab-host-media-ws?v=3&run=${run}&compat=${compat}&epoch=${epoch}&stripe=15`, { headers }), env);
-  assert.equal(lane15, mediaResponse);
-  const lane0 = await worker.fetch(new Request(
-    `https://playfull-cat.example/lab-host-media-ws?v=3&run=${run}&compat=${compat}&epoch=${epoch}&stripe=0`, { headers }), env);
-  assert.equal(lane0, mediaResponse);
-  assert.deepEqual(selected, [
-    `lab-media-v3:${run}:${epoch}:15`,
-    `lab-media-v3:${run}:${epoch}:0`,
-  ], "v3 lab lanes should preserve stripe-isolated media actors");
-
-  for (const url of [
-    `https://playfull-cat.example/lab-host-media-ws?v=3&run=${run}&compat=${compat}&epoch=${epoch}&stripe=16`,
-    `https://playfull-cat.example/lab-host-media-ws?v=3&run=${run}&compat=${compat}&epoch=${epoch}&stripe=-1`,
-    `https://playfull-cat.example/lab-host-media-ws?v=2&run=${run}&compat=${compat}&epoch=${epoch}&stripe=4`,
-  ]) assert.equal((await worker.fetch(new Request(url, { headers }), env)).status, 404);
-  assert.equal(selected.length, 2);
 });

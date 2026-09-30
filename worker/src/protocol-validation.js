@@ -1,48 +1,10 @@
 import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
 
-export function validWssTopology(topology) {
-  if (!topology || typeof topology !== "object" || Array.isArray(topology)) return false;
-  if (Object.keys(topology).some(key => !["laneCount", "dataShards", "parityShards"].includes(key))) return false;
-  const { laneCount, dataShards, parityShards } = topology;
-  return Number.isInteger(laneCount) && laneCount >= 1 && laneCount <= 16 &&
-    Number.isInteger(dataShards) && dataShards >= 1 && dataShards <= 16 &&
-    Number.isInteger(parityShards) && parityShards >= 0 && parityShards <= 2 &&
-    laneCount === dataShards + parityShards;
-}
-
 export function validCurrentMediaEpoch(epoch, attachment) {
   return typeof epoch === "string" && /^[a-f0-9]{32}$/.test(epoch) && epoch === attachment.mediaEpoch;
 }
 
 function uint32(value) { return Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff; }
-
-export function validMediaAckV3(message, attachment) {
-  if (message.protocol !== 3 || !validCurrentMediaEpoch(message.epoch, attachment) ||
-      !validWssTopology(message.topology) || !Array.isArray(message.lanes) ||
-      message.lanes.length !== message.topology.laneCount || !message.lanes.every(uint32)) return false;
-  if (message.completionMissingByLane !== undefined &&
-      (!Array.isArray(message.completionMissingByLane) ||
-       message.completionMissingByLane.length !== message.topology.laneCount ||
-       !message.completionMissingByLane.every(uint32))) return false;
-  for (const field of ["generation", "reconstructed", "presented", "recoveredFrames", "expiredFrames",
-    "decoderDrops", "dependencyLosses", "deadlineMs", "reassemblyP95Ms"]) if (!uint32(message[field])) return false;
-  return ["healthy", "awaiting-keyframe", "awaiting-keyframe-output"].includes(message.recoveryState);
-}
-
-export function validHostMediaCapabilities(message) {
-  const fields = [message.mediaProtocols, message.maxWssLanes, message.wssFec];
-  if (fields.every(value => value === undefined)) return true;
-  const validFec = Array.isArray(message.wssFec) &&
-    (message.wssFec.length === 2 || message.wssFec.length === 3) &&
-    message.wssFec[0] === "none" && message.wssFec[1] === "xor-1" &&
-    (message.wssFec.length === 2 || message.wssFec[2] === "rs-2");
-  // Protocol 4 (single-socket WSS) is an optional, additive capability.
-  const protocols = message.mediaProtocols;
-  const validProtocols = Array.isArray(protocols) &&
-    (protocols.length === 2 || protocols.length === 3) &&
-    protocols[0] === 2 && protocols[1] === 3 && (protocols.length === 2 || protocols[2] === 4);
-  return validProtocols && message.maxWssLanes === 16 && validFec;
-}
 
 export function validInputStatus(message, role, raw) {
   if (role !== "host" || typeof raw !== "string" || utf8Length(raw) > 1_024 ||
@@ -354,7 +316,6 @@ function validBenchEffective(effective, protocol = 1) {
   const keys = ["transport", "codec", "streamMode", "width", "height", "fps", "bitrateBps", "gopSeconds", "encoder"];
   if (protocol === 2) {
     keys.push("implementationVariant", "experimentId");
-    if (effective?.wssTopology !== undefined) keys.push("wssTopology");
     if (effective?.hybridMode !== undefined) keys.push("hybridMode");
     if (effective?.hybridCacheMode !== undefined) keys.push("hybridCacheMode");
   }
@@ -368,7 +329,6 @@ function validBenchEffective(effective, protocol = 1) {
     boundedInteger(effective.width, 320, 3_840) && boundedInteger(effective.height, 180, 2_160) &&
     boundedInteger(effective.fps, 1, maxFps) && boundedInteger(effective.bitrateBps, ...bitrateBounds) &&
     [1, 2, 4].includes(effective.gopSeconds) && (protocol === 1 || validBenchExperiment(effective)) &&
-    (effective.wssTopology === undefined || (effective.transport === "wss" && validWssTopology(effective.wssTopology))) &&
     validBenchEncoder(effective.encoder, protocol, effective.streamMode) &&
     validBenchPipelineControls(effective, protocol);
 }
@@ -400,12 +360,10 @@ function validBenchPipelineControls(effective, protocol) {
     Number(encoder.resourceMode !== "per-frame" || encoder.asyncDepth !== 0) +
     Number(rateControlMode !== "cbr");
   if (activeAxes === 0) return true;
-  const topology = effective.wssTopology;
   return activeAxes === 1 && effective.implementationVariant === "candidate" &&
     effective.transport === "wss" && effective.streamMode === "work" &&
     effective.width === 1920 && effective.height === 1080 && effective.fps === 30 &&
     boundedInteger(effective.bitrateBps, 500_000, 6_000_000) &&
-    topology?.laneCount === 16 && topology.dataShards === 15 && topology.parityShards === 1 &&
     encoder.main10 === false && (encoder.asyncDepth === 0 || encoder.resourceMode === "persistent");
 }
 

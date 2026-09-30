@@ -1,7 +1,7 @@
 import { finiteOrNull, frameCount } from "./stream-lab-measurement.mjs";
 import { decoderSupportsCodec } from "../public/transport.js";
-import { chooseOptimizationFinalists, summarizeAlignmentFailure, evaluateWssCohortContinuity, evaluateWssCohortProgress, advanceWssCohortAdmission, hybridSceneRequirement, shouldRunQuiescentInteractionTrials, qualityAnchorAlignmentOptions, qualityAnchorLaneDelivery, exactQualityAnchorAlignment, quiescentInteractionReady, quiescentTransitionCommitted, quiescentCursorSweepSettled, quiescentCursorCounterChanges, exactFrameAlignment, performanceFrameTrace, buildTemporalCapturePlan, HYBRID_SCENES } from "./stream-lab-measurement.mjs";
-export { advanceWssCohortAdmission, buildTemporalCapturePlan, chooseOptimizationFinalists, evaluateWssCohortContinuity, evaluateWssCohortProgress, exactFrameAlignment, exactQualityAnchorAlignment, hybridSceneRequirement, performanceFrameTrace, qualityAnchorAlignmentOptions, qualityAnchorLaneDelivery, quiescentCursorCounterChanges, quiescentCursorSweepSettled, quiescentInteractionReady, quiescentTransitionCommitted, shouldRunQuiescentInteractionTrials, summarizeAlignmentFailure } from "./stream-lab-measurement.mjs";
+import { chooseOptimizationFinalists, summarizeAlignmentFailure, evaluateWssCohortContinuity, evaluateWssCohortProgress, advanceWssCohortAdmission, hybridSceneRequirement, shouldRunQuiescentInteractionTrials, qualityAnchorAlignmentOptions, quiescentInteractionReady, quiescentTransitionCommitted, quiescentCursorSweepSettled, quiescentCursorCounterChanges, exactFrameAlignment, performanceFrameTrace, buildTemporalCapturePlan, HYBRID_SCENES } from "./stream-lab-measurement.mjs";
+export { advanceWssCohortAdmission, buildTemporalCapturePlan, chooseOptimizationFinalists, evaluateWssCohortContinuity, evaluateWssCohortProgress, exactFrameAlignment, hybridSceneRequirement, performanceFrameTrace, qualityAnchorAlignmentOptions, quiescentCursorCounterChanges, quiescentCursorSweepSettled, quiescentInteractionReady, quiescentTransitionCommitted, shouldRunQuiescentInteractionTrials, summarizeAlignmentFailure } from "./stream-lab-measurement.mjs";
 import { runCheckpointedUnit, runFreshCheckpoint, SerializedLeaseHeartbeat, installTerminationCleanup, interruptedCampaignState, StreamLabUnavailable } from "./stream-lab-lifecycle.mjs";
 export { runCheckpointedUnit, runFreshCheckpoint, SerializedLeaseHeartbeat, installTerminationCleanup, interruptedCampaignState, StreamLabUnavailable } from "./stream-lab-lifecycle.mjs";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -198,9 +198,7 @@ export function classifySilentDdaFailure(
   state, diagnostics, expectedSource, currentSource, elapsedMs,
 ) {
   const media = diagnostics?.wssMedia;
-  const topology = media?.topology;
   const bench = diagnostics?.benchStatus;
-  const ack = media?.acknowledgements;
   const sourceFrameDelta = Number(currentSource?.frameId) - Number(expectedSource?.frameId);
   const stalled = elapsedMs >= 1_250 &&
     state?.rendered === true && state?.routeOkay === true && state?.decoderOkay === true &&
@@ -208,56 +206,26 @@ export function classifySilentDdaFailure(
     currentSource?.paused === false && Number.isFinite(sourceFrameDelta) && sourceFrameDelta > 0 &&
     Number(diagnostics?.renderedAgeMs) >= 1_000 &&
     Number(media?.receivedPackets) > 0 && Number(media?.presented) > 0 &&
-    Number.isInteger(media?.openLanes) && Number.isInteger(topology?.laneCount) &&
-    media.openLanes === topology.laneCount && Number(media?.dependencyLosses) === 0 &&
+    media?.v4?.socketOpen === true &&
     Number(media?.packetRejects?.total) === 0 &&
     Number(bench?.encodeCount) === 0 && Number(bench?.encodedBytes) === 0 &&
     Number(bench?.wssPayloadBytes) === 0;
   if (!stalled) return null;
-  const highestSequenceByLane = media?.highestSequenceByLane;
-  const firstRecoveryFrameOnly = Number(media?.reconstructed) === 1 &&
-    Number(media?.presented) === 1 && Number(media?.receivedPackets) === Number(topology?.laneCount) &&
-    Array.isArray(highestSequenceByLane) && highestSequenceByLane.length === Number(topology?.laneCount) &&
-    highestSequenceByLane.every(sequence => Number(sequence) <= 1);
-  if (firstRecoveryFrameOnly) {
-    const acknowledgements = ack ? {
-      attempts: Number(ack.attempts),
-      sent: Number(ack.sent),
-      failed: Number(ack.failed),
-      last: ack.last ?? null,
-    } : null;
-    const ackDisposition = !ack ? "uninstrumented" : Number(ack.attempts) === 0 ? "not-attempted" :
-      Number(ack.sent) === 0 && Number(ack.failed) > 0 ? "send-failed" :
-      Number(ack.sent) > 0 ? "sent-unconfirmed" : "unknown";
-    return {
-      code: "wss-recovery-ack-stalled",
-      sourceFrameDelta,
-      renderedAgeMs: Number(diagnostics.renderedAgeMs),
-      openLanes: Number(media.openLanes),
-      receivedPackets: Number(media.receivedPackets),
-      reconstructed: Number(media.reconstructed),
-      presented: Number(media.presented),
-      ackDisposition,
-      acknowledgements,
-    };
-  }
   return {
     code: "dda-session-stalled",
     sourceFrameDelta,
     renderedAgeMs: Number(diagnostics.renderedAgeMs),
-    openLanes: Number(media.openLanes),
+    mediaSocketOpen: true,
     receivedPackets: Number(media.receivedPackets),
   };
 }
 
 export function shouldRetryQualityFrameMatch(snapshot, elapsedMs, retryCount) {
   const media = snapshot?.wssMedia;
-  const topology = media?.topology;
   return retryCount === 0 && elapsedMs >= 750 &&
     snapshot?.route === "wss" && snapshot?.signaling?.registered === true &&
     Number(media?.receivedBytes) > 0 && media?.recoveryState === "healthy" &&
-    Number.isInteger(media?.openLanes) && Number.isInteger(topology?.dataShards) &&
-    media.openLanes >= topology.dataShards;
+    media?.v4?.socketOpen === true;
 }
 
 export function candidateStartupRejection(error, configuration, bandwidthMbps) {
@@ -450,14 +418,12 @@ export function normalizeReceiverOptions(options = {}, current = {}) {
     relay: options.relay !== false,
     adaptive: options.adaptive === true,
     decoderPath: normalizeDecoderPath(options.decoderPath ?? current.decoderPath),
-    ...(options.wssTopology ? { wssTopology: { ...options.wssTopology } } : {}),
   };
 }
 
 export function sameReceiverOptions(a = {}, b = {}) {
   return a.relay === b.relay && a.adaptive === b.adaptive &&
-    normalizeDecoderPath(a.decoderPath) === normalizeDecoderPath(b.decoderPath) &&
-    JSON.stringify(a.wssTopology ?? null) === JSON.stringify(b.wssTopology ?? null);
+    normalizeDecoderPath(a.decoderPath) === normalizeDecoderPath(b.decoderPath);
 }
 
 export function buildReceiverUrl(baseUrl, transport, options = {}) {
@@ -474,27 +440,6 @@ export function buildReceiverUrl(baseUrl, transport, options = {}) {
   if (options.labRun) {
     url.searchParams.set("labRun", options.labRun);
     url.searchParams.set("labCompat", STREAM_LAB_COMPATIBILITY.id);
-  }
-  // Explicit lab opt-in to the single-socket v4 protocol. v4 has no lane
-  // topology and no host/edge packet traces, so the v3 default is skipped.
-  if (options.mediaProtocol !== undefined) {
-    if (options.mediaProtocol !== 4 || !options.labRun || transport !== "wss" || options.wssTopology !== undefined)
-      throw new RangeError("Stream Lab media protocol 4 requires a WSS lab run without a topology");
-    url.searchParams.set("wssProtocol", "4");
-    return url;
-  }
-  // Lab packets require protocol-v3 host/edge traces. Pin the lab default so
-  // a slow host reconnect cannot make capability discovery fall back to v2.
-  const topology = options.wssTopology === undefined && options.labRun && transport === "wss"
-    ? productionProbeTopology() : options.wssTopology;
-  if (topology !== undefined) {
-    const valid = topology && Number.isInteger(topology.laneCount) && topology.laneCount >= 1 && topology.laneCount <= 16 &&
-      Number.isInteger(topology.dataShards) && topology.dataShards >= 1 &&
-      Number.isInteger(topology.parityShards) && topology.parityShards >= 0 && topology.parityShards <= 2 &&
-      topology.laneCount === topology.dataShards + topology.parityShards;
-    if (!valid || !options.labRun || transport !== "wss") throw new RangeError("invalid Stream Lab WSS topology");
-    url.searchParams.set("wssLanes", String(topology.laneCount));
-    url.searchParams.set("wssParity", String(topology.parityShards));
   }
   if (transport === "webrtc" && options.relay !== false) url.searchParams.set("ice", "relay");
   return url;
@@ -563,273 +508,6 @@ export function receiverBootstrapUrl(targetUrl, options = {}) {
   return options.workerVersionOverride || options.receiverAssetOverride
     ? "about:blank"
     : String(targetUrl);
-}
-
-function productionProbeTopology(options = {}) {
-  const topology = options.wssTopology ?? { laneCount: 16, dataShards: 15, parityShards: 1 };
-  if (!Number.isInteger(topology?.laneCount) || topology.laneCount < 1 || topology.laneCount > 16 ||
-      !Number.isInteger(topology?.dataShards) || topology.dataShards < 1 ||
-      !Number.isInteger(topology?.parityShards) || topology.parityShards < 0 || topology.parityShards > 2 ||
-      topology.laneCount !== topology.dataShards + topology.parityShards) {
-    throw new RangeError("production probe WSS topology is invalid");
-  }
-  return { laneCount: topology.laneCount, dataShards: topology.dataShards, parityShards: topology.parityShards };
-}
-
-export function buildProductionProbeUrl(baseUrl = DEFAULT_URL, options = {}) {
-  const url = new URL(baseUrl);
-  if (!["https:", "http:"].includes(url.protocol))
-    throw new RangeError("production probe URL must use HTTP or HTTPS");
-  url.pathname = "/";
-  url.search = "";
-  url.searchParams.set("diag", "1");
-  if (options.wssTopology) {
-    const labRun = String(options.labRun || "");
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(labRun))
-      throw new RangeError("a canonical lab run UUID is required for a production topology probe");
-    const topology = productionProbeTopology(options);
-    url.searchParams.set("labRun", labRun);
-    url.searchParams.set("wssLanes", String(topology.laneCount));
-    url.searchParams.set("wssParity", String(topology.parityShards));
-  }
-  url.hash = '';
-  return url;
-}
-
-export function summarizeProductionProbe(samples, options = {}) {
-  const ordered = [...(Array.isArray(samples) ? samples : [])]
-    .filter(sample => Number.isFinite(sample?.atMs))
-    .sort((a, b) => a.atMs - b.atMs);
-  const requiredTopology = Object.freeze(productionProbeTopology(options));
-  const topologyMatches = sample => sample?.protocol === 3 &&
-    sample?.topology?.laneCount === requiredTopology.laneCount &&
-    sample?.topology?.dataShards === requiredTopology.dataShards &&
-    sample?.topology?.parityShards === requiredTopology.parityShards;
-  const capabilitiesMatch = sample => sample?.hostCapabilitiesCurrent === true &&
-    Array.isArray(sample?.hostCapabilities?.mediaProtocols) &&
-    sample.hostCapabilities.mediaProtocols.includes(3) &&
-    Number(sample.hostCapabilities.maxWssLanes) >= requiredTopology.laneCount &&
-    Array.isArray(sample.hostCapabilities.wssFec) &&
-    sample.hostCapabilities.wssFec.includes("xor-1");
-  const laneSequencesCurrent = sample => topologyMatches(sample) &&
-    Array.isArray(sample?.highestSequenceByLane) &&
-    sample.highestSequenceByLane.length === requiredTopology.laneCount &&
-    sample.highestSequenceByLane.every(sequence => Number(sequence) > 0);
-  const admittedSample = ordered.find(sample =>
-    sample.signalingRegistered === true && capabilitiesMatch(sample) && topologyMatches(sample) &&
-    sample.topologyAccepted === true && Number(sample.openLanes) === requiredTopology.laneCount &&
-    laneSequencesCurrent(sample) && Number(sample.receivedPackets) > 0 &&
-    Number(sample.reconstructed) > 0 && Number(sample.presented) > 0);
-  const admissionReasons = [];
-  if (ordered.length && !ordered.some(sample => sample.signalingRegistered === true))
-    admissionReasons.push("signaling-not-registered");
-  if (ordered.length && !ordered.some(sample => sample.hostCapabilitiesCurrent === true))
-    admissionReasons.push("host-capabilities-not-current");
-  if (ordered.length && !ordered.some(capabilitiesMatch)) admissionReasons.push("host-capability-mismatch");
-  if (ordered.length && !ordered.some(topologyMatches)) admissionReasons.push("topology-mismatch");
-  if (ordered.length && !ordered.some(sample => topologyMatches(sample) && sample.topologyAccepted === true))
-    admissionReasons.push("topology-not-accepted");
-  if (ordered.length && !ordered.some(sample => topologyMatches(sample) &&
-      Number(sample.openLanes) === requiredTopology.laneCount)) admissionReasons.push("lanes-not-open");
-  if (ordered.length && !ordered.some(laneSequencesCurrent)) admissionReasons.push("lane-sequences-missing");
-  if (ordered.length && !ordered.some(sample => Number(sample.receivedPackets) > 0))
-    admissionReasons.push("no-media-packets");
-  if (ordered.length && !ordered.some(sample => Number(sample.reconstructed) > 0))
-    admissionReasons.push("no-reconstructed-frames");
-  if (ordered.length && !ordered.some(sample => Number(sample.presented) > 0))
-    admissionReasons.push("no-presented-frames");
-  if (ordered.length && !admittedSample && admissionReasons.length === 0)
-    admissionReasons.push("no-coherent-admission-sample");
-  const stallThresholdMs = Number.isFinite(options.stallThresholdMs)
-    ? Math.max(1, options.stallThresholdMs)
-    : 1_000;
-  const presentationStalls = [];
-  let progress = ordered[0] ?? null;
-  for (const sample of ordered.slice(1)) {
-    const presented = Number(sample.presented);
-    const previousPresented = Number(progress?.presented);
-    const advanced = Number.isFinite(presented) &&
-      (!Number.isFinite(previousPresented) || presented > previousPresented);
-    if (!advanced) continue;
-    const durationMs = sample.atMs - progress.atMs;
-    const receivedPacketsDelta = Math.max(0,
-      (Number(sample.receivedPackets) || 0) - (Number(progress.receivedPackets) || 0));
-    if (durationMs >= stallThresholdMs && receivedPacketsDelta > 0) {
-      presentationStalls.push({
-        startedAtMs: progress.atMs,
-        endedAtMs: sample.atMs,
-        durationMs,
-        receivedPacketsDelta,
-        recovered: true,
-      });
-    }
-    progress = sample;
-  }
-  const last = ordered.at(-1);
-  if (progress && last && last !== progress) {
-    const durationMs = last.atMs - progress.atMs;
-    const receivedPacketsDelta = Math.max(0,
-      (Number(last.receivedPackets) || 0) - (Number(progress.receivedPackets) || 0));
-    if (durationMs >= stallThresholdMs && receivedPacketsDelta > 0) {
-      presentationStalls.push({
-        startedAtMs: progress.atMs,
-        endedAtMs: last.atMs,
-        durationMs,
-        receivedPacketsDelta,
-        recovered: false,
-      });
-    }
-  }
-  return {
-    schemaVersion: 1,
-    result: !ordered.length ? "unavailable" : admittedSample ? "complete" : "fail",
-    inputAutomation: false,
-    candidateHostStarted: false,
-    sampleCount: ordered.length,
-    durationMs: ordered.length > 1 ? ordered.at(-1).atMs - ordered[0].atMs : 0,
-    admission: {
-      admitted: Boolean(admittedSample),
-      atMs: admittedSample?.atMs ?? null,
-      requiredTopology,
-      reasons: admissionReasons,
-    },
-    ...(!ordered.length || admittedSample ? {} : {
-      error: {
-        code: "production-probe-admission-failed",
-        message: "The production receiver never admitted the installed host media stream.",
-        detail: { reasons: admissionReasons },
-      },
-    }),
-    presentationStalls,
-  };
-}
-
-export async function runProductionProbe(options = {}) {
-  const env = options.env ?? process.env;
-  const chrome = options.chrome || findChrome(env);
-  if (!chrome) throw new StreamLabUnavailable("chromium-missing", "Chrome or Edge was not found.");
-  const durationMs = Math.max(1_000, Number(options.durationMs) || 180_000);
-  const intervalMs = Math.max(100, Number(options.intervalMs) || 250);
-  const authTimeoutMs = Math.max(1_000, Number(options.authTimeoutMs) || 30_000);
-  const port = Number(options.port) || 19343;
-  const url = buildProductionProbeUrl(options.baseUrl || env.BUBBLEPLAY_URL || DEFAULT_URL, {
-    labRun: options.runId,
-    wssTopology: options.wssTopology,
-  });
-  const profile = options.profile || persistentReceiverProfile(env);
-  const store = options.store ?? null;
-  const child = launchChrome(chrome,
-    buildReceiverChromeArgs(profile, port, url.href, { startMinimized: true }));
-  let page = null;
-  const samples = [];
-  try {
-    page = await new CdpPage(port).open();
-    await page.call("Emulation.setDeviceMetricsOverride",
-      { width: 1920, height: 1080, deviceScaleFactor: 1, mobile: false });
-    const authDeadline = Date.now() + authTimeoutMs;
-    let readiness = null;
-    while (Date.now() < authDeadline) {
-      readiness = await page.evaluate(`(() => ({
-        href: location.href,
-        diagnostics: typeof window.__bubbleplayDiagnostics?.snapshot === "function",
-        snapshot: window.__bubbleplayDiagnostics?.snapshot?.() ?? null,
-      }))()`);
-      if (readiness?.diagnostics) break;
-      await sleep(200);
-    }
-    if (!readiness?.diagnostics) {
-      throw new StreamLabUnavailable("production-probe-authentication",
-        "The saved Stream Lab browser profile did not reach the BubblePlay receiver.", readiness);
-    }
-    const startedAtMs = Date.now();
-    const deadline = startedAtMs + durationMs;
-    while (Date.now() <= deadline) {
-      const captured = await page.evaluate(`(() => {
-        const snapshot = window.__bubbleplayDiagnostics?.snapshot?.() ?? null;
-        const base = document.getElementById("screen");
-        const sharp = document.getElementById("sharp-screen");
-        const source = sharp?.classList.contains("active") ? sharp : base;
-        let visual = null;
-        if (source?.width > 0 && source?.height > 0) {
-          try {
-            const sample = document.createElement("canvas");
-            sample.width = 96;
-            sample.height = 54;
-            const context = sample.getContext("2d", { willReadFrequently: true });
-            context.drawImage(source, 0, 0, sample.width, sample.height);
-            const pixels = context.getImageData(0, 0, sample.width, sample.height).data;
-            let lumaTotal = 0;
-            let edgeTotal = 0;
-            let checksum = 2166136261;
-            let previous = 0;
-            for (let index = 0; index < pixels.length; index += 4) {
-              const luma = (pixels[index] * 54 + pixels[index + 1] * 183 + pixels[index + 2] * 19) >> 8;
-              lumaTotal += luma;
-              if (index > 0) edgeTotal += Math.abs(luma - previous);
-              previous = luma;
-              checksum = Math.imul(checksum ^ luma, 16777619) >>> 0;
-            }
-            const count = pixels.length / 4;
-            visual = {
-              source: source === sharp ? "sharp" : "base",
-              width: source.width,
-              height: source.height,
-              meanLuma: lumaTotal / count,
-              edgeEnergy: edgeTotal / Math.max(1, count - 1),
-              checksum,
-            };
-          } catch (error) {
-            visual = { error: String(error?.message || error).slice(0, 160) };
-          }
-        }
-        return { snapshot, visual };
-      })()`);
-      const snapshot = captured?.snapshot ?? null;
-      const sample = {
-        at: new Date().toISOString(),
-        atMs: Date.now() - startedAtMs,
-        presented: Number(snapshot?.wssMedia?.presented),
-        reconstructed: Number(snapshot?.wssMedia?.reconstructed),
-        receivedPackets: Number(snapshot?.wssMedia?.receivedPackets),
-        receivedBytes: Number(snapshot?.wssMedia?.receivedBytes),
-        signalingRegistered: snapshot?.signaling?.registered === true,
-        hostCapabilitiesCurrent: snapshot?.hostCapabilities?.current === true,
-        hostCapabilities: snapshot?.hostCapabilities ?? null,
-        protocol: Number(snapshot?.wssMedia?.protocol),
-        topology: snapshot?.wssMedia?.topology ?? null,
-        topologyAccepted: snapshot?.wssMedia?.topologyAccepted === true,
-        openLanes: Number(snapshot?.wssMedia?.openLanes),
-        highestSequenceByLane: Array.isArray(snapshot?.wssMedia?.highestSequenceByLane) ?
-          [...snapshot.wssMedia.highestSequenceByLane] : null,
-        route: snapshot?.route ?? null,
-        decoder: snapshot?.dec ?? null,
-        renderedAgeMs: snapshot?.renderedAgeMs ?? null,
-        recoveryState: snapshot?.wssMedia?.recoveryState ?? null,
-        expiredFrames: Number(snapshot?.wssMedia?.expiredFrames) || 0,
-        recoveredFrames: Number(snapshot?.wssMedia?.recoveredFrames) || 0,
-        dependencyLosses: Number(snapshot?.wssMedia?.dependencyLosses) || 0,
-        resyncs: Number(snapshot?.resyncs) || 0,
-        dropped: Number(snapshot?.dropped) || 0,
-        keyframes: Number(snapshot?.keyframes) || 0,
-        visual: captured?.visual ?? null,
-        diagnostics: snapshot,
-      };
-      samples.push(sample);
-      store?.appendTelemetry?.({ phase: "production-probe", ...sample });
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) break;
-      await sleep(Math.min(intervalMs, remainingMs));
-    }
-    return {
-      ...summarizeProductionProbe(samples, options),
-      url: `${url.origin}/`,
-      diagnosticReceiverUrlRequiredFromUser: false,
-      samples,
-    };
-  } finally {
-    await shutdownChrome(page, child).catch(() => undefined);
-    page?.close();
-  }
 }
 
 export function receiverAuthenticationReady(state, runId) {
@@ -1049,11 +727,10 @@ export function effectiveEncoderBitrateMbps(requestedMbps, bandwidthMbps, transp
   return Math.min(requestedMbps, Math.floor(bandwidthMbps * headroom * 10) / 10);
 }
 
-export function initialEncoderTargetMbps(requestedMbps, bandwidthMbps, topology = { laneCount: 4, dataShards: 3, parityShards: 1 }) {
+export function initialEncoderTargetMbps(requestedMbps, bandwidthMbps) {
   if (!Number.isFinite(bandwidthMbps)) return requestedMbps;
   if (bandwidthMbps >= requestedMbps) return requestedMbps;
-  const expansion = topology.laneCount / topology.dataShards;
-  return clampBitrate(Math.min(requestedMbps, bandwidthMbps / (expansion * 1.35)));
+  return clampBitrate(Math.min(requestedMbps, bandwidthMbps / 1.35));
 }
 
 export function nextStabilizedBitrateMbps(currentMbps, offeredWireMbps, bandwidthMbps) {
@@ -1120,8 +797,7 @@ export function benchmarkProfile(candidate, transport = "wss") {
     Object.hasOwn(candidate, "dirtyQpMap") || Object.hasOwn(candidate, "main10") ||
     Object.hasOwn(candidate, "roiMode") || Object.hasOwn(candidate, "resourceMode") ||
     Object.hasOwn(candidate, "asyncDepth") || Object.hasOwn(candidate, "hybridMode") ||
-    Object.hasOwn(candidate, "hybridCacheMode") || Object.hasOwn(candidate, "rateControlMode") ||
-    Object.hasOwn(candidate, "wssTopology");
+    Object.hasOwn(candidate, "hybridCacheMode") || Object.hasOwn(candidate, "rateControlMode");
   if (v2) return benchmarkProfileV2(candidate, transport, streamMode);
   return {
     schemaVersion: 1,
@@ -1204,29 +880,17 @@ function benchmarkProfileV2(candidate, transport, streamMode) {
   if (!Number.isFinite(totalMediaCapMbps) || totalMediaCapMbps < 0.5 || totalMediaCapMbps > 12)
     throw new RangeError("totalMediaCapMbps must be from 0.5 to 12");
   if (![1, 2, 4].includes(gopSeconds)) throw new RangeError("gopSeconds must be 1, 2, or 4");
-  let wssTopology;
-  if (candidate.wssTopology !== undefined) {
-    const topology = candidate.wssTopology;
-    if (transport !== "wss" || !topology || !Number.isInteger(topology.laneCount) || topology.laneCount < 1 || topology.laneCount > 16 ||
-        !Number.isInteger(topology.dataShards) || topology.dataShards < 1 ||
-        !Number.isInteger(topology.parityShards) || topology.parityShards < 0 || topology.parityShards > 2 ||
-        topology.laneCount !== topology.dataShards + topology.parityShards)
-      throw new RangeError("invalid benchmark WSS topology");
-    wssTopology = { laneCount: topology.laneCount, dataShards: topology.dataShards, parityShards: topology.parityShards };
-  }
   const roiActive = roiMode !== "off";
   const hybridActive = hybridMode !== "off";
   const resourceActive = resourceMode !== "per-frame" || asyncDepth !== 0;
   const rateControlActive = rateControlMode !== "cbr";
   const activeAxes = Number(roiActive) + Number(hybridActive) + Number(resourceActive) + Number(rateControlActive);
   if (activeAxes > 0) {
-    const topologyIsControl = wssTopology?.laneCount === 16 && wssTopology.dataShards === 15 &&
-      wssTopology.parityShards === 1;
     if (activeAxes !== 1 || implementationVariant !== "candidate" || transport !== "wss" ||
         streamMode !== "work" || (candidate.fps ?? 30) !== 30 || requestedBitrateMbps !== 6 ||
         totalMediaCapMbps !== 6 || bitrateMbps > requestedBitrateMbps || bitrateMbps > totalMediaCapMbps ||
-        !topologyIsControl || main10 || (asyncDepth === 1 && resourceMode !== "persistent"))
-      throw new RangeError("pipeline experiment controls require one candidate axis on the 1080p30 6 Mbps 15+1 WSS control");
+        main10 || (asyncDepth === 1 && resourceMode !== "persistent"))
+      throw new RangeError("pipeline experiment controls require one candidate axis on the 1080p30 6 Mbps WSS control");
   }
   if (main10 && activeAxes > 0)
     throw new RangeError("Main10 combinations are deferred until a pipeline experiment wins");
@@ -1247,7 +911,6 @@ function benchmarkProfileV2(candidate, transport, streamMode) {
     ...(candidate.totalMediaCapMbps !== undefined
       ? { totalMediaCapBps: Math.round(totalMediaCapMbps * 1_000_000) } : {}),
     gopSeconds,
-    ...(wssTopology ? { wssTopology } : {}),
     hybridMode,
     hybridCacheMode,
     encoder: {
@@ -1280,77 +943,6 @@ export function benchStatusConfirmsApply(previous, current, expected, runId) {
   if (!previous) return true;
   if (!Number.isSafeInteger(previous.profileRevision)) return false;
   return current.profileRevision > previous.profileRevision;
-}
-
-function wssLaneCounterDelta(first, last, field, laneCount) {
-  const before = first?.wssMedia?.[field];
-  const after = last?.wssMedia?.[field];
-  if (!Array.isArray(before) || !Array.isArray(after) ||
-      before.length !== laneCount || after.length !== laneCount) return null;
-  const delta = after.map((value, lane) => Number(value) - Number(before[lane]));
-  return delta.every(value => Number.isFinite(value) && value >= 0) ? delta : null;
-}
-
-function summarizeWssSequenceLag(samples, laneCount) {
-  const rows = [];
-  for (const sample of samples) {
-    const sequences = sample?.wssMedia?.highestSequenceByLane;
-    if (!Array.isArray(sequences) || sequences.length !== laneCount ||
-        !sequences.every(value => Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff)) continue;
-    const highest = Math.max(...sequences);
-    const lowest = Math.min(...sequences);
-    // A short benchmark cannot legitimately span half the u32 sequence space.
-    // Treat that spread as wrap ambiguity instead of manufacturing huge lag.
-    if (highest - lowest >= 0x8000_0000) continue;
-    rows.push(sequences.map(sequence => highest - sequence));
-  }
-  if (!rows.length) return null;
-  const byLane = Array.from({ length: laneCount }, (_, lane) => rows.map(row => row[lane]));
-  return {
-    sequenceLagSampleCount: rows.length,
-    sequenceLagMeanByLane: byLane.map(values =>
-      values.reduce((sum, value) => sum + value, 0) / values.length),
-    sequenceLagP95ByLane: byLane.map(values => percentile(values, 0.95)),
-    sequenceLagMaxByLane: byLane.map(values => Math.max(...values)),
-    sequenceLagPositiveShareByLane: byLane.map(values =>
-      values.filter(value => value > 0).length / values.length),
-  };
-}
-
-function summarizeWssLaneTelemetry(first, last, samples = [first, last]) {
-  const topology = last?.wssMedia?.topology;
-  if (first?.wssMedia?.protocol !== 3 || last?.wssMedia?.protocol !== 3 ||
-      !topology || !Number.isInteger(topology.laneCount) || topology.laneCount < 1 ||
-      topology.laneCount !== Number(topology.dataShards) + Number(topology.parityShards) ||
-      JSON.stringify(first.wssMedia.topology) !== JSON.stringify(topology)) return null;
-  const reconstructedFrames = Number(last.wssMedia.reconstructed) - Number(first.wssMedia.reconstructed);
-  const parityRecoveredFrames = Number(last.wssMedia.recoveredFrames) - Number(first.wssMedia.recoveredFrames);
-  if (!Number.isFinite(reconstructedFrames) || reconstructedFrames <= 0 ||
-      !Number.isFinite(parityRecoveredFrames) || parityRecoveredFrames < 0) return null;
-  const completionMissingByLane =
-    wssLaneCounterDelta(first, last, "completionMissingByLane", topology.laneCount);
-  const lateShardCountByLane =
-    wssLaneCounterDelta(first, last, "lateShardCountByLane", topology.laneCount);
-  const lateShardDelayMsTotalByLane =
-    wssLaneCounterDelta(first, last, "lateShardDelayMsTotalByLane", topology.laneCount);
-  if (!completionMissingByLane || !lateShardCountByLane || !lateShardDelayMsTotalByLane) return null;
-  return {
-    topology: {
-      laneCount: topology.laneCount,
-      dataShards: topology.dataShards,
-      parityShards: topology.parityShards,
-    },
-    reconstructedFrames,
-    parityRecoveredFrames,
-    parityRecoveryRatio: parityRecoveredFrames / reconstructedFrames,
-    ...(summarizeWssSequenceLag(samples, topology.laneCount) ?? {}),
-    completionMissingByLane,
-    completionShareByLane: completionMissingByLane.map(count => count / reconstructedFrames),
-    lateShardCountByLane,
-    lateShardDelayMsTotalByLane,
-    lateShardDelayMsMeanByLane: lateShardCountByLane.map((count, lane) =>
-      count ? lateShardDelayMsTotalByLane[lane] / count : null),
-  };
 }
 
 export function summarizePerformance(samples, context = {}) {
@@ -1416,55 +1008,9 @@ export function summarizePerformance(samples, context = {}) {
   const stageDuration = (start, end) => stageTraces
     .map(trace => Number(end(trace)) - Number(start(trace)))
     .filter(value => Number.isFinite(value) && value >= 0);
-  const sourceToFirstShard = stageTraces
-    .map(trace => Number(trace.network?.sourceToFirstShardMs))
-    .filter(value => Number.isFinite(value) && value >= 0);
-  const sourceToHostEgress = stageTraces
-    .map(trace => Number(trace.network?.sourceToHostEgressMs))
-    .filter(value => Number.isFinite(value) && value >= 0);
-  const hostEgressToEdge = stageTraces
-    .map(trace => Number(trace.network?.hostEgressToEdgeMs))
-    .filter(value => Number.isFinite(value) && value >= 0);
-  const hostEgressToFirstShard = stageTraces
-    .map(trace => Number(trace.network?.hostEgressToFirstShardMs))
-    .filter(value => Number.isFinite(value) && value >= 0);
-  const sourceToEdge = stageTraces
-    .map(trace => Number(trace.network?.sourceToEdgeMs))
-    .filter(value => Number.isFinite(value) && value >= 0);
-  const edgeToFirstShard = stageTraces
-    .map(trace => Number(trace.network?.edgeToFirstShardMs))
-    .filter(value => Number.isFinite(value) && value >= 0);
   const sourceToPresented = stageTraces
     .map(trace => Number(trace.presentation?.sourceToPresentedMs))
     .filter(value => Number.isFinite(value) && value >= 0);
-  const networkAssembly = stageDuration(
-    trace => trace.network?.firstShardAtMs,
-    trace => trace.network?.reconstructedAtMs,
-  );
-  const browserFirstShardQueue = stageTraces
-    .map(trace => Number(trace.network?.firstShardQueueDelayMs))
-    .filter(value => Number.isFinite(value) && value >= 0);
-  const browserCompletingShardQueue = stageTraces
-    .map(trace => Number(trace.network?.completingShardQueueDelayMs))
-    .filter(value => Number.isFinite(value) && value >= 0);
-  const browserEventQueue = [...browserFirstShardQueue, ...browserCompletingShardQueue];
-  const shapedBandwidthMbps = Number(context.bandwidthMbps);
-  const dataShards = Number(last.wssMedia?.topology?.dataShards);
-  const networkSerialization = [];
-  const networkAssemblyResidual = [];
-  if (Number.isFinite(shapedBandwidthMbps) && shapedBandwidthMbps > 0 &&
-      Number.isInteger(dataShards) && dataShards > 0) {
-    for (const trace of stageTraces) {
-      const assemblyMs = Number(trace.network?.reconstructedAtMs) - Number(trace.network?.firstShardAtMs);
-      const encodedFrameBytes = Number(trace.encode?.encodedBytes);
-      if (!Number.isFinite(assemblyMs) || assemblyMs < 0 ||
-          !Number.isFinite(encodedFrameBytes) || encodedFrameBytes <= 0) continue;
-      const remainingQuorumBytes = Math.ceil(encodedFrameBytes / dataShards) * Math.max(0, dataShards - 1);
-      const serializationMs = remainingQuorumBytes * 8 / shapedBandwidthMbps / 1_000;
-      networkSerialization.push(serializationMs);
-      networkAssemblyResidual.push(assemblyMs - serializationMs);
-    }
-  }
   const decode = stageDuration(
     trace => trace.decode?.queuedAtMs,
     trace => trace.decode?.decodedAtMs,
@@ -1473,8 +1019,8 @@ export function summarizePerformance(samples, context = {}) {
     trace => trace.decode?.decodedAtMs,
     trace => trace.presentation?.presentedAtMs,
   );
-  const shardToPresent = stageDuration(
-    trace => trace.network?.firstShardAtMs,
+  const receiveToPresent = stageDuration(
+    trace => trace.network?.receivedAtMs,
     trace => trace.presentation?.presentedAtMs,
   );
   const hostDurationSeconds = bench.windowDurationMs > 0 ? bench.windowDurationMs / 1000 : durationSeconds;
@@ -1494,40 +1040,15 @@ export function summarizePerformance(samples, context = {}) {
     latencyP95Ms: percentile(latency, 0.95),
     latencyP50Ms: percentile(latency, 0.50),
     performanceTraceSamples: stageTraces.length,
-    sourceToFirstShardP50Ms: percentile(sourceToFirstShard, 0.50),
-    sourceToFirstShardP95Ms: percentile(sourceToFirstShard, 0.95),
-    sourceToHostEgressP50Ms: percentile(sourceToHostEgress, 0.50),
-    sourceToHostEgressP95Ms: percentile(sourceToHostEgress, 0.95),
-    hostEgressToEdgeP50Ms: percentile(hostEgressToEdge, 0.50),
-    hostEgressToEdgeP95Ms: percentile(hostEgressToEdge, 0.95),
-    hostEgressToFirstShardP50Ms: percentile(hostEgressToFirstShard, 0.50),
-    hostEgressToFirstShardP95Ms: percentile(hostEgressToFirstShard, 0.95),
-    sourceToEdgeP50Ms: percentile(sourceToEdge, 0.50),
-    sourceToEdgeP95Ms: percentile(sourceToEdge, 0.95),
-    edgeToFirstShardP50Ms: percentile(edgeToFirstShard, 0.50),
-    edgeToFirstShardP95Ms: percentile(edgeToFirstShard, 0.95),
     sourceToPresentedP50Ms: percentile(sourceToPresented, 0.50),
     sourceToPresentedP95Ms: percentile(sourceToPresented, 0.95),
-    networkAssemblyP50Ms: percentile(networkAssembly, 0.50),
-    networkAssemblyP95Ms: percentile(networkAssembly, 0.95),
-    networkSerializationEstimateP50Ms: percentile(networkSerialization, 0.50),
-    networkSerializationEstimateP95Ms: percentile(networkSerialization, 0.95),
-    networkAssemblyResidualP50Ms: percentile(networkAssemblyResidual, 0.50),
-    networkAssemblyResidualP95Ms: percentile(networkAssemblyResidual, 0.95),
-    browserEventQueueDelayP50Ms: percentile(browserEventQueue, 0.50),
-    browserEventQueueDelayP95Ms: percentile(browserEventQueue, 0.95),
-    browserFirstShardQueueP50Ms: percentile(browserFirstShardQueue, 0.50),
-    browserFirstShardQueueP95Ms: percentile(browserFirstShardQueue, 0.95),
-    browserCompletingShardQueueP50Ms: percentile(browserCompletingShardQueue, 0.50),
-    browserCompletingShardQueueP95Ms: percentile(browserCompletingShardQueue, 0.95),
     decodeP50Ms: percentile(decode, 0.50),
     decodeP95Ms: percentile(decode, 0.95),
     presentationP50Ms: percentile(presentation, 0.50),
     presentationP95Ms: percentile(presentation, 0.95),
     wssPresentation,
-    shardToPresentP50Ms: percentile(shardToPresent, 0.50),
-    shardToPresentP95Ms: percentile(shardToPresent, 0.95),
-    wssLaneTelemetry: summarizeWssLaneTelemetry(first, last, samples),
+    receiveToPresentP50Ms: percentile(receiveToPresent, 0.50),
+    receiveToPresentP95Ms: percentile(receiveToPresent, 0.95),
     actionToPhotonP95Ms: percentile(context.actionToPhotonSamples ?? [], 0.95),
     encodedBitrateMbps,
     offeredWireBitrateMbps,
@@ -1564,109 +1085,6 @@ export function summarizePerformance(samples, context = {}) {
     sampleCount: samples.length,
     durationSeconds,
   };
-}
-
-function returningLaneSequenceStatus(previous, current, stripe, maxLagFrames = 8) {
-  const laneCount = Number(current?.wssMedia?.topology?.laneCount);
-  const previousSequences = previous?.wssMedia?.highestSequenceByLane;
-  const currentSequences = current?.wssMedia?.highestSequenceByLane;
-  if (!Number.isInteger(stripe) || stripe < 0 || stripe >= laneCount ||
-      !Array.isArray(previousSequences) || previousSequences.length !== laneCount ||
-      !Array.isArray(currentSequences) || currentSequences.length !== laneCount ||
-      !previousSequences.every(Number.isInteger) || !currentSequences.every(Number.isInteger)) {
-    return { available: false, advanced: false, lag: null, caughtUp: false };
-  }
-  const previousSequence = previousSequences[stripe] >>> 0;
-  const currentSequence = currentSequences[stripe] >>> 0;
-  const advance = (currentSequence - previousSequence) >>> 0;
-  const highest = Math.max(...currentSequences);
-  const lowest = Math.min(...currentSequences);
-  const lag = highest - lowest < 0x8000_0000 ? highest - currentSequence : null;
-  const advanced = advance > 0 && advance < 0x8000_0000;
-  return {
-    available: lag !== null,
-    advanced,
-    lag,
-    caughtUp: advanced && lag <= maxLagFrames,
-  };
-}
-
-export function evaluateWssLaneRecovery(before, during, after, options = {}) {
-  const topology = before?.wssMedia?.topology;
-  const stripe = Number(options.stripe ?? 0);
-  const recoveryMs = Number(options.recoveryMs);
-  const maxRecoveryMs = Number(options.maxRecoveryMs ?? 5_000);
-  const maxLaneLagFrames = Number(options.maxLaneLagFrames ?? 8);
-  const delta = (field, left = before, right = after) =>
-    Math.max(0, Number(right?.wssMedia?.[field] ?? 0) - Number(left?.wssMedia?.[field] ?? 0));
-  const reconstructedDuringLoss = delta("reconstructed", before, during);
-  const presentedDuringLoss = delta("presented", before, during);
-  const recoveredFramesDuringLoss = delta("recoveredFrames", before, during);
-  const dependencyLosses = delta("dependencyLosses");
-  const decoderResets = Math.max(0, Number(after?.resyncs ?? 0) - Number(before?.resyncs ?? 0));
-  const returningLane = returningLaneSequenceStatus(during, after, stripe, maxLaneLagFrames);
-  const reasons = [];
-  if (before?.wssMedia?.protocol !== 3 || Number(topology?.parityShards) < 1)
-    reasons.push("not-v3-xor-topology");
-  if (Number(during?.wssMedia?.openLanes) !== Number(topology?.laneCount) - 1)
-    reasons.push("single-lane-loss-not-observed");
-  if (reconstructedDuringLoss < 1 || recoveredFramesDuringLoss < 1)
-    reasons.push("no-parity-reconstruction-during-loss");
-  if (presentedDuringLoss < 1) reasons.push("no-presented-frame-during-loss");
-  if (Number(after?.wssMedia?.openLanes) !== Number(topology?.laneCount) ||
-      after?.wssMedia?.recoveryState !== "healthy") reasons.push("lane-not-recovered");
-  if (!returningLane.available) reasons.push("returning-lane-sequence-unavailable");
-  else if (!returningLane.advanced) reasons.push("returning-lane-stalled");
-  else if (!returningLane.caughtUp) reasons.push("returning-lane-lag");
-  if (dependencyLosses > 0) reasons.push("dependency-loss");
-  if (decoderResets > 0) reasons.push("decoder-reset");
-  if (after?.mediaGeneration !== before?.mediaGeneration) reasons.push("media-generation-changed");
-  if (!Number.isFinite(recoveryMs) || recoveryMs > maxRecoveryMs) reasons.push("recovery-timeout");
-  return {
-    accepted: reasons.length === 0,
-    reasons,
-    recoveryMs,
-    maxRecoveryMs,
-    reconstructedDuringLoss,
-    presentedDuringLoss,
-    recoveredFramesDuringLoss,
-    reconstructedTotal: delta("reconstructed"),
-    presentedTotal: delta("presented"),
-    recoveredFramesTotal: delta("recoveredFrames"),
-    dependencyLosses,
-    decoderResets,
-    returningLane: { stripe, maxLaneLagFrames, ...returningLane },
-    topology,
-  };
-}
-
-export function evaluateLaneRecoveryQuality(control, recovered) {
-  const thresholds = {
-    vmafP5: 2,
-    ssimP5: 0.01,
-    worstTileSsim: 0.01,
-    edgeFidelity: 0.01,
-    colorError: 0.5,
-    ocrCer: 0.01,
-    blockArtifactSeverity: 0.5,
-  };
-  const lowerIsBetter = new Set(["colorError", "ocrCer", "blockArtifactSeverity"]);
-  const reasons = [];
-  const deltas = {};
-  for (const [field, allowance] of Object.entries(thresholds)) {
-    const before = Number(control?.[field]), after = Number(recovered?.[field]);
-    if (!Number.isFinite(before) || !Number.isFinite(after)) {
-      reasons.push(`${field}-unavailable`);
-      continue;
-    }
-    deltas[field] = after - before;
-    if (lowerIsBetter.has(field) ? after - before > allowance : before - after > allowance)
-      reasons.push(`${field}-regression`);
-  }
-  if (control?.exactFrameRatio !== 1 || recovered?.exactFrameRatio !== 1)
-    reasons.push("exact-frame-regression");
-  return { accepted: reasons.length === 0, reasons, deltas,
-    sourceParity: { control: summarizeSourceParityLoss(control), recovered: summarizeSourceParityLoss(recovered) } };
 }
 
 export function aggregateQualityRepetitions(repetitions, id = "quality") {
@@ -1707,98 +1125,6 @@ export async function collectQualityRepetitions(session, candidateId, sceneIds, 
   for (let repetition = 1; repetition <= repetitions; repetition++)
     captures.push(await session.collectQuality(`${candidateId}-r${repetition}`, sceneIds, captureOptions));
   return aggregateQualityRepetitions(captures, candidateId);
-}
-
-export async function collectLaneRecoveryQualitySequence(session, sceneIds, options = {}) {
-  const requestedRepetitions = Number(options.qualityRepetitions ?? 2);
-  if (!Number.isSafeInteger(requestedRepetitions) || requestedRepetitions < 1 || requestedRepetitions > 10)
-    throw new RangeError("quality repetitions must be an integer from 1 to 10");
-  const abbaRepetitions = Math.ceil(requestedRepetitions / 2);
-  const order = buildAbbaOrder("sham", "loss", abbaRepetitions);
-  const captureOptions = {
-    maxSamples: options.maxSamples ?? 8,
-    retainWorst: options.retainWorst ?? 10,
-  };
-  const waiter = options.waiter ?? sleep;
-  const lossDurationMs = options.lossDurationMs ?? 1_500;
-  const maxRecoveryMs = options.maxRecoveryMs ?? 5_000;
-  const shamDurationMs = options.shamDurationMs ?? lossDurationMs + 2_000;
-  const captures = [];
-  const transitions = [];
-  const warmup = await session.collectQuality("lane-recovery-warmup", sceneIds, captureOptions);
-  let before = await session.collectQuality("lane-recovery-q0", sceneIds, captureOptions);
-  captures.push(before);
-  for (const position of order) {
-    let laneRecovery = null;
-    if (position.variant === "loss") {
-      laneRecovery = await session.collectWssLaneRecovery({
-        stripe: options.stripe ?? 0,
-        durationMs: lossDurationMs,
-        maxRecoveryMs,
-      });
-    } else {
-      await waiter(shamDurationMs);
-    }
-    const index = transitions.length + 1;
-    const after = await session.collectQuality(
-      `lane-recovery-q${index}-${position.variant}`,
-      sceneIds,
-      captureOptions,
-    );
-    captures.push(after);
-    transitions.push({
-      ...position,
-      before,
-      after,
-      quality: evaluateLaneRecoveryQuality(before, after),
-      laneRecovery,
-    });
-    before = after;
-  }
-  const summarizeArm = variant => {
-    const arm = transitions.filter(transition => transition.variant === variant);
-    const beforeQuality = aggregateQualityRepetitions(
-      arm.map(transition => transition.before),
-      `lane-recovery-${variant}-before`,
-    );
-    const afterQuality = aggregateQualityRepetitions(
-      arm.map(transition => transition.after),
-      `lane-recovery-${variant}-after`,
-    );
-    return {
-      repetitions: arm.length,
-      before: beforeQuality,
-      after: afterQuality,
-      quality: evaluateLaneRecoveryQuality(beforeQuality, afterQuality),
-      transitions: arm,
-    };
-  };
-  const sham = summarizeArm("sham");
-  const loss = summarizeArm("loss");
-  const transportReports = loss.transitions.map(transition => transition.laneRecovery);
-  const transportReasons = [...new Set(transportReports.flatMap(report => report?.reasons ?? []))];
-  const reasons = [
-    ...transportReasons,
-    ...loss.quality.reasons,
-    ...sham.quality.reasons.map(reason => `sham-unstable:${reason}`),
-  ];
-  return {
-    accepted: reasons.length === 0,
-    reasons,
-    requestedQualityRepetitions: requestedRepetitions,
-    qualityRepetitions: loss.repetitions,
-    order: order.map(position => position.variant),
-    warmup,
-    captures,
-    sham,
-    loss,
-    transport: {
-      accepted: transportReports.every(report => report?.accepted === true),
-      reasons: transportReasons,
-      recoveryMs: Math.max(...transportReports.map(report => Number(report?.recoveryMs)).filter(Number.isFinite)),
-      reports: transportReports,
-    },
-  };
 }
 
 export async function prepareQualitySourceFrame(source, scene, targetFrame, options = {}) {
@@ -2423,8 +1749,7 @@ export class LiveStreamLabSession {
     this.lastFirstFrameMs = null;
     this.applyExpectedSource = null;
     this.transport = "wss";
-    this.receiverOptions = { relay: true, adaptive: false, decoderPath: "webcodecs",
-      ...(options.wssTopology ? { wssTopology: { ...options.wssTopology } } : {}) };
+    this.receiverOptions = { relay: true, adaptive: false, decoderPath: "webcodecs" };
     this.heartbeat = null;
     this.disposeTermination = null;
     this.stopped = false;
@@ -2706,10 +2031,6 @@ export class LiveStreamLabSession {
     this.assertLeaseHealthy();
     await this.setBandwidthCap(bandwidthMbps);
     const profile = benchmarkProfile(candidate, transport);
-    if (transport === "wss" && profile.wssTopology &&
-        JSON.stringify(profile.wssTopology) !== JSON.stringify(this.receiverOptions.wssTopology ?? null)) {
-      await this.switchTransport("wss", { ...this.receiverOptions, wssTopology: profile.wssTopology });
-    }
     const preApplyBenchStatus = (await this.snapshot())?.benchStatus ?? null;
     this.candidateProfileRevision++;
     this.candidateProfileLease = buildCandidateProfileLease(profile, this.runId, Date.now(), this.candidateProfileRevision);
@@ -3368,13 +2689,7 @@ export class LiveStreamLabSession {
           continue;
         }
         try {
-          alignment = exactQualityAnchorAlignment(
-            metadata,
-            snapshot,
-            "quality",
-            alignmentOptions,
-            qualityAck.sequence,
-          );
+          alignment = exactFrameAlignment(metadata, snapshot, "quality", alignmentOptions);
           matched = snapshot;
           break;
         } catch (error) {
@@ -3406,13 +2721,9 @@ export class LiveStreamLabSession {
         if (!matched) await sleep(100);
       }
       if (!matched) {
-        const laneDeliveryTimeout =
-          lastAlignmentFailure?.code === "quality-anchor-lane-delivery-pending";
         throw new StreamLabUnavailable(
-          laneDeliveryTimeout ? "quality-anchor-lane-delivery-timeout" : "frame-match-timeout",
-          laneDeliveryTimeout
-            ? `The acknowledged quality IDR never reached every WSS lane for ${scene}:${targetFrame}.`
-            : `Decoded output never presented matched frame ${scene}:${targetFrame}.`,
+          "frame-match-timeout",
+          `Decoded output never presented matched frame ${scene}:${targetFrame}.`,
           { source: metadata, lastAlignmentFailure, diagnostics: await this.snapshot() },
         );
       }
@@ -3651,66 +2962,6 @@ export class LiveStreamLabSession {
     return { result: "complete", recoveryMs: performance.now() - started,
       resets: Number(recovered.resyncs ?? recovered.worker?.resyncs) - Number(before.resyncs ?? before.worker?.resyncs),
       codec: recovered.dec, route: recovered.route };
-  }
-
-  async collectWssLaneRecovery(options = {}) {
-    this.assertLeaseHealthy();
-    const stripe = Number(options.stripe ?? 0);
-    const durationMs = Number(options.durationMs ?? 1_500);
-    const maxRecoveryMs = Number(options.maxRecoveryMs ?? 5_000);
-    await this.source.evaluate(`window.__bubbleplaySource.setScene("motion-60",469); window.__bubbleplaySource.resume(); true`);
-    await sleep(1_000);
-    const before = await this.snapshot();
-    const topology = before?.wssMedia?.topology;
-    if (before?.wssMedia?.protocol !== 3 || Number(topology?.parityShards) < 1 ||
-        Number(before?.wssMedia?.openLanes) !== Number(topology?.laneCount))
-      throw new StreamLabUnavailable("wss-lane-loss-unavailable",
-        "The receiver is not on a fully connected WSS v3 XOR topology.", { before });
-    const injected = await this.receiver.evaluate(
-      `window.__bubbleplayDiagnostics?.injectWssLaneLoss?.(${JSON.stringify(stripe)},${JSON.stringify(durationMs)}) ?? false`);
-    if (!injected?.accepted)
-      throw new StreamLabUnavailable("wss-lane-loss-rejected",
-        "The receiver rejected the bounded single-lane loss injection.", { stripe, durationMs, before });
-    const started = performance.now();
-    const during = await poll(async () => {
-      this.assertLeaseHealthy();
-      const snapshot = await this.snapshot();
-      const laneMissing = Number(snapshot?.wssMedia?.openLanes) === Number(topology.laneCount) - 1;
-      const parityAdvanced = Number(snapshot?.wssMedia?.recoveredFrames) > Number(before?.wssMedia?.recoveredFrames);
-      const presentationAdvanced = Number(snapshot?.wssMedia?.presented) > Number(before?.wssMedia?.presented);
-      return laneMissing && parityAdvanced && presentationAdvanced ? snapshot : false;
-    }, Math.min(durationMs, maxRecoveryMs));
-    if (!during) throw new StreamLabUnavailable("wss-lane-loss-not-observed",
-      "The loss window did not show live parity reconstruction and presentation with exactly one missing lane.",
-      { stripe, durationMs, before, diagnostics: await this.snapshot() });
-    const after = await poll(async () => {
-      this.assertLeaseHealthy();
-      const snapshot = await this.snapshot();
-      const returningLane = returningLaneSequenceStatus(
-        during,
-        snapshot,
-        stripe,
-        Number(options.maxLaneLagFrames ?? 8),
-      );
-      return Number(snapshot?.wssMedia?.openLanes) === Number(topology.laneCount) &&
-        snapshot?.wssMedia?.recoveryState === "healthy" &&
-        Number(snapshot?.wssMedia?.presented) > Number(during?.wssMedia?.presented) &&
-        returningLane.caughtUp ? snapshot : false;
-    }, maxRecoveryMs);
-    const recoveryMs = performance.now() - started;
-    if (!after) throw new StreamLabUnavailable("wss-lane-recovery-timeout",
-      "The missing WSS lane did not return to a healthy, advancing topology within the bounded timeout.",
-      { stripe, durationMs, before, during, diagnostics: await this.snapshot() });
-    const evaluation = evaluateWssLaneRecovery(before, during, after, {
-      stripe,
-      recoveryMs,
-      maxRecoveryMs,
-      maxLaneLagFrames: options.maxLaneLagFrames,
-    });
-    const report = { result: evaluation.accepted ? "complete" : "rejected",
-      stripe, durationMs, before, during, after, ...evaluation };
-    this.store.appendTelemetry({ phase: "wss-lane-recovery", at: new Date().toISOString(), ...report });
-    return report;
   }
 
   async collectSharpViewportComparison(candidateId) {
@@ -4109,7 +3360,6 @@ function benchMatches(status, expected) {
       status?.roiActivity?.reconstructionActive !== true) return false;
   if (expected.schemaVersion === 2) return status.protocol === 2 &&
     effective.implementationVariant === expected.implementationVariant && effective.experimentId === expected.experimentId &&
-    wssTopologyMatches(effective.wssTopology, expected.wssTopology) &&
     (effective.hybridMode ?? "off") === expected.hybridMode &&
     (effective.hybridCacheMode ?? "suppress-reactivate") === expected.hybridCacheMode &&
     encoder.aqMode === expected.encoder.aqMode && encoder.lookaheadDepth === expected.encoder.lookaheadDepth &&
@@ -4123,13 +3373,6 @@ function benchMatches(status, expected) {
     encoder.targetQuality === expected.encoder.targetQuality &&
     encoder.peakBitrateMultiplier === expected.encoder.peakBitrateMultiplier;
   return encoder.temporalAq === expected.encoder.temporalAq;
-}
-
-function wssTopologyMatches(actual, expected) {
-  if (!actual || !expected) return actual == null && expected == null;
-  return actual.laneCount === expected.laneCount &&
-    actual.dataShards === expected.dataShards &&
-    actual.parityShards === expected.parityShards;
 }
 
 async function poll(operation, timeoutMs, intervalMs = 100) {
@@ -4451,198 +3694,14 @@ export async function runLiveBaseline(options) {
   } finally { await session.stop(); }
 }
 
-export async function runLiveLaneRecovery(options) {
-  const topology = laneRecoveryTopology(options.wssTopology);
-  const candidate = options.candidate ?? {
-    schemaVersion: 2,
-    implementationVariant: "production",
-    experimentId: "wss-lane-recovery-control",
-    preset: "p3",
-    tuning: "ultra-low-latency",
-    multipass: "disabled",
-    aqMode: "spatial",
-    aqStrength: 8,
-    vbvFrames: 1,
-    lookaheadFrames: 0,
-    weightedPrediction: false,
-    gopSeconds: 2,
-    bitrateMbps: 6,
-    wssTopology: topology,
-  };
-  const bandwidthMbps = options.bandwidthMbps ?? 4;
-  const qualityScenes = options.sceneIds ?? [
-    "ui-text", "gradients", "motion-60", "localized-change",
-    "source-code", "chrome-text", "chrome-canvas", "generated-video",
-  ];
-  const session = new LiveStreamLabSession({ ...options, wssTopology: topology });
-  try {
-    await session.start("wss");
-    const effective = constrainedConfiguration(candidate, bandwidthMbps, "wss");
-    const stabilized = await stabilizeEncoderForCap(session, effective, bandwidthMbps, options, { firstFrameRetry: true });
-    const controlPerformanceSample = await session.collectPerformance(
-      options.performanceSeconds ?? 8,
-      { actionProbe: options.actionProbe },
-    );
-    const controlPerformance = summarizePerformance(controlPerformanceSample.samples, {
-      transport: "wss", firstFrameMs: session.lastFirstFrameMs,
-      actionToPhotonSamples: controlPerformanceSample.actionToPhotonSamples,
-      bandwidthMbps, encoderBitrateMbps: stabilized.stabilizedEncoderBitrateMbps, qosPolicy: session.qosPolicy,
-    });
-    assertShapingValid(controlPerformance, bandwidthMbps, session.qosPolicy, stabilized);
-    const recoveryComparison = await collectLaneRecoveryQualitySequence(session, qualityScenes, {
-      qualityRepetitions: options.qualityRepetitions ?? 2,
-      maxSamples: options.qualitySamples ?? 8,
-      retainWorst: options.retainWorst ?? 10,
-      stripe: options.stripe ?? 0,
-      lossDurationMs: options.lossDurationMs ?? 1_500,
-      maxRecoveryMs: options.maxRecoveryMs ?? 5_000,
-    });
-    const recoveredPerformanceSample = await session.collectPerformance(
-      options.performanceSeconds ?? 8,
-      { actionProbe: options.actionProbe },
-    );
-    const recoveredPerformance = summarizePerformance(recoveredPerformanceSample.samples, {
-      transport: "wss", firstFrameMs: session.lastFirstFrameMs,
-      actionToPhotonSamples: recoveredPerformanceSample.actionToPhotonSamples,
-      bandwidthMbps, encoderBitrateMbps: stabilized.stabilizedEncoderBitrateMbps, qosPolicy: session.qosPolicy,
-    });
-    assertShapingValid(recoveredPerformance, bandwidthMbps, session.qosPolicy, stabilized);
-    const controlQuality = recoveryComparison.loss.before;
-    const recoveredQuality = recoveryComparison.loss.after;
-    const quality = recoveryComparison.loss.quality;
-    const laneRecovery = recoveryComparison.transport;
-    const reasons = recoveryComparison.reasons;
-    return {
-      result: reasons.length ? "rejected" : "complete",
-      accepted: reasons.length === 0,
-      reasons,
-      objective: "source-quality-primary-single-lane-loss-recovery",
-      bandwidthMbps,
-      topology,
-      qualityRepetitions: recoveryComparison.qualityRepetitions,
-      stabilized,
-      firstFrameMs: session.lastFirstFrameMs,
-      laneRecovery,
-      quality,
-      recoveryComparison,
-      control: combinePerformanceAndQuality(controlPerformance, controlQuality),
-      recovered: combinePerformanceAndQuality(recoveredPerformance, recoveredQuality),
-    };
-  } finally { await session.stop(); }
-}
-
-export function laneRecoveryTopology(topology = { laneCount: 16, dataShards: 15, parityShards: 1 }) {
-  const valid = topology && Number.isInteger(topology.laneCount) &&
-    topology.laneCount >= 2 && topology.laneCount <= 16 &&
-    Number.isInteger(topology.dataShards) && topology.dataShards >= 1 &&
-    Number.isInteger(topology.parityShards) && topology.parityShards >= 1 && topology.parityShards <= 2 &&
-    topology.laneCount === topology.dataShards + topology.parityShards;
-  if (!valid) throw new RangeError("lane-recovery requires a valid parity-protected WSS v3 topology");
-  return {
-    laneCount: topology.laneCount,
-    dataShards: topology.dataShards,
-    parityShards: topology.parityShards,
-  };
-}
-
-export function defaultTopologyFrontier({ quality = false } = {}) {
-  return quality ? [
-    { laneCount: 6, dataShards: 5, parityShards: 1 },
-    { laneCount: 9, dataShards: 8, parityShards: 1 },
-    { laneCount: 16, dataShards: 15, parityShards: 1 },
-  ] : [
-    null,
-    { laneCount: 2, dataShards: 2, parityShards: 0 },
-    { laneCount: 3, dataShards: 2, parityShards: 1 },
-    { laneCount: 4, dataShards: 3, parityShards: 1 },
-    { laneCount: 5, dataShards: 4, parityShards: 1 },
-    { laneCount: 9, dataShards: 8, parityShards: 1 },
-    { laneCount: 16, dataShards: 15, parityShards: 1 },
-  ];
-}
-
-export async function runLiveTopologySweep(options) {
-  const topologies = options.topologies ?? defaultTopologyFrontier({ quality: options.quality });
-  const repetitions = options.repetitions ?? (options.quality ? 3 : 1);
-  const trials = buildTopologyTrialPlan(topologies, repetitions);
-  const runs = [...(options.resumeCheckpoint?.runs ?? [])];
-  const completedTrials = new Set(runs.map(run => run.id));
-  const pendingTrials = trials.filter(trial => !completedTrials.has(`${trial.id}-r${trial.repetition}`));
-  const candidate = options.candidate ?? {
-    id: "topology-control", preset: "p3", tuning: "ultra-low-latency", multipass: "disabled",
-    vbvFrames: 1, aqStrength: 8, temporalAq: false, bitrateMbps: 6,
-  };
-  const session = new LiveStreamLabSession({ ...options,
-    ...(pendingTrials[0]?.topology ? { wssTopology: pendingTrials[0].topology } : {}) });
-  try {
-    if (pendingTrials.length) await session.start("wss");
-    for (const trial of pendingTrials) {
-      const topology = trial.topology;
-      await session.switchTransport("wss", { adaptive: false, ...(topology ? { wssTopology: topology } : {}) });
-      const bandwidthMbps = options.bandwidthMbps ?? 4;
-      const effective = constrainedConfiguration(candidate, bandwidthMbps, "wss");
-      const stabilized = await stabilizeEncoderForCap(session, effective, bandwidthMbps, options, { firstFrameRetry: true });
-      const performance = await session.collectPerformance(options.performanceSeconds ?? 10);
-      const topologyValue = topology ?? { protocol: 2, laneCount: 4, dataShards: 3, parityShards: 1 };
-      const performanceMetrics = summarizePerformance(performance.samples, { transport: "wss", firstFrameMs: session.lastFirstFrameMs,
-        actionToPhotonSamples: performance.actionToPhotonSamples, bandwidthMbps,
-        encoderBitrateMbps: stabilized.stabilizedEncoderBitrateMbps, qosPolicy: session.qosPolicy });
-      assertShapingValid(performanceMetrics, bandwidthMbps, session.qosPolicy, stabilized);
-      const quality = options.quality ? await session.collectQuality(`${trial.id}-r${trial.repetition}`,
-        options.sceneIds ?? ["ui-text", "gradients", "motion-60", "localized-change", "source-code", "chrome-text", "chrome-canvas", "generated-video"],
-        { maxSamples: options.qualitySamples ?? 8, retainWorst: options.retainWorst ?? 10 }) : null;
-      runs.push({ id: `${trial.id}-r${trial.repetition}`, topology: topologyValue,
-        ...stabilized, ...(quality ? combinePerformanceAndQuality(performanceMetrics, quality) : performanceMetrics) });
-      session.store.writeTopologyCheckpoint?.({ schemaVersion: 1, status: "running",
-        strategy: options.quality ? "wss-topology-parity-frontier" : "wss-topology-frontier",
-        bandwidthMbps: options.bandwidthMbps ?? 4, repetitions, quality: options.quality === true,
-        completedTrials: runs.length, totalTrials: trials.length, runs });
-    }
-    const results = topologies.map(topology => {
-      const topologyValue = topology ?? { protocol: 2, laneCount: 4, dataShards: 3, parityShards: 1 };
-      const id = topologyTrialId(topology);
-      const topologyRuns = runs.filter(run => run.id.startsWith(`${id}-r`));
-      if (topologyRuns.length === 1) return topologyRuns[0];
-      return { topology: topologyValue, ...aggregateRepetitions(topologyRuns,
-        { id, configuration: { ...candidate, ...(topology ? { wssTopology: topology } : {}) } }) };
-    });
-    const report = { result: "complete", strategy: options.quality ? "wss-topology-parity-frontier" : "wss-topology-frontier",
-      objective: options.quality ? "measure-topology-with-source-quality-visible" : "measure-topology-performance",
-      bandwidthMbps: options.bandwidthMbps ?? 4, repetitions, quality: options.quality === true, results, runs };
-    session.store.writeTopologyCheckpoint?.({ schemaVersion: 1, status: "complete", ...report });
-    return report;
-  } finally { await session.stop(); }
-}
-
 export async function applyWithFirstFrameRetry(session, effective, bandwidthMbps) {
   try { return await session.apply(effective, bandwidthMbps, "wss"); }
   catch (error) {
     if (error?.code !== "first-frame-timeout") throw error;
-    session.store?.appendTelemetry?.({ phase: "topology-first-frame-retry", at: new Date().toISOString(),
-      topology: effective.wssTopology ?? session.receiverOptions?.wssTopology ?? null });
+    session.store?.appendTelemetry?.({ phase: "first-frame-retry", at: new Date().toISOString() });
     await session.restartTransport("wss", session.receiverOptions);
     return session.apply(effective, bandwidthMbps, "wss");
   }
-}
-
-export function buildTopologyTrialPlan(topologies, repetitions = 1) {
-  if (!Array.isArray(topologies) || topologies.length === 0) throw new RangeError("topologies must be a non-empty array");
-  if (!Number.isInteger(repetitions) || repetitions < 1 || repetitions > 5)
-    throw new RangeError("topology repetitions must be an integer from 1 to 5");
-  const trials = [];
-  const [control, ...candidates] = topologies;
-  for (let repetition = 1; repetition <= repetitions; repetition++) {
-    // Legacy v2 cannot safely be re-entered after a v3 media epoch in the
-    // same host session. Keep the control first and balance drift by reversing
-    // only the v3 candidate order on even repetitions.
-    const ordered = repetition % 2 === 0 ? [control, ...[...candidates].reverse()] : [control, ...candidates];
-    for (const topology of ordered) trials.push({ id: topologyTrialId(topology), repetition, topology });
-  }
-  return trials;
-}
-
-function topologyTrialId(topology) {
-  return topology ? `v3-${topology.dataShards}+${topology.parityShards}` : "v2-3+1";
 }
 
 export async function runLiveOptimize(options) {
@@ -4840,9 +3899,7 @@ export async function stabilizeEncoderForCap(session, configuration, bandwidthMb
     return { requestedBitrateMbps, initialEncoderBitrateMbps: requestedBitrateMbps,
       stabilizedEncoderBitrateMbps: requestedBitrateMbps, stabilization: [], effectiveConfiguration };
   }
-  const topology = configuration.wssTopology ?? session.receiverOptions?.wssTopology ??
-    { laneCount: 4, dataShards: 3, parityShards: 1 };
-  const targetKey = JSON.stringify({ bandwidthMbps, topology,
+  const targetKey = JSON.stringify({ bandwidthMbps,
     streamMode: configuration.streamMode ?? "work", fps: configuration.fps ?? 30,
     preset: configuration.preset, tuning: configuration.tuning ?? "ultra-low-latency",
     multipass: configuration.multipass, aqMode: configuration.aqMode ??
@@ -4856,7 +3913,7 @@ export async function stabilizeEncoderForCap(session, configuration, bandwidthMb
     hybridCacheMode: configuration.hybridCacheMode ?? "suppress-reactivate",
     gopSeconds: configuration.gopSeconds ?? 2, requestedBitrateMbps });
   session.stabilizedTargets ??= new Map();
-  const calculatedInitialEncoderBitrateMbps = initialEncoderTargetMbps(requestedBitrateMbps, bandwidthMbps, topology);
+  const calculatedInitialEncoderBitrateMbps = initialEncoderTargetMbps(requestedBitrateMbps, bandwidthMbps);
   const priorSafeTarget = Number(session.stabilizedTargets.get(targetKey));
   const hasPriorSafeTarget = Number.isFinite(priorSafeTarget);
   const initialEncoderBitrateMbps = hasPriorSafeTarget
@@ -5096,12 +4153,7 @@ function aggregateVerification(values) {
 
 export function aggregateExperimentRepetitions(repetitions, candidate) {
   const fields = ["firstFrameMs", "presentedFps", "encodeP95Ms", "latencyP95Ms", "actionToPhotonP95Ms",
-    "sourceToFirstShardP50Ms", "sourceToFirstShardP95Ms",
-    "sourceToHostEgressP50Ms", "sourceToHostEgressP95Ms",
-    "hostEgressToEdgeP50Ms", "hostEgressToEdgeP95Ms",
-    "hostEgressToFirstShardP50Ms", "hostEgressToFirstShardP95Ms",
-    "sourceToEdgeP50Ms", "sourceToEdgeP95Ms",
-    "edgeToFirstShardP50Ms", "edgeToFirstShardP95Ms", "sourceToPresentedP50Ms", "sourceToPresentedP95Ms",
+    "sourceToPresentedP50Ms", "sourceToPresentedP95Ms", "receiveToPresentP50Ms", "receiveToPresentP95Ms",
     "encodedBitrateMbps", "wireBitrateMbps", "wireExpansion", "encodedBitrateCv", "wireBitrateCv",
     "frameGapP95Ms", "frameGapMaxMs", "hostCpuPct", "gpuUtilizationMeanPct", "gpuEncoderMeanPct",
     "privateMemoryPeakMb", "vramPeakMb", "gpuPowerMeanWatts", "memorySlopeMbPerMinute",
@@ -5114,12 +4166,7 @@ export function aggregateExperimentRepetitions(repetitions, candidate) {
   const lowerIsWorse = new Set(["presentedFps", "worstTileSsim", "vmaf", "ssim", "psnr", "vmafMean",
     "vmafP5", "ssimMean", "ssimP5", "edgeFidelity", "exactFrameRatio"]);
   const higherIsWorse = new Set(["firstFrameMs", "encodeP95Ms", "latencyP95Ms", "actionToPhotonP95Ms",
-    "sourceToFirstShardP50Ms", "sourceToFirstShardP95Ms",
-    "sourceToHostEgressP50Ms", "sourceToHostEgressP95Ms",
-    "hostEgressToEdgeP50Ms", "hostEgressToEdgeP95Ms",
-    "hostEgressToFirstShardP50Ms", "hostEgressToFirstShardP95Ms",
-    "sourceToEdgeP50Ms", "sourceToEdgeP95Ms",
-    "edgeToFirstShardP50Ms", "edgeToFirstShardP95Ms", "sourceToPresentedP50Ms", "sourceToPresentedP95Ms",
+    "sourceToPresentedP50Ms", "sourceToPresentedP95Ms", "receiveToPresentP50Ms", "receiveToPresentP95Ms",
     "encodedBitrateCv", "wireBitrateCv", "frameGapP95Ms", "frameGapMaxMs", "hostCpuPct",
     "gpuUtilizationMeanPct", "gpuEncoderMeanPct", "privateMemoryPeakMb", "vramPeakMb",
     "gpuPowerMeanWatts", "memorySlopeMbPerMinute", "ocrCer", "colorError", "unchangedRegionError",
@@ -5534,7 +4581,7 @@ async function runSweepCandidate(session, candidate, options, bandwidthMbps = nu
 function constrainedConfiguration(configuration, bandwidthMbps, transport) {
   const requestedBitrateMbps = configuration.requestedBitrateMbps ?? configuration.bitrateMbps ?? 6;
   const bitrateMbps = transport === "wss" && Number.isFinite(bandwidthMbps)
-    ? initialEncoderTargetMbps(requestedBitrateMbps, bandwidthMbps, configuration.wssTopology)
+    ? initialEncoderTargetMbps(requestedBitrateMbps, bandwidthMbps)
     : effectiveEncoderBitrateMbps(requestedBitrateMbps, bandwidthMbps, transport);
   return { ...configuration, requestedBitrateMbps, bitrateMbps };
 }

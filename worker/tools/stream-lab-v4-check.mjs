@@ -144,7 +144,7 @@ async function main() {
     closeSync(out); closeSync(err);
     host.once("exit", code => { report.hostExit = code; });
 
-    const url = buildReceiverUrl(relay.url, "wss", { labRun: runId, mediaProtocol: 4, adaptive: true });
+    const url = buildReceiverUrl(relay.url, "wss", { labRun: runId, adaptive: true });
     const port = Number(values["cdp-port"]);
     const args = buildReceiverChromeArgs(resolve(dir, "receiver-profile"), port, "about:blank", { startMinimized: false });
     receiverProcess = spawn(chrome, ["--headless=new", ...args], { stdio: "ignore", windowsHide: true });

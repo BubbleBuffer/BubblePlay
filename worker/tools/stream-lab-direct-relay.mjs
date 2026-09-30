@@ -4,13 +4,7 @@ import { readFile } from "node:fs/promises";
 import { extname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
-import {
-  LAB_EDGE_TRACE_BYTES,
-  LAB_EDGE_TRACE_MAGIC,
-  LAB_HOST_TRACE_BYTES,
-  STREAM_LAB_COMPATIBILITY,
-  V3_MAX_PACKET_BYTES,
-} from "../public/media.js";
+import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
 import {
   V4_HEADER_BYTES,
   V4_MAX_PACKET_BYTES,
@@ -49,7 +43,7 @@ export async function startDirectLabRelay(options = {}) {
   const sockets = new Set();
   const webSockets = new WebSocketServer({
     noServer: true,
-    maxPayload: Math.max(V3_MAX_PACKET_BYTES + LAB_HOST_TRACE_BYTES, V4_MAX_PACKET_BYTES),
+    maxPayload: V4_MAX_PACKET_BYTES,
   });
   const server = createServer((request, response) => serveRequest(request, response, publicDir, emit));
   server.on("upgrade", (request, socket, head) => {
@@ -69,7 +63,6 @@ export async function startDirectLabRelay(options = {}) {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     if (route.kind === "signal") attachSignalingSocket(socket, route, signalingRooms, emit);
-    else if (route.version === 4) attachMediaSocketV4(socket, route, mediaRooms, emit);
     else attachMediaSocket(socket, route, mediaRooms, emit);
   });
   await new Promise((resolveListen, reject) => {
@@ -104,19 +97,13 @@ function parseSocketRoute(rawUrl) {
   const mediaHost = url.pathname === "/lab-host-media-ws";
   const mediaClient = url.pathname === "/lab-media-ws";
   if (!mediaHost && !mediaClient) return null;
-  const version = Number(url.searchParams.get("v"));
   const epoch = url.searchParams.get("epoch") || "";
-  const stripe = Number(url.searchParams.get("stripe"));
-  const laneLimit = version === 4 ? 1 : version === 3 ? 16 : version === 2 ? 4 : 0;
-  if (!laneLimit || !EPOCH_PATTERN.test(epoch) ||
-      !Number.isInteger(stripe) || stripe < 0 || stripe >= laneLimit) return null;
+  if (!EPOCH_PATTERN.test(epoch)) return null;
   return {
     kind: "media",
     run,
-    version,
     epoch,
-    stripe,
-    key: `${run}:${version}:${epoch}:${stripe}`,
+    key: `${run}:${epoch}`,
     expectedRole: mediaHost ? "media-host" : "media-client",
   };
 }
@@ -178,45 +165,10 @@ function attachSignalingSocket(socket, route, rooms, emit) {
     role, message: String(error?.message || error) }));
 }
 
-function attachMediaSocket(socket, route, rooms, emit) {
-  const room = getRoom(rooms, route.key, () => ({ "media-host": null, "media-client": null }));
-  let role = null;
-  socket.on("message", (data, isBinary) => {
-    if (!role) {
-      const hello = isBinary ? null : parseJson(data);
-      if (hello?.type !== "hello" || hello.role !== route.expectedRole) {
-        socket.close(1008, "bad role");
-        return;
-      }
-      role = route.expectedRole;
-      replaceSocket(room, role, socket);
-      emit({ type: "socket-hello", kind: route.kind, run: route.run, role,
-        version: route.version, stripe: route.stripe });
-      socket.send(JSON.stringify({ type: "hello-ok" }));
-      return;
-    }
-    if (role !== "media-host" || !isBinary || data.byteLength === 0 ||
-        data.byteLength > V3_MAX_PACKET_BYTES + LAB_HOST_TRACE_BYTES) return;
-    const peer = room["media-client"];
-    if (peer?.readyState === WebSocket.OPEN) {
-      peer.send(route.version === 3 ? appendLabEdgeTrace(data) : data, { binary: true });
-    }
-  });
-  socket.once("close", (code, reason) => {
-    emit({ type: "socket-close", kind: route.kind, run: route.run, role,
-      version: route.version, stripe: route.stripe, code, reason: String(reason || "") });
-    if (!role || room[role] !== socket) return;
-    room[role] = null;
-    if (!room["media-host"] && !room["media-client"]) rooms.delete(route.key);
-  });
-  socket.on("error", error => emit({ type: "socket-error", kind: route.kind, run: route.run,
-    role, version: route.version, stripe: route.stripe, message: String(error?.message || error) }));
-}
-
 // Protocol v4: one socket per side. Host binary frames go to the client;
 // client ACK/keyframe text goes to the host; heartbeats are answered here
 // and each side is told whether its peer is present (mirrors worker/src).
-function attachMediaSocketV4(socket, route, rooms, emit) {
+function attachMediaSocket(socket, route, rooms, emit) {
   const room = getRoom(rooms, route.key, () => ({ "media-host": null, "media-client": null }));
   let role = null;
   const peerRole = () => (role === "media-host" ? "media-client" : "media-host");
@@ -232,7 +184,7 @@ function attachMediaSocketV4(socket, route, rooms, emit) {
       }
       role = route.expectedRole;
       replaceSocket(room, role, socket);
-      emit({ type: "socket-hello", kind: route.kind, run: route.run, role, version: 4, stripe: 0 });
+      emit({ type: "socket-hello", kind: route.kind, run: route.run, role });
       socket.send(JSON.stringify({ type: "hello-ok" }));
       const peer = room[peerRole()];
       notify(socket, peer?.readyState === WebSocket.OPEN);
@@ -255,7 +207,7 @@ function attachMediaSocketV4(socket, route, rooms, emit) {
     if (role === "media-client" && peer?.readyState === WebSocket.OPEN) peer.send(text);
   });
   socket.once("close", (code, reason) => {
-    emit({ type: "socket-close", kind: route.kind, run: route.run, role, version: 4, stripe: 0,
+    emit({ type: "socket-close", kind: route.kind, run: route.run, role,
       code, reason: String(reason || "") });
     if (!role || room[role] !== socket) return;
     room[role] = null;
@@ -263,17 +215,7 @@ function attachMediaSocketV4(socket, route, rooms, emit) {
     if (!room["media-host"] && !room["media-client"]) rooms.delete(route.key);
   });
   socket.on("error", error => emit({ type: "socket-error", kind: route.kind, run: route.run,
-    role, version: 4, stripe: 0, message: String(error?.message || error) }));
-}
-
-function appendLabEdgeTrace(message, edgeReceivedAtEpochMs = Date.now()) {
-  const source = new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
-  const tagged = new Uint8Array(source.byteLength + LAB_EDGE_TRACE_BYTES);
-  tagged.set(source);
-  const trailer = new DataView(tagged.buffer, source.byteLength, LAB_EDGE_TRACE_BYTES);
-  trailer.setUint32(0, LAB_EDGE_TRACE_MAGIC);
-  trailer.setFloat64(4, edgeReceivedAtEpochMs);
-  return tagged;
+    role, message: String(error?.message || error) }));
 }
 
 function getRoom(rooms, key, create) {

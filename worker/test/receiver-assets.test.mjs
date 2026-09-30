@@ -25,7 +25,7 @@ test("local receiver overrides include the entrypoint and its module dependencie
     pending.push(...[...body.matchAll(/from\s+["'](\/[^"']+\.js)["']/g)].map(match => match[1]));
   }
   assert.ok(visited.has("/receiver.js"));
-  assert.ok(visited.has("/media-ack.js"));
+  assert.ok(visited.has("/media-v4.js"));
   await paused({ requestId: "external", resourceType: "Script", request: { url: "https://other.example/receiver.js" } });
   assert.equal(calls.at(-1).method, "Fetch.continueRequest");
 });

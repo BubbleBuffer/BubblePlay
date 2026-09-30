@@ -59,20 +59,6 @@ test("WSS recovery watches for a keyframe and never suppresses an identified lab
   assert.doesNotMatch(diagnostic, /resetWssDecoderForRecovery/);
 });
 
-test("a delayed completed-frame shard bypasses normal WSS ACK batching", () => {
-  const receive = client.slice(client.indexOf("socket.onmessage = (event) =>"),
-    client.indexOf("socket.onclose = () =>", client.indexOf("socket.onmessage = (event) =>")));
-  assert.match(receive,
-    /takeImmediateAck\?\.\(\)[\s\S]*?scheduleWssAck\(wssReassembler\.generation,\s*immediateAck\)/);
-});
-
-test("a parity-lane reconnect rearms host delivery without resetting the decoder", () => {
-  const receive = client.slice(client.indexOf("socket.onmessage = (event) =>"),
-    client.indexOf("socket.onclose = () =>", client.indexOf("socket.onmessage = (event) =>")));
-  assert.match(receive,
-    /if \(reconnect\)[\s\S]*?shouldRecoverWssStripeReconnect[\s\S]*?beginWssRecovery\("stripe-reconnect"\)[\s\S]*?else[\s\S]*?requestWssKeyframe\("stripe-reconnect"\)/);
-});
-
 test("campaign runner checkpoints the complete baseline and post-champion evidence matrix", () => {
   const units = campaignCheckpointContract();
   assert.deepEqual(units.baseline, [

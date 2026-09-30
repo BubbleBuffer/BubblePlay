@@ -1,4 +1,4 @@
-import { validWssTopology, validCurrentMediaEpoch, validMediaAckV3, validHostMediaCapabilities, validInputStatus, canonicalWorkerVersionId, validFirstFrameMessage, benchStatusRejectionReason, utf8Length } from "./protocol-validation.js";
+import { validCurrentMediaEpoch, validInputStatus, canonicalWorkerVersionId, validFirstFrameMessage, benchStatusRejectionReason, utf8Length } from "./protocol-validation.js";
 import { validClipboardMessage, validInputCapabilities } from "./protocol-validation.js";
 export { benchStatusRejectionReason } from "./protocol-validation.js";
 // BubblePlay signaling relay.
@@ -23,15 +23,7 @@ export { benchStatusRejectionReason } from "./protocol-validation.js";
 //
 import { createTurnIceServers } from "./turn.js";
 import { ApprovalGate, authorized } from "./gate.js";
-import {
-  LAB_EDGE_TRACE_BYTES,
-  LAB_EDGE_TRACE_MAGIC,
-  LAB_HOST_TRACE_BYTES,
-  MAX_MEDIA_PACKET_BYTES,
-  STREAM_LAB_COMPATIBILITY,
-  V2_MAX_PACKET_BYTES,
-  V3_MAX_PACKET_BYTES,
-} from "../public/media.js";
+import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
 import {
   V4_HEADER_BYTES,
   V4_MAX_PACKET_BYTES,
@@ -70,11 +62,11 @@ export default {
       if (!localLabBypass && !(await authorized(request, env.HOST_GATE_TOKEN))) {
         return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });
       }
-      if (!validSocketRoute(url)) return badStripe();
+      if (!validSocketRoute(url)) return badRoute();
       return handleWebSocket(request, env);
     }
     if (isBrowserSocketPath(url.pathname)) {
-      if (!validSocketRoute(url)) return badStripe();
+      if (!validSocketRoute(url)) return badRoute();
       if (!localLabBypass) {
         const checkHeaders = new Headers({ Cookie: request.headers.get("Cookie") || "" });
         const versionOverrides = request.headers.get("Cloudflare-Workers-Version-Overrides");
@@ -104,14 +96,12 @@ function handleWebSocket(request, env) {
   const lab = isLabSocketPath(url.pathname);
   const namespace = media ? env.MEDIA_ROOM : env.ROOM;
   const epoch = url.searchParams.get("epoch");
-  const stripe = url.searchParams.get("stripe");
   const run = url.searchParams.get("run");
-  const mediaVersion = url.searchParams.get("v") || "1";
+  // One media Durable Object per browser epoch carries the single v4 socket
+  // pair (media down, ACK/keyframe up).
   const roomName = lab
-    ? (media
-      ? `lab-media-v${mediaVersion}:${run}:${epoch}:${stripe}`
-      : `lab-signal-v1:${run}`)
-    : (media && epoch ? `media-v${mediaVersion}:${epoch}:${stripe}` : media ? "media-v1" : "room-v3");
+    ? (media ? `lab-media-v4:${run}:${epoch}` : `lab-signal-v1:${run}`)
+    : (media ? `media-v4:${epoch}` : "room-v3");
   const roomId = namespace.idFromName(roomName);
   const stub = namespace.get(roomId);
   // Pass the ORIGINAL request straight through. Reconstructing headers here
@@ -141,28 +131,14 @@ function isLocalLabSocket(url, env) {
 function validSocketRoute(url) {
   if (isLabSocketPath(url.pathname) && !validLabRun(url)) return false;
   if (!isMediaSocketPath(url.pathname)) return true;
-  if (!validStripe(url) || !validMediaSession(url)) return false;
-  return !isLabSocketPath(url.pathname) || ["2", "3", "4"].includes(url.searchParams.get("v"));
+  return /^[a-f0-9]{32}$/.test(url.searchParams.get("epoch") || "");
 }
 function validLabRun(url) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
     .test(url.searchParams.get("run") || "") &&
     url.searchParams.get("compat") === STREAM_LAB_COMPATIBILITY.id;
 }
-function validStripe(url) {
-  const value = url.searchParams.get("stripe") || "";
-  const version = url.searchParams.get("v");
-  // Protocol v4 multiplexes media, ACKs and keyframe requests on one socket.
-  if (version === "4") return value === "0";
-  return version === "3" ? /^(?:[0-9]|1[0-5])$/.test(value) : /^(0|1|2|3)$/.test(value);
-}
-function validMediaSession(url) {
-  const version = url.searchParams.get("v");
-  if (version === null || version === "1") return true;
-  return (version === "2" || version === "3" || version === "4") &&
-    /^[a-f0-9]{32}$/.test(url.searchParams.get("epoch") || "");
-}
-function badStripe() { return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } }); }
+function badRoute() { return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } }); }
 
 export class Room {
   constructor(state, env) {
@@ -172,7 +148,6 @@ export class Room {
     // fresh Room at any time, so socket attachments remain authoritative and a
     // cache miss always rebuilds from state.getWebSockets().
     this.peerCache = new Map();
-    this.mediaForwardTarget = new Map();
   }
 
   async fetch(request) {
@@ -191,9 +166,7 @@ export class Room {
       media ? (isHostSocketPath(url.pathname) ? "media-host" : "media-client") :
         (isHostSocketPath(url.pathname) ? "host" : "client");
     server.serializeAttachment({ role: null, expectedRole,
-      stripe: media ? Number(url.searchParams.get("stripe")) : null,
       epoch: url.searchParams.get("epoch") || null,
-      version: media ? Number(url.searchParams.get("v") || 1) : null,
       run: lab ? url.searchParams.get("run") : null,
       localLab });
 
@@ -205,35 +178,10 @@ export class Room {
 
   async webSocketMessage(ws, message) {
     const att = ws.deserializeAttachment() || {};
-    if (att.version === 4 && (att.role === "media-host" || att.role === "media-client")) {
+    if (att.role === "media-host" || att.role === "media-client") {
       this.relayMediaV4(ws, att, message);
       return;
     }
-    if (att.role === "media-host") {
-      const limit = att.version === 3
-        ? V3_MAX_PACKET_BYTES + (att.run ? LAB_HOST_TRACE_BYTES : 0)
-        : att.epoch ? V2_MAX_PACKET_BYTES : MAX_MEDIA_PACKET_BYTES;
-      if (binaryLength(message) <= limit && binaryLength(message) > 0) {
-        const target = this.findPeer("media-client", att.stripe);
-        if (target) {
-          if (att.run) {
-            const targetAttachment = target.deserializeAttachment() || {};
-            const targetId = targetAttachment.registeredAtMs ?? "legacy";
-            if (this.mediaForwardTarget.get(att.stripe) !== targetId) {
-              this.mediaForwardTarget.set(att.stripe, targetId);
-              console.log(`[room] media-forward run=${att.run} stripe=${att.stripe} target=${targetId} replaced=${!!targetAttachment.replaced}`);
-              target.send(JSON.stringify({
-                type: "media-forward",
-                registeredAtMs: targetAttachment.registeredAtMs ?? null,
-              }));
-            }
-          }
-          target.send(att.run && att.version === 3 ? appendLabEdgeTrace(message) : message);
-        }
-      }
-      return;
-    }
-    if (att.role === "media-client") return;
     // WSS media leaves input and cursor on the pre-existing authenticated
     // signaling relay. Those packets are small binary control messages, never
     // video, and are bounded independently from media packets.
@@ -292,9 +240,9 @@ export class Room {
       }
 
       // Exactly one host + one client: kick any stale socket of the same role.
-      const existing = this.findPeer(role, att.stripe);
+      const existing = this.findPeer(role);
       const existingAttachment = existing?.deserializeAttachment?.() || {};
-      console.log(`[room] hello role=${role} run=${att.run || "-"} stripe=${att.stripe ?? "-"} existing=${existing ? "yes" : "none"} existingTarget=${existingAttachment.registeredAtMs ?? "-"} existingReplaced=${!!existingAttachment.replaced}`);
+      console.log(`[room] hello role=${role} run=${att.run || "-"} existing=${existing ? "yes" : "none"} existingTarget=${existingAttachment.registeredAtMs ?? "-"} existingReplaced=${!!existingAttachment.replaced}`);
       if (existing && existing !== ws) {
         // A replacement signaling host has no control or media state from the
         // old host. Force the live browser to establish a fresh signaling
@@ -316,7 +264,7 @@ export class Room {
       ws.serializeAttachment(role === "client"
         ? { ...att, role, mediaEpoch, registeredAtMs }
         : { ...att, role, registeredAtMs });
-      this.rememberPeer(role, att.stripe, ws);
+      this.rememberPeer(role, ws);
       // Hosts keep the original wire shape. Clients receive only short-lived
       // TURN REST credentials, minted after authentication and never stored.
       const hello = role === "client"
@@ -326,15 +274,15 @@ export class Room {
             ...(role === "media-client" ? { registeredAtMs } : {}),
             ...(workerVersionId ? { workerVersionId } : {}) };
       ws.send(JSON.stringify(hello));
-      if (att.version === 4 && (role === "media-host" || role === "media-client")) {
+      if (role === "media-host" || role === "media-client") {
         // v4 peers learn about each other from the relay: the host needs a
         // fresh keyframe for every new receiver and must not encode for an
         // empty room.
-        const other = this.findPeer(role === "media-host" ? "media-client" : "media-host", att.stripe);
+        const other = this.findPeer(role === "media-host" ? "media-client" : "media-host");
         ws.send(JSON.stringify({ type: "media-peer", present: !!other }));
         try { other?.send(JSON.stringify({ type: "media-peer", present: true })); } catch { /* closing */ }
       }
-      console.log(`[room] ${role} registered run=${att.run || "-"} stripe=${att.stripe ?? "-"} target=${registeredAtMs}, hello-ok sent`);
+      console.log(`[room] ${role} registered run=${att.run || "-"} target=${registeredAtMs}, hello-ok sent`);
       if (role === "client") {
         const hostCapabilities = this.findPeer("host")?.deserializeAttachment()?.hostCapabilities;
         if (typeof hostCapabilities === "string") ws.send(hostCapabilities);
@@ -398,8 +346,7 @@ export class Room {
     if (msg.type === "host-capabilities" &&
         (att.role !== "host" || typeof message !== "string" || utf8Length(message) > 512 ||
          typeof msg.serviceMode !== "boolean" || typeof msg.coldBoot !== "boolean" ||
-         typeof msg.secureDesktop !== "boolean" || typeof msg.secureText !== "boolean" ||
-         !validHostMediaCapabilities(msg))) {
+         typeof msg.secureDesktop !== "boolean" || typeof msg.secureText !== "boolean")) {
       return;
     }
     if (msg.type === "host-capabilities") {
@@ -422,27 +369,18 @@ export class Room {
     if (msg.type === "first-frame" && !validFirstFrameMessage(msg, att.role, message)) {
       return;
     }
-    if ((msg.type === "media-control" || msg.type === "media-ack" || msg.type === "media-ack-v2" || msg.type === "media-ack-v3") &&
+    if (msg.type === "media-control" &&
         (att.role !== "client" || typeof message !== "string" || utf8Length(message) > 2_048)) {
       return;
     }
-    if (msg.type === "media-control" && (msg.protocol === 3 || msg.protocol === 4) &&
+    if (msg.type === "media-control" && msg.protocol === 4 &&
         !validCurrentMediaEpoch(msg.epoch, att)) return;
-    if (msg.type === "media-control" && msg.protocol === 3 && msg.action === "start" &&
-        !validWssTopology(msg.topology)) return;
-    if (msg.type === "media-ack-v3" && !validMediaAckV3(msg, att)) return;
-    if (msg.type === "media-topology" &&
-        (att.role !== "host" || typeof message !== "string" || utf8Length(message) > 1_024 ||
-         msg.protocol !== 3 || !/^[a-f0-9]{32}$/.test(msg.epoch || "") ||
-         (msg.status !== "accepted" && msg.status !== "rejected") || !validWssTopology(msg.topology) ||
-         (msg.reason !== undefined && msg.reason !== null &&
-          (typeof msg.reason !== "string" || msg.reason.length > 96)))) return;
     if (msg.type === "media-control" && msg.action === "monitor" &&
         (att.role !== "client" || typeof msg.monitor !== "string" || msg.monitor.length === 0 || msg.monitor.length > 128)) {
       return;
     }
     if (msg.type === "media-control" && msg.action === "monitors" &&
-        (att.role !== "client" || ![2, 3, 4].includes(msg.protocol) || typeof msg.epoch !== "string" ||
+        (att.role !== "client" || msg.protocol !== 4 || typeof msg.epoch !== "string" ||
          !/^[a-f0-9]{32}$/.test(msg.epoch) || msg.epoch !== att.mediaEpoch)) {
       return;
     }
@@ -488,7 +426,7 @@ export class Room {
     const att = ws.deserializeAttachment() || {};
     const role = att.role;
     this.forgetPeer(ws);
-    console.log(`[room] socket closed role=${role || "unassigned"} run=${att.run || "-"} stripe=${att.stripe ?? "-"} target=${att.registeredAtMs ?? "-"} replaced=${!!att.replaced}`);
+    console.log(`[room] socket closed role=${role || "unassigned"} run=${att.run || "-"} target=${att.registeredAtMs ?? "-"} replaced=${!!att.replaced}`);
     if (!role) return;
     // When the client dies, its buffered offer/ICE is worthless — clear it so
     // a later host never receives a stale offer from a dead peer.
@@ -496,14 +434,13 @@ export class Room {
       await this.state.storage.delete("pendingToHost");
     }
     if (att.replaced) return; // replaced sockets get no farewell
-    // Media stripe churn is isolated from the signaling session. Losing one
-    // TCP lane must not tell the host/browser that the application peer left.
-    if (att.version === 4 && (role === "media-host" || role === "media-client")) {
-      const other = this.findPeer(role === "media-host" ? "media-client" : "media-host", att.stripe);
+    // Media socket churn is isolated from the signaling session. Losing the
+    // media socket must not tell the host/browser that the application peer left.
+    if (role === "media-host" || role === "media-client") {
+      const other = this.findPeer(role === "media-host" ? "media-client" : "media-host");
       try { other?.send(JSON.stringify({ type: "media-peer", present: false })); } catch { /* closing */ }
       return;
     }
-    if (role === "media-host" || role === "media-client") return;
     const peer = role === "host" ? this.findPeer("client") : this.findPeer("host");
     if (peer) {
       try {
@@ -524,7 +461,7 @@ export class Room {
     const length = binaryLength(message);
     if (typeof message !== "string") {
       if (att.role !== "media-host" || length <= V4_HEADER_BYTES || length > V4_MAX_PACKET_BYTES) return;
-      const target = this.findPeer("media-client", att.stripe);
+      const target = this.findPeer("media-client");
       if (target) {
         try { target.send(message); } catch { /* receiver closing */ }
       }
@@ -537,7 +474,7 @@ export class Room {
       return;
     }
     if (att.role !== "media-client") return;
-    const target = this.findPeer("media-host", att.stripe);
+    const target = this.findPeer("media-host");
     if (target) {
       try { target.send(message); } catch { /* host closing */ }
     }
@@ -557,37 +494,31 @@ export class Room {
     try { ws.close(1008, message); } catch { /* socket already closed */ }
   }
 
-  findPeer(role, stripe = null) {
-    const key = this.peerCacheKey(role, stripe);
-    const cached = this.peerCache.get(key);
+  findPeer(role) {
+    const cached = this.peerCache.get(role);
     if (cached) {
       const attachment = cached.deserializeAttachment() || {};
-      if (cached.readyState === 1 && !attachment.replaced &&
-          attachment.role === role && (attachment.stripe ?? null) === stripe) return cached;
-      this.peerCache.delete(key);
+      if (cached.readyState === 1 && !attachment.replaced && attachment.role === role) return cached;
+      this.peerCache.delete(role);
     }
     const sockets = this.state.getWebSockets();
     const peer =
       sockets.find((s) => {
         const a = s.deserializeAttachment() || {};
-        return a.role === role && (a.stripe ?? null) === stripe && !a.replaced && s.readyState === 1;
+        return a.role === role && !a.replaced && s.readyState === 1;
       }) || null;
-    if (peer) this.peerCache.set(key, peer);
+    if (peer) this.peerCache.set(role, peer);
     return peer;
   }
 
-  rememberPeer(role, stripe, ws) {
-    this.peerCache.set(this.peerCacheKey(role, stripe), ws);
+  rememberPeer(role, ws) {
+    this.peerCache.set(role, ws);
   }
 
   forgetPeer(ws) {
     for (const [key, peer] of this.peerCache) {
       if (peer === ws) this.peerCache.delete(key);
     }
-  }
-
-  peerCacheKey(role, stripe) {
-    return `${role}:${stripe ?? ""}`;
   }
 }
 
@@ -597,21 +528,6 @@ function binaryLength(value) {
   if (value instanceof ArrayBuffer) return value.byteLength;
   if (ArrayBuffer.isView(value)) return value.byteLength;
   return 0;
-}
-
-function appendLabEdgeTrace(message, edgeReceivedAtEpochMs = Date.now()) {
-  const source = message instanceof ArrayBuffer
-    ? new Uint8Array(message)
-    : ArrayBuffer.isView(message)
-      ? new Uint8Array(message.buffer, message.byteOffset, message.byteLength)
-      : null;
-  if (!source) return message;
-  const tagged = new Uint8Array(source.byteLength + LAB_EDGE_TRACE_BYTES);
-  tagged.set(source);
-  const trailer = new DataView(tagged.buffer, source.byteLength, LAB_EDGE_TRACE_BYTES);
-  trailer.setUint32(0, LAB_EDGE_TRACE_MAGIC);
-  trailer.setFloat64(4, edgeReceivedAtEpochMs);
-  return tagged.buffer;
 }
 
 function randomEpoch() {

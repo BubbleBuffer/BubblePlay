@@ -148,7 +148,7 @@ export function prepareLabExecution(command, env, options = {}) {
   const candidateBuilder = options.buildCandidate ?? buildCandidateHost;
   let preflight = preflightRunner({ env, requireActivityGuard: false });
   let candidateHost = null;
-  if (["optimize", "lane-recovery"].includes(command) && preflight.missing.length === 0) {
+  if (command === "optimize" && preflight.missing.length === 0) {
     candidateHost = candidateBuilder({ env });
     preflight = preflightRunner({ env, requireActivityGuard: command === "optimize" });
   }
@@ -283,20 +283,6 @@ export function parseSceneOptions(args) {
   return scenes;
 }
 
-export function parseWssTopologyOptions(args) {
-  const rawLanes = option(args, "--wss-lanes", null);
-  if (rawLanes === null) return null;
-  const laneCount = Number(rawLanes);
-  const parityShards = Number(option(args, "--wss-parity", "1"));
-  if (!Number.isInteger(laneCount) || laneCount < 1 || laneCount > 16)
-    throw new RangeError("--wss-lanes must be an integer from 1 to 16");
-  if (!Number.isInteger(parityShards) || parityShards < 0 || parityShards > 2)
-    throw new RangeError("--wss-parity must be 0, 1, or 2");
-  const topology = { laneCount, dataShards: laneCount - parityShards, parityShards };
-  if (topology.dataShards < 1) throw new RangeError("invalid WSS topology: at least one data lane is required");
-  return topology;
-}
-
 export function parseWorkerVersionOptions(args, env = process.env) {
   const cliName = option(args, "--worker-name", null);
   const cliVersion = option(args, "--worker-version-id", null);
@@ -349,12 +335,6 @@ export function buildScreeningCandidate(args) {
   if (Number(dirtyQpMap) + Number(main10) + Number(roiIndex >= 0) +
       Number(explicitResourceMode) + Number(hybridIndex >= 0) + Number(rateControlIndex >= 0) > 1)
     throw new Error("--dirty-qp-map, --roi-mode, --main10, --resource-mode, --hybrid-mode, and --rate-control are separate hypotheses");
-  const requestedTopology = parseWssTopologyOptions(args);
-  const controlTopology = { laneCount: 16, dataShards: 15, parityShards: 1 };
-  if ((explicitResourceMode || roiIndex >= 0 || hybridIndex >= 0 || rateControlIndex >= 0) && requestedTopology &&
-      (requestedTopology.laneCount !== 16 || requestedTopology.dataShards !== 15 ||
-       requestedTopology.parityShards !== 1))
-    throw new Error("pipeline experiments require the unchanged 16-lane 15+1 control topology");
   const common = {
     schemaVersion: 2,
     implementationVariant: "candidate",
@@ -375,7 +355,6 @@ export function buildScreeningCandidate(args) {
     experimentId: "hevc-main10",
     dirtyQpMap: false,
     main10: true,
-    wssTopology: controlTopology,
   };
   if (dirtyQpMap) return {
     id: "dirty-qp-map",
@@ -383,7 +362,6 @@ export function buildScreeningCandidate(args) {
     experimentId: "dirty-qp-map",
     dirtyQpMap: true,
     main10: false,
-    wssTopology: requestedTopology ?? controlTopology,
   };
   if (roiMode) return {
     id: `roi-${roiMode}`,
@@ -395,7 +373,6 @@ export function buildScreeningCandidate(args) {
     resourceMode: "per-frame",
     asyncDepth: 0,
     hybridMode: "off",
-    wssTopology: controlTopology,
   };
   if (hybridMode) return {
     id: `hybrid-${hybridMode}${hybridCacheMode === "dda-gated" ? "-dda-gated" : ""}`,
@@ -408,7 +385,6 @@ export function buildScreeningCandidate(args) {
     asyncDepth: 0,
     hybridMode,
     hybridCacheMode,
-    wssTopology: controlTopology,
   };
   if (rateControlMode) return {
     id: "external-budget-vbr-cq23",
@@ -426,7 +402,6 @@ export function buildScreeningCandidate(args) {
     peakBitrateMultiplier: 4,
     requestedBitrateMbps: 6,
     totalMediaCapMbps: 6,
-    wssTopology: controlTopology,
   };
   if (resourceMode === "per-frame") return {
     id: "nvenc-per-frame-control",
@@ -439,7 +414,6 @@ export function buildScreeningCandidate(args) {
     resourceMode: "per-frame",
     asyncDepth: 0,
     hybridMode: "off",
-    wssTopology: controlTopology,
   };
   if (persistent) return {
     id: "nvenc-persistent",
@@ -451,7 +425,6 @@ export function buildScreeningCandidate(args) {
     resourceMode: "persistent",
     asyncDepth: 0,
     hybridMode: "off",
-    wssTopology: controlTopology,
   };
   return {
     id: "quality-latency-control",
@@ -464,7 +437,6 @@ export function buildScreeningCandidate(args) {
     resourceMode: "per-frame",
     asyncDepth: 0,
     hybridMode: "off",
-    wssTopology: requestedTopology ?? controlTopology,
   };
 }
 
@@ -498,19 +470,12 @@ function newestResumableCampaign(root) {
       item.state.invalidated?.resumable !== false).sort((a, b) => b.mtime - a.mtime)[0]?.name ?? null;
 }
 
-function newestResumableTopology(root) {
-  if (!existsSync(root)) return null;
-  return readdirSync(root).map(name => ({ name, path: join(root, name, "topology-checkpoint.json") }))
-    .filter(item => existsSync(item.path)).map(item => ({ ...item, state: JSON.parse(readFileSync(item.path, "utf8")), mtime: statSync(item.path).mtimeMs }))
-    .filter(item => item.state.status !== "complete").sort((a, b) => b.mtime - a.mtime)[0]?.name ?? null;
-}
-
 function resumeArgument(args, root, command) {
   const index = args.indexOf("--resume");
   if (index < 0) return null;
   const explicit = args[index + 1];
   if (explicit && !explicit.startsWith("--")) return explicit;
-  const latest = command === "topology-sweep" ? newestResumableTopology(root) : newestResumableCampaign(root);
+  const latest = newestResumableCampaign(root);
   if (!latest) throw new Error("No incomplete Stream Lab campaign is available to resume.");
   return latest;
 }
@@ -519,7 +484,7 @@ async function runLabCommand(command, args, env) {
   const root = artifactRoot(env);
   const baseUrl = option(args, "--url", env.BUBBLEPLAY_URL);
   const workerVersionOverride = parseWorkerVersionOptions(args, env);
-  const resumeRun = ["campaign", "optimize", "topology-sweep"].includes(command) ? resumeArgument(args, root, command) : null;
+  const resumeRun = ["campaign", "optimize"].includes(command) ? resumeArgument(args, root, command) : null;
   const runId = resumeRun ?? option(args, "--run-id", newRunId(command));
   validateRunId(runId);
   const transientVdd = args.includes("--transient-vdd");
@@ -573,7 +538,7 @@ async function runLabCommand(command, args, env) {
       throw error;
     }
     store.updateManifest({ candidateHost: inspectCandidateHostCompatibility(candidateHost) });
-    const { runLiveBaseline, runLiveLaneRecovery, runLiveManual, runLiveOptimize, runLiveSweep, runLiveTopologySweep } =
+    const { runLiveBaseline, runLiveManual, runLiveOptimize, runLiveSweep } =
       await import("./stream-lab-live.mjs");
     const common = {
       runId, store, env,
@@ -583,8 +548,6 @@ async function runLabCommand(command, args, env) {
       workerVersionOverride,
       receiverAssetOverride: receiverAssetInterceptionForRun(loopbackRelay),
       transientVdd,
-      ...(parseWssTopologyOptions(args) ? { wssTopology: parseWssTopologyOptions(args) } : {}),
-      ...(command === "topology-sweep" && resumeRun ? { resumeCheckpoint: store.readTopologyCheckpoint() } : {}),
     };
     const bandwidthOption = option(args, "--bandwidth", null);
     let metrics;
@@ -593,7 +556,6 @@ async function runLabCommand(command, args, env) {
       metrics = await runLiveManual({
         ...common,
         candidate,
-        wssTopology: candidate.wssTopology,
         onReady: report => process.stdout.write(`${JSON.stringify(report, null, 2)}\n`),
       });
     } else if (["baseline", "smoke"].includes(command)) {
@@ -616,29 +578,6 @@ async function runLabCommand(command, args, env) {
           actionProbe: performanceActionProbeEnabled(args, roiCandidate, hybridCandidate),
           ...(sceneIds ? { sceneIds } : {}),
         });
-    } else if (command === "topology-sweep") {
-      const requestedTopology = parseWssTopologyOptions(args);
-      metrics = await runLiveTopologySweep({ ...common,
-        ...(requestedTopology ? { topologies: [requestedTopology] } : {}),
-        bandwidthMbps: Number(option(args, "--bandwidth", 4)),
-        performanceSeconds: Number(option(args, "--seconds", 10)),
-        quality: args.includes("--quality"),
-        repetitions: Number(option(args, "--repetitions", args.includes("--quality") ? 3 : 1)),
-        qualitySamples: Number(option(args, "--quality-samples", 8)),
-      });
-    } else if (command === "lane-recovery") {
-      const sceneIds = parseSceneOptions(args);
-      metrics = await runLiveLaneRecovery({ ...common,
-        actionProbe: performanceActionProbeEnabled(args, false, false),
-        bandwidthMbps: Number(option(args, "--bandwidth", 4)),
-        performanceSeconds: Number(option(args, "--seconds", 8)),
-        qualitySamples: Number(option(args, "--quality-samples", 8)),
-        qualityRepetitions: Number(option(args, "--quality-repetitions", 2)),
-        ...(sceneIds ? { sceneIds } : {}),
-        stripe: Number(option(args, "--lane", 0)),
-        lossDurationMs: Number(option(args, "--loss-ms", 1_500)),
-        maxRecoveryMs: Number(option(args, "--recovery-timeout-ms", 5_000)),
-      });
     } else if (command === "optimize") {
       const activityGuard = await launchPhysicalActivityGuard({ idleMs: 600_000 });
       try {
@@ -716,60 +655,6 @@ async function runLabCommand(command, args, env) {
   }
 }
 
-export async function runProductionProbeCommand(args, env = process.env) {
-  const root = artifactRoot(env);
-  const runId = option(args, "--run-id", newRunId("production-probe"));
-  validateRunId(runId);
-  const store = artifactStore(root, runId);
-  const durationMs = Math.max(1_000, Number(option(args, "--seconds", 180)) * 1_000);
-  const intervalMs = Math.max(100, Number(option(args, "--interval-ms", 250)));
-  const baseUrl = option(args, "--url", env.BUBBLEPLAY_URL);
-  const wssTopology = parseWssTopologyOptions(args);
-  store.initialize({
-    command: "production-probe",
-    transport: "wss",
-    installedHost: true,
-    candidateHostStarted: false,
-    inputAutomation: false,
-    receiverProfile: persistentReceiverProfile(env),
-    baseUrl: baseUrl || "https://playfull-cat.your-subdomain.workers.dev/",
-    durationMs,
-    intervalMs,
-    ...(wssTopology ? { wssTopology } : {}),
-  });
-  try {
-    const { runProductionProbe } = await import("./stream-lab-live.mjs");
-    const report = await runProductionProbe({
-      env,
-      store,
-      baseUrl,
-      durationMs,
-      intervalMs,
-      runId,
-      ...(wssTopology ? { wssTopology } : {}),
-      authTimeoutMs: Number(option(args, "--auth-timeout-ms", 30_000)),
-      port: Number(option(args, "--port", 19343)),
-    });
-    const { samples: _samples, ...metrics } = report;
-    store.writeMetrics(metrics);
-    return { exitCode: reportExitCode(metrics), runId, artifactPath: store.path, ...metrics };
-  } catch (error) {
-    const unavailable = error?.name === "StreamLabUnavailable";
-    const metrics = {
-      schemaVersion: 1,
-      result: unavailable ? "unavailable" : "fail",
-      error: {
-        code: error?.code || "unexpected-error",
-        message: String(error?.message || error),
-        detail: error?.detail ?? null,
-      },
-    };
-    store.writeMetrics(metrics);
-    store.writeFailure(metrics.error);
-    return { exitCode: unavailable ? 2 : 1, runId, artifactPath: store.path, ...metrics };
-  }
-}
-
 export function reportExitCode(report) {
   if (report?.result === "unavailable") return 2;
   return report?.result === "rejected" || report?.accepted === false || report?.result === "fail" ? 1 : 0;
@@ -812,14 +697,8 @@ async function main(argv = process.argv.slice(2), env = process.env) {
     if (report.result !== "ready") process.exitCode = 2;
     return;
   }
-  if (["manual", "baseline", "smoke", "sweep", "campaign", "optimize", "topology-sweep", "lane-recovery"].includes(command)) {
+  if (["manual", "baseline", "smoke", "sweep", "campaign", "optimize"].includes(command)) {
     const report = await runLabCommand(command, args, env);
-    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    process.exitCode = report.exitCode;
-    return;
-  }
-  if (command === "production-probe") {
-    const report = await runProductionProbeCommand(args, env);
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     process.exitCode = report.exitCode;
     return;
@@ -842,7 +721,7 @@ async function main(argv = process.argv.slice(2), env = process.env) {
     process.stdout.write(`${JSON.stringify({ result: "pass", ...report }, null, 2)}\n`);
     return;
   }
-  process.stdout.write("BubblePlay Stream Lab\n\nRemote live runs require --worker-version-id UUID for a version admitted to the active deployment and accept --worker-name NAME (default playfull-cat). Pinned remote runs may add --transient-vdd. Use --candidate-host with an existing uninstalled binary when the default target is occupied. Explicit HTTP loopback runs use the local compatibility descriptor, omit Worker version flags, and may also add --transient-vdd.\n\nCommands: preflight, production-probe [--seconds N --interval-ms N --wss-lanes N --wss-parity 0|1|2], manual [candidate flags; defaults to png-quiescent-detail], smoke, baseline [--no-action-probe --dirty-qp-map|--roi-mode damage|text-edge|feedback|feedback-headroom|--hybrid-mode png-static-roi|png-quiescent-detail|hevc-quiescent-tiles [--hybrid-cache-mode dda-gated|suppress-reactivate]|--rate-control external-budget-vbr|--main10|--resource-mode per-frame|persistent --performance-scene id --quality-samples N --delta-quality --delta-trigger-frames N], sweep, topology-sweep [--quality --repetitions N --quality-samples N] [--wss-lanes N --wss-parity 0|1|2], lane-recovery [--scenes id,id --quality-repetitions N --lane N --loss-ms N --recovery-timeout-ms N], campaign, optimize [--resume [run-id]], compare, cleanup\n");
+  process.stdout.write("BubblePlay Stream Lab\n\nRemote live runs require --worker-version-id UUID for a version admitted to the active deployment and accept --worker-name NAME (default playfull-cat). Pinned remote runs may add --transient-vdd. Use --candidate-host with an existing uninstalled binary when the default target is occupied. Explicit HTTP loopback runs use the local compatibility descriptor, omit Worker version flags, and may also add --transient-vdd.\n\nCommands: preflight, manual [candidate flags; defaults to png-quiescent-detail], smoke, baseline [--no-action-probe --dirty-qp-map|--roi-mode damage|text-edge|feedback|feedback-headroom|--hybrid-mode png-static-roi|png-quiescent-detail|hevc-quiescent-tiles [--hybrid-cache-mode dda-gated|suppress-reactivate]|--rate-control external-budget-vbr|--main10|--resource-mode per-frame|persistent --performance-scene id --quality-samples N --delta-quality --delta-trigger-frames N], sweep, campaign, optimize [--resume [run-id]], compare, cleanup\n");
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

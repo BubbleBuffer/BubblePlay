@@ -18,7 +18,7 @@ use tungstenite::http::{header::AUTHORIZATION, HeaderName, HeaderValue, Request}
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
-const STREAM_LAB_COMPATIBILITY_ID: &str = "wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
+const STREAM_LAB_COMPATIBILITY_ID: &str = "wss-v4-bench2-hevc-tiles-bpip4-v16";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaCodec {
@@ -334,7 +334,7 @@ mod tests {
     use super::*;
 
     const EPOCH: &str = "0123456789abcdef0123456789abcdef";
-    const LAB_URL: &str = "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15";
+    const LAB_URL: &str = "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v4-bench2-hevc-tiles-bpip4-v16";
 
     #[test]
     fn derives_the_single_media_endpoint_and_sends_bearer_only_in_upgrade_header() {
@@ -362,10 +362,10 @@ mod tests {
             media_request_with_worker_version(LAB_URL, "host-bearer", EPOCH, None).unwrap();
         assert_eq!(
             request.uri().to_string(),
-            "wss://worker.example/lab-host-media-ws?epoch=0123456789abcdef0123456789abcdef&run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15"
+            "wss://worker.example/lab-host-media-ws?epoch=0123456789abcdef0123456789abcdef&run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v4-bench2-hevc-tiles-bpip4-v16"
         );
         assert!(media_request_with_worker_version(
-            "wss://worker.example/lab-host-ws?run=not-a-uuid&compat=wss-v3-host20-edge12-bench2-hevc-tiles-bpip4-v15",
+            "wss://worker.example/lab-host-ws?run=not-a-uuid&compat=wss-v4-bench2-hevc-tiles-bpip4-v16",
             "host-bearer",
             EPOCH,
             None,

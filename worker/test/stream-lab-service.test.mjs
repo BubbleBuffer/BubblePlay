@@ -23,7 +23,6 @@ test("schema-v2 helper apply normalizes the legacy dirty QP-map candidate flag",
       schemaVersion: 2, implementationVariant: "candidate", experimentId: "dirty-qp-map",
       transport: "wss", codec: "hevc", streamMode: "work", adaptive: false,
       width: 1920, height: 1080, fps: 30, bitrateBps: 6_000_000, gopSeconds: 2,
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       encoder: {
         preset: "p4", tuning: "low-latency", multipass: "quarter",
         aqMode: "spatial", aqStrength: 8, vbvFrames: 1, lookaheadDepth: 0,
@@ -46,7 +45,6 @@ test("schema-v2 helper apply preserves one bounded pipeline experiment axis", ()
       schemaVersion: 2, implementationVariant: "candidate", experimentId: "nvenc-persistent",
       transport: "wss", codec: "hevc", streamMode: "work", adaptive: false,
       width: 1920, height: 1080, fps: 30, bitrateBps: 6_000_000, gopSeconds: 2,
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "off",
       encoder: {
         preset: "p3", tuning: "ultra-low-latency", multipass: "disabled",
@@ -75,7 +73,6 @@ test("schema-v2 helper admits the bounded CQ23 external-budget VBR axis", () => 
       transport: "wss", codec: "hevc", streamMode: "work", adaptive: false,
       width: 1920, height: 1080, fps: 30, bitrateBps: 6_000_000,
       requestedBitrateBps: 6_000_000, totalMediaCapBps: 6_000_000, gopSeconds: 2,
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "off", hybridCacheMode: "suppress-reactivate",
       encoder: {
         preset: "p3", tuning: "ultra-low-latency", multipass: "disabled",
@@ -96,7 +93,6 @@ test("schema-v2 helper apply accepts the quiescence-gated hybrid experiment", ()
     experimentId: "hybrid-png-quiescent-detail",
     transport: "wss", codec: "hevc", streamMode: "work", adaptive: false,
     width: 1920, height: 1080, fps: 30, bitrateBps: 6_000_000, gopSeconds: 2,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
     hybridMode: "png-quiescent-detail",
     hybridCacheMode: "suppress-reactivate",
     encoder: {
@@ -125,7 +121,6 @@ test("helper admission binds a calibrated pipeline target to the requested six-m
     transport: "wss", codec: "hevc", streamMode: "work", adaptive: false,
     width: 1920, height: 1080, fps: 30, bitrateBps: 5_400_000,
     requestedBitrateBps: 6_000_000, totalMediaCapBps: 6_000_000, gopSeconds: 2,
-    wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
     hybridMode: "png-quiescent-detail", hybridCacheMode: "suppress-reactivate",
     encoder: {
       preset: "p3", tuning: "ultra-low-latency", multipass: "disabled",

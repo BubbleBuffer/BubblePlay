@@ -22,12 +22,6 @@ export function parseQualityPreset(params, storage = null) {
   return QUALITY.HIGH;
 }
 
-export function parseAdaptive(params) {
-  if (params.get("adaptive") === "0") return false;
-  if (params.get("adaptive") === "1") return true;
-  return params.get("quality") === QUALITY.AUTO;
-}
-
 export function decoderSupportsCodec(transport, decoderPath, codec) {
   if (!["hevc", "h264"].includes(codec)) return false;
   return transport === "wss" || decoderPath !== "webcodecs" || codec === "h264";

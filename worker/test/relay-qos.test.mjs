@@ -45,7 +45,6 @@ test("quiescent benchmark validation reports the missing activity field", () => 
       transport: "wss", codec: "hevc", streamMode: "work", width: 1920, height: 1080,
       fps: 30, bitrateBps: 6_000_000, gopSeconds: 2, implementationVariant: "candidate",
       experimentId: "png-quiescent-detail",
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "png-quiescent-detail",
       hybridCacheMode: "suppress-reactivate",
       encoder: { preset: "p3", tuning: "ultra-low-latency", multipass: "disabled", aqMode: "spatial",
@@ -81,7 +80,6 @@ test("Worker admits a bounded codec-native HEVC tile activity contract", () => {
       transport: "wss", codec: "hevc", streamMode: "work", width: 1920, height: 1080,
       fps: 30, bitrateBps: 6_000_000, gopSeconds: 2, implementationVariant: "candidate",
       experimentId: "hevc-quiescent-tiles",
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "hevc-quiescent-tiles", hybridCacheMode: "suppress-reactivate",
       encoder: { preset: "p3", tuning: "ultra-low-latency", multipass: "disabled", aqMode: "spatial",
         aqStrength: 8, vbvFrames: 1, lookaheadDepth: 0, weightedPrediction: false,
@@ -114,7 +112,6 @@ test("Worker admits only the bounded CQ23 external-budget VBR status", () => {
       transport: "wss", codec: "hevc", streamMode: "work", width: 1920, height: 1080,
       fps: 30, bitrateBps: 6_000_000, gopSeconds: 2, implementationVariant: "candidate",
       experimentId: "external-budget-vbr-cq23",
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "off", hybridCacheMode: "suppress-reactivate",
       encoder: { preset: "p3", tuning: "ultra-low-latency", multipass: "disabled", aqMode: "spatial",
         aqStrength: 8, vbvFrames: 4, lookaheadDepth: 0, weightedPrediction: false,
@@ -142,7 +139,7 @@ test("lab clients receive a bounded benchmark rejection diagnostic", async () =>
 
 test("client hello persists the minted media epoch on its socket attachment", async () => {
   const client = new FakeSocket(null);
-  client.attachment = { role: null, expectedRole: "client", stripe: null, epoch: null };
+  client.attachment = { role: null, expectedRole: "client", epoch: null };
   const storage = { get: async () => [], put: async () => {}, delete: async () => {} };
   const room = new Room({ getWebSockets: () => [client], storage }, { TOKEN: "test" });
 
@@ -156,13 +153,12 @@ test("client hello persists the minted media epoch on its socket attachment", as
 test("a client registering after the host receives the host's latest capabilities", async () => {
   const host = new FakeSocket("host");
   const client = new FakeSocket(null);
-  client.attachment = { role: null, expectedRole: "client", stripe: null, epoch: null };
+  client.attachment = { role: null, expectedRole: "client", epoch: null };
   const sockets = [host, client];
   const storage = { get: async () => [], put: async () => {}, delete: async () => {} };
   const room = new Room({ getWebSockets: () => sockets, storage }, { TOKEN: "test" });
   const capability = JSON.stringify({ type: "host-capabilities", serviceMode: false, coldBoot: false,
-    secureDesktop: false, secureText: false, mediaProtocols: [2, 3], maxWssLanes: 16,
-    wssFec: ["none", "xor-1"] });
+    secureDesktop: false, secureText: false });
 
   await room.webSocketMessage(host, capability);
   await room.webSocketMessage(client, JSON.stringify({ type: "hello", role: "client" }));
@@ -254,7 +250,6 @@ test("relays strict v2 candidate benchmark telemetry while retaining v1 compatib
       transport: "wss", codec: "hevc", streamMode: "work", width: 1920, height: 1080,
       fps: 30, bitrateBps: 6_000_000, gopSeconds: 2, implementationVariant: "candidate",
       experimentId: "enc-work-001",
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "off",
       encoder: { preset: "p7", tuning: "low-latency", multipass: "full", aqMode: "spatial",
         aqStrength: 15, vbvFrames: 4, lookaheadDepth: 2, weightedPrediction: true, dirtyQpMap: true, main10: false,
@@ -304,8 +299,6 @@ test("relays strict v2 candidate benchmark telemetry while retaining v1 compatib
   await room.webSocketMessage(host, JSON.stringify({ ...v2, effective: { ...v2.effective, encoder: {
     ...v2.effective.encoder, lookaheadDepth: 3,
   } } }));
-  await room.webSocketMessage(host, JSON.stringify({ ...v2, effective: { ...v2.effective,
-    wssTopology: { laneCount: 9, dataShards: 7, parityShards: 1 } } }));
   await room.webSocketMessage(host, JSON.stringify({ ...v2, roiActivity: {
     ...v2.roiActivity, lastReason: "invented",
   } }));
@@ -336,7 +329,6 @@ test("relays reconstruction-feedback activity only for a feedback ROI candidate"
       transport: "wss", codec: "hevc", streamMode: "work", width: 1920, height: 1080,
       fps: 30, bitrateBps: 6_000_000, gopSeconds: 2, implementationVariant: "candidate",
       experimentId: "feedback-roi-001",
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "off", hybridCacheMode: "suppress-reactivate",
       encoder: { preset: "p3", tuning: "ultra-low-latency", multipass: "disabled",
         aqMode: "spatial", aqStrength: 8, vbvFrames: 1, lookaheadDepth: 0,
@@ -387,7 +379,6 @@ test("relays feedback-headroom only with exact wire-occupancy policy telemetry",
       transport: "wss", codec: "hevc", streamMode: "work", width: 1920, height: 1080,
       fps: 30, bitrateBps: 6_000_000, gopSeconds: 2, implementationVariant: "candidate",
       experimentId: "feedback-headroom-001",
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "off", hybridCacheMode: "suppress-reactivate",
       encoder: { preset: "p3", tuning: "ultra-low-latency", multipass: "disabled",
         aqMode: "spatial", aqStrength: 8, vbvFrames: 1, lookaheadDepth: 0,
@@ -440,7 +431,6 @@ test("relays the bandwidth-shaped quiescence-gated hybrid experiment profile", a
       transport: "wss", codec: "hevc", streamMode: "work", width: 1920, height: 1080,
       fps: 30, bitrateBps: 5_700_000, gopSeconds: 2, implementationVariant: "candidate",
       experimentId: "png-quiescent-detail",
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "png-quiescent-detail",
       hybridCacheMode: "suppress-reactivate",
       encoder: { preset: "p3", tuning: "ultra-low-latency", multipass: "disabled", aqMode: "spatial",
@@ -518,7 +508,6 @@ test("relays completed benchmark stages that round below one microsecond", async
       transport: "wss", codec: "hevc", streamMode: "work", width: 1920, height: 1080,
       fps: 30, bitrateBps: 6_000_000, gopSeconds: 2, implementationVariant: "candidate",
       experimentId: "png-quiescent-detail",
-      wssTopology: { laneCount: 16, dataShards: 15, parityShards: 1 },
       hybridMode: "png-quiescent-detail",
       hybridCacheMode: "suppress-reactivate",
       encoder: { preset: "p3", tuning: "ultra-low-latency", multipass: "disabled", aqMode: "spatial",
@@ -661,83 +650,22 @@ test("relays only bounded privileged capability and secure desktop state from th
   assert.deepEqual(host.messages, []);
 });
 
-test("relays only bounded protocol-v3 topology negotiation and dynamic ACKs", async () => {
-  const { room, sockets: [client, host] } = createRoom();
-  const topology = { laneCount: 5, dataShards: 4, parityShards: 1 };
-  const duplicateParityTopology = { laneCount: 16, dataShards: 14, parityShards: 2 };
-  const start = JSON.stringify({ type: "media-control", action: "start", protocol: 3,
-    epoch: CURRENT_MEDIA_EPOCH, codec: "hevc", topology });
-  const ack = JSON.stringify({ type: "media-ack-v3", protocol: 3, epoch: CURRENT_MEDIA_EPOCH,
-    generation: 7, topology, lanes: [10, 11, 12, 13, 14], reconstructed: 14, presented: 13,
-    recoveredFrames: 1, expiredFrames: 0, decoderDrops: 0, dependencyLosses: 0,
-    deadlineMs: 220, reassemblyP95Ms: 4, recoveryState: "healthy",
-    completionMissingByLane: [1, 7, 0, 2, 14] });
-  const accepted = JSON.stringify({ type: "media-topology", protocol: 3, epoch: CURRENT_MEDIA_EPOCH,
-    status: "accepted", topology });
-  await room.webSocketMessage(client, start);
-  await room.webSocketMessage(client, ack);
-  await room.webSocketMessage(host, accepted);
-  const duplicateParityStart = JSON.stringify({ type: "media-control", action: "start", protocol: 3,
-    epoch: CURRENT_MEDIA_EPOCH, codec: "hevc", topology: duplicateParityTopology });
-  const duplicateParityAccepted = JSON.stringify({ type: "media-topology", protocol: 3,
-    epoch: CURRENT_MEDIA_EPOCH, status: "accepted", topology: duplicateParityTopology });
-  await room.webSocketMessage(client, duplicateParityStart);
-  await room.webSocketMessage(host, duplicateParityAccepted);
-
-  for (const invalid of [
-    { type: "media-control", action: "start", protocol: 3, epoch: CURRENT_MEDIA_EPOCH,
-      topology: { laneCount: 17, dataShards: 16, parityShards: 1 } },
-    { type: "media-control", action: "start", protocol: 3, epoch: CURRENT_MEDIA_EPOCH,
-      topology: { laneCount: 5, dataShards: 3, parityShards: 1 } },
-    { type: "media-control", action: "start", protocol: 3, epoch: STALE_MEDIA_EPOCH, topology },
-    { type: "media-ack-v3", protocol: 3, epoch: CURRENT_MEDIA_EPOCH, generation: 7,
-      topology, lanes: [1, 2, 3, 4] },
-    { type: "media-ack-v3", protocol: 3, epoch: CURRENT_MEDIA_EPOCH, generation: 7,
-      topology, lanes: [1, 2, 3, 4, 5], reconstructed: 5, presented: 5,
-      recoveredFrames: 0, expiredFrames: 0, decoderDrops: 0, dependencyLosses: 0,
-      deadlineMs: 220, reassemblyP95Ms: 4, recoveryState: "healthy",
-      completionMissingByLane: [1, 2, 3, 4] },
-  ]) await room.webSocketMessage(client, JSON.stringify(invalid));
-  await room.webSocketMessage(host, JSON.stringify({ type: "media-topology", protocol: 3,
-    epoch: CURRENT_MEDIA_EPOCH, status: "accepted", topology: { laneCount: 5, dataShards: 3, parityShards: 1 } }));
-
-  assert.deepEqual(host.messages, [start, ack, duplicateParityStart]);
-  assert.deepEqual(client.messages, [accepted, duplicateParityAccepted]);
-});
-
-test("relays the Rust host's accepted topology wire with a null optional reason", async () => {
-  const { room, sockets: [client, host] } = createRoom();
-  const topology = { laneCount: 16, dataShards: 15, parityShards: 1 };
-  const accepted = JSON.stringify({
-    type: "media-topology",
-    protocol: 3,
-    epoch: CURRENT_MEDIA_EPOCH,
-    status: "accepted",
-    topology,
-    reason: null,
-  });
-
-  await room.webSocketMessage(host, accepted);
-
-  assert.deepEqual(client.messages, [accepted]);
-});
-
-test("host capabilities bound advertised WSS protocol and lane support", async () => {
+test("host capabilities relay only the bounded boolean contract", async () => {
   const { room, sockets: [client, host] } = createRoom();
   const capability = JSON.stringify({ type: "host-capabilities", serviceMode: true, coldBoot: true,
-    secureDesktop: true, secureText: true, mediaProtocols: [2, 3], maxWssLanes: 16,
-    wssFec: ["none", "xor-1", "rs-2"] });
+    secureDesktop: true, secureText: true });
   await room.webSocketMessage(host, capability);
-  await room.webSocketMessage(host, JSON.stringify({ type: "host-capabilities", serviceMode: true,
-    coldBoot: true, secureDesktop: true, secureText: true, mediaProtocols: [2, 4], maxWssLanes: 16,
-    wssFec: ["none", "xor-1"] }));
+  await room.webSocketMessage(host, JSON.stringify({ type: "host-capabilities", serviceMode: "yes",
+    coldBoot: true, secureDesktop: true, secureText: true }));
+  await room.webSocketMessage(client, capability);
   assert.deepEqual(client.messages, [capability]);
+  assert.deepEqual(host.messages, []);
 });
 
 test("relays monitor lists and bounded monitor selections", async () => {
   const { room, sockets: [client, host] } = createRoom();
   const list = JSON.stringify({ type: "monitor-list", monitors: [{ selector: "\\\\.\\\\DISPLAY1", name: "Primary", width: 1920, height: 1080, selected: true }] });
-  const select = JSON.stringify({ type: "media-control", action: "monitor", protocol: 2, monitor: "\\\\.\\\\DISPLAY2" });
+  const select = JSON.stringify({ type: "media-control", action: "monitor", protocol: 4, epoch: CURRENT_MEDIA_EPOCH, monitor: "\\\\.\\\\DISPLAY2" });
   await room.webSocketMessage(host, list);
   await room.webSocketMessage(client, select);
   await room.webSocketMessage(client, JSON.stringify({ type: "media-control", action: "monitor", monitor: "x".repeat(129) }));
@@ -747,16 +675,16 @@ test("relays monitor lists and bounded monitor selections", async () => {
   assert.deepEqual(host.closed, []);
 });
 
-test("relays only v2 epoch-scoped idempotent monitor refresh requests", async () => {
+test("relays only v4 epoch-scoped idempotent monitor refresh requests", async () => {
   const { room, sockets: [client, host] } = createRoom();
   const epoch = CURRENT_MEDIA_EPOCH;
-  const refresh = JSON.stringify({ type: "media-control", action: "monitors", protocol: 2, epoch });
-  const replay = JSON.stringify({ type: "media-control", action: "monitors", protocol: 2, epoch: STALE_MEDIA_EPOCH });
+  const refresh = JSON.stringify({ type: "media-control", action: "monitors", protocol: 4, epoch });
+  const replay = JSON.stringify({ type: "media-control", action: "monitors", protocol: 4, epoch: STALE_MEDIA_EPOCH });
   await room.webSocketMessage(client, refresh);
   await room.webSocketMessage(client, replay);
-  await room.webSocketMessage(client, JSON.stringify({ type: "media-control", action: "monitors", protocol: 1, epoch }));
-  await room.webSocketMessage(client, JSON.stringify({ type: "media-control", action: "monitors", protocol: 2 }));
-  await room.webSocketMessage(client, JSON.stringify({ type: "media-control", action: "monitors", protocol: 2, epoch: "A".repeat(32) }));
+  await room.webSocketMessage(client, JSON.stringify({ type: "media-control", action: "monitors", protocol: 2, epoch }));
+  await room.webSocketMessage(client, JSON.stringify({ type: "media-control", action: "monitors", protocol: 4 }));
+  await room.webSocketMessage(client, JSON.stringify({ type: "media-control", action: "monitors", protocol: 4, epoch: "A".repeat(32) }));
   await room.webSocketMessage(host, refresh);
   assert.deepEqual(host.messages, [refresh]);
   assert.deepEqual(client.messages, []);
@@ -774,8 +702,8 @@ test("buffers monitor refresh only for the client socket's current media epoch",
     delete: async () => { pending = []; },
   };
   const room = new Room({ getWebSockets: () => [client], storage }, { TOKEN: "test" });
-  const refresh = JSON.stringify({ type: "media-control", action: "monitors", protocol: 2, epoch: CURRENT_MEDIA_EPOCH });
-  const replay = JSON.stringify({ type: "media-control", action: "monitors", protocol: 2, epoch: STALE_MEDIA_EPOCH });
+  const refresh = JSON.stringify({ type: "media-control", action: "monitors", protocol: 4, epoch: CURRENT_MEDIA_EPOCH });
+  const replay = JSON.stringify({ type: "media-control", action: "monitors", protocol: 4, epoch: STALE_MEDIA_EPOCH });
 
   await room.webSocketMessage(client, refresh);
   await room.webSocketMessage(client, replay);

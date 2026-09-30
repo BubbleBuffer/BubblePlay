@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { Room } from "../src/index.js";
-import { validHostMediaCapabilities } from "../src/protocol-validation.js";
 import {
   V4_HEADER_BYTES,
   V4_MAX_PAYLOAD_BYTES,
@@ -12,7 +11,6 @@ import {
   keyframeMessageV4,
   nextBackoffMsV4,
   parseFrameV4,
-  preferWssProtocolV4,
   shouldPresentDecodedV4,
   validateClientMessageV4,
   validateHostTextV4,
@@ -92,15 +90,14 @@ test("v4 routes accept one epoch-scoped socket per side and nothing else", async
   const hostHeaders = { Upgrade: "websocket", Authorization: "Bearer host-only" };
   const browserHeaders = { Upgrade: "websocket" };
   assert.equal(await worker.fetch(new Request(
-    `https://playfull-cat.example/host-media-ws?v=4&epoch=${epoch}&stripe=0`, { headers: hostHeaders }), env), mediaResponse);
+    `https://playfull-cat.example/host-media-ws?epoch=${epoch}`, { headers: hostHeaders }), env), mediaResponse);
   assert.equal(await worker.fetch(new Request(
-    `https://playfull-cat.example/media-ws?v=4&epoch=${epoch}&stripe=0`, { headers: browserHeaders }), env), mediaResponse);
-  assert.deepEqual(selected, [`media-v4:${epoch}:0`, `media-v4:${epoch}:0`]);
+    `https://playfull-cat.example/media-ws?epoch=${epoch}`, { headers: browserHeaders }), env), mediaResponse);
+  assert.deepEqual(selected, [`media-v4:${epoch}`, `media-v4:${epoch}`]);
   for (const url of [
-    `https://playfull-cat.example/host-media-ws?v=4&epoch=${epoch}&stripe=1`,
-    `https://playfull-cat.example/host-media-ws?v=4&stripe=0`,
-    `https://playfull-cat.example/host-media-ws?v=4&epoch=BAD&stripe=0`,
-    `https://playfull-cat.example/host-media-ws?v=5&epoch=${epoch}&stripe=0`,
+    "https://playfull-cat.example/host-media-ws",
+    "https://playfull-cat.example/host-media-ws?epoch=BAD",
+    `https://playfull-cat.example/host-media-ws?epoch=${epoch.toUpperCase()}`,
   ]) assert.equal((await worker.fetch(new Request(url, { headers: hostHeaders }), env)).status, 404, url);
   assert.equal(selected.length, 2);
 });
@@ -168,15 +165,6 @@ test("v4 hello and close announce peer presence to the other side", async () => 
   assert.deepEqual(JSON.parse(host.messages.at(-1)), { type: "media-peer", present: false });
 });
 
-test("host capabilities may add protocol 4 without dropping 2 and 3", () => {
-  const base = { maxWssLanes: 16, wssFec: ["none", "xor-1", "rs-2"] };
-  assert.equal(validHostMediaCapabilities({ ...base, mediaProtocols: [2, 3] }), true);
-  assert.equal(validHostMediaCapabilities({ ...base, mediaProtocols: [2, 3, 4] }), true);
-  assert.equal(validHostMediaCapabilities({ ...base, mediaProtocols: [2, 4] }), false);
-  assert.equal(validHostMediaCapabilities({ ...base, mediaProtocols: [4] }), false);
-  assert.equal(validHostMediaCapabilities({ ...base, mediaProtocols: [2, 3, 5] }), false);
-});
-
 test("v4 receive gate decodes in order and drops deltas until a keyframe after any gap", () => {
   const gate = new V4ReceiveGate();
   const frame = (seq, key = false, generation = 1) => ({ seq, key, generation });
@@ -207,47 +195,31 @@ test("v4 reconnect backoff, presentation skipping and status labels", () => {
   assert.equal(shouldPresentDecodedV4({ decodeQueueSize: 1, msSinceLastPresent: 5 }), true);
   assert.equal(shouldPresentDecodedV4({ decodeQueueSize: 3, msSinceLastPresent: 5 }), false);
   assert.equal(shouldPresentDecodedV4({ decodeQueueSize: 3, msSinceLastPresent: 150 }), true);
-  const capable = { mediaProtocols: [2, 3, 4] };
-  assert.equal(preferWssProtocolV4({ hostCapabilities: capable }), true);
-  assert.equal(preferWssProtocolV4({ hostCapabilities: { mediaProtocols: [2, 3] } }), false);
-  assert.equal(preferWssProtocolV4({ hostCapabilities: capable, lab: true }), false);
-  assert.equal(preferWssProtocolV4({ hostCapabilities: capable, requestedTopology: { laneCount: 4 } }), false);
-  assert.equal(preferWssProtocolV4({ hostCapabilities: capable, capabilitiesCurrent: false }), false);
   assert.equal(wssV4StatusLabel({ socketOpen: false, reconnecting: true }), "reconnecting");
   assert.equal(wssV4StatusLabel({ socketOpen: true, framesPresented: 0 }), "starting");
   assert.equal(wssV4StatusLabel({ socketOpen: true, framesPresented: 5, lastFrameAtMs: 0, nowMs: 5_000 }), "paused-static");
   assert.equal(wssV4StatusLabel({ socketOpen: true, framesPresented: 5, lastFrameAtMs: 4_900, nowMs: 5_000 }), "connected");
 });
 
-test("lab runs use v4 only on an explicit opt-in", async () => {
+test("lab receiver URLs carry no WSS protocol or lane selection", async () => {
   const { buildReceiverUrl } = await import("../tools/stream-lab-live.mjs");
-  const { labRequestsWssProtocolV4 } = await import("../public/media-v4.js");
   const run = "123e4567-e89b-42d3-a456-426614174000";
-  const url = buildReceiverUrl("http://127.0.0.1:8787/", "wss", { labRun: run, mediaProtocol: 4 });
-  assert.equal(url.searchParams.get("wssProtocol"), "4");
-  assert.equal(url.searchParams.get("wssLanes"), null);
-  assert.equal(buildReceiverUrl("http://127.0.0.1:8787/", "wss", { labRun: run }).searchParams.get("wssProtocol"), null);
-  assert.throws(() => buildReceiverUrl("http://127.0.0.1:8787/", "wss", { mediaProtocol: 4 }), RangeError);
-  assert.throws(() => buildReceiverUrl("http://127.0.0.1:8787/", "webrtc", { labRun: run, mediaProtocol: 4 }), RangeError);
-  assert.throws(() => buildReceiverUrl("http://127.0.0.1:8787/", "wss", { labRun: run, mediaProtocol: 3 }), RangeError);
-  assert.equal(labRequestsWssProtocolV4(url.searchParams, run), true);
-  assert.equal(labRequestsWssProtocolV4(url.searchParams, null), false);
-  const capable = { mediaProtocols: [2, 3, 4] };
-  assert.equal(preferWssProtocolV4({ lab: true, labRequestsV4: true, hostCapabilities: capable }), true);
-  assert.equal(preferWssProtocolV4({ lab: true, labRequestsV4: true, hostCapabilities: { mediaProtocols: [2, 3] } }), false);
+  const url = buildReceiverUrl("http://127.0.0.1:8787/", "wss", { labRun: run });
+  assert.equal(url.searchParams.get("transport"), "wss");
+  assert.equal(url.searchParams.get("labRun"), run);
+  for (const legacy of ["wssProtocol", "wssLanes", "wssParity"]) assert.equal(url.searchParams.get(legacy), null);
 });
 
 test("receiver wires v4: media-socket keyframes, in-order decode, reconnect backoff, static status", () => {
   const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   assert.match(source, /from "\/media-v4\.js";/);
-  assert.match(source, /wssProtocol = useV4 \? 4 : selectedTopology \? 3 : 2;/);
-  assert.match(source, /preferWssProtocolV4\(\{\s*lab: labRun !== null,/);
-  assert.match(source, /if \(wssProtocol === 4 && usingWssMedia && !requestId\) return sendWssV4\(keyframeMessageV4\(reason\)\);/);
+  assert.match(source, /const WSS_PROTOCOL = V4_VERSION;/);
+  assert.match(source, /if \(usingWssMedia && !requestId\) return sendWssV4\(keyframeMessageV4\(reason\)\);/);
   assert.match(source, /wssV4\.backoffMs = nextBackoffMsV4\(wssV4\.backoffMs\);/);
-  assert.match(source, /usingWssMedia && wssProtocol !== 4 && decoder\.decodeQueueSize >= decodeLimit/);
+  assert.match(source, /latencyGuard\.admitDecode\(usingWssMedia \? Infinity : decodeHardLimit\)/);
   assert.match(source, /shouldPresentDecodedV4\(/);
   assert.match(source, /Connected · WSS \(static\)/);
   assert.match(source, /sendSignal\(\{ type: "ping" \}\);\s*\}, V4_HEARTBEAT_MS\);/);
   // v4 has no deadline expiry timer.
-  assert.match(source, /if \(wssProtocol === 4\) \{\s*\/\/ v4 decodes every frame in order: there is no deadline expiry\.\s*startWssV4\(\);\s*return;/);
+  assert.match(source, /\/\/ v4 decodes every frame in order: there is no deadline expiry\.\s*startWssV4\(\);/);
 });

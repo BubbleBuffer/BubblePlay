@@ -1,4 +1,3 @@
-import { createMediaAckScheduler } from "/media-ack.js";
 "use strict";
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats, computeQosRxWindow, createQosPayload, parseHostQuality } from "/latency.js";
 import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateIceServers } from "/turn.js";
@@ -9,10 +8,10 @@ import {
 } from "/recovery.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
  import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
-import { AdaptiveFrameDeadline, applyLateShardDeadline, classifyMediaShardV3, CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, OrderedFrameRelease, ParityFrameReassembler, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, selectStaleWssLane, selectWssMediaTopology, shouldDeferWssMediaStart, shouldFallbackToWssOnMissingRtp, shouldRecoverWssStripeReconnect, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY, stripLabEdgeTrace, VariableParityFrameReassembler, validateWssTopology, WssLaneLifecycleTelemetry } from "/media.js";
+import { CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, shouldFallbackToWssOnMissingRtp, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
-import { V4ReceiveGate, V4_HEARTBEAT_MS, ackMessageV4, keyframeMessageV4, labRequestsWssProtocolV4, nextBackoffMsV4, parseFrameV4, preferWssProtocolV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
-import { TRANSPORT, createCodecSession, parseAdaptive, parseQualityPreset, parseTransport, rtpCodecMimeTypes } from "/transport.js";
+import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
+import { TRANSPORT, createCodecSession, parseQualityPreset, parseTransport, rtpCodecMimeTypes } from "/transport.js";
 import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
 
 const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
@@ -87,22 +86,11 @@ function parseLabRun(searchParams) {
 }
 const labRun = parseLabRun(params);
 const labCompatibilityId = labRun ? STREAM_LAB_COMPATIBILITY.id : null;
-function parseRequestedWssTopology(searchParams, runId) {
-  if (!runId || !searchParams.has("wssLanes")) return null;
-  const laneCount = Number(searchParams.get("wssLanes"));
-  const parityShards = Number(searchParams.get("wssParity") ?? 1);
-  const topology = { laneCount, dataShards: laneCount - parityShards, parityShards };
-  return validateWssTopology(topology) ? topology : null;
-}
-const requestedWssTopology = parseRequestedWssTopology(params, labRun);
-const labRequestsV4 = labRequestsWssProtocolV4(params, labRun);
-const V2_WSS_TOPOLOGY = Object.freeze({ laneCount: 4, dataShards: 3, parityShards: 1 });
-// Protocol v4 is one media socket; the topology shape only feeds lane counters.
-const V4_WSS_TOPOLOGY = Object.freeze({ laneCount: 1, dataShards: 1, parityShards: 0 });
+// Media-control messages carry the WSS protocol version (v4 is the only one).
+const WSS_PROTOCOL = V4_VERSION;
 const useWebCodecs = params.get("decoderPath") === "webcodecs";
 const requestedTransport = parseTransport(params);
 let qualityPreset = parseQualityPreset(params, localStorage);
-let wssAdaptive = qualityPreset === "auto" || parseAdaptive(params);
 const codecSession = createCodecSession({ transport: requestedTransport, decoderPath: useWebCodecs ? "webcodecs" : "native" }); // page-local
 const diagnosticsEnabled = params.get("diag") === "1";
 const profilingEnabled = params.get("profile") === "1" || diagnosticsEnabled;
@@ -141,8 +129,7 @@ let desktopKind = "default";
 let desktopInputState = "enabled";
 let desktopGeneration = null;
 let latestInputStatus = null;
-let hostCapabilities = { serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false,
-  mediaProtocols: [2], maxWssLanes: 4, wssFec: ["xor-1"] };
+let hostCapabilities = { serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false };
 let hostCapabilitiesGeneration = 0;
 let hasPresentedFrame = false;
 const firstFrameHandshake = { requestId: null, transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, failureReason: "", timer: null };
@@ -266,7 +253,7 @@ function armFirstFrameWatchdog() {
       firstFrameHandshake.phase = "retrying";
       renderDesktopState();
       sendFirstFrameRequest();
-      sendSignal({ type: "media-control", action: "keyframe", protocol: wssProtocol, epoch: firstFrameHandshake.epoch, reason: "first-frame-timeout", codec: codecSession.codec });
+      sendSignal({ type: "media-control", action: "keyframe", protocol: WSS_PROTOCOL, epoch: firstFrameHandshake.epoch, reason: "first-frame-timeout", codec: codecSession.codec });
       armFirstFrameWatchdog();
     } else {
       firstFrameHandshake.phase = "failed";
@@ -453,7 +440,7 @@ function requestMonitor(selector) {
   monitorSwitchPending = selector;
   lastMonitorRequest = { selector, atMs: Date.now() };
   renderMonitorList();
-  sendSignal({ type: "media-control", action: "monitor", protocol: usingWssMedia ? wssProtocol : 2, epoch: mediaEpoch, monitor: selector, reason: "user-monitor" });
+  sendSignal({ type: "media-control", action: "monitor", protocol: WSS_PROTOCOL, epoch: mediaEpoch, monitor: selector, reason: "user-monitor" });
   return true;
 }
 
@@ -464,7 +451,7 @@ function renderConnectionStatus() {
   let label = "Connecting…";
   if (terminalSignalingFailure) { state = "error"; label = "Session unavailable"; }
   else if (!desktopAvailable) { state = "error"; label = "Desktop unavailable"; }
-  else if (usingWssMedia && wssProtocol === 4) {
+  else if (usingWssMedia) {
     // v4 never reports "waiting for stream" for a static desktop: no frames
     // is the expected steady state while nothing on screen changes.
     const v4 = wssV4Status();
@@ -554,42 +541,18 @@ let currentIceServers = STUN_FALLBACK;
 let mediaEpoch = null;
 let usingWssMedia = false;
 let wssSelected = requestedTransport === TRANSPORT.WSS;
-let wssMediaSockets = [];
-let wssReconnectTimers = [];
-const wssLaneLifecycle = new WssLaneLifecycleTelemetry();
-let wssStripeOpened = [];
-let wssStripeEverOpened = [];
-let wssDiagnosticLaneFaultUntil = [];
-let wssReassembler = new ParityFrameReassembler();
-let wssProtocol = requestedWssTopology ? 3 : 2;
-let wssTopology = requestedWssTopology || V2_WSS_TOPOLOGY;
-let wssTopologyAccepted = wssProtocol === 2;
-let wssV3Rejected = false;
-let wssOrdered = new OrderedFrameRelease();
+let wssReconnectTimer = null;
 let wssKeyframeTimer = null;
 let wssDecoderEpoch = 0;
 let wssNoOutputFailures = 0;
 let wssRecoveryPending = false;
 let wssRecoveryState = "awaiting-keyframe";
 let wssLastRecoveryAt = -Infinity;
-let wssDependencyLosses = 0;
-let wssBackpressureSince = null;
-const wssDeadline = new AdaptiveFrameDeadline({ mode: "work" });
-let wssTailDeadlineTelemetry = {
-  observations: 0,
-  raises: 0,
-  maxAgeMs: 0,
-  lastAgeMs: null,
-  previousDeadlineMs: null,
-  deadlineMs: wssDeadline.deadlineMs,
-  raisedByMs: 0,
-};
 let wssStartupRecoveries = 0;
-let wssExpiryTimer = null;
 // WSS v4 single-socket session state.
 const wssV4 = {
-  gate: new V4ReceiveGate(), socket: null, socketOpen: false, hostPresent: false, reconnecting: false,
-  backoffMs: 0, reconnects: 0, heartbeatTimer: null, lastSendAt: 0, lastInboundAt: 0,
+  gate: new V4ReceiveGate(), socket: null, socketOpen: false, everOpened: false, hostPresent: false,
+  reconnecting: false, backoffMs: 0, reconnects: 0, heartbeatTimer: null, lastSendAt: 0, lastInboundAt: 0,
   lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity,
   presentSkips: 0, gateDrops: 0, frames: 0,
 };
@@ -603,26 +566,10 @@ function wssV4Status() {
     nowMs: performance.now(),
   });
 }
-const mediaAck = createMediaAckScheduler({
-  snapshot: () => ({ protocol: wssProtocol, epoch: mediaEpoch, topology: wssTopology,
-    reassembler: wssReassembler, presented: wssPresentedSequence, dependencyLosses: wssDependencyLosses,
-    deadline: wssDeadline, recoveryState: wssRecoveryState, decoderDrops: hudState.dropped }),
-  send: message => sendSignal(message), record: recordWssAckAttempt,
-});
-let wssAckAttempts = 0;
-let wssAckSent = 0;
-let wssAckFailed = 0;
-let wssLastAckAttempt = null;
 let wssStartedHost = false;
 let wssStartInFlight = false;
-let wssStartDeadlineAt = 0;
-let wssStartDeadlineTimer = null;
-let wssStaleLaneRecycleAt = 0;
-let wssCapabilityTimer = null;
 let wssPresentedSequence = 0;
-let wssShardPackets = 0;
 let debugFirstMediaPacket = false;
-let debugFirstMediaReconstructed = false;
 let debugFirstDecoderConfigured = false;
 let debugFirstDecoderOutput = false;
 let wssMediaReceivedBytes = 0;
@@ -674,12 +621,8 @@ setInterval(() => sendClientLog("info", "client-health", {
   hud: { ice: hudState.ice, decoder: hudState.dec, fps: hudState.fps, presented: hudState.presented,
     drops: hudState.dropped, resets: hudState.resyncs, gapMs: hudState.frameGap, maxGapMs: hudState.maxFrameGap,
     dimensions: hudState.dimensions, generation: hudState.mediaGeneration },
-  media: { reconstructed: wssReassembler.highestReconstructed, presented: wssPresentedSequence,
-    recovered: wssReassembler.stats.recoveredFrames, expired: wssReassembler.stats.expiredFrames,
-    dependencyLosses: wssDependencyLosses, deadlineMs: wssDeadline.deadlineMs,
-    reassemblyP95Ms: wssDeadline.p95Ms, recoveryState: wssRecoveryState,
-    tailDeadline: { ...wssTailDeadlineTelemetry },
-    stripes: wssStripeOpened.filter(Boolean).length, packets: wssShardPackets,
+  media: { reconstructed: wssV4.lastSeq, presented: wssPresentedSequence,
+    recoveryState: wssRecoveryState, socketOpen: wssV4.socketOpen, packets: wssMediaReceivedPackets,
     presentation: framePresentationTelemetry.snapshot(),
     hybrid: activeWssHybridCache().snapshot() },
   view: viewportHealthSnapshot(),
@@ -756,11 +699,9 @@ function recycleSignaling(reason) {
     signalingRegistered,
     socketReadyState: ws?.readyState ?? null,
     usingWssMedia,
-    wssProtocol,
-    laneCount: wssTopology.laneCount,
-    openLanes: wssStripeOpened.filter(Boolean).length,
-    mediaGeneration: wssReassembler.generation,
-    reconstructed: wssProtocol === 4 ? wssV4.lastSeq : wssReassembler.highestReconstructed,
+    mediaSocketOpen: wssV4.socketOpen,
+    mediaGeneration: Number.isSafeInteger(hudState.mediaGeneration) ? hudState.mediaGeneration : null,
+    reconstructed: wssV4.lastSeq,
     presented: wssPresentedSequence,
     receivedPackets: wssMediaReceivedPackets,
     recoveryState: wssRecoveryState,
@@ -788,7 +729,7 @@ async function handleSignal(socket, generation, ev) {
   }
   let msg;
   try { msg = JSON.parse(ev.data); } catch { return; }
-  if (["answer", "ice", "quality", "bench-status", "media-view", "desktop-state", "input-status", "host-capabilities", "media-topology", "first-frame", "monitor-list", "monitor-error"].includes(msg.type)) recordHostEvidence(msg.type);
+  if (["answer", "ice", "quality", "bench-status", "media-view", "desktop-state", "input-status", "host-capabilities", "first-frame", "monitor-list", "monitor-error"].includes(msg.type)) recordHostEvidence(msg.type);
   switch (msg.type) {
     case "hello-ok":
       signalingRegistered = true;
@@ -873,28 +814,9 @@ async function handleSignal(socket, generation, ev) {
         coldBoot: msg.coldBoot === true,
         secureDesktop: msg.secureDesktop === true,
         secureText: msg.secureText === true,
-        mediaProtocols: Array.isArray(msg.mediaProtocols) ? msg.mediaProtocols.filter(value => value === 2 || value === 3 || value === 4) : [2],
-        maxWssLanes: Number.isInteger(msg.maxWssLanes) ? Math.max(4, Math.min(16, msg.maxWssLanes)) : 4,
-        wssFec: Array.isArray(msg.wssFec) ?
-          msg.wssFec.filter(value => value === "none" || value === "xor-1" || value === "rs-2") :
-          ["xor-1"],
       };
       hostCapabilitiesGeneration = generation;
       if (wssSelected && !usingWssMedia) requestWssMediaStart();
-      break;
-    case "media-topology":
-      if (msg.protocol !== 3 || msg.epoch !== mediaEpoch || !validateWssTopology(msg.topology) ||
-          msg.topology.laneCount !== wssTopology.laneCount || msg.topology.dataShards !== wssTopology.dataShards ||
-          msg.topology.parityShards !== wssTopology.parityShards) break;
-      if (msg.status === "accepted") {
-        wssTopologyAccepted = true;
-        sendClientLog("info", "wss-topology-accepted", { topology: wssTopology });
-      } else if (msg.status === "rejected") {
-        wssV3Rejected = true;
-        sendClientLog("warn", "wss-topology-rejected", { topology: wssTopology, reason: msg.reason || "host-rejected" });
-        recycleSignaling("wss-topology-rejected");
-        restartPeer("wss-topology-rejected", false);
-      }
       break;
     case "first-frame":
       handleFirstFrameMessage(msg);
@@ -992,29 +914,21 @@ function clearWssTimers() {
   clearTimeout(iceFallbackTimer); iceFallbackTimer = null;
   clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
   clearWssKeyframeWatchdog();
-  clearInterval(wssExpiryTimer); wssExpiryTimer = null;
   clearInterval(wssV4.heartbeatTimer); wssV4.heartbeatTimer = null;
-  mediaAck.clear();
-  clearTimeout(wssStartDeadlineTimer); wssStartDeadlineTimer = null;
-  clearTimeout(wssCapabilityTimer); wssCapabilityTimer = null;
-  for (const timer of wssReconnectTimers) clearTimeout(timer);
-  wssReconnectTimers = [];
+  clearTimeout(wssReconnectTimer); wssReconnectTimer = null;
 }
 
 function stopWssMedia() {
   usingWssMedia = false;
   clearWssTimers();
   wssDecoderEpoch++;
-  for (const socket of wssMediaSockets) try { socket?.close(1000, "switch"); } catch {}
-  wssMediaSockets = [];
-  Object.assign(wssV4, { socket: null, socketOpen: false, hostPresent: false, reconnecting: false,
+  try { wssV4.socket?.close(1000, "switch"); } catch {}
+  Object.assign(wssV4, { socket: null, socketOpen: false, everOpened: false, hostPresent: false, reconnecting: false,
     backoffMs: 0, lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity });
-  wssV4.gate.reset("start"); wssStripeOpened = []; wssStripeEverOpened = []; wssDiagnosticLaneFaultUntil = [];
-  wssLaneLifecycle.reset();
-  wssStartedHost = false; wssStartDeadlineAt = 0; wssStaleLaneRecycleAt = 0; wssReassembler.reset(); wssOrdered.reset();
-  wssPresentedSequence = 0; wssShardPackets = 0; wssDecodeSequenceByTimestamp.clear(); wssFrameMeta = new WeakMap();
-  wssAckAttempts = 0; wssAckSent = 0; wssAckFailed = 0; wssLastAckAttempt = null;
-  debugFirstMediaPacket = false; debugFirstMediaReconstructed = false;
+  wssV4.gate.reset("start");
+  wssStartedHost = false;
+  wssPresentedSequence = 0; wssDecodeSequenceByTimestamp.clear(); wssFrameMeta = new WeakMap();
+  debugFirstMediaPacket = false;
   debugFirstDecoderConfigured = false; debugFirstDecoderOutput = false;
   wssPresentedFrameTraces.clear();
   wssPresentedIdentityFramesRemaining = 0;
@@ -1023,8 +937,6 @@ function stopWssMedia() {
   requestWssKeyframe.lastAt = 0;
   wssRecoveryPending = false;
   wssRecoveryState = "awaiting-keyframe";
-  wssDependencyLosses = 0;
-  wssBackpressureSince = null;
   wssLastRecoveryAt = -Infinity;
   viewportState = { enabled: false, revision: viewportRevision, generation: 0 };
   viewportPending = null;
@@ -1038,38 +950,6 @@ function stopWssMedia() {
   sharpScreen.classList.remove("active");
 }
 
-function noteOrderedDependencyLoss(before, reason) {
-  const added = Math.max(0, wssOrdered.dependencyLosses - before);
-  if (!added) return false;
-  wssDependencyLosses += added;
-  wssDeadline.noteExpiry();
-  beginWssRecovery(reason);
-  return true;
-}
-
-function processExpiredWssFrames(expired, reason = "v2-frame-expired") {
-  if (!expired.length) return false;
-  const before = wssOrdered.dependencyLosses;
-  for (const frame of expired) wssOrdered.markLost(frame.sequence);
-  wssReassembler.setTtlMs(wssDeadline.deadlineMs);
-  return noteOrderedDependencyLoss(before, reason);
-}
-
-function scheduleWssMediaReconnect(stripe, socketGeneration, delayMs, reason) {
-  clearTimeout(wssReconnectTimers[stripe]);
-  const boundedDelayMs = Math.max(0, Number(delayMs) || 0);
-  wssLaneLifecycle.reconnectScheduled(stripe, socketGeneration, reason, boundedDelayMs);
-  debugTrace("media-lane-reconnect-scheduled", {
-    stripe, socketGeneration, reason, delayMs: boundedDelayMs,
-  });
-  wssReconnectTimers[stripe] = setTimeout(() => {
-    if (!usingWssMedia || wssLaneLifecycle.currentGeneration(stripe) !== socketGeneration) return;
-    wssLaneLifecycle.reconnectFired(stripe, socketGeneration, reason);
-    debugTrace("media-lane-reconnect-fired", { stripe, socketGeneration, reason });
-    openWssMediaStripe(stripe);
-  }, boundedDelayMs);
-}
-
 function sendWssV4(text) {
   const socket = wssV4.socket;
   if (!socket || socket.readyState !== WebSocket.OPEN) return false;
@@ -1079,26 +959,26 @@ function sendWssV4(text) {
 }
 
 function scheduleWssV4Reconnect(reason) {
-  clearTimeout(wssReconnectTimers[0]);
+  clearTimeout(wssReconnectTimer);
   wssV4.backoffMs = nextBackoffMsV4(wssV4.backoffMs);
   wssV4.reconnecting = true;
   debugTrace("media-v4-reconnect-scheduled", { reason, delayMs: wssV4.backoffMs });
-  wssReconnectTimers[0] = setTimeout(() => {
-    if (!usingWssMedia || wssProtocol !== 4) return;
+  wssReconnectTimer = setTimeout(() => {
+    wssReconnectTimer = null;
+    if (!usingWssMedia) return;
     wssV4.reconnects++;
     openWssV4Socket();
   }, wssV4.backoffMs);
 }
 
 function openWssV4Socket() {
-  if (!usingWssMedia || wssProtocol !== 4 || !mediaEpoch) return;
-  const socket = new WebSocket(mediaSocketUrl(0));
+  if (!usingWssMedia || !mediaEpoch) return;
+  const socket = new WebSocket(mediaSocketUrl());
   socket.binaryType = "arraybuffer";
   wssV4.socket = socket;
-  wssMediaSockets[0] = socket;
   wssV4.socketOpen = false;
   wssV4.hostPresent = false;
-  const current = () => usingWssMedia && wssProtocol === 4 && wssV4.socket === socket;
+  const current = () => usingWssMedia && wssV4.socket === socket;
   socket.onopen = () => {
     if (!current()) return;
     socket.send(JSON.stringify({ type: "hello", role: "media-client" }));
@@ -1114,12 +994,11 @@ function openWssV4Socket() {
     let message;
     try { message = JSON.parse(event.data); } catch { return; }
     if (message.type === "hello-ok") {
-      const reconnect = wssStripeEverOpened[0] === true;
+      const reconnect = wssV4.everOpened;
       wssV4.socketOpen = true;
+      wssV4.everOpened = true;
       wssV4.reconnecting = false;
       wssV4.backoffMs = 0;
-      wssStripeOpened[0] = true;
-      wssStripeEverOpened[0] = true;
       // Whatever was in flight on the old socket is gone: the decoder must
       // restart from the keyframe the host sends when it sees this peer.
       wssV4.gate.reset(reconnect ? "reconnect" : "connect");
@@ -1134,7 +1013,6 @@ function openWssV4Socket() {
   };
   socket.onclose = (event) => {
     if (!current()) return;
-    wssStripeOpened[0] = false;
     wssV4.socketOpen = false;
     wssV4.hostPresent = false;
     wssV4.socket = null;
@@ -1153,7 +1031,7 @@ function onWssV4Packet(data) {
   wssMediaReceivedPackets++;
   const frame = parseFrameV4(data);
   if (!frame) {
-    recordWssPacketRejection("v4-invalid-packet", 0);
+    recordWssPacketRejection("v4-invalid-packet");
     return;
   }
   const nowMs = performance.now();
@@ -1165,7 +1043,7 @@ function onWssV4Packet(data) {
   wssV4.lastSeq = frame.seq;
   if (!debugFirstMediaPacket) {
     debugFirstMediaPacket = true;
-    debugTrace("media-first-packet", { stripe: 0, bytes: data.byteLength, protocol: 4 });
+    debugTrace("media-first-packet", { bytes: data.byteLength, protocol: WSS_PROTOCOL });
   }
   const verdict = wssV4.gate.accept(frame);
   if (verdict.requestKeyframe) requestWssKeyframe(verdict.requestKeyframe);
@@ -1187,10 +1065,9 @@ function onWssV4Packet(data) {
 }
 
 function startWssV4() {
-  wssMediaSockets = [null];
   clearInterval(wssV4.heartbeatTimer);
   wssV4.heartbeatTimer = setInterval(() => {
-    if (!usingWssMedia || wssProtocol !== 4) return;
+    if (!usingWssMedia) return;
     const now = performance.now();
     if (wssV4.socketOpen && now - wssV4.lastSendAt >= V4_HEARTBEAT_MS) sendWssV4('{"type":"ping"}');
     // The relay answers every heartbeat; silence means a half-open socket.
@@ -1202,207 +1079,9 @@ function startWssV4() {
   openWssV4Socket();
 }
 
-function openWssMediaStripe(stripe) {
-  if (!usingWssMedia || !mediaEpoch) return;
-  const faultDelayMs = Math.max(0, Number(wssDiagnosticLaneFaultUntil[stripe] || 0) - performance.now());
-  if (faultDelayMs > 0) {
-    scheduleWssMediaReconnect(
-      stripe,
-      wssLaneLifecycle.currentGeneration(stripe),
-      faultDelayMs,
-      "diagnostic-lane-loss",
-    );
-    return;
-  }
-  const socketGeneration = wssLaneLifecycle.construct(stripe);
-  debugTrace("media-lane-construct", { stripe, socketGeneration });
-  const socket = new WebSocket(mediaSocketUrl(stripe));
-  socket.binaryType = "arraybuffer";
-  wssMediaSockets[stripe] = socket;
-  socket.onopen = () => {
-    if (!usingWssMedia || wssMediaSockets[stripe] !== socket) return;
-    wssLaneLifecycle.transportOpen(stripe, socketGeneration);
-    debugTrace("media-lane-transport-open", { stripe, socketGeneration });
-    socket.send(JSON.stringify({ type: "hello", role: "media-client" }));
-  };
-  socket.onmessage = (event) => {
-    if (!usingWssMedia || wssMediaSockets[stripe] !== socket) return;
-    if (typeof event.data === "string") {
-      try {
-        const message = JSON.parse(event.data);
-        if (message.type === "media-forward") {
-          const registeredAtMs = Number(message.registeredAtMs);
-          wssLaneLifecycle.mediaForward(
-            stripe,
-            socketGeneration,
-            Number.isFinite(registeredAtMs) ? registeredAtMs : null,
-          );
-          debugTrace("media-lane-forward-target", {
-            stripe, socketGeneration,
-            registeredAtMs: Number.isFinite(registeredAtMs) ? registeredAtMs : null,
-          });
-          return;
-        }
-        if (message.type === "hello-ok") {
-          const registeredAtMs = Number(message.registeredAtMs);
-          wssLaneLifecycle.helloOk(
-            stripe,
-            socketGeneration,
-            Number.isFinite(registeredAtMs) ? registeredAtMs : null,
-          );
-          const reconnect = wssStripeEverOpened[stripe];
-          wssReassembler.noteLaneConnected?.(stripe);
-          wssStripeEverOpened[stripe] = true;
-          wssStripeOpened[stripe] = true; maybeStartWssHost();
-          debugTrace("media-lane-open", {
-            stripe, socketGeneration,
-            registeredAtMs: Number.isFinite(registeredAtMs) ? registeredAtMs : null,
-            openLanes: wssStripeOpened.filter(Boolean).length,
-          });
-          if (reconnect) {
-            if (shouldRecoverWssStripeReconnect({ protocol: wssProtocol, topology: wssTopology })) {
-              beginWssRecovery("stripe-reconnect");
-            } else {
-              // Parity keeps presentation healthy while one lane is absent,
-              // so preserve decoder state but tell the host that any recovery
-              // IDR sent before this replacement existed cannot be ACKed.
-              requestWssKeyframe("stripe-reconnect");
-            }
-          }
-        }
-      } catch { /* ignore non-protocol text */ }
-      return;
-    }
-    const trace = labRun
-      ? stripLabEdgeTrace(event.data, { requireEdgeTrace: true, requireHostTrace: true })
-      : { packet: event.data, edgeReceivedAtEpochMs: null, hostSentAtEpochMs: null, hostRoiTrace: null };
-    wssMediaReceivedBytes += event.data.byteLength;
-    wssMediaReceivedPackets++;
-    wssShardPackets++;
-    if (wssLaneLifecycle.firstPacket(stripe, socketGeneration, event.data.byteLength)) {
-      debugFirstMediaPacket = true;
-      const lane = wssLaneLifecycle.snapshot()[stripe];
-      debugTrace("media-first-packet", {
-        stripe, socketGeneration, bytes: event.data.byteLength, protocol: wssProtocol,
-        registeredAtMs: lane?.workerRegisteredAtMs ?? null,
-        forwardRegisteredAtMs: lane?.mediaForwardRegisteredAtMs ?? null,
-      });
-    }
-    if (trace.rejection) {
-      recordWssPacketRejection(trace.rejection, stripe);
-      return;
-    }
-    const { packet, edgeReceivedAtEpochMs, hostSentAtEpochMs, hostRoiTrace } = trace;
-    const packetRejection = wssProtocol === 3
-      ? classifyMediaShardV3(packet, {
-        topology: wssTopology,
-        lane: stripe,
-        generation: wssReassembler.generation,
-      })
-      : null;
-    if (packetRejection) {
-      recordWssPacketRejection(packetRejection, stripe);
-      return;
-    }
-    const frame = wssReassembler.push(
-      packet,
-      stripe,
-      event.timeStamp,
-      edgeReceivedAtEpochMs,
-      hostSentAtEpochMs,
-      hostRoiTrace,
-    );
-    const tailDeadlineUpdate = applyLateShardDeadline({
-      reassembler: wssReassembler,
-      ordered: wssOrdered,
-      deadline: wssDeadline,
-    });
-    if (tailDeadlineUpdate) {
-      wssTailDeadlineTelemetry.observations += tailDeadlineUpdate.observations;
-      wssTailDeadlineTelemetry.raises += tailDeadlineUpdate.raisedByMs > 0 ? 1 : 0;
-      wssTailDeadlineTelemetry.maxAgeMs = Math.max(
-        wssTailDeadlineTelemetry.maxAgeMs,
-        tailDeadlineUpdate.maxAgeMs,
-      );
-      wssTailDeadlineTelemetry.lastAgeMs = tailDeadlineUpdate.maxAgeMs;
-      wssTailDeadlineTelemetry.previousDeadlineMs = tailDeadlineUpdate.previousDeadlineMs;
-      wssTailDeadlineTelemetry.deadlineMs = tailDeadlineUpdate.deadlineMs;
-      wssTailDeadlineTelemetry.raisedByMs = tailDeadlineUpdate.raisedByMs;
-      debugTrace("wss-tail-deadline", { ...tailDeadlineUpdate });
-    }
-    const immediateAck = wssReassembler.takeImmediateAck?.() === true;
-    processExpiredWssFrames(wssReassembler.takeExpired());
-    if (wssReassembler.generation !== null) scheduleWssAck(wssReassembler.generation, immediateAck);
-    if (!frame) return;
-    if (!debugFirstMediaReconstructed) {
-      debugFirstMediaReconstructed = true;
-      debugTrace("media-first-reconstructed", {
-        generation: frame.generation, sequence: frame.sequence, recovered: frame.recovered === true,
-      });
-    }
-    wssDeadline.observeCompletion(wssReassembler.lastCompletionAgeMs);
-    wssReassembler.setTtlMs(wssDeadline.deadlineMs); wssOrdered.setTtlMs(wssDeadline.deadlineMs);
-    const lossBefore = wssOrdered.dependencyLosses;
-    for (const ordered of wssOrdered.push(frame)) {
-      scheduleWssAck(ordered.generation, ordered.key || ordered.recovered);
-      decodeWssFrame(ordered);
-    }
-    noteOrderedDependencyLoss(lossBefore, "v2-frame-expired");
-  };
-  socket.onclose = (event) => {
-    if (!usingWssMedia || wssMediaSockets[stripe] !== socket) return;
-    wssStripeOpened[stripe] = false;
-    hudState.ice = `wss stripe ${stripe} reconnecting`;
-    wssLaneLifecycle.close(stripe, socketGeneration, event);
-    debugTrace("media-lane-close", {
-      stripe, socketGeneration, code: event.code,
-      reason: event.reason || "", wasClean: event.wasClean,
-    });
-    const faultDelayMs = Math.max(0, Number(wssDiagnosticLaneFaultUntil[stripe] || 0) - performance.now());
-    scheduleWssMediaReconnect(
-      stripe,
-      socketGeneration,
-      Math.max(250, faultDelayMs),
-      faultDelayMs > 0 ? "diagnostic-lane-loss" : "socket-close",
-    );
-  };
-  socket.onerror = () => {
-    if (!usingWssMedia || wssMediaSockets[stripe] !== socket) return;
-    wssLaneLifecycle.error(stripe, socketGeneration);
-    debugTrace("media-lane-error", { stripe, socketGeneration });
-    try { socket.close(); } catch {}
-  };
-}
-
-function recycleStaleWssLane() {
-  if (wssProtocol !== 3 || performance.now() < wssStaleLaneRecycleAt) return false;
-  const stripe = selectStaleWssLane({
-    highestReconstructed: wssReassembler.highestReconstructed,
-    highestSequenceByLane: wssReassembler.highestSequence,
-    lastProgressAtMsByLane: wssReassembler.lastProgressAtMs,
-    openByLane: wssStripeOpened,
-    nowMs: performance.now(),
-  });
-  if (stripe === null) return false;
-  const lagFrames = (wssReassembler.highestReconstructed - wssReassembler.highestSequence[stripe]) >>> 0;
-  wssStaleLaneRecycleAt = performance.now() + 1_500;
-  wssStripeOpened[stripe] = false;
-  sendClientLog("warn", "wss-stale-lane-recycle", { stripe, lagFrames, topology: wssTopology });
-  const staleSocket = wssMediaSockets[stripe];
-  wssMediaSockets[stripe] = null;
-  scheduleWssMediaReconnect(
-    stripe,
-    wssLaneLifecycle.currentGeneration(stripe),
-    0,
-    "stale-lane"
-  );
-  try { staleSocket?.close(4001, "stale-lane"); } catch {}
-  return true;
-}
-
-function mediaSocketUrl(stripe) {
+function mediaSocketUrl() {
   const path = labRun ? "/lab-media-ws" : "/media-ws";
-  const query = new URLSearchParams({ v: String(wssProtocol), epoch: mediaEpoch, stripe: String(stripe) });
+  const query = new URLSearchParams({ epoch: mediaEpoch });
   if (labRun) {
     query.set("run", labRun);
     query.set("compat", labCompatibilityId);
@@ -1410,39 +1089,18 @@ function mediaSocketUrl(stripe) {
   return `${proto}//${location.host}${path}?${query}`;
 }
 
-function recordWssPacketRejection(reason, stripe) {
+function recordWssPacketRejection(reason) {
   wssPacketRejects.total++;
   wssPacketRejects.byReason[reason] = (wssPacketRejects.byReason[reason] || 0) + 1;
   if (wssPacketRejects.total <= 4) {
     sendClientLog("error", "wss-media-packet-rejected", {
       reason,
-      stripe,
       count: wssPacketRejects.byReason[reason],
     });
   }
 }
 
 function requestWssMediaStart() {
-  if (usingWssMedia) return;
-  const defer = shouldDeferWssMediaStart({
-    requestedTopology: requestedWssTopology,
-    capabilitiesGeneration: hostCapabilitiesGeneration,
-    signalingGeneration,
-  });
-  if (!defer) {
-    clearTimeout(wssCapabilityTimer);
-    wssCapabilityTimer = null;
-    startWssMedia();
-    return;
-  }
-  if (wssCapabilityTimer !== null) return;
-  wssCapabilityTimer = setTimeout(() => {
-    wssCapabilityTimer = null;
-    if (wssSelected) startWssMedia();
-  }, 500);
-}
-
-function startWssMedia() {
   if (usingWssMedia) return;
   if (!mediaEpoch) { hudState.ice = "wss session unavailable"; return; }
   // Automatic fallback keeps the peer and data channels alive, but the
@@ -1453,39 +1111,9 @@ function startWssMedia() {
   stage.classList.remove("native-video-input");
   wssSelected = true;
   usingWssMedia = true;
-  const selectedTopology = selectWssMediaTopology({
-    requestedTopology: requestedWssTopology,
-    hostCapabilities,
-    capabilitiesCurrent: hostCapabilitiesGeneration === signalingGeneration,
-    v3Rejected: wssV3Rejected,
-  });
-  const useV4 = preferWssProtocolV4({
-    lab: labRun !== null,
-    labRequestsV4,
-    requestedTopology: requestedWssTopology,
-    hostCapabilities,
-    capabilitiesCurrent: hostCapabilitiesGeneration === signalingGeneration,
-  });
-  wssProtocol = useV4 ? 4 : selectedTopology ? 3 : 2;
-  wssTopology = useV4 ? V4_WSS_TOPOLOGY : selectedTopology || V2_WSS_TOPOLOGY;
-  wssTopologyAccepted = wssProtocol !== 3;
-  wssReassembler = wssProtocol === 3
-    ? new VariableParityFrameReassembler({ topology: wssTopology })
-    : new ParityFrameReassembler();
   wssPacketRejects = { total: 0, byReason: {} };
   wssRecoveryPending = true;
   wssRecoveryState = "awaiting-keyframe";
-  wssDeadline.setMode(streamModeValue());
-  wssTailDeadlineTelemetry = {
-    observations: 0,
-    raises: 0,
-    maxAgeMs: 0,
-    lastAgeMs: null,
-    previousDeadlineMs: null,
-    deadlineMs: wssDeadline.deadlineMs,
-    raisedByMs: 0,
-  };
-  wssReassembler.setTtlMs(wssDeadline.deadlineMs); wssOrdered.setTtlMs(wssDeadline.deadlineMs);
   // A new WSS epoch is a fresh desktop-state conversation.  Do not carry a
   // secure-desktop overlay from an older, disconnected session into this one;
   // wait for the first authenticated keyframe instead.
@@ -1496,37 +1124,11 @@ function startWssMedia() {
   // Closing it here makes the host interpret the transport fallback as the
   // browser leaving. The host stops admitting RTP once WSS is selected.
   hudState.ice = "wss"; hudState.route = "wss"; hudState.dec = `${codecSession.codec} wss`;
-  sendClientLog("info", "wss-start", { epoch: mediaEpoch, protocol: wssProtocol, topology: wssTopology });
+  sendClientLog("info", "wss-start", { epoch: mediaEpoch, protocol: WSS_PROTOCOL });
   inputReady = connected = true; onInputReady();
-  // One role/socket per stripe is enforced by the DO. No browser secret is sent.
-  wssMediaSockets = Array(wssTopology.laneCount);
-  wssStripeOpened = Array(wssTopology.laneCount).fill(false);
-  wssStripeEverOpened = Array(wssTopology.laneCount).fill(false);
-  wssDiagnosticLaneFaultUntil = Array(wssTopology.laneCount).fill(0);
-  wssStaleLaneRecycleAt = 0;
   wssStartedHost = false;
-  // Let all four media Durable Objects register before the host emits its
-  // first IDR. If one lane is unavailable, the bounded deadline still allows
-  // parity with three lanes instead of hanging forever.
-  wssStartDeadlineAt = performance.now() + 1_500;
-  clearTimeout(wssStartDeadlineTimer);
-  wssStartDeadlineTimer = setTimeout(() => { wssStartDeadlineTimer = null; maybeStartWssHost(); }, 1_550);
-  if (wssProtocol === 4) {
-    // v4 decodes every frame in order: there is no deadline expiry.
-    startWssV4();
-    return;
-  }
-  wssExpiryTimer = setInterval(() => {
-    wssDeadline.tick();
-    wssReassembler.setTtlMs(wssDeadline.deadlineMs); wssOrdered.setTtlMs(wssDeadline.deadlineMs);
-    wssReassembler.expire();
-    processExpiredWssFrames(wssReassembler.takeExpired());
-    recycleStaleWssLane();
-    const before = wssOrdered.dependencyLosses;
-    wssOrdered.expire();
-    noteOrderedDependencyLoss(before, "v2-frame-expired");
-  }, 40);
-  for (let stripe = 0; stripe < wssTopology.laneCount; stripe++) openWssMediaStripe(stripe);
+  // v4 decodes every frame in order: there is no deadline expiry.
+  startWssV4();
 }
 
 function activeWssMain10() {
@@ -1613,27 +1215,23 @@ async function selectWssCodec() {
 }
 
 async function maybeStartWssHost() {
-  const open = wssStripeOpened.filter(Boolean).length;
-  const waitingForAll = open < wssTopology.laneCount && performance.now() < wssStartDeadlineAt;
-  hudState.ice = waitingForAll ? `wss ${open}/${wssTopology.laneCount} waiting lanes` : `wss ${open}/${wssTopology.laneCount}`;
-  if (wssStartedHost || wssStartInFlight || open < wssTopology.dataShards || waitingForAll) return;
+  hudState.ice = wssV4.socketOpen ? "wss" : "wss connecting";
+  if (wssStartedHost || wssStartInFlight || !wssV4.socketOpen) return;
   wssStartInFlight = true;
   const codec = await selectWssCodec();
   if (!codec) {
     wssStartInFlight = false;
     return;
   }
-  if (!usingWssMedia || wssStartedHost || wssStripeOpened.filter(Boolean).length < wssTopology.dataShards) {
+  if (!usingWssMedia || wssStartedHost || !wssV4.socketOpen) {
     wssStartInFlight = false;
     return;
   }
   wssStartedHost = true;
   wssStartInFlight = false;
-  sendSignal({ type: "media-control", action: "start", protocol: wssProtocol, epoch: mediaEpoch,
-    ...(wssProtocol === 3 ? { topology: { laneCount: wssTopology.laneCount,
-      dataShards: wssTopology.dataShards, parityShards: wssTopology.parityShards } } : {}),
+  sendSignal({ type: "media-control", action: "start", protocol: WSS_PROTOCOL, epoch: mediaEpoch,
     codec, streamMode: streamModeValue(), reason: "client-start",
-    quality: qualityPreset === "auto" ? "high" : qualityPreset, adaptive: wssAdaptive });
+    quality: qualityPreset === "auto" ? "high" : qualityPreset });
   startFirstFrameHandshake("wss-host-start");
   scheduleSharpViewport(fullFrameDiagnostic ? "diagnostic-full-frame" : "wss-start");
 }
@@ -1643,8 +1241,8 @@ function requestWssKeyframe(reason, requestId = null) {
   if (!requestId && requestWssKeyframe.lastAt && now - requestWssKeyframe.lastAt < 250) return false;
   requestWssKeyframe.lastAt = now;
   sendClientLog("warn", "wss-keyframe-request", { reason, requestId });
-  if (wssProtocol === 4 && usingWssMedia && !requestId) return sendWssV4(keyframeMessageV4(reason));
-  sendSignal({ type: "media-control", action: "keyframe", protocol: wssProtocol, epoch: mediaEpoch, reason,
+  if (usingWssMedia && !requestId) return sendWssV4(keyframeMessageV4(reason));
+  sendSignal({ type: "media-control", action: "keyframe", protocol: WSS_PROTOCOL, epoch: mediaEpoch, reason,
     ...(requestId ? { requestId } : {}), codec: codecSession.codec });
   return true;
 }
@@ -1680,7 +1278,6 @@ function resyncWssDecoder(reason) {
     hybrid: activeWssHybridCache().snapshot(),
   });
   clearWssHybridCaches();
-  wssReassembler.waitForKeyframe(); wssOrdered.reset(wssReassembler.generation);
   wssV4.gate.invalidate(reason);
   hudState.dec = `waiting keyframe (${reason})`;
 }
@@ -1709,36 +1306,6 @@ function beginWssRecovery(reason, requestId = null) {
   return requested;
 }
 
-function recordWssAckAttempt(message, immediate, sent) {
-  wssAckAttempts++;
-  if (sent) wssAckSent++;
-  else wssAckFailed++;
-  wssLastAckAttempt = {
-    attempt: wssAckAttempts,
-    sent,
-    immediate,
-    signalingGeneration,
-    signalingRegistered,
-    socketOpen: ws?.readyState === WebSocket.OPEN,
-    bufferedAmount: Number(ws?.bufferedAmount || 0),
-    protocol: message.protocol ?? 2,
-    generation: message.generation,
-    reconstructed: message.reconstructed,
-    presented: message.presented,
-    recoveryState: message.recoveryState,
-    lanes: message.lanes.length,
-    laneMin: Math.min(...message.lanes),
-    laneMax: Math.max(...message.lanes),
-  };
-  if (labRun !== null && (wssAckAttempts === 1 || !sent)) {
-    sendClientLog(sent ? "info" : "warn", "wss-ack-attempt", wssLastAckAttempt);
-  }
-}
-
-function scheduleWssAck(generation, immediate = false) {
-  mediaAck.request(generation, immediate);
-}
-
 function switchToWss(reason) {
   if (usingWssMedia) return;
   wssSelected = true;
@@ -1757,13 +1324,12 @@ function networkRouteHealthSnapshot() {
     signalingRegistered,
     signalingSocketOpen: ws?.readyState === WebSocket.OPEN,
     usingWssMedia,
-    openLanes: wssStripeOpened.filter(Boolean).length,
-    dataShards: wssTopology.dataShards,
+    mediaSocketOpen: wssV4.socketOpen,
     recoveryState: wssRecoveryState,
     // A static v4 desktop sends no frames by design; heartbeats cover liveness.
-    allowQuiescentIdle: labRun !== null || wssProtocol === 4,
+    allowQuiescentIdle: true,
     receivedPackets: wssMediaReceivedPackets,
-    reconstructed: wssProtocol === 4 ? wssV4.lastSeq : wssReassembler.highestReconstructed,
+    reconstructed: wssV4.lastSeq,
     presented: wssPresentedSequence,
     renderedAgeMs,
     peerConnectionState: pc?.connectionState ?? null,
@@ -1778,7 +1344,7 @@ function probeNetworkRouteChange() {
     networkRouteProbeTimer = null;
     if (terminalSignalingFailure || before.signalingGeneration !== signalingGeneration) return;
     const after = networkRouteHealthSnapshot();
-    const maxRenderedAgeMs = Math.max(1_000, Math.round(wssDeadline.deadlineMs * 4));
+    const maxRenderedAgeMs = 1_000;
     const recover = shouldRecoverAfterNetworkRouteProbe(before, after, { maxRenderedAgeMs });
     sendClientLog(recover ? "warn" : "info", "network-route-probe", {
       phase: "complete", recover, maxRenderedAgeMs, ...after,
@@ -1891,8 +1457,7 @@ function decodeWssFrame(frame) {
     cropRevision: prepared.cropRevision,
     frameTrace,
   });
-  const metadataLimit = wssProtocol === 4 ? 64 : 8;
-  while (wssDecodeSequenceByTimestamp.size > metadataLimit) wssDecodeSequenceByTimestamp.delete(wssDecodeSequenceByTimestamp.keys().next().value);
+  while (wssDecodeSequenceByTimestamp.size > 64) wssDecodeSequenceByTimestamp.delete(wssDecodeSequenceByTimestamp.keys().next().value);
   const chunk = {
     type: frame.key ? "key" : "delta",
     timestamp,
@@ -2130,7 +1695,7 @@ function readTimestampPattern(target = screen, context = ctx) {
 if (diagnosticsEnabled) {
   window.__bubbleplayDiagnostics = {
     requestMonitors() {
-      return sendSignal({ type: "media-control", action: "monitors", protocol: usingWssMedia ? wssProtocol : 2, epoch: mediaEpoch, reason: "diagnostic-refresh" });
+      return sendSignal({ type: "media-control", action: "monitors", protocol: WSS_PROTOCOL, epoch: mediaEpoch, reason: "diagnostic-refresh" });
     },
     selectMonitor(selector) {
       if (typeof selector !== "string" || !monitorList.some(monitor => monitor.selector === selector)) return false;
@@ -2168,45 +1733,10 @@ if (diagnosticsEnabled) {
     },
     // Lab-only: drop the v4 media socket to exercise backoff reconnect.
     dropWssV4Socket() {
-      if (!labRun || !usingWssMedia || wssProtocol !== 4 || !wssV4.socket) return false;
+      if (!labRun || !usingWssMedia || !wssV4.socket) return false;
       sendClientLog("warn", "wss-v4-diagnostic-drop", {});
       try { wssV4.socket.close(4000, "diagnostic-drop"); } catch { return false; }
       return true;
-    },
-    injectWssLaneLoss(stripe = 0, durationMs = 1_000) {
-      if (!labRun || !usingWssMedia || wssProtocol !== 3 || wssTopology.parityShards < 1) return false;
-      stripe = Number(stripe);
-      durationMs = Number(durationMs);
-      if (!Number.isInteger(stripe) || stripe < 0 || stripe >= wssTopology.dataShards ||
-          !Number.isFinite(durationMs) || durationMs < 500 || durationMs > 5_000) return false;
-      const socket = wssMediaSockets[stripe];
-      if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-      wssDiagnosticLaneFaultUntil[stripe] = performance.now() + durationMs;
-      wssStripeOpened[stripe] = false;
-      const socketGeneration = wssLaneLifecycle.currentGeneration(stripe);
-      sendClientLog("warn", "wss-diagnostic-lane-loss", { stripe, durationMs, topology: wssTopology });
-      wssLaneLifecycle.close(stripe, socketGeneration, {
-        code: 4000,
-        reason: "diagnostic-lane-loss",
-        wasClean: false,
-      });
-      debugTrace("media-lane-close", {
-        stripe, socketGeneration, code: 4000,
-        reason: "diagnostic-lane-loss", wasClean: false,
-      });
-      try { socket.close(4000, "diagnostic-lane-loss"); } catch { return false; }
-      // A locally initiated close can remain in CLOSING while the relay keeps
-      // the peer half-open, so do not depend on `onclose` to arm the lab
-      // reconnect. Detach this socket and schedule the bounded replacement
-      // directly; the lane DO will replace any stale server-side association.
-      wssMediaSockets[stripe] = null;
-      scheduleWssMediaReconnect(
-        stripe,
-        socketGeneration,
-        durationMs,
-        "diagnostic-lane-loss",
-      );
-      return { accepted: true, stripe, durationMs };
     },
     setFixedZoom(zoom) {
       const value = Number(zoom);
@@ -2311,41 +1841,20 @@ if (diagnosticsEnabled) {
         frameTraceHistory: [...wssPresentedFrameTraces.values()].map(trace => ({ ...trace })),
         wssMedia: {
           receivedBytes: wssMediaReceivedBytes, receivedPackets: wssMediaReceivedPackets,
-          protocol: wssProtocol, topology: { ...wssTopology },
-          topologyAccepted: wssTopologyAccepted,
-          openLanes: wssStripeOpened.filter(Boolean).length,
-          reconstructed: wssProtocol === 4 ? wssV4.lastSeq : wssReassembler.highestReconstructed, presented: wssPresentedSequence,
-          v4: wssProtocol === 4 ? {
+          protocol: WSS_PROTOCOL,
+          reconstructed: wssV4.lastSeq, presented: wssPresentedSequence,
+          v4: {
             status: wssV4Status(), socketOpen: wssV4.socketOpen, hostPresent: wssV4.hostPresent,
             frames: wssV4.frames, lastSeq: wssV4.lastSeq, decodedSeq: wssV4.decodedSeq ?? null,
             gateDrops: wssV4.gateDrops, presentSkips: wssV4.presentSkips, reconnects: wssV4.reconnects,
             waitingForKey: wssV4.gate.waitingForKey,
-          } : null,
-          highestSequenceByLane: [...wssReassembler.highestSequence],
-          recoveredFrames: wssReassembler.stats.recoveredFrames,
-          expiredFrames: wssReassembler.stats.expiredFrames,
-          completionMissingByLane: wssReassembler.stats.completionMissingByLane ?
-            [...wssReassembler.stats.completionMissingByLane] : null,
-          lateShardCountByLane: wssReassembler.stats.lateShardCountByLane ?
-            [...wssReassembler.stats.lateShardCountByLane] : null,
-          lateShardDelayMsTotalByLane: wssReassembler.stats.lateShardDelayMsTotalByLane ?
-            [...wssReassembler.stats.lateShardDelayMsTotalByLane] : null,
-          lateShardDelayMsMaxByLane: wssReassembler.stats.lateShardDelayMsMaxByLane ?
-            [...wssReassembler.stats.lateShardDelayMsMaxByLane] : null,
-          dependencyLosses: wssDependencyLosses, recoveryState: wssRecoveryState,
-          acknowledgements: {
-            attempts: wssAckAttempts,
-            sent: wssAckSent,
-            failed: wssAckFailed,
-            last: wssLastAckAttempt ? { ...wssLastAckAttempt } : null,
           },
+          recoveryState: wssRecoveryState,
           packetRejects: {
             total: wssPacketRejects.total,
             byReason: { ...wssPacketRejects.byReason },
           },
-          tailDeadline: { ...wssTailDeadlineTelemetry },
           presentation: framePresentationTelemetry.snapshot(),
-          lanes: wssLaneLifecycle.snapshot(),
           hybrid: activeWssHybridCache().snapshot(),
         },
         viewport: viewportHealthSnapshot(),
@@ -2430,7 +1939,7 @@ function onDecodedFrame(frame) {
       dropAndResync("missing-media-anchor");
       return;
     }
-    if (usingWssMedia && wssProtocol === 4) {
+    if (usingWssMedia) {
       if (!shouldPresentDecodedV4({ decodeQueueSize: decoder?.decodeQueueSize ?? 0,
         msSinceLastPresent: now - wssV4.lastPresentAt })) {
         wssV4.presentSkips++;
@@ -2980,7 +2489,7 @@ function feedDecoder(chunk, generation) {
           if (metadata !== undefined) {
             metadata.frameTrace.decodedAtMs = performance.now();
             wssFrameMeta.set(frame, metadata);
-            if (wssProtocol === 4) wssV4.decodedSeq = metadata.sequence >>> 0;
+            if (usingWssMedia) wssV4.decodedSeq = metadata.sequence >>> 0;
           }
           if (metadata?.key && wssRecoveryState === "awaiting-keyframe-output") {
             wssRecoveryPending = false;
@@ -3023,18 +2532,7 @@ function feedDecoder(chunk, generation) {
   const decodeHardLimit = usingWssMedia ? decodeLimit + 2 : decodeLimit;
   // v4 never drops a chunk for decoder backpressure: every frame is decoded
   // and only presentation is skipped while the decoder catches up.
-  if (usingWssMedia && wssProtocol !== 4 && decoder.decodeQueueSize >= decodeLimit) {
-    wssBackpressureSince ??= performance.now();
-    const graceMs = streamModeValue() === "game" ? 150 : 500;
-    if (performance.now() - wssBackpressureSince >= graceMs || decoder.decodeQueueSize >= decodeHardLimit) {
-      hudState.dropped++;
-      beginWssRecovery("decoder-backpressure");
-      return;
-    }
-  } else {
-    wssBackpressureSince = null;
-  }
-  if (!latencyGuard.admitDecode(usingWssMedia && wssProtocol === 4 ? Infinity : decodeHardLimit)) {
+  if (!latencyGuard.admitDecode(usingWssMedia ? Infinity : decodeHardLimit)) {
     if (usingWssMedia) { hudState.dropped++; beginWssRecovery("decoder-backpressure"); }
     else dropAndResync("decoder-backpressure");
     return;
@@ -3129,10 +2627,7 @@ function drawFrame(frame, due = performance.now()) {
     fpsWindow++;
     framesDrawn++;
     hudState.presented = framesDrawn;
-    if (usingWssMedia && wssOrdered.expected !== null) {
-      if (metadata !== undefined) wssPresentedSequence = metadata.sequence >>> 0;
-      scheduleWssAck(wssReassembler.generation);
-    }
+    if (usingWssMedia && metadata !== undefined) wssPresentedSequence = metadata.sequence >>> 0;
   } finally {
     try { frame.close(); } catch {}
   }
@@ -3622,8 +3117,6 @@ function setPointerMode(next, persist=true) {
   locallyAuthoritativeCursor=false;
   if (pointerMode === "desktop" && document.pointerLockElement) document.exitPointerLock?.();
   if (persist) localStorage.setItem("bp_pointer_mode", pointerMode);
-  wssDeadline.setMode(streamModeValue());
-  wssReassembler.setTtlMs(wssDeadline.deadlineMs); wssOrdered.setTtlMs(wssDeadline.deadlineMs);
   if (persist) sendStreamMode("user-mode");
   clearCursorSyncTimer(); updatePointerHud(); renderTouchCursor();
   if (inputReady) {
@@ -3637,7 +3130,7 @@ function setPointerMode(next, persist=true) {
 function streamModeValue() { return pointerMode === "game" ? "game" : "work"; }
 function sendStreamMode(reason) {
   if (!signalingRegistered || ws?.readyState !== WebSocket.OPEN) return;
-  sendSignal({ type: "media-control", action: "mode", protocol: wssSelected ? wssProtocol : 2, epoch: mediaEpoch,
+  sendSignal({ type: "media-control", action: "mode", protocol: WSS_PROTOCOL, epoch: mediaEpoch,
     streamMode: streamModeValue(), reason });
 }
 function containedContentRect() { const mediaWidth = activeVideo?.videoWidth || screen.width, mediaHeight = activeVideo?.videoHeight || screen.height; if (!mediaWidth || !mediaHeight) return {x:0,y:0,width:innerWidth,height:innerHeight}; const scale=Math.min(innerWidth/mediaWidth,innerHeight/mediaHeight), width=mediaWidth*scale, height=mediaHeight*scale; return {x:(innerWidth-width)/2,y:(innerHeight-height)/2,width,height}; }
@@ -3695,7 +3188,8 @@ function armViewportTransitionTimeout(revision) {
   }, 1_500);
 }
 function sendViewportRequest(crop, reason, force = false) {
-  if (!usingWssMedia || !wssStartedHost || viewportPending || wssProtocol === 4) return false;
+  // The sharp viewport crop has no v4 wire support: v4 always streams the full desktop.
+  if (!usingWssMedia || !wssStartedHost || viewportPending || WSS_PROTOCOL === 4) return false;
   const active = activeViewportCrop();
   if (!force && !cropNeedsUpdate(active, crop, remoteDesktop.width, remoteDesktop.height)) return false;
   const revision = viewportRevision = (viewportRevision + 1) >>> 0;
@@ -3703,7 +3197,7 @@ function sendViewportRequest(crop, reason, force = false) {
   viewportLast = { enabled: crop.enabled, x: crop.x, y: crop.y, width: crop.width, height: crop.height };
   viewportPending = { revision, requested: crop, reason, sentAt: viewportLastSentAt, recoveryRequested: false, generation: 0, source: null };
   viewportTelemetry = { state: "refining", revision, generation: 0, crop: `${crop.width}x${crop.height}@${crop.x},${crop.y}` };
-  sendSignal({ type: "media-control", action: "viewport", protocol: wssProtocol, epoch: mediaEpoch,
+  sendSignal({ type: "media-control", action: "viewport", protocol: WSS_PROTOCOL, epoch: mediaEpoch,
     revision, enabled: crop.enabled, xQ16: q16(crop.x, remoteDesktop.width), yQ16: q16(crop.y, remoteDesktop.height),
     widthQ16: q16(crop.width, remoteDesktop.width), heightQ16: q16(crop.height, remoteDesktop.height), reason });
   armViewportTransitionTimeout(revision);
@@ -3716,7 +3210,7 @@ function flushSharpViewport(reason = "sharp-viewport") {
   sendViewportRequest(viewportDesired, reason);
 }
 function scheduleSharpViewport(reason = "sharp-viewport") {
-  if (!usingWssMedia || !wssStartedHost || wssProtocol === 4) return;
+  if (!usingWssMedia || !wssStartedHost || WSS_PROTOCOL === 4) return;
   viewportDesired = computeDesiredViewport();
   if (viewportPending) return;
   clearTimeout(viewportTimer);
@@ -3798,14 +3292,13 @@ qualitySelect.value = qualityPreset;
 qualitySelect.onchange = e => {
   e.stopPropagation();
   qualityPreset = qualitySelect.value;
-  wssAdaptive = qualityPreset === "auto";
   try { localStorage.setItem("bp_quality", qualityPreset); } catch {}
   if (signalingRegistered) {
     const effectiveQuality = qualityPreset === "auto" ? "high" : qualityPreset;
-    sendSignal({ type: "media-control", action: "quality", protocol: usingWssMedia ? wssProtocol : 2,
+    sendSignal({ type: "media-control", action: "quality", protocol: WSS_PROTOCOL,
       ...(usingWssMedia ? { epoch: mediaEpoch } : {}),
       codec: codecSession.codec, streamMode: streamModeValue(), reason: "user-preset",
-      quality: effectiveQuality, adaptive: wssAdaptive });
+      quality: effectiveQuality });
   }
 };
 document.getElementById("zoom-out").onclick = e => { e.stopPropagation(); setZoom(viewport.zoom-.25); };

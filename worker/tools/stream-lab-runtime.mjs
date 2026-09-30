@@ -415,28 +415,16 @@ function validateBenchmarkProfile(profile, bandwidthMbps = null) {
       throw new RangeError("hybridCacheMode dda-gated requires png-quiescent-detail");
     if (encoder.dirtyQpMap && roiMode !== "damage")
       throw new RangeError("legacy dirtyQpMap can only normalize to roiMode damage");
-    let wssTopology;
-    if (profile.wssTopology !== undefined) {
-      const topology = profile.wssTopology;
-      if (profile.transport !== "wss" || !topology || !Number.isInteger(topology.laneCount) || topology.laneCount < 1 || topology.laneCount > 16 ||
-          !Number.isInteger(topology.dataShards) || topology.dataShards < 1 ||
-          !Number.isInteger(topology.parityShards) || ![0, 1].includes(topology.parityShards) ||
-          topology.laneCount !== topology.dataShards + topology.parityShards)
-        throw new RangeError("invalid benchmark WSS topology");
-      wssTopology = { laneCount: topology.laneCount, dataShards: topology.dataShards, parityShards: topology.parityShards };
-    }
     const activeAxes = Number(roiMode !== "off") + Number(hybridMode !== "off") +
       Number(resourceMode !== "per-frame" || asyncDepth !== 0) + Number(rateControlMode !== "cbr");
     if (activeAxes > 0) {
-      const topologyIsControl = wssTopology?.laneCount === 16 && wssTopology.dataShards === 15 &&
-        wssTopology.parityShards === 1;
       if (activeAxes !== 1 || profile.implementationVariant !== "candidate" || profile.transport !== "wss" ||
           profile.streamMode !== "work" || profile.width !== 1920 || profile.height !== 1080 ||
           profile.fps !== 30 || requestedBitrateBps !== 6_000_000 || totalMediaCapBps !== 6_000_000 ||
           profile.bitrateBps > requestedBitrateBps || profile.bitrateBps > totalMediaCapBps ||
-          (profile.totalMediaCapBps !== undefined && bandwidthMbps !== 6) || !topologyIsControl ||
+          (profile.totalMediaCapBps !== undefined && bandwidthMbps !== 6) ||
           encoder.main10 || (asyncDepth === 1 && resourceMode !== "persistent"))
-        throw new RangeError("pipeline experiment controls require one candidate axis on the 1080p30 6 Mbps 15+1 WSS control");
+        throw new RangeError("pipeline experiment controls require one candidate axis on the 1080p30 6 Mbps WSS control");
     }
     return {
       schemaVersion: 2, implementationVariant: profile.implementationVariant, experimentId: profile.experimentId,
@@ -444,7 +432,6 @@ function validateBenchmarkProfile(profile, bandwidthMbps = null) {
       width: profile.width, height: profile.height, fps: profile.fps, bitrateBps: profile.bitrateBps, gopSeconds,
       ...(profile.requestedBitrateBps !== undefined ? { requestedBitrateBps } : {}),
       ...(profile.totalMediaCapBps !== undefined ? { totalMediaCapBps } : {}),
-      ...(wssTopology ? { wssTopology } : {}),
       hybridMode,
       hybridCacheMode,
       encoder: { preset: encoder.preset, tuning: encoder.tuning, multipass: encoder.multipass,

@@ -44,8 +44,7 @@ test("Network Information estimate changes do not tear down a healthy WSS cohort
     signalingRegistered: true,
     signalingSocketOpen: true,
     usingWssMedia: true,
-    openLanes: 16,
-    dataShards: 15,
+    mediaSocketOpen: true,
     recoveryState: "healthy",
     renderedAgeMs: 203,
   };
@@ -71,8 +70,7 @@ test("a Network Information probe still recovers a stalled or degraded WSS route
     signalingRegistered: true,
     signalingSocketOpen: true,
     usingWssMedia: true,
-    openLanes: 16,
-    dataShards: 15,
+    mediaSocketOpen: true,
     recoveryState: "healthy",
     renderedAgeMs: 1_501,
   };
@@ -80,7 +78,7 @@ test("a Network Information probe still recovers a stalled or degraded WSS route
   assert.equal(shouldRecoverAfterNetworkRouteProbe(before, {
     ...stalled,
     renderedAgeMs: 200,
-    openLanes: 14,
+    mediaSocketOpen: false,
   }), true);
   assert.equal(shouldRecoverAfterNetworkRouteProbe(before, {
     ...stalled,
@@ -101,15 +99,14 @@ test("a lab quality pause is not mistaken for a dead healthy WSS route", () => {
     signalingRegistered: true,
     signalingSocketOpen: true,
     usingWssMedia: true,
-    openLanes: 16,
-    dataShards: 15,
+    mediaSocketOpen: true,
     recoveryState: "healthy",
     renderedAgeMs: 10_571,
     allowQuiescentIdle: true,
   };
 
   assert.equal(shouldRecoverAfterNetworkRouteProbe(before, paused), false);
-  assert.equal(shouldRecoverAfterNetworkRouteProbe(before, { ...paused, openLanes: 14 }), true);
+  assert.equal(shouldRecoverAfterNetworkRouteProbe(before, { ...paused, mediaSocketOpen: false }), true);
   assert.equal(shouldRecoverAfterNetworkRouteProbe(before, {
     ...paused,
     recoveryState: "awaiting-keyframe",

@@ -27,7 +27,7 @@ export function shouldRecoverAfterNetworkRouteProbe(before = {}, after = {}, {
   if (!after.signalingRegistered || !after.signalingSocketOpen) return true;
 
   if (after.usingWssMedia) {
-    if (Number(after.openLanes) < Number(after.dataShards) || after.recoveryState !== "healthy") return true;
+    if (after.mediaSocketOpen !== true || after.recoveryState !== "healthy") return true;
     if (after.allowQuiescentIdle === true) return false;
     return Number.isFinite(after.renderedAgeMs) && after.renderedAgeMs > maxRenderedAgeMs;
   }

@@ -556,8 +556,6 @@ export function artifactStore(root, runId) {
     writeMetrics(metrics) { writeJson("metrics.json", metrics); },
     writeComparison(comparison) { writeJson("comparison.json", comparison); },
     writeFailure(failure) { writeJsonAtomic("failure-diagnostics.json", failure); },
-    writeTopologyCheckpoint(state) { writeJsonAtomic("topology-checkpoint.json", state); },
-    readTopologyCheckpoint() { return JSON.parse(readFileSync(join(path, "topology-checkpoint.json"), "utf8")); },
     writeCampaignState(state) { writeJsonAtomic("campaign-state.json", state); },
     readCampaignState() { return JSON.parse(readFileSync(join(path, "campaign-state.json"), "utf8")); },
     listTemporaryFiles() { return readdirSync(path).filter(name => name.endsWith(".tmp")); },

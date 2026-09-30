@@ -116,34 +116,6 @@ test("direct Stream Lab signaling pairs one host and browser with the existing h
   assert.deepEqual(await nextJson(client.socket), { type: "pong" });
 });
 
-test("direct Stream Lab media preserves the host trailer and appends one edge trailer", async (t) => {
-  const relay = await startDirectLabRelay({ port: 0 });
-  t.after(() => relay.close());
-  const mediaBase = relay.url.replace(/^http/, "ws");
-  const query = `v=3&epoch=${EPOCH}&stripe=15&run=${RUN_ID}&${COMPAT}`;
-  const host = await openRole(`${mediaBase}lab-host-media-ws?${query}`, "media-host");
-  const client = await openRole(`${mediaBase}lab-media-ws?${query}`, "media-client");
-  t.after(() => host.socket.close());
-  t.after(() => client.socket.close());
-
-  const packet = new Uint8Array(19);
-  packet.set([3, 1, 0, 15, 9, 8, 7]);
-  const hostTrailer = new DataView(packet.buffer, 7, 12);
-  hostTrailer.setUint32(0, 0x42504854);
-  hostTrailer.setFloat64(4, 1_787_940_000_100);
-  const earliest = Date.now();
-  host.socket.send(packet);
-
-  const forwarded = new Uint8Array(await nextMessage(client.socket));
-  const latest = Date.now();
-  assert.equal(forwarded.byteLength, packet.byteLength + 12);
-  assert.deepEqual([...forwarded.subarray(0, packet.byteLength)], [...packet]);
-  const edgeTrailer = new DataView(forwarded.buffer, forwarded.byteOffset + packet.byteLength, 12);
-  assert.equal(edgeTrailer.getUint32(0), 0x42504554);
-  assert.ok(edgeTrailer.getFloat64(4) >= earliest);
-  assert.ok(edgeTrailer.getFloat64(4) <= latest);
-});
-
 test("direct Stream Lab relay rejects missing or stale compatibility identifiers", async (t) => {
   const relay = await startDirectLabRelay({ port: 0 });
   t.after(() => relay.close());
@@ -175,8 +147,8 @@ function queued(socket) {
   return () => items.length ? Promise.resolve(items.shift()) : new Promise(resolve => waiters.push(resolve));
 }
 
-function v4Url(relay, path, stripe = 0) {
-  return `${relay.url.replace(/^http/, "ws")}${path}?v=4&epoch=${EPOCH}&stripe=${stripe}&run=${RUN_ID}&${COMPAT}`;
+function v4Url(relay, path, epoch = EPOCH) {
+  return `${relay.url.replace(/^http/, "ws")}${path}?epoch=${epoch}&run=${RUN_ID}&${COMPAT}`;
 }
 
 async function openV4(relay, role) {
@@ -222,10 +194,10 @@ test("direct Stream Lab relay carries protocol v4 media, control, heartbeats and
   client.socket.close();
 });
 
-test("direct Stream Lab relay rejects v4 media stripes other than zero", async (t) => {
+test("direct Stream Lab relay rejects media sockets without a canonical epoch", async (t) => {
   const relay = await startDirectLabRelay({ port: 0 });
   t.after(() => relay.close());
-  const socket = new WebSocket(v4Url(relay, "lab-media-ws", 1));
+  const socket = new WebSocket(v4Url(relay, "lab-media-ws", "BAD"));
   await assert.rejects(new Promise((resolve, reject) => {
     socket.once("open", resolve);
     socket.once("error", reject);
