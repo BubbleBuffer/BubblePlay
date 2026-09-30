@@ -14,6 +14,7 @@ pub mod input;
 pub mod input_proxy_client;
 pub mod input_proxy_protocol;
 pub mod input_proxy_runtime;
+pub mod link_capacity;
 pub mod privileged_backend;
 pub mod privileged_ipc;
 pub mod privileged_pipe;
