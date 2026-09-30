@@ -640,6 +640,9 @@ unsafe fn zeroed<T>() -> T {
     std::mem::MaybeUninit::zeroed().assume_init()
 }
 
+/// Highest QP of H.264 / HEVC (8-bit).
+pub const MAX_HEVC_QP: u32 = 51;
+
 pub struct EncodedFrame {
     /// Annex B access unit (SPS/PPS included on IDR when repeatSPSPPS is on).
     pub data: Vec<u8>,
@@ -1526,6 +1529,53 @@ impl Nvenc {
             }
             Err(e) => {
                 warn!(bitrate_bps, ?e, "NVENC reconfigure failed");
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Rate-control QP ceiling for every picture type, if one binds.
+    pub fn max_qp(&self) -> Option<u32> {
+        let qp = self.cfg.rcParams.maxQP.qpInterP;
+        (self.cfg.rcParams.enableMaxQP() != 0 && qp < MAX_HEVC_QP).then_some(qp)
+    }
+
+    /// Reconfigure (no reset, no forced IDR) a rate-control QP ceiling for
+    /// every picture type; `None` lifts it. NVENC applies it from the next
+    /// picture onward. Frames may then exceed the CBR target.
+    ///
+    /// Lifting keeps the ceiling enabled at the codec maximum: on this
+    /// driver, reconfiguring `enableMaxQP` back to 0 leaves the old ceiling
+    /// in force (probe_nvenc_max_qp).
+    pub fn set_max_qp(&mut self, max_qp: Option<u32>) -> Result<()> {
+        let max_qp = max_qp.map(|qp| qp.min(MAX_HEVC_QP)).filter(|qp| *qp < MAX_HEVC_QP);
+        if max_qp == self.max_qp() {
+            return Ok(());
+        }
+        let mut cfg = *self.cfg;
+        let qp = max_qp.unwrap_or(MAX_HEVC_QP);
+        cfg.rcParams.set_enableMaxQP(1);
+        cfg.rcParams.maxQP = nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_QP {
+            qpInterP: qp,
+            qpInterB: qp,
+            qpIntra: qp,
+        };
+        let mut init = *self.init_params;
+        init.encodeConfig = &mut cfg;
+        let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
+        reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+        reconf.reInitEncodeParams = init;
+        let st = unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) };
+        match st.result_without_string() {
+            Ok(()) => {
+                *self.cfg = cfg;
+                *self.init_params = init;
+                self.init_params.encodeConfig = self.cfg.as_mut();
+                info!(?max_qp, "NVENC max QP reconfigured");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(?max_qp, ?e, "NVENC max QP reconfigure failed");
                 Err(e.into())
             }
         }
