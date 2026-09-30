@@ -11,7 +11,10 @@ import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, shouldFallbackToWssOnMissingRtp, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
 import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
-import { TRANSPORT, createCodecSession, parseQualityPreset, parseTransport, rtpCodecMimeTypes } from "/transport.js";
+import {
+  TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
+  rememberedRtcFailure, rtpCodecMimeTypes,
+} from "/transport.js";
 import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
 
 const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
@@ -90,6 +93,11 @@ const labCompatibilityId = labRun ? STREAM_LAB_COMPATIBILITY.id : null;
 const WSS_PROTOCOL = V4_VERSION;
 const useWebCodecs = params.get("decoderPath") === "webcodecs";
 const requestedTransport = parseTransport(params);
+function browserStorage() {
+  try { return window.localStorage; } catch { return null; }
+}
+// ?transport= always wins; only auto mode consults the remembered RTC failure.
+const startOnRememberedWss = rememberedRtcFailure(requestedTransport, browserStorage());
 let qualityPreset = parseQualityPreset(params, localStorage);
 const codecSession = createCodecSession({ transport: requestedTransport, decoderPath: useWebCodecs ? "webcodecs" : "native" }); // page-local
 const diagnosticsEnabled = params.get("diag") === "1";
@@ -540,7 +548,7 @@ let remoteDescriptionSet = false;
 let currentIceServers = STUN_FALLBACK;
 let mediaEpoch = null;
 let usingWssMedia = false;
-let wssSelected = requestedTransport === TRANSPORT.WSS;
+let wssSelected = requestedTransport === TRANSPORT.WSS || startOnRememberedWss;
 let wssReconnectTimer = null;
 let wssKeyframeTimer = null;
 let wssDecoderEpoch = 0;
@@ -1124,7 +1132,7 @@ function requestWssMediaStart() {
   // Closing it here makes the host interpret the transport fallback as the
   // browser leaving. The host stops admitting RTP once WSS is selected.
   hudState.ice = "wss"; hudState.route = "wss"; hudState.dec = `${codecSession.codec} wss`;
-  sendClientLog("info", "wss-start", { epoch: mediaEpoch, protocol: WSS_PROTOCOL });
+  sendClientLog("info", "wss-start", { epoch: mediaEpoch, protocol: WSS_PROTOCOL, rememberedRtcFailure: startOnRememberedWss });
   inputReady = connected = true; onInputReady();
   wssStartedHost = false;
   // v4 decodes every frame in order: there is no deadline expiry.
@@ -1326,6 +1334,9 @@ function endRtcPeerOnly(reason) {
 
 function switchToWss(reason) {
   if (usingWssMedia) return;
+  // Auto mode only reaches here when WebRTC could not start in this browser.
+  rememberRtcFailure(browserStorage());
+  sendClientLog("warn", "rtc-failed-switch-to-wss", { reason, remembered: true });
   wssSelected = true;
   hudState.ice = `wss (${reason})`;
   requestWssMediaStart();
@@ -1611,6 +1622,8 @@ async function startPeer(generation = peerGeneration) {
             : 0;
           if (shouldFallbackToWssOnMissingRtp({ connected, framesReceived, nativeFramesPresented })) {
             switchToWss("no-rtp");
+          } else {
+            forgetRtcFailure(browserStorage());
           }
         }, 2_000);
       }

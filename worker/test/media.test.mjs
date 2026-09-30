@@ -17,6 +17,11 @@ import {
   createCodecSession,
   parseQualityPreset,
   parseTransport,
+  rememberedRtcFailure,
+  rememberRtcFailure,
+  forgetRtcFailure,
+  RTC_FAILURE_STORAGE_KEY,
+  RTC_REPROBE_INTERVAL_MS,
   rtpCodecMimeTypes,
 } from "../public/transport.js";
 
@@ -753,6 +758,35 @@ test("transport accepts auto, webrtc, wss, and the wsl compatibility alias", () 
   assert.equal(parseTransport(new URLSearchParams("wsl=1")), "wss");
   assert.equal(parseTransport(new URLSearchParams("transport=wsl")), "wss");
   assert.equal(parseTransport(new URLSearchParams("transport=unknown")), "auto");
+});
+
+test("auto mode remembers an RTC failure for a day and the query still overrides it", () => {
+  const values = new Map();
+  const storage = {
+    getItem: key => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: key => values.delete(key),
+  };
+  const now = 1_700_000_000_000;
+  assert.equal(rememberedRtcFailure("auto", storage, now), false);
+  rememberRtcFailure(storage, now);
+  assert.equal(values.get(RTC_FAILURE_STORAGE_KEY), String(now));
+  assert.equal(rememberedRtcFailure("auto", storage, now + 60_000), true);
+  assert.equal(rememberedRtcFailure("webrtc", storage, now + 60_000), false);
+  assert.equal(rememberedRtcFailure("wss", storage, now + 60_000), false);
+  // Re-probe RTC at most once a day.
+  assert.equal(rememberedRtcFailure("auto", storage, now + RTC_REPROBE_INTERVAL_MS), false);
+  forgetRtcFailure(storage);
+  assert.equal(rememberedRtcFailure("auto", storage, now + 60_000), false);
+  // Storage may be missing or throw in private contexts.
+  const throwing = { getItem() { throw new Error("denied"); }, setItem() { throw new Error("denied"); },
+    removeItem() { throw new Error("denied"); } };
+  assert.doesNotThrow(() => rememberRtcFailure(throwing, now));
+  assert.doesNotThrow(() => forgetRtcFailure(throwing));
+  assert.equal(rememberedRtcFailure("auto", throwing, now), false);
+  assert.equal(rememberedRtcFailure("auto", null, now), false);
+  values.set(RTC_FAILURE_STORAGE_KEY, "garbage");
+  assert.equal(rememberedRtcFailure("auto", storage, now), false);
 });
 
 test("WSS quality defaults high, remembers selection, and lets the query override it", () => {
