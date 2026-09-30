@@ -15,6 +15,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
@@ -344,6 +345,16 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         input?.cursorSync()
     }
 
+    override fun onInputLost() {
+        // The host drops held input with its session; mirror that locally so
+        // nothing stays "down" and the next packet starts with a release-all.
+        input?.releaseAll(send = false)
+        gestures.cancel()
+        main.removeCallbacks(longPress)
+        mouseButtons = 0
+        latched.clear(); activeLatched.clear(); renderLatches()
+    }
+
     override fun onSecureDesktop(secure: Boolean) {
         if (secure) Toast.makeText(this, R.string.secure_desktop, Toast.LENGTH_SHORT).show()
     }
@@ -453,6 +464,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
                 applyViewport()
             }
             is GestureAction.Pan -> { viewport.pan(action.dx, action.dy); applyViewport() }
+            GestureAction.LongPressArmed -> stage.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            GestureAction.ResetZoom -> { viewport.resetZoom(); applyViewport() }
         }
     }
 

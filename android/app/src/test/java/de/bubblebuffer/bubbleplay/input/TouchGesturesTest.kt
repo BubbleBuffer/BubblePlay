@@ -113,21 +113,110 @@ class TouchGesturesTest {
     }
 
     @Test
-    fun directDragIsLeftDragFromTheOrigin() {
+    fun directOneFingerDragPansAndSendsNothing() {
         g.mode = TouchMode.DIRECT
         g.down(0, 10f, 20f, 0)
-        assertEquals(listOf(PointAt(10f, 20f), Press(BUTTON_LEFT), PointAt(40f, 20f)), g.move(0, 40f, 20f))
-        assertEquals(listOf(PointAt(50f, 25f)), g.move(0, 50f, 25f))
-        assertEquals(listOf(PointAt(50f, 25f), Release(BUTTON_LEFT)), g.up(0, 400))
+        assertEquals(emptyList<GestureAction>(), g.move(0, 15f, 22f)) // inside the slop: still a tap candidate
+        assertEquals(listOf(Pan(30f, 0f)), g.move(0, 40f, 20f)) // includes the slop distance
+        assertEquals(listOf(Pan(10f, 5f)), g.move(0, 50f, 25f))
+        assertNull(g.longPressDeadline)
+        assertEquals(emptyList<GestureAction>(), g.onLongPress(450)) // panning cancels the long-press
+        assertEquals(emptyList<GestureAction>(), g.up(0, 900)) // no click after a pan
+        assertFalse(g.active)
     }
 
     @Test
-    fun directLongPressIsRightClick() {
+    fun directSmallJitterStaysATap() {
         g.mode = TouchMode.DIRECT
         g.down(0, 10f, 20f, 0)
-        assertEquals(listOf(PointAt(10f, 20f), Click(BUTTON_RIGHT)), g.onLongPress(450))
-        assertEquals(emptyList<GestureAction>(), g.move(0, 60f, 20f))
-        assertEquals(emptyList<GestureAction>(), g.up(0, 900))
+        g.move(0, 18f, 24f)
+        assertEquals(listOf(PointAt(18f, 24f), Click(BUTTON_LEFT)), g.up(0, 150))
+    }
+
+    @Test
+    fun directLongPressThenDragIsAMouseDrag() {
+        g.mode = TouchMode.DIRECT
+        g.down(0, 10f, 20f, 0)
+        assertEquals(listOf(GestureAction.LongPressArmed), g.onLongPress(450)) // nothing sent yet
+        assertEquals(listOf(PointAt(10f, 20f), Press(BUTTON_LEFT), PointAt(40f, 20f)), g.move(0, 40f, 20f))
+        assertEquals(listOf(PointAt(50f, 25f)), g.move(0, 50f, 25f))
+        assertEquals(listOf(PointAt(50f, 25f), Release(BUTTON_LEFT)), g.up(0, 900))
+    }
+
+    @Test
+    fun directLongPressWithoutMovingIsRightClick() {
+        g.mode = TouchMode.DIRECT
+        g.down(0, 10f, 20f, 0)
+        g.onLongPress(450)
+        g.move(0, 12f, 21f) // within slop
+        assertEquals(listOf(PointAt(12f, 21f), Click(BUTTON_RIGHT)), g.up(0, 900))
+    }
+
+    @Test
+    fun directCancelDuringLongPressDragReleases() {
+        g.mode = TouchMode.DIRECT
+        g.down(0, 10f, 20f, 0)
+        g.onLongPress(450)
+        g.move(0, 60f, 20f)
+        assertEquals(listOf(Release(BUTTON_LEFT)), g.cancel())
+    }
+
+    @Test
+    fun directTwoFingerDragScrollsAndPinchZooms() {
+        g.mode = TouchMode.DIRECT
+        g.down(0, 100f, 100f, 0)
+        g.down(1, 200f, 100f, 10)
+        assertEquals(emptyList<GestureAction>(), g.move(0, 100f, 105f))
+        assertEquals(listOf(Scroll(0f, 20f)), g.move(1, 200f, 135f))
+        assertEquals(emptyList<GestureAction>(), g.up(0, 300))
+        g.up(1, 310)
+        g.down(0, 100f, 100f, 1_000)
+        g.down(1, 200f, 100f, 1_010)
+        val zoom = g.move(1, 250f, 100f).single() as Zoom
+        assertEquals(1.5f, zoom.scale, 1e-4f)
+        assertEquals(175f, zoom.focusX, 1e-4f) // direct keeps the pinch focus
+    }
+
+    @Test
+    fun directTwoFingerDoubleTapResetsZoom() {
+        g.mode = TouchMode.DIRECT
+        g.down(0, 100f, 100f, 0)
+        g.down(1, 200f, 100f, 20)
+        assertEquals(emptyList<GestureAction>(), g.up(1, 100)) // a single two-finger tap does nothing in direct mode
+        g.up(0, 110)
+        g.down(0, 100f, 100f, 300)
+        g.down(1, 200f, 100f, 310)
+        assertEquals(listOf(GestureAction.ResetZoom), g.up(0, 380))
+        g.up(1, 390)
+    }
+
+    @Test
+    fun directSlowSecondTwoFingerTapIsNotADoubleTap() {
+        g.mode = TouchMode.DIRECT
+        g.down(0, 100f, 100f, 0); g.down(1, 200f, 100f, 20)
+        g.up(1, 100); g.up(0, 110)
+        g.down(0, 100f, 100f, 900); g.down(1, 200f, 100f, 910)
+        assertEquals(emptyList<GestureAction>(), g.up(0, 980))
+    }
+
+    @Test
+    fun trackpadTwoFingerDoubleTapIsTwoRightClicks() {
+        g.down(0, 100f, 100f, 0); g.down(1, 200f, 100f, 20)
+        assertEquals(listOf(Click(BUTTON_RIGHT)), g.up(1, 100)); g.up(0, 110)
+        g.down(0, 100f, 100f, 300); g.down(1, 200f, 100f, 310)
+        assertEquals(listOf(Click(BUTTON_RIGHT)), g.up(0, 380))
+    }
+
+    @Test
+    fun resetZoomReturnsToFit() {
+        val v = Viewport().apply { layout(1000, 500, 1920, 1080) }
+        v.zoomBy(3f, 100f, 100f)
+        v.pan(-50f, -50f)
+        assertTrue(v.zoomed)
+        v.resetZoom()
+        assertFalse(v.zoomed)
+        assertEquals(0.5f, v.toNormalized(500f, 250f).first, 1e-4f)
+        assertEquals(0.5f, v.toNormalized(500f, 250f).second, 1e-4f)
     }
 
     @Test

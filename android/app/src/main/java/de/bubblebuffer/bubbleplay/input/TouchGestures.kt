@@ -16,8 +16,12 @@ sealed interface GestureAction {
     data class Scroll(val dx: Float, val dy: Float) : GestureAction
     /** Pinch: local view zoom around a focus point; never sent to the host. */
     data class Zoom(val scale: Float, val focusX: Float, val focusY: Float) : GestureAction
-    /** Local view pan while pinching. */
+    /** Local view pan (pinch, or a one-finger drag in direct mode); never sent to the host. */
     data class Pan(val dx: Float, val dy: Float) : GestureAction
+    /** Direct: a long-press was recognised (haptic cue only; nothing is sent yet). */
+    data object LongPressArmed : GestureAction
+    /** Direct: two-finger double-tap, zoom back to fit. */
+    data object ResetZoom : GestureAction
 }
 
 enum class TouchMode { TRACKPAD, DIRECT }
@@ -28,8 +32,10 @@ enum class TouchMode { TRACKPAD, DIRECT }
  * Trackpad: one-finger drag moves the cursor, tap = left click, long-press
  * then drag = left drag, two-finger tap = right click, two-finger drag =
  * wheel scroll, pinch = local zoom.
- * Direct: tap = left click where touched, one-finger drag = left drag,
- * long-press = right click, two-finger gestures as in trackpad mode.
+ * Direct: one-finger drag pans the (zoomed) view and sends nothing, tap =
+ * left click where touched, long-press then drag = left drag, long-press
+ * without moving = right click, two-finger drag = wheel scroll, pinch =
+ * zoom around the pinch focus, two-finger double-tap = reset zoom.
  *
  * The caller schedules [longPressDeadline] and calls [onLongPress] when it
  * passes (the view posts a delayed runnable).
@@ -40,7 +46,10 @@ class TouchGestures(
     private val pinchThresholdPx: Float = 24f,
     private val longPressMs: Long = 450,
     private val twoFingerTapMs: Long = 600,
+    private val doubleTapMs: Long = 400,
 ) {
+    /** When the last direct-mode two-finger tap ended (for double-tap), or null. */
+    private var lastTwoTapAt: Long? = null
     private enum class Phase { IDLE, ONE, TWO, DONE }
     private enum class TwoMode { UNDECIDED, SCROLL, PINCH }
 
@@ -123,18 +132,27 @@ class TouchGestures(
                     if (dragging) out += GestureAction.Release(BUTTON_LEFT)
                     else if (!moved && !longPressed) out += GestureAction.Click(BUTTON_LEFT)
                 } else {
-                    if (dragging) { out += GestureAction.PointAt(point.x, point.y); out += GestureAction.Release(BUTTON_LEFT) }
-                    else if (!moved && !longPressed) { out += GestureAction.PointAt(point.x, point.y); out += GestureAction.Click(BUTTON_LEFT) }
+                    when {
+                        dragging -> { out += GestureAction.PointAt(point.x, point.y); out += GestureAction.Release(BUTTON_LEFT) }
+                        longPressed && !moved -> { out += GestureAction.PointAt(point.x, point.y); out += GestureAction.Click(BUTTON_RIGHT) }
+                        !moved -> { out += GestureAction.PointAt(point.x, point.y); out += GestureAction.Click(BUTTON_LEFT) }
+                        // else: the finger panned the view; nothing for the host.
+                    }
                 }
                 reset()
             }
             Phase.TWO -> {
                 if (twoFingerTap && twoMode == TwoMode.UNDECIDED && now - downAt <= twoFingerTapMs) {
-                    if (mode == TouchMode.DIRECT) {
-                        val o = origins.values.firstOrNull() ?: point
-                        out += GestureAction.PointAt(o.x, o.y)
+                    if (mode == TouchMode.TRACKPAD) {
+                        out += GestureAction.Click(BUTTON_RIGHT)
+                    } else {
+                        // Direct: a single two-finger tap does nothing; a second one soon after resets zoom.
+                        val last = lastTwoTapAt
+                        if (last != null && downAt - last <= doubleTapMs) {
+                            out += GestureAction.ResetZoom
+                            lastTwoTapAt = null
+                        } else lastTwoTapAt = now
                     }
-                    out += GestureAction.Click(BUTTON_RIGHT)
                 }
                 // Remaining finger does nothing until every finger lifts.
                 phase = if (points.isEmpty()) Phase.IDLE else Phase.DONE
@@ -159,12 +177,12 @@ class TouchGestures(
         if (phase != Phase.ONE || moved || now < deadline) return emptyList()
         longPressDeadline = null
         longPressed = true
-        val o = points.values.first()
         return if (mode == TouchMode.TRACKPAD) {
             dragging = true
             listOf(GestureAction.Press(BUTTON_LEFT))
         } else {
-            listOf(GestureAction.PointAt(o.x, o.y), GestureAction.Click(BUTTON_RIGHT))
+            // Direct: wait to see whether the finger drags (left drag) or lifts (right click).
+            listOf(GestureAction.LongPressArmed)
         }
     }
 
@@ -177,18 +195,20 @@ class TouchGestures(
             }
             moved = true
             longPressDeadline = null
-            if (mode == TouchMode.DIRECT) {
-                if (longPressed) return emptyList() // right click already sent
-                dragging = true
-                return listOf(GestureAction.PointAt(origin.x, origin.y), GestureAction.Press(BUTTON_LEFT), GestureAction.PointAt(point.x, point.y))
-            }
             val dx = pendingDx + point.x - old.x
             val dy = pendingDy + point.y - old.y
             pendingDx = 0f; pendingDy = 0f
+            if (mode == TouchMode.DIRECT) {
+                if (longPressed) {
+                    dragging = true
+                    return listOf(GestureAction.PointAt(origin.x, origin.y), GestureAction.Press(BUTTON_LEFT), GestureAction.PointAt(point.x, point.y))
+                }
+                return listOf(GestureAction.Pan(dx, dy))
+            }
             return listOf(GestureAction.Move(dx, dy))
         }
         return if (mode == TouchMode.DIRECT) {
-            if (dragging) listOf(GestureAction.PointAt(point.x, point.y)) else emptyList()
+            if (dragging) listOf(GestureAction.PointAt(point.x, point.y)) else listOf(GestureAction.Pan(point.x - old.x, point.y - old.y))
         } else listOf(GestureAction.Move(point.x - old.x, point.y - old.y))
     }
 
@@ -272,6 +292,11 @@ class Viewport {
     }
 
     fun pan(dx: Float, dy: Float) { x += dx; y += dy; clamp() }
+
+    val zoomed: Boolean get() = zoom > 1f
+
+    /** Back to fit-to-view. */
+    fun resetZoom() { zoom = 1f; x = 0f; y = 0f; clamp() }
 
     /**
      * Zoom anchored on a normalized frame point (trackpad mode: the cursor):
