@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { CLIPBOARD, clipboardPackets, ClipboardReceiver, InputController, keyDescriptor, packet, SCAN_CODES, WheelAccumulator } from "../public/input.js";
 
-const contract = JSON.parse(readFileSync(new URL("../../fixtures/input-contract.json", import.meta.url), "utf8"));
+import { CLIPBOARD_CHUNK_TEXT_BYTES, CLIPBOARD_MAX_CHUNKS, validClipboardMessage, validInputCapabilities } from "../src/protocol-validation.js";
+
+const contract =JSON.parse(readFileSync(new URL("../../fixtures/input-contract.json", import.meta.url), "utf8"));
 
 function harness({ state = "open", accept = () => true } = {}) {
   const sent = [], timers = [];
@@ -148,4 +150,38 @@ test("host clipboard chunks reassemble only in order", () => {
   assert.equal(r.push({ protocol: 1, id: 6, index: 0, count: 65, text: "x" }), null);
   r.push({ protocol: 1, id: 7, index: 0, count: 3, text: "a" });
   assert.equal(r.push({ protocol: 1, id: 8, index: 1, count: 3, text: "b" }), null, "interleaved transfer resets");
+});
+
+test("relay validates host clipboard chunks and input capabilities", () => {
+  assert.equal(CLIPBOARD_CHUNK_TEXT_BYTES, contract.hostClipboardMessage.chunkBytes);
+  assert.equal(CLIPBOARD_MAX_CHUNKS, contract.hostClipboardMessage.maxChunks);
+  const ok = { type: "clipboard", protocol: 1, id: 3, index: 0, count: 1, text: "hé" };
+  const check = (msg, role = "host") => validClipboardMessage(msg, role, JSON.stringify(msg));
+  assert.equal(check(ok), true);
+  assert.equal(check({ ...ok, text: "" }), true);
+  assert.equal(check({ ...ok, text: "\u0001".repeat(CLIPBOARD_CHUNK_TEXT_BYTES) }), true, "escaped control chars fit");
+  assert.equal(check(ok, "client"), false, "browsers cannot inject host clipboard messages");
+  assert.equal(check({ ...ok, protocol: 2 }), false);
+  assert.equal(check({ ...ok, index: 1 }), false);
+  assert.equal(check({ ...ok, count: 0 }), false);
+  assert.equal(check({ ...ok, count: CLIPBOARD_MAX_CHUNKS + 1 }), false);
+  assert.equal(check({ ...ok, id: -1 }), false);
+  assert.equal(check({ ...ok, text: 7 }), false);
+  assert.equal(check({ ...ok, extra: true }), false);
+  assert.equal(check({ ...ok, text: "é".repeat(CLIPBOARD_CHUNK_TEXT_BYTES / 2 + 1) }), false);
+
+  const caps = { type: "input-capabilities", protocol: 1, scancode: true, clipboard: true, clipboardMaxBytes: CLIPBOARD.maxBytes };
+  const capsOk = (msg, role = "host") => validInputCapabilities(msg, role, JSON.stringify(msg));
+  assert.equal(capsOk(caps), true);
+  assert.equal(capsOk(caps, "client"), false);
+  assert.equal(capsOk({ ...caps, scancode: "yes" }), false);
+  assert.equal(capsOk({ ...caps, clipboardMaxBytes: CLIPBOARD.maxBytes + 1 }), false);
+  assert.equal(capsOk({ ...caps, extra: 1 }), false);
+});
+
+test("relay wires clipboard validation and replays input capabilities to new clients", () => {
+  const source = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
+  assert.match(source, /msg\.type === "clipboard" && !validClipboardMessage\(msg, att\.role, message\)\) return;/);
+  assert.match(source, /validInputCapabilities\(msg, att\.role, message\)\) return;\s*ws\.serializeAttachment\(\{ \.\.\.ws\.deserializeAttachment\(\), inputCapabilities: message \}\)/);
+  assert.match(source, /inputCapabilities = this\.findPeer\("host"\)\?\.deserializeAttachment\(\)\?\.inputCapabilities;\s*if \(typeof inputCapabilities === "string"\) ws\.send\(inputCapabilities\);/);
 });

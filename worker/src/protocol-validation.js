@@ -59,6 +59,30 @@ export function validInputStatus(message, role, raw) {
 }
 
 
+// Host clipboard text travels as in-order JSON chunks of at most 32 KiB of
+// UTF-8 (64 chunks, 1 MiB total). JSON escaping can inflate a chunk up to 6x.
+export const CLIPBOARD_CHUNK_TEXT_BYTES = 32 * 1024;
+export const CLIPBOARD_MAX_CHUNKS = 64;
+export const CLIPBOARD_MAX_BYTES = 1024 * 1024;
+const CLIPBOARD_MAX_RAW_BYTES = CLIPBOARD_CHUNK_TEXT_BYTES * 6 + 256;
+
+export function validClipboardMessage(message, role, raw) {
+  return role === "host" && typeof raw === "string" && utf8Length(raw) <= CLIPBOARD_MAX_RAW_BYTES &&
+    exactObjectKeys(message, ["count", "id", "index", "protocol", "text", "type"]) &&
+    message.protocol === 1 && uint32(message.id) &&
+    boundedInteger(message.count, 1, CLIPBOARD_MAX_CHUNKS) &&
+    boundedInteger(message.index, 0, message.count - 1) &&
+    typeof message.text === "string" && utf8Length(message.text) <= CLIPBOARD_CHUNK_TEXT_BYTES;
+}
+
+export function validInputCapabilities(message, role, raw) {
+  return role === "host" && typeof raw === "string" && utf8Length(raw) <= 256 &&
+    exactObjectKeys(message, ["clipboard", "clipboardMaxBytes", "protocol", "scancode", "type"]) &&
+    message.protocol === 1 && typeof message.scancode === "boolean" &&
+    typeof message.clipboard === "boolean" &&
+    boundedInteger(message.clipboardMaxBytes, 0, CLIPBOARD_MAX_BYTES);
+}
+
 export function canonicalWorkerVersionId(value) {
   return typeof value === "string" &&
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
