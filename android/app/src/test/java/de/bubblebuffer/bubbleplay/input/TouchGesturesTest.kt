@@ -253,6 +253,47 @@ class TouchGesturesTest {
         assertEquals(0f, v.x)
     }
 
+    /**
+     * The stream is laid out in the area above the docked bar (and above the
+     * soft keyboard): the frame fits inside that area and touches map to the
+     * frame within it, never under the bar.
+     */
+    private fun assertFitsAbove(windowW: Int, windowH: Int, ime: Int, bar: Int, landscapeFill: Boolean) {
+        val areaH = windowH - ime - bar
+        val v = Viewport().apply { layout(windowW, areaH, 1920, 1080) }
+        assertEquals(areaH.toFloat(), v.viewH, 0.01f)
+        assertTrue("frame bottom ${v.contentY + v.contentH} inside $areaH", v.contentY + v.contentH <= areaH + 0.01f)
+        assertTrue(v.contentY >= -0.01f && v.contentX >= -0.01f)
+        if (landscapeFill) assertEquals(areaH.toFloat(), v.contentH, 0.01f) else assertEquals(windowW.toFloat(), v.contentW, 0.01f)
+        // Frame corners map to 0..1 inside the area.
+        val (l, t) = v.toNormalized(v.contentX, v.contentY)
+        val (r, b) = v.toNormalized(v.contentX + v.contentW, v.contentY + v.contentH)
+        assertEquals(0f, l, 1e-4f); assertEquals(0f, t, 1e-4f)
+        assertEquals(1f, r, 1e-4f); assertEquals(1f, b, 1e-4f)
+        // The centre of the area is the centre of the frame.
+        val (cx, cy) = v.toNormalized(windowW / 2f, areaH / 2f)
+        assertEquals(0.5f, cx, 1e-4f); assertEquals(0.5f, cy, 1e-4f)
+        // Zoomed in and panned to the bottom: the frame's last row reaches at most
+        // the bar's top edge (exactly, once the zoomed frame is taller than the area).
+        v.zoomBy(3f, windowW / 2f, areaH / 2f)
+        v.pan(0f, -1e6f)
+        val bottom = v.toScreen(0.5f, 1f).second
+        assertTrue("zoomed frame bottom $bottom inside $areaH", bottom <= areaH + 1e-2f)
+        if (v.contentH * v.zoom >= areaH) assertEquals(areaH.toFloat(), bottom, 1e-2f)
+    }
+
+    @Test
+    fun viewportUsesTheAreaAboveTheBarInPortrait() {
+        assertFitsAbove(1080, 2400, ime = 0, bar = 147, landscapeFill = false)
+        assertFitsAbove(1080, 2400, ime = 1000, bar = 147, landscapeFill = false)
+    }
+
+    @Test
+    fun viewportUsesTheAreaAboveTheBarInLandscape() {
+        assertFitsAbove(2400, 1080, ime = 0, bar = 147, landscapeFill = true)
+        assertFitsAbove(2400, 1080, ime = 600, bar = 147, landscapeFill = true)
+    }
+
     @Test
     fun viewportHandlesDegenerateSizes() {
         val v = Viewport()

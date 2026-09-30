@@ -20,14 +20,14 @@ It uses the same WSS v4 media path and input contract as the browser receiver (`
   - Trackpad mode: one finger moves the cursor, tap clicks, two fingers scroll, pinch zooms around the cursor, and a two-finger tap right-clicks.
   - Direct mode: tap clicks where you touch; one-finger drag pans a zoomed view; long-press then drag is a mouse drag, and long-press without moving is a right-click; two fingers scroll and pinch-zoom; a two-finger double tap resets the zoom.
   - The soft keyboard sends Unicode text for committed text and scan codes for keys.
-  - Quick-action bar (icons, left to right): keyboard, switch screen (monitor list, current one marked; disabled with one monitor), touch mode, shortcuts (19 chords plus paste from the phone clipboard; no Ctrl+Alt+Del), keys (sticky Ctrl/Alt/Shift/Win, Esc, Tab, navigation, F1 to F12), arrows (D-pad with Enter, Home/End, PgUp/PgDn), zoom reset (only while zoomed), and more (full screen, settings, disconnect). Arrow and navigation keys repeat while held (350 ms, then every 40 ms). The bar hides after about 3 s; tap or swipe up the handle, or tap the status line, to bring it back.
+  - Quick-action bar (icons, left to right): keyboard, switch screen (monitor list, current one marked; disabled with one monitor), touch mode, shortcuts (19 chords plus paste from the phone clipboard; no Ctrl+Alt+Del), keys (sticky Ctrl/Alt/Shift/Win, Esc, Tab, navigation, F1 to F12), arrows (D-pad with Enter, Home/End, PgUp/PgDn), zoom reset (only while zoomed), and more (full screen, settings, disconnect). Arrow and navigation keys repeat while held (350 ms, then every 40 ms). The bar is always visible and docked: the stream is laid out (letterbox and touch mapping included) in the area above it, and with the soft keyboard open the bar sits on the keyboard with the stream above. Back closes a popover, then the keyboard, then asks to disconnect.
   - Input is sent only on a signaling socket that has completed hello for the current host session and presented a first frame. If signaling drops while media is up, the app reconnects signaling with the same backoff, shows "Input reconnecting…", releases held keys and buttons, and re-arms input on the new session. A half-open socket is detected by an early ping (after 4 s of input with no inbound traffic, dead if no pong within 6 s).
   - A hardware keyboard sends scan codes.
   - A hardware mouse is captured and sends relative motion, buttons and wheel.
   - Clipboard works in both directions.
 - **Session:**
   - The screen stays on and the app runs immersive.
-  - A status line shows state, codec and size. Tap it to show or hide the bar, or to reconnect after an error. Full screen can be turned off from the bar's More menu (not persisted).
+  - A status line shows state, codec and size. Tap it to reconnect after an error. Full screen can be turned off from the bar's More menu (not persisted).
   - The session is stopped 30 s after the app leaves the foreground (see "Known limits").
 
 Code layout (`app/src/main/java/de/bubblebuffer/bubbleplay/`):

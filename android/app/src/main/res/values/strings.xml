@@ -32,7 +32,6 @@
     <string name="bar_arrows">Arrow keys</string>
     <string name="bar_zoom_reset">Reset zoom to fit</string>
     <string name="bar_more">More</string>
-    <string name="bar_show">Show toolbar</string>
     <!-- Popovers -->
     <string name="pop_screens">Screens</string>
     <string name="pop_screens_loading">Asking the desktop for its screens…</string>

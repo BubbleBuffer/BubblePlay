@@ -156,6 +156,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         })
 
         quickBar = QuickBar(this, root, this)
+        // The bar is docked, never over the video: the stage (and so the
+        // viewport, letterbox and touch mapping) is the area above it. Root
+        // padding already removes the soft keyboard and, outside full screen,
+        // the system bars, so the bar sits on the keyboard and the stream above.
+        (stage.layoutParams as FrameLayout.LayoutParams).bottomMargin = quickBar.height
 
         root.setOnApplyWindowInsetsListener { v, insets -> applyInsets(v, insets); insets }
         setContentView(root)
@@ -189,7 +194,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         keyboardShown = false
         keyboardView.clearFocus()
         quickBar.render()
-        quickBar.scheduleHide()
     }
 
     private fun enterImmersive() {
@@ -283,7 +287,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         when {
             quickBar.dismiss() -> {}
             keyboardShown -> toggleKeyboard()
-            !quickBar.shown -> quickBar.show()
             else -> AlertDialog.Builder(this)
                 .setMessage(R.string.confirm_disconnect)
                 .setPositiveButton(R.string.key_disconnect) { _, _ -> finish() }
@@ -677,7 +680,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             keyboardView.clearFocus()
         }
         quickBar.render()
-        quickBar.scheduleHide()
     }
 
     // ---- QuickBar.Host: everything else --------------------------------------------------------
@@ -733,9 +735,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     private fun onStatusTapped() {
         if (lastStatus?.state == Session.State.ERROR || session == null) {
-            stopSession(); startSession(); return
+            stopSession(); startSession()
         }
-        quickBar.toggleShown()
     }
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).roundToInt()
