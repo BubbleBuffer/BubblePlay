@@ -9,11 +9,17 @@
 //!
 //! Delivery rates are lower bounds of the capacity, so the estimate is a
 //! windowed maximum. Samples taken while the sender is app-limited (the usual
-//! case on a desktop stream) only say "at least this much"; the link counts
-//! as constrained only while ACKs show a queue: several samples within a
-//! short hold whose RTT exceeds the minimum by `QUEUE_EVIDENCE` and whose
-//! delivery was slower than the sending. An unconstrained link has no
-//! estimate and so no budget.
+//! case on a desktop stream) only say "at least this much". A link becomes
+//! constrained once ACKs show a queue: several samples within a short hold
+//! whose RTT exceeds the minimum by `QUEUE_EVIDENCE` and whose delivery was
+//! slower than the sending. An unconstrained link has no estimate and so no
+//! budget (no behaviour change).
+//!
+//! Like BBR, a constrained estimate is held while the sender is app-limited
+//! (idle screens say nothing about the link), raised by any faster delivery,
+//! and probed upward by 25 % after `PROBE_INTERVAL` of busy sending with no
+//! queue, so a link that got faster is found again. It is only re-measured
+//! downward by fresh queue evidence.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -35,6 +41,16 @@ pub const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(8);
 pub const MIN_SAMPLE_BYTES: u64 = 4_096;
 /// Per-frame budget = capacity x frame interval x 80 %.
 pub const BUDGET_UTILIZATION_PCT: u64 = 80;
+/// Busy sending without queue evidence for this long probes upward.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(2);
+/// Probe step, percent of the current estimate.
+pub const PROBE_GAIN_PCT: u64 = 125;
+/// "Busy": the sending rate over the last `PROBE_INTERVAL` reached this
+/// share of the estimate (the sender was using the link, not idle).
+pub const PROBE_BUSY_PCT: u64 = 60;
+/// A lone frame (sent into an empty pipe) must be this large to count as
+/// queue evidence; smaller ones are dominated by RTT jitter.
+pub const LONE_FRAME_EVIDENCE_BYTES: u64 = 4 * MIN_SAMPLE_BYTES;
 const MAX_TRACKED_FRAMES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +104,12 @@ pub struct CapacityEstimator {
     min_rtt: VecDeque<(Instant, Duration)>,
     samples: VecDeque<(Instant, u64)>,
     queue_evidence: VecDeque<Instant>,
+    capacity_bps: Option<u64>,
+    /// Last queue-evidence update or probe of `capacity_bps`.
+    last_update: Instant,
+    /// Bytes sent over the last `PROBE_INTERVAL`.
+    recent_sends: VecDeque<(Instant, u64)>,
+    recent_bytes: u64,
 }
 
 impl CapacityEstimator {
@@ -100,6 +122,10 @@ impl CapacityEstimator {
             min_rtt: VecDeque::new(),
             samples: VecDeque::new(),
             queue_evidence: VecDeque::new(),
+            capacity_bps: None,
+            last_update: now,
+            recent_sends: VecDeque::new(),
+            recent_bytes: 0,
         }
     }
 
@@ -118,6 +144,8 @@ impl CapacityEstimator {
         if self.sent.len() >= MAX_TRACKED_FRAMES {
             self.sent.pop_front();
         }
+        self.recent_sends.push_back((now, bytes));
+        self.recent_bytes += bytes;
         self.sent.push_back(SentFrame {
             generation,
             seq,
@@ -148,6 +176,7 @@ impl CapacityEstimator {
             }
         }
         self.delivered_time = now;
+        self.maybe_probe(now);
         let frame = acked?;
         self.first_sent_time = frame.sent_at;
         let rtt = now.saturating_duration_since(frame.sent_at);
@@ -166,19 +195,62 @@ impl CapacityEstimator {
         }
         let delivered = self.delivered - frame.delivered;
         let bps = (u128::from(delivered) * 8_000_000 / interval.as_micros().max(1)) as u64;
-        let link_limited = delivered >= MIN_SAMPLE_BYTES
-            && rtt >= min_rtt + QUEUE_EVIDENCE
-            && ack_elapsed > send_elapsed;
+        let min_bytes = if frame.restart {
+            LONE_FRAME_EVIDENCE_BYTES
+        } else {
+            MIN_SAMPLE_BYTES
+        };
+        let link_limited =
+            delivered >= min_bytes && rtt >= min_rtt + QUEUE_EVIDENCE && ack_elapsed > send_elapsed;
         self.samples.push_back((now, bps));
         if link_limited {
             self.queue_evidence.push_back(now);
         }
         self.expire(now);
+        self.update_capacity(now, bps);
         Some(RateSample {
             bps,
             rtt,
             link_limited,
         })
+    }
+
+    fn update_capacity(&mut self, now: Instant, bps: u64) {
+        let window_max = self.max_delivery_bps(now).unwrap_or(bps);
+        if self.queue_evidence.len() >= CONSTRAINED_MIN_SAMPLES {
+            // A queue: the window's best delivery is the link.
+            self.capacity_bps = Some(window_max);
+            self.last_update = now;
+            return;
+        }
+        if let Some(capacity) = self.capacity_bps {
+            self.capacity_bps = Some(capacity.max(bps));
+        }
+    }
+
+    /// Busy sending with no queue for a probe interval: step the estimate
+    /// up. Idle time proves nothing and holds it.
+    fn maybe_probe(&mut self, now: Instant) {
+        while self
+            .recent_sends
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > PROBE_INTERVAL)
+        {
+            let (_, bytes) = self.recent_sends.pop_front().unwrap_or((now, 0));
+            self.recent_bytes -= bytes;
+        }
+        let Some(capacity) = self.capacity_bps else {
+            return;
+        };
+        if now.saturating_duration_since(self.last_update) < PROBE_INTERVAL {
+            return;
+        }
+        let send_bps =
+            u128::from(self.recent_bytes) * 8_000_000 / PROBE_INTERVAL.as_micros().max(1);
+        if send_bps * 100 >= u128::from(capacity) * u128::from(PROBE_BUSY_PCT) {
+            self.capacity_bps = Some(capacity * PROBE_GAIN_PCT / 100);
+            self.last_update = now;
+        }
     }
 
     fn note_rtt(&mut self, now: Instant, rtt: Duration) {
@@ -226,21 +298,14 @@ impl CapacityEstimator {
             .max()
     }
 
-    pub fn is_constrained(&self, now: Instant) -> bool {
-        self.queue_evidence
-            .iter()
-            .filter(|at| now.saturating_duration_since(**at) <= CONSTRAINED_HOLD)
-            .count()
-            >= CONSTRAINED_MIN_SAMPLES
+    pub fn is_constrained(&self) -> bool {
+        self.capacity_bps.is_some()
     }
 
-    /// The capacity of a constrained link; `None` while the link shows no
-    /// queue (unconstrained: no budget, no behaviour change).
-    pub fn capacity(&self, now: Instant) -> Option<Capacity> {
-        if !self.is_constrained(now) {
-            return None;
-        }
-        self.max_delivery_bps(now).map(|bps| Capacity { bps })
+    /// The capacity of a constrained link; `None` until the link has shown
+    /// a queue (unconstrained: no budget, no behaviour change).
+    pub fn capacity(&self) -> Option<Capacity> {
+        self.capacity_bps.map(|bps| Capacity { bps })
     }
 }
 
@@ -303,8 +368,8 @@ mod tests {
             busy_until: Instant::now(),
         };
         let (estimator, now) = run(&mut link, 120, 25_000);
-        assert!(!estimator.is_constrained(now));
-        assert_eq!(estimator.capacity(now), None);
+        assert!(!estimator.is_constrained());
+        assert_eq!(estimator.capacity(), None);
         // The samples still say "at least the sending rate".
         assert!(estimator.max_delivery_bps(now).unwrap() >= 5_000_000);
     }
@@ -318,8 +383,8 @@ mod tests {
             prop: Duration::from_millis(20),
             busy_until: Instant::now(),
         };
-        let (estimator, now) = run(&mut link, 60, 25_000);
-        let capacity = estimator.capacity(now).expect("constrained");
+        let (estimator, _) = run(&mut link, 60, 25_000);
+        let capacity = estimator.capacity().expect("constrained");
         assert!(
             (1_800_000..=2_200_000).contains(&capacity.bps),
             "{capacity:?}"
@@ -364,20 +429,87 @@ mod tests {
             let rtt = if seq == 10 { 60 } else { 10 };
             estimator.on_ack(now + Duration::from_millis(rtt), 1, seq);
         }
-        assert!(!estimator.is_constrained(now + Duration::from_millis(10)));
+        let _ = now;
+        assert!(!estimator.is_constrained());
     }
 
     #[test]
-    fn constrained_state_expires_without_fresh_queue_evidence() {
+    fn estimate_is_held_through_idle_and_probed_up_when_busy() {
+        let start = Instant::now();
+        let mut link = Link {
+            bps: 2_000_000,
+            prop: Duration::from_millis(20),
+            busy_until: start,
+        };
+        let mut estimator = CapacityEstimator::new(start);
+        let mut seq = 0;
+        let mut send =
+            |estimator: &mut CapacityEstimator, link: &mut Link, at: Instant, bytes: u64| {
+                estimator.on_sent(at, 1, seq, bytes);
+                let ack = link.deliver(at, bytes);
+                seq += 1;
+                (ack, seq - 1)
+            };
+        // Overload: 25 KB frames at 30 fps into 2 Mbps.
+        let mut pending = VecDeque::new();
+        for n in 0..60u32 {
+            let at = start + FRAME * n;
+            while pending.front().is_some_and(|(ack, _)| *ack <= at) {
+                let (ack, s) = pending.pop_front().unwrap();
+                estimator.on_ack(ack, 1, s);
+            }
+            pending.push_back(send(&mut estimator, &mut link, at, 25_000));
+        }
+        let mut last = start;
+        for (ack, s) in pending.drain(..) {
+            estimator.on_ack(ack, 1, s);
+            last = ack;
+        }
+        let measured = estimator.capacity().unwrap().bps;
+        // Ten idle seconds of tiny frames: nothing learned, estimate held.
+        let idle_start = last + Duration::from_millis(100);
+        for n in 0..300u32 {
+            let at = idle_start + FRAME * n;
+            let (ack, s) = send(&mut estimator, &mut link, at, 300);
+            estimator.on_ack(ack, 1, s);
+        }
+        assert_eq!(estimator.capacity().unwrap().bps, measured);
+        // The link got faster (10 Mbps) and the sender follows the estimate
+        // (80 %): no queue forms, so the estimate is probed up step by step.
+        link.bps = 10_000_000;
+        let mut at = idle_start + FRAME * 300 + Duration::from_millis(100);
+        for _ in 0..300u32 {
+            let target = estimator.capacity().unwrap().target_bps();
+            let (ack, s) = send(&mut estimator, &mut link, at, target / 30 / 8);
+            estimator.on_ack(ack, 1, s);
+            at += FRAME;
+        }
+        assert!(
+            estimator.capacity().unwrap().bps > measured * 3 / 2,
+            "{:?}",
+            estimator.capacity()
+        );
+    }
+
+    #[test]
+    fn faster_delivery_raises_a_held_estimate() {
         let mut link = Link {
             bps: 2_000_000,
             prop: Duration::from_millis(20),
             busy_until: Instant::now(),
         };
-        let (estimator, now) = run(&mut link, 60, 25_000);
-        assert!(estimator.capacity(now).is_some());
-        let later = now + CONSTRAINED_HOLD + Duration::from_millis(1);
-        assert_eq!(estimator.capacity(later), None);
+        let (mut estimator, now) = run(&mut link, 60, 25_000);
+        let measured = estimator.capacity().unwrap().bps;
+        // One large lone frame over a now-faster link measures it directly.
+        let at = now + Duration::from_secs(1);
+        estimator.on_sent(at, 1, 1_000, 200_000);
+        let min_rtt = estimator.min_rtt().unwrap();
+        estimator.on_ack(at + min_rtt + Duration::from_millis(160), 1, 1_000);
+        assert!(
+            estimator.capacity().unwrap().bps > measured * 4,
+            "{:?}",
+            estimator.capacity()
+        );
     }
 
     #[test]
