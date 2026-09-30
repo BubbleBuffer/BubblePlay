@@ -30,11 +30,13 @@ use bubbleplay_host::quality;
 use bubbleplay_host::reconstruction_feedback;
 use bubbleplay_host::rtc;
 use bubbleplay_host::scale;
+use bubbleplay_host::scroll_detect::{extend_to_runs, sample_tiles, ScrollDetector};
 use bubbleplay_host::signaling;
 use bubbleplay_host::stun;
 use bubbleplay_host::temporal_diff;
 use bubbleplay_host::tile_hash::{TileHasher, MAX_HASHED_PER_MILLE};
 use bubbleplay_host::tile_quality::{refine_qp_map, RefinePlan, TileQualityTracker};
+use bubbleplay_host::tile_schedule::{pointer_pixels, PaceDecision, V4Pacer};
 use bubbleplay_host::transport;
 use bubbleplay_host::vdd;
 use bubbleplay_host::wss_media;
@@ -630,8 +632,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     // v4: per-tile quality debt, no-op repaint skipping and tile refines.
     let mut tile_tracker: Option<TileQualityTracker> = None;
     let mut tile_hasher: Option<TileHasher> = None;
+    // v4: scrolls found by shifted tile content (no DDA move rects).
+    let mut scroll_detector: Option<ScrollDetector> = None;
+    let mut scroll_detections: u64 = 0;
+    let mut scroll_dy: i32 = 0;
     let mut tile_hashing_failed = false;
     let mut tile_hash_us: u64 = 0;
+    // v4 on a constrained link: per-frame byte budget, content-aware pacing
+    // and pointer-first refinement (inert while the link is unconstrained).
+    let mut v4_pacer = V4Pacer::default();
+    // Last sampled pointer, normalized to the capture region (0..=65535).
+    let mut v4_pointer_norm: Option<(u16, u16)> = None;
     // NVENC frameAvgQP of v4 frames in the current 1 s window: (max, sum, count).
     let mut wss_v4_qp_window: (u32, u64, u64) = (0, 0, 0);
     let mut wss_v4_key_reason: Option<String> = None;
@@ -1282,6 +1293,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         let cursor_now = Instant::now();
         if !capture.is_privileged() && cursor_now >= next_cursor_poll {
             if let Some(state) = cursor_tracker.sample(None, cursor_now) {
+                v4_pointer_norm = state.in_bounds.then_some((state.x, state.y));
                 pump.publish_cursor_state(state.encode());
             }
             next_cursor_poll = cursor_now + Duration::from_millis(16);
@@ -2587,6 +2599,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 if wss_media.is_none() || active_benchmark_profile.is_some() {
                     tile_tracker = None;
                     tile_hasher = None;
+                    scroll_detector = None;
+                    v4_pacer = V4Pacer::default();
                 } else {
                     if recovered
                         || tile_tracker
@@ -2595,6 +2609,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     {
                         tile_tracker = None;
                         tile_hasher = None;
+                        scroll_detector = None;
                         tile_hashing_failed = false;
                     }
                     let tracker = tile_tracker.get_or_insert_with(|| {
@@ -2602,6 +2617,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     });
                     if is_new && !is_idle_snapshot {
                         tracker.note_damage(now, frame.damage());
+                        v4_pacer.on_capture(
+                            now,
+                            frame.width(),
+                            frame.height(),
+                            frame.damage(),
+                            frame.moved(),
+                        );
                     }
                 }
                 let main10 = active_benchmark_profile.is_some_and(|profile| profile.encoder.main10);
@@ -2669,14 +2691,21 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     let mut tile_hashes: Vec<(usize, Option<u64>)> = Vec::new();
                     let mut tile_changed: Vec<usize> = Vec::new();
                     let mut wss_v4_refine_plan: Option<RefinePlan> = None;
+                    let v4_pointer = v4_pointer_norm
+                        .map(|(x, y)| pointer_pixels(x, y, frame.width(), frame.height()));
                     if let Some(tracker) = tile_tracker.as_mut() {
                         let dirty = tracker.dirty_tiles();
                         let mut hashed = None;
-                        if !dirty.is_empty()
-                            && !tile_hashing_failed
-                            && frame.damage().is_some()
-                            && tracker.dirty_per_mille() <= MAX_HASHED_PER_MILLE
-                        {
+                        // Damage too large to hash in full: read back a few
+                        // columns only, for scroll detection.
+                        let hash_all = tracker.dirty_per_mille() <= MAX_HASHED_PER_MILLE;
+                        let to_hash = if hash_all {
+                            dirty.clone()
+                        } else {
+                            sample_tiles(tracker.grid(), &dirty)
+                        };
+                        let mut row_hashes = None;
+                        if !to_hash.is_empty() && !tile_hashing_failed && frame.damage().is_some() {
                             if tile_hasher.as_ref().is_none_or(|hasher| {
                                 !hasher.is_for(frame.device(), frame.texture())
                             }) {
@@ -2694,10 +2723,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 };
                             }
                             if let Some(hasher) = tile_hasher.as_mut() {
-                                match hasher.hash_tiles(frame.texture(), tracker.grid(), &dirty) {
-                                    Ok((hashes, elapsed_us)) => {
+                                match hasher.hash_tiles(frame.texture(), tracker.grid(), &to_hash) {
+                                    Ok((hashes, rows, elapsed_us)) => {
                                         tile_hash_us = tile_hash_us.saturating_add(elapsed_us);
-                                        hashed = Some(hashes);
+                                        if hash_all {
+                                            hashed = Some(hashes);
+                                        }
+                                        row_hashes = Some(rows);
                                     }
                                     Err(error) => {
                                         warn!(
@@ -2710,13 +2742,45 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 }
                             }
                         }
+                        if let Some(rows) = row_hashes {
+                            let grid = tracker.grid();
+                            let detector = match scroll_detector.as_mut() {
+                                Some(detector) if detector.is_for(grid) => detector,
+                                _ => scroll_detector.insert(ScrollDetector::new(grid)),
+                            };
+                            if let Some(found) = detector.detect(&rows) {
+                                scroll_detections += 1;
+                                scroll_dy = found.dy;
+                                v4_pacer
+                                    .on_scrolled(now, &extend_to_runs(grid, &dirty, &found.tiles));
+                            }
+                        }
                         tile_hashes = hashed
                             .unwrap_or_else(|| dirty.iter().map(|&tile| (tile, None)).collect());
                         let classification = tracker.classify(&tile_hashes);
                         tile_changed = classification.changed;
                         let key_due = urgent || encoder.as_ref().is_some_and(Nvenc::idr_pending);
+                        v4_pacer.begin_frame(
+                            now,
+                            wss_media.as_ref().and_then(|egress| egress.capacity()),
+                            tile_changed.is_empty(),
+                        );
+                        // Changed tiles go in any case; a refine is paid from
+                        // the budget they leave (constrained link only).
+                        let mut refine_wait = Duration::ZERO;
                         if !key_due {
-                            wss_v4_refine_plan = tracker.refine_plan(now);
+                            if let Some(plan) = tracker.refine_plan(now) {
+                                wss_v4_refine_plan = v4_pacer.fit_refine(
+                                    &tracker.grid(),
+                                    plan,
+                                    v4_pointer,
+                                    !tile_changed.is_empty(),
+                                    encoder.as_ref().is_some_and(Nvenc::refine_qp_map_enabled),
+                                );
+                                if wss_v4_refine_plan.is_none() {
+                                    refine_wait = v4_pacer.refine_retry_after();
+                                }
+                            }
                         }
                         if is_new
                             && !is_idle_snapshot
@@ -2727,9 +2791,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             tracker.on_noop_skipped();
                             if let Some(at) = tracker.next_refine_at() {
                                 capture.request_idle_followup_snapshot(
-                                    at.saturating_duration_since(Instant::now()),
+                                    at.saturating_duration_since(Instant::now())
+                                        .max(refine_wait),
                                 );
                             }
+                            continue 'session;
+                        }
+                        // Text-dominant on a constrained link: hold changes
+                        // while the budget is spent (never past 100 ms).
+                        if let PaceDecision::Skip { retry_after } = v4_pacer.pace(now, key_due) {
+                            capture.request_idle_followup_snapshot(retry_after);
                             continue 'session;
                         }
                     }
@@ -3237,17 +3308,38 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             mode,
                         );
                         let mut temporal_result = None;
-                        let wss_v4_qp_map = if wss_v4_refine_frame
+                        // Scroll/video-dominant on a constrained link: changed
+                        // tiles near the pointer get the lower QP instead.
+                        let wss_v4_pointer_tiles = match tile_tracker.as_ref() {
+                            Some(tracker)
+                                if !wss_v4_refine_frame
+                                    && !wss_forced_idr
+                                    && latest_idr.is_some()
+                                    && !transition
+                                    && !encoder.as_ref().is_some_and(Nvenc::idr_pending) =>
+                            {
+                                v4_pacer.pointer_tiles(&tracker.grid(), v4_pointer, &tile_changed)
+                            }
+                            _ => Vec::new(),
+                        };
+                        let wss_v4_qp_map = if (wss_v4_refine_frame
+                            || !wss_v4_pointer_tiles.is_empty())
                             && encoder.as_ref().is_some_and(Nvenc::refine_qp_map_enabled)
                         {
-                            wss_v4_refine_plan
-                                .as_ref()
-                                .filter(|plan| !plan.whole_frame)
+                            let lowered = if wss_v4_refine_frame {
+                                wss_v4_refine_plan
+                                    .as_ref()
+                                    .filter(|plan| !plan.whole_frame)
+                                    .map(|plan| plan.tiles.as_slice())
+                            } else {
+                                Some(wss_v4_pointer_tiles.as_slice())
+                            };
+                            lowered
                                 .zip(tile_tracker.as_ref())
-                                .and_then(|(plan, tracker)| {
+                                .and_then(|(tiles, tracker)| {
                                     refine_qp_map(
                                         tracker.grid(),
-                                        &plan.tiles,
+                                        tiles,
                                         &tile_changed,
                                         encode_crop(
                                             frame.width(),
@@ -3508,6 +3600,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         } else {
                             encode_frame_damage(&frame, viewport_crop, mode, wss_v4_qp_map.as_ref())
                         };
+                        if tile_tracker.is_some() {
+                            // Text-dominant on a constrained link: a QP
+                            // ceiling (reconfigured in place, no IDR).
+                            let _ = encoder.as_mut().unwrap().set_max_qp(v4_pacer.max_qp());
+                        }
                         let wss_v4_boost = wss_v4_refine_frame
                             || (tile_tracker.is_some()
                                 && encoder.as_ref().is_some_and(Nvenc::idr_pending));
@@ -4372,6 +4469,23 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 wss_v4_qp_window.2 += 1;
                                 if let Some(tracker) = tile_tracker.as_mut() {
                                     let now = Instant::now();
+                                    let refined_tiles = wss_v4_refine_plan
+                                        .as_ref()
+                                        .filter(|_| wss_v4_refine_frame && !encoded.is_idr)
+                                        .map_or(0, |plan| {
+                                            if plan.whole_frame {
+                                                tracker.grid().tile_count()
+                                            } else {
+                                                plan.tiles.len()
+                                            }
+                                        });
+                                    v4_pacer.on_encoded(
+                                        now,
+                                        encoded_len as u64,
+                                        encoded.is_idr,
+                                        refined_tiles,
+                                        !tile_changed.is_empty(),
+                                    );
                                     tracker.on_encoded(
                                         now,
                                         &tile_hashes,
@@ -4383,8 +4497,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     // refine is scheduled after that frame.
                                     if !encoded.is_idr {
                                         if let Some(at) = tracker.next_refine_at() {
+                                            // On a constrained link, not before
+                                            // the budget covers a tile.
+                                            let budget_wait = if v4_pacer.capacity().is_some() {
+                                                v4_pacer.refine_retry_after()
+                                            } else {
+                                                Duration::ZERO
+                                            };
                                             capture.request_idle_followup_snapshot(
-                                                at.saturating_duration_since(now),
+                                                at.saturating_duration_since(now).max(budget_wait),
                                             );
                                         }
                                     }
@@ -4558,6 +4679,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             let debt_tiles = tile_tracker
                 .as_ref()
                 .map_or(0, TileQualityTracker::debt_tiles);
+            let pacing = v4_pacer.stats();
+            let classes = v4_pacer.counts();
             info!(
                 connected = v4.connected,
                 peer_present = v4.peer_present,
@@ -4586,6 +4709,21 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 tile_hash_us,
                 frame_qp_max = wss_v4_qp_window.0,
                 frame_qp_mean = wss_v4_qp_window.1 / wss_v4_qp_window.2.max(1),
+                capacity_bps = v4.capacity_bps,
+                rate_cap_bps = v4.rate_cap_bps,
+                constrained_ms = v4.constrained_ms,
+                budget_tokens = v4_pacer.tokens(),
+                content = classes.dominant().as_str(),
+                text_tiles = classes.text,
+                scroll_tiles = classes.scroll,
+                video_tiles = classes.video,
+                max_qp = encoder.as_ref().and_then(Nvenc::max_qp).unwrap_or(0),
+                paced_skips = pacing.paced_skips,
+                refines_deferred = pacing.refines_deferred,
+                refines_trimmed = pacing.refines_trimmed,
+                pointer_maps = pacing.pointer_maps,
+                scroll_detections,
+                scroll_dy,
                 "WSS v4 link totals"
             );
             tile_hash_us = 0;

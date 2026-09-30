@@ -19,6 +19,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC,
 };
 
+use crate::scroll_detect::TileRows;
 use crate::tile_quality::{hash_rows, TileGrid};
 
 /// Hash only while the dirty tiles cover at most this share of the frame (per
@@ -120,20 +121,21 @@ impl TileHasher {
             && desc.Format == self.format
     }
 
-    /// Hash `tiles` of `texture`; returns `(tile, hash)` pairs and the time
-    /// spent (copy + map + hash) in microseconds.
+    /// Hash `tiles` of `texture`; returns `(tile, hash)` pairs, the per-row
+    /// hashes they were built from (for scroll detection), and the time spent
+    /// (copy + map + hash) in microseconds.
     pub fn hash_tiles(
         &mut self,
         texture: &ID3D11Texture2D,
         grid: TileGrid,
         tiles: &[usize],
-    ) -> Result<(TileHashes, u64)> {
+    ) -> Result<(TileHashes, TileRows, u64)> {
         let started = Instant::now();
         if grid.width != self.width || grid.height != self.height {
             bail!("tile grid does not match the capture texture");
         }
         if tiles.is_empty() {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), Vec::new(), 0));
         }
         for (row, first, last) in tile_runs(grid, tiles) {
             let left = grid.tile_rect((row * grid.columns + first) as usize);
@@ -170,20 +172,31 @@ impl TileHasher {
             std::slice::from_raw_parts(mapped.pData.cast::<u8>(), pitch * self.height as usize)
         };
         let bpp = self.bytes_per_pixel as usize;
-        let hashes = tiles
+        let rows: TileRows = tiles
             .iter()
             .map(|&index| {
                 let rect = grid.tile_rect(index);
                 let start = rect.left as usize * bpp;
                 let end = rect.right as usize * bpp;
                 let rows = (rect.top as usize..rect.bottom as usize)
-                    .map(|y| &data[y * pitch + start..y * pitch + end]);
-                (index, Some(hash_rows(rows)))
+                    .map(|y| hash_rows(std::iter::once(&data[y * pitch + start..y * pitch + end])))
+                    .collect();
+                (index, rows)
             })
             .collect();
         unsafe { self.context.Unmap(&self.staging, 0) };
-        Ok((hashes, started.elapsed().as_micros() as u64))
+        let hashes = rows
+            .iter()
+            .map(|(index, rows)| (*index, Some(tile_hash_from_rows(rows))))
+            .collect();
+        Ok((hashes, rows, started.elapsed().as_micros() as u64))
     }
+}
+
+/// A tile's hash from its row hashes (equal tiles hash equal).
+pub fn tile_hash_from_rows(rows: &[u64]) -> u64 {
+    let bytes: Vec<u8> = rows.iter().flat_map(|hash| hash.to_le_bytes()).collect();
+    hash_rows(std::iter::once(bytes.as_slice()))
 }
 
 #[cfg(test)]

@@ -151,6 +151,11 @@ impl WssMediaEgress {
         self.link.set_bitrate_bounds(bitrate_bps, max_bitrate_bps);
     }
 
+    /// Measured capacity of a constrained link; `None` when unconstrained.
+    pub fn capacity(&self) -> Option<crate::link_capacity::Capacity> {
+        self.link.capacity()
+    }
+
     pub fn set_frame_size(&self, width: u32, height: u32) {
         self.link.set_frame_size(width, height);
     }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import WebSocket from "ws";
 import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
-import { startDirectLabRelay } from "../tools/stream-lab-direct-relay.mjs";
+import { createMediaShaper, startDirectLabRelay } from "../tools/stream-lab-direct-relay.mjs";
 
 const RUN_ID = "123e4567-e89b-42d3-a456-426614174000";
 const EPOCH = "0123456789abcdef0123456789abcdef";
@@ -206,4 +206,24 @@ test("direct Stream Lab relay rejects media sockets without a canonical epoch", 
     });
   }), /404|unexpected response/i);
   socket.terminate();
+});
+
+test("lab media shaper serializes packets FIFO at the throttle rate", () => {
+  let now = 0;
+  const sent = [];
+  const timers = [];
+  const shaper = createMediaShaper({ kbps: 1000, delayMs: 20 }, () => now, (fn, ms) => timers.push({ fn, at: now + ms }));
+  const peer = { readyState: WebSocket.OPEN, send: data => sent.push({ bytes: data.byteLength, at: now }) };
+  // 1000 kbps = 1 byte per 8 us: 12500 bytes take 100 ms on the wire.
+  shaper.forward(peer, new Uint8Array(12_500));
+  shaper.forward(peer, new Uint8Array(12_500));
+  assert.deepEqual(timers.map(t => t.at), [120, 220]);
+  assert.equal(shaper.stats().maxQueueMs, 200);
+  for (const timer of timers) { now = timer.at; timer.fn(); }
+  assert.deepEqual(sent.map(s => s.at), [120, 220]);
+  assert.equal(shaper.stats().queuedBytes, 0);
+  shaper.set(null);
+  shaper.forward(peer, new Uint8Array(10));
+  assert.equal(sent.length, 3);
+  assert.throws(() => shaper.set({ kbps: 0 }), RangeError);
 });
