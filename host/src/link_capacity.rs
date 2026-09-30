@@ -153,7 +153,9 @@ impl CapacityEstimator {
         let rtt = now.saturating_duration_since(frame.sent_at);
         self.note_rtt(now, rtt);
         let min_rtt = self.min_rtt().unwrap_or(rtt);
-        let send_elapsed = frame.sent_at.saturating_duration_since(frame.first_sent_time);
+        let send_elapsed = frame
+            .sent_at
+            .saturating_duration_since(frame.first_sent_time);
         let mut ack_elapsed = now.saturating_duration_since(frame.delivered_time);
         if frame.restart {
             ack_elapsed = ack_elapsed.saturating_sub(min_rtt);
@@ -347,10 +349,7 @@ mod tests {
             last = estimator.on_ack(at, 1, seq);
         }
         let sample = last.unwrap();
-        assert!(
-            (3_800_000..=4_200_000).contains(&sample.bps),
-            "{sample:?}"
-        );
+        assert!((3_800_000..=4_200_000).contains(&sample.bps), "{sample:?}");
         assert!(sample.link_limited);
     }
 
@@ -385,8 +384,14 @@ mod tests {
     fn frame_budget_is_eighty_percent_of_capacity_per_interval() {
         let capacity = Capacity { bps: 3_000_000 };
         // 3 Mbps x 1/30 s x 0.8 = 10 000 bytes.
-        assert_eq!(capacity.frame_budget_bytes(Duration::from_micros(33_333)), 9_999);
-        assert_eq!(capacity.frame_budget_bytes(Duration::from_millis(100)), 30_000);
+        assert_eq!(
+            capacity.frame_budget_bytes(Duration::from_micros(33_333)),
+            9_999
+        );
+        assert_eq!(
+            capacity.frame_budget_bytes(Duration::from_millis(100)),
+            30_000
+        );
     }
 
     #[test]

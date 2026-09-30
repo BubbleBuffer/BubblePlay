@@ -28,6 +28,7 @@ pub mod stun;
 pub mod temporal_diff;
 pub mod tile_hash;
 pub mod tile_quality;
+pub mod tile_schedule;
 pub mod transport;
 pub mod vdd;
 pub mod wss_media;
