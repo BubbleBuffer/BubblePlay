@@ -613,7 +613,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         ProfileTransition::new_for_mode(Profile::Full, quality.profile(), stream_mode);
     // Only an unprivileged local host runs as the interactive user; the
     // service path syncs clipboard inside the input proxy instead.
-    let mut input_sink = InputSink::new().with_clipboard(!capture.is_privileged());
+    // Admin mode: the tray points the user-level host at the elevated input
+    // agent; without it (or if it is unavailable) input stays user-level.
+    let admin_agent = if capture.is_privileged() {
+        None
+    } else {
+        bubbleplay_host::admin_agent::client::AdminAgentLink::from_env()
+    };
+    let mut input_sink = InputSink::new()
+        .with_clipboard(!capture.is_privileged())
+        .with_admin_agent(admin_agent);
     input_sink.set_absolute_region(capture.region());
     let mut local_clipboard = LocalClipboardPoll::default();
     let mut cursor_tracker = CursorTracker::for_region(capture.region(), Instant::now());

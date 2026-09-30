@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
+use crate::admin_agent::client::AdminAgentLink;
+use crate::admin_agent::protocol::Record;
 use crate::clipboard;
 use windows::Win32::Foundation::{SetLastError, POINT, WIN32_ERROR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -223,6 +225,8 @@ pub struct InputSink {
     absolute_region: DesktopRegion,
     failure_log: InputFailureLogGate,
     clipboard: Option<ClipboardSync>,
+    /// Admin mode: the elevated agent injects on our behalf when reachable.
+    admin_agent: Option<AdminAgentLink>,
 }
 
 /// Clipboard state exists only where the sink runs as the interactive user
@@ -652,6 +656,31 @@ impl ClipboardAssembly {
 
     fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// The agent-protocol form of one `INPUT` (time/extra info are always 0).
+fn input_record(input: &INPUT) -> Option<Record> {
+    // SAFETY: the union member read matches the INPUT type tag.
+    unsafe {
+        if input.r#type == INPUT_MOUSE {
+            let mi = input.Anonymous.mi;
+            Some(Record::Mouse {
+                dx: mi.dx,
+                dy: mi.dy,
+                data: mi.mouseData,
+                flags: mi.dwFlags.0,
+            })
+        } else if input.r#type == INPUT_KEYBOARD {
+            let ki = input.Anonymous.ki;
+            Some(Record::Key {
+                vk: ki.wVk.0,
+                scan: ki.wScan,
+                flags: ki.dwFlags.0,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -1173,7 +1202,15 @@ impl InputSink {
             absolute_region: DesktopRegion::new(0, 0, 1920, 1080),
             failure_log: InputFailureLogGate::default(),
             clipboard: None,
+            admin_agent: None,
         }
+    }
+
+    /// Route injection through the Admin-mode agent when it is available;
+    /// every batch falls back to local (user-level) `SendInput` otherwise.
+    pub fn with_admin_agent(mut self, link: Option<AdminAgentLink>) -> Self {
+        self.admin_agent = link;
+        self
     }
 
     /// Enable text clipboard sync. Only call from a process running as the
@@ -1294,13 +1331,24 @@ impl InputSink {
         if inputs.is_empty() {
             return InputApplication::default();
         }
-        unsafe { SetLastError(WIN32_ERROR(0)) };
-        let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
         let expected = inputs.len().min(u32::MAX as usize) as u32;
-        // SendInput does not reliably set a useful error for UIPI rejection,
-        // but capture it immediately: other desktop/session failures do.
-        let error = std::io::Error::last_os_error();
-        let error_code = error.raw_os_error().unwrap_or(0);
+        let via_agent = self.admin_agent.as_mut().and_then(|link| {
+            let records = inputs.iter().map(input_record).collect::<Option<Vec<_>>>()?;
+            link.inject(&records)
+        });
+        let (sent, error_code) = match via_agent {
+            Some(receipt) => receipt,
+            None => {
+                unsafe { SetLastError(WIN32_ERROR(0)) };
+                let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+                // SendInput does not reliably set a useful error for UIPI
+                // rejection, but capture it immediately: other desktop/session
+                // failures do.
+                let error = std::io::Error::last_os_error();
+                (sent, error.raw_os_error().unwrap_or(0))
+            }
+        };
+        let error = std::io::Error::from_raw_os_error(error_code);
         if sent != expected {
             if let Some(suppressed) = self.failure_log.admit(Instant::now()) {
                 warn!(
