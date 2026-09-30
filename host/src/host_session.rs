@@ -255,7 +255,7 @@ pub(super) fn valid_monitor_refresh_control(
     epoch: Option<&str>,
     _active_wss_epoch: Option<&str>,
 ) -> bool {
-    matches!(protocol, Some(2 | 3)) && epoch.is_some_and(valid_v2_epoch)
+    matches!(protocol, Some(2..=4)) && epoch.is_some_and(valid_v2_epoch)
 }
 
 pub(super) fn valid_stripe_reconnect_recovery_control(

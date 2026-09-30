@@ -6016,6 +6016,8 @@ mod tests {
     fn monitor_refresh_is_v2_epoch_scoped_and_accepts_pre_wss_refresh() {
         let epoch = "0123456789abcdef0123456789abcdef";
         assert!(valid_monitor_refresh_control(Some(2), Some(epoch), None));
+        assert!(valid_monitor_refresh_control(Some(4), Some(epoch), None));
+        assert!(!valid_monitor_refresh_control(Some(5), Some(epoch), None));
         assert!(valid_monitor_refresh_control(
             Some(2),
             Some(epoch),
