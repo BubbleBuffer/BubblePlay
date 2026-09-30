@@ -1,4 +1,5 @@
 import { validWssTopology, validCurrentMediaEpoch, validMediaAckV3, validHostMediaCapabilities, validInputStatus, canonicalWorkerVersionId, validFirstFrameMessage, benchStatusRejectionReason, utf8Length } from "./protocol-validation.js";
+import { validClipboardMessage, validInputCapabilities } from "./protocol-validation.js";
 export { benchStatusRejectionReason } from "./protocol-validation.js";
 // BubblePlay signaling relay.
 //
@@ -315,6 +316,8 @@ export class Room {
       if (role === "client") {
         const hostCapabilities = this.findPeer("host")?.deserializeAttachment()?.hostCapabilities;
         if (typeof hostCapabilities === "string") ws.send(hostCapabilities);
+        const inputCapabilities = this.findPeer("host")?.deserializeAttachment()?.inputCapabilities;
+        if (typeof inputCapabilities === "string") ws.send(inputCapabilities);
       }
 
       // Flush anything the client sent before the host arrived.
@@ -389,6 +392,11 @@ export class Room {
       return;
     }
     if (msg.type === "input-status" && !validInputStatus(msg, att.role, message)) return;
+    if (msg.type === "clipboard" && !validClipboardMessage(msg, att.role, message)) return;
+    if (msg.type === "input-capabilities") {
+      if (!validInputCapabilities(msg, att.role, message)) return;
+      ws.serializeAttachment({ ...ws.deserializeAttachment(), inputCapabilities: message });
+    }
     if (msg.type === "first-frame" && !validFirstFrameMessage(msg, att.role, message)) {
       return;
     }

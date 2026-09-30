@@ -119,6 +119,14 @@ impl InputProxyClient {
         }
     }
 
+    /// Clipboard text the interactive user changed since the last poll.
+    pub fn poll_clipboard(&mut self, reset: bool) -> Result<Option<String>> {
+        match self.call(Request::PollClipboard { reset })? {
+            Response::Clipboard { text } => Ok(text),
+            response => bail!("input proxy returned unexpected clipboard response: {response:?}"),
+        }
+    }
+
     fn call(&mut self, request: Request) -> Result<Response> {
         let request_id = self.next_request_id;
         self.next_request_id = self
@@ -422,9 +430,9 @@ mod tests {
             generation: 4,
             process_id: 8,
         };
-        assert!(validate_ready(ready, 2, 4, 8).is_ok());
-        assert!(validate_ready(ready, 3, 4, 8).is_err());
-        assert!(validate_ready(ready, 2, 5, 8).is_err());
+        assert!(validate_ready(ready.clone(), 2, 4, 8).is_ok());
+        assert!(validate_ready(ready.clone(), 3, 4, 8).is_err());
+        assert!(validate_ready(ready.clone(), 2, 5, 8).is_err());
         assert!(validate_ready(ready, 2, 4, 9).is_err());
     }
 }

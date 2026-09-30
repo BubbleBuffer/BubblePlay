@@ -22,6 +22,7 @@ pub const CONTROL_CHANNEL_CAPACITY: usize = 64;
 pub const MEDIA_CHANNEL_CAPACITY: usize = 2;
 const LOOP_TICK: Duration = Duration::from_millis(20);
 const DESKTOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopBinding {
@@ -57,6 +58,12 @@ pub trait AgentBackend: Send + 'static {
     ) -> Result<DesktopBinding>;
     fn start_work(&mut self, request: Message) -> Result<()>;
     fn poll_work(&mut self) -> Result<Option<Message>>;
+    /// Check the interactive session clipboard; changed text is queued as
+    /// `Message::ClipboardText` chunks returned by `poll_work`. `reset`
+    /// re-baselines without reporting the current contents.
+    fn poll_clipboard(&mut self, _reset: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait DesktopSource: Send + 'static {
@@ -106,6 +113,8 @@ pub struct AgentCore<B: AgentBackend> {
     last_announced_input_enabled: Option<bool>,
     suspended: bool,
     stopped: bool,
+    clipboard_poll_at: Option<Instant>,
+    clipboard_reset: bool,
 }
 
 impl<B: AgentBackend> AgentCore<B> {
@@ -127,6 +136,8 @@ impl<B: AgentBackend> AgentCore<B> {
             // Explicitly suspend the backend on the first desktop observation.
             suspended: false,
             stopped: false,
+            clipboard_poll_at: None,
+            clipboard_reset: true,
         }
     }
 
@@ -226,7 +237,8 @@ impl<B: AgentBackend> AgentCore<B> {
             | Message::MonitorSwitchResult(_)
             | Message::InputStats(_)
             | Message::RecoverableError(_)
-            | Message::FatalError(_) => {}
+            | Message::FatalError(_)
+            | Message::ClipboardText { .. } => {}
         }
         events
     }
@@ -234,6 +246,7 @@ impl<B: AgentBackend> AgentCore<B> {
     pub fn tick(&mut self, now: Instant) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         self.expire_lease(now, &mut events);
+        self.poll_clipboard(now);
         if let Ok(Some(result)) = self.backend.poll_work() {
             match result.permit_identity() {
                 Some(identity) if Some(identity) == self.outstanding => {
@@ -443,6 +456,30 @@ impl<B: AgentBackend> AgentCore<B> {
 
     fn lease_active(&self, now: Instant) -> bool {
         self.lease.is_some_and(|lease| now < lease.expires_at)
+    }
+
+    /// Host-to-browser clipboard sync runs only while a leased session has
+    /// verified input on the interactive default desktop. Any gap (lease
+    /// change, secure desktop, suspension) re-baselines so text copied while
+    /// the stream was not live is never sent.
+    fn poll_clipboard(&mut self, now: Instant) {
+        let eligible = self.lease_active(now)
+            && self.input_ready
+            && !self.suspended
+            && self.desktop == Some(DesktopKind::Default);
+        if !eligible {
+            self.clipboard_reset = true;
+            self.clipboard_poll_at = None;
+            return;
+        }
+        if self.clipboard_poll_at.is_some_and(|at| now < at) {
+            return;
+        }
+        self.clipboard_poll_at = Some(now + CLIPBOARD_POLL_INTERVAL);
+        let reset = std::mem::replace(&mut self.clipboard_reset, false);
+        if self.backend.poll_clipboard(reset).is_err() {
+            self.clipboard_reset = true;
+        }
     }
 
     fn release_all(&mut self) {
@@ -714,6 +751,7 @@ mod tests {
         resumes: usize,
         inputs: usize,
         monitor_requests: usize,
+        clipboard_polls: Vec<bool>,
         fail_transition: bool,
         transitions: Vec<(DesktopKind, u32)>,
         started: Vec<PermitIdentity>,
@@ -793,6 +831,67 @@ mod tests {
         fn poll_work(&mut self) -> Result<Option<Message>> {
             Ok(self.0.lock().unwrap().pending_results.pop_front())
         }
+        fn poll_clipboard(&mut self, reset: bool) -> Result<()> {
+            self.0.lock().unwrap().clipboard_polls.push(reset);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn clipboard_is_polled_only_while_verified_input_is_live_on_the_default_desktop() {
+        let backend = FakeBackend::default();
+        let state = backend.0.clone();
+        let mut core = AgentCore::new(backend);
+        let now = Instant::now();
+        core.observe_desktop(DesktopKind::Default, now);
+        core.tick(now);
+        assert!(state.lock().unwrap().clipboard_polls.is_empty(), "no lease");
+        core.handle(
+            Message::RenewLease {
+                lease_id: 1,
+                ttl_ms: 2_000,
+            },
+            now,
+        );
+        core.tick(now);
+        assert!(
+            state.lock().unwrap().clipboard_polls.is_empty(),
+            "input is not verified before the first encoded frame"
+        );
+        assert!(core.handle(permit(1, 1, 1), now).is_empty());
+        state
+            .lock()
+            .unwrap()
+            .pending_results
+            .push_back(Message::CaptureHealth {
+                state: CaptureState::Active,
+                error_code: 0,
+            });
+        core.tick(now);
+        core.tick(now);
+        core.tick(now + Duration::from_millis(100));
+        core.tick(now + CLIPBOARD_POLL_INTERVAL);
+        assert_eq!(state.lock().unwrap().clipboard_polls, vec![true, false]);
+        state
+            .lock()
+            .unwrap()
+            .pending_results
+            .push_back(Message::ClipboardText {
+                id: 1,
+                index: 0,
+                count: 1,
+                text: "copied".into(),
+            });
+        assert!(core
+            .tick(now + CLIPBOARD_POLL_INTERVAL)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Control(Message::ClipboardText { .. }))));
+
+        // Moving to the secure desktop stops polling and forces a new baseline.
+        core.observe_desktop(DesktopKind::Secure, now + CLIPBOARD_POLL_INTERVAL * 2);
+        core.tick(now + CLIPBOARD_POLL_INTERVAL * 3);
+        assert_eq!(state.lock().unwrap().clipboard_polls.len(), 2);
+        assert!(core.clipboard_reset);
     }
 
     #[test]

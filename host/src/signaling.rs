@@ -48,6 +48,17 @@ fn is_zero_u8(value: &u8) -> bool {
     *value == 0
 }
 
+/// Every host build injects set-1 scan codes and syncs text clipboard (the
+/// browser still disables clipboard on the secure desktop).
+fn input_capabilities_message() -> SignalMsg {
+    SignalMsg::InputCapabilities {
+        protocol: 1,
+        scancode: true,
+        clipboard: true,
+        clipboard_max_bytes: crate::clipboard::MAX_CLIPBOARD_BYTES as u32,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BenchStatusEncoder {
@@ -633,6 +644,25 @@ pub enum SignalMsg {
     #[serde(rename = "monitor-list")]
     MonitorList {
         monitors: Vec<MonitorInfo>,
+    },
+    /// Input features beyond the original VK packet set. Sent separately from
+    /// `host-capabilities` so older browsers simply ignore it.
+    #[serde(rename = "input-capabilities")]
+    InputCapabilities {
+        protocol: u8,
+        scancode: bool,
+        clipboard: bool,
+        #[serde(rename = "clipboardMaxBytes")]
+        clipboard_max_bytes: u32,
+    },
+    /// One in-order chunk of host clipboard text for the browser.
+    #[serde(rename = "clipboard")]
+    Clipboard {
+        protocol: u8,
+        id: u32,
+        index: u16,
+        count: u16,
+        text: String,
     },
     #[serde(rename = "monitor-error")]
     MonitorError {
@@ -1651,6 +1681,40 @@ impl Signaling {
             media_protocols: vec![2, 3],
             max_wss_lanes: 16,
             wss_fec: vec!["none".into(), "xor-1".into(), "rs-2".into()],
+        };
+        if self
+            .ws
+            .send(Message::text(
+                serde_json::to_string(&msg).unwrap_or_default(),
+            ))
+            .is_ok()
+        {
+            let _ = self.ws.flush();
+        }
+        self.send_input_capabilities();
+    }
+
+    fn send_input_capabilities(&mut self) {
+        let msg = input_capabilities_message();
+        if self
+            .ws
+            .send(Message::text(
+                serde_json::to_string(&msg).unwrap_or_default(),
+            ))
+            .is_ok()
+        {
+            let _ = self.ws.flush();
+        }
+    }
+
+    /// Send one host clipboard chunk (see `clipboard::chunk_text`).
+    pub fn send_clipboard_chunk(&mut self, id: u32, index: u16, count: u16, text: &str) {
+        let msg = SignalMsg::Clipboard {
+            protocol: 1,
+            id,
+            index,
+            count,
+            text: text.to_owned(),
         };
         if self
             .ws
@@ -3022,6 +3086,37 @@ mod tests {
         .unwrap();
         assert!(
             matches!(accepted, SignalMsg::MediaTopology { status, .. } if status == "accepted")
+        );
+    }
+
+    #[test]
+    fn input_capabilities_and_clipboard_messages_match_the_contract() {
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/input-contract.json")).unwrap();
+        let encoded = serde_json::to_value(super::input_capabilities_message()).unwrap();
+        assert_eq!(encoded["type"], "input-capabilities");
+        assert_eq!(encoded["protocol"], 1);
+        assert_eq!(encoded["scancode"], true);
+        assert_eq!(encoded["clipboard"], true);
+        assert_eq!(
+            encoded["clipboardMaxBytes"],
+            contract["clipboardPacket"]["maxBytes"]
+        );
+        let chunk = serde_json::to_value(SignalMsg::Clipboard {
+            protocol: 1,
+            id: 3,
+            index: 0,
+            count: 1,
+            text: "hé".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            chunk,
+            serde_json::json!({"type":"clipboard","protocol":1,"id":3,"index":0,"count":1,"text":"hé"})
+        );
+        assert_eq!(
+            contract["hostClipboardMessage"]["type"],
+            serde_json::json!("clipboard")
         );
     }
 

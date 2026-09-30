@@ -35,7 +35,9 @@ impl ProxyState {
             },
             last_request_id: 0,
             initialized: false,
-            input: InputSink::new(),
+            // The proxy runs as the interactive user on the default desktop,
+            // which is where clipboard access belongs.
+            input: InputSink::new().with_clipboard(true),
         }
     }
 
@@ -146,6 +148,12 @@ impl ProxyState {
                 let _ = self.input.release_all_report();
                 (Response::Ack, true)
             }
+            Request::PollClipboard { reset } => (
+                Response::Clipboard {
+                    text: self.input.poll_clipboard(reset),
+                },
+                false,
+            ),
         }
     }
 }

@@ -64,6 +64,8 @@
   #connection-status[data-state="error"] .status-dot { background:var(--bad); box-shadow:0 0 0 3px #ff71871c; }
   #connection-status button { display:none; border:0; background:transparent; color:#fff; padding:0; text-decoration:underline; cursor:pointer; font:inherit; }
   #connection-status[data-state="error"] button { display:block; }
+  #remote-clipboard { position:fixed; top:calc(max(14px,env(safe-area-inset-top)) + 46px); right:max(16px,env(safe-area-inset-right)); z-index:11; padding:7px 12px; border:1px solid var(--line); border-radius:999px; background:var(--glass); color:#e9e9ef; font:12px system-ui; cursor:pointer; backdrop-filter:blur(14px); }
+  #remote-clipboard[hidden] { display:none; }
   #controls { position:fixed; inset:auto 0 max(12px,env(safe-area-inset-bottom)); z-index:11; display:flex; justify-content:center; pointer-events:none; padding:0 max(12px,env(safe-area-inset-right)) 0 max(12px,env(safe-area-inset-left)); }
   #desktop-toolbar, #mobile-toolbar { pointer-events:auto; display:flex; align-items:center; gap:5px; padding:7px; border:1px solid var(--line); border-radius:18px; background:var(--glass); box-shadow:0 12px 40px #0009; backdrop-filter:blur(16px); }
   #mobile-toolbar { display:none; width:min(100%,520px); justify-content:space-around; border-radius:18px 18px 10px 10px; padding:7px max(6px,env(safe-area-inset-left)) max(7px,env(safe-area-inset-bottom)); }
@@ -123,6 +125,7 @@
   </div>
   <div id="secure-desktop-status" hidden role="status" aria-live="polite"><span aria-hidden="true">◆</span><span>Windows secure desktop · protected input</span></div>
   <div id="connection-status" data-state="connecting" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="connection-status-label">Connecting…</span><button id="connection-retry" type="button">Retry</button></div>
+  <button id="remote-clipboard" type="button" hidden title="The host clipboard changed while this tab was not focused">Copy remote clipboard</button>
 </header>
 <div id="visual"><div id="stage"><canvas id="screen"></canvas><canvas id="sharp-screen"></canvas></div></div>
 <div id="input-surface" tabindex="0" aria-label="Remote desktop input"></div>

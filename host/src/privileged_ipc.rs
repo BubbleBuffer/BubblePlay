@@ -103,6 +103,7 @@ pub enum MessageKind {
     InputStats = 0x109,
     RecoverableError = 0x10a,
     FatalError = 0x10b,
+    ClipboardText = 0x10c,
 }
 
 impl MessageKind {
@@ -131,6 +132,7 @@ impl MessageKind {
             0x109 => Self::InputStats,
             0x10a => Self::RecoverableError,
             0x10b => Self::FatalError,
+            0x10c => Self::ClipboardText,
             _ => return Err(ProtocolError::UnknownMessageKind(value)),
         })
     }
@@ -431,7 +433,19 @@ pub enum Message {
     InputStats(InputStatistics),
     RecoverableError(AgentError),
     FatalError(AgentError),
+    /// One in-order chunk of interactive-session clipboard text (UTF-8,
+    /// split on character boundaries, at most `MAX_CLIPBOARD_CHUNK_BYTES`).
+    ClipboardText {
+        id: u32,
+        index: u16,
+        count: u16,
+        text: String,
+    },
 }
+
+/// Clipboard chunks stay well inside the control payload limit.
+pub const MAX_CLIPBOARD_CHUNK_BYTES: usize = crate::clipboard::HOST_CHUNK_BYTES;
+const MAX_CLIPBOARD_CHUNKS: u16 = 64;
 
 impl Message {
     pub fn kind(&self) -> MessageKind {
@@ -459,6 +473,7 @@ impl Message {
             Self::InputStats(_) => MessageKind::InputStats,
             Self::RecoverableError(_) => MessageKind::RecoverableError,
             Self::FatalError(_) => MessageKind::FatalError,
+            Self::ClipboardText { .. } => MessageKind::ClipboardText,
         }
     }
 
@@ -792,6 +807,24 @@ fn encode_message(message: &Message) -> Result<Vec<u8>, ProtocolError> {
         Message::RecoverableError(error) | Message::FatalError(error) => {
             encode_agent_error(&mut out, error);
         }
+        Message::ClipboardText {
+            id,
+            index,
+            count,
+            text,
+        } => {
+            if text.len() > MAX_CLIPBOARD_CHUNK_BYTES
+                || *count == 0
+                || *count > MAX_CLIPBOARD_CHUNKS
+                || index >= count
+            {
+                return malformed(kind, "invalid clipboard chunk");
+            }
+            out.u32(*id);
+            out.u16(*index);
+            out.u16(*count);
+            out.bytes(text.as_bytes());
+        }
     }
     Ok(out.0)
 }
@@ -974,6 +1007,30 @@ fn decode_message(kind: MessageKind, payload: &[u8]) -> Result<Message, Protocol
         }
         MessageKind::RecoverableError => Message::RecoverableError(decode_agent_error(&mut input)?),
         MessageKind::FatalError => Message::FatalError(decode_agent_error(&mut input)?),
+        MessageKind::ClipboardText => {
+            let id = input.u32()?;
+            let index = input.u16()?;
+            let count = input.u16()?;
+            let text = input.rest();
+            if count == 0 || count > MAX_CLIPBOARD_CHUNKS || index >= count {
+                return malformed(kind, "invalid clipboard chunk position");
+            }
+            if text.len() > MAX_CLIPBOARD_CHUNK_BYTES {
+                return malformed(kind, "clipboard chunk is too large");
+            }
+            let text = std::str::from_utf8(text)
+                .map_err(|_| ProtocolError::MalformedPayload {
+                    kind,
+                    reason: "clipboard chunk is not UTF-8",
+                })?
+                .to_owned();
+            Message::ClipboardText {
+                id,
+                index,
+                count,
+                text,
+            }
+        }
     };
     input.finish()?;
     Ok(message)
@@ -1523,6 +1580,18 @@ mod tests {
                 config_revision: 8,
                 permit_id: None,
             }),
+            Message::ClipboardText {
+                id: 9,
+                index: 1,
+                count: 2,
+                text: "wörld\r\n".into(),
+            },
+            Message::ClipboardText {
+                id: 10,
+                index: 0,
+                count: 1,
+                text: String::new(),
+            },
         ];
 
         for (sequence, message) in messages.into_iter().enumerate() {

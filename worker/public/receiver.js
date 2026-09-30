@@ -7,6 +7,7 @@ import {
   shouldReconnectAfterClose,
   shouldRecycleSignalingForPeerState,
 } from "/recovery.js";
+import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
  import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { AdaptiveFrameDeadline, applyLateShardDeadline, classifyMediaShardV3, CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, OrderedFrameRelease, ParityFrameReassembler, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, selectStaleWssLane, selectWssMediaTopology, shouldDeferWssMediaStart, shouldFallbackToWssOnMissingRtp, shouldRecoverWssStripeReconnect, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY, stripLabEdgeTrace, VariableParityFrameReassembler, validateWssTopology, WssLaneLifecycleTelemetry } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
@@ -173,6 +174,7 @@ function handleDesktopState(message) {
   if (["enabled", "suspended", "read-only"].includes(message.input)) desktopInputState = message.input;
   if (desktopInputState !== "enabled") releaseInput(false);
   const secureDesktop = desktopKind === "secure";
+  if (secureDesktop) clearRemoteClipboard();
   document.body.classList.toggle("secure-desktop", secureDesktop);
   secureDesktopStatus.hidden = !secureDesktop;
   keyboardInput.setAttribute("autocorrect", secureDesktop ? "off" : "on");
@@ -504,7 +506,17 @@ const input = new InputController({
   sendControl: data => sendInput(data, dc),
   sendMotion: data => sendInput(data, motionDc),
   motionBuffered: () => motionDc?.bufferedAmount || (usingWssMedia ? ws?.bufferedAmount || 0 : 0),
+  controlState: inputControlState,
 });
+// Control input (keys, buttons, clipboard) is queued while the lane is
+// congested and discarded only when it is gated or dead; the controller then
+// sends release-all before the next event.
+function inputControlState() {
+  if (desktopInputState !== "enabled" || !desktopAvailable || desktopAwaitingFrame) return "down";
+  if (dc?.readyState === "open") return dc.bufferedAmount > 262_144 ? "busy" : "open";
+  if (usingWssMedia && ws?.readyState === WebSocket.OPEN) return ws.bufferedAmount > 16_384 ? "busy" : "open";
+  return "down";
+}
 function sendInput(data, channel) {
   if (desktopInputState !== "enabled") return false;
   if (!desktopAvailable || desktopAwaitingFrame) return false;
@@ -520,7 +532,7 @@ function updateMotionHud() { hudState.motionSent = input.stats.sent; hudState.mo
 function queueTouchMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motionNow(dx, dy, wheelX, wheelY); updateMotionHud(); }
 function queueTouchAbsolute(x, y) { input.absolute(x, y); const sent = input.flushMotion(); if (sent) cursorReconciler?.noteSent(input.lastSentSequence); updateMotionHud(); return sent; }
 function queueAbsolute(x, y) { input.absolute(x, y); armMotionFlush(); }
-function releaseInput(send = dc?.readyState === "open") { input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; renderKeyboardModifiers?.(); }
+function releaseInput(send = true) { input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; renderKeyboardModifiers?.(); }
 let connected = false;
 let offerSent = false;
 let peerGeneration = 0;
@@ -819,7 +831,14 @@ async function handleSignal(socket, generation, ev) {
       });
       break;
     }
+    case "input-capabilities":
+      applyInputCapabilities(msg);
+      break;
+    case "clipboard":
+      receiveRemoteClipboard(msg);
+      break;
     case "host-capabilities":
+      applyInputCapabilities(null);
       hostCapabilities = {
         serviceMode: msg.serviceMode === true,
         coldBoot: msg.coldBoot === true,
@@ -911,7 +930,7 @@ function cleanupPeer() {
   if (usingWssMedia) stopWssMedia();
   clearWssTimers();
   closingPeer = true;
-  releaseInput(dc?.readyState === "open");
+  releaseInput();
   resetKeyboardDraft();
   resetTouchCursor();
   inputReady = false;
@@ -3013,34 +3032,74 @@ document.addEventListener("wheel", (e) => {
   if (e.target !== inputSurface) return;
   if (e.ctrlKey) { syncViewport(); updateRemoteCursor(cursor => cursor.setFromScreen({x:e.clientX,y:e.clientY}, viewport)); setZoom(viewport.zoom + (e.deltaY < 0 ? .1 : -.1), {x:e.clientX,y:e.clientY}); e.preventDefault(); return; }
   if (!inputReady) return;
-  // Normalize browser deltas to WHEEL_DELTA (120 per notch).
-  const delta = e.deltaMode === 1 ? e.deltaY * 120 : e.deltaY * 1.2;
-  queueMotion(0, 0, clamp16(Math.round(e.deltaX * 1.2)), clamp16(Math.round(delta)));
+  // Accumulate high-resolution deltas into WHEEL_DELTA units (120 per notch),
+  // carrying fractions so smooth scrolling never loses distance.
+  const units = wheelAccumulator.add(e.deltaX, e.deltaY, e.deltaMode);
+  if (units.x || units.y) queueMotion(0, 0, units.x, units.y);
   e.preventDefault();
 }, { passive: false });
+const wheelAccumulator = new WheelAccumulator();
 
-// ---- input: keyboard (e.code -> Windows VK) ----------------------------------
-// US ANSI physical layout. SendInput on the host uses wVk, so the physical
-// key is what matters, not the character.
-const KEY = {
-  Backspace: 0x08, Tab: 0x09, Enter: 0x0D, ShiftLeft: 0x10, ShiftRight: 0x10,
-  ControlLeft: 0x11, ControlRight: 0x11, AltLeft: 0x12, AltRight: 0x12,
-  CapsLock: 0x14, Escape: 0x1B, Space: 0x20, PageUp: 0x21, PageDown: 0x22,
-  End: 0x23, Home: 0x24, ArrowLeft: 0x25, ArrowUp: 0x26, ArrowRight: 0x27,
-  ArrowDown: 0x28, PrintScreen: 0x2C, Insert: 0x2D, Delete: 0x2E,
-  MetaLeft: 0x5B, MetaRight: 0x5C, ContextMenu: 0x5D,
-  Numpad0: 0x60, Numpad1: 0x61, Numpad2: 0x62, Numpad3: 0x63, Numpad4: 0x64,
-  Numpad5: 0x65, Numpad6: 0x66, Numpad7: 0x67, Numpad8: 0x68, Numpad9: 0x69,
-  NumpadMultiply: 0x6A, NumpadAdd: 0x6B, NumpadSubtract: 0x6D,
-  NumpadDecimal: 0x6E, NumpadDivide: 0x6F,
-  Semicolon: 0xBA, Equal: 0xBB, Comma: 0xBC, Minus: 0xBD, Period: 0xBE,
-  Slash: 0xBF, Backquote: 0xC0, BracketLeft: 0xDB, Backslash: 0xDC,
-  BracketRight: 0xDD, Quote: 0xDE,
-  NumLock: 0x90, ScrollLock: 0x91, Pause: 0x13,
-};
-for (let i = 0; i < 26; i++) KEY["Key" + String.fromCharCode(65 + i)] = 0x41 + i;
-for (let i = 0; i < 10; i++) KEY["Digit" + i] = 0x30 + i;
-for (let i = 1; i <= 12; i++) KEY["F" + i] = 0x70 + (i - 1);
+// ---- input: clipboard text + keyboard lock ----------------------------------
+let hostInputCapabilities = { scancode: false, clipboard: false };
+const remoteClipboard = new ClipboardReceiver();
+const remoteClipboardButton = document.getElementById("remote-clipboard");
+let pendingRemoteClipboard = null;
+let pasteArmed = null;
+let clipboardTransferId = 0;
+function applyInputCapabilities(msg) {
+  hostInputCapabilities = { scancode: msg?.protocol === 1 && msg.scancode === true, clipboard: msg?.protocol === 1 && msg.clipboard === true };
+  input.scancode = hostInputCapabilities.scancode;
+  if (!hostInputCapabilities.clipboard) clearRemoteClipboard();
+}
+// Clipboard sync is text-only and never runs on the Windows secure desktop.
+function clipboardSyncEnabled() { return hostInputCapabilities.clipboard && desktopKind !== "secure" && inputReady; }
+function clearRemoteClipboard() { pendingRemoteClipboard = null; remoteClipboard.reset(); if (remoteClipboardButton) remoteClipboardButton.hidden = true; }
+function writeRemoteClipboard(text) {
+  if (!navigator.clipboard?.writeText) { pendingRemoteClipboard = text; remoteClipboardButton.hidden = false; return; }
+  navigator.clipboard.writeText(text).then(() => {
+    if (pendingRemoteClipboard === text) { pendingRemoteClipboard = null; remoteClipboardButton.hidden = true; }
+  }, () => { pendingRemoteClipboard = text; remoteClipboardButton.hidden = false; });
+}
+function receiveRemoteClipboard(msg) {
+  if (!hostInputCapabilities.clipboard || desktopKind === "secure") return;
+  const text = remoteClipboard.push(msg);
+  if (!text) return;
+  pendingRemoteClipboard = text;
+  if (document.hasFocus()) writeRemoteClipboard(text); else remoteClipboardButton.hidden = false;
+}
+remoteClipboardButton.onclick = e => { e.stopPropagation(); if (pendingRemoteClipboard !== null) writeRemoteClipboard(pendingRemoteClipboard); inputSurface.focus?.(); };
+window.addEventListener("focus", () => { if (pendingRemoteClipboard !== null && desktopKind !== "secure") writeRemoteClipboard(pendingRemoteClipboard); });
+function isPasteShortcut(e) { return (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "v" || e.key === "V"); }
+// Ctrl/Cmd+V: let the browser raise a paste event carrying the local
+// clipboard, then set the host clipboard and paste there. Without clipboard
+// text (or permission) the plain key goes through and pastes the host's own.
+function armBrowserPaste() {
+  clearTimeout(pasteArmed);
+  pasteArmed = setTimeout(() => { pasteArmed = null; sendPhysicalTap("KeyV"); }, 300);
+}
+function sendPhysicalTap(code) { if (!inputReady) return; input.physicalKey(code, false); input.physicalKey(code, true); }
+document.addEventListener("paste", e => {
+  if (pasteArmed === null) return;
+  clearTimeout(pasteArmed); pasteArmed = null;
+  e.preventDefault();
+  const text = e.clipboardData?.getData("text/plain") || "";
+  clipboardTransferId = (clipboardTransferId + 1) & 0xffff;
+  if (!text || !clipboardSyncEnabled() || !input.clipboard(text, clipboardTransferId)) sendPhysicalTap("KeyV");
+}, true);
+function updateKeyboardLock() {
+  const keyboard = navigator.keyboard;
+  if (!keyboard?.lock) return;
+  // Fullscreen streams receive system shortcuts (Ctrl+W, Alt+Tab where the
+  // browser allows it, Esc) instead of the local browser.
+  if (document.fullscreenElement) keyboard.lock().catch(() => {}); else keyboard.unlock?.();
+}
+document.addEventListener("fullscreenchange", updateKeyboardLock);
+
+// ---- input: keyboard (e.code -> set-1 scan code; VK for legacy hosts) -------
+// The physical key is sent, never the character: the host keyboard layout
+// produces the text, so AltGr and non-US layouts behave natively. See
+// keyDescriptor/SCAN_CODES in input.js.
 
 const held = new Set();
 function keyboardActive() {
@@ -3060,21 +3119,24 @@ document.addEventListener("keydown", (e) => {
     if (localEditKey.includes(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey) return;
     if (e.key?.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) return;
   }
-  const vk = KEY[e.code];
-  if (vk === undefined) return;
+  if (!keyDescriptor(e.code)) return;
+  if (isPasteShortcut(e) && clipboardSyncEnabled()) {
+    // Leave the event to the browser so it fires `paste`; see armBrowserPaste.
+    if (!e.repeat) armBrowserPaste();
+    return;
+  }
   e.preventDefault();
   if (e.repeat || held.has(e.code)) return;
   held.add(e.code);
-  input.key(vk, false);
+  input.physicalKey(e.code, false);
 });
 document.addEventListener("keyup", (e) => {
-  const vk = KEY[e.code];
-  if (vk === undefined) return;
+  if (!keyDescriptor(e.code)) return;
   if (!keyboardActive() && !held.has(e.code)) return;
   e.preventDefault();
   if (!held.has(e.code)) return;
   held.delete(e.code);
-  input.key(vk, true);
+  input.physicalKey(e.code, true);
 });
 const keyboardInput = document.getElementById("keyboard-input");
 const keyboardStatus = document.getElementById("keyboard-status");

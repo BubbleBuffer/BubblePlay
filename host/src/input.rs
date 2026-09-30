@@ -16,6 +16,8 @@
 //! | 9    | buttons at | u16 seq barrier, u16 x, u16 y, u8 mask |
 //! | 10   | cursor sync | u16 sequence barrier                   |
 //! | 11   | text       | UTF-8 bytes (max 512)                  |
+//! | 12   | clipboard  | u8 flags(1=paste), u16 id, u16 index, u16 count, UTF-8 chunk (max 8 KiB) |
+//! | 13   | scan key   | u8 flags(1=up 2=extended), u16 set-1 scan (0 = use vk), u16 vk |
 //! | 128  | cursor state (host -> browser) | u16 ack, x, y, u8 flags |
 //!
 //! Anti-cheat note: SendInput is the v0 injection method. Games with kernel
@@ -25,13 +27,16 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
+
+use crate::clipboard;
 use windows::Win32::Foundation::{SetLastError, POINT, WIN32_ERROR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorInfo, GetCursorPos, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING, SM_CXVIRTUALSCREEN,
@@ -50,7 +55,26 @@ const TYPE_ABSOLUTE_V2: u8 = 8;
 const TYPE_BUTTONS_AT: u8 = 9;
 const TYPE_CURSOR_SYNC: u8 = 10;
 const TYPE_TEXT: u8 = 11;
+const TYPE_CLIPBOARD: u8 = 12;
+const TYPE_KEY_SCAN: u8 = 13;
 const MAX_TEXT_BYTES: usize = 512;
+pub const CLIPBOARD_CHUNK_BYTES: usize = 8 * 1024;
+pub const CLIPBOARD_MAX_CHUNKS: u16 = 128;
+const CLIPBOARD_FLAG_PASTE: u8 = 1;
+const SCAN_FLAG_UP: u8 = 1;
+const SCAN_FLAG_EXTENDED: u8 = 2;
+const VK_CONTROL: u16 = 0x11;
+const VK_LCONTROL: u16 = 0xA2;
+const VK_RCONTROL: u16 = 0xA3;
+const VK_LWIN: u16 = 0x5B;
+const VK_RWIN: u16 = 0x5C;
+const VK_V: u16 = 0x56;
+/// Unassigned VK used (like AutoHotkey's menu mask key) so releasing a held
+/// Windows key during a paste does not open the Start menu.
+const VK_MASK: u16 = 0xE8;
+const SCAN_LCONTROL: u8 = 0x1D;
+const SCAN_LWIN: u8 = 0x5B;
+const SCAN_RWIN: u8 = 0x5C;
 const INPUT_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 pub const TYPE_CURSOR_STATE: u8 = 128;
@@ -75,6 +99,25 @@ enum Command {
     ButtonsAt(u16, u16, u16, u8),
     CursorSync(u16),
     Text(String),
+    ScanKey(HeldKey, bool),
+    Clipboard(ClipboardChunk),
+}
+
+/// One physical key as the host injected it. Scan-code keys and VK-only keys
+/// are tracked separately so release-all repeats exactly what was pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HeldKey {
+    Vk(u16),
+    Scan { code: u8, extended: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClipboardChunk {
+    paste: bool,
+    id: u16,
+    index: u16,
+    count: u16,
+    bytes: Vec<u8>,
 }
 
 fn decode(data: &[u8]) -> Option<Command> {
@@ -124,6 +167,44 @@ fn decode(data: &[u8]) -> Option<Command> {
                 .ok()
                 .map(Command::Text)
         }
+        TYPE_KEY_SCAN if data.len() == 6 => {
+            let flags = data[1];
+            let scan = u16::from_le_bytes([data[2], data[3]]);
+            let vk = u16::from_le_bytes([data[4], data[5]]);
+            if flags & !(SCAN_FLAG_UP | SCAN_FLAG_EXTENDED) != 0 || scan > 0xFF {
+                return None;
+            }
+            let key = match (scan, vk) {
+                (0, 0) => return None,
+                (0, vk) if vk <= 0xFF => HeldKey::Vk(vk),
+                (0, _) => return None,
+                (code, _) => HeldKey::Scan {
+                    code: code as u8,
+                    extended: flags & SCAN_FLAG_EXTENDED != 0,
+                },
+            };
+            Some(Command::ScanKey(key, flags & SCAN_FLAG_UP != 0))
+        }
+        TYPE_CLIPBOARD if (8..=8 + CLIPBOARD_CHUNK_BYTES).contains(&data.len()) => {
+            let flags = data[1];
+            let id = u16::from_le_bytes([data[2], data[3]]);
+            let index = u16::from_le_bytes([data[4], data[5]]);
+            let count = u16::from_le_bytes([data[6], data[7]]);
+            if flags & !CLIPBOARD_FLAG_PASTE != 0
+                || count == 0
+                || count > CLIPBOARD_MAX_CHUNKS
+                || index >= count
+            {
+                return None;
+            }
+            Some(Command::Clipboard(ClipboardChunk {
+                paste: flags & CLIPBOARD_FLAG_PASTE != 0,
+                id,
+                index,
+                count,
+                bytes: data[8..].to_vec(),
+            }))
+        }
         _ => None,
     }
 }
@@ -141,6 +222,16 @@ pub struct InputSink {
     stats: InputStats,
     absolute_region: DesktopRegion,
     failure_log: InputFailureLogGate,
+    clipboard: Option<ClipboardSync>,
+}
+
+/// Clipboard state exists only where the sink runs as the interactive user
+/// (input proxy, unprivileged local host). Elsewhere clipboard packets are
+/// ignored.
+#[derive(Debug, Default)]
+struct ClipboardSync {
+    assembly: ClipboardAssembly,
+    watcher: clipboard::ClipboardWatcher,
 }
 
 #[derive(Debug, Default)]
@@ -402,25 +493,88 @@ fn virtual_desktop_region() -> Option<DesktopRegion> {
 
 #[derive(Default)]
 struct InputState {
-    pressed_keys: BTreeSet<u16>,
+    pressed_keys: BTreeSet<HeldKey>,
+    /// Keys the host already released on the browser's behalf (a held Windows
+    /// key during paste). Their eventual browser key-up must not be injected.
+    swallowed_releases: BTreeSet<HeldKey>,
     buttons: u8,
     last_motion_sequence: Option<u16>,
     last_absolute_position: Option<(u16, u16)>,
 }
 
+fn is_control_key(key: HeldKey) -> bool {
+    matches!(
+        key,
+        HeldKey::Vk(VK_CONTROL | VK_LCONTROL | VK_RCONTROL)
+            | HeldKey::Scan {
+                code: SCAN_LCONTROL,
+                ..
+            }
+    )
+}
+
+fn is_windows_key(key: HeldKey) -> bool {
+    matches!(
+        key,
+        HeldKey::Vk(VK_LWIN | VK_RWIN)
+            | HeldKey::Scan {
+                code: SCAN_LWIN | SCAN_RWIN,
+                extended: true
+            }
+    )
+}
+
 impl InputState {
-    fn key(&mut self, vk: u16, up: bool) {
+    /// Track a key transition; returns whether it should be injected.
+    fn key(&mut self, key: HeldKey, up: bool) -> bool {
         if up {
-            self.pressed_keys.remove(&vk);
+            if self.swallowed_releases.remove(&key) {
+                return false;
+            }
+            self.pressed_keys.remove(&key);
         } else {
-            self.pressed_keys.insert(vk);
+            self.swallowed_releases.remove(&key);
+            self.pressed_keys.insert(key);
         }
+        true
     }
 
-    fn take_release_plan(&mut self) -> (Vec<u16>, u8) {
+    fn take_release_plan(&mut self) -> (Vec<HeldKey>, u8) {
         let keys = std::mem::take(&mut self.pressed_keys).into_iter().collect();
+        self.swallowed_releases.clear();
         let buttons = std::mem::replace(&mut self.buttons, 0);
         (keys, buttons)
+    }
+
+    /// Key transitions that paste the (already replaced) clipboard with
+    /// Ctrl+V, respecting modifiers the browser user is physically holding.
+    fn paste_plan(&mut self) -> Vec<(HeldKey, bool)> {
+        let control_held = self.pressed_keys.iter().copied().any(is_control_key);
+        let windows_keys: Vec<HeldKey> = self
+            .pressed_keys
+            .iter()
+            .copied()
+            .filter(|key| is_windows_key(*key))
+            .collect();
+        let mut plan = Vec::with_capacity(8);
+        if !windows_keys.is_empty() {
+            plan.push((HeldKey::Vk(VK_MASK), false));
+            plan.push((HeldKey::Vk(VK_MASK), true));
+            for key in windows_keys {
+                self.pressed_keys.remove(&key);
+                self.swallowed_releases.insert(key);
+                plan.push((key, true));
+            }
+        }
+        if !control_held {
+            plan.push((HeldKey::Vk(VK_CONTROL), false));
+        }
+        plan.push((HeldKey::Vk(VK_V), false));
+        plan.push((HeldKey::Vk(VK_V), true));
+        if !control_held {
+            plan.push((HeldKey::Vk(VK_CONTROL), true));
+        }
+        plan
     }
 
     fn accept_motion(&mut self, sequence: u16) -> bool {
@@ -441,12 +595,101 @@ impl InputState {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ClipboardProgress {
+    Pending,
+    Complete { text: String, paste: bool },
+    Rejected,
+}
+
+/// Reassembles chunked browser clipboard text. Chunks arrive in order on a
+/// reliable channel; anything else discards the transfer.
+#[derive(Debug, Default)]
+struct ClipboardAssembly {
+    active: bool,
+    id: u16,
+    next: u16,
+    count: u16,
+    paste: bool,
+    bytes: Vec<u8>,
+}
+
+impl ClipboardAssembly {
+    fn push(&mut self, chunk: ClipboardChunk) -> ClipboardProgress {
+        if chunk.index == 0 {
+            self.active = true;
+            self.id = chunk.id;
+            self.count = chunk.count;
+            self.paste = chunk.paste;
+            self.next = 0;
+            self.bytes.clear();
+        } else if !self.active
+            || chunk.id != self.id
+            || chunk.count != self.count
+            || chunk.index != self.next
+            || chunk.paste != self.paste
+        {
+            self.reset();
+            return ClipboardProgress::Rejected;
+        }
+        if self.bytes.len() + chunk.bytes.len() > clipboard::MAX_CLIPBOARD_BYTES {
+            self.reset();
+            return ClipboardProgress::Rejected;
+        }
+        self.bytes.extend_from_slice(&chunk.bytes);
+        self.next += 1;
+        if self.next < self.count {
+            return ClipboardProgress::Pending;
+        }
+        let bytes = std::mem::take(&mut self.bytes);
+        let paste = self.paste;
+        self.reset();
+        match String::from_utf8(bytes) {
+            Ok(text) if !text.is_empty() => ClipboardProgress::Complete { text, paste },
+            _ => ClipboardProgress::Rejected,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The exact keyboard event injected for a tracked key. Scan-code keys let
+/// the host's own layout translate the physical key (AltGr, non-US layouts);
+/// VK-only keys remain for codes without a scan code (Pause, legacy packets).
+fn keyboard_input(key: HeldKey, up: bool) -> KEYBDINPUT {
+    let mut flags = KEYBD_EVENT_FLAGS::default();
+    if up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    let (vk, scan) = match key {
+        HeldKey::Vk(vk) => (vk, 0),
+        HeldKey::Scan { code, extended } => {
+            flags |= KEYEVENTF_SCANCODE;
+            if extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            (0, u16::from(code))
+        }
+    };
+    KEYBDINPUT {
+        wVk: VIRTUAL_KEY(vk),
+        wScan: scan,
+        dwFlags: flags,
+        time: 0,
+        dwExtraInfo: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cursor_snapshot, decode, map_monitor_absolute_to_virtual, newer_sequence, Command,
-        CursorState, DesktopRegion, InputApplication, InputFailureLogGate, InputState,
-        INPUT_FAILURE_LOG_INTERVAL,
+        cursor_snapshot, decode, keyboard_input, map_monitor_absolute_to_virtual, newer_sequence,
+        ClipboardAssembly, ClipboardChunk, ClipboardProgress, Command, CursorState, DesktopRegion,
+        HeldKey, InputApplication, InputFailureLogGate, InputState, CLIPBOARD_CHUNK_BYTES,
+        CLIPBOARD_MAX_CHUNKS, INPUT_FAILURE_LOG_INTERVAL, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+        KEYEVENTF_SCANCODE, SCAN_LCONTROL, SCAN_LWIN, VK_CONTROL, VK_MASK, VK_V,
     };
     use std::time::Instant;
 
@@ -475,13 +718,302 @@ mod tests {
     #[test]
     fn release_plan_contains_each_held_key_and_pressed_button_once() {
         let mut state = InputState::default();
-        state.key(0x41, false);
-        state.key(0x10, false);
-        state.key(0x41, false);
+        state.key(HeldKey::Vk(0x41), false);
+        state.key(HeldKey::Vk(0x10), false);
+        state.key(HeldKey::Vk(0x41), false);
         state.buttons = 0b101;
 
-        assert_eq!(state.take_release_plan(), (vec![0x10, 0x41], 0b101));
+        assert_eq!(
+            state.take_release_plan(),
+            (vec![HeldKey::Vk(0x10), HeldKey::Vk(0x41)], 0b101)
+        );
         assert_eq!(state.take_release_plan(), (Vec::new(), 0));
+    }
+
+    fn contract() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../fixtures/input-contract.json")).unwrap()
+    }
+
+    fn bytes(value: &serde_json::Value) -> Vec<u8> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|byte| byte.as_u64().unwrap() as u8)
+            .collect()
+    }
+
+    #[test]
+    fn contract_scan_codes_decode_to_scan_keys_with_extended_flags() {
+        let contract = contract();
+        let table = contract["scanCodes"].as_object().unwrap();
+        assert!(table.len() > 100);
+        for (code, entry) in table {
+            let scan = entry["scan"].as_u64().unwrap() as u16;
+            let extended = entry["extended"].as_bool().unwrap();
+            let packet = [13, if extended { 2 } else { 0 }, scan as u8, 0, 0, 0];
+            assert_eq!(
+                decode(&packet),
+                Some(Command::ScanKey(
+                    HeldKey::Scan {
+                        code: scan as u8,
+                        extended
+                    },
+                    false
+                )),
+                "{code}"
+            );
+        }
+        for code in contract["mustBeExtended"].as_array().unwrap() {
+            assert_eq!(
+                table[code.as_str().unwrap()]["extended"],
+                serde_json::json!(true),
+                "{code}"
+            );
+        }
+        // Left/right modifiers are physically distinct keys.
+        assert_ne!(table["ControlLeft"], table["ControlRight"]);
+        assert_ne!(table["AltLeft"], table["AltRight"]);
+        assert_ne!(table["ShiftLeft"], table["ShiftRight"]);
+    }
+
+    #[test]
+    fn contract_packets_decode_and_invalid_packets_are_rejected() {
+        let contract = contract();
+        for case in contract["packets"].as_array().unwrap() {
+            let packet = bytes(&case["bytes"]);
+            let decoded = decode(&packet);
+            if let Some(key) = case.get("key") {
+                let expected = match key.get("vk") {
+                    Some(vk) => HeldKey::Vk(vk.as_u64().unwrap() as u16),
+                    None => HeldKey::Scan {
+                        code: key["scan"].as_u64().unwrap() as u8,
+                        extended: key["extended"].as_bool().unwrap(),
+                    },
+                };
+                assert_eq!(
+                    decoded,
+                    Some(Command::ScanKey(expected, case["up"].as_bool().unwrap())),
+                    "{}",
+                    case["name"]
+                );
+            } else {
+                let clip = &case["clipboard"];
+                assert_eq!(
+                    decoded,
+                    Some(Command::Clipboard(ClipboardChunk {
+                        paste: clip["paste"].as_bool().unwrap(),
+                        id: clip["id"].as_u64().unwrap() as u16,
+                        index: clip["index"].as_u64().unwrap() as u16,
+                        count: clip["count"].as_u64().unwrap() as u16,
+                        bytes: clip["text"].as_str().unwrap().as_bytes().to_vec(),
+                    }))
+                );
+            }
+        }
+        for packet in contract["invalidPackets"].as_array().unwrap() {
+            assert_eq!(decode(&bytes(packet)), None, "{packet}");
+        }
+        assert_eq!(
+            contract["clipboardPacket"]["chunkBytes"],
+            serde_json::json!(CLIPBOARD_CHUNK_BYTES)
+        );
+        assert_eq!(
+            contract["clipboardPacket"]["maxChunks"],
+            serde_json::json!(CLIPBOARD_MAX_CHUNKS)
+        );
+        assert_eq!(
+            contract["hostClipboardMessage"]["chunkBytes"],
+            serde_json::json!(crate::clipboard::HOST_CHUNK_BYTES)
+        );
+        let mut oversized = vec![12, 0, 0, 0, 0, 0, 1, 0];
+        oversized.resize(8 + CLIPBOARD_CHUNK_BYTES + 1, b'x');
+        assert_eq!(decode(&oversized), None);
+    }
+
+    #[test]
+    fn scan_keys_inject_scancode_with_extended_flag_and_vk_fallback_without() {
+        let arrow = keyboard_input(
+            HeldKey::Scan {
+                code: 0x4B,
+                extended: true,
+            },
+            true,
+        );
+        assert_eq!(arrow.wVk.0, 0);
+        assert_eq!(arrow.wScan, 0x4B);
+        assert_eq!(
+            arrow.dwFlags,
+            KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
+        );
+        let letter = keyboard_input(
+            HeldKey::Scan {
+                code: 0x1E,
+                extended: false,
+            },
+            false,
+        );
+        assert_eq!(letter.dwFlags, KEYEVENTF_SCANCODE);
+        let pause = keyboard_input(HeldKey::Vk(0x13), false);
+        assert_eq!((pause.wVk.0, pause.wScan, pause.dwFlags.0), (0x13, 0, 0));
+    }
+
+    #[test]
+    fn release_all_repeats_the_scan_codes_that_were_pressed() {
+        let mut state = InputState::default();
+        let right_ctrl = HeldKey::Scan {
+            code: 0x1D,
+            extended: true,
+        };
+        let left_ctrl = HeldKey::Scan {
+            code: 0x1D,
+            extended: false,
+        };
+        state.key(right_ctrl, false);
+        state.key(left_ctrl, false);
+        state.key(left_ctrl, true);
+        let (keys, _) = state.take_release_plan();
+        assert_eq!(keys, vec![right_ctrl]);
+        let release = keyboard_input(keys[0], true);
+        assert_eq!(
+            release.dwFlags,
+            KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
+        );
+    }
+
+    #[test]
+    fn paste_plan_adds_ctrl_only_when_not_held_and_masks_windows_keys() {
+        let v = [(HeldKey::Vk(VK_V), false), (HeldKey::Vk(VK_V), true)];
+        let mut idle = InputState::default();
+        let plan = idle.paste_plan();
+        assert_eq!(plan.first(), Some(&(HeldKey::Vk(VK_CONTROL), false)));
+        assert_eq!(&plan[1..3], &v);
+        assert_eq!(plan.last(), Some(&(HeldKey::Vk(VK_CONTROL), true)));
+
+        let mut ctrl = InputState::default();
+        ctrl.key(
+            HeldKey::Scan {
+                code: SCAN_LCONTROL,
+                extended: false,
+            },
+            false,
+        );
+        assert_eq!(ctrl.paste_plan(), v.to_vec());
+
+        let win = HeldKey::Scan {
+            code: SCAN_LWIN,
+            extended: true,
+        };
+        let mut meta = InputState::default();
+        meta.key(win, false);
+        let plan = meta.paste_plan();
+        assert_eq!(
+            &plan[..3],
+            &[
+                (HeldKey::Vk(VK_MASK), false),
+                (HeldKey::Vk(VK_MASK), true),
+                (win, true)
+            ]
+        );
+        assert!(
+            !meta.key(win, true),
+            "the browser's later Win key-up is swallowed"
+        );
+        assert!(meta.key(win, false));
+        assert!(meta.key(win, true));
+    }
+
+    fn chunk(id: u16, index: u16, count: u16, bytes: &[u8]) -> ClipboardChunk {
+        ClipboardChunk {
+            paste: true,
+            id,
+            index,
+            count,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn clipboard_assembly_requires_ordered_complete_utf8() {
+        let mut assembly = ClipboardAssembly::default();
+        assert_eq!(
+            assembly.push(chunk(1, 0, 2, &[0xC3])),
+            ClipboardProgress::Pending
+        );
+        assert_eq!(
+            assembly.push(chunk(1, 1, 2, &[0xA9])),
+            ClipboardProgress::Complete {
+                text: "é".into(),
+                paste: true
+            }
+        );
+        assert_eq!(
+            assembly.push(chunk(2, 1, 2, b"x")),
+            ClipboardProgress::Rejected
+        );
+        assert_eq!(
+            assembly.push(chunk(3, 0, 3, b"a")),
+            ClipboardProgress::Pending
+        );
+        assert_eq!(
+            assembly.push(chunk(3, 2, 3, b"c")),
+            ClipboardProgress::Rejected
+        );
+        assert_eq!(
+            assembly.push(chunk(4, 0, 1, &[0xFF])),
+            ClipboardProgress::Rejected
+        );
+        assert_eq!(
+            assembly.push(chunk(5, 0, 1, b"")),
+            ClipboardProgress::Rejected
+        );
+        // A new transfer restarts cleanly after an abandoned one.
+        assembly.push(chunk(6, 0, 2, b"a"));
+        assert_eq!(
+            assembly.push(chunk(7, 0, 1, b"b")),
+            ClipboardProgress::Complete {
+                text: "b".into(),
+                paste: true
+            }
+        );
+    }
+
+    #[test]
+    fn clipboard_assembly_rejects_more_than_one_mebibyte() {
+        let mut assembly = ClipboardAssembly::default();
+        let full = vec![b'x'; CLIPBOARD_CHUNK_BYTES];
+        for index in 0..CLIPBOARD_MAX_CHUNKS - 1 {
+            assert_eq!(
+                assembly.push(chunk(1, index, CLIPBOARD_MAX_CHUNKS, &full)),
+                ClipboardProgress::Pending
+            );
+        }
+        assert!(matches!(
+            assembly.push(chunk(
+                1,
+                CLIPBOARD_MAX_CHUNKS - 1,
+                CLIPBOARD_MAX_CHUNKS,
+                &full
+            )),
+            ClipboardProgress::Complete { .. }
+        ));
+        let mut over = ClipboardAssembly {
+            active: true,
+            id: 1,
+            next: 1,
+            count: 2,
+            paste: true,
+            bytes: vec![b'x'; crate::clipboard::MAX_CLIPBOARD_BYTES],
+        };
+        assert_eq!(over.push(chunk(1, 1, 2, b"y")), ClipboardProgress::Rejected);
+    }
+
+    #[test]
+    fn clipboard_packets_are_ignored_by_sinks_without_clipboard_access() {
+        let mut sink = super::InputSink::new();
+        let outcome = sink.handle(&[12, 1, 7, 0, 0, 0, 1, 0, b'h', b'i']);
+        assert_eq!(outcome.application.requested, 0);
+        assert_eq!(sink.poll_clipboard(false), None);
     }
     #[test]
     fn protocol_rejects_malformed_and_accepts_release_and_motion_wrap() {
@@ -640,7 +1172,21 @@ impl InputSink {
             stats: InputStats::default(),
             absolute_region: DesktopRegion::new(0, 0, 1920, 1080),
             failure_log: InputFailureLogGate::default(),
+            clipboard: None,
         }
+    }
+
+    /// Enable text clipboard sync. Only call from a process running as the
+    /// interactive user on the default desktop.
+    pub fn with_clipboard(mut self, enabled: bool) -> Self {
+        self.clipboard = enabled.then(ClipboardSync::default);
+        self
+    }
+
+    /// New host clipboard text since the previous poll (never echoes text
+    /// this sink set from the browser). `reset` starts a new baseline.
+    pub fn poll_clipboard(&mut self, reset: bool) -> Option<String> {
+        self.clipboard.as_mut()?.watcher.poll(reset)
     }
 
     pub fn set_absolute_region(&mut self, region: DesktopRegion) {
@@ -657,9 +1203,16 @@ impl InputSink {
         let mut outcome = InputOutcome::default();
         match command {
             Command::Key(vk, up) => {
-                self.state.key(vk, up);
-                outcome.application.merge(self.key(vk, up));
+                if self.state.key(HeldKey::Vk(vk), up) {
+                    outcome.application.merge(self.key(HeldKey::Vk(vk), up));
+                }
             }
+            Command::ScanKey(key, up) => {
+                if self.state.key(key, up) {
+                    outcome.application.merge(self.key(key, up));
+                }
+            }
+            Command::Clipboard(chunk) => outcome.application.merge(self.clipboard_chunk(chunk)),
             Command::Rel(dx, dy) => {
                 self.stats.relative_packets += 1;
                 self.state.last_absolute_position = None;
@@ -765,24 +1318,56 @@ impl InputSink {
         application
     }
 
-    fn key(&mut self, vk: u16, up: bool) -> InputApplication {
-        let mut flags = windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS::default();
-        if up {
-            flags |= KEYEVENTF_KEYUP;
-        }
+    fn key(&mut self, key: HeldKey, up: bool) -> InputApplication {
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(vk),
-                    wScan: 0,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
+                ki: keyboard_input(key, up),
             },
         };
         self.send_inputs(if up { "key-up" } else { "key-down" }, &[input])
+    }
+
+    fn clipboard_chunk(&mut self, chunk: ClipboardChunk) -> InputApplication {
+        let Some(sync) = self.clipboard.as_mut() else {
+            debug!("clipboard packet ignored: clipboard sync is disabled for this sink");
+            return InputApplication::default();
+        };
+        let (text, paste) = match sync.assembly.push(chunk) {
+            ClipboardProgress::Pending => return InputApplication::default(),
+            ClipboardProgress::Rejected => {
+                warn!("browser clipboard transfer rejected (out of order, oversized or not UTF-8)");
+                return InputApplication::default();
+            }
+            ClipboardProgress::Complete { text, paste } => (text, paste),
+        };
+        match clipboard::set_text(&text) {
+            Ok(sequence) => sync.watcher.note_own_change(sequence),
+            Err(error) => {
+                warn!(?error, "failed to set host clipboard from browser");
+                let code = error
+                    .downcast_ref::<windows::core::Error>()
+                    .map_or(0, |error| error.code().0);
+                let mut application = InputApplication::default();
+                application.observe(1, 0, code);
+                return application;
+            }
+        }
+        if !paste {
+            return InputApplication::default();
+        }
+        let inputs: Vec<INPUT> = self
+            .state
+            .paste_plan()
+            .into_iter()
+            .map(|(key, up)| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: keyboard_input(key, up),
+                },
+            })
+            .collect();
+        self.send_inputs("clipboard-paste", &inputs)
     }
 
     fn text(&mut self, text: &str) -> InputApplication {
@@ -939,8 +1524,8 @@ impl InputSink {
     pub fn release_all_report(&mut self) -> InputApplication {
         let (keys, buttons) = self.state.take_release_plan();
         let mut application = InputApplication::default();
-        for vk in keys {
-            application.merge(self.key(vk, true));
+        for key in keys {
+            application.merge(self.key(key, true));
         }
         if buttons != 0 {
             application.merge(self.send_button_releases(buttons));

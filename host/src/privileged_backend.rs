@@ -309,6 +309,7 @@ enum InputWorkerCommand {
     Suspend,
     Resume,
     Shutdown,
+    PollClipboard { reset: bool },
 }
 
 struct InputWorkerRequest {
@@ -571,6 +572,16 @@ impl AgentBackend for RealAgentBackend {
             .as_ref()
             .context("desktop input worker is unavailable")?
             .call(InputWorkerCommand::Input(packet.to_vec()))?;
+        self.pending.extend(events);
+        Ok(())
+    }
+
+    fn poll_clipboard(&mut self, reset: bool) -> Result<()> {
+        let events = self
+            .input_worker
+            .as_ref()
+            .context("desktop input worker is unavailable")?
+            .call(InputWorkerCommand::PollClipboard { reset })?;
         self.pending.extend(events);
         Ok(())
     }
@@ -918,6 +929,23 @@ struct InputWorkerState {
     dropped_inputs: u64,
     released_inputs: u64,
     last_input_sequence: Option<u16>,
+    clipboard_id: u32,
+}
+
+/// Split host clipboard text into in-order IPC chunks.
+fn clipboard_messages(id: u32, text: &str) -> Vec<Message> {
+    let chunks = crate::clipboard::chunk_text(text, crate::clipboard::HOST_CHUNK_BYTES);
+    let count = chunks.len() as u16;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| Message::ClipboardText {
+            id,
+            index: index as u16,
+            count,
+            text: chunk.to_owned(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1014,6 +1042,7 @@ fn input_worker_main(
                 dropped_inputs: 0,
                 released_inputs: 0,
                 last_input_sequence: None,
+                clipboard_id: 0,
             },
         ))
     })();
@@ -1075,6 +1104,19 @@ impl InputWorkerState {
                 self.release_all();
                 self.suspended = true;
                 Ok(Vec::new())
+            }
+            InputWorkerCommand::PollClipboard { reset } => {
+                if self.suspended || !proxy_input_supported(self.desktop) {
+                    return Ok(Vec::new());
+                }
+                let Some(proxy) = self.input_proxy.as_mut() else {
+                    return Ok(Vec::new());
+                };
+                let Some(text) = proxy.poll_clipboard(reset)? else {
+                    return Ok(Vec::new());
+                };
+                self.clipboard_id = self.clipboard_id.wrapping_add(1);
+                Ok(clipboard_messages(self.clipboard_id, &text))
             }
         }
     }
@@ -1794,6 +1836,29 @@ mod tests {
         assert!(proxy_input_supported(DesktopKind::Default));
         assert!(!proxy_input_supported(DesktopKind::Secure));
         assert!(!proxy_input_supported(DesktopKind::Other));
+    }
+
+    #[test]
+    fn host_clipboard_text_is_split_into_ordered_ipc_chunks() {
+        let text = "é".repeat(crate::clipboard::HOST_CHUNK_BYTES);
+        let messages = super::clipboard_messages(7, &text);
+        assert_eq!(messages.len(), 2);
+        let mut joined = String::new();
+        for (expected_index, message) in messages.iter().enumerate() {
+            let Message::ClipboardText {
+                id,
+                index,
+                count,
+                text,
+            } = message
+            else {
+                panic!("unexpected message {message:?}");
+            };
+            assert_eq!((*id, *index as usize, *count), (7, expected_index, 2));
+            assert!(text.len() <= crate::privileged_ipc::MAX_CLIPBOARD_CHUNK_BYTES);
+            joined.push_str(text);
+        }
+        assert_eq!(joined, text);
     }
 
     #[test]
