@@ -133,7 +133,7 @@ impl Drop for AccessUnitReservation {
 impl TransportPump {
     pub fn spawn(
         socket: UdpSocket,
-        host_addr: SocketAddr,
+        host_addr: Option<SocketAddr>,
         mapped_addr: Option<SocketAddr>,
         initial_bitrate: u32,
     ) -> Self {
@@ -276,13 +276,19 @@ fn emit(tx: &Sender<TransportEvent>, event: TransportEvent) {
     }
 }
 
+/// `host_addr` is `None` when local IP discovery failed: the RTC session then
+/// has no candidates (WebRTC cannot connect) but the pump keeps running so
+/// the WSS session is unaffected.
 fn fresh_epoch(
     socket: &UdpSocket,
-    host_addr: SocketAddr,
+    host_addr: Option<SocketAddr>,
     mapped: Option<SocketAddr>,
     bitrate: u32,
 ) -> Result<RtcSession> {
     let mut rtc = RtcSession::new(Instant::now(), bitrate);
+    let Some(host_addr) = host_addr else {
+        return Ok(rtc);
+    };
     rtc.add_host_candidate(host_addr)?;
     drain_outputs(&mut rtc, socket, None, None)?;
     if let Some(mapped) = mapped {
@@ -325,7 +331,7 @@ fn drain_outputs(
 
 fn transport_loop(
     socket: UdpSocket,
-    host_addr: SocketAddr,
+    host_addr: Option<SocketAddr>,
     mapped: Option<SocketAddr>,
     bitrate: u32,
     au_rx: Receiver<AccessUnit>,
@@ -503,13 +509,15 @@ fn transport_loop(
         if !mutated {
             match socket.recv_from(&mut buffer) {
                 Ok((n, source)) => {
-                    if let Ok(contents) = buffer[..n].try_into() {
+                    // Without a host address there are no candidates, so
+                    // nothing inbound can belong to the RTC session.
+                    if let (Ok(contents), Some(destination)) = (buffer[..n].try_into(), host_addr) {
                         let input = Input::Receive(
                             Instant::now(),
                             Receive {
                                 proto: Protocol::Udp,
                                 source,
-                                destination: host_addr,
+                                destination,
                                 contents,
                             },
                         );
@@ -645,6 +653,13 @@ mod tests {
         mpsc::{channel, sync_channel},
         Mutex,
     };
+
+    #[test]
+    fn rtc_epoch_without_a_host_address_starts_without_candidates() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(super::fresh_epoch(&socket, None, None, 2_000_000).is_ok());
+    }
+
     #[test]
     fn full_access_unit_slot_rejects_before_encode_and_preserves_the_first_frame() {
         let (tx, rx) = sync_channel(1);

@@ -556,10 +556,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             .is_ok_and(|value| value == "1");
     let mut capture = CaptureSource::open(args, selection.selector())?;
     let socket = UdpSocket::bind("0.0.0.0:0").context("bind media socket")?;
-    let host_addr = SocketAddr::new(
-        pick_host_ip().context("discover local host IP")?,
-        socket.local_addr()?.port(),
-    );
+    // Host-IP discovery only feeds RTC ICE candidates. WSS media and
+    // signaling do not need it, so a failure (e.g. WSAEAFNOSUPPORT on a
+    // machine without a usable default route) must not end `serve`.
+    let host_addr = match pick_host_ip() {
+        Ok(ip) => Some(SocketAddr::new(ip, socket.local_addr()?.port())),
+        Err(error) => {
+            warn!(?error, "local host IP discovery failed; RTC host candidates disabled, WSS unaffected");
+            None
+        }
+    };
     socket.set_nonblocking(false)?;
     let mapped_addr = stun::discover_mapped_address(&socket, STUN_SERVER).ok();
     let mut signaling = Signaling::connect(&worker, &token, args.host_gate_token.as_deref())?;
@@ -629,6 +635,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut next_ping = Instant::now() + SIGNALING_HEARTBEAT_INTERVAL;
     // v4: a static-screen refine frame is pending after damage-driven frames.
     let mut wss_v4_refine_armed = false;
+    let mut infinite_gop_unsupported = false;
     let mut next_wss_stats = Instant::now() + Duration::from_secs(1);
     let mut next_quality_tick = Instant::now() + Duration::from_secs(1);
     let mut benchmark_lease = args
@@ -3063,6 +3070,23 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 if (is_new && frame_admission_due(now, next_admission, frame_interval, urgent))
                     || (!is_new && urgent)
                 {
+                    // WSS v4 owns keyframes (start / request / 30 s safety):
+                    // run NVENC with an infinite GOP while it is active.
+                    let want_infinite_gop = wss_is_v4(wss_media.as_ref());
+                    if let Some(enc) = encoder.as_mut() {
+                        if enc.infinite_gop() != want_infinite_gop && !infinite_gop_unsupported {
+                            match enc.set_infinite_gop(want_infinite_gop) {
+                                Ok(()) => next_idr = now,
+                                Err(error) => {
+                                    infinite_gop_unsupported = true;
+                                    warn!(?error, "NVENC GOP switch failed; keeping periodic IDR");
+                                }
+                            }
+                        }
+                    }
+                    if let Some(egress) = wss_media.as_ref().filter(|egress| egress.is_v4()) {
+                        egress.set_v4_frame_size(mode.width, mode.height);
+                    }
                     let mut wss_reservation = None;
                     let mut wss_forced_idr = false;
                     if let Some(egress) = wss_media.as_ref() {
@@ -4893,16 +4917,18 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
 /// no packets are sent).
 fn pick_host_ip() -> Result<std::net::IpAddr> {
     let probe = UdpSocket::bind("0.0.0.0:0")?;
-    let stun_addr: SocketAddr =
-        format!("{STUN_SERVER}")
-            .parse()
-            .or_else(|_| -> Result<SocketAddr> {
-                Ok(std::net::ToSocketAddrs::to_socket_addrs(STUN_SERVER)?
-                    .next()
-                    .context("no stun addr")?)
-            })?;
-    probe.connect(stun_addr)?;
+    let stun_addr = ipv4_probe_target(
+        std::net::ToSocketAddrs::to_socket_addrs(STUN_SERVER).context("resolve STUN server")?,
+    )
+    .context("STUN server has no IPv4 address")?;
+    probe.connect(stun_addr).context("connect IPv4 route probe")?;
     Ok(probe.local_addr()?.ip())
+}
+
+/// The route probe is bound to an IPv4 socket; connecting it to an IPv6
+/// resolution result fails with WSAEAFNOSUPPORT (10047). Use IPv4 only.
+fn ipv4_probe_target(addrs: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    addrs.into_iter().find(SocketAddr::is_ipv4)
 }
 
 /// Start the inline VDD keepalive when the capture target needs a virtual
@@ -4968,6 +4994,15 @@ fn physical_monitor_count() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_ip_probe_skips_ipv6_resolution_results() {
+        let v6: std::net::SocketAddr = "[2001:4860:4864:5:8000::1]:19302".parse().unwrap();
+        let v4: std::net::SocketAddr = "74.125.250.129:19302".parse().unwrap();
+        assert_eq!(super::ipv4_probe_target([v6, v4]), Some(v4));
+        assert_eq!(super::ipv4_probe_target([v6]), None);
+        assert_eq!(super::ipv4_probe_target([]), None);
+    }
+
     #[test]
     fn wss_v4_refine_bitrate_is_bounded_and_parks_periodic_idr() {
         assert_eq!(super::wss_v4_refine_bitrate(3_000_000), 12_000_000);
