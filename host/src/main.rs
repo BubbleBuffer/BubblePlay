@@ -36,6 +36,7 @@ use bubbleplay_host::temporal_diff;
 use bubbleplay_host::transport;
 use bubbleplay_host::vdd;
 use bubbleplay_host::wss_media;
+use bubbleplay_host::wss_v4::{damage_per_mille, RefineSettle, REFINE_LARGE_DAMAGE_PER_MILLE};
 
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
@@ -113,9 +114,6 @@ const WSS_BALANCED_BITRATE_BPS: u32 = 3_000_000;
 const WSS_SAVER_BITRATE_BPS: u32 = 1_500_000;
 /// Idle heartbeat on the signaling socket (the browser uses the same period).
 const SIGNALING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-/// v4 static-screen refine: one high-quality P frame this long after the
-/// last damage-driven frame.
-const WSS_V4_REFINE_DELAY: Duration = Duration::from_millis(300);
 /// v4 refine frames are encoded at this multiple of the live bitrate.
 const WSS_V4_REFINE_BITRATE_FACTOR: u32 = 4;
 /// v4 keyframes are owned by the media link (start / request / 30 s safety),
@@ -624,8 +622,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut next_admission = Instant::now();
     let mut next_idr = Instant::now();
     let mut next_ping = Instant::now() + SIGNALING_HEARTBEAT_INTERVAL;
-    // v4: a static-screen refine frame is pending after damage-driven frames.
-    let mut wss_v4_refine_armed = false;
+    // v4: one static-screen refine after a large change settles.
+    let mut wss_v4_refine = RefineSettle::default();
     let mut next_wss_stats = Instant::now() + Duration::from_secs(1);
     let mut next_quality_tick = Instant::now() + Duration::from_secs(1);
     let mut benchmark_lease = args
@@ -1802,7 +1800,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                         u64::from(adjustment.target_bps),
                                     );
                                 }
-                                wss_v4_refine_armed = false;
+                                wss_v4_refine.reset();
                                 if staged {
                                     // Announce intent immediately; a second quality
                                     // message after the IDR ACK confirms activation.
@@ -2122,7 +2120,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 enc.force_idr();
             }
             next_idr = now;
-            wss_v4_refine_armed = false;
+            wss_v4_refine.reset();
             info!(reason, "WSS v4 keyframe requested");
         }
         if let Some(bitrate_bps) = wss_v4_events.bitrate_bps {
@@ -2698,11 +2696,18 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                         wss_reservation = Some(reservation);
                     }
-                    // v4 static-screen refine: the delayed follow-up snapshot
-                    // after the last damage frame is encoded once, as a
-                    // high-bitrate P frame flagged `refine` on the wire.
-                    let wss_v4_refine_frame = wss_v4_refine_armed
-                        && is_idle_snapshot
+                    // v4 static-screen refine: once damage has stayed below
+                    // the large-change share for the settle time, the next
+                    // quiet frame (idle follow-up snapshot or small-damage
+                    // frame) is encoded once as a high-bitrate P frame
+                    // flagged `refine` on the wire.
+                    let wss_v4_damage_per_mille = if is_idle_snapshot {
+                        0
+                    } else {
+                        damage_per_mille(frame.damage(), frame.width(), frame.height())
+                    };
+                    let wss_v4_refine_frame = wss_v4_refine.due(Instant::now())
+                        && wss_v4_damage_per_mille < REFINE_LARGE_DAMAGE_PER_MILLE
                         && !wss_forced_idr
                         && latest_idr.is_some()
                         && !transition
@@ -4180,12 +4185,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                     if wss_media.is_some() {
                         if wss_v4_refine_frame {
-                            wss_v4_refine_armed = false;
-                        } else if !is_idle_snapshot {
-                            // Each damage frame pushes the refine out again,
-                            // so it lands once the screen has settled.
-                            wss_v4_refine_armed = true;
-                            capture.request_idle_followup_snapshot(WSS_V4_REFINE_DELAY);
+                            wss_v4_refine.on_refine_sent();
+                            tracing::debug!("WSS v4 refine sent after the screen settled");
+                        } else {
+                            wss_v4_refine.on_frame(Instant::now(), wss_v4_damage_per_mille);
+                        }
+                        // Only a large change moves the deadline; small
+                        // changes neither cancel nor extend it.
+                        if let Some(deadline) = wss_v4_refine.deadline() {
+                            capture.request_idle_followup_snapshot(
+                                deadline.saturating_duration_since(Instant::now()),
+                            );
                         }
                     }
                     next_admission = advance_frame_deadline(next_admission, now, frame_interval);

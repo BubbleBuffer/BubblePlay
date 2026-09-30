@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+
+use crate::frame_damage::DamageRect;
 use tracing::{debug, info, warn};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
@@ -77,6 +79,12 @@ const RATE_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
 const RATE_RTT_SLACK_MS: f64 = 40.0;
 const RATE_RTT_FACTOR: f64 = 1.5;
 const WRITE_STALL_LIMIT: Duration = Duration::from_secs(10);
+/// A change covering at least this share of the frame (per mille) earns one
+/// refine; smaller changes (cursor blink, clock) neither earn nor delay it.
+pub const REFINE_LARGE_DAMAGE_PER_MILLE: u64 = 20;
+/// The refine is sent once damage has stayed small this long after the last
+/// large change.
+pub const REFINE_SETTLE: Duration = Duration::from_millis(300);
 const LINK_QUEUE_CAPACITY: usize = INFLIGHT_MAX_FRAMES + 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,6 +532,59 @@ impl DelayRateController {
             self.bitrate_bps = next;
             next
         })
+    }
+}
+
+/// Share of a `width` x `height` frame covered by `rects`, in per mille.
+/// Unknown damage (`None`) counts as the whole frame.
+pub fn damage_per_mille(rects: Option<&[DamageRect]>, width: u32, height: u32) -> u64 {
+    let total = u64::from(width) * u64::from(height);
+    let Some(rects) = rects else {
+        return 1_000;
+    };
+    if total == 0 {
+        return 0;
+    }
+    let area: u64 = rects
+        .iter()
+        .map(|rect| {
+            let w = rect.right.min(width).saturating_sub(rect.left);
+            let h = rect.bottom.min(height).saturating_sub(rect.top);
+            u64::from(w) * u64::from(h)
+        })
+        .sum();
+    (area.min(total) * 1_000 / total).min(1_000)
+}
+
+/// Settle-by-area refine scheduling: a large change arms one refine, which is
+/// due after `REFINE_SETTLE` without another large change. The next refine
+/// needs another large change.
+#[derive(Debug, Default)]
+pub struct RefineSettle {
+    large_change_at: Option<Instant>,
+}
+
+impl RefineSettle {
+    pub fn on_frame(&mut self, now: Instant, damage_per_mille: u64) {
+        if damage_per_mille >= REFINE_LARGE_DAMAGE_PER_MILLE {
+            self.large_change_at = Some(now);
+        }
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.large_change_at.map(|at| at + REFINE_SETTLE)
+    }
+
+    pub fn due(&self, now: Instant) -> bool {
+        self.deadline().is_some_and(|deadline| now >= deadline)
+    }
+
+    pub fn on_refine_sent(&mut self) {
+        self.large_change_at = None;
+    }
+
+    pub fn reset(&mut self) {
+        self.large_change_at = None;
     }
 }
 
@@ -1058,6 +1119,54 @@ fn serve_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rect(left: u32, top: u32, right: u32, bottom: u32) -> DamageRect {
+        DamageRect { left, top, right, bottom }
+    }
+
+    #[test]
+    fn damage_area_is_measured_in_per_mille_of_the_frame() {
+        assert_eq!(damage_per_mille(None, 1920, 1080), 1_000);
+        assert_eq!(damage_per_mille(Some(&[]), 1920, 1080), 0);
+        // A 20x20 cursor blink is far below the 2 % large-change share.
+        assert_eq!(damage_per_mille(Some(&[rect(100, 100, 120, 120)]), 1920, 1080), 0);
+        // A quarter of the frame.
+        assert_eq!(damage_per_mille(Some(&[rect(0, 0, 960, 540)]), 1920, 1080), 250);
+        // Rects are clipped to the frame and the total is capped.
+        assert_eq!(
+            damage_per_mille(Some(&[rect(0, 0, 4000, 4000), rect(0, 0, 1920, 1080)]), 1920, 1080),
+            1_000
+        );
+    }
+
+    #[test]
+    fn refine_is_sent_once_after_a_large_change_settles() {
+        let now = Instant::now();
+        let ms = |value| now + Duration::from_millis(value);
+        let mut settle = RefineSettle::default();
+        // Small changes alone never earn a refine.
+        settle.on_frame(now, REFINE_LARGE_DAMAGE_PER_MILLE - 1);
+        assert_eq!(settle.deadline(), None);
+
+        settle.on_frame(now, 300);
+        assert!(!settle.due(ms(299)));
+        // A cursor blink during the settle neither cancels nor extends it.
+        settle.on_frame(ms(150), 1);
+        assert_eq!(settle.deadline(), Some(ms(300)));
+        assert!(settle.due(ms(300)));
+        settle.on_refine_sent();
+        // Further small changes do not arm another refine.
+        settle.on_frame(ms(600), 1);
+        assert!(!settle.due(ms(5_000)));
+
+        // Another large change arms exactly one more, measured from it.
+        settle.on_frame(ms(6_000), 1_000);
+        settle.on_frame(ms(6_200), 40);
+        assert!(!settle.due(ms(6_300)));
+        assert!(settle.due(ms(6_500)));
+        settle.reset();
+        assert!(!settle.due(ms(10_000)));
+    }
 
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../../fixtures/wss-v4-contract.json")).unwrap()
