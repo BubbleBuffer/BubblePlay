@@ -8,7 +8,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,23 @@ pub struct SupervisorConfig {
     pub host_config: PathBuf,
     /// Host stdout/stderr destination.
     pub host_log: SharedLog,
+    /// Optional lifecycle events for update probation.
+    pub events: Option<Sender<HostEvent>>,
+}
+
+/// Host lifecycle events observed by the supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostEvent {
+    Started,
+    /// The host logged its signaling registration line.
+    Registered,
+    Exited,
+}
+
+fn emit(events: &Option<Sender<HostEvent>>, event: HostEvent) {
+    if let Some(events) = events {
+        let _ = events.send(event);
+    }
 }
 
 pub type SharedState = Arc<Mutex<HostState>>;
@@ -46,7 +63,14 @@ fn wait_for_stop(stop: &Receiver<()>, duration: Duration) -> bool {
     }
 }
 
-fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog) {
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog, events: Option<Sender<HostEvent>>) {
+    let marker = super::update::REGISTERED_MARKER.as_bytes();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut line = Vec::with_capacity(512);
@@ -56,7 +80,12 @@ fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog) {
                 // Keep draining even if logging fails, so the host never blocks
                 // on a full pipe.
                 Ok(0) | Err(_) => break,
-                Ok(_) => log.append(&line),
+                Ok(_) => {
+                    log.append(&line);
+                    if contains(&line, marker) {
+                        emit(&events, HostEvent::Registered);
+                    }
+                }
             }
         }
     });
@@ -117,10 +146,10 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
         return Err(error);
     }
     if let Some(out) = child.stdout.take() {
-        pump(out, config.host_log.clone());
+        pump(out, config.host_log.clone(), config.events.clone());
     }
     if let Some(err) = child.stderr.take() {
-        pump(err, config.host_log.clone());
+        pump(err, config.host_log.clone(), config.events.clone());
     }
     Ok(child)
 }
@@ -184,6 +213,7 @@ pub fn supervise(config: SupervisorConfig, state: SharedState, stop: Receiver<()
         let pid = child.id();
         tracing::info!(pid, exe = %config.host_exe.display(), "host started");
         publish(&state, HostState::Running { pid });
+        emit(&config.events, HostEvent::Started);
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
@@ -202,6 +232,7 @@ pub fn supervise(config: SupervisorConfig, state: SharedState, stop: Receiver<()
             let _ = child.wait();
             break;
         };
+        emit(&config.events, HostEvent::Exited);
         let ran_for = started.elapsed();
         let delay = backoff.on_exit(ran_for);
         tracing::warn!(pid, ?status, ?ran_for, ?delay, "host exited; restarting");
