@@ -37,6 +37,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::frame_damage::DamageRect;
+use crate::link_capacity::{Capacity, CapacityEstimator};
 use tracing::{debug, info, warn};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
@@ -71,6 +72,10 @@ pub const RATE_FLOOR_1080P_BPS: u64 = 2_500_000;
 /// Absolute floor for tiny frames (and profiles capped below the floor).
 pub const RATE_FLOOR_MIN_BPS: u64 = 500_000;
 const PIXELS_1080P: u64 = 1920 * 1080;
+/// A new capacity target moves the bitrate only when it differs from the
+/// current target by at least this much (percent); smaller moves would
+/// reconfigure NVENC on every ACK.
+const CAPACITY_TARGET_DEADBAND_PCT: u64 = 5;
 /// x0.8 on sustained congestion, x1.15 after a clean interval (percent).
 const RATE_DECREASE_PCT: u64 = 80;
 const RATE_INCREASE_PCT: u64 = 115;
@@ -420,6 +425,8 @@ pub enum RateReason {
     SustainedSkips,
     /// A clean interval with ACK traffic: step up.
     Clean,
+    /// The measured link capacity moved (constrained link only).
+    Capacity,
 }
 
 impl RateReason {
@@ -428,6 +435,7 @@ impl RateReason {
             Self::RttGrowth => "rtt-growth",
             Self::SustainedSkips => "sustained-skips",
             Self::Clean => "clean",
+            Self::Capacity => "capacity",
         }
     }
 }
@@ -456,10 +464,16 @@ pub fn rate_floor_for_pixels(width: u32, height: u32) -> u64 {
 /// pixels). Budget skips are the first response to a burst; they cut the
 /// bitrate only when they persist for 500 ms without a clean ACK. One clean
 /// second with ACK traffic steps up by x1.15, capped at the profile maximum.
+///
+/// On a constrained link the measured capacity sets a target (80 % of it):
+/// the bitrate follows the target, never steps above it, and the floor gives
+/// way to it (a measured 2 Mbps link cannot carry a 2.5 Mbps floor). With no
+/// target (unconstrained) the controller behaves as above.
 #[derive(Debug)]
 pub struct DelayRateController {
     bitrate_bps: u64,
     max_bps: u64,
+    capacity_target_bps: Option<u64>,
     floor_for_frame_bps: u64,
     rtt_samples: VecDeque<(Instant, f64)>,
     high_rtt_since: Option<Instant>,
@@ -474,6 +488,7 @@ impl DelayRateController {
         let mut controller = Self {
             bitrate_bps,
             max_bps,
+            capacity_target_bps: None,
             floor_for_frame_bps: RATE_FLOOR_1080P_BPS,
             rtt_samples: VecDeque::new(),
             high_rtt_since: None,
@@ -494,9 +509,60 @@ impl DelayRateController {
         self.max_bps
     }
 
-    /// The effective floor: the frame-size floor, but never above the cap.
+    /// The effective floor: the frame-size floor, but never above the cap
+    /// or a capacity target.
     pub fn floor_bps(&self) -> u64 {
-        self.floor_for_frame_bps.min(self.max_bps)
+        self.floor_for_frame_bps
+            .min(self.max_bps)
+            .min(self.capacity_target_bps.unwrap_or(u64::MAX))
+    }
+
+    /// The effective ceiling: the profile maximum, or a lower capacity target.
+    pub fn ceiling_bps(&self) -> u64 {
+        self.max_bps
+            .min(self.capacity_target_bps.unwrap_or(u64::MAX))
+    }
+
+    pub fn capacity_target_bps(&self) -> Option<u64> {
+        self.capacity_target_bps
+    }
+
+    /// A new capacity target from the link estimate (`None`: unconstrained).
+    /// The bitrate moves to the target; moves within the deadband are
+    /// ignored.
+    pub fn set_capacity_target(
+        &mut self,
+        now: Instant,
+        target_bps: Option<u64>,
+    ) -> Option<RateDecision> {
+        let target_bps = target_bps.map(|bps| bps.max(RATE_FLOOR_MIN_BPS));
+        if let (Some(old), Some(new)) = (self.capacity_target_bps, target_bps) {
+            if old.abs_diff(new) * 100 < old * CAPACITY_TARGET_DEADBAND_PCT {
+                return None;
+            }
+        }
+        if target_bps == self.capacity_target_bps {
+            return None;
+        }
+        self.capacity_target_bps = target_bps;
+        let Some(target_bps) = target_bps else {
+            return None;
+        };
+        self.clean_since = now;
+        self.last_increase = now;
+        self.clean_samples = 0;
+        self.high_rtt_since = None;
+        self.skipping_since = None;
+        let previous_bps = self.bitrate_bps;
+        let next = target_bps.min(self.max_bps);
+        (next != previous_bps).then(|| {
+            self.bitrate_bps = next;
+            RateDecision {
+                bitrate_bps: next,
+                previous_bps,
+                reason: RateReason::Capacity,
+            }
+        })
     }
 
     pub fn min_rtt_ms(&self) -> Option<f64> {
@@ -511,7 +577,7 @@ impl DelayRateController {
     /// Profile change: new cap, and the bitrate the encoder now runs at.
     pub fn set_bounds(&mut self, now: Instant, bitrate_bps: u64, max_bps: u64) {
         self.max_bps = max_bps.max(RATE_FLOOR_MIN_BPS);
-        self.bitrate_bps = bitrate_bps.clamp(self.floor_bps(), self.max_bps);
+        self.bitrate_bps = bitrate_bps.clamp(self.floor_bps(), self.ceiling_bps());
         self.clean_since = now;
         self.last_increase = now;
         self.clean_samples = 0;
@@ -588,7 +654,7 @@ impl DelayRateController {
     }
 
     pub fn tick(&mut self, now: Instant) -> Option<RateDecision> {
-        if self.bitrate_bps >= self.max_bps
+        if self.bitrate_bps >= self.ceiling_bps()
             || self.clean_samples == 0
             || now.saturating_duration_since(self.clean_since) < RATE_CLEAN_INTERVAL
             || now.saturating_duration_since(self.last_increase) < RATE_CLEAN_INTERVAL
@@ -600,7 +666,7 @@ impl DelayRateController {
         let previous_bps = self.bitrate_bps;
         let next = (previous_bps * RATE_INCREASE_PCT / 100)
             .max(self.floor_bps())
-            .min(self.max_bps);
+            .min(self.ceiling_bps());
         (next > previous_bps).then(|| {
             self.bitrate_bps = next;
             RateDecision {
@@ -709,6 +775,8 @@ pub struct V4Stats {
     pub bitrate_bps: u64,
     pub min_rtt_ms: f64,
     pub last_rtt_ms: f64,
+    /// Measured capacity of a constrained link (0: unconstrained).
+    pub capacity_bps: u64,
 }
 
 struct Shared {
@@ -716,6 +784,7 @@ struct Shared {
     peer_present: bool,
     policy: SendPolicy,
     rate: DelayRateController,
+    capacity: CapacityEstimator,
     events: V4Events,
     timestamps: TimestampExtender,
     frame_size: (u16, u16),
@@ -759,6 +828,7 @@ impl V4Link {
             peer_present: false,
             policy: SendPolicy::new(now),
             rate: DelayRateController::new(now, bitrate_bps, max_bps),
+            capacity: CapacityEstimator::new(now),
             events: V4Events::default(),
             timestamps: TimestampExtender::default(),
             frame_size: (0, 0),
@@ -858,6 +928,7 @@ impl V4Link {
         match tx.try_send(Outgoing { packet }) {
             Ok(()) => {
                 shared.policy.on_sent(now, generation, seq, bytes, key);
+                shared.capacity.on_sent(now, generation, seq, bytes);
                 shared.stats.frames_sent += 1;
                 shared.stats.bytes_sent += bytes;
                 shared.stats.keyframes_sent += u64::from(key);
@@ -884,6 +955,11 @@ impl V4Link {
         self.lock().rate.bitrate_bps()
     }
 
+    /// Measured capacity of a constrained link; `None` when unconstrained.
+    pub fn capacity(&self) -> Option<Capacity> {
+        self.lock().capacity.capacity()
+    }
+
     pub fn set_bitrate_bounds(&self, bitrate_bps: u64, max_bps: u64) {
         self.lock()
             .rate
@@ -908,6 +984,10 @@ impl V4Link {
             inflight_bytes: shared.policy.inflight_bytes(),
             bitrate_bps: shared.rate.bitrate_bps(),
             min_rtt_ms: shared.rate.min_rtt_ms().unwrap_or(0.0),
+            capacity_bps: shared
+                .capacity
+                .capacity()
+                .map_or(0, |capacity| capacity.bps),
             ..shared.stats
         }
     }
@@ -940,6 +1020,10 @@ fn record_rate_decision(shared: &mut Shared, decision: Option<RateDecision>) {
         bitrate_bps = decision.bitrate_bps,
         previous_bps = decision.previous_bps,
         reason = decision.reason.as_str(),
+        capacity_bps = shared
+            .capacity
+            .capacity()
+            .map_or(0, |capacity| capacity.bps),
         last_rtt_ms = shared.stats.last_rtt_ms,
         min_rtt_ms = shared.rate.min_rtt_ms().unwrap_or(0.0),
         floor_bps = shared.rate.floor_bps(),
@@ -1011,6 +1095,7 @@ fn link_loop(
             // Presence is announced by the relay right after hello.
             state.peer_present = false;
             state.policy.reset(now);
+            state.capacity.forget_inflight();
             if !first {
                 state.stats.reconnects += 1;
             }
@@ -1023,6 +1108,7 @@ fn link_loop(
             state.connected = false;
             state.peer_present = false;
             state.policy.reset(Instant::now());
+            state.capacity.forget_inflight();
         }
         let _ = ws.close(None);
         let _ = ws.flush();
@@ -1106,6 +1192,10 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
             generation, seq, ..
         } => {
             state.stats.acks += 1;
+            state.capacity.on_ack(now, generation, seq);
+            let target = state.capacity.capacity().map(Capacity::target_bps);
+            let decision = state.rate.set_capacity_target(now, target);
+            record_rate_decision(&mut state, decision);
             if let Some(outcome) = state.policy.on_ack(now, generation, seq) {
                 let rtt_ms = outcome.rtt.as_secs_f64() * 1_000.0;
                 state.stats.last_rtt_ms = rtt_ms;
@@ -1133,6 +1223,7 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
         V4Inbound::MediaPeer { present } => {
             state.peer_present = present;
             state.policy.reset(now);
+            state.capacity.forget_inflight();
             if present {
                 state.events.keyframe = Some("peer-joined".into());
             }
@@ -1180,6 +1271,7 @@ fn serve_socket(
         let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
         if state.policy.expire(now) {
             state.stats.ack_timeouts += 1;
+            state.capacity.forget_inflight();
         }
         let decision = state.rate.tick(now);
         record_rate_decision(&mut state, decision);
@@ -1518,6 +1610,47 @@ mod tests {
             rate.tick(ms(start, 11_000)).map(|d| d.bitrate_bps),
             Some(5_750_000)
         );
+    }
+
+    #[test]
+    fn rate_follows_a_capacity_target_below_the_floor() {
+        let start = Instant::now();
+        let mut rate = DelayRateController::new(start, 6_000_000, 6_000_000);
+        // A measured 2 Mbps link: 80 % = 1.6 Mbps, under the 2.5 Mbps floor.
+        let follow = rate.set_capacity_target(start, Some(1_600_000)).unwrap();
+        assert_eq!(
+            (follow.bitrate_bps, follow.reason),
+            (1_600_000, RateReason::Capacity)
+        );
+        assert_eq!(rate.floor_bps(), 1_600_000);
+        // Clean seconds do not step above the target.
+        rate.on_rtt(ms(start, 1_500), 20.0);
+        assert_eq!(rate.tick(ms(start, 2_000)), None);
+        // A move inside the deadband is ignored; a larger one is followed.
+        assert_eq!(
+            rate.set_capacity_target(ms(start, 2_000), Some(1_650_000)),
+            None
+        );
+        let up = rate
+            .set_capacity_target(ms(start, 2_000), Some(2_000_000))
+            .unwrap();
+        assert_eq!(up.bitrate_bps, 2_000_000);
+        // Never above the profile maximum.
+        let capped = rate
+            .set_capacity_target(ms(start, 3_000), Some(20_000_000))
+            .unwrap();
+        assert_eq!(capped.bitrate_bps, 6_000_000);
+        assert_eq!(rate.ceiling_bps(), 6_000_000);
+    }
+
+    #[test]
+    fn rate_without_a_capacity_target_is_unchanged() {
+        let start = Instant::now();
+        let mut rate = DelayRateController::new(start, 3_000_000, 6_000_000);
+        assert_eq!(rate.set_capacity_target(start, None), None);
+        assert_eq!(rate.bitrate_bps(), 3_000_000);
+        assert_eq!(rate.floor_bps(), RATE_FLOOR_1080P_BPS);
+        assert_eq!(rate.ceiling_bps(), 6_000_000);
     }
 
     #[test]
