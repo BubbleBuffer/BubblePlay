@@ -1,0 +1,768 @@
+{
+  "description": "Browser->host input contract shared by worker/public/input.js and host/src/input.rs tests.",
+  "scanKeyPacket": {
+    "type": 13,
+    "length": 6,
+    "flags": {
+      "up": 1,
+      "extended": 2
+    },
+    "layout": "u8 type, u8 flags, u16le scan (0 = VK fallback), u16le vk"
+  },
+  "clipboardPacket": {
+    "type": 12,
+    "headerBytes": 8,
+    "flags": {
+      "paste": 1
+    },
+    "layout": "u8 type, u8 flags, u16le id, u16le index, u16le count, UTF-8 chunk",
+    "chunkBytes": 8192,
+    "maxChunks": 128,
+    "maxBytes": 1048576
+  },
+  "hostClipboardMessage": {
+    "type": "clipboard",
+    "protocol": 1,
+    "chunkBytes": 32768,
+    "maxChunks": 64
+  },
+  "mustBeExtended": [
+    "ArrowUp",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+    "Insert",
+    "Delete",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+    "ControlRight",
+    "AltRight",
+    "NumpadEnter",
+    "NumpadDivide",
+    "MetaLeft",
+    "MetaRight",
+    "ContextMenu",
+    "PrintScreen"
+  ],
+  "vkOnly": {
+    "Pause": 19,
+    "NumLock": 144
+  },
+  "scanCodes": {
+    "Escape": {
+      "scan": 1,
+      "extended": false
+    },
+    "Digit1": {
+      "scan": 2,
+      "extended": false
+    },
+    "Digit2": {
+      "scan": 3,
+      "extended": false
+    },
+    "Digit3": {
+      "scan": 4,
+      "extended": false
+    },
+    "Digit4": {
+      "scan": 5,
+      "extended": false
+    },
+    "Digit5": {
+      "scan": 6,
+      "extended": false
+    },
+    "Digit6": {
+      "scan": 7,
+      "extended": false
+    },
+    "Digit7": {
+      "scan": 8,
+      "extended": false
+    },
+    "Digit8": {
+      "scan": 9,
+      "extended": false
+    },
+    "Digit9": {
+      "scan": 10,
+      "extended": false
+    },
+    "Digit0": {
+      "scan": 11,
+      "extended": false
+    },
+    "Minus": {
+      "scan": 12,
+      "extended": false
+    },
+    "Equal": {
+      "scan": 13,
+      "extended": false
+    },
+    "Backspace": {
+      "scan": 14,
+      "extended": false
+    },
+    "Tab": {
+      "scan": 15,
+      "extended": false
+    },
+    "KeyQ": {
+      "scan": 16,
+      "extended": false
+    },
+    "KeyW": {
+      "scan": 17,
+      "extended": false
+    },
+    "KeyE": {
+      "scan": 18,
+      "extended": false
+    },
+    "KeyR": {
+      "scan": 19,
+      "extended": false
+    },
+    "KeyT": {
+      "scan": 20,
+      "extended": false
+    },
+    "KeyY": {
+      "scan": 21,
+      "extended": false
+    },
+    "KeyU": {
+      "scan": 22,
+      "extended": false
+    },
+    "KeyI": {
+      "scan": 23,
+      "extended": false
+    },
+    "KeyO": {
+      "scan": 24,
+      "extended": false
+    },
+    "KeyP": {
+      "scan": 25,
+      "extended": false
+    },
+    "BracketLeft": {
+      "scan": 26,
+      "extended": false
+    },
+    "BracketRight": {
+      "scan": 27,
+      "extended": false
+    },
+    "Enter": {
+      "scan": 28,
+      "extended": false
+    },
+    "ControlLeft": {
+      "scan": 29,
+      "extended": false
+    },
+    "KeyA": {
+      "scan": 30,
+      "extended": false
+    },
+    "KeyS": {
+      "scan": 31,
+      "extended": false
+    },
+    "KeyD": {
+      "scan": 32,
+      "extended": false
+    },
+    "KeyF": {
+      "scan": 33,
+      "extended": false
+    },
+    "KeyG": {
+      "scan": 34,
+      "extended": false
+    },
+    "KeyH": {
+      "scan": 35,
+      "extended": false
+    },
+    "KeyJ": {
+      "scan": 36,
+      "extended": false
+    },
+    "KeyK": {
+      "scan": 37,
+      "extended": false
+    },
+    "KeyL": {
+      "scan": 38,
+      "extended": false
+    },
+    "Semicolon": {
+      "scan": 39,
+      "extended": false
+    },
+    "Quote": {
+      "scan": 40,
+      "extended": false
+    },
+    "Backquote": {
+      "scan": 41,
+      "extended": false
+    },
+    "ShiftLeft": {
+      "scan": 42,
+      "extended": false
+    },
+    "Backslash": {
+      "scan": 43,
+      "extended": false
+    },
+    "KeyZ": {
+      "scan": 44,
+      "extended": false
+    },
+    "KeyX": {
+      "scan": 45,
+      "extended": false
+    },
+    "KeyC": {
+      "scan": 46,
+      "extended": false
+    },
+    "KeyV": {
+      "scan": 47,
+      "extended": false
+    },
+    "KeyB": {
+      "scan": 48,
+      "extended": false
+    },
+    "KeyN": {
+      "scan": 49,
+      "extended": false
+    },
+    "KeyM": {
+      "scan": 50,
+      "extended": false
+    },
+    "Comma": {
+      "scan": 51,
+      "extended": false
+    },
+    "Period": {
+      "scan": 52,
+      "extended": false
+    },
+    "Slash": {
+      "scan": 53,
+      "extended": false
+    },
+    "ShiftRight": {
+      "scan": 54,
+      "extended": false
+    },
+    "NumpadMultiply": {
+      "scan": 55,
+      "extended": false
+    },
+    "AltLeft": {
+      "scan": 56,
+      "extended": false
+    },
+    "Space": {
+      "scan": 57,
+      "extended": false
+    },
+    "CapsLock": {
+      "scan": 58,
+      "extended": false
+    },
+    "F1": {
+      "scan": 59,
+      "extended": false
+    },
+    "F2": {
+      "scan": 60,
+      "extended": false
+    },
+    "F3": {
+      "scan": 61,
+      "extended": false
+    },
+    "F4": {
+      "scan": 62,
+      "extended": false
+    },
+    "F5": {
+      "scan": 63,
+      "extended": false
+    },
+    "F6": {
+      "scan": 64,
+      "extended": false
+    },
+    "F7": {
+      "scan": 65,
+      "extended": false
+    },
+    "F8": {
+      "scan": 66,
+      "extended": false
+    },
+    "F9": {
+      "scan": 67,
+      "extended": false
+    },
+    "F10": {
+      "scan": 68,
+      "extended": false
+    },
+    "ScrollLock": {
+      "scan": 70,
+      "extended": false
+    },
+    "Numpad7": {
+      "scan": 71,
+      "extended": false
+    },
+    "Numpad8": {
+      "scan": 72,
+      "extended": false
+    },
+    "Numpad9": {
+      "scan": 73,
+      "extended": false
+    },
+    "NumpadSubtract": {
+      "scan": 74,
+      "extended": false
+    },
+    "Numpad4": {
+      "scan": 75,
+      "extended": false
+    },
+    "Numpad5": {
+      "scan": 76,
+      "extended": false
+    },
+    "Numpad6": {
+      "scan": 77,
+      "extended": false
+    },
+    "NumpadAdd": {
+      "scan": 78,
+      "extended": false
+    },
+    "Numpad1": {
+      "scan": 79,
+      "extended": false
+    },
+    "Numpad2": {
+      "scan": 80,
+      "extended": false
+    },
+    "Numpad3": {
+      "scan": 81,
+      "extended": false
+    },
+    "Numpad0": {
+      "scan": 82,
+      "extended": false
+    },
+    "NumpadDecimal": {
+      "scan": 83,
+      "extended": false
+    },
+    "IntlBackslash": {
+      "scan": 86,
+      "extended": false
+    },
+    "F11": {
+      "scan": 87,
+      "extended": false
+    },
+    "F12": {
+      "scan": 88,
+      "extended": false
+    },
+    "NumpadEqual": {
+      "scan": 89,
+      "extended": false
+    },
+    "F13": {
+      "scan": 100,
+      "extended": false
+    },
+    "F14": {
+      "scan": 101,
+      "extended": false
+    },
+    "F15": {
+      "scan": 102,
+      "extended": false
+    },
+    "F16": {
+      "scan": 103,
+      "extended": false
+    },
+    "F17": {
+      "scan": 104,
+      "extended": false
+    },
+    "F18": {
+      "scan": 105,
+      "extended": false
+    },
+    "F19": {
+      "scan": 106,
+      "extended": false
+    },
+    "F20": {
+      "scan": 107,
+      "extended": false
+    },
+    "F21": {
+      "scan": 108,
+      "extended": false
+    },
+    "F22": {
+      "scan": 109,
+      "extended": false
+    },
+    "F23": {
+      "scan": 110,
+      "extended": false
+    },
+    "KanaMode": {
+      "scan": 112,
+      "extended": false
+    },
+    "Lang2": {
+      "scan": 113,
+      "extended": false
+    },
+    "Lang1": {
+      "scan": 114,
+      "extended": false
+    },
+    "IntlRo": {
+      "scan": 115,
+      "extended": false
+    },
+    "F24": {
+      "scan": 118,
+      "extended": false
+    },
+    "Convert": {
+      "scan": 121,
+      "extended": false
+    },
+    "NonConvert": {
+      "scan": 123,
+      "extended": false
+    },
+    "IntlYen": {
+      "scan": 125,
+      "extended": false
+    },
+    "NumpadComma": {
+      "scan": 126,
+      "extended": false
+    },
+    "MediaTrackPrevious": {
+      "scan": 16,
+      "extended": true
+    },
+    "MediaTrackNext": {
+      "scan": 25,
+      "extended": true
+    },
+    "NumpadEnter": {
+      "scan": 28,
+      "extended": true
+    },
+    "ControlRight": {
+      "scan": 29,
+      "extended": true
+    },
+    "AudioVolumeMute": {
+      "scan": 32,
+      "extended": true
+    },
+    "LaunchApp2": {
+      "scan": 33,
+      "extended": true
+    },
+    "MediaPlayPause": {
+      "scan": 34,
+      "extended": true
+    },
+    "MediaStop": {
+      "scan": 36,
+      "extended": true
+    },
+    "AudioVolumeDown": {
+      "scan": 46,
+      "extended": true
+    },
+    "AudioVolumeUp": {
+      "scan": 48,
+      "extended": true
+    },
+    "BrowserHome": {
+      "scan": 50,
+      "extended": true
+    },
+    "NumpadDivide": {
+      "scan": 53,
+      "extended": true
+    },
+    "PrintScreen": {
+      "scan": 55,
+      "extended": true
+    },
+    "AltRight": {
+      "scan": 56,
+      "extended": true
+    },
+    "Home": {
+      "scan": 71,
+      "extended": true
+    },
+    "ArrowUp": {
+      "scan": 72,
+      "extended": true
+    },
+    "PageUp": {
+      "scan": 73,
+      "extended": true
+    },
+    "ArrowLeft": {
+      "scan": 75,
+      "extended": true
+    },
+    "ArrowRight": {
+      "scan": 77,
+      "extended": true
+    },
+    "End": {
+      "scan": 79,
+      "extended": true
+    },
+    "ArrowDown": {
+      "scan": 80,
+      "extended": true
+    },
+    "PageDown": {
+      "scan": 81,
+      "extended": true
+    },
+    "Insert": {
+      "scan": 82,
+      "extended": true
+    },
+    "Delete": {
+      "scan": 83,
+      "extended": true
+    },
+    "MetaLeft": {
+      "scan": 91,
+      "extended": true
+    },
+    "MetaRight": {
+      "scan": 92,
+      "extended": true
+    },
+    "ContextMenu": {
+      "scan": 93,
+      "extended": true
+    },
+    "BrowserSearch": {
+      "scan": 101,
+      "extended": true
+    },
+    "BrowserFavorites": {
+      "scan": 102,
+      "extended": true
+    },
+    "BrowserRefresh": {
+      "scan": 103,
+      "extended": true
+    },
+    "BrowserStop": {
+      "scan": 104,
+      "extended": true
+    },
+    "BrowserForward": {
+      "scan": 105,
+      "extended": true
+    },
+    "BrowserBack": {
+      "scan": 106,
+      "extended": true
+    },
+    "LaunchApp1": {
+      "scan": 107,
+      "extended": true
+    },
+    "LaunchMail": {
+      "scan": 108,
+      "extended": true
+    },
+    "MediaSelect": {
+      "scan": 109,
+      "extended": true
+    }
+  },
+  "packets": [
+    {
+      "name": "arrow-left-down",
+      "bytes": [
+        13,
+        2,
+        75,
+        0,
+        37,
+        0
+      ],
+      "key": {
+        "scan": 75,
+        "extended": true
+      },
+      "up": false
+    },
+    {
+      "name": "altgr-up",
+      "bytes": [
+        13,
+        3,
+        56,
+        0,
+        165,
+        0
+      ],
+      "key": {
+        "scan": 56,
+        "extended": true
+      },
+      "up": true
+    },
+    {
+      "name": "shift-left-down",
+      "bytes": [
+        13,
+        0,
+        42,
+        0,
+        160,
+        0
+      ],
+      "key": {
+        "scan": 42,
+        "extended": false
+      },
+      "up": false
+    },
+    {
+      "name": "pause-vk-down",
+      "bytes": [
+        13,
+        0,
+        0,
+        0,
+        19,
+        0
+      ],
+      "key": {
+        "vk": 19
+      },
+      "up": false
+    },
+    {
+      "name": "clipboard-single-paste",
+      "bytes": [
+        12,
+        1,
+        7,
+        0,
+        0,
+        0,
+        1,
+        0,
+        104,
+        195,
+        169
+      ],
+      "clipboard": {
+        "id": 7,
+        "index": 0,
+        "count": 1,
+        "paste": true,
+        "text": "hé"
+      }
+    }
+  ],
+  "invalidPackets": [
+    [
+      13,
+      4,
+      30,
+      0,
+      0,
+      0
+    ],
+    [
+      13,
+      0,
+      0,
+      1,
+      0,
+      0
+    ],
+    [
+      13,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      12,
+      1,
+      0,
+      0,
+      1,
+      0,
+      1,
+      0
+    ],
+    [
+      12,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      12,
+      2,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      65
+    ]
+  ]
+}
