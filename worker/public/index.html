@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <title>BubblePlay</title>
 <style>
-  :root { color-scheme: dark; --bg:#050507; --glass:rgba(18,18,24,.86); --glass-solid:#15151c; --line:rgba(255,255,255,.14); --muted:#a8a8b4; --text:#f7f7fb; --accent:#9b6cff; --accent-strong:#7c3aed; --good:#65d59a; --warn:#f5c76a; --bad:#ff7187; }
+  :root { color-scheme: dark; }
   * { box-sizing:border-box; }
-  html, body { margin: 0; height: 100%; background: var(--bg); color:var(--text); overflow: hidden; font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  html, body { margin: 0; height: 100%; background: #101214; color:#F3EFE7; overflow: hidden; }
   #stage {
     position: fixed; inset: 0;
     display: flex; align-items: center; justify-content: center;
@@ -27,28 +27,19 @@
     max-width: none; max-height: none; background: transparent; opacity: 0;
   }
   #stage.native-video-input #sharp-screen { display:none; }
-  #hud {
-    display:none; position: fixed; top: 8px; left: 8px; z-index: 30;
-    font: 12px/1.5 ui-monospace, Consolas, monospace;
-    color: #cfc; background: rgba(0,0,0,.55); padding: 6px 10px;
-    border-radius: 6px; pointer-events: none; white-space: pre;
-    user-select: none;
-  }
-  #hud .bad { color: #f77; }
-  #hud .ok  { color: #8f8; }
-  body.diagnostics-mode #hud { display:block; }
-  #desktop-state { position:fixed; left:50%; top:50%; z-index:12; width:min(360px,calc(100vw - 32px)); transform:translate(-50%,-50%); padding:18px 20px; box-sizing:border-box; color:#fff; background:rgba(18,18,24,.92); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 60px #000b; backdrop-filter:blur(18px); font:14px/1.45 system-ui; text-align:center; }
+  #hud { display:none; position: fixed; top: 8px; left: 8px; z-index: 30; font-size: 12px; line-height: 1.5; padding: 6px 10px; border-radius: 6px; pointer-events: none; white-space: pre; user-select: none; }
+  #desktop-state { position:fixed; left:50%; top:50%; z-index:12; width:min(360px,calc(100vw - 32px)); transform:translate(-50%,-50%); padding:18px 20px; text-align:center; font-size:14px; line-height:1.45; }
   body.desktop-unavailable #visual { opacity:.28; }
-  .startup-card-icon { display:grid; place-items:center; width:38px; height:38px; margin:0 auto 10px; border-radius:13px; background:#7c3aed33; color:#c4b5fd; }
+  .startup-card-icon { display:grid; place-items:center; width:38px; height:38px; margin:0 auto 10px; }
   .startup-card-icon svg { width:21px; height:21px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
   #desktop-state-title { display:block; font-weight:700; font-size:15px; }
-  #desktop-state-detail { display:block; margin-top:5px; color:var(--muted); }
-  #first-frame-retry { display:none; margin:13px auto 0; border:1px solid #ffffff2b; border-radius:10px; padding:9px 14px; color:#fff; background:#7c3aed; font:650 13px system-ui; cursor:pointer; }
+  #desktop-state-detail { display:block; margin-top:5px; }
+  #first-frame-retry { display:none; margin:13px auto 0; padding:9px 14px; font-weight:650; font-size:13px; cursor:pointer; }
   #desktop-state[data-state="failed"] #first-frame-retry { display:inline-block; }
   #desktop-state[data-state="unavailable"] #first-frame-retry { display:inline-block; }
   #desktop-state[data-state="starting"] .startup-card-icon svg { animation:startup-spin 1.1s linear infinite; }
   @keyframes startup-spin { to { transform:rotate(360deg); } }
-  #input-surface { position:fixed; inset:0; z-index:3; touch-action:none; overscroll-behavior:none; cursor:default; }
+  #input-surface { position:fixed; inset:0; z-index:3; touch-action:none; overscroll-behavior:none; cursor:default; outline:none; }
   #touch-cursor {
     position:fixed; left:0; top:0; z-index:4; width:24px; height:32px;
     pointer-events:none; opacity:0; transform:translate3d(-100px,-100px,0);
@@ -56,78 +47,36 @@
   }
   #touch-cursor svg { display:block; width:100%; height:100%; overflow:visible; }
   #touch-cursor.visible { opacity:1; }
-  #app-brand { position:fixed; top:max(14px,env(safe-area-inset-top)); left:max(16px,env(safe-area-inset-left)); z-index:11; display:flex; align-items:center; gap:8px; pointer-events:none; font-weight:700; letter-spacing:.02em; text-shadow:0 2px 12px #000; }
-  #app-brand .brand-mark { display:grid; place-items:center; width:28px; height:28px; border-radius:9px; background:linear-gradient(135deg,#a78bfa,#6d28d9); box-shadow:0 5px 18px #0008; font-size:15px; }
-  #connection-status { position:fixed; top:max(14px,env(safe-area-inset-top)); right:max(16px,env(safe-area-inset-right)); z-index:11; display:flex; align-items:center; gap:8px; max-width:min(70vw,360px); padding:8px 11px; border:1px solid var(--line); border-radius:999px; background:var(--glass); box-shadow:0 8px 30px #0007; backdrop-filter:blur(14px); font-size:12px; color:#e9e9ef; pointer-events:auto; }
-  #connection-status .status-dot { width:8px; height:8px; border-radius:50%; background:var(--warn); box-shadow:0 0 0 3px #f5c76a1c; flex:0 0 auto; }
-  #connection-status[data-state="connected"] .status-dot { background:var(--good); box-shadow:0 0 0 3px #65d59a1c; }
-  #connection-status[data-state="error"] .status-dot { background:var(--bad); box-shadow:0 0 0 3px #ff71871c; }
-  #connection-status button { display:none; border:0; background:transparent; color:#fff; padding:0; text-decoration:underline; cursor:pointer; font:inherit; }
-  #connection-status[data-state="error"] button { display:block; }
-  #remote-clipboard { position:fixed; top:calc(max(14px,env(safe-area-inset-top)) + 46px); right:max(16px,env(safe-area-inset-right)); z-index:11; padding:7px 12px; border:1px solid var(--line); border-radius:999px; background:var(--glass); color:#e9e9ef; font:12px system-ui; cursor:pointer; backdrop-filter:blur(14px); }
-  #remote-clipboard[hidden] { display:none; }
-  #controls { position:fixed; inset:auto 0 max(12px,env(safe-area-inset-bottom)); z-index:11; display:flex; justify-content:center; pointer-events:none; padding:0 max(12px,env(safe-area-inset-right)) 0 max(12px,env(safe-area-inset-left)); }
-  #desktop-toolbar, #mobile-toolbar { pointer-events:auto; display:flex; align-items:center; gap:5px; padding:7px; border:1px solid var(--line); border-radius:18px; background:var(--glass); box-shadow:0 12px 40px #0009; backdrop-filter:blur(16px); }
-  #mobile-toolbar { display:none; width:min(100%,520px); justify-content:space-around; border-radius:18px 18px 10px 10px; padding:7px max(6px,env(safe-area-inset-left)) max(7px,env(safe-area-inset-bottom)); }
-  #controls button, #control-sheet button, #control-sheet select { border:1px solid var(--line); border-radius:11px; color:var(--text); background:rgba(22,22,29,.92); padding:9px 11px; font:13px ui-sans-serif,system-ui,sans-serif; cursor:pointer; transition:background .15s,border-color .15s,transform .15s; }
-  #controls button:hover, #control-sheet button:hover, #control-sheet select:hover { background:#292332; border-color:#ffffff38; }
-  #controls button:active, #control-sheet button:active { transform:translateY(1px); }
-  #controls button:focus-visible, #control-sheet button:focus-visible, #control-sheet select:focus-visible, #keyboard-input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-  .ui-action { display:inline-flex; align-items:center; justify-content:center; gap:7px; min-height:38px; white-space:nowrap; }
-  .ui-action .ui-icon { width:17px; height:17px; display:block; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-  #mobile-toolbar .ui-action { flex:1; flex-direction:column; gap:2px; min-width:0; padding:7px 4px; font-size:10px; border-color:transparent; background:transparent; }
-  #mobile-toolbar .ui-action .ui-icon { width:19px; height:19px; }
-  #mobile-toolbar .ui-action:hover { background:#ffffff12; }
-  #control-sheet { position:fixed; left:50%; bottom:0; z-index:20; width:min(720px,100vw); max-height:min(78vh,680px); transform:translate(-50%,0); padding:14px max(16px,env(safe-area-inset-right)) max(18px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left)); box-sizing:border-box; background:rgba(21,21,28,.98); border:1px solid var(--line); border-bottom:0; border-radius:20px 20px 0 0; box-shadow:0 -16px 50px #000c; overflow:auto; }
-  #control-sheet[hidden] { display:none; }
-  .sheet-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
-  .sheet-title { font:700 17px system-ui; }
-  .sheet-subtitle { color:var(--muted); font-size:12px; margin-top:3px; }
-  .sheet-tabs { display:flex; gap:6px; margin-bottom:14px; border-bottom:1px solid var(--line); padding-bottom:8px; }
-  .sheet-tabs button { flex:1; padding:9px 8px !important; }
-  .sheet-tabs button.active { background:var(--accent-strong); border-color:#a78bfa; }
-  .sheet-panel[hidden] { display:none; }
-  .sheet-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(74px,1fr)); gap:7px; }
-  .sheet-grid button { min-height:42px; }
-  .modifier.active { background:#2563eb; border-color:#60a5fa; }
-  #keyboard-input { width:100%; box-sizing:border-box; margin:4px 0 9px; padding:13px 14px; border-radius:11px; border:1px solid var(--line); background:#09090b; color:#fff; font:15px system-ui; }
-  #keyboard-status, #monitor-status { color:var(--muted); font:12px system-ui; margin:8px 2px; min-height:18px; }
-  .monitor-card { display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%; text-align:left; margin:5px 0; }
-  .monitor-card.current { border-color:#8b5cf6; }
-  .monitor-card small { display:block; color:#aaa; margin-top:2px; }
-  .session-actions { display:flex; flex-wrap:wrap; gap:7px; align-items:center; }
-  .settings-section { padding:12px 0; border-top:1px solid var(--line); }
-  .settings-section:first-child { border-top:0; padding-top:0; }
-  .settings-label { font-weight:650; margin-bottom:4px; }
-  .settings-help { color:var(--muted); font-size:12px; line-height:1.45; }
-  #diagnostics-output { max-height:36vh; overflow:auto; white-space:pre-wrap; word-break:break-word; margin:10px 0 0; padding:10px; border:1px solid var(--line); border-radius:10px; background:#09090b; color:#c8facc; font:11px/1.45 ui-monospace,Consolas,monospace; }
   #visual { position:fixed; inset:0; z-index:1; transform-origin:center center; pointer-events:none; }
-  @media (max-width:767px), (any-pointer:coarse) {
-    #app-brand { top:max(10px,env(safe-area-inset-top)); left:max(12px,env(safe-area-inset-left)); font-size:13px; }
-    #app-brand .brand-mark { width:25px; height:25px; border-radius:8px; }
-    #connection-status { top:max(10px,env(safe-area-inset-top)); right:max(10px,env(safe-area-inset-right)); max-width:58vw; padding:7px 9px; }
-    #desktop-toolbar { display:none; }
-    #mobile-toolbar { display:flex; }
-    #controls { bottom:0; padding:0; }
-    #control-sheet { max-height:min(84svh,720px); border-radius:20px 20px 0 0; }
-  }
-  @media (min-width:768px) and (pointer:fine) {
-    #control-sheet { width:min(760px,calc(100vw - 32px)); }
-  }
 </style>
 <link rel="stylesheet" href="/bubbleplay.css">
 </head>
-<body class="session-page mode-work chrome-dock-closed">
-<header id="top-seam">
-  <div id="app-brand" aria-label="BubblePlay">
-    <span class="signal-cut" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 4H4v16h16v-5M15 4h5v5"/><path class="signal-piece" d="m10 14 4-4m-4 0h4v4"/></svg></span>
-    <span class="wordmark">BubblePlay</span>
+<body class="session-page mode-work">
+<!-- Session strip: docked top row (desktop, ≤32 px) or docked bottom bar (touch).
+     The stream is laid out beside it, never under it. -->
+<header id="session-strip" aria-label="Session controls">
+  <div class="strip-status">
+    <div id="connection-status" data-state="connecting" role="status" aria-live="polite" title="Connecting to the host"><span class="status-dot" aria-hidden="true"></span><span id="connection-status-label">Connecting…</span></div>
+    <button id="connection-retry" class="strip-chip strip-chip-accent" type="button" hidden>Retry</button>
+    <div id="secure-desktop-status" hidden role="status" aria-live="polite" title="Windows secure desktop · protected input"><span aria-hidden="true">◆</span><span class="secure-short">Secure desktop</span><span class="sr-only">Windows secure desktop · protected input</span></div>
   </div>
-  <div id="secure-desktop-status" hidden role="status" aria-live="polite"><span aria-hidden="true">◆</span><span>Windows secure desktop · protected input</span></div>
-  <div id="connection-status" data-state="connecting" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="connection-status-label">Connecting…</span><button id="connection-retry" type="button">Retry</button></div>
-  <button id="seam-fullscreen" type="button" title="Fullscreen" aria-label="Toggle fullscreen" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
-  <button id="remote-clipboard" type="button" hidden title="The host clipboard changed while this tab was not focused">Copy remote clipboard</button>
+  <div class="strip-actions" role="toolbar" aria-label="Session actions">
+    <button class="strip-item only-touch" data-ui-action="keyboard" type="button" aria-label="Show keyboard" aria-pressed="false" title="Keyboard"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M6 9h.01M9 9h.01M12 9h.01M15 9h.01M18 9h.01M6 13h.01M9 13h.01M12 13h.01M15 13h3M7 16h10"/></svg></button>
+    <button id="strip-monitors" class="strip-item" data-ui-action="monitors" data-popover="pop-monitors" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Monitors" title="Monitors"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M9 20h6M12 16v4"/></svg></button>
+    <button id="strip-touch-mode" class="strip-item only-touch" data-ui-action="pointer" type="button" aria-pressed="false" aria-label="Touch mode: Work" title="Touch mode"><svg class="ui-icon mode-work-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m10 8.5 6 3.6-2.9.7-1.2 2.9z"/></svg><svg class="ui-icon mode-game-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6.5"/><path d="M12 2.5v5M12 16.5v5M2.5 12h5M16.5 12h5"/></svg></button>
+    <button id="strip-shortcuts" class="strip-item" data-ui-action="shortcuts" data-popover="pop-shortcuts" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Shortcuts" title="Shortcuts"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9V6.5A2.5 2.5 0 1 0 6.5 9H9Zm0 0h6M9 9v6m6-6V6.5A2.5 2.5 0 1 1 17.5 9H15Zm0 0v6m0 0h2.5a2.5 2.5 0 1 1-2.5 2.5V15Zm0 0H9m0 0v2.5A2.5 2.5 0 1 1 6.5 15H9Z"/></svg></button>
+    <button id="strip-keys" class="strip-item only-touch" data-ui-action="keys" data-popover="pop-keys" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Keys" title="Keys"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="m8.5 13 3.5-3.5 3.5 3.5"/></svg><span id="latch-label" class="latch-label" aria-hidden="true"></span></button>
+    <button id="strip-arrows" class="strip-item only-touch" data-ui-action="arrows" data-popover="pop-arrows" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Arrow keys" title="Arrow keys"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3.5-2.5 3h5zM12 20.5l-2.5-3h5zM3.5 12l3-2.5v5zM20.5 12l-3-2.5v5z"/></svg></button>
+    <!-- Files: shown only when the host announces the fileTransfer capability. -->
+    <button id="strip-files" class="strip-item" data-ui-action="files" data-popover="pop-files" type="button" hidden aria-haspopup="dialog" aria-expanded="false" aria-label="Files" title="Files"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H6v18h12V7z"/><path d="M14 3v4h4M12 17v-6M9 14l3-3 3 3"/></svg><span class="strip-badge" aria-hidden="true" hidden></span></button>
+    <button id="remote-clipboard" type="button" hidden title="The host clipboard changed while this tab was not focused">Copy remote clipboard</button>
+    <button id="zoom-reset" class="strip-chip" type="button" hidden aria-label="Reset zoom" title="Reset zoom">1.0×</button>
+    <button id="strip-fullscreen" class="strip-item only-desktop" data-ui-action="fullscreen" type="button" aria-pressed="false" aria-label="Enter fullscreen" title="Fullscreen"><svg class="ui-icon fs-enter" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg><svg class="ui-icon fs-exit" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg></button>
+    <button id="strip-settings" class="strip-item only-desktop" data-ui-action="settings" data-popover="settings-panel" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Settings" title="Settings"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h9M19 7h1M4 17h3M13 17h7"/><circle cx="16" cy="7" r="2.5"/><circle cx="10" cy="17" r="2.5"/></svg></button>
+    <button id="strip-more" class="strip-item only-touch" data-ui-action="more" data-popover="pop-more" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="More" title="More"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h.01M12 12h.01M19 12h.01"/></svg></button>
+  </div>
 </header>
+<button id="strip-handle" type="button" hidden aria-label="Show session controls" title="Show session controls"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></button>
 <div id="visual"><div id="stage"><canvas id="screen"></canvas><canvas id="sharp-screen"></canvas></div></div>
 <div id="input-surface" tabindex="0" aria-label="Remote desktop input"></div>
 <div id="touch-cursor" aria-hidden="true">
@@ -135,54 +84,94 @@
     <path d="M2 2v22l6.2-5.5 5 11 3.8-1.8-5-10.7h9L2 2Z" fill="white" stroke="black" stroke-width="2" stroke-linejoin="round"/>
   </svg>
 </div>
-<div id="controls">
-  <div id="desktop-toolbar" aria-label="Remote desktop controls">
-    <button class="ui-action" data-ui-action="keyboard" type="button" title="Keyboard"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M6 9h.01M9 9h.01M12 9h.01M15 9h.01M18 9h.01M6 13h.01M9 13h.01M12 13h.01M15 13h3M6 16h12"/></svg><span>Keyboard</span></button>
-    <button class="ui-action" data-ui-action="pointer" type="button" title="Switch pointer mode"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 3 13 9-6 1-3 7-4-17Z"/><path d="m14 15 4 4"/></svg><span>Pointer</span></button>
-    <button class="ui-action" data-ui-action="monitors" type="button" title="Choose monitor"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span>Monitor</span></button>
-    <button class="ui-action" data-ui-action="zoom-out" type="button" title="Zoom out"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5M8 10.8h5.5"/></svg><span>Zoom −</span></button>
-    <button class="ui-action" data-ui-action="zoom-in" type="button" title="Zoom in"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5M8 10.8h5.5M10.8 8v5.5"/></svg><span>Zoom +</span></button>
-    <button class="ui-action" data-ui-action="fullscreen" type="button" title="Fullscreen"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5"/></svg><span>Fullscreen</span></button>
-    <button id="open-controls" class="ui-action" data-ui-action="settings" aria-expanded="false" type="button" title="More settings"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 1.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.2h-2.6v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1-1.8-1.8.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H6v-2.6h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.8-1.8.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5V4h2.6v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.8 1.8-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.5 1h.2v2.6h-.2a1.7 1.7 0 0 0-1.5 1Z"/></svg><span>More</span></button>
-  </div>
-  <div id="mobile-toolbar" aria-label="Remote desktop controls">
-    <button class="ui-action" data-ui-action="keyboard" type="button" title="Keyboard"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M6 9h.01M9 9h.01M12 9h.01M15 9h.01M18 9h.01M6 13h.01M9 13h.01M12 13h.01M15 13h3M6 16h12"/></svg><span>Keyboard</span></button>
-    <button class="ui-action" data-ui-action="pointer" type="button" title="Switch pointer mode"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 3 13 9-6 1-3 7-4-17Z"/><path d="m14 15 4 4"/></svg><span>Pointer</span></button>
-    <button class="ui-action" data-ui-action="monitors" type="button" title="Choose monitor"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span>Monitor</span></button>
-    <button class="ui-action" data-ui-action="settings" type="button" title="More settings"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg><span>More</span></button>
-  </div>
+<input id="keyboard-input" class="keyboard-sink" autocomplete="on" autocorrect="on" autocapitalize="sentences" spellcheck="true" aria-label="Remote text input" enterkeyhint="enter">
+<div id="popover-scrim" hidden></div>
+
+<div id="pop-monitors" class="bp-popover" role="dialog" aria-labelledby="pop-monitors-title" hidden>
+  <div id="pop-monitors-title" class="pop-caption">Monitors</div>
+  <div id="monitor-status" class="pop-note" role="status" aria-live="polite">Waiting for monitor information…</div>
+  <div id="monitor-list" class="pop-list" role="radiogroup" aria-labelledby="pop-monitors-title"></div>
 </div>
-<button id="chrome-reveal" type="button" aria-label="Show controls" aria-controls="controls" aria-expanded="false"><span aria-hidden="true">⌄</span><span>Controls</span></button>
-<aside id="control-sheet" hidden aria-hidden="true" role="dialog" aria-modal="false" aria-labelledby="control-sheet-title">
-  <div class="sheet-head"><div><div id="control-sheet-title" class="sheet-title">BubblePlay controls</div><div class="sheet-subtitle">Remote desktop session</div></div><button id="close-controls" aria-label="Close controls" type="button">×</button></div>
-  <div class="sheet-tabs" role="tablist" aria-label="Control sections"><button id="control-tab-keyboard" class="active" data-tab="keyboard" role="tab" aria-selected="true" aria-controls="tab-keyboard" type="button">Keyboard</button><button id="control-tab-monitors" data-tab="monitors" role="tab" aria-selected="false" aria-controls="tab-monitors" tabindex="-1" type="button">Monitors</button><button id="control-tab-session" data-tab="session" role="tab" aria-selected="false" aria-controls="tab-session" tabindex="-1" type="button">Session</button><button id="control-tab-settings" data-tab="settings" role="tab" aria-selected="false" aria-controls="tab-settings" tabindex="-1" type="button">Settings</button></div>
-  <section id="tab-keyboard" class="sheet-panel" role="tabpanel" aria-labelledby="control-tab-keyboard">
-    <input id="keyboard-input" autocomplete="on" autocorrect="on" autocapitalize="sentences" spellcheck="true" aria-label="Remote text input" placeholder="Tap here to open the device keyboard">
-    <div id="modifier-row" class="sheet-grid"><button class="modifier" data-vk="162">Ctrl</button><button class="modifier" data-vk="164">Alt</button><button class="modifier" data-vk="160">Shift</button><button class="modifier" data-vk="91">Win</button><button id="clear-modifiers">Clear</button></div>
-    <div id="special-key-grid" class="sheet-grid" style="margin-top:7px"></div>
-    <div id="keyboard-status">Native text input is ready.</div>
+
+<div id="pop-shortcuts" class="bp-popover" role="dialog" aria-labelledby="pop-shortcuts-title" hidden>
+  <div id="pop-shortcuts-title" class="pop-caption">Send to the remote PC</div>
+  <div id="shortcut-list" class="pop-list"></div>
+  <div class="pop-divider only-desktop" role="separator"></div>
+  <button id="capture" class="pop-row only-desktop" type="button"><span class="pop-row-title">Capture cursor</span><span class="pop-row-detail">For games and pointer-lock apps · Esc releases</span></button>
+</div>
+
+<!-- Files popover: file-ui.js renders the PC's offer and the transfer rows into
+     #file-transfer; the strip icon appears only with the fileTransfer capability. -->
+<div id="pop-files" class="bp-popover pop-wide" role="dialog" aria-labelledby="pop-files-title" hidden>
+  <div id="pop-files-title" class="pop-caption">Files</div>
+  <section id="file-transfer" hidden aria-label="File transfers">
+    <div class="file-offer" data-file-offer hidden role="status" aria-live="polite">
+      <span data-file-offer-label></span>
+      <button type="button" data-file-offer-download>Download</button>
+      <button type="button" class="file-offer-dismiss" data-file-offer-dismiss aria-label="Hide the files offered by the PC">×</button>
+    </div>
+    <ul class="file-list" data-file-list aria-live="polite"></ul>
   </section>
-  <section id="tab-monitors" class="sheet-panel" role="tabpanel" aria-labelledby="control-tab-monitors" hidden><div id="monitor-status">Waiting for monitor information…</div><div id="monitor-list"></div></section>
-  <section id="tab-session" class="sheet-panel" role="tabpanel" aria-labelledby="control-tab-session" hidden>
-    <dl class="session-summary"><dt>Transport</dt><dd id="session-transport">Connecting</dd><dt>Pointer</dt><dd id="session-pointer">Work</dd><dt>Display</dt><dd id="session-display">Waiting for host</dd></dl>
-    <div class="session-actions"><button id="capture">Capture cursor</button><button id="pointer-mode">Mode: Work</button><select id="quality" aria-label="Stream quality"><option value="auto">Auto</option><option value="high">High</option><option value="balanced">Balanced</option><option value="saver">Data Saver</option></select><button id="zoom-out">−</button><button id="zoom-reset">1×</button><button id="zoom-in">+</button><button id="fullscreen">Fullscreen</button></div>
-    <div class="session-danger"><h3>Browser access</h3><p>Sign out keeps this browser approved. Forgetting it requires a new ntfy approval.</p><div class="session-actions"><button id="logout-session" type="button">Sign out</button><button id="forget-browser" type="button">Forget this browser</button></div><p id="session-action-status" role="status" aria-live="polite"></p></div>
+  <button id="file-choose" class="pop-row" type="button"><svg class="pop-row-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V5M7.5 9.5 12 5l4.5 4.5M5 19h14"/></svg><span class="pop-row-title">Choose files…</span><span class="pop-row-detail">Saved in Downloads\BubblePlay on the PC</span></button>
+  <input id="file-picker" type="file" multiple hidden tabindex="-1" aria-hidden="true">
+  <div id="files-status" class="pop-note" role="status" aria-live="polite"></div>
+</div>
+
+<div id="pop-keys" class="bp-popover" role="dialog" aria-labelledby="pop-keys-title" hidden>
+  <div id="pop-keys-title" class="pop-caption">Keys</div>
+  <div id="modifier-row" class="key-grid key-grid-mods"><button class="modifier key" type="button" data-vk="162" aria-pressed="false">Ctrl</button><button class="modifier key" type="button" data-vk="164" aria-pressed="false">Alt</button><button class="modifier key" type="button" data-vk="160" aria-pressed="false">Shift</button><button class="modifier key" type="button" data-vk="91" aria-pressed="false">Win</button><button id="clear-modifiers" class="key" type="button">Clear</button></div>
+  <div id="special-key-grid" class="key-grid"></div>
+  <div id="keyboard-status" class="pop-note" role="status" aria-live="polite">Modifiers stay held until the next key.</div>
+</div>
+
+<div id="pop-arrows" class="bp-popover" role="dialog" aria-labelledby="pop-arrows-title" hidden>
+  <div id="pop-arrows-title" class="pop-caption">Arrow keys</div>
+  <div id="arrow-pad" class="arrow-pad"></div>
+</div>
+
+<div id="pop-more" class="bp-popover" role="dialog" aria-labelledby="pop-more-title" hidden>
+  <div id="pop-more-title" class="pop-caption">More</div>
+  <button id="more-fullscreen" class="pop-row" type="button" data-ui-action="fullscreen"><span class="pop-row-title">Full screen</span><span class="pop-row-trail" id="more-fullscreen-state">Off</span></button>
+  <button id="more-settings" class="pop-row" type="button" data-ui-action="settings"><span class="pop-row-title">Settings</span><span class="pop-row-detail">Quality, input, browser access</span></button>
+</div>
+
+<aside id="settings-panel" class="bp-panel" role="dialog" aria-modal="false" aria-labelledby="settings-title" data-placement="panel" hidden>
+  <div class="panel-head"><h2 id="settings-title">Settings</h2><button id="close-settings" class="panel-close" type="button" aria-label="Close settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+  <section class="settings-section" aria-labelledby="settings-stream">
+    <h3 id="settings-stream">Stream</h3>
+    <label class="setting-row"><span class="setting-text"><span class="setting-label">Quality</span><span class="setting-help">Applies to the running stream.</span></span><select id="quality" aria-label="Stream quality"><option value="auto">Auto</option><option value="high">High</option><option value="balanced">Balanced</option><option value="saver">Data Saver</option></select></label>
   </section>
-  <section id="tab-settings" class="sheet-panel" role="tabpanel" aria-labelledby="control-tab-settings" hidden>
-    <div class="settings-section"><div class="settings-label">Session settings</div><div class="settings-help">Adjust quality and pointer behavior from the Session tab. These controls stay out of the way while you work.</div></div>
-    <div class="settings-section"><div class="settings-label">Diagnostics</div><div class="settings-help">Detailed transport, decoder, latency, and viewport metrics are hidden here during normal use.</div><div class="session-actions" style="margin-top:9px"><button id="open-diagnostics" type="button">Show diagnostics</button><button id="copy-diagnostics" type="button">Copy report</button></div><pre id="diagnostics-output" aria-live="polite">Diagnostics are hidden.</pre></div>
+  <section class="settings-section" aria-labelledby="settings-input">
+    <h3 id="settings-input">Input</h3>
+    <label class="setting-row"><span class="setting-text"><span class="setting-label">Capture keyboard shortcuts in fullscreen</span><span class="setting-help">Keyboard Lock sends Ctrl+W, Alt+Tab and Esc to the remote PC. Hold Esc to leave fullscreen.</span></span><input id="setting-keyboard-lock" class="switch" type="checkbox" role="switch"></label>
+    <label class="setting-row"><span class="setting-text"><span class="setting-label">Scroll speed</span></span><select id="setting-scroll-speed"><option value="0.5">Slow</option><option value="1">Normal</option><option value="1.5">Fast</option><option value="2">Fastest</option></select></label>
+    <label class="setting-row"><span class="setting-text"><span class="setting-label">Pointer</span><span id="session-pointer" class="setting-help">Work · absolute pointer</span></span><select id="setting-pointer-mode"><option value="desktop">Work</option><option value="game">Game</option></select></label>
+  </section>
+  <section class="settings-section" aria-labelledby="settings-display">
+    <h3 id="settings-display">Display</h3>
+    <label class="setting-row"><span class="setting-text"><span class="setting-label">Default monitor for new sessions</span><span id="session-display" class="setting-help">Waiting for host</span></span><select id="setting-default-monitor"><option value="">Host's choice</option></select></label>
+  </section>
+  <section class="settings-section" aria-labelledby="settings-access">
+    <h3 id="settings-access">Browser access</h3>
+    <p class="setting-help">Sign out keeps this browser approved. Forgetting it requires a new ntfy approval.</p>
+    <div class="settings-actions"><button id="logout-session" type="button">Sign out</button><button id="forget-browser" type="button">Forget this browser</button></div>
+    <p id="session-action-status" class="setting-help" role="status" aria-live="polite"></p>
+  </section>
+  <section class="settings-section" aria-labelledby="settings-diagnostics">
+    <details id="diagnostics-details">
+      <summary><h3 id="settings-diagnostics">Diagnostics</h3></summary>
+      <p class="setting-help">Transport, decoder, latency and viewport metrics.</p>
+      <div class="settings-actions"><button id="open-diagnostics" type="button">Show</button><button id="copy-diagnostics" type="button">Copy report</button></div>
+      <pre id="diagnostics-output" aria-live="polite" hidden>Diagnostics are hidden.</pre>
+    </details>
+  </section>
+  <section class="settings-section" aria-labelledby="settings-about">
+    <h3 id="settings-about">About</h3>
+    <dl class="about-list"><dt>Relay</dt><dd id="about-relay">Not reported</dd><dt>Host build</dt><dd id="about-host">Not reported</dd><dt>Receiver</dt><dd id="about-receiver">…</dd></dl>
   </section>
 </aside>
-<!-- File transfer (file-ui.js): hidden unless the host advertises fileTransfer. -->
+<!-- File transfer drop veil (file-ui.js): hidden unless the host advertises fileTransfer. -->
 <div id="file-drop-veil" hidden aria-hidden="true"><div><strong>Drop to send to the PC</strong><span>Saved in Downloads\BubblePlay and put on the PC clipboard.</span></div></div>
-<section id="file-transfer" hidden aria-label="File transfers">
-  <div class="file-offer" data-file-offer hidden role="status" aria-live="polite">
-    <span data-file-offer-label></span>
-    <button type="button" data-file-offer-download>Download</button>
-    <button type="button" class="file-offer-dismiss" data-file-offer-dismiss aria-label="Hide the files offered by the PC">×</button>
-  </div>
-  <ul class="file-list" data-file-list aria-live="polite"></ul>
-</section>
 <aside id="context-hint" hidden><span id="context-hint-copy"></span><button id="dismiss-context-hint" type="button" aria-label="Dismiss control hint">Dismiss</button></aside>
 <div id="hud">connecting…</div>
 <div id="desktop-state" data-state="starting" hidden role="status" aria-live="polite">

@@ -16,6 +16,8 @@ import {
   rememberedRtcFailure, rtpCodecMimeTypes,
 } from "/transport.js";
 import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
+import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyName, shortcutsFor } from "/chrome.js";
+import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
 import { FileTransferClient } from "/file-client.js";
 import { filesFromPaste, installFileTransferUi } from "/file-ui.js";
@@ -101,7 +103,10 @@ function browserStorage() {
 }
 // ?transport= always wins; only auto mode consults the remembered RTC failure.
 const startOnRememberedWss = rememberedRtcFailure(requestedTransport, browserStorage());
-let qualityPreset = parseQualityPreset(params, localStorage);
+// One versioned settings record (settings.js); ?quality= still wins for a page.
+const settings = loadSettings(browserStorage());
+function persistSettings() { saveSettings(browserStorage(), settings); }
+let qualityPreset = parseQualityPreset(params, qualityStorageView(settings));
 const codecSession = createCodecSession({ transport: requestedTransport, decoderPath: useWebCodecs ? "webcodecs" : "native" }); // page-local
 const diagnosticsEnabled = params.get("diag") === "1";
 const profilingEnabled = params.get("profile") === "1" || diagnosticsEnabled;
@@ -383,6 +388,7 @@ let monitorListRevision = 0;
 let monitorSwitchPending = null;
 let lastMonitorRequest = null;
 let lastMonitorError = null;
+let monitorErrorNotice = null; // shown in the Monitors popover until the next list
 function invalidatePendingMonitorRequest(reason) {
   const invalidated = monitorRequestAfterRestart(monitorSwitchPending, reason);
   if (!invalidated) return;
@@ -395,21 +401,56 @@ function renderMonitorList() {
   const status = document.getElementById("monitor-status");
   if (!list || !status) return;
   list.replaceChildren();
-  if (!monitorList.length) { status.textContent = "No monitor information yet."; return; }
-  status.textContent = monitorSwitchPending ? "Switching display…" : "Select a display for the stream.";
+  renderMonitorChrome();
+  if (!monitorList.length) { status.textContent = monitorErrorNotice ? `Monitor switch failed: ${monitorErrorNotice}` : "Waiting for monitor information…"; return; }
+  status.textContent = monitorSwitchPending ? "Switching display…" : monitorErrorNotice ? `Monitor switch failed: ${monitorErrorNotice}` : monitorList.length === 1 ? "The host has one monitor." : "";
   for (const monitor of monitorList) {
     const button = document.createElement("button");
-    button.className = `monitor-card${monitor.selected ? " current" : ""}`;
+    button.type = "button";
+    button.className = "pop-row monitor-row";
+    button.setAttribute("role", "radio");
+    button.setAttribute("aria-checked", String(monitor.selected));
     button.disabled = !!monitorSwitchPending;
-    const label = document.createElement("span");
-    label.textContent = monitor.name || monitor.selector;
-    const detail = document.createElement("small");
-    detail.textContent = `${monitor.width || "?"}×${monitor.height || "?"}${monitor.selected ? " · current" : ""}`;
-    label.append(detail);
-    button.append(label);
-    button.onclick = () => requestMonitor(monitor.selector);
+    button.innerHTML = monitor.selected ? '<svg class="pop-row-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>' : "";
+    const title = document.createElement("span");
+    title.className = "pop-row-title";
+    title.textContent = monitor.name || monitor.selector;
+    const detail = document.createElement("span");
+    detail.className = "pop-row-detail";
+    detail.textContent = `${monitor.width || "?"}×${monitor.height || "?"}`;
+    const trail = document.createElement("span");
+    trail.className = "pop-row-trail";
+    trail.textContent = monitor.selected ? "Current" : monitorSwitchPending === monitor.selector ? "Switching…" : "";
+    button.append(title, detail, trail);
+    button.onclick = () => {
+      if (!monitor.selected) requestMonitor(monitor.selector);
+      popovers.close();
+    };
     list.append(button);
   }
+}
+// Strip icon state and the Settings › Display default-monitor choices.
+function renderMonitorChrome() {
+  const stripButton = document.getElementById("strip-monitors");
+  const single = monitorList.length === 1;
+  stripButton.disabled = single;
+  const label = single ? "Monitors: the host has one monitor" : "Monitors";
+  stripButton.setAttribute("aria-label", label);
+  stripButton.title = label;
+  const select = document.getElementById("setting-default-monitor");
+  const options = [["", "Host's choice"], ...monitorList.map(m => [m.selector, m.name || m.selector])];
+  if (settings.defaultMonitor && !monitorList.some(m => m.selector === settings.defaultMonitor))
+    options.push([settings.defaultMonitor, "Saved monitor (not connected)"]);
+  select.replaceChildren(...options.map(([value, text]) => new Option(text, value)));
+  select.value = settings.defaultMonitor;
+}
+// A saved default monitor is requested once per page, on the first list.
+let defaultMonitorApplied = false;
+function applyDefaultMonitor() {
+  if (defaultMonitorApplied || !settings.defaultMonitor || !monitorList.length) return;
+  defaultMonitorApplied = true;
+  const target = monitorList.find(m => m.selector === settings.defaultMonitor);
+  if (target && !target.selected) requestMonitor(target.selector);
 }
 function handleMonitorList(message) {
   if (!Array.isArray(message.monitors) || message.monitors.length > 16) return;
@@ -418,13 +459,15 @@ function handleMonitorList(message) {
   monitorListRevision++;
   const selected = monitorList.find(m => m.selected);
   const sessionDisplay = document.getElementById("session-display");
-  if (sessionDisplay) sessionDisplay.textContent = selected?.name || "No display selected";
+  if (sessionDisplay) sessionDisplay.textContent = selected ? `Now showing ${selected.name}` : "No display selected";
   if (selected?.width > 0 && selected?.height > 0 && typeof remoteDesktop !== "undefined") {
     remoteDesktop.width = selected.width; remoteDesktop.height = selected.height;
     syncViewportAndFollow?.();
   }
   monitorSwitchPending = null;
+  monitorErrorNotice = null;
   renderMonitorList();
+  applyDefaultMonitor();
 }
 function handleMonitorError(message) {
   monitorSwitchPending = null;
@@ -433,8 +476,7 @@ function handleMonitorError(message) {
     reason: String(message.reason || "unknown error").slice(0, 180),
     atMs: Date.now(),
   };
-  const status = document.getElementById("monitor-status");
-  if (status) status.textContent = `Monitor switch failed: ${lastMonitorError.reason}`;
+  monitorErrorNotice = lastMonitorError.reason;
   renderMonitorList();
 }
 function requestMonitor(selector) {
@@ -474,11 +516,20 @@ function renderConnectionStatus() {
   else if (inputReady && (hudState.ice === "connected" || hudState.ice === "completed" || hudState.ice === "connected/connected")) { state = "connected"; label = "Connected · WebRTC"; }
   else if (hudState.ws.startsWith("reconnecting") || hudState.ws === "closed") { label = "Reconnecting…"; }
   else if (hudState.ws === "error") { state = "error"; label = "Connection error"; }
-  connectionStatus.dataset.state = state;
-  connectionStatusLabel.textContent = label;
-  const sessionTransport = document.getElementById("session-transport");
-  if (sessionTransport) sessionTransport.textContent = label.replace(" · ", " via ");
+  connectionStatusDetail = label.replace(" · ", " via ");
+  // The strip shows a short state; transport and round trip go in the tooltip.
+  const shortLabel = label.split(" · ")[0];
+  const detail = [connectionStatusDetail,
+    hudState.rtt !== "…" ? `round trip ${hudState.rtt} ms` : null,
+    monitorList.find(m => m.selected)?.name || null].filter(Boolean).join(" · ");
+  if (connectionStatus.dataset.state !== state) connectionStatus.dataset.state = state;
+  if (connectionStatusLabel.textContent !== shortLabel) connectionStatusLabel.textContent = shortLabel;
+  if (connectionStatus.title !== detail) connectionStatus.title = detail;
+  const retry = document.getElementById("connection-retry");
+  if (retry.hidden !== (state !== "error")) retry.hidden = state !== "error";
+  document.getElementById("session-strip").classList.toggle("status-error", state === "error");
 }
+let connectionStatusDetail = "Connecting…";
 function qualityHudText() {
   if (!hostQuality) return "quality …";
   const target = `${Math.round(hostQuality.targetBitrateBps / 1_000)}k`;
@@ -750,6 +801,7 @@ async function handleSignal(socket, generation, ev) {
       hudState.ws = "ok";
       currentIceServers = validateIceServers(msg.iceServers);
       mediaEpoch = /^[a-f0-9]{32}$/.test(msg.mediaEpoch || "") ? msg.mediaEpoch : null;
+      renderAbout({ relay: typeof msg.workerVersionId === "string" ? msg.workerVersionId.slice(0, 96) : null });
       // File transfer hook (2/5): file sockets pair on the epoch.
       noteFileEpoch(mediaEpoch);
       sendStreamMode("signaling-start");
@@ -831,6 +883,7 @@ async function handleSignal(socket, generation, ev) {
       hostCapabilitiesGeneration = generation;
       // File transfer hook (3/5): all file UI stays hidden without the capability.
       setFileTransferAvailable(Number.isInteger(msg.fileTransfer) && msg.fileTransfer >= 1);
+      renderFilesSlot();
       if (wssSelected && !usingWssMedia) requestWssMediaStart();
       break;
     case "file-offer":
@@ -2747,7 +2800,6 @@ document.addEventListener("pointerlockchange", () => {
   locked = document.pointerLockElement === inputSurface;
   updatePointerHud();
   if (!locked) releaseInput();
-  scheduleChromeIdle();
 });
 document.addEventListener("click", (event) => {
   if (pointerMode === "game" && event.target === inputSurface && event.detail && event.pointerType !== "touch" && event.pointerType !== "pen" && !event.sourceCapabilities?.firesTouchEvents && performance.now() - lastNonMousePointerAt > 1500 && !locked && connected) requestPointerLock();
@@ -2794,7 +2846,7 @@ document.addEventListener("wheel", (e) => {
   if (!inputReady) return;
   // Accumulate high-resolution deltas into WHEEL_DELTA units (120 per notch),
   // carrying fractions so smooth scrolling never loses distance.
-  const units = wheelAccumulator.add(e.deltaX, e.deltaY, e.deltaMode);
+  const units = wheelAccumulator.add(e.deltaX * settings.scrollSpeed, e.deltaY * settings.scrollSpeed, e.deltaMode);
   if (units.x || units.y) queueMotion(0, 0, units.x, units.y);
   e.preventDefault();
 }, { passive: false });
@@ -2885,7 +2937,7 @@ function updateKeyboardLock() {
   if (!keyboard?.lock) return;
   // Fullscreen streams receive system shortcuts (Ctrl+W, Alt+Tab where the
   // browser allows it, Esc) instead of the local browser.
-  if (document.fullscreenElement) keyboard.lock().catch(() => {}); else keyboard.unlock?.();
+  if (document.fullscreenElement && settings.keyboardLock) keyboard.lock().catch(() => {}); else keyboard.unlock?.();
 }
 document.addEventListener("fullscreenchange", updateKeyboardLock);
 
@@ -2898,7 +2950,7 @@ const held = new Set();
 function keyboardActive() {
   const active = document.activeElement;
   const keyboard = document.getElementById("keyboard-input");
-  const localControlFocused = active !== keyboard && Boolean(active?.closest?.("#controls, #control-sheet, #connection-status"));
+  const localControlFocused = active !== keyboard && Boolean(active?.closest?.("#session-strip, #strip-handle, .bp-popover, .bp-panel, #context-hint, #desktop-state"));
   return shouldCaptureKeyboard({ inputReady, pointerMode, locked,
     surfaceFocused: active === inputSurface, keyboardFocused: active === keyboard, localControlFocused });
 }
@@ -2972,14 +3024,30 @@ const secureCompositionCommit = createCompositionCommitGate(text => {
   handleSecureKeyboardInput({ data: text, inputType: "insertCompositionText" });
 });
 const modifierVks = new Map([["Ctrl", 0x11], ["Alt", 0x12], ["Shift", 0x10], ["Win", 0x5B]]);
+// Keys popover (touch), after the Android app: navigation and editing keys,
+// then function keys. Arrows live in their own popover.
 const specialKeys = [
-  ["Esc", 0x1B], ["Tab", 0x09], ["Enter", 0x0D], ["Backspace", 0x08], ["Delete", 0x2E],
-  ["↑", 0x26], ["↓", 0x28], ["←", 0x25], ["→", 0x27], ["Home", 0x24], ["End", 0x23],
-  ["PgUp", 0x21], ["PgDn", 0x22], ["Insert", 0x2D], ["Space", 0x20],
+  ["Esc", 0x1B], ["Tab", 0x09], ["Home", 0x24], ["End", 0x23], ["PgUp", 0x21], ["PgDn", 0x22],
+  ["Enter", 0x0D], ["Bksp", 0x08], ["Del", 0x2E], ["Ins", 0x2D], ["Space", 0x20], ["Menu", 0x5D],
   ...Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, 0x70 + i]),
 ];
+// Arrow pad: [label, vk, repeats while held, small label].
+const arrowPad = [
+  ["Home", 0x24, false, true], ["↑", 0x26, true], ["PgUp", 0x21, true, true],
+  ["←", 0x25, true], ["Enter", 0x0D, false, true], ["→", 0x27, true],
+  ["End", 0x23, false, true], ["↓", 0x28, true], ["PgDn", 0x22, true, true],
+];
+const modifierNames = new Map([[162, "Ctrl"], [164, "Alt"], [160, "Shift"], [91, "Win"]]);
 function renderKeyboardModifiers() {
-  document.querySelectorAll(".modifier[data-vk]").forEach(button => button.classList.toggle("active", latchedModifiers.has(Number(button.dataset.vk))));
+  document.querySelectorAll(".modifier[data-vk]").forEach(button => {
+    const held = latchedModifiers.has(Number(button.dataset.vk));
+    button.classList.toggle("active", held);
+    button.setAttribute("aria-pressed", String(held));
+  });
+  const names = [...modifierNames].filter(([vk]) => latchedModifiers.has(vk)).map(([, name]) => name);
+  const latch = document.getElementById("latch-label");
+  if (latch) latch.textContent = names.map(name => name[0]).join("");
+  document.getElementById("strip-keys")?.setAttribute("aria-label", names.length ? `Keys, holding ${names.join("+")}` : "Keys");
 }
 function releaseLatchedModifiers() {
   for (const vk of latchedModifiers) input.key(vk, true);
@@ -2993,6 +3061,7 @@ function sendSpecialKey(vk) {
 }
 document.querySelectorAll(".modifier[data-vk]").forEach(button => {
   button.onclick = () => {
+    if (!inputReady) return;
     const vk = Number(button.dataset.vk);
     if (latchedModifiers.has(vk)) { input.key(vk, true); latchedModifiers.delete(vk); }
     else { input.key(vk, false); latchedModifiers.add(vk); }
@@ -3001,11 +3070,65 @@ document.querySelectorAll(".modifier[data-vk]").forEach(button => {
 });
 for (const [label, vk] of specialKeys) {
   const button = document.createElement("button");
-  button.type = "button"; button.textContent = label; button.dataset.vk = String(vk);
+  button.type = "button"; button.className = "key"; button.textContent = label; button.dataset.vk = String(vk);
   button.onclick = () => sendSpecialKey(vk);
   document.getElementById("special-key-grid").append(button);
 }
 document.getElementById("clear-modifiers").onclick = () => releaseLatchedModifiers();
+// Held arrow keys repeat like a physical key: down, repeated downs, then up.
+let heldPadKey = null;
+function stopPadRepeat() {
+  if (!heldPadKey) return;
+  clearTimeout(heldPadKey.timer);
+  if (inputReady) input.key(heldPadKey.vk, true);
+  heldPadKey = null;
+  releaseLatchedModifiers();
+}
+for (const [label, vk, repeats, small] of arrowPad) {
+  const button = document.createElement("button");
+  button.type = "button"; button.className = `key${small ? " key-small" : ""}`; button.textContent = label; button.dataset.vk = String(vk);
+  button.setAttribute("aria-label", { "↑": "Up", "↓": "Down", "←": "Left", "→": "Right" }[label] || label);
+  if (!repeats) button.onclick = () => sendSpecialKey(vk);
+  else {
+    button.addEventListener("pointerdown", event => {
+      event.preventDefault();
+      stopPadRepeat();
+      if (!inputReady) return;
+      input.key(vk, false);
+      const tick = () => { if (heldPadKey?.vk !== vk || !inputReady) return; input.key(vk, false); heldPadKey.timer = setTimeout(tick, 60); };
+      heldPadKey = { vk, timer: setTimeout(tick, 400) };
+    });
+    for (const type of ["pointerup", "pointercancel", "pointerleave"]) button.addEventListener(type, stopPadRepeat);
+    // Keyboard activation (Enter/Space) taps once.
+    button.addEventListener("click", event => { if (event.detail === 0) sendSpecialKey(vk); });
+  }
+  document.getElementById("arrow-pad").append(button);
+}
+// Shortcuts popover: one row per chord, sent as physical keys.
+function sendChord(keys) {
+  if (!inputReady) return false;
+  for (const [code, up] of chordSteps(keys)) input.physicalKey(code, up);
+  return true;
+}
+function renderShortcutList() {
+  const list = document.getElementById("shortcut-list");
+  list.replaceChildren(...shortcutsFor(chromeLayout()).map(shortcut => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "pop-row";
+    row.dataset.shortcut = shortcut.id;
+    const title = document.createElement("span");
+    title.className = "pop-row-title";
+    title.textContent = shortcut.label;
+    const keys = document.createElement("span");
+    keys.className = "pop-row-trail";
+    keys.textContent = chordLabel(shortcut.keys);
+    row.append(title, keys);
+    row.setAttribute("aria-label", `${shortcut.label}, ${shortcut.keys.map(keyName).join(" ")}`);
+    row.onclick = () => { sendChord(shortcut.keys); popovers.close(); };
+    return row;
+  }));
+}
 function resetKeyboardDraft() {
   keyboardComposing = false;
   secureCompositionCommit.reset();
@@ -3086,9 +3209,9 @@ const remoteCursor = new RemoteCursor();
 cursorReconciler = new CursorReconciler(remoteCursor);
 const touchCursor = document.getElementById("touch-cursor");
 const mobilePointerDevice = navigator.maxTouchPoints > 0 && matchMedia("(any-pointer:coarse)").matches;
-const pointerModeButton = document.getElementById("pointer-mode");
+const pointerModeSelect = document.getElementById("setting-pointer-mode");
 const qualitySelect = document.getElementById("quality");
-let pointerMode = localStorage.getItem("bp_pointer_mode") === "game" ? "game" : "desktop";
+let pointerMode = settings.pointerMode === "game" ? "game" : "desktop";
 let cursorSyncTimer = null;
 let locallyAuthoritativeCursor = false;
 let lastCursorCorrectionAt = -Infinity;
@@ -3102,7 +3225,10 @@ let touchCursorVisible = false;
 // A real mouse uses the native pointer; the drawn overlay is for touch/pen.
 let mousePointerActive = false;
 const coarsePointerQuery = matchMedia("(any-pointer:coarse)");
-let chromeIdleTimer = null;
+// The strip layout follows the primary pointer: a touch-first device gets the
+// bottom bar, a mouse-first one (even with a touchscreen) the top strip.
+const touchLayoutQuery = matchMedia("(pointer: coarse)");
+function chromeLayout() { return touchLayoutQuery.matches ? "touch" : "desktop"; }
 const contextHint = document.getElementById("context-hint");
 const contextHintCopy = document.getElementById("context-hint-copy");
 
@@ -3114,43 +3240,10 @@ function syncShellMode() {
   const gameMode = pointerMode === "game";
   document.body.classList.toggle("mode-game", gameMode);
   document.body.classList.toggle("mode-work", !gameMode);
-  document.querySelectorAll('[data-ui-action="pointer"]').forEach(button => {
-    button.setAttribute("aria-pressed", String(gameMode));
-    const label = button.querySelector("span:last-child");
-    if (label) label.textContent = gameMode ? (locked ? "Release" : "Game") : "Work";
-  });
-  if (!gameMode) {
-    clearTimeout(chromeIdleTimer);
-    chromeIdleTimer = null;
-    document.body.classList.remove("chrome-idle");
-  }
-}
-
-function scheduleChromeIdle() {
-  clearTimeout(chromeIdleTimer);
-  chromeIdleTimer = null;
-  document.body.classList.remove("chrome-idle");
-  if (pointerMode !== "game" || (!locked && !coarsePointerQuery.matches) || !controlSheet.hidden) return;
-  chromeIdleTimer = setTimeout(() => document.body.classList.add("chrome-idle"), 1_750);
-}
-
-function revealChrome() {
-  document.body.classList.remove("chrome-idle");
-  scheduleChromeIdle();
-}
-
-function setChromeDockOpen(open, remember = true) {
-  const reveal = document.getElementById("chrome-reveal");
-  const expanded = Boolean(open);
-  document.body.classList.toggle("chrome-dock-closed", !expanded);
-  reveal.setAttribute("aria-expanded", String(expanded));
-  reveal.setAttribute("aria-label", expanded ? "Hide controls" : "Show controls");
-  reveal.querySelector("span:first-child").textContent = expanded ? "⌃" : "⌄";
-  reveal.querySelector("span:last-child").textContent = expanded ? "Hide" : "Controls";
-  if (remember) {
-    try { localStorage.setItem("bp_controls_open", expanded ? "1" : "0"); } catch {}
-  }
-  if (expanded) revealChrome();
+  const touchMode = document.getElementById("strip-touch-mode");
+  touchMode.setAttribute("aria-pressed", String(gameMode));
+  touchMode.setAttribute("aria-label", `Touch mode: ${gameMode ? "Game (relative)" : "Work (pointer)"}`);
+  touchMode.title = gameMode ? "Touch mode: Game" : "Touch mode: Work";
 }
 
 function showContextHint() {
@@ -3161,25 +3254,25 @@ function showContextHint() {
   contextHint.hidden = dismissed;
   contextHint.dataset.mode = mode;
   contextHintCopy.textContent = mode === "game"
-    ? "Capture the pointer to control the game · reveal controls from the edge."
+    ? (chromeLayout() === "touch" ? "Drag to move the pointer · tap to click · Touch mode switches back to Work." : "Click the stream to capture the pointer · Esc releases it.")
     : "Drag to move the pointer · pinch to zoom · two-finger tap to right-click.";
 }
 
 syncPointerCapability();
-coarsePointerQuery.addEventListener?.("change", () => { syncPointerCapability(); scheduleChromeIdle(); });
+coarsePointerQuery.addEventListener?.("change", syncPointerCapability);
 function clearCursorSyncTimer() { if (cursorSyncTimer !== null) clearTimeout(cursorSyncTimer); cursorSyncTimer = null; }
  function updatePointerHud() {
    const workMode = pointerMode === "desktop";
    hudState.pointer = workMode ? "work" : "gaming";
    hudState.cursorSeq = `${cursorReconciler.lastSent ?? "…"}/${cursorReconciler.lastAck ?? "…"}`;
    hudState.cursorAge = cursorReconciler.feedbackAt === null ? "…" : Math.round(performance.now()-cursorReconciler.feedbackAt);
-   pointerModeButton.textContent = `Mode: ${workMode ? "Work" : "Game"}`;
-   pointerModeButton.setAttribute("aria-pressed", String(!workMode));
-   const capture = document.getElementById("capture");
-   capture.disabled = workMode;
-   capture.textContent = workMode ? "Work cursor" : (locked ? "Release cursor" : "Capture cursor");
+   if (pointerModeSelect.value !== pointerMode) pointerModeSelect.value = pointerMode;
+   const captureTitle = document.querySelector("#capture .pop-row-title");
+   const captureText = locked ? "Release cursor" : "Capture cursor";
+   if (captureTitle.textContent !== captureText) captureTitle.textContent = captureText;
    const sessionPointer = document.getElementById("session-pointer");
-   if (sessionPointer) sessionPointer.textContent = workMode ? "Work · authoritative" : (locked ? "Game · captured" : "Game · released");
+   const pointerText = workMode ? "Work · absolute pointer" : (locked ? "Game · cursor captured" : "Game · relative, cursor released");
+   if (sessionPointer && sessionPointer.textContent !== pointerText) sessionPointer.textContent = pointerText;
    syncShellMode();
  }
 function requestCursorSync() {
@@ -3210,7 +3303,7 @@ function setPointerMode(next, persist=true) {
   releaseInput(); gestures.reset(); cursorReconciler.reset(); touchCursorVisible=false; pointerMode=next;
   locallyAuthoritativeCursor=false;
   if (pointerMode === "desktop" && document.pointerLockElement) document.exitPointerLock?.();
-  if (persist) localStorage.setItem("bp_pointer_mode", pointerMode);
+  if (persist) { settings.pointerMode = pointerMode; persistSettings(); }
   if (persist) sendStreamMode("user-mode");
   clearCursorSyncTimer(); updatePointerHud(); renderTouchCursor();
   if (inputReady) {
@@ -3219,7 +3312,6 @@ function setPointerMode(next, persist=true) {
    }
    scheduleSharpViewport("pointer-mode");
    showContextHint();
-   scheduleChromeIdle();
  }
 function streamModeValue() { return pointerMode === "game" ? "game" : "work"; }
 function sendStreamMode(reason) {
@@ -3354,7 +3446,7 @@ function layoutSharpCanvas(crop) {
   sharpScreen.classList.add("active");
   renderedSharpView = crop;
 }
-function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = "0 0"; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); document.getElementById("zoom-reset").textContent = `${s.zoom.toFixed(1)}×`; if (renderedSharpView) layoutSharpCanvas(renderedSharpView); renderTouchCursor(); }
+function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = "0 0"; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); renderZoomChip(s.zoom); if (renderedSharpView) layoutSharpCanvas(renderedSharpView); renderTouchCursor(); }
 function setZoom(next) { syncViewport(); const anchor=mobilePointerDevice && (pointerMode !== "desktop" || !cursorReconciler.synced) ? {x:innerWidth/2,y:innerHeight/2} : remoteCursor.screenPoint(viewport); viewport.setZoom(next, anchor); centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("zoom"); }
 function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); scheduleSharpViewport("pan"); }
 addEventListener("resize", syncViewportAndFollow);
@@ -3380,13 +3472,41 @@ inputSurface.addEventListener("pointermove", e => { if (e.pointerType !== "touch
 inputSurface.addEventListener("pointerup", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.up(e.pointerId,e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointercancel", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.cancel(e.pointerId)); releaseInput(); resetTouchCursor(); hudState.touch = "cancelled"; e.preventDefault(); });
 
-document.getElementById("capture").onclick = e => { e.stopPropagation(); if (pointerMode !== "game") return; if (locked) document.exitPointerLock?.(); else requestPointerLock(); };
-pointerModeButton.onclick = e => { e.stopPropagation(); setPointerMode(pointerMode === "desktop" ? "game" : "desktop"); };
+// ---- session chrome: strip, popovers, settings, fullscreen handle ---------
+// UI only: every action below calls the existing input, monitor, quality and
+// session functions. See chrome.js for the popover and edge-reveal mechanics.
+const sessionStrip = document.getElementById("session-strip");
+const stripHandle = document.getElementById("strip-handle");
+const stripSettingsButton = document.getElementById("strip-settings");
+const popovers = createPopoverController({
+  scrim: document.getElementById("popover-scrim"),
+  surface: inputSurface,
+  layout: chromeLayout,
+  onChange(opened, closed) {
+    if (opened === "pop-monitors") renderMonitorList();
+    if (opened === "pop-shortcuts") renderShortcutList();
+    if (opened === "pop-files") renderFilesSlot();
+    if (closed === "pop-arrows") stopPadRepeat();
+    if (!opened) settleStripPeek();
+  },
+});
+function openPanel(id, anchor, viaKeyboard) { popovers.open(id, document.getElementById(id), anchor, viaKeyboard); }
+
+document.getElementById("capture").onclick = () => {
+  popovers.close();
+  if (locked) { document.exitPointerLock?.(); return; }
+  // Capturing implies Game mode (relative motion); Settings › Input returns to Work.
+  if (pointerMode !== "game") setPointerMode("game");
+  requestPointerLock();
+};
+pointerModeSelect.value = pointerMode;
+pointerModeSelect.onchange = () => setPointerMode(pointerModeSelect.value);
 qualitySelect.value = qualityPreset;
 qualitySelect.onchange = e => {
   e.stopPropagation();
   qualityPreset = qualitySelect.value;
-  try { localStorage.setItem("bp_quality", qualityPreset); } catch {}
+  settings.quality = qualityPreset;
+  persistSettings();
   if (signalingRegistered) {
     const effectiveQuality = qualityPreset === "auto" ? "high" : qualityPreset;
     sendSignal({ type: "media-control", action: "quality", protocol: WSS_PROTOCOL,
@@ -3395,29 +3515,180 @@ qualitySelect.onchange = e => {
       quality: effectiveQuality });
   }
 };
-document.getElementById("zoom-out").onclick = e => { e.stopPropagation(); setZoom(viewport.zoom-.25); };
-document.getElementById("zoom-in").onclick = e => { e.stopPropagation(); setZoom(viewport.zoom+.25); };
-document.getElementById("zoom-reset").onclick = e => { e.stopPropagation(); setZoom(1); };
+const keyboardLockSwitch = document.getElementById("setting-keyboard-lock");
+keyboardLockSwitch.checked = settings.keyboardLock;
+if (!navigator.keyboard?.lock) {
+  keyboardLockSwitch.disabled = true;
+  keyboardLockSwitch.closest(".setting-row").querySelector(".setting-help").textContent = "This browser cannot capture system shortcuts; use Shortcuts in the strip.";
+}
+keyboardLockSwitch.onchange = () => { settings.keyboardLock = keyboardLockSwitch.checked; persistSettings(); updateKeyboardLock(); };
+const scrollSpeedSelect = document.getElementById("setting-scroll-speed");
+scrollSpeedSelect.value = String(settings.scrollSpeed);
+scrollSpeedSelect.onchange = () => { settings.scrollSpeed = Number(scrollSpeedSelect.value); persistSettings(); };
+const defaultMonitorSelect = document.getElementById("setting-default-monitor");
+defaultMonitorSelect.onchange = () => { settings.defaultMonitor = defaultMonitorSelect.value; persistSettings(); renderMonitorChrome(); };
+
+function renderZoomChip(zoom) {
+  const chip = document.getElementById("zoom-reset");
+  if (!chip) return;
+  const zoomed = Math.abs(zoom - 1) > 0.01;
+  if (chip.hidden === zoomed) chip.hidden = !zoomed;
+  if (!zoomed) return;
+  chip.textContent = `${zoom.toFixed(1)}× · Reset`;
+  chip.setAttribute("aria-label", `Reset zoom from ${zoom.toFixed(1)}×`);
+}
+document.getElementById("zoom-reset").onclick = e => { e.stopPropagation(); setZoom(1); inputSurface.focus({ preventScroll: true }); };
+
 function toggleFullscreen(e) { e?.stopPropagation(); if (document.fullscreenElement) document.exitFullscreen?.(); else document.documentElement.requestFullscreen?.(); }
-document.getElementById("fullscreen").onclick = toggleFullscreen;
-document.getElementById("seam-fullscreen").onclick = toggleFullscreen;
 document.addEventListener("fullscreenchange", () => {
   const full = Boolean(document.fullscreenElement);
   document.body.classList.toggle("is-fullscreen", full);
-  document.getElementById("fullscreen").textContent = full ? "Exit fullscreen" : "Fullscreen";
-  const seamButton = document.getElementById("seam-fullscreen");
-  seamButton.setAttribute("aria-pressed", String(full));
-  seamButton.title = full ? "Exit fullscreen" : "Fullscreen";
+  const button = document.getElementById("strip-fullscreen");
+  button.setAttribute("aria-pressed", String(full));
+  button.setAttribute("aria-label", full ? "Exit fullscreen" : "Enter fullscreen");
+  button.title = full ? "Exit fullscreen" : "Fullscreen";
+  document.getElementById("more-fullscreen-state").textContent = full ? "On" : "Off";
+  setStripPeek(false);
+  popovers.reposition();
   requestAnimationFrame(syncViewportAndFollow);
 });
-const controlSheet = document.getElementById("control-sheet");
-const openControls = document.getElementById("open-controls");
+
+// Fullscreen (desktop layout): the strip is hidden. Resting the pointer on the
+// top edge for 300 ms shows a handle; the handle brings the strip back as an
+// overlay that stays while the pointer is on it or a popover is open.
+let stripPeek = false;
+let stripPeekTimer = null;
+const edgeReveal = createEdgeReveal({ delayMs: 300, edgePx: 4, onArm: () => { stripHandle.hidden = false; } });
+function stripHiddenByFullscreen() { return document.body.classList.contains("is-fullscreen") && chromeLayout() === "desktop"; }
+function setStripPeek(on) {
+  clearTimeout(stripPeekTimer);
+  stripPeek = Boolean(on) && stripHiddenByFullscreen();
+  document.body.classList.toggle("strip-peek", stripPeek);
+  stripHandle.hidden = true;
+  edgeReveal.reset();
+}
+function settleStripPeek() {
+  if (!stripPeek) return;
+  clearTimeout(stripPeekTimer);
+  stripPeekTimer = setTimeout(() => {
+    if (!popovers.current && !sessionStrip.matches(":hover")) setStripPeek(false);
+  }, 300);
+}
+document.addEventListener("mousemove", e => {
+  if (!stripHiddenByFullscreen() || locked || stripPeek) return;
+  edgeReveal.move(e.clientY, true);
+  if (!stripHandle.hidden && e.clientY > 28 && e.target !== stripHandle && !stripHandle.contains(e.target)) {
+    stripHandle.hidden = true;
+    edgeReveal.reset();
+  }
+}, { passive: true });
+stripHandle.addEventListener("pointerenter", e => { if (e.pointerType === "mouse") setStripPeek(true); });
+stripHandle.addEventListener("click", () => setStripPeek(true));
+stripHandle.addEventListener("mousedown", e => e.preventDefault());
+sessionStrip.addEventListener("pointerenter", () => clearTimeout(stripPeekTimer));
+sessionStrip.addEventListener("pointerleave", () => { if (stripPeek && !popovers.current) settleStripPeek(); });
+
+// Touch keyboard: a hidden text field raises the soft keyboard; its input is
+// mirrored to the remote by the reconciliation listeners above.
+const keyboardButton = document.querySelector('[data-ui-action="keyboard"]');
+function renderKeyboardButton() {
+  const shown = document.activeElement === keyboardInput;
+  keyboardButton.setAttribute("aria-pressed", String(shown));
+  keyboardButton.setAttribute("aria-label", shown ? "Hide keyboard" : "Show keyboard");
+}
+function toggleTouchKeyboard() {
+  popovers.close({ restore: false });
+  if (document.activeElement === keyboardInput) { keyboardInput.blur(); resetKeyboardDraft(); releaseLatchedModifiers(); }
+  else keyboardInput.focus({ preventScroll: true });
+  renderKeyboardButton();
+}
+keyboardInput.addEventListener("focus", renderKeyboardButton);
+keyboardInput.addEventListener("blur", renderKeyboardButton);
+
+const stripActions = {
+  keyboard: () => toggleTouchKeyboard(),
+  monitors: (button, viaKeyboard) => openPanel("pop-monitors", button, viaKeyboard),
+  pointer: () => { popovers.close(); setPointerMode(pointerMode === "desktop" ? "game" : "desktop"); },
+  shortcuts: (button, viaKeyboard) => openPanel("pop-shortcuts", button, viaKeyboard),
+  keys: (button, viaKeyboard) => openPanel("pop-keys", button, viaKeyboard),
+  arrows: (button, viaKeyboard) => openPanel("pop-arrows", button, viaKeyboard),
+  files: (button, viaKeyboard) => openPanel("pop-files", button, viaKeyboard),
+  more: (button, viaKeyboard) => openPanel("pop-more", button, viaKeyboard),
+  settings: (_button, viaKeyboard) => openPanel("settings-panel", stripSettingsButton, viaKeyboard),
+  fullscreen: () => { popovers.close(); toggleFullscreen(); },
+};
+document.querySelectorAll("[data-ui-action]").forEach(button => {
+  // A pointer press must not move keyboard focus off the remote input surface.
+  button.addEventListener("mousedown", e => e.preventDefault());
+  button.addEventListener("click", e => {
+    e.stopPropagation();
+    stripActions[button.dataset.uiAction]?.(button, e.detail === 0);
+  });
+});
+// Popover keys and rows keep focus (and a raised soft keyboard) where it was.
+document.querySelectorAll(".bp-popover").forEach(panel => panel.addEventListener("mousedown", e => {
+  if (e.target.closest("button")) e.preventDefault();
+}));
+for (const id of ["remote-clipboard", "zoom-reset", "connection-retry"])
+  document.getElementById(id).addEventListener("mousedown", e => e.preventDefault());
+document.getElementById("close-settings").onclick = () => popovers.close();
+addEventListener("resize", () => popovers.reposition());
+touchLayoutQuery.addEventListener?.("change", () => { popovers.close({ restore: false }); setStripPeek(false); renderShortcutList(); });
+
+// Files: the strip icon exists only with the host's fileTransfer capability.
+// file-ui.js renders the offer and transfer rows inside the popover; this
+// keeps the icon's attention dot, the picker and the empty state in step.
+const stripFiles = document.getElementById("strip-files");
+const fileChoose = document.getElementById("file-choose");
+const filePicker = document.getElementById("file-picker");
+const filesStatus = document.getElementById("files-status");
+function renderFilesSlot() {
+  const capable = fileUi.enabled;
+  stripFiles.hidden = !capable;
+  if (!capable) {
+    if (popovers.isOpen("pop-files")) popovers.close({ restore: false });
+    return;
+  }
+  const rows = fileClient.transfers;
+  const running = rows.filter(row => !["done", "failed", "cancelled"].includes(row.state)).length;
+  const offerShown = !document.querySelector("#file-transfer [data-file-offer]").hidden;
+  const badge = stripFiles.querySelector(".strip-badge");
+  badge.hidden = !(running || offerShown);
+  stripFiles.setAttribute("aria-label", offerShown ? "Files, the PC is offering files" : running ? `Files, ${running} ${running === 1 ? "transfer" : "transfers"} running` : "Files");
+  const available = fileTransferAvailable();
+  fileChoose.disabled = !available;
+  filesStatus.textContent = !available
+    ? (desktopKind === "secure" ? "Files are paused on the Windows secure desktop." : "Files are available once remote input is ready.")
+    : rows.length || offerShown ? "" : (chromeLayout() === "touch" ? "Send files to the PC from this device." : "Choose files, or drop or paste them onto the stream.");
+}
+fileClient.addEventListener("change", () => renderFilesSlot());
+// Dismissing the offer re-renders file-ui without a client change event.
+document.getElementById("file-transfer").addEventListener("click", () => queueMicrotask(renderFilesSlot), true);
+fileChoose.onclick = () => {
+  if (!fileTransferAvailable()) { renderFilesSlot(); return; }
+  filePicker.click();
+};
+filePicker.onchange = () => {
+  const files = Array.from(filePicker.files || []);
+  filePicker.value = "";
+  if (files.length && fileTransferAvailable()) fileClient.upload(files, "save");
+  inputSurface.focus({ preventScroll: true });
+};
+
+const aboutState = { relay: null };
+function renderAbout(update = {}) {
+  Object.assign(aboutState, update);
+  document.getElementById("about-relay").textContent = aboutState.relay || "Not reported";
+  document.getElementById("about-host").textContent = "Not reported by this host";
+  document.getElementById("about-receiver").textContent = `${clientBuild} · ${INDEX_ASSET_BUILD}`;
+}
+
 let diagnosticsVisible = diagnosticsEnabled;
 function diagnosticsReport() {
   const view = viewportHealthSnapshot();
   return [
     "TRANSPORT",
-    `state       ${connectionStatusLabel.textContent}`,
+    `state       ${connectionStatusDetail}`,
     `route       ${hudState.route}`,
     `rtt/jitter  ${hudState.rtt} / ${hudState.jit}`,
     `loss        ${hudState.loss}`,
@@ -3444,74 +3715,35 @@ function diagnosticsReport() {
     `generation  ${view.generation}`,
   ].join("\n");
 }
-function selectControlTab(tabName) {
-  const tab = document.querySelector(`.sheet-tabs [data-tab="${tabName}"]`);
-  if (!tab) return;
-  tab.click();
-}
+// ?diag=1 shows the live HUD over the stream; Settings › Diagnostics shows the report.
 function setDiagnosticsVisible(visible) {
   diagnosticsVisible = Boolean(visible);
-  document.body.classList.toggle("diagnostics-mode", diagnosticsVisible);
-  if (diagnosticsOutput) diagnosticsOutput.textContent = diagnosticsVisible ? diagnosticsReport() : "Diagnostics are hidden.";
+  if (diagnosticsOutput) {
+    diagnosticsOutput.hidden = !diagnosticsVisible;
+    diagnosticsOutput.textContent = diagnosticsVisible ? diagnosticsReport() : "Diagnostics are hidden.";
+  }
   const button = document.getElementById("open-diagnostics");
-  if (button) button.textContent = diagnosticsVisible ? "Hide diagnostics" : "Show diagnostics";
+  if (button) button.textContent = diagnosticsVisible ? "Hide" : "Show";
+  if (diagnosticsVisible) document.getElementById("diagnostics-details").open = true;
 }
-function setControlsOpen(open) {
-  controlSheet.hidden = !open;
-  controlSheet.setAttribute("aria-hidden", String(!open));
-  openControls.setAttribute("aria-expanded", String(open));
-  if (!open) { keyboardInput.blur(); resetKeyboardDraft(); releaseLatchedModifiers(); }
-  if (open) document.body.classList.remove("chrome-idle");
-  else scheduleChromeIdle();
-}
-openControls.onclick = e => { e.stopPropagation(); setControlsOpen(controlSheet.hidden); };
-document.getElementById("close-controls").onclick = e => { e.stopPropagation(); setControlsOpen(false); };
-const controlTabs = [...document.querySelectorAll(".sheet-tabs [data-tab]")];
-function activateControlTab(tab, focus = false) {
-  const selected = tab.dataset.tab;
-  controlTabs.forEach(button => {
-    const active = button === tab;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-selected", String(active));
-    button.tabIndex = active ? 0 : -1;
-  });
-  document.querySelectorAll(".sheet-panel").forEach(panel => { panel.hidden = panel.id !== `tab-${selected}`; });
-  if (selected === "monitors") renderMonitorList();
-  if (focus) tab.focus();
-}
-controlTabs.forEach((tab, index) => {
-  tab.onclick = () => activateControlTab(tab);
-  tab.onkeydown = event => {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    event.preventDefault();
-    const direction = event.key === "ArrowRight" ? 1 : -1;
-    activateControlTab(controlTabs[(index + direction + controlTabs.length) % controlTabs.length], true);
-  };
-});
+document.body.classList.toggle("diagnostics-mode", diagnosticsEnabled);
 document.getElementById("open-diagnostics").onclick = e => { e.stopPropagation(); setDiagnosticsVisible(!diagnosticsVisible); };
 document.getElementById("copy-diagnostics").onclick = async e => {
   e.stopPropagation();
+  const button = e.currentTarget;
   setDiagnosticsVisible(true);
   try {
     await navigator.clipboard?.writeText(diagnosticsReport());
-    e.currentTarget.textContent = "Copied";
-    setTimeout(() => { e.currentTarget.textContent = "Copy report"; }, 1400);
-  } catch { e.currentTarget.textContent = "Copy unavailable"; }
+    button.textContent = "Copied";
+    setTimeout(() => { button.textContent = "Copy report"; }, 1400);
+  } catch { button.textContent = "Copy unavailable"; }
 };
 document.getElementById("dismiss-context-hint").onclick = e => {
   e.stopPropagation();
   const mode = contextHint.dataset.mode === "game" ? "game" : "work";
   try { localStorage.setItem(`bp_hint_${mode}_dismissed`, "1"); } catch {}
   contextHint.hidden = true;
-};
-document.getElementById("chrome-reveal").onclick = e => {
-  e.stopPropagation();
-  if (document.body.classList.contains("chrome-idle")) {
-    revealChrome();
-    setChromeDockOpen(true);
-    return;
-  }
-  setChromeDockOpen(document.body.classList.contains("chrome-dock-closed"));
+  inputSurface.focus({ preventScroll: true });
 };
 
 async function endBrowserSession(endpoint, forgetBrowser) {
@@ -3535,32 +3767,15 @@ async function endBrowserSession(endpoint, forgetBrowser) {
 
 document.getElementById("logout-session").onclick = e => { e.stopPropagation(); endBrowserSession("/__auth/logout", false); };
 document.getElementById("forget-browser").onclick = e => { e.stopPropagation(); endBrowserSession("/__auth/forget-browser", true); };
-
-document.addEventListener("pointerdown", () => {
-  if (pointerMode === "game") revealChrome();
-}, { capture: true, passive: true });
-document.addEventListener("mousemove", () => {
-  if (pointerMode === "game" && !locked) revealChrome();
-}, { passive: true });
-document.querySelectorAll("[data-ui-action]").forEach(button => button.addEventListener("click", e => {
-  e.stopPropagation();
-  if (button === openControls) return;
-  const action = button.dataset.uiAction;
-  if (action === "settings") { setControlsOpen(true); selectControlTab("settings"); return; }
-  if (action === "keyboard") { setControlsOpen(true); selectControlTab("keyboard"); setTimeout(() => keyboardInput.focus(), 80); return; }
-  if (action === "monitors") { setControlsOpen(true); selectControlTab("monitors"); return; }
-  const target = document.getElementById(action === "pointer" ? "pointer-mode" : action);
-  if (target) target.click();
-}));
 document.getElementById("connection-retry").onclick = e => { e.stopPropagation(); terminalSignalingFailure = false; restartPeer("user-retry", true); };
 firstFrameRetry.onclick = e => { e.stopPropagation(); startFirstFrameHandshake("user-retry", true); };
-document.addEventListener("keydown", e => { if (e.key === "Escape" && !locked && !controlSheet.hidden) setControlsOpen(false); });
 setPointerMode(pointerMode,false);
-let controlsInitiallyOpen = false;
-try { controlsInitiallyOpen = localStorage.getItem("bp_controls_open") === "1"; } catch {}
-setChromeDockOpen(controlsInitiallyOpen, false);
 setDiagnosticsVisible(diagnosticsEnabled);
-if (diagnosticsEnabled) { setControlsOpen(true); selectControlTab("settings"); }
+renderAbout();
+renderMonitorList();
+renderShortcutList();
+renderKeyboardModifiers();
+renderKeyboardButton();
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function clamp16(v) { return clamp(v, -32768, 32767); }

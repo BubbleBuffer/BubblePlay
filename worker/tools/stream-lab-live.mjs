@@ -2600,7 +2600,7 @@ export class LiveStreamLabSession {
   async collectQuality(candidateId, sceneIds = [...SCENES.map(scene => scene.id), ...HYBRID_SCENES], options = {}) {
     const samplesRoot = join(this.store.path, "samples", safeName(candidateId));
     mkdirSync(samplesRoot, { recursive: true });
-    await this.receiver.evaluate(`(() => { let style=document.querySelector("#stream-lab-capture-style"); if(!style){style=document.createElement("style");style.id="stream-lab-capture-style";style.textContent="#top-seam,#controls,#control-sheet,#touch-cursor,#desktop-state{display:none!important}";document.head.append(style)} return true })()`);
+    await this.receiver.evaluate(`(() => { let style=document.querySelector("#stream-lab-capture-style"); if(!style){style=document.createElement("style");style.id="stream-lab-capture-style";style.textContent="#session-strip,#strip-handle,#popover-scrim,.bp-popover,.bp-panel,#touch-cursor,#desktop-state{display:none!important}";document.head.append(style)} return true })()`);
     const scores = [];
     const capturePlan = buildTemporalCapturePlan(sceneIds, {
       maxSamples: options.maxSamples ?? 12,

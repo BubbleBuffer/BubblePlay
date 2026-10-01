@@ -164,14 +164,19 @@ test("native video keeps an explicit input overlay and diagnostics count present
 
 test("responsive product shell keeps normal controls compact and diagnostics advanced-only", () => {
   const client = readClientSource();
-  assert.match(client, /id="app-brand"/);
   assert.match(client, /id="connection-status"/);
-  assert.match(client, /id="desktop-toolbar"/);
-  assert.match(client, /id="mobile-toolbar"/);
+  assert.match(client, /id="session-strip"/);
   assert.match(client, /data-ui-action="keyboard"/);
   assert.match(client, /data-ui-action="monitors"/);
+  assert.match(client, /data-ui-action="shortcuts"/);
   assert.match(client, /data-ui-action="settings"/);
-  assert.match(client, /id="tab-settings"/);
+  assert.match(client, /data-ui-action="fullscreen"/);
+  assert.match(client, /data-ui-action="more"/);
+  assert.match(client, /id="settings-panel"[^>]*role="dialog"/);
+  // Desktop zoom buttons and the desktop keyboard button are gone; touch zoom stays.
+  assert.doesNotMatch(client, /id="zoom-in"|id="zoom-out"/);
+  assert.match(client, /class="strip-item only-touch" data-ui-action="keyboard"/);
+  assert.match(client, /id="zoom-reset"/);
   assert.match(client, /id="diagnostics-output"/);
   assert.match(client, /function setDiagnosticsVisible\(visible\)/);
   assert.match(client, /params\.get\("diag"\) === "1"/);
@@ -180,20 +185,23 @@ test("responsive product shell keeps normal controls compact and diagnostics adv
   assert.match(client, /desktopKind === "secure"/);
   assert.match(client, /keyboardInput\.setAttribute\("autocorrect", secureDesktop \? "off" : "on"\)/);
   assert.match(client, /secureTextUnits/);
-  assert.match(client, /@media \(max-width:767px\), \(any-pointer:coarse\)/);
-  assert.match(client, /id="mobile-toolbar"[\s\S]*Keyboard[\s\S]*Monitor[\s\S]*More/);
+  // Touch order follows the Android quick-action bar.
+  assert.match(client, /data-ui-action="keyboard"[\s\S]*data-ui-action="monitors"[\s\S]*data-ui-action="pointer"[\s\S]*data-ui-action="shortcuts"[\s\S]*data-ui-action="keys"[\s\S]*data-ui-action="arrows"[\s\S]*data-ui-action="more"/);
 });
 
-test("session controls use a top-edge dock and a persistent reveal tab", () => {
+test("session strip is docked above the stream and hides only in desktop fullscreen", () => {
   const client = readClientSource();
   const styles = readFileSync(new URL("../public/bubbleplay.css", import.meta.url), "utf8");
-  assert.match(client, /id="chrome-reveal"[^>]*aria-expanded="false"/);
-  assert.match(client, /function setChromeDockOpen\(open/);
-  assert.match(styles, /#controls\s*\{[\s\S]*inset:\s*calc\(var\(--top-seam-height\)/);
-  assert.match(styles, /#chrome-reveal\s*\{[\s\S]*top:/);
-  assert.match(styles, /body\.chrome-dock-closed #controls/);
-  assert.doesNotMatch(styles, /#controls\s*\{[\s\S]{0,220}inset:\s*auto 0 0/);
-  assert.doesNotMatch(styles, /#control-sheet\s*\{[\s\S]{0,220}inset:\s*auto 0 0/);
+  assert.match(styles, /--strip-height:\s*32px/);
+  assert.match(styles, /body\.session-page #input-surface \{ top: var\(--strip-top\); bottom: var\(--strip-bottom\); \}/);
+  assert.match(styles, /body\.is-fullscreen \{ --strip-top: 0px; \}/);
+  assert.match(client, /id="strip-handle"/);
+  assert.match(client, /createEdgeReveal\(\{ delayMs: 300/);
+  assert.match(client, /function setStripPeek\(on\)/);
+  // Strip buttons never take keyboard focus from the remote input surface.
+  assert.match(client, /button\.addEventListener\("mousedown", e => e\.preventDefault\(\)\)/);
+  assert.doesNotMatch(client, /id="chrome-reveal"|id="control-sheet"|setChromeDockOpen/);
+  assert.doesNotMatch(styles, /--top-seam-height|#control-sheet/);
 });
 
 test("first-frame startup uses one bounded retry and clears on native or decoded presentation", () => {
@@ -239,7 +247,6 @@ test("BubbleBuffer edge instrument replaces purple glass and exposes adaptive se
   assert.match(login, /href="\/bubbleplay\.css"/);
   assert.match(client, /class="session-page/);
   assert.match(login, /class="auth-page"/);
-  assert.match(client, /class="signal-cut"/);
   assert.match(login, /class="signal-cut"/);
   assert.match(client, /id="context-hint"/);
   assert.match(client, /id="logout-session"/);
@@ -251,8 +258,11 @@ test("BubbleBuffer edge instrument replaces purple glass and exposes adaptive se
   assert.match(client, /endBrowserSession\("\/__auth\/forget-browser", true\)/);
   assert.match(styles, /--bright-apricot:\s*#F0A064/i);
   assert.match(styles, /@font-face[\s\S]*atkinson-hyperlegible-next\.woff2/);
-  assert.match(styles, /@media \(orientation:\s*landscape\)/);
-  assert.match(styles, /body\.mode-game\.chrome-idle/);
+  // Touch layout docks the bar at the bottom with 48px targets (session-ui.md, Web touch).
+  assert.match(styles, /@media \(pointer: coarse\)/);
+  // The session strip stays docked; it never auto-hides (session-ui.md).
+  assert.doesNotMatch(styles, /chrome-idle/);
+  assert.doesNotMatch(client, /chrome-idle/);
   assert.doesNotMatch(styles, /#7c3aed|#9b6cff|backdrop-filter|linear-gradient|radial-gradient/i);
   assert.doesNotMatch(login, /#7c3aed|#9b6cff|backdrop-filter|linear-gradient|radial-gradient/i);
 });
@@ -286,7 +296,8 @@ test("browser signaling uses the remembered server session and never stores an a
 test("WSS fallback negotiates the v4 media socket and keeps the control surface", () => {
   const client = readClientSource();
   assert.match(client, /parseTransport\(params\)/);
-  assert.match(client, /parseQualityPreset\(params, localStorage\)/);
+  assert.match(client, /parseQualityPreset\(params, qualityStorageView\(settings\)\)/);
+  assert.match(client, /settings\.quality = qualityPreset;\s*persistSettings\(\);/);
   assert.match(client, /<select id="quality"/);
   assert.match(client, /action: "quality"/);
   assert.match(client, /quality: qualityPreset === "auto" \? "high" : qualityPreset }\);/);
@@ -311,7 +322,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /case "desktop-state"/);
   assert.match(client, /case "monitor-list"/);
   assert.match(client, /action: "monitor"/);
-  assert.match(client, /id="control-sheet"/);
+  assert.match(client, /id="session-strip"/);
   assert.match(client, /id="keyboard-input"/);
   assert.match(client, /reconcileTextEdit/);
   assert.match(client, /let keyboardShadow = ""/);
@@ -319,7 +330,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /Applied correction/);
   assert.doesNotMatch(client, /keyboardInput\.value = "";\s*\}\);/);
   assert.match(client, /data-vk="162"/);
-  assert.match(client, /function setControlsOpen\(open\)/);
+  assert.match(client, /createPopoverController\(\{/);
   assert.match(client, /desktop-unavailable/);
   assert.match(client, /if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false/);
   assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
@@ -453,7 +464,7 @@ test("mobile press actions atomically warp reliable control to the overlay curso
 
 test("mobile desktop pointer uses absolute targets and authoritative host reconciliation", () => {
   const client = readClientSource();
-  assert.match(client, /Mode: Work/);
+  assert.match(client, /Work · absolute pointer/);
   assert.match(client, /new CursorReconciler\(remoteCursor\)/);
   assert.match(client, /channel\.onmessage[\s\S]*handleCursorState/);
   assert.match(client, /motionChannel\.onmessage[\s\S]*handleCursorState/);
@@ -462,7 +473,8 @@ test("mobile desktop pointer uses absolute targets and authoritative host reconc
   assert.match(client, /action\.type === "motion-end"[\s\S]*setTouchButtonsAtCursor\(touchButtons\)/);
   assert.match(client, /pointerMode === "game"[\s\S]*queueTouchMotion/);
   assert.match(client, /shouldCorrectCursorDrift/);
-  assert.match(client, /capture\.disabled = workMode/);
+  // Capture cursor is always available on desktop: it switches to Game mode and locks the pointer.
+  assert.match(client, /document\.getElementById\("capture"\)\.onclick = \(\) => \{[\s\S]*if \(pointerMode !== "game"\) setPointerMode\("game"\);\s*requestPointerLock\(\);/);
 });
 
 test("desktop input suspension is enforced at the final browser transport boundary", () => {

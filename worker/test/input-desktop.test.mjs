@@ -188,8 +188,10 @@ test("receiver wires physical keys, keyboard lock, wheel accumulation and clipbo
   assert.match(client, /input\.physicalKey\(e\.code, false\)/);
   assert.match(client, /input\.physicalKey\(e\.code, true\)/);
   assert.doesNotMatch(client, /const KEY = \{/);
-  assert.match(client, /wheelAccumulator\.add\(e\.deltaX, e\.deltaY, e\.deltaMode\)/);
-  assert.match(client, /if \(document\.fullscreenElement\) keyboard\.lock\(\)\.catch\(\(\) => \{\}\); else keyboard\.unlock\?\.\(\);/);
+  // Scroll speed and the keyboard-lock preference come from the saved session settings.
+  assert.match(client, /wheelAccumulator\.add\(e\.deltaX \* settings\.scrollSpeed, e\.deltaY \* settings\.scrollSpeed, e\.deltaMode\)/);
+  assert.match(client, /if \(document\.fullscreenElement && settings\.keyboardLock\) keyboard\.lock\(\)\.catch\(\(\) => \{\}\); else keyboard\.unlock\?\.\(\);/);
+  assert.match(client, /keyboardLockSwitch\.onchange = \(\) => \{ settings\.keyboardLock = keyboardLockSwitch\.checked; persistSettings\(\); updateKeyboardLock\(\); \}/);
   assert.match(client, /document\.addEventListener\("fullscreenchange", updateKeyboardLock\)/);
   assert.match(client, /case "clipboard":\s*receiveRemoteClipboard\(msg\);/);
   assert.match(client, /case "host-capabilities":\s*applyInputCapabilities\(null\);/, "stale capabilities reset when a host (re)announces");
