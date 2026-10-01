@@ -20,6 +20,8 @@ use bubbleplay_host::benchmark;
 use bubbleplay_host::capture;
 use bubbleplay_host::encode;
 use bubbleplay_host::feedback_roi;
+use bubbleplay_host::file_service::{FileService, FileServiceConfig};
+use bubbleplay_host::file_transfer::file_rate_cap_bps;
 use bubbleplay_host::frame_damage;
 use bubbleplay_host::hevc_tiles;
 use bubbleplay_host::hybrid;
@@ -601,6 +603,23 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     socket.set_nonblocking(false)?;
     let mapped_addr = stun::discover_mapped_address(&socket, STUN_SERVER).ok();
     let mut signaling = Signaling::connect(&worker, &token, args.host_gate_token.as_deref())?;
+    // File transfer runs only in the user-level host (Downloads, clipboard
+    // and Send To belong to the interactive user) and needs the host bearer
+    // for `/host-file-ws`.
+    let file_service = match args.host_gate_token.as_deref() {
+        Some(bearer) if !args.privileged_agent => {
+            match FileService::spawn(&worker, bearer, FileServiceConfig::from_env()) {
+                Ok(service) => Some(service),
+                Err(error) => {
+                    warn!(error = %format!("{error:#}"), "file transfer unavailable");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    signaling.set_file_transfer(file_service.is_some());
+    let mut next_file_rate_update = Instant::now();
     signaling.send_host_capabilities(
         args.privileged_agent,
         args.privileged_agent,
@@ -1345,6 +1364,31 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             let viewer_live =
                 capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
             local_clipboard.poll(viewer_live, cursor_now, &mut input_sink, &mut signaling);
+        }
+        if let Some(files) = file_service.as_ref() {
+            // The file socket pairs on the live WSS media epoch.
+            files.set_epoch(wss_media.as_ref().and(active_wss_epoch.as_deref()));
+            if cursor_now >= next_file_rate_update {
+                let cap = wss_media.as_ref().map_or(0, |egress| {
+                    file_rate_cap_bps(
+                        egress.capacity().map(|capacity| capacity.bps),
+                        egress.stats().bitrate_bps,
+                    )
+                });
+                files.set_rate_cap_bps(cap);
+                next_file_rate_update = cursor_now + Duration::from_millis(250);
+            }
+            let outbox = files.take_outbox();
+            for text in &outbox.signals {
+                signaling.send_text(text);
+            }
+            for _ in 0..outbox.pastes {
+                if remote_input_ready && capture_available {
+                    input_sink.paste();
+                } else {
+                    info!("file paste skipped: remote input is not ready");
+                }
+            }
         }
         if cursor_now >= next_input_log {
             let stats = input_sink.take_stats();

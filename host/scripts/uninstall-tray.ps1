@@ -41,6 +41,7 @@ $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValue = 'BubblePlayTray'
 $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BubblePlay'
 $StartMenuShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'BubblePlay.lnk'
+$SendToShortcut = Join-Path ([Environment]::GetFolderPath('SendTo')) 'BubblePlay.lnk'
 $DataDir = Join-Path $env:LOCALAPPDATA 'BubblePlay'
 $PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
@@ -155,7 +156,7 @@ try {
         if ($PSCmdlet.ShouldProcess("$RunKey\$RunValue", 'Remove autostart')) { Remove-ItemProperty -Path $RunKey -Name $RunValue; Write-Step 'autostart' 'done' 'Removed.' }
         else { Write-Step 'autostart' 'planned' "Remove HKCU Run\$RunValue." }
     }
-    foreach ($item in @($StartMenuShortcut, $UninstallKey)) {
+    foreach ($item in @($StartMenuShortcut, $SendToShortcut, $UninstallKey)) {
         if (-not (Test-Path -LiteralPath $item)) { continue }
         if ($PSCmdlet.ShouldProcess($item, 'Remove')) { Remove-Item -Recurse -Force -LiteralPath $item; Write-Step 'registration' 'done' "Removed $item." }
         else { Write-Step 'registration' 'planned' "Remove $item." }

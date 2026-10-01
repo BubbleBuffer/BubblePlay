@@ -30,6 +30,7 @@ import {
   validateClientMessageV4,
   validateHostTextV4,
 } from "../public/media-v4.js";
+import { relayAcceptsFilePacket, validFileOffer, FT_MAX_BATCH_FILES, FT_MAX_NAME_BYTES } from "../public/file-transfer.js";
 
 export { ApprovalGate };
 
@@ -93,15 +94,20 @@ function handleWebSocket(request, env) {
   // certificate then didn't match ("remote fingerprint no match").
   const url = new URL(request.url);
   const media = isMediaSocketPath(url.pathname);
+  const file = isFileSocketPath(url.pathname);
   const lab = isLabSocketPath(url.pathname);
-  const namespace = media ? env.MEDIA_ROOM : env.ROOM;
+  // File sockets reuse the MediaRoom class (same pairing code) under their
+  // own room names, so no new Durable Object class or migration is needed.
+  const namespace = media || file ? env.MEDIA_ROOM : env.ROOM;
   const epoch = url.searchParams.get("epoch");
   const run = url.searchParams.get("run");
   // One media Durable Object per browser epoch carries the single v4 socket
   // pair (media down, ACK/keyframe up).
-  const roomName = lab
-    ? (media ? `lab-media-v4:${run}:${epoch}` : `lab-signal-v1:${run}`)
-    : (media ? `media-v4:${epoch}` : "room-v3");
+  const roomName = file
+    ? (lab ? `lab-file-v1:${run}:${epoch}` : `file-v1:${epoch}`)
+    : lab
+      ? (media ? `lab-media-v4:${run}:${epoch}` : `lab-signal-v1:${run}`)
+      : (media ? `media-v4:${epoch}` : "room-v3");
   const roomId = namespace.idFromName(roomName);
   const stub = namespace.get(roomId);
   // Pass the ORIGINAL request straight through. Reconstructing headers here
@@ -113,13 +119,16 @@ function handleWebSocket(request, env) {
 function isHostSocketPath(pathname) {
   return pathname === "/host-ws" || pathname === "/host-media-ws" ||
     pathname === "/lab-host-ws" || pathname === "/lab-host-media-ws" ||
+    pathname === "/host-file-ws" || pathname === "/lab-host-file-ws" ||
     pathname === "/host-version-ws";
 }
 function isBrowserSocketPath(pathname) {
   return pathname === "/ws" || pathname === "/media-ws" ||
-    pathname === "/lab-ws" || pathname === "/lab-media-ws";
+    pathname === "/lab-ws" || pathname === "/lab-media-ws" ||
+    pathname === "/file-ws" || pathname === "/lab-file-ws";
 }
 function isMediaSocketPath(pathname) { return pathname.endsWith("media-ws"); }
+function isFileSocketPath(pathname) { return pathname.endsWith("file-ws"); }
 function isLabSocketPath(pathname) { return pathname.startsWith("/lab-"); }
 function isLocalStreamLabRequest(url, env) {
   return env.STREAM_LAB_LOCAL_BYPASS === "1" &&
@@ -130,7 +139,7 @@ function isLocalLabSocket(url, env) {
 }
 function validSocketRoute(url) {
   if (isLabSocketPath(url.pathname) && !validLabRun(url)) return false;
-  if (!isMediaSocketPath(url.pathname)) return true;
+  if (!isMediaSocketPath(url.pathname) && !isFileSocketPath(url.pathname)) return true;
   return /^[a-f0-9]{32}$/.test(url.searchParams.get("epoch") || "");
 }
 function validLabRun(url) {
@@ -160,9 +169,11 @@ export class Room {
     // fields are not authoritative peer state. Attachments and storage are.
     const url = new URL(request.url);
     const media = isMediaSocketPath(url.pathname);
+    const file = isFileSocketPath(url.pathname);
     const lab = isLabSocketPath(url.pathname);
     const localLab = isLocalLabSocket(url, this.env);
     const expectedRole = url.pathname === "/host-version-ws" ? "version-probe" :
+      file ? (isHostSocketPath(url.pathname) ? "file-host" : "file-client") :
       media ? (isHostSocketPath(url.pathname) ? "media-host" : "media-client") :
         (isHostSocketPath(url.pathname) ? "host" : "client");
     server.serializeAttachment({ role: null, expectedRole,
@@ -180,6 +191,10 @@ export class Room {
     const att = ws.deserializeAttachment() || {};
     if (att.role === "media-host" || att.role === "media-client") {
       this.relayMediaV4(ws, att, message);
+      return;
+    }
+    if (att.role === "file-host" || att.role === "file-client") {
+      this.relayFile(ws, att, message);
       return;
     }
     // WSS media leaves input and cursor on the pre-existing authenticated
@@ -215,7 +230,7 @@ export class Room {
       if (msg.type !== "hello") return;
       const configuredToken = this.env.TOKEN;
       const role = msg.role;
-      if (!["host", "client", "media-host", "media-client", "version-probe"].includes(role) ||
+      if (!["host", "client", "media-host", "media-client", "file-host", "file-client", "version-probe"].includes(role) ||
           role !== att.expectedRole) {
         this.reject(ws, "bad role");
         return;
@@ -224,6 +239,7 @@ export class Room {
       // request reached the room. Do not require or duplicate the relay token
       // inside the media socket hello.
       const tokenOk = role === "client" || role === "media-client" || role === "media-host" ||
+        role === "file-client" || role === "file-host" ||
         (role === "host" && att.localLab === true && this.env.STREAM_LAB_LOCAL_BYPASS === "1") ||
         (typeof configuredToken === "string" && configuredToken.length > 0 && msg.token === configuredToken);
       if (!tokenOk) {
@@ -281,6 +297,13 @@ export class Room {
         const other = this.findPeer(role === "media-host" ? "media-client" : "media-host");
         ws.send(JSON.stringify({ type: "media-peer", present: !!other }));
         try { other?.send(JSON.stringify({ type: "media-peer", present: true })); } catch { /* closing */ }
+      }
+      if (role === "file-host" || role === "file-client") {
+        // A replacement peer starts with no transfer state: the other side
+        // learns about it and resets.
+        const other = this.findPeer(role === "file-host" ? "file-client" : "file-host");
+        ws.send(JSON.stringify({ type: "file-peer", present: !!other }));
+        try { other?.send(JSON.stringify({ type: "file-peer", present: true })); } catch { /* closing */ }
       }
       console.log(`[room] ${role} registered run=${att.run || "-"} target=${registeredAtMs}, hello-ok sent`);
       if (role === "client") {
@@ -347,6 +370,15 @@ export class Room {
         (att.role !== "host" || typeof message !== "string" || utf8Length(message) > 512 ||
          typeof msg.serviceMode !== "boolean" || typeof msg.coldBoot !== "boolean" ||
          typeof msg.secureDesktop !== "boolean" || typeof msg.secureText !== "boolean")) {
+      return;
+    }
+    if (msg.type === "host-capabilities" && msg.fileTransfer !== undefined &&
+        !(Number.isInteger(msg.fileTransfer) && msg.fileTransfer >= 0 && msg.fileTransfer <= 255)) {
+      return;
+    }
+    if (msg.type === "file-offer" &&
+        (att.role !== "host" || typeof message !== "string" || utf8Length(message) > FILE_OFFER_MAX_RAW_BYTES ||
+         !validFileOffer(msg))) {
       return;
     }
     if (msg.type === "host-capabilities") {
@@ -441,6 +473,17 @@ export class Room {
       try { other?.send(JSON.stringify({ type: "media-peer", present: false })); } catch { /* closing */ }
       return;
     }
+    if (role === "file-host" || role === "file-client") {
+      // A transfer never outlives either socket: close the other side so it
+      // cancels whatever was in flight (no resume in v1).
+      const other = this.findPeer(role === "file-host" ? "file-client" : "file-host");
+      if (other) {
+        try { other.serializeAttachment({ ...(other.deserializeAttachment() || {}), replaced: true }); } catch { /* gone */ }
+        this.forgetPeer(other);
+        try { other.close(1001, "file-peer-left"); } catch { /* already closed */ }
+      }
+      return;
+    }
     const peer = role === "host" ? this.findPeer("client") : this.findPeer("host");
     if (peer) {
       try {
@@ -478,6 +521,38 @@ export class Room {
     if (target) {
       try { target.send(message); } catch { /* host closing */ }
     }
+  }
+
+  /**
+   * File transfer v1: binary packets in both directions, each validated on
+   * its own (header, type, payload limits, control JSON); REQUEST only from
+   * the client. A malformed packet closes the sender, and so its peer.
+   * Nothing is buffered: a packet without a live peer is dropped, and the
+   * sender's 1 MiB window bounds what is in flight.
+   */
+  relayFile(ws, att, message) {
+    if (typeof message !== "string") {
+      if (!relayAcceptsFilePacket(message, att.role)) {
+        console.log(`[room] file packet rejected role=${att.role}`);
+        const other = this.findPeer(att.role === "file-host" ? "file-client" : "file-host");
+        this.reject(ws, "bad file packet");
+        if (other) {
+          try { other.serializeAttachment({ ...(other.deserializeAttachment() || {}), replaced: true }); } catch { /* gone */ }
+          this.forgetPeer(other);
+          try { other.close(1001, "file-peer-left"); } catch { /* already closed */ }
+        }
+        return;
+      }
+      const target = this.findPeer(att.role === "file-host" ? "file-client" : "file-host");
+      if (target) {
+        try { target.send(message); } catch { /* peer closing */ }
+      }
+      return;
+    }
+    if (message.length > 256) return;
+    let msg;
+    try { msg = JSON.parse(message); } catch { return; }
+    if (msg?.type === "ping") ws.send(JSON.stringify({ type: "pong" }));
   }
 
   reject(ws, message) {
@@ -523,6 +598,10 @@ export class Room {
 }
 
 export class MediaRoom extends Room {}
+
+// A file-offer lists at most 64 items whose names are at most 1 KiB of
+// UTF-8 each; JSON escaping can grow a name up to 6x.
+const FILE_OFFER_MAX_RAW_BYTES = 256 + FT_MAX_BATCH_FILES * (FT_MAX_NAME_BYTES * 6 + 64);
 
 function binaryLength(value) {
   if (value instanceof ArrayBuffer) return value.byteLength;

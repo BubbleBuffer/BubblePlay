@@ -10,6 +10,9 @@
 //! Modes:
 //!   bubbleplay_tray.exe          tray (single instance)
 //!   bubbleplay_tray.exe --quit   ask a running tray to exit
+//!   bubbleplay_tray.exe --send-files <paths...>
+//!                                hand files to the running host as a file
+//!                                offer (Explorer "Send to > BubblePlay")
 #![windows_subsystem = "windows"]
 
 #[path = "../tray/logic.rs"]
@@ -95,6 +98,7 @@ fn main() {
     let code = match args.next().as_deref() {
         None => run_tray(),
         Some("--quit") => quit_running_tray(),
+        Some("--send-files") => send_files(args.map(PathBuf::from).collect()),
         Some(_) => Ok(2),
     };
     std::process::exit(match code {
@@ -143,7 +147,13 @@ fn supervisor_config(
     test_mode: bool,
 ) -> Result<SupervisorConfig> {
     let exe = std::env::current_exe().context("current_exe")?;
-    let mut extra_env = vec![(ENV_PIPE.to_string(), agent_pipe())];
+    let mut extra_env = vec![
+        (ENV_PIPE.to_string(), agent_pipe()),
+        (
+            "BUBBLEPLAY_SENDTO_DIR".to_string(),
+            sendto_dir().to_string_lossy().into_owned(),
+        ),
+    ];
     if test_mode {
         // Isolated test instance: its agent is an unelevated --dev build.
         extra_env.push((ENV_ALLOW_DEV_AGENT.to_string(), "1".to_string()));
@@ -160,6 +170,26 @@ fn supervisor_config(
 // ---------------------------------------------------------------------------
 // --quit
 // ---------------------------------------------------------------------------
+
+/// Where `--send-files` spools requests for the host (`file_service`).
+fn sendto_dir() -> PathBuf {
+    data_dir().join("sendto")
+}
+
+/// Explorer "Send to > BubblePlay": write a spool request the running host
+/// turns into a file offer. Nothing is sent until the client downloads.
+fn send_files(paths: Vec<PathBuf>) -> Result<i32> {
+    let paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| std::path::absolute(&path).unwrap_or(path))
+        .collect();
+    if paths.is_empty() {
+        return Ok(2);
+    }
+    bubbleplay_host::file_service::write_spool_request(&sendto_dir(), &paths)?;
+    Ok(0)
+}
 
 fn quit_running_tray() -> Result<i32> {
     let class = wide(&scoped(WINDOW_CLASS));
