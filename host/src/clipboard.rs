@@ -132,6 +132,84 @@ pub fn set_text(text: &str) -> Result<u32> {
     Ok(sequence_number())
 }
 
+const CF_HDROP: u32 = 15;
+
+/// Build the CF_HDROP payload: a DROPFILES header (20 bytes, wide names)
+/// followed by NUL-terminated UTF-16 paths and a final NUL.
+pub fn hdrop_bytes(paths: &[std::path::PathBuf]) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    const HEADER: u32 = 20;
+    let mut out = Vec::new();
+    out.extend_from_slice(&HEADER.to_le_bytes()); // pFiles
+    out.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+    out.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+    out.extend_from_slice(&0i32.to_le_bytes()); // fNC
+    out.extend_from_slice(&1i32.to_le_bytes()); // fWide
+    for path in paths {
+        for unit in path.as_os_str().encode_wide() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+    }
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// Put `paths` on the clipboard as a file list (what Explorer's Ctrl+C
+/// puts there) and return the resulting sequence number.
+pub fn set_files(paths: &[std::path::PathBuf]) -> Result<u32> {
+    if paths.is_empty() {
+        bail!("no files to place on the clipboard");
+    }
+    if !input_desktop_is_default() {
+        bail!("clipboard is unavailable outside the default desktop");
+    }
+    let bytes = hdrop_bytes(paths);
+    let _guard = OpenClipboardGuard::open()?;
+    unsafe { EmptyClipboard() }.context("EmptyClipboard")?;
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }.context("GlobalAlloc")?;
+    let target = unsafe { GlobalLock(memory) } as *mut u8;
+    if target.is_null() {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        bail!("GlobalLock failed for clipboard file list");
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len());
+        let _ = GlobalUnlock(memory);
+    }
+    if let Err(error) = unsafe { SetClipboardData(CF_HDROP, Some(HANDLE(memory.0))) } {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        return Err(error).context("SetClipboardData(CF_HDROP)");
+    }
+    Ok(sequence_number())
+}
+
+/// The clipboard's file list (CF_HDROP), or `None` when it holds no files.
+pub fn read_files() -> Result<Option<Vec<std::path::PathBuf>>> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    if !input_desktop_is_default() {
+        bail!("clipboard is unavailable outside the default desktop");
+    }
+    let _guard = OpenClipboardGuard::open()?;
+    let Ok(handle) = (unsafe { GetClipboardData(CF_HDROP) }) else {
+        return Ok(None);
+    };
+    let drop = HDROP(handle.0);
+    let count = unsafe { DragQueryFileW(drop, u32::MAX, None) };
+    let mut paths = Vec::new();
+    for index in 0..count {
+        let length = unsafe { DragQueryFileW(drop, index, None) } as usize;
+        let mut buffer = vec![0u16; length + 1];
+        let written = unsafe { DragQueryFileW(drop, index, Some(&mut buffer)) } as usize;
+        buffer.truncate(written);
+        paths.push(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+            &buffer,
+        )));
+    }
+    Ok(Some(paths))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardText {
     Text(String),
@@ -237,6 +315,22 @@ mod tests {
             "a\r\nb\r\nc\r\n"
         );
         assert_eq!(normalize_newlines_for_windows("plain"), "plain");
+    }
+
+    #[test]
+    fn hdrop_payload_is_a_wide_double_nul_list() {
+        let bytes = hdrop_bytes(&[
+            std::path::PathBuf::from(r"C:\a.txt"),
+            std::path::PathBuf::from("b"),
+        ]);
+        assert_eq!(&bytes[0..4], &20u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &1i32.to_le_bytes());
+        let units: Vec<u16> = bytes[20..]
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let expected: Vec<u16> = "C:\\a.txt\0b\0\0".encode_utf16().collect();
+        assert_eq!(units, expected);
     }
 
     #[test]

@@ -784,3 +784,82 @@ body.has-presented-frame #first-frame-retry { margin: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.001ms !important; animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* ---- Files popover (file-ui.js renders #file-transfer inside #pop-files) ---- */
+
+.bp-popover.pop-wide { width: min(360px, calc(100vw - 16px)); }
+
+/* Attention dot: the PC is offering files, or a transfer is running. */
+.strip-badge {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  width: 6px;
+  height: 6px;
+  background: var(--bright-apricot);
+  border-radius: 50%;
+}
+.strip-badge[hidden] { display: none; }
+
+#file-transfer { display: grid; gap: 6px; margin-bottom: 6px; }
+#file-transfer[hidden],
+#file-transfer [hidden] { display: none; }
+
+#file-transfer .file-offer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px 4px 10px;
+  background: var(--dark-surface);
+  border: 1px solid var(--thread);
+  border-left: 3px solid var(--bright-apricot);
+  border-radius: 6px 9px 5px 8px;
+}
+#file-transfer .file-offer span { flex: 1; min-width: 0; font-weight: 650; }
+#file-transfer button { min-height: 30px; padding: 4px 10px; font-size: 12px; font-weight: 650; }
+#file-transfer [data-file-offer-download] { color: var(--duvet-ink); background: var(--bright-apricot); border-color: var(--bright-apricot); }
+#file-transfer [data-file-offer-download]:hover { background: var(--calico-apricot); }
+#file-transfer .file-offer-dismiss { min-width: 30px; padding: 4px; background: transparent; }
+
+#file-transfer .file-list { display: grid; gap: 4px; max-height: 40vh; margin: 0; padding: 0; overflow: auto; list-style: none; }
+#file-transfer .file-list:empty { display: none; }
+#file-transfer .file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  align-items: center;
+  padding: 6px 6px 6px 10px;
+  background: var(--dark-surface);
+  border: 1px solid var(--thread);
+  border-radius: 6px 9px 5px 8px;
+}
+#file-transfer .file-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+#file-transfer .file-row-bar { grid-column: 1 / -1; height: 4px; overflow: hidden; background: var(--dark-muted); border-radius: 2px; }
+#file-transfer .file-row-bar span { display: block; height: 100%; background: var(--bright-apricot); transition: width 120ms linear; }
+#file-transfer .file-row-status { grid-column: 1 / -1; color: var(--muted-cream); font-size: 12px; }
+#file-transfer .file-row[data-state="done"] .file-row-bar span { background: var(--eye-moss); }
+#file-transfer .file-row[data-state="failed"] { border-left: 3px solid var(--danger); }
+#file-transfer .file-row[data-state="failed"] .file-row-status { color: var(--danger); }
+#file-transfer .file-row[data-state="failed"] .file-row-bar,
+#file-transfer .file-row[data-state="cancelled"] .file-row-bar { display: none; }
+
+#file-drop-veil {
+  position: fixed;
+  z-index: 16;
+  inset: var(--strip-top) 0 var(--strip-bottom);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--calico-black) 62%, transparent);
+  border: 2px solid var(--bright-apricot);
+}
+#file-drop-veil[hidden] { display: none; }
+#file-drop-veil div { display: grid; gap: 4px; max-width: 420px; padding: 16px 20px; text-align: center; background: var(--duvet); border: 1px solid var(--thread-strong); border-radius: 8px 12px 7px 10px; }
+#file-drop-veil strong { font-family: "Bricolage Grotesque", "Segoe UI", sans-serif; font-size: 20px; font-weight: 660; }
+#file-drop-veil span { color: var(--muted-cream); }
+
+@media (pointer: coarse) {
+  .strip-badge { top: 9px; right: 10px; }
+  #file-transfer button { min-height: 44px; }
+}

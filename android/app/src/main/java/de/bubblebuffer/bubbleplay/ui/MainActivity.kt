@@ -10,6 +10,7 @@ import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
@@ -17,14 +18,17 @@ import android.widget.ScrollView
 import android.widget.TextView
 import de.bubblebuffer.bubbleplay.R
 import de.bubblebuffer.bubbleplay.net.ServerConfig
+import de.bubblebuffer.bubbleplay.net.Session
 
 /** Launcher: server settings, then sign-in (WebView gate) or straight to the stream. */
-class MainActivity : Activity() {
+class MainActivity : Activity(), SettingsView.Host {
     private lateinit var prefs: Prefs
     private lateinit var server: EditText
     private lateinit var labRun: EditText
     private lateinit var codec: RadioGroup
     private lateinit var message: TextView
+    private lateinit var frame: FrameLayout
+    private var settingsView: SettingsView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -84,6 +88,10 @@ class MainActivity : Activity() {
             setOnClickListener { connect(forceLogin = true) }
         })
         column.addView(Button(this).apply {
+            setText(R.string.settings_open)
+            setOnClickListener { openSettings() }
+        })
+        column.addView(Button(this).apply {
             setText(R.string.forget_browser)
             setOnClickListener {
                 CookieManager.getInstance().removeAllCookies(null)
@@ -91,12 +99,63 @@ class MainActivity : Activity() {
                 message.setText(R.string.forgot_browser)
             }
         })
-        setContentView(ScrollView(this).apply {
+        frame = FrameLayout(this).apply {
             setBackgroundColor(0xFF10141A.toInt())
-            fitsSystemWindows = true // API 35 draws edge-to-edge; keep the form clear of the bars.
-            addView(column)
-        })
-        if (intent.getBooleanExtra(EXTRA_AUTH_EXPIRED, false)) message.setText(R.string.auth_expired)
+            fitsSystemWindows = true // API 35 draws edge-to-edge; keep the form and settings clear of the bars.
+        }
+        frame.addView(ScrollView(this).apply { addView(column) })
+        setContentView(frame)
+        showIntentMessage(intent)
+    }
+
+    private fun showIntentMessage(intent: Intent?) {
+        when {
+            intent?.getBooleanExtra(EXTRA_SIGNED_OUT, false) == true -> message.setText(R.string.settings_signed_out_notice)
+            intent?.getBooleanExtra(EXTRA_AUTH_EXPIRED, false) == true -> message.setText(R.string.auth_expired)
+        }
+    }
+
+    // ---- settings view -------------------------------------------------------------------------
+    private fun openSettings() {
+        if (settingsView != null) return
+        // Unsaved edits to the server field are kept as the starting value.
+        ServerConfig.parseServer(server.text.toString())?.let { prefs.server = it.toString() }
+        val view = SettingsView(this, prefs, this)
+        settingsView = view
+        frame.addView(view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    }
+
+    override fun closeSettings() {
+        val view = settingsView ?: return
+        (getSystemService(INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager).hideSoftInputFromWindow(view.windowToken, 0)
+        frame.removeView(view)
+        settingsView = null
+        // The form shows what Settings saved.
+        server.setText(prefs.server)
+        codec.findViewWithTag<RadioButton>(prefs.codec)?.isChecked = true
+    }
+
+    override val settingsConfig: ServerConfig? get() = prefs.serverConfig()
+    override val inSession: Boolean get() = false
+    override val settingsMonitors: List<Session.Monitor> get() = emptyList()
+    override fun diagnostics(): Session.Diagnostics? = null
+    override fun probeRoundTrip() {}
+    override fun onSettingChanged(setting: SettingsView.Setting) {}
+
+    override fun signOut() {
+        val config = prefs.serverConfig() ?: return
+        Prefs.signOut(config) {
+            message.setText(R.string.settings_signed_out_notice)
+            settingsView?.connectionChanged()
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (settingsView != null) closeSettings() else {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
     }
 
     private fun connect(forceLogin: Boolean) {
@@ -110,7 +169,14 @@ class MainActivity : Activity() {
         val config = prefs.serverConfig() ?: return
         val signedIn = ServerConfig.hasSessionCookies(Prefs.cookieHeader(config))
         val next = if (config.isLab || (signedIn && !forceLogin)) StreamActivity::class.java else LoginActivity::class.java
-        startActivity(Intent(this, next).putExtra(LoginActivity.EXTRA_FORCE, forceLogin))
+        startActivity(PendingShares.attach(Intent(this, next).putExtra(LoginActivity.EXTRA_FORCE, forceLogin), PendingShares.read(intent)))
+        PendingShares.consume(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent) // shares from the share sheet, kept until Connect
+        showIntentMessage(intent)
     }
 
     private fun label(text: Int) = TextView(this).apply {
@@ -124,5 +190,6 @@ class MainActivity : Activity() {
 
     companion object {
         const val EXTRA_AUTH_EXPIRED = "authExpired"
+        const val EXTRA_SIGNED_OUT = "signedOut"
     }
 }

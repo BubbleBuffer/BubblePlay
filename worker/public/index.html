@@ -67,9 +67,8 @@
     <button id="strip-shortcuts" class="strip-item" data-ui-action="shortcuts" data-popover="pop-shortcuts" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Shortcuts" title="Shortcuts"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9V6.5A2.5 2.5 0 1 0 6.5 9H9Zm0 0h6M9 9v6m6-6V6.5A2.5 2.5 0 1 1 17.5 9H15Zm0 0v6m0 0h2.5a2.5 2.5 0 1 1-2.5 2.5V15Zm0 0H9m0 0v2.5A2.5 2.5 0 1 1 6.5 15H9Z"/></svg></button>
     <button id="strip-keys" class="strip-item only-touch" data-ui-action="keys" data-popover="pop-keys" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Keys" title="Keys"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="m8.5 13 3.5-3.5 3.5 3.5"/></svg><span id="latch-label" class="latch-label" aria-hidden="true"></span></button>
     <button id="strip-arrows" class="strip-item only-touch" data-ui-action="arrows" data-popover="pop-arrows" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Arrow keys" title="Arrow keys"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3.5-2.5 3h5zM12 20.5l-2.5-3h5zM3.5 12l3-2.5v5zM20.5 12l-3-2.5v5z"/></svg></button>
-    <!-- FILES SLOT: shown only when the host announces the fileTransfer capability.
-         The popover body (#pop-files) is where transfer progress and offers render. -->
-    <button id="strip-files" class="strip-item" data-ui-action="files" data-popover="pop-files" type="button" hidden aria-haspopup="dialog" aria-expanded="false" aria-label="Files" title="Files"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H6v18h12V7z"/><path d="M14 3v4h4M12 17v-6M9 14l3-3 3 3"/></svg></button>
+    <!-- Files: shown only when the host announces the fileTransfer capability. -->
+    <button id="strip-files" class="strip-item" data-ui-action="files" data-popover="pop-files" type="button" hidden aria-haspopup="dialog" aria-expanded="false" aria-label="Files" title="Files"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H6v18h12V7z"/><path d="M14 3v4h4M12 17v-6M9 14l3-3 3 3"/></svg><span class="strip-badge" aria-hidden="true" hidden></span></button>
     <button id="remote-clipboard" type="button" hidden title="The host clipboard changed while this tab was not focused">Copy remote clipboard</button>
     <button id="zoom-reset" class="strip-chip" type="button" hidden aria-label="Reset zoom" title="Reset zoom">1.0×</button>
     <button id="strip-fullscreen" class="strip-item only-desktop" data-ui-action="fullscreen" type="button" aria-pressed="false" aria-label="Enter fullscreen" title="Fullscreen"><svg class="ui-icon fs-enter" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg><svg class="ui-icon fs-exit" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg></button>
@@ -101,10 +100,21 @@
   <button id="capture" class="pop-row only-desktop" type="button"><span class="pop-row-title">Capture cursor</span><span class="pop-row-detail">For games and pointer-lock apps · Esc releases</span></button>
 </div>
 
-<!-- FILES SLOT (popover): transfer progress and host offers render here. -->
-<div id="pop-files" class="bp-popover" role="dialog" aria-labelledby="pop-files-title" hidden>
+<!-- Files popover: file-ui.js renders the PC's offer and the transfer rows into
+     #file-transfer; the strip icon appears only with the fileTransfer capability. -->
+<div id="pop-files" class="bp-popover pop-wide" role="dialog" aria-labelledby="pop-files-title" hidden>
   <div id="pop-files-title" class="pop-caption">Files</div>
-  <div id="files-status" class="pop-note" role="status" aria-live="polite">No transfers yet.</div>
+  <section id="file-transfer" hidden aria-label="File transfers">
+    <div class="file-offer" data-file-offer hidden role="status" aria-live="polite">
+      <span data-file-offer-label></span>
+      <button type="button" data-file-offer-download>Download</button>
+      <button type="button" class="file-offer-dismiss" data-file-offer-dismiss aria-label="Hide the files offered by the PC">×</button>
+    </div>
+    <ul class="file-list" data-file-list aria-live="polite"></ul>
+  </section>
+  <button id="file-choose" class="pop-row" type="button"><svg class="pop-row-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V5M7.5 9.5 12 5l4.5 4.5M5 19h14"/></svg><span class="pop-row-title">Choose files…</span><span class="pop-row-detail">Saved in Downloads\BubblePlay on the PC</span></button>
+  <input id="file-picker" type="file" multiple hidden tabindex="-1" aria-hidden="true">
+  <div id="files-status" class="pop-note" role="status" aria-live="polite"></div>
 </div>
 
 <div id="pop-keys" class="bp-popover" role="dialog" aria-labelledby="pop-keys-title" hidden>
@@ -160,6 +170,8 @@
     <dl class="about-list"><dt>Relay</dt><dd id="about-relay">Not reported</dd><dt>Host build</dt><dd id="about-host">Not reported</dd><dt>Receiver</dt><dd id="about-receiver">…</dd></dl>
   </section>
 </aside>
+<!-- File transfer drop veil (file-ui.js): hidden unless the host advertises fileTransfer. -->
+<div id="file-drop-veil" hidden aria-hidden="true"><div><strong>Drop to send to the PC</strong><span>Saved in Downloads\BubblePlay and put on the PC clipboard.</span></div></div>
 <aside id="context-hint" hidden><span id="context-hint-copy"></span><button id="dismiss-context-hint" type="button" aria-label="Dismiss control hint">Dismiss</button></aside>
 <div id="hud">connecting…</div>
 <div id="desktop-state" data-state="starting" hidden role="status" aria-live="polite">

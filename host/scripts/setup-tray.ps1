@@ -92,6 +92,8 @@ $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValue = 'BubblePlayTray'
 $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BubblePlay'
 $StartMenuShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'BubblePlay.lnk'
+# Explorer "Send to > BubblePlay": offers the selected files to the viewer.
+$SendToShortcut = Join-Path ([Environment]::GetFolderPath('SendTo')) 'BubblePlay.lnk'
 
 if (-not $SourceDir) { $SourceDir = Join-Path $PSScriptRoot '..\target\release' }
 $SourceDir = [IO.Path]::GetFullPath($SourceDir)
@@ -413,6 +415,21 @@ function Set-UserRegistration {
         Add-Step 'start-menu' 'done' $StartMenuShortcut
     }
     else { Add-Step 'start-menu' 'planned' "Create $StartMenuShortcut -> $TrayExe" }
+
+    # Send To entry (file transfer): bubbleplay_tray.exe --send-files <paths>
+    if ($PSCmdlet.ShouldProcess($SendToShortcut, "Create Send To entry for $TrayExe --send-files")) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $SendToShortcut) | Out-Null
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut($SendToShortcut)
+        $link.TargetPath = $TrayExe
+        $link.Arguments = '--send-files'
+        $link.WorkingDirectory = $InstallDir
+        $link.Description = 'Offer files to the connected BubblePlay viewer'
+        $link.IconLocation = "$TrayExe,0"
+        $link.Save()
+        Add-Step 'send-to' 'done' $SendToShortcut
+    }
+    else { Add-Step 'send-to' 'planned' "Create $SendToShortcut -> $TrayExe --send-files" }
 
     # Apps & features entry (per user)
     $uninstallScript = Join-Path $InstallDir 'uninstall-tray.ps1'

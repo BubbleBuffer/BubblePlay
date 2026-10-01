@@ -20,14 +20,14 @@ It uses the same WSS v4 media path and input contract as the browser receiver (`
   - Trackpad mode: one finger moves the cursor, tap clicks, two fingers scroll, pinch zooms around the cursor, and a two-finger tap right-clicks.
   - Direct mode: tap clicks where you touch; one-finger drag pans a zoomed view; long-press then drag is a mouse drag, and long-press without moving is a right-click; two fingers scroll and pinch-zoom; a two-finger double tap resets the zoom.
   - The soft keyboard sends Unicode text for committed text and scan codes for keys.
-  - Quick-action bar (icons, left to right): keyboard, switch screen (monitor list, current one marked; disabled with one monitor), touch mode, shortcuts (19 chords plus paste from the phone clipboard; no Ctrl+Alt+Del), keys (sticky Ctrl/Alt/Shift/Win, Esc, Tab, navigation, F1 to F12), arrows (D-pad with Enter, Home/End, PgUp/PgDn), zoom reset (only while zoomed), and more (full screen, settings, disconnect). Arrow and navigation keys repeat while held (350 ms, then every 40 ms). The bar is always visible and docked: the stream is laid out (letterbox and touch mapping included) in the area above it, and with the soft keyboard open the bar sits on the keyboard with the stream above. Back closes a popover, then the keyboard, then asks to disconnect.
+  - Quick-action bar (icons, left to right): keyboard, switch screen (monitor list, current one marked; disabled with one monitor), touch mode, shortcuts (19 chords plus paste from the phone clipboard; no Ctrl+Alt+Del), keys (sticky Ctrl/Alt/Shift/Win, Esc, Tab, navigation, F1 to F12), arrows (D-pad with Enter, Home/End, PgUp/PgDn), zoom reset (only while zoomed), and more (full screen, settings, disconnect). Arrow and navigation keys repeat while held (350 ms, then every 40 ms). The bar is always visible and docked: the stream is laid out (letterbox and touch mapping included) in the area above it, and with the soft keyboard open the bar sits on the keyboard with the stream above. Back closes the settings view, then a popover, then the keyboard, then asks to disconnect.
   - Input is sent only on a signaling socket that has completed hello for the current host session and presented a first frame. If signaling drops while media is up, the app reconnects signaling with the same backoff, shows "Input reconnecting…", releases held keys and buttons, and re-arms input on the new session. A half-open socket is detected by an early ping (after 4 s of input with no inbound traffic, dead if no pong within 6 s).
   - A hardware keyboard sends scan codes.
   - A hardware mouse is captured and sends relative motion, buttons and wheel.
   - Clipboard works in both directions.
 - **Session:**
-  - The screen stays on and the app runs immersive.
-  - A status line shows state, codec and size. Tap it to reconnect after an error. Full screen can be turned off from the bar's More menu (not persisted).
+  - The screen stays on and the app runs immersive (both are settings).
+  - A status line shows state, codec and size. Tap it to reconnect after an error. Full screen and touch mode can also be switched from the bar for the current session only.
   - The session is stopped 30 s after the app leaves the foreground (see "Known limits").
 
 Code layout (`app/src/main/java/de/bubblebuffer/bubbleplay/`):
@@ -36,7 +36,33 @@ Code layout (`app/src/main/java/de/bubblebuffer/bubbleplay/`):
 - `input/`: the touch gesture state machine, the viewport, and input sequencing and coalescing.
 - `media/`: Annex-B parsing and the MediaCodec decoder.
 - `net/`: server configuration and the signaling and media session.
+- `files/`: file transfer v1 (flow control, names, the transfer engine, MediaStore downloads).
 - `ui/`: the activities, the IME target view and the cursor overlay.
+
+### Settings
+
+Follows "Settings view (Android)" in `.superpawers/session-ui.md`. One view (`ui/SettingsView.kt`), opened from More in the bar and from the connection screen. From the bar it opens over the stream inside `StreamActivity`, so the session keeps running (a separate activity would start the 30 s background disconnect); Disconnect stays a separate item in More. Values persist in `Prefs` (SharedPreferences, schema version 2) and apply live:
+
+- **Connection:** server address (saved here applies to the next connection), Sign out (expires the `__Host-gate` and `__Host-bp-session` cookies for that server, ends the session, returns to the connection screen).
+- **Touch:** default touch mode, trackpad pointer speed (levels 1 to 9; 5 is the old fixed gain 1.6, each step 25 %), tap to click (trackpad one-finger tap; when off, long-press clicks and a two-finger tap still right-clicks).
+- **Display:** start in full screen, keep screen on, default monitor (requested once when a session starts, if the host lists it and is not already showing it; choosing one in a session switches to it now).
+- **Video:** codec (Auto, HEVC, H.264). A change reconnects the stream with a short notice; transfers in flight end with the old session.
+- **Diagnostics:** decoder, resolution and codec, presented frames/s and media bitrate (1 s windows), relay round trip (signaling ping to pong; the view sends an extra ping every 5 s while open). Copy report puts these plus app, device and settings (server host only, no cookies) on the clipboard.
+- **About:** app version.
+
+### File transfer (v1)
+
+Follows `.superpawers/file-transfer.md` and `fixtures/file-transfer-contract.json`. All of it is hidden unless the host's `host-capabilities` carries `fileTransfer` >= 1.
+
+- **Socket:** a second OkHttp WebSocket, `/file-ws?epoch=<mediaEpoch>` (lab: `/lab-file-ws` with `run` and `compat`), with the same gate cookie as `/ws`. It opens on demand, sends `hello`, waits for `file-peer` present (10 s), pings every 15 s and closes after 60 s idle. One transfer runs per direction; the rest queue.
+- **Upload:**
+  - Share sheet: "BubblePlay" accepts `SEND`/`SEND_MULTIPLE` of any type, purpose `save`. Without a session it opens the app (connect or sign in first), then uploads. At most 64 files go; the rest are reported.
+  - The Attach icon in the quick bar opens the system picker (multiple).
+  - Shortcuts → Paste: a content URI on the phone clipboard is uploaded with purpose `paste` instead of pasting text.
+  - Files are read through `ContentResolver`; no storage permission. A source without a known size is copied to the app cache first.
+- **Download:** a `file-offer` shows a chip above the bar. Download requests each item, writes it to `Download/BubblePlay` via MediaStore (pending until the SHA-256 and size check out, deleted otherwise), then shows a notification and an in-app notice with Open / Share. Notification permission is asked on the first download (Android 13+). A withdrawn offer removes the chip.
+- **Progress:** a slim row per direction above the bar (name, percent, cancel). Cancel stops the active transfer and its queue.
+- **Lifetime:** no foreground service in v1. Transfers belong to the stream session: ending the session (disconnect, or 30 s in the background) cancels them all. If the host leaves or the epoch changes, the file socket drops: the transfer in flight fails, and queued ones retry on a new socket (up to 3 failed opens, 10 s wait for the host's file socket). Partial downloads are always discarded.
 
 ## Build
 
@@ -90,6 +116,8 @@ Cleartext HTTP is allowed only for `10.0.2.2`, `127.0.0.1` and `localhost`. See 
 - **v4 packets:** every packet in `fixtures/wss-v4-contract.json` parses (or is rejected) and re-encodes byte for byte.
 - **ACK, keyframe, heartbeat and backoff output, and the receive gate:** compared with vectors generated from `worker/public/media-v4.js`. Regenerate the vectors with `node android/tools/gen-v4-vectors.mjs`.
 - **Scan codes:** compared with `fixtures/input-contract.json` (scan codes, `mustBeExtended`, `vkOnly`, contract packets, invalid packets).
+- **Settings:** `Prefs` defaults, version 1 to 2 migration (codec spellings normalized, last touch mode kept as the default), malformed values; pointer-speed mapping; tap-to-click off.
+- **File transfer:** every packet, rejected case, receiver session and signaling case in `fixtures/file-transfer-contract.json`; the send window and ACK pacing; size and hash mismatch; MediaStore names; share-intent parsing.
 - **Also covered:** clipboard chunking and reassembly, the touch gesture state machine and viewport, input coalescing and text splitting, and IME text reconciliation.
 
 ## Measured (lab relay, 2026-09-30)

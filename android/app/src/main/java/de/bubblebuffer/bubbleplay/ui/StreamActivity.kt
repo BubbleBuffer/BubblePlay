@@ -1,6 +1,15 @@
 package de.bubblebuffer.bubbleplay.ui
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.ContentResolver
+import android.net.Uri
+import android.widget.LinearLayout
+import de.bubblebuffer.bubbleplay.files.DownloadNotifier
+import de.bubblebuffer.bubbleplay.files.FileTransfers
+import de.bubblebuffer.bubbleplay.files.ReceiveCheck
+import de.bubblebuffer.bubbleplay.protocol.FileWire
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
@@ -34,6 +43,7 @@ import android.widget.Toast
 import de.bubblebuffer.bubbleplay.R
 import de.bubblebuffer.bubbleplay.input.Chord
 import de.bubblebuffer.bubbleplay.input.GestureAction
+import de.bubblebuffer.bubbleplay.input.PointerSpeed
 import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.input.TouchGestures
 import de.bubblebuffer.bubbleplay.input.TouchMode
@@ -51,7 +61,7 @@ import kotlin.math.roundToInt
  * (trackpad / direct), IME and hardware keyboard, captured mouse, clipboard,
  * and the quick-action bar ([QuickBar]).
  */
-class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink, QuickBar.Host {
+class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink, QuickBar.Host, TransferDock.Host, SettingsView.Host {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
     private lateinit var config: ServerConfig
@@ -66,6 +76,22 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private lateinit var status: TextView
     private lateinit var keyboardView: KeyboardInputView
     private lateinit var quickBar: QuickBar
+    private lateinit var dock: LinearLayout
+    private lateinit var transferDock: TransferDock
+    /** The settings view, over everything while open; the session keeps running behind it. */
+    private var settingsView: SettingsView? = null
+    private var pointerGain = PointerSpeed.DEFAULT_GAIN
+    /** The default monitor is requested once per session, on the first monitor list. */
+    private var defaultMonitorChecked = false
+
+    // File transfer v1: capability from host-capabilities (null = no host yet).
+    private var files: FileTransfers? = null
+    private var fileCapability: Boolean? = null
+    @Volatile private var fileEpoch: String? = null
+    private var currentOffer: FileWire.Offer? = null
+    /** Uploads asked for before the host said it can take files (share sheet, picker after a reconnect). */
+    private val pendingUploads = ArrayList<Pair<List<Uri>, String>>()
+    private var askedNotifications = false
 
     private val viewport = Viewport()
     private val gestures = TouchGestures()
@@ -103,6 +129,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override val touchMode: TouchMode get() = gestures.mode
     override val zoomed: Boolean get() = viewport.zoomed
     override val latched: Set<String> get() = latchSet
+    override val fileTransfer: Boolean get() = fileCapability == true
 
     private val backgroundDisconnect = Runnable { stopSession() }
     private val longPress = Runnable { apply(gestures.onLongPress(SystemClock.uptimeMillis())) }
@@ -118,9 +145,28 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         prefs = Prefs(this)
         config = prefs.serverConfig() ?: run { finish(); return }
         gestures.mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
+        gestures.tapToClick = prefs.tapToClick
+        pointerGain = PointerSpeed.gain(prefs.pointerSpeed)
+        immersive = prefs.startFullscreen
         buildViews()
-        enterImmersive()
+        files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, { if (config.isLab) null else Prefs.cookieHeader(config) }, fileListener)
+        enterImmersive() // also sets up edge-to-edge and the cutout mode
+        if (!immersive) exitImmersive()
         startSession()
+        takeShares(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        takeShares(intent)
+    }
+
+    /** Files shared to BubblePlay from another app. */
+    private fun takeShares(intent: Intent?) {
+        val uris = PendingShares.read(intent)
+        PendingShares.consume(intent)
+        if (uris.isNotEmpty()) enqueueUpload(uris, FileWire.PURPOSE_SAVE)
     }
 
     // ---- views ---------------------------------------------------------------
@@ -155,12 +201,21 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             topMargin = dp(8); leftMargin = dp(8)
         })
 
-        quickBar = QuickBar(this, root, this)
-        // The bar is docked, never over the video: the stage (and so the
-        // viewport, letterbox and touch mapping) is the area above it. Root
-        // padding already removes the soft keyboard and, outside full screen,
-        // the system bars, so the bar sits on the keyboard and the stream above.
+        // The dock: transfer rows over the quick-action bar. It never covers the
+        // video: the stage (and so the viewport, letterbox and touch mapping) is
+        // the area above the dock. Root padding already removes the soft keyboard
+        // and, outside full screen, the system bars, so the bar sits on the
+        // keyboard and the stream above.
+        dock = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        transferDock = TransferDock(this, dock, this)
+        quickBar = QuickBar(this, root, dock, this) // adds its scrim to root and the bar last in the dock
+        root.addView(dock, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         (stage.layoutParams as FrameLayout.LayoutParams).bottomMargin = quickBar.height
+        dock.addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
+            val height = bottom - top
+            val lp = stage.layoutParams as FrameLayout.LayoutParams
+            if (height > 0 && lp.bottomMargin != height) stage.post { lp.bottomMargin = height; stage.layoutParams = lp }
+        }
 
         root.setOnApplyWindowInsetsListener { v, insets -> applyInsets(v, insets); insets }
         setContentView(root)
@@ -197,7 +252,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     private fun enterImmersive() {
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.attributes = window.attributes.apply {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
@@ -241,11 +295,21 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         surface?.let { s.decoder.setSurface(it) }
         cursorSynced = false
         s.start()
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        defaultMonitorChecked = false
+        applyKeepScreenOn()
+    }
+
+    private fun applyKeepScreenOn() {
+        if (session != null && prefs.keepScreenOn) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     private fun stopSession() {
         quickBar.release()
+        // No background transfers in v1: the session's end cancels them.
+        files?.cancelAll()
+        currentOffer = null
+        transferDock.clear()
         input?.releaseAll()
         session?.stop()
         session = null
@@ -277,14 +341,18 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         main.removeCallbacksAndMessages(null)
         if (::quickBar.isInitialized) {
             quickBar.onDestroy()
+            transferDock.onDestroy()
             stopSession()
         }
+        files?.shutdown()
+        files = null
         super.onDestroy()
     }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
+            settingsView != null -> closeSettings()
             quickBar.dismiss() -> {}
             keyboardShown -> toggleKeyboard()
             else -> AlertDialog.Builder(this)
@@ -323,7 +391,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onAuthRequired() {
         stopSession()
-        startActivity(Intent(this, LoginActivity::class.java).putExtra(LoginActivity.EXTRA_FORCE, true))
+        // Shares that have not gone out yet come back after sign-in.
+        val waiting = pendingUploads.filter { it.second == FileWire.PURPOSE_SAVE }.flatMap { it.first }
+        startActivity(PendingShares.attach(Intent(this, LoginActivity::class.java).putExtra(LoginActivity.EXTRA_FORCE, true), waiting))
         finish()
     }
 
@@ -356,8 +426,15 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             monitorError = null
             val target = switchingMonitor
             if (target != null && monitors.any { it.selector == target && it.selected }) switchingMonitor = null
+            if (!defaultMonitorChecked) {
+                // Settings -> Default monitor: asked for once per session, when the host has it.
+                defaultMonitorChecked = true
+                val wanted = prefs.defaultMonitor
+                if (wanted.isNotEmpty() && switchingMonitor == null && monitors.any { it.selector == wanted && !it.selected }) switchMonitor(wanted)
+            }
         }
         quickBar.monitorsChanged()
+        settingsView?.monitorsChanged()
     }
 
     override fun onVideoSize(width: Int, height: Int) {
@@ -420,7 +497,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             gestures.mode == TouchMode.TRACKPAD -> true
             else -> mouseActive && cursorVisible
         }
-        cursorView.update(sx, sy, show)
+        cursorView.update(sx, sy, show && settingsView == null)
     }
 
     private fun setMouseActive(active: Boolean) {
@@ -457,7 +534,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val remote = input ?: return
         for (action in actions) when (action) {
             is GestureAction.Move -> {
-                val (dx, dy) = viewport.deltaToNormalized(action.dx * TRACKPAD_GAIN, action.dy * TRACKPAD_GAIN)
+                val (dx, dy) = viewport.deltaToNormalized(action.dx * pointerGain, action.dy * pointerGain)
                 cursorX = (cursorX + dx).coerceIn(0f, 1f); cursorY = (cursorY + dy).coerceIn(0f, 1f)
                 localCursorUntil = SystemClock.uptimeMillis() + 300
                 remote.absoluteNormalized(cursorX, cursorY)
@@ -561,7 +638,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val device = event.device
         val hardware = device != null && !device.isVirtual && event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD
-        if (hardware && event.isFromSource(InputDevice.SOURCE_KEYBOARD) && KeyMap.ANDROID_TO_CODE.containsKey(event.keyCode)) {
+        // While settings are open, keys belong to the settings view (text field, focus, Back).
+        if (hardware && settingsView == null && event.isFromSource(InputDevice.SOURCE_KEYBOARD) && KeyMap.ANDROID_TO_CODE.containsKey(event.keyCode)) {
             return sendKey(event)
         }
         return super.dispatchKeyEvent(event)
@@ -685,8 +763,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     // ---- QuickBar.Host: everything else --------------------------------------------------------
     override fun toggleTouchMode() {
         gestures.cancel().let { apply(it) }
+        // For this session only; the default is in Settings.
         gestures.mode = if (gestures.mode == TouchMode.TRACKPAD) TouchMode.DIRECT else TouchMode.TRACKPAD
-        prefs.directTouch = gestures.mode == TouchMode.DIRECT
         renderCursor()
     }
 
@@ -716,7 +794,13 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun pastePhoneClipboard() {
         val manager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val text = manager.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+        val item = manager.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
+        // An image or file on the phone clipboard is uploaded and pasted on the PC.
+        val uri = item?.uri
+        if (uri != null && fileTransfer && ContentResolver.SCHEME_CONTENT == uri.scheme) {
+            enqueueUpload(listOf(uri), FileWire.PURPOSE_PASTE); return
+        }
+        val text = item?.coerceToText(this)?.toString()
         if (text.isNullOrEmpty()) { Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show(); return }
         val remote = input ?: return
         val ok = if (session?.clipboardEnabled() == true) remote.clipboard(text, paste = true) else remote.text(text)
@@ -727,10 +811,228 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         finish()
     }
 
-    /** There is no in-session settings screen: end the session on the connection screen. */
+    // ---- settings ------------------------------------------------------------------------------
+    /** Settings open over the stream; the session (video, transfers) keeps running. */
     override fun openSettings() {
-        startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
-        finish()
+        if (settingsView != null) return
+        quickBar.dismiss()
+        if (keyboardShown) toggleKeyboard()
+        quickBar.release()
+        input?.releaseAll()
+        gestures.cancel().let { apply(it) }
+        if (stage.hasPointerCapture()) stage.releasePointerCapture()
+        val view = SettingsView(this, prefs, this)
+        view.setOnApplyWindowInsetsListener { v, insets -> padForCutout(v, insets); insets }
+        settingsView = view
+        root.addView(view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        view.requestApplyInsets()
+        renderCursor()
+        session?.requestMonitorList()
+    }
+
+    override fun closeSettings() {
+        val view = settingsView ?: return
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(view.windowToken, 0)
+        root.removeView(view)
+        settingsView = null
+        renderCursor()
+    }
+
+    /** Full screen leaves the cutout to the stream; the settings view keeps its content clear of it. */
+    private fun padForCutout(v: View, insets: WindowInsets) {
+        val cutout = insets.displayCutout
+        v.setPadding(
+            maxOf(0, (cutout?.safeInsetLeft ?: 0) - root.paddingLeft),
+            maxOf(0, (cutout?.safeInsetTop ?: 0) - root.paddingTop),
+            maxOf(0, (cutout?.safeInsetRight ?: 0) - root.paddingRight),
+            0,
+        )
+    }
+
+    override val settingsConfig: ServerConfig get() = config
+    override val inSession: Boolean get() = session != null
+    override val settingsMonitors: List<Session.Monitor> get() = if (session != null) monitors else emptyList()
+    override fun diagnostics(): Session.Diagnostics? = session?.diagnostics
+    override fun probeRoundTrip() { session?.probeRoundTrip() }
+
+    override fun onSettingChanged(setting: SettingsView.Setting) {
+        when (setting) {
+            SettingsView.Setting.TOUCH_MODE -> {
+                val mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
+                if (gestures.mode != mode) { gestures.cancel().let { apply(it) }; gestures.mode = mode; renderCursor(); quickBar.render() }
+            }
+            SettingsView.Setting.POINTER_SPEED -> pointerGain = PointerSpeed.gain(prefs.pointerSpeed)
+            SettingsView.Setting.TAP_TO_CLICK -> gestures.tapToClick = prefs.tapToClick
+            SettingsView.Setting.FULLSCREEN -> if (immersive != prefs.startFullscreen) toggleImmersive()
+            SettingsView.Setting.KEEP_SCREEN_ON -> applyKeepScreenOn()
+            SettingsView.Setting.DEFAULT_MONITOR -> {
+                val wanted = prefs.defaultMonitor
+                if (session != null && wanted.isNotEmpty() && monitors.any { it.selector == wanted && !it.selected }) switchMonitor(wanted)
+            }
+            SettingsView.Setting.CODEC -> {
+                // The codec is fixed for a session: reconnect with the new one (transfers in flight end with it).
+                val running = session ?: return
+                if (Session.chooseCodec(prefs.codec) == running.preferredCodec) return
+                stopSession()
+                startSession()
+                transferDock.showNotice(getString(R.string.settings_codec_reconnecting))
+            }
+            SettingsView.Setting.SERVER -> {} // the next connection uses it
+        }
+    }
+
+    override fun signOut() {
+        closeSettings()
+        stopSession()
+        Prefs.signOut(config) {
+            startActivity(Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(MainActivity.EXTRA_SIGNED_OUT, true))
+            finish()
+        }
+    }
+
+    // ---- file transfer ---------------------------------------------------------------------------
+    override fun attachFiles() {
+        val pick = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("*/*")
+            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(pick, REQUEST_ATTACH)
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.file_no_picker, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_ATTACH || resultCode != RESULT_OK || data == null) return
+        val uris = ArrayList<Uri>()
+        data.clipData?.let { c -> for (i in 0 until c.itemCount) c.getItemAt(i).uri?.let { uris += it } }
+        if (uris.isEmpty()) data.data?.let { uris += it }
+        if (uris.size > FileWire.MAX_BATCH) {
+            Toast.makeText(this, resources.getQuantityString(R.plurals.file_too_many, uris.size - FileWire.MAX_BATCH, uris.size - FileWire.MAX_BATCH), Toast.LENGTH_LONG).show()
+        }
+        if (uris.isNotEmpty()) enqueueUpload(uris.distinct().take(FileWire.MAX_BATCH), FileWire.PURPOSE_SAVE)
+    }
+
+    private fun enqueueUpload(uris: List<Uri>, purpose: String) {
+        when (fileCapability) {
+            true -> files?.upload(uris, purpose)
+            false -> Toast.makeText(this, R.string.file_unsupported, Toast.LENGTH_LONG).show()
+            null -> {
+                pendingUploads += uris to purpose
+                transferDock.showNotice(getString(R.string.file_waiting_pc))
+            }
+        }
+    }
+
+    override fun onFileCapability(enabled: Boolean?) {
+        fileCapability = enabled
+        files?.setEnabled(enabled == true)
+        quickBar.render()
+        when (enabled) {
+            true -> {
+                val waiting = pendingUploads.toList()
+                pendingUploads.clear()
+                waiting.forEach { (uris, purpose) -> files?.upload(uris, purpose) }
+            }
+            false -> {
+                if (pendingUploads.isNotEmpty()) Toast.makeText(this, R.string.file_unsupported, Toast.LENGTH_LONG).show()
+                pendingUploads.clear()
+                currentOffer = null
+                quickBar.dismiss()
+                transferDock.clear()
+            }
+            null -> { currentOffer = null; transferDock.showOffer(null) }
+        }
+    }
+
+    override fun onFileEpoch(epoch: String?) {
+        if (epoch == fileEpoch) return
+        fileEpoch = epoch
+        files?.epochChanged()
+    }
+
+    override fun onFileOffer(offer: FileWire.Offer) {
+        if (fileCapability != true) return
+        // A new offer replaces the previous one; no items withdraws it.
+        currentOffer = offer.takeIf { it.items.isNotEmpty() }
+        transferDock.showOffer(currentOffer)
+    }
+
+    override fun downloadOffer() {
+        val offer = currentOffer ?: return
+        currentOffer = null
+        transferDock.showOffer(null)
+        if (Build.VERSION.SDK_INT >= 33 && !DownloadNotifier.canNotify(this) && !askedNotifications) {
+            askedNotifications = true
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFY)
+        }
+        files?.download(offer)
+    }
+
+    override fun dismissOffer() {
+        currentOffer = null
+        transferDock.showOffer(null)
+    }
+
+    override fun cancelTransfer(direction: FileTransfers.Direction) {
+        files?.cancel(direction)
+    }
+
+    override fun openDownload(uri: Uri, mime: String) = launch(DownloadNotifier.openIntent(uri, mime))
+
+    override fun shareDownload(uri: Uri, mime: String) = launch(DownloadNotifier.shareIntent(this, uri, mime))
+
+    private fun launch(intent: Intent) {
+        try { startActivity(intent) } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.file_no_app, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun fileError(error: String): String = when (error) {
+        FileTransfers.ERR_CONNECTION -> getString(R.string.file_err_connection)
+        FileTransfers.ERR_AUTH -> getString(R.string.file_err_auth)
+        FileTransfers.ERR_UNAVAILABLE -> getString(R.string.file_err_unavailable)
+        FileTransfers.ERR_TOO_LARGE -> getString(R.string.file_err_too_large)
+        FileTransfers.ERR_UNREADABLE -> getString(R.string.file_err_unreadable)
+        FileTransfers.ERR_SIZE_CHANGED -> getString(R.string.file_err_size_changed)
+        FileTransfers.ERR_STORAGE -> getString(R.string.file_err_storage)
+        ReceiveCheck.ERR_HASH, ReceiveCheck.ERR_SIZE -> getString(R.string.file_err_hash)
+        FileTransfers.ERR_PROTOCOL, ReceiveCheck.ERR_SEQUENCE -> getString(R.string.file_err_protocol)
+        else -> getString(R.string.file_err_refused, error)
+    }
+
+    private val fileListener = object : FileTransfers.Listener {
+        override fun onProgress(up: FileTransfers.Row?, down: FileTransfers.Row?) {
+            if (!isDestroyed) transferDock.showProgress(up, down)
+        }
+
+        override fun onUploadBatchDone(purpose: String, saved: Int, failed: Int) {
+            if (isDestroyed || saved == 0) return
+            val text = when {
+                failed > 0 -> resources.getQuantityString(R.plurals.file_uploaded_partly, saved + failed, saved, saved + failed)
+                purpose == FileWire.PURPOSE_PASTE -> getString(R.string.file_pasted)
+                else -> resources.getQuantityString(R.plurals.file_uploaded, saved, saved)
+            }
+            transferDock.showNotice(text)
+        }
+
+        override fun onDownloaded(name: String, uri: Uri, mime: String) {
+            DownloadNotifier.notify(this@StreamActivity, name, uri, mime)
+            if (!isDestroyed) transferDock.showNotice(getString(R.string.file_saved_as, name), uri, mime)
+        }
+
+        override fun onFailed(direction: FileTransfers.Direction, name: String, error: String) {
+            if (isDestroyed || error == FileTransfers.ERR_CANCELLED) return
+            val res = if (direction == FileTransfers.Direction.UP) R.string.file_failed_up else R.string.file_failed_down
+            transferDock.showNotice(getString(res, name, fileError(error)))
+        }
     }
 
     private fun onStatusTapped() {
@@ -743,8 +1045,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     companion object {
         private const val BACKGROUND_GRACE_MS = 30_000L
-        private const val TRACKPAD_GAIN = 1.6f
         private const val SCROLL_DP_PER_NOTCH = 40f
         private const val MONITOR_REFRESH_MS = 1_500L
+        private const val REQUEST_ATTACH = 41
+        private const val REQUEST_NOTIFY = 42
     }
 }

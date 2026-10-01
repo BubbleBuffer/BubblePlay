@@ -108,6 +108,18 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   integrity can connect to the pipe and drive elevated windows.
   Turn Admin mode on only when you need it.
 
+## File transfer
+
+- Browser to PC: drop files on the stream to save them, or paste files or an
+  image to paste them into the focused app. Files land in
+  `%USERPROFILE%\Downloads\BubblePlay` with Mark-of-the-Web, are placed on the
+  PC clipboard, and are never opened.
+- PC to browser: copy files in Explorer or use Send To > BubblePlay; the
+  viewer gets "N files from PC · Download". Only offered files can be read.
+- Bytes use a separate `/file-ws` socket, rate-capped below video. Contract
+  and current state: `.superpawers/file-transfer.md`; lab check:
+  `node worker/tools/stream-lab-file-transfer.mjs`.
+
 ## Runtime boundaries
 
 - `host/src/lib.rs` owns modules shared by services, probes, and the host binary.

@@ -48,6 +48,13 @@ class TouchGestures(
     private val twoFingerTapMs: Long = 600,
     private val doubleTapMs: Long = 400,
 ) {
+    /**
+     * Trackpad: a one-finger tap left-clicks. When off, click with a
+     * long-press (press and release in place); two-finger tap still
+     * right-clicks. Direct mode always clicks where tapped.
+     */
+    var tapToClick = true
+
     /** When the last direct-mode two-finger tap ended (for double-tap), or null. */
     private var lastTwoTapAt: Long? = null
     private enum class Phase { IDLE, ONE, TWO, DONE }
@@ -130,7 +137,7 @@ class TouchGestures(
                 longPressDeadline = null
                 if (mode == TouchMode.TRACKPAD) {
                     if (dragging) out += GestureAction.Release(BUTTON_LEFT)
-                    else if (!moved && !longPressed) out += GestureAction.Click(BUTTON_LEFT)
+                    else if (!moved && !longPressed && tapToClick) out += GestureAction.Click(BUTTON_LEFT)
                 } else {
                     when {
                         dragging -> { out += GestureAction.PointAt(point.x, point.y); out += GestureAction.Release(BUTTON_LEFT) }

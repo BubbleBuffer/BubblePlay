@@ -1,0 +1,388 @@
+{
+  "protocol": 1,
+  "magic": "BPF1",
+  "headerBytes": 16,
+  "header": {
+    "magic": 0,
+    "type": 4,
+    "flags": 5,
+    "reserved": 6,
+    "transferId": 8,
+    "seq": 12,
+    "byteOrder": "little-endian"
+  },
+  "types": {
+    "OFFER": 1,
+    "ACCEPT": 2,
+    "DATA": 3,
+    "ACK": 4,
+    "DONE": 5,
+    "CANCEL": 6,
+    "RESULT": 7,
+    "REQUEST": 8
+  },
+  "limits": {
+    "maxDataBytes": 65536,
+    "maxControlPayloadBytes": 4096,
+    "maxMessageBytes": 65552,
+    "windowBytes": 1048576,
+    "ackEveryBytes": 262144,
+    "ackEveryMs": 100,
+    "maxFileBytes": 2147483648,
+    "maxBatchFiles": 64,
+    "maxNameBytes": 1024,
+    "idleCloseMs": 60000
+  },
+  "sockets": {
+    "client": "/file-ws?epoch=<mediaEpoch>",
+    "host": "/host-file-ws?epoch=<mediaEpoch>",
+    "lab": "/lab-file-ws and /lab-host-file-ws, plus run=<uuid>&compat=<STREAM_LAB_COMPATIBILITY.id> as on the lab media sockets",
+    "auth": "client: gate cookie (as /ws); host: Authorization: Bearer <host gate token> (as /host-media-ws)",
+    "epoch": "the 32-hex mediaEpoch from the signaling hello-ok; the relay pairs one file-client with one file-host per epoch",
+    "text": [
+      {
+        "from": "either",
+        "text": "{\"type\":\"hello\",\"role\":\"file-client\"}",
+        "note": "first message; role file-host on the host socket"
+      },
+      {
+        "from": "relay",
+        "text": "{\"type\":\"hello-ok\"}"
+      },
+      {
+        "from": "relay",
+        "text": "{\"type\":\"file-peer\",\"present\":true}",
+        "note": "sent after hello-ok (present true or false) and when the other side arrives; send OFFER/REQUEST only while present (a leaving peer closes this socket instead)"
+      },
+      {
+        "from": "either",
+        "text": "{\"type\":\"ping\"}",
+        "note": "answered by the relay with {\"type\":\"pong\"}, never relayed; send every 15 s while open"
+      }
+    ],
+    "rules": [
+      "binary messages are relayed only after hello and only when they pass decodeFilePacket; REQUEST is accepted only from file-client",
+      "when one side closes, the relay closes the other (code 1001 'file-peer-left'); an active transfer is cancelled on both ends",
+      "the host keeps its file socket open while a viewer epoch is live and reconnects 1 s after a close; clients open on demand and close after idleCloseMs without a transfer",
+      "the client picks every transferId, unique per socket: its OFFER for an upload, its REQUEST for a download (the host answers with OFFER using that transferId); one transfer at a time per direction"
+    ]
+  },
+  "packets": [
+    {
+      "name": "offer",
+      "hex": "425046310100000007000000000000007b226e616d65223a2253637265656e73686f7420323032362d31302d30312e706e67222c2273697a65223a352c226d696d65223a22696d6167652f706e67222c226d74696d654d73223a313739303030303030303030302c22707572706f7365223a227061737465222c2262617463684964223a332c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "type": "OFFER",
+      "transferId": 7,
+      "seq": 0,
+      "payloadHex": "7b226e616d65223a2253637265656e73686f7420323032362d31302d30312e706e67222c2273697a65223a352c226d696d65223a22696d6167652f706e67222c226d74696d654d73223a313739303030303030303030302c22707572706f7365223a227061737465222c2262617463684964223a332c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "decoded": {
+        "batchCount": 1,
+        "batchId": 3,
+        "batchIndex": 0,
+        "mime": "image/png",
+        "mtimeMs": 1790000000000,
+        "name": "Screenshot 2026-10-01.png",
+        "purpose": "paste",
+        "size": 5
+      }
+    },
+    {
+      "name": "accept",
+      "hex": "42504631020000000700000000000000",
+      "type": "ACCEPT",
+      "transferId": 7,
+      "seq": 0,
+      "payloadHex": "",
+      "decoded": null
+    },
+    {
+      "name": "data",
+      "hex": "4250463103000000070000000000000068656c6c6f",
+      "type": "DATA",
+      "transferId": 7,
+      "seq": 0,
+      "payloadHex": "68656c6c6f",
+      "decoded": {
+        "dataHex": "68656c6c6f"
+      }
+    },
+    {
+      "name": "data-seq-1",
+      "hex": "42504631030000000403020101000000ff",
+      "type": "DATA",
+      "transferId": 16909060,
+      "seq": 1,
+      "payloadHex": "ff",
+      "decoded": {
+        "dataHex": "ff"
+      }
+    },
+    {
+      "name": "ack",
+      "hex": "425046310400000007000000000000000500000000000000",
+      "type": "ACK",
+      "transferId": 7,
+      "seq": 0,
+      "payloadHex": "0500000000000000",
+      "decoded": {
+        "total": 5
+      }
+    },
+    {
+      "name": "ack-large",
+      "hex": "425046310400000007000000000000000000008000000000",
+      "type": "ACK",
+      "transferId": 7,
+      "seq": 0,
+      "payloadHex": "0000008000000000",
+      "decoded": {
+        "total": 2147483648
+      }
+    },
+    {
+      "name": "done",
+      "hex": "425046310500000007000000000000002cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "type": "DONE",
+      "transferId": 7,
+      "seq": 0,
+      "payloadHex": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "decoded": {
+        "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+      }
+    },
+    {
+      "name": "cancel",
+      "hex": "425046310600000007000000000000007b22726561736f6e223a2275736572227d",
+      "type": "CANCEL",
+      "transferId": 7,
+      "seq": 0,
+      "payloadHex": "7b22726561736f6e223a2275736572227d",
+      "decoded": {
+        "reason": "user"
+      }
+    },
+    {
+      "name": "result-ok",
+      "hex": "425046310700000007000000000000007b226f6b223a747275657d",
+      "type": "RESULT",
+      "transferId": 7,
+      "seq": 0,
+      "payloadHex": "7b226f6b223a747275657d",
+      "decoded": {
+        "ok": true
+      }
+    },
+    {
+      "name": "result-error",
+      "hex": "425046310700000007000000000000007b226f6b223a66616c73652c226572726f72223a22686173682d6d69736d61746368227d",
+      "type": "RESULT",
+      "transferId": 7,
+      "seq": 0,
+      "payloadHex": "7b226f6b223a66616c73652c226572726f72223a22686173682d6d69736d61746368227d",
+      "decoded": {
+        "error": "hash-mismatch",
+        "ok": false
+      }
+    },
+    {
+      "name": "request",
+      "hex": "425046310800000009000000000000007b226f666665724964223a342c226964223a327d",
+      "type": "REQUEST",
+      "transferId": 9,
+      "seq": 0,
+      "payloadHex": "7b226f666665724964223a342c226964223a327d",
+      "decoded": {
+        "id": 2,
+        "offerId": 4
+      }
+    }
+  ],
+  "rejected": [
+    {
+      "name": "truncated-header",
+      "hex": "425046310200000007000000000000",
+      "reason": "short"
+    },
+    {
+      "name": "bad-magic",
+      "hex": "42504632020000000700000000000000",
+      "reason": "magic"
+    },
+    {
+      "name": "unknown-type-0",
+      "hex": "42504631000000000700000000000000",
+      "reason": "type"
+    },
+    {
+      "name": "unknown-type-9",
+      "hex": "42504631090000000700000000000000",
+      "reason": "type"
+    },
+    {
+      "name": "nonzero-flags",
+      "hex": "42504631020100000700000000000000",
+      "reason": "flags"
+    },
+    {
+      "name": "nonzero-reserved",
+      "hex": "42504631020000010700000000000000",
+      "reason": "reserved"
+    },
+    {
+      "name": "nonzero-seq-on-control",
+      "hex": "42504631020000000700000001000000",
+      "reason": "seq"
+    },
+    {
+      "name": "accept-with-payload",
+      "hex": "4250463102000000070000000000000078",
+      "reason": "payload"
+    },
+    {
+      "name": "empty-data",
+      "hex": "42504631030000000700000000000000",
+      "reason": "payload"
+    },
+    {
+      "name": "short-ack",
+      "hex": "4250463104000000070000000000000005000000",
+      "reason": "payload"
+    },
+    {
+      "name": "short-done",
+      "hex": "4250463105000000070000000000000000000000000000000000000000000000",
+      "reason": "payload"
+    },
+    {
+      "name": "offer-not-json",
+      "hex": "425046310100000007000000000000007b6e616d653a",
+      "reason": "json"
+    },
+    {
+      "name": "offer-missing-size",
+      "hex": "425046310100000007000000000000007b226e616d65223a2261222c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "reason": "json"
+    },
+    {
+      "name": "offer-too-big-file",
+      "hex": "425046310100000007000000000000007b226e616d65223a2261222c2273697a65223a323134373438333634392c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "reason": "json"
+    },
+    {
+      "name": "offer-bad-purpose",
+      "hex": "425046310100000007000000000000007b226e616d65223a2261222c2273697a65223a312c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a226f70656e222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "reason": "json"
+    },
+    {
+      "name": "request-not-object",
+      "hex": "425046310800000009000000000000005b342c325d",
+      "reason": "json"
+    },
+    {
+      "name": "cancel-invalid-utf8",
+      "hex": "425046310600000007000000000000007bff7d",
+      "reason": "json"
+    },
+    {
+      "name": "oversize-data",
+      "headerHex": "42504631030000000700000000000000",
+      "totalBytes": 65553,
+      "reason": "too-large",
+      "note": "header followed by 65537 bytes of 0xab"
+    }
+  ],
+  "receiverSessions": [
+    {
+      "name": "ok",
+      "outcome": "ok",
+      "packets": [
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631030000000b0000000000000068656c",
+        "42504631030000000b000000010000006c6f",
+        "42504631050000000b000000000000002cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+      ]
+    },
+    {
+      "name": "data-seq-gap",
+      "outcome": "seq-gap",
+      "packets": [
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631030000000b0000000000000068656c",
+        "42504631030000000b000000020000006c6f"
+      ]
+    },
+    {
+      "name": "data-past-size",
+      "outcome": "size-mismatch",
+      "packets": [
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a342c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631030000000b0000000000000068656c",
+        "42504631030000000b000000010000006c6f"
+      ]
+    },
+    {
+      "name": "done-before-all-bytes",
+      "outcome": "size-mismatch",
+      "packets": [
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631030000000b0000000000000068656c",
+        "42504631050000000b000000000000002cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+      ]
+    },
+    {
+      "name": "hash-mismatch",
+      "outcome": "hash-mismatch",
+      "packets": [
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631030000000b0000000000000068656c",
+        "42504631030000000b000000010000006c70",
+        "42504631050000000b000000000000002cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+      ]
+    }
+  ],
+  "signaling": {
+    "fileOffer": [
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":7,\"items\":[{\"id\":1,\"name\":\"report.pdf\",\"size\":1234}],\"source\":\"clipboard\"}",
+        "accepted": true
+      },
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":8,\"items\":[],\"source\":\"clipboard\"}",
+        "accepted": true,
+        "note": "items [] withdraws the previous offer"
+      },
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[{\"id\":1,\"name\":\"a.txt\",\"size\":1},{\"id\":2,\"name\":\"b.bin\",\"size\":2147483648}],\"source\":\"sendto\"}",
+        "accepted": true
+      },
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[{\"id\":1,\"name\":\"\",\"size\":1}],\"source\":\"sendto\"}",
+        "accepted": false
+      },
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[{\"id\":1,\"name\":\"a\",\"size\":2147483649}],\"source\":\"sendto\"}",
+        "accepted": false
+      },
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[],\"source\":\"disk\"}",
+        "accepted": false
+      },
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":9,\"items\":[],\"source\":\"clipboard\"}",
+        "accepted": false
+      },
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":-1,\"items\":[],\"source\":\"clipboard\"}",
+        "accepted": false
+      },
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[{\"id\":0,\"name\":\"f\",\"size\":1},{\"id\":1,\"name\":\"f\",\"size\":1},{\"id\":2,\"name\":\"f\",\"size\":1},{\"id\":3,\"name\":\"f\",\"size\":1},{\"id\":4,\"name\":\"f\",\"size\":1},{\"id\":5,\"name\":\"f\",\"size\":1},{\"id\":6,\"name\":\"f\",\"size\":1},{\"id\":7,\"name\":\"f\",\"size\":1},{\"id\":8,\"name\":\"f\",\"size\":1},{\"id\":9,\"name\":\"f\",\"size\":1},{\"id\":10,\"name\":\"f\",\"size\":1},{\"id\":11,\"name\":\"f\",\"size\":1},{\"id\":12,\"name\":\"f\",\"size\":1},{\"id\":13,\"name\":\"f\",\"size\":1},{\"id\":14,\"name\":\"f\",\"size\":1},{\"id\":15,\"name\":\"f\",\"size\":1},{\"id\":16,\"name\":\"f\",\"size\":1},{\"id\":17,\"name\":\"f\",\"size\":1},{\"id\":18,\"name\":\"f\",\"size\":1},{\"id\":19,\"name\":\"f\",\"size\":1},{\"id\":20,\"name\":\"f\",\"size\":1},{\"id\":21,\"name\":\"f\",\"size\":1},{\"id\":22,\"name\":\"f\",\"size\":1},{\"id\":23,\"name\":\"f\",\"size\":1},{\"id\":24,\"name\":\"f\",\"size\":1},{\"id\":25,\"name\":\"f\",\"size\":1},{\"id\":26,\"name\":\"f\",\"size\":1},{\"id\":27,\"name\":\"f\",\"size\":1},{\"id\":28,\"name\":\"f\",\"size\":1},{\"id\":29,\"name\":\"f\",\"size\":1},{\"id\":30,\"name\":\"f\",\"size\":1},{\"id\":31,\"name\":\"f\",\"size\":1},{\"id\":32,\"name\":\"f\",\"size\":1},{\"id\":33,\"name\":\"f\",\"size\":1},{\"id\":34,\"name\":\"f\",\"size\":1},{\"id\":35,\"name\":\"f\",\"size\":1},{\"id\":36,\"name\":\"f\",\"size\":1},{\"id\":37,\"name\":\"f\",\"size\":1},{\"id\":38,\"name\":\"f\",\"size\":1},{\"id\":39,\"name\":\"f\",\"size\":1},{\"id\":40,\"name\":\"f\",\"size\":1},{\"id\":41,\"name\":\"f\",\"size\":1},{\"id\":42,\"name\":\"f\",\"size\":1},{\"id\":43,\"name\":\"f\",\"size\":1},{\"id\":44,\"name\":\"f\",\"size\":1},{\"id\":45,\"name\":\"f\",\"size\":1},{\"id\":46,\"name\":\"f\",\"size\":1},{\"id\":47,\"name\":\"f\",\"size\":1},{\"id\":48,\"name\":\"f\",\"size\":1},{\"id\":49,\"name\":\"f\",\"size\":1},{\"id\":50,\"name\":\"f\",\"size\":1},{\"id\":51,\"name\":\"f\",\"size\":1},{\"id\":52,\"name\":\"f\",\"size\":1},{\"id\":53,\"name\":\"f\",\"size\":1},{\"id\":54,\"name\":\"f\",\"size\":1},{\"id\":55,\"name\":\"f\",\"size\":1},{\"id\":56,\"name\":\"f\",\"size\":1},{\"id\":57,\"name\":\"f\",\"size\":1},{\"id\":58,\"name\":\"f\",\"size\":1},{\"id\":59,\"name\":\"f\",\"size\":1},{\"id\":60,\"name\":\"f\",\"size\":1},{\"id\":61,\"name\":\"f\",\"size\":1},{\"id\":62,\"name\":\"f\",\"size\":1},{\"id\":63,\"name\":\"f\",\"size\":1},{\"id\":64,\"name\":\"f\",\"size\":1}],\"source\":\"clipboard\"}",
+        "accepted": false
+      }
+    ],
+    "hostCapabilities": {
+      "text": "{\"type\":\"host-capabilities\",\"serviceMode\":false,\"coldBoot\":false,\"secureDesktop\":false,\"secureText\":false,\"fileTransfer\":1}",
+      "note": "clients show file UI only when fileTransfer >= 1"
+    }
+  }
+}

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   SETTINGS_KEY, SETTINGS_VERSION, DEFAULT_SETTINGS,
   loadSettings, normalizeSettings, qualityStorageView, saveSettings,
@@ -122,4 +123,17 @@ test("popovers anchor below the desktop strip and above the touch bar inside the
   assert.equal(above.left, 8);
   assert.equal(above.bottom, 844 - 795 + 6);
   assert.equal(above.top, undefined);
+});
+
+test("file transfer lives in the Files popover with a picker, gated on the capability", () => {
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const client = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
+  assert.match(html, /<button id="strip-files"[^>]*hidden/);
+  assert.match(html, /<div id="pop-files"[\s\S]*<section id="file-transfer"[\s\S]*id="file-choose"[\s\S]*<input id="file-picker" type="file" multiple/);
+  assert.match(html, /id="file-drop-veil"/);
+  assert.match(client, /stripFiles\.hidden = !capable/);
+  assert.match(client, /if \(files\.length && fileTransferAvailable\(\)\) fileClient\.upload\(files, "save"\)/);
+  // Drop and paste uploads stay wired through file-ui.js and the paste hook.
+  assert.match(client, /const pastedFiles = fileTransferAvailable\(\) \? filesFromPaste\(e\) : \[\]/);
+  assert.match(client, /veil: document\.getElementById\("file-drop-veil"\)/);
 });
