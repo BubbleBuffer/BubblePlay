@@ -108,14 +108,28 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   integrity can connect to the pipe and drive elevated windows.
   Turn Admin mode on only when you need it.
 
+## Web session UI
+
+- A docked strip holds every session control: a 32 px row at the top on a
+  desktop browser, a 48 px bar at the bottom on touch. The stream is laid out
+  beside it, never under it. Fullscreen on a desktop hides the strip; resting
+  the pointer on the top edge shows a handle that brings it back.
+- Monitors, Shortcuts, Files, Keys, Arrows and More open small popovers that
+  close on an outside click or Esc. Settings (quality, keyboard lock, scroll
+  speed, pointer mode, default monitor, sign out, diagnostics, about) is a
+  slide-over saved in `localStorage` under `bubbleplay.settings`.
+- Intent and current state: `.superpawers/session-ui.md`.
+
 ## File transfer
 
-- Browser to PC: drop files on the stream to save them, or paste files or an
-  image to paste them into the focused app. Files land in
+- Browser to PC: drop files on the stream or use Files > Choose files… in the
+  session strip to save them, or paste files or an image to paste them into
+  the focused app. Files land in
   `%USERPROFILE%\Downloads\BubblePlay` with Mark-of-the-Web, are placed on the
   PC clipboard, and are never opened.
 - PC to browser: copy files in Explorer or use Send To > BubblePlay; the
-  viewer gets "N files from PC · Download". Only offered files can be read.
+  Files icon gets a dot and its popover shows "N files from PC · Download".
+  Only offered files can be read.
 - Bytes use a separate `/file-ws` socket, rate-capped below video. Contract
   and current state: `.superpawers/file-transfer.md`; lab check:
   `node worker/tools/stream-lab-file-transfer.mjs`.

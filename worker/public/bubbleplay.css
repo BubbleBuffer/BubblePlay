@@ -265,7 +265,7 @@ body.session-page #input-surface { top: var(--strip-top); bottom: var(--strip-bo
   position: fixed;
   inset: 0 0 auto;
   z-index: 18;
-  height: var(--strip-top);
+  height: calc(var(--strip-height) + env(safe-area-inset-top));
   display: flex;
   align-items: center;
   gap: 8px;
