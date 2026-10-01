@@ -9,6 +9,7 @@ import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.media.VideoDecoder
 import de.bubblebuffer.bubbleplay.protocol.ClipboardReceiver
 import de.bubblebuffer.bubbleplay.protocol.CursorState
+import de.bubblebuffer.bubbleplay.protocol.FileWire
 import de.bubblebuffer.bubbleplay.protocol.V4
 import de.bubblebuffer.bubbleplay.protocol.V4ReceiveGate
 import okhttp3.OkHttpClient
@@ -56,6 +57,12 @@ class Session(
         fun onSecureDesktop(secure: Boolean)
         /** The signaling socket carrying input was lost: drop held keys/buttons locally. */
         fun onInputLost()
+        /** File transfer v1: true/false from host-capabilities, null while no host is known. */
+        fun onFileCapability(enabled: Boolean?)
+        /** The signaling epoch the file socket pairs on (null: none). */
+        fun onFileEpoch(epoch: String?)
+        /** A host `file-offer`; an empty item list withdraws it. */
+        fun onFileOffer(offer: FileWire.Offer)
     }
 
     enum class State { CONNECTING, CONNECTED, STATIC, RECONNECTING, ERROR }
@@ -317,11 +324,20 @@ class Session(
                 if (media != null) closeMedia()
                 resetFirstFrame()
                 mediaEpoch = epoch
+                main.post { listener.onFileEpoch(epoch) }
                 sendSig(JSONObject().put("type", "media-control").put("action", "mode").put("protocol", V4.VERSION)
                     .put("epoch", mediaEpoch).put("streamMode", "work").put("reason", "signaling-start"))
                 startMedia()
             }
-            "host-capabilities" -> if (!mediaOpen && media == null && registered) startMedia()
+            "host-capabilities" -> {
+                val files = msg.optInt("fileTransfer") >= 1
+                main.post { listener.onFileCapability(files) }
+                if (!mediaOpen && media == null && registered) startMedia()
+            }
+            "file-offer" -> {
+                val offer = FileWire.parseOfferMessage(msg) ?: return
+                main.post { listener.onFileOffer(offer) }
+            }
             "input-capabilities" -> {
                 scancode = msg.optInt("protocol") == 1 && msg.optBoolean("scancode")
                 clipboardEnabled = msg.optInt("protocol") == 1 && msg.optBoolean("clipboard")
@@ -359,7 +375,7 @@ class Session(
                 sig = null; sigOpen = false; registered = false
                 closeMedia()
                 resetFirstFrame()
-                main.post { listener.onInputLost() }
+                main.post { listener.onInputLost(); listener.onFileCapability(null); listener.onFileEpoch(null) }
                 sigBackoff = 0
                 scheduleSignalingReconnect("peer-left")
             }

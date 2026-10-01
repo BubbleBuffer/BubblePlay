@@ -24,6 +24,12 @@ data class ServerConfig(
         if (isLab) { addQueryParameter("run", labRun); addQueryParameter("compat", labCompat) }
     }.build()
 
+    /** File transfer v1 socket for the signaling epoch (the relay pairs it with the host's). */
+    fun fileUrl(epoch: String): HttpUrl = base.newBuilder().encodedPath(if (isLab) "/lab-file-ws" else "/file-ws").query(null).apply {
+        addQueryParameter("epoch", epoch)
+        if (isLab) { addQueryParameter("run", labRun); addQueryParameter("compat", labCompat) }
+    }.build()
+
     companion object {
         const val DEFAULT_SERVER = "https://playfull-cat.your-subdomain.workers.dev/"
         const val GATE_COOKIE = "__Host-gate"

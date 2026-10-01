@@ -44,7 +44,7 @@ import kotlin.math.roundToInt
  * remote desktop) and the soft keyboard keeps focus while the Keys popover is
  * open, so sticky modifiers combine with typing.
  */
-class QuickBar(private val activity: Activity, private val root: FrameLayout, private val host: Host) {
+class QuickBar(private val activity: Activity, private val root: FrameLayout, private val dock: LinearLayout, private val host: Host) {
 
     interface Host {
         val keyboardShown: Boolean
@@ -55,6 +55,8 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         val monitors: List<Session.Monitor>
         val monitorError: String?
         val switchingMonitor: String?
+        /** The host has file transfer v1 (shows Attach). */
+        val fileTransfer: Boolean
         fun toggleKeyboard()
         fun toggleTouchMode()
         fun resetZoom()
@@ -72,6 +74,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         fun keyUp(code: String)
         fun disconnect()
         fun openSettings()
+        fun attachFiles()
     }
 
     private enum class Kind { SCREEN, SHORTCUTS, KEYS, ARROWS, MORE }
@@ -88,6 +91,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
     private val shortcutsItem: ImageButton
     private val keysItem: ImageButton
     private val arrowsItem: ImageButton
+    private val attachItem: ImageButton
     private val zoomItem: ImageButton
     private val latchLabel: TextView
     private val moreItem: ImageButton
@@ -124,7 +128,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
             isClickable = true // touches on the strip never reach the stream
         }
         bar.addView(View(activity).apply { setBackgroundColor(THREAD) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)))
-        row = LinearLayout(activity).apply {
+        row = FitRow(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(4), 0, dp(4), 0)
@@ -137,6 +141,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         shortcutsItem = item(R.drawable.ic_bar_shortcuts, R.string.bar_shortcuts) { toggle(Kind.SHORTCUTS) }
         keysItem = item(R.drawable.ic_bar_keys, R.string.bar_keys) { toggle(Kind.KEYS) }
         arrowsItem = item(R.drawable.ic_bar_arrows, R.string.bar_arrows) { toggle(Kind.ARROWS) }
+        attachItem = item(R.drawable.ic_bar_attach, R.string.bar_attach) { dismiss(); host.attachFiles() }
         zoomItem = item(R.drawable.ic_bar_zoom_reset, R.string.bar_zoom_reset) { host.resetZoom(); render() }
         // Held modifiers, in mono beside the Keys item: the one accent on the bar.
         latchLabel = TextView(activity).apply {
@@ -152,7 +157,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         moreItem = item(R.drawable.ic_bar_more, R.string.bar_more) { toggle(Kind.MORE) }
         items = mapOf(Kind.SCREEN to screenItem, Kind.SHORTCUTS to shortcutsItem, Kind.KEYS to keysItem, Kind.ARROWS to arrowsItem, Kind.MORE to moreItem)
 
-        root.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+        dock.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         render()
     }
 
@@ -187,6 +192,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         describe(modeItem, activity.getString(R.string.bar_mode, activity.getString(if (direct) R.string.mode_direct else R.string.mode_trackpad)))
 
         zoomItem.visibility = if (host.zoomed) View.VISIBLE else View.GONE
+        attachItem.visibility = if (host.fileTransfer) View.VISIBLE else View.GONE
 
         val latched = host.latched
         val names = Shortcuts.MODIFIERS.filter { it in latched }.joinToString("+") { Shortcuts.keyName(it) }
@@ -247,16 +253,16 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         openKind = kind
         panel = frame
         scrim.visibility = View.VISIBLE
-        root.addView(frame, root.indexOfChild(bar), FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START))
+        root.addView(frame, root.indexOfChild(dock), FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START))
         position(frame, anchor)
         render()
     }
 
-    /** Above its bar item, clamped inside the window with an 8 dp margin. */
+    /** Above its bar item (and any transfer rows), clamped inside the window with an 8 dp margin. */
     private fun position(frame: View, anchor: View) {
         val width = root.width - root.paddingLeft - root.paddingRight
         val height = root.height - root.paddingTop - root.paddingBottom
-        val above = bar.height + dp(6)
+        val above = dock.height + dp(6)
         val maxHeight = (height - above - dp(8)).coerceAtLeast(dp(120))
         (frame as ViewGroup).getChildAt(0).let { if (it is CappedScroll) it.maxHeight = maxHeight - dp(16) }
         frame.measure(
@@ -574,6 +580,22 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         override fun onTouch(v: View, event: MotionEvent): Boolean {
             if (event.actionMasked == MotionEvent.ACTION_DOWN) dismiss()
             return true
+        }
+    }
+
+    /**
+     * The bar row: 48 dp items, shrunk evenly (never below 40 dp) when the
+     * visible items would not fit the width, so More is never pushed off.
+     */
+    private inner class FitRow(context: Context) : LinearLayout(context) {
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            val available = MeasureSpec.getSize(widthMeasureSpec) - paddingLeft - paddingRight
+            val buttons = (0 until childCount).map { getChildAt(it) }.filter { it is ImageButton && it.visibility != View.GONE }
+            if (buttons.isNotEmpty() && MeasureSpec.getMode(widthMeasureSpec) != MeasureSpec.UNSPECIFIED) {
+                val size = (available / buttons.size).coerceIn(dp(40), dp(BAR_ITEM_DP))
+                for (b in buttons) (b.layoutParams as LayoutParams).width = size
+            }
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec)
         }
     }
 

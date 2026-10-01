@@ -110,7 +110,13 @@ class MainActivity : Activity() {
         val config = prefs.serverConfig() ?: return
         val signedIn = ServerConfig.hasSessionCookies(Prefs.cookieHeader(config))
         val next = if (config.isLab || (signedIn && !forceLogin)) StreamActivity::class.java else LoginActivity::class.java
-        startActivity(Intent(this, next).putExtra(LoginActivity.EXTRA_FORCE, forceLogin))
+        startActivity(PendingShares.attach(Intent(this, next).putExtra(LoginActivity.EXTRA_FORCE, forceLogin), PendingShares.read(intent)))
+        PendingShares.consume(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent) // shares from the share sheet, kept until Connect
     }
 
     private fun label(text: Int) = TextView(this).apply {
