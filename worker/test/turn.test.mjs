@@ -8,7 +8,7 @@ const STUN_URL = "stun:stun.l.google.com:19302";
 test("mints the coturn REST credential with a bounded deterministic expiry", async () => {
   const iceServers = await createTurnIceServers(
     { TURN_SECRET: "1234567890", TURN_TTL_SECONDS: "999999" },
-    { now: () => 1_700_000_000_000 },
+    { turn: true, now: () => 1_700_000_000_000 },
   );
 
   assert.deepEqual(iceServers, [
@@ -25,9 +25,15 @@ test("mints the coturn REST credential with a bounded deterministic expiry", asy
 });
 
 test("uses STUN only when TURN_SECRET is missing or invalid", async () => {
-  assert.deepEqual(await createTurnIceServers({}), [{ urls: STUN_URL }]);
-  assert.deepEqual(await createTurnIceServers({ TURN_SECRET: "   " }), [{ urls: STUN_URL }]);
-  assert.deepEqual(await createTurnIceServers({ TURN_SECRET: 42 }), [{ urls: STUN_URL }]);
+  assert.deepEqual(await createTurnIceServers({}, { turn: true }), [{ urls: STUN_URL }]);
+  assert.deepEqual(await createTurnIceServers({ TURN_SECRET: "   " }, { turn: true }), [{ urls: STUN_URL }]);
+  assert.deepEqual(await createTurnIceServers({ TURN_SECRET: 42 }, { turn: true }), [{ urls: STUN_URL }]);
+});
+
+test("uses STUN only unless the client opted into TURN", async () => {
+  for (const turn of [undefined, false, "true", 1]) {
+    assert.deepEqual(await createTurnIceServers({ TURN_SECRET: "1234567890" }, { turn }), [{ urls: STUN_URL }]);
+  }
 });
 
 class FakeSocket {
@@ -51,7 +57,7 @@ test("host relay token and preauthenticated client role remain separate", async 
   const room = new Room({ getWebSockets: () => [client, host], storage }, env);
 
   await room.webSocketMessage(host, JSON.stringify({ type: "hello", token: "token", role: "host" }));
-  await room.webSocketMessage(client, JSON.stringify({ type: "hello", role: "client" }));
+  await room.webSocketMessage(client, JSON.stringify({ type: "hello", role: "client", turn: true }));
 
   const hostHello = JSON.parse(host.messages[0]);
   const clientHello = JSON.parse(client.messages[0]);
@@ -61,6 +67,19 @@ test("host relay token and preauthenticated client role remain separate", async 
   const observable = JSON.stringify({ messages: [...host.messages, ...client.messages], stored: [...storage.values.values()] });
   assert.equal(observable.includes(env.TURN_SECRET), false);
   assert.equal(observable.includes("turn:turn.example.com"), true);
+});
+
+test("a client hello without the TURN opt-in never sees the TURN hostname", async () => {
+  const storage = { values: new Map(), get: async (key) => storage.values.get(key), put: async (key, value) => storage.values.set(key, value), delete: async (key) => storage.values.delete(key) };
+  const client = new FakeSocket("client");
+  const room = new Room({ getWebSockets: () => [client], storage }, { TOKEN: "token", TURN_SECRET: "1234567890" });
+
+  await room.webSocketMessage(client, JSON.stringify({ type: "hello", role: "client" }));
+
+  const clientHello = JSON.parse(client.messages[0]);
+  assert.equal(clientHello.type, "hello-ok");
+  assert.deepEqual(clientHello.iceServers, [{ urls: STUN_URL }]);
+  assert.equal(client.messages.some((message) => message.includes("turn.example.com")), false);
 });
 
 test("never authenticates a host hello when TOKEN is absent, empty, or mismatched", async () => {

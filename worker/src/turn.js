@@ -10,7 +10,10 @@ const MAX_TTL_SECONDS = 24 * 60 * 60;
 // Coturn's TURN REST API uses an expiring username and the base64-encoded
 // HMAC-SHA1(username, shared-secret) as the password. This only creates
 // short-lived credentials; the shared secret never leaves the Worker.
-export async function createTurnIceServers(env, { now = Date.now } = {}) {
+// TURN is opt-in per client (`turn: true` in its hello): by default the
+// browser is never told the TURN hostname, so it never contacts it.
+export async function createTurnIceServers(env, { turn = false, now = Date.now } = {}) {
+  if (turn !== true) return [STUN_SERVER];
   const secret = env?.TURN_SECRET;
   if (typeof secret !== "string" || !secret.trim()) return [STUN_SERVER];
 

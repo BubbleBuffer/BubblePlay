@@ -1,6 +1,6 @@
 "use strict";
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats, computeQosRxWindow, createQosPayload, parseHostQuality } from "/latency.js";
-import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateIceServers } from "/turn.js";
+import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateIceServers, wantsTurn } from "/turn.js";
 import {
   shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
@@ -671,7 +671,7 @@ function reconnectSignaling(reason) {
       if (ws !== socket || generation !== signalingGeneration) return;
       hudState.ws = "open";
       debugTrace("signaling-open", { generation });
-      sendSignal({ type: "hello", role: "client" });
+      sendSignal({ type: "hello", role: "client", ...(wantsTurn(params) ? { turn: true } : {}) });
     };
     socket.onclose = (event) => {
       if (ws !== socket || generation !== signalingGeneration) return;

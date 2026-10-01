@@ -284,7 +284,7 @@ export class Room {
       // Hosts keep the original wire shape. Clients receive only short-lived
       // TURN REST credentials, minted after authentication and never stored.
       const hello = role === "client"
-        ? { type: "hello-ok", iceServers: await createTurnIceServers(this.env), mediaEpoch,
+        ? { type: "hello-ok", iceServers: await createTurnIceServers(this.env, { turn: msg.turn === true }), mediaEpoch,
             ...(workerVersionId ? { workerVersionId } : {}) }
         : { type: "hello-ok",
             ...(role === "media-client" ? { registeredAtMs } : {}),

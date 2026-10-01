@@ -272,7 +272,7 @@ test("browser signaling uses the remembered server session and never stores an a
   assert.match(client, /const labRun = parseLabRun\(params\)/);
   assert.match(client, /labRun \? "\/lab-ws" : "\/ws"/);
   assert.match(client, /labRun \? "\/lab-media-ws" : "\/media-ws"/);
-  assert.match(client, /sendSignal\(\{ type: "hello", role: "client" \}\)/);
+  assert.match(client, /sendSignal\(\{ type: "hello", role: "client", \.\.\.\(wantsTurn\(params\) \? \{ turn: true \} : \{\}\) \}\)/);
   assert.doesNotMatch(client, /bp_token|BubblePlay token|hello", token/);
   assert.match(login, /autocomplete="current-password"/);
   assert.match(login, /Remember this browser for 30 days/);

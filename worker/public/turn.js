@@ -32,6 +32,12 @@ export function validateIceServers(value) {
   return servers;
 }
 
+// TURN is opt-in (`?turn=1`); a relay-only policy cannot work without it.
+export function wantsTurn(search) {
+  const params = typeof search === "string" ? new URLSearchParams(search) : search;
+  return params?.get?.("turn") === "1" || parseIceTransportPolicy(params) === "relay";
+}
+
 export function parseIceTransportPolicy(search) {
   const params = typeof search === "string" ? new URLSearchParams(search) : search;
   return params?.get?.("ice") === "relay" ? "relay" : "all";

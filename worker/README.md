@@ -32,6 +32,13 @@ registration secret and separate endpoint credential:
 bubbleplay-host.exe --mode serve --worker ws://localhost:8787/ws --token <TOKEN> --host-gate-token <HOST_GATE_TOKEN>
 ```
 
+## TURN is opt-in
+
+The browser only receives TURN credentials (and the TURN hostname) when the
+page URL has `?turn=1` or `?ice=relay`. Otherwise WebRTC gets STUN only and
+falls back to WSS if no direct route works. `TURN_SECRET` must still be set
+for the opt-in to return TURN.
+
 ## Latency tests
 
 The deterministic receiver tests have no third-party dependencies:

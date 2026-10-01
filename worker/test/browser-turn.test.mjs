@@ -5,6 +5,7 @@ import {
   deriveCandidateRoute,
   parseIceTransportPolicy,
   validateIceServers,
+  wantsTurn,
 } from "../public/turn.js";
 
 test("rejects malformed, malicious, and oversized signaled ICE payloads to STUN-only", () => {
@@ -37,6 +38,14 @@ test("defaults ICE transport policy to all and only relay query forces relay", (
   assert.equal(parseIceTransportPolicy("?ice=relay"), "relay");
   assert.equal(parseIceTransportPolicy("?ice=all"), "all");
   assert.equal(parseIceTransportPolicy("?anything=relay"), "all");
+});
+
+test("TURN is requested only by ?turn=1 or a relay-only ICE policy", () => {
+  assert.equal(wantsTurn(""), false);
+  assert.equal(wantsTurn("?transport=webrtc"), false);
+  assert.equal(wantsTurn("?turn=0"), false);
+  assert.equal(wantsTurn("?turn=1"), true);
+  assert.equal(wantsTurn("?ice=relay"), true);
 });
 
 test("derives a type-only candidate route without address-like stat values", () => {
