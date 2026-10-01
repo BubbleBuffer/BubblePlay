@@ -400,7 +400,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
             // The window insets change after this; re-anchor on the next layout.
             root.post { reopen(Kind.MORE) }
         })
-        column.addView(listRow(activity.getString(R.string.pop_settings), activity.getString(R.string.pop_settings_hint), null, false) {
+        column.addView(listRow(activity.getString(R.string.pop_settings), null, null, false) {
             dismiss()
             host.openSettings()
         })

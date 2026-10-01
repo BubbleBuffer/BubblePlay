@@ -43,6 +43,7 @@ import android.widget.Toast
 import de.bubblebuffer.bubbleplay.R
 import de.bubblebuffer.bubbleplay.input.Chord
 import de.bubblebuffer.bubbleplay.input.GestureAction
+import de.bubblebuffer.bubbleplay.input.PointerSpeed
 import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.input.TouchGestures
 import de.bubblebuffer.bubbleplay.input.TouchMode
@@ -60,7 +61,7 @@ import kotlin.math.roundToInt
  * (trackpad / direct), IME and hardware keyboard, captured mouse, clipboard,
  * and the quick-action bar ([QuickBar]).
  */
-class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink, QuickBar.Host, TransferDock.Host {
+class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink, QuickBar.Host, TransferDock.Host, SettingsView.Host {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
     private lateinit var config: ServerConfig
@@ -77,6 +78,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private lateinit var quickBar: QuickBar
     private lateinit var dock: LinearLayout
     private lateinit var transferDock: TransferDock
+    /** The settings view, over everything while open; the session keeps running behind it. */
+    private var settingsView: SettingsView? = null
+    private var pointerGain = PointerSpeed.DEFAULT_GAIN
+    /** The default monitor is requested once per session, on the first monitor list. */
+    private var defaultMonitorChecked = false
 
     // File transfer v1: capability from host-capabilities (null = no host yet).
     private var files: FileTransfers? = null
@@ -139,9 +145,13 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         prefs = Prefs(this)
         config = prefs.serverConfig() ?: run { finish(); return }
         gestures.mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
+        gestures.tapToClick = prefs.tapToClick
+        pointerGain = PointerSpeed.gain(prefs.pointerSpeed)
+        immersive = prefs.startFullscreen
         buildViews()
         files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, { if (config.isLab) null else Prefs.cookieHeader(config) }, fileListener)
-        enterImmersive()
+        enterImmersive() // also sets up edge-to-edge and the cutout mode
+        if (!immersive) exitImmersive()
         startSession()
         takeShares(intent)
     }
@@ -242,7 +252,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     private fun enterImmersive() {
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.attributes = window.attributes.apply {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
@@ -286,7 +295,13 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         surface?.let { s.decoder.setSurface(it) }
         cursorSynced = false
         s.start()
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        defaultMonitorChecked = false
+        applyKeepScreenOn()
+    }
+
+    private fun applyKeepScreenOn() {
+        if (session != null && prefs.keepScreenOn) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     private fun stopSession() {
@@ -337,6 +352,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
+            settingsView != null -> closeSettings()
             quickBar.dismiss() -> {}
             keyboardShown -> toggleKeyboard()
             else -> AlertDialog.Builder(this)
@@ -410,8 +426,15 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             monitorError = null
             val target = switchingMonitor
             if (target != null && monitors.any { it.selector == target && it.selected }) switchingMonitor = null
+            if (!defaultMonitorChecked) {
+                // Settings -> Default monitor: asked for once per session, when the host has it.
+                defaultMonitorChecked = true
+                val wanted = prefs.defaultMonitor
+                if (wanted.isNotEmpty() && switchingMonitor == null && monitors.any { it.selector == wanted && !it.selected }) switchMonitor(wanted)
+            }
         }
         quickBar.monitorsChanged()
+        settingsView?.monitorsChanged()
     }
 
     override fun onVideoSize(width: Int, height: Int) {
@@ -474,7 +497,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             gestures.mode == TouchMode.TRACKPAD -> true
             else -> mouseActive && cursorVisible
         }
-        cursorView.update(sx, sy, show)
+        cursorView.update(sx, sy, show && settingsView == null)
     }
 
     private fun setMouseActive(active: Boolean) {
@@ -511,7 +534,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val remote = input ?: return
         for (action in actions) when (action) {
             is GestureAction.Move -> {
-                val (dx, dy) = viewport.deltaToNormalized(action.dx * TRACKPAD_GAIN, action.dy * TRACKPAD_GAIN)
+                val (dx, dy) = viewport.deltaToNormalized(action.dx * pointerGain, action.dy * pointerGain)
                 cursorX = (cursorX + dx).coerceIn(0f, 1f); cursorY = (cursorY + dy).coerceIn(0f, 1f)
                 localCursorUntil = SystemClock.uptimeMillis() + 300
                 remote.absoluteNormalized(cursorX, cursorY)
@@ -615,7 +638,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val device = event.device
         val hardware = device != null && !device.isVirtual && event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD
-        if (hardware && event.isFromSource(InputDevice.SOURCE_KEYBOARD) && KeyMap.ANDROID_TO_CODE.containsKey(event.keyCode)) {
+        // While settings are open, keys belong to the settings view (text field, focus, Back).
+        if (hardware && settingsView == null && event.isFromSource(InputDevice.SOURCE_KEYBOARD) && KeyMap.ANDROID_TO_CODE.containsKey(event.keyCode)) {
             return sendKey(event)
         }
         return super.dispatchKeyEvent(event)
@@ -739,8 +763,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     // ---- QuickBar.Host: everything else --------------------------------------------------------
     override fun toggleTouchMode() {
         gestures.cancel().let { apply(it) }
+        // For this session only; the default is in Settings.
         gestures.mode = if (gestures.mode == TouchMode.TRACKPAD) TouchMode.DIRECT else TouchMode.TRACKPAD
-        prefs.directTouch = gestures.mode == TouchMode.DIRECT
         renderCursor()
     }
 
@@ -787,10 +811,85 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         finish()
     }
 
-    /** There is no in-session settings screen: end the session on the connection screen. */
+    // ---- settings ------------------------------------------------------------------------------
+    /** Settings open over the stream; the session (video, transfers) keeps running. */
     override fun openSettings() {
-        startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
-        finish()
+        if (settingsView != null) return
+        quickBar.dismiss()
+        if (keyboardShown) toggleKeyboard()
+        quickBar.release()
+        input?.releaseAll()
+        gestures.cancel().let { apply(it) }
+        if (stage.hasPointerCapture()) stage.releasePointerCapture()
+        val view = SettingsView(this, prefs, this)
+        view.setOnApplyWindowInsetsListener { v, insets -> padForCutout(v, insets); insets }
+        settingsView = view
+        root.addView(view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        view.requestApplyInsets()
+        renderCursor()
+        session?.requestMonitorList()
+    }
+
+    override fun closeSettings() {
+        val view = settingsView ?: return
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(view.windowToken, 0)
+        root.removeView(view)
+        settingsView = null
+        renderCursor()
+    }
+
+    /** Full screen leaves the cutout to the stream; the settings view keeps its content clear of it. */
+    private fun padForCutout(v: View, insets: WindowInsets) {
+        val cutout = insets.displayCutout
+        v.setPadding(
+            maxOf(0, (cutout?.safeInsetLeft ?: 0) - root.paddingLeft),
+            maxOf(0, (cutout?.safeInsetTop ?: 0) - root.paddingTop),
+            maxOf(0, (cutout?.safeInsetRight ?: 0) - root.paddingRight),
+            0,
+        )
+    }
+
+    override val settingsConfig: ServerConfig get() = config
+    override val inSession: Boolean get() = session != null
+    override val settingsMonitors: List<Session.Monitor> get() = if (session != null) monitors else emptyList()
+    override fun diagnostics(): Session.Diagnostics? = session?.diagnostics
+    override fun probeRoundTrip() { session?.probeRoundTrip() }
+
+    override fun onSettingChanged(setting: SettingsView.Setting) {
+        when (setting) {
+            SettingsView.Setting.TOUCH_MODE -> {
+                val mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
+                if (gestures.mode != mode) { gestures.cancel().let { apply(it) }; gestures.mode = mode; renderCursor(); quickBar.render() }
+            }
+            SettingsView.Setting.POINTER_SPEED -> pointerGain = PointerSpeed.gain(prefs.pointerSpeed)
+            SettingsView.Setting.TAP_TO_CLICK -> gestures.tapToClick = prefs.tapToClick
+            SettingsView.Setting.FULLSCREEN -> if (immersive != prefs.startFullscreen) toggleImmersive()
+            SettingsView.Setting.KEEP_SCREEN_ON -> applyKeepScreenOn()
+            SettingsView.Setting.DEFAULT_MONITOR -> {
+                val wanted = prefs.defaultMonitor
+                if (session != null && wanted.isNotEmpty() && monitors.any { it.selector == wanted && !it.selected }) switchMonitor(wanted)
+            }
+            SettingsView.Setting.CODEC -> {
+                // The codec is fixed for a session: reconnect with the new one (transfers in flight end with it).
+                val running = session ?: return
+                if (Session.chooseCodec(prefs.codec) == running.preferredCodec) return
+                stopSession()
+                startSession()
+                transferDock.showNotice(getString(R.string.settings_codec_reconnecting))
+            }
+            SettingsView.Setting.SERVER -> {} // the next connection uses it
+        }
+    }
+
+    override fun signOut() {
+        closeSettings()
+        stopSession()
+        Prefs.signOut(config) {
+            startActivity(Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(MainActivity.EXTRA_SIGNED_OUT, true))
+            finish()
+        }
     }
 
     // ---- file transfer ---------------------------------------------------------------------------
@@ -946,7 +1045,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     companion object {
         private const val BACKGROUND_GRACE_MS = 30_000L
-        private const val TRACKPAD_GAIN = 1.6f
         private const val SCROLL_DP_PER_NOTCH = 40f
         private const val MONITOR_REFRESH_MS = 1_500L
         private const val REQUEST_ATTACH = 41
