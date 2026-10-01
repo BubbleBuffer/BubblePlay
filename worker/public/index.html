@@ -173,6 +173,16 @@
     <div class="settings-section"><div class="settings-label">Diagnostics</div><div class="settings-help">Detailed transport, decoder, latency, and viewport metrics are hidden here during normal use.</div><div class="session-actions" style="margin-top:9px"><button id="open-diagnostics" type="button">Show diagnostics</button><button id="copy-diagnostics" type="button">Copy report</button></div><pre id="diagnostics-output" aria-live="polite">Diagnostics are hidden.</pre></div>
   </section>
 </aside>
+<!-- File transfer (file-ui.js): hidden unless the host advertises fileTransfer. -->
+<div id="file-drop-veil" hidden aria-hidden="true"><div><strong>Drop to send to the PC</strong><span>Saved in Downloads\BubblePlay and put on the PC clipboard.</span></div></div>
+<section id="file-transfer" hidden aria-label="File transfers">
+  <div class="file-offer" data-file-offer hidden role="status" aria-live="polite">
+    <span data-file-offer-label></span>
+    <button type="button" data-file-offer-download>Download</button>
+    <button type="button" class="file-offer-dismiss" data-file-offer-dismiss aria-label="Hide the files offered by the PC">×</button>
+  </div>
+  <ul class="file-list" data-file-list aria-live="polite"></ul>
+</section>
 <aside id="context-hint" hidden><span id="context-hint-copy"></span><button id="dismiss-context-hint" type="button" aria-label="Dismiss control hint">Dismiss</button></aside>
 <div id="hud">connecting…</div>
 <div id="desktop-state" data-state="starting" hidden role="status" aria-live="polite">

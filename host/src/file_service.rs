@@ -871,6 +871,10 @@ impl Session {
         if let Some(ws) = ws {
             let _ = send_cancel(ws, id, code);
         }
+        // The files of the batch that did arrive still reach the clipboard.
+        if receiving.meta.batch_index + 1 == receiving.meta.batch_count {
+            self.finish_batch(shared);
+        }
     }
 
     /// The last file of a batch is done: put the saved files on the

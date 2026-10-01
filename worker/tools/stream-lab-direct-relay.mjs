@@ -11,6 +11,7 @@ import {
   validateClientMessageV4,
   validateHostTextV4,
 } from "../public/media-v4.js";
+import { relayAcceptsFilePacket } from "../public/file-transfer.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const EPOCH_PATTERN = /^[a-f0-9]{32}$/;
@@ -41,6 +42,7 @@ export async function startDirectLabRelay(options = {}) {
   const shaper = createMediaShaper(options.throttle);
   const signalingRooms = new Map();
   const mediaRooms = new Map();
+  const fileRooms = new Map();
   const sockets = new Set();
   const webSockets = new WebSocketServer({
     noServer: true,
@@ -64,6 +66,7 @@ export async function startDirectLabRelay(options = {}) {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     if (route.kind === "signal") attachSignalingSocket(socket, route, signalingRooms, emit);
+    else if (route.kind === "file") attachFileSocket(socket, route, fileRooms, emit);
     else attachMediaSocket(socket, route, mediaRooms, emit, shaper);
   });
   await new Promise((resolveListen, reject) => {
@@ -101,9 +104,14 @@ function parseSocketRoute(rawUrl) {
     return { kind: "signal", run, expectedRole: "client" };
   const mediaHost = url.pathname === "/lab-host-media-ws";
   const mediaClient = url.pathname === "/lab-media-ws";
-  if (!mediaHost && !mediaClient) return null;
+  const fileHost = url.pathname === "/lab-host-file-ws";
+  const fileClient = url.pathname === "/lab-file-ws";
+  if (!mediaHost && !mediaClient && !fileHost && !fileClient) return null;
   const epoch = url.searchParams.get("epoch") || "";
   if (!EPOCH_PATTERN.test(epoch)) return null;
+  if (fileHost || fileClient) {
+    return { kind: "file", run, epoch, key: `${run}:${epoch}`, expectedRole: fileHost ? "file-host" : "file-client" };
+  }
   return {
     kind: "media",
     run,
@@ -111,6 +119,57 @@ function parseSocketRoute(rawUrl) {
     key: `${run}:${epoch}`,
     expectedRole: mediaHost ? "media-host" : "media-client",
   };
+}
+
+// File transfer v1 (mirrors relayFile in worker/src): one file-host and one
+// file-client per epoch; binary packets are validated and relayed both ways,
+// a malformed one closes both sides, and a leaving side closes the other.
+function attachFileSocket(socket, route, rooms, emit) {
+  const room = getRoom(rooms, route.key, () => ({ "file-host": null, "file-client": null }));
+  let role = null;
+  const peerRole = () => (role === "file-host" ? "file-client" : "file-host");
+  const notify = (target, present) => {
+    if (target?.readyState === WebSocket.OPEN) target.send(JSON.stringify({ type: "file-peer", present }));
+  };
+  socket.on("message", (data, isBinary) => {
+    if (!role) {
+      const hello = isBinary ? null : parseJson(data);
+      if (hello?.type !== "hello" || hello.role !== route.expectedRole) {
+        socket.close(1008, "bad role");
+        return;
+      }
+      role = route.expectedRole;
+      replaceSocket(room, role, socket);
+      emit({ type: "socket-hello", kind: route.kind, run: route.run, role });
+      socket.send(JSON.stringify({ type: "hello-ok" }));
+      const peer = room[peerRole()];
+      notify(socket, peer?.readyState === WebSocket.OPEN);
+      notify(peer, true);
+      return;
+    }
+    const peer = room[peerRole()];
+    if (isBinary) {
+      if (!relayAcceptsFilePacket(new Uint8Array(data.buffer, data.byteOffset, data.byteLength), role)) {
+        emit({ type: "file-packet-rejected", run: route.run, role });
+        socket.close(1008, "bad file packet");
+        return;
+      }
+      if (peer?.readyState === WebSocket.OPEN) peer.send(data, { binary: true });
+      return;
+    }
+    if (data.byteLength > 256) return;
+    if (parseJson(data)?.type === "ping") socket.send(JSON.stringify({ type: "pong" }));
+  });
+  socket.once("close", (code, reason) => {
+    emit({ type: "socket-close", kind: route.kind, run: route.run, role, code, reason: String(reason || "") });
+    if (!role || room[role] !== socket) return;
+    room[role] = null;
+    const peer = room[peerRole()];
+    if (peer?.readyState === WebSocket.OPEN) peer.close(1001, "file-peer-left");
+    if (!room["file-host"] && !room["file-client"]) rooms.delete(route.key);
+  });
+  socket.on("error", error => emit({ type: "socket-error", kind: route.kind, run: route.run,
+    role, message: String(error?.message || error) }));
 }
 
 function attachSignalingSocket(socket, route, rooms, emit) {

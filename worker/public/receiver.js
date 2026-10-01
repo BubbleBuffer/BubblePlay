@@ -16,6 +16,9 @@ import {
   rememberedRtcFailure, rtpCodecMimeTypes,
 } from "/transport.js";
 import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
+// File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
+import { FileTransferClient } from "/file-client.js";
+import { filesFromPaste, installFileTransferUi } from "/file-ui.js";
 
 const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
 const diagnosticAttemptId = window.__bubbleplayDebugTrace?.attemptId || null;
@@ -747,6 +750,8 @@ async function handleSignal(socket, generation, ev) {
       hudState.ws = "ok";
       currentIceServers = validateIceServers(msg.iceServers);
       mediaEpoch = /^[a-f0-9]{32}$/.test(msg.mediaEpoch || "") ? msg.mediaEpoch : null;
+      // File transfer hook (2/5): file sockets pair on the epoch.
+      noteFileEpoch(mediaEpoch);
       sendStreamMode("signaling-start");
       if (wssSelected) requestWssMediaStart();
       else startPeer(peerGeneration);
@@ -824,7 +829,12 @@ async function handleSignal(socket, generation, ev) {
         secureText: msg.secureText === true,
       };
       hostCapabilitiesGeneration = generation;
+      // File transfer hook (3/5): all file UI stays hidden without the capability.
+      setFileTransferAvailable(Number.isInteger(msg.fileTransfer) && msg.fileTransfer >= 1);
       if (wssSelected && !usingWssMedia) requestWssMediaStart();
+      break;
+    case "file-offer":
+      fileClient.setOffer(msg);
       break;
     case "first-frame":
       handleFirstFrameMessage(msg);
@@ -2833,10 +2843,43 @@ document.addEventListener("paste", e => {
   if (pasteArmed === null) return;
   clearTimeout(pasteArmed); pasteArmed = null;
   e.preventDefault();
+  // File transfer hook (4/5): pasted files or an image upload and paste on the PC.
+  const pastedFiles = fileTransferAvailable() ? filesFromPaste(e) : [];
+  if (pastedFiles.length) { fileClient.upload(pastedFiles, "paste"); return; }
   const text = e.clipboardData?.getData("text/plain") || "";
   clipboardTransferId = (clipboardTransferId + 1) & 0xffff;
   if (!text || !clipboardSyncEnabled() || !input.clipboard(text, clipboardTransferId)) sendPhysicalTap("KeyV");
 }, true);
+// ---- file transfer (hook 5/5) ----------------------------------------------
+// Protocol and state: file-transfer.js / file-client.js; rendering: file-ui.js.
+const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl });
+const fileUi = installFileTransferUi({
+  client: fileClient,
+  root: document.getElementById("file-transfer"),
+  veil: document.getElementById("file-drop-veil"),
+  onError: error => sendClientLog("warn", "file-download-target", { message: String(error?.message || error) }),
+});
+function fileSocketUrl() {
+  if (!mediaEpoch) return null;
+  const query = new URLSearchParams({ epoch: mediaEpoch });
+  if (labRun) {
+    query.set("run", labRun);
+    query.set("compat", labCompatibilityId);
+  }
+  return `${proto}//${location.host}${labRun ? "/lab-file-ws" : "/file-ws"}?${query}`;
+}
+let fileEpoch = null;
+function noteFileEpoch(epoch) {
+  if (epoch !== fileEpoch) fileClient.reset("disconnected");
+  fileEpoch = epoch;
+}
+function fileTransferAvailable() { return fileUi.enabled && desktopKind !== "secure" && inputReady; }
+function setFileTransferAvailable(available) {
+  if (!available && fileUi.enabled) fileClient.reset("disconnected");
+  fileUi.setEnabled(available);
+}
+// Lab and diagnostics handle (stream-lab-file-transfer.mjs drives transfers through it).
+window.__bubbleplayFiles = { client: fileClient, capability: () => fileUi.enabled, available: () => fileTransferAvailable() };
 function updateKeyboardLock() {
   const keyboard = navigator.keyboard;
   if (!keyboard?.lock) return;
@@ -2870,7 +2913,7 @@ document.addEventListener("keydown", (e) => {
     if (e.key?.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) return;
   }
   if (!keyDescriptor(e.code)) return;
-  if (isPasteShortcut(e) && clipboardSyncEnabled()) {
+  if (isPasteShortcut(e) && (clipboardSyncEnabled() || fileTransferAvailable())) {
     // Leave the event to the browser so it fires `paste`; see armBrowserPaste.
     if (!e.repeat) armBrowserPaste();
     return;
