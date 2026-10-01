@@ -9,6 +9,7 @@ pub mod content_class;
 pub mod desktop_session;
 pub mod encode;
 pub mod file_hash;
+pub mod file_service;
 pub mod file_transfer;
 pub mod feedback_roi;
 pub mod frame_damage;

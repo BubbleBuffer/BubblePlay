@@ -20,6 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 
+/// `fileTransfer` capability and `protocol` value of `file-offer`.
+pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAGIC: [u8; 4] = *b"BPF1";
 pub const HEADER_BYTES: usize = 16;
 pub const MAX_DATA_BYTES: usize = 64 * 1024;
@@ -622,7 +624,7 @@ pub struct FileOfferItem {
 pub fn file_offer_message(offer_id: u32, items: &[FileOfferItem], source: &str) -> String {
     serde_json::json!({
         "type": "file-offer",
-        "protocol": 1,
+        "protocol": PROTOCOL_VERSION,
         "offerId": offer_id,
         "items": items,
         "source": source,

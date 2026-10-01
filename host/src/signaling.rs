@@ -616,6 +616,14 @@ pub enum SignalMsg {
         secure_desktop: bool,
         #[serde(rename = "secureText")]
         secure_text: bool,
+        /// File transfer protocol version (`.superpawers/file-transfer.md`);
+        /// absent when the host cannot transfer files.
+        #[serde(
+            rename = "fileTransfer",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        file_transfer: Option<u8>,
     },
     #[serde(rename = "monitor-list")]
     MonitorList {
@@ -820,6 +828,8 @@ pub struct Signaling {
     peer_seen: bool,
     last_keepalive_ack: Instant,
     version_monitor: Option<WorkerVersionMonitor>,
+    /// Advertised as `fileTransfer: 1` in host-capabilities.
+    file_transfer: bool,
 }
 
 struct WorkerVersionMonitor {
@@ -924,7 +934,20 @@ impl Signaling {
             peer_seen: false,
             last_keepalive_ack: Instant::now(),
             version_monitor,
+            file_transfer: false,
         })
+    }
+
+    /// Advertise file transfer in later host-capabilities messages.
+    pub fn set_file_transfer(&mut self, enabled: bool) {
+        self.file_transfer = enabled;
+    }
+
+    /// Send an already-serialized message (e.g. `file-offer`).
+    pub fn send_text(&mut self, text: &str) {
+        if self.ws.send(Message::text(text)).is_ok() {
+            let _ = self.ws.flush();
+        }
     }
 
     pub fn registered(&self) -> bool {
@@ -1460,6 +1483,9 @@ impl Signaling {
             cold_boot,
             secure_desktop,
             secure_text,
+            file_transfer: self
+                .file_transfer
+                .then_some(crate::file_transfer::PROTOCOL_VERSION),
         };
         if self
             .ws
@@ -2808,12 +2834,31 @@ mod tests {
             cold_boot: true,
             secure_desktop: true,
             secure_text: true,
+            file_transfer: None,
         };
         let encoded = serde_json::to_value(message).unwrap();
         let object = encoded.as_object().unwrap();
-        for legacy in ["mediaProtocols", "maxWssLanes", "wssFec"] {
+        for legacy in ["mediaProtocols", "maxWssLanes", "wssFec", "fileTransfer"] {
             assert!(!object.contains_key(legacy), "{legacy} must not be sent");
         }
+    }
+
+    #[test]
+    fn host_capabilities_advertise_file_transfer_as_in_the_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/file-transfer-contract.json"))
+                .unwrap();
+        let message = SignalMsg::HostCapabilities {
+            service_mode: false,
+            cold_boot: false,
+            secure_desktop: false,
+            secure_text: false,
+            file_transfer: Some(crate::file_transfer::PROTOCOL_VERSION),
+        };
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            fixture["signaling"]["hostCapabilities"]["text"].as_str().unwrap()
+        );
     }
 
     #[test]

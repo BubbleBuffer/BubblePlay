@@ -182,6 +182,23 @@ if ($refreshAgent) {
     }
 }
 
+# Send To entry (file transfer), for installs made before it existed.
+$SendToShortcut = Join-Path ([Environment]::GetFolderPath('SendTo')) 'BubblePlay.lnk'
+if ((Test-Path -LiteralPath $TrayExe) -and -not (Test-Path -LiteralPath $SendToShortcut)) {
+    if ($PSCmdlet.ShouldProcess($SendToShortcut, "Create Send To entry for $TrayExe --send-files")) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $SendToShortcut) | Out-Null
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut($SendToShortcut)
+        $link.TargetPath = $TrayExe
+        $link.Arguments = '--send-files'
+        $link.WorkingDirectory = $InstallDir
+        $link.Description = 'Offer files to the connected BubblePlay viewer'
+        $link.IconLocation = "$TrayExe,0"
+        $link.Save()
+        Write-Host "Created $SendToShortcut."
+    }
+}
+
 if (-not $NoStart -and -not (Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)) {
     if ($PSCmdlet.ShouldProcess($TrayExe, 'Start tray')) {
         if (-not (Test-Path -LiteralPath $TrayExe)) { throw "Tray not installed at $TrayExe; run setup-tray.ps1 first." }

@@ -207,6 +207,37 @@ fn connect_media_socket(
 }
 
 fn media_request(worker_url: &str, bearer: &str, epoch: &str) -> Result<Request<()>> {
+    host_socket_request(worker_url, bearer, epoch, HostSocket::Media)
+}
+
+/// The host's epoch-scoped relay sockets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostSocket {
+    Media,
+    File,
+}
+
+impl HostSocket {
+    fn paths(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Media => ("/host-media-ws", "/lab-host-media-ws"),
+            Self::File => ("/host-file-ws", "/lab-host-file-ws"),
+        }
+    }
+}
+
+/// Upgrade request for an epoch-scoped host socket (`/host-media-ws` or
+/// `/host-file-ws`, or their lab twins when the Worker URL is a lab route),
+/// authenticated with `Authorization: Bearer <bearer>`.
+pub fn host_socket_request(
+    worker_url: &str,
+    bearer: &str,
+    epoch: &str,
+    kind: HostSocket,
+) -> Result<Request<()>> {
+    if !valid_epoch(epoch) {
+        bail!("invalid relay epoch");
+    }
     let worker_name = std::env::var("BUBBLEPLAY_LAB_WORKER_NAME")
         .ok()
         .filter(|value| !value.is_empty());
@@ -220,15 +251,27 @@ fn media_request(worker_url: &str, bearer: &str, epoch: &str) -> Result<Request<
             "Stream Lab Worker version override requires both worker name and version identifier"
         ),
     };
-    media_request_with_worker_version(worker_url, bearer, epoch, worker_version)
+    socket_request_with_worker_version(worker_url, bearer, epoch, worker_version, kind)
 }
 
+#[cfg(test)]
 fn media_request_with_worker_version(
     worker_url: &str,
     bearer: &str,
     epoch: &str,
     worker_version: Option<(&str, &str)>,
 ) -> Result<Request<()>> {
+    socket_request_with_worker_version(worker_url, bearer, epoch, worker_version, HostSocket::Media)
+}
+
+fn socket_request_with_worker_version(
+    worker_url: &str,
+    bearer: &str,
+    epoch: &str,
+    worker_version: Option<(&str, &str)>,
+    kind: HostSocket,
+) -> Result<Request<()>> {
+    let (production_path, lab_path) = kind.paths();
     let mut url = tungstenite::http::Uri::try_from(worker_url)
         .context("invalid Worker URL")?
         .to_string();
@@ -263,9 +306,9 @@ fn media_request_with_worker_version(
         None
     };
     let media_path = if lab_route.is_some() {
-        "/lab-host-media-ws"
+        lab_path
     } else {
-        "/host-media-ws"
+        production_path
     };
     let lab_query = lab_route
         .map(|(run, compatibility)| format!("&run={run}&compat={compatibility}"))
@@ -280,7 +323,7 @@ fn media_request_with_worker_version(
     let value = HeaderValue::from_str(&format!("Bearer {bearer}"))
         .context("host bearer is not a valid HTTP header value")?;
     request.headers_mut().insert(AUTHORIZATION, value);
-    if parsed.path() == "/lab-host-media-ws" {
+    if parsed.path() == lab_path {
         if let Some((worker_name, version_id)) = worker_version {
             if !canonical_worker_name(worker_name) || !canonical_worker_version_id(version_id) {
                 bail!("Stream Lab Worker version override is not canonical");
@@ -359,6 +402,34 @@ mod tests {
             request.headers().get(AUTHORIZATION).unwrap(),
             "Bearer host-bearer"
         );
+    }
+
+    #[test]
+    fn derives_the_file_socket_endpoints() {
+        let request = socket_request_with_worker_version(
+            "https://worker.example/host-ws",
+            "host-bearer",
+            EPOCH,
+            None,
+            HostSocket::File,
+        )
+        .unwrap();
+        assert_eq!(
+            request.uri().to_string(),
+            "wss://worker.example/host-file-ws?epoch=0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Bearer host-bearer"
+        );
+        let lab =
+            socket_request_with_worker_version(LAB_URL, "b", EPOCH, None, HostSocket::File)
+                .unwrap();
+        assert!(lab
+            .uri()
+            .to_string()
+            .starts_with("wss://worker.example/lab-host-file-ws?epoch="));
+        assert!(host_socket_request(LAB_URL, "b", "BAD", HostSocket::File).is_err());
     }
 
     #[test]

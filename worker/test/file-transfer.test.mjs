@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import worker, { Room } from "../src/index.js";
 import {
   FT,
   FT_ACK_EVERY_BYTES,
@@ -165,4 +166,125 @@ test("send window and ACK cadence", () => {
   assert.equal(incoming.onData(5, FT_MAX_DATA_BYTES), null);
   assert.equal(incoming.ackDue(now), null);
   assert.equal(incoming.ackDue(now + FT_ACK_EVERY_MS), 6 * 65_536);
+});
+
+class FakeSocket {
+  constructor(role, extra = {}) {
+    this.attachment = { role, ...extra };
+    this.readyState = 1;
+    this.messages = [];
+    this.closed = [];
+  }
+  deserializeAttachment() { return this.attachment; }
+  serializeAttachment(value) { this.attachment = value; }
+  send(value) { this.messages.push(value); }
+  close(code, reason) { this.closed.push({ code, reason }); this.readyState = 3; }
+}
+
+test("file routes are gated like the media routes and paired per epoch in the MediaRoom class", async () => {
+  const selected = [];
+  const fileResponse = new Response("file", { status: 200 });
+  let gateStatus = 204;
+  const env = {
+    HOST_GATE_TOKEN: "host-only",
+    GATE: { idFromName: () => "gate", get: () => ({ fetch: async () => new Response(null, { status: gateStatus }) }) },
+    ROOM: { idFromName: name => name, get: () => ({ fetch: async () => new Response("signal") }) },
+    MEDIA_ROOM: { idFromName: name => { selected.push(name); return name; }, get: () => ({ fetch: async () => fileResponse }) },
+  };
+  const epoch = "0123456789abcdef0123456789abcdef";
+  const hostHeaders = { Upgrade: "websocket", Authorization: "Bearer host-only" };
+  assert.equal(await worker.fetch(new Request(`https://x.example/host-file-ws?epoch=${epoch}`, { headers: hostHeaders }), env), fileResponse);
+  assert.equal(await worker.fetch(new Request(`https://x.example/file-ws?epoch=${epoch}`, { headers: { Upgrade: "websocket" } }), env), fileResponse);
+  assert.deepEqual(selected, [`file-v1:${epoch}`, `file-v1:${epoch}`]);
+  // No host token, no cookie, or no epoch: 404 before any room is touched.
+  assert.equal((await worker.fetch(new Request(`https://x.example/host-file-ws?epoch=${epoch}`,
+    { headers: { Upgrade: "websocket", Authorization: "Bearer wrong" } }), env)).status, 404);
+  assert.equal((await worker.fetch(new Request("https://x.example/file-ws?epoch=BAD", { headers: { Upgrade: "websocket" } }), env)).status, 404);
+  gateStatus = 401;
+  assert.equal((await worker.fetch(new Request(`https://x.example/file-ws?epoch=${epoch}`, { headers: { Upgrade: "websocket" } }), env)).status, 404);
+  assert.equal(selected.length, 2);
+});
+
+test("file relay forwards valid packets both ways, answers pings and drops pre-hello traffic", async () => {
+  const host = new FakeSocket("file-host");
+  const client = new FakeSocket("file-client");
+  const room = new Room({ getWebSockets: () => [host, client] }, {});
+  const offer = hex(contract.packets.find(entry => entry.name === "offer").hex).buffer;
+  const request = hex(contract.packets.find(entry => entry.name === "request").hex).buffer;
+  const ack = hex(contract.packets.find(entry => entry.name === "ack").hex).buffer;
+  await room.webSocketMessage(client, offer);
+  await room.webSocketMessage(client, request);
+  await room.webSocketMessage(host, ack);
+  assert.deepEqual(host.messages, [offer, request]);
+  assert.deepEqual(client.messages, [ack]);
+  await room.webSocketMessage(client, '{"type":"ping"}');
+  assert.equal(client.messages.at(-1), '{"type":"pong"}');
+  await room.webSocketMessage(client, '{"type":"file-offer"}');
+  assert.equal(host.messages.length, 2, "text is never relayed on the file socket");
+
+  const fresh = new FakeSocket(null, { expectedRole: "file-client" });
+  const lone = new Room({ getWebSockets: () => [fresh] }, {});
+  await lone.webSocketMessage(fresh, offer);
+  assert.deepEqual(fresh.messages, []);
+});
+
+test("file relay closes both sides on a malformed packet or a REQUEST from the host", async () => {
+  for (const [sender, packet] of [
+    ["client", rejectedBytes(contract.rejected.find(entry => entry.name === "nonzero-flags"))],
+    ["client", rejectedBytes(contract.rejected.find(entry => entry.name === "oversize-data"))],
+    ["host", hex(contract.packets.find(entry => entry.name === "request").hex)],
+  ]) {
+    const host = new FakeSocket("file-host");
+    const client = new FakeSocket("file-client");
+    const room = new Room({ getWebSockets: () => [host, client].filter(socket => socket.readyState === 1) }, {});
+    const from = sender === "host" ? host : client;
+    const to = sender === "host" ? client : host;
+    await room.webSocketMessage(from, packet.buffer);
+    assert.equal(to.messages.filter(message => typeof message !== "string").length, 0);
+    assert.equal(from.closed[0]?.code, 1008);
+    assert.equal(to.closed[0]?.code, 1001);
+  }
+});
+
+test("file hello announces presence and a leaving side closes the other", async () => {
+  const host = new FakeSocket(null, { expectedRole: "file-host" });
+  let sockets = [host];
+  const room = new Room({ getWebSockets: () => sockets }, {});
+  await room.webSocketMessage(host, JSON.stringify({ type: "hello", role: "file-host" }));
+  assert.deepEqual(host.messages.map(message => JSON.parse(message)), [
+    { type: "hello-ok" }, { type: "file-peer", present: false }]);
+  const client = new FakeSocket(null, { expectedRole: "file-client" });
+  sockets = [host, client];
+  await room.webSocketMessage(client, JSON.stringify({ type: "hello", role: "file-client" }));
+  assert.deepEqual(JSON.parse(host.messages.at(-1)), { type: "file-peer", present: true });
+  assert.deepEqual(JSON.parse(client.messages.at(-1)), { type: "file-peer", present: true });
+  // A client socket cannot claim the host role.
+  const impostor = new FakeSocket(null, { expectedRole: "file-client" });
+  await room.webSocketMessage(impostor, JSON.stringify({ type: "hello", role: "file-host" }));
+  assert.equal(impostor.closed[0]?.code, 1008);
+
+  client.readyState = 3;
+  sockets = [host];
+  await room.webSocketClose(client, 1000, "", true);
+  assert.deepEqual(host.closed, [{ code: 1001, reason: "file-peer-left" }]);
+});
+
+test("signaling relays only valid host file-offers and fileTransfer capabilities", async () => {
+  const host = new FakeSocket("host");
+  const client = new FakeSocket("client");
+  const room = new Room({ getWebSockets: () => [host, client] }, {});
+  for (const entry of contract.signaling.fileOffer) {
+    const before = client.messages.length;
+    await room.webSocketMessage(host, entry.text);
+    assert.equal(client.messages.length - before, entry.accepted ? 1 : 0, entry.text.slice(0, 100));
+  }
+  // Clients cannot send offers.
+  const valid = contract.signaling.fileOffer.find(entry => entry.accepted).text;
+  await room.webSocketMessage(client, valid);
+  assert.equal(host.messages.length, 0);
+  await room.webSocketMessage(host, contract.signaling.hostCapabilities.text);
+  assert.equal(client.messages.at(-1), contract.signaling.hostCapabilities.text);
+  const before = client.messages.length;
+  await room.webSocketMessage(host, contract.signaling.hostCapabilities.text.replace('"fileTransfer":1', '"fileTransfer":"yes"'));
+  assert.equal(client.messages.length, before);
 });

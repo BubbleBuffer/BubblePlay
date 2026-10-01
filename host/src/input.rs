@@ -1421,6 +1421,23 @@ impl InputSink {
         self.send_inputs("clipboard-paste", &inputs)
     }
 
+    /// Inject Ctrl+V for whatever the host clipboard holds now (file
+    /// transfer: a paste-purpose upload already placed its files there).
+    pub fn paste(&mut self) -> InputApplication {
+        let inputs: Vec<INPUT> = self
+            .state
+            .paste_plan()
+            .into_iter()
+            .map(|(key, up)| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: keyboard_input(key, up),
+                },
+            })
+            .collect();
+        self.send_inputs("file-paste", &inputs)
+    }
+
     fn text(&mut self, text: &str) -> InputApplication {
         let mut inputs = Vec::new();
         for unit in text.encode_utf16() {
