@@ -38,7 +38,7 @@ test("direct Stream Lab relay serves the existing receiver assets on loopback", 
   assert.equal(new URL(relay.url).hostname, "127.0.0.1");
   const response = await fetch(relay.url);
   assert.equal(response.status, 200);
-  assert.match(await response.text(), /id="app-brand"/);
+  assert.match(await response.text(), /id="session-strip"/);
 });
 
 test("direct Stream Lab relay exposes the exact receiver compatibility contract", async (t) => {
