@@ -87,7 +87,7 @@ class LoginActivity : Activity() {
         if (handedOff) return
         handedOff = true
         CookieManager.getInstance().flush()
-        startActivity(Intent(this, StreamActivity::class.java))
+        startActivity(PendingShares.attach(Intent(this, StreamActivity::class.java), PendingShares.read(intent)))
         finish()
     }
 

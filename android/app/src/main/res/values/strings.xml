@@ -84,4 +84,60 @@
     <string name="secure_desktop">Windows secure desktop: clipboard is off</string>
     <string name="clipboard_empty">The phone clipboard is empty</string>
     <string name="paste_failed">Paste did not go through (not connected or too large)</string>
+
+    <!-- File transfer v1 -->
+    <string name="bar_attach">Send files to PC</string>
+    <string name="share_label">BubblePlay</string>
+    <string name="file_open">Open</string>
+    <string name="file_share">Share</string>
+    <string name="file_share_title">Share file</string>
+    <string name="file_dismiss">Dismiss</string>
+    <string name="file_download">Download</string>
+    <string name="file_offer_dismiss">Ignore files from PC</string>
+    <string name="file_offer_one">%1$s from PC · %2$s</string>
+    <plurals name="file_offer_many">
+        <item quantity="one">%1$d file from PC · %2$s</item>
+        <item quantity="other">%1$d files from PC · %2$s</item>
+    </plurals>
+    <string name="file_queued">+%1$d</string>
+    <string name="file_waiting">Waiting</string>
+    <string name="file_verifying">Checking</string>
+    <string name="file_percent">%1$d%%</string>
+    <string name="file_sending">Sending</string>
+    <string name="file_receiving">Receiving</string>
+    <string name="file_cancel_upload">Cancel sending</string>
+    <string name="file_cancel_download">Cancel download</string>
+    <string name="file_channel">Downloads from PC</string>
+    <string name="file_saved_downloads">Saved to Downloads/BubblePlay</string>
+    <string name="file_saved_as">Saved %1$s to Downloads</string>
+    <plurals name="file_uploaded">
+        <item quantity="one">Saved on the PC · on the PC clipboard</item>
+        <item quantity="other">%1$d files saved on the PC · on the PC clipboard</item>
+    </plurals>
+    <string name="file_pasted">Pasted on the PC</string>
+    <plurals name="file_uploaded_partly">
+        <item quantity="one">%1$d of %2$d file saved on the PC</item>
+        <item quantity="other">%1$d of %2$d files saved on the PC</item>
+    </plurals>
+    <string name="file_failed_up">Couldn\'t send %1$s: %2$s</string>
+    <string name="file_failed_down">Couldn\'t download %1$s: %2$s</string>
+    <string name="file_err_connection">the connection to the PC dropped</string>
+    <string name="file_err_auth">sign-in expired</string>
+    <string name="file_err_unavailable">file transfer isn\'t available</string>
+    <string name="file_err_too_large">larger than 2 GB</string>
+    <string name="file_err_unreadable">the phone couldn\'t read it</string>
+    <string name="file_err_size_changed">the file changed while sending</string>
+    <string name="file_err_storage">no room in Downloads</string>
+    <string name="file_err_hash">it arrived damaged and was deleted</string>
+    <string name="file_err_protocol">the transfer got out of step</string>
+    <string name="file_err_refused">the PC refused it (%1$s)</string>
+    <plurals name="file_too_many">
+        <item quantity="one">Only the first 64 files are sent; %1$d file left out</item>
+        <item quantity="other">Only the first 64 files are sent; %1$d files left out</item>
+    </plurals>
+    <string name="file_nothing">Nothing to send: share a file, not text</string>
+    <string name="file_unsupported">This PC\'s BubblePlay host can\'t receive files yet</string>
+    <string name="file_waiting_pc">Files will send when the PC is connected</string>
+    <string name="file_no_app">No app on this phone can open it</string>
+    <string name="file_no_picker">No file picker on this phone</string>
 </resources>

@@ -1,6 +1,15 @@
 package de.bubblebuffer.bubbleplay.ui
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.ContentResolver
+import android.net.Uri
+import android.widget.LinearLayout
+import de.bubblebuffer.bubbleplay.files.DownloadNotifier
+import de.bubblebuffer.bubbleplay.files.FileTransfers
+import de.bubblebuffer.bubbleplay.files.ReceiveCheck
+import de.bubblebuffer.bubbleplay.protocol.FileWire
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
@@ -51,7 +60,7 @@ import kotlin.math.roundToInt
  * (trackpad / direct), IME and hardware keyboard, captured mouse, clipboard,
  * and the quick-action bar ([QuickBar]).
  */
-class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink, QuickBar.Host {
+class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink, QuickBar.Host, TransferDock.Host {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
     private lateinit var config: ServerConfig
@@ -66,6 +75,17 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private lateinit var status: TextView
     private lateinit var keyboardView: KeyboardInputView
     private lateinit var quickBar: QuickBar
+    private lateinit var dock: LinearLayout
+    private lateinit var transferDock: TransferDock
+
+    // File transfer v1: capability from host-capabilities (null = no host yet).
+    private var files: FileTransfers? = null
+    private var fileCapability: Boolean? = null
+    @Volatile private var fileEpoch: String? = null
+    private var currentOffer: FileWire.Offer? = null
+    /** Uploads asked for before the host said it can take files (share sheet, picker after a reconnect). */
+    private val pendingUploads = ArrayList<Pair<List<Uri>, String>>()
+    private var askedNotifications = false
 
     private val viewport = Viewport()
     private val gestures = TouchGestures()
@@ -103,6 +123,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override val touchMode: TouchMode get() = gestures.mode
     override val zoomed: Boolean get() = viewport.zoomed
     override val latched: Set<String> get() = latchSet
+    override val fileTransfer: Boolean get() = fileCapability == true
 
     private val backgroundDisconnect = Runnable { stopSession() }
     private val longPress = Runnable { apply(gestures.onLongPress(SystemClock.uptimeMillis())) }
@@ -119,8 +140,23 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         config = prefs.serverConfig() ?: run { finish(); return }
         gestures.mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
         buildViews()
+        files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, { if (config.isLab) null else Prefs.cookieHeader(config) }, fileListener)
         enterImmersive()
         startSession()
+        takeShares(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        takeShares(intent)
+    }
+
+    /** Files shared to BubblePlay from another app. */
+    private fun takeShares(intent: Intent?) {
+        val uris = PendingShares.read(intent)
+        PendingShares.consume(intent)
+        if (uris.isNotEmpty()) enqueueUpload(uris, FileWire.PURPOSE_SAVE)
     }
 
     // ---- views ---------------------------------------------------------------
@@ -155,12 +191,21 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             topMargin = dp(8); leftMargin = dp(8)
         })
 
-        quickBar = QuickBar(this, root, this)
-        // The bar is docked, never over the video: the stage (and so the
-        // viewport, letterbox and touch mapping) is the area above it. Root
-        // padding already removes the soft keyboard and, outside full screen,
-        // the system bars, so the bar sits on the keyboard and the stream above.
+        // The dock: transfer rows over the quick-action bar. It never covers the
+        // video: the stage (and so the viewport, letterbox and touch mapping) is
+        // the area above the dock. Root padding already removes the soft keyboard
+        // and, outside full screen, the system bars, so the bar sits on the
+        // keyboard and the stream above.
+        dock = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        transferDock = TransferDock(this, dock, this)
+        quickBar = QuickBar(this, root, dock, this) // adds its scrim to root and the bar last in the dock
+        root.addView(dock, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         (stage.layoutParams as FrameLayout.LayoutParams).bottomMargin = quickBar.height
+        dock.addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
+            val height = bottom - top
+            val lp = stage.layoutParams as FrameLayout.LayoutParams
+            if (height > 0 && lp.bottomMargin != height) stage.post { lp.bottomMargin = height; stage.layoutParams = lp }
+        }
 
         root.setOnApplyWindowInsetsListener { v, insets -> applyInsets(v, insets); insets }
         setContentView(root)
@@ -246,6 +291,10 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     private fun stopSession() {
         quickBar.release()
+        // No background transfers in v1: the session's end cancels them.
+        files?.cancelAll()
+        currentOffer = null
+        transferDock.clear()
         input?.releaseAll()
         session?.stop()
         session = null
@@ -277,8 +326,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         main.removeCallbacksAndMessages(null)
         if (::quickBar.isInitialized) {
             quickBar.onDestroy()
+            transferDock.onDestroy()
             stopSession()
         }
+        files?.shutdown()
+        files = null
         super.onDestroy()
     }
 
@@ -323,7 +375,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onAuthRequired() {
         stopSession()
-        startActivity(Intent(this, LoginActivity::class.java).putExtra(LoginActivity.EXTRA_FORCE, true))
+        // Shares that have not gone out yet come back after sign-in.
+        val waiting = pendingUploads.filter { it.second == FileWire.PURPOSE_SAVE }.flatMap { it.first }
+        startActivity(PendingShares.attach(Intent(this, LoginActivity::class.java).putExtra(LoginActivity.EXTRA_FORCE, true), waiting))
         finish()
     }
 
@@ -716,7 +770,13 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun pastePhoneClipboard() {
         val manager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val text = manager.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+        val item = manager.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
+        // An image or file on the phone clipboard is uploaded and pasted on the PC.
+        val uri = item?.uri
+        if (uri != null && fileTransfer && ContentResolver.SCHEME_CONTENT == uri.scheme) {
+            enqueueUpload(listOf(uri), FileWire.PURPOSE_PASTE); return
+        }
+        val text = item?.coerceToText(this)?.toString()
         if (text.isNullOrEmpty()) { Toast.makeText(this, R.string.clipboard_empty, Toast.LENGTH_SHORT).show(); return }
         val remote = input ?: return
         val ok = if (session?.clipboardEnabled() == true) remote.clipboard(text, paste = true) else remote.text(text)
@@ -733,6 +793,149 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         finish()
     }
 
+    // ---- file transfer ---------------------------------------------------------------------------
+    override fun attachFiles() {
+        val pick = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("*/*")
+            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(pick, REQUEST_ATTACH)
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.file_no_picker, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_ATTACH || resultCode != RESULT_OK || data == null) return
+        val uris = ArrayList<Uri>()
+        data.clipData?.let { c -> for (i in 0 until c.itemCount) c.getItemAt(i).uri?.let { uris += it } }
+        if (uris.isEmpty()) data.data?.let { uris += it }
+        if (uris.size > FileWire.MAX_BATCH) {
+            Toast.makeText(this, resources.getQuantityString(R.plurals.file_too_many, uris.size - FileWire.MAX_BATCH, uris.size - FileWire.MAX_BATCH), Toast.LENGTH_LONG).show()
+        }
+        if (uris.isNotEmpty()) enqueueUpload(uris.distinct().take(FileWire.MAX_BATCH), FileWire.PURPOSE_SAVE)
+    }
+
+    private fun enqueueUpload(uris: List<Uri>, purpose: String) {
+        when (fileCapability) {
+            true -> files?.upload(uris, purpose)
+            false -> Toast.makeText(this, R.string.file_unsupported, Toast.LENGTH_LONG).show()
+            null -> {
+                pendingUploads += uris to purpose
+                transferDock.showNotice(getString(R.string.file_waiting_pc))
+            }
+        }
+    }
+
+    override fun onFileCapability(enabled: Boolean?) {
+        fileCapability = enabled
+        files?.setEnabled(enabled == true)
+        quickBar.render()
+        when (enabled) {
+            true -> {
+                val waiting = pendingUploads.toList()
+                pendingUploads.clear()
+                waiting.forEach { (uris, purpose) -> files?.upload(uris, purpose) }
+            }
+            false -> {
+                if (pendingUploads.isNotEmpty()) Toast.makeText(this, R.string.file_unsupported, Toast.LENGTH_LONG).show()
+                pendingUploads.clear()
+                currentOffer = null
+                quickBar.dismiss()
+                transferDock.clear()
+            }
+            null -> { currentOffer = null; transferDock.showOffer(null) }
+        }
+    }
+
+    override fun onFileEpoch(epoch: String?) {
+        if (epoch == fileEpoch) return
+        fileEpoch = epoch
+        files?.epochChanged()
+    }
+
+    override fun onFileOffer(offer: FileWire.Offer) {
+        if (fileCapability != true) return
+        // A new offer replaces the previous one; no items withdraws it.
+        currentOffer = offer.takeIf { it.items.isNotEmpty() }
+        transferDock.showOffer(currentOffer)
+    }
+
+    override fun downloadOffer() {
+        val offer = currentOffer ?: return
+        currentOffer = null
+        transferDock.showOffer(null)
+        if (Build.VERSION.SDK_INT >= 33 && !DownloadNotifier.canNotify(this) && !askedNotifications) {
+            askedNotifications = true
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFY)
+        }
+        files?.download(offer)
+    }
+
+    override fun dismissOffer() {
+        currentOffer = null
+        transferDock.showOffer(null)
+    }
+
+    override fun cancelTransfer(direction: FileTransfers.Direction) {
+        files?.cancel(direction)
+    }
+
+    override fun openDownload(uri: Uri, mime: String) = launch(DownloadNotifier.openIntent(uri, mime))
+
+    override fun shareDownload(uri: Uri, mime: String) = launch(DownloadNotifier.shareIntent(this, uri, mime))
+
+    private fun launch(intent: Intent) {
+        try { startActivity(intent) } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.file_no_app, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun fileError(error: String): String = when (error) {
+        FileTransfers.ERR_CONNECTION -> getString(R.string.file_err_connection)
+        FileTransfers.ERR_AUTH -> getString(R.string.file_err_auth)
+        FileTransfers.ERR_UNAVAILABLE -> getString(R.string.file_err_unavailable)
+        FileTransfers.ERR_TOO_LARGE -> getString(R.string.file_err_too_large)
+        FileTransfers.ERR_UNREADABLE -> getString(R.string.file_err_unreadable)
+        FileTransfers.ERR_SIZE_CHANGED -> getString(R.string.file_err_size_changed)
+        FileTransfers.ERR_STORAGE -> getString(R.string.file_err_storage)
+        ReceiveCheck.ERR_HASH, ReceiveCheck.ERR_SIZE -> getString(R.string.file_err_hash)
+        FileTransfers.ERR_PROTOCOL, ReceiveCheck.ERR_SEQUENCE -> getString(R.string.file_err_protocol)
+        else -> getString(R.string.file_err_refused, error)
+    }
+
+    private val fileListener = object : FileTransfers.Listener {
+        override fun onProgress(up: FileTransfers.Row?, down: FileTransfers.Row?) {
+            if (!isDestroyed) transferDock.showProgress(up, down)
+        }
+
+        override fun onUploadBatchDone(purpose: String, saved: Int, failed: Int) {
+            if (isDestroyed || saved == 0) return
+            val text = when {
+                failed > 0 -> resources.getQuantityString(R.plurals.file_uploaded_partly, saved + failed, saved, saved + failed)
+                purpose == FileWire.PURPOSE_PASTE -> getString(R.string.file_pasted)
+                else -> resources.getQuantityString(R.plurals.file_uploaded, saved, saved)
+            }
+            transferDock.showNotice(text)
+        }
+
+        override fun onDownloaded(name: String, uri: Uri, mime: String) {
+            DownloadNotifier.notify(this@StreamActivity, name, uri, mime)
+            if (!isDestroyed) transferDock.showNotice(getString(R.string.file_saved_as, name), uri, mime)
+        }
+
+        override fun onFailed(direction: FileTransfers.Direction, name: String, error: String) {
+            if (isDestroyed || error == FileTransfers.ERR_CANCELLED) return
+            val res = if (direction == FileTransfers.Direction.UP) R.string.file_failed_up else R.string.file_failed_down
+            transferDock.showNotice(getString(res, name, fileError(error)))
+        }
+    }
+
     private fun onStatusTapped() {
         if (lastStatus?.state == Session.State.ERROR || session == null) {
             stopSession(); startSession()
@@ -746,5 +949,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         private const val TRACKPAD_GAIN = 1.6f
         private const val SCROLL_DP_PER_NOTCH = 40f
         private const val MONITOR_REFRESH_MS = 1_500L
+        private const val REQUEST_ATTACH = 41
+        private const val REQUEST_NOTIFY = 42
     }
 }
