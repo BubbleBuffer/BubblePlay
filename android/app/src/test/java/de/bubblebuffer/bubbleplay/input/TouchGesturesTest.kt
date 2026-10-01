@@ -29,6 +29,25 @@ class TouchGesturesTest {
     }
 
     @Test
+    fun tapToClickOffLeavesLongPressAndTwoFingerTap() {
+        g.tapToClick = false
+        g.down(0, 100f, 100f, 0)
+        assertEquals(emptyList<GestureAction>(), g.up(0, 120))
+        // Long-press then lift in place: press + release is a click.
+        g.down(0, 100f, 100f, 1_000)
+        assertEquals(listOf(Press(BUTTON_LEFT)), g.onLongPress(1_450))
+        assertEquals(listOf(Release(BUTTON_LEFT)), g.up(0, 1_600))
+        g.down(0, 100f, 100f, 2_000)
+        g.down(1, 200f, 100f, 2_050)
+        assertEquals(listOf(Click(BUTTON_RIGHT)), g.up(1, 2_150))
+        assertEquals(emptyList<GestureAction>(), g.up(0, 2_160))
+        // Direct mode always clicks where tapped.
+        g.mode = TouchMode.DIRECT
+        g.down(0, 50f, 60f, 3_000)
+        assertEquals(listOf(PointAt(50f, 60f), Click(BUTTON_LEFT)), g.up(0, 3_100))
+    }
+
+    @Test
     fun trackpadDragMovesRelativelyIncludingSlop() {
         g.down(0, 100f, 100f, 0)
         g.move(0, 105f, 100f)

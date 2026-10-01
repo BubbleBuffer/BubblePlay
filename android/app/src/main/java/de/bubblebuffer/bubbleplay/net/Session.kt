@@ -41,7 +41,7 @@ import java.util.concurrent.TimeUnit
 class Session(
     config: ServerConfig,
     private val cookieProvider: () -> String?,
-    private val preferredCodec: String,
+    val preferredCodec: String,
     private val listener: Listener,
 ) : RemoteInput.Transport, VideoDecoder.Listener {
 
@@ -68,6 +68,17 @@ class Session(
     enum class State { CONNECTING, CONNECTED, STATIC, RECONNECTING, ERROR }
 
     data class Status(val state: State, val text: String)
+
+    /** Live values for the settings view's Diagnostics (null: not known yet). */
+    data class Diagnostics(
+        val decoder: String?,
+        val codec: String?,
+        val width: Int,
+        val height: Int,
+        val fps: Double?,
+        val kbps: Double?,
+        val rttMs: Long?,
+    )
 
     data class Monitor(val selector: String, val name: String, val width: Int, val height: Int, val selected: Boolean)
 
@@ -148,6 +159,7 @@ class Session(
             heartbeat()
             publishStatus()
             logStats()
+            updateDiagnostics()
             handler.postDelayed(this, 250)
         }
     }
@@ -158,6 +170,39 @@ class Session(
     private var statsDecoded = 0L
     private var statsPresented = 0L
     private var statsSkipped = 0L
+
+    // Diagnostics: presented fps and media bitrate over ~1 s windows; relay round trip from ping/pong.
+    @Volatile var diagnostics = Diagnostics(null, null, 0, 0, null, null, null)
+        private set
+    private var mediaBytes = 0L
+    private var diagAt = 0L
+    private var diagBytes = 0L
+    private var diagPresented = 0L
+    private var decoderName: String? = null
+    private var pingSentAt = 0L
+    private var rttMs: Long? = null
+
+    private fun updateDiagnostics() {
+        val now = now()
+        if (diagAt == 0L) { diagAt = now; diagBytes = mediaBytes; diagPresented = framesPresented; return }
+        val elapsed = now - diagAt
+        if (elapsed < 1_000) return
+        val flowing = mediaOpen && lastFrameAt?.let { now - it < 2_000 } == true
+        val fps = if (flowing) (framesPresented - diagPresented) * 1000.0 / elapsed else null
+        val kbps = if (mediaOpen) (mediaBytes - diagBytes) * 8.0 / elapsed else null
+        val codec = when (activeCodec) { V4.CODEC_HEVC -> "HEVC"; V4.CODEC_H264 -> "H.264"; else -> null }
+        diagnostics = Diagnostics(decoderName, codec, videoWidth, videoHeight, fps, kbps, rttMs)
+        diagAt = now; diagBytes = mediaBytes; diagPresented = framesPresented
+    }
+
+    /** Sends an extra signaling ping so the round trip is fresh (diagnostics only; the relay answers pong). */
+    fun probeRoundTrip() = handler.post {
+        if (pingSentAt == 0L || now() - pingSentAt > PING_STALE_MS) sendPing()
+    }
+
+    private fun sendPing() {
+        if (sendSig(JSONObject().put("type", "ping"))) pingSentAt = now()
+    }
 
     private fun logStats() {
         val now = now()
@@ -333,6 +378,9 @@ class Session(
                 val files = msg.optInt("fileTransfer") >= 1
                 main.post { listener.onFileCapability(files) }
                 if (!mediaOpen && media == null && registered) startMedia()
+            }
+            "pong" -> {
+                if (pingSentAt != 0L) { rttMs = now() - pingSentAt; pingSentAt = 0L }
             }
             "file-offer" -> {
                 val offer = FileWire.parseOfferMessage(msg) ?: return
@@ -614,6 +662,7 @@ class Session(
         // ACK on receipt: the host measures delivery, not decode time.
         sendMedia(V4.ackMessage(frame.generation, frame.seq, receivedMs, decoder.lastDecodedSeq))
         framesReceived++
+        mediaBytes += packet.size
         lastFrameAt = now()
         val verdict = gate.accept(frame)
         verdict.requestKeyframe?.let { requestKeyframe(it) }
@@ -677,7 +726,10 @@ class Session(
 
     override fun onDecoderSelected(name: String, mime: String, hardware: Boolean, lowLatency: Boolean) {
         Log.i(TAG, "decoder $name ($mime) hw=$hardware lowLatency=$lowLatency")
-        handler.post { decoderLabel = if (hardware) "hw" else "sw" }
+        handler.post {
+            decoderLabel = if (hardware) "hw" else "sw"
+            decoderName = "$name (${if (hardware) "hardware" else "software"}${if (lowLatency) ", low latency" else ""})"
+        }
     }
 
     // ---- heartbeat and status ----------------------------------------------------
@@ -688,7 +740,7 @@ class Session(
             // socket (probed early while input is flowing). Cancelling it runs
             // the normal signalingDown -> reconnect path.
             when (liveness.check(now)) {
-                SignalLiveness.Action.PING -> sendSig(JSONObject().put("type", "ping"))
+                SignalLiveness.Action.PING -> sendPing()
                 SignalLiveness.Action.DEAD -> { Log.w(TAG, "signaling unanswered: reconnecting"); sig?.cancel() }
                 SignalLiveness.Action.NONE -> {}
             }
@@ -743,6 +795,7 @@ class Session(
 
     companion object {
         private const val TAG = "BubblePlaySession"
+        private const val PING_STALE_MS = 10_000L
 
         /** "hevc" when a hardware HEVC decoder exists, else "h264" (override with a setting). */
         fun chooseCodec(preference: String): String = when (preference) {
