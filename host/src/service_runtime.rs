@@ -596,6 +596,8 @@ impl TransportConfig {
             &fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
         )
         .with_context(|| format!("parsing {}", path.display()))?;
+        crate::relay_url::require_secure_relay_url(&stored.worker)
+            .with_context(|| format!("worker in {}", path.display()))?;
         let token = String::from_utf8(dpapi_unprotect_hex(&stored.token_dpapi_hex)?)
             .context("stored BubblePlay token is not UTF-8")?;
         let host_gate_token = stored

@@ -28,6 +28,57 @@ const SIGNALING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKER_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 const BENCH_STATUS_MAX_BYTES: usize = 4_096;
+const FILE_DRAG_PREVIEW_MAX_BYTES: usize = 8_192;
+
+/// Client-side drag metadata for the native OLE target probe. No file bytes or
+/// paths travel in this control; the host checks epoch and desktop readiness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDragPreviewControl {
+    pub protocol: u8,
+    pub epoch: String,
+    pub drag_id: u32,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop: Option<crate::file_transfer::DropPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types: Option<Vec<String>>,
+}
+
+impl FileDragPreviewControl {
+    pub fn valid(&self) -> bool {
+        if self.protocol != 1 || self.drag_id == 0 || self.epoch.len() != 32
+            || !self.epoch.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return false;
+        }
+        match self.action.as_str() {
+            "cancel" => self.drop.is_none() && self.types.is_none(),
+            "update" => self.drop.is_some_and(|point| point.generation != 0)
+                && self.types.as_ref().is_some_and(|types| {
+                    (1..=64).contains(&types.len())
+                        && types.iter().all(|mime| mime.len() <= 96 && mime.bytes().all(|b| b.is_ascii_graphic()))
+                }),
+            _ => false,
+        }
+    }
+}
+
+fn valid_file_drag_preview_wire(text: &str, control: &FileDragPreviewControl) -> bool {
+    if text.len() > FILE_DRAG_PREVIEW_MAX_BYTES || !control.valid() {
+        return false;
+    }
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(text) else { return false; };
+    if fields.keys().any(|key| !["type", "protocol", "epoch", "dragId", "action", "drop", "types"].contains(&key.as_str())) {
+        return false;
+    }
+    if control.action == "cancel" {
+        return !fields.contains_key("drop") && !fields.contains_key("types");
+    }
+    fields.get("drop").and_then(serde_json::Value::as_object).is_some_and(|point| {
+        point.len() == 4 && point.keys().all(|key| ["x", "y", "generation", "viewportRevision"].contains(&key.as_str()))
+    })
+}
 
 const V2_REDUNDANT_BENCH_FIELDS: [&str; 12] = [
     "transport",
@@ -236,6 +287,23 @@ fn u64_is_zero(value: &u64) -> bool {
 fn u32_is_zero(value: &u32) -> bool {
     *value == 0
 }
+
+fn host_capabilities_message(
+    service_mode: bool, cold_boot: bool, secure_desktop: bool, secure_text: bool,
+    file_transfer: bool, file_drop: bool, follow_window: Option<bool>,
+    browser_approval_eligible: bool,
+) -> SignalMsg {
+    SignalMsg::HostCapabilities {
+        browser_approval: !service_mode && browser_approval_eligible,
+        service_mode, cold_boot, secure_desktop, secure_text,
+        file_transfer: file_transfer.then_some(crate::file_transfer::PROTOCOL_VERSION),
+        file_drop: (!service_mode && file_transfer && file_drop).then_some(1),
+        file_drop_preview: (!service_mode && file_transfer && file_drop).then_some(1),
+        follow_window: follow_window.map(|_| crate::follow_window::PROTOCOL_VERSION),
+    }
+}
+
+fn is_false(value: &bool) -> bool { !*value }
 
 fn bench_status_wire(msg: &SignalMsg) -> Result<String> {
     let mut value = serde_json::to_value(msg).context("serialize benchmark status value")?;
@@ -474,6 +542,10 @@ pub enum SignalMsg {
         #[serde(default)]
         presentation: QosPresentation,
     },
+    FileDragPreview {
+        #[serde(flatten)]
+        control: FileDragPreviewControl,
+    },
     Quality {
         profile: String,
         width: u32,
@@ -578,6 +650,10 @@ pub enum SignalMsg {
         state: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         desktop: Option<String>,
+        #[serde(rename = "secureKind", skip_serializing_if = "Option::is_none")]
+        secure_kind: Option<String>,
+        #[serde(rename = "secureCapabilities", skip_serializing_if = "Option::is_none")]
+        secure_capabilities: Option<Vec<String>>,
         #[serde(rename = "input", skip_serializing_if = "Option::is_none")]
         input_state: Option<String>,
         generation: u32,
@@ -606,8 +682,14 @@ pub enum SignalMsg {
         #[serde(rename = "lastSequence", skip_serializing_if = "Option::is_none")]
         last_sequence: Option<u16>,
     },
+    #[serde(rename = "secure-action")]
+    SecureAction { action: String },
+    #[serde(rename = "secure-action-result")]
+    SecureActionResult { action: String, ok: bool, reason: String },
     #[serde(rename = "host-capabilities")]
     HostCapabilities {
+        #[serde(rename = "browserApproval", default, skip_serializing_if = "is_false")]
+        browser_approval: bool,
         #[serde(rename = "serviceMode")]
         service_mode: bool,
         #[serde(rename = "coldBoot")]
@@ -616,7 +698,7 @@ pub enum SignalMsg {
         secure_desktop: bool,
         #[serde(rename = "secureText")]
         secure_text: bool,
-        /// File transfer protocol version (`.superpawers/file-transfer.md`);
+        /// File transfer protocol version (`docs/architecture/file-transfer.md`);
         /// absent when the host cannot transfer files.
         #[serde(
             rename = "fileTransfer",
@@ -624,10 +706,27 @@ pub enum SignalMsg {
             skip_serializing_if = "Option::is_none"
         )]
         file_transfer: Option<u8>,
+        /// Native Windows virtual-file drops; absent on older/service hosts.
+        #[serde(rename = "fileDrop", default, skip_serializing_if = "Option::is_none")]
+        file_drop: Option<u8>,
+        /// Native OLE pre-drop target preview; absent on older/service hosts.
+        #[serde(rename = "fileDropPreview", default, skip_serializing_if = "Option::is_none")]
+        file_drop_preview: Option<u8>,
+        /// Follow active window version (`docs/architecture/follow-active-window.md`);
+        /// absent when the host cannot follow the foreground window.
+        #[serde(
+            rename = "followWindow",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        follow_window: Option<u8>,
     },
     #[serde(rename = "monitor-list")]
     MonitorList {
         monitors: Vec<MonitorInfo>,
+        /// The host's follow state; absent when follow is not advertised.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        follow: Option<bool>,
     },
     /// Input features beyond the original VK packet set. Sent separately from
     /// `host-capabilities` so older browsers simply ignore it.
@@ -647,7 +746,11 @@ pub enum SignalMsg {
         index: u16,
         count: u16,
         text: String,
+
     },
+    #[serde(rename = "clipboard-image")]
+    ClipboardImage { protocol: u8, id: u32, index: u16, count: u16, text: String,
+        #[serde(rename = "mimeType")] mime_type: String },
     #[serde(rename = "monitor-error")]
     MonitorError {
         selector: String,
@@ -703,6 +806,9 @@ pub enum SignalMsg {
         height_q16: Option<u16>,
         #[serde(default)]
         monitor: Option<String>,
+        /// `action: "follow"`: turn follow active window on or off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        follow: Option<bool>,
     },
     #[serde(rename = "peer-left")]
     PeerLeft,
@@ -752,12 +858,14 @@ pub struct QosPresentation {
 }
 
 pub enum SignalEvent {
+    SecureDeny,
     /// Worker accepted our hello.
     Registered,
     /// Browser sent an SDP offer.
     Offer(String),
     /// Browser trickled an ICE candidate (SDP string form).
     RemoteCandidate(String),
+    FileDragPreview(FileDragPreviewControl),
     /// Authenticated browser profiling snapshot (enabled with ?profile=1).
     ClientDiagnostics {
         seq: u64,
@@ -793,6 +901,7 @@ pub enum SignalEvent {
         width_q16: Option<u16>,
         height_q16: Option<u16>,
         monitor: Option<String>,
+        follow: Option<bool>,
     },
     MediaView {
         state: String,
@@ -822,14 +931,155 @@ pub enum SignalEvent {
     PeerLeft,
 }
 
+#[derive(Default)]
+struct PendingCursorState {
+    latest: Option<[u8; 8]>,
+    // Keep the acknowledgement watermark across slot drainage. External
+    // cursor polls carry the latest position, not a new input watermark.
+    // A new authenticated signaling session starts with no watermark.
+    acknowledged_sequence: Option<u16>,
+}
+
+#[cfg(test)]
+mod pending_cursor_state_tests {
+    use super::PendingCursorState;
+    use crate::input::CursorState;
+
+    fn snapshot(acknowledged_sequence: Option<u16>, x: u16) -> [u8; 8] {
+        CursorState {
+            acknowledged_sequence,
+            x,
+            y: x + 1,
+            in_bounds: true,
+            visible: true,
+        }.encode()
+    }
+
+    #[test]
+    fn routine_cursor_feedback_keeps_only_the_latest_before_admission() {
+        let mut pending = PendingCursorState::default();
+        assert_eq!(pending.publish(snapshot(None, 1), false), None);
+        assert_eq!(pending.publish(snapshot(None, 2), false), None);
+        assert_eq!(pending.latest.take(), Some(snapshot(None, 2)));
+        assert_eq!(pending.latest, None);
+    }
+
+    #[test]
+    fn reliable_responses_are_distinct_and_supersede_older_routine_state() {
+        let mut pending = PendingCursorState::default();
+        pending.publish(snapshot(Some(1), 1), false);
+        assert_eq!(pending.publish(snapshot(Some(2), 2), true), Some(snapshot(Some(2), 2)));
+        assert_eq!(pending.latest, None);
+        assert_eq!(pending.publish(snapshot(Some(3), 3), true), Some(snapshot(Some(3), 3)));
+        pending.publish(snapshot(None, 4), false);
+        assert_eq!(pending.latest, Some(snapshot(Some(3), 4)));
+    }
+
+    #[test]
+    fn ackless_latest_snapshot_keeps_final_ack_and_its_own_visibility() {
+        let mut pending = PendingCursorState::default();
+        pending.publish(snapshot(Some(42), 1), false);
+        let external = CursorState {
+            acknowledged_sequence: None,
+            x: 300,
+            y: 400,
+            in_bounds: false,
+            visible: false,
+        };
+        pending.publish(external.encode(), false);
+        assert_eq!(pending.latest.take(), Some(CursorState {
+            acknowledged_sequence: Some(42), ..external
+        }.encode()));
+    }
+
+    #[test]
+    fn stale_ack_does_not_lower_watermark_in_pending_or_after_slot_drainage() {
+        let mut pending = PendingCursorState::default();
+        pending.publish(snapshot(Some(100), 1), false);
+        pending.publish(snapshot(Some(99), 2), false);
+        assert_eq!(pending.latest.take(), Some(snapshot(Some(100), 2)));
+        pending.publish(snapshot(None, 3), false);
+        assert_eq!(pending.latest.take(), Some(snapshot(Some(100), 3)));
+        pending.publish(snapshot(Some(90), 4), false);
+        assert_eq!(pending.latest.take(), Some(snapshot(Some(100), 4)));
+        // Explicit responses also preserve the watermark without being
+        // coalesced together or resurrecting the drained position slot.
+        assert_eq!(pending.publish(snapshot(Some(98), 5), true), Some(snapshot(Some(100), 5)));
+        assert_eq!(pending.latest, None);
+    }
+
+    #[test]
+    fn ack_watermark_wraps_and_rejects_duplicates_stale_and_half_range() {
+        let mut pending = PendingCursorState::default();
+        pending.publish(snapshot(Some(u16::MAX), 1), false);
+        pending.publish(snapshot(Some(0), 2), false);
+        pending.publish(snapshot(Some(u16::MAX), 3), false);
+        pending.publish(snapshot(Some(0), 4), false);
+        pending.publish(snapshot(Some(0x8000), 5), false);
+        assert_eq!(pending.latest.take(), Some(snapshot(Some(0), 5)));
+        pending.publish(snapshot(Some(1), 6), false);
+        assert_eq!(pending.latest.take(), Some(snapshot(Some(1), 6)));
+    }
+
+    #[test]
+    fn new_signaling_session_starts_without_previous_ack_watermark() {
+        let mut previous = PendingCursorState::default();
+        previous.publish(snapshot(Some(100), 1), false);
+        let mut fresh = PendingCursorState::default();
+        fresh.publish(snapshot(None, 2), false);
+        assert_eq!(fresh.latest.take(), Some(snapshot(None, 2)));
+        fresh.publish(snapshot(Some(1), 3), false);
+        assert_eq!(fresh.latest.take(), Some(snapshot(Some(1), 3)));
+    }
+}
+
+fn valid_secure_action_wire(text: &str) -> bool {
+    if text.len() > 512 { return false; }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return false; };
+    value.as_object().is_some_and(|value| value.len() == 2 && value.get("type") == Some(&serde_json::json!("secure-action"))
+        && value.get("action") == Some(&serde_json::json!("deny")))
+}
+
+impl PendingCursorState {
+    fn publish(&mut self, mut state: [u8; 8], reliable: bool) -> Option<[u8; 8]> {
+        if state[7] & crate::input::CURSOR_ACK_VALID != 0 {
+            let sequence = u16::from_le_bytes([state[1], state[2]]);
+            if crate::input::newer_sequence(self.acknowledged_sequence, sequence) {
+                self.acknowledged_sequence = Some(sequence);
+            }
+        }
+        // Coordinates and visibility always use the newest snapshot, while
+        // ACK-less, duplicate or stale snapshots cannot erase/lower its ACK.
+        if let Some(sequence) = self.acknowledged_sequence {
+            state[1..3].copy_from_slice(&sequence.to_le_bytes());
+            state[7] |= crate::input::CURSOR_ACK_VALID;
+        }
+        if reliable {
+            // This newer authoritative response supersedes an unsent routine
+            // state, but each reliable response itself is sent distinctly.
+            self.latest = None;
+            Some(state)
+        } else {
+            self.latest = Some(state);
+            None
+        }
+    }
+}
+
 pub struct Signaling {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
+    pending_cursor_state: PendingCursorState,
     registered: bool,
     peer_seen: bool,
     last_keepalive_ack: Instant,
     version_monitor: Option<WorkerVersionMonitor>,
     /// Advertised as `fileTransfer: 1` in host-capabilities.
     file_transfer: bool,
+    file_drop: bool,
+    /// `None` when follow active window is unsupported (not advertised);
+    /// otherwise the session's follow state, sent in monitor-list.
+    follow_window: Option<bool>,
+    browser_approval: crate::browser_approval::BrowserApproval,
 }
 
 struct WorkerVersionMonitor {
@@ -930,17 +1180,39 @@ impl Signaling {
         info!("signaling registered as host");
         Ok(Self {
             ws,
+            pending_cursor_state: PendingCursorState::default(),
             registered: true,
             peer_seen: false,
             last_keepalive_ack: Instant::now(),
             version_monitor,
             file_transfer: false,
+            file_drop: false,
+            follow_window: None,
+            browser_approval: Default::default(),
         })
     }
 
     /// Advertise file transfer in later host-capabilities messages.
     pub fn set_file_transfer(&mut self, enabled: bool) {
         self.file_transfer = enabled;
+    }
+
+    pub fn set_file_drop(&mut self, enabled: bool) {
+        self.file_drop = enabled;
+    }
+
+    /// Advertise follow active window (`followWindow: 1`) in later
+    /// host-capabilities messages; follow starts off.
+    pub fn set_follow_window_supported(&mut self, supported: bool) {
+        self.follow_window = supported.then_some(false);
+    }
+
+    /// Record the session's follow state for later monitor-list messages.
+    /// Ignored when follow is not advertised.
+    pub fn set_follow(&mut self, follow: bool) {
+        if let Some(state) = self.follow_window.as_mut() {
+            *state = follow;
+        }
     }
 
     /// Send an already-serialized message (e.g. `file-offer`).
@@ -956,12 +1228,14 @@ impl Signaling {
 
     /// Drain pending messages without blocking. Call once per main-loop tick.
     pub fn poll(&mut self) -> Result<Vec<SignalEvent>> {
+        self.flush_cursor_state();
         if let Some((connected, current)) = self
             .version_monitor
             .as_ref()
             .and_then(WorkerVersionMonitor::changed)
         {
             self.registered = false;
+            self.browser_approval.disconnect();
             bail!("signaling Worker version changed from {connected} to {current}");
         }
         let mut events = Vec::new();
@@ -970,14 +1244,22 @@ impl Signaling {
                 Ok(m) => m,
                 Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 // TLS may surface "want read" as WouldBlock via native-tls too.
-                Err(e) => return Err(e).context("ws read"),
+                Err(e) => {
+                    self.registered = false;
+                    self.browser_approval.disconnect();
+                    return Err(e).context("ws read");
+                }
             };
             match msg {
                 Message::Text(text) => {
+                    if let Some(decisions) = self.browser_approval.handle_wire(&text, crate::browser_approval::now_ms()) {
+                        self.send_approval_decisions(decisions);
+                        continue;
+                    }
                     let parsed: SignalMsg = match serde_json::from_str(&text) {
                         Ok(m) => m,
                         Err(e) => {
-                            warn!(?e, %text, "ignoring unparsable signal message");
+                            warn!(%e, bytes = text.len(), "ignoring unparsable signal message");
                             continue;
                         }
                     };
@@ -1026,6 +1308,16 @@ impl Signaling {
                             rx,
                             presentation,
                         }),
+                        SignalMsg::FileDragPreview { control } => {
+                            if valid_file_drag_preview_wire(&text, &control) {
+                                events.push(SignalEvent::FileDragPreview(control));
+                            }
+                        }
+                        SignalMsg::SecureAction { action } => {
+                            if action == "deny" && valid_secure_action_wire(&text) {
+                                events.push(SignalEvent::SecureDeny);
+                            }
+                        }
                         SignalMsg::MediaControl {
                             action,
                             request_id,
@@ -1042,6 +1334,7 @@ impl Signaling {
                             width_q16,
                             height_q16,
                             monitor,
+                            follow,
                         } => {
                             events.push(SignalEvent::MediaControl {
                                 action,
@@ -1059,6 +1352,7 @@ impl Signaling {
                                 width_q16,
                                 height_q16,
                                 monitor,
+                                follow,
                             });
                         }
                         SignalMsg::MediaView {
@@ -1116,12 +1410,13 @@ impl Signaling {
                         SignalMsg::Error { message } => {
                             warn!(message, "worker error message");
                         }
-                        other => debug!(?other, "ignoring signal message"),
+                        other => debug!(kind = ?std::mem::discriminant(&other), "ignoring signal message"),
                     }
                 }
                 Message::Ping(_) | Message::Pong(_) => {} // tungstenite auto-pongs
                 Message::Close(_) => {
                     self.registered = false;
+                    self.browser_approval.disconnect();
                     events.push(SignalEvent::PeerLeft);
                     break;
                 }
@@ -1133,9 +1428,22 @@ impl Signaling {
         }
         if keepalive_expired(self.last_keepalive_ack, Instant::now()) {
             self.registered = false;
+            self.browser_approval.disconnect();
             bail!("signaling keepalive acknowledgement timed out");
         }
+        if self.registered {
+            let decisions = self.browser_approval.poll(crate::browser_approval::now_ms());
+            self.send_approval_decisions(decisions);
+        }
         Ok(events)
+    }
+
+    fn send_approval_decisions(&mut self, decisions: Vec<crate::browser_approval::ApprovalDecision>) {
+        for decision in decisions {
+            if let Ok(text) = serde_json::to_string(&decision) {
+                self.send_text(&text);
+            }
+        }
     }
 
     pub fn send_answer(&mut self, sdp: &str) -> Result<()> {
@@ -1189,6 +1497,39 @@ impl Signaling {
         }
         if self.ws.send(Message::Binary(data.to_vec().into())).is_ok() {
             self.ws.flush().ok();
+        }
+    }
+
+    /// Routine feedback has one replaceable slot before socket admission.
+    /// Explicit cursor-sync/button responses retain the existing reliable path.
+    pub fn send_cursor_state(&mut self, state: [u8; 8], reliable: bool) {
+        if let Some(state) = self.pending_cursor_state.publish(state, reliable) {
+            self.send_binary(&state);
+        }
+    }
+
+    pub fn flush_cursor_state(&mut self) {
+        // Tungstenite retains an already admitted frame on WouldBlock. Drain
+        // it before admitting another routine state, bounding that backlog.
+        if self.ws.flush().is_err() {
+            return;
+        }
+        let Some(state) = self.pending_cursor_state.latest.take() else {
+            return;
+        };
+        if let Err(WsError::WriteBufferFull(_)) =
+            self.ws.send(Message::Binary(state.to_vec().into()))
+        {
+            // WriteBufferFull is the only send result that did not admit it.
+            self.pending_cursor_state.latest = Some(state);
+        }
+    }
+
+    /// Preserve feedback at an Agent input-status barrier. The Agent emits
+    /// such a barrier immediately after each explicit button/sync response.
+    pub fn flush_cursor_state_reliable(&mut self) {
+        if let Some(state) = self.pending_cursor_state.latest.take() {
+            self.send_binary(&state);
         }
     }
 
@@ -1418,6 +1759,8 @@ impl Signaling {
         let msg = SignalMsg::DesktopState {
             state: state.into(),
             desktop: desktop.map(str::to_owned),
+            secure_kind: None,
+            secure_capabilities: None,
             input_state: input_state.map(str::to_owned),
             generation,
             reason: reason.into(),
@@ -1431,6 +1774,30 @@ impl Signaling {
         {
             let _ = self.ws.flush();
         }
+    }
+
+    pub fn send_secure_desktop_state(&mut self, kind: &str, capabilities: &[&str], generation: u32) {
+        self.send_secure_desktop_state_status(false, kind, capabilities, generation);
+    }
+
+    pub fn send_secure_desktop_state_status(&mut self, active: bool, kind: &str, capabilities: &[&str], generation: u32) {
+        let msg = SignalMsg::DesktopState {
+            state: if active { "active" } else { "unavailable" }.into(),
+            desktop: Some("secure".into()),
+            secure_kind: Some(kind.into()),
+            secure_capabilities: Some(capabilities.iter().map(|value| (*value).to_owned()).collect()),
+            input_state: Some(if active && capabilities.contains(&"input") { "enabled" } else if active { "read-only" } else { "suspended" }.into()),
+            generation,
+            reason: if active { "desktop-switched" } else { "secure-desktop" }.into(),
+        };
+        if let Ok(text) = serde_json::to_string(&msg) {
+            if self.ws.send(Message::text(text)).is_ok() { let _ = self.ws.flush(); }
+        }
+    }
+
+    pub fn send_secure_action_result(&mut self, ok: bool, reason: &str) {
+        let message = SignalMsg::SecureActionResult { action: "deny".into(), ok, reason: reason.into() };
+        if let Ok(text) = serde_json::to_string(&message) { self.send_text(&text); }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1478,15 +1845,9 @@ impl Signaling {
         secure_desktop: bool,
         secure_text: bool,
     ) {
-        let msg = SignalMsg::HostCapabilities {
-            service_mode,
-            cold_boot,
-            secure_desktop,
-            secure_text,
-            file_transfer: self
-                .file_transfer
-                .then_some(crate::file_transfer::PROTOCOL_VERSION),
-        };
+        let msg = host_capabilities_message(service_mode, cold_boot, secure_desktop, secure_text,
+            self.file_transfer, self.file_drop, self.follow_window,
+            crate::browser_approval::capability_available(service_mode));
         if self
             .ws
             .send(Message::text(
@@ -1514,12 +1875,14 @@ impl Signaling {
 
     /// Send one host clipboard chunk (see `clipboard::chunk_text`).
     pub fn send_clipboard_chunk(&mut self, id: u32, index: u16, count: u16, text: &str) {
-        let msg = SignalMsg::Clipboard {
-            protocol: 1,
-            id,
-            index,
-            count,
-            text: text.to_owned(),
+        self.send_clipboard_content_chunk(id, index, count, text, false);
+    }
+
+    pub fn send_clipboard_content_chunk(&mut self, id: u32, index: u16, count: u16, text: &str, png: bool) {
+        let msg = if png {
+            SignalMsg::ClipboardImage { protocol: 1, id, index, count, text: text.to_owned(), mime_type: "image/png".to_owned() }
+        } else {
+            SignalMsg::Clipboard { protocol: 1, id, index, count, text: text.to_owned() }
         };
         if self
             .ws
@@ -1533,7 +1896,10 @@ impl Signaling {
     }
 
     pub fn send_monitor_list(&mut self, monitors: Vec<MonitorInfo>) {
-        let msg = SignalMsg::MonitorList { monitors };
+        let msg = SignalMsg::MonitorList {
+            monitors,
+            follow: self.follow_window,
+        };
         if self
             .ws
             .send(Message::text(
@@ -1675,6 +2041,7 @@ fn signaling_request_with_worker_version(
     host_gate_token: Option<&str>,
     worker_version: Option<(&str, &str)>,
 ) -> Result<Request<()>> {
+    crate::relay_url::require_secure_relay_url(url)?;
     let mut request = url
         .into_client_request()
         .context("build websocket request")?;
@@ -2655,6 +3022,28 @@ mod tests {
     }
 
     #[test]
+    fn signaling_refuses_cleartext_except_to_a_loopback_relay() {
+        for url in [
+            "ws://192.168.1.20:8787/host-ws",
+            "ws://playfull-cat.example/host-ws",
+            "ws://localhost.evil.com/host-ws",
+        ] {
+            let error = signaling_request_with_worker_version(url, Some("gate-credential"), None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("loopback"), "{error}");
+            assert!(!error.contains("gate-credential"), "{error}");
+        }
+        for url in [
+            "ws://127.0.0.1:8787/lab-host-ws?run=abc",
+            "ws://localhost:8787/host-ws",
+            "ws://[::1]:8787/host-ws",
+        ] {
+            signaling_request_with_worker_version(url, Some("gate-credential"), None).unwrap();
+        }
+    }
+
+    #[test]
     fn parses_client_diagnostics_message() {
         let message: SignalMsg = serde_json::from_str(
             r#"{"type":"diag","seq":12,"atMs":1780000000000,"profile":{"rtc":{"inbound":{"packetsLost":3}}}}"#,
@@ -2830,18 +3219,47 @@ mod tests {
     #[test]
     fn host_capabilities_carry_no_media_protocol_negotiation() {
         let message = SignalMsg::HostCapabilities {
+            browser_approval: false,
             service_mode: true,
             cold_boot: true,
             secure_desktop: true,
             secure_text: true,
             file_transfer: None,
+            file_drop: None,
+            file_drop_preview: None,
+            follow_window: None,
         };
         let encoded = serde_json::to_value(message).unwrap();
         let object = encoded.as_object().unwrap();
-        for legacy in ["mediaProtocols", "maxWssLanes", "wssFec", "fileTransfer"] {
+        for legacy in [
+            "mediaProtocols",
+            "maxWssLanes",
+            "wssFec",
+            "fileTransfer",
+            "followWindow",
+        ] {
             assert!(!object.contains_key(legacy), "{legacy} must not be sent");
         }
     }
+
+    #[test]
+    fn host_capabilities_announce_browser_approval_as_in_contract() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../fixtures/browser-approval-contract.json")).unwrap();
+        let value = serde_json::to_value(super::host_capabilities_message(false, false, false, false, false, false, None, true)).unwrap();
+        assert_eq!(value["type"], fixture["capability"]["type"]);
+        assert_eq!(value["browserApproval"], fixture["capability"]["browserApproval"]);
+    }
+
+    #[test]
+    fn host_capabilities_omit_browser_approval_for_ineligible_or_service_hosts() {
+        for (service, eligible) in [(false, false), (true, false), (true, true)] {
+            let value = serde_json::to_value(super::host_capabilities_message(service, false, false, false,
+                false, false, None, eligible)).unwrap();
+            assert!(!value.as_object().unwrap().contains_key("browserApproval"));
+        }
+    }
+
+
 
     #[test]
     fn host_capabilities_advertise_file_transfer_as_in_the_fixture() {
@@ -2849,16 +3267,147 @@ mod tests {
             serde_json::from_str(include_str!("../../fixtures/file-transfer-contract.json"))
                 .unwrap();
         let message = SignalMsg::HostCapabilities {
+            browser_approval: false,
             service_mode: false,
             cold_boot: false,
             secure_desktop: false,
             secure_text: false,
             file_transfer: Some(crate::file_transfer::PROTOCOL_VERSION),
+            file_drop: None,
+            file_drop_preview: None,
+            follow_window: None,
         };
         assert_eq!(
             serde_json::to_string(&message).unwrap(),
-            fixture["signaling"]["hostCapabilities"]["text"].as_str().unwrap()
+            fixture["signaling"]["hostCapabilities"]["text"]
+                .as_str()
+                .unwrap()
         );
+    }
+
+    #[test]
+    fn host_capabilities_advertise_native_drop_independently() {
+        let message = SignalMsg::HostCapabilities {
+            browser_approval: false,
+            service_mode: false,
+            cold_boot: false,
+            secure_desktop: false,
+            secure_text: false,
+            file_transfer: Some(1),
+            file_drop: Some(1),
+            file_drop_preview: Some(1),
+            follow_window: None,
+        };
+        let encoded = serde_json::to_value(message).unwrap();
+        assert_eq!(encoded["fileTransfer"], 1);
+        assert_eq!(encoded["fileDrop"], 1);
+        assert_eq!(encoded["fileDropPreview"], 1);
+    }
+
+    fn preview_wire_valid(text: &str) -> bool {
+        match serde_json::from_str::<SignalMsg>(text) {
+            Ok(SignalMsg::FileDragPreview { control }) => super::valid_file_drag_preview_wire(text, &control),
+            _ => false,
+        }
+    }
+
+    fn preview_update() -> serde_json::Value {
+        serde_json::json!({ "type": "file-drag-preview", "protocol": 1,
+            "epoch": "0123456789abcdef0123456789abcdef", "dragId": 1, "action": "update",
+            "drop": { "x": 0, "y": 65535, "generation": 1, "viewportRevision": 0 },
+            "types": ["text/plain", ""] })
+    }
+
+    #[test]
+    fn file_drag_preview_wire_round_trip_and_cancel() {
+        let value = preview_update();
+        let wire = value.to_string();
+        assert!(preview_wire_valid(&wire));
+        let message: SignalMsg = serde_json::from_str(&wire).unwrap();
+        let SignalMsg::FileDragPreview { control } = &message else { panic!("typed preview"); };
+        assert!(control.valid());
+        assert_eq!(control.drag_id, 1);
+        assert_eq!(control.drop.unwrap().y, u16::MAX);
+        assert_eq!(control.types.as_ref().unwrap(), &["text/plain", ""]);
+        assert_eq!(serde_json::to_value(message).unwrap(), value);
+        let cancel = super::FileDragPreviewControl { protocol: 1,
+            epoch: "0123456789abcdef0123456789abcdef".into(), drag_id: u32::MAX,
+            action: "cancel".into(), drop: None, types: None };
+        let wire = serde_json::to_string(&SignalMsg::FileDragPreview { control: cancel }).unwrap();
+        assert!(preview_wire_valid(&wire));
+        let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert!(value.get("drop").is_none());
+        assert!(value.get("types").is_none());
+    }
+
+    #[test]
+    fn file_drag_preview_rejects_bad_bounds_shapes_and_mime_hints() {
+        for (field, bad) in [
+            ("protocol", serde_json::json!(2)), ("dragId", serde_json::json!(0)),
+            ("dragId", serde_json::json!(4294967296u64)), ("dragId", serde_json::json!(1.5)),
+            ("epoch", serde_json::json!("0123456789ABCDEF0123456789ABCDEF")),
+            ("epoch", serde_json::json!("short")), ("action", serde_json::json!("drop")),
+            ("types", serde_json::json!([])), ("types", serde_json::json!(["bad type"])),
+            ("types", serde_json::json!(["text/ü"])), ("types", serde_json::json!(["text/\n"])),
+            ("types", serde_json::json!(["a".repeat(97)])),
+            ("types", serde_json::json!(vec![""; 65])), ("types", serde_json::json!([1])),
+            ("extra", serde_json::json!(true)),
+        ] {
+            let mut value = preview_update();
+            value[field] = bad;
+            assert!(!preview_wire_valid(&value.to_string()), "{field}: {value}");
+        }
+        for (field, bad) in [
+            ("x", serde_json::json!(-1)), ("x", serde_json::json!(65536)),
+            ("y", serde_json::json!(0.5)), ("generation", serde_json::json!(0)),
+            ("generation", serde_json::json!(4294967296u64)),
+            ("viewportRevision", serde_json::json!(-1)), ("extra", serde_json::json!(0)),
+        ] {
+            let mut value = preview_update();
+            value["drop"][field] = bad;
+            assert!(!preview_wire_valid(&value.to_string()), "drop {field}: {value}");
+        }
+        for missing in ["drop", "types", "protocol", "epoch", "dragId"] {
+            let mut value = preview_update();
+            value.as_object_mut().unwrap().remove(missing);
+            assert!(!preview_wire_valid(&value.to_string()), "missing {missing}");
+        }
+        let mut cancel = preview_update();
+        cancel["action"] = serde_json::json!("cancel");
+        assert!(!preview_wire_valid(&cancel.to_string()));
+        cancel["drop"] = serde_json::Value::Null;
+        cancel["types"] = serde_json::Value::Null;
+        assert!(!preview_wire_valid(&cancel.to_string()), "cancel must omit fields, not null them");
+    }
+
+    #[test]
+    fn file_drag_preview_accepts_limits_and_bounds_raw_utf8_text() {
+        let mut value = preview_update();
+        value["dragId"] = serde_json::json!(u32::MAX);
+        value["drop"]["generation"] = serde_json::json!(u32::MAX);
+        value["drop"]["viewportRevision"] = serde_json::json!(u32::MAX);
+        value["types"] = serde_json::json!(vec!["a".repeat(96); 64]);
+        let mut wire = value.to_string();
+        assert!(preview_wire_valid(&wire));
+        wire.extend(std::iter::repeat_n(' ', super::FILE_DRAG_PREVIEW_MAX_BYTES - wire.len()));
+        assert!(preview_wire_valid(&wire));
+        wire.push(' ');
+        assert!(!preview_wire_valid(&wire));
+        let escaped = value.to_string().replace('a', "\\u0061");
+        assert!(escaped.len() > super::FILE_DRAG_PREVIEW_MAX_BYTES);
+        assert!(!preview_wire_valid(&escaped));
+    }
+
+    #[test]
+    fn file_drag_preview_capability_is_optional_for_older_hosts() {
+        for text in [
+            r#"{"type":"host-capabilities","serviceMode":true,"coldBoot":true,"secureDesktop":true,"secureText":false}"#,
+            r#"{"type":"host-capabilities","serviceMode":false,"coldBoot":false,"secureDesktop":false,"secureText":false,"fileTransfer":1,"fileDrop":1}"#,
+        ] {
+            let message: SignalMsg = serde_json::from_str(text).unwrap();
+            assert!(matches!(&message, SignalMsg::HostCapabilities { file_drop_preview: None, .. }));
+            assert_eq!(serde_json::to_value(message).unwrap(), serde_json::from_str::<serde_json::Value>(text).unwrap());
+        }
     }
 
     #[test]
@@ -2877,5 +3426,173 @@ mod tests {
                 ..
             } if action == "monitors" && epoch == "0123456789abcdef0123456789abcdef"
         ));
+    }
+
+    fn follow_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../fixtures/follow-window-contract.json")).unwrap()
+    }
+
+    #[test]
+    fn secure_desktop_state_serializes_optional_contract_fields() {
+        let message = SignalMsg::DesktopState {
+            state: "unavailable".into(), desktop: Some("secure".into()),
+            secure_kind: Some("other".into()), secure_capabilities: Some(vec![]),
+            input_state: Some("suspended".into()), generation: 7,
+            reason: "secure-desktop".into(),
+        };
+        let value = serde_json::to_value(message).unwrap();
+        assert_eq!(value["secureKind"], "other");
+        assert_eq!(value["secureCapabilities"], serde_json::json!([]));
+        let legacy: SignalMsg = serde_json::from_str(r#"{"type":"desktop-state","state":"active","generation":8,"reason":"capture-recovered"}"#).unwrap();
+        let legacy = serde_json::to_value(legacy).unwrap();
+        assert!(legacy.get("secureKind").is_none());
+        assert!(legacy.get("secureCapabilities").is_none());
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../fixtures/secure-desktop-contract.json")).unwrap();
+        assert_eq!(value, fixture["desktopStates"][0]);
+        for expected in fixture["desktopStates"].as_array().unwrap() {
+            let message: SignalMsg = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(serde_json::to_value(message).unwrap(), *expected);
+        }
+    }
+
+    #[test]
+    fn secure_deny_contract_is_parameterless_and_results_roundtrip() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../fixtures/secure-desktop-contract.json")).unwrap();
+        for message in fixture["secureActions"].as_array().unwrap() {
+            assert!(super::valid_secure_action_wire(&message.to_string()));
+        }
+        for message in fixture["secureActionResults"].as_array().unwrap() {
+            let parsed: SignalMsg = serde_json::from_value(message.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), *message);
+        }
+        assert!(!super::valid_secure_action_wire(r#"{"type":"secure-action","action":"deny","x":0}"#));
+        assert!(!super::valid_secure_action_wire(r#"{"type":"secure-action","action":"allow"}"#));
+        assert!(!super::valid_secure_action_wire(r#"{"type":"secure-action-result","action":"deny"}"#));
+    }
+
+    #[test]
+    fn host_capabilities_advertise_follow_window_as_in_the_fixture() {
+        let fixture = follow_fixture();
+        assert_eq!(fixture["protocol"], crate::follow_window::PROTOCOL_VERSION);
+        let message = SignalMsg::HostCapabilities {
+            browser_approval: false,
+            service_mode: false,
+            cold_boot: false,
+            secure_desktop: false,
+            secure_text: false,
+            file_transfer: None,
+            file_drop: None,
+            file_drop_preview: None,
+            follow_window: Some(crate::follow_window::PROTOCOL_VERSION),
+        };
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            fixture["signaling"]["hostCapabilities"]["text"]
+                .as_str()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn host_capabilities_without_follow_serialize_as_before() {
+        let message = SignalMsg::HostCapabilities {
+            browser_approval: false,
+            service_mode: true,
+            cold_boot: true,
+            secure_desktop: true,
+            secure_text: false,
+            file_transfer: None,
+            file_drop: None,
+            file_drop_preview: None,
+            follow_window: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"type":"host-capabilities","serviceMode":true,"coldBoot":true,"secureDesktop":true,"secureText":false}"#
+        );
+    }
+
+    #[test]
+    fn follow_media_control_parses_as_in_the_fixture() {
+        let fixture = follow_fixture();
+        let control: SignalMsg = serde_json::from_str(
+            fixture["signaling"]["followControl"]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            control,
+            SignalMsg::MediaControl {
+                action,
+                follow: Some(true),
+                protocol: Some(4),
+                epoch: Some(_),
+                reason: Some(reason),
+                ..
+            } if action == "follow" && reason == "user-follow"
+        ));
+        let off: SignalMsg =
+            serde_json::from_str(r#"{"type":"media-control","action":"follow","follow":false}"#)
+                .unwrap();
+        assert!(matches!(
+            off,
+            SignalMsg::MediaControl {
+                follow: Some(false),
+                ..
+            }
+        ));
+        // Older controls carry no follow flag.
+        let monitor: SignalMsg = serde_json::from_str(
+            r#"{"type":"media-control","action":"monitor","monitor":"DISPLAY2"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            monitor,
+            SignalMsg::MediaControl { follow: None, .. }
+        ));
+    }
+
+    #[test]
+    fn monitor_list_carries_follow_as_in_the_fixture() {
+        let fixture = follow_fixture();
+        let text = fixture["signaling"]["monitorList"]["text"]
+            .as_str()
+            .unwrap();
+        let parsed: SignalMsg = serde_json::from_str(text).unwrap();
+        let SignalMsg::MonitorList { monitors, follow } = parsed else {
+            panic!("not a monitor-list");
+        };
+        assert_eq!(follow, Some(true));
+        let message = SignalMsg::MonitorList {
+            monitors: monitors.clone(),
+            follow: Some(true),
+        };
+        assert_eq!(serde_json::to_string(&message).unwrap(), text);
+        // Without the capability the list is serialized as before.
+        let legacy = serde_json::to_value(SignalMsg::MonitorList {
+            monitors,
+            follow: None,
+        })
+        .unwrap();
+        assert!(!legacy.as_object().unwrap().contains_key("follow"));
+    }
+
+    #[test]
+    fn ignored_window_classes_match_the_fixture() {
+        let fixture = follow_fixture();
+        for class in fixture["ignoredWindowClasses"].as_array().unwrap() {
+            assert!(crate::follow_window::is_shell_class(
+                class.as_str().unwrap()
+            ));
+        }
+        assert_eq!(
+            fixture["sampleIntervalMs"],
+            crate::follow_window::SAMPLE_INTERVAL.as_millis() as u64
+        );
+        assert_eq!(
+            fixture["minSwitchIntervalMs"],
+            crate::follow_window::MIN_SWITCH_INTERVAL.as_millis() as u64
+        );
     }
 }

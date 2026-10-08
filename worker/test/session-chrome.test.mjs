@@ -56,6 +56,41 @@ test("settings normalization rejects out-of-range values field by field", () => 
   assert.deepEqual(normalizeSettings({ quality: "ultra", pointerMode: "tablet", keyboardLock: "yes", scrollSpeed: 7, defaultMonitor: 3 }), DEFAULT_SETTINGS);
   assert.equal(normalizeSettings({ scrollSpeed: "0.5" }).scrollSpeed, 0.5);
   assert.equal(normalizeSettings({ defaultMonitor: "x".repeat(200) }).defaultMonitor, "");
+  assert.equal(normalizeSettings({ followWindow: "true" }).followWindow, false);
+});
+
+test("follow active window is a boolean setting, off by default, added without resetting older records", () => {
+  assert.equal(DEFAULT_SETTINGS.followWindow, false);
+  // A version-1 record saved before the field existed keeps every other choice.
+  const older = { version: SETTINGS_VERSION, quality: "saver", pointerMode: "game", keyboardLock: false, scrollSpeed: 2, defaultMonitor: "\\\\.\\DISPLAY2" };
+  const storage = memoryStorage({ [SETTINGS_KEY]: JSON.stringify(older) });
+  assert.deepEqual(loadSettings(storage), { ...older, followWindow: false, clipboardAutoCopy: true });
+  saveSettings(storage, { ...loadSettings(storage), followWindow: true });
+  assert.deepEqual(loadSettings(storage), { ...older, followWindow: true, clipboardAutoCopy: true });
+});
+
+test("automatic PC clipboard copying defaults on and persists an explicit opt-out", () => {
+  assert.equal(DEFAULT_SETTINGS.clipboardAutoCopy, true);
+  assert.equal(normalizeSettings({ clipboardAutoCopy: "false" }).clipboardAutoCopy, true);
+  const storage = memoryStorage({ [SETTINGS_KEY]: JSON.stringify({ version: SETTINGS_VERSION, quality: "saver" }) });
+  assert.equal(loadSettings(storage).clipboardAutoCopy, true);
+  saveSettings(storage, { ...loadSettings(storage), clipboardAutoCopy: false });
+  assert.equal(loadSettings(storage).clipboardAutoCopy, false);
+  assert.equal(loadSettings(storage).quality, "saver");
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /Copy from the PC automatically[\s\S]*?id="setting-clipboard-auto-copy" class="switch" type="checkbox" role="switch"/);
+});
+
+test("the Monitors popover has a Follow active window switch, hidden until the host announces it", () => {
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../public/bubbleplay.css", import.meta.url), "utf8");
+  const popover = html.match(/<div id="pop-monitors"[\s\S]*?<\/button>\s*<\/div>\s*<\/div>/)?.[0] ?? "";
+  // Below the list, behind a separator, hidden by default.
+  assert.match(popover, /id="monitor-list"[\s\S]*<div id="follow-window-group" hidden>\s*<div class="pop-divider" role="separator"><\/div>/);
+  // A button row (popover ArrowUp/Down and mousedown focus handling apply to buttons).
+  assert.match(popover, /<button id="follow-window" class="pop-row follow-row" type="button" role="switch" aria-checked="false">/);
+  assert.match(popover, /<span class="pop-row-title">Follow active window<\/span>/);
+  assert.match(css, /\.follow-row\[aria-checked="true"\] \.pop-switch \{/);
 });
 
 test("the quality preset still flows through transport parsing from the settings record", () => {

@@ -1,0 +1,35 @@
+{
+  "protocol": 1,
+  "spec": ".superpawers/follow-active-window.md",
+  "sampleIntervalMs": 250,
+  "confirmSamples": 2,
+  "minSwitchIntervalMs": 1000,
+  "ignoredWindowClasses": [
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd"
+  ],
+  "signaling": {
+    "hostCapabilities": {
+      "note": "followWindow is present only when the host captures in the interactive session; absent otherwise",
+      "text": "{\"type\":\"host-capabilities\",\"serviceMode\":false,\"coldBoot\":false,\"secureDesktop\":false,\"secureText\":false,\"followWindow\":1}"
+    },
+    "followControl": {
+      "note": "client to host; follow is a boolean, sent on every connect",
+      "text": "{\"type\":\"media-control\",\"action\":\"follow\",\"follow\":true,\"protocol\":4,\"epoch\":\"0123456789abcdef0123456789abcdef\",\"reason\":\"user-follow\"}"
+    },
+    "monitorList": {
+      "note": "follow is the host's current state for this signaling session; absent when followWindow is not advertised",
+      "text": "{\"type\":\"monitor-list\",\"monitors\":[{\"selector\":\"\\\\.\\\\DISPLAY1\",\"name\":\"Monitor 1\",\"width\":3840,\"height\":2160,\"origin_x\":0,\"origin_y\":0,\"selected\":false},{\"selector\":\"\\\\.\\\\DISPLAY2\",\"name\":\"Monitor 2\",\"width\":2560,\"height\":1440,\"origin_x\":3840,\"origin_y\":0,\"selected\":true}],\"follow\":true}"
+    },
+    "autoSwitch": {
+      "note": "an automatic switch sends the same messages as a manual pick",
+      "desktopStateReasons": [
+        "monitor-switch",
+        "monitor-switched"
+      ],
+      "then": "monitor-list"
+    }
+  }
+}

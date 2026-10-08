@@ -272,6 +272,7 @@ fn socket_request_with_worker_version(
     kind: HostSocket,
 ) -> Result<Request<()>> {
     let (production_path, lab_path) = kind.paths();
+    crate::relay_url::require_secure_relay_url(worker_url)?;
     let mut url = tungstenite::http::Uri::try_from(worker_url)
         .context("invalid Worker URL")?
         .to_string();
@@ -472,6 +473,31 @@ mod tests {
             .headers()
             .get("Cloudflare-Workers-Version-Overrides")
             .is_none());
+    }
+
+    #[test]
+    fn host_sockets_refuse_cleartext_except_to_a_loopback_relay() {
+        for kind in [HostSocket::Media, HostSocket::File] {
+            for url in ["ws://192.168.1.20:8787/host-ws", "http://worker.example/host-ws"] {
+                let error =
+                    socket_request_with_worker_version(url, "host-bearer", EPOCH, None, kind)
+                        .unwrap_err()
+                        .to_string();
+                assert!(error.contains("loopback"), "{error}");
+                assert!(!error.contains("host-bearer"), "{error}");
+            }
+        }
+        let request = media_request_with_worker_version(
+            "http://127.0.0.1:8787/host-ws",
+            "host-bearer",
+            EPOCH,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            request.uri().to_string(),
+            "ws://127.0.0.1:8787/host-media-ws?epoch=0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]

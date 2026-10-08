@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCodecSession } from "../public/transport.js";
-import { LiveStreamLabSession, webRtcDiagnosticProgress } from "../tools/stream-lab-live.mjs";
+import { LiveStreamLabSession, webRtcDiagnosticProgress } from "../tools/lab/stream-lab-live.mjs";
 
 test("diagnostic WebRTC selects H264 while native WebRTC and WSS retain HEVC", () => {
   assert.equal(createCodecSession({ transport: "webrtc", decoderPath: "webcodecs" }).codec, "h264");

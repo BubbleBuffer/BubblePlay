@@ -2,10 +2,10 @@ import { readClientSource } from "./helpers/client-source.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { campaignCheckpointContract } from "../tools/stream-lab-live.mjs";
+import { campaignCheckpointContract } from "../tools/lab/stream-lab-live.mjs";
 
 const client = readClientSource();
-const runner = readFileSync(new URL("../tools/stream-lab-live.mjs", import.meta.url), "utf8");
+const runner = readFileSync(new URL("../tools/lab/stream-lab-live.mjs", import.meta.url), "utf8");
 
 test("diagnostics exposes structured signaling and monitor evidence", () => {
   assert.match(client, /signaling:\s*\{/);
@@ -95,10 +95,10 @@ test("performance and parity screenshots remain separate passes", () => {
 });
 
 test("lab CLI exposes smoke and resumable campaign commands", () => {
-  const cli = readFileSync(new URL("../tools/stream-lab.mjs", import.meta.url), "utf8");
+  const cli = readFileSync(new URL("../tools/lab/stream-lab.mjs", import.meta.url), "utf8");
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   assert.match(cli, /campaign/);
   assert.match(cli, /--resume/);
-  assert.equal(pkg.scripts["lab:smoke"], "node tools/stream-lab.mjs smoke");
-  assert.equal(pkg.scripts["lab:campaign"], "node tools/stream-lab.mjs campaign");
+  assert.equal(pkg.scripts["lab:smoke"], "node tools/lab/stream-lab.mjs smoke");
+  assert.equal(pkg.scripts["lab:campaign"], "node tools/lab/stream-lab.mjs campaign");
 });

@@ -9,7 +9,7 @@
     into %LOCALAPPDATA%\Programs\BubblePlay, restarting the tray and its host.
     The replaced binaries are moved to <install>\previous\ (exactly one
     previous of each). Also refreshes the staged admin agent
-    (bubbleplay_admin_agent.exe) and the setup/uninstall scripts beside them.
+    (bubbleplay_admin_agent.exe and bubbleplay_secure_helper.exe) and the setup/uninstall scripts beside them.
     Run setup-tray.ps1 once before the first update.
 
     When the host changes, update-state.json in the tray data dir records it
@@ -46,6 +46,8 @@ $ErrorActionPreference = 'Stop'
 # Rollback-tracked binaries (kept in previous\) and plain staged files.
 $Binaries = @('bubbleplay-host.exe', 'bubbleplay_tray.exe')
 $AgentExeName = 'bubbleplay_admin_agent.exe'
+$HelperExeName = 'bubbleplay_secure_helper.exe'
+$PrivilegedBinaries = @($AgentExeName, $HelperExeName)
 $Scripts = @('setup-tray.ps1', 'uninstall-tray.ps1')
 if (-not $SourceDir) { $SourceDir = Join-Path $PSScriptRoot '..\target\release' }
 $SourceDir = [IO.Path]::GetFullPath($SourceDir)
@@ -78,33 +80,28 @@ function Get-Sha256OrNull([string]$Path) {
 if ($Build) {
     $manifest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Cargo.toml'))
     if (-not $env:NVIDIA_VIDEO_CODEC_SDK_PATH) { $env:NVIDIA_VIDEO_CODEC_SDK_PATH = Join-Path $PSScriptRoot '..\sdk-stub' }
-    if ($PSCmdlet.ShouldProcess($manifest, 'cargo build --release (host + tray + admin agent)')) {
-        & cargo build --offline --locked --release --manifest-path $manifest --bin bubbleplay-host --bin bubbleplay_tray --bin bubbleplay_admin_agent
+    if ($PSCmdlet.ShouldProcess($manifest, 'cargo build --release (host + tray + admin agent + secure-desktop helper)')) {
+        & cargo build --offline --locked --release --manifest-path $manifest --bin bubbleplay-host --bin bubbleplay_tray --bin bubbleplay_admin_agent --bin bubbleplay_secure_helper
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed with $LASTEXITCODE" }
     }
 }
 
 $sources = @{}
-foreach ($name in @($Binaries + $AgentExeName)) { $sources[$name] = Join-Path $SourceDir $name }
+foreach ($name in @($Binaries + $PrivilegedBinaries)) { $sources[$name] = Join-Path $SourceDir $name }
 foreach ($name in $Scripts) { $sources[$name] = Join-Path $PSScriptRoot $name }
 $changed = @()
-foreach ($name in @($Binaries + $AgentExeName + $Scripts)) {
+foreach ($name in @($Binaries + $PrivilegedBinaries + $Scripts)) {
     $source = $sources[$name]
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing $source (build first or pass -Build)." }
     if ((Get-Sha256OrNull (Join-Path $InstallDir $name)) -ne (Get-Sha256 $source)) { $changed += $name }
 }
-$agentSourceHash = Get-Sha256 $sources[$AgentExeName]
-$agentInstalledHash = Get-Sha256OrNull (Join-Path $AgentDir $AgentExeName)
-$agentStale = $agentInstalledHash -ne $agentSourceHash
-if ($agentStale -and -not $IncludeAgent) {
-    if ($agentInstalledHash) {
-        Write-Host "Note: the installed admin agent differs from this build's agent. That is fine: the host negotiates the agent protocol and the tray asks for an agent update only when one is required. Pass -IncludeAgent (one UAC prompt) to install it anyway."
-    }
-    else {
-        Write-Host 'Note: the admin agent is not installed (Admin mode unavailable). Pass -IncludeAgent (one UAC prompt) or use the tray menu to install it.'
-    }
+$staleHelpers = @($PrivilegedBinaries | Where-Object {
+    (Get-Sha256OrNull (Join-Path $AgentDir $_)) -ne (Get-Sha256 $sources[$_])
+})
+if ($staleHelpers.Count -gt 0 -and -not $IncludeAgent) {
+    Write-Host "Note: installed privileged helpers are missing or differ from this build: $($staleHelpers -join ', '). The tray checks protocol compatibility. Pass -IncludeAgent (one UAC prompt) or use the tray menu to install both."
 }
-$refreshAgent = $IncludeAgent -and $agentStale
+$refreshAgent = $IncludeAgent # setup also checks/repairs task principal and DACL.
 $dataDir = if ($env:BUBBLEPLAY_TRAY_DATA_DIR) { $env:BUBBLEPLAY_TRAY_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'BubblePlay' }
 if (-not (Test-Path -LiteralPath (Join-Path $dataDir 'host.json'))) {
     Write-Warning 'host.json is missing: run setup-tray.ps1 once to write the host configuration.'
@@ -172,13 +169,15 @@ elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $($changed -
 
 if ($refreshAgent) {
     $setup = Join-Path $InstallDir 'setup-tray.ps1'
-    if ($PSCmdlet.ShouldProcess($AgentDir, 'Install the staged admin agent (one UAC prompt: setup-tray.ps1 -AgentOnly)')) {
+    if ($PSCmdlet.ShouldProcess($AgentDir, 'Check/install both staged privileged helpers (at most one UAC prompt: setup-tray.ps1 -AgentOnly)')) {
         $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$setup`"", '-AgentOnly',
             '-SourceDir', "`"$($InstallDir.TrimEnd('\'))`"", '-InstallDir', "`"$($InstallDir.TrimEnd('\'))`"")
-        $elevated = Start-Process -FilePath $shell -ArgumentList $arguments -Verb RunAs -Wait -PassThru -WindowStyle Hidden
-        if ($elevated.ExitCode -ne 0) { throw "Agent install failed with exit code $($elevated.ExitCode); see setup-tray-machine-*.json in %LOCALAPPDATA%\BubblePlay\receipts." }
-        Write-Host "Installed the admin agent in $AgentDir."
+        # Setup evaluates hashes, ACLs and task configuration first, then
+        # elevates once only when machine changes are actually needed.
+        $setupProcess = Start-Process -FilePath $shell -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+        if ($setupProcess.ExitCode -ne 0) { throw "Agent install failed with exit code $($setupProcess.ExitCode); see setup-tray-machine-*.json in %LOCALAPPDATA%\BubblePlay\receipts." }
+        Write-Host "Installed the admin agent and secure-desktop helper in $AgentDir."
     }
 }
 

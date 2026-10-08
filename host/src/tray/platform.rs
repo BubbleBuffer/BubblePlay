@@ -37,6 +37,7 @@ pub use bubbleplay_host::admin_agent::protocol::{AGENT_MUTEX, AGENT_STOP_EVENT, 
 /// On-demand task that starts the elevated admin input agent
 /// (`%ProgramFiles%\BubblePlay\agent\bubbleplay_admin_agent.exe`).
 pub const AGENT_TASK: &str = r"\BubblePlay\AdminAgent";
+pub const SECURE_HELPER_TASK: &str = r"\BubblePlay\SecureDesktop";
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const RUN_VALUE: &str = "BubblePlayTray";
 
@@ -269,6 +270,25 @@ pub fn run_agent_task() -> Result<()> {
     if !out.status.success() {
         bail!(
             "schtasks /run failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The SYSTEM task launches an independent session process. The host pipe
+/// and helper timeout own its lifetime; never use /end on the launcher.
+pub fn secure_helper_task_exists() -> bool {
+    schtasks(&["/query", "/tn", SECURE_HELPER_TASK])
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+pub fn run_secure_helper_task() -> Result<()> {
+    let out = schtasks(&["/run", "/tn", SECURE_HELPER_TASK])?;
+    if !out.status.success() {
+        bail!(
+            "SecureDesktop task launch failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }

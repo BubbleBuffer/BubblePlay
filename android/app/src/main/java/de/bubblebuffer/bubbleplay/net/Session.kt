@@ -9,6 +9,7 @@ import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.media.VideoDecoder
 import de.bubblebuffer.bubbleplay.protocol.ClipboardReceiver
 import de.bubblebuffer.bubbleplay.protocol.CursorState
+import de.bubblebuffer.bubbleplay.protocol.CursorKind
 import de.bubblebuffer.bubbleplay.protocol.FileWire
 import de.bubblebuffer.bubbleplay.protocol.V4
 import de.bubblebuffer.bubbleplay.protocol.V4ReceiveGate
@@ -49,12 +50,18 @@ class Session(
         fun onStatus(status: Status)
         fun onAuthRequired()
         fun onCursor(state: CursorState)
+        fun onCursorType(kind: CursorKind)
         fun onRemoteClipboard(text: String)
         fun onMonitors(monitors: List<Monitor>, error: String?)
         fun onVideoSize(width: Int, height: Int)
         /** Input became usable after a presented frame (sync the cursor). */
         fun onInputReady()
-        fun onSecureDesktop(secure: Boolean)
+        /** The secure desktop (UAC prompt, lock screen) and what the viewer may do there; null when it closes. */
+        fun onSecureDesktop(state: SecureDesktop?)
+        /** Answer to [denySecurePrompt]. */
+        fun onSecureActionResult(ok: Boolean, reason: String)
+        /** The desktop/caret context changed; discard the IME's known remote tail. */
+        fun onDesktopChanged()
         /** The signaling socket carrying input was lost: drop held keys/buttons locally. */
         fun onInputLost()
         /** File transfer v1: true/false from host-capabilities, null while no host is known. */
@@ -96,10 +103,12 @@ class Session(
     private val startedAt = SystemClock.elapsedRealtimeNanos()
 
     private var running = false
+    @Volatile private var cursorCallbacksEnabled = true
     private var terminal: String? = null
 
     // Signaling (/ws).
     @Volatile private var sig: WebSocket? = null
+    private val pendingCursor = PendingCursor<WebSocket>()
     /** Owns the current signaling generation and decides which socket may carry input. */
     private val link = InputLink<WebSocket>()
     private val liveness = SignalLiveness(V4.HEARTBEAT_MS)
@@ -116,19 +125,22 @@ class Session(
     @Volatile private var inputEnabled = true
     @Volatile private var awaitingFrame = true
     private var desktopKind = "default"
+    private var secureDesktop: SecureDesktop? = null
     private var desktopGeneration: Int? = null
     private var hasPresented = false
     private val clipboardReceiver = ClipboardReceiver()
 
     // Media (/media-ws, v4).
     private var media: WebSocket? = null
-    private var mediaId = 0
+    private val mediaLeg = MediaLeg()
+    private val mediaId get() = mediaLeg.id
     private var mediaOpen = false
     private var mediaEverOpened = false
     private var mediaReconnecting = false
     private var mediaBackoff = 0L
     private var hostPresent = false
-    private var hostStarted = false
+    private val surfaceRecovery = SurfaceRecovery()
+    private var surfaceWatchdog: Runnable? = null
     private var mediaLastSend = 0L
     private var mediaLastInbound = 0L
     private val gate = V4ReceiveGate()
@@ -144,10 +156,10 @@ class Session(
     // First-frame handshake (host gates input on "presented").
     private var ffRequestId: String? = null
     private var ffEpoch: String? = null
-    private var ffGeneration = 0L
-    private var ffAdmitted = false
-    private var ffPresented = false
-    private var ffRequireAdmission = false
+    private val firstFramePresentation = FirstFramePresentation()
+    private val ffGeneration get() = firstFramePresentation.generation
+    private val ffAdmitted get() = firstFramePresentation.admitted
+    private val ffPresented get() = firstFramePresentation.presented
     private var ffRetries = 0
     private var ffFailed = false
     private var ffWatchdog: Runnable? = null
@@ -227,11 +239,13 @@ class Session(
         running = true
         terminal = null
         openSignaling()
+        if (surfaceWatchdog == null) surfaceRecovery.waitingGeneration()?.let { armSurfaceWatchdog(it) }
         handler.post(tick)
     }
 
     /** Closes both sockets and the decoder; the session cannot be restarted. */
     fun stop() {
+        cursorCallbacksEnabled = false
         handler.post {
             running = false
             handler.removeCallbacksAndMessages(null)
@@ -247,6 +261,11 @@ class Session(
     fun requestMonitor(selector: String) = handler.post {
         sendSig(JSONObject().put("type", "media-control").put("action", "monitor").put("protocol", V4.VERSION)
             .put("epoch", mediaEpoch).put("monitor", selector).put("reason", "user-monitor"))
+    }
+
+    /** Ask the host's SYSTEM helper to cancel the open UAC prompt (never approves it). */
+    fun denySecurePrompt() = handler.post {
+        if ("deny" in (secureDesktop?.capabilities ?: emptySet())) sendSig(JSONObject().put("type", "secure-action").put("action", "deny"))
     }
 
     fun requestMonitorList() = handler.post {
@@ -293,10 +312,16 @@ class Session(
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                if (webSocket !== sig) return // a stale socket
+                if (webSocket !== sig || !PendingCursor.accepts(bytes)) return
                 liveness.inbound(now())
-                val state = CursorState.decode(bytes.toByteArray()) ?: return
-                main.post { listener.onCursor(state) }
+                if (!pendingCursor.offer(webSocket, bytes)) return
+                main.post deliver@{
+                    val update = pendingCursor.take() ?: return@deliver
+                    // A queued packet must not restore old appearance after a reset/disconnect.
+                    if (!cursorCallbacksEnabled || update.source !== sig) return@deliver
+                    update.kind?.let { listener.onCursorType(it) }
+                    update.state?.let { listener.onCursor(it) }
+                }
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -366,7 +391,7 @@ class Session(
                 // A new signaling epoch: the old media socket belongs to the old
                 // epoch, and the host needs a fresh first-frame handshake before it
                 // accepts input again (it ignores input until then).
-                if (media != null) closeMedia()
+                closeMedia()
                 resetFirstFrame()
                 mediaEpoch = epoch
                 main.post { listener.onFileEpoch(epoch) }
@@ -391,6 +416,11 @@ class Session(
                 clipboardEnabled = msg.optInt("protocol") == 1 && msg.optBoolean("clipboard")
             }
             "desktop-state" -> handleDesktopState(msg)
+            "secure-action-result" -> if (msg.optString("action") == "deny") {
+                val ok = msg.optBoolean("ok")
+                val reason = msg.optString("reason").take(120)
+                main.post { listener.onSecureActionResult(ok, reason) }
+            }
             "first-frame" -> handleFirstFrame(msg)
             "clipboard" -> {
                 if (!clipboardEnabled()) return
@@ -423,7 +453,8 @@ class Session(
                 sig = null; sigOpen = false; registered = false
                 closeMedia()
                 resetFirstFrame()
-                main.post { listener.onInputLost(); listener.onFileCapability(null); listener.onFileEpoch(null) }
+                desktopKind = "default"; secureDesktop = null
+                main.post { listener.onInputLost(); listener.onSecureDesktop(null); listener.onFileCapability(null); listener.onFileEpoch(null) }
                 sigBackoff = 0
                 scheduleSignalingReconnect("peer-left")
             }
@@ -438,6 +469,8 @@ class Session(
     private fun handleDesktopState(msg: JSONObject) {
         val state = msg.optString("state")
         if (state != "active" && state != "unavailable") return
+        val oldDesktopKind = desktopKind
+        val oldAvailable = desktopAvailable
         val generation = msg.optIntOrNull("generation")
         val generationChanged = generation != null && generation != desktopGeneration
         if (generation != null) desktopGeneration = generation
@@ -445,13 +478,20 @@ class Session(
             if (kind != desktopKind) {
                 desktopKind = kind
                 if (kind == "secure") clipboardReceiver.reset()
-                main.post { listener.onSecureDesktop(kind == "secure") }
             }
+        }
+        val secure = if (desktopKind == "secure") SecureDesktop.parse(msg) else null
+        if (secure != secureDesktop) {
+            secureDesktop = secure
+            main.post { listener.onSecureDesktop(secure) }
         }
         msg.optString("input").takeIf { it in listOf("enabled", "suspended", "read-only") }?.let { inputEnabled = it == "enabled" }
         val reason = msg.optString("reason")
         val transition = reason == "monitor-switch" || reason == "monitor-switched" ||
             (state == "active" && reason in listOf("desktop-switched", "capture-recovered", "session-changed", "agent-restarted"))
+        if (generationChanged || oldDesktopKind != desktopKind || oldAvailable != (state == "active") || transition) {
+            main.post { listener.onDesktopChanged() }
+        }
         if (transition && hasPresented) {
             desktopAvailable = true
             setAwaiting(true)
@@ -466,15 +506,15 @@ class Session(
 
     // ---- first-frame handshake -------------------------------------------------
     private fun startFirstFrame(reason: String, forceNew: Boolean) {
-        if (!sigOpen || mediaEpoch == null) return
+        if (!sigOpen || mediaEpoch == null || !surfaceRecovery.canRestartMedia()) return
         // Like the browser: an existing request only counts for the same media epoch.
         if (!forceNew && firstFrameRequestReusable(ffRequestId, ffEpoch, mediaEpoch, ffFailed)) return
         cancelFirstFrame()
         val bytes = ByteArray(12).also { random.nextBytes(it) }
         ffRequestId = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
         ffEpoch = mediaEpoch
-        ffGeneration = 0; ffAdmitted = false; ffPresented = false; ffRetries = 0; ffFailed = false
-        ffRequireAdmission = forceNew || reason == "desktop-transition"
+        firstFramePresentation.start(ffRequestId!!, mediaId, forceNew || reason == "desktop-transition")
+        ffRetries = 0; ffFailed = false
         setAwaiting(true)
         Log.i(TAG, "first-frame request ($reason)")
         sendFirstFrameRequest()
@@ -491,7 +531,7 @@ class Session(
         ffWatchdog?.let { handler.removeCallbacks(it) }
         val id = ffRequestId
         val watchdog = Runnable {
-            if (id != ffRequestId || ffPresented) return@Runnable
+            if (id != ffRequestId || ffPresented || !surfaceRecovery.canRestartMedia()) return@Runnable
             if (ffRetries < 1) {
                 ffRetries++
                 sendFirstFrameRequest()
@@ -516,7 +556,8 @@ class Session(
     private fun resetFirstFrame() {
         cancelFirstFrame()
         ffRequestId = null; ffEpoch = null
-        ffGeneration = 0; ffAdmitted = false; ffPresented = false; ffRetries = 0; ffFailed = false
+        firstFramePresentation.reset()
+        ffRetries = 0; ffFailed = false
         setAwaiting(true)
     }
 
@@ -529,9 +570,9 @@ class Session(
         if (msg.optInt("protocol") != 1 || msg.optString("requestId") != ffRequestId) return
         when (msg.optString("phase")) {
             "admitted" -> {
-                ffAdmitted = true
-                msg.optLongOrNull("generation")?.let { ffGeneration = it }
-                if (ffPresented) sendPresented()
+                val completed = firstFramePresentation.admit(ffRequestId!!, msg.optLongOrNull("generation") ?: ffGeneration)
+                if (completed) completePresentation()
+                else if (ffPresented) sendPresented()
             }
             "failed" -> {
                 if (ffPresented) { cancelFirstFrame(); setAwaiting(false); return }
@@ -543,13 +584,15 @@ class Session(
         }
     }
 
-    private fun markPresented(generation: Long) {
+    private fun markPresented(generation: Long, mediaLeg: Int) {
+        if (mediaLeg != mediaId || !surfaceRecovery.canRestartMedia()) return
         if (!hasPresented) Log.i(TAG, "first frame presented ${(SystemClock.elapsedRealtimeNanos() - startedAt) / 1_000_000} ms after session start")
         hasPresented = true
-        if (ffPresented || ffRequestId == null) return
-        if (ffRequireAdmission && !ffAdmitted) return
-        if (ffRequireAdmission && ffGeneration != 0L && generation != ffGeneration) return
-        ffPresented = true
+        val requestId = ffRequestId ?: return
+        if (firstFramePresentation.observe(requestId, mediaLeg, generation)) completePresentation()
+    }
+
+    private fun completePresentation() {
         cancelFirstFrame()
         val wasAwaiting = awaitingFrame
         setAwaiting(false)
@@ -565,23 +608,29 @@ class Session(
 
     /** The stream did not start: rebuild the media path in the same signaling epoch. */
     private fun recoverStartup(reason: String) {
+        if (!surfaceRecovery.canRestartMedia()) {
+            Log.w(TAG, "startup recovery blocked after surface exhaustion: $reason")
+            cancelFirstFrame()
+            return
+        }
         Log.w(TAG, "startup recovery: $reason")
         closeMedia()
         mediaBackoff = V4.nextBackoffMs(mediaBackoff)
         mediaReconnecting = true
-        handler.postDelayed({ if (registered) startMedia() }, mediaBackoff)
+        val id = mediaId
+        handler.postDelayed({ if (running && registered && id == mediaId) startMedia() }, mediaBackoff)
     }
 
     // ---- media (v4) -------------------------------------------------------------
     private fun startMedia() {
-        if (mediaEpoch == null || media != null) return
+        if (mediaEpoch == null || media != null || !surfaceRecovery.canRestartMedia()) return
         openMedia()
     }
 
     private fun openMedia() {
         val epoch = mediaEpoch ?: return
-        if (!running || !registered) return
-        val id = ++mediaId
+        if (!running || !registered || !surfaceRecovery.canRestartMedia()) return
+        val id = mediaLeg.open()
         val cookie = if (config.isLab) null else cookieProvider()
         val request = Request.Builder().url(config.mediaUrl(epoch)).apply { if (cookie != null) header("Cookie", cookie) }.build()
         media = http.newWebSocket(request, object : WebSocketListener() {
@@ -640,12 +689,11 @@ class Session(
                 // Anything in flight on the old socket is gone: restart from a keyframe.
                 gate.reset(if (reconnect) "reconnect" else "connect")
                 decoder.dropPending()
-                if (!hostStarted) {
-                    hostStarted = true
+                if (mediaLeg.startHost()) {
                     sendSig(JSONObject().put("type", "media-control").put("action", "start").put("protocol", V4.VERSION)
                         .put("epoch", mediaEpoch).put("codec", preferredCodec).put("streamMode", "work")
                         .put("reason", "client-start").put("quality", "high"))
-                    startFirstFrame("wss-host-start", false)
+                    startFirstFrame("wss-host-start", true)
                 }
                 if (reconnect) requestKeyframe("reconnect", force = true)
             }
@@ -672,7 +720,7 @@ class Session(
             val (w, h) = videoWidth to videoHeight
             main.post { listener.onVideoSize(w, h) }
         }
-        decoder.submit(frame)
+        decoder.submit(frame, mediaId)
     }
 
     private fun requestKeyframe(reason: String, force: Boolean = false) {
@@ -692,7 +740,7 @@ class Session(
         link.mediaUp = false
         hostPresent = false
         media = null
-        if (!running || !registered) return
+        if (!running || !registered || !surfaceRecovery.canRestartMedia()) return
         mediaBackoff = V4.nextBackoffMs(mediaBackoff)
         mediaReconnecting = true
         val id = mediaId
@@ -700,27 +748,82 @@ class Session(
     }
 
     private fun closeMedia() {
-        mediaId++
+        mediaLeg.invalidate()
+        resetFirstFrame() // Neither early presentation nor admission can outlive its media leg.
         try { media?.close(1000, "client-close") } catch (_: Exception) {}
         media = null
         mediaOpen = false
         link.mediaUp = false
         hostPresent = false
-        hostStarted = false
         gate.reset("connect")
         decoder.dropPending()
     }
 
     // ---- decoder callbacks (decoder thread) -------------------------------------
-    override fun onFramePresented(generation: Long, seq: Long, width: Int, height: Int) {
-        framesPresented++
-        handler.post { markPresented(generation) }
+    override fun onSurfaceChanged(generation: Long, attached: Boolean) {
+        handler.post {
+            surfaceWatchdog?.let { handler.removeCallbacks(it) }
+            surfaceWatchdog = null
+            surfaceRecovery.changed(generation, attached)
+            if (attached && running) {
+                Log.i(TAG, "surface attached generation=$generation")
+                armSurfaceWatchdog(generation)
+                if (registered && media == null) startMedia()
+            }
+        }
+    }
+
+    override fun onSurfaceOutput(generation: Long) {
+        handler.post {
+            if (surfaceRecovery.output(generation)) {
+                Log.i(TAG, "surface output generation=$generation")
+                surfaceWatchdog?.let { handler.removeCallbacks(it) }
+                surfaceWatchdog = null
+            }
+        }
+    }
+
+    private fun armSurfaceWatchdog(generation: Long) {
+        val watchdog = Runnable {
+            if (!running) return@Runnable
+            when (surfaceRecovery.missed(generation)) {
+                SurfaceRecovery.Action.KEYFRAME -> {
+                    Log.w(TAG, "surface timeout generation=$generation: retry forced keyframe")
+                    requestKeyframe("surface-timeout", force = true)
+                    armSurfaceWatchdog(generation)
+                }
+                SurfaceRecovery.Action.RESTART -> {
+                    Log.w(TAG, "surface timeout generation=$generation: restart media")
+                    if (registered) recoverStartup("surface-timeout")
+                    armSurfaceWatchdog(generation)
+                }
+                SurfaceRecovery.Action.EXHAUSTED -> {
+                    Log.w(TAG, "surface timeout generation=$generation: recovery exhausted, automatic media restart stopped")
+                    closeMedia() // Invalidates startup/media reconnect timers already queued.
+                    ffFailed = true
+                    mediaReconnecting = true
+                    surfaceWatchdog = null
+                    publishStatus()
+                }
+                SurfaceRecovery.Action.NONE -> Unit
+            }
+        }
+        surfaceWatchdog = watchdog
+        handler.postDelayed(watchdog, 2_000)
+    }
+
+    override fun onFramePresented(generation: Long, seq: Long, width: Int, height: Int, mediaLeg: Int) {
+        handler.post {
+            if (mediaLeg != mediaId) return@post
+            framesPresented++
+            markPresented(generation, mediaLeg)
+        }
     }
 
     override fun onNeedsKeyframe(reason: String) {
         handler.post {
             gate.invalidate(reason)
-            if (mediaOpen) requestKeyframe(reason, force = reason == "surface")
+            if (mediaOpen && surfaceRecovery.canRestartMedia()) requestKeyframe(reason, force = reason == "surface")
         }
     }
 
@@ -760,6 +863,7 @@ class Session(
 
     private fun computeStatus(): Status {
         terminal?.let { return Status(State.ERROR, "Session ended: $it") }
+        if (surfaceRecovery.exhausted) return Status(State.ERROR, "Stream recovery stopped. Tap to retry.")
         if (link.inputReconnecting && framesPresented > 0) return Status(State.RECONNECTING, "Input reconnecting…")
         if (!sigOpen || !registered) return Status(if (sigReconnecting) State.RECONNECTING else State.CONNECTING, if (sigReconnecting) "Reconnecting…" else "Connecting…")
         if (!desktopAvailable) return Status(State.ERROR, "Desktop unavailable")

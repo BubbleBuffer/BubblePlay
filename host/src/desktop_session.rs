@@ -15,7 +15,7 @@ use windows::Win32::Security::{
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, CloseWindowStation, GetProcessWindowStation, GetThreadDesktop,
     GetUserObjectInformationW, OpenDesktopW, OpenInputDesktop, OpenWindowStationW,
-    SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
+    SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_JOURNALPLAYBACK, DESKTOP_READOBJECTS,
     DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS, HDESK, UOI_NAME,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken};
@@ -293,8 +293,13 @@ fn integrity_name(rid: u32) -> &'static str {
 
 impl InputDesktop {
     pub fn open() -> Result<Self> {
+        // SendInput on the bound thread fails with ERROR_ACCESS_DENIED unless
+        // the desktop handle carries DESKTOP_JOURNALPLAYBACK.
         let access = DESKTOP_ACCESS_FLAGS(
-            DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0 | DESKTOP_SWITCHDESKTOP.0,
+            DESKTOP_READOBJECTS.0
+                | DESKTOP_WRITEOBJECTS.0
+                | DESKTOP_SWITCHDESKTOP.0
+                | DESKTOP_JOURNALPLAYBACK.0,
         );
         let handle = unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, access) }
             .context("OpenInputDesktop")?;
@@ -347,6 +352,95 @@ fn desktop_name(handle: HDESK) -> Result<String> {
     user_object_name(HANDLE(handle.0))
 }
 
+/// Read-only probe from the interactive host. Failure (including access denied)
+/// cannot establish that normal-desktop capture or input is safe.
+pub fn input_desktop_kind() -> Option<DesktopKind> {
+    let handle = unsafe {
+        OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS)
+    }.ok()?;
+    let kind = desktop_name(handle).ok().map(|name| DesktopKind::from_name(&name));
+    let _ = unsafe { CloseDesktop(handle) };
+    kind
+}
+
+pub fn input_desktop_is_default() -> bool {
+    input_desktop_kind() == Some(DesktopKind::Default)
+}
+
+pub fn normal_frame_is_verified(frame_acquired: bool, desktop: Option<DesktopKind>, helper_secure: bool) -> bool {
+    frame_acquired && desktop == Some(DesktopKind::Default) && !helper_secure
+}
+
+/// Best-effort classification from the interactive host. Access to Winlogon
+/// normally fails at medium integrity; never guess that such a prompt is UAC.
+pub fn secure_desktop_kind() -> Option<&'static str> {
+    let desktop = unsafe {
+        OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS)
+    };
+    match desktop {
+        Ok(handle) => {
+            let kind = desktop_name(handle).ok().map(|name| DesktopKind::from_name(&name));
+            let consent = kind == Some(DesktopKind::Secure) && desktop_has_consent(handle);
+            let _ = unsafe { CloseDesktop(handle) };
+            match kind {
+                Some(DesktopKind::Secure) => Some(if consent { "uac" } else if session_locked() { "lock" } else { "other" }),
+                Some(DesktopKind::Default) => None,
+                _ => Some("other"),
+            }
+        }
+        Err(error) if error.code() == windows::Win32::Foundation::E_ACCESSDENIED => {
+            Some(if session_locked() { "lock" } else { "other" })
+        }
+        Err(_) => None,
+    }
+}
+
+pub fn session_locked() -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::System::RemoteDesktop::{
+        WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx, WTSINFOEXW,
+        WTS_SESSIONSTATE_LOCK,
+    };
+    let session = crate::admin_agent::trust::current_session_id();
+    let mut buffer = PWSTR::null();
+    let mut bytes = 0;
+    if unsafe { WTSQuerySessionInformationW(None, session, WTSSessionInfoEx, &mut buffer, &mut bytes) }.is_err() {
+        return false;
+    }
+    let locked = if !buffer.is_null() && bytes as usize >= std::mem::size_of::<WTSINFOEXW>() {
+        // WTS allocates an aligned, sized WTSINFOEXW for this query.
+        let info = unsafe { &*buffer.0.cast::<WTSINFOEXW>() };
+        info.Level == 1 && unsafe {
+            info.Data.WTSInfoExLevel1.SessionId == session &&
+            info.Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK as i32
+        }
+    } else { false };
+    unsafe { WTSFreeMemory(buffer.0.cast()) };
+    locked
+}
+
+fn desktop_has_consent(desktop: HDESK) -> bool {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::System::StationsAndDesktops::EnumDesktopWindows;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    unsafe extern "system" fn visit(window: HWND, param: LPARAM) -> BOOL {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+        let expected = std::env::var_os("SystemRoot").map(std::path::PathBuf::from)
+            .map(|root| root.join("System32").join("consent.exe"));
+        if crate::admin_agent::trust::process_session_id(pid) == Some(crate::admin_agent::trust::current_session_id()) &&
+            expected.zip(crate::admin_agent::trust::process_image_path(pid)).is_some_and(|(expected, actual)|
+                expected.to_string_lossy().eq_ignore_ascii_case(&actual.to_string_lossy())) {
+            unsafe { *(param.0 as *mut bool) = true };
+        }
+        true.into()
+    }
+    let mut found = false;
+    let result = unsafe { EnumDesktopWindows(Some(desktop), Some(visit), LPARAM((&mut found as *mut bool) as isize)) };
+    result.is_ok() && found
+}
+
 fn user_object_name(handle: HANDLE) -> Result<String> {
     let mut needed = 0u32;
     let _ = unsafe { GetUserObjectInformationW(handle, UOI_NAME, None, 0, Some(&mut needed)) };
@@ -374,6 +468,18 @@ fn user_object_name(handle: HANDLE) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_or_unknown_input_desktop_blocks_a_dda_recovery_frame() {
+        for desktop in [Some(DesktopKind::Secure), Some(DesktopKind::Other), None] {
+            // None includes OpenInputDesktop access denied and name query failure.
+            assert!(!normal_frame_is_verified(true, desktop, false));
+            assert!(!normal_frame_is_verified(true, desktop, true));
+        }
+        assert!(!normal_frame_is_verified(true, Some(DesktopKind::Default), true));
+        assert!(!normal_frame_is_verified(false, Some(DesktopKind::Default), false));
+        assert!(normal_frame_is_verified(true, Some(DesktopKind::Default), false));
+    }
 
     #[test]
     fn classifies_windows_desktop_names_without_case_sensitivity() {

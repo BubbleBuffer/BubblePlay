@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { installReceiverAssetOverrides } from "../tools/stream-lab-live.mjs";
+import { installReceiverAssetOverrides } from "../tools/lab/stream-lab-live.mjs";
 
 test("local receiver overrides include the entrypoint and its module dependencies", async () => {
   let paused;

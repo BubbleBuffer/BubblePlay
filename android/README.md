@@ -3,6 +3,10 @@
 A native Kotlin app (sideloaded APK, no Google Play services) that uses the home desktop through the Cloudflare Worker relay.
 It uses the same WSS v4 media path and input contract as the browser receiver (`worker/public/receiver.js`).
 
+Start with the [public documentation](../docs/README.md) for host/relay setup and [architecture](../docs/architecture/README.md) for the shared contracts. Android's packaged/device acceptance is separate from the Windows/browser alpha. Interoperability with the new Go relay has not been demonstrated.
+
+On a fresh install, enter your own relay address before connecting. Existing saved addresses are retained; the app has no built-in personal relay destination.
+
 ## How it works
 
 - **Sign-in:** a WebView opens `<server>/`, which is the unchanged Worker gate (ntfy approval, then the password page).
@@ -41,7 +45,7 @@ Code layout (`app/src/main/java/de/bubblebuffer/bubbleplay/`):
 
 ### Settings
 
-Follows "Settings view (Android)" in `.superpawers/session-ui.md`. One view (`ui/SettingsView.kt`), opened from More in the bar and from the connection screen. From the bar it opens over the stream inside `StreamActivity`, so the session keeps running (a separate activity would start the 30 s background disconnect); Disconnect stays a separate item in More. Values persist in `Prefs` (SharedPreferences, schema version 2) and apply live:
+See the shared [session UI](../docs/architecture/session-ui.md). One view (`ui/SettingsView.kt`), opened from More in the bar and from the connection screen. From the bar it opens over the stream inside `StreamActivity`, so the session keeps running (a separate activity would start the 30 s background disconnect); Disconnect stays a separate item in More. Values persist in `Prefs` (SharedPreferences, schema version 2) and apply live:
 
 - **Connection:** server address (saved here applies to the next connection), Sign out (expires the `__Host-gate` and `__Host-bp-session` cookies for that server, ends the session, returns to the connection screen).
 - **Touch:** default touch mode, trackpad pointer speed (levels 1 to 9; 5 is the old fixed gain 1.6, each step 25 %), tap to click (trackpad one-finger tap; when off, long-press clicks and a two-finger tap still right-clicks).
@@ -52,7 +56,7 @@ Follows "Settings view (Android)" in `.superpawers/session-ui.md`. One view (`ui
 
 ### File transfer (v1)
 
-Follows `.superpawers/file-transfer.md` and `fixtures/file-transfer-contract.json`. All of it is hidden unless the host's `host-capabilities` carries `fileTransfer` >= 1.
+See [file-transfer behavior](../docs/architecture/file-transfer.md) and the [shared fixture](../fixtures/file-transfer-contract.json). All of it is hidden unless the host's `host-capabilities` carries `fileTransfer` >= 1.
 
 - **Socket:** a second OkHttp WebSocket, `/file-ws?epoch=<mediaEpoch>` (lab: `/lab-file-ws` with `run` and `compat`), with the same gate cookie as `/ws`. It opens on demand, sends `hello`, waits for `file-peer` present (10 s), pings every 15 s and closes after 60 s idle. One transfer runs per direction; the rest queue.
 - **Upload:**
@@ -90,6 +94,8 @@ If `keystore.properties` is missing, `assembleRelease` produces an unsigned APK.
 Back up that folder: an update signed with a different key cannot be installed over an existing install.
 The `.gitignore` also excludes `*.jks`, `*.keystore` and `keystore.properties`.
 
+Each build's `versionCode` is the build time in minutes since the Unix epoch, so every new build outranks the installed one and update stores (F-Droid repos, Obtainium) offer it. `versionName` is `0.1.0-<that number>`. Pass `-PversionCode=<n>` to set it explicitly.
+
 ## Install
 
 ```powershell
@@ -100,7 +106,7 @@ Alternatively, copy the APK to the phone and open it after allowing installs fro
 
 ## Testing against the local Stream Lab relay (not production)
 
-1. `cd worker && npm ci && node tools/stream-lab-direct-relay.mjs --port 8787`
+1. Install dependencies with `npm --prefix worker ci` from the repository root, then start `node worker/tools/lab/stream-lab-direct-relay.mjs --port 8787`.
 2. Start a candidate host against that relay. `<compat>` is `compatibility.id` from `http://127.0.0.1:8787/lab-compat`, and `<uuid>` is any new UUID:
    `host\target\release\bubbleplay-host.exe --mode serve --worker "ws://127.0.0.1:8787/lab-host-ws?run=<uuid>&compat=<compat>"`
 3. In the app, set **Server** to `http://10.0.2.2:8787/` (emulator) and **Lab run** to the same UUID, then tap Connect.
@@ -116,13 +122,14 @@ Cleartext HTTP is allowed only for `10.0.2.2`, `127.0.0.1` and `localhost`. See 
 - **v4 packets:** every packet in `fixtures/wss-v4-contract.json` parses (or is rejected) and re-encodes byte for byte.
 - **ACK, keyframe, heartbeat and backoff output, and the receive gate:** compared with vectors generated from `worker/public/media-v4.js`. Regenerate the vectors with `node android/tools/gen-v4-vectors.mjs`.
 - **Scan codes:** compared with `fixtures/input-contract.json` (scan codes, `mustBeExtended`, `vkOnly`, contract packets, invalid packets).
+- **Cursor appearance:** the separate two-byte type-129 packet and Android system pointer mappings match `fixtures/cursor-types.json`; unknown kinds fall back to the arrow. Type-128 position packets keep their eight-byte format. Touch/trackpad and captured mice draw semantic overlay glyphs; uncaptured mice use Android system pointers. Android maps Progress to Wait and UpArrow to Arrow; the overlay distinguishes them. Only explicit Hidden suppresses the trackpad cursor, preserving older hosts' visibility behavior.
 - **Settings:** `Prefs` defaults, version 1 to 2 migration (codec spellings normalized, last touch mode kept as the default), malformed values; pointer-speed mapping; tap-to-click off.
 - **File transfer:** every packet, rejected case, receiver session and signaling case in `fixtures/file-transfer-contract.json`; the send window and ACK pacing; size and hash mismatch; MediaStore names; share-intent parsing.
 - **Also covered:** clipboard chunking and reassembly, the touch gesture state machine and viewport, input coalescing and text splitting, and IME text reconciliation.
 
-## Measured (lab relay, 2026-09-30)
+## Historical lab measurements (2026-09-30)
 
-These runs had no input sent to the desktop. logcat shows the numbers under the `BubblePlaySession` tag, with a `stats` line every 5 s.
+These earlier runs describe those devices and builds; they do not establish acceptance of the current APK or Go relay. No input was sent to the desktop. logcat shows the numbers under the `BubblePlaySession` tag, with a `stats` line every 5 s.
 
 - **Pixel 8 Pro:**
   - The app chose `c2.exynos.hevc.decoder` (hardware, low latency on).

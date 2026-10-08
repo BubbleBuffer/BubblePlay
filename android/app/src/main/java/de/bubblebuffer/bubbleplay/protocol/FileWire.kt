@@ -9,7 +9,7 @@ import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 
 /**
- * File transfer v1 (`.superpawers/file-transfer.md`): the binary framing of
+ * File transfer v1 (`docs/architecture/file-transfer.md`): the binary framing of
  * the on-demand file socket (`/file-ws`) and the JSON payloads it carries,
  * plus the `file-offer` signaling message. Pure: no Android types, so the
  * shared contract fixture runs on the JVM.

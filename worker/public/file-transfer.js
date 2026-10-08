@@ -1,5 +1,5 @@
 // File transfer protocol v1, shared by the relay (worker/src) and the web
-// receiver. Intent and wire contract: .superpawers/file-transfer.md. Shared
+// receiver. Intent and wire contract: docs/architecture/file-transfer.md. Shared
 // vectors: fixtures/file-transfer-contract.json (also tested from Rust in
 // host/src/file_transfer.rs and from Kotlin).
 //
@@ -89,13 +89,20 @@ export function decodeFilePacket(message) {
 
 function plainObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
 
+export function validDropPoint(point) {
+  return plainObject(point) && [point.x, point.y].every(value =>
+    Number.isInteger(value) && value >= 0 && value <= 65535) &&
+    uint32(point.generation) && point.generation > 0 && uint32(point.viewportRevision);
+}
+
 export function validOfferMeta(meta) {
   return plainObject(meta) &&
     typeof meta.name === "string" && meta.name.length > 0 && utf8Bytes(meta.name) <= FT_MAX_NAME_BYTES &&
     Number.isSafeInteger(meta.size) && meta.size >= 0 && meta.size <= FT_MAX_FILE_BYTES &&
     typeof meta.mime === "string" && utf8Bytes(meta.mime) <= FT_MAX_MIME_BYTES &&
     Number.isSafeInteger(meta.mtimeMs) && meta.mtimeMs >= 0 &&
-    (meta.purpose === "save" || meta.purpose === "paste") &&
+    (meta.purpose === "save" || meta.purpose === "paste" || meta.purpose === "drop") &&
+    (meta.purpose === "drop" ? validDropPoint(meta.drop) : meta.drop === undefined) &&
     uint32(meta.batchId) &&
     Number.isInteger(meta.batchCount) && meta.batchCount >= 1 && meta.batchCount <= FT_MAX_BATCH_FILES &&
     Number.isInteger(meta.batchIndex) && meta.batchIndex >= 0 && meta.batchIndex < meta.batchCount;
@@ -136,6 +143,8 @@ export function encodeOffer(transferId, meta) {
   return jsonPacket(FT.OFFER, transferId, {
     name: meta.name, size: meta.size, mime: meta.mime, mtimeMs: meta.mtimeMs, purpose: meta.purpose,
     batchId: meta.batchId, batchIndex: meta.batchIndex, batchCount: meta.batchCount,
+    ...(meta.drop !== undefined ? { drop: { x: meta.drop.x, y: meta.drop.y,
+      generation: meta.drop.generation, viewportRevision: meta.drop.viewportRevision } } : {}),
   });
 }
 export function encodeAccept(transferId) { return encodeFilePacket(FT.ACCEPT, transferId, 0); }

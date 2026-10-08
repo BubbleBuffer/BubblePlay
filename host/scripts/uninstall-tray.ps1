@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Elevated part (ONE UAC prompt, only when something machine-wide is
-    installed): end and unregister the \BubblePlay\AdminAgent task, delete
+    installed): unregister the \BubblePlay\AdminAgent and \BubblePlay\SecureDesktop tasks, delete
     %ProgramFiles%\BubblePlay\agent, and remove leftovers of the old elevated
     host path (\BubblePlay\ElevatedHost, %ProgramFiles%\BubblePlay\elevated).
     %ProgramFiles%\BubblePlay is removed when it ends up empty.
@@ -36,7 +36,7 @@ $MachineDir = Join-Path $ProgramFilesRoot 'BubblePlay'
 $AgentDir = Join-Path $MachineDir 'agent'
 $LegacyElevatedDir = Join-Path $MachineDir 'elevated'
 $TaskPath = '\BubblePlay\'
-$Tasks = @('AdminAgent', 'ElevatedHost')
+$Tasks = @('AdminAgent', 'SecureDesktop', 'ElevatedHost')
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValue = 'BubblePlayTray'
 $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BubblePlay'
@@ -72,6 +72,10 @@ function Get-MachineWork {
 }
 
 function Remove-WithRetry([string]$Path) {
+    $resolved = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $allowed = @($AgentDir, $LegacyElevatedDir, $InstallDir, $DataDir) | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
+    if ($allowed -notcontains $resolved) { throw "Refusing unexpected delete target: $resolved" }
+    if ((Test-Path -LiteralPath $resolved) -and ((Get-Item -LiteralPath $resolved -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing reparse-point delete: $resolved" }
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     while (Test-Path -LiteralPath $Path) {
         try { Remove-Item -Recurse -Force -LiteralPath $Path; return }
@@ -83,7 +87,8 @@ function Invoke-MachineSteps {
     foreach ($name in $Tasks) {
         if (-not (Test-Task $name)) { continue }
         if ($PSCmdlet.ShouldProcess("$TaskPath$name", 'End and unregister')) {
-            [void](Invoke-Schtasks @('/end', '/tn', "$TaskPath$name"))
+            # SecureDesktop is a launcher: ending the task does not end its child.
+            if ($name -ne 'SecureDesktop') { [void](Invoke-Schtasks @('/end', '/tn', "$TaskPath$name")) }
             [void](Invoke-Schtasks @('/delete', '/tn', "$TaskPath$name", '/f'))
             Write-Step 'task' 'done' "Removed $TaskPath$name."
         }
@@ -92,7 +97,7 @@ function Invoke-MachineSteps {
     foreach ($dir in @($AgentDir, $LegacyElevatedDir)) {
         if (-not (Test-Path -LiteralPath $dir)) { continue }
         if ($PSCmdlet.ShouldProcess($dir, 'Stop its processes and delete')) {
-            Get-Process bubbleplay_admin_agent, bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
+            Get-Process bubbleplay_admin_agent, bubbleplay_secure_helper, bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
                 Where-Object { $_.Path -and $_.Path.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase) } |
                 Stop-Process -Force -ErrorAction SilentlyContinue
             Remove-WithRetry $dir

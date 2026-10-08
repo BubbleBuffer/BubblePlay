@@ -164,6 +164,7 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
     if let Err(error) = job.assign(HANDLE(child.as_raw_handle())) {
         let _ = child.kill();
         let _ = child.wait();
+        bubbleplay_host::input::restore_headless_cursor_after_exit(child.id());
         return Err(error);
     }
     if let Some(out) = child.stdout.take() {
@@ -251,8 +252,10 @@ pub fn supervise(config: SupervisorConfig, state: SharedState, stop: Receiver<()
             tracing::info!(pid, "stopping host");
             let _ = child.kill();
             let _ = child.wait();
+            bubbleplay_host::input::restore_headless_cursor_after_exit(pid);
             break;
         };
+        bubbleplay_host::input::restore_headless_cursor_after_exit(pid);
         emit(&config.events, HostEvent::Exited);
         let ran_for = started.elapsed();
         let delay = backoff.on_exit(ran_for);

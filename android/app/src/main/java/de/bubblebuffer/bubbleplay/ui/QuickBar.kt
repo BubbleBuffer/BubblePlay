@@ -57,6 +57,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         val switchingMonitor: String?
         /** The host has file transfer v1 (shows Attach). */
         val fileTransfer: Boolean
+        val remoteClipboardRow: RemoteClipboard.Row
         fun toggleKeyboard()
         fun toggleTouchMode()
         fun resetZoom()
@@ -65,6 +66,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         fun switchMonitor(selector: String)
         fun sendChord(chord: Chord)
         fun pastePhoneClipboard()
+        fun copyPcClipboard()
         fun toggleLatch(code: String)
         /** Tap a key with any latched modifiers (then the latch clears). */
         fun tapKey(code: String)
@@ -298,6 +300,9 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         if (openKind == Kind.SCREEN) { dismissQuietly(); open(Kind.SCREEN) }
     }
 
+    /** A PC snapshot arrived or was consumed: refresh the More popover if it is open. */
+    fun clipboardChanged() = reopen(Kind.MORE)
+
     /** Full-screen state changed: refresh the More popover in place. */
     private fun reopen(kind: Kind) { if (openKind == kind) { dismissQuietly(); open(kind) } }
 
@@ -394,6 +399,16 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
     private fun moreContent(): View {
         val column = column()
         column.addView(caption(R.string.pop_more))
+        val clipboard = host.remoteClipboardRow
+        val detail = if (clipboard.enabled) activity.resources.getQuantityString(R.plurals.pop_pc_clipboard_text, clipboard.characters, clipboard.characters)
+        else activity.getString(R.string.pop_pc_clipboard_empty)
+        column.addView(listRow(activity.getString(R.string.pop_copy_pc_clipboard), detail, null, false) {
+            host.copyPcClipboard()
+            dismiss()
+        }.apply {
+            isEnabled = clipboard.enabled
+            alpha = if (clipboard.enabled) 1f else 0.55f
+        })
         column.addView(listRow(activity.getString(R.string.pop_fullscreen), null,
             activity.getString(if (host.immersive) R.string.pop_on else R.string.pop_off), false) {
             host.toggleImmersive()

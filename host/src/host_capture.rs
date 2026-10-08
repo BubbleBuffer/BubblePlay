@@ -3,6 +3,15 @@ use super::{
     capture, info, input, pick_monitor, privileged_ipc, warn, AgentClient, AgentMessage, Args,
     Capture, Context, DesktopRegion, Duration, Instant, Result, RetryPolicy,
 };
+use bubbleplay_host::secure_helper::client::{SecureHelperLink, SecureState};
+use std::sync::{Arc, Mutex};
+
+pub(super) type SharedSecureHelper = Arc<Mutex<SecureHelperLink>>;
+
+fn finish_normal_recovery(pending: &mut bool, recovered: bool) -> bool {
+    let pending = std::mem::take(pending);
+    recovered || pending
+}
 
 pub(super) enum CaptureSource {
     Local(LocalCaptureSource),
@@ -16,6 +25,13 @@ pub(super) struct LocalCaptureSource {
     pub(super) height: u32,
     pub(super) region: DesktopRegion,
     pub(super) idle_snapshot_requested: bool,
+    pub(super) secure_helper: SharedSecureHelper,
+    pub(super) secure_state: Option<SecureState>,
+    pub(super) secure_streaming: bool,
+    secure_upload: Option<capture::SecureFrameUpload>,
+    normal_recovery_pending: bool,
+    secure_loss_pending: bool,
+    next_secure_kind_probe: Instant,
 }
 
 impl LocalCaptureSource {
@@ -35,6 +51,13 @@ impl LocalCaptureSource {
             height,
             region,
             idle_snapshot_requested: false,
+            secure_helper: Arc::new(Mutex::new(SecureHelperLink::new())),
+            secure_state: None,
+            secure_streaming: false,
+            secure_upload: None,
+            normal_recovery_pending: false,
+            secure_loss_pending: false,
+            next_secure_kind_probe: Instant::now(),
         })
     }
 
@@ -58,6 +81,9 @@ impl LocalCaptureSource {
     }
 
     pub(super) fn switch_monitor(&mut self, selector: &str) -> Result<()> {
+        if self.secure_state.as_ref().is_some_and(|state| state.secure) {
+            anyhow::bail!("secure desktop active; monitor selection is suspended until recovery");
+        }
         if let Some(capture) = self.capture.as_mut() {
             capture.switch_monitor(selector)?;
             self.selector = capture.monitor_selector().to_string();
@@ -83,6 +109,99 @@ impl LocalCaptureSource {
             capture.request_idle_snapshot();
             self.idle_snapshot_requested = false;
         }
+    }
+
+    pub(super) fn take_availability_transition(&mut self) -> Option<capture::CaptureAvailability> {
+        if std::mem::take(&mut self.secure_loss_pending) {
+            if let Some(capture) = self.capture.as_mut() { let _ = capture.take_availability_transition(); }
+            return Some(capture::CaptureAvailability::Unavailable);
+        }
+        self.capture.as_mut().and_then(Capture::take_availability_transition)
+    }
+
+    fn tick_secure(&mut self, viewer: bool, now: Instant) {
+        let mut link = self.secure_helper.lock().unwrap_or_else(|error| error.into_inner());
+        link.tick(viewer, self.region, now);
+        let next = link.state();
+        drop(link);
+        let desktop_default = bubbleplay_host::desktop_session::input_desktop_is_default();
+        let mut fallback_kind = self.secure_state.as_ref().map_or("other", |state| state.kind);
+        if !desktop_default && !next.as_ref().is_some_and(|state| state.secure)
+            && now >= self.next_secure_kind_probe {
+            fallback_kind = bubbleplay_host::desktop_session::secure_desktop_kind().unwrap_or("other");
+            self.next_secure_kind_probe = now + capture::CAPTURE_RECOVERY_INTERVAL;
+        }
+        self.observe_desktop(next, desktop_default, fallback_kind);
+    }
+
+    fn observe_desktop(&mut self, next: Option<SecureState>, desktop_default: bool, fallback_kind: &'static str) {
+        // Neither a missing helper nor a delayed Default report can override
+        // the host's observation that the input desktop is not Default.
+        let next = if !desktop_default && !next.as_ref().is_some_and(|state| state.secure) {
+            Some(SecureState { secure: true, kind: fallback_kind, caps: vec![], available: false, desktop_epoch: 0 })
+        } else { next };
+        let secure = next.as_ref().is_some_and(|state| state.secure);
+        let was_secure = self.secure_state.as_ref().is_some_and(|state| state.secure);
+        let epoch_changed = secure && self.secure_state.as_ref().zip(next.as_ref())
+            .is_some_and(|(previous, next)| previous.desktop_epoch != next.desktop_epoch);
+        if secure && !was_secure {
+            self.normal_recovery_pending = true;
+            if let Some(capture) = self.capture.as_mut() { capture.suspend_for_secure_desktop(); }
+            self.secure_loss_pending = true;
+        }
+        if self.secure_streaming && (epoch_changed || !next.as_ref().is_some_and(|state| state.secure && state.available)) {
+            self.secure_streaming = false;
+            self.secure_upload = None;
+            self.secure_loss_pending = true;
+        }
+        self.secure_state = next;
+    }
+
+    fn acquire(&mut self, timeout: Duration) -> Result<Option<(capture::CapturedFrame<'_>, bool, bool)>> {
+        if self.secure_state.as_ref().is_some_and(|state| state.secure) {
+            let frame = self.secure_helper.lock().unwrap_or_else(|error| error.into_inner()).take_frame();
+            let Some(frame) = frame else { return Ok(None) };
+            if frame.width != self.width || frame.height != self.height
+                || !self.secure_state.as_ref().is_some_and(|state| state.available && state.desktop_epoch == frame.desktop_epoch) {
+                warn!("secure helper frame does not match selected monitor; preserving session without media");
+                self.secure_streaming = false;
+                self.secure_loss_pending = true;
+                return Ok(None);
+            }
+            if self.secure_upload.is_none() {
+                let device = self.capture.as_ref().and_then(Capture::device);
+                match capture::SecureFrameUpload::new(device) {
+                    Ok(upload) => self.secure_upload = Some(upload),
+                    Err(error) => {
+                        warn!(%error, "secure frame upload unavailable; preserving viewer session");
+                        self.secure_streaming = false;
+                        self.secure_loss_pending = true;
+                        return Ok(None);
+                    }
+                }
+            }
+            let uploaded = self.secure_upload.as_mut().expect("secure upload present")
+                .upload(frame.width, frame.height, frame.stride, &frame.pixels);
+            return match uploaded {
+                Ok(frame) => {
+                    let recovered = !self.secure_streaming;
+                    self.secure_streaming = true;
+                    Ok(Some((frame, true, recovered)))
+                }
+                Err(error) => {
+                    warn!(%error, "secure frame upload failed; preserving viewer session");
+                    self.secure_streaming = false;
+                    self.secure_loss_pending = true;
+                    Ok(None)
+                }
+            };
+        }
+        self.ensure_capture()?;
+        let frame = self.capture.as_mut().expect("capture initialized").acquire(timeout)?;
+        Ok(frame.map(|(frame, changed, recovered)| {
+            let recovered = finish_normal_recovery(&mut self.normal_recovery_pending, recovered);
+            (frame, changed, recovered)
+        }))
     }
 }
 
@@ -326,6 +445,7 @@ pub(super) enum PrivilegedEvent {
         reason: &'static str,
     },
     Cursor([u8; 8]),
+    CursorKind([u8; 2]),
     InputStatus(privileged_ipc::InputStatistics),
     Monitors(Vec<capture::MonitorInfo>),
     MonitorSwitch {
@@ -338,6 +458,7 @@ pub(super) enum PrivilegedEvent {
         index: u16,
         count: u16,
         text: String,
+        png: bool,
     },
 }
 
@@ -414,6 +535,9 @@ impl CaptureSource {
     }
 
     pub(super) fn switch_monitor(&mut self, selector: &str) -> Result<bool> {
+        if !self.desktop_state().available || self.desktop_state().desktop == "secure" {
+            anyhow::bail!("capture unavailable; monitor selection is suspended until recovery");
+        }
         match self {
             Self::Local(source) => {
                 source.switch_monitor(selector)?;
@@ -460,18 +584,18 @@ impl CaptureSource {
         timeout: Duration,
     ) -> Result<Option<(capture::CapturedFrame<'_>, bool, bool)>> {
         match self {
-            Self::Local(source) => source.ensure_capture()?.acquire(timeout),
+            Self::Local(source) => source.acquire(timeout),
             Self::Privileged(_) => Ok(None),
         }
     }
 
     pub(super) fn take_idle_snapshot_frame(&mut self) -> Option<capture::CapturedFrame<'_>> {
         match self {
-            Self::Local(source) => source
+            Self::Local(source) if !source.normal_recovery_pending && !source.secure_state.as_ref().is_some_and(|state| state.secure) => source
                 .capture
                 .as_mut()
                 .and_then(Capture::take_idle_snapshot_frame),
-            Self::Privileged(_) => None,
+            _ => None,
         }
     }
 
@@ -488,6 +612,10 @@ impl CaptureSource {
             Self::Local(source) => source.capture.as_ref().map(Capture::stats),
             Self::Privileged(_) => None,
         }
+    }
+
+    pub(super) fn tick_secure(&mut self, viewer: bool, now: Instant) {
+        if let Self::Local(source) = self { source.tick_secure(viewer, now); }
     }
 
     pub(super) fn tick(&mut self, now: Instant) -> Result<()> {
@@ -576,6 +704,7 @@ impl CaptureSource {
                     },
                 })
             }
+            AgentMessage::CursorKind(kind) => Some(PrivilegedEvent::CursorKind(kind.encode())),
             AgentMessage::Cursor(cursor) => Some(PrivilegedEvent::Cursor(
                 input::CursorState {
                     acknowledged_sequence: cursor.acknowledged_sequence,
@@ -619,16 +748,11 @@ impl CaptureSource {
                 })
             }
             AgentMessage::InputStats(stats) => Some(PrivilegedEvent::InputStatus(stats)),
-            AgentMessage::ClipboardText {
-                id,
-                index,
-                count,
-                text,
-            } => Some(PrivilegedEvent::Clipboard {
-                id,
-                index,
-                count,
-                text,
+            AgentMessage::ClipboardText { id, index, count, text } => Some(PrivilegedEvent::Clipboard {
+                id, index, count, text, png: false,
+            }),
+            AgentMessage::ClipboardPng { id, index, count, text } => Some(PrivilegedEvent::Clipboard {
+                id, index, count, text, png: true,
             }),
             AgentMessage::Capabilities(_) | AgentMessage::ConfigAck { .. } => None,
             AgentMessage::RecoverableError(error) => {
@@ -667,12 +791,25 @@ impl CaptureSource {
 
     pub(super) fn desktop_state(&self) -> PrivilegedDesktopState {
         match self {
-            Self::Local(_) => PrivilegedDesktopState {
-                available: true,
-                desktop: "default",
-                input: "enabled",
-                agent_generation: 0,
-            },
+            Self::Local(source) => {
+                if let Some(state) = source.secure_state.as_ref().filter(|state| state.secure) {
+                    return PrivilegedDesktopState {
+                        available: source.secure_streaming && state.available,
+                        desktop: "secure",
+                        input: if source.secure_streaming && state.available && state.caps.contains(&"input") { "enabled" } else if source.secure_streaming && state.available { "read-only" } else { "suspended" },
+                        agent_generation: 0,
+                    };
+                }
+                let available = !source.normal_recovery_pending && source.capture.as_ref().is_none_or(|capture| {
+                    capture.availability() == capture::CaptureAvailability::Active
+                });
+                PrivilegedDesktopState {
+                    available,
+                    desktop: if available { "default" } else { "none" },
+                    input: if available { "enabled" } else { "suspended" },
+                    agent_generation: 0,
+                }
+            }
             Self::Privileged(source) => PrivilegedDesktopState {
                 available: source.desktop_available,
                 desktop: source.desktop,
@@ -684,6 +821,23 @@ impl CaptureSource {
                 agent_generation: source.generation,
             },
         }
+    }
+
+    pub(super) fn secure_helper(&self) -> Option<SharedSecureHelper> {
+        match self { Self::Local(source) => Some(source.secure_helper.clone()), _ => None }
+    }
+
+    pub(super) fn secure_helper_ready(&self) -> bool {
+        matches!(self, Self::Local(source) if source.secure_helper.lock()
+            .unwrap_or_else(|error| error.into_inner()).state().is_some())
+    }
+
+    pub(super) fn secure_state(&self) -> Option<SecureState> {
+        match self { Self::Local(source) => source.secure_state.clone().filter(|state| state.secure), _ => None }
+    }
+
+    pub(super) fn secure_input_allowed(&self) -> bool {
+        self.secure_state().is_none_or(|state| self.desktop_state().available && state.caps.contains(&"input"))
     }
 
     pub(super) fn send_input(&mut self, data: &[u8]) -> Result<bool> {
@@ -715,6 +869,71 @@ impl CaptureSource {
 #[cfg(test)]
 mod agent_encode_recovery_tests {
     use super::*;
+
+    #[test]
+    fn secure_exit_recovers_once_with_warm_or_cold_duplication() {
+        for dda_recovered in [false, true] {
+            let mut pending = true;
+            assert!(finish_normal_recovery(&mut pending, dda_recovered));
+            assert!(!finish_normal_recovery(&mut pending, false));
+        }
+    }
+
+    #[test]
+    fn secure_source_pins_monitor_and_requires_frame_before_input() {
+        let mut source = LocalCaptureSource {
+            capture: None, selector: "DISPLAY2".into(), width: 1920, height: 1080,
+            region: DesktopRegion::new(-1920, 0, 1920, 1080), idle_snapshot_requested: false,
+            secure_helper: Arc::new(Mutex::new(SecureHelperLink::new())),
+            secure_state: Some(SecureState { secure: true, kind: "uac", caps: vec!["view", "deny", "input"], available: true, desktop_epoch: 1 }),
+            secure_streaming: false, secure_upload: None, normal_recovery_pending: true, secure_loss_pending: false,
+            next_secure_kind_probe: Instant::now(),
+        };
+        assert!(source.switch_monitor("DISPLAY1").is_err());
+        assert_eq!(source.selector, "DISPLAY2");
+        assert_eq!(source.region.x, -1920);
+        let mut capture = CaptureSource::Local(source);
+        assert!(!capture.desktop_state().available);
+        assert!(!capture.secure_input_allowed());
+        if let CaptureSource::Local(source) = &mut capture { source.secure_streaming = true; }
+        assert!(capture.desktop_state().available);
+        assert!(capture.secure_input_allowed());
+        if let CaptureSource::Local(source) = &mut capture { source.secure_state.as_mut().unwrap().caps = vec!["view", "deny"]; }
+        assert!(!capture.secure_input_allowed());
+        assert!(capture.switch_monitor("DISPLAY1").is_err());
+        if let CaptureSource::Local(source) = &mut capture { source.secure_state = None; }
+        assert!(!capture.desktop_state().available);
+        assert!(capture.take_idle_snapshot_frame().is_none());
+    }
+
+    #[test]
+    fn secure_input_desktop_overrides_missing_or_default_helper_report() {
+        for helper in [None, Some(SecureState {
+            secure: false, kind: "other", caps: vec![], available: false, desktop_epoch: 1,
+        })] {
+            let mut source = LocalCaptureSource {
+                capture: None, selector: "DISPLAY2".into(), width: 1920, height: 1080,
+                region: DesktopRegion::new(-1920, 0, 1920, 1080), idle_snapshot_requested: false,
+                secure_helper: Arc::new(Mutex::new(SecureHelperLink::new())), secure_state: None,
+                secure_streaming: false, secure_upload: None, normal_recovery_pending: false,
+                secure_loss_pending: false, next_secure_kind_probe: Instant::now(),
+            };
+            source.observe_desktop(helper, false, "uac");
+            assert_eq!(source.take_availability_transition(), Some(capture::CaptureAvailability::Unavailable));
+            assert!(source.acquire(Duration::ZERO).unwrap().is_none());
+            assert!(source.capture.is_none(), "must not initialize DDA on the secure input desktop");
+            assert!(source.normal_recovery_pending);
+            let mut capture = CaptureSource::Local(source);
+            assert_eq!(capture.desktop_state().desktop, "secure");
+            assert!(!capture.desktop_state().available);
+            assert!(!capture.secure_input_allowed());
+            assert_eq!(capture.secure_state().unwrap().caps, Vec::<&str>::new());
+            if let CaptureSource::Local(source) = &mut capture {
+                source.observe_desktop(None, true, "other");
+            }
+            assert!(!capture.desktop_state().available, "Default alone is not a recovered DDA frame");
+        }
+    }
 
     fn timed_out() -> anyhow::Error {
         anyhow::anyhow!("Agent encode permit timed out")

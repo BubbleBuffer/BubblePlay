@@ -7,14 +7,34 @@ export const SETTINGS_VERSION = 1;
 export const QUALITY_PRESETS = Object.freeze(["auto", "high", "balanced", "saver"]);
 export const SCROLL_SPEEDS = Object.freeze([0.5, 1, 1.5, 2]);
 export const POINTER_MODES = Object.freeze(["desktop", "game"]);
+export const DEFAULT_SOURCE_URL = "https://github.com/BubbleBuffer/BubblePlay";
+
+export function sourceURL(value) {
+  try {
+    const url = new URL(value);
+    if (["https:", "http:"].includes(url.protocol) && !url.username && !url.password) return url.href;
+  } catch { /* missing or invalid: retain the default */ }
+  return DEFAULT_SOURCE_URL;
+}
+
+export async function loadSourceLink(link, fetcher = globalThis.fetch) {
+  link.href = DEFAULT_SOURCE_URL;
+  try {
+    const response = await fetcher("/__auth/methods", { cache: "no-store" });
+    if (response.ok) link.href = sourceURL((await response.json()).sourceURL);
+  } catch { /* offline: retain the default */ }
+}
 
 export const DEFAULT_SETTINGS = Object.freeze({
   version: SETTINGS_VERSION,
   quality: "high",
   pointerMode: "desktop",
   keyboardLock: true,
+  clipboardAutoCopy: true,
   scrollSpeed: 1,
   defaultMonitor: "",
+  // Added within version 1: older records simply lack it and read as false.
+  followWindow: false,
 });
 
 // Keys written by receivers before the settings record existed.
@@ -32,8 +52,10 @@ export function normalizeSettings(raw) {
     quality: QUALITY_PRESETS.includes(value.quality) ? value.quality : DEFAULT_SETTINGS.quality,
     pointerMode: POINTER_MODES.includes(value.pointerMode) ? value.pointerMode : DEFAULT_SETTINGS.pointerMode,
     keyboardLock: typeof value.keyboardLock === "boolean" ? value.keyboardLock : DEFAULT_SETTINGS.keyboardLock,
+    clipboardAutoCopy: typeof value.clipboardAutoCopy === "boolean" ? value.clipboardAutoCopy : DEFAULT_SETTINGS.clipboardAutoCopy,
     scrollSpeed: SCROLL_SPEEDS.includes(Number(value.scrollSpeed)) ? Number(value.scrollSpeed) : DEFAULT_SETTINGS.scrollSpeed,
     defaultMonitor: typeof value.defaultMonitor === "string" && value.defaultMonitor.length <= 128 ? value.defaultMonitor : "",
+    followWindow: typeof value.followWindow === "boolean" ? value.followWindow : DEFAULT_SETTINGS.followWindow,
   };
 }
 

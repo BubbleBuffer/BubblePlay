@@ -2,12 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createTurnIceServers } from "../src/turn.js";
 import workerRuntime, { Room } from "../src/index.js";
+import { RELAY_SECRETS } from "./helpers/relay-secrets.mjs";
 
 const STUN_URL = "stun:stun.l.google.com:19302";
 
 test("mints the coturn REST credential with a bounded deterministic expiry", async () => {
   const iceServers = await createTurnIceServers(
-    { TURN_SECRET: "1234567890", TURN_TTL_SECONDS: "999999" },
+    { TURN_SECRET: "1234567890", TURN_HOST: "turn.example.test", TURN_TTL_SECONDS: "999999" },
     { turn: true, now: () => 1_700_000_000_000 },
   );
 
@@ -15,8 +16,8 @@ test("mints the coturn REST credential with a bounded deterministic expiry", asy
     { urls: STUN_URL },
     {
       urls: [
-        "turn:turn.example.com:3478?transport=udp",
-        "turn:turn.example.com:3478?transport=tcp",
+        "turn:turn.example.test:3478?transport=udp",
+        "turn:turn.example.test:3478?transport=tcp",
       ],
       username: "1700086400:bubbleplay",
       credential: "SldKiYBI923K/9zxmmhPIaexMFY=",
@@ -30,9 +31,25 @@ test("uses STUN only when TURN_SECRET is missing or invalid", async () => {
   assert.deepEqual(await createTurnIceServers({ TURN_SECRET: 42 }, { turn: true }), [{ urls: STUN_URL }]);
 });
 
+test("TURN stays disabled until the deployment names a valid TURN_HOST", async () => {
+  for (const TURN_HOST of [undefined, "", "   ", 42, "turn.example.test/path", "turn example", "turn.example.test:99999", "user@turn.example.test"]) {
+    assert.deepEqual(
+      await createTurnIceServers({ TURN_SECRET: "1234567890", TURN_HOST }, { turn: true }),
+      [{ urls: STUN_URL }],
+      String(TURN_HOST),
+    );
+  }
+  const custom = await createTurnIceServers(
+    { TURN_SECRET: "1234567890", TURN_HOST: " relay.example.test:5349 " }, { turn: true });
+  assert.deepEqual(custom[1].urls, [
+    "turn:relay.example.test:5349?transport=udp",
+    "turn:relay.example.test:5349?transport=tcp",
+  ]);
+});
+
 test("uses STUN only unless the client opted into TURN", async () => {
   for (const turn of [undefined, false, "true", 1]) {
-    assert.deepEqual(await createTurnIceServers({ TURN_SECRET: "1234567890" }, { turn }), [{ urls: STUN_URL }]);
+    assert.deepEqual(await createTurnIceServers({ TURN_SECRET: "1234567890", TURN_HOST: "turn.example.test" }, { turn }), [{ urls: STUN_URL }]);
   }
 });
 
@@ -53,7 +70,7 @@ test("host relay token and preauthenticated client role remain separate", async 
   const storage = { values: new Map(), get: async (key) => storage.values.get(key), put: async (key, value) => storage.values.set(key, value), delete: async (key) => storage.values.delete(key) };
   const client = new FakeSocket("client");
   const host = new FakeSocket("host");
-  const env = { TOKEN: "token", TURN_SECRET: "1234567890" };
+  const env = { TOKEN: "token", TURN_SECRET: "1234567890", TURN_HOST: "turn.example.test" };
   const room = new Room({ getWebSockets: () => [client, host], storage }, env);
 
   await room.webSocketMessage(host, JSON.stringify({ type: "hello", token: "token", role: "host" }));
@@ -66,34 +83,34 @@ test("host relay token and preauthenticated client role remain separate", async 
   assert.equal(clientHello.iceServers.length, 2);
   const observable = JSON.stringify({ messages: [...host.messages, ...client.messages], stored: [...storage.values.values()] });
   assert.equal(observable.includes(env.TURN_SECRET), false);
-  assert.equal(observable.includes("turn:turn.example.com"), true);
+  assert.equal(observable.includes("turn:turn.example.test"), true);
 });
 
 test("a client hello without the TURN opt-in never sees the TURN hostname", async () => {
   const storage = { values: new Map(), get: async (key) => storage.values.get(key), put: async (key, value) => storage.values.set(key, value), delete: async (key) => storage.values.delete(key) };
   const client = new FakeSocket("client");
-  const room = new Room({ getWebSockets: () => [client], storage }, { TOKEN: "token", TURN_SECRET: "1234567890" });
+  const room = new Room({ getWebSockets: () => [client], storage }, { TOKEN: "token", TURN_SECRET: "1234567890", TURN_HOST: "turn.example.test" });
 
   await room.webSocketMessage(client, JSON.stringify({ type: "hello", role: "client" }));
 
   const clientHello = JSON.parse(client.messages[0]);
   assert.equal(clientHello.type, "hello-ok");
   assert.deepEqual(clientHello.iceServers, [{ urls: STUN_URL }]);
-  assert.equal(client.messages.some((message) => message.includes("turn.example.com")), false);
+  assert.equal(client.messages.some((message) => message.includes("turn.example.test")), false);
 });
 
 test("never authenticates a host hello when TOKEN is absent, empty, or mismatched", async () => {
   for (const env of [
-    { TURN_SECRET: "1234567890" },
-    { TOKEN: "", TURN_SECRET: "1234567890" },
-    { TOKEN: "configured", TURN_SECRET: "1234567890" },
+    { TURN_SECRET: "1234567890", TURN_HOST: "turn.example.test" },
+    { TOKEN: "", TURN_SECRET: "1234567890", TURN_HOST: "turn.example.test" },
+    { TOKEN: "configured", TURN_SECRET: "1234567890", TURN_HOST: "turn.example.test" },
   ]) {
     const storage = { get: async () => [], put: async () => {}, delete: async () => {} };
     const host = new FakeSocket("host");
     const room = new Room({ getWebSockets: () => [host], storage }, env);
     await room.webSocketMessage(host, JSON.stringify({ type: "hello", token: "wrong", role: "host" }));
     assert.equal(host.messages.some((message) => JSON.parse(message).type === "hello-ok"), false);
-    assert.equal(host.messages.some((message) => message.includes("turn:turn.example.com")), false);
+    assert.equal(host.messages.some((message) => message.includes("turn:turn.example.test")), false);
   }
 });
 
@@ -136,7 +153,8 @@ test("the version-probe route requires host authorization before it reaches the 
   const roomNames = [];
   let forwarded = 0;
   const env = {
-    HOST_GATE_TOKEN: "host-secret",
+    ...RELAY_SECRETS,
+    APPROVAL_METHODS: "host",
     GATE: {
       idFromName: () => "gate",
       get: () => ({ fetch: async () => new Response("gate") }),
@@ -160,7 +178,7 @@ test("the version-probe route requires host authorization before it reaches the 
   assert.equal(forwarded, 0);
 
   const accepted = await workerRuntime.fetch(new Request("https://play.example/host-version-ws", {
-    headers: { Authorization: "Bearer host-secret" },
+    headers: { Authorization: `Bearer ${RELAY_SECRETS.HOST_GATE_TOKEN}` },
   }), env);
   assert.equal(accepted.status, 200);
   assert.equal(forwarded, 1);

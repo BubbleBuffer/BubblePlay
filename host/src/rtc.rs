@@ -51,6 +51,8 @@ fn preferred_negotiated_codec(hevc: Option<Pt>, h264: Option<Pt>) -> Option<(Vid
 pub enum RtcAction {
     IceConnected,
     IceDisconnected,
+    /// Reliable input lane opened (including an in-session reopen).
+    InputControlReady,
     /// Binary data from the input channel.
     InputData(Vec<u8>),
     /// PLI/FIR — force an IDR.
@@ -219,7 +221,10 @@ impl RtcSession {
             Event::ChannelOpen(id, label) => {
                 info!(channel_id = ?id, label = %label, "data channel opened by peer");
                 match label.as_str() {
-                    "input-control" => self.input_control = Some(id),
+                    "input-control" => {
+                        self.input_control = Some(id);
+                        return Some(RtcAction::InputControlReady);
+                    }
                     "input-motion" => self.input_motion = Some(id),
                     _ => return None,
                 }

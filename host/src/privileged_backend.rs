@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use crate::desktop_session::{BoundInputDesktop, DesktopKind, InputDesktop};
 use crate::encode::{
     AqMode, EncodedFrame, EncoderOptions, Multipass, Nvenc, Preset, Tuning, VideoCodec,
 };
-use crate::input::{CursorTracker, DesktopRegion, InputApplication};
+use crate::input::{CursorKind, CursorKindTracker, CursorTracker, DesktopRegion, InputApplication};
 use crate::input_proxy_client::{current_process_session_id, InputProxyClient};
 use crate::privileged_ipc::{
     CaptureState, Codec, CropRect, EncodedAccessUnit, EncoderAqMode, EncoderMultipass,
@@ -38,6 +38,7 @@ use crate::scale::Scaler;
 const WORKER_QUEUE_CAPACITY: usize = 8;
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(4);
 const MEDIA_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MEDIA_IDLE_RELEASE_AFTER: Duration = Duration::from_secs(5);
 const SECURE_MAX_FPS: u32 = 15;
 const SECURE_MAX_BITRATE_BPS: u32 = 3_000_000;
@@ -320,6 +321,7 @@ struct InputWorkerRequest {
 struct InputWorkerHandle {
     commands: SyncSender<InputWorkerRequest>,
     join: Option<JoinHandle<()>>,
+    cursor_kind_latest: Arc<Mutex<Option<CursorKind>>>,
 }
 
 impl InputWorkerHandle {
@@ -331,6 +333,8 @@ impl InputWorkerHandle {
     ) -> Result<Self> {
         let (commands, command_rx) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
         let (startup_tx, startup_rx) = mpsc::sync_channel(0);
+        let cursor_kind_latest = Arc::new(Mutex::new(None));
+        let worker_cursor_kind_latest = Arc::clone(&cursor_kind_latest);
         let join = thread::Builder::new()
             .name(format!("bubbleplay-input-{generation}"))
             .spawn(move || {
@@ -341,6 +345,7 @@ impl InputWorkerHandle {
                     capture_active,
                     command_rx,
                     startup_tx,
+                    worker_cursor_kind_latest,
                 )
             })
             .context("spawn desktop-bound input worker")?;
@@ -351,6 +356,7 @@ impl InputWorkerHandle {
             Ok(()) => Ok(Self {
                 commands,
                 join: Some(join),
+                cursor_kind_latest,
             }),
             Err(error) => {
                 let _ = join.join();
@@ -744,7 +750,6 @@ impl AgentBackend for RealAgentBackend {
         if let Some(message) = self.pending.pop_front() {
             return Ok(Some(message));
         }
-
         let aux_count = self.pending_aux.len();
         for _ in 0..aux_count {
             let response = self.pending_aux.pop_front().expect("aux count is stable");
@@ -769,7 +774,20 @@ impl AgentBackend for RealAgentBackend {
                 }
             }
         }
-        Ok(self.pending.pop_front())
+        if let Some(message) = self.pending.pop_front() {
+            return Ok(Some(message));
+        }
+        // Poll media completions first: a burst of type changes must not
+        // starve the outstanding encode permit. Cursor polling is independent
+        // of the GPU, with just one latest kind retained for a slow IPC reader.
+        if let Some(worker) = self.input_worker.as_ref() {
+            let kind = worker.cursor_kind_latest.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+            if let Some(kind) = kind {
+                return Ok(Some(Message::CursorKind(kind)));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -924,12 +942,21 @@ struct InputWorkerState {
     capture_active: Arc<AtomicBool>,
     input_proxy: Option<InputProxyClient>,
     cursor: CursorTracker,
+    cursor_kind: CursorKindTracker,
     suspended: bool,
     delivery: InputDeliveryCounters,
     dropped_inputs: u64,
     released_inputs: u64,
     last_input_sequence: Option<u16>,
     clipboard_id: u32,
+}
+
+fn clipboard_content_messages(id: u32, content: &crate::clipboard::ClipboardContent) -> Vec<Message> {
+    let (png, text) = content.wire();
+    clipboard_messages(id, &text).into_iter().map(|message| match message {
+        Message::ClipboardText { id, index, count, text } if png => Message::ClipboardPng { id, index, count, text },
+        message => message,
+    }).collect()
 }
 
 /// Split host clipboard text into in-order IPC chunks.
@@ -995,6 +1022,7 @@ fn input_worker_main(
     capture_active: Arc<AtomicBool>,
     commands: Receiver<InputWorkerRequest>,
     startup: SyncSender<Result<()>>,
+    cursor_kind_latest: Arc<Mutex<Option<CursorKind>>>,
 ) {
     let start = (|| -> Result<(BoundInputDesktop, InputWorkerState)> {
         let bound = InputDesktop::open()?.bind_thread()?;
@@ -1037,6 +1065,7 @@ fn input_worker_main(
                 capture_active,
                 input_proxy,
                 cursor: CursorTracker::for_region(region, Instant::now()),
+                cursor_kind: CursorKindTracker::new(Instant::now()),
                 suspended: true,
                 delivery: InputDeliveryCounters::default(),
                 dropped_inputs: 0,
@@ -1059,12 +1088,39 @@ fn input_worker_main(
         }
     };
 
-    while let Ok(request) = commands.recv() {
-        let stopping = matches!(request.command, InputWorkerCommand::Shutdown);
-        let result = state.handle(request.command);
-        let _ = request.reply.send(result);
-        if stopping {
-            break;
+    let mut next_cursor_poll = Instant::now();
+    loop {
+        match commands.recv_timeout(next_cursor_poll.saturating_duration_since(Instant::now())) {
+            Ok(request) => {
+                let stopping = matches!(request.command, InputWorkerCommand::Shutdown);
+                let result = state.handle(request.command);
+                let _ = request.reply.send(result);
+                if stopping {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        let now = Instant::now();
+        if now >= next_cursor_poll {
+            if input_is_enabled(
+                state.suspended,
+                state.capture_active.load(Ordering::Acquire),
+            ) {
+                if let Some(kind) = state.cursor_kind.sample(false, now) {
+                    *cursor_kind_latest
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(kind);
+                }
+            } else {
+                state.cursor_kind.reset();
+                cursor_kind_latest
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+            }
+            next_cursor_poll = now + CURSOR_POLL_INTERVAL;
         }
     }
     state.release_all();
@@ -1084,6 +1140,7 @@ impl InputWorkerState {
                     proxy.set_region(region)?;
                 }
                 self.cursor = CursorTracker::for_region(region, Instant::now());
+                self.cursor_kind.reset();
                 Ok(Vec::new())
             }
             InputWorkerCommand::ListMonitors => Ok(vec![monitor_list_for_desktop(self.desktop)?]),
@@ -1098,6 +1155,7 @@ impl InputWorkerState {
             }
             InputWorkerCommand::Resume => {
                 self.suspended = false;
+                self.cursor_kind.reset();
                 Ok(Vec::new())
             }
             InputWorkerCommand::Shutdown => {
@@ -1116,7 +1174,7 @@ impl InputWorkerState {
                     return Ok(Vec::new());
                 };
                 self.clipboard_id = self.clipboard_id.wrapping_add(1);
-                Ok(clipboard_messages(self.clipboard_id, &text))
+                Ok(clipboard_content_messages(self.clipboard_id, &text))
             }
         }
     }
@@ -1158,6 +1216,9 @@ impl InputWorkerState {
         }
         if outcome.feedback_reliable || outcome.application.failed_calls > 0 {
             events.push(self.input_stats());
+        }
+        if outcome.sync_requested {
+            self.cursor_kind.reset();
         }
         Ok(events)
     }
@@ -1839,6 +1900,25 @@ mod tests {
     }
 
     #[test]
+    fn host_clipboard_png_uses_dedicated_bounded_ordered_chunks() {
+        use base64::Engine;
+        let png = vec![42; crate::clipboard_image::MAX_PNG_BYTES];
+        let messages = super::clipboard_content_messages(8, &crate::clipboard::ClipboardContent::Png(png.clone()));
+        assert_eq!(messages.len(), 342);
+        let mut joined = String::new();
+        for (expected, message) in messages.iter().enumerate() {
+            let Message::ClipboardPng { id, index, count, text } = message else { panic!("image became text"); };
+            assert_eq!((*id, *index as usize, *count), (8, expected, 342));
+            assert!(text.len() <= crate::privileged_ipc::MAX_CLIPBOARD_CHUNK_BYTES);
+            let mut frame = Vec::new();
+            crate::privileged_ipc::write_frame(&mut frame, 0, expected as u32, message).unwrap();
+            assert_eq!(crate::privileged_ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap().message, *message);
+            joined.push_str(text);
+        }
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(joined).unwrap(), png);
+    }
+
+    #[test]
     fn host_clipboard_text_is_split_into_ordered_ipc_chunks() {
         let text = "é".repeat(crate::clipboard::HOST_CHUNK_BYTES);
         let messages = super::clipboard_messages(7, &text);
@@ -1995,6 +2075,33 @@ mod tests {
     }
 
     #[test]
+    fn cursor_kind_slot_is_latest_only_and_does_not_starve_media_completion() {
+        let mut backend = RealAgentBackend::new();
+        let (commands, _) = mpsc::sync_channel(1);
+        let latest = Arc::new(Mutex::new(Some(CursorKind::Text)));
+        backend.input_worker = Some(InputWorkerHandle {
+            commands,
+            join: None,
+            cursor_kind_latest: Arc::clone(&latest),
+        });
+        *latest.lock().unwrap() = Some(CursorKind::Hidden);
+        let (reply, response) = mpsc::sync_channel(1);
+        let media = Message::NoFrame {
+            permit_id: 1,
+            session_generation: 1,
+            config_revision: 1,
+            reason: NoFrameReason::NoChange,
+        };
+        reply.send(Ok(vec![media.clone()])).unwrap();
+        backend.pending_work = Some(response);
+        assert_eq!(backend.poll_work().unwrap(), Some(media));
+        assert_eq!(
+            backend.poll_work().unwrap(),
+            Some(Message::CursorKind(CursorKind::Hidden))
+        );
+        assert_eq!(backend.poll_work().unwrap(), None);
+    }
+    #[test]
     fn input_release_channel_progresses_while_media_reply_is_blocked() {
         let (media_commands, queued_media) = mpsc::sync_channel(1);
         let media = WorkerHandle {
@@ -2021,6 +2128,7 @@ mod tests {
         let input = InputWorkerHandle {
             commands: input_commands,
             join: Some(input_join),
+            cursor_kind_latest: Arc::new(Mutex::new(None)),
         };
         input.call(InputWorkerCommand::ReleaseAll).unwrap();
         assert!(matches!(

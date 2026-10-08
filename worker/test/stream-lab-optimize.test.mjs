@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { UserActivityPause } from "../tools/stream-lab-activity.mjs";
-import { runOptimizationLoop } from "../tools/stream-lab-optimize.mjs";
-import { createCampaignStateV2 } from "../tools/stream-lab-parity.mjs";
+import { UserActivityPause } from "../tools/lab/stream-lab-activity.mjs";
+import { runOptimizationLoop } from "../tools/lab/stream-lab-optimize.mjs";
+import { createCampaignStateV2 } from "../tools/lab/stream-lab-parity.mjs";
 
 test("optimization checkpoints a pause, cleans resources, waits for idle, and resumes", async () => {
   const states = [];

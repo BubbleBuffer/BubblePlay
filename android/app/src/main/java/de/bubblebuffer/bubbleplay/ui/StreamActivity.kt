@@ -29,6 +29,7 @@ import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.PointerIcon
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -42,6 +43,7 @@ import android.widget.TextView
 import android.widget.Toast
 import de.bubblebuffer.bubbleplay.R
 import de.bubblebuffer.bubbleplay.input.Chord
+import de.bubblebuffer.bubbleplay.input.CursorReconciler
 import de.bubblebuffer.bubbleplay.input.GestureAction
 import de.bubblebuffer.bubbleplay.input.PointerSpeed
 import de.bubblebuffer.bubbleplay.input.RemoteInput
@@ -49,9 +51,11 @@ import de.bubblebuffer.bubbleplay.input.TouchGestures
 import de.bubblebuffer.bubbleplay.input.TouchMode
 import de.bubblebuffer.bubbleplay.input.Viewport
 import de.bubblebuffer.bubbleplay.input.WheelAccumulator
+import de.bubblebuffer.bubbleplay.net.SecureDesktop
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.Session
 import de.bubblebuffer.bubbleplay.protocol.CursorState
+import de.bubblebuffer.bubbleplay.protocol.CursorKind
 import de.bubblebuffer.bubbleplay.protocol.InputPackets
 import de.bubblebuffer.bubbleplay.protocol.KeyMap
 import kotlin.math.roundToInt
@@ -74,6 +78,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private lateinit var video: SurfaceView
     private lateinit var cursorView: CursorView
     private lateinit var status: TextView
+    private lateinit var secureBanner: SecureBanner
     private lateinit var keyboardView: KeyboardInputView
     private lateinit var quickBar: QuickBar
     private lateinit var dock: LinearLayout
@@ -104,13 +109,17 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private var cursorX = 0.5f
     private var cursorY = 0.5f
     private var cursorVisible = false
-    private var cursorSynced = false
-    private var localCursorUntil = 0L
+    private val cursorReconciler = CursorReconciler()
 
     private val latchSet = LinkedHashSet<String>()
     private val activeLatched = HashMap<String, Set<String>>()
+    private val latchedKeySender = LatchedKeySender(latchSet, activeLatched,
+        { code, up -> input?.key(code, up) == true }, { latchesChanged() })
     private var lastStatus: Session.Status? = null
-    private var lastClipboardFromHost: String? = null
+    private val remoteClipboard = RemoteClipboard()
+    private val clipboardManager by lazy { getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
+    private var resumed = false
+    private val clipboardChanged = ClipboardManager.OnPrimaryClipChangedListener { observeLocalClipboard() }
     private var mouseButtons = 0
     private var mouseActive = false
     private var motionFramePosted = false
@@ -130,6 +139,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override val zoomed: Boolean get() = viewport.zoomed
     override val latched: Set<String> get() = latchSet
     override val fileTransfer: Boolean get() = fileCapability == true
+    override val remoteClipboardRow: RemoteClipboard.Row get() = remoteClipboard.row
 
     private val backgroundDisconnect = Runnable { stopSession() }
     private val longPress = Runnable { apply(gestures.onLongPress(SystemClock.uptimeMillis())) }
@@ -137,18 +147,20 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private val motionFrame = Choreographer.FrameCallback {
         motionFramePosted = false
         input?.flushMotion()
-        if (input?.hasPendingMotion() == true) scheduleMotionFlush()
+        if (input?.hasPendingInput() == true) scheduleMotionFlush()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
+        remoteClipboard.automatic = prefs.autoCopyRemoteClipboard
         config = prefs.serverConfig() ?: run { finish(); return }
         gestures.mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
         gestures.tapToClick = prefs.tapToClick
         pointerGain = PointerSpeed.gain(prefs.pointerSpeed)
         immersive = prefs.startFullscreen
         buildViews()
+        clipboardManager.addPrimaryClipChangedListener(clipboardChanged)
         files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, { if (config.isLab) null else Prefs.cookieHeader(config) }, fileListener)
         enterImmersive() // also sets up edge-to-edge and the cutout mode
         if (!immersive) exitImmersive()
@@ -173,7 +185,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     @SuppressLint("ClickableViewAccessibility")
     private fun buildViews() {
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        stage = FrameLayout(this)
+        stage = object : FrameLayout(this) {
+            // ViewGroup normally asks its topmost child first. The full-size
+            // cursor overlay must not replace the stream's semantic mouse icon.
+            override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? = pointerIcon
+        }
         video = SurfaceView(this).apply {
             holder.addCallback(this@StreamActivity)
             pivotX = 0f; pivotY = 0f
@@ -200,6 +216,10 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         root.addView(status, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
             topMargin = dp(8); leftMargin = dp(8)
         })
+        secureBanner = SecureBanner(this, root) {
+            session?.denySecurePrompt()
+            secureBanner.denySent()
+        }
 
         // The dock: transfer rows over the quick-action bar. It never covers the
         // video: the stage (and so the viewport, letterbox and touch mapping) is
@@ -247,6 +267,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private fun onImeClosed() {
         if (!keyboardShown) return
         keyboardShown = false
+        keyboardView.resetContext()
         keyboardView.clearFocus()
         quickBar.render()
     }
@@ -283,6 +304,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        remoteClipboard.foreground = resumed && hasFocus
+        if (remoteClipboard.foreground) { observeLocalClipboard(); applyRemoteClipboard() }
         if (hasFocus) { if (immersive) enterImmersive() } else if (stage.hasPointerCapture()) stage.releasePointerCapture()
     }
 
@@ -291,9 +314,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         if (session != null) return
         val s = Session(config, { Prefs.cookieHeader(config) }, Session.chooseCodec(prefs.codec), this)
         session = s
-        input = RemoteInput(s)
+        input = RemoteInput(s, cursorReconciler::noteSent, ::scheduleMotionFlush)
         surface?.let { s.decoder.setSurface(it) }
-        cursorSynced = false
+        cursorReconciler.reset()
+        onCursorType(CursorKind.Arrow)
+        renderCursor()
         s.start()
         defaultMonitorChecked = false
         applyKeepScreenOn()
@@ -305,6 +330,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     private fun stopSession() {
+        keyboardView.resetContext()
+        remoteClipboard.localAction()
         quickBar.release()
         // No background transfers in v1: the session's end cancels them.
         files?.cancelAll()
@@ -314,6 +341,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         session?.stop()
         session = null
         input = null
+        cursorReconciler.reset()
+        onCursorType(CursorKind.Arrow)
+        renderCursor()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onStatus(Session.Status(Session.State.CONNECTING, getString(R.string.status_paused)))
     }
@@ -325,10 +355,22 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     override fun onPause() {
+        observeLocalClipboard()
+        resumed = false
+        remoteClipboard.foreground = false
         super.onPause()
         quickBar.release()
         input?.releaseAll()
+        cursorReconciler.reset()
+        keyboardView.resetContext()
         latchSet.clear(); activeLatched.clear(); latchesChanged()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        remoteClipboard.foreground = hasWindowFocus()
+        if (remoteClipboard.foreground) { observeLocalClipboard(); applyRemoteClipboard() }
     }
 
     override fun onStop() {
@@ -338,6 +380,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     override fun onDestroy() {
+        clipboardManager.removePrimaryClipChangedListener(clipboardChanged)
         main.removeCallbacksAndMessages(null)
         if (::quickBar.isInitialized) {
             quickBar.onDestroy()
@@ -399,20 +442,43 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onCursor(state: CursorState) {
         cursorVisible = state.visible
+        // A late echo never rewinds newer queued or unacknowledged movement.
+        val authoritative = cursorReconciler.apply(state, gestures.active, input?.hasPendingCursorMotion() == true)
         if (!state.inBounds) { cursorView.update(0f, 0f, false); return }
-        // Local prediction wins while a finger drives the cursor; the host's
-        // position is authoritative otherwise.
-        if (gestures.active || SystemClock.uptimeMillis() < localCursorUntil) return
+        if (!authoritative) return
         cursorX = state.x / 65535f
         cursorY = state.y / 65535f
-        cursorSynced = true
         renderCursor()
     }
 
+    override fun onCursorType(kind: CursorKind) {
+        cursorView.setKind(kind)
+        stage.pointerIcon = PointerIcon.getSystemIcon(this, CursorAppearance.systemType(kind))
+        // Keep the overlay's position/visibility intact: appearance updates even
+        // during touch prediction, without undoing an out-of-bounds position.
+    }
+
     override fun onRemoteClipboard(text: String) {
-        lastClipboardFromHost = text
-        val manager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        manager.setPrimaryClip(ClipData.newPlainText("BubblePlay", text))
+        remoteClipboard.receive(text)
+        applyRemoteClipboard()
+    }
+
+    private fun observeLocalClipboard() {
+        if (!resumed || !hasWindowFocus()) return
+        val before = remoteClipboard.row
+        remoteClipboard.observeLocal(clipboardManager.primaryClipDescription?.timestamp)
+        if (remoteClipboard.row != before && ::quickBar.isInitialized) quickBar.clipboardChanged()
+    }
+
+    private fun applyRemoteClipboard() {
+        remoteClipboard.takeAutomatic()?.let { writeRemoteClipboard(it) }
+        if (::quickBar.isInitialized) quickBar.clipboardChanged()
+    }
+
+    private fun writeRemoteClipboard(text: String) {
+        clipboardManager.setPrimaryClip(ClipData.newPlainText("BubblePlay", text))
+        // Remember our own write before its asynchronous change callback arrives.
+        remoteClipboard.rememberWrite(clipboardManager.primaryClipDescription?.timestamp)
     }
 
     override fun onMonitors(monitors: List<Session.Monitor>, error: String?) {
@@ -446,23 +512,36 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     override fun onInputReady() {
+        keyboardView.resetContext()
+        cursorReconciler.reset()
         input?.cursorSync()
         session?.requestMonitorList()
     }
 
     override fun onInputLost() {
+        keyboardView.resetContext()
         // The host drops held input with its session; mirror that locally so
         // nothing stays "down" and the next packet starts with a release-all.
         quickBar.release()
         input?.releaseAll(send = false)
+        cursorReconciler.reset()
         gestures.cancel()
         main.removeCallbacks(longPress)
         mouseButtons = 0
+        onCursorType(CursorKind.Arrow)
         latchSet.clear(); activeLatched.clear(); latchesChanged()
     }
 
-    override fun onSecureDesktop(secure: Boolean) {
-        if (secure) Toast.makeText(this, R.string.secure_desktop, Toast.LENGTH_SHORT).show()
+    override fun onSecureDesktop(state: SecureDesktop?) {
+        secureBanner.show(state)
+    }
+
+    override fun onSecureActionResult(ok: Boolean, reason: String) {
+        secureBanner.denyResult(ok, reason)
+    }
+
+    override fun onDesktopChanged() {
+        keyboardView.resetContext()
     }
 
     // ---- layout ---------------------------------------------------------------------
@@ -536,7 +615,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             is GestureAction.Move -> {
                 val (dx, dy) = viewport.deltaToNormalized(action.dx * pointerGain, action.dy * pointerGain)
                 cursorX = (cursorX + dx).coerceIn(0f, 1f); cursorY = (cursorY + dy).coerceIn(0f, 1f)
-                localCursorUntil = SystemClock.uptimeMillis() + 300
                 remote.absoluteNormalized(cursorX, cursorY)
                 // Zoomed trackpad: the view follows the cursor (re-centres after a two-finger nudge).
                 viewport.centerOn(cursorX, cursorY)
@@ -546,7 +624,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             is GestureAction.PointAt -> {
                 val (nx, ny) = viewport.toNormalized(action.x, action.y)
                 cursorX = nx.coerceIn(0f, 1f); cursorY = ny.coerceIn(0f, 1f)
-                localCursorUntil = SystemClock.uptimeMillis() + 300
                 remote.absoluteNormalized(cursorX, cursorY)
                 renderCursor()
                 scheduleMotionFlush()
@@ -577,8 +654,10 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     private fun buttonsAtCursor(remote: RemoteInput, mask: Int) {
+        keyboardView.resetContext()
         remote.flushMotion()
         remote.buttonsAt((cursorX * 65535f).roundToInt(), (cursorY * 65535f).roundToInt(), mask)
+        if (remote.hasPendingInput()) scheduleMotionFlush()
     }
 
     private fun scheduleMotionFlush() {
@@ -617,9 +696,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         }
         val mask = mouseMask(event.buttonState)
         if (mask != mouseButtons) {
+            keyboardView.resetContext()
             mouseButtons = mask
             remote.flushMotion()
             remote.buttons(mask)
+            if (remote.hasPendingInput()) scheduleMotionFlush()
         }
         return true
     }
@@ -640,59 +721,78 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val hardware = device != null && !device.isVirtual && event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD
         // While settings are open, keys belong to the settings view (text field, focus, Back).
         if (hardware && settingsView == null && event.isFromSource(InputDevice.SOURCE_KEYBOARD) && KeyMap.ANDROID_TO_CODE.containsKey(event.keyCode)) {
-            return sendKey(event)
+            sendKey(event)
+            return true
         }
         return super.dispatchKeyEvent(event)
     }
 
     /** Soft-keyboard key events (Enter, Backspace, some IMEs send every key). */
     override fun onImeKey(event: KeyEvent): Boolean {
+        if (session?.inputOpen() != true) return false
         val code = KeyMap.ANDROID_TO_CODE[event.keyCode]
         val unicode = event.getUnicodeChar(event.metaState)
         val printable = unicode > 0 && !Character.isISOControl(unicode) && code != "Space"
         if (printable && latchSet.isEmpty() && !event.isCtrlPressed && !event.isAltPressed) {
             // A character from the IME: send the character, not a US-layout key.
-            if (event.action == KeyEvent.ACTION_DOWN) input?.text(String(Character.toChars(unicode)))
-            return true
+            return event.action != KeyEvent.ACTION_DOWN || input?.text(String(Character.toChars(unicode))) == true
         }
         if (code == null) return false
-        return sendKey(event)
+        return sendKey(event, imeOrigin = true)
     }
 
     @Suppress("DEPRECATION") // ACTION_MULTIPLE still arrives from some IMEs and HID stacks.
-    private fun sendKey(event: KeyEvent): Boolean {
+    private fun sendKey(event: KeyEvent, imeOrigin: Boolean = false): Boolean {
         val code = KeyMap.ANDROID_TO_CODE[event.keyCode] ?: return false
-        if (input == null) return true
-        when (event.action) {
-            KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) keyDown(code) else keyRepeat(code)
-            KeyEvent.ACTION_UP -> keyUp(code)
-            KeyEvent.ACTION_MULTIPLE -> event.characters?.let { input?.text(it) }
+        if (input == null) return false
+        if (code == "Backspace" || code == "Delete") {
+            // Injected held keys do not repeat on Windows. Every Android repeat
+            // is a complete tap, including repeats received with an empty IME.
+            if (event.action == KeyEvent.ACTION_UP) return true
+            val count = when (event.action) {
+                KeyEvent.ACTION_DOWN -> 1
+                KeyEvent.ACTION_MULTIPLE -> event.repeatCount.coerceAtLeast(1)
+                else -> return false
+            }
+            if (!imeOrigin) keyboardView.resetContext() // Hardware deletion abandons the known IME segment.
+            return RemoteKeyRepeats.tap(count) { up ->
+                if (up) keyUpChecked(code) else keyDownChecked(code, resetImeContext = false)
+            }
+        }
+        return when (event.action) {
+            KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) keyDownChecked(code, resetImeContext = !imeOrigin) else input?.key(code, false) == true
+            KeyEvent.ACTION_UP -> keyUpChecked(code)
+            KeyEvent.ACTION_MULTIPLE -> if (imeOrigin && (code == "Enter" || code == "Tab")) {
+                RemoteKeyRepeats.tap(1) { up ->
+                    if (up) keyUpChecked(code) else keyDownChecked(code, resetImeContext = false)
+                }
+            } else event.characters?.let { input?.text(it) } == true
+            else -> false
+        }
+    }
+
+    override fun onImeEdit(deleteCount: Int, insert: String): Boolean {
+        val remote = input ?: return false
+        if (session?.inputOpen() != true) return false
+        return ImeTextSender(
+            text = remote::text,
+            rawTap = { code -> remote.key(code, false) && remote.key(code, true) },
+            keyTap = { code -> keyDownChecked(code, resetImeContext = false) && keyUpChecked(code) },
+            hasLatch = { latchSet.isNotEmpty() },
+            requestReset = { keyboardView.requestDeferredResetContext() },
+        ).send(deleteCount, insert)
+    }
+
+    override fun onImeDeleteForward(count: Int): Boolean {
+        val remote = input ?: return false
+        if (session?.inputOpen() != true) return false
+        repeat(count) {
+            if (!remote.key("Delete", false) || !remote.key("Delete", true)) {
+                keyboardView.requestDeferredResetContext()
+                return false
+            }
         }
         return true
-    }
-
-    override fun onImeEdit(deleteCount: Int, insert: String) {
-        val remote = input ?: return
-        repeat(deleteCount) { remote.tap("Backspace") }
-        if (insert.isEmpty()) return
-        if (latchSet.isNotEmpty() && insert.length == 1) {
-            val code = KeyMap.codeForShortcutChar(insert[0])
-            if (code != null) { tapKey(code); return }
-        }
-        // Newlines and tabs are keys on the host; everything else is Unicode text.
-        val pending = StringBuilder()
-        fun flush() { if (pending.isNotEmpty()) { remote.text(pending.toString()); pending.setLength(0) } }
-        for (ch in insert) when (ch) {
-            '\n' -> { flush(); remote.tap("Enter") }
-            '\t' -> { flush(); remote.tap("Tab") }
-            else -> pending.append(ch)
-        }
-        flush()
-    }
-
-    override fun onImeDeleteForward(count: Int) {
-        val remote = input ?: return
-        repeat(count) { remote.tap("Delete") }
     }
 
     // ---- QuickBar.Host: keys ------------------------------------------------------------------
@@ -707,25 +807,28 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
      * it: they go down first and come up after this key's release.
      */
     override fun keyDown(code: String) {
-        val remote = input ?: return
-        if (code !in KeyMap.MODIFIERS && latchSet.isNotEmpty()) {
-            val mods = latchSet.toList()
-            activeLatched[code] = mods.toSet()
-            mods.forEach { remote.key(it, false) }
-            latchSet.clear(); latchesChanged()
-        }
-        remote.key(code, false)
+        keyDownChecked(code)
+    }
+
+    private fun keyDownChecked(code: String, resetImeContext: Boolean = true): Boolean {
+        if (resetImeContext && code !in KeyMap.MODIFIERS) keyboardView.resetContext()
+        if (input == null) return false
+        return latchedKeySender.down(code)
     }
 
     /** Typematic repeat: Windows does not auto-repeat injected keys, so resend the press. */
     override fun keyRepeat(code: String) {
+        if (code !in KeyMap.MODIFIERS) keyboardView.resetContext()
         input?.key(code, false)
     }
 
     override fun keyUp(code: String) {
-        val remote = input ?: return
-        remote.key(code, true)
-        activeLatched.remove(code)?.reversed()?.forEach { remote.key(it, true) }
+        keyUpChecked(code)
+    }
+
+    private fun keyUpChecked(code: String): Boolean {
+        if (input == null) return false
+        return latchedKeySender.up(code)
     }
 
     /** Sticky Ctrl/Alt/Shift/Win: held for the next key; tapping it again lets go (sends nothing). */
@@ -736,6 +839,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     /** Shortcut chords are exact: they ignore (and keep) any sticky modifiers. */
     override fun sendChord(chord: Chord) {
+        keyboardView.resetContext()
         val remote = input ?: return
         chord.mods.forEach { remote.key(it, false) }
         remote.tap(chord.key)
@@ -754,6 +858,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             imm.restartInput(keyboardView)
             imm.showSoftInput(keyboardView, InputMethodManager.SHOW_IMPLICIT)
         } else {
+            keyboardView.resetContext()
             imm.hideSoftInputFromWindow(keyboardView.windowToken, 0)
             keyboardView.clearFocus()
         }
@@ -784,6 +889,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     override fun switchMonitor(selector: String) {
+        keyboardView.resetContext()
         switchingMonitor = selector
         monitorError = null
         session?.requestMonitor(selector)
@@ -793,6 +899,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     override fun pastePhoneClipboard() {
+        keyboardView.resetContext()
+        remoteClipboard.localAction()
+        quickBar.clipboardChanged()
         val manager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val item = manager.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
         // An image or file on the phone clipboard is uploaded and pasted on the PC.
@@ -805,6 +914,13 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val remote = input ?: return
         val ok = if (session?.clipboardEnabled() == true) remote.clipboard(text, paste = true) else remote.text(text)
         if (!ok) Toast.makeText(this, R.string.paste_failed, Toast.LENGTH_SHORT).show()
+    }
+
+    override fun copyPcClipboard() {
+        if (!resumed || !hasWindowFocus()) return
+        val text = remoteClipboard.take() ?: return
+        writeRemoteClipboard(text)
+        quickBar.clipboardChanged()
     }
 
     override fun disconnect() {
@@ -878,6 +994,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
                 transferDock.showNotice(getString(R.string.settings_codec_reconnecting))
             }
             SettingsView.Setting.SERVER -> {} // the next connection uses it
+            SettingsView.Setting.AUTO_COPY_REMOTE_CLIPBOARD -> {
+                remoteClipboard.automatic = prefs.autoCopyRemoteClipboard
+                observeLocalClipboard()
+                applyRemoteClipboard()
+            }
         }
     }
 

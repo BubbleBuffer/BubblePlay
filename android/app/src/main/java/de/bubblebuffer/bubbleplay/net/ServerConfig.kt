@@ -31,7 +31,8 @@ data class ServerConfig(
     }.build()
 
     companion object {
-        const val DEFAULT_SERVER = "https://playfull-cat.your-subdomain.workers.dev/"
+        // A fresh install must use the operator's relay; saved addresses stay in Prefs.
+        const val DEFAULT_SERVER = ""
         const val GATE_COOKIE = "__Host-gate"
         const val AUTH_COOKIE = "__Host-bp-session"
         private val UUID = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", RegexOption.IGNORE_CASE)

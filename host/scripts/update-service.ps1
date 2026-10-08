@@ -182,7 +182,7 @@ function Invoke-BubblePlayManifestUpdate([string]$ManifestPath, [switch]$Validat
             if ($service.Status -ne 'Running') { throw "$name is not running after update." }
         }
         $helper = Get-Service -Name 'BubblePlayLabHelper' -ErrorAction Stop
-        $probe = Join-Path (Join-Path $hostDir '..\worker\tools') 'stream-lab-helper-probe.mjs'
+        $probe = Join-Path (Join-Path $hostDir '..\worker\tools\lab') 'stream-lab-helper-probe.mjs'
         $probeOutput = @(& node.exe $probe 2>&1)
         if ($LASTEXITCODE -ne 0) { throw "BubblePlayLabHelper no-VDD probe failed: $($probeOutput -join ' ')" }
         $helper.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(15))

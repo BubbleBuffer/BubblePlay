@@ -31,7 +31,7 @@ import {
   receiverAssetInterceptionForRun,
   sendHelperRequest,
   validateLiveRunRouting,
-} from "../tools/stream-lab.mjs";
+} from "../tools/lab/stream-lab.mjs";
 
 test("performance input probing can be disabled without changing the media candidate", () => {
   assert.equal(performanceActionProbeEnabled([], false, false), true);
@@ -95,7 +95,7 @@ test("a pinned remote Worker can use the Lab Helper transient display without we
     versionId: "a34966a1-d238-4dec-8dbe-5405f6a9fdce",
   };
   assert.deepEqual(validateLiveRunRouting(
-    "https://playfull-cat.your-subdomain.workers.dev/",
+    "https://relay.example.com/",
     workerVersionOverride,
     true,
   ), { loopbackRelay: false, transientVdd: true });
@@ -274,7 +274,7 @@ test("candidate build targets the uninstalled lab directory and never invokes se
 });
 
 test("an explicit uninstalled candidate host bypasses the occupied default target", async () => {
-  const cli = await import("../tools/stream-lab.mjs");
+  const cli = await import("../tools/lab/stream-lab.mjs");
   assert.equal(typeof cli.selectCandidateHostForRun, "function");
   const root = mkdtempSync(join(tmpdir(), "bubbleplay-explicit-candidate-"));
   try {
@@ -304,7 +304,7 @@ test("an explicit uninstalled candidate host bypasses the occupied default targe
 });
 
 test("the optimizer activity guard resolves beside the uninstalled candidate host", async () => {
-  const { defaultActivityGuardPath } = await import("../tools/stream-lab-activity.mjs");
+  const { defaultActivityGuardPath } = await import("../tools/lab/stream-lab-activity.mjs");
   assert.match(defaultActivityGuardPath(), /host[\\/]target-candidate[\\/]release[\\/]bubbleplay_lab_activity_guard\.exe$/);
 });
 
@@ -343,7 +343,7 @@ test("lab helper repair is a one-service transaction and self-tests before writi
   assert.match(repair, /probePassed/);
   assert.doesNotMatch(repair, /BubblePlayBroker|BubblePlayTransport|bubbleplay_agent|bubbleplay-host\.exe|update-service/);
 });
-import { validateRunId } from "../tools/stream-lab-runtime.mjs";
+import { validateRunId } from "../tools/lab/stream-lab-runtime.mjs";
 
 test("Helper run IDs accept a bare UUID and reject decorated UUIDs", () => {
   const canonical = "c0734ff0-fb0d-4536-9da0-d3943f02fa96";
@@ -420,7 +420,7 @@ test("a helper pipe that closes without a reply rejects immediately", async () =
 });
 
 test("the live runner owns one demand-started helper session without importing the CLI or elevation paths", () => {
-  const live = readFileSync(new URL("../tools/stream-lab-live.mjs", import.meta.url), "utf8");
+  const live = readFileSync(new URL("../tools/lab/stream-lab-live.mjs", import.meta.url), "utf8");
   assert.match(live, /from "\.\/stream-lab-runtime\.mjs"/);
   assert.match(live, /startCandidateHost\(\)/);
   assert.match(live, /openDemandStartedHelperSession/);
@@ -533,7 +533,7 @@ test("the first input-proxy rollout preserves a complete rollback for an additiv
 });
 
 test("the privileged helper probe exercises a real no-VDD begin/end lifecycle", () => {
-  const probe = readFileSync(new URL("../tools/stream-lab-helper-probe.mjs", import.meta.url), "utf8");
+  const probe = readFileSync(new URL("../tools/lab/stream-lab-helper-probe.mjs", import.meta.url), "utf8");
   assert.match(probe, /openDemandStartedHelperSession/);
   assert.match(probe, /const\s+runId\s*=\s*randomUUID\(\)/);
   assert.match(probe, /validateRunId\(runId\)/);
@@ -766,7 +766,7 @@ test("compare CLI reads metrics and persists its decision", () => {
     writeFileSync(baseline, JSON.stringify(fixture({ id: "baseline", ocrCer: 0.08 })));
     writeFileSync(candidate, JSON.stringify(fixture({ id: "candidate", ocrCer: 0.05 })));
     const result = spawnSync(process.execPath, [
-      new URL("../tools/stream-lab.mjs", import.meta.url).pathname.slice(1),
+      new URL("../tools/lab/stream-lab.mjs", import.meta.url).pathname.slice(1),
       "compare", baseline, candidate, "--output", join(root, "comparison.json"),
     ], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
@@ -812,9 +812,9 @@ function fixture(overrides = {}) {
 
 test("package and CLI expose the manual and optimize commands", () => {
   const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  const cli = readFileSync(new URL("../tools/stream-lab.mjs", import.meta.url), "utf8");
-  assert.equal(packageJson.scripts["lab:manual"], "node tools/stream-lab.mjs manual");
-  assert.equal(packageJson.scripts["lab:optimize"], "node tools/stream-lab.mjs optimize");
+  const cli = readFileSync(new URL("../tools/lab/stream-lab.mjs", import.meta.url), "utf8");
+  assert.equal(packageJson.scripts["lab:manual"], "node tools/lab/stream-lab.mjs manual");
+  assert.equal(packageJson.scripts["lab:optimize"], "node tools/lab/stream-lab.mjs optimize");
   assert.match(cli, /\["manual", "baseline", "smoke", "sweep", "campaign", "optimize"\]/);
   assert.match(cli, /createCampaignStateV2\(\{ runId \}\)/);
   assert.match(cli, /runLiveOptimize/);

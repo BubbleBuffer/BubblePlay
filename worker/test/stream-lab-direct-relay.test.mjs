@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import WebSocket from "ws";
 import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
-import { createMediaShaper, startDirectLabRelay } from "../tools/stream-lab-direct-relay.mjs";
+import { createMediaShaper, startDirectLabRelay } from "../tools/lab/stream-lab-direct-relay.mjs";
 
 const RUN_ID = "123e4567-e89b-42d3-a456-426614174000";
 const EPOCH = "0123456789abcdef0123456789abcdef";

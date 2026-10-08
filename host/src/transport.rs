@@ -148,6 +148,7 @@ pub struct TransportPump {
     event_rx: Receiver<TransportEvent>,
     cursor_latest: Arc<Mutex<Option<[u8; 8]>>>,
     cursor_feedback_coalesced: Arc<AtomicU64>,
+    cursor_kind_latest: Arc<Mutex<ReliableCursorKind>>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -230,6 +231,8 @@ impl TransportPump {
         let cursor_feedback_coalesced = Arc::new(AtomicU64::new(0));
         let transport_cursor_latest = cursor_latest.clone();
         let transport_cursor_coalesced = cursor_feedback_coalesced.clone();
+        let cursor_kind_latest = Arc::new(Mutex::new(ReliableCursorKind::default()));
+        let transport_cursor_kind = cursor_kind_latest.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let join = thread::Builder::new()
@@ -248,6 +251,7 @@ impl TransportPump {
                     thread_stop,
                     transport_cursor_latest,
                     transport_cursor_coalesced,
+                    transport_cursor_kind,
                 ) {
                     warn!(?error, "RTC transport pump stopped with error");
                 }
@@ -260,6 +264,7 @@ impl TransportPump {
             event_rx,
             cursor_latest,
             cursor_feedback_coalesced,
+            cursor_kind_latest,
             stop,
             join: Some(join),
         }
@@ -277,6 +282,14 @@ impl TransportPump {
     /// thread consumes the newest state on its next bounded transport wake.
     pub fn publish_cursor_state(&self, state: [u8; 8]) {
         replace_latest_cursor(&self.cursor_latest, state, &self.cursor_feedback_coalesced);
+    }
+    /// Reliable type changes use a separate latest-only slot. Keep the last
+    /// delivered kind too, so a fresh RTC offer can replay it when control opens.
+    pub fn publish_cursor_kind(&self, kind: [u8; 2]) {
+        self.cursor_kind_latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .publish(kind);
     }
     pub fn try_event(&self) -> Option<TransportEvent> {
         self.event_rx.try_recv().ok()
@@ -313,6 +326,33 @@ fn replace_latest_cursor(slot: &Mutex<Option<[u8; 8]>>, state: [u8; 8], coalesce
     }
 }
 
+#[derive(Default)]
+struct ReliableCursorKind {
+    current: Option<[u8; 2]>,
+    pending: bool,
+}
+
+impl ReliableCursorKind {
+    fn publish(&mut self, kind: [u8; 2]) {
+        self.current = Some(kind);
+        self.pending = true;
+    }
+    fn replay(&mut self) {
+        self.pending = self.current.is_some();
+    }
+    fn next(&self) -> Option<[u8; 2]> {
+        if self.pending {
+            self.current
+        } else {
+            None
+        }
+    }
+    fn delivered(&mut self, kind: [u8; 2]) {
+        if self.current == Some(kind) {
+            self.pending = false;
+        }
+    }
+}
 fn stop_takes_priority(stop_requested: bool) -> bool {
     stop_requested
 }
@@ -421,6 +461,7 @@ fn transport_loop(
     stop: Arc<AtomicBool>,
     cursor_latest: Arc<Mutex<Option<[u8; 8]>>>,
     cursor_feedback_coalesced: Arc<AtomicU64>,
+    cursor_kind_latest: Arc<Mutex<ReliableCursorKind>>,
 ) -> Result<()> {
     socket
         .set_nonblocking(true)
@@ -452,6 +493,7 @@ fn transport_loop(
             Ok(_) if stop_takes_priority(stop.load(Ordering::Acquire)) => break,
             Ok(TransportCommand::Offer(sdp)) => {
                 rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+                cursor_kind_latest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).replay();
                 reliable_cursor_pending = None;
                 cursor_latest
                     .lock()
@@ -500,6 +542,20 @@ fn transport_loop(
             DeadEpochAction::StopNegotiated => {
                 emit(&events, TransportEvent::Action(RtcAction::Closed));
                 break;
+            }
+        }
+        if !mutated {
+            let kind = cursor_kind_latest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).next();
+            if let Some(kind) = kind {
+                match rtc.write_cursor_state(true, &kind) {
+                    Ok(true) => {
+                        cursor_kind_latest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).delivered(kind);
+                        counters.cursor_feedback_sent += 1;
+                        mutated = true;
+                    }
+                    Ok(false) => {}
+                    Err(error) => warn!(?error, "write reliable cursor kind"),
+                }
             }
         }
         if !mutated {
@@ -685,6 +741,7 @@ fn transport_loop(
                 match command {
                     TransportCommand::Offer(s) => {
                         rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+                        cursor_kind_latest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).replay();
                         reliable_cursor_pending = None;
                         cursor_latest
                             .lock()
@@ -723,10 +780,31 @@ fn transport_loop(
 #[cfg(test)]
 mod tests {
     use super::{
+        ReliableCursorKind,
         dead_epoch_action, emit, replace_latest_cursor, schedule_timeout, stop_takes_priority,
         try_admit_access_unit, try_send_command, DeadEpochAction, RtcPeerDecision,
         RtcPeerLifecycle, TransportCounters, TransportEvent, RTC_DISCONNECT_GRACE,
     };
+
+    #[test]
+    fn reliable_cursor_kind_survives_control_not_ready_and_replays_on_reconnect() {
+        let mut slot = ReliableCursorKind::default();
+        assert_eq!(slot.next(), None);
+        slot.publish([129, 1]);
+        // A channel that is not open does not acknowledge delivery.
+        assert_eq!(slot.next(), Some([129, 1]));
+        assert_eq!(slot.next(), Some([129, 1]));
+        slot.publish([129, 2]);
+        slot.delivered([129, 1]); // In-flight old data cannot clear a newer kind.
+        assert_eq!(slot.next(), Some([129, 2]));
+        slot.delivered([129, 2]);
+        assert_eq!(slot.next(), None);
+        slot.replay();
+        assert_eq!(slot.next(), Some([129, 2]));
+        slot.delivered([129, 2]);
+        slot.publish([129, 2]); // Explicit sync replays even an unchanged kind.
+        assert_eq!(slot.next(), Some([129, 2]));
+    }
     use std::time::{Duration, Instant};
     use std::sync::{
         atomic::{AtomicU64, Ordering},

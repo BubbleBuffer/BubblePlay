@@ -1,0 +1,824 @@
+{
+  "desktopStates": [
+    {
+      "type": "desktop-state",
+      "state": "unavailable",
+      "desktop": "secure",
+      "input": "suspended",
+      "generation": 7,
+      "reason": "secure-desktop",
+      "secureKind": "other",
+      "secureCapabilities": []
+    },
+    {
+      "type": "desktop-state",
+      "state": "unavailable",
+      "desktop": "secure",
+      "input": "suspended",
+      "generation": 8,
+      "reason": "secure-desktop",
+      "secureKind": "uac",
+      "secureCapabilities": []
+    },
+    {
+      "type": "desktop-state",
+      "state": "unavailable",
+      "desktop": "secure",
+      "input": "suspended",
+      "generation": 9,
+      "reason": "secure-desktop",
+      "secureKind": "lock",
+      "secureCapabilities": []
+    },
+    {
+      "type": "desktop-state",
+      "state": "active",
+      "desktop": "secure",
+      "input": "read-only",
+      "generation": 11,
+      "reason": "desktop-switched",
+      "secureKind": "uac",
+      "secureCapabilities": [
+        "view",
+        "deny"
+      ]
+    },
+    {
+      "type": "desktop-state",
+      "state": "active",
+      "desktop": "secure",
+      "input": "read-only",
+      "generation": 11,
+      "reason": "desktop-switched",
+      "secureKind": "lock",
+      "secureCapabilities": [
+        "view"
+      ]
+    },
+    {
+      "type": "desktop-state",
+      "state": "active",
+      "desktop": "secure",
+      "input": "read-only",
+      "generation": 11,
+      "reason": "desktop-switched",
+      "secureKind": "other",
+      "secureCapabilities": [
+        "view"
+      ]
+    },
+    {
+      "type": "desktop-state",
+      "state": "active",
+      "desktop": "secure",
+      "input": "enabled",
+      "generation": 11,
+      "reason": "desktop-switched",
+      "secureKind": "uac",
+      "secureCapabilities": [
+        "view",
+        "deny",
+        "input"
+      ]
+    },
+    {
+      "type": "desktop-state",
+      "state": "active",
+      "desktop": "secure",
+      "input": "enabled",
+      "generation": 11,
+      "reason": "desktop-switched",
+      "secureKind": "lock",
+      "secureCapabilities": [
+        "view",
+        "input"
+      ]
+    },
+    {
+      "type": "desktop-state",
+      "state": "active",
+      "desktop": "secure",
+      "input": "enabled",
+      "generation": 11,
+      "reason": "desktop-switched",
+      "secureKind": "other",
+      "secureCapabilities": [
+        "view",
+        "input"
+      ]
+    }
+  ],
+  "recoveredState": {
+    "type": "desktop-state",
+    "state": "active",
+    "generation": 10,
+    "reason": "capture-recovered"
+  },
+  "recoveryProbeMs": 500,
+  "liveQualification": "pending",
+  "policyCases": [
+    {
+      "adminMode": false,
+      "secureKind": "uac",
+      "desktopStateIndex": 3,
+      "inputAccepted": false,
+      "denyAllowed": true
+    },
+    {
+      "adminMode": false,
+      "secureKind": "lock",
+      "desktopStateIndex": 4,
+      "inputAccepted": false,
+      "denyAllowed": false
+    },
+    {
+      "adminMode": false,
+      "secureKind": "other",
+      "desktopStateIndex": 5,
+      "inputAccepted": false,
+      "denyAllowed": false
+    },
+    {
+      "adminMode": true,
+      "secureKind": "uac",
+      "desktopStateIndex": 6,
+      "inputAccepted": true,
+      "denyAllowed": true
+    },
+    {
+      "adminMode": true,
+      "secureKind": "lock",
+      "desktopStateIndex": 7,
+      "inputAccepted": true,
+      "denyAllowed": false
+    },
+    {
+      "adminMode": true,
+      "secureKind": "other",
+      "desktopStateIndex": 8,
+      "inputAccepted": true,
+      "denyAllowed": false
+    }
+  ],
+  "secureActions": [
+    {
+      "type": "secure-action",
+      "action": "deny"
+    }
+  ],
+  "secureActionResults": [
+    {
+      "type": "secure-action-result",
+      "action": "deny",
+      "ok": true,
+      "reason": ""
+    },
+    {
+      "type": "secure-action-result",
+      "action": "deny",
+      "ok": false,
+      "reason": "consent-remains"
+    }
+  ],
+  "invalidMessages": [
+    {
+      "name": "kind-unknown",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "password",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "kind-non-string",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": true,
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "capability-unknown",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "approve"
+        ]
+      }
+    },
+    {
+      "name": "capability-duplicate",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "view"
+        ]
+      }
+    },
+    {
+      "name": "capability-non-array",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": "view"
+      }
+    },
+    {
+      "name": "capability-null",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": null
+      }
+    },
+    {
+      "name": "capability-non-string",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          true
+        ]
+      }
+    },
+    {
+      "name": "secure-fields-on-default",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "default",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "state-extra-parameter",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ],
+        "x": 12
+      }
+    },
+    {
+      "name": "generation-negative",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": -1,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "generation-overflow",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 4294967296,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "generation-fractional",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 1.5,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "generation-string",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": "11",
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "desktop-unknown",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "alternate",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "input-unknown",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "full",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "state-unknown",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "locked",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "state-reason-over-limit",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "state-reason-utf8-over-limit",
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "ééééééééééééééééééééééééééééééééééééééééééééééééé",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      }
+    },
+    {
+      "name": "deny-coordinates",
+      "role": "client",
+      "message": {
+        "type": "secure-action",
+        "action": "deny",
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "name": "deny-key-parameter",
+      "role": "client",
+      "message": {
+        "type": "secure-action",
+        "action": "deny",
+        "key": "Escape"
+      }
+    },
+    {
+      "name": "deny-args-parameter",
+      "role": "client",
+      "message": {
+        "type": "secure-action",
+        "action": "deny",
+        "args": []
+      }
+    },
+    {
+      "name": "deny-unknown-action",
+      "role": "client",
+      "message": {
+        "type": "secure-action",
+        "action": "allow"
+      }
+    },
+    {
+      "name": "deny-missing-action",
+      "role": "client",
+      "message": {
+        "type": "secure-action"
+      }
+    },
+    {
+      "name": "result-non-boolean",
+      "role": "host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": 1,
+        "reason": ""
+      }
+    },
+    {
+      "name": "result-missing-reason",
+      "role": "host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true
+      }
+    },
+    {
+      "name": "result-non-string-reason",
+      "role": "host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": null
+      }
+    },
+    {
+      "name": "result-unknown-action",
+      "role": "host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "input",
+        "ok": true,
+        "reason": ""
+      }
+    },
+    {
+      "name": "result-extra-parameter",
+      "role": "host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": "",
+        "coordinates": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "result-reason-over-limit",
+      "role": "host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+    },
+    {
+      "name": "result-reason-utf8-over-limit",
+      "role": "host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": "ééééééééééééééééééééééééééééééééééééééééééééééééé"
+      }
+    }
+  ],
+  "roleCases": [
+    {
+      "role": "host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      },
+      "accepted": true
+    },
+    {
+      "role": "client",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      },
+      "accepted": false
+    },
+    {
+      "role": "client",
+      "message": {
+        "type": "secure-action",
+        "action": "deny"
+      },
+      "accepted": true
+    },
+    {
+      "role": "host",
+      "message": {
+        "type": "secure-action",
+        "action": "deny"
+      },
+      "accepted": false
+    },
+    {
+      "role": "host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": ""
+      },
+      "accepted": true
+    },
+    {
+      "role": "client",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": ""
+      },
+      "accepted": false
+    },
+    {
+      "role": "media-host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      },
+      "accepted": false
+    },
+    {
+      "role": "media-host",
+      "message": {
+        "type": "secure-action",
+        "action": "deny"
+      },
+      "accepted": false
+    },
+    {
+      "role": "media-host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": ""
+      },
+      "accepted": false
+    },
+    {
+      "role": "media-client",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      },
+      "accepted": false
+    },
+    {
+      "role": "media-client",
+      "message": {
+        "type": "secure-action",
+        "action": "deny"
+      },
+      "accepted": false
+    },
+    {
+      "role": "media-client",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": ""
+      },
+      "accepted": false
+    },
+    {
+      "role": "file-host",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      },
+      "accepted": false
+    },
+    {
+      "role": "file-host",
+      "message": {
+        "type": "secure-action",
+        "action": "deny"
+      },
+      "accepted": false
+    },
+    {
+      "role": "file-host",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": ""
+      },
+      "accepted": false
+    },
+    {
+      "role": "file-client",
+      "message": {
+        "type": "desktop-state",
+        "state": "active",
+        "desktop": "secure",
+        "input": "read-only",
+        "generation": 11,
+        "reason": "desktop-switched",
+        "secureKind": "uac",
+        "secureCapabilities": [
+          "view",
+          "deny"
+        ]
+      },
+      "accepted": false
+    },
+    {
+      "role": "file-client",
+      "message": {
+        "type": "secure-action",
+        "action": "deny"
+      },
+      "accepted": false
+    },
+    {
+      "role": "file-client",
+      "message": {
+        "type": "secure-action-result",
+        "action": "deny",
+        "ok": true,
+        "reason": ""
+      },
+      "accepted": false
+    }
+  ],
+  "limits": {
+    "messageMaxBytes": 512,
+    "reasonMaxUtf8Bytes": 96
+  },
+  "streamingTransition": {
+    "entryReason": "desktop-switched",
+    "exitReason": "capture-recovered",
+    "newGenerationOnEntryAndExit": true,
+    "reannounceKindAndCapabilitiesWithinGeneration": true
+  }
+}

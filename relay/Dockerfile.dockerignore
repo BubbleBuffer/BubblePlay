@@ -1,0 +1,12 @@
+# This file is interpreted relative to the repository-root build context.
+# Send only public build inputs; never send artifacts, identities or operator state.
+**
+!LICENSE
+!relay/
+!relay/*.go
+!relay/go.mod
+!relay/go.sum
+!relay/THIRD-PARTY-NOTICES.md
+!worker/
+!worker/public/
+!worker/public/**

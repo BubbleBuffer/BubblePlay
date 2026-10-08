@@ -10,10 +10,11 @@
     User part (no elevation):
       - Quit a running tray (its host and admin agent exit with it).
       - Copy bubbleplay-host.exe, bubbleplay_tray.exe, the staged
-        bubbleplay_admin_agent.exe, setup-tray.ps1 and uninstall-tray.ps1 to
+        bubbleplay_admin_agent.exe, bubbleplay_secure_helper.exe, setup-tray.ps1 and uninstall-tray.ps1 to
         %LOCALAPPDATA%\Programs\BubblePlay.
       - Write %LOCALAPPDATA%\BubblePlay\host.json (worker URL + tokens,
-        CurrentUser DPAPI) from -WorkerUrl/-Token or an existing host.json.
+        CurrentUser DPAPI) from -WorkerUrl/-Token/-HostGateToken or an
+        existing host.json. Both tokens must contain at least 32 characters.
       - HKCU Run autostart, a Start-menu shortcut, an HKCU "Apps" uninstall
         entry (uninstall-tray.ps1) and tray.json.
       - Start the tray.
@@ -24,6 +25,10 @@
         verified) and register the on-demand task \BubblePlay\AdminAgent
         (this user, RunLevel Highest, no triggers; the user may only query,
         run and end it). The tray starts it while Admin mode is on.
+      - Install bubbleplay_secure_helper.exe beside the admin agent; register
+        \BubblePlay\SecureDesktop as SYSTEM, action --launch, no triggers.
+        Its protected task DACL grants only this installing user read+execute
+        and SYSTEM/Administrators full control, and is verified after setup.
       - Remove the old elevated whole-host path: the \BubblePlay\ElevatedHost
         task and %ProgramFiles%\BubblePlay\elevated.
       - Remove the old BubblePlay services, their hash-matched binaries and
@@ -32,13 +37,14 @@
 
     -AgentOnly runs just the agent install + old elevated cleanup (used by
     the tray's "Admin agent needs update" item and update-tray.ps1
-    -IncludeAgent). -SkipAgent installs no agent (Admin mode unavailable)
+    -IncludeAgent). Both install the admin agent AND secure-desktop helper
+    in one elevation. -SkipAgent installs neither helper
     and removes an installed one. -WhatIf previews everything (no
     elevation, nothing written). A receipt JSON is written per run to
     %LOCALAPPDATA%\BubblePlay\receipts.
 
-    Admin mode lets input reach elevated windows (UIPI); the secure desktop
-    (UAC prompts, lock screen) is still NOT captured.
+    The secure-desktop helper runs as SYSTEM only for viewer sessions. Admin
+    mode off allows view and UAC Deny; Admin mode on also allows full input.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -52,6 +58,8 @@ param(
     [switch]$KeepServices,
     [Alias('SkipElevatedTask')]
     [switch]$SkipAgent,
+    # Explicit spelling for the default full install (also used by update-tray).
+    [switch]$IncludeAgent,
     [Alias('ElevatedBinariesOnly')]
     [switch]$AgentOnly,
     # Internal: the elevated half, started by this script through one UAC prompt.
@@ -61,6 +69,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($IncludeAgent -and $SkipAgent) { throw '-IncludeAgent and -SkipAgent cannot be combined.' }
 Add-Type -AssemblyName System.Security
 # Load modules up front with WhatIf off so module import noise (alias creation)
 # does not show up as fake plan items; queries below pass -WhatIf:$false too.
@@ -74,6 +83,9 @@ $MachineDir = Join-Path $ProgramFilesRoot 'BubblePlay'
 $AgentDir = Join-Path $MachineDir 'agent'
 $AgentExeName = 'bubbleplay_admin_agent.exe'
 $AgentExe = Join-Path $AgentDir $AgentExeName
+$HelperExeName = 'bubbleplay_secure_helper.exe'
+$HelperExe = Join-Path $AgentDir $HelperExeName
+$PrivilegedBinaries = @($AgentExeName, $HelperExeName)
 $LegacyElevatedDir = Join-Path $MachineDir 'elevated'
 # Binaries install-service.ps1 placed in $MachineDir.
 $ServiceBinaries = @('bubbleplay_broker.exe', 'bubbleplay_transport.exe', 'bubbleplay_agent.exe',
@@ -82,10 +94,11 @@ $TrustedSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831
 $ServiceNames = @('BubblePlayLabHelper', 'BubblePlayTransport', 'BubblePlayBroker')
 $ServiceProcessNames = @('bubbleplay_broker', 'bubbleplay_transport', 'bubbleplay_agent',
     'bubbleplay_input_proxy', 'bubbleplay_lab_helper', 'bubbleplay_lab_activity_guard', 'bubbleplay-host')
-$UserBinaries = @('bubbleplay-host.exe', 'bubbleplay_tray.exe', $AgentExeName)
+$UserBinaries = @('bubbleplay-host.exe', 'bubbleplay_tray.exe') + $PrivilegedBinaries
 $UserScripts = @('setup-tray.ps1', 'uninstall-tray.ps1')
 $TaskPath = '\BubblePlay\'
 $AgentTaskName = 'AdminAgent'
+$HelperTaskName = 'SecureDesktop'
 $LegacyTaskName = 'ElevatedHost'
 $LaunchTaskName = 'LaunchTray'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -206,7 +219,7 @@ function Invoke-Schtasks([string[]]$Arguments) {
 }
 
 function Test-Task([string]$Name) {
-    (Invoke-Schtasks @('/query', '/tn', "$TaskPath$Name")).ExitCode -eq 0
+    [bool](Get-ScheduledTask -TaskPath $TaskPath -TaskName $Name -ErrorAction SilentlyContinue)
 }
 
 function Assert-InteractiveUserMatches {
@@ -276,18 +289,30 @@ function Get-ExistingHostConfig {
 
 # Returns 'machine' when only the elevated part can read the config (the old
 # service config under ProgramData); otherwise writes/plans host.json itself.
+function Assert-HostCredentials([string]$RegistrationToken, [string]$EndpointToken) {
+    # Keep these minimums aligned with worker/src/index.js MIN_SECRET_LENGTHS.
+    if ([string]::IsNullOrWhiteSpace($RegistrationToken) -or $RegistrationToken.Length -lt 32) {
+        throw 'Host registration token (TOKEN / -Token) must contain at least 32 characters.'
+    }
+    if ([string]::IsNullOrWhiteSpace($EndpointToken) -or $EndpointToken.Length -lt 32) {
+        throw 'Host endpoint token (HOST_GATE_TOKEN / -HostGateToken) must contain at least 32 characters.'
+    }
+}
+
 function Update-HostConfig {
     $existing = Get-ExistingHostConfig
     $service = Get-ServiceConfig
     $explicitToken = ConvertFrom-Secure $Token
     $explicitGate = ConvertFrom-Secure $HostGateToken
+    $hasExplicitToken = $null -ne $Token
+    $hasExplicitGate = $null -ne $HostGateToken
 
     $source = $null; $worker = $null; $tok = $null; $gate = $null
-    if ($WorkerUrl -or $explicitToken) {
+    if ($WorkerUrl -or $hasExplicitToken -or $hasExplicitGate) {
         $source = 'parameters'
         $worker = if ($WorkerUrl) { $WorkerUrl } elseif ($existing) { $existing.Worker } elseif ($service -and $service.Readable) { $service.Worker } else { $null }
-        $tok = if ($explicitToken) { $explicitToken } elseif ($existing) { $existing.Token } elseif ($service -and $service.Readable) { $service.Token } else { $null }
-        $gate = if ($explicitGate) { $explicitGate } elseif ($existing) { $existing.HostGateToken } elseif ($service -and $service.Readable) { $service.HostGateToken } else { $null }
+        $tok = if ($hasExplicitToken) { $explicitToken } elseif ($existing) { $existing.Token } elseif ($service -and $service.Readable) { $service.Token } else { $null }
+        $gate = if ($hasExplicitGate) { $explicitGate } elseif ($existing) { $existing.HostGateToken } elseif ($service -and $service.Readable) { $service.HostGateToken } else { $null }
     }
     elseif ($existing) {
         $source = 'existing host.json'
@@ -301,14 +326,10 @@ function Update-HostConfig {
         return 'machine'
     }
     else {
-        if ($IsWhatIf) {
-            Add-Step 'config' 'blocked' 'No service config or host.json found; the real run needs -WorkerUrl and -Token.'
-            return 'none'
-        }
-        throw 'No existing configuration found. Pass -WorkerUrl wss://.../host-ws and -Token (SecureString).'
+        throw 'No existing configuration found. Pass -WorkerUrl wss://.../host-ws, -Token and -HostGateToken (SecureString).'
     }
     if (-not $worker -or $worker -notmatch '^wss?://') { throw "Worker URL must be ws:// or wss:// (got '$worker')." }
-    if (-not $tok) { throw 'No host registration token available.' }
+    Assert-HostCredentials $tok $gate
     $monitorValue = if ($PSBoundParameters.ContainsKey('Monitor') -or $Monitor) { $Monitor } elseif ($existing) { $existing.Monitor } else { $null }
 
     if ($existing -and $existing.Worker -eq $worker -and $existing.Token -eq $tok -and
@@ -329,7 +350,7 @@ function Update-HostConfig {
         Move-Item -Force -LiteralPath $temp -Destination $HostConfigPath
         # Round-trip to prove the tray (same user) can decrypt it.
         $check = Get-ExistingHostConfig
-        if (-not $check -or $check.Token -ne $tok) { throw 'host.json round-trip verification failed.' }
+        if (-not $check -or $check.Token -ne $tok -or $check.HostGateToken -ne $gate) { throw 'host.json round-trip verification failed.' }
         Add-Step 'config' 'done' "Wrote $HostConfigPath from $source (worker $worker, gate token: $([bool]$gate))."
     }
     else {
@@ -532,7 +553,7 @@ function Get-UnsafeAclFindings([string]$Path) {
 
 function Get-AgentAclFindings {
     $findings = @()
-    foreach ($path in @($AgentDir, $AgentExe, (Join-Path $AgentDir 'logs'))) {
+    foreach ($path in @($MachineDir, $AgentDir, $AgentExe, $HelperExe, (Join-Path $AgentDir 'logs'))) {
         try { if (Test-Path -LiteralPath $path) { $findings += Get-UnsafeAclFindings $path } }
         catch { $findings += "$path is not inspectable: $($_.Exception.Message)" }
     }
@@ -543,21 +564,25 @@ function Get-AgentAclFindings {
 function Get-MachineWork([bool]$ConfigNeedsMachine) {
     $work = [Collections.Generic.List[string]]::new()
     if ($SkipAgent) {
-        if ((Test-Task $AgentTaskName) -or (Test-Path -LiteralPath $AgentDir)) {
-            $work.Add("remove the admin agent (task $TaskPath$AgentTaskName, $AgentDir) because of -SkipAgent")
+        if ((Test-Task $AgentTaskName) -or (Test-Task $HelperTaskName) -or (Test-Path -LiteralPath $AgentDir)) {
+            $work.Add("remove privileged helpers (tasks $TaskPath$AgentTaskName and $TaskPath$HelperTaskName, $AgentDir) because of -SkipAgent")
         }
     }
     else {
-        $source = Join-Path $SourceDir $AgentExeName
-        $sourceHash = Get-Sha256OrNull $source
-        $installedHash = Get-Sha256OrNull $AgentExe
-        if (-not $sourceHash) { $work.Add("install the admin agent (source $source is missing: build first)") }
-        elseif ($installedHash -ne $sourceHash) {
-            $what = if ($installedHash) { 'update' } else { 'install' }
-            $work.Add("$what the admin agent -> $AgentExe (protected ACL: SYSTEM/Administrators full, Users read+execute; verified)")
+        foreach ($name in $PrivilegedBinaries) {
+            $source = Join-Path $SourceDir $name
+            $target = Join-Path $AgentDir $name
+            $sourceHash = Get-Sha256OrNull $source
+            $installedHash = Get-Sha256OrNull $target
+            if (-not $sourceHash) { $work.Add("install $name (source $source is missing: build first)") }
+            elseif ($installedHash -ne $sourceHash) {
+                $what = if ($installedHash) { 'update' } else { 'install' }
+                $work.Add("$what $name -> $target (protected ACL: SYSTEM/Administrators full, Users read+execute; verified)")
+            }
         }
-        elseif ((Get-AgentAclFindings).Count -gt 0) { $work.Add("repair the admin agent folder ACL in $AgentDir") }
+        if ((Get-AgentAclFindings).Count -gt 0) { $work.Add("repair the privileged helper folder ACL in $AgentDir") }
         if (-not (Test-Task $AgentTaskName)) { $work.Add("register on-demand task $TaskPath$AgentTaskName (user $UserName, RunLevel Highest, user may only query/run/end it)") }
+        if (-not (Test-SecureTaskCurrent)) { $work.Add("register/repair on-demand task $TaskPath$HelperTaskName (SYSTEM, --launch; protected DACL: this user read+execute, SYSTEM/Administrators full; verified)") }
     }
     if (Test-Task $LegacyTaskName) { $work.Add("remove the old elevated-host task $TaskPath$LegacyTaskName") }
     if (Test-Path -LiteralPath $LegacyElevatedDir) { $work.Add("remove the old elevated host copy $LegacyElevatedDir") }
@@ -575,14 +600,18 @@ function Get-MachineWork([bool]$ConfigNeedsMachine) {
 }
 
 function Stop-AgentProcesses {
+    if (-not $PSCmdlet.ShouldProcess('installed privileged helper processes', 'Stop before replacing/removing protected binaries')) {
+        Add-Step 'stop-helpers' 'planned' 'Stop installed admin agent and secure helper processes (SecureDesktop task is only a launcher; do not end it).'
+        return
+    }
     foreach ($name in @($AgentTaskName, $LegacyTaskName)) {
         if (Test-Task $name) { [void](Invoke-Schtasks @('/end', '/tn', "$TaskPath$name")) }
     }
     $roots = @($AgentDir, $LegacyElevatedDir)
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
-        $busy = @(Get-Process bubbleplay_admin_agent, bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
-                Where-Object { $p = $_.Path; $p -and @($roots | Where-Object { $p.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count })
+        $busy = @(Get-Process bubbleplay_admin_agent, bubbleplay_secure_helper, bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
+                Where-Object { $p = $_.Path; $p -and @($roots | Where-Object { $p.StartsWith("$($_.TrimEnd('\'))\", [StringComparison]::OrdinalIgnoreCase) }).Count })
         if ($busy.Count -eq 0) { return }
         $busy | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 300
@@ -611,45 +640,118 @@ function Reset-ToInheritedAcl([string]$Path) {
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
+function Assert-RemovableAgentDir {
+    $expected = [IO.Path]::GetFullPath((Join-Path $MachineDir 'agent'))
+    if (-not (Test-SamePath $AgentDir $expected)) { throw "Refusing unexpected privileged directory: $AgentDir" }
+    foreach ($path in @($MachineDir, $AgentDir)) {
+        if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$path is a reparse point." }
+    }
+}
+
 function Install-Agent {
     if ($SkipAgent) {
-        if ((Test-Task $AgentTaskName) -and $PSCmdlet.ShouldProcess("$TaskPath$AgentTaskName", 'Unregister (because -SkipAgent)')) {
-            Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $AgentTaskName -Confirm:$false
+        foreach ($name in @($AgentTaskName, $HelperTaskName)) {
+            if ((Test-Task $name) -and $PSCmdlet.ShouldProcess("$TaskPath$name", 'Unregister (because -SkipAgent)')) {
+                Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $name -Confirm:$false
+            }
         }
         if ((Test-Path -LiteralPath $AgentDir) -and $PSCmdlet.ShouldProcess($AgentDir, 'Remove (because -SkipAgent)')) {
+            Assert-RemovableAgentDir
             Remove-Item -Recurse -Force -LiteralPath $AgentDir
         }
-        Add-Step 'agent' 'skipped' '-SkipAgent given; Admin mode is unavailable.'
+        Add-Step 'agent' 'skipped' '-SkipAgent given; Admin mode and secure-desktop helper unavailable.'
         return
     }
-    $source = Join-Path $SourceDir $AgentExeName
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing $source." }
-    $sourceHash = Get-Sha256 $source
-    $changed = (Get-Sha256OrNull $AgentExe) -ne $sourceHash
-    if (-not $PSCmdlet.ShouldProcess($AgentDir, "Install admin input agent ($AgentExeName)")) {
-        Add-Step 'agent' 'planned' "Copy $AgentExeName -> $AgentDir; set protected ACL and verify no user write access."
+    # Validate both sources before making any machine change.
+    $hashes = [ordered]@{}
+    foreach ($name in $PrivilegedBinaries) {
+        $source = Join-Path $SourceDir $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing $source." }
+        $hashes[$name] = Get-Sha256 $source
+    }
+    if (-not $PSCmdlet.ShouldProcess($AgentDir, "Install admin input agent and secure-desktop helper ($($PrivilegedBinaries -join ', '))")) {
+        Add-Step 'agent' 'planned' "Copy $($PrivilegedBinaries -join ', ') -> $AgentDir; set protected ACL and verify no user write access."
         return
     }
     foreach ($dir in @($MachineDir, $AgentDir)) {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
         if ((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$dir is a reparse point." }
+        Set-ProtectedDirAcl $dir
     }
-    Set-ProtectedDirAcl $AgentDir
-    if ($changed) {
-        $temp = "$AgentExe.new"
-        Copy-Item -Force -LiteralPath $source -Destination $temp
-        Move-Item -Force -LiteralPath $temp -Destination $AgentExe
+    foreach ($path in @($AgentExe, $HelperExe, "$AgentExe.new", "$HelperExe.new", (Join-Path $AgentDir 'logs'))) {
+        if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$path is a reparse point." }
+    }
+    foreach ($name in $PrivilegedBinaries) {
+        $target = Join-Path $AgentDir $name
+        if ((Get-Sha256OrNull $target) -ne $hashes[$name]) {
+            $temp = "$target.new"
+            Copy-Item -Force -LiteralPath (Join-Path $SourceDir $name) -Destination $temp
+            Move-Item -Force -LiteralPath $temp -Destination $target
+        }
+        Reset-ToInheritedAcl $target
+        if ((Get-Sha256 $target) -ne $hashes[$name]) { throw "Hash mismatch after copying $name." }
     }
     $logs = Join-Path $AgentDir 'logs'
     if (-not (Test-Path -LiteralPath $logs)) { New-Item -ItemType Directory -Path $logs | Out-Null }
-    Reset-ToInheritedAcl $AgentExe
     Reset-ToInheritedAcl $logs
-    if ((Get-Sha256 $AgentExe) -ne $sourceHash) { throw "Hash mismatch after copying $AgentExeName." }
     $findings = Get-AgentAclFindings
-    if ($findings.Count -gt 0) { throw "Agent folder is not admin-only: $($findings -join '; ')" }
-    $receipt.agentSha256 = $sourceHash
-    $detail = if ($changed) { 'Installed' } else { 'Already current' }
-    Add-Step 'agent' 'done' "$detail $AgentExe; ACL verified admin-only."
+    if ($findings.Count -gt 0) { throw "Privileged helper folder is not admin-only: $($findings -join '; ')" }
+    $receipt.agentSha256 = $hashes[$AgentExeName]
+    $receipt.secureHelperSha256 = $hashes[$HelperExeName]
+    Add-Step 'agent' 'done' "Installed/current $($PrivilegedBinaries -join ', ') in $AgentDir; ACL verified admin-only."
+}
+
+function Get-SecureTaskSddl { "D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;$UserSid)" }
+
+function Test-SecureTaskDacl([string]$Actual) {
+    # Task Scheduler normalises what SetSecurityDescriptor stores: it drops the
+    # protected flag and adds (A;;FR;;;SY). So check the effect, not the text:
+    # only SYSTEM and Administrators may hold more than read+execute, the user
+    # holds read+execute, and nobody else is granted anything.
+    $readExecute = 0x1200a9
+    $admins = @('S-1-5-18', 'S-1-5-32-544')
+    $userCanRun = $false
+    foreach ($ace in [Security.AccessControl.RawSecurityDescriptor]::new($Actual).DiscretionaryAcl) {
+        if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed) { continue }
+        $sid = $ace.SecurityIdentifier.Value
+        if ($sid -in $admins) { continue }
+        if ($sid -ne $UserSid -or ($ace.AccessMask -band -bnot $readExecute) -ne 0) { return $false }
+        if (($ace.AccessMask -band $readExecute) -eq $readExecute) { $userCanRun = $true }
+    }
+    return $userCanRun
+}
+
+function Test-SecureTaskCurrent {
+    try {
+        $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $HelperTaskName -ErrorAction Stop
+        if ($task.Principal.UserId -notin @('SYSTEM', 'S-1-5-18', 'NT AUTHORITY\SYSTEM') -or $task.Actions.Count -ne 1 -or
+            -not (Test-SamePath $task.Actions[0].Execute $HelperExe) -or $task.Actions[0].Arguments -ne '--launch' -or $task.Triggers) { return $false }
+        $scheduler = New-Object -ComObject Schedule.Service
+        $scheduler.Connect()
+        return Test-SecureTaskDacl ($scheduler.GetFolder($TaskPath.TrimEnd('\')).GetTask($HelperTaskName).GetSecurityDescriptor(4))
+    }
+    catch { return $false }
+}
+
+function Register-SecureTask {
+    if ($SkipAgent) { return }
+    $fullName = "$TaskPath$HelperTaskName"
+    if (-not $PSCmdlet.ShouldProcess($fullName, 'Register on-demand SYSTEM secure-desktop launcher and verify its DACL')) {
+        Add-Step 'secure-task' 'planned' "Register $fullName -> `"$HelperExe`" --launch (SYSTEM, on demand; only $UserSid read+execute, SYSTEM/Administrators full; verified)."
+        return
+    }
+    $findings = Get-AgentAclFindings
+    if (-not (Test-Path -LiteralPath $HelperExe) -or $findings.Count -gt 0) { throw "Secure helper missing or unsafe: $($findings -join '; ')" }
+    $action = New-ScheduledTaskAction -Execute $HelperExe -Argument '--launch' -WorkingDirectory $AgentDir
+    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Priority 4
+    Register-ScheduledTask -TaskPath $TaskPath -TaskName $HelperTaskName -Action $action -Principal $principal -Settings $settings -Description 'BubblePlay secure-desktop helper launcher (viewer sessions only; host owns helper lifetime).' -Force | Out-Null
+    $scheduler = New-Object -ComObject Schedule.Service
+    $scheduler.Connect()
+    $task = $scheduler.GetFolder($TaskPath.TrimEnd('\')).GetTask($HelperTaskName)
+    $task.SetSecurityDescriptor((Get-SecureTaskSddl), 0)
+    if (-not (Test-SecureTaskCurrent)) { throw 'SecureDesktop task principal/action/DACL verification failed.' }
+    Add-Step 'secure-task' 'done' "Registered and verified $fullName (SYSTEM; user read+execute only)."
 }
 
 function Register-AgentTask {
@@ -792,10 +894,11 @@ function Remove-ServiceBinaryLeftovers {
 
 # The elevated part, run inline (already elevated) or in the UAC child.
 function Invoke-MachineSteps([bool]$ConfigNeedsMachine) {
-    Stop-AgentProcesses
     if ($ConfigNeedsMachine) { [void](Update-HostConfig) }
+    Stop-AgentProcesses
     Install-Agent
     Register-AgentTask
+    Register-SecureTask
     Remove-LegacyElevated
     if (-not $AgentOnly) { Remove-BubblePlayServices }
 }
@@ -849,7 +952,7 @@ try {
     elseif ($AgentOnly) {
         Assert-InteractiveUserMatches
         $work = Get-MachineWork $false
-        if ($work.Count -eq 0) { Add-Step 'agent' 'unchanged' 'Admin agent, its task and the old elevated cleanup are already current.' }
+        if ($work.Count -eq 0) { Add-Step 'agent' 'unchanged' 'Admin agent, secure helper, their tasks and the old elevated cleanup are already current.' }
         elseif ($IsElevated) { Invoke-MachineSteps $false }
         else { Invoke-ElevatedMachinePhase $work }
     }
@@ -866,7 +969,7 @@ try {
         elseif ($IsElevated) { Invoke-MachineSteps $configNeedsMachine }
         else { Invoke-ElevatedMachinePhase $work }
         if ($configNeedsMachine -and -not $IsWhatIf -and -not (Test-Path -LiteralPath $HostConfigPath -PathType Leaf)) {
-            throw "The service config could not be migrated to $HostConfigPath; pass -WorkerUrl and -Token."
+            throw "The service config could not be migrated to $HostConfigPath; pass -WorkerUrl, -Token and -HostGateToken."
         }
         Set-UserRegistration
         Start-Tray

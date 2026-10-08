@@ -1,3 +1,4 @@
+import { RemoteClipboardWriter, sameClipboardImage, pasteHostClipboard } from "/remote-clipboard.js";
 "use strict";
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats, computeQosRxWindow, createQosPayload, parseHostQuality } from "/latency.js";
 import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateIceServers, wantsTurn } from "/turn.js";
@@ -7,6 +8,7 @@ import {
   rtcPeerEndAction,
 } from "/recovery.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
+import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, shouldFallbackToWssOnMissingRtp, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
@@ -20,7 +22,7 @@ import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyN
 import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
 import { FileTransferClient } from "/file-client.js";
-import { filesFromPaste, installFileTransferUi } from "/file-ui.js";
+import { createFileDragPreviewController, filesFromPaste, installFileTransferUi, mapFileDropPoint } from "/file-ui.js";
 
 const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
 const diagnosticAttemptId = window.__bubbleplayDebugTrace?.attemptId || null;
@@ -137,17 +139,25 @@ const desktopState = document.getElementById("desktop-state");
 const desktopStateTitle = document.getElementById("desktop-state-title");
 const desktopStateDetail = document.getElementById("desktop-state-detail");
 const firstFrameRetry = document.getElementById("first-frame-retry");
+const secureDeny = document.getElementById("secure-deny");
 let desktopAvailable = true;
 let desktopAwaitingFrame = false;
 let suppressDesktopTransitionOverlay = false;
 let transitionNeedsKeyframe = false;
 let desktopKind = "default";
+// Secure desktop (UAC prompt, lock screen): what it is and what the host's
+// SYSTEM helper lets this viewer do there ("view", "deny", "input").
+let secureKind = "other";
+let secureCapabilities = [];
+let secureDenyState = { pending: false, error: "" };
 let desktopInputState = "enabled";
 let desktopGeneration = null;
 let latestInputStatus = null;
 let hostCapabilities = { serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false };
 let hostCapabilitiesGeneration = 0;
 let hasPresentedFrame = false;
+let fileDropPresentedGeneration = null;
+let fileDropPresentedViewportRevision = null;
 const firstFrameHandshake = { requestId: null, transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, failureReason: "", timer: null };
 const labQualityKeyframeAcks = new Map();
 let viewportRevision = 0;
@@ -162,10 +172,29 @@ let viewportConsecutiveTimeouts = 0;
 let sharpDisabledForSession = false;
 let renderedSharpView = null;
 let viewportTelemetry = { state: "full", revision: 0, generation: 0, crop: "1920x1080@0,0" };
-const clientBuild = "edge-instrument-2026-08-17";
+const clientBuild = "native-file-drop-2026-10-05";
 
+function secureDesktopText() {
+  const title = secureKind === "uac" ? "Admin prompt open on the PC" : secureKind === "lock" ? "PC is locked" : "Secure screen open on the PC";
+  if (secureDenyState.pending) return [title, "Closing the prompt…"];
+  if (secureDenyState.error) return [title, `Couldn't close the prompt (${secureDenyState.error}).`];
+  if (!secureCapabilities.includes("view")) return [title, "BubblePlay can't show this screen. The stream resumes when it closes."];
+  if (secureCapabilities.includes("input")) return [title, secureKind === "lock" ? "You can sign in with the keyboard." : "You can use it with mouse and keyboard."];
+  return [title, secureKind === "uac" ? "View only. Turn on Admin mode on the PC to approve prompts." : "View only. Turn on Admin mode on the PC to use it."];
+}
 function renderDesktopState() {
   document.body.classList.toggle("desktop-unavailable", !desktopAvailable);
+  if (desktopKind === "secure" && !(desktopAvailable && desktopAwaitingFrame && !hasPresentedFrame)) {
+    const [title, detail] = secureDesktopText();
+    desktopState.dataset.state = "secure";
+    desktopState.hidden = false;
+    desktopStateTitle.textContent = title;
+    desktopStateDetail.textContent = detail;
+    secureDeny.hidden = !secureCapabilities.includes("deny");
+    secureDeny.disabled = secureDenyState.pending;
+    return;
+  }
+  secureDeny.hidden = true;
   const state = !desktopAvailable ? "unavailable" : desktopAwaitingFrame ? (firstFrameHandshake.phase === "failed" ? "failed" : firstFrameHandshake.phase === "retrying" ? "retrying" : "starting") : "ready";
   desktopState.dataset.state = state;
   desktopState.hidden = state === "ready" || (suppressDesktopTransitionOverlay && hasPresentedFrame && desktopAwaitingFrame);
@@ -178,6 +207,17 @@ function handleDesktopState(message) {
     message.generation !== desktopGeneration;
   if (Number.isInteger(message.generation)) desktopGeneration = message.generation;
   if (["default", "secure", "none"].includes(message.desktop)) desktopKind = message.desktop;
+  if (desktopKind === "secure") {
+    const nextKind = ["uac", "lock", "other"].includes(message.secureKind) ? message.secureKind : "other";
+    if (nextKind !== secureKind) secureDenyState = { pending: false, error: "" };
+    secureKind = nextKind;
+    secureCapabilities = Array.isArray(message.secureCapabilities)
+      ? message.secureCapabilities.filter(c => ["view", "deny", "input"].includes(c)) : [];
+  } else {
+    secureKind = "other";
+    secureCapabilities = [];
+    secureDenyState = { pending: false, error: "" };
+  }
   if (["enabled", "suspended", "read-only"].includes(message.input)) desktopInputState = message.input;
   if (desktopInputState !== "enabled") releaseInput(false);
   const secureDesktop = desktopKind === "secure";
@@ -305,14 +345,16 @@ function startFirstFrameHandshake(reason, forceNew = false) {
   sendClientLog("info", "first-frame-request", { reason, transport });
   armFirstFrameWatchdog();
 }
-function markFirstFramePresented(presentedGeneration = null) {
-  if (firstFrameHandshake.presented) return true;
-  if (firstFrameHandshake.requireAdmission && !firstFrameHandshake.admitted) return false;
-  if (firstFrameHandshake.requireAdmission
+function markFirstFramePresented(presentedGeneration = null, presentedViewportRevision = null) {
+  if (!firstFrameHandshake.presented && firstFrameHandshake.requireAdmission && !firstFrameHandshake.admitted) return false;
+  if (!firstFrameHandshake.presented && firstFrameHandshake.requireAdmission
       && Number.isInteger(presentedGeneration)
       && Number.isInteger(firstFrameHandshake.generation)
       && firstFrameHandshake.generation !== 0
       && presentedGeneration !== firstFrameHandshake.generation) return false;
+  if (Number.isInteger(presentedGeneration)) fileDropPresentedGeneration = presentedGeneration;
+  if (Number.isInteger(presentedGeneration)) fileDropPresentedViewportRevision = Number.isInteger(presentedViewportRevision) ? presentedViewportRevision : null;
+  if (firstFrameHandshake.presented) return true;
   if (usingWssMedia) wssStartupRecoveries = 0;
   firstFrameHandshake.presented = true;
   hasPresentedFrame = true;
@@ -389,6 +431,8 @@ let monitorSwitchPending = null;
 let lastMonitorRequest = null;
 let lastMonitorError = null;
 let monitorErrorNotice = null; // shown in the Monitors popover until the next list
+let hostFollowCapable = false; // host-capabilities.followWindow >= 1
+let hostFollowState = null; // monitor-list.follow, the host's truth when known
 function invalidatePendingMonitorRequest(reason) {
   const invalidated = monitorRequestAfterRestart(monitorSwitchPending, reason);
   if (!invalidated) return;
@@ -402,6 +446,7 @@ function renderMonitorList() {
   if (!list || !status) return;
   list.replaceChildren();
   renderMonitorChrome();
+  renderFollowWindow();
   if (!monitorList.length) { status.textContent = monitorErrorNotice ? `Monitor switch failed: ${monitorErrorNotice}` : "Waiting for monitor information…"; return; }
   status.textContent = monitorSwitchPending ? "Switching display…" : monitorErrorNotice ? `Monitor switch failed: ${monitorErrorNotice}` : monitorList.length === 1 ? "The host has one monitor." : "";
   for (const monitor of monitorList) {
@@ -457,6 +502,7 @@ function handleMonitorList(message) {
   monitorList = message.monitors.filter(m => m && typeof m.selector === "string" && m.selector.length <= 128)
     .map(m => ({ selector: m.selector, name: typeof m.name === "string" ? m.name : m.selector, width: Number(m.width) || 0, height: Number(m.height) || 0, selected: !!m.selected }));
   monitorListRevision++;
+  if (typeof message.follow === "boolean") hostFollowState = message.follow;
   const selected = monitorList.find(m => m.selected);
   const sessionDisplay = document.getElementById("session-display");
   if (sessionDisplay) sessionDisplay.textContent = selected ? `Now showing ${selected.name}` : "No display selected";
@@ -495,6 +541,36 @@ function requestMonitor(selector) {
   renderMonitorList();
   sendSignal({ type: "media-control", action: "monitor", protocol: WSS_PROTOCOL, epoch: mediaEpoch, monitor: selector, reason: "user-monitor" });
   return true;
+}
+// Follow active window (docs/architecture/follow-active-window.md): the host
+// decides and switches through the normal desktop-state/monitor-list path;
+// the client only owns the saved choice and resends it on every connect.
+function followWindowShown() { return hostFollowState ?? settings.followWindow; }
+function renderFollowWindow() {
+  const group = document.getElementById("follow-window-group");
+  const row = document.getElementById("follow-window");
+  if (!group || !row) return;
+  group.hidden = !hostFollowCapable;
+  row.setAttribute("aria-checked", String(followWindowShown()));
+  row.disabled = monitorList.length === 1;
+}
+function sendFollowWindow() {
+  if (!hostFollowCapable) return;
+  sendSignal({ type: "media-control", action: "follow", follow: settings.followWindow, protocol: WSS_PROTOCOL, epoch: mediaEpoch, reason: "user-follow" });
+}
+function applyFollowCapability(message) {
+  hostFollowCapable = Number.isInteger(message.followWindow) && message.followWindow >= 1;
+  hostFollowState = null; // a new host session starts with follow off until told
+  renderFollowWindow();
+  if (settings.followWindow) sendFollowWindow();
+}
+function toggleFollowWindow() {
+  if (!hostFollowCapable) return;
+  settings.followWindow = !followWindowShown();
+  persistSettings();
+  hostFollowState = null; // show the choice until the host's next monitor-list
+  renderFollowWindow();
+  sendFollowWindow();
 }
 
 // ---- status HUD ------------------------------------------------------------
@@ -691,7 +767,7 @@ setInterval(() => sendClientLog("info", "client-health", {
   input: { ready: inputReady, state: desktopInputState,
     sent: input.stats.controlSent, rejected: input.stats.controlDropped,
     motionSent: input.stats.sent, motionRejected: input.stats.dropped,
-    host: latestInputStatus },
+    host: latestInputStatus, cursor: cursorAppearance.snapshot() },
 }), 5_000);
 
 addEventListener("error", event => sendClientLog("error", "window-error", {
@@ -786,7 +862,7 @@ function recycleSignaling(reason) {
 async function handleSignal(socket, generation, ev) {
   if (ws !== socket || generation !== signalingGeneration) return;
   if (ev.data instanceof ArrayBuffer || ArrayBuffer.isView(ev.data)) {
-    handleCursorState(ev.data);
+    handleCursorState(ev.data, "signaling");
     return;
   }
   let msg;
@@ -856,6 +932,12 @@ async function handleSignal(socket, generation, ev) {
     case "desktop-state":
       handleDesktopState(msg);
       break;
+    case "secure-action-result":
+      if (msg.action === "deny") {
+        secureDenyState = { pending: false, error: msg.ok ? "" : (typeof msg.reason === "string" && msg.reason ? msg.reason : "failed") };
+        renderDesktopState();
+      }
+      break;
     case "input-status": {
       const previousFailures = latestInputStatus?.failedPackets || 0;
       latestInputStatus = msg;
@@ -869,6 +951,7 @@ async function handleSignal(socket, generation, ev) {
     case "input-capabilities":
       applyInputCapabilities(msg);
       break;
+    case "clipboard-image":
     case "clipboard":
       receiveRemoteClipboard(msg);
       break;
@@ -883,7 +966,12 @@ async function handleSignal(socket, generation, ev) {
       hostCapabilitiesGeneration = generation;
       // File transfer hook (3/5): all file UI stays hidden without the capability.
       setFileTransferAvailable(Number.isInteger(msg.fileTransfer) && msg.fileTransfer >= 1);
+      nativeFileDropAvailable = Number.isInteger(msg.fileDrop) && msg.fileDrop >= 1;
+      nativeFileDropPreviewAvailable = msg.fileDropPreview === 1 && nativeFileDropAvailable && fileUi.enabled;
+      if (!nativeFileDropPreviewAvailable) fileDragPreview.cancel();
       renderFilesSlot();
+      // Follow active window: show the switch and resend a saved "on" per connect.
+      applyFollowCapability(msg);
       if (wssSelected && !usingWssMedia) requestWssMediaStart();
       break;
     case "file-offer":
@@ -949,12 +1037,17 @@ function restartPeer(reason, reconnect = true) {
 }
 
 function cleanupPeer() {
+  fileDragPreview.cancel();
+  nativeFileDropPreviewAvailable = false;
+  fileDropPresentedGeneration = null;
+  fileDropPresentedViewportRevision = null;
   if (usingWssMedia) stopWssMedia();
   clearWssTimers();
   closingPeer = true;
   releaseInput();
   resetKeyboardDraft();
   resetTouchCursor();
+  cursorAppearance.reset();
   inputReady = false;
   connected = false;
   try { dc?.close(); } catch {}
@@ -2712,7 +2805,7 @@ function drawFrame(frame, due = performance.now()) {
     }
     // Mark only after the frame has been copied to its visible canvas. Codec
     // labels and host admission alone are not enough to hide startup UI.
-    markFirstFramePresented(metadata?.generation ?? null);
+    markFirstFramePresented(metadata?.generation ?? null, metadata?.cropRevision ?? null);
     if (usingWssMedia) framePresentationTelemetry.noteImmediatePresented();
     const renderedAt = performance.now();
     if (metadata?.frameTrace) {
@@ -2771,9 +2864,10 @@ let buttons = 0, touchButtons = 0;
 let locked = false;
 let lastNonMousePointerAt = -Infinity;
 
+// The media inside an object-fit: contain element (a <video> or the canvas).
 function videoContentRect(video) {
   const box = video.getBoundingClientRect();
-  const aspect = video.videoWidth / video.videoHeight;
+  const aspect = (video.videoWidth || video.width) / (video.videoHeight || video.height);
   if (!Number.isFinite(aspect) || aspect <= 0 || box.width === 0 || box.height === 0) return box;
   const boxAspect = box.width / box.height;
   if (aspect > boxAspect) {
@@ -2814,7 +2908,7 @@ document.addEventListener("mousemove", (e) => {
     if (pointerMode !== "desktop") return;
     if (e.target !== inputSurface) return;
     // Absolute fallback over the displayed video (not its letterbox): 0..65535.
-    const r = activeVideo ? videoContentRect(activeVideo) : screen.getBoundingClientRect();
+    const r = videoContentRect(activeVideo || screen);
     if (r.width === 0 || r.height === 0) return;
     const x = clamp((e.clientX - r.left) / r.width, 0, 1);
     const y = clamp((e.clientY - r.top) / r.height, 0, 1);
@@ -2852,11 +2946,13 @@ document.addEventListener("wheel", (e) => {
 }, { passive: false });
 const wheelAccumulator = new WheelAccumulator();
 
-// ---- input: clipboard text + keyboard lock ----------------------------------
+// ---- input: clipboard text/images + keyboard lock ----------------------------------
 let hostInputCapabilities = { scancode: false, clipboard: false };
 const remoteClipboard = new ClipboardReceiver();
 const remoteClipboardButton = document.getElementById("remote-clipboard");
-let pendingRemoteClipboard = null;
+const remoteClipboardWriter = new RemoteClipboardWriter({ clipboard: navigator.clipboard, ClipboardItem: globalThis.ClipboardItem,
+  autoCopy: settings.clipboardAutoCopy,
+  onPending: pending => { if (remoteClipboardButton) remoteClipboardButton.hidden = !pending; } });
 let pasteArmed = null;
 let clipboardTransferId = 0;
 function applyInputCapabilities(msg) {
@@ -2866,38 +2962,51 @@ function applyInputCapabilities(msg) {
 }
 // Clipboard sync is text-only and never runs on the Windows secure desktop.
 function clipboardSyncEnabled() { return hostInputCapabilities.clipboard && desktopKind !== "secure" && inputReady; }
-function clearRemoteClipboard() { pendingRemoteClipboard = null; remoteClipboard.reset(); if (remoteClipboardButton) remoteClipboardButton.hidden = true; }
-function writeRemoteClipboard(text) {
-  if (!navigator.clipboard?.writeText) { pendingRemoteClipboard = text; remoteClipboardButton.hidden = false; return; }
-  navigator.clipboard.writeText(text).then(() => {
-    if (pendingRemoteClipboard === text) { pendingRemoteClipboard = null; remoteClipboardButton.hidden = true; }
-  }, () => { pendingRemoteClipboard = text; remoteClipboardButton.hidden = false; });
-}
+function clearRemoteClipboard() { remoteClipboardWriter.clear(); remoteClipboard.reset(); }
+function discardPendingClipboard() { remoteClipboardWriter.discardPending(); remoteClipboard.reset(); }
 function receiveRemoteClipboard(msg) {
   if (!hostInputCapabilities.clipboard || desktopKind === "secure") return;
-  const text = remoteClipboard.push(msg);
-  if (!text) return;
-  pendingRemoteClipboard = text;
-  if (document.hasFocus()) writeRemoteClipboard(text); else remoteClipboardButton.hidden = false;
+  const content = remoteClipboard.push(msg);
+  if (content === null) return;
+  remoteClipboardWriter.receive(content, document.hasFocus());
 }
-remoteClipboardButton.onclick = e => { e.stopPropagation(); if (pendingRemoteClipboard !== null) writeRemoteClipboard(pendingRemoteClipboard); inputSurface.focus?.(); };
-window.addEventListener("focus", () => { if (pendingRemoteClipboard !== null && desktopKind !== "secure") writeRemoteClipboard(pendingRemoteClipboard); });
+remoteClipboardButton.onclick = e => { e.stopPropagation(); remoteClipboardWriter.write(); inputSurface.focus?.(); };
+window.addEventListener("focus", () => { if (desktopKind !== "secure") remoteClipboardWriter.writeAutomatically(true); });
+window.addEventListener("blur", () => remoteClipboardWriter.writeAutomatically(false));
+document.addEventListener("copy", clearRemoteClipboard, true);
+document.addEventListener("cut", clearRemoteClipboard, true);
 function isPasteShortcut(e) { return (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "v" || e.key === "V"); }
 // Ctrl/Cmd+V: let the browser raise a paste event carrying the local
 // clipboard, then set the host clipboard and paste there. Without clipboard
 // text (or permission) the plain key goes through and pastes the host's own.
 function armBrowserPaste() {
+  discardPendingClipboard();
   clearTimeout(pasteArmed);
   pasteArmed = setTimeout(() => { pasteArmed = null; sendPhysicalTap("KeyV"); }, 300);
 }
+function sendHostClipboardPaste() {
+  if (!inputReady) return;
+  pasteHostClipboard(input, held);
+}
 function sendPhysicalTap(code) { if (!inputReady) return; input.physicalKey(code, false); input.physicalKey(code, true); }
 document.addEventListener("paste", e => {
+  discardPendingClipboard();
   if (pasteArmed === null) return;
   clearTimeout(pasteArmed); pasteArmed = null;
   e.preventDefault();
   // File transfer hook (4/5): pasted files or an image upload and paste on the PC.
   const pastedFiles = fileTransferAvailable() ? filesFromPaste(e) : [];
-  if (pastedFiles.length) { fileClient.upload(pastedFiles, "paste"); return; }
+  if (pastedFiles.length) {
+    const snapshot = remoteClipboardWriter.latest, pasteEpoch = mediaEpoch;
+    if (pastedFiles.length === 1 && snapshot?.mimeType === "image/png") {
+      sameClipboardImage(snapshot, pastedFiles[0]).then(matches => {
+        if (!inputReady || desktopKind === "secure" || mediaEpoch !== pasteEpoch) return;
+        if (matches && remoteClipboardWriter.latest === snapshot && remoteClipboardWriter.pending === null) sendHostClipboardPaste();
+        else fileClient.upload(pastedFiles, "paste");
+      });
+    } else fileClient.upload(pastedFiles, "paste");
+    return;
+  }
   const text = e.clipboardData?.getData("text/plain") || "";
   clipboardTransferId = (clipboardTransferId + 1) & 0xffff;
   if (!text || !clipboardSyncEnabled() || !input.clipboard(text, clipboardTransferId)) sendPhysicalTap("KeyV");
@@ -2905,10 +3014,20 @@ document.addEventListener("paste", e => {
 // ---- file transfer (hook 5/5) ----------------------------------------------
 // Protocol and state: file-transfer.js / file-client.js; rendering: file-ui.js.
 const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl });
+let nativeFileDropAvailable = false;
+let nativeFileDropPreviewAvailable = false;
+const fileDragPreview = createFileDragPreviewController({
+  send: sendSignal,
+  getContext: () => ({ available: nativeFileDropPreviewAvailable && nativeFileDropAvailable && fileTransferAvailable() && connected, epoch: mediaEpoch }),
+  resolveDrop: resolveNativeFileDrop,
+});
 const fileUi = installFileTransferUi({
   client: fileClient,
   root: document.getElementById("file-transfer"),
   veil: document.getElementById("file-drop-veil"),
+  resolveDrop: resolveNativeFileDrop,
+  onDragPreview: (event, target) => fileDragPreview.update(event, target),
+  onDragPreviewEnd: () => fileDragPreview.cancel(),
   onError: error => sendClientLog("warn", "file-download-target", { message: String(error?.message || error) }),
 });
 function fileSocketUrl() {
@@ -2922,7 +3041,7 @@ function fileSocketUrl() {
 }
 let fileEpoch = null;
 function noteFileEpoch(epoch) {
-  if (epoch !== fileEpoch) fileClient.reset("disconnected");
+  if (epoch !== fileEpoch) { fileDragPreview.cancel(); fileClient.reset("disconnected"); }
   fileEpoch = epoch;
 }
 function fileTransferAvailable() { return fileUi.enabled && desktopKind !== "secure" && inputReady; }
@@ -2931,7 +3050,31 @@ function setFileTransferAvailable(available) {
   fileUi.setEnabled(available);
 }
 // Lab and diagnostics handle (stream-lab-file-transfer.mjs drives transfers through it).
-window.__bubbleplayFiles = { client: fileClient, capability: () => fileUi.enabled, available: () => fileTransferAvailable() };
+window.__bubbleplayFiles = { client: fileClient, capability: () => fileUi.enabled, available: () => fileTransferAvailable(), dropCapability: () => nativeFileDropAvailable, dropPreviewCapability: () => nativeFileDropPreviewAvailable };
+function resolveNativeFileDrop(event) {
+  // Keep the existing save route on touch devices, outside the remote surface,
+  // and when connected to hosts implementing only the original file protocol.
+  if (!nativeFileDropAvailable || mobilePointerDevice || pointerMode !== "desktop" ||
+      event.pointerType === "touch" || event.sourceCapabilities?.firesTouchEvents || event.target !== inputSurface) return { purpose: "save" };
+  if (!fileTransferAvailable() || !connected || !desktopAvailable || desktopAwaitingFrame ||
+      desktopInputState !== "enabled" || !hasPresentedFrame || viewportPending || transitionNeedsKeyframe) return { error: "drop-not-ready" };
+  // The base full-desktop canvas remains the coordinate plane while a sharp
+  // crop is overlaid. A committed crop without its matching rendered overlay
+  // is transitional geometry and must not become a native drop target.
+  if (viewportState.enabled && (!renderedSharpView || renderedSharpView.revision !== viewportState.revision ||
+      renderedSharpView.generation !== fileDropPresentedGeneration)) return { error: "drop-not-ready" };
+  const media = activeVideo || screen;
+  const width = activeVideo ? activeVideo.videoWidth : screen.width;
+  const height = activeVideo ? activeVideo.videoHeight : screen.height;
+  if (!(width > 0 && height > 0)) return { error: "drop-not-ready" };
+  const area = streamArea();
+  const drop = mapFileDropPoint({ x: event.clientX, y: event.clientY }, videoContentRect(media), area);
+  if (!drop) return { purpose: "save" };
+  const generation = fileDropPresentedGeneration;
+  if (!Number.isInteger(generation) || generation <= 0 || generation > 0xffff_ffff) return { error: "drop-not-ready" };
+  return { purpose: "drop", drop: { ...drop, generation,
+    viewportRevision: fileDropPresentedViewportRevision ?? (viewportState.revision || 0) } };
+}
 function updateKeyboardLock() {
   const keyboard = navigator.keyboard;
   if (!keyboard?.lock) return;
@@ -2955,6 +3098,8 @@ function keyboardActive() {
     surfaceFocused: active === inputSurface, keyboardFocused: active === keyboard, localControlFocused });
 }
 document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && ["c", "C", "x", "X"].includes(e.key)) clearRemoteClipboard();
+  if (isPasteShortcut(e)) discardPendingClipboard();
   if (!inputReady || !keyboardActive()) return;
   if (e.target?.id === "keyboard-input") {
     // Let the native field own text editing. Its resulting value is mirrored
@@ -2971,7 +3116,12 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   e.preventDefault();
-  if (e.repeat || held.has(e.code)) return;
+  if (held.has(e.code)) {
+    // Typematic repeat: Windows does not auto-repeat injected keys, so resend the press.
+    if (e.repeat) input.physicalKey(e.code, false);
+    return;
+  }
+  if (e.repeat) return;
   held.add(e.code);
   input.physicalKey(e.code, false);
 });
@@ -3208,6 +3358,7 @@ const viewport = new Viewport(innerWidth, innerHeight);
 const remoteCursor = new RemoteCursor();
 cursorReconciler = new CursorReconciler(remoteCursor);
 const touchCursor = document.getElementById("touch-cursor");
+const cursorAppearance = new BrowserCursorAppearance(inputSurface, touchCursor);
 const mobilePointerDevice = navigator.maxTouchPoints > 0 && matchMedia("(any-pointer:coarse)").matches;
 const pointerModeSelect = document.getElementById("setting-pointer-mode");
 const qualitySelect = document.getElementById("quality");
@@ -3283,7 +3434,8 @@ function requestCursorSync() {
   if (!cursorReconciler.synced) cursorSyncTimer = setTimeout(requestCursorSync, 500);
 }
 function onInputReady() { cursorReconciler.reset(); locallyAuthoritativeCursor=false; touchCursorVisible=shouldShowPredictedCursor({pointerMode,inputReady}); renderTouchCursor(); requestCursorSync(); }
-function handleCursorState(data) {
+function handleCursorState(data, source = "rtc") {
+  if (cursorAppearance.receive(data, { source, controlOpen: !usingWssMedia && dc?.readyState === "open" })) { renderTouchCursor(); return; }
   const state=decodeCursorState(data);
   if (!state || !cursorReconciler) return;
   const applied=cursorReconciler.apply(state,{touchActive:gestures.points.size>0,preserveCursor:pointerMode === "desktop" && locallyAuthoritativeCursor});
@@ -3319,9 +3471,11 @@ function sendStreamMode(reason) {
   sendSignal({ type: "media-control", action: "mode", protocol: WSS_PROTOCOL, epoch: mediaEpoch,
     streamMode: streamModeValue(), reason });
 }
-function containedContentRect() { const area = visual.getBoundingClientRect(), areaWidth = area.width || innerWidth, areaHeight = area.height || innerHeight, mediaWidth = activeVideo?.videoWidth || screen.width, mediaHeight = activeVideo?.videoHeight || screen.height; if (!mediaWidth || !mediaHeight) return {x:area.left,y:area.top,width:areaWidth,height:areaHeight}; const scale=Math.min(areaWidth/mediaWidth,areaHeight/mediaHeight), width=mediaWidth*scale, height=mediaHeight*scale; return {x:area.left+(areaWidth-width)/2,y:area.top+(areaHeight-height)/2,width,height}; }
-function syncViewport() { viewport.resize(innerWidth,innerHeight); viewport.setContent(containedContentRect()); renderTouchCursor(); }
-function renderTouchCursor() { const p=remoteCursor.screenPoint(viewport); touchCursor.style.transform=`translate3d(${p.x}px,${p.y}px,0)`; touchCursor.classList.toggle("visible",touchCursorVisible && !mousePointerActive); }
+// The stream area in window coordinates, without #visual's zoom/pan transform.
+function streamArea() { const width = visual.offsetWidth || innerWidth, height = visual.offsetHeight || innerHeight; return { left: visual.offsetLeft, top: visual.offsetTop, width, height }; }
+function containedContentRect() { const area = streamArea(), areaWidth = area.width, areaHeight = area.height, mediaWidth = activeVideo?.videoWidth || screen.width, mediaHeight = activeVideo?.videoHeight || screen.height; if (!mediaWidth || !mediaHeight) return {x:area.left,y:area.top,width:areaWidth,height:areaHeight}; const scale=Math.min(areaWidth/mediaWidth,areaHeight/mediaHeight), width=mediaWidth*scale, height=mediaHeight*scale; return {x:area.left+(areaWidth-width)/2,y:area.top+(areaHeight-height)/2,width,height}; }
+function syncViewport() { const area = streamArea(); viewport.resize(area.width, area.height, area.left, area.top); viewport.setContent(containedContentRect()); renderTouchCursor(); }
+function renderTouchCursor() { cursorAppearance.render({ pointerMode, inputReady, point: remoteCursor.screenPoint(viewport), overlayVisible: touchCursorVisible, mousePointerActive }); }
 function centerCameraOnCursor() { if (shouldCenterCameraOnCursor({ zoom: viewport.zoom, pointerMode, synced: cursorReconciler.synced, locallyAuthoritative: locallyAuthoritativeCursor })) viewport.centerOnNormalized(remoteCursor.snapshot()); }
 function syncViewportAndFollow() { syncViewport(); centerCameraOnCursor(); renderViewport(); }
 function updateRemoteCursor(update) { update(remoteCursor); if (pointerMode === "desktop") locallyAuthoritativeCursor=true; centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("cursor-follow"); }
@@ -3439,14 +3593,15 @@ function layoutSharpCanvas(crop) {
   const content = viewport.content;
   const desktopWidth = Math.max(1, crop.desktopWidth || remoteDesktop.width);
   const desktopHeight = Math.max(1, crop.desktopHeight || remoteDesktop.height);
-  sharpScreen.style.left = `${content.x + crop.x / desktopWidth * content.width}px`;
-  sharpScreen.style.top = `${content.y + crop.y / desktopHeight * content.height}px`;
+  // The stage is laid out inside #visual; content is in window coordinates.
+  sharpScreen.style.left = `${content.x - visual.offsetLeft + crop.x / desktopWidth * content.width}px`;
+  sharpScreen.style.top = `${content.y - visual.offsetTop + crop.y / desktopHeight * content.height}px`;
   sharpScreen.style.width = `${crop.width / desktopWidth * content.width}px`;
   sharpScreen.style.height = `${crop.height / desktopHeight * content.height}px`;
   sharpScreen.classList.add("active");
   renderedSharpView = crop;
 }
-function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = "0 0"; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); renderZoomChip(s.zoom); if (renderedSharpView) layoutSharpCanvas(renderedSharpView); renderTouchCursor(); }
+function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = `${-visual.offsetLeft}px ${-visual.offsetTop}px`; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); renderZoomChip(s.zoom); if (renderedSharpView) layoutSharpCanvas(renderedSharpView); renderTouchCursor(); }
 function setZoom(next) { syncViewport(); const anchor=mobilePointerDevice && (pointerMode !== "desktop" || !cursorReconciler.synced) ? {x:innerWidth/2,y:innerHeight/2} : remoteCursor.screenPoint(viewport); viewport.setZoom(next, anchor); centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("zoom"); }
 function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); scheduleSharpViewport("pan"); }
 addEventListener("resize", syncViewportAndFollow);
@@ -3467,7 +3622,11 @@ function dispatchGesture(actions) {
   }
   hudState.touch = gestures.cancelled ? "cancelled" : (gestures.dragActive ? "drag" : gestures.mode || (gestures.points.size > 1 ? "two-finger" : gestures.points.size ? "touch" : "…"));
 }
-inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "mouse") mousePointerActive = false; if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); showTouchCursor(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY},e.timeStamp)); e.preventDefault(); });
+// A desktop-mode mouse drag keeps the pointer captured: moves over the strip
+// or outside the browser window still reach the mousemove handler (clamped
+// to the picture's edge, so the remote cursor reaches the monitor edge for
+// edge hold), and the release is never lost.
+inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "mouse" && pointerMode === "desktop") { try { inputSurface.setPointerCapture(e.pointerId); } catch {} } if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "mouse") mousePointerActive = false; if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); showTouchCursor(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY},e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointermove", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.move(e.pointerId,{x:e.clientX,y:e.clientY})); e.preventDefault(); });
 inputSurface.addEventListener("pointerup", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.up(e.pointerId,e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointercancel", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.cancel(e.pointerId)); releaseInput(); resetTouchCursor(); hudState.touch = "cancelled"; e.preventDefault(); });
@@ -3522,11 +3681,20 @@ if (!navigator.keyboard?.lock) {
   keyboardLockSwitch.closest(".setting-row").querySelector(".setting-help").textContent = "This browser cannot capture system shortcuts; use Shortcuts in the strip.";
 }
 keyboardLockSwitch.onchange = () => { settings.keyboardLock = keyboardLockSwitch.checked; persistSettings(); updateKeyboardLock(); };
+const clipboardAutoCopySwitch = document.getElementById("setting-clipboard-auto-copy");
+clipboardAutoCopySwitch.checked = settings.clipboardAutoCopy;
+clipboardAutoCopySwitch.onchange = () => {
+  settings.clipboardAutoCopy = clipboardAutoCopySwitch.checked;
+  persistSettings();
+  remoteClipboardWriter.setAutomatic(settings.clipboardAutoCopy, document.hasFocus() && desktopKind !== "secure");
+};
 const scrollSpeedSelect = document.getElementById("setting-scroll-speed");
 scrollSpeedSelect.value = String(settings.scrollSpeed);
 scrollSpeedSelect.onchange = () => { settings.scrollSpeed = Number(scrollSpeedSelect.value); persistSettings(); };
 const defaultMonitorSelect = document.getElementById("setting-default-monitor");
 defaultMonitorSelect.onchange = () => { settings.defaultMonitor = defaultMonitorSelect.value; persistSettings(); renderMonitorChrome(); };
+// A switch: toggling keeps the Monitors popover open (rows above close it).
+document.getElementById("follow-window").onclick = () => toggleFollowWindow();
 
 function renderZoomChip(zoom) {
   const chip = document.getElementById("zoom-reset");
@@ -3706,6 +3874,7 @@ function diagnosticsReport() {
     `mode        ${pointerMode === "desktop" ? "work" : "game"}`,
     `capture     ${locked ? "captured" : "released"}`,
     `control     ${hudState.control}`,
+    `cursor      ${cursorAppearance.kind} / ${inputSurface.style.cursor} (${cursorAppearance.accepted}/${cursorAppearance.received} updates)`,
     `host apply  ${latestInputStatus ? `${latestInputStatus.appliedEvents}/${latestInputStatus.requestedEvents} (${latestInputStatus.failedPackets} failed)` : "…"}`,
     "",
     "VIEWPORT",
@@ -3733,6 +3902,7 @@ document.getElementById("copy-diagnostics").onclick = async e => {
   const button = e.currentTarget;
   setDiagnosticsVisible(true);
   try {
+    clearRemoteClipboard();
     await navigator.clipboard?.writeText(diagnosticsReport());
     button.textContent = "Copied";
     setTimeout(() => { button.textContent = "Copy report"; }, 1400);
@@ -3747,7 +3917,7 @@ document.getElementById("dismiss-context-hint").onclick = e => {
 };
 
 async function endBrowserSession(endpoint, forgetBrowser) {
-  if (forgetBrowser && !confirm("Forget this browser? The next visit will require a new ntfy approval.")) return;
+  if (forgetBrowser && !confirm("Forget this browser? The next visit will require new browser approval.")) return;
   const status = document.getElementById("session-action-status");
   status.textContent = forgetBrowser ? "Forgetting this browser…" : "Signing out…";
   releaseInput();
@@ -3769,6 +3939,19 @@ document.getElementById("logout-session").onclick = e => { e.stopPropagation(); 
 document.getElementById("forget-browser").onclick = e => { e.stopPropagation(); endBrowserSession("/__auth/forget-browser", true); };
 document.getElementById("connection-retry").onclick = e => { e.stopPropagation(); terminalSignalingFailure = false; restartPeer("user-retry", true); };
 firstFrameRetry.onclick = e => { e.stopPropagation(); startFirstFrameHandshake("user-retry", true); };
+secureDeny.onclick = e => {
+  e.stopPropagation();
+  if (secureDenyState.pending || !secureCapabilities.includes("deny")) return;
+  if (!sendSignal({ type: "secure-action", action: "deny" })) return;
+  secureDenyState = { pending: true, error: "" };
+  renderDesktopState();
+  // The host answers with secure-action-result; don't leave the button stuck if it never does.
+  setTimeout(() => {
+    if (!secureDenyState.pending) return;
+    secureDenyState = { pending: false, error: "no answer from the PC" };
+    renderDesktopState();
+  }, 8000);
+};
 setPointerMode(pointerMode,false);
 setDiagnosticsVisible(diagnosticsEnabled);
 renderAbout();

@@ -41,6 +41,12 @@
     <string name="pop_shortcuts">Shortcuts</string>
     <string name="pop_paste_phone">Paste phone clipboard</string>
     <string name="pop_paste_phone_hint">Phone → PC</string>
+    <string name="pop_copy_pc_clipboard">Copy PC clipboard</string>
+    <string name="pop_pc_clipboard_empty">Nothing waiting to copy</string>
+    <plurals name="pop_pc_clipboard_text">
+        <item quantity="one">Text, %1$d character</item>
+        <item quantity="other">Text, %1$d characters</item>
+    </plurals>
     <string name="pop_keys">Keys</string>
     <string name="pop_keys_hint">Modifiers stay held until the next key</string>
     <string name="pop_latched">%1$s, held</string>
@@ -80,7 +86,6 @@
     <string name="confirm_disconnect">Disconnect from the desktop?</string>
     <string name="status_paused">Paused. Tap to reconnect.</string>
     <string name="monitor_failed">Screen switch failed: %1$s</string>
-    <string name="secure_desktop">Windows secure desktop: clipboard is off</string>
     <string name="clipboard_empty">The phone clipboard is empty</string>
     <string name="paste_failed">Paste did not go through (not connected or too large)</string>
 
@@ -188,6 +193,9 @@
     <string name="settings_codec_detail">Auto uses HEVC when this phone decodes it in hardware. Changing it reconnects the stream.</string>
     <string name="settings_codec_reconnecting">Reconnecting with the new codec…</string>
     <string name="settings_diagnostics">Diagnostics</string>
+    <string name="settings_clipboard">Clipboard</string>
+    <string name="settings_auto_copy_remote_clipboard">Copy from the PC automatically</string>
+    <string name="settings_auto_copy_remote_clipboard_detail">While this screen is in the foreground. When off, use More → Copy PC clipboard.</string>
     <string name="settings_diag_decoder">Decoder</string>
     <string name="settings_diag_resolution">Resolution</string>
     <string name="settings_diag_fps">Frames/s</string>
@@ -198,5 +206,7 @@
     <string name="settings_report_label">BubblePlay report</string>
     <string name="settings_report_copied">Report copied</string>
     <string name="settings_about">About</string>
+    <string name="settings_source_code">Source code</string>
+    <string name="settings_no_browser">No browser available to open the source code.</string>
     <string name="settings_app_version">App version</string>
 </resources>

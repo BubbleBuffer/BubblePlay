@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "methods": ["totp", "ntfy", "host"],
+  "cloudflareMethods": ["ntfy", "host"],
+  "capability": { "type": "host-capabilities", "browserApproval": true },
+  "request": {
+    "type": "approval-request",
+    "id": "q8V3m1xYtZ0aP4nR7sLk2w",
+    "client": "203.0.113.0/24",
+    "agent": "Chrome 141 on Windows",
+    "expiresAt": 1790000090000
+  },
+  "decision": { "type": "approval-decision", "id": "q8V3m1xYtZ0aP4nR7sLk2w", "approve": true },
+  "cancel": { "type": "approval-cancel", "id": "q8V3m1xYtZ0aP4nR7sLk2w" },
+  "limits": { "idMin": 22, "idMax": 64, "agentMax": 80 },
+  "invalid": [
+    { "type": "approval-decision", "id": "short", "approve": true },
+    { "type": "approval-decision", "id": "q8V3m1xYtZ0aP4nR7sLk2w", "approve": "yes" },
+    { "type": "approval-request", "id": "q8V3m1xYtZ0aP4nR7sLk2w", "client": "203.0.113.0/24", "agent": "bad\u0007agent", "expiresAt": 1790000090000 }
+  ],
+  "methodsResponse": { "totp": true, "approval": ["ntfy", "host"], "hostOnline": false }
+}

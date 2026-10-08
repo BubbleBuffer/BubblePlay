@@ -9,7 +9,9 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"BPIP";
-pub const PROTOCOL_VERSION: u16 = 4;
+// Native cursor-kind events were added in v5. Host and privileged Agent must
+// be built/upgraded together; mismatched versions fail before payload parsing.
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const HEADER_LEN: usize = 20;
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_MEDIA_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -104,6 +106,8 @@ pub enum MessageKind {
     RecoverableError = 0x10a,
     FatalError = 0x10b,
     ClipboardText = 0x10c,
+    ClipboardPng = 0x10e,
+    CursorKind = 0x10d,
 }
 
 impl MessageKind {
@@ -133,6 +137,8 @@ impl MessageKind {
             0x10a => Self::RecoverableError,
             0x10b => Self::FatalError,
             0x10c => Self::ClipboardText,
+            0x10e => Self::ClipboardPng,
+            0x10d => Self::CursorKind,
             _ => return Err(ProtocolError::UnknownMessageKind(value)),
         })
     }
@@ -416,6 +422,7 @@ pub enum Message {
     },
     MonitorList(Vec<MonitorInfo>),
     Cursor(CursorState),
+    CursorKind(crate::input::CursorKind),
     ConfigAck {
         session_generation: u32,
         config_revision: u32,
@@ -441,11 +448,14 @@ pub enum Message {
         count: u16,
         text: String,
     },
+    /// Base64 PNG chunks, bounded to an 8 MiB image.
+    ClipboardPng { id: u32, index: u16, count: u16, text: String },
 }
 
 /// Clipboard chunks stay well inside the control payload limit.
 pub const MAX_CLIPBOARD_CHUNK_BYTES: usize = crate::clipboard::HOST_CHUNK_BYTES;
 const MAX_CLIPBOARD_CHUNKS: u16 = 64;
+const MAX_PNG_CHUNKS: u16 = crate::clipboard_image::MAX_PNG_WIRE_BYTES.div_ceil(MAX_CLIPBOARD_CHUNK_BYTES) as u16;
 
 impl Message {
     pub fn kind(&self) -> MessageKind {
@@ -466,6 +476,7 @@ impl Message {
             Self::CaptureHealth { .. } => MessageKind::CaptureHealth,
             Self::MonitorList(_) => MessageKind::MonitorList,
             Self::Cursor(_) => MessageKind::Cursor,
+            Self::CursorKind(_) => MessageKind::CursorKind,
             Self::ConfigAck { .. } => MessageKind::ConfigAck,
             Self::NoFrame { .. } => MessageKind::NoFrame,
             Self::EncodedAccessUnit(_) => MessageKind::EncodedAccessUnit,
@@ -474,6 +485,7 @@ impl Message {
             Self::RecoverableError(_) => MessageKind::RecoverableError,
             Self::FatalError(_) => MessageKind::FatalError,
             Self::ClipboardText { .. } => MessageKind::ClipboardText,
+            Self::ClipboardPng { .. } => MessageKind::ClipboardPng,
         }
     }
 
@@ -739,6 +751,7 @@ fn encode_message(message: &Message) -> Result<Vec<u8>, ProtocolError> {
                 out.bytes(monitor.name.as_bytes());
             }
         }
+        Message::CursorKind(kind) => out.u8(*kind as u8),
         Message::Cursor(cursor) => {
             out.u16(cursor.acknowledged_sequence.unwrap_or(0));
             out.bool(cursor.acknowledged_sequence.is_some());
@@ -807,15 +820,11 @@ fn encode_message(message: &Message) -> Result<Vec<u8>, ProtocolError> {
         Message::RecoverableError(error) | Message::FatalError(error) => {
             encode_agent_error(&mut out, error);
         }
-        Message::ClipboardText {
-            id,
-            index,
-            count,
-            text,
-        } => {
+        Message::ClipboardText { id, index, count, text }
+        | Message::ClipboardPng { id, index, count, text } => {
             if text.len() > MAX_CLIPBOARD_CHUNK_BYTES
                 || *count == 0
-                || *count > MAX_CLIPBOARD_CHUNKS
+                || *count > if kind == MessageKind::ClipboardPng { MAX_PNG_CHUNKS } else { MAX_CLIPBOARD_CHUNKS }
                 || index >= count
             {
                 return malformed(kind, "invalid clipboard chunk");
@@ -935,6 +944,12 @@ fn decode_message(kind: MessageKind, payload: &[u8]) -> Result<Message, Protocol
             }
             Message::MonitorList(monitors)
         }
+        MessageKind::CursorKind => Message::CursorKind(
+            crate::input::CursorKind::from_id(input.u8()?).ok_or(ProtocolError::MalformedPayload {
+                kind,
+                reason: "unknown cursor kind",
+            })?,
+        ),
         MessageKind::Cursor => {
             let acknowledged_sequence = input.u16()?;
             let acknowledged = input.bool()?;
@@ -1007,12 +1022,12 @@ fn decode_message(kind: MessageKind, payload: &[u8]) -> Result<Message, Protocol
         }
         MessageKind::RecoverableError => Message::RecoverableError(decode_agent_error(&mut input)?),
         MessageKind::FatalError => Message::FatalError(decode_agent_error(&mut input)?),
-        MessageKind::ClipboardText => {
+        MessageKind::ClipboardText | MessageKind::ClipboardPng => {
             let id = input.u32()?;
             let index = input.u16()?;
             let count = input.u16()?;
             let text = input.rest();
-            if count == 0 || count > MAX_CLIPBOARD_CHUNKS || index >= count {
+            if count == 0 || count > if kind == MessageKind::ClipboardPng { MAX_PNG_CHUNKS } else { MAX_CLIPBOARD_CHUNKS } || index >= count {
                 return malformed(kind, "invalid clipboard chunk position");
             }
             if text.len() > MAX_CLIPBOARD_CHUNK_BYTES {
@@ -1024,12 +1039,8 @@ fn decode_message(kind: MessageKind, payload: &[u8]) -> Result<Message, Protocol
                     reason: "clipboard chunk is not UTF-8",
                 })?
                 .to_owned();
-            Message::ClipboardText {
-                id,
-                index,
-                count,
-                text,
-            }
+            if kind == MessageKind::ClipboardPng { Message::ClipboardPng { id, index, count, text } }
+            else { Message::ClipboardText { id, index, count, text } }
         }
     };
     input.finish()?;
@@ -1327,6 +1338,34 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[test]
+    fn cursor_kind_ipc_round_trips_all_native_types_and_rejects_invalid_ids() {
+        for id in 0..=14 {
+            let message = Message::CursorKind(crate::input::CursorKind::from_id(id).unwrap());
+            let mut wire = Vec::new();
+            write_frame(&mut wire, 0, 1, &message).unwrap();
+            assert_eq!(
+                read_frame(&mut Cursor::new(wire)).unwrap().unwrap().message,
+                message
+            );
+        }
+        let mut wire = Vec::new();
+        write_frame(
+            &mut wire,
+            0,
+            1,
+            &Message::CursorKind(crate::input::CursorKind::Arrow),
+        )
+        .unwrap();
+        *wire.last_mut().unwrap() = 255;
+        assert!(matches!(
+            read_frame(&mut Cursor::new(wire)),
+            Err(ProtocolError::MalformedPayload {
+                kind: MessageKind::CursorKind,
+                ..
+            })
+        ));
+    }
     #[test]
     fn representative_messages_round_trip() {
         let messages = [

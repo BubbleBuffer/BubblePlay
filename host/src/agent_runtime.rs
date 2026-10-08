@@ -231,6 +231,7 @@ impl<B: AgentBackend> AgentCore<B> {
             | Message::CaptureHealth { .. }
             | Message::MonitorList(_)
             | Message::Cursor(_)
+            | Message::CursorKind(_)
             | Message::ConfigAck { .. }
             | Message::NoFrame { .. }
             | Message::EncodedAccessUnit(_)
@@ -238,7 +239,7 @@ impl<B: AgentBackend> AgentCore<B> {
             | Message::InputStats(_)
             | Message::RecoverableError(_)
             | Message::FatalError(_)
-            | Message::ClipboardText { .. } => {}
+            | Message::ClipboardText { .. } | Message::ClipboardPng { .. } => {}
         }
         events
     }
@@ -257,6 +258,11 @@ impl<B: AgentBackend> AgentCore<B> {
                     // A result for an old permit/generation is intentionally dropped.
                 }
                 None => {
+                    if matches!(result, Message::CursorKind(_))
+                        && (!self.lease_active(now) || self.suspended)
+                    {
+                        return events;
+                    }
                     if let Message::CaptureHealth { state, .. } = &result {
                         if *state == CaptureState::Active {
                             // Active is meaningful only while the correlated
@@ -628,6 +634,8 @@ fn run_loop<B, S>(
             next_desktop_poll = now + DESKTOP_POLL_INTERVAL;
         }
         outputs.extend(core.tick(now));
+        coalesce_pending_cursor_kinds(&mut outputs);
+        coalesce_pending_clipboards(&mut outputs);
 
         if !flush_outputs(&mut outputs, &control_tx, &media_tx) {
             break;
@@ -646,6 +654,30 @@ fn run_loop<B, S>(
     }
 }
 
+fn coalesce_pending_clipboards(outputs: &mut VecDeque<AgentEvent>) {
+    let snapshot = |event: &AgentEvent| match event {
+        AgentEvent::Control(Message::ClipboardText { id, .. }) => Some((*id, false)),
+        AgentEvent::Control(Message::ClipboardPng { id, .. }) => Some((*id, true)),
+        _ => None,
+    };
+    let latest = outputs.iter().rev().find_map(snapshot);
+    outputs.retain(|event| snapshot(event).is_none_or(|id| Some(id) == latest));
+}
+
+fn coalesce_pending_cursor_kinds(outputs: &mut VecDeque<AgentEvent>) {
+    let latest = outputs
+        .iter()
+        .rposition(|event| matches!(event, AgentEvent::Control(Message::CursorKind(_))));
+    if let Some(latest) = latest {
+        let mut index = 0;
+        outputs.retain(|event| {
+            let keep =
+                index == latest || !matches!(event, AgentEvent::Control(Message::CursorKind(_)));
+            index += 1;
+            keep
+        });
+    }
+}
 fn flush_outputs(
     outputs: &mut VecDeque<AgentEvent>,
     control_tx: &SyncSender<Message>,
@@ -835,6 +867,20 @@ mod tests {
             self.0.lock().unwrap().clipboard_polls.push(reset);
             Ok(())
         }
+    }
+
+    #[test]
+    fn clipboard_backpressure_keeps_latest_snapshot_and_other_control() {
+        let mut outputs = VecDeque::from([
+            AgentEvent::Control(Message::ClipboardText { id: 1, index: 0, count: 1, text: "old".into() }),
+            AgentEvent::Control(Message::ReleaseAll),
+            AgentEvent::Control(Message::ClipboardPng { id: 2, index: 0, count: 2, text: "AAAA".into() }),
+            AgentEvent::Control(Message::ClipboardPng { id: 2, index: 1, count: 2, text: "BBBB".into() }),
+        ]);
+        coalesce_pending_clipboards(&mut outputs);
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0], AgentEvent::Control(Message::ReleaseAll));
+        assert!(outputs.iter().skip(1).all(|event| matches!(event, AgentEvent::Control(Message::ClipboardPng { id: 2, .. }))));
     }
 
     #[test]
@@ -1439,4 +1485,65 @@ mod tests {
             })]
         ));
     }
+
+    #[test]
+    fn cursor_kind_telemetry_requires_a_live_unsuspended_lease() {
+        let backend = FakeBackend::default();
+        let state = backend.0.clone();
+        let mut core = AgentCore::new(backend);
+        let now = Instant::now();
+        let kind = Message::CursorKind(crate::input::CursorKind::Text);
+        state
+            .lock()
+            .unwrap()
+            .pending_results
+            .push_back(kind.clone());
+        assert!(
+            core.tick(now).is_empty(),
+            "no cursor updates without a lease"
+        );
+        core.observe_desktop(DesktopKind::Default, now);
+        core.handle(
+            Message::RenewLease {
+                lease_id: 1,
+                ttl_ms: 2_000,
+            },
+            now,
+        );
+        state
+            .lock()
+            .unwrap()
+            .pending_results
+            .push_back(kind.clone());
+        assert!(core
+            .tick(now)
+            .iter()
+            .any(|event| event == &AgentEvent::Control(kind.clone())));
+        let expired = now + LEASE_TTL + Duration::from_millis(1);
+        state.lock().unwrap().pending_results.push_back(kind);
+        assert!(!core
+            .tick(expired)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Control(Message::CursorKind(_)))));
+    }
+
+    #[test]
+    fn cursor_kind_output_backpressure_keeps_only_the_latest_pending_kind() {
+        use crate::input::CursorKind;
+        let mut outputs = VecDeque::from([
+            AgentEvent::Control(Message::CursorKind(CursorKind::Text)),
+            AgentEvent::Control(Message::ReleaseAll),
+            AgentEvent::Control(Message::CursorKind(CursorKind::Pointer)),
+        ]);
+        coalesce_pending_cursor_kinds(&mut outputs);
+        coalesce_pending_clipboards(&mut outputs);
+        assert_eq!(
+            outputs,
+            VecDeque::from([
+                AgentEvent::Control(Message::ReleaseAll),
+                AgentEvent::Control(Message::CursorKind(CursorKind::Pointer)),
+            ])
+        );
+    }
+
 }

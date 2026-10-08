@@ -1,4 +1,4 @@
-name = "playfull-cat"
+name = "bubbleplay-relay"
 preview_urls = true
 main = "src/index.js"
 compatibility_date = "2026-07-15"
@@ -8,9 +8,17 @@ compatibility_flags = ["enable_request_signal"]
 binding = "WORKER_VERSION"
 
 [vars]
-NTFY_URL = "https://ntfy.example.com"
-NTFY_TOPIC = "your-random-topic"
+SOURCE_URL = "https://github.com/BubbleBuffer/BubblePlay"
 GATE_APPROVAL_TTL_SECONDS = "90"
+# New-browser second factors: ntfy (the default), host, or ntfy,host.
+# Host approval needs a connected host announcing browserApproval: true.
+# APPROVAL_METHODS = "ntfy"
+# Approval notifications: your own ntfy server and topic (NTFY_TOKEN is a secret).
+# NTFY_URL = "https://ntfy.example.com"
+# NTFY_TOPIC = "your-random-topic"
+# Optional TURN relay (coturn REST credentials; TURN_SECRET is a secret).
+# TURN is disabled while TURN_HOST is unset.
+# TURN_HOST = "turn.example.com"
 
 # Static hosting of the client page (worker/public/).
 [assets]

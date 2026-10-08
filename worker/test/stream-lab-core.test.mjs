@@ -14,7 +14,7 @@ import {
   scoreLumaTiles,
   successiveHalving,
   temporalUnchangedRegionError,
-} from "../tools/stream-lab-core.mjs";
+} from "../tools/lab/stream-lab-core.mjs";
 
 test("synthetic corpus exposes stable named scenes", () => {
   assert.deepEqual(SCENES.map((scene) => scene.id), [

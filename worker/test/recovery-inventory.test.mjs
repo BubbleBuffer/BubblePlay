@@ -10,7 +10,7 @@ import {
   fingerprintFile,
   redactCommandLine,
   summarizeWorkspaceEntries,
-} from "../tools/recovery-inventory.mjs";
+} from "../tools/lab/recovery-inventory.mjs";
 
 test("recovery inventory separates reviewable source from generated and runtime evidence", () => {
   assert.equal(classifyWorkspacePath("host/src/input.rs"), "source");

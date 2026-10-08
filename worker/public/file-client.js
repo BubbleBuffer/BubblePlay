@@ -1,22 +1,22 @@
 // File transfer v1, web client side: the `/file-ws` socket, uploads
 // (browser -> PC) and offer downloads (PC -> browser). DOM-free apart from
 // the optional download sinks at the bottom, so any UI can drive it.
-// Intent: .superpawers/file-transfer.md; wire: fixtures/file-transfer-contract.json.
+// Intent: docs/architecture/file-transfer.md; wire: fixtures/file-transfer-contract.json.
 //
 // API (FileTransferClient extends EventTarget, fires "change"):
 //   new FileTransferClient({ socketUrl })   socketUrl() -> ws(s) URL or null
 //   client.transfers                        snapshot rows (see snapshot())
 //   client.offer                            { offerId, items, source } | null
 //   client.setOffer(fileOfferMessage)       signaling `file-offer` (items [] withdraws)
-//   client.upload(files, "save"|"paste")    one batch; returns the row ids
-//   client.download(items, sinkFor)         sinkFor(item) -> Promise<sink>; sink = { write(bytes), close(), abort() }
+//   client.upload(files, "save"|"paste"|"drop", dropPoint?) one batch; returns the row ids
+//   client.download(items, sinkFor, offerId) sinkFor(item) -> Promise<sink>; sink = { write(bytes), close(), abort() }
 //   client.cancel(id) / client.dismiss(id) / client.clearFinished()
 //   client.reset(reason)                    epoch or capability gone: fail everything, drop the offer
 import {
   FT, FT_IDLE_CLOSE_MS, FT_MAX_BATCH_FILES, FT_MAX_DATA_BYTES, FT_MAX_FILE_BYTES, FT_MAX_NAME_BYTES,
-  FT_ACK_EVERY_BYTES, FT_ACK_EVERY_MS, FT_BLOB_DOWNLOAD_MAX_BYTES,
+  FT_ACK_EVERY_BYTES, FT_ACK_EVERY_MS, FT_BLOB_DOWNLOAD_MAX_BYTES, FT_WINDOW_BYTES,
   FileIncoming, FileSendWindow, Sha256, decodeFilePacket, encodeAccept, encodeAck, encodeCancel, encodeData,
-  encodeDone, encodeOffer, encodeRequest, encodeResult, validFileOffer, validOfferMeta,
+  encodeDone, encodeOffer, encodeRequest, encodeResult, validDropPoint, validFileOffer, validOfferMeta,
 } from "./file-transfer.js";
 
 const PING_MS = 15_000;
@@ -40,12 +40,27 @@ export function describeFileError(code) {
     case "write-failed": return "The PC could not save the file.";
     case "unreadable": return "The PC could not read the file.";
     case "unknown-offer": return "The PC no longer offers this file.";
+    case "offer-replaced": return "The PC replaced these files. Try again.";
+    case "window-exceeded": return "The PC sent more file data than the browser could save; the transfer was stopped.";
     case "timeout": return "The transfer stalled.";
     case "no-peer": return "The PC is not ready for files. Try again in a moment.";
     case "disconnected": return "The connection dropped; the transfer was stopped.";
     case "too-many": return "More than 64 files in one go.";
     case "blob-too-large": return "Over 256 MB: this browser can only save it with Chrome or Edge on a computer.";
     case "save-failed": return "The browser could not save the file.";
+    case "invalid-drop": return "The file drop could not be prepared. Try again.";
+    case "drop-not-ready": return "Wait for the PC stream to be ready, then drop again.";
+    case "drop-stale-view": return "The PC view changed. Drop the files again at the new spot.";
+    case "drop-desktop-unavailable": return "Wait for the PC desktop to return, then drop again.";
+    case "drop-timeout": return "The PC app took too long to accept the files. Try again.";
+    case "drop-input-busy": return "Release the PC's keys and mouse buttons, then drop again.";
+    case "drop-target-moved": case "drop-target-changed": return "The drop target changed. Drop the files again.";
+    case "drop-interrupted": return "PC input changed while sending. Drop the files again.";
+    case "drop-rejected": return "The PC app did not accept these files. Try another drop area.";
+    case "drop-failed": return "The PC could not complete the file drop.";
+    case "drop-unavailable": return "File dropping is unavailable on the PC right now.";
+    case "drop-cancelled": return "The file drop was cancelled.";
+    case "drop-too-large": return "The files exceed the 2 GB limit for one drop.";
     default: return code ? `Stopped (${code}).` : "Stopped.";
   }
 }
@@ -86,8 +101,14 @@ export class FileTransferClient extends EventTarget {
     return true;
   }
 
-  upload(files, purpose = "save") {
+  upload(files, purpose = "save", dropPoint) {
     const list = Array.from(files || []);
+    if (!["save", "paste", "drop"].includes(purpose) || (purpose === "drop" && !validDropPoint(dropPoint))) {
+      return this.rejectUpload(list, purpose, "invalid-drop");
+    }
+    if (purpose === "drop" && (list.length > FT_MAX_BATCH_FILES || list.reduce((sum, file) => sum + (file?.size ?? Infinity), 0) > FT_MAX_FILE_BYTES)) {
+      return this.rejectUpload(list, purpose, list.length > FT_MAX_BATCH_FILES ? "too-many" : "drop-too-large");
+    }
     const ids = [];
     const accepted = [];
     for (const file of list) {
@@ -103,6 +124,8 @@ export class FileTransferClient extends EventTarget {
         name: safeName(row.name), size: row.size, mime: (row.file.type || "").slice(0, 255),
         mtimeMs: Number.isSafeInteger(row.file.lastModified) && row.file.lastModified >= 0 ? row.file.lastModified : 0,
         purpose, batchId, batchIndex: index, batchCount: accepted.length,
+        ...(purpose === "drop" ? { drop: { x: dropPoint.x, y: dropPoint.y,
+          generation: dropPoint.generation, viewportRevision: dropPoint.viewportRevision } } : {}),
       };
     });
     this.changed();
@@ -110,8 +133,19 @@ export class FileTransferClient extends EventTarget {
     return ids;
   }
 
-  download(items, sinkFor) {
+  rejectUpload(files, purpose, error) {
+    return Array.from(files || []).map(file => {
+      const row = this.addRow("upload", file?.name || "file", file?.size ?? 0, purpose);
+      this.fail(row, error);
+      return row.id;
+    });
+  }
+
+  download(items, sinkFor, offerId = this.currentOffer?.offerId) {
     const offer = this.currentOffer;
+    if (offerId !== undefined && offer?.offerId !== offerId) {
+      throw Object.assign(new Error(describeFileError("offer-replaced")), { code: "offer-replaced" });
+    }
     if (!offer) return [];
     const ids = [];
     for (const item of items) {
@@ -129,10 +163,12 @@ export class FileTransferClient extends EventTarget {
   cancel(id) {
     const row = this.rows.find(candidate => candidate.id === id);
     if (!row || TERMINAL.has(row.state)) return;
-    if (row.transferId !== null && this.ws && this.socketState !== "closed") {
-      this.sendBinary(encodeCancel(row.transferId, "cancelled"));
+    const rows = row.purpose === "drop" ? this.rows.filter(candidate => candidate.meta?.batchId === row.meta?.batchId && candidate.purpose === "drop") : [row];
+    for (const member of rows) {
+      if (TERMINAL.has(member.state)) continue;
+      if (member.transferId !== null && this.ws && this.socketState !== "closed") this.sendBinary(encodeCancel(member.transferId, "cancelled"));
+      this.finish(member, "cancelled", null);
     }
-    this.finish(row, "cancelled", null);
   }
 
   dismiss(id) {
@@ -307,9 +343,20 @@ export class FileTransferClient extends EventTarget {
       for (;;) {
         const row = this.rows.find(candidate => candidate.direction === "upload" && candidate.state === "queued");
         if (!row) break;
-        await this.runUpload(row).catch(error => {
-          if (!(error instanceof TransferAborted)) this.fail(row, error?.code || "disconnected");
-        });
+        if (row.purpose === "drop") {
+          const batch = this.rows.filter(candidate => candidate.direction === "upload" && candidate.state === "queued" && candidate.meta.batchId === row.meta.batchId);
+          await this.runDropBatch(batch).catch(error => {
+            for (const member of batch) {
+              if (TERMINAL.has(member.state)) continue;
+              if (member.transferId !== null) this.sendBinary(encodeCancel(member.transferId, "drop-cancelled"));
+              this.fail(member, error?.code || "drop-cancelled");
+            }
+          });
+        } else {
+          await this.runUpload(row).catch(error => {
+            if (!(error instanceof TransferAborted)) this.fail(row, error?.code || "disconnected");
+          });
+        }
       }
     } finally {
       this.uploadRunning = false;
@@ -318,6 +365,25 @@ export class FileTransferClient extends EventTarget {
   }
 
   async runUpload(row) {
+    await this.offerUpload(row);
+    await this.until(row, () => row.accepted);
+    await this.sendUpload(row);
+    await this.completeUpload(row);
+  }
+
+  async runDropBatch(batch) {
+    // Publish the complete descriptor set before any file contents, so Windows
+    // can start the virtual drag while the bounded upload is still in progress.
+    for (const row of batch) await this.offerUpload(row);
+    for (const row of batch) await this.until(row, () => row.accepted);
+    for (const row of batch) {
+      if (batch.some(member => TERMINAL.has(member.state))) throw new TransferAborted();
+      await this.sendUpload(row);
+    }
+    for (const row of batch) await this.completeUpload(row);
+  }
+
+  async offerUpload(row) {
     row.state = "connecting";
     this.changed();
     await this.ensureSocket(row);
@@ -327,7 +393,9 @@ export class FileTransferClient extends EventTarget {
     row.accepted = false;
     row.result = null;
     this.sendBinary(encodeOffer(row.transferId, row.meta));
-    await this.until(row, () => row.accepted);
+  }
+
+  async sendUpload(row) {
     row.state = "active";
     row.startedAt = this.now();
     this.changed();
@@ -353,6 +421,9 @@ export class FileTransferClient extends EventTarget {
     this.sendBinary(encodeDone(row.transferId, hash.finish()));
     row.state = "verifying";
     this.changed();
+  }
+
+  async completeUpload(row) {
     const result = await this.until(row, () => row.result);
     if (result.ok) { row.bytes = row.size; this.finish(row, "done", null); }
     else this.fail(row, result.error || "failed");
@@ -454,6 +525,11 @@ export class FileTransferClient extends EventTarget {
       }
       case FT.DATA: {
         if (!row.incoming || row.doneHash) return;
+        if (row.incoming.received - row.acked + packet.payload.byteLength > FT_WINDOW_BYTES) {
+          this.sendBinary(encodeCancel(row.transferId, "window-exceeded"));
+          this.fail(row, "window-exceeded");
+          return;
+        }
         const error = row.incoming.onData(packet.seq, packet.payload.byteLength);
         if (error) { this.sendBinary(encodeCancel(row.transferId, error)); this.fail(row, error); return; }
         const bytes = packet.payload.slice();

@@ -7,7 +7,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
 
-/** Spec-derived checks (`.superpawers/file-transfer.md`); the shared fixture is in FileContractTest. */
+/** Spec-derived checks (`docs/architecture/file-transfer.md`); the shared fixture is in FileContractTest. */
 class FileWireTest {
     private fun hex(s: String) = s.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 

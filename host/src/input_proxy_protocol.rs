@@ -4,8 +4,8 @@ pub const MAGIC: [u8; 4] = *b"BPXP";
 pub const VERSION: u16 = 1;
 pub const HEADER_LEN: usize = 20;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
-/// Responses may carry one whole clipboard text (1 MiB cap) plus framing.
-pub const MAX_RESPONSE_PAYLOAD_BYTES: usize = crate::clipboard::MAX_CLIPBOARD_BYTES + 64;
+/// Responses carry bounded text (1 MiB) or PNG (8 MiB) plus framing.
+pub const MAX_RESPONSE_PAYLOAD_BYTES: usize = crate::clipboard_image::MAX_PNG_BYTES + 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -60,6 +60,7 @@ pub enum Response {
     Clipboard {
         text: Option<String>,
     },
+    ClipboardPng { png: Vec<u8> },
 }
 
 pub fn write_request<W: Write>(
@@ -161,6 +162,11 @@ fn decode_request(payload: &[u8]) -> io::Result<Request> {
 fn encode_response(response: &Response) -> Vec<u8> {
     match response {
         Response::Ack => vec![3],
+        Response::ClipboardPng { png } => {
+            let mut payload = vec![7];
+            payload.extend_from_slice(png);
+            payload
+        }
         Response::Clipboard { text } => {
             let mut payload = vec![6, u8::from(text.is_some())];
             if let Some(text) = text {
@@ -252,6 +258,7 @@ fn decode_response(payload: &[u8]) -> io::Result<Response> {
             })
         }
         3 if body.is_empty() => Ok(Response::Ack),
+        7 if crate::clipboard_image::valid_png(body) => Ok(Response::ClipboardPng { png: body.to_vec() }),
         6 if !body.is_empty() => {
             let has_text = decode_bool(body[0])?;
             let text = &body[1..];
@@ -424,6 +431,23 @@ mod tests {
             write_response(&mut wire, 52, &response).unwrap();
             assert_eq!(read_response(&mut wire.as_slice()).unwrap(), (52, response));
         }
+    }
+
+    #[test]
+    fn clipboard_png_response_roundtrips_and_rejects_bad_or_oversized_images() {
+        let mut encoder_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoder_bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.write_header().unwrap().write_image_data(&[1,2,3,255]).unwrap();
+        }
+        let response = Response::ClipboardPng { png: encoder_bytes };
+        let mut wire = Vec::new();
+        write_response(&mut wire, 10, &response).unwrap();
+        assert_eq!(read_response(&mut wire.as_slice()).unwrap(), (10, response));
+        assert!(decode_response(&[7,0,1,2]).is_err());
+        let oversized = Response::ClipboardPng { png: vec![0; crate::clipboard_image::MAX_PNG_BYTES+65] };
+        assert!(write_response(&mut Vec::new(), 11, &oversized).is_err());
     }
 
     #[test]

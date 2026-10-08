@@ -1,5 +1,8 @@
 import { validCurrentMediaEpoch, validInputStatus, canonicalWorkerVersionId, validFirstFrameMessage, benchStatusRejectionReason, utf8Length } from "./protocol-validation.js";
 import { validClipboardMessage, validInputCapabilities } from "./protocol-validation.js";
+import { validApprovalMessage } from "./protocol-validation.js";
+import { validDesktopState, validSecureAction, validSecureActionResult } from "./protocol-validation.js";
+import { approvalMethods } from "./approval-methods.js";
 export { benchStatusRejectionReason } from "./protocol-validation.js";
 // BubblePlay signaling relay.
 //
@@ -39,6 +42,8 @@ export { ApprovalGate };
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/__approval/") ||
+        ["/__auth/socket", "/__auth/socket-register", "/__auth/socket-unregister", "/__auth/recheck"].includes(url.pathname)) return badRoute();
     if (url.pathname === "/lab-compat" && ["GET", "HEAD"].includes(request.method)) {
       const body = request.method === "HEAD" ? null : JSON.stringify({
         ok: true,
@@ -54,10 +59,24 @@ export default {
     }
     const gateId = env.GATE.idFromName("global-v1");
     const gate = env.GATE.get(gateId);
-    const localLabBypass = isLocalLabSocket(url, env);
-    if (isLocalStreamLabRequest(url, env) && ["GET", "HEAD"].includes(request.method) &&
-        !isHostSocketPath(url.pathname) && !isBrowserSocketPath(url.pathname)) {
+    const localLabBypass = isLocalLabSocket(request, url, env);
+    const socketPath = isHostSocketPath(url.pathname) || isBrowserSocketPath(url.pathname);
+    if (isLocalStreamLabRequest(request, url, env) && ["GET", "HEAD"].includes(request.method) && !socketPath) {
       return env.ASSETS.fetch(request);
+    }
+    // Browsers attach cookies to cross-site WebSocket upgrades, so a socket
+    // opened by another site's page is refused here. Native peers (the host,
+    // the Android client) send no Origin header and are unaffected.
+    if (socketPath && !sameOriginUpgrade(request, url)) return badRoute();
+    // Only the credential-free local lab socket may run without real secrets.
+    if (!localLabBypass) {
+      const weak = weakSecretNames(env);
+      if (weak.length) return configurationError(weak);
+      try { approvalMethods(env); } catch (error) {
+        return new Response(`Relay configuration error: ${error.message}`, {
+          status: 500, headers: { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
     }
     if (isHostSocketPath(url.pathname)) {
       if (!localLabBypass && !(await authorized(request, env.HOST_GATE_TOKEN))) {
@@ -86,19 +105,17 @@ export default {
   },
 };
 
-function handleWebSocket(request, env) {
+function socketRoom(url) {
   // Room name bump = fresh Durable Object state. The previous "room" instance
   // accumulated stale sockets/buffers across several force-killed sessions
   // (phone attempt, UAC crash, test browsers), which poisoned the relay: a
   // stale offer from an old session was flushed to a new host, whose DTLS
   // certificate then didn't match ("remote fingerprint no match").
-  const url = new URL(request.url);
   const media = isMediaSocketPath(url.pathname);
   const file = isFileSocketPath(url.pathname);
   const lab = isLabSocketPath(url.pathname);
   // File sockets reuse the MediaRoom class (same pairing code) under their
   // own room names, so no new Durable Object class or migration is needed.
-  const namespace = media || file ? env.MEDIA_ROOM : env.ROOM;
   const epoch = url.searchParams.get("epoch");
   const run = url.searchParams.get("run");
   // One media Durable Object per browser epoch carries the single v4 socket
@@ -108,6 +125,12 @@ function handleWebSocket(request, env) {
     : lab
       ? (media ? `lab-media-v4:${run}:${epoch}` : `lab-signal-v1:${run}`)
       : (media ? `media-v4:${epoch}` : "room-v3");
+  return { roomName, namespace: media || file ? "MEDIA_ROOM" : "ROOM" };
+}
+
+function handleWebSocket(request, env) {
+  const { roomName, namespace: binding } = socketRoom(new URL(request.url));
+  const namespace = env[binding];
   const roomId = namespace.idFromName(roomName);
   const stub = namespace.get(roomId);
   // Pass the ORIGINAL request straight through. Reconstructing headers here
@@ -130,12 +153,52 @@ function isBrowserSocketPath(pathname) {
 function isMediaSocketPath(pathname) { return pathname.endsWith("media-ws"); }
 function isFileSocketPath(pathname) { return pathname.endsWith("file-ws"); }
 function isLabSocketPath(pathname) { return pathname.startsWith("/lab-"); }
-function isLocalStreamLabRequest(url, env) {
+// Lab only. The URL hostname comes from the client's Host header wherever
+// the relay is not behind Cloudflare's hostname routing, so it never decides
+// "local" alone: the variable must be set explicitly and every client-address
+// header a proxy or runtime attached must name a loopback address. A relay
+// reachable without such a header must leave the variable unset.
+const CLIENT_ADDRESS_HEADERS = ["CF-Connecting-IP", "True-Client-IP", "X-Real-IP", "X-Forwarded-For", "Forwarded"];
+function isLocalStreamLabRequest(request, url, env) {
   return env.STREAM_LAB_LOCAL_BYPASS === "1" &&
-    ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
+    ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) &&
+    CLIENT_ADDRESS_HEADERS.every((name) => loopbackAddressList(name, request.headers.get(name)));
 }
-function isLocalLabSocket(url, env) {
-  return isLocalStreamLabRequest(url, env) && isLabSocketPath(url.pathname) && validSocketRoute(url);
+function loopbackAddressList(name, value) {
+  if (value === null) return true;
+  const entries = name === "Forwarded"
+    ? value.split(/[;,]/).map((part) => /^\s*for=(.*)$/i.exec(part)?.[1]).filter((entry) => entry !== undefined)
+    : value.split(",");
+  return entries.length > 0 && entries.every(isLoopbackAddress);
+}
+function isLoopbackAddress(entry) {
+  const address = entry.trim().replace(/^"|"$/g, "").replace(/^\[([^\]]*)\](?::\d+)?$/, "$1")
+    .replace(/^(\d+\.\d+\.\d+\.\d+):\d+$/, "$1").toLowerCase();
+  return /^(?:::ffff:)?127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(address) || address === "::1";
+}
+function isLocalLabSocket(request, url, env) {
+  return isLocalStreamLabRequest(request, url, env) && isLabSocketPath(url.pathname) && validSocketRoute(url);
+}
+function sameOriginUpgrade(request, url) {
+  const origin = request.headers.get("Origin");
+  return origin === null || origin === url.origin;
+}
+// Guessable credentials are a deployment error, not a weaker mode: the relay
+// answers nothing until every secret meets its minimum length.
+const MIN_SECRET_LENGTHS = { TOKEN: 32, HOST_GATE_TOKEN: 32, GATE_ADMIN_TOKEN: 32, APP_PASSWORD: 12 };
+export function weakSecretNames(env) {
+  return Object.entries(MIN_SECRET_LENGTHS)
+    .filter(([name, min]) => typeof env?.[name] !== "string" || env[name].length < min)
+    .map(([name]) => name);
+}
+function configurationError(names) {
+  const message = "Relay configuration error: " + names
+    .map((name) => `${name} must be set to at least ${MIN_SECRET_LENGTHS[name]} characters`).join("; ") + ".";
+  console.log(`[config] ${message}`);
+  return new Response(message, {
+    status: 500,
+    headers: { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" },
+  });
 }
 function validSocketRoute(url) {
   if (isLabSocketPath(url.pathname) && !validLabRun(url)) return false;
@@ -157,26 +220,59 @@ export class Room {
     // fresh Room at any time, so socket attachments remain authoritative and a
     // cache miss always rebuilds from state.getWebSockets().
     this.peerCache = new Map();
+    this.sessionChecks = new Map();
+    this.pendingOperation = Promise.resolve();
+    if (env.GATE && state.blockConcurrencyWhile && state.getWebSockets().some(socket => {
+      const att = socket.deserializeAttachment() || {};
+      return socket.readyState === 1 && !att.replaced && (att.role || att.expectedRole)?.endsWith("client");
+    })) {
+      // Revalidate attachments on wake, including sockets accepted before
+      // session binding was introduced, before allowing peer traffic.
+      state.blockConcurrencyWhile(async () => {
+        await this.checkBrowserSockets();
+        await this.scheduleAlarm();
+      });
+    }
   }
 
   async fetch(request) {
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    console.log("[room] socket accepted");
-
     // Remember the query token + role on the socket itself: with the
     // hibernation API the DO class is re-instantiated per wake, so instance
     // fields are not authoritative peer state. Attachments and storage are.
     const url = new URL(request.url);
+    if (url.origin === "https://room.internal") {
+      if (url.pathname.startsWith("/__approval/")) return this.approvalFetch(request, url);
+      if (url.pathname === "/__auth/recheck" && request.method === "POST") {
+        await this.checkBrowserSockets();
+        return new Response(null, { status: 204 });
+      }
+      return badRoute();
+    }
     const media = isMediaSocketPath(url.pathname);
     const file = isFileSocketPath(url.pathname);
     const lab = isLabSocketPath(url.pathname);
-    const localLab = isLocalLabSocket(url, this.env);
+    const localLab = isLocalLabSocket(request, url, this.env);
     const expectedRole = url.pathname === "/host-version-ws" ? "version-probe" :
       file ? (isHostSocketPath(url.pathname) ? "file-host" : "file-client") :
       media ? (isHostSocketPath(url.pathname) ? "media-host" : "media-client") :
         (isHostSocketPath(url.pathname) ? "host" : "client");
-    server.serializeAttachment({ role: null, expectedRole,
+    let sessionIdentity = null;
+    const location = socketRoom(url);
+    if (expectedRole.endsWith("client") && !localLab) {
+      const check = await this.gateFetch("/__auth/socket", { headers: { Cookie: request.headers.get("Cookie") || "" } });
+      if (check.status !== 200) return badRoute();
+      sessionIdentity = await check.json();
+      if (!validSocketIdentity(sessionIdentity)) return badRoute();
+      const registration = await this.gateFetch("/__auth/socket-register", {
+        method: "POST", body: JSON.stringify({ ...location, identity: sessionIdentity }),
+      });
+      if (registration.status !== 204) return badRoute();
+      await this.scheduleAlarm();
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    console.log("[room] socket accepted");
+    server.serializeAttachment({ role: null, expectedRole, sessionIdentity, ...location,
       epoch: url.searchParams.get("epoch") || null,
       run: lab ? url.searchParams.get("run") : null,
       localLab });
@@ -189,6 +285,8 @@ export class Room {
 
   async webSocketMessage(ws, message) {
     const att = ws.deserializeAttachment() || {};
+    if (att.replaced) return;
+    if (!(await this.checkBrowserSocket(ws, att))) return;
     if (att.role === "media-host" || att.role === "media-client") {
       this.relayMediaV4(ws, att, message);
       return;
@@ -208,11 +306,29 @@ export class Room {
       return;
     }
     let msg;
+    if (typeof message !== "string") return;
+    if (utf8Length(message) > SIGNAL_MAX_BYTES) {
+      this.closePeer(ws, 1009, "signaling message too large");
+      return;
+    }
     try {
       msg = JSON.parse(message);
     } catch {
       return; // not JSON: ignore
     }
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) return;
+
+    if (msg.type === "approval-decision") {
+      if (att.role !== "host" || !validApprovalMessage(msg)) return;
+      const expiresAt = att.approvalRequests?.[msg.id];
+      if (!expiresAt || expiresAt <= Date.now()) return;
+      const approvalRequests = { ...att.approvalRequests };
+      delete approvalRequests[msg.id];
+      ws.serializeAttachment({ ...att, approvalRequests });
+      await this.gateFetch("/__approval/decision", { method: "POST", body: message });
+      return;
+    }
+    if (msg.type === "approval-request" || msg.type === "approval-cancel") return;
 
     if (msg.type !== "diag") {
       console.log(`[room] msg type=${msg.type} role=${att.role || "unassigned"}`);
@@ -273,7 +389,7 @@ export class Room {
       // now-dead session — delivering them to a future host would poison it
       // (the host accepts a stale offer, its DTLS times out, session dies).
       if (role === "client") {
-        await this.state.storage.delete("pendingToHost");
+        await this.withPending(() => this.state.storage.delete("pendingToHost"));
       }
       const mediaEpoch = role === "client" ? randomEpoch() : null;
       const registeredAtMs = Date.now();
@@ -315,16 +431,26 @@ export class Room {
 
       // Flush anything the client sent before the host arrived.
       if (role === "host") {
-        const pending = (await this.state.storage.get("pendingToHost")) || [];
-        if (pending.length) {
-          console.log(`[room] flushing ${pending.length} buffered msg(s) to host`);
-          // The buffered messages came FROM the client and go TO the host —
-          // which is this socket, `ws`.
-          for (const m of pending) {
-            ws.send(m);
+        await this.withPending(async () => {
+          const pending = (await this.state.storage.get("pendingToHost")) || [];
+          const pendingBytes = pending.reduce((total, raw) => total + (typeof raw === "string" ? utf8Length(raw) : PENDING_MAX_BYTES + 1), 0);
+          if (pending.length > 64 || pendingBytes > PENDING_MAX_BYTES) {
+            await this.state.storage.delete("pendingToHost");
+            const client = this.findPeer("client");
+            if (client) this.closePeer(client, 1013, "pending queue full");
+            return;
           }
-          await this.state.storage.delete("pendingToHost");
-        }
+          if (pending.length) {
+            console.log(`[room] flushing ${pending.length} buffered msg(s) to host`);
+            // The buffered messages came FROM the client and go TO the host —
+            // which is this socket, `ws`.
+            for (const m of pending) {
+              if (typeof m !== "string" || utf8Length(m) > SIGNAL_MAX_BYTES) continue;
+              if (!this.sendPeer(ws, m)) break;
+            }
+            await this.state.storage.delete("pendingToHost");
+          }
+        });
       }
       return;
     }
@@ -366,14 +492,29 @@ export class Room {
         return;
       }
     }
+    const approvalOnly = msg.type === "host-capabilities" &&
+      Object.keys(msg).length === 2 && validApprovalMessage(msg);
     if (msg.type === "host-capabilities" &&
         (att.role !== "host" || typeof message !== "string" || utf8Length(message) > 512 ||
-         typeof msg.serviceMode !== "boolean" || typeof msg.coldBoot !== "boolean" ||
-         typeof msg.secureDesktop !== "boolean" || typeof msg.secureText !== "boolean")) {
+         (!approvalOnly && (typeof msg.serviceMode !== "boolean" || typeof msg.coldBoot !== "boolean" ||
+         typeof msg.secureDesktop !== "boolean" || typeof msg.secureText !== "boolean")) ||
+         (msg.browserApproval !== undefined && typeof msg.browserApproval !== "boolean"))) {
       return;
     }
     if (msg.type === "host-capabilities" && msg.fileTransfer !== undefined &&
         !(Number.isInteger(msg.fileTransfer) && msg.fileTransfer >= 0 && msg.fileTransfer <= 255)) {
+      return;
+    }
+    if (msg.type === "host-capabilities" && msg.fileDrop !== undefined &&
+        !(msg.fileDrop === 1 && msg.fileTransfer === 1)) {
+      return;
+    }
+    if (msg.type === "host-capabilities" && msg.fileDropPreview !== undefined &&
+        !(msg.fileDropPreview === 1 && msg.fileDrop === 1 && msg.fileTransfer === 1 && msg.serviceMode === false)) {
+      return;
+    }
+    if (msg.type === "host-capabilities" && msg.followWindow !== undefined &&
+        !(Number.isInteger(msg.followWindow) && msg.followWindow >= 0 && msg.followWindow <= 255)) {
       return;
     }
     if (msg.type === "file-offer" &&
@@ -382,18 +523,13 @@ export class Room {
       return;
     }
     if (msg.type === "host-capabilities") {
-      ws.serializeAttachment({ ...att, hostCapabilities: message });
+      ws.serializeAttachment({ ...att, hostCapabilities: message, browserApproval: msg.browserApproval === true });
     }
-    if (msg.type === "desktop-state" &&
-        (att.role !== "host" || typeof message !== "string" || utf8Length(message) > 512 ||
-         (msg.state !== "active" && msg.state !== "unavailable") ||
-         !Number.isInteger(msg.generation) || typeof msg.reason !== "string" || msg.reason.length > 96 ||
-         (msg.desktop !== undefined && msg.desktop !== "default" && msg.desktop !== "secure" && msg.desktop !== "none") ||
-         (msg.input !== undefined && msg.input !== "enabled" && msg.input !== "suspended" && msg.input !== "read-only"))) {
-      return;
-    }
+    if (msg.type === "desktop-state" && !validDesktopState(msg, att.role, message)) return;
+    if (msg.type === "secure-action" && !validSecureAction(msg, att.role, message)) return;
+    if (msg.type === "secure-action-result" && !validSecureActionResult(msg, att.role, message)) return;
     if (msg.type === "input-status" && !validInputStatus(msg, att.role, message)) return;
-    if (msg.type === "clipboard" && !validClipboardMessage(msg, att.role, message)) return;
+    if ((msg.type === "clipboard" || msg.type === "clipboard-image") && !validClipboardMessage(msg, att.role, message)) return;
     if (msg.type === "input-capabilities") {
       if (!validInputCapabilities(msg, att.role, message)) return;
       ws.serializeAttachment({ ...ws.deserializeAttachment(), inputCapabilities: message });
@@ -405,6 +541,7 @@ export class Room {
         (att.role !== "client" || typeof message !== "string" || utf8Length(message) > 2_048)) {
       return;
     }
+    if (msg.type === "file-drag-preview" && !validFileDragPreview(msg, att, message)) return;
     if (msg.type === "media-control" && msg.protocol === 4 &&
         !validCurrentMediaEpoch(msg.epoch, att)) return;
     if (msg.type === "media-control" && msg.action === "monitor" &&
@@ -414,6 +551,13 @@ export class Room {
     if (msg.type === "media-control" && msg.action === "monitors" &&
         (att.role !== "client" || msg.protocol !== 4 || typeof msg.epoch !== "string" ||
          !/^[a-f0-9]{32}$/.test(msg.epoch) || msg.epoch !== att.mediaEpoch)) {
+      return;
+    }
+    // Follow active window: a session-scoped boolean the host applies; v4 and
+    // the client socket's current epoch only, like the monitor refresh.
+    if (msg.type === "media-control" && msg.action === "follow" &&
+        (att.role !== "client" || msg.protocol !== 4 || typeof msg.follow !== "boolean" ||
+         !validCurrentMediaEpoch(msg.epoch, att))) {
       return;
     }
     const target = att.role === "host" ? this.findPeer("client") : this.findPeer("host");
@@ -432,40 +576,60 @@ export class Room {
       // host connects. Route changes commonly bring the browser back first.
       // ACKs/keyframe requests are epoch-specific and must never be replayed.
       if (att.role === "client" && (msg.type === "offer" || msg.type === "ice" ||
-          (msg.type === "media-control" && (msg.action === "start" || msg.action === "monitors")) ||
+          (msg.type === "media-control" && (msg.action === "start" || msg.action === "monitors" || msg.action === "follow")) ||
           (msg.type === "first-frame" && msg.phase === "request"))) {
-        const pending = (await this.state.storage.get("pendingToHost")) || [];
-        if (msg.type === "media-control" || msg.type === "first-frame") {
-          for (let i = pending.length - 1; i >= 0; i -= 1) {
-            try {
-              const old = JSON.parse(pending[i]);
-              if ((msg.type === "media-control" && old.type === "media-control" && old.action === msg.action &&
-                   (msg.action === "start" || msg.action === "monitors")) ||
-                  (msg.type === "first-frame" && old.type === "first-frame" && old.phase === "request")) pending.splice(i, 1);
-            } catch { /* retain validated offer/ICE wire text */ }
+        await this.withPending(async () => {
+          if (ws.deserializeAttachment()?.replaced) return;
+          const liveHost = this.findPeer("host");
+          if (liveHost) { this.sendPeer(liveHost, message); return; }
+          const pending = (await this.state.storage.get("pendingToHost")) || [];
+          if (msg.type === "media-control" || msg.type === "first-frame") {
+            for (let i = pending.length - 1; i >= 0; i -= 1) {
+              try {
+                const old = JSON.parse(pending[i]);
+                if ((msg.type === "media-control" && old.type === "media-control" && old.action === msg.action &&
+                     (msg.action === "start" || msg.action === "monitors" || msg.action === "follow")) ||
+                    (msg.type === "first-frame" && old.type === "first-frame" && old.phase === "request")) pending.splice(i, 1);
+              } catch { /* retain validated offer/ICE wire text */ }
+            }
           }
-        }
-        pending.push(message);
-        if (pending.length > 64) pending.shift();
-        await this.state.storage.put("pendingToHost", pending);
+          const bytes = pending.reduce((total, raw) => total + (typeof raw === "string" ? utf8Length(raw) : PENDING_MAX_BYTES), 0);
+          if (pending.length >= 64 || bytes + utf8Length(message) > PENDING_MAX_BYTES) {
+            await this.state.storage.delete("pendingToHost");
+            this.closePeer(ws, 1013, "pending queue full");
+            return;
+          }
+          pending.push(message);
+          await this.state.storage.put("pendingToHost", pending);
+        });
       }
       return;
     }
-    target.send(message);
+    this.sendPeer(target, message);
   }
 
   async webSocketClose(ws, _code, _reason, _wasClean) {
     const att = ws.deserializeAttachment() || {};
     const role = att.role;
     this.forgetPeer(ws);
+    if (att.sessionIdentity) {
+      this.sessionChecks.delete(`${att.sessionIdentity.gateHash}:${att.sessionIdentity.authHash}`);
+      const stillAttached = this.state.getWebSockets().some(socket => socket !== ws && socket.readyState === 1 &&
+        !socket.deserializeAttachment()?.replaced &&
+        socket.deserializeAttachment()?.sessionIdentity?.authHash === att.sessionIdentity.authHash);
+      if (!stillAttached) {
+        await this.gateFetch("/__auth/socket-unregister", { method: "POST",
+          body: JSON.stringify({ roomName: att.roomName, namespace: att.namespace, identity: att.sessionIdentity }) });
+      }
+    }
     console.log(`[room] socket closed role=${role || "unassigned"} run=${att.run || "-"} target=${att.registeredAtMs ?? "-"} replaced=${!!att.replaced}`);
     if (!role) return;
     // When the client dies, its buffered offer/ICE is worthless — clear it so
     // a later host never receives a stale offer from a dead peer.
     if (role === "client") {
-      await this.state.storage.delete("pendingToHost");
+      await this.withPending(() => this.state.storage.delete("pendingToHost"));
     }
-    if (att.replaced) return; // replaced sockets get no farewell
+    if (att.replaced && !att.closedByRelay) return; // replaced sockets get no farewell
     // Media socket churn is isolated from the signaling session. Losing the
     // media socket must not tell the host/browser that the application peer left.
     if (role === "media-host" || role === "media-client") {
@@ -555,6 +719,132 @@ export class Room {
     if (msg?.type === "ping") ws.send(JSON.stringify({ type: "pong" }));
   }
 
+  gateFetch(path, init = {}) {
+    const gate = this.env.GATE.get(this.env.GATE.idFromName("global-v1"));
+    return gate.fetch(new Request(`https://gate.internal${path}`, init));
+  }
+
+  async approvalFetch(request, url) {
+    const host = this.findPeer("host");
+    const att = host?.deserializeAttachment() || {};
+    if (url.pathname === "/__approval/status" && request.method === "GET") {
+      return Response.json({ hostOnline: !!host && att.browserApproval === true });
+    }
+    if (request.method !== "POST") return badRoute();
+    let msg;
+    const raw = await request.text();
+    if (utf8Length(raw) > 1_024) return badRoute();
+    try { msg = JSON.parse(raw); } catch { return badRoute(); }
+    if (!validApprovalMessage(msg)) return badRoute();
+    // Re-read ownership after the request body yields; a replacement host
+    // must never inherit another connection's pending dialogs.
+    if (!host || this.findPeer("host") !== host) return new Response(null, { status: 503 });
+    const current = host.deserializeAttachment() || {};
+    const approvalRequests = { ...current.approvalRequests };
+    if (url.pathname === "/__approval/request" && msg.type === "approval-request") {
+      if (current.browserApproval !== true || msg.expiresAt <= Date.now() ||
+          Object.keys(approvalRequests).length >= 10 || approvalRequests[msg.id]) return new Response(null, { status: 503 });
+      approvalRequests[msg.id] = msg.expiresAt;
+      host.serializeAttachment({ ...current, approvalRequests });
+      await this.scheduleAlarm();
+      return new Response(null, { status: this.sendPeer(host, raw) ? 204 : 503 });
+    }
+    if (url.pathname === "/__approval/cancel" && msg.type === "approval-cancel") {
+      if (approvalRequests[msg.id]) {
+        delete approvalRequests[msg.id];
+        host.serializeAttachment({ ...current, approvalRequests });
+        this.sendPeer(host, raw);
+      }
+      return new Response(null, { status: 204 });
+    }
+    return badRoute();
+  }
+
+  async checkBrowserSocket(ws, att, force = false) {
+    if ((att.localLab && this.env.STREAM_LAB_LOCAL_BYPASS === "1") ||
+        !(att.role || att.expectedRole)?.endsWith("client")) return true;
+    // Real Rooms always have GATE; direct protocol unit tests provide only
+    // peers. Browser admission itself requires a valid gate identity.
+    if (!this.env.GATE && !att.sessionIdentity) return true;
+    const identity = att.sessionIdentity;
+    if (!validSocketIdentity(identity)) {
+      this.closePeer(ws, 1008, "browser session revoked");
+      return false;
+    }
+    const key = `${identity.gateHash}:${identity.authHash}`;
+    let cached = this.sessionChecks.get(key);
+    if (force || !cached || cached.until <= Date.now()) {
+      cached = { until: Date.now() + SESSION_CACHE_MS,
+        valid: this.gateFetch("/__auth/socket", { method: "POST", body: JSON.stringify(identity) })
+          .then(response => response.status === 204, () => false) };
+      this.sessionChecks.set(key, cached);
+    }
+    const valid = await cached.valid;
+    if (!valid) {
+      this.closePeer(ws, 1008, "browser session revoked");
+      if (att.role === "client" || att.expectedRole === "client") {
+        await this.withPending(() => this.state.storage.delete("pendingToHost"));
+      }
+    }
+    return valid && !ws.deserializeAttachment()?.replaced;
+  }
+
+  async checkBrowserSockets() {
+    this.sessionChecks.clear();
+    for (const socket of this.state.getWebSockets()) {
+      const att = socket.deserializeAttachment() || {};
+      if (socket.readyState === 1 && !att.replaced) await this.checkBrowserSocket(socket, att);
+    }
+  }
+
+  async scheduleAlarm() {
+    if (!this.state.storage.setAlarm) return;
+    const next = Date.now() + SESSION_CHECK_MS;
+    const current = await this.state.storage.getAlarm();
+    if (current === null || current > next) await this.state.storage.setAlarm(next);
+  }
+
+  async alarm() {
+    await this.checkBrowserSockets();
+    let needed = false;
+    for (const socket of this.state.getWebSockets()) {
+      const att = socket.deserializeAttachment() || {};
+      if (socket.readyState !== 1 || att.replaced) continue;
+      if (att.sessionIdentity) needed = true;
+      const approvalRequests = { ...att.approvalRequests };
+      for (const [id, expiresAt] of Object.entries(approvalRequests)) {
+        if (expiresAt <= Date.now()) {
+          delete approvalRequests[id];
+          this.sendPeer(socket, JSON.stringify({ type: "approval-cancel", id }));
+        } else needed = true;
+      }
+      if (att.approvalRequests) socket.serializeAttachment({ ...socket.deserializeAttachment(), approvalRequests });
+    }
+    if (needed) await this.state.storage.setAlarm(Date.now() + SESSION_CHECK_MS);
+  }
+
+  withPending(operation) {
+    const next = this.pendingOperation.then(operation);
+    this.pendingOperation = next.catch(() => {});
+    return next;
+  }
+
+  sendPeer(ws, message) {
+    if (ws.readyState !== 1 || ws.deserializeAttachment()?.replaced) return false;
+    try { ws.send(message); return true; } catch {
+      this.closePeer(ws, 1013, "peer send failed");
+      return false;
+    }
+  }
+
+  closePeer(ws, code, reason) {
+    const att = ws.deserializeAttachment() || {};
+    if (att.sessionIdentity) this.sessionChecks.delete(`${att.sessionIdentity.gateHash}:${att.sessionIdentity.authHash}`);
+    try { ws.serializeAttachment({ ...att, replaced: true, closedByRelay: true }); } catch { /* gone */ }
+    this.forgetPeer(ws);
+    try { ws.close(code, reason); } catch { /* already closed */ }
+  }
+
   reject(ws, message) {
     console.log(`[room] REJECT: ${message}`);
     // Make the durable attachment non-authoritative before touching the wire.
@@ -591,6 +881,8 @@ export class Room {
   }
 
   forgetPeer(ws) {
+    const identity = ws.deserializeAttachment()?.sessionIdentity;
+    if (identity) this.sessionChecks.delete(`${identity.gateHash}:${identity.authHash}`);
     for (const [key, peer] of this.peerCache) {
       if (peer === ws) this.peerCache.delete(key);
     }
@@ -599,9 +891,34 @@ export class Room {
 
 export class MediaRoom extends Room {}
 
+const SIGNAL_MAX_BYTES = 512 * 1024;
+const PENDING_MAX_BYTES = 512 * 1024;
+const SESSION_CACHE_MS = 3_000;
+const SESSION_CHECK_MS = 5_000;
+
+function validSocketIdentity(identity) {
+  return identity && /^[a-f0-9]{64}$/.test(identity.gateHash) && /^[a-f0-9]{64}$/.test(identity.authHash);
+}
+
 // A file-offer lists at most 64 items whose names are at most 1 KiB of
 // UTF-8 each; JSON escaping can grow a name up to 6x.
 const FILE_OFFER_MAX_RAW_BYTES = 256 + FT_MAX_BATCH_FILES * (FT_MAX_NAME_BYTES * 6 + 64);
+
+function validFileDragPreview(msg, att, raw) {
+  if (att.role !== "client" || typeof raw !== "string" || utf8Length(raw) > 8_192 ||
+      msg.protocol !== 1 || !validCurrentMediaEpoch(msg.epoch, att) ||
+      !Number.isInteger(msg.dragId) || msg.dragId < 1 || msg.dragId > 0xffff_ffff ||
+      Object.keys(msg).some(key => !["type", "protocol", "epoch", "dragId", "action", "drop", "types"].includes(key))) return false;
+  if (msg.action === "cancel") return !Object.hasOwn(msg, "drop") && !Object.hasOwn(msg, "types");
+  if (msg.action !== "update" || !msg.drop || typeof msg.drop !== "object" || Array.isArray(msg.drop) ||
+      Object.keys(msg.drop).length !== 4 ||
+      Object.keys(msg.drop).some(key => !["x", "y", "generation", "viewportRevision"].includes(key))) return false;
+  const integer = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
+  return integer(msg.drop.x, 0, 0xffff) && integer(msg.drop.y, 0, 0xffff) &&
+    integer(msg.drop.generation, 1, 0xffff_ffff) && integer(msg.drop.viewportRevision, 0, 0xffff_ffff) &&
+    Array.isArray(msg.types) && msg.types.length >= 1 && msg.types.length <= 64 &&
+    msg.types.every(mime => typeof mime === "string" && mime.length <= 96 && /^[\x21-\x7e]*$/.test(mime));
+}
 
 function binaryLength(value) {
   if (value instanceof ArrayBuffer) return value.byteLength;

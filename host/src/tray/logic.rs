@@ -273,10 +273,7 @@ impl StoredHostConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        let worker = self.worker.to_ascii_lowercase();
-        if !(worker.starts_with("wss://") || worker.starts_with("ws://")) {
-            anyhow::bail!("host.json worker must be a ws:// or wss:// URL");
-        }
+        bubbleplay_host::relay_url::require_secure_relay_url(&self.worker)?;
         if self.token_dpapi_hex.trim().is_empty() {
             anyhow::bail!("host.json tokenDpapiHex is empty");
         }
@@ -386,6 +383,70 @@ pub fn admin_mode_line(agent: &AgentStatus) -> Option<&'static str> {
         AgentStatus::Starting => Some("Admin mode: starting (viewer connected)"),
         AgentStatus::Ready => Some("Admin mode: active"),
         AgentStatus::NeedsUpdate { .. } => Some("Admin mode: agent needs update"),
+    }
+}
+
+/// Secure-desktop helper state is independent of Admin mode. The tray only
+/// launches it; its authenticated host connection owns shutdown and timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecureHelperStatus {
+    Armed,
+    Starting,
+    Ready,
+    NeedsUpdate { reason: String },
+}
+
+impl SecureHelperStatus {
+    pub fn needs_update(&self) -> bool {
+        matches!(self, Self::NeedsUpdate { .. })
+    }
+
+    pub fn line(&self) -> String {
+        match self {
+            Self::Armed => "Secure desktop: armed (starts when a viewer connects)".into(),
+            Self::Starting => "Secure desktop: helper starting".into(),
+            Self::Ready => "Secure desktop: helper ready".into(),
+            Self::NeedsUpdate { reason } => format!("Secure desktop: {reason}"),
+        }
+    }
+}
+
+pub const SECURE_HELPER_UPDATE_LABEL: &str =
+    "Secure desktop helper needs update (one admin prompt)";
+
+/// Launch only for an active viewer, independent of Admin mode. An idle
+/// helper exits through the host pipe; the tray must never restart it idle.
+pub fn secure_helper_should_launch(
+    viewer_connected: bool,
+    status: &SecureHelperStatus,
+    updating: bool,
+) -> bool {
+    viewer_connected && !updating && matches!(status, SecureHelperStatus::Armed)
+}
+
+/// Handle each new viewer session with a real launch attempt. A stale
+/// missing/incompatible result from an earlier session must not veto it:
+/// installation may have been repaired while the tray remained running.
+/// Admin mode is intentionally not an input to this lifecycle action.
+pub fn start_secure_helper_for_viewer(
+    status: &mut SecureHelperStatus,
+    updating: bool,
+    launch: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    if updating {
+        return Ok(false);
+    }
+    match launch() {
+        Ok(()) => {
+            *status = SecureHelperStatus::Starting;
+            Ok(true)
+        }
+        Err(reason) => {
+            *status = SecureHelperStatus::NeedsUpdate {
+                reason: reason.clone(),
+            };
+            Err(reason)
+        }
     }
 }
 
@@ -614,12 +675,38 @@ mod tests {
         let parsed = StoredHostConfig::load(&path).unwrap();
         assert_eq!(parsed.host_gate_token_dpapi_hex, None);
         assert_eq!(parsed.monitor, None);
-        fs::write(&path, br#"{"worker":"https://x","tokenDpapiHex":"01"}"#).unwrap();
+        fs::write(&path, br#"{"worker":"ftp://x","tokenDpapiHex":"01"}"#).unwrap();
         assert!(StoredHostConfig::load(&path).is_err());
         fs::write(&path, br#"{"worker":"wss://x","tokenDpapiHex":""}"#).unwrap();
         assert!(StoredHostConfig::load(&path).is_err());
         assert!(StoredHostConfig::load(&dir.join("missing.json")).is_err());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tray_and_host_share_relay_transport_and_scheme_rules() {
+        for (url, accepted) in [
+            ("wss://play.example/host-ws", true),
+            ("https://play.example/host-ws", true),
+            ("ws://localhost:8787/host-ws", true),
+            ("ws://127.0.0.1/host-ws", true),
+            ("ws://[::1]/host-ws", true),
+            ("ws://play.example/host-ws", false),
+            ("ws://192.168.1.20/host-ws", false),
+            ("http://play.example/host-ws", false),
+            ("WSS://play.example/host-ws", false),
+            ("WS://127.0.0.1/host-ws", false),
+            ("Https://play.example/host-ws", false),
+        ] {
+            let mut stored = config();
+            stored.worker = url.into();
+            assert_eq!(stored.validate().is_ok(), accepted, "tray: {url}");
+            assert_eq!(
+                bubbleplay_host::relay_url::require_secure_relay_url(url).is_ok(),
+                accepted,
+                "host: {url}"
+            );
+        }
     }
 
     #[test]
@@ -699,6 +786,117 @@ mod tests {
         assert!(gate.wants_agent(at(129)));
         assert!(!gate.wants_agent(at(130)));
         assert!(!gate.wants_agent(at(500)));
+    }
+
+    #[test]
+    fn secure_helper_launch_is_viewer_scoped_and_does_not_restart_idle() {
+        assert!(!secure_helper_should_launch(
+            false,
+            &SecureHelperStatus::Armed,
+            false
+        ));
+        // Admin mode is deliberately absent from this decision.
+        assert!(secure_helper_should_launch(
+            true,
+            &SecureHelperStatus::Armed,
+            false
+        ));
+        assert!(!secure_helper_should_launch(
+            true,
+            &SecureHelperStatus::Armed,
+            true
+        ));
+        assert!(!secure_helper_should_launch(
+            true,
+            &SecureHelperStatus::Starting,
+            false
+        ));
+        assert!(!secure_helper_should_launch(
+            true,
+            &SecureHelperStatus::Ready,
+            false
+        ));
+        let unavailable = SecureHelperStatus::NeedsUpdate {
+            reason: "missing".into(),
+        };
+        assert!(!secure_helper_should_launch(true, &unavailable, false));
+        assert!(unavailable.needs_update());
+        let mut gate = ViewerGate::default();
+        gate.on_started();
+        gate.on_ended(Instant::now());
+        assert!(gate.wants_agent(Instant::now()));
+        assert!(!secure_helper_should_launch(
+            gate.viewer_connected(),
+            &SecureHelperStatus::Armed,
+            false
+        ));
+    }
+
+    #[test]
+    fn every_viewer_start_launches_helper_with_admin_off_or_on_even_after_failure() {
+        for admin_mode in [false, true] {
+            let settings = TraySettings {
+                admin_mode,
+                ..TraySettings::default()
+            };
+            let mut gate = ViewerGate::default();
+            let mut helper = SecureHelperStatus::NeedsUpdate {
+                reason: "old startup failure".into(),
+            };
+            let mut launches = 0;
+            // The actual action runs even when a startup query/probe had failed.
+            gate.on_started();
+            assert_eq!(
+                start_secure_helper_for_viewer(&mut helper, false, || {
+                    launches += 1;
+                    Ok(())
+                }),
+                Ok(true)
+            );
+            assert!(gate.viewer_connected());
+            assert_eq!(helper, SecureHelperStatus::Starting);
+            // Every viewer start, including overlapping sessions or reconnects,
+            // invokes the launcher even while a compatible helper was ready.
+            helper = SecureHelperStatus::Ready;
+            gate.on_started();
+            assert_eq!(
+                start_secure_helper_for_viewer(&mut helper, false, || {
+                    launches += 1;
+                    Ok(())
+                }),
+                Ok(true)
+            );
+            assert_eq!(launches, 2);
+            assert_eq!(helper, SecureHelperStatus::Starting);
+            assert_eq!(settings.admin_mode, admin_mode);
+        }
+    }
+
+    #[test]
+    fn viewer_helper_start_reports_launch_failure_and_defers_during_update() {
+        let mut helper = SecureHelperStatus::Armed;
+        assert_eq!(
+            start_secure_helper_for_viewer(&mut helper, false, || Err("task missing".into())),
+            Err("task missing".into())
+        );
+        assert_eq!(
+            helper,
+            SecureHelperStatus::NeedsUpdate {
+                reason: "task missing".into()
+            }
+        );
+        assert_eq!(
+            start_secure_helper_for_viewer(&mut helper, true, || panic!(
+                "must not launch during installation"
+            )),
+            Ok(false)
+        );
+        assert!(helper.needs_update());
+        assert_eq!(
+            start_secure_helper_for_viewer(&mut helper, false, || Ok(())),
+            Ok(true)
+        );
+        assert_eq!(helper, SecureHelperStatus::Starting);
     }
 
     #[test]

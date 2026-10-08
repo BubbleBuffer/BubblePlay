@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { Room } from "../src/index.js";
+import { RELAY_SECRETS } from "./helpers/relay-secrets.mjs";
 import {
   V4_HEADER_BYTES,
   V4_MAX_PAYLOAD_BYTES,
@@ -81,13 +82,14 @@ test("v4 routes accept one epoch-scoped socket per side and nothing else", async
   const selected = [];
   const mediaResponse = new Response("media", { status: 200 });
   const env = {
-    HOST_GATE_TOKEN: "host-only",
+    ...RELAY_SECRETS,
+    APPROVAL_METHODS: "host",
     GATE: { idFromName: () => "gate", get: () => ({ fetch: async () => new Response(null, { status: 204 }) }) },
     ROOM: { idFromName: name => name, get: () => ({ fetch: async () => new Response("signal") }) },
     MEDIA_ROOM: { idFromName: name => { selected.push(name); return name; }, get: () => ({ fetch: async () => mediaResponse }) },
   };
   const epoch = "0123456789abcdef0123456789abcdef";
-  const hostHeaders = { Upgrade: "websocket", Authorization: "Bearer host-only" };
+  const hostHeaders = { Upgrade: "websocket", Authorization: `Bearer ${RELAY_SECRETS.HOST_GATE_TOKEN}` };
   const browserHeaders = { Upgrade: "websocket" };
   assert.equal(await worker.fetch(new Request(
     `https://playfull-cat.example/host-media-ws?epoch=${epoch}`, { headers: hostHeaders }), env), mediaResponse);
@@ -202,7 +204,7 @@ test("v4 reconnect backoff, presentation skipping and status labels", () => {
 });
 
 test("lab receiver URLs carry no WSS protocol or lane selection", async () => {
-  const { buildReceiverUrl } = await import("../tools/stream-lab-live.mjs");
+  const { buildReceiverUrl } = await import("../tools/lab/stream-lab-live.mjs");
   const run = "123e4567-e89b-42d3-a456-426614174000";
   const url = buildReceiverUrl("http://127.0.0.1:8787/", "wss", { labRun: run });
   assert.equal(url.searchParams.get("transport"), "wss");

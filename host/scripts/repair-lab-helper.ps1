@@ -3,7 +3,7 @@ param(
     [string]$SourceBinary = (Join-Path $PSScriptRoot '..\target-candidate\release\bubbleplay_lab_helper.exe'),
     [string]$InstallDir = (Join-Path $env:ProgramFiles 'BubblePlay\LabHelper'),
     [string]$DataDir = (Join-Path $env:ProgramData 'BubblePlay'),
-    [string]$ProbeScript = (Join-Path $PSScriptRoot '..\..\worker\tools\stream-lab-helper-probe.mjs'),
+    [string]$ProbeScript = (Join-Path $PSScriptRoot '..\..\worker\tools\lab\stream-lab-helper-probe.mjs'),
     [string]$ReceiptPath = (Join-Path $PSScriptRoot '..\target-candidate\lab-helper-repair-receipt.json'),
     [string]$OwnerSid = ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
 )

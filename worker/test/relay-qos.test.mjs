@@ -711,6 +711,147 @@ test("buffers monitor refresh only for the client socket's current media epoch",
   assert.deepEqual(pending, [refresh]);
 });
 
+test("host capabilities relay followWindow only as an integer 0..255", async () => {
+  const { room, sockets: [client, host] } = createRoom();
+  const base = { type: "host-capabilities", serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false };
+  const valid = [0, 1, 255].map(followWindow => JSON.stringify({ ...base, followWindow }));
+  for (const text of valid) await room.webSocketMessage(host, text);
+  for (const followWindow of [-1, 256, 1.5, "1", true, null])
+    await room.webSocketMessage(host, JSON.stringify({ ...base, followWindow }));
+  assert.deepEqual(client.messages, valid);
+  assert.deepEqual(host.messages, []);
+});
+
+test("native file drops require the compatible file transfer capability", async () => {
+  const { room, sockets: [client, host] } = createRoom();
+  const base = { type: "host-capabilities", serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false };
+  const valid = JSON.stringify({ ...base, fileTransfer: 1, fileDrop: 1 });
+  await room.webSocketMessage(host, valid);
+  for (const fileDrop of [0, 2, "1", true, null])
+    await room.webSocketMessage(host, JSON.stringify({ ...base, fileTransfer: 1, fileDrop }));
+  await room.webSocketMessage(host, JSON.stringify({ ...base, fileDrop: 1 }));
+  await room.webSocketMessage(host, JSON.stringify({ ...base, fileTransfer: 2, fileDrop: 1 }));
+  assert.deepEqual(client.messages, [valid]);
+});
+
+test("native drag previews require fileTransfer and fileDrop v1 on a local host", async () => {
+  const { room, sockets: [client, host] } = createRoom();
+  const base = { type: "host-capabilities", serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false };
+  const valid = JSON.stringify({ ...base, fileTransfer: 1, fileDrop: 1, fileDropPreview: 1 });
+  await room.webSocketMessage(host, valid);
+  for (const fileDropPreview of [0, 2, "1", true, null])
+    await room.webSocketMessage(host, JSON.stringify({ ...base, fileTransfer: 1, fileDrop: 1, fileDropPreview }));
+  for (const change of [{ fileTransfer: 2 }, { fileDrop: 2 }, { fileTransfer: undefined }, { fileDrop: undefined }, { serviceMode: true }])
+    await room.webSocketMessage(host, JSON.stringify({ ...JSON.parse(valid), ...change }));
+  await room.webSocketMessage(client, valid);
+  assert.deepEqual(client.messages, [valid]);
+  assert.deepEqual(host.messages, []);
+});
+
+function fileDragPreview(change = {}) {
+  return { type: "file-drag-preview", protocol: 1, epoch: CURRENT_MEDIA_EPOCH, dragId: 1, action: "update",
+    drop: { x: 0, y: 65535, generation: 1, viewportRevision: 0 }, types: ["text/plain", ""], ...change };
+}
+
+test("relays current-epoch native drag preview updates and cancellation client-to-host only", async () => {
+  const { room, sockets: [client, host] } = createRoom();
+  const update = JSON.stringify(fileDragPreview());
+  const cancel = JSON.stringify(fileDragPreview({ action: "cancel", drop: undefined, types: undefined }));
+  await room.webSocketMessage(client, update);
+  await room.webSocketMessage(client, cancel);
+  await room.webSocketMessage(host, update);
+  await room.webSocketMessage(host, cancel);
+  assert.deepEqual(host.messages, [update, cancel]);
+  assert.deepEqual(client.messages, []);
+  assert.deepEqual(client.closed, []);
+  assert.deepEqual(host.closed, []);
+});
+
+test("rejects malformed drag preview controls without closing either peer", async () => {
+  const { room, sockets: [client, host] } = createRoom();
+  for (const change of [
+    { epoch: STALE_MEDIA_EPOCH }, { epoch: CURRENT_MEDIA_EPOCH.toUpperCase() }, { epoch: undefined },
+    { protocol: 2 }, { protocol: "1" }, { dragId: 0 }, { dragId: -1 }, { dragId: 1.5 },
+    { dragId: 0x1_0000_0000 }, { dragId: "1" }, { action: "drop" }, { drop: undefined },
+    { drop: null }, { drop: [] }, { types: undefined }, { types: [] }, { types: Array(65).fill("") },
+    { types: ["a".repeat(97)] }, { types: ["text/ü"] }, { types: ["bad type"] },
+    { types: ["text/\n"] }, { types: [1] }, { extra: true },
+    { action: "cancel" }, { action: "cancel", drop: null, types: null },
+  ]) await room.webSocketMessage(client, JSON.stringify(fileDragPreview(change)));
+  for (const change of [
+    { x: -1 }, { x: 65536 }, { y: 0.5 }, { generation: 0 }, { generation: 0x1_0000_0000 },
+    { viewportRevision: -1 }, { viewportRevision: 0x1_0000_0000 }, { viewportRevision: undefined }, { extra: 1 },
+  ]) await room.webSocketMessage(client, JSON.stringify(fileDragPreview({ drop: { ...fileDragPreview().drop, ...change } })));
+  assert.deepEqual(host.messages, []);
+  assert.deepEqual(client.messages, []);
+  assert.deepEqual(client.closed, []);
+  assert.deepEqual(host.closed, []);
+});
+
+test("drag previews admit inclusive numeric/type limits and enforce the raw UTF8 ceiling", async () => {
+  const { room, sockets: [client, host] } = createRoom();
+  const value = fileDragPreview({ dragId: 0xffff_ffff, types: Array(64).fill("a".repeat(96)),
+    drop: { x: 65535, y: 0, generation: 0xffff_ffff, viewportRevision: 0xffff_ffff } });
+  const bounded = JSON.stringify(value).padEnd(8192, " ");
+  assert.equal(Buffer.byteLength(bounded), 8192);
+  await room.webSocketMessage(client, bounded);
+  await room.webSocketMessage(client, bounded + " ");
+  const escaped = JSON.stringify(value).replaceAll("a", "\\u0061");
+  assert.ok(Buffer.byteLength(escaped) > 8192);
+  await room.webSocketMessage(client, escaped);
+  assert.deepEqual(host.messages, [bounded]);
+});
+
+test("drag previews never queue for a later host", async () => {
+  const client = new FakeSocket("client");
+  client.attachment.mediaEpoch = CURRENT_MEDIA_EPOCH;
+  const writes = [];
+  const storage = { get: async () => [], put: async (...args) => writes.push(args), delete: async () => {} };
+  const room = new Room({ getWebSockets: () => [client], storage }, {});
+  await room.webSocketMessage(client, JSON.stringify(fileDragPreview()));
+  assert.deepEqual(writes, []);
+});
+
+test("relays follow controls only from the client with a boolean flag on the current v4 epoch", async () => {
+  const { room, sockets: [client, host] } = createRoom();
+  const on = JSON.stringify({ type: "media-control", action: "follow", follow: true, protocol: 4, epoch: CURRENT_MEDIA_EPOCH, reason: "user-follow" });
+  const off = JSON.stringify({ type: "media-control", action: "follow", follow: false, protocol: 4, epoch: CURRENT_MEDIA_EPOCH, reason: "user-follow" });
+  await room.webSocketMessage(client, on);
+  await room.webSocketMessage(client, off);
+  for (const invalid of [
+    { ...JSON.parse(on), follow: "true" },
+    { ...JSON.parse(on), follow: 1 },
+    { type: "media-control", action: "follow", protocol: 4, epoch: CURRENT_MEDIA_EPOCH },
+    { ...JSON.parse(on), epoch: STALE_MEDIA_EPOCH },
+    { ...JSON.parse(on), protocol: 2 },
+    { type: "media-control", action: "follow", follow: true, protocol: 4 },
+  ]) await room.webSocketMessage(client, JSON.stringify(invalid));
+  await room.webSocketMessage(host, on);
+  assert.deepEqual(host.messages, [on, off]);
+  assert.deepEqual(client.messages, []);
+  assert.deepEqual(client.closed, []);
+  assert.deepEqual(host.closed, []);
+});
+
+test("buffers only the latest follow control until the host connects", async () => {
+  const client = new FakeSocket("client");
+  client.attachment.mediaEpoch = CURRENT_MEDIA_EPOCH;
+  let pending = [];
+  const storage = {
+    get: async () => pending,
+    put: async (_key, value) => { pending = value; },
+    delete: async () => { pending = []; },
+  };
+  const room = new Room({ getWebSockets: () => [client], storage }, { TOKEN: "test" });
+  const follow = value => JSON.stringify({ type: "media-control", action: "follow", follow: value, protocol: 4, epoch: CURRENT_MEDIA_EPOCH, reason: "user-follow" });
+  const refresh = JSON.stringify({ type: "media-control", action: "monitors", protocol: 4, epoch: CURRENT_MEDIA_EPOCH });
+  await room.webSocketMessage(client, follow(true));
+  await room.webSocketMessage(client, refresh);
+  await room.webSocketMessage(client, follow(false));
+  await room.webSocketMessage(client, JSON.stringify({ ...JSON.parse(follow(true)), follow: "yes" }));
+  assert.deepEqual(pending, [refresh, follow(false)]);
+});
+
 test("relays the first-frame handshake in the correct direction and buffers only requests", async () => {
   const { room, sockets: [client, host] } = createRoom();
   const request = JSON.stringify({ type: "first-frame", protocol: 1, phase: "request", requestId: "firstFrame_1", transport: "webrtc" });
@@ -767,8 +908,10 @@ test("signaling relay carries binary input and cursor feedback in both direction
   const { room, sockets: [client, host] } = createRoom();
   const sync = Uint8Array.of(10, 7, 0).buffer;
   const cursor = Uint8Array.of(128, 7, 0, 0, 64, 0, 192, 3).buffer;
+  const cursorType = Uint8Array.of(129, 1).buffer;
   await room.webSocketMessage(client, sync);
   await room.webSocketMessage(host, cursor);
+  await room.webSocketMessage(host, cursorType);
   assert.deepEqual(host.messages, [sync]);
-  assert.deepEqual(client.messages, [cursor]);
+  assert.deepEqual(client.messages, [cursor, cursorType]);
 });

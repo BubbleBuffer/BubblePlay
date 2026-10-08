@@ -19,19 +19,30 @@
 //! | 12   | clipboard  | u8 flags(1=paste), u16 id, u16 index, u16 count, UTF-8 chunk (max 8 KiB) |
 //! | 13   | scan key   | u8 flags(1=up 2=extended), u16 set-1 scan (0 = use vk), u16 vk |
 //! | 128  | cursor state (host -> browser) | u16 ack, x, y, u8 flags |
+//! | 129  | cursor kind (host -> client, reliable) | u8 native kind |
 //!
 //! Anti-cheat note: SendInput is the v0 injection method. Games with kernel
 //! anti-cheat may ignore synthetic input or flag the process; accepted for v0.
 
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::admin_agent::client::AdminAgentLink;
 use crate::admin_agent::protocol::Record;
 use crate::clipboard;
-use windows::Win32::Foundation::{SetLastError, POINT, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    CloseHandle, SetLastError, ERROR_INVALID_PARAMETER, HANDLE, POINT, WAIT_ABANDONED,
+    WAIT_OBJECT_0, WIN32_ERROR,
+};
+use windows::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, ReleaseMutex, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+};
+use windows::Win32::UI::Accessibility::MOUSEKEYS;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
@@ -41,8 +52,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorInfo, GetCursorPos, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetCursorInfo, GetCursorPos, GetSystemMetrics, LoadCursorW, SystemParametersInfoW, CURSORINFO,
+    CURSOR_SHOWING, IDC_APPSTARTING, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO,
+    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_UPARROW, IDC_WAIT,
+    MKF_MOUSEKEYSON, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_MOUSEPRESENT, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SPI_GETMOUSEKEYS, SPI_SETMOUSEKEYS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
 const TYPE_KEY_DOWN: u8 = 0;
@@ -80,13 +94,680 @@ const SCAN_RWIN: u8 = 0x5C;
 const INPUT_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 pub const TYPE_CURSOR_STATE: u8 = 128;
-const CURSOR_ACK_VALID: u8 = 1;
+pub const TYPE_CURSOR_KIND: u8 = 129;
+pub(crate) const CURSOR_ACK_VALID: u8 = 1;
 const CURSOR_IN_BOUNDS: u8 = 2;
 const CURSOR_VISIBLE: u8 = 4;
 // Work mode treats the browser overlay as authoritative. A 10 Hz heartbeat
 // lets it detect an OS cursor displaced by local input without flooding the
 // control channel; changed positions are still emitted immediately.
 const CURSOR_HEARTBEAT: Duration = Duration::from_millis(100);
+
+/// Make Windows expose cursor semantics on a headless PC only while a viewer
+/// is active. No registry persistence or mouse movement is requested. MouseKeys
+/// retains the user's NumLock policy, so its normal numpad behavior applies
+/// until this guard restores the feature on disconnect or Drop.
+#[derive(Default)]
+pub struct HeadlessCursorSupport {
+    state: HeadlessCursorState,
+    marker: Option<PathBuf>,
+    retry: HeadlessCursorRetry,
+}
+
+impl HeadlessCursorSupport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_active(&mut self, active: bool) {
+        let now = Instant::now();
+        if !self.retry.take_attempt(active, now) {
+            return;
+        }
+        let _lock = match CursorSupportLock::acquire() {
+            Ok(lock) => lock,
+            Err(error) => {
+                // Record the requested edge; retries wait for their deadline.
+                self.state.active = active;
+                self.retry.finish(false, now);
+                warn!(?error, "headless cursor support lifecycle lock unavailable");
+                return;
+            }
+        };
+        self.remove_released_marker();
+        if active && self.state.owned.is_none() {
+            recover_cursor_marker(None);
+        }
+        let original = std::cell::Cell::new(None);
+        let mut claimed = None;
+        let enabling = active && self.state.owned.is_none();
+        let succeeded = self.state.apply_active_with(
+            active,
+            unsafe { GetSystemMetrics(SM_MOUSEPRESENT) } != 0,
+            || {
+                let settings = read_mouse_keys()?;
+                original.set(Some(settings));
+                Ok(settings)
+            },
+            |settings| {
+                if enabling {
+                    let path = create_cursor_marker(MouseKeysLease {
+                        original: original.get().expect("settings were read before enabling"),
+                        applied: *settings,
+                    })?;
+                    let result = write_mouse_keys(settings);
+                    if result.is_ok() {
+                        claimed = Some(path);
+                    } else if !remove_cursor_marker(&path, std::process::id()) {
+                        claimed = Some(path);
+                    }
+                    result
+                } else {
+                    write_mouse_keys(settings)
+                }
+            },
+        );
+        if let Some(path) = claimed {
+            self.marker = Some(path);
+        }
+        self.remove_released_marker();
+        // A failed marker deletion must also be retried before a later viewer
+        // can claim its lease. Successful transitions never poll external edits.
+        let released = self.state.owned.is_some() || self.marker.is_none();
+        self.retry.finish(succeeded && released, now);
+    }
+
+    fn remove_released_marker(&mut self) {
+        if self.state.owned.is_none() {
+            if let Some(path) = self.marker.as_ref() {
+                if remove_cursor_marker(path, std::process::id()) {
+                    self.marker = None;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct HeadlessCursorRetry {
+    requested_active: Option<bool>,
+    attempts: u8,
+    next_attempt: Option<Instant>,
+}
+
+impl HeadlessCursorRetry {
+    fn take_attempt(&mut self, active: bool, now: Instant) -> bool {
+        if self.requested_active != Some(active) {
+            self.requested_active = Some(active);
+            self.attempts = 0;
+            self.next_attempt = None;
+        } else if self.next_attempt.is_none_or(|next| now < next) {
+            return false;
+        }
+        self.attempts += 1;
+        self.next_attempt = None;
+        true
+    }
+
+    fn finish(&mut self, succeeded: bool, now: Instant) {
+        // One initial attempt plus two bounded recovery attempts. Never retry
+        // a successful activation because the user may disable it themselves.
+        if !succeeded && self.attempts < 3 {
+            self.next_attempt = Some(now + Duration::from_secs(self.attempts as u64));
+        }
+    }
+}
+
+impl Drop for HeadlessCursorSupport {
+    fn drop(&mut self) {
+        // One final restoration/marker cleanup attempt after bounded retries.
+        // A process that never acquired ownership does no settings API work.
+        if self.state.owned.is_some() || self.marker.is_some() {
+            if let Ok(_lock) = CursorSupportLock::acquire() {
+                self.state.restore_with(read_mouse_keys, write_mouse_keys);
+                self.remove_released_marker();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MouseKeysLease {
+    original: MOUSEKEYS,
+    applied: MOUSEKEYS,
+}
+
+// The marker records only the one feature bit we own and its surrounding
+// preferences. It is durable before the API write, so tray kill/job teardown
+// can restore it even when Rust Drop cannot run.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CursorRecoveryRecord {
+    owner_pid: u32,
+    original: [u32; 7],
+    applied: [u32; 7],
+}
+
+impl CursorRecoveryRecord {
+    fn new(owner_pid: u32, lease: MouseKeysLease) -> Self {
+        Self {
+            owner_pid,
+            original: mouse_keys_fields(lease.original),
+            applied: mouse_keys_fields(lease.applied),
+        }
+    }
+
+    fn lease(&self) -> windows::core::Result<MouseKeysLease> {
+        let original = mouse_keys_from_fields(self.original);
+        let applied = mouse_keys_from_fields(self.applied);
+        let mut expected = original;
+        expected.dwFlags |= MKF_MOUSEKEYSON;
+        if self.owner_pid == 0
+            || original.cbSize != std::mem::size_of::<MOUSEKEYS>() as u32
+            || original.dwFlags & MKF_MOUSEKEYSON != 0
+            || applied != expected
+        {
+            return Err(cursor_support_error(
+                "invalid headless cursor ownership record",
+            ));
+        }
+        Ok(MouseKeysLease { original, applied })
+    }
+}
+
+fn mouse_keys_fields(settings: MOUSEKEYS) -> [u32; 7] {
+    [
+        settings.cbSize,
+        settings.dwFlags,
+        settings.iMaxSpeed,
+        settings.iTimeToMaxSpeed,
+        settings.iCtrlSpeed,
+        settings.dwReserved1,
+        settings.dwReserved2,
+    ]
+}
+
+fn mouse_keys_from_fields(fields: [u32; 7]) -> MOUSEKEYS {
+    MOUSEKEYS {
+        cbSize: fields[0],
+        dwFlags: fields[1],
+        iMaxSpeed: fields[2],
+        iTimeToMaxSpeed: fields[3],
+        iCtrlSpeed: fields[4],
+        dwReserved1: fields[5],
+        dwReserved2: fields[6],
+    }
+}
+
+fn cursor_support_error(message: impl AsRef<str>) -> windows::core::Error {
+    windows::core::Error::new(windows::Win32::Foundation::E_FAIL, message)
+}
+
+fn cursor_marker_path() -> windows::core::Result<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| cursor_support_error("LOCALAPPDATA is unavailable for cursor recovery"))?;
+    Ok(PathBuf::from(base)
+        .join("BubblePlay")
+        .join("headless-cursor-state.json"))
+}
+
+fn write_cursor_marker(path: &Path, record: &CursorRecoveryRecord) -> windows::core::Result<()> {
+    let bytes =
+        serde_json::to_vec(record).map_err(|error| cursor_support_error(error.to_string()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| cursor_support_error(format!("claim cursor recovery marker: {error}")))?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(cursor_support_error(format!(
+            "save cursor recovery marker: {error}"
+        )));
+    }
+    Ok(())
+}
+
+fn create_cursor_marker(lease: MouseKeysLease) -> windows::core::Result<PathBuf> {
+    let path = cursor_marker_path()?;
+    std::fs::create_dir_all(path.parent().expect("fixed cursor marker has a parent"))
+        .map_err(|error| cursor_support_error(error.to_string()))?;
+    write_cursor_marker(&path, &CursorRecoveryRecord::new(std::process::id(), lease))?;
+    Ok(path)
+}
+
+fn read_cursor_marker(path: &Path) -> windows::core::Result<Option<CursorRecoveryRecord>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(cursor_support_error(error.to_string())),
+    };
+    let mut bytes = Vec::new();
+    file.take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|error| cursor_support_error(error.to_string()))?;
+    if bytes.len() > 4096 {
+        return Err(cursor_support_error("oversized cursor recovery marker"));
+    }
+    let record: CursorRecoveryRecord =
+        serde_json::from_slice(&bytes).map_err(|error| cursor_support_error(error.to_string()))?;
+    record.lease()?;
+    Ok(Some(record))
+}
+
+fn remove_cursor_marker(path: &Path, owner_pid: u32) -> bool {
+    match read_cursor_marker(path) {
+        Ok(Some(record)) if record.owner_pid == owner_pid => {
+            if let Err(error) = std::fs::remove_file(path) {
+                warn!(?error, "could not remove restored cursor recovery marker");
+                return false;
+            }
+            true
+        }
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(error) => {
+            warn!(
+                ?error,
+                "could not validate cursor recovery marker for removal"
+            );
+            false
+        }
+    }
+}
+
+/// Called by the tray only after a host exits. The dead-PID check is independent
+/// of the tray's wait result, and a live or mismatched owner is left untouched.
+pub fn restore_headless_cursor_after_exit(pid: u32) {
+    match CursorSupportLock::acquire() {
+        Ok(_lock) => recover_cursor_marker(Some(pid)),
+        Err(error) => warn!(?error, "cursor recovery lifecycle lock unavailable"),
+    }
+}
+
+/// Local tray-host startup recovery, including when no viewer is connected.
+/// Privileged Agent callers must not invoke this per-user settings operation.
+pub fn recover_headless_cursor_support() {
+    match CursorSupportLock::acquire() {
+        Ok(_lock) => recover_cursor_marker(None),
+        Err(error) => warn!(?error, "cursor startup recovery lifecycle lock unavailable"),
+    }
+}
+
+fn recover_cursor_marker(expected_owner: Option<u32>) {
+    let result = (|| -> windows::core::Result<()> {
+        let path = cursor_marker_path()?;
+        let Some(record) = read_cursor_marker(&path)? else {
+            return Ok(());
+        };
+        if expected_owner.is_some_and(|pid| pid != record.owner_pid)
+            || cursor_owner_alive(record.owner_pid)
+        {
+            return Ok(());
+        }
+        let lease = record.lease()?;
+        if let Some(restored) = mouse_keys_restoration(lease, read_mouse_keys()?) {
+            write_mouse_keys(&restored)?;
+        }
+        if !remove_cursor_marker(&path, record.owner_pid) {
+            return Err(cursor_support_error(
+                "restored settings but could not remove recovery marker",
+            ));
+        }
+        info!(
+            owner_pid = record.owner_pid,
+            "restored headless cursor support after host exit"
+        );
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // Keep the durable marker on failure for the next lifecycle attempt.
+        warn!(
+            ?error,
+            "headless cursor recovery could not restore settings"
+        );
+    }
+}
+
+fn cursor_owner_alive(pid: u32) -> bool {
+    match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+        Ok(process) => {
+            let exited = unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0;
+            let _ = unsafe { CloseHandle(process) };
+            !exited
+        }
+        Err(error) => error.code().0 as u32 != (0x8007_0000 | ERROR_INVALID_PARAMETER.0),
+    }
+}
+
+// Serialize lifecycle changes between a starting host and tray exit cleanup.
+// A killed process automatically abandons this kernel mutex; no watcher or
+// persistent lock file is required.
+struct CursorSupportLock(HANDLE);
+
+impl CursorSupportLock {
+    fn acquire() -> windows::core::Result<Self> {
+        let handle = unsafe {
+            CreateMutexW(
+                None,
+                false,
+                windows::core::w!("Local\\BubblePlay.HeadlessCursorSupport"),
+            )
+        }?;
+        let wait = unsafe { WaitForSingleObject(handle, 250) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            return Ok(Self(handle));
+        }
+        let _ = unsafe { CloseHandle(handle) };
+        Err(cursor_support_error("headless cursor lifecycle is busy"))
+    }
+}
+
+impl Drop for CursorSupportLock {
+    fn drop(&mut self) {
+        let _ = unsafe { ReleaseMutex(self.0) };
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[derive(Default)]
+struct HeadlessCursorState {
+    active: bool,
+    owned: Option<MouseKeysLease>,
+}
+
+impl HeadlessCursorState {
+    #[cfg(test)]
+    fn set_active_with(
+        &mut self,
+        active: bool,
+        mouse_present: bool,
+        read: impl FnMut() -> windows::core::Result<MOUSEKEYS>,
+        write: impl FnMut(&MOUSEKEYS) -> windows::core::Result<()>,
+    ) {
+        if self.active == active {
+            return;
+        }
+        self.apply_active_with(active, mouse_present, read, write);
+    }
+
+    fn apply_active_with(
+        &mut self,
+        active: bool,
+        mouse_present: bool,
+        mut read: impl FnMut() -> windows::core::Result<MOUSEKEYS>,
+        mut write: impl FnMut(&MOUSEKEYS) -> windows::core::Result<()>,
+    ) -> bool {
+        self.active = active;
+        if !active {
+            self.restore_with(read, write);
+            return self.owned.is_none();
+        }
+        if mouse_present || self.owned.is_some() {
+            return true;
+        }
+        let original = match read() {
+            Ok(settings) => settings,
+            Err(error) => {
+                warn!(?error, "headless cursor support could not read MouseKeys");
+                return false;
+            }
+        };
+        if original.dwFlags & MKF_MOUSEKEYSON != 0 {
+            // The user owns an already-enabled feature; never disable it later.
+            return true;
+        }
+        let mut applied = original;
+        applied.dwFlags |= MKF_MOUSEKEYSON;
+        match write(&applied) {
+            Ok(()) => {
+                self.owned = Some(MouseKeysLease { original, applied });
+                info!("headless cursor support enabled MouseKeys for the active viewer");
+                true
+            }
+            Err(error) => {
+                warn!(?error, "headless cursor support could not enable MouseKeys");
+                false
+            }
+        }
+    }
+
+    fn restore_with(
+        &mut self,
+        mut read: impl FnMut() -> windows::core::Result<MOUSEKEYS>,
+        mut write: impl FnMut(&MOUSEKEYS) -> windows::core::Result<()>,
+    ) {
+        let Some(lease) = self.owned else {
+            return;
+        };
+        let current = match read() {
+            Ok(settings) => settings,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "headless cursor support could not read settings for restoration"
+                );
+                return;
+            }
+        };
+        let Some(restored) = mouse_keys_restoration(lease, current) else {
+            self.owned = None;
+            return;
+        };
+        match write(&restored) {
+            Ok(()) => {
+                self.owned = None;
+                info!("headless cursor support restored MouseKeys after the viewer");
+            }
+            Err(error) => warn!(
+                ?error,
+                "headless cursor support could not restore MouseKeys"
+            ),
+        }
+    }
+}
+
+fn mouse_keys_restoration(lease: MouseKeysLease, current: MOUSEKEYS) -> Option<MOUSEKEYS> {
+    if current.dwFlags & MKF_MOUSEKEYSON == 0 {
+        return None; // The user already disabled it; preserve every current field.
+    }
+    if current == lease.applied {
+        return Some(lease.original);
+    }
+    // Concurrent preference edits belong to the user. Restore only the ON bit
+    // acquired by this guard, keeping their current speed and NumLock settings.
+    let mut restored = current;
+    restored.dwFlags &= !MKF_MOUSEKEYSON;
+    Some(restored)
+}
+
+fn read_mouse_keys() -> windows::core::Result<MOUSEKEYS> {
+    let mut settings = MOUSEKEYS {
+        cbSize: std::mem::size_of::<MOUSEKEYS>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSEKEYS,
+            settings.cbSize,
+            Some((&raw mut settings).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )?;
+    }
+    Ok(settings)
+}
+
+fn write_mouse_keys(settings: &MOUSEKEYS) -> windows::core::Result<()> {
+    let mut settings = *settings;
+    unsafe {
+        SystemParametersInfoW(
+            SPI_SETMOUSEKEYS,
+            settings.cbSize,
+            Some((&raw mut settings).cast()),
+            // No SPIF_UPDATEINIFILE: the change is limited to this login session.
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+}
+
+/// Stable native cursor semantics shared by browser and Android clients.
+/// Custom Windows images deliberately fall back to the client's arrow.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    Arrow = 0,
+    Text = 1,
+    Pointer = 2,
+    Crosshair = 3,
+    Move = 4,
+    ResizeNS = 5,
+    ResizeEW = 6,
+    ResizeNESW = 7,
+    ResizeNWSE = 8,
+    Wait = 9,
+    Progress = 10,
+    NotAllowed = 11,
+    Help = 12,
+    UpArrow = 13,
+    Hidden = 14,
+}
+
+impl CursorKind {
+    pub fn encode(self) -> [u8; 2] {
+        [TYPE_CURSOR_KIND, self as u8]
+    }
+
+    pub fn from_id(id: u8) -> Option<Self> {
+        Some(match id {
+            0 => Self::Arrow,
+            1 => Self::Text,
+            2 => Self::Pointer,
+            3 => Self::Crosshair,
+            4 => Self::Move,
+            5 => Self::ResizeNS,
+            6 => Self::ResizeEW,
+            7 => Self::ResizeNESW,
+            8 => Self::ResizeNWSE,
+            9 => Self::Wait,
+            10 => Self::Progress,
+            11 => Self::NotAllowed,
+            12 => Self::Help,
+            13 => Self::UpArrow,
+            14 => Self::Hidden,
+            _ => return None,
+        })
+    }
+}
+
+fn classify_cursor(handle: usize, visible: bool, standard: &[usize; 14]) -> CursorKind {
+    if !visible {
+        return CursorKind::Hidden;
+    }
+    if handle != 0 {
+        if let Some(index) = standard
+            .iter()
+            .position(|&candidate| candidate != 0 && candidate == handle)
+        {
+            return CursorKind::from_id(index as u8).unwrap_or(CursorKind::Arrow);
+        }
+    }
+    CursorKind::Arrow
+}
+
+/// Desktop-bound standard handles are loaded once, with no allocation during
+/// movement. A small replay heartbeat covers WSS joins and reconnects even
+/// when the pointer is stationary and the client has not requested a sync.
+pub struct CursorKindTracker {
+    standard: [usize; 14],
+    last_kind: Option<CursorKind>,
+    last_emit: Instant,
+    last_diagnostic: Option<((u32, usize, CursorKind), Instant)>,
+    headless_support: HeadlessCursorSupport,
+}
+
+impl CursorKindTracker {
+    pub fn new(now: Instant) -> Self {
+        let ids = [
+            IDC_ARROW,
+            IDC_IBEAM,
+            IDC_HAND,
+            IDC_CROSS,
+            IDC_SIZEALL,
+            IDC_SIZENS,
+            IDC_SIZEWE,
+            IDC_SIZENESW,
+            IDC_SIZENWSE,
+            IDC_WAIT,
+            IDC_APPSTARTING,
+            IDC_NO,
+            IDC_HELP,
+            IDC_UPARROW,
+        ];
+        Self {
+            standard: ids
+                .map(|id| unsafe { LoadCursorW(None, id) }.map_or(0, |cursor| cursor.0 as usize)),
+            last_kind: None,
+            last_emit: now,
+            last_diagnostic: None,
+            headless_support: HeadlessCursorSupport::new(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.last_kind = None;
+    }
+
+    pub fn set_active(&mut self, active: bool) {
+        if self.headless_support.state.active != active {
+            self.reset();
+        }
+        self.headless_support.set_active(active);
+    }
+
+    pub fn sample(&mut self, force: bool, now: Instant) -> Option<CursorKind> {
+        let mut info = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        // A failed desktop query is not proof that Windows hid the pointer.
+        if unsafe { GetCursorInfo(&raw mut info) }.is_err() {
+            return None;
+        }
+        let kind = classify_cursor(
+            info.hCursor.0 as usize,
+            info.flags.0 & CURSOR_SHOWING.0 != 0,
+            &self.standard,
+        );
+        let snapshot = (info.flags.0, info.hCursor.0 as usize, kind);
+        if self.last_diagnostic.is_none_or(|(previous, at)| {
+            previous != snapshot && now.saturating_duration_since(at) >= Duration::from_millis(250)
+        }) {
+            info!(
+                flags = info.flags.0,
+                handle_present = snapshot.1 != 0,
+                standard_match = snapshot.1 != 0 && self.standard.contains(&snapshot.1),
+                ?kind,
+                mouse_present = unsafe { GetSystemMetrics(SM_MOUSEPRESENT) } != 0,
+                "native cursor classification changed"
+            );
+            self.last_diagnostic = Some((snapshot, now));
+        }
+        self.observe(kind, force, now)
+    }
+
+    fn observe(&mut self, kind: CursorKind, force: bool, now: Instant) -> Option<CursorKind> {
+        if !force
+            && self.last_kind == Some(kind)
+            && now.saturating_duration_since(self.last_emit) < Duration::from_secs(1)
+        {
+            return None;
+        }
+        self.last_kind = Some(kind);
+        self.last_emit = now;
+        Some(kind)
+    }
+}
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -103,6 +784,97 @@ enum Command {
     Text(String),
     ScanKey(HeldKey, bool),
     Clipboard(ClipboardChunk),
+}
+
+fn release_only(command: Command, held_buttons: u8) -> Option<Command> {
+    match command {
+        Command::Key(_, true)
+        | Command::ScanKey(_, true)
+        | Command::ReleaseAll
+        | Command::CursorSync(_) => Some(command),
+        Command::Buttons(mask) | Command::ButtonsAt(_, _, _, mask) => {
+            Some(Command::Buttons(held_buttons & mask))
+        }
+        _ => None,
+    }
+}
+
+/// Held input carried through a monitor switch. While presentation is gated,
+/// remember a release instead of forwarding it to an unavailable desktop.
+/// Resume releases both input backends before any new pointer movement.
+#[derive(Default)]
+pub struct CarriedInput {
+    keys: BTreeSet<HeldKey>,
+    buttons: u8,
+    carrying: bool,
+    release_pending: bool,
+}
+
+impl CarriedInput {
+    pub fn begin_switch(&mut self, carry: bool) {
+        if carry {
+            self.carrying = true;
+        } else {
+            self.reset();
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Observe only packets admitted by the producer's input gate.
+    pub fn observe_forwarded(&mut self, data: &[u8]) {
+        match decode(data) {
+            Some(Command::Key(vk, up)) => self.key(HeldKey::Vk(vk), up),
+            Some(Command::ScanKey(key, up)) => self.key(key, up),
+            Some(Command::Buttons(mask) | Command::ButtonsAt(_, _, _, mask)) => {
+                self.buttons = mask;
+            }
+            Some(Command::ReleaseAll) => self.reset(),
+            _ => {}
+        }
+    }
+
+    fn key(&mut self, key: HeldKey, up: bool) {
+        if up {
+            self.keys.remove(&key);
+        } else {
+            self.keys.insert(key);
+        }
+    }
+
+    pub fn observe_gated(&mut self, data: &[u8]) {
+        if !self.carrying {
+            return;
+        }
+        let releases_held_input = match decode(data) {
+            Some(Command::Key(vk, true)) => self.keys.contains(&HeldKey::Vk(vk)),
+            Some(Command::ScanKey(key, true)) => self.keys.contains(&key),
+            Some(Command::Buttons(mask) | Command::ButtonsAt(_, _, _, mask)) => {
+                self.buttons & !mask != 0
+            }
+            Some(Command::ReleaseAll) => !self.keys.is_empty() || self.buttons != 0,
+            _ => false,
+        };
+        self.release_pending |= releases_held_input;
+    }
+
+    /// A true result must release both sinks before processing resumed input.
+    /// Releasing all ends a carried drag when any carried key/button was let
+    /// go, including when the backend could not accept input during the gate.
+    pub fn take_resume_release(&mut self, capture_available: bool, input_ready: bool) -> bool {
+        if !capture_available || !input_ready {
+            return false;
+        }
+        self.carrying = false;
+        if self.release_pending {
+            self.reset();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// One physical key as the host injected it. Scan-code keys and VK-only keys
@@ -211,12 +983,250 @@ fn decode(data: &[u8]) -> Option<Command> {
     }
 }
 
-fn newer_sequence(last: Option<u16>, next: u16) -> bool {
+pub(crate) fn newer_sequence(last: Option<u16>, next: u16) -> bool {
     last.map(|old| {
         let delta = next.wrapping_sub(old);
         delta != 0 && delta < 0x8000
     })
     .unwrap_or(true)
+}
+
+/// Coalesce only admitted producer input. Validate every original sequence,
+/// including packets eliminated by coalescing, before accumulating deltas.
+/// Different motion kinds and every control packet are ordering barriers.
+#[derive(Default)]
+pub struct InputPacketCoalescer {
+    last_sequence: Option<u16>,
+}
+
+impl InputPacketCoalescer {
+    pub fn observe_release_only(&mut self, data: &[u8]) {
+        if matches!(decode(data), Some(Command::ButtonsAt(..) | Command::CursorSync(..))) {
+            self.observe(data);
+        }
+    }
+
+    pub fn observe(&mut self, data: &[u8]) {
+        let sequence = match decode(data) {
+            Some(Command::Motion(seq, ..) | Command::Absolute(seq, ..)
+                | Command::ButtonsAt(seq, ..) | Command::CursorSync(seq)) => seq,
+            _ => return,
+        };
+        if newer_sequence(self.last_sequence, sequence) {
+            self.last_sequence = Some(sequence);
+        }
+    }
+
+    pub fn coalesce(&mut self, packets: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut output = Vec::with_capacity(packets.len());
+        let mut pending: Option<(Vec<u8>, Option<u16>)> = None;
+        for packet in packets {
+            let command = decode(&packet);
+            let sequence = match command {
+                Some(Command::Motion(seq, ..) | Command::Absolute(seq, ..)) => Some(seq),
+                _ => None,
+            };
+            let motion = matches!(command, Some(Command::Rel(..) | Command::Abs(..)
+                | Command::Wheel(..) | Command::Motion(..) | Command::Absolute(..)));
+            let before = self.last_sequence;
+            let accepted = sequence.is_none_or(|seq| newer_sequence(before, seq));
+            if motion && accepted {
+                self.observe(&packet);
+                if let Some((previous, anchor)) = pending.as_mut() {
+                    // The merged sequence must still be acceptable from the
+                    // watermark before the run, even across a long/wrapped run.
+                    if sequence.is_none_or(|seq| newer_sequence(*anchor, seq))
+                        && merge_motion_packet(previous, &packet)
+                    {
+                        continue;
+                    }
+                }
+                if let Some((previous, _)) = pending.take() {
+                    output.push(previous);
+                }
+                pending = Some((packet, before));
+            } else {
+                if let Some((previous, _)) = pending.take() {
+                    output.push(previous);
+                }
+                self.observe(&packet);
+                // Keep stale and malformed packets for the sink's existing
+                // rejection/accounting path; never add their displacement.
+                output.push(packet);
+            }
+        }
+        if let Some((previous, _)) = pending {
+            output.push(previous);
+        }
+        output
+    }
+}
+
+fn merge_motion_packet(previous: &mut Vec<u8>, next: &[u8]) -> bool {
+    if previous[0] != next[0] {
+        return false;
+    }
+    let (start, end) = match decode(next) {
+        Some(Command::Abs(..) | Command::Absolute(..)) => {
+            previous.copy_from_slice(next);
+            return true;
+        }
+        Some(Command::Rel(..)) => (1, 5),
+        Some(Command::Wheel(..)) => (1, 3),
+        Some(Command::Motion(..)) => (3, 11),
+        _ => return false,
+    };
+    let mut merged = previous.clone();
+    for offset in (start..end).step_by(2) {
+        let a = i16::from_le_bytes([previous[offset], previous[offset + 1]]);
+        let b = i16::from_le_bytes([next[offset], next[offset + 1]]);
+        let Some(sum) = a.checked_add(b) else {
+            // Flush before overflow: splitting retains all displacement and
+            // distinct accepted sequences without clamping or duplication.
+            return false;
+        };
+        merged[offset..offset + 2].copy_from_slice(&sum.to_le_bytes());
+    }
+    if start == 3 {
+        merged[1..3].copy_from_slice(&next[1..3]);
+    }
+    *previous = merged;
+    true
+}
+
+#[cfg(test)]
+mod packet_coalescing_tests {
+    use super::*;
+
+    fn packet(kind: u8, values: &[i16]) -> Vec<u8> {
+        let mut packet = vec![kind];
+        for value in values {
+            packet.extend_from_slice(&value.to_le_bytes());
+        }
+        packet
+    }
+
+    fn motion(seq: u16, dx: i16, dy: i16, wx: i16, wy: i16) -> Vec<u8> {
+        packet(TYPE_MOTION_V2, &[seq as i16, dx, dy, wx, wy])
+    }
+
+    #[test]
+    fn coalescing_sums_displacement_and_wheels_without_overflow_loss() {
+        let mut coalescer = InputPacketCoalescer::default();
+        let output = coalescer.coalesce(vec![
+            motion(1, 20_000, -5, 7, 120),
+            motion(2, 20_000, 8, -3, -40),
+            motion(3, -5, 2, 1, 20),
+        ]);
+        assert_eq!(output.len(), 2);
+        assert_eq!(decode(&output[0]), Some(Command::Motion(1, 20_000, -5, 7, 120)));
+        assert_eq!(decode(&output[1]), Some(Command::Motion(3, 19_995, 10, -2, -20)));
+        let legacy = coalescer.coalesce(vec![
+            packet(TYPE_MOUSE_REL, &[3, 5]), packet(TYPE_MOUSE_REL, &[-1, 2]),
+            packet(TYPE_WHEEL, &[120]), packet(TYPE_WHEEL, &[-40]),
+        ]);
+        assert_eq!(legacy, vec![packet(TYPE_MOUSE_REL, &[2, 7]), packet(TYPE_WHEEL, &[80])]);
+    }
+
+    #[test]
+    fn coalescing_keeps_controls_and_mixed_absolute_relative_order() {
+        let controls = vec![
+            vec![TYPE_BUTTONS, 1], packet(TYPE_KEY_DOWN, &[65]),
+            vec![TYPE_TEXT, b'x'], vec![TYPE_RELEASE_ALL],
+            packet(TYPE_CURSOR_SYNC, &[3]),
+        ];
+        for control in controls {
+            let mut coalescer = InputPacketCoalescer::default();
+            let a = packet(TYPE_ABSOLUTE_V2, &[1, 100, 200]);
+            let b = packet(TYPE_ABSOLUTE_V2, &[2, 300, 400]);
+            let c = motion(3, 5, 0, 0, 0);
+            let d = packet(TYPE_ABSOLUTE_V2, &[4, 500, 600]);
+            let e = packet(TYPE_ABSOLUTE_V2, &[5, 700, 800]);
+            assert_eq!(coalescer.coalesce(vec![a, b.clone(), c.clone(), control.clone(), d, e.clone()]),
+                vec![b, c, control, e]);
+        }
+        let click = vec![TYPE_BUTTONS_AT, 10, 0, 100, 0, 200, 0, 1];
+        let mut coalescer = InputPacketCoalescer::default();
+        let after = motion(11, 9, 0, 0, 0);
+        assert_eq!(coalescer.coalesce(vec![motion(9, 3, 0, 0, 0), click.clone(), after.clone()]),
+            vec![motion(9, 3, 0, 0, 0), click, after]);
+    }
+
+    #[test]
+    fn coalescing_checks_each_sequence_across_batches_and_wrap() {
+        let mut coalescer = InputPacketCoalescer::default();
+        coalescer.observe(&motion(u16::MAX - 1, 0, 0, 0, 0));
+        let output = coalescer.coalesce(vec![motion(u16::MAX, 2, 0, 0, 0), motion(0, 3, 0, 0, 0)]);
+        assert_eq!(output, vec![motion(0, 5, 0, 0, 0)]);
+        let output = coalescer.coalesce(vec![
+            motion(u16::MAX, 100, 0, 0, 0), motion(0, 100, 0, 0, 0),
+            motion(1, 4, 0, 0, 0), motion(2, 6, 0, 0, 0),
+        ]);
+        let mut sink_state = InputState { last_motion_sequence: Some(0), ..Default::default() };
+        let mut displacement = 0;
+        for packet in output {
+            if let Some(Command::Motion(seq, dx, ..)) = decode(&packet) {
+                if sink_state.accept_motion(seq) {
+                    displacement += i32::from(dx);
+                }
+            }
+        }
+        assert_eq!(displacement, 10);
+        assert_eq!(sink_state.last_motion_sequence, Some(2));
+        coalescer.observe_release_only(&packet(TYPE_CURSOR_SYNC, &[10]));
+        assert_eq!(coalescer.last_sequence, Some(10));
+        coalescer.observe_release_only(&motion(11, 2, 0, 0, 0));
+        assert_eq!(coalescer.last_sequence, Some(10));
+    }
+
+    #[test]
+    fn coalescing_splits_sequence_windows_and_preserves_stale_rejection() {
+        let mut coalescer = InputPacketCoalescer { last_sequence: Some(0) };
+        let output = coalescer.coalesce(vec![
+            motion(1, 1, 0, 0, 0), motion(16_384, 1, 0, 0, 0),
+            motion(32_767, 1, 0, 0, 0), motion(32_768, 1, 0, 0, 0),
+            motion(40_000, 1, 0, 0, 0),
+        ]);
+        assert_eq!(output, vec![motion(32_767, 3, 0, 0, 0), motion(40_000, 2, 0, 0, 0)]);
+        let rejected = motion(40_000u16.wrapping_add(0x8000), 100, 0, 0, 0);
+        let accepted = motion(40_001, 5, 0, 0, 0);
+        assert_eq!(coalescer.coalesce(vec![rejected.clone(), accepted.clone()]), vec![rejected, accepted]);
+    }
+
+    #[test]
+    fn cancelled_motion_reaches_the_sink_and_requests_cursor_acknowledgement() {
+        let mut coalescer = InputPacketCoalescer::default();
+        let packets = coalescer.coalesce(vec![
+            motion(1, 5, 0, 0, 0), motion(2, -5, 0, 0, 0),
+        ]);
+        assert_eq!(packets, vec![motion(2, 0, 0, 0, 0)]);
+        let mut sink = InputSink::new();
+        let outcome = sink.handle(&packets[0]);
+        assert_eq!(outcome.accepted_sequence, Some(2));
+        assert_eq!(outcome.application.requested, 0);
+        // These are the production local (main.rs) and privileged backend
+        // decisions to sample/send the cursor, not just packet decoding.
+        assert!(outcome.cursor_feedback_requested());
+        assert!(outcome.cursor_changed || outcome.sync_requested || outcome.feedback_reliable);
+        let stale = sink.handle(&packets[0]);
+        assert_eq!(stale.accepted_sequence, None);
+        assert!(!stale.cursor_feedback_requested());
+    }
+
+    #[test]
+    fn fully_cancelled_motion_and_wheels_still_acknowledge_sequence_wrap() {
+        let mut coalescer = InputPacketCoalescer::default();
+        let packets = coalescer.coalesce(vec![
+            motion(u16::MAX, 5, -2, 120, -120), motion(0, -5, 2, -120, 120),
+        ]);
+        assert_eq!(packets, vec![motion(0, 0, 0, 0, 0)]);
+        let mut sink = InputSink::new();
+        let outcome = sink.handle(&packets[0]);
+        assert_eq!(outcome.accepted_sequence, Some(0));
+        assert_eq!(outcome.application.requested, 0);
+        assert!(outcome.cursor_feedback_requested());
+        assert!(outcome.cursor_changed || outcome.sync_requested || outcome.feedback_reliable);
+    }
 }
 
 pub struct InputSink {
@@ -227,6 +1237,9 @@ pub struct InputSink {
     clipboard: Option<ClipboardSync>,
     /// Admin mode: the elevated agent injects on our behalf when reachable.
     admin_agent: Option<AdminAgentLink>,
+    secure_helper: Option<std::sync::Arc<std::sync::Mutex<crate::secure_helper::client::SecureHelperLink>>>,
+    secure_desktop: bool,
+    secure_input_allowed: bool,
 }
 
 /// Clipboard state exists only where the sink runs as the interactive user
@@ -307,6 +1320,17 @@ pub struct InputOutcome {
     pub sync_requested: bool,
     pub feedback_reliable: bool,
     pub application: InputApplication,
+}
+
+impl InputOutcome {
+    /// An accepted sequence needs a sampled acknowledgement even if motion
+    /// coalesced to zero or Windows did not move the pointer.
+    pub fn cursor_feedback_requested(self) -> bool {
+        self.accepted_sequence.is_some()
+            || self.cursor_changed
+            || self.sync_requested
+            || self.feedback_reliable
+    }
 }
 
 /// What Windows accepted at the `SendInput` boundary for one browser packet.
@@ -485,6 +1509,18 @@ fn map_monitor_absolute_to_virtual(
         pixel_to_normalized_axis(pixel_x, virtual_desktop.x, virtual_desktop.width),
         pixel_to_normalized_axis(pixel_y, virtual_desktop.y, virtual_desktop.height),
     )
+}
+
+fn absolute_coordinates_for_input(
+    secure: bool, x: u16, y: u16, monitor: DesktopRegion, normal_virtual: DesktopRegion,
+) -> (u16, u16) {
+    if secure {
+        // Secure protocol v2 carries capture-region coordinates. Only the
+        // desktop-bound SYSTEM worker knows the target virtual-screen geometry.
+        (x, y)
+    } else {
+        map_monitor_absolute_to_virtual(x, y, monitor, normal_virtual)
+    }
 }
 
 fn virtual_desktop_region() -> Option<DesktopRegion> {
@@ -713,6 +1749,29 @@ fn keyboard_input(key: HeldKey, up: bool) -> KEYBDINPUT {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secure_absolute_coordinates_are_not_normalized_against_default_desktop() {
+        let selected = super::DesktopRegion::new(1920, 0, 1920, 1080);
+        let normal = super::DesktopRegion::new(0, 0, 3840, 1080);
+        for point in [(0, 0), (32768, 32768), (65535, 65535)] {
+            assert_eq!(super::absolute_coordinates_for_input(true, point.0, point.1, selected, normal), point);
+        }
+        assert_ne!(super::absolute_coordinates_for_input(false, 32768, 32768, selected, normal), (32768, 32768));
+    }
+    #[test]
+    fn secure_input_is_dropped_without_capability_and_never_falls_back() {
+        let mut sink = super::InputSink::new();
+        sink.set_secure_desktop(true, false);
+        for packet in [vec![super::TYPE_KEY_DOWN, 65, 0], vec![super::TYPE_TEXT, b'x']] {
+            assert_eq!(sink.handle(&packet), super::InputOutcome::default());
+        }
+        sink.set_secure_desktop(true, true);
+        let result = sink.handle(&[super::TYPE_TEXT, b'x']);
+        assert_eq!(result.application.applied, 0);
+        assert!(result.application.requested > 0);
+        assert_eq!(sink.handle(&[super::TYPE_CLIPBOARD]), super::InputOutcome::default());
+        assert!(sink.poll_clipboard(false).is_none());
+    }
     use super::{
         cursor_snapshot, decode, keyboard_input, map_monitor_absolute_to_virtual, newer_sequence,
         ClipboardAssembly, ClipboardChunk, ClipboardProgress, Command, CursorState, DesktopRegion,
@@ -722,6 +1781,549 @@ mod tests {
     };
     use std::time::Instant;
 
+    #[test]
+    fn carried_button_release_is_reconciled_before_resumed_motion() {
+        let mut carry = super::CarriedInput::default();
+        let mut sink_state = InputState {
+            buttons: 1,
+            ..Default::default()
+        };
+        carry.observe_forwarded(&[4, 1]);
+        carry.begin_switch(true);
+        // A positioned release must not move the pointer during the gate.
+        carry.observe_gated(&[9, 7, 0, 100, 0, 200, 0, 0]);
+        assert!(!carry.take_resume_release(true, false));
+        assert_eq!(sink_state.buttons, 1, "carry still owns the native drag");
+        assert!(carry.take_resume_release(true, true));
+        let (keys, released_buttons) = sink_state.take_release_plan();
+        assert!(keys.is_empty());
+        assert_eq!(released_buttons, 1);
+        // This is the same release plan consumed by InputSink::release_all;
+        // exercise its state without invoking Windows SendInput.
+        carry.observe_forwarded(&[7, 8, 0, 1, 0, 2, 0, 0, 0, 0, 0]);
+        assert!(sink_state.accept_motion(8));
+        assert_eq!(sink_state.buttons, 0, "resumed motion cannot keep dragging");
+        assert!(!carry.take_resume_release(true, true), "release is consumed once");
+    }
+
+    #[test]
+    fn carried_release_waits_for_available_capture_and_presented_frame() {
+        // Capture availability may return before presentation acknowledgement,
+        // on either local capture or the privileged Agent path.
+        for (available, ready) in [(false, false), (false, true), (true, false)] {
+            let mut carry = super::CarriedInput::default();
+            carry.observe_forwarded(&[4, 1]);
+            carry.begin_switch(true);
+            carry.observe_gated(&[4, 0]);
+            assert!(!carry.take_resume_release(available, ready));
+            assert!(carry.take_resume_release(true, true));
+        }
+    }
+
+    #[test]
+    fn carried_vk_and_scan_key_releases_reconcile_held_input() {
+        for (down, up) in [
+            (vec![0, 65, 0], vec![1, 65, 0]),
+            (vec![13, 2, 29, 0, 0, 0], vec![13, 3, 29, 0, 0, 0]),
+        ] {
+            let mut carry = super::CarriedInput::default();
+            carry.observe_forwarded(&down);
+            carry.begin_switch(true);
+            carry.observe_gated(&up);
+            assert!(carry.take_resume_release(true, true));
+            assert!(carry.keys.is_empty());
+        }
+    }
+
+    #[test]
+    fn carry_without_a_release_keeps_held_input_and_ignores_gated_actions() {
+        let mut carry = super::CarriedInput::default();
+        carry.observe_forwarded(&[4, 1]);
+        carry.observe_forwarded(&[0, 65, 0]);
+        carry.begin_switch(true);
+        for packet in [
+            vec![4, 3], // New press while left is still held.
+            vec![0, 66, 0],
+            vec![1, 66, 0], // Release of a key that was never admitted.
+            vec![13, 1, 30, 0, 0, 0],
+            vec![7, 8, 0, 1, 0, 2, 0, 0, 0, 0, 0],
+            vec![3, 100, 0, 200, 0],
+            vec![5, 120, 0],
+            vec![11, b'x'],
+            vec![9], // Malformed positioned button packet.
+        ] {
+            carry.observe_gated(&packet);
+        }
+        assert!(!carry.take_resume_release(true, true));
+        assert_eq!(carry.buttons, 1);
+        assert_eq!(carry.keys, [HeldKey::Vk(65)].into_iter().collect());
+    }
+
+    #[test]
+    fn partial_button_release_and_release_all_reconcile_but_manual_switch_resets() {
+        for release in [vec![4, 2], vec![6]] {
+            let mut carry = super::CarriedInput::default();
+            carry.observe_forwarded(&[4, 3]);
+            carry.begin_switch(true);
+            carry.observe_gated(&release);
+            assert!(carry.take_resume_release(true, true));
+            assert_eq!(carry.buttons, 0);
+        }
+        let mut carry = super::CarriedInput::default();
+        carry.observe_forwarded(&[4, 1]);
+        carry.begin_switch(true);
+        carry.observe_gated(&[4, 0]);
+        carry.begin_switch(false);
+        carry.observe_gated(&[4, 0]);
+        assert!(!carry.take_resume_release(true, true));
+        assert_eq!(carry.buttons, 0);
+    }
+
+    #[test]
+    fn native_drag_input_keeps_releases_without_new_presses_or_motion() {
+        assert_eq!(
+            super::release_only(Command::Buttons(0b110), 0b101),
+            Some(Command::Buttons(0b100))
+        );
+        assert_eq!(
+            super::release_only(Command::ButtonsAt(7, 900, 800, 0b110), 0b101),
+            Some(Command::Buttons(0b100))
+        );
+        for command in [
+            Command::Key(65, true),
+            Command::ScanKey(
+                HeldKey::Scan {
+                    code: 30,
+                    extended: false,
+                },
+                true,
+            ),
+            Command::ReleaseAll,
+            Command::CursorSync(7),
+        ] {
+            assert!(super::release_only(command, 0).is_some());
+        }
+        for command in [
+            Command::Key(65, false),
+            Command::ScanKey(HeldKey::Vk(65), false),
+            Command::Abs(900, 800),
+            Command::Rel(1, 2),
+            Command::Wheel(120),
+            Command::Motion(7, 1, 2, 0, 0),
+            Command::Absolute(7, 900, 800),
+            Command::Text("x".into()),
+            Command::Clipboard(ClipboardChunk {
+                paste: true,
+                id: 1,
+                index: 0,
+                count: 1,
+                bytes: vec![b'x'],
+            }),
+        ] {
+            assert!(super::release_only(command, 0).is_none());
+        }
+    }
+
+    struct FakeMouseKeys {
+        settings: std::cell::Cell<super::MOUSEKEYS>,
+        reads: std::cell::Cell<usize>,
+        writes: std::cell::Cell<usize>,
+        fail_read: std::cell::Cell<bool>,
+        fail_write: std::cell::Cell<bool>,
+    }
+
+    impl FakeMouseKeys {
+        fn new() -> Self {
+            Self {
+                settings: std::cell::Cell::new(super::MOUSEKEYS {
+                    cbSize: std::mem::size_of::<super::MOUSEKEYS>() as u32,
+                    dwFlags: 0x1000_003e,
+                    iMaxSpeed: 80,
+                    iTimeToMaxSpeed: 3000,
+                    iCtrlSpeed: 2,
+                    dwReserved1: 0,
+                    dwReserved2: 0,
+                }),
+                reads: std::cell::Cell::new(0),
+                writes: std::cell::Cell::new(0),
+                fail_read: std::cell::Cell::new(false),
+                fail_write: std::cell::Cell::new(false),
+            }
+        }
+
+        fn read(&self) -> windows::core::Result<super::MOUSEKEYS> {
+            self.reads.set(self.reads.get() + 1);
+            if self.fail_read.get() {
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_ACCESSDENIED,
+                ))
+            } else {
+                Ok(self.settings.get())
+            }
+        }
+
+        fn write(&self, settings: &super::MOUSEKEYS) -> windows::core::Result<()> {
+            self.writes.set(self.writes.get() + 1);
+            if self.fail_write.get() {
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_ACCESSDENIED,
+                ))
+            } else {
+                self.settings.set(*settings);
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn headless_cursor_support_changes_only_on_bit_and_restores_on_disconnect() {
+        let api = FakeMouseKeys::new();
+        let original = api.settings.get();
+        let mut state = super::HeadlessCursorState::default();
+        state.set_active_with(true, false, || api.read(), |settings| api.write(settings));
+        let mut expected = original;
+        expected.dwFlags |= super::MKF_MOUSEKEYSON;
+        assert_eq!(api.settings.get(), expected);
+        assert!(state.owned.is_some());
+        for _ in 0..100 {
+            state.set_active_with(true, false, || api.read(), |settings| api.write(settings));
+        }
+        assert_eq!((api.reads.get(), api.writes.get()), (1, 1));
+        state.set_active_with(false, false, || api.read(), |settings| api.write(settings));
+        assert_eq!(api.settings.get(), original);
+        assert!(state.owned.is_none());
+    }
+
+    #[test]
+    fn headless_cursor_support_leaves_real_mouse_and_user_enabled_mousekeys_alone() {
+        let api = FakeMouseKeys::new();
+        let mut state = super::HeadlessCursorState::default();
+        state.set_active_with(true, true, || api.read(), |settings| api.write(settings));
+        state.set_active_with(false, true, || api.read(), |settings| api.write(settings));
+        assert_eq!((api.reads.get(), api.writes.get()), (0, 0));
+        let mut user_settings = api.settings.get();
+        user_settings.dwFlags |= super::MKF_MOUSEKEYSON;
+        api.settings.set(user_settings);
+        state.set_active_with(true, false, || api.read(), |settings| api.write(settings));
+        state.set_active_with(false, false, || api.read(), |settings| api.write(settings));
+        assert_eq!(api.writes.get(), 0);
+        assert_eq!(api.settings.get(), user_settings);
+        assert!(state.owned.is_none());
+    }
+
+    #[test]
+    fn headless_cursor_support_preserves_concurrent_preferences_and_user_disable() {
+        let api = FakeMouseKeys::new();
+        let mut state = super::HeadlessCursorState::default();
+        state.set_active_with(true, false, || api.read(), |settings| api.write(settings));
+        let mut edited = api.settings.get();
+        edited.dwFlags |= 0x80; // User changes NumLock policy while streaming.
+        edited.iMaxSpeed = 133;
+        api.settings.set(edited);
+        state.set_active_with(false, false, || api.read(), |settings| api.write(settings));
+        edited.dwFlags &= !super::MKF_MOUSEKEYSON;
+        assert_eq!(api.settings.get(), edited);
+        state.set_active_with(true, false, || api.read(), |settings| api.write(settings));
+        edited.iMaxSpeed = 200;
+        api.settings.set(edited); // User disables the feature themselves.
+        let writes = api.writes.get();
+        state.set_active_with(false, false, || api.read(), |settings| api.write(settings));
+        assert_eq!(api.writes.get(), writes);
+        assert_eq!(api.settings.get(), edited);
+        assert!(state.owned.is_none());
+    }
+
+    #[test]
+    fn headless_cursor_support_api_failure_does_not_retry_during_polling() {
+        let api = FakeMouseKeys::new();
+        api.fail_read.set(true);
+        let mut state = super::HeadlessCursorState::default();
+        for _ in 0..100 {
+            state.set_active_with(true, false, || api.read(), |settings| api.write(settings));
+        }
+        assert_eq!((api.reads.get(), api.writes.get()), (1, 0));
+        state.set_active_with(false, false, || api.read(), |settings| api.write(settings));
+        api.fail_read.set(false);
+        api.fail_write.set(true);
+        for _ in 0..100 {
+            state.set_active_with(true, false, || api.read(), |settings| api.write(settings));
+        }
+        assert_eq!(api.writes.get(), 1);
+        assert!(state.owned.is_none());
+    }
+
+    #[test]
+    fn headless_cursor_support_failed_restore_retains_ownership_for_drop_retry() {
+        let api = FakeMouseKeys::new();
+        let original = api.settings.get();
+        let mut state = super::HeadlessCursorState::default();
+        state.set_active_with(true, false, || api.read(), |settings| api.write(settings));
+        api.fail_write.set(true);
+        state.set_active_with(false, false, || api.read(), |settings| api.write(settings));
+        assert!(state.owned.is_some());
+        api.fail_write.set(false);
+        state.restore_with(|| api.read(), |settings| api.write(settings));
+        assert_eq!(api.settings.get(), original);
+        assert!(state.owned.is_none());
+    }
+
+    #[test]
+    fn headless_cursor_support_retries_failed_activation_with_bounded_backoff() {
+        let api = FakeMouseKeys::new();
+        api.fail_read.set(true);
+        let mut state = super::HeadlessCursorState::default();
+        let mut retry = super::HeadlessCursorRetry::default();
+        let start = Instant::now();
+        for millis in (0..10_000).step_by(16) {
+            let now = start + std::time::Duration::from_millis(millis);
+            if retry.take_attempt(true, now) {
+                let succeeded = state.apply_active_with(
+                    true,
+                    false,
+                    || api.read(),
+                    |settings| api.write(settings),
+                );
+                retry.finish(succeeded, now);
+            }
+        }
+        assert_eq!(api.reads.get(), 3);
+        assert_eq!(api.writes.get(), 0);
+        // A new viewer-state edge gets a fresh bounded budget.
+        assert!(retry.take_attempt(false, start + std::time::Duration::from_secs(11)));
+        retry.finish(true, start + std::time::Duration::from_secs(11));
+        api.fail_read.set(false);
+        assert!(retry.take_attempt(true, start + std::time::Duration::from_secs(12)));
+        let succeeded =
+            state.apply_active_with(true, false, || api.read(), |settings| api.write(settings));
+        retry.finish(succeeded, start + std::time::Duration::from_secs(12));
+        assert!(succeeded);
+        assert!(state.owned.is_some());
+    }
+
+    #[test]
+    fn headless_cursor_support_retries_restore_but_never_overrides_user_disable() {
+        let api = FakeMouseKeys::new();
+        let original = api.settings.get();
+        let mut state = super::HeadlessCursorState::default();
+        let mut retry = super::HeadlessCursorRetry::default();
+        let start = Instant::now();
+        assert!(retry.take_attempt(true, start));
+        retry.finish(
+            state.apply_active_with(true, false, || api.read(), |settings| api.write(settings)),
+            start,
+        );
+        let mut disabled = api.settings.get();
+        disabled.dwFlags &= !super::MKF_MOUSEKEYSON;
+        api.settings.set(disabled);
+        for seconds in 1..100 {
+            assert!(!retry.take_attempt(true, start + std::time::Duration::from_secs(seconds)));
+        }
+        assert_eq!(api.writes.get(), 1);
+        assert!(retry.take_attempt(false, start + std::time::Duration::from_secs(100)));
+        retry.finish(
+            state.apply_active_with(false, false, || api.read(), |settings| api.write(settings)),
+            start,
+        );
+        assert_eq!(api.settings.get(), original);
+        assert!(retry.take_attempt(true, start + std::time::Duration::from_secs(101)));
+        retry.finish(
+            state.apply_active_with(true, false, || api.read(), |settings| api.write(settings)),
+            start,
+        );
+        api.fail_write.set(true);
+        let disconnect = start + std::time::Duration::from_secs(102);
+        assert!(retry.take_attempt(false, disconnect));
+        retry.finish(
+            state.apply_active_with(false, false, || api.read(), |settings| api.write(settings)),
+            disconnect,
+        );
+        assert!(state.owned.is_some());
+        assert!(!retry.take_attempt(false, disconnect + std::time::Duration::from_millis(999)));
+        api.fail_write.set(false);
+        let next = disconnect + std::time::Duration::from_secs(1);
+        assert!(retry.take_attempt(false, next));
+        retry.finish(
+            state.apply_active_with(false, false, || api.read(), |settings| api.write(settings)),
+            next,
+        );
+        assert!(state.owned.is_none());
+        assert_eq!(api.settings.get(), original);
+        assert!(!retry.take_attempt(false, next + std::time::Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn headless_cursor_support_retains_marker_until_failed_delete_can_succeed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = std::env::temp_dir().join(format!(
+            "bubbleplay-cursor-delete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("state.json");
+        let original = FakeMouseKeys::new().settings.get();
+        let mut applied = original;
+        applied.dwFlags |= super::MKF_MOUSEKEYSON;
+        let record = super::CursorRecoveryRecord::new(
+            std::process::id(),
+            super::MouseKeysLease { original, applied },
+        );
+        super::write_cursor_marker(&path, &record).unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&path)
+            .unwrap();
+        let mut guard = super::HeadlessCursorSupport::default();
+        guard.marker = Some(path.clone());
+        guard.remove_released_marker();
+        assert_eq!(guard.marker.as_ref(), Some(&path));
+        assert!(path.exists());
+        drop(locked);
+        guard.remove_released_marker();
+        assert!(guard.marker.is_none());
+        assert!(!path.exists());
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn headless_cursor_marker_accepts_only_the_owned_feature_bit() {
+        let original = FakeMouseKeys::new().settings.get();
+        let mut applied = original;
+        applied.dwFlags |= super::MKF_MOUSEKEYSON;
+        let record =
+            super::CursorRecoveryRecord::new(42, super::MouseKeysLease { original, applied });
+        let encoded = serde_json::to_vec(&record).unwrap();
+        let mut restored: super::CursorRecoveryRecord = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.lease().unwrap().original, original);
+        restored.applied[2] += 1;
+        assert!(restored.lease().is_err());
+        restored.applied = record.applied;
+        restored.original[1] |= super::MKF_MOUSEKEYSON;
+        assert!(restored.lease().is_err());
+    }
+
+    #[test]
+    fn headless_cursor_marker_cannot_overwrite_an_owner_and_bounds_its_input() {
+        let directory = std::env::temp_dir().join(format!(
+            "bubbleplay-cursor-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("state.json");
+        let original = FakeMouseKeys::new().settings.get();
+        let mut applied = original;
+        applied.dwFlags |= super::MKF_MOUSEKEYSON;
+        let record =
+            super::CursorRecoveryRecord::new(42, super::MouseKeysLease { original, applied });
+        super::write_cursor_marker(&path, &record).unwrap();
+        assert!(super::write_cursor_marker(&path, &record).is_err());
+        assert_eq!(
+            super::read_cursor_marker(&path).unwrap().unwrap().owner_pid,
+            42
+        );
+        super::remove_cursor_marker(&path, 43);
+        assert!(path.exists());
+        super::remove_cursor_marker(&path, 42);
+        assert!(!path.exists());
+        std::fs::write(&path, b"malformed").unwrap();
+        assert!(super::read_cursor_marker(&path).is_err());
+        std::fs::write(&path, vec![b' '; 4097]).unwrap();
+        assert!(super::read_cursor_marker(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn cursor_kind_contract_matches_the_shared_native_mapping() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/cursor-types.json")).unwrap();
+        assert_eq!(fixture["packetType"], super::TYPE_CURSOR_KIND);
+        assert_eq!(fixture["packetBytes"], 2);
+        let types = fixture["types"].as_array().unwrap();
+        assert_eq!(types.len(), 15);
+        for ty in types {
+            let id = ty["id"].as_u64().unwrap() as u8;
+            let kind = super::CursorKind::from_id(id).unwrap();
+            assert_eq!(format!("{kind:?}"), ty["name"].as_str().unwrap());
+            assert_eq!(kind.encode(), [129, id]);
+        }
+        assert!(super::CursorKind::from_id(15).is_none());
+        assert!(super::CursorKind::from_id(255).is_none());
+    }
+
+    #[test]
+    fn standard_cursor_handles_map_to_native_kinds_with_hidden_and_custom_fallbacks() {
+        let handles = std::array::from_fn(|index| index + 100);
+        for (index, handle) in handles.iter().enumerate() {
+            assert_eq!(
+                super::classify_cursor(*handle, true, &handles),
+                super::CursorKind::from_id(index as u8).unwrap()
+            );
+            assert_eq!(
+                super::classify_cursor(*handle, false, &handles),
+                super::CursorKind::Hidden
+            );
+        }
+        assert_eq!(
+            super::classify_cursor(9999, true, &handles),
+            super::CursorKind::Arrow
+        );
+        assert_eq!(
+            super::classify_cursor(0, true, &[0; 14]),
+            super::CursorKind::Arrow
+        );
+        assert_eq!(
+            super::classify_cursor(0, false, &handles),
+            super::CursorKind::Hidden
+        );
+    }
+
+    #[test]
+    fn stationary_kind_changes_and_forced_sync_bypass_motion_and_heartbeat() {
+        use super::CursorKind::{Arrow, Hidden, Text};
+        let now = Instant::now();
+        let mut tracker = super::CursorKindTracker {
+            standard: [0; 14],
+            last_kind: None,
+            last_emit: now,
+            last_diagnostic: None,
+            headless_support: super::HeadlessCursorSupport::new(),
+        };
+        assert_eq!(tracker.observe(Arrow, false, now), Some(Arrow));
+        assert_eq!(tracker.observe(Arrow, false, now), None);
+        assert_eq!(tracker.observe(Text, false, now), Some(Text));
+        assert_eq!(tracker.observe(Hidden, false, now), Some(Hidden));
+        assert_eq!(tracker.observe(Hidden, true, now), Some(Hidden));
+        assert_eq!(
+            tracker.observe(Hidden, false, now + std::time::Duration::from_secs(1)),
+            Some(Hidden)
+        );
+        tracker.reset();
+        assert_eq!(tracker.observe(Hidden, false, now), Some(Hidden));
+    }
+
+    #[test]
+    fn windows_standard_cursor_handles_are_loaded_once_and_classified() {
+        let mut tracker = super::CursorKindTracker::new(Instant::now());
+        for (id, handle) in tracker.standard.iter().enumerate() {
+            assert_ne!(*handle, 0, "standard Windows cursor {id} failed to load");
+            assert_eq!(
+                super::classify_cursor(*handle, true, &tracker.standard),
+                super::CursorKind::from_id(id as u8).unwrap()
+            );
+        }
+        // Read-only smoke of the current cursor; does not move it or set its shape.
+        let kind = tracker.sample(true, Instant::now());
+        eprintln!("GetCursorInfo native-kind sample: {kind:?}");
+    }
     #[test]
     fn repeated_windows_injection_failures_are_rate_limited_with_a_suppressed_count() {
         let start = Instant::now();
@@ -1203,6 +2805,9 @@ impl InputSink {
             failure_log: InputFailureLogGate::default(),
             clipboard: None,
             admin_agent: None,
+            secure_helper: None,
+            secure_desktop: false,
+            secure_input_allowed: false,
         }
     }
 
@@ -1211,6 +2816,21 @@ impl InputSink {
     pub fn with_admin_agent(mut self, link: Option<AdminAgentLink>) -> Self {
         self.admin_agent = link;
         self
+    }
+
+    pub fn with_secure_helper(mut self, link: Option<std::sync::Arc<std::sync::Mutex<crate::secure_helper::client::SecureHelperLink>>>) -> Self {
+        self.secure_helper = link;
+        self
+    }
+
+    pub fn set_secure_desktop(&mut self, secure: bool, input_allowed: bool) {
+        if self.secure_desktop != secure || (self.secure_input_allowed && !input_allowed) {
+            self.release_all();
+            self.state = InputState::default();
+            if let Some(sync) = self.clipboard.as_mut() { sync.assembly = ClipboardAssembly::default(); }
+        }
+        self.secure_desktop = secure;
+        self.secure_input_allowed = input_allowed;
     }
 
     /// Enable text clipboard sync. Only call from a process running as the
@@ -1222,7 +2842,8 @@ impl InputSink {
 
     /// New host clipboard text since the previous poll (never echoes text
     /// this sink set from the browser). `reset` starts a new baseline.
-    pub fn poll_clipboard(&mut self, reset: bool) -> Option<String> {
+    pub fn poll_clipboard(&mut self, reset: bool) -> Option<clipboard::ClipboardContent> {
+        if self.secure_desktop { return None; }
         self.clipboard.as_mut()?.watcher.poll(reset)
     }
 
@@ -1233,10 +2854,34 @@ impl InputSink {
 
     /// Handle one data-channel packet. Malformed packets are logged and dropped.
     pub fn handle(&mut self, data: &[u8]) -> InputOutcome {
+        if self.secure_desktop && (!self.secure_input_allowed || data.first() == Some(&TYPE_CLIPBOARD)) {
+            if !self.secure_input_allowed { self.note_secure_input_drop(data, "no_input_capability"); }
+            return InputOutcome::default();
+        }
         let Some(command) = decode(data) else {
-            debug!(?data, "malformed or unknown input packet");
+            debug!(kind = ?data.first(), bytes = data.len(), "malformed or unknown input packet");
             return InputOutcome::default();
         };
+        self.apply(command)
+    }
+
+    /// During a native drag, preserve releases without introducing another
+    /// press, paste or pointer move into the attached Windows input queue.
+    pub fn handle_release_only(&mut self, data: &[u8]) -> InputOutcome {
+        if self.secure_desktop && !self.secure_input_allowed { return InputOutcome::default(); }
+        let Some(command) = decode(data) else {
+            return InputOutcome::default();
+        };
+        if let Command::ButtonsAt(seq, _, _, _) = &command {
+            self.state.advance_motion_barrier(*seq);
+        }
+        match release_only(command, self.state.buttons) {
+            Some(command) => self.apply(command),
+            None => InputOutcome::default(),
+        }
+    }
+
+    fn apply(&mut self, command: Command) -> InputOutcome {
         let mut outcome = InputOutcome::default();
         match command {
             Command::Key(vk, up) => {
@@ -1273,7 +2918,11 @@ impl InputSink {
                     outcome.application.merge(self.wheel_horizontal(wx));
                     outcome.application.merge(self.wheel(wy));
                     outcome.accepted_sequence = Some(seq);
-                    outcome.cursor_changed = dx != 0 || dy != 0;
+                    // Accepted sequencing itself requires cursor feedback:
+                    // coalesced opposing movements can have no net displacement,
+                    // but the receiver still needs this sequence acknowledged.
+                    // The privileged backend also uses this feedback predicate.
+                    outcome.cursor_changed = true;
                 } else {
                     self.stats.stale_motion_dropped += 1;
                 }
@@ -1327,11 +2976,46 @@ impl InputSink {
         std::mem::take(&mut self.stats)
     }
 
+    /// Count rejected injection records without retaining or logging values.
+    pub fn note_secure_input_drop(&mut self, data: &[u8], reason: &'static str) {
+        let count = match decode(data) {
+            Some(Command::Key(..) | Command::ScanKey(..) | Command::Abs(..) | Command::Absolute(..)) => 1,
+            Some(Command::Rel(dx, dy)) => usize::from(dx != 0 || dy != 0),
+            Some(Command::Wheel(delta)) => usize::from(delta != 0),
+            Some(Command::Text(text)) => text.encode_utf16().count().saturating_mul(2),
+            Some(Command::Motion(_, dx, dy, wx, wy)) => usize::from(dx != 0 || dy != 0) + usize::from(wx != 0) + usize::from(wy != 0),
+            Some(Command::Buttons(mask)) => (self.state.buttons ^ mask).count_ones() as usize,
+            Some(Command::ButtonsAt(_, _, _, mask)) => 1 + (self.state.buttons ^ mask).count_ones() as usize,
+            Some(Command::ReleaseAll) => self.state.pressed_keys.len() + self.state.buttons.count_ones() as usize,
+            _ => 0,
+        };
+        if let Some(link) = &self.secure_helper {
+            link.lock().unwrap_or_else(|error| error.into_inner()).note_input_drop(count as u64, reason);
+        }
+    }
+
     fn send_inputs(&mut self, operation: &'static str, inputs: &[INPUT]) -> InputApplication {
         if inputs.is_empty() {
             return InputApplication::default();
         }
         let expected = inputs.len().min(u32::MAX as usize) as u32;
+        if self.secure_desktop {
+            let accepted = self.secure_input_allowed && self.secure_helper.as_ref().is_some_and(|link| {
+                let Some(records) = inputs.iter().map(input_record).collect::<Option<Vec<_>>>() else { return false; };
+                link.lock().unwrap_or_else(|error| error.into_inner()).send_input(&records)
+            });
+            let mut application = InputApplication::default();
+            // Submission is asynchronous. Never fall back to user/admin-agent
+            // injection for secure input, even when the helper disappears.
+            if !accepted { application.observe(expected, 0, crate::admin_agent::client::ERROR_AGENT_LOST); }
+            return application;
+        }
+        // The desktop can switch between the serve-loop observation and this
+        // input batch. Never send secure-desktop input through either normal
+        // user SendInput or the elevated normal-desktop admin agent.
+        if !crate::desktop_session::input_desktop_is_default() {
+            return InputApplication::default();
+        }
         let via_agent = self.admin_agent.as_mut().and_then(|link| {
             let records = inputs
                 .iter()
@@ -1424,6 +3108,7 @@ impl InputSink {
     /// Inject Ctrl+V for whatever the host clipboard holds now (file
     /// transfer: a paste-purpose upload already placed its files there).
     pub fn paste(&mut self) -> InputApplication {
+        if self.secure_desktop { return InputApplication::default(); }
         let inputs: Vec<INPUT> = self
             .state
             .paste_plan()
@@ -1484,8 +3169,9 @@ impl InputSink {
     }
 
     fn mouse_abs(&mut self, x: u16, y: u16) -> InputApplication {
-        let virtual_desktop = virtual_desktop_region().unwrap_or(self.absolute_region);
-        let (x, y) = map_monitor_absolute_to_virtual(x, y, self.absolute_region, virtual_desktop);
+        let virtual_desktop = if self.secure_desktop { self.absolute_region }
+            else { virtual_desktop_region().unwrap_or(self.absolute_region) };
+        let (x, y) = absolute_coordinates_for_input(self.secure_desktop, x, y, self.absolute_region, virtual_desktop);
         let input = INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {

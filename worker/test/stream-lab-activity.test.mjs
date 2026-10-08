@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {
   PhysicalActivityTracker,
   UserActivityPause,
-} from "../tools/stream-lab-activity.mjs";
+} from "../tools/lab/stream-lab-activity.mjs";
 
 test("physical activity pauses a campaign until the complete idle window", () => {
   const tracker = new PhysicalActivityTracker({ idleMs: 600_000 });

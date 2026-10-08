@@ -1,8 +1,5 @@
 const STUN_SERVER = { urls: "stun:stun.l.google.com:19302" };
-const TURN_URLS = [
-  "turn:turn.example.com:3478?transport=udp",
-  "turn:turn.example.com:3478?transport=tcp",
-];
+const DEFAULT_TURN_PORT = 3478;
 const DEFAULT_TTL_SECONDS = 6 * 60 * 60;
 const MIN_TTL_SECONDS = 5 * 60;
 const MAX_TTL_SECONDS = 24 * 60 * 60;
@@ -12,10 +9,14 @@ const MAX_TTL_SECONDS = 24 * 60 * 60;
 // short-lived credentials; the shared secret never leaves the Worker.
 // TURN is opt-in per client (`turn: true` in its hello): by default the
 // browser is never told the TURN hostname, so it never contacts it.
+// The relay ships without a TURN server: TURN stays disabled until the
+// deployment sets TURN_HOST (`host` or `host:port`) and TURN_SECRET.
 export async function createTurnIceServers(env, { turn = false, now = Date.now } = {}) {
   if (turn !== true) return [STUN_SERVER];
   const secret = env?.TURN_SECRET;
   if (typeof secret !== "string" || !secret.trim()) return [STUN_SERVER];
+  const urls = turnUrls(env.TURN_HOST);
+  if (!urls) return [STUN_SERVER];
 
   try {
     const expiry = Math.floor(now() / 1_000) + turnTtlSeconds(env.TURN_TTL_SECONDS);
@@ -30,12 +31,20 @@ export async function createTurnIceServers(env, { turn = false, now = Date.now }
     const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username));
     return [
       STUN_SERVER,
-      { urls: TURN_URLS, username, credential: base64(signature) },
+      { urls, username, credential: base64(signature) },
     ];
   } catch {
     // A malformed or unavailable crypto environment must not block signaling.
     return [STUN_SERVER];
   }
+}
+
+function turnUrls(value) {
+  if (typeof value !== "string") return null;
+  const match = /^([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::(\d{1,5}))?$/.exec(value.trim());
+  if (!match || Number(match[2] ?? DEFAULT_TURN_PORT) > 65_535) return null;
+  const authority = `${match[1]}:${match[2] ?? DEFAULT_TURN_PORT}`;
+  return [`turn:${authority}?transport=udp`, `turn:${authority}?transport=tcp`];
 }
 
 function turnTtlSeconds(value) {

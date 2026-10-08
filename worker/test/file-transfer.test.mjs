@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import worker, { Room } from "../src/index.js";
+import { RELAY_SECRETS } from "./helpers/relay-secrets.mjs";
 import {
   FT,
   FT_ACK_EVERY_BYTES,
@@ -186,13 +187,14 @@ test("file routes are gated like the media routes and paired per epoch in the Me
   const fileResponse = new Response("file", { status: 200 });
   let gateStatus = 204;
   const env = {
-    HOST_GATE_TOKEN: "host-only",
+    ...RELAY_SECRETS,
+    APPROVAL_METHODS: "host",
     GATE: { idFromName: () => "gate", get: () => ({ fetch: async () => new Response(null, { status: gateStatus }) }) },
     ROOM: { idFromName: name => name, get: () => ({ fetch: async () => new Response("signal") }) },
     MEDIA_ROOM: { idFromName: name => { selected.push(name); return name; }, get: () => ({ fetch: async () => fileResponse }) },
   };
   const epoch = "0123456789abcdef0123456789abcdef";
-  const hostHeaders = { Upgrade: "websocket", Authorization: "Bearer host-only" };
+  const hostHeaders = { Upgrade: "websocket", Authorization: `Bearer ${RELAY_SECRETS.HOST_GATE_TOKEN}` };
   assert.equal(await worker.fetch(new Request(`https://x.example/host-file-ws?epoch=${epoch}`, { headers: hostHeaders }), env), fileResponse);
   assert.equal(await worker.fetch(new Request(`https://x.example/file-ws?epoch=${epoch}`, { headers: { Upgrade: "websocket" } }), env), fileResponse);
   assert.deepEqual(selected, [`file-v1:${epoch}`, `file-v1:${epoch}`]);

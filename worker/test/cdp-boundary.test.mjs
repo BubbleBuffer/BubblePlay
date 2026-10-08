@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 test("live collector attaches to a page target and collects rendered and barcode latency", () => {
-  const source = readFileSync(new URL("../tools/latency-live.mjs", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../tools/lab/latency-live.mjs", import.meta.url), "utf8");
   assert.match(source, /webSocketDebuggerUrl/);
   assert.match(source, /json\/list/);
   assert.match(source, /__bubbleplayDiagnostics/);
@@ -150,12 +150,14 @@ test("native video is the default path and WebCodecs is opt-in", () => {
 
 test("native video keeps an explicit input overlay and diagnostics count presented frames", () => {
   const client = readClientSource();
-  const collector = readFileSync(new URL("../tools/latency-live.mjs", import.meta.url), "utf8");
+  const collector = readFileSync(new URL("../tools/lab/latency-live.mjs", import.meta.url), "utf8");
   assert.match(client, /#stage\.native-video-input #screen/);
   assert.match(client, /stage\.classList\.add\("native-video-input"\)/);
   assert.match(client, /z-index:1;pointer-events:none/);
   assert.match(client, /function videoContentRect\(video\)/);
-  assert.match(client, /const r = activeVideo \? videoContentRect\(activeVideo\) : screen\.getBoundingClientRect\(\);/);
+  assert.match(client, /const r = videoContentRect\(activeVideo \|\| screen\);/);
+  // The canvas scales up to the stage like the native video does.
+  assert.match(client, /canvas \{\s*width: 100%; height: 100%;\s*object-fit: contain;/);
   assert.match(client, /framesDrawn = nativePresentation\.framesPresented/);
   assert.match(client, /renderedTimestamp: lastRenderedTimestamp \?\? \(nativeFramesPresented > 0 \? nativeFramesPresented : null\)/);
   assert.match(collector, /function hasRenderedFrame\(snapshot\)/);
@@ -222,7 +224,7 @@ test("first-frame startup uses one bounded retry and clears on native or decoded
   assert.match(client, /function startFirstFrameHandshake\(reason, forceNew = false\)/);
   assert.match(client, /firstFrameHandshake.retries < 1/);
   assert.match(client, /}, 5_000\)/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null\)/);
   assert.match(client, /video\.requestVideoFrameCallback/);
   assert.match(client, /markFirstFramePresented\(\);/);
   assert.match(client, /lastDecodedDimensions/);
@@ -287,7 +289,8 @@ test("browser signaling uses the remembered server session and never stores an a
   assert.match(login, /autocomplete="current-password"/);
   assert.match(login, /Remember this browser for 30 days/);
   assert.match(login, /fetch\("\/__auth\/login"/);
-  assert.match(login, /location\.replace\(`\$\{location\.pathname\}\$\{location\.search\}`\)/);
+  assert.match(login, /next\.searchParams\.delete\("approval"\)/);
+  assert.match(login, /location\.replace\(`\$\{next\.pathname\}\$\{next\.search\}`\)/);
   const inlineScript = login.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   assert.ok(inlineScript);
   assert.doesNotThrow(() => new Function(inlineScript));
@@ -333,7 +336,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /createPopoverController\(\{/);
   assert.match(client, /desktop-unavailable/);
   assert.match(client, /if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null\)[\s\S]*desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
   assert.doesNotMatch(client, /sharpZoomEnabled\s*&&\s*pointerMode\s*===\s*"desktop"/);
   assert.match(client, /function requestWssMediaStart\(\) \{\s*if \(usingWssMedia\) return;\s*if \(!mediaEpoch\)[\s\S]*ensureMainCanvas\(\);/);
   assert.match(client, /function requestWssMediaStart\(\)[\s\S]*stage\.classList\.remove\("native-video-input"\)/);
@@ -503,9 +506,9 @@ test("desktop source transitions preserve the last frame without authorizing sta
   assert.match(client, /if \(!usingWssMedia && firstFrameHandshake\.requireAdmission\) \{[\s\S]*if \(!firstFrameHandshake\.admitted\)[\s\S]*if \(transitionNeedsKeyframe\)[\s\S]*if \(!isKey\)/);
   assert.match(client, /function sendInput\(data, channel\) \{[\s\S]*if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false;/);
   assert.match(client, /firstFrameHandshake\.requireAdmission = forceNew \|\| reason === "desktop-source-transition"/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*requireAdmission && !firstFrameHandshake\.admitted[\s\S]*return false/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null\)[\s\S]*requireAdmission && !firstFrameHandshake\.admitted[\s\S]*return false/);
   assert.match(client, /presentedGeneration !== firstFrameHandshake\.generation[\s\S]*return false/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null\)[\s\S]*desktopAwaitingFrame = false/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null\)[\s\S]*desktopAwaitingFrame = false/);
 });
 
 test("monitor control uses the signaling epoch and drops stale confirmations", () => {

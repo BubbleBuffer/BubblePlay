@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { extractHistoryMeasurements } from "../tools/stream-lab-history-data.mjs";
+import { extractHistoryMeasurements } from "../tools/lab/stream-lab-history-data.mjs";
 
 test("history extraction keeps recorded passes and excludes noise summaries", () => {
   const manifest = {

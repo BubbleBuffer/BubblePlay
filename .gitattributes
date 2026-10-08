@@ -1,0 +1,13 @@
+* text=auto
+
+# Shell entry points must remain usable from a Linux checkout.
+*.sh text eol=lf
+android/gradlew text eol=lf
+
+# Keep binary dependencies and media byte-for-byte intact.
+*.jar binary
+*.woff2 binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary

@@ -65,8 +65,6 @@ pub struct Capture {
     /// Backoff deadline for a failed AccessLost recreation. Keeping this as
     /// state avoids sleeping inside `acquire()` and starving the RTC pump.
     next_recreate_attempt: Instant,
-    /// Index into the bounded 250/500/1000/2000 ms retry schedule.
-    recovery_backoff_step: usize,
     /// A recreated duplication is not healthy until it yields a real frame.
     awaiting_recovery_frame: bool,
     /// If a replacement immediately loses access, discard the complete
@@ -131,10 +129,24 @@ pub struct MonitorInfo {
 }
 
 const IDLE_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(250);
-const RECOVERY_BACKOFF_MS: [u64; 4] = [250, 500, 1_000, 2_000];
+pub const CAPTURE_RECOVERY_INTERVAL: Duration = Duration::from_millis(500);
 
-fn recovery_delay(step: usize) -> Duration {
-    Duration::from_millis(RECOVERY_BACKOFF_MS[step.min(RECOVERY_BACKOFF_MS.len() - 1)])
+/// Windows-capture reports AcquireNextFrame and DuplicateOutput HRESULTs
+/// through WindowsError (sometimes nested inside DirectXError).
+pub fn capture_error_is_unavailable(error: &CaptureError) -> bool {
+    if matches!(error, CaptureError::AccessLost) {
+        return true;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<windows::core::Error>() {
+            if matches!(error.code().0 as u32, 0x80070005 | 0x887A0026) {
+                return true;
+            }
+        }
+        source = error.source();
+    }
+    false
 }
 
 fn idle_snapshot_retry_due(now: Instant, retry_at: Instant) -> bool {
@@ -236,6 +248,10 @@ pub enum CapturedFrame<'a> {
 impl CapturedFrame<'_> {
     pub fn is_idle_snapshot(&self) -> bool {
         matches!(self, Self::IdleSnapshot { .. })
+    }
+
+    pub fn is_secure_snapshot(&self) -> bool {
+        matches!(self, Self::SecureSnapshot { .. })
     }
 
     pub fn width(&self) -> u32 {
@@ -489,6 +505,62 @@ pub struct SecureCapture {
     width: u32,
     height: u32,
     monitor_device_name: String,
+}
+
+/// Uploads helper BGRA pixels on the interactive host's encoder device.
+/// The helper never creates an encoder or supplies a D3D device to the host.
+pub struct SecureFrameUpload {
+    device: ID3D11Device,
+    texture: Option<ID3D11Texture2D>,
+    size: (u32, u32),
+}
+
+impl SecureFrameUpload {
+    pub fn new(device: Option<&ID3D11Device>) -> Result<Self> {
+        let device = if let Some(device) = device {
+            device.clone()
+        } else {
+            let mut device = None;
+            unsafe {
+                D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT, Some(&[D3D_FEATURE_LEVEL_11_0]),
+                    D3D11_SDK_VERSION, Some(&mut device), None, None)
+            }.context("create host device for secure frame upload")?;
+            device.context("secure frame upload returned no host device")?
+        };
+        Ok(Self { device, texture: None, size: (0, 0) })
+    }
+
+    pub fn upload(&mut self, width: u32, height: u32, stride: u32, pixels: &[u8]) -> Result<CapturedFrame<'_>> {
+        validate_bgra_upload(width, height, stride, pixels.len())?;
+        if self.texture.is_none() || self.size != (width, height) {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width, Height: height, MipLevels: 1, ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                ..Default::default()
+            };
+            let mut texture = None;
+            unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+                .context("create host secure frame texture")?;
+            self.texture = Some(texture.context("secure frame texture missing")?);
+            self.size = (width, height);
+        }
+        let texture = self.texture.as_ref().expect("secure texture initialized");
+        let context = unsafe { self.device.GetImmediateContext() }.context("secure upload context")?;
+        unsafe { context.UpdateSubresource(texture, 0, None, pixels.as_ptr().cast(), stride, 0) };
+        Ok(CapturedFrame::SecureSnapshot { device: &self.device, texture: texture.clone(), width, height })
+    }
+}
+
+fn validate_bgra_upload(width: u32, height: u32, stride: u32, len: usize) -> Result<()> {
+    let row = width.checked_mul(4).context("BGRA row overflow")?;
+    let size = (stride as usize).checked_mul(height as usize).context("BGRA size overflow")?;
+    anyhow::ensure!(width > 0 && height > 0 && width <= 16384 && height <= 16384
+        && stride >= row && stride % 4 == 0 && size == len && size <= 256 * 1024 * 1024,
+        "invalid secure BGRA upload dimensions");
+    Ok(())
 }
 
 impl SecureCapture {
@@ -808,13 +880,21 @@ impl Capture {
         let monitor = pick_monitor(monitor_filter)?;
         let region = monitor_region(monitor).context("selected monitor bounds")?;
         let dev = monitor.device_name().unwrap_or_default();
-        let api = DxgiDuplicationApi::new(monitor).context("DxgiDuplicationApi::new")?;
-        let width = api.width();
-        let height = api.height();
-        let device_obj = api.device().clone();
-        info!(width, height, monitor = %dev, "DDA session created");
+        let api = match DxgiDuplicationApi::new(monitor) {
+            Ok(api) => Some(api),
+            Err(error) if capture_error_is_unavailable(&error) => {
+                warn!(?error, monitor = %dev, "DDA creation unavailable; preserving session");
+                None
+            }
+            Err(error) => return Err(error).context("DxgiDuplicationApi::new"),
+        };
+        let unavailable = api.is_none();
+        let width = api.as_ref().map_or(region.width, DxgiDuplicationApi::width);
+        let height = api.as_ref().map_or(region.height, DxgiDuplicationApi::height);
+        let device_obj = api.as_ref().map(|api| api.device().clone());
+        info!(width, height, monitor = %dev, unavailable, "DDA source initialized");
         Ok(Self {
-            api: Some(api),
+            api,
             width,
             height,
             origin_x: region.x,
@@ -822,17 +902,18 @@ impl Capture {
             frames_acquired: 0,
             frames_new: 0,
             last_present_qpc: 0,
-            device_obj: Some(device_obj),
-            pending_recreate: false,
-            next_recreate_attempt: Instant::now(),
-            recovery_backoff_step: 0,
+            device_obj,
+            pending_recreate: unavailable,
+            next_recreate_attempt: Instant::now() + if unavailable { CAPTURE_RECOVERY_INTERVAL } else { Duration::ZERO },
             awaiting_recovery_frame: false,
             fresh_recreate_required: false,
-            monitor_filter: monitor_filter.map(|s| s.to_string()),
+            // Pin the selected physical output; "primary" may resolve to a
+            // different monitor after a desktop/topology transition.
+            monitor_filter: Some(dev.clone()),
             monitor_device_name: dev,
             idle_snapshot: IdleSnapshotState::new(Instant::now()),
-            availability: CaptureAvailability::Active,
-            availability_transition: None,
+            availability: if unavailable { CaptureAvailability::Unavailable } else { CaptureAvailability::Active },
+            availability_transition: unavailable.then_some(CaptureAvailability::Unavailable),
         })
     }
 
@@ -859,6 +940,9 @@ impl Capture {
     /// Replace the duplication session only after the new monitor has been
     /// opened successfully, leaving the current stream intact on failure.
     pub fn switch_monitor(&mut self, selector: &str) -> Result<()> {
+        if self.availability == CaptureAvailability::Unavailable {
+            bail!("capture unavailable; monitor selection is suspended until recovery");
+        }
         let monitor = pick_monitor(Some(selector))?;
         let region = monitor_region(monitor).context("selected monitor bounds")?;
         let dev = monitor.device_name().unwrap_or_default();
@@ -871,11 +955,13 @@ impl Capture {
             // same selector, which is also the required ownership order for a
             // silently stalled (timeout-only) duplication session.
             self.monitor_filter = Some(dev.clone());
-            self.recreate(false)
-                .context("recreate current monitor duplication")?;
+            if let Err(error) = self.recreate(false) {
+                // Recreate consumes the old duplication even when it fails.
+                self.mark_unavailable();
+                return Err(error).context("recreate current monitor duplication");
+            }
             self.pending_recreate = false;
             self.next_recreate_attempt = Instant::now();
-            self.recovery_backoff_step = 0;
             self.awaiting_recovery_frame = false;
             self.fresh_recreate_required = false;
             self.availability = CaptureAvailability::Active;
@@ -887,8 +973,14 @@ impl Capture {
             );
             return Ok(());
         }
-        let api =
-            DxgiDuplicationApi::new(monitor).context("DxgiDuplicationApi::new monitor switch")?;
+        let api = match DxgiDuplicationApi::new(monitor) {
+            Ok(api) => api,
+            Err(error) if capture_error_is_unavailable(&error) => {
+                self.mark_unavailable();
+                return Err(error).context("DxgiDuplicationApi::new monitor switch unavailable");
+            }
+            Err(error) => return Err(error).context("DxgiDuplicationApi::new monitor switch"),
+        };
         self.width = api.width();
         self.height = api.height();
         self.origin_x = region.x;
@@ -900,7 +992,6 @@ impl Capture {
         self.api = Some(api);
         self.pending_recreate = false;
         self.next_recreate_attempt = Instant::now();
-        self.recovery_backoff_step = 0;
         self.awaiting_recovery_frame = false;
         self.fresh_recreate_required = false;
         self.idle_snapshot = IdleSnapshotState::new(Instant::now());
@@ -918,16 +1009,45 @@ impl Capture {
         self.availability_transition.take()
     }
 
+    pub fn availability(&self) -> CaptureAvailability {
+        self.availability
+    }
+
+    /// The helper observed Winlogon before DDA reported its own access loss.
+    /// Keep the selected output/device, but never reuse its desktop pixels.
+    pub fn suspend_for_secure_desktop(&mut self) {
+        self.api = None;
+        self.mark_unavailable();
+        self.fresh_recreate_required = true;
+        self.awaiting_recovery_frame = false;
+        self.idle_snapshot = IdleSnapshotState::new(Instant::now());
+    }
+
+    fn mark_unavailable(&mut self) {
+        self.pending_recreate = true;
+        self.next_recreate_attempt = Instant::now() + CAPTURE_RECOVERY_INTERVAL;
+        self.availability = CaptureAvailability::Unavailable;
+        self.availability_transition = Some(CaptureAvailability::Unavailable);
+    }
+
     /// Acquire the next frame, blocking up to `timeout`.
     ///
-    /// `Ok(None)` on timeout (desktop idle). On `AccessLost` we recreate the
-    /// session inline and return `Ok(None)` — the caller just retries.
+    /// `Ok(None)` on timeout (desktop idle). Access-lost and access-denied
+    /// enter an unavailable circuit with deferred 500 ms recreation attempts,
+    /// returning `Ok(None)` while signaling and media sockets stay alive.
     /// The returned tuple is `(frame, is_new_present, recovered)`. `recovered`
     /// is true only for the first real DDA frame after an unavailable period.
     pub fn acquire<'a>(
         &'a mut self,
         timeout: Duration,
     ) -> Result<Option<(CapturedFrame<'a>, bool, bool)>> {
+        if !crate::desktop_session::input_desktop_is_default() {
+            if self.availability != CaptureAvailability::Unavailable {
+                self.suspend_for_secure_desktop();
+                warn!("input desktop is not Default; normal capture suspended");
+            }
+            return Ok(None);
+        }
         // Deferred recovery from a previous AccessLost (see field doc).
         if self.pending_recreate {
             if Instant::now() < self.next_recreate_attempt {
@@ -949,8 +1069,7 @@ impl Capture {
                     // session AND denies new ones until the desktop is back.
                     // Never kill or block the stream over this — the RTC loop
                     // keeps pumping while we wait for the next retry deadline.
-                    let delay = recovery_delay(self.recovery_backoff_step);
-                    self.recovery_backoff_step = self.recovery_backoff_step.saturating_add(1);
+                    let delay = CAPTURE_RECOVERY_INTERVAL;
                     self.next_recreate_attempt = Instant::now() + delay;
                     self.fresh_recreate_required = true;
                     debug!(
@@ -971,7 +1090,7 @@ impl Capture {
         {
             Ok(f) => f,
             Err(CaptureError::Timeout) => return Ok(None),
-            Err(CaptureError::AccessLost) => {
+            Err(error) if capture_error_is_unavailable(&error) => {
                 let first_loss = self.availability != CaptureAvailability::Unavailable;
                 if first_loss {
                     warn!(
@@ -983,8 +1102,7 @@ impl Capture {
                 // Disjoint field write; `self.api` is borrowed for 'a by the
                 // (absent) Ok frame, so no `&mut self` calls here.
                 self.pending_recreate = true;
-                let delay = recovery_delay(self.recovery_backoff_step);
-                self.recovery_backoff_step = self.recovery_backoff_step.saturating_add(1);
+                let delay = CAPTURE_RECOVERY_INTERVAL;
                 self.next_recreate_attempt = Instant::now() + delay;
                 if self.awaiting_recovery_frame {
                     self.fresh_recreate_required = true;
@@ -998,6 +1116,26 @@ impl Capture {
             }
             Err(e) => return Err(anyhow::anyhow!("acquire_next_frame: {e:?}")),
         };
+
+        // A duplication acquire can yield stale Default pixels on Winlogon.
+        // Recheck after acquire as the desktop may switch during the call.
+        if !crate::desktop_session::normal_frame_is_verified(
+            true, crate::desktop_session::input_desktop_kind(), false,
+        ) {
+            drop(frame);
+            // self.api is borrowed for 'a by the absent returned frame. Update
+            // disjoint recovery fields; replace the API only on the next call.
+            if self.availability != CaptureAvailability::Unavailable {
+                self.availability_transition = Some(CaptureAvailability::Unavailable);
+                warn!("discarded DDA frame from a non-Default input desktop");
+            }
+            self.availability = CaptureAvailability::Unavailable;
+            self.pending_recreate = true;
+            self.fresh_recreate_required = true;
+            self.awaiting_recovery_frame = false;
+            self.next_recreate_attempt = Instant::now() + CAPTURE_RECOVERY_INTERVAL;
+            return Ok(None);
+        }
 
         // Keep the capture device pinned for diagnostics and AccessLost
         // recreation. It is also available before this first DDA frame.
@@ -1027,7 +1165,6 @@ impl Capture {
                 availability_after(self.availability, CaptureRecoveryEvent::FrameAcquired);
             self.awaiting_recovery_frame = false;
             self.fresh_recreate_required = false;
-            self.recovery_backoff_step = 0;
             info!("DDA capture produced a verified recovery frame");
         }
 
@@ -1058,12 +1195,23 @@ impl Capture {
     /// and retried after a short backoff, leaving the zero-timeout DDA pump
     /// untouched.
     pub fn take_idle_snapshot_frame(&mut self) -> Option<CapturedFrame<'_>> {
+        // A snapshot cannot prove DDA recovery and must never expose pixels
+        // while the normal desktop source is unavailable.
+        if self.availability == CaptureAvailability::Unavailable || !crate::desktop_session::input_desktop_is_default() {
+            return None;
+        }
         let now = Instant::now();
         if !self.idle_snapshot.is_due(now) {
             return None;
         }
         match self.capture_idle_snapshot() {
             Ok(texture) => {
+                if !crate::desktop_session::input_desktop_is_default() {
+                    drop(texture);
+                    self.suspend_for_secure_desktop();
+                    warn!("discarded idle snapshot after input desktop left Default");
+                    return None;
+                }
                 self.idle_snapshot.on_snapshot_copied(now);
                 debug!(
                     width = self.width,
@@ -1199,9 +1347,16 @@ pub fn texture_ptr(frame: &CapturedFrame<'_>) -> *mut c_void {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secure_upload_rejects_malformed_bgra_dimensions() {
+        assert!(super::validate_bgra_upload(2, 2, 8, 16).is_ok());
+        for (width, height, stride, len) in [(0, 2, 8, 16), (2, 0, 8, 0), (2, 2, 4, 8), (2, 2, 9, 18), (2, 2, 8, 15), (u32::MAX, 1, 4, 4)] {
+            assert!(super::validate_bgra_upload(width, height, stride, len).is_err());
+        }
+    }
     use super::{
         availability_after, gdi_texture_desc, idle_snapshot_retry_due, monitor_switch_plan,
-        move_damage_rects, pack_bgra_rows, recovery_delay, supports_idle_snapshot_rotation,
+        move_damage_rects, pack_bgra_rows, supports_idle_snapshot_rotation,
         CaptureAvailability, CaptureRecoveryEvent, IdleSnapshotState, MonitorSwitchPlan,
     };
 
@@ -1325,12 +1480,49 @@ mod tests {
     }
 
     #[test]
-    fn capture_recovery_backoff_caps_at_two_seconds() {
-        assert_eq!(recovery_delay(0), Duration::from_millis(250));
-        assert_eq!(recovery_delay(1), Duration::from_millis(500));
-        assert_eq!(recovery_delay(2), Duration::from_secs(1));
-        assert_eq!(recovery_delay(3), Duration::from_secs(2));
-        assert_eq!(recovery_delay(99), Duration::from_secs(2));
+    fn access_denied_and_access_lost_are_source_unavailable() {
+        use windows_capture::dxgi_duplication_api::Error;
+        use windows::core::{Error as WindowsError, HRESULT};
+        assert!(super::capture_error_is_unavailable(&Error::AccessLost));
+        for code in [0x80070005u32, 0x887A0026] {
+            assert!(super::capture_error_is_unavailable(&Error::WindowsError(
+                WindowsError::from_hresult(HRESULT(code as i32)),
+            )));
+        }
+        assert!(!super::capture_error_is_unavailable(&Error::Timeout));
+        assert!(!super::capture_error_is_unavailable(&Error::WindowsError(
+            WindowsError::from_hresult(HRESULT(0x80070057u32 as i32)),
+        )));
+        assert!(super::capture_error_is_unavailable(&Error::DirectXError(
+            windows_capture::d3d11::Error::WindowsError(
+                WindowsError::from_hresult(HRESULT(0x80070005u32 as i32)),
+            ),
+        )));
+        assert_eq!(super::CAPTURE_RECOVERY_INTERVAL, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn unavailable_capture_refuses_monitor_switch_and_retains_recovery_output() {
+        let now = Instant::now();
+        let selected = r"\\.\DISPLAY6";
+        let mut capture = super::Capture {
+            api: None, width: 1920, height: 1080, origin_x: -1920, origin_y: 0,
+            frames_acquired: 0, frames_new: 0, last_present_qpc: 0,
+            device_obj: None, pending_recreate: true,
+            next_recreate_attempt: now + Duration::from_secs(30),
+            awaiting_recovery_frame: false, fresh_recreate_required: false,
+            monitor_filter: Some(selected.into()), monitor_device_name: selected.into(),
+            idle_snapshot: IdleSnapshotState::new(now),
+            availability: CaptureAvailability::Unavailable, availability_transition: None,
+        };
+        assert!(capture.switch_monitor(r"\\.\DISPLAY1").is_err());
+        assert!(capture.switch_monitor(selected).is_err());
+        assert_eq!(capture.monitor_selector(), selected);
+        assert_eq!(capture.region(), crate::input::DesktopRegion::new(-1920, 0, 1920, 1080));
+        assert!(capture.acquire(Duration::ZERO).unwrap().is_none());
+        assert!(capture.take_idle_snapshot_frame().is_none());
+        assert_eq!(capture.monitor_filter.as_deref(), Some(selected));
+        assert_eq!(capture.availability(), CaptureAvailability::Unavailable);
     }
 
     #[test]

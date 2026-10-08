@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$ManifestPath = '',
-    [string]$Url = 'https://playfull-cat.your-subdomain.workers.dev/',
+    [string]$Url = $env:BUBBLEPLAY_URL,
     [ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')]
     [string]$WorkerVersionId = '',
     [ValidateRange(1, 10)]
@@ -181,6 +181,10 @@ if ($EnvironmentOnly) {
     }
 }
 
+if ([string]::IsNullOrWhiteSpace($Url)) { throw 'A relay URL is required: pass -Url or set BUBBLEPLAY_URL.' }
+$relayUri = $null
+if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$relayUri) -or
+    $relayUri.Scheme -notin @('http', 'https')) { throw 'The relay URL must be an absolute HTTP or HTTPS URL.' }
 if (-not $ManifestPath) { throw 'ManifestPath is required unless -EnvironmentOnly is used.' }
 if (-not $WorkerVersionId) { throw 'WorkerVersionId is required for live external validation.' }
 $manifestPath = [IO.Path]::GetFullPath($ManifestPath)
@@ -195,8 +199,8 @@ New-Item -ItemType Directory -Path $evidenceDir -Force | Out-Null
 
 $publisher = Join-Path $PSScriptRoot 'publish-update-validation.ps1'
 $collector = Join-Path $PSScriptRoot 'collect-diagnostics.ps1'
-$helperProbe = Join-Path $workerDir 'tools\stream-lab-helper-probe.mjs'
-$labCli = Join-Path $workerDir 'tools\stream-lab.mjs'
+$helperProbe = Join-Path $workerDir 'tools\lab\stream-lab-helper-probe.mjs'
+$labCli = Join-Path $workerDir 'tools\lab\stream-lab.mjs'
 $summaryPath = Join-Path $evidenceDir 'summary.json'
 $hostLog = Join-Path $env:ProgramData 'BubblePlay\logs\transport\transport-host.stderr.log'
 

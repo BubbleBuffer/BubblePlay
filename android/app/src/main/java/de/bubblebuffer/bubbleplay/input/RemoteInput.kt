@@ -3,17 +3,24 @@ package de.bubblebuffer.bubbleplay.input
 import de.bubblebuffer.bubbleplay.protocol.Clipboard
 import de.bubblebuffer.bubbleplay.protocol.InputPackets
 import de.bubblebuffer.bubbleplay.protocol.KeyMap
+import java.util.ArrayDeque
 import kotlin.math.roundToInt
 
 /**
  * Ordered input to the host (the essentials of input.js InputController).
  * Control packets (keys, buttons, text, clipboard) are sent in order; the
- * WebSocket buffers them. Pointer motion is coalesced and dropped under
- * congestion. While the transport is down or input is gated nothing is sent,
+ * WebSocket buffers them. Pointer motion is coalesced and retained under
+ * congestion. Deferred motion and reliable controls retain their event order.
+ * While the transport is down or input is gated nothing is sent,
  * and the next live packet is preceded by release-all so the host never keeps
  * keys from an earlier session.
  */
-class RemoteInput(private val transport: Transport) {
+class RemoteInput(
+    private val transport: Transport,
+    /** Cursor authority barriers only; wheel-only sends still advance [lastSentSequence]. */
+    private val onSequenceSent: (Int) -> Unit = {},
+    private val onDeferredInput: () -> Unit = {},
+) {
     interface Transport {
         /** True while the signaling socket is open and the host accepts input. */
         fun inputOpen(): Boolean
@@ -31,21 +38,36 @@ class RemoteInput(private val transport: Transport) {
     private var clipboardId = 0
 
     // Coalesced motion.
-    private var pendingDx = 0
-    private var pendingDy = 0
-    private var pendingWheelX = 0
-    private var pendingWheelY = 0
+    private var pendingDx = 0L
+    private var pendingDy = 0L
+    private var pendingWheelX = 0L
+    private var pendingWheelY = 0L
     private var pendingAbsolute: Pair<Int, Int>? = null
+    private sealed interface Pending
+    private data class Reliable(val packet: ByteArray, val sequenced: Boolean = false) : Pending
+    private data class Motion(
+        var dx: Long, var dy: Long, var wx: Long, var wy: Long,
+        var absolute: Pair<Int, Int>?,
+    ) : Pending {
+        fun empty() = absolute == null && dx == 0L && dy == 0L && wx == 0L && wy == 0L
+    }
+    private val deferred = ArrayDeque<Pending>()
 
+    /** True means queued locally for this live session, not acknowledged by the host. */
     @Synchronized
     fun control(packet: ByteArray?): Boolean {
         if (packet == null) return false
-        if (!transport.inputOpen()) { needsRelease = true; return false }
-        if (needsRelease) {
-            if (!transport.send(InputPackets.releaseAll())) return false
-            needsRelease = false
-        }
-        return transport.send(packet)
+        return enqueueControl(packet)
+    }
+
+    /** True means accepted into this session's ordered queue, including a deferred send. */
+    private fun enqueueControl(packet: ByteArray, sequenced: Boolean = false): Boolean {
+        if (!transport.inputOpen()) { discardPending(); needsRelease = true; return false }
+        freezeMotion()
+        deferred.addLast(Reliable(packet, sequenced))
+        drain()
+        if (hasPendingInput()) onDeferredInput()
+        return true
     }
 
     /** Physical key by DOM code; scan code on capable hosts, VK otherwise. */
@@ -90,36 +112,38 @@ class RemoteInput(private val transport: Transport) {
     }
 
     @Synchronized
-    fun buttons(mask: Int): Boolean { buttonMask = mask; return control(InputPackets.buttons(mask)) }
+    fun buttons(mask: Int): Boolean {
+        if (!control(InputPackets.buttons(mask))) return false
+        buttonMask = mask
+        return true
+    }
 
     /** Buttons at an absolute position (normalized 0..65535), with a sequence barrier. */
     @Synchronized
     fun buttonsAt(x: Int, y: Int, mask: Int): Boolean {
-        clearMotion()
-        val s = seq
-        if (!control(InputPackets.buttonsAt(s, x.coerceIn(0, 65535), y.coerceIn(0, 65535), mask))) return false
-        lastSentSequence = s; seq = (s + 1) and 0xffff; buttonMask = mask
+        if (!enqueueControl(InputPackets.buttonsAt(0, x.coerceIn(0, 65535), y.coerceIn(0, 65535), mask), sequenced = true)) return false
+        buttonMask = mask
         return true
     }
 
     @Synchronized
     fun cursorSync(): Boolean {
         clearMotion()
-        val s = seq
-        if (!control(InputPackets.cursorSync(s))) return false
-        lastSentSequence = s; seq = (s + 1) and 0xffff
-        return true
+        return enqueueControl(InputPackets.cursorSync(0), sequenced = true)
     }
 
     @Synchronized
     fun motion(dx: Int, dy: Int, wheelX: Int = 0, wheelY: Int = 0) {
-        pendingAbsolute = null
+        // A relative sample after an unsent absolute target follows that target.
+        // drain() sends the target first, then the accumulated relative/wheel tail.
         pendingDx += dx; pendingDy += dy; pendingWheelX += wheelX; pendingWheelY += wheelY
     }
 
     @Synchronized
     fun absolute(x: Int, y: Int) {
-        pendingDx = 0; pendingDy = 0
+        // A newer target supersedes earlier position deltas in this unfenced
+        // segment; wheel distance is independent and must remain pending.
+        pendingDx = 0L; pendingDy = 0L
         pendingAbsolute = x.coerceIn(0, 65535) to y.coerceIn(0, 65535)
     }
 
@@ -128,36 +152,104 @@ class RemoteInput(private val transport: Transport) {
     /** Sends coalesced motion; keeps it pending while the socket is congested. */
     @Synchronized
     fun flushMotion(): Boolean {
-        val abs = pendingAbsolute
-        val hasRelative = pendingDx != 0 || pendingDy != 0 || pendingWheelX != 0 || pendingWheelY != 0
-        if (abs == null && !hasRelative) return false
-        if (!transport.inputOpen()) { clearMotion(); return false }
-        if (transport.queuedBytes() > MOTION_BACKLOG_BYTES) return false
-        val s = seq
-        val packet = if (abs != null) InputPackets.absolute(s, abs.first, abs.second)
-        else InputPackets.motion(s, pendingDx, pendingDy, pendingWheelX, pendingWheelY)
-        if (!control(packet)) return false
-        clearMotion()
-        lastSentSequence = s; seq = (s + 1) and 0xffff
-        return true
+        return drain()
     }
 
-    fun hasPendingMotion(): Boolean = synchronized(this) {
-        pendingAbsolute != null || pendingDx != 0 || pendingDy != 0 || pendingWheelX != 0 || pendingWheelY != 0
+    private fun drain(): Boolean {
+        if (!transport.inputOpen()) { discardPending(); needsRelease = true; return false }
+        var sent = false
+        while (true) {
+            // Keep unfenced motion live so new events can still coalesce into it.
+            if (deferred.isEmpty()) freezeMotion()
+            val next = deferred.peekFirst() ?: return sent
+            val packet = when (next) {
+                is Reliable -> if (next.sequenced) next.packet.copyOf().also {
+                    it[1] = seq.toByte(); it[2] = (seq ushr 8).toByte()
+                } else next.packet
+                is Motion -> next.absolute?.let { InputPackets.absolute(seq, it.first, it.second) }
+                    ?: InputPackets.motion(seq, chunk(next.dx), chunk(next.dy), chunk(next.wx), chunk(next.wy))
+            }
+            val releaseBytes = if (needsRelease) 1 else 0
+            if (next is Motion && transport.queuedBytes() + packet.size + releaseBytes > MOTION_BACKLOG_BYTES) {
+                thawUnfencedMotion()
+                return sent
+            }
+            if (needsRelease) {
+                if (!transport.send(InputPackets.releaseAll())) { thawUnfencedMotion(); return sent }
+                needsRelease = false
+            }
+            if (!transport.send(packet)) { thawUnfencedMotion(); return sent }
+            sent = true
+            when (next) {
+                is Reliable -> {
+                    deferred.removeFirst()
+                    if (next.sequenced) noteSequenceSent()
+                }
+                is Motion -> {
+                    val movesCursor = next.absolute != null || next.dx != 0L || next.dy != 0L
+                    if (next.absolute != null) next.absolute = null
+                    else {
+                        next.dx -= chunk(next.dx); next.dy -= chunk(next.dy)
+                        next.wx -= chunk(next.wx); next.wy -= chunk(next.wy)
+                    }
+                    noteSequenceSent(cursorAuthority = movesCursor)
+                    if (next.empty()) deferred.removeFirst()
+                }
+            }
+        }
     }
+
+    private fun noteSequenceSent(cursorAuthority: Boolean = true) {
+        lastSentSequence = seq
+        if (cursorAuthority) onSequenceSent(seq)
+        seq = (seq + 1) and 0xffff
+    }
+
+    private fun freezeMotion() {
+        if (!hasLiveMotion()) return
+        deferred.addLast(Motion(pendingDx, pendingDy, pendingWheelX, pendingWheelY, pendingAbsolute))
+        clearMotion()
+    }
+
+    /** A refused final segment has no control barrier; continue coalescing into it. */
+    private fun thawUnfencedMotion() {
+        if (deferred.size != 1 || deferred.peekFirst() !is Motion) return
+        val motion = deferred.removeFirst() as Motion
+        pendingDx += motion.dx; pendingDy += motion.dy
+        pendingWheelX += motion.wx; pendingWheelY += motion.wy
+        if (pendingAbsolute == null) pendingAbsolute = motion.absolute
+    }
+
+    private fun hasLiveMotion() = pendingAbsolute != null || pendingDx != 0L || pendingDy != 0L || pendingWheelX != 0L || pendingWheelY != 0L
+    private fun chunk(value: Long) = value.coerceIn(-32768L, 32767L).toInt()
+
+    fun hasPendingMotion(): Boolean = synchronized(this) {
+        hasLiveMotion() || deferred.any { it is Motion }
+    }
+
+    /** Unsent cursor coordinates/displacement; wheel alone needs no prediction protection. */
+    fun hasPendingCursorMotion(): Boolean = synchronized(this) {
+        pendingAbsolute != null || pendingDx != 0L || pendingDy != 0L || deferred.any {
+            it is Motion && (it.absolute != null || it.dx != 0L || it.dy != 0L)
+        }
+    }
+
+    fun hasPendingInput(): Boolean = synchronized(this) { hasLiveMotion() || deferred.isNotEmpty() }
 
     @Synchronized
     fun releaseAll(send: Boolean = true) {
-        held.clear(); buttonMask = 0; clearMotion()
+        held.clear(); buttonMask = 0; discardPending(); lastSentSequence = null
         if (send) control(InputPackets.releaseAll()) else needsRelease = true
     }
 
     private fun clearMotion() {
-        pendingDx = 0; pendingDy = 0; pendingWheelX = 0; pendingWheelY = 0; pendingAbsolute = null
+        pendingDx = 0L; pendingDy = 0L; pendingWheelX = 0L; pendingWheelY = 0L; pendingAbsolute = null
     }
 
+    private fun discardPending() { clearMotion(); deferred.clear() }
+
     companion object {
-        const val MOTION_BACKLOG_BYTES = 16_384L
+        const val MOTION_BACKLOG_BYTES = 512L
     }
 }
 

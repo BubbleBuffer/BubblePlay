@@ -31,20 +31,20 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD,
     NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_INFOTIP_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    SetTimer, TrackPopupMenu, TranslateMessage, HICON, ICONINFO, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
-    WM_APP, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONUP, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
+    LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    SetForegroundWindow, SetProcessDPIAware, SetTimer, TrackPopupMenu, TranslateMessage, HICON,
+    IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON,
+    SM_CYSMICON, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_DESTROY,
+    WM_ENDSESSION, WM_LBUTTONUP, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 
 use bubbleplay_host::admin_agent::client::{probe, ProbeResult, AGENT_EXE};
@@ -52,15 +52,21 @@ use bubbleplay_host::admin_agent::protocol::{
     pipe_name, scoped_name, ENV_ALLOW_DEV_AGENT, ENV_PIPE, PROTOCOL_MAX, PROTOCOL_MIN,
 };
 use bubbleplay_host::admin_agent::trust::current_session_id;
+use bubbleplay_host::secure_helper::client::{probe as probe_secure_helper, LinkError};
+use bubbleplay_host::secure_helper::protocol::{
+    PROTOCOL_MAX as SECURE_PROTOCOL_MAX, PROTOCOL_MIN as SECURE_PROTOCOL_MIN,
+};
 use logic::{
-    admin_mode_line, run_key_command, status_line, unix_ms_now, AgentStatus, HostState, SharedLog,
-    TraySettings, ViewerGate, AGENT_UPDATE_LABEL,
+    admin_mode_line, run_key_command, secure_helper_should_launch, start_secure_helper_for_viewer,
+    status_line, unix_ms_now, AgentStatus, HostState, SecureHelperStatus, SharedLog, TraySettings,
+    ViewerGate, AGENT_UPDATE_LABEL, SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
     acquire_single_instance, agent_task_exists, create_manual_event, data_dir, end_agent_task,
     host_exe_beside, named_mutex_exists, open_folder, read_run_value, run_agent_task,
-    run_elevated_and_wait, set_event, set_run_value, sha256_file, wide, Handle, AGENT_MUTEX,
-    AGENT_STOP_EVENT, TRAY_MUTEX,
+    run_elevated_and_wait, run_secure_helper_task, secure_helper_task_exists, set_event,
+    set_run_value, sha256_file, wide, Handle, AGENT_MUTEX, AGENT_STOP_EVENT, SECURE_HELPER_TASK,
+    TRAY_MUTEX,
 };
 use supervisor::{HostEvent, SupervisorConfig, SupervisorThread};
 use update::{
@@ -83,6 +89,7 @@ const CMD_QUIT: usize = 6;
 const CMD_ROLLBACK: usize = 7;
 const CMD_BUILD: usize = 8;
 const CMD_AGENT_UPDATE: usize = 9;
+const CMD_SECURE_HELPER_UPDATE: usize = 10;
 
 /// Time the agent gets to answer after its task was started.
 const AGENT_START_GRACE: Duration = Duration::from_secs(15);
@@ -213,71 +220,45 @@ fn quit_running_tray() -> Result<i32> {
 // Tray
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IconKind {
-    Running,
-    Busy,
-    Stopped,
+/// Owned copy of the embedded BubblePlay mark at the system's small-icon size.
+/// Resource ID 1 is linked into this executable by build.rs.
+struct TrayIcon {
+    handle: HICON,
+    size: (i32, i32),
 }
 
-fn icon_kind(state: &HostState) -> IconKind {
-    match state {
-        HostState::Running { .. } => IconKind::Running,
-        HostState::Starting | HostState::Restarting { .. } => IconKind::Busy,
-        HostState::NotConfigured { .. } | HostState::Stopped => IconKind::Stopped,
+impl TrayIcon {
+    fn small_size() -> (i32, i32) {
+        // SAFETY: these metrics need no pointers. run_tray enables system DPI awareness.
+        unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) }
     }
-}
 
-/// Draw a 32x32 status disc with a white "play" glyph.
-fn make_icon(kind: IconKind) -> HICON {
-    const SIZE: i32 = 32;
-    let (r, g, b) = match kind {
-        IconKind::Running => (0x2e, 0xa0, 0x5a),
-        IconKind::Busy => (0xe0, 0x9a, 0x1f),
-        IconKind::Stopped => (0x80, 0x80, 0x88),
-    };
-    let mut pixels = vec![0u32; (SIZE * SIZE) as usize];
-    let center = (SIZE as f32 - 1.0) / 2.0;
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let coverage = (15.5 - distance).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
-                continue;
-            }
-            // Play triangle: x in [11, 23], |dy| <= (23 - x) / 2 * ...
-            let fx = x as f32;
-            let in_triangle = (11.0..=23.0).contains(&fx) && dy.abs() <= (23.0 - fx) * 0.6;
-            let (pr, pg, pb) = if in_triangle {
-                (255, 255, 255)
-            } else {
-                (r, g, b)
-            };
-            let alpha = (coverage * 255.0) as u32;
-            // Premultiplied BGRA.
-            let premultiply = |c: u32| c * alpha / 255;
-            pixels[(y * SIZE + x) as usize] =
-                (alpha << 24) | (premultiply(pr) << 16) | (premultiply(pg) << 8) | premultiply(pb);
-        }
-    }
-    let mask = vec![0u8; (SIZE * SIZE / 8) as usize];
-    // SAFETY: buffers match the declared bitmap dimensions and live across the calls.
-    unsafe {
-        let color = CreateBitmap(SIZE, SIZE, 1, 32, Some(pixels.as_ptr().cast()));
-        let mask_bitmap = CreateBitmap(SIZE, SIZE, 1, 1, Some(mask.as_ptr().cast()));
-        let info = ICONINFO {
-            fIcon: true.into(),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask_bitmap,
-            hbmColor: color,
+    fn load(size: (i32, i32)) -> Result<Self> {
+        // SAFETY: module is our executable; PCWSTR(1) is MAKEINTRESOURCEW(1).
+        // Omitting LR_SHARED gives this object ownership of the loaded icon.
+        let handle = unsafe {
+            let module = GetModuleHandleW(PCWSTR::null()).context("GetModuleHandleW")?;
+            LoadImageW(
+                Some(module.into()),
+                PCWSTR(1usize as *const u16),
+                IMAGE_ICON,
+                size.0,
+                size.1,
+                LR_DEFAULTCOLOR,
+            )
+            .context("loading embedded BubblePlay tray icon")?
         };
-        let icon = CreateIconIndirect(&info).unwrap_or_default();
-        let _ = DeleteObject(HGDIOBJ(color.0));
-        let _ = DeleteObject(HGDIOBJ(mask_bitmap.0));
-        icon
+        Ok(Self {
+            handle: HICON(handle.0),
+            size,
+        })
+    }
+}
+
+impl Drop for TrayIcon {
+    fn drop(&mut self) {
+        // SAFETY: LoadImageW created this non-shared icon, destroyed exactly once.
+        let _ = unsafe { DestroyIcon(self.handle) };
     }
 }
 
@@ -296,6 +277,9 @@ struct App {
     host_log: SharedLog,
     user: Option<SupervisorThread>,
     agent: AgentStatus,
+    secure_helper: SecureHelperStatus,
+    helper_started: Option<Instant>,
+    helper_last_probe: Option<Instant>,
     /// Viewer sessions seen in the host log: the agent runs only around them.
     viewers: ViewerGate,
     /// When the agent task was last started.
@@ -308,8 +292,8 @@ struct App {
     announce_ready: bool,
     agent_pipe: String,
     stop_event: Handle,
-    icons: [HICON; 3],
-    shown: Option<(IconKind, String)>,
+    icon: TrayIcon,
+    shown: Option<String>,
     taskbar_created: u32,
     shut_down: bool,
     events_tx: std::sync::mpsc::Sender<HostEvent>,
@@ -323,8 +307,17 @@ struct App {
 }
 
 impl App {
-    fn icon(&self, kind: IconKind) -> HICON {
-        self.icons[kind as usize]
+    fn refresh_icon(&mut self) {
+        let size = TrayIcon::small_size();
+        if size != self.icon.size {
+            match TrayIcon::load(size) {
+                Ok(icon) => {
+                    self.icon = icon;
+                    self.shown = None;
+                }
+                Err(error) => tracing::warn!(?error, "reloading tray icon failed"),
+            }
+        }
     }
 
     fn notify_data(&self) -> NOTIFYICONDATAW {
@@ -337,18 +330,18 @@ impl App {
     }
 
     fn add_icon(&mut self) {
+        self.refresh_icon();
         let state = self.state();
-        let kind = icon_kind(&state);
         let tip = status_line(&state, &self.agent);
         let mut data = self.notify_data();
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
-        data.hIcon = self.icon(kind);
+        data.hIcon = self.icon.handle;
         copy_wide(&mut data.szTip, &tip);
         // SAFETY: data is fully initialized.
         let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool();
         tracing::info!(added, "notification icon registered");
-        self.shown = Some((kind, tip));
+        self.shown = added.then_some(tip);
     }
 
     fn remove_icon(&self) {
@@ -431,6 +424,120 @@ impl App {
         }
     }
 
+    fn start_secure_helper(&mut self, trigger: &str) {
+        if self.test_mode {
+            tracing::debug!(trigger, "test mode: secure helper task launch skipped");
+            return;
+        }
+        // Do not pre-probe or gate on the previous helper status: each new
+        // viewer must attempt the installed task even after a prior failure.
+        let result = start_secure_helper_for_viewer(
+            &mut self.secure_helper,
+            self.agent_update_running,
+            || {
+                run_secure_helper_task()
+                    .map_err(|error| format!("secure helper did not launch: {error:#}"))
+            },
+        );
+        match result {
+            Ok(true) => {
+                self.helper_started = Some(Instant::now());
+                self.helper_last_probe = None;
+                tracing::info!(
+                    trigger,
+                    task = SECURE_HELPER_TASK,
+                    admin_mode = self.settings.admin_mode,
+                    "secure helper task started"
+                );
+            }
+            Ok(false) => tracing::info!(
+                trigger,
+                "secure helper start deferred during privileged helper update"
+            ),
+            Err(reason) => {
+                self.helper_started = None;
+                self.helper_last_probe = None;
+                tracing::warn!(trigger, %reason, "secure helper task start failed");
+            }
+        }
+    }
+
+    /// Probe never claims the host role or changes the helper lifetime. All
+    /// probes verify the protected image, SYSTEM token and session identity.
+    fn check_secure_helper(&mut self, force_probe: bool) {
+        if self.test_mode || self.agent_update_running {
+            return;
+        }
+        if !self.viewers.viewer_connected() {
+            if !self.secure_helper.needs_update() {
+                self.secure_helper = SecureHelperStatus::Armed;
+            }
+            self.helper_started = None;
+            self.helper_last_probe = None;
+            return;
+        }
+        if secure_helper_should_launch(true, &self.secure_helper, false) {
+            self.start_secure_helper("active viewer retry");
+        }
+        if self.secure_helper.needs_update() {
+            return;
+        }
+        let due = force_probe
+            || self.secure_helper == SecureHelperStatus::Starting
+            || self
+                .helper_last_probe
+                .is_none_or(|at| at.elapsed() >= AGENT_PROBE_INTERVAL);
+        if !due {
+            return;
+        }
+        let first_probe = self.helper_last_probe.is_none();
+        self.helper_last_probe = Some(Instant::now());
+        match probe_secure_helper() {
+            Ok(()) => {
+                if self.secure_helper != SecureHelperStatus::Ready || force_probe {
+                    tracing::info!("secure helper probe ready (version and identity verified)");
+                } else {
+                    tracing::debug!("secure helper probe ready");
+                }
+                self.secure_helper = SecureHelperStatus::Ready;
+            }
+            Err(LinkError::Unavailable)
+                if self
+                    .helper_started
+                    .is_some_and(|at| at.elapsed() < AGENT_START_GRACE) =>
+            {
+                if first_probe {
+                    tracing::info!("secure helper probe unavailable; waiting for task startup");
+                } else {
+                    tracing::debug!("secure helper probe unavailable during startup grace");
+                }
+            }
+            Err(LinkError::Unavailable) if self.secure_helper == SecureHelperStatus::Ready => {
+                // Re-arm once; the next tick retries launch. Failure is then
+                // reported instead of endlessly restarting a SYSTEM process.
+                tracing::warn!(
+                    "secure helper probe unavailable; will retry task for active viewer"
+                );
+                self.secure_helper = SecureHelperStatus::Armed;
+            }
+            Err(error) => {
+                let reason = Self::helper_error(error);
+                tracing::warn!(%reason, "secure helper probe failed; helper needs update");
+                self.secure_helper = SecureHelperStatus::NeedsUpdate { reason };
+            }
+        }
+    }
+
+    fn helper_error(error: LinkError) -> String {
+        match error {
+            LinkError::Busy => "the secure helper already has a host client".into(),
+            LinkError::Unavailable => "the secure helper did not answer".into(),
+            LinkError::Incompatible { helper_min, helper_max } => format!("secure helper protocol {helper_min}-{helper_max}; host needs {SECURE_PROTOCOL_MIN}-{SECURE_PROTOCOL_MAX}"),
+            LinkError::Untrusted => "secure helper identity verification failed".into(),
+            LinkError::Protocol => "secure helper protocol verification failed".into(),
+        }
+    }
+
     fn agent_running(&self) -> bool {
         named_mutex_exists(&scoped(AGENT_MUTEX))
     }
@@ -479,7 +586,7 @@ impl App {
                 self.announce_ready = false;
                 self.balloon(
                     "BubblePlay",
-                    "Admin mode on: input can reach elevated windows. The secure desktop (UAC prompts, lock screen) is still not captured.",
+                    "Admin mode on: input can reach elevated windows. An installed secure-desktop helper also allows input on UAC prompts and the lock screen.",
                     NIIF_INFO,
                 );
             }
@@ -706,7 +813,16 @@ impl App {
     fn agent_updated(&mut self, code: u32) {
         self.agent_update_running = false;
         if code == 0 {
-            tracing::info!("admin agent update finished");
+            tracing::info!("privileged helper update finished");
+            self.secure_helper = if self.test_mode || secure_helper_task_exists() {
+                SecureHelperStatus::Armed
+            } else {
+                SecureHelperStatus::NeedsUpdate {
+                    reason: "the secure helper is not installed".into(),
+                }
+            };
+            self.helper_started = None;
+            self.helper_last_probe = None;
             if self.agent_wanted() {
                 self.announce_ready = true;
                 self.start_agent();
@@ -721,6 +837,9 @@ impl App {
                 "the admin prompt was declined or failed".to_string()
             } else {
                 format!("the agent update failed (exit {code}; see receipts\\setup-tray-machine-*.json)")
+            };
+            self.secure_helper = SecureHelperStatus::NeedsUpdate {
+                reason: reason.clone(),
             };
             self.set_agent(AgentStatus::NeedsUpdate { reason });
         }
@@ -914,6 +1033,7 @@ impl App {
                 HostEvent::ViewerStarted => {
                     tracing::info!("viewer session started");
                     self.viewers.on_started();
+                    self.start_secure_helper("viewer session started");
                 }
                 HostEvent::ViewerEnded => {
                     self.viewers.on_ended(Instant::now());
@@ -969,17 +1089,19 @@ impl App {
         self.watch_update();
         self.gate_agent();
         self.check_agent(false);
+        self.check_secure_helper(false);
+        self.refresh_icon();
         let state = self.state();
-        let kind = icon_kind(&state);
         let tip = status_line(&state, &self.agent);
-        if self.shown.as_ref() != Some(&(kind, tip.clone())) {
+        if self.shown.as_ref() != Some(&tip) {
             let mut data = self.notify_data();
             data.uFlags = NIF_ICON | NIF_TIP;
-            data.hIcon = self.icon(kind);
+            data.hIcon = self.icon.handle;
             copy_wide(&mut data.szTip, &tip);
             // SAFETY: data is fully initialized.
-            let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
-            self.shown = Some((kind, tip));
+            if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+                self.shown = Some(tip);
+            }
         }
     }
 
@@ -1007,7 +1129,7 @@ impl App {
                 self.announce_ready = self.settings.admin_mode;
                 self.apply_mode();
             }
-            CMD_AGENT_UPDATE => self.update_agent(),
+            CMD_AGENT_UPDATE | CMD_SECURE_HELPER_UPDATE => self.update_agent(),
             CMD_LOGIN => {
                 self.settings.start_at_login = !self.settings.start_at_login;
                 self.save_settings();
@@ -1040,27 +1162,46 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 fn show_menu(hwnd: HWND) {
-    let Some((status, admin, admin_line, login, agent_update, build, error, can_roll_back)) =
-        with_app(|app| {
-            app.check_agent(true);
-            let agent_update = if app.agent_update_running {
-                Some((MF_STRING | MF_GRAYED, "Admin agent update running..."))
-            } else if app.settings.admin_mode && app.agent.needs_update() {
-                Some((MF_STRING, AGENT_UPDATE_LABEL))
+    let Some((
+        status,
+        admin,
+        admin_line,
+        login,
+        agent_update,
+        helper_line,
+        helper_update,
+        build,
+        error,
+        can_roll_back,
+    )) = with_app(|app| {
+        app.check_agent(true);
+        app.check_secure_helper(true);
+        let agent_update = if app.agent_update_running {
+            Some((MF_STRING | MF_GRAYED, "Admin agent update running..."))
+        } else if app.settings.admin_mode && app.agent.needs_update() {
+            Some((MF_STRING, AGENT_UPDATE_LABEL))
+        } else {
+            None
+        };
+        (
+            status_line(&app.state(), &app.agent),
+            app.settings.admin_mode,
+            admin_mode_line(&app.agent),
+            app.settings.start_at_login,
+            agent_update,
+            app.secure_helper.line(),
+            if app.agent_update_running {
+                Some((MF_STRING | MF_GRAYED, "Privileged helper update running..."))
+            } else if app.secure_helper.needs_update() {
+                Some((MF_STRING, SECURE_HELPER_UPDATE_LABEL))
             } else {
                 None
-            };
-            (
-                status_line(&app.state(), &app.agent),
-                app.settings.admin_mode,
-                admin_mode_line(&app.agent),
-                app.settings.start_at_login,
-                agent_update,
-                app.build_line(),
-                app.host_error.clone(),
-                app.can_roll_back(),
-            )
-        })
+            },
+            app.build_line(),
+            app.host_error.clone(),
+            app.can_roll_back(),
+        )
+    })
     else {
         return;
     };
@@ -1093,6 +1234,10 @@ fn show_menu(hwnd: HWND) {
         }
         if let Some((flags, label)) = agent_update {
             item(flags, CMD_AGENT_UPDATE, label);
+        }
+        item(MF_STRING | MF_GRAYED, CMD_STATUS, &helper_line);
+        if let Some((flags, label)) = helper_update {
+            item(flags, CMD_SECURE_HELPER_UPDATE, label);
         }
         item(
             if login {
@@ -1182,6 +1327,10 @@ unsafe extern "system" fn window_proc(
 }
 
 fn run_tray() -> Result<i32> {
+    // SAFETY: opt this tray process into system DPI before creating any windows,
+    // so small-icon metrics select the matching embedded frame (16/20/24/32 px).
+    let _ = unsafe { SetProcessDPIAware() };
+    let icon = TrayIcon::load(TrayIcon::small_size())?;
     let data = data_dir();
     let test_mode = std::env::var_os("BUBBLEPLAY_TRAY_DATA_DIR").is_some();
     let logs = logs_dir(&data);
@@ -1241,6 +1390,15 @@ fn run_tray() -> Result<i32> {
         host_log: SharedLog::new(logs.join("host.log")),
         user: None,
         agent: AgentStatus::Off,
+        secure_helper: if test_mode || secure_helper_task_exists() {
+            SecureHelperStatus::Armed
+        } else {
+            SecureHelperStatus::NeedsUpdate {
+                reason: "the secure helper is not installed".into(),
+            }
+        },
+        helper_started: None,
+        helper_last_probe: None,
         viewers: ViewerGate::default(),
         agent_started: None,
         last_probe: None,
@@ -1249,11 +1407,7 @@ fn run_tray() -> Result<i32> {
         announce_ready: false,
         agent_pipe: agent_pipe(),
         stop_event,
-        icons: [
-            make_icon(IconKind::Running),
-            make_icon(IconKind::Busy),
-            make_icon(IconKind::Stopped),
-        ],
+        icon,
         shown: None,
         taskbar_created,
         shut_down: false,
@@ -1286,10 +1440,6 @@ fn run_tray() -> Result<i32> {
     let app = APP.with(|cell| cell.borrow_mut().take());
     if let Some(mut app) = app {
         app.shutdown();
-        for icon in app.icons {
-            // SAFETY: icons were created by make_icon.
-            let _ = unsafe { DestroyIcon(icon) };
-        }
     }
     tracing::info!("tray exited");
     Ok(0)

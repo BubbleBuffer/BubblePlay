@@ -1,6 +1,6 @@
 //! File transfer protocol v1 (pure logic, no sockets or files).
 //!
-//! The intent and wire contract live in `.superpawers/file-transfer.md`; the
+//! The intent and wire contract live in `docs/architecture/file-transfer.md`; the
 //! shared vectors are `fixtures/file-transfer-contract.json`, tested from Rust
 //! (here), JS (`worker/public/file-transfer.js`) and Kotlin.
 //!
@@ -120,6 +120,17 @@ impl Reject {
 pub enum Purpose {
     Save,
     Paste,
+    Drop,
+}
+
+/// Desktop coordinates normalized to unsigned Q16 (0..=65535).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DropPoint {
+    pub x: u16,
+    pub y: u16,
+    pub generation: u32,
+    #[serde(rename = "viewportRevision")]
+    pub viewport_revision: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -136,6 +147,8 @@ pub struct OfferMeta {
     pub batch_index: u32,
     #[serde(rename = "batchCount")]
     pub batch_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop: Option<DropPoint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -336,6 +349,8 @@ pub fn valid_offer_meta(meta: &OfferMeta) -> bool {
         && meta.batch_count >= 1
         && meta.batch_count <= MAX_BATCH_FILES
         && meta.batch_index < meta.batch_count
+        && ((meta.purpose == Purpose::Drop) == meta.drop.is_some())
+        && meta.drop.is_none_or(|point| point.generation != 0)
 }
 
 /// Number of DATA chunks a file of `size` bytes is sent in.
@@ -850,6 +865,7 @@ mod tests {
             batch_id: 1,
             batch_index: 0,
             batch_count: 1,
+            drop: None,
         };
         let mut incoming = Incoming::new(1, &meta).unwrap();
         let mut acks = Vec::new();
@@ -976,6 +992,7 @@ mod tests {
             batch_id: 3,
             batch_index: 0,
             batch_count: 1,
+            drop: None,
         };
         let sha_hello = {
             let mut hasher = crate::file_hash::Sha256::new().unwrap();
@@ -1187,6 +1204,7 @@ mod tests {
                     batch_id: 1,
                     batch_index: 0,
                     batch_count: 1,
+                    drop: None,
                 }),
             }))
         };

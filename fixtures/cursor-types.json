@@ -1,0 +1,22 @@
+{
+  "packetType": 129,
+  "packetBytes": 2,
+  "fallback": 0,
+  "types": [
+    { "id": 0, "name": "Arrow", "css": "default", "androidType": "TYPE_ARROW" },
+    { "id": 1, "name": "Text", "css": "text", "androidType": "TYPE_TEXT" },
+    { "id": 2, "name": "Pointer", "css": "pointer", "androidType": "TYPE_HAND" },
+    { "id": 3, "name": "Crosshair", "css": "crosshair", "androidType": "TYPE_CROSSHAIR" },
+    { "id": 4, "name": "Move", "css": "move", "androidType": "TYPE_ALL_SCROLL" },
+    { "id": 5, "name": "ResizeNS", "css": "ns-resize", "androidType": "TYPE_VERTICAL_DOUBLE_ARROW" },
+    { "id": 6, "name": "ResizeEW", "css": "ew-resize", "androidType": "TYPE_HORIZONTAL_DOUBLE_ARROW" },
+    { "id": 7, "name": "ResizeNESW", "css": "nesw-resize", "androidType": "TYPE_TOP_RIGHT_DIAGONAL_DOUBLE_ARROW" },
+    { "id": 8, "name": "ResizeNWSE", "css": "nwse-resize", "androidType": "TYPE_TOP_LEFT_DIAGONAL_DOUBLE_ARROW" },
+    { "id": 9, "name": "Wait", "css": "wait", "androidType": "TYPE_WAIT" },
+    { "id": 10, "name": "Progress", "css": "progress", "androidType": "TYPE_WAIT" },
+    { "id": 11, "name": "NotAllowed", "css": "not-allowed", "androidType": "TYPE_NO_DROP" },
+    { "id": 12, "name": "Help", "css": "help", "androidType": "TYPE_HELP" },
+    { "id": 13, "name": "UpArrow", "css": "default", "androidType": "TYPE_ARROW" },
+    { "id": 14, "name": "Hidden", "css": "none", "androidType": "TYPE_NULL" }
+  ]
+}

@@ -1,9 +1,23 @@
 param(
-  [string]$Worker = "playfull-cat",
+  [string]$Worker,
   [switch]$Deploy
 )
 
 $ErrorActionPreference = "Stop"
+
+function Assert-WorkerName([string]$Name) {
+  if ([string]::IsNullOrWhiteSpace($Name) -or $Name -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$') {
+    throw 'Pass -Worker with the name of your deployed Worker (1-63 letters, digits, underscores or hyphens).'
+  }
+}
+
+function Assert-AppPassword([string]$Password, [string]$Repeated) {
+  # Match worker/src/index.js MIN_SECRET_LENGTHS.APP_PASSWORD.
+  if ([string]::IsNullOrWhiteSpace($Password) -or $Password.Length -lt 12 -or $Password.Length -gt 256) {
+    throw 'Password must be 12-256 characters.'
+  }
+  if ($Password -cne $Repeated) { throw 'Passwords do not match.' }
+}
 
 function Read-Secret([string]$Prompt) {
   $secure = Read-Host -Prompt $Prompt -AsSecureString
@@ -12,14 +26,11 @@ function Read-Secret([string]$Prompt) {
   finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
 }
 
-$first = Read-Secret "New BubblePlay password"
-$second = Read-Secret "Repeat BubblePlay password"
-if ([string]::IsNullOrWhiteSpace($first) -or $first.Length -lt 8 -or $first.Length -gt 256) {
-  throw "Password must be 8-256 characters."
-}
-if ($first -cne $second) { throw "Passwords do not match." }
-
+Assert-WorkerName $Worker
 try {
+  $first = Read-Secret "New BubblePlay password"
+  $second = Read-Secret "Repeat BubblePlay password"
+  Assert-AppPassword $first $second
   $first | npx wrangler secret put APP_PASSWORD --name $Worker
   if ($LASTEXITCODE -ne 0) { throw "Wrangler failed to update APP_PASSWORD." }
   if ($Deploy) {

@@ -121,22 +121,36 @@ export function clipboardPackets(text, id, { paste = true } = {}) {
   return packets;
 }
 
-/** Reassembles host `clipboard` JSON chunks; returns the text when complete. */
+export const CLIPBOARD_IMAGE = Object.freeze({ maxBytes: 8 * 1024 * 1024, maxWireBytes: Math.ceil(8 * 1024 * 1024 / 3) * 4, maxPixels: 16 * 1024 * 1024, chunkBytes: 32 * 1024, maxChunks: 342 });
+
+/** Reassemble bounded text or base64 PNG snapshots; never mix their chunks. */
 export class ClipboardReceiver {
   constructor() { this.reset(); }
-  reset() { this.id = null; this.next = 0; this.count = 0; this.parts = []; this.bytes = 0; }
+  reset() { this.id = null; this.next = 0; this.count = 0; this.parts = []; this.bytes = 0; this.image = false; }
   push(message) {
     const { id, index, count, text } = message || {};
-    if (message?.protocol !== 1 || !Number.isInteger(id) || !Number.isInteger(index) || !Number.isInteger(count) ||
-        typeof text !== "string" || count < 1 || count > CLIPBOARD.hostMaxChunks || index < 0 || index >= count) { this.reset(); return null; }
-    if (index === 0) { this.reset(); this.id = id; this.count = count; }
-    else if (id !== this.id || count !== this.count || index !== this.next) { this.reset(); return null; }
-    this.parts.push(text); this.next = index + 1; this.bytes += text.length;
-    if (this.bytes > CLIPBOARD.maxBytes) { this.reset(); return null; }
+    const image = message?.type === "clipboard-image";
+    if (message?.protocol !== 1 || !Number.isInteger(id) || id < 0 || id > 0xffffffff || !Number.isInteger(index) || !Number.isInteger(count) ||
+        typeof text !== "string" || (image && message.mimeType !== "image/png") || (!image && message?.mimeType !== undefined) ||
+        count < 1 || count > (image ? CLIPBOARD_IMAGE.maxChunks : CLIPBOARD.hostMaxChunks) || index < 0 || index >= count ||
+        new TextEncoder().encode(text).length > CLIPBOARD_IMAGE.chunkBytes || (image && !/^[A-Za-z0-9+/]*={0,2}$/.test(text))) { this.reset(); return null; }
+    if (index === 0) { this.reset(); this.id = id; this.count = count; this.image = image; }
+    else if (id !== this.id || count !== this.count || index !== this.next || image !== this.image) { this.reset(); return null; }
+    this.parts.push(text); this.next = index + 1; this.bytes += new TextEncoder().encode(text).length;
+    if (this.bytes > (image ? CLIPBOARD_IMAGE.maxWireBytes : CLIPBOARD.maxBytes)) { this.reset(); return null; }
     if (this.next < this.count) return null;
-    const complete = this.parts.join("");
-    this.reset();
-    return complete;
+    const complete = this.parts.join(""); this.reset();
+    if (!image) return complete;
+    try {
+      const data = Uint8Array.from(atob(complete), c => c.charCodeAt(0));
+      if (data.length < 33 || data.length > CLIPBOARD_IMAGE.maxBytes ||
+          ![137,80,78,71,13,10,26,10].every((v,i) => data[i] === v)) return null;
+      const view = new DataView(data.buffer);
+      if (view.getUint32(8) !== 13 || view.getUint32(12) !== 0x49484452) return null;
+      const width = view.getUint32(16), height = view.getUint32(20);
+      if (!width || !height || width * height > CLIPBOARD_IMAGE.maxPixels) return null;
+      return { mimeType: "image/png", data };
+    } catch { return null; }
   }
 }
 export const shouldAcceptSequence = (last, next) => ((next - last) & 0xffff) > 0 && ((next - last) & 0xffff) < 0x8000;
@@ -168,9 +182,9 @@ export function secureTextUnits(value = "", inputType = "insertText") {
   if (inputType !== "insertText" && inputType !== "insertCompositionText") return [];
   return Array.from(String(value));
 }
-// The synthetic overlay remains visible while Pointer Lock or the remote app
-// hides the Windows cursor sprite. Position/in-bounds are authoritative; the
-// OS visibility bit describes the captured sprite, not overlay usability.
+// Legacy position-only feedback keeps the synthetic overlay usable even when
+// the remote app hides the OS sprite. Type-129 shape feedback must preserve
+// this Work-mode visibility policy independently of position ACKs.
 export const shouldShowCursorOverlay = ({ pointerMode, synced, inBounds }) =>
   pointerMode === "desktop" && synced && inBounds;
 export const shouldShowPredictedCursor = ({ pointerMode, inputReady }) =>
@@ -341,12 +355,13 @@ export class CursorReconciler {
 
 export class Viewport {
   constructor(width, height, content = { x: 0, y: 0, width, height }) { this.zoom = 1; this.x = this.y = 0; this.resize(width, height); this.setContent(content); }
-  resize(width, height) { this.width = Math.max(1, width); this.height = Math.max(1, height); return this.clamp(); }
+  // left/top: where the stream area starts in the window (below the docked strip).
+  resize(width, height, left = 0, top = 0) { this.width = Math.max(1, width); this.height = Math.max(1, height); this.left = left; this.top = top; return this.clamp(); }
   setContent({ x, y, width, height }) { this.content = { x, y, width: Math.max(1, width), height: Math.max(1, height) }; return this.clamp(); }
-  axis(value, start, size, viewport) { const scaled = size * this.zoom; const result = scaled < viewport ? (viewport - scaled) / 2 - start * this.zoom : clamp(value, viewport - (start + size) * this.zoom, -start * this.zoom); return result === 0 ? 0 : result; }
-  clamp() { const c = this.content || { x: 0, y: 0, width: this.width, height: this.height }; this.x = this.axis(this.x, c.x, c.width, this.width); this.y = this.axis(this.y, c.y, c.height, this.height); return this.snapshot(); }
-  setZoom(next, anchor = { x: this.width / 2, y: this.height / 2 }) { const old = this.zoom; this.zoom = clamp(next, 1, 4); this.x = anchor.x - (anchor.x - this.x) * this.zoom / old; this.y = anchor.y - (anchor.y - this.y) * this.zoom / old; if (this.zoom === 1) this.x = this.y = 0; return this.clamp(); }
-  centerOnNormalized({ x, y }) { const c = this.content; this.x = this.width / 2 - (c.x + clamp(x, 0, 1) * c.width) * this.zoom; this.y = this.height / 2 - (c.y + clamp(y, 0, 1) * c.height) * this.zoom; return this.clamp(); }
+  axis(value, start, size, viewport, origin = 0) { const scaled = size * this.zoom; const result = scaled < viewport ? origin + (viewport - scaled) / 2 - start * this.zoom : clamp(value, origin + viewport - (start + size) * this.zoom, origin - start * this.zoom); return result === 0 ? 0 : result; }
+  clamp() { const c = this.content || { x: 0, y: 0, width: this.width, height: this.height }; this.x = this.axis(this.x, c.x, c.width, this.width, this.left); this.y = this.axis(this.y, c.y, c.height, this.height, this.top); return this.snapshot(); }
+  setZoom(next, anchor = { x: this.left + this.width / 2, y: this.top + this.height / 2 }) { const old = this.zoom; this.zoom = clamp(next, 1, 4); this.x = anchor.x - (anchor.x - this.x) * this.zoom / old; this.y = anchor.y - (anchor.y - this.y) * this.zoom / old; if (this.zoom === 1) this.x = this.y = 0; return this.clamp(); }
+  centerOnNormalized({ x, y }) { const c = this.content; this.x = this.left + this.width / 2 - (c.x + clamp(x, 0, 1) * c.width) * this.zoom; this.y = this.top + this.height / 2 - (c.y + clamp(y, 0, 1) * c.height) * this.zoom; return this.clamp(); }
   pan(dx, dy) { this.x += dx; this.y += dy; return this.clamp(); }
   snapshot() { return { zoom: this.zoom, x: this.x, y: this.y }; }
 }

@@ -1,0 +1,37 @@
+# Session UI
+
+The receiver keeps quick actions beside the stream in a docked bar. The stream's layout and input coordinates account for that bar; controls do not cover the desktop during ordinary use.
+
+The approved BubblePlay mark appears on launcher icons, login pages and the Windows notification area (with host/input status in its tooltip and menu), outside the session strip; About links to the relay operator's configured source code.
+
+## Browser
+
+Desktop pointers use a 32 px top strip. Touch pointers use a 48 px bottom bar plus its seam. Desktop actions include Monitors, Shortcuts, Files, Fullscreen and Settings; clipboard retry and zoom reset appear only when needed. Touch adds Keyboard, Touch mode, Keys, Arrows and More.
+
+Popovers open with one action and close on an outside press or Escape. Only one is open at a time. Keyboard navigation moves between rows and restores focus on close; Escape used by a popover does not reach the remote PC. Mouse-opened controls preserve remote-input focus.
+
+Desktop fullscreen hides the strip. Resting at the top edge reveals a handle that brings controls back temporarily; an open popover keeps them visible. Touch fullscreen keeps the bottom bar. Ctrl+wheel and touch pinch zoom the viewport; a reset chip appears while zoomed.
+
+The Monitors popover marks the current monitor and exposes [Follow active window](follow-active-window.md) only for a capable host. Files appears only with `fileTransfer`; an offer or active transfer adds an indicator without opening the popover automatically. Desktop drops, paste and picker uploads have different [file-transfer behavior](file-transfer.md).
+
+Settings opens a slide-over with stream quality, keyboard lock, scroll speed, pointer mode, default monitor, clipboard copying, browser access, diagnostics and version information. Browser support determines whether keyboard lock is available. Sign out ends the password session; Forget browser also removes approval.
+
+Copy from the PC automatically defaults on. Turning it off keeps host clipboard updates behind the Copy remote clipboard chip until it is clicked. Ctrl/Cmd+V uses the local clipboard; local paste, copy or cut drops a pending host snapshot.
+
+[`settings.js`](../../worker/public/settings.js) stores a versioned `bubbleplay.settings` record in localStorage. Settings apply live; default monitor is requested once per page session. Invalid records fall back to defaults and storage errors leave the session usable. [`chrome.js`](../../worker/public/chrome.js) owns popover focus, shortcuts and fullscreen reveal; [`receiver.js`](../../worker/public/receiver.js) connects those controls to the session. Relay version is shown when supplied by the relay; a host build is not currently carried on the wire.
+
+## Android
+
+The native app uses a docked bottom bar and popovers, with its own gesture, keyboard and captured-mouse behavior. Settings opens inside the active stream activity so opening it does not trigger the background disconnect timer. Preferences cover server/login, touch, display, codec, clipboard copying and diagnostics; codec changes reconnect the stream.
+
+Copy from the PC automatically defaults on in Android Settings. Host clipboard text is written only while the activity is resumed and focused. The latest background snapshot waits for focus to return; automatic copying applies it when enabled. With automatic copying off, it remains pending for the Copy PC clipboard row in More. That row is enabled only while a snapshot is pending and describes its text length. Tapping it copies the snapshot to the phone clipboard and clears pending; local clipboard changes or paste also discard pending content. The Android host clipboard channel currently supports text only.
+
+The Android signaling callback rejects binary packets with unsupported types or lengths before copying them. Cursor position and appearance updates share one pending delivery that retains the latest value of each.
+
+Each accepted Android signaling hello replaces the media leg, including when its old socket is already gone. Every media leg sends stream start and a fresh first-frame handshake; a frame presented before signaling admission is remembered for that leg and completes the handshake when matching admission arrives. Attached decoder surfaces have their own generation: missing output triggers a forced keyframe retry after two seconds, then one media restart after a second miss; stale surface output cannot satisfy the watchdog. Exhaustion cancels pending recovery timers and blocks further automatic media restarts, with an error state offering Retry. Only a new attached surface or user retry resets that limit.
+
+Android reconciles cursor echoes using wrap-safe movement acknowledgements, so delayed feedback cannot overwrite newer local touch prediction. Wheel-only input does not create pending cursor authority or block external cursor movement. Motion admission uses a 512-byte signaling queue budget and keeps coalesced movement pending under congestion. Captured-mouse buttons remain behind their preceding movement, and later reliable input preserves that order. The host coalesces queued motion between input barriers and acknowledges accepted sequenced motion even when its net displacement is zero. Routine cursor feedback retains the latest position and highest wrap-safe acknowledgement, including when a newer snapshot has no acknowledgement of its own.
+
+The Android IME uses a bounded local Editable with real committed text, selection and composing spans. It reconciles the changed suffix once per outer edit batch using code-point Backspaces and Unicode text, and advances its remote snapshot only when the edit is accepted. Deletion beyond retained context replaces the full known segment plus the outside deletion span, then re-sends the resulting local text. IME key events flush pending edits before sending the key, even inside a batch. Soft-keyboard Enter down/up, editor actions and committed newlines send text before one Enter tap or key pair. Enter, Tab and navigation retire local context after key-up or a completed tap; their input restart is posted after the IME callback, and a later edit cancels stale restart work. Hardware and QuickBar keys retain their immediate reset behavior. Android 14 `replaceText` uses the same edit and reconciliation path. Remote clicks, navigation, Enter, clipboard paste, desktop changes, signaling loss and keyboard hide reset the known text context. Local selection away from the end is a reset point; remote editing keeps the caret-at-end contract. Autocorrect and suggestions remain enabled. IME Backspace and Delete key repeats remove the preceding grapheme from the known end-caret segment without clearing word or composing context; each removed Unicode code point produces one host Backspace (one for a supplementary emoji, two for a base letter plus combining accent). Once that segment is empty, each Backspace/Delete repeat sends a complete host key tap, and its key-up is consumed. Optional `BubblePlayIme` DEBUG logging records only method, lengths, counts, key and selection/composition metadata; enable it with `adb shell setprop log.tag.BubblePlayIme DEBUG`.
+
+Android currently has no monitor-follow toggle. File uploads use the save/paste route rather than desktop OLE drops. See the [Android guide](../../android/README.md) for layout, settings, signing, tests and device-validation limits.

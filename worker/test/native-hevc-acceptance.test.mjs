@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { nativeFrameState } from "../tools/native-hevc-acceptance.mjs";
+import { nativeFrameState } from "../tools/lab/native-hevc-acceptance.mjs";
 
 test("native acceptance requires HEVC, current selected monitor and fresh presented frames", () => {
   const sample = { signaling: { registered: true, monitors: [{ selector: "display5", selected: true }] },

@@ -22,6 +22,7 @@ use bubbleplay_host::encode;
 use bubbleplay_host::feedback_roi;
 use bubbleplay_host::file_service::{FileService, FileServiceConfig};
 use bubbleplay_host::file_transfer::file_rate_cap_bps;
+use bubbleplay_host::follow_window::{self, FollowWindow};
 use bubbleplay_host::frame_damage;
 use bubbleplay_host::hevc_tiles;
 use bubbleplay_host::hybrid;
@@ -51,7 +52,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use tracing::{error, info, warn};
 use windows::core::Interface;
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{POINT, RECT};
 
 use agent_client::AgentClient;
 use benchmark::{
@@ -77,7 +78,7 @@ use hybrid::{
     HybridWireBudget, QuiescentTilePlan, QuiescentTilePlanner, StaticTilePlanner, ViewportGeometry,
     MAX_HYBRID_SIDECAR_BYTES,
 };
-use input::{CursorTracker, DesktopRegion, InputSink};
+use input::{CursorKindTracker, CursorTracker, DesktopRegion, InputPacketCoalescer, InputSink};
 use privileged_ipc::{
     Codec as AgentCodec, CropRect as AgentCrop, EncoderAqMode as AgentAqMode,
     EncoderMultipass as AgentMultipass, EncoderPreset as AgentPreset, EncoderTuning as AgentTuning,
@@ -260,6 +261,249 @@ fn parse_args() -> Result<Args> {
     Ok(args)
 }
 
+fn local_recovery_probe_due(privileged: bool, available: bool, now: Instant, deadline: Instant) -> bool {
+    !privileged && !available && now >= deadline
+}
+
+fn announce_capture_state(signaling: &mut Signaling, capture: &CaptureSource, generation: u32, reason: &str) {
+    let state = capture.desktop_state();
+    if let Some(secure) = capture.secure_state() {
+        signaling.send_secure_desktop_state_status(state.available, secure.kind,
+            if state.available { &secure.caps } else { &[] }, generation);
+        return;
+    }
+    if !capture.is_privileged() && !state.available {
+        if let Some(kind) = bubbleplay_host::desktop_session::secure_desktop_kind() {
+            signaling.send_secure_desktop_state(kind, &[], generation);
+            return;
+        }
+    }
+    signaling.send_desktop_state_kind(
+        if state.available { "active" } else { "unavailable" },
+        Some(state.desktop), Some(state.input), generation, reason,
+    );
+}
+
+fn native_drop_pixel(x: u16, y: u16, region: DesktopRegion) -> POINT {
+    let axis = |value: u16, origin: i32, extent: u32| {
+        let offset = (u64::from(value) * u64::from(extent.saturating_sub(1))
+            + u64::from(u16::MAX) / 2)
+            / u64::from(u16::MAX);
+        (i64::from(origin) + offset as i64).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    };
+    POINT {
+        x: axis(x, region.x, region.width),
+        y: axis(y, region.y, region.height),
+    }
+}
+
+struct NativeDropView<'a> {
+    ready: bool,
+    epoch: Option<&'a str>,
+    generation: u32,
+    revision: u32,
+}
+impl NativeDropView<'_> {
+    fn accepts(&self, epoch: &str, point: bubbleplay_host::file_transfer::DropPoint) -> bool {
+        self.ready
+            && self.epoch == Some(epoch)
+            && point.generation == self.generation
+            && point.viewport_revision == self.revision
+    }
+}
+struct ActiveFileDragPreview {
+    drag_id: u32,
+    epoch: String,
+    point: bubbleplay_host::file_transfer::DropPoint,
+    updated: Instant,
+    handle: bubbleplay_host::native_file_drop::NativeDropPreview,
+}
+#[derive(Default)]
+struct FileDragPreviewState {
+    desired: Option<(signaling::FileDragPreviewControl, Instant)>,
+    active: Option<ActiveFileDragPreview>,
+    attempted: Option<(u32, String)>,
+}
+impl FileDragPreviewState {
+    fn control(&mut self, control: signaling::FileDragPreviewControl, now: Instant) {
+        if !control.valid() {
+            return;
+        }
+        if control.action == "cancel" {
+            if self.desired.as_ref().is_some_and(|(current, _)| {
+                current.drag_id == control.drag_id && current.epoch == control.epoch
+            }) {
+                self.desired = None;
+            }
+            if let Some(active) = self
+                .active
+                .as_ref()
+                .filter(|active| active.drag_id == control.drag_id && active.epoch == control.epoch)
+            {
+                active.handle.cancel();
+            }
+        } else {
+            self.desired = Some((control, now));
+        }
+    }
+    fn tick(&mut self, view: NativeDropView<'_>, region: DesktopRegion, now: Instant) {
+        if self.desired.as_ref().is_some_and(|(control, received)| {
+            now.saturating_duration_since(*received) >= Duration::from_secs(2)
+                || !view.accepts(&control.epoch, control.drop.unwrap())
+        }) {
+            self.desired = None;
+        }
+        if let Some(active) = self.active.as_mut() {
+            let next = self.desired.as_ref().filter(|(control, _)| {
+                control.drag_id == active.drag_id
+                    && control.epoch == active.epoch
+                    && view.accepts(&active.epoch, active.point)
+            });
+            if let Some((control, received)) = next {
+                if *received != active.updated {
+                    active.point = control.drop.unwrap();
+                    if active
+                        .handle
+                        .update(native_drop_pixel(active.point.x, active.point.y, region))
+                        .is_err()
+                    {
+                        active.handle.cancel();
+                    }
+                    active.updated = *received;
+                }
+            } else {
+                active.handle.cancel();
+            }
+            if active.handle.finished() {
+                if let Some(error) = active.handle.error() {
+                    tracing::debug!(%error, "native drag preview ended; final file drops remain available");
+                }
+                self.active = None;
+            }
+        }
+        if self.active.is_none() {
+            if let Some((control, received)) = self.desired.as_ref() {
+                let token = (control.drag_id, control.epoch.clone());
+                if self.attempted.as_ref() == Some(&token) {
+                    return;
+                }
+                self.attempted = Some(token);
+                let point = control.drop.unwrap();
+                let types = control.types.as_ref().unwrap();
+                match bubbleplay_host::native_file_drop::NativeDropPreview::start_with_types(
+                    types.len() as u16,
+                    types,
+                    native_drop_pixel(point.x, point.y, region),
+                ) {
+                    Ok(handle) => {
+                        self.active = Some(ActiveFileDragPreview {
+                            drag_id: control.drag_id,
+                            epoch: control.epoch.clone(),
+                            point,
+                            updated: *received,
+                            handle,
+                        })
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "native drag preview unavailable; using local preview")
+                    }
+                }
+            }
+        }
+    }
+    fn cancel(&mut self) {
+        self.desired = None;
+        if let Some(active) = self.active.as_ref() {
+            active.handle.cancel();
+        }
+    }
+    fn finished(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_none_or(|active| active.handle.finished())
+    }
+}
+
+fn native_drag_blocks_motion(data: &[u8], input_sink: &mut InputSink) -> bool {
+    if !bubbleplay_host::native_file_drop::drag_active() {
+        return false;
+    }
+    // OLE owns the pointer and shares the destination's input queue. Preserve
+    // releases while preventing new presses or text from changing that queue.
+    input_sink.handle_release_only(data);
+    true
+}
+
+fn reconcile_carried_input(
+    carried_input: &mut input::CarriedInput,
+    capture_available: bool,
+    remote_input_ready: bool,
+    input_sink: &mut InputSink,
+    capture: &mut CaptureSource,
+) {
+    if carried_input.take_resume_release(capture_available, remote_input_ready) {
+        input_sink.release_all();
+        capture.release_input();
+    }
+}
+
+struct PendingNativeDrop {
+    request: bubbleplay_host::native_file_drop::NativeDropRequest,
+    since: Instant,
+    target: Option<bubbleplay_host::native_file_drop::NativeDropTarget>,
+    input: Option<bubbleplay_host::native_file_drop::NativeDropInputGuard>,
+}
+impl PendingNativeDrop {
+    fn note_input(&mut self, data: &[u8]) -> bool {
+        if self.target.is_none() {
+            return false;
+        }
+        prepared_drop_input_invalidates(data)
+    }
+}
+fn prepared_drop_input_invalidates(data: &[u8]) -> bool {
+    match data.first().copied() {
+        Some(0) => data.len() == 3, // key press
+        Some(4) => data.len() == 2 && data[1] != 0,
+        Some(5) => data.len() == 3 && (data[1] != 0 || data[2] != 0),
+        Some(7) => data.len() == 11 && data[7..11].iter().any(|value| *value != 0),
+        Some(9) => data.len() == 8 && data[7] != 0,
+        Some(11) => data.len() > 1,
+        Some(12) => data.len() >= 8 && data[1] & 1 != 0, // paste, not clipboard synchronization
+        Some(13) => data.len() == 6 && data[1] & 1 == 0,
+        _ => false, // motion, releases and cursor feedback cannot change the binding
+    }
+}
+fn invalidate_pending_drop_input(pending: &mut Option<PendingNativeDrop>, data: &[u8]) {
+    if pending
+        .as_mut()
+        .is_some_and(|pending| pending.note_input(data))
+    {
+        pending.take().unwrap().request.reject("drop-interrupted");
+        info!(
+            reason = "drop-interrupted",
+            "prepared native file drop cancelled"
+        );
+    }
+}
+fn native_drop_view_rejection(
+    view: &NativeDropView<'_>,
+    desktop: bool,
+    request: &bubbleplay_host::native_file_drop::NativeDropRequest,
+) -> Option<&'static str> {
+    if !desktop {
+        Some("drop-desktop-unavailable")
+    } else if !view.ready || view.epoch != Some(request.epoch.as_str()) {
+        Some("drop-not-ready")
+    } else if request.point.generation != view.generation
+        || request.point.viewport_revision != view.revision
+    {
+        Some("drop-stale-view")
+    } else {
+        None
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(|| std::io::LineWriter::new(std::io::stderr()))
@@ -271,6 +515,9 @@ fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+    if args.mode == "serve" && !args.privileged_agent {
+        bubbleplay_host::input::recover_headless_cursor_support();
+    }
     info!(
         build = env!("CARGO_PKG_VERSION"),
         "BubblePlay host starting"
@@ -508,13 +755,14 @@ impl LocalClipboardPoll {
             return;
         };
         self.id = self.id.wrapping_add(1);
+        let (png, text) = text.wire();
         let chunks = bubbleplay_host::clipboard::chunk_text(
             &text,
             bubbleplay_host::clipboard::HOST_CHUNK_BYTES,
         );
         let count = chunks.len() as u16;
         for (index, chunk) in chunks.into_iter().enumerate() {
-            signaling.send_clipboard_chunk(self.id, index as u16, count, chunk);
+            signaling.send_clipboard_content_chunk(self.id, index as u16, count, chunk, png);
         }
     }
 }
@@ -581,6 +829,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         .worker
         .clone()
         .context("--worker wss://... is required")?;
+    bubbleplay_host::relay_url::require_secure_relay_url(&worker).context("--worker")?;
     let token = args.token.clone().context("--token is required")?;
     let reset_lab_encoder_on_diagnostic_keyframe =
         std::env::var("BUBBLEPLAY_LAB_RESET_ENCODER_ON_DIAGNOSTIC_KEYFRAME")
@@ -619,7 +868,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         _ => None,
     };
     signaling.set_file_transfer(file_service.is_some());
+    signaling.set_file_drop(file_service.is_some() && !capture.is_privileged());
+    // Follow active window needs the interactive user's foreground window,
+    // so only the local (tray) capture path advertises it.
+    signaling.set_follow_window_supported(!capture.is_privileged());
     let mut next_file_rate_update = Instant::now();
+    let mut file_drag_preview = FileDragPreviewState::default();
+    let mut pending_native_drop: Option<PendingNativeDrop> = None;
     signaling.send_host_capabilities(
         args.privileged_agent,
         args.privileged_agent,
@@ -673,10 +928,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     };
     let mut input_sink = InputSink::new()
         .with_clipboard(!capture.is_privileged())
-        .with_admin_agent(admin_agent);
+        .with_admin_agent(admin_agent)
+        .with_secure_helper(capture.secure_helper());
     input_sink.set_absolute_region(capture.region());
     let mut local_clipboard = LocalClipboardPoll::default();
+    let mut input_coalescer = InputPacketCoalescer::default();
     let mut cursor_tracker = CursorTracker::for_region(capture.region(), Instant::now());
+    let mut cursor_kind_tracker = CursorKindTracker::new(Instant::now());
+    let mut latest_cursor_kind: Option<[u8; 2]> = None;
     let mut next_cursor_poll = Instant::now();
     let mut next_input_log = Instant::now() + Duration::from_secs(1);
     let mut latest_idr: Option<CachedIdr> = None;
@@ -771,11 +1030,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut wss_max_access_unit_bytes = 0usize;
     let mut next_au_id = 1u64;
     let mut capture_available = !args.privileged_agent;
+    let mut next_local_recovery_probe = Instant::now();
     // The privileged path stays fail-closed across desktop/monitor/source
     // transitions until the browser acknowledges presentation of a frame from
     // the newly announced media generation.
     let mut remote_input_ready = !args.privileged_agent;
+    let mut carried_input = input::CarriedInput::default();
     let mut last_privileged_desktop_state: Option<PrivilegedDesktopState> = None;
+    let mut last_secure_announcement: Option<(bool, &'static str, Vec<&'static str>)> = None;
+    let mut last_secure_helper_ready = false;
+    let mut next_secure_state_poll = Instant::now();
     let mut pending_transition_idr: Option<PendingSubmittedIdr> = None;
     let mut pending_wss_idr: Option<PendingWssIdr> = None;
     let mut pending_lab_quality_keyframe: Option<String> = None;
@@ -788,6 +1052,94 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut producer_loop_iterations = 0u64;
     let mut last_capture_stats = (0u64, 0u64);
     let mut viewer_session = ViewerSessionLog::default();
+    // Follow active window: per signaling session, off until the client asks.
+    let mut follow_state: Option<FollowWindow> = None;
+    let mut next_follow_sample = Instant::now();
+    // Edge hold: sampled every 50 ms only while a move loop is active; the
+    // monitor list is read once per loop.
+    let mut edge_monitors: Option<Vec<capture::MonitorInfo>> = None;
+    let mut next_edge_sample = Instant::now();
+    // One live monitor switch, shared by the manual Monitors pick and
+    // "Follow active window". A macro because the switch resets most of the
+    // session locals below; it must stay defined after all of them.
+    // `carry_input: true` (edge hold) keeps held buttons and keys so the
+    // window being dragged stays in its move loop across the switch; the
+    // viewer's release during the presentation gate is reconciled on resume.
+    macro_rules! switch_capture_monitor {
+        ($selector:expr) => {
+            switch_capture_monitor!($selector, false)
+        };
+        ($selector:expr, $carry_input:expr) => {{
+            let selector: &str = $selector;
+            if !capture_available || !capture.desktop_state().available || capture.desktop_state().desktop == "secure" {
+                signaling.send_monitor_error(selector, "desktop unavailable; monitor selection is suspended");
+            } else {
+            carried_input.begin_switch($carry_input);
+            if !$carry_input {
+                input_sink.release_all();
+                capture.release_input();
+            }
+            remote_input_ready = false;
+            latest_cursor_kind = None;
+            cursor_kind_tracker.reset();
+            signaling.send_desktop_state("unavailable", media_generation, "monitor-switch");
+            media_generation = media_generation.wrapping_add(1).max(1);
+            media_sequence = 0;
+            latest_idr = None;
+            pending_transition_idr = None;
+            pending_wss_idr = None;
+            pending_viewport_idr = None;
+            encoder = None;
+            scaler = None;
+            next_admission = Instant::now();
+            next_idr = Instant::now();
+            match capture.switch_monitor(selector) {
+                Ok(completed) => {
+                    // Local capture completes synchronously. The
+                    // privileged Agent returns false and must prove
+                    // the newly selected monitor with
+                    // CaptureHealth::Active before input/media are
+                    // advertised ready.
+                    capture_available = completed;
+                    if completed {
+                        // The client owns the display choice for
+                        // the lifetime of the host process: a
+                        // later session reopens the same monitor.
+                        selection.remember(capture.monitor_selector());
+                        input_sink.set_absolute_region(capture.region());
+                        cursor_tracker =
+                            CursorTracker::for_region(capture.region(), Instant::now());
+                        signaling.send_desktop_state(
+                            "active",
+                            media_generation,
+                            "monitor-switched",
+                        );
+                    }
+                    if let Ok(monitors) = capture.monitors() {
+                        signaling.send_monitor_list(monitors);
+                    }
+                    info!(
+                        monitor = selector,
+                        generation = media_generation,
+                        "live monitor switch complete"
+                    );
+                }
+                Err(error) => {
+                    capture_available = capture.desktop_state().available;
+                    signaling.send_monitor_error(selector, &error.to_string());
+                    if let Ok(monitors) = capture.monitors() {
+                        signaling.send_monitor_list(monitors);
+                    }
+                    warn!(
+                        monitor = selector,
+                        ?error,
+                        "live monitor switch failed; retaining previous capture"
+                    );
+                }
+            }
+            }
+        }};
+    }
     'session: loop {
         producer_loop_iterations = producer_loop_iterations.saturating_add(1);
         let loop_now = Instant::now();
@@ -1013,6 +1365,19 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 benchmark_status_now + benchmark_status_retry_delay(status_sent);
         }
         capture.tick(loop_now)?;
+        capture.tick_secure(ice_connected || wss_media.is_some(), loop_now);
+        let secure_helper_ready = capture.secure_helper_ready();
+        if secure_helper_ready != last_secure_helper_ready {
+            signaling.send_host_capabilities(args.privileged_agent, args.privileged_agent,
+                args.privileged_agent || secure_helper_ready, secure_helper_ready);
+            last_secure_helper_ready = secure_helper_ready;
+        }
+        input_sink.set_secure_desktop(capture.secure_state().is_some(), capture.secure_input_allowed());
+        if let Some(link) = capture.secure_helper() {
+            while let Some(result) = link.lock().unwrap_or_else(|error| error.into_inner()).take_deny_result() {
+                signaling.send_secure_action_result(result.ok, &result.reason);
+            }
+        }
         while let Some(event) = capture.try_privileged_event()? {
             match event {
                 PrivilegedEvent::Desktop {
@@ -1061,29 +1426,41 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     );
                 }
                 PrivilegedEvent::Cursor(encoded) => {
-                    signaling.send_binary(&encoded);
+                    signaling.send_cursor_state(encoded, false);
                     if ice_connected {
                         pump.publish_cursor_state(encoded);
                     }
                 }
-                PrivilegedEvent::InputStatus(stats) => signaling.send_input_status(
-                    stats.session_generation,
-                    stats.received_packets,
-                    stats.accepted_packets,
-                    stats.failed_packets,
-                    stats.dropped_packets,
-                    stats.released_inputs,
-                    stats.requested_events,
-                    stats.applied_events,
-                    stats.last_error_code,
-                    stats.last_sequence,
-                ),
+                PrivilegedEvent::CursorKind(encoded) => {
+                    latest_cursor_kind = Some(encoded);
+                    signaling.send_binary(&encoded);
+                    pump.publish_cursor_kind(encoded);
+                }
+                PrivilegedEvent::InputStatus(stats) => {
+                    // Agent input handling emits an ordered Cursor + InputStats
+                    // pair for every reliable button/cursor-sync response.
+                    // Preserve that response distinctly before this barrier.
+                    signaling.flush_cursor_state_reliable();
+                    signaling.send_input_status(
+                        stats.session_generation,
+                        stats.received_packets,
+                        stats.accepted_packets,
+                        stats.failed_packets,
+                        stats.dropped_packets,
+                        stats.released_inputs,
+                        stats.requested_events,
+                        stats.applied_events,
+                        stats.last_error_code,
+                        stats.last_sequence,
+                    );
+                }
                 PrivilegedEvent::Clipboard {
                     id,
                     index,
                     count,
                     text,
-                } => signaling.send_clipboard_chunk(id, index, count, &text),
+                    png,
+                } => signaling.send_clipboard_content_chunk(id, index, count, &text, png),
                 PrivilegedEvent::Monitors(monitors) => signaling.send_monitor_list(monitors),
                 PrivilegedEvent::MonitorSwitch {
                     accepted,
@@ -1117,15 +1494,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         if let CaptureSource::Local(source) = &mut capture {
-            if let Some(state) = source
-                .capture
-                .as_mut()
-                .and_then(Capture::take_availability_transition)
+            if let Some(state) = source.take_availability_transition()
             {
                 match state {
                     CaptureAvailability::Unavailable => {
                         capture_available = false;
+                        next_local_recovery_probe = Instant::now();
                         pending_first_frame = None;
+                        carried_input.reset();
                         input_sink.release_all();
                         latest_idr = None;
                         pending_transition_idr = None;
@@ -1133,11 +1509,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         pending_viewport_idr = None;
                         encoder = None;
                         scaler = None;
-                        signaling.send_desktop_state(
-                            "unavailable",
-                            media_generation,
-                            "capture-unavailable",
-                        );
+                        if let Some(secure) = source.secure_state.as_ref().filter(|state| state.secure) {
+                            signaling.send_secure_desktop_state(secure.kind, &[], media_generation);
+                        } else if let Some(kind) = bubbleplay_host::desktop_session::secure_desktop_kind() {
+                            signaling.send_secure_desktop_state(kind, &[], media_generation);
+                        } else {
+                            signaling.send_desktop_state("unavailable", media_generation, "capture-unavailable");
+                        }
                         warn!(
                             generation = media_generation,
                             "desktop capture unavailable; input suspended"
@@ -1168,6 +1546,26 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
             }
+        }
+        let mut secure_announcement = capture.secure_state().map(|state| {
+            let active = capture.desktop_state().available;
+            (active, state.kind, if active { state.caps } else { vec![] })
+        });
+        if secure_announcement.is_none() && !capture.is_privileged() && !capture_available {
+            if loop_now >= next_secure_state_poll {
+                secure_announcement = bubbleplay_host::desktop_session::secure_desktop_kind()
+                    .map(|kind| (false, kind, vec![]));
+                next_secure_state_poll = loop_now + capture::CAPTURE_RECOVERY_INTERVAL;
+            } else if last_secure_announcement.as_ref().is_some_and(|(active, _, _)| !active) {
+                secure_announcement = last_secure_announcement.clone();
+            }
+        }
+        if secure_announcement != last_secure_announcement {
+            if let Some((active, kind, caps)) = &secure_announcement {
+                signaling.send_secure_desktop_state_status(*active, kind, caps, media_generation);
+                info!(active, kind, ?caps, generation = media_generation, "secure desktop capabilities changed");
+            }
+            last_secure_announcement = secure_announcement;
         }
         while let Some(event) = pump.try_event() {
             // After an RTC-only teardown the pump's trailing events (Closed,
@@ -1214,11 +1612,19 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     offer_accepted = true;
                 }
                 TransportEvent::OfferRejected => break 'session,
+                TransportEvent::Action(RtcAction::InputControlReady) => {
+                    if let Some(kind) = latest_cursor_kind {
+                        pump.publish_cursor_kind(kind);
+                    }
+                }
                 TransportEvent::Action(RtcAction::IceConnected) => {
                     rtc_peer.on_connected();
                     ice_connected = true;
                     replay.on_ice_connected();
                     next_idr = Instant::now();
+                    if let Some(kind) = latest_cursor_kind {
+                        pump.publish_cursor_kind(kind);
+                    }
                 }
                 TransportEvent::Action(RtcAction::VideoCodecSelected(codec)) => {
                     if codec != active_codec && accept_session_codec(active_codec, codec) {
@@ -1271,14 +1677,42 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 TransportEvent::Action(RtcAction::InputData(data)) => {
-                    if !capture_available || !remote_input_ready {
+                    reconcile_carried_input(
+                        &mut carried_input,
+                        capture_available,
+                        remote_input_ready,
+                        &mut input_sink,
+                        &mut capture,
+                    );
+                    if !capture_available || !remote_input_ready || !capture.secure_input_allowed() {
+                        if let Some(state) = capture.secure_state() {
+                            input_sink.note_secure_input_drop(&data, if state.caps.contains(&"input") {
+                                "not_ready"
+                            } else { "no_input_capability" });
+                        }
+                        carried_input.observe_gated(&data);
                         continue;
                     }
+                    if native_drag_blocks_motion(&data, &mut input_sink) {
+                        input_coalescer.observe_release_only(&data);
+                        continue;
+                    }
+                    input_coalescer.observe(&data);
+                    carried_input.observe_forwarded(&data);
+                    invalidate_pending_drop_input(&mut pending_native_drop, &data);
                     if capture.send_input(&data)? {
                         continue;
                     }
                     let outcome = input_sink.handle(&data);
-                    if outcome.cursor_changed || outcome.sync_requested {
+                    if outcome.sync_requested && capture.desktop_state().desktop != "secure" {
+                        if let Some(kind) = cursor_kind_tracker.sample(true, Instant::now()) {
+                            let encoded = kind.encode();
+                            latest_cursor_kind = Some(encoded);
+                            signaling.send_binary(&encoded);
+                            pump.publish_cursor_kind(encoded);
+                        }
+                    }
+                    if outcome.cursor_feedback_requested() && capture.desktop_state().desktop != "secure" {
                         if let Some(state) =
                             cursor_tracker.sample(outcome.accepted_sequence, Instant::now())
                         {
@@ -1352,18 +1786,147 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         let cursor_now = Instant::now();
-        if !capture.is_privileged() && cursor_now >= next_cursor_poll {
+        cursor_kind_tracker.set_active(
+            !capture.is_privileged() && capture_available && capture.desktop_state().desktop != "secure" && (ice_connected || wss_media.is_some()),
+        );
+        if !capture.is_privileged() && capture.desktop_state().desktop != "secure" && cursor_now >= next_cursor_poll {
             if let Some(state) = cursor_tracker.sample(None, cursor_now) {
                 v4_pointer_norm = state.in_bounds.then_some((state.x, state.y));
                 pump.publish_cursor_state(state.encode());
+                if wss_media.is_some() {
+                    signaling.send_cursor_state(state.encode(), false);
+                }
+            }
+            if capture_available && capture.desktop_state().desktop != "secure" {
+                if let Some(kind) = cursor_kind_tracker.sample(false, cursor_now) {
+                    let encoded = kind.encode();
+                    latest_cursor_kind = Some(encoded);
+                    signaling.send_binary(&encoded);
+                    pump.publish_cursor_kind(encoded);
+                }
+            } else {
+                cursor_kind_tracker.reset();
             }
             next_cursor_poll = cursor_now + Duration::from_millis(16);
         }
         viewer_session.observe(ice_connected || wss_media.is_some());
+        if let Some(follow) = follow_state.as_mut() {
+            let now = Instant::now();
+            let viewer_live = capture_available && capture.desktop_state().desktop != "secure" && (ice_connected || wss_media.is_some());
+            if !viewer_live {
+                edge_monitors = None;
+            } else if edge_monitors.is_some() && now >= next_edge_sample {
+                // Edge hold while a window is being moved (see
+                // `docs/architecture/follow-active-window.md`).
+                next_edge_sample = now + follow_window::EDGE_SAMPLE_INTERVAL;
+                let moving = follow_window::sample_move();
+                let monitors = edge_monitors.as_deref().unwrap_or_default();
+                let rects: Vec<follow_window::Rect> =
+                    monitors.iter().map(follow_window::Rect::of).collect();
+                let current = capture
+                    .monitor_selector()
+                    .and_then(|current| {
+                        monitors
+                            .iter()
+                            .find(|m| m.selector.eq_ignore_ascii_case(&current))
+                    })
+                    .map(follow_window::Rect::of);
+                let carry = current.and_then(|from| {
+                    let to =
+                        follow_window::observe_edge(Some(&mut *follow), moving, &rects, from, now)?;
+                    let selector = monitors
+                        .iter()
+                        .find(|m| follow_window::Rect::of(m) == to)?
+                        .selector
+                        .clone();
+                    Some((from, to, selector, moving?.cursor))
+                });
+                if moving.is_none() {
+                    edge_monitors = None;
+                }
+                if let Some((from, to, selector, cursor)) = carry {
+                    follow.switched(now);
+                    info!(
+                        monitor = %selector,
+                        "follow active window: edge hold, switching monitor"
+                    );
+                    switch_capture_monitor!(&selector, true);
+                    // Same relative position on the new monitor while the
+                    // button is still held, so the dragged window comes along.
+                    if capture
+                        .monitor_selector()
+                        .is_some_and(|streamed| streamed.eq_ignore_ascii_case(&selector))
+                    {
+                        let (x, y) = follow_window::carry_cursor(cursor, from, to);
+                        if !follow_window::set_cursor(x, y) {
+                            warn!("follow active window: edge hold could not move the cursor");
+                        }
+                    }
+                }
+            }
+            if viewer_live && now >= next_follow_sample {
+                next_follow_sample = now + follow_window::SAMPLE_INTERVAL;
+                let sample = follow_window::sample_foreground();
+                if sample == follow_window::Sample::Busy && edge_monitors.is_none() {
+                    // A move loop may have started: sample the edge finely
+                    // until it ends. The monitor list is read once per loop.
+                    if follow_window::sample_move().is_some() {
+                        edge_monitors = capture.monitors().ok();
+                        next_edge_sample = now;
+                    }
+                }
+                if let Some(target) = follow.observe(sample, now) {
+                    match capture.monitors() {
+                        Ok(monitors) => match follow_window::selector_for(&monitors, &target) {
+                            Some(selector)
+                                if !capture.monitor_selector().is_some_and(|current| {
+                                    current.eq_ignore_ascii_case(&selector)
+                                }) =>
+                            {
+                                follow.switched(now);
+                                info!(
+                                    monitor = %selector,
+                                    "follow active window: switching monitor"
+                                );
+                                switch_capture_monitor!(&selector);
+                            }
+                            Some(_) => {}
+                            None => warn!(
+                                device = %target.device,
+                                "follow active window: no capture monitor matches"
+                            ),
+                        },
+                        Err(error) => {
+                            warn!(?error, "follow active window: monitor enumeration failed")
+                        }
+                    }
+                }
+            }
+        }
         if !capture.is_privileged() {
             let viewer_live =
                 capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
             local_clipboard.poll(viewer_live, cursor_now, &mut input_sink, &mut signaling);
+        }
+        if file_drag_preview.desired.is_some() || file_drag_preview.active.is_some() {
+            file_drag_preview.tick(
+                NativeDropView {
+                    ready: file_service.is_some()
+                        && !capture.is_privileged()
+                        && bubbleplay_host::clipboard::input_desktop_is_default()
+                        && remote_input_ready
+                        && capture_available
+                        && wss_media.is_some()
+                        && pending_first_frame.is_none()
+                        && pending_transition_idr.is_none()
+                        && pending_viewport_idr.is_none(),
+                    epoch: active_wss_epoch.as_deref(),
+                    generation: media_generation,
+                    revision: viewport_revision,
+                },
+                capture.region(),
+                cursor_now,
+            );
         }
         if let Some(files) = file_service.as_ref() {
             // The file socket pairs on the live WSS media epoch.
@@ -1382,8 +1945,124 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             for text in &outbox.signals {
                 signaling.send_text(text);
             }
+            let desktop =
+                !capture.is_privileged() && bubbleplay_host::clipboard::input_desktop_is_default();
+            let view = NativeDropView {
+                ready: remote_input_ready
+                    && capture_available
+                    && wss_media.is_some()
+                    && pending_first_frame.is_none()
+                    && pending_transition_idr.is_none()
+                    && pending_viewport_idr.is_none(),
+                epoch: active_wss_epoch.as_deref(),
+                generation: media_generation,
+                revision: viewport_revision,
+            };
+            for request in outbox.drops {
+                if pending_native_drop.is_some() {
+                    request.reject("busy");
+                    continue;
+                }
+                if let Some(reason) = native_drop_view_rejection(&view, desktop, &request) {
+                    request.reject(reason);
+                    info!(reason, "native file drop rejected");
+                    continue;
+                }
+                let point = native_drop_pixel(request.point.x, request.point.y, capture.region());
+                let target = if request.preparation_required() {
+                    match bubbleplay_host::native_file_drop::NativeDropTarget::capture(point) {
+                        Ok(target) => Some(target),
+                        Err(error) => {
+                            request.reject("drop-target-changed");
+                            info!(%error, reason = "drop-target-changed", "prepared native file drop cancelled");
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                file_drag_preview.cancel();
+                if target.is_some() {
+                    info!(
+                        bytes = request.total_bytes(),
+                        "native file drop preparing verified contents"
+                    );
+                }
+                pending_native_drop = Some(PendingNativeDrop {
+                    request,
+                    since: Instant::now(),
+                    target,
+                    input: None,
+                });
+            }
+            if let Some(mut pending) = pending_native_drop.take() {
+                let mut reason =
+                    native_drop_view_rejection(&view, desktop, &pending.request).map(str::to_owned);
+                let preparation = pending.request.preparation_status();
+                if let Err(error) = &preparation {
+                    reason.get_or_insert_with(|| error.clone());
+                }
+                if pending
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| !target.matches_current())
+                {
+                    reason.get_or_insert("drop-target-changed".into());
+                }
+                let preview_finished = file_drag_preview.finished();
+                if !preview_finished && pending.since.elapsed() >= Duration::from_secs(2) {
+                    reason.get_or_insert("drop-unavailable".into());
+                }
+                let mut input_ready = pending.target.is_none();
+                if preview_finished && pending.target.is_some() && reason.is_none() {
+                    if let Some(input) = pending.input.as_ref() {
+                        use bubbleplay_host::native_file_drop::NativeDropInputStatus;
+                        match input.poll() {
+                            NativeDropInputStatus::Starting => {}
+                            NativeDropInputStatus::Clear => input_ready = true,
+                            NativeDropInputStatus::Interrupted => {
+                                reason = Some("drop-interrupted".into())
+                            }
+                            NativeDropInputStatus::Unavailable => {
+                                reason = Some("drop-unavailable".into())
+                            }
+                        }
+                    } else {
+                        match bubbleplay_host::native_file_drop::NativeDropInputGuard::new() {
+                            Ok(input) => pending.input = Some(input),
+                            Err(_) => reason = Some("drop-unavailable".into()),
+                        }
+                    }
+                }
+                if let Some(reason) = reason {
+                    pending.request.reject(&reason);
+                    info!(%reason, "prepared native file drop cancelled");
+                } else if preview_finished && input_ready && preparation == Ok(true) {
+                    let point = native_drop_pixel(
+                        pending.request.point.x,
+                        pending.request.point.y,
+                        capture.region(),
+                    );
+                    let started = if let Some(target) = pending.target {
+                        info!(
+                            elapsed_ms = pending.since.elapsed().as_millis() as u64,
+                            "native file drop prepared; committing to original target"
+                        );
+                        // Stop category monitoring before our own OLE button bootstrap.
+                        drop(pending.input.take());
+                        pending.request.start_prepared(target)
+                    } else {
+                        pending.request.start(point)
+                    };
+                    if let Err(error) = started {
+                        warn!(%error, "native file drop could not start");
+                    }
+                } else {
+                    pending_native_drop = Some(pending);
+                }
+            }
             for _ in 0..outbox.pastes {
-                if remote_input_ready && capture_available {
+                if remote_input_ready && capture_available && capture.desktop_state().desktop != "secure" {
                     input_sink.paste();
                 } else {
                     info!("file paste skipped: remote input is not ready");
@@ -1429,34 +2108,29 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
             next_quality_tick = now + Duration::from_secs(1);
         }
-        for event in signaling.poll()? {
+        let mut signal_events = signaling.poll()?.into_iter().peekable();
+        while let Some(event) = signal_events.next() {
             match event {
                 SignalEvent::Offer(sdp) => {
+                    if let Some(kind) = latest_cursor_kind {
+                        signaling.send_binary(&kind);
+                        pump.publish_cursor_kind(kind);
+                    }
                     if args.privileged_agent {
                         remote_input_ready = false;
+                        carried_input.reset();
                         capture.release_input();
                     }
                     signaling.send_host_capabilities(
                         args.privileged_agent,
                         args.privileged_agent,
-                        args.privileged_agent,
-                        false,
+                        args.privileged_agent || capture.secure_helper_ready(),
+                        capture.secure_helper_ready(),
                     );
                     if let Ok(monitors) = capture.monitors() {
                         signaling.send_monitor_list(monitors);
                     }
-                    let state = capture.desktop_state();
-                    signaling.send_desktop_state_kind(
-                        if state.available {
-                            "active"
-                        } else {
-                            "unavailable"
-                        },
-                        Some(state.desktop),
-                        Some(state.input),
-                        media_generation,
-                        "offer-state-replay",
-                    );
+                    announce_capture_state(&mut signaling, &capture, media_generation, "offer-state-replay");
                     if rtc_peer.ended() {
                         warn!("ignoring an RTC offer after the RTC peer ended under WSS");
                     } else if should_forward_offer(ice_connected, offer_accepted, offer_in_flight) {
@@ -1560,6 +2234,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 generation,
                                 media_generation,
                             );
+                            reconcile_carried_input(
+                                &mut carried_input,
+                                capture_available,
+                                remote_input_ready,
+                                &mut input_sink,
+                                &mut capture,
+                            );
                             pending_first_frame = None;
                             info!(generation, "first-frame handshake ready");
                         }
@@ -1593,6 +2274,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     let _ = pump.command(TransportCommand::RemoteCandidate(c));
                 }
                 SignalEvent::RemoteCandidate(c) => pending_candidates.push_back(c),
+                SignalEvent::FileDragPreview(control) => {
+                    if active_wss_epoch.as_deref() == Some(control.epoch.as_str())
+                        && (pending_native_drop.is_none() || control.action == "cancel")
+                    {
+                        file_drag_preview.control(control, Instant::now());
+                    }
+                }
                 SignalEvent::PeerLeft => break 'session,
                 SignalEvent::Qos {
                     seq: _,
@@ -1629,26 +2317,81 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 SignalEvent::InputData(data) => {
-                    if !capture_available || !remote_input_ready {
-                        continue;
+                    let mut packets = vec![data];
+                    while matches!(signal_events.peek(), Some(SignalEvent::InputData(_))) {
+                        if let Some(SignalEvent::InputData(data)) = signal_events.next() {
+                            packets.push(data);
+                        }
                     }
-                    if capture.send_input(&data)? {
-                        continue;
-                    }
-                    let outcome = input_sink.handle(&data);
-                    if outcome.cursor_changed || outcome.sync_requested {
-                        if let Some(state) =
-                            cursor_tracker.sample(outcome.accepted_sequence, Instant::now())
-                        {
-                            // WSS mode uses the authenticated signaling socket
-                            // for cursor feedback; the Worker relays binary in
-                            // the opposite direction without JSON wrapping.
-                            signaling.send_binary(&state.encode());
-                            if outcome.sync_requested {
-                                info!(ack = ?state.acknowledged_sequence, in_bounds = state.in_bounds, os_visible = state.visible, "WSS cursor feedback sent");
+                    // Coalescing cannot consume sequences or motion behind
+                    // the presentation/native-drag gate. Preserve releases
+                    // and every other signal event at their original boundary.
+                    let packets = if capture_available && remote_input_ready
+                        && !bubbleplay_host::native_file_drop::drag_active()
+                    {
+                        input_coalescer.coalesce(packets)
+                    } else {
+                        packets
+                    };
+                    for data in packets {
+                        reconcile_carried_input(
+                            &mut carried_input,
+                            capture_available,
+                            remote_input_ready,
+                            &mut input_sink,
+                            &mut capture,
+                        );
+                        if !capture_available || !remote_input_ready || !capture.secure_input_allowed() {
+                            if let Some(state) = capture.secure_state() {
+                                input_sink.note_secure_input_drop(&data, if state.caps.contains(&"input") {
+                                    "not_ready"
+                                } else { "no_input_capability" });
+                            }
+                            carried_input.observe_gated(&data);
+                            continue;
+                        }
+                        if native_drag_blocks_motion(&data, &mut input_sink) {
+                            input_coalescer.observe_release_only(&data);
+                            continue;
+                        }
+                        carried_input.observe_forwarded(&data);
+                        invalidate_pending_drop_input(&mut pending_native_drop, &data);
+                        if capture.send_input(&data)? {
+                            continue;
+                        }
+                        let outcome = input_sink.handle(&data);
+                        if outcome.sync_requested && capture.desktop_state().desktop != "secure" {
+                            if let Some(kind) = cursor_kind_tracker.sample(true, Instant::now()) {
+                                let encoded = kind.encode();
+                                latest_cursor_kind = Some(encoded);
+                                signaling.send_binary(&encoded);
+                                pump.publish_cursor_kind(encoded);
+                            }
+                        }
+                        if outcome.cursor_feedback_requested() && capture.desktop_state().desktop != "secure" {
+                            if let Some(state) =
+                                cursor_tracker.sample(outcome.accepted_sequence, Instant::now())
+                            {
+                                // WSS mode uses the authenticated signaling socket
+                                // for cursor feedback; the Worker relays binary in
+                                // the opposite direction without JSON wrapping.
+                                signaling.send_cursor_state(
+                                    state.encode(),
+                                    outcome.feedback_reliable,
+                                );
+                                if outcome.sync_requested {
+                                    info!(ack = ?state.acknowledged_sequence, in_bounds = state.in_bounds, os_visible = state.visible, "WSS cursor feedback sent");
+                                }
                             }
                         }
                     }
+                }
+                SignalEvent::SecureDeny => {
+                    let allowed = capture.desktop_state().available && capture.secure_state().is_some_and(|state|
+                        state.available && state.kind == "uac" && state.caps.contains(&"deny"));
+                    let queued = allowed && capture.secure_helper().is_some_and(|link|
+                        link.lock().unwrap_or_else(|error| error.into_inner()).deny_consent());
+                    if !queued { signaling.send_secure_action_result(false, if allowed { "helper-unavailable" } else { "deny-unavailable" }); }
                 }
                 SignalEvent::MediaControl {
                     action,
@@ -1666,7 +2409,34 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     width_q16,
                     height_q16,
                     monitor,
+                    follow,
                 } => {
+                    if action == "follow" {
+                        let Some(enabled) = follow else {
+                            warn!("follow control missing boolean follow");
+                            continue;
+                        };
+                        if capture.is_privileged() {
+                            warn!("follow control ignored: not advertised by this host");
+                            continue;
+                        }
+                        let changed = follow_state.is_some() != enabled;
+                        if enabled {
+                            follow_state.get_or_insert_with(FollowWindow::default);
+                        } else {
+                            follow_state = None;
+                        }
+                        signaling.set_follow(enabled);
+                        if changed {
+                            next_follow_sample = Instant::now();
+                            info!(enabled, "follow active window changed");
+                            match capture.monitors() {
+                                Ok(monitors) => signaling.send_monitor_list(monitors),
+                                Err(error) => warn!(?error, "monitor enumeration failed"),
+                            }
+                        }
+                        continue;
+                    }
                     if action == "monitors" {
                         if !valid_monitor_refresh_control(
                             protocol,
@@ -1728,68 +2498,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             warn!("monitor control missing bounded selector");
                             continue;
                         };
-                        input_sink.release_all();
-                        capture.release_input();
-                        remote_input_ready = false;
-                        signaling.send_desktop_state(
-                            "unavailable",
-                            media_generation,
-                            "monitor-switch",
-                        );
-                        media_generation = media_generation.wrapping_add(1).max(1);
-                        media_sequence = 0;
-                        latest_idr = None;
-                        pending_transition_idr = None;
-                        pending_wss_idr = None;
-                        pending_viewport_idr = None;
-                        encoder = None;
-                        scaler = None;
-                        next_admission = Instant::now();
-                        next_idr = Instant::now();
-                        match capture.switch_monitor(selector) {
-                            Ok(completed) => {
-                                // Local capture completes synchronously. The
-                                // privileged Agent returns false and must prove
-                                // the newly selected monitor with
-                                // CaptureHealth::Active before input/media are
-                                // advertised ready.
-                                capture_available = completed;
-                                if completed {
-                                    // The client owns the display choice for
-                                    // the lifetime of the host process: a
-                                    // later session reopens the same monitor.
-                                    selection.remember(capture.monitor_selector());
-                                    input_sink.set_absolute_region(capture.region());
-                                    cursor_tracker =
-                                        CursorTracker::for_region(capture.region(), Instant::now());
-                                    signaling.send_desktop_state(
-                                        "active",
-                                        media_generation,
-                                        "monitor-switched",
-                                    );
-                                }
-                                if let Ok(monitors) = capture.monitors() {
-                                    signaling.send_monitor_list(monitors);
-                                }
-                                info!(
-                                    monitor = selector,
-                                    generation = media_generation,
-                                    "live monitor switch complete"
-                                );
-                            }
-                            Err(error) => {
-                                capture_available = true;
-                                signaling.send_monitor_error(selector, &error.to_string());
-                                if let Ok(monitors) = capture.monitors() {
-                                    signaling.send_monitor_list(monitors);
-                                }
-                                warn!(
-                                    monitor = selector,
-                                    ?error,
-                                    "live monitor switch failed; retaining previous capture"
-                                );
-                            }
-                        }
+                        switch_capture_monitor!(selector);
                         continue;
                     }
                     if action == "start" {
@@ -1854,6 +2563,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             Ok(egress) => {
                                 if args.privileged_agent {
                                     remote_input_ready = false;
+                                    carried_input.reset();
                                     capture.release_input();
                                 }
                                 info!(codec = active_codec.name(), "WSS media egress connected");
@@ -1864,23 +2574,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 // current capture state at every media start
                                 // so the client cannot retain stale overlay
                                 // state across WSS epochs.
-                                let state = capture.desktop_state();
-                                signaling.send_desktop_state_kind(
-                                    if state.available {
-                                        "active"
-                                    } else {
-                                        "unavailable"
-                                    },
-                                    Some(state.desktop),
-                                    Some(state.input),
-                                    media_generation,
-                                    "wss-session-start",
-                                );
+                                announce_capture_state(&mut signaling, &capture, media_generation, "wss-session-start");
                                 signaling.send_host_capabilities(
                                     args.privileged_agent,
                                     args.privileged_agent,
-                                    args.privileged_agent,
-                                    false,
+                                    args.privileged_agent || capture.secure_helper_ready(),
+                                    capture.secure_helper_ready(),
                                 );
                                 // WSS-only clients do not necessarily complete
                                 // the WebRTC offer path, so announce monitors
@@ -2177,6 +2876,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 _ => {}
             }
         }
+        signaling.flush_cursor_state();
         match rtc_peer.poll(Instant::now(), wss_media.is_some()) {
             RtcPeerDecision::Continue => {}
             RtcPeerDecision::EndPeer => {
@@ -2330,7 +3030,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         let negotiation_active = offer_in_flight || offer_accepted;
         let media_demand_active = negotiation_active || ice_connected || wss_media.is_some();
         let prewarm_needed = negotiation_active && !ice_connected && latest_idr.is_none();
-        if capture_admission_ready(
+        let local_recovery_probe = local_recovery_probe_due(
+            capture.is_privileged(), capture_available, now, next_local_recovery_probe,
+        );
+        if local_recovery_probe || capture_admission_ready(
             capture_available,
             capture.is_privileged() && !capture_available,
             negotiation_active,
@@ -2339,6 +3042,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             rtc_reservation.is_some(),
             prewarm_needed,
         ) {
+            if local_recovery_probe {
+                next_local_recovery_probe = now + capture::CAPTURE_RECOVERY_INTERVAL;
+            }
             let active_benchmark_profile = benchmark_lease.active().filter(|profile| {
                 active_codec == VideoCodec::Hevc
                     && benchmark_mode_matches(profile.stream_mode, stream_mode)
@@ -2653,6 +3359,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 next_admission = Instant::now();
                 next_idr = Instant::now();
             }
+            let secure_frame_state = capture.secure_state();
             let captured = match capture.acquire(Duration::ZERO)? {
                 Some(frame) => Some(frame),
                 None if should_snapshot_idle_desktop(media_ready, latest_idr.is_none()) => capture
@@ -2674,11 +3381,33 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     scaler = None;
                     next_admission = Instant::now();
                     next_idr = Instant::now();
-                    signaling.send_desktop_state("active", media_generation, "capture-recovered");
+                    if frame.is_secure_snapshot() {
+                        if let Some(state) = &secure_frame_state {
+                            signaling.send_secure_desktop_state_status(true, state.kind, &state.caps, media_generation);
+                            info!(active = true, kind = state.kind, caps = ?state.caps,
+                                generation = media_generation, "secure desktop capabilities changed");
+                            last_secure_announcement = Some((true, state.kind, state.caps.clone()));
+                        }
+                    } else {
+                        signaling.send_desktop_state_kind("active", Some("default"), Some("enabled"), media_generation, "capture-recovered");
+                        last_secure_announcement = None;
+                    }
                     info!(
                         generation = media_generation,
+                        secure_frame = frame.is_secure_snapshot(),
+                        desktop = if frame.is_secure_snapshot() { "secure" } else { "default" },
                         "desktop capture recovered from verified frame; waiting for fresh IDR"
                     );
+                }
+                // Recovery probes are independent of media queue admission.
+                // A verified frame may close recovery while the peer has no
+                // room for media; keep the fresh-IDR request armed for the
+                // next admitted capture without encoding this probe.
+                if local_recovery_probe && !capture_admission_ready(
+                    true, false, negotiation_active, ice_connected,
+                    wss_media.is_some(), rtc_reservation.is_some(), prewarm_needed,
+                ) {
+                    continue 'session;
                 }
                 let is_idle_snapshot = frame.is_idle_snapshot();
                 // v4 tile quality: accumulate every captured frame's damage
@@ -4825,7 +5554,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }
         // This bounds producer polling only; the RTC transport is a separate
         // thread and continues to wake on its own timers and channels.
-        std::thread::sleep(producer_poll_interval(media_demand_active));
+        let poll_interval = producer_poll_interval(media_demand_active);
+        std::thread::sleep(if !capture_available && !capture.is_privileged() {
+            poll_interval.min(capture::CAPTURE_RECOVERY_INTERVAL)
+        } else {
+            poll_interval
+        });
+    }
+    file_drag_preview.cancel();
+    if let Some(pending) = pending_native_drop.take() {
+        pending.request.reject("drop-not-ready");
     }
     input_sink.release_all();
     capture.release_input();
@@ -4920,6 +5658,131 @@ fn physical_monitor_count() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_drop_input_keeps_motion_and_cleanup_but_invalidates_actions() {
+        for packet in [
+            vec![1, 65, 0],
+            vec![4, 0],
+            vec![6],
+            vec![10, 0, 0],
+            vec![2, 1, 0, 0, 0],
+            vec![3, 1, 0, 2, 0],
+            vec![7, 1, 0, 1, 0, 2, 0, 0, 0, 0, 0],
+            vec![8, 1, 0, 1, 0, 2, 0],
+            vec![9, 1, 0, 1, 0, 2, 0, 0],
+            vec![13, 1, 30, 0, 65, 0],
+        ] {
+            assert!(
+                !super::prepared_drop_input_invalidates(&packet),
+                "allowed {packet:?}"
+            );
+        }
+        for packet in [
+            vec![0, 65, 0],
+            vec![4, 1],
+            vec![5, 1, 0],
+            vec![9, 1, 0, 1, 0, 2, 0, 1],
+            vec![11, 65],
+            vec![12, 1, 1, 0, 0, 0, 1, 0],
+            vec![13, 0, 30, 0, 65, 0],
+            vec![7, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+            vec![7, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+        ] {
+            assert!(
+                super::prepared_drop_input_invalidates(&packet),
+                "invalidating {packet:?}"
+            );
+        }
+    }
+    fn preview_control() -> super::signaling::FileDragPreviewControl {
+        super::signaling::FileDragPreviewControl {
+            protocol: 1,
+            epoch: "0123456789abcdef0123456789abcdef".into(),
+            drag_id: 7,
+            action: "update".into(),
+            drop: Some(bubbleplay_host::file_transfer::DropPoint {
+                x: 123,
+                y: 456,
+                generation: 3,
+                viewport_revision: 2,
+            }),
+            types: Some(vec!["image/png".into()]),
+        }
+    }
+    #[test]
+    fn native_preview_stale_binding_and_missing_heartbeat_never_start_hover() {
+        let now = std::time::Instant::now();
+        for (ready, epoch, generation, revision, age) in [
+            (false, Some("0123456789abcdef0123456789abcdef"), 3, 2, 0),
+            (true, None, 3, 2, 0),
+            (true, Some("fedcba9876543210fedcba9876543210"), 3, 2, 0),
+            (true, Some("0123456789abcdef0123456789abcdef"), 4, 2, 0),
+            (true, Some("0123456789abcdef0123456789abcdef"), 3, 4, 0),
+            (true, Some("0123456789abcdef0123456789abcdef"), 3, 2, 2),
+        ] {
+            let mut state = super::FileDragPreviewState::default();
+            state.control(preview_control(), now);
+            state.tick(
+                super::NativeDropView {
+                    ready,
+                    epoch,
+                    generation,
+                    revision,
+                },
+                super::DesktopRegion::new(0, 0, 1920, 1080),
+                now + std::time::Duration::from_secs(age),
+            );
+            assert!(state.desired.is_none());
+            assert!(state.active.is_none());
+            assert!(state.attempted.is_none());
+        }
+    }
+    #[test]
+    fn native_preview_cancel_is_scoped_and_failed_drag_is_not_retried() {
+        let now = std::time::Instant::now();
+        let mut state = super::FileDragPreviewState::default();
+        let update = preview_control();
+        state.control(update.clone(), now);
+        let mut cancel = update.clone();
+        cancel.action = "cancel".into();
+        cancel.drop = None;
+        cancel.types = None;
+        cancel.drag_id += 1;
+        state.control(cancel.clone(), now);
+        assert!(
+            state.desired.is_some(),
+            "unrelated cancel must not clear another drag"
+        );
+        state.attempted = Some((update.drag_id, update.epoch.clone()));
+        state.tick(
+            super::NativeDropView {
+                ready: true,
+                epoch: Some(&update.epoch),
+                generation: 3,
+                revision: 2,
+            },
+            super::DesktopRegion::new(0, 0, 1920, 1080),
+            now,
+        );
+        assert!(
+            state.active.is_none(),
+            "same refused/expired drag must not repeatedly attach queues"
+        );
+        cancel.drag_id = update.drag_id;
+        state.control(cancel, now);
+        assert!(state.desired.is_none());
+    }
+    #[test]
+    fn native_drop_uses_full_monitor_bounds_including_negative_origins() {
+        let region = super::DesktopRegion::new(-1920, -100, 1920, 1080);
+        let first = super::native_drop_pixel(0, 0, region);
+        let last = super::native_drop_pixel(u16::MAX, u16::MAX, region);
+        assert_eq!((first.x, first.y), (-1920, -100));
+        assert_eq!((last.x, last.y), (-1, 979));
+        let tiny =
+            super::native_drop_pixel(u16::MAX, u16::MAX, super::DesktopRegion::new(3, 4, 1, 1));
+        assert_eq!((tiny.x, tiny.y), (3, 4));
+    }
     #[test]
     fn host_ip_probe_skips_ipv6_resolution_results() {
         let v6: std::net::SocketAddr = "[2001:4860:4864:5:8000::1]:19302".parse().unwrap();
@@ -6228,6 +7091,18 @@ mod tests {
         assert!(!capture_admission_ready(
             false, false, true, true, true, false, false
         ));
+    }
+
+    #[test]
+    fn unavailable_local_capture_probes_without_media_admission_every_500ms() {
+        let now = Instant::now();
+        assert!(!capture_admission_ready(false, false, true, true, false, false, false));
+        assert!(super::local_recovery_probe_due(false, false, now, now));
+        let deadline = now + super::capture::CAPTURE_RECOVERY_INTERVAL;
+        assert!(!super::local_recovery_probe_due(false, false, now, deadline));
+        assert!(super::local_recovery_probe_due(false, false, deadline, deadline));
+        assert!(!super::local_recovery_probe_due(false, true, deadline, deadline));
+        assert!(!super::local_recovery_probe_due(true, false, deadline, deadline));
     }
 
     #[test]

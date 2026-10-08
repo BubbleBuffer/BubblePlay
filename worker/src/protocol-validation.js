@@ -1,10 +1,60 @@
+import { CLIPBOARD_IMAGE } from "../public/input.js";
 import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
+
+export function validApprovalMessage(message) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  if (message.type === "host-capabilities") return typeof message.browserApproval === "boolean";
+  if (typeof message.id !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(message.id)) return false;
+  if (message.type === "approval-decision") {
+    return exactObjectKeys(message, ["type", "id", "approve"]) && typeof message.approve === "boolean";
+  }
+  if (message.type === "approval-cancel") return exactObjectKeys(message, ["type", "id"]);
+  return message.type === "approval-request" &&
+    exactObjectKeys(message, ["type", "id", "client", "agent", "expiresAt"]) &&
+    typeof message.client === "string" && message.client.length > 0 && message.client.length <= 64 &&
+    /^[\x20-\x7e]+$/.test(message.client) && typeof message.agent === "string" &&
+    message.agent.length <= 80 && /^[\x20-\x7e]*$/.test(message.agent) &&
+    Number.isSafeInteger(message.expiresAt) && message.expiresAt > 0;
+}
 
 export function validCurrentMediaEpoch(epoch, attachment) {
   return typeof epoch === "string" && /^[a-f0-9]{32}$/.test(epoch) && epoch === attachment.mediaEpoch;
 }
 
 function uint32(value) { return Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff; }
+
+export function validDesktopState(message, role, raw) {
+  const keys = ["type", "state", "desktop", "input", "generation", "reason", "secureKind", "secureCapabilities"];
+  if (role !== "host" || typeof raw !== "string" || utf8Length(raw) > 512 ||
+      !message || typeof message !== "object" || Array.isArray(message) ||
+      message.type !== "desktop-state" || !Object.keys(message).every(key => keys.includes(key)) ||
+      !["active", "unavailable"].includes(message.state) || !uint32(message.generation) ||
+      typeof message.reason !== "string" || utf8Length(message.reason) > 96) return false;
+  if (Object.hasOwn(message, "desktop") && !["default", "secure", "none"].includes(message.desktop)) return false;
+  if (Object.hasOwn(message, "input") && !["enabled", "suspended", "read-only"].includes(message.input)) return false;
+  if (Object.hasOwn(message, "secureKind") &&
+      (message.desktop !== "secure" || !["uac", "lock", "other"].includes(message.secureKind))) return false;
+  if (Object.hasOwn(message, "secureCapabilities")) {
+    const capabilities = message.secureCapabilities;
+    if (message.desktop !== "secure" || !Array.isArray(capabilities) || capabilities.length > 3 ||
+        new Set(capabilities).size !== capabilities.length ||
+        !capabilities.every(value => ["view", "deny", "input"].includes(value))) return false;
+  }
+  return true;
+}
+
+export function validSecureAction(message, role, raw) {
+  return role === "client" && typeof raw === "string" && utf8Length(raw) <= 512 &&
+    exactObjectKeys(message, ["type", "action"]) &&
+    message.type === "secure-action" && message.action === "deny";
+}
+
+export function validSecureActionResult(message, role, raw) {
+  return role === "host" && typeof raw === "string" && utf8Length(raw) <= 512 &&
+    exactObjectKeys(message, ["type", "action", "ok", "reason"]) &&
+    message.type === "secure-action-result" && message.action === "deny" &&
+    typeof message.ok === "boolean" && typeof message.reason === "string" && utf8Length(message.reason) <= 96;
+}
 
 export function validInputStatus(message, role, raw) {
   if (role !== "host" || typeof raw !== "string" || utf8Length(raw) > 1_024 ||
@@ -32,10 +82,12 @@ export const CLIPBOARD_MAX_BYTES = 1024 * 1024;
 const CLIPBOARD_MAX_RAW_BYTES = CLIPBOARD_CHUNK_TEXT_BYTES * 6 + 256;
 
 export function validClipboardMessage(message, role, raw) {
+  const image = message?.type === "clipboard-image";
   return role === "host" && typeof raw === "string" && utf8Length(raw) <= CLIPBOARD_MAX_RAW_BYTES &&
-    exactObjectKeys(message, ["count", "id", "index", "protocol", "text", "type"]) &&
+    exactObjectKeys(message, image ? ["count", "id", "index", "mimeType", "protocol", "text", "type"] : ["count", "id", "index", "protocol", "text", "type"]) &&
+    (image ? message.mimeType === "image/png" && /^[A-Za-z0-9+/]*={0,2}$/.test(message.text) : message.type === "clipboard") &&
     message.protocol === 1 && uint32(message.id) &&
-    boundedInteger(message.count, 1, CLIPBOARD_MAX_CHUNKS) &&
+    boundedInteger(message.count, 1, image ? CLIPBOARD_IMAGE.maxChunks : CLIPBOARD_MAX_CHUNKS) &&
     boundedInteger(message.index, 0, message.count - 1) &&
     typeof message.text === "string" && utf8Length(message.text) <= CLIPBOARD_CHUNK_TEXT_BYTES;
 }

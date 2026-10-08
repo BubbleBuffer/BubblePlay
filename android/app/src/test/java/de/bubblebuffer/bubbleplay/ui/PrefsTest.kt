@@ -30,7 +30,7 @@ class PrefsTest {
     fun defaultsOnAFreshInstall() {
         val store = MapStore()
         val prefs = Prefs(store)
-        assertEquals(ServerConfig.DEFAULT_SERVER, prefs.server)
+        assertEquals("", prefs.server)
         assertEquals("", prefs.labRun)
         assertEquals(Prefs.CODEC_AUTO, prefs.codec)
         assertFalse(prefs.directTouch)
@@ -40,7 +40,7 @@ class PrefsTest {
         assertTrue(prefs.keepScreenOn)
         assertEquals("", prefs.defaultMonitor)
         assertEquals(Prefs.VERSION, store.map[Prefs.KEY_VERSION])
-        assertEquals(ServerConfig.parseServer(ServerConfig.DEFAULT_SERVER), prefs.serverConfig()!!.base)
+        assertNull("a fresh install has no relay to contact", prefs.serverConfig())
     }
 
     @Test
@@ -117,5 +117,23 @@ class PrefsTest {
         prefs.setDefaultMonitor("", "")
         assertEquals("", prefs.defaultMonitor)
         assertNull(store.map[Prefs.KEY_DEFAULT_MONITOR_NAME])
+    }
+
+    @Test
+    fun automaticRemoteClipboardDefaultsOnAndPersistsBothChoices() {
+        val store = MapStore(hashMapOf(Prefs.KEY_VERSION to Prefs.VERSION))
+        val prefs = Prefs(store)
+        assertTrue(prefs.autoCopyRemoteClipboard)
+        prefs.autoCopyRemoteClipboard = false
+        assertEquals(false, store.map[Prefs.KEY_AUTO_COPY_REMOTE_CLIPBOARD])
+        assertFalse(Prefs(store).autoCopyRemoteClipboard)
+        prefs.autoCopyRemoteClipboard = true
+        assertTrue(Prefs(store).autoCopyRemoteClipboard)
+    }
+
+    @Test
+    fun malformedAutomaticRemoteClipboardPreferenceDefaultsOn() {
+        val store = MapStore(hashMapOf(Prefs.KEY_VERSION to Prefs.VERSION, Prefs.KEY_AUTO_COPY_REMOTE_CLIPBOARD to "off"))
+        assertTrue(Prefs(store).autoCopyRemoteClipboard)
     }
 }

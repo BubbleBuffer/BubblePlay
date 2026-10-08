@@ -14,7 +14,7 @@ import {
   selectParetoFrontier,
   summarizeSourceParityLoss,
   validateCampaignStateV2,
-} from "../tools/stream-lab-parity.mjs";
+} from "../tools/lab/stream-lab-parity.mjs";
 
 test("source parity summary states visual loss directly instead of implying exact-frame identity is quality", () => {
   const loss = summarizeSourceParityLoss(parityVector({

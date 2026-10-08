@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as liveModule from "../tools/stream-lab-live.mjs";
+import * as liveModule from "../tools/lab/stream-lab-live.mjs";
 
 import {
   benchmarkProfile,
@@ -72,7 +72,7 @@ import {
   shapingFailureReasons,
   stabilizeEncoderForCap,
   summarizePerformance,
-} from "../tools/stream-lab-live.mjs";
+} from "../tools/lab/stream-lab-live.mjs";
 import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
 
 test("quiescent hybrid treats animated chrome canvas as a motion guard", () => {
@@ -1271,7 +1271,7 @@ test("quality pass cannot overwrite live cadence or freeze gates", () => {
 
 test("WSS canvas presentation records wall-clock frame gaps and performance resets them", () => {
   const client = readClientSource();
-  const collector = readFileSync(new URL("../tools/stream-lab-live.mjs", import.meta.url), "utf8");
+  const collector = readFileSync(new URL("../tools/lab/stream-lab-live.mjs", import.meta.url), "utf8");
   assert.match(client, /const frameGap = Math\.max\(0, Math\.round\(renderedAt - lastFrameDrawnAt\)\)/);
   assert.match(client, /hudState\.maxFrameGap = Math\.max/);
   assert.match(client, /lastFrameDrawnAt = null/);
@@ -1280,7 +1280,7 @@ test("WSS canvas presentation records wall-clock frame gaps and performance rese
 });
 
 test("Stream Lab can pin only its browser requests to an admitted zero-percent Worker version", async () => {
-  const live = await import("../tools/stream-lab-live.mjs");
+  const live = await import("../tools/lab/stream-lab-live.mjs");
   assert.equal(typeof live.applyWorkerVersionOverride, "function");
   const calls = [];
   const receiver = {
@@ -1849,12 +1849,12 @@ test("lab Chrome closes gracefully before force-kill so remembered cookies persi
 
 test("every live-unit health check consults the campaign activity guard before the helper lease", () => {
   const events = [];
-  const session = new LiveStreamLabSession({ runId: "123e4567-e89b-42d3-a456-426614174000",
+  const session = new LiveStreamLabSession({ baseUrl: "https://relay.example.com/", runId: "123e4567-e89b-42d3-a456-426614174000",
     store: { appendTelemetry() {} }, assertCampaignActive: () => events.push("activity") });
   session.heartbeat = { assertHealthy: () => events.push("lease") };
   session.assertLeaseHealthy();
   assert.deepEqual(events, ["activity", "lease"]);
-  const aborted = new LiveStreamLabSession({ runId: "123e4567-e89b-42d3-a456-426614174000",
+  const aborted = new LiveStreamLabSession({ baseUrl: "https://relay.example.com/", runId: "123e4567-e89b-42d3-a456-426614174000",
     store: { appendTelemetry() {} }, assertCampaignActive: () => { throw new Error("physical activity"); } });
   aborted.heartbeat = { assertHealthy: () => events.push("must-not-run") };
   assert.throws(() => aborted.assertLeaseHealthy(), /physical activity/);
@@ -1872,7 +1872,7 @@ test("transient display selection requires one new 1080p screen", () => {
 test("an explicit transient-display session asks Lab Helper to own the VDD lease", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "bubbleplay-lab-transient-vdd-"));
   const requests = [];
-  const session = new LiveStreamLabSession({
+  const session = new LiveStreamLabSession({ baseUrl: "https://relay.example.com/",
     runId: "123e4567-e89b-42d3-a456-426614174000",
     store: { appendTelemetry() {} },
     env: { LOCALAPPDATA: root },
@@ -2136,7 +2136,7 @@ test("encoder screening is unshaped while constrained runs reserve transport hea
   assert.equal(effectiveEncoderBitrateMbps(6, null, "wss"), 6);
   assert.equal(effectiveEncoderBitrateMbps(6, 4, "wss"), 2.6);
   assert.equal(effectiveEncoderBitrateMbps(8, 8, "webrtc"), 7.2);
-  const source = readFileSync(new URL("../tools/stream-lab-live.mjs", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../tools/lab/stream-lab-live.mjs", import.meta.url), "utf8");
   assert.match(source, /runSweepCandidate\(session, candidate, options, null\)/);
   assert.match(source, /options\.bandwidthMbps === undefined \? null/);
 });
@@ -2350,7 +2350,7 @@ test("a shaped pipeline candidate retains its six-megabit cohort while lowering 
 
 test("cap changes shape through the helper before exactly one fresh WSS transport epoch", async () => {
   const events = [];
-  const session = new LiveStreamLabSession({
+  const session = new LiveStreamLabSession({ baseUrl: "https://relay.example.com/",
     runId: "123e4567-e89b-42d3-a456-426614174000",
     store: { appendTelemetry() {} },
     helperSession: { async shape(_runId, cap) { events.push(`shape:${cap}`); return { ok: true, event: "shaped" }; } },
@@ -2366,7 +2366,7 @@ test("cap changes shape through the helper before exactly one fresh WSS transpor
 
 test("a missing helper shape acknowledgement fails closed before transport restart", async () => {
   let restarted = false;
-  const session = new LiveStreamLabSession({
+  const session = new LiveStreamLabSession({ baseUrl: "https://relay.example.com/",
     runId: "123e4567-e89b-42d3-a456-426614174000",
     store: { appendTelemetry() {} },
     helperSession: { async shape() { return null; } },
@@ -3205,7 +3205,7 @@ test("screening checkpoints an incompatible encoder candidate and propagates non
 });
 
 test("the optimizer recovers a poisoned candidate host through a known-good profile before continuing", () => {
-  const source = readFileSync(new URL("../tools/stream-lab-live.mjs", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../tools/lab/stream-lab-live.mjs", import.meta.url), "utf8");
   const screening = source.slice(source.indexOf("const screenRuns = []"), source.indexOf("allRuns.push(...screenRuns)"));
   const rejected = screening.indexOf("shouldRecoverRejectedCandidate(run, wasCompleted)");
   const recover = screening.indexOf("await session.recoverAfterRejectedCandidate(baselineConfiguration)");
@@ -3308,7 +3308,7 @@ test("session cleanup waits for an in-flight local renewal before deleting scrat
   mkdirSync(scratch);
   let releaseRenewal;
   const events = [];
-  const session = new LiveStreamLabSession({
+  const session = new LiveStreamLabSession({ baseUrl: "https://relay.example.com/",
     runId: "123e4567-e89b-42d3-a456-426614174000",
     store: { appendTelemetry() {} },
     env: { LOCALAPPDATA: root },
@@ -3334,7 +3334,7 @@ test("session cleanup completes before rethrowing an in-flight renewal failure",
   const scratch = join(root, "scratch");
   mkdirSync(scratch);
   const events = [];
-  const session = new LiveStreamLabSession({
+  const session = new LiveStreamLabSession({ baseUrl: "https://relay.example.com/",
     runId: "123e4567-e89b-42d3-a456-426614174000", store: { appendTelemetry() {} }, env: { LOCALAPPDATA: root },
   });
   session.runScratch = scratch;

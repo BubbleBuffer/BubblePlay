@@ -1,8 +1,8 @@
-//! Text clipboard access for the interactive user session.
+//! Text and image clipboard access for the interactive user session.
 //!
 //! Only the input proxy (interactive user token, default desktop) and the
 //! unprivileged local host use this module. Every access re-checks that the
-//! current input desktop is the default desktop, so clipboard text is never
+//! current input desktop is the default desktop, so clipboard contents are never
 //! read or written while Winlogon/UAC (the secure desktop) is active.
 //!
 //! Wire formats (see `fixtures/input-contract.json`):
@@ -10,6 +10,8 @@
 //!   `crate::input`), reassembled by `InputSink`.
 //! - host -> browser: JSON `{"type":"clipboard","protocol":1,"id","index","count","text"}`
 //!   chunks of at most `HOST_CHUNK_BYTES` UTF-8 bytes, split on char boundaries.
+//! - host images use separate `clipboard-image` JSON chunks, PNG base64,
+//!   `mimeType: image/png`; older text-only clients ignore these messages.
 
 use std::thread;
 use std::time::Duration;
@@ -18,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
-    SetClipboardData,
+    SetClipboardData, RegisterClipboardFormatW,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -32,6 +34,8 @@ pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 /// by at most 6x, which keeps every signaling message far below relay limits.
 pub const HOST_CHUNK_BYTES: usize = 32 * 1024;
 const CF_UNICODETEXT: u32 = 13;
+const CF_DIB: u32 = 8;
+const CF_DIBV5: u32 = 17;
 const OPEN_ATTEMPTS: u32 = 10;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(5);
 
@@ -217,6 +221,75 @@ pub enum ClipboardText {
     TooLarge,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardContent {
+    Text(String),
+    Png(Vec<u8>),
+}
+
+impl ClipboardContent {
+    pub fn wire(&self) -> (bool, String) {
+        use base64::Engine;
+        match self {
+            Self::Text(text) => (false, text.clone()),
+            Self::Png(bytes) => (true, base64::engine::general_purpose::STANDARD.encode(bytes)),
+        }
+    }
+}
+
+// Copies bounded clipboard memory while the clipboard is open. Windows owns
+// the handle; unlock it before closing and never free it.
+fn clipboard_bytes(format: u32, limit: usize) -> Result<Option<Vec<u8>>> {
+    let Ok(handle) = (unsafe { GetClipboardData(format) }) else { return Ok(None); };
+    let memory = HGLOBAL(handle.0);
+    let size = unsafe { GlobalSize(memory) };
+    if size == 0 || size > limit { bail!("clipboard image exceeds memory limit"); }
+    let source = unsafe { GlobalLock(memory) } as *const u8;
+    if source.is_null() { bail!("GlobalLock failed for clipboard image"); }
+    let bytes = unsafe { std::slice::from_raw_parts(source, size) }.to_vec();
+    let _ = unsafe { GlobalUnlock(memory) };
+    Ok(Some(bytes))
+}
+
+pub fn read_content() -> Result<Option<ClipboardContent>> {
+    if !input_desktop_is_default() { bail!("clipboard is unavailable outside the default desktop"); }
+    {
+        let _guard = OpenClipboardGuard::open()?;
+        let png_format = unsafe { RegisterClipboardFormatW(windows::core::w!("PNG")) };
+        if png_format != 0 {
+            if let Some(bytes) = read_image_format(png_format, crate::clipboard_image::MAX_PNG_BYTES) {
+                if crate::clipboard_image::valid_png(&bytes) { return Ok(Some(ClipboardContent::Png(bytes))); }
+            }
+        }
+    }
+    for format in [CF_DIBV5, CF_DIB] {
+        let bytes = {
+            let _guard = OpenClipboardGuard::open()?;
+            read_image_format(format, crate::clipboard_image::MAX_IMAGE_BYTES + 1024)
+        };
+        // Release the OS clipboard before pixel conversion/compression.
+        if let Some(bytes) = bytes {
+            match crate::clipboard_image::dib_to_png(&bytes) {
+                Ok(png) => return Ok(Some(ClipboardContent::Png(png))),
+                Err(error) => tracing::debug!(?error, format, "unsupported clipboard image; checking fallback format"),
+            }
+        }
+    }
+    Ok(match read_text()? {
+        ClipboardText::Text(text) => Some(ClipboardContent::Text(text)),
+        ClipboardText::NoText | ClipboardText::TooLarge => None,
+    })
+}
+
+fn read_image_format(format: u32, limit: usize) -> Option<Vec<u8>> {
+    match clipboard_bytes(format, limit) {
+        Ok(bytes) => bytes,
+        // Format/size failures are permanent for this sequence. Only a busy
+        // OpenClipboard or text renderer is retried by the watcher.
+        Err(error) => { tracing::debug!(?error, format, "clipboard image format rejected"); None }
+    }
+}
+
 pub fn read_text() -> Result<ClipboardText> {
     if !input_desktop_is_default() {
         bail!("clipboard is unavailable outside the default desktop");
@@ -270,19 +343,28 @@ impl ClipboardWatcher {
         !reset && sequence != 0 && previous.is_some_and(|previous| previous != sequence)
     }
 
-    /// Return new clipboard text since the last poll, if any.
-    pub fn poll(&mut self, reset: bool) -> Option<String> {
-        if !self.observe(sequence_number(), reset) {
+    /// Return changed text or a bounded PNG since the last poll, if any.
+    pub fn poll(&mut self, reset: bool) -> Option<ClipboardContent> {
+        let previous = self.last_sequence;
+        let sequence = sequence_number();
+        if !self.observe(sequence, reset) {
             return None;
         }
-        match read_text() {
-            Ok(ClipboardText::Text(text)) => Some(text),
-            Ok(ClipboardText::TooLarge) => {
-                tracing::warn!("host clipboard text exceeds 1 MiB; not synchronized");
-                None
-            }
-            Ok(ClipboardText::NoText) => None,
+        let result = read_content();
+        if sequence_number() != sequence {
+            self.last_sequence = previous;
+            return None;
+        }
+        self.finish_read(previous, result)
+    }
+
+    fn finish_read(&mut self, previous: Option<u32>, result: Result<Option<ClipboardContent>>) -> Option<ClipboardContent> {
+        match result {
+            Ok(content) => content,
             Err(error) => {
+                // A busy clipboard or delayed renderer is retried on the next
+                // poll even if Windows does not advance the sequence again.
+                self.last_sequence = previous;
                 tracing::debug!(?error, "host clipboard read failed");
                 None
             }
@@ -293,6 +375,17 @@ impl ClipboardWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_retries_busy_reads_but_consumes_unsupported_formats() {
+        let mut watcher = ClipboardWatcher::default();
+        assert!(!watcher.observe(5, true));
+        assert!(watcher.observe(6, false));
+        assert_eq!(watcher.finish_read(Some(5), Err(anyhow::anyhow!("busy"))), None);
+        assert!(watcher.observe(6, false), "busy copy gets another attempt");
+        assert_eq!(watcher.finish_read(Some(5), Ok(None)), None);
+        assert!(!watcher.observe(6, false), "unsupported image does not spin");
+    }
 
     #[test]
     fn chunks_respect_byte_limit_and_code_points() {

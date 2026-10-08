@@ -41,7 +41,7 @@ private class SharedPrefStore(private val prefs: SharedPreferences) : PrefStore 
 
 /**
  * Persisted settings: the connection (server URL, optional Stream Lab run)
- * and the settings view (touch, display, video). Reads fall back to the
+ * and the settings view (touch, display, video, clipboard). Reads fall back to the
  * defaults for missing or malformed values; [migrate] runs once per instance.
  */
 class Prefs(private val store: PrefStore) {
@@ -85,6 +85,10 @@ class Prefs(private val store: PrefStore) {
     var keepScreenOn: Boolean
         get() = store.getBoolean(KEY_KEEP_SCREEN_ON) ?: true
         set(value) = store.edit { putBoolean(KEY_KEEP_SCREEN_ON, value) }
+
+    var autoCopyRemoteClipboard: Boolean
+        get() = store.getBoolean(KEY_AUTO_COPY_REMOTE_CLIPBOARD) ?: true
+        set(value) = store.edit { putBoolean(KEY_AUTO_COPY_REMOTE_CLIPBOARD, value) }
 
     /** The host monitor selector requested when a session starts; blank = the host's choice. */
     val defaultMonitor: String get() = store.getString(KEY_DEFAULT_MONITOR) ?: ""
@@ -135,6 +139,7 @@ class Prefs(private val store: PrefStore) {
         const val KEY_TAP_TO_CLICK = "tapToClick"
         const val KEY_START_FULLSCREEN = "startFullscreen"
         const val KEY_KEEP_SCREEN_ON = "keepScreenOn"
+        const val KEY_AUTO_COPY_REMOTE_CLIPBOARD = "autoCopyRemoteClipboard"
         const val KEY_DEFAULT_MONITOR = "defaultMonitor"
         const val KEY_DEFAULT_MONITOR_NAME = "defaultMonitorName"
 

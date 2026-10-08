@@ -4,8 +4,10 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
+import android.content.ActivityNotFoundException
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
@@ -15,6 +17,7 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
 import android.os.Build
 import android.os.Handler
+import android.net.Uri
 import android.os.Looper
 import android.text.InputType
 import android.util.TypedValue
@@ -39,12 +42,19 @@ import de.bubblebuffer.bubbleplay.R
 import de.bubblebuffer.bubbleplay.input.PointerSpeed
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.Session
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import org.json.JSONObject
+import java.io.IOException
 import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * The settings view (`.superpawers/session-ui.md`, "Settings view (Android)"):
- * Connection, Touch, Display, Video, Diagnostics, About. It is a view, not an
+ * The settings view (`docs/architecture/session-ui.md`, "Settings view (Android)"):
+ * Connection, Touch, Display, Video, Clipboard, Diagnostics, About. It is a view, not an
  * activity, so opening it from the stream keeps the session (an activity on
  * top would start the 30 s background disconnect). Every change is written to
  * [Prefs] at once and reported through [Host.onSettingChanged] so the host
@@ -66,7 +76,7 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         fun closeSettings()
     }
 
-    enum class Setting { SERVER, TOUCH_MODE, POINTER_SPEED, TAP_TO_CLICK, FULLSCREEN, KEEP_SCREEN_ON, DEFAULT_MONITOR, CODEC }
+    enum class Setting { SERVER, TOUCH_MODE, POINTER_SPEED, TAP_TO_CLICK, FULLSCREEN, KEEP_SCREEN_ON, DEFAULT_MONITOR, CODEC, AUTO_COPY_REMOTE_CLIPBOARD }
 
     private val density = resources.displayMetrics.density
     private val timers = Handler(Looper.getMainLooper())
@@ -78,6 +88,9 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
     private lateinit var monitorList: LinearLayout
     private val diagValues = LinkedHashMap<Int, TextView>()
     private var probes = 0
+    private var sourceURL = SourceLink.DEFAULT_URL
+    private var sourceCall: Call? = null
+    private val sourceHttp = OkHttpClient.Builder().followRedirects(false).build()
 
     private val refresh = object : Runnable {
         override fun run() {
@@ -116,9 +129,12 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         timers.post(refresh)
+        loadSourceLink()
     }
 
     override fun onDetachedFromWindow() {
+        sourceCall?.cancel()
+        sourceCall = null
         timers.removeCallbacksAndMessages(null)
         super.onDetachedFromWindow()
     }
@@ -130,6 +146,7 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
     fun connectionChanged() {
         serverField.setText(prefs.server)
         renderSignOut()
+        if (isAttachedToWindow) loadSourceLink()
     }
 
     // ---- sections ----------------------------------------------------------------------------
@@ -197,6 +214,11 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         ) { prefs.codec = it; host.onSettingChanged(Setting.CODEC) })
         column.addView(detailText(activity.getString(R.string.settings_codec_detail)).apply { setPadding(0, dp(6), 0, 0) })
 
+        section(R.string.settings_clipboard)
+        column.addView(switchRow(R.string.settings_auto_copy_remote_clipboard, R.string.settings_auto_copy_remote_clipboard_detail, prefs.autoCopyRemoteClipboard) {
+            prefs.autoCopyRemoteClipboard = it; host.onSettingChanged(Setting.AUTO_COPY_REMOTE_CLIPBOARD)
+        })
+
         section(R.string.settings_diagnostics)
         for (label in DIAG_LABELS) column.addView(valueRow(label))
         column.addView(button(R.string.settings_copy_report, primary = true) { copyReport() },
@@ -205,6 +227,31 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
 
         section(R.string.settings_about)
         column.addView(valueRow(R.string.settings_app_version).also { diagValues[R.string.settings_app_version]?.text = appVersion() })
+        column.addView(button(R.string.settings_source_code, primary = false) {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(sourceURL))
+            try { activity.startActivity(intent) }
+            catch (_: ActivityNotFoundException) { Toast.makeText(activity, R.string.settings_no_browser, Toast.LENGTH_SHORT).show() }
+        })
+    }
+
+    private fun loadSourceLink() {
+        sourceCall?.cancel()
+        sourceURL = SourceLink.DEFAULT_URL
+        val base = host.settingsConfig?.base ?: return
+        val request = Request.Builder().url(base.newBuilder().encodedPath("/__auth/methods").query(null).build()).build()
+        val call = sourceHttp.newCall(request)
+        sourceCall = call
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {}
+            override fun onResponse(call: Call, response: Response) {
+                val url = response.use {
+                    if (!it.isSuccessful) return
+                    try { SourceLink.normalize(JSONObject(it.body?.string().orEmpty()).optString("sourceURL")) }
+                    catch (_: Exception) { SourceLink.DEFAULT_URL }
+                }
+                timers.post { if (sourceCall === call && isAttachedToWindow) sourceURL = url }
+            }
+        })
     }
 
     private fun header() = LinearLayout(activity).apply {
@@ -238,6 +285,7 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         }
         val changed = base.toString() != ServerConfig.parseServer(prefs.server)?.toString()
         prefs.server = base.toString()
+        loadSourceLink()
         serverField.setText(base.toString())
         hideKeyboard()
         showServerNote(activity.getString(when {

@@ -1,0 +1,43 @@
+# Architecture
+
+BubblePlay has a native Windows host, a relay that serves the browser receiver, and an optional Android receiver. One relay room pairs one host with one viewer. Docker runs the relay and site; it does not capture or encode a Windows desktop.
+
+## Runtime paths
+
+| Component | Entry points | Responsibility |
+| --- | --- | --- |
+| Windows host | [`host/src/main.rs`](../../host/src/main.rs), [`host/src/host_capture.rs`](../../host/src/host_capture.rs), [`host/src/host_encode.rs`](../../host/src/host_encode.rs) | DXGI capture, NVIDIA encoding, session state and input |
+| Per-user tray | [`host/src/bin/bubbleplay_tray.rs`](../../host/src/bin/bubbleplay_tray.rs), [`host/src/tray/`](../../host/src/tray) | Host supervision, settings, startup and rollback |
+| Optional admin-input helper | [`host/src/admin_agent/`](../../host/src/admin_agent) | Validated SendInput through a restricted local pipe for elevated apps |
+| Go relay | [`relay/server.go`](../../relay/server.go), [`relay/auth.go`](../../relay/auth.go), [`relay/protocol.go`](../../relay/protocol.go) | Site, password/authenticator or ntfy login, signaling and packet relay |
+| Cloudflare relay | [`worker/src/index.js`](../../worker/src/index.js), [`gate.js`](../../worker/src/gate.js), [`protocol-validation.js`](../../worker/src/protocol-validation.js) | Alternative relay using Durable Objects and ntfy approval |
+| Browser receiver | [`worker/public/receiver.js`](../../worker/public/receiver.js), [`transport.js`](../../worker/public/transport.js), [`media-v4.js`](../../worker/public/media-v4.js) | Session lifecycle, decode/presentation, input and media feedback; assets shared by both relays |
+| Android receiver | [`android/app/src/main/java/de/bubblebuffer/bubbleplay/`](../../android/app/src/main/java/de/bubblebuffer/bubbleplay) | Native Kotlin WSS receiver, MediaCodec and touch input |
+
+The Rust tree also retains older service/privileged-capture binaries, probes and stream-lab helpers. Those are development paths and are excluded from the public Windows ZIP. The admin-input helper above is the optional packaged component. Private command-execution companion packages are outside the public product.
+
+## Transports and contracts
+
+The `/host-ws` and `/ws` sockets carry registration, session signaling, desktop state, cursor/clipboard controls and input. WebRTC carries media directly or through separately configured TURN. WSS uses `/host-media-ws` and `/media-ws`, paired by the current session epoch; files have separate `/host-file-ws` and `/file-ws` sockets. A reconnect or changed epoch invalidates old sockets and input state.
+
+WSS v4 sends one encoded access unit per binary message, with a 28-byte header describing codec, generation, sequence, capture time and dimensions. The receiver returns frame ACKs and keyframe requests on that media socket. Generation/sequence gates prevent stale deltas from being presented after recovery or a monitor switch. Host feedback controls capture/encoding admission instead of accumulating a queue of old frames.
+
+Shared fixtures are the cross-language contract; update them and the affected implementations together:
+
+| Fixture | Contract |
+| --- | --- |
+| [`wss-v4-contract.json`](../../fixtures/wss-v4-contract.json) | Current WSS framing, ACK and keyframe messages |
+| [`wss-contract.json`](../../fixtures/wss-contract.json) | Retained transport framing contracts |
+| [`input-contract.json`](../../fixtures/input-contract.json) | Input packets and scan codes |
+| [`cursor-types.json`](../../fixtures/cursor-types.json) | Reliable semantic cursor kinds; position packets remain separate |
+| [`file-transfer-contract.json`](../../fixtures/file-transfer-contract.json) | File packets, validation limits and socket behavior |
+| [`follow-window-contract.json`](../../fixtures/follow-window-contract.json) | Monitor-follow capability and controls |
+| [`browser-approval-contract.json`](../../fixtures/browser-approval-contract.json) | Host approval messages and login methods ([browser approval](browser-approval.md)) |
+
+See [file transfer](file-transfer.md), [monitor following](follow-active-window.md), [session UI](session-ui.md), and [secure desktop](secure-desktop.md) for the behavior behind these contracts. Go also consumes [browser-generated packet fixtures](../../relay/testdata/worker-contract.json).
+
+## Development boundaries
+
+The browser uses small modules for settings, session chrome, monitor selection, cursor translation, clipboard and files. The host separates capture adapters, encoding, session policy and telemetry from its main event loop. The lab separates process/browser orchestration from lifecycle and measurement logic.
+
+Deterministic fixture tests establish packet and state contracts. They do not establish capture-driver behavior, elevated input, physical display output or a deployed relay's interoperability. Use the [development guide](../development.md) for build commands, [Worker lab guide](../../worker/README.md#closed-loop-stream-lab) for isolated Windows acceptance, and [release status](../release-status.md) for remaining public-release checks.

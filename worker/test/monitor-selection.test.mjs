@@ -77,3 +77,24 @@ test("a monitor confirmation cannot survive an epoch restart", () => {
   assert.equal(monitorRequestAfterRestart(null, "peer-left"), null);
   assert.equal(monitorRequestAfterRestart("", "peer-left"), null);
 });
+
+test("follow active window: the client sends the saved choice and shows the host's truth", async () => {
+  const { readFileSync } = await import("node:fs");
+  const client = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
+  // Exact wire shape from docs/architecture/follow-active-window.md.
+  assert.match(client, /sendSignal\(\{ type: "media-control", action: "follow", follow: settings\.followWindow, protocol: WSS_PROTOCOL, epoch: mediaEpoch, reason: "user-follow" \}\)/);
+  // Capability gate: integer version >= 1; resent once per host-capabilities while on.
+  assert.match(client, /hostFollowCapable = Number\.isInteger\(message\.followWindow\) && message\.followWindow >= 1;/);
+  assert.match(client, /if \(settings\.followWindow\) sendFollowWindow\(\);/);
+  assert.match(client, /case "host-capabilities":[\s\S]*?applyFollowCapability\(msg\);[\s\S]*?break;/);
+  // The switch shows monitor-list.follow when present, otherwise the setting.
+  assert.match(client, /if \(typeof message\.follow === "boolean"\) hostFollowState = message\.follow;/);
+  assert.match(client, /return hostFollowState \?\? settings\.followWindow;/);
+  assert.match(client, /group\.hidden = !hostFollowCapable;/);
+  assert.match(client, /row\.setAttribute\("aria-checked", String\(followWindowShown\(\)\)\);/);
+  // Toggling persists the choice and keeps the popover open.
+  assert.match(client, /settings\.followWindow = !followWindowShown\(\);\s*persistSettings\(\);/);
+  assert.match(client, /document\.getElementById\("follow-window"\)\.onclick = \(\) => toggleFollowWindow\(\);/);
+  // Automatic switches reuse the manual path: no follow-specific desktop-state handling.
+  assert.doesNotMatch(client.match(/function handleDesktopState[\s\S]*?\n}\n/)?.[0] ?? "", /follow/i);
+});

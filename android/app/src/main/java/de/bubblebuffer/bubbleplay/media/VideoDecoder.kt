@@ -25,27 +25,32 @@ import de.bubblebuffer.bubbleplay.protocol.V4Frame
 class VideoDecoder(private val listener: Listener) {
     interface Listener {
         /** Called on the decoder thread after a frame is released to the surface. */
-        fun onFramePresented(generation: Long, seq: Long, width: Int, height: Int)
+        fun onFramePresented(generation: Long, seq: Long, width: Int, height: Int, mediaLeg: Int)
         /** The decoder cannot continue from the current reference chain. */
         fun onNeedsKeyframe(reason: String)
         fun onDecoderSelected(name: String, mime: String, hardware: Boolean, lowLatency: Boolean)
+        fun onSurfaceChanged(generation: Long, attached: Boolean)
+        fun onSurfaceOutput(generation: Long)
     }
 
     private val thread = HandlerThread("bp-decoder").apply { start() }
     private val handler = Handler(thread.looper)
 
     private var surface: Surface? = null
+    private var surfaceGeneration = 0L
+    private var surfaceOutputReported = false
     private var codec: MediaCodec? = null
     private var codecType = 0
     private var width = 0
     private var height = 0
     private var csd: List<ByteArray> = emptyList()
     private val freeInputs = ArrayDeque<Int>()
-    private val pending = ArrayDeque<V4Frame>()
-    private val inFlight = HashMap<Long, V4Frame>()
+    private data class QueuedFrame(val frame: V4Frame, val mediaLeg: Int)
+    private val pending = ArrayDeque<QueuedFrame>()
+    private val inFlight = HashMap<Long, QueuedFrame>()
     private var nextPts = 0L
     private var heldOutput = -1
-    private var heldFrame: V4Frame? = null
+    private var heldFrame: QueuedFrame? = null
     private var presentPosted = false
 
     @Volatile var decodedFrames = 0L; private set
@@ -58,6 +63,8 @@ class VideoDecoder(private val listener: Listener) {
         surface = value
         releaseCodec()
         pending.clear()
+        surfaceOutputReported = false
+        listener.onSurfaceChanged(++surfaceGeneration, value != null)
         if (value != null) listener.onNeedsKeyframe("surface")
     }
 
@@ -68,12 +75,13 @@ class VideoDecoder(private val listener: Listener) {
             surface = null
             releaseCodec()
             pending.clear()
+            listener.onSurfaceChanged(++surfaceGeneration, false)
             done.countDown()
         }
         if (posted) done.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
 
-    fun submit(frame: V4Frame) = handler.post { onFrame(frame) }
+    fun submit(frame: V4Frame, mediaLeg: Int) = handler.post { onFrame(QueuedFrame(frame, mediaLeg)) }
 
     /** Drop frames not yet queued (gate reset / reconnect). */
     fun dropPending() = handler.post { pending.clear() }
@@ -83,7 +91,8 @@ class VideoDecoder(private val listener: Listener) {
         thread.quitSafely()
     }
 
-    private fun onFrame(frame: V4Frame) {
+    private fun onFrame(queued: QueuedFrame) {
+        val frame = queued.frame
         if (surface == null) return
         if (frame.key) {
             val frameCsd = AnnexB.codecSpecificData(frame.codec, frame.data)
@@ -94,7 +103,7 @@ class VideoDecoder(private val listener: Listener) {
             }
         }
         if (codec == null) return
-        pending.addLast(frame)
+        pending.addLast(queued)
         if (pending.size > MAX_PENDING) { fail("decode-backlog"); return }
         drain()
     }
@@ -103,7 +112,8 @@ class VideoDecoder(private val listener: Listener) {
         val c = codec ?: return
         try {
             while (freeInputs.isNotEmpty() && pending.isNotEmpty()) {
-                val frame = pending.removeFirst()
+                val queued = pending.removeFirst()
+                val frame = queued.frame
                 val index = freeInputs.removeFirst()
                 val buffer = c.getInputBuffer(index) ?: continue
                 if (frame.data.size > buffer.capacity()) { fail("input-too-large"); return }
@@ -111,7 +121,7 @@ class VideoDecoder(private val listener: Listener) {
                 buffer.put(frame.data)
                 val pts = nextPts
                 nextPts += 16_667
-                inFlight[pts] = frame
+                inFlight[pts] = queued
                 c.queueInputBuffer(index, 0, frame.data.size, pts, if (frame.key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
             }
         } catch (e: IllegalStateException) {
@@ -170,12 +180,17 @@ class VideoDecoder(private val listener: Listener) {
 
         override fun onOutputBufferAvailable(c: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
             if (c !== codec || c !== owner) return
-            val frame = inFlight.remove(info.presentationTimeUs)
+            val queued = inFlight.remove(info.presentationTimeUs)
+            val frame = queued?.frame
             if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0 || info.size < 0) {
                 try { c.releaseOutputBuffer(index, false) } catch (_: IllegalStateException) {}
                 return
             }
             decodedFrames++
+            if (frame != null && !surfaceOutputReported) {
+                surfaceOutputReported = true
+                listener.onSurfaceOutput(surfaceGeneration)
+            }
             if (frame != null) lastDecodedSeq = frame.seq
             // Latest wins: a newer decoded frame replaces the held one unpainted.
             if (heldOutput >= 0) {
@@ -183,7 +198,7 @@ class VideoDecoder(private val listener: Listener) {
                 skippedFrames++
             }
             heldOutput = index
-            heldFrame = frame
+            heldFrame = queued
             if (!presentPosted) {
                 presentPosted = true
                 handler.post { presentHeld(owner) }
@@ -203,7 +218,7 @@ class VideoDecoder(private val listener: Listener) {
         presentPosted = false
         val c = codec
         val index = heldOutput
-        val frame = heldFrame
+        val queued = heldFrame
         heldOutput = -1
         heldFrame = null
         if (c == null || c !== owner || index < 0) return
@@ -213,7 +228,7 @@ class VideoDecoder(private val listener: Listener) {
             fail("decoder-output"); return
         }
         presentedFrames++
-        if (frame != null) listener.onFramePresented(frame.generation, frame.seq, frame.width, frame.height)
+        if (queued != null) listener.onFramePresented(queued.frame.generation, queued.frame.seq, queued.frame.width, queued.frame.height, queued.mediaLeg)
     }
 
     private fun fail(reason: String) {

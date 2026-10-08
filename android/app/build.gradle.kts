@@ -26,8 +26,11 @@ android {
         applicationId = "de.bubblebuffer.bubbleplay"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        // Every build must outrank the installed one so update stores (F-Droid repo,
+        // Obtainium) offer it: minutes since the Unix epoch unless -PversionCode is given.
+        val buildMinute = System.currentTimeMillis() / 60_000
+        versionCode = (findProperty("versionCode") as String?)?.toInt() ?: buildMinute.toInt()
+        versionName = "0.1.0-$buildMinute"
     }
 
     signingConfigs {
