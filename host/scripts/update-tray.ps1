@@ -81,7 +81,10 @@ if ($Build) {
     $manifest = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Cargo.toml'))
     if (-not $env:NVIDIA_VIDEO_CODEC_SDK_PATH) { $env:NVIDIA_VIDEO_CODEC_SDK_PATH = Join-Path $PSScriptRoot '..\sdk-stub' }
     if ($PSCmdlet.ShouldProcess($manifest, 'cargo build --release (host + tray + admin agent + secure-desktop helper)')) {
-        & cargo build --offline --locked --release --manifest-path $manifest --bin bubbleplay-host --bin bubbleplay_tray --bin bubbleplay_admin_agent --bin bubbleplay_secure_helper
+        # Cargo reads .cargo/config.toml from the working directory, not the manifest's, so build from host/.
+        Push-Location (Split-Path $manifest)
+        try { & cargo build --offline --locked --release --manifest-path $manifest --bin bubbleplay-host --bin bubbleplay_tray --bin bubbleplay_admin_agent --bin bubbleplay_secure_helper }
+        finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed with $LASTEXITCODE" }
     }
 }

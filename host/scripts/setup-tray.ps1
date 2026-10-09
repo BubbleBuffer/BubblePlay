@@ -395,7 +395,7 @@ function Install-UserFiles {
         $source = $sources[$name]
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
             if ($IsWhatIf) { Add-Step 'user-files' 'blocked' "Missing $source (build first)."; return }
-            throw "Missing $source. Build first: cargo build --offline --locked --release --bins --manifest-path host/Cargo.toml"
+            throw "Missing $source. Build first, from host/: cargo build --offline --locked --release --bins"
         }
         $target = Join-Path $InstallDir $name
         if (Test-SamePath $source $target) { continue }
