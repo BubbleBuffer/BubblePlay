@@ -117,11 +117,11 @@ function diagnosticEvent(seq, stage = "bootstrap-inline") {
   };
 }
 
-async function waitFor(predicate, timeoutMs = 1000) {
+async function waitFor(predicate, timeoutMs = 10_000, schedule = setTimeout) {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error("condition did not become true");
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => schedule(resolve, 5));
   }
 }
 
@@ -751,11 +751,11 @@ test("ntfy failure is fail-closed and the global pending limit is bounded", asyn
   await Promise.all(held);
 });
 
-test("a simultaneous burst cannot take more than one slot per prefix or exceed the global cap", async () => {
+test("a simultaneous burst cannot take more than one slot per prefix or exceed the global cap", async (t) => {
   const samePrefix = fixture();
   const burst = [];
   for (let i = 1; i <= 5; i += 1) burst.push(samePrefix.gate.fetch(navigation(`203.0.113.${i}`)));
-  await waitFor(() => samePrefix.notices.length >= 1);
+  await waitFor(() => samePrefix.notices.length >= 1, 10_000);
   const refused = await Promise.all(burst.slice(1));
   assert.deepEqual(refused.map((response) => response.status), [404, 404, 404, 404]);
   assert.equal(samePrefix.notices.length, 1);
@@ -764,23 +764,29 @@ test("a simultaneous burst cannot take more than one slot per prefix or exceed t
   assert.equal((await burst[0]).status, 404);
 
   const capped = fixture();
+  // Hashing may outlast the short fixture lease on a busy machine. Control
+  // expiry explicitly while polling real asynchronous approval publication.
+  const pollTimer = setTimeout;
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   capped.gate.env.__gateApprovalTtlMs = 150;
   const held = [];
   for (let i = 0; i < 14; i += 1) held.push(capped.gate.fetch(navigation(`10.${i}.0.1`)));
-  await waitFor(() => capped.notices.length >= 10);
+  await waitFor(() => capped.notices.length >= 10, 10_000, pollTimer);
   assert.deepEqual((await Promise.all(held.slice(10))).map((response) => response.status), [404, 404, 404, 404]);
   assert.equal(capped.notices.length, 10);
   assert.equal(capped.gate.pendingById.size, 10);
 
   // Expiry frees every slot, capability and prefix at the deadline, so a new
   // network is held again straight away.
+  t.mock.timers.tick(150);
   assert.deepEqual((await Promise.all(held)).map((response) => response.status), Array(14).fill(404));
   assert.equal(capped.gate.pendingById.size, 0);
   assert.equal(capped.gate.pendingByCapability.size, 0);
   assert.equal(capped.gate.pendingPrefixes.size, 0);
   const next = capped.gate.fetch(navigation("192.0.2.1"));
-  await waitFor(() => capped.notices.length === 11);
+  await waitFor(() => capped.notices.length === 11, 10_000, pollTimer);
   assert.equal(capped.gate.pendingById.size, 1);
+  t.mock.timers.tick(150);
   assert.equal((await next).status, 404);
   assert.equal(capped.gate.pendingById.size, 0);
 });

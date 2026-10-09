@@ -21,7 +21,6 @@ import {
   rememberRtcFailure,
   forgetRtcFailure,
   RTC_FAILURE_STORAGE_KEY,
-  RTC_REPROBE_INTERVAL_MS,
   rtpCodecMimeTypes,
 } from "../public/transport.js";
 
@@ -760,7 +759,7 @@ test("transport accepts auto, webrtc, wss, and the wsl compatibility alias", () 
   assert.equal(parseTransport(new URLSearchParams("transport=unknown")), "auto");
 });
 
-test("auto mode remembers an RTC failure for a day and the query still overrides it", () => {
+test("auto mode remembers an RTC failure in supplied session storage and the query still overrides it", () => {
   const values = new Map();
   const storage = {
     getItem: key => values.get(key) ?? null,
@@ -774,8 +773,7 @@ test("auto mode remembers an RTC failure for a day and the query still overrides
   assert.equal(rememberedRtcFailure("auto", storage, now + 60_000), true);
   assert.equal(rememberedRtcFailure("webrtc", storage, now + 60_000), false);
   assert.equal(rememberedRtcFailure("wss", storage, now + 60_000), false);
-  // Re-probe RTC at most once a day.
-  assert.equal(rememberedRtcFailure("auto", storage, now + RTC_REPROBE_INTERVAL_MS), false);
+  assert.equal(rememberedRtcFailure("auto", storage, now + 24 * 60 * 60 * 1000), true);
   forgetRtcFailure(storage);
   assert.equal(rememberedRtcFailure("auto", storage, now + 60_000), false);
   // Storage may be missing or throw in private contexts.
@@ -812,21 +810,23 @@ test("HEVC RTP capability accepts Chromium H265 naming and its HEVC alias", () =
 });
 
 test("a connected native WebRTC peer with presented frames never falls back to WSS", () => {
+  const healthyPeer = { connected: true, peerConnected: true, statsAvailable: true,
+    requestAtMs: 0, lastProgressAtMs: 0, nowMs: 5_000 };
   // Production regression: ICE connected, native HEVC presented 11 frames at
   // 8 fps, yet the 2 s no-rtp timer fired because only the encoded-frame
   // counter was consulted.
   assert.equal(shouldFallbackToWssOnMissingRtp({
-    connected: true,
+    ...healthyPeer,
     framesReceived: 0,
     nativeFramesPresented: 11,
   }), false);
   assert.equal(shouldFallbackToWssOnMissingRtp({
-    connected: true,
+    ...healthyPeer,
     framesReceived: 7,
     nativeFramesPresented: 0,
   }), false);
   assert.equal(shouldFallbackToWssOnMissingRtp({
-    connected: true,
+    ...healthyPeer,
     framesReceived: 0,
     nativeFramesPresented: 0,
   }), true);
@@ -834,7 +834,7 @@ test("a connected native WebRTC peer with presented frames never falls back to W
   // Unknown counters keep the original rescue behavior for a genuinely silent
   // peer; they must never be read as evidence that media arrived.
   assert.equal(shouldFallbackToWssOnMissingRtp({
-    connected: true,
+    ...healthyPeer,
     framesReceived: null,
     nativeFramesPresented: null,
   }), true);
@@ -843,7 +843,7 @@ test("a connected native WebRTC peer with presented frames never falls back to W
 test("the receiver consults native presentation before the automatic WSS fallback", () => {
   const receiver = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   assert.match(receiver,
-    /shouldFallbackToWssOnMissingRtp\(\{ connected, framesReceived, nativeFramesPresented \}\)/);
+    /createRtcStartupFallback\(\{[\s\S]*?nativeFramesPresented: nativePresentation\?\.generation === generation/);
   assert.match(receiver,
-    /clearTimeout\(rtpFallbackTimer\); rtpFallbackTimer = null;\s*\n\s*markFirstFramePresented\(\);/);
+    /rtcStartupFallback\?\.stop\(\);\s*\n\s*markFirstFramePresented\(\);/);
 });

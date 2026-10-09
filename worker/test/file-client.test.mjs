@@ -306,6 +306,13 @@ test("written and ACKed bytes reopen the download window for a compliant sender"
     }
     release();
     await client.rows[0].writes;
+    // The message handlers can still be admitting writes after that snapshot.
+    // Wait for the protocol acknowledgement before sending another window.
+    const ackDeadline = Date.now() + 2_000;
+    while (!host.sentByClient.some(packet => packet.type === FT.ACK && packet.total === FT_WINDOW_BYTES)) {
+      assert.ok(Date.now() < ackDeadline, "written download window was not ACKed");
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
     assert.ok(host.sentByClient.some(packet => packet.type === FT.ACK && packet.total === FT_WINDOW_BYTES));
     ws.onmessage({ data: encodeData(id, seq, bytes.subarray(FT_WINDOW_BYTES)) });
     ws.onmessage({ data: encodeDone(id, createHash("sha256").update(bytes).digest()) });

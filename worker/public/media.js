@@ -761,17 +761,108 @@ export function prepareHybridWssFrame(frame, { active = false, cache = null } = 
   };
 }
 
-/** A connected WebRTC peer is only abandoned for WSS when no media has
- * arrived. The native `<video>` path presents frames through
- * requestVideoFrameCallback independently of encoded-frame callbacks, so
- * both concrete arrival signals must be consulted before falling back. */
+/** A fully connected WebRTC peer is only abandoned after five seconds with
+ * no RTP and no startup progress. Native presentation is independent of the
+ * encoded-frame callbacks, so both arrival signals protect a healthy peer. */
 export function shouldFallbackToWssOnMissingRtp({
   connected = false,
+  peerConnected = false,
   framesReceived = 0,
   nativeFramesPresented = 0,
+  rtpPacketsReceived = 0,
+  rtpBytesReceived = 0,
+  statsAvailable = false,
+  requestAtMs = null,
+  lastProgressAtMs = null,
+  nowMs = 0,
 } = {}) {
-  if (connected !== true) return false;
+  if (connected !== true || peerConnected !== true || statsAvailable !== true) return false;
+  if (!Number.isFinite(requestAtMs) || !Number.isFinite(lastProgressAtMs)
+      || nowMs - requestAtMs < 5_000 || nowMs - lastProgressAtMs < 5_000) return false;
   const received = Number.isFinite(framesReceived) ? framesReceived : 0;
   const presented = Number.isFinite(nativeFramesPresented) ? nativeFramesPresented : 0;
-  return received <= 0 && presented <= 0;
+  return received <= 0 && presented <= 0 && rtpPacketsReceived <= 0 && rtpBytesReceived <= 0;
+}
+
+/** Startup-only probe. Each sent first-frame request and each concrete startup
+ * milestone gets five seconds. Missing or stalled stats never prove no RTP. */
+export function createRtcStartupFallback({
+  now = () => performance.now(),
+  schedule = (callback, delay) => setTimeout(callback, delay),
+  cancel = timer => clearTimeout(timer),
+  isCurrent = () => true,
+  snapshot,
+  getStats,
+  onFallback,
+  onHealthy = () => {},
+}) {
+  let requestAtMs = null;
+  let lastProgressAtMs = now();
+  let timer = null;
+  let stopped = false;
+  let revision = 0;
+  function stop() {
+    stopped = true;
+    revision++;
+    if (timer !== null) cancel(timer);
+    timer = null;
+  }
+  function arm(delay = 1_000) {
+    if (stopped || requestAtMs === null) return;
+    if (timer !== null) cancel(timer);
+    timer = schedule(check, delay);
+  }
+  async function check() {
+    timer = null;
+    if (stopped || !isCurrent()) return stop();
+    const before = snapshot();
+    if (before.framesReceived > 0 || before.nativeFramesPresented > 0) {
+      stop(); onHealthy(); return;
+    }
+    // ICE and DTLS may continue making progress after the offer. The old 4s
+    // timer must not preempt that startup opportunity.
+    if (!before.connected || !before.peerConnected) return arm();
+    const checkRevision = revision;
+    let report;
+    try { report = await getStats(); } catch {
+      if (!stopped && isCurrent() && checkRevision === revision) arm();
+      return;
+    }
+    if (stopped || !isCurrent() || checkRevision !== revision) return;
+    if (!report || typeof report.forEach !== "function") return arm();
+    let rtpPacketsReceived = 0;
+    let rtpBytesReceived = 0;
+    let statsAvailable = true;
+    report.forEach(stat => {
+      if (stat.type !== "inbound-rtp" || (stat.kind ?? stat.mediaType) !== "video") return;
+      if (!Number.isFinite(stat.packetsReceived) && !Number.isFinite(stat.bytesReceived)) statsAvailable = false;
+      rtpPacketsReceived += Number.isFinite(stat.packetsReceived) ? Math.max(0, stat.packetsReceived) : 0;
+      rtpBytesReceived += Number.isFinite(stat.bytesReceived) ? Math.max(0, stat.bytesReceived) : 0;
+    });
+    const current = snapshot();
+    if (rtpPacketsReceived > 0 || rtpBytesReceived > 0
+        || current.framesReceived > 0 || current.nativeFramesPresented > 0) {
+      stop(); onHealthy(); return;
+    }
+    if (shouldFallbackToWssOnMissingRtp({ ...current, rtpPacketsReceived,
+      rtpBytesReceived, statsAvailable, requestAtMs, lastProgressAtMs, nowMs: now() })) {
+      stop(); onFallback(); return;
+    }
+    arm();
+  }
+  return {
+    requestSent() {
+      if (stopped) return;
+      requestAtMs = now();
+      revision++;
+      arm(5_000);
+    },
+    progress() {
+      if (stopped) return;
+      lastProgressAtMs = now();
+      revision++;
+      arm(5_000);
+    },
+    stop,
+  };
 }

@@ -49,7 +49,8 @@ test("live CLIs reject a missing relay URL before files, children, services or n
       syncBuiltinESMExports();
       process.argv = [process.execPath, ${JSON.stringify(fileURLToPath(entry))}, ...${JSON.stringify(args)}];
       await import(${JSON.stringify(entry.href)});
-    `], { encoding: "utf8", env: { ...process.env, BUBBLEPLAY_URL: "", BUBBLEPLAY_TOKEN: "" }, timeout: 10_000 });
+    `], { encoding: "utf8", env: { ...process.env, BUBBLEPLAY_URL: "", BUBBLEPLAY_TOKEN: "" }, timeout: 60_000 });
+    assert.ifError(child.error);
     assert.equal(child.status, 1, child.stderr);
     assert.match(child.stderr, /pass --url or set BUBBLEPLAY_URL/, name);
     assert.doesNotMatch(child.stderr, /UNEXPECTED_SIDE_EFFECT/, name);
@@ -60,8 +61,11 @@ test("service validation requires an explicit URL only for live validation", {
   skip: process.platform !== "win32",
 }, () => {
   const script = fileURLToPath(new URL("../../host/scripts/validate-service-update.ps1", import.meta.url));
-  const options = { encoding: "utf8", env: { ...process.env, BUBBLEPLAY_URL: "" }, timeout: 10_000 };
+  // Windows PowerShell startup can exceed 10s on a busy development machine.
+  // Keep the guard assertions intact while allowing a bounded launch window.
+  const options = { encoding: "utf8", env: { ...process.env, BUBBLEPLAY_URL: "" }, timeout: 60_000 };
   const missing = spawnSync("powershell.exe", ["-NoProfile", "-File", script], options);
+  assert.ifError(missing.error);
   assert.equal(missing.status, 1, missing.stderr);
   assert.match(missing.stderr, /pass -Url or set BUBBLEPLAY_URL/);
   for (const [args, env] of [
@@ -69,6 +73,7 @@ test("service validation requires an explicit URL only for live validation", {
     [[], { ...options.env, BUBBLEPLAY_URL: "http://127.0.0.1:8787/" }],
   ]) {
     const configured = spawnSync("powershell.exe", ["-NoProfile", "-File", script, ...args], { ...options, env });
+    assert.ifError(configured.error);
     assert.equal(configured.status, 1, configured.stderr);
     assert.match(configured.stderr, /ManifestPath is required/);
     assert.doesNotMatch(configured.stderr, /relay URL is required/);

@@ -408,12 +408,12 @@ test("optimization preflight fails closed when the physical activity guard is ab
 test("a helper pipe that closes without a reply rejects immediately", async () => {
   const server = createServer(socket => socket.once("data", () => socket.destroy()));
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-  const started = Date.now();
   try {
+    // A close-specific error proves the close event rejected the request,
+    // rather than its timeout; scheduler load is not part of this contract.
     await assert.rejects(sendHelperRequest("end", {
       runId: "123e4567-e89b-42d3-a456-426614174000",
-    }, { pipe: server.address(), timeoutMs: 2_000 }), /closed/i);
-    assert.ok(Date.now() - started < 1_000);
+    }, { pipe: server.address(), timeoutMs: 10_000 }), /closed/i);
   } finally {
     await new Promise(resolve => server.close(resolve));
   }

@@ -345,7 +345,8 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /function probeNetworkRouteChange\(\)/);
   assert.match(client, /routeConnection\?\.addEventListener\("change", probeNetworkRouteChange\)/);
   assert.doesNotMatch(client, /routeConnection\?\.addEventListener\("change", \(\) => recoverNetworkRoute/);
-  assert.match(client, /4_000/);
+  assert.match(client, /createRtcStartupFallback\(\{[\s\S]*?getStats: \(\) => candidate\.getStats\(\),[\s\S]*?onFallback: \(\) => switchToWss\("no-rtp"\)/);
+  assert.doesNotMatch(client, /switchToWss\("ice-timeout"\)/);
   assert.match(client, /2_000/);
   assert.doesNotMatch(client, /localStorage\.setItem\([^\n]*codec/);
   assert.match(client, /const due = usingWssMedia \? now : latencyGuard\.expectedWall\(ts\)/);

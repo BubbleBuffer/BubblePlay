@@ -6,6 +6,8 @@ The approved BubblePlay mark appears on launcher icons, login pages and the Wind
 
 ## Browser
 
+The browser opens its signaling socket immediately on startup and requests the first frame just after sending the WebRTC offer, with the existing five-second first-frame watchdog. Automatic no-RTP fallback waits at least five seconds from the latest first-frame request and the last startup progress, requires connected ICE and peer state, and checks that neither RTP nor a presented frame has arrived; a terminal RTC failure also selects WSS in automatic mode. A remembered fallback lives only in the current tab's sessionStorage, so a new tab session tries WebRTC again. Explicit transport choices and transient disconnections retain their existing policies. Each relay socket still checks current approval and login validity before admission.
+
 Desktop pointers use a 32 px top strip. Touch pointers use a 48 px bottom bar plus its seam. Desktop actions include Monitors, Shortcuts, Files, Fullscreen and Settings; clipboard retry and zoom reset appear only when needed. Touch adds Keyboard, Touch mode, Keys, Arrows and More.
 
 Popovers open with one action and close on an outside press or Escape. Only one is open at a time. Keyboard navigation moves between rows and restores focus on close; Escape used by a popover does not reach the remote PC. Mouse-opened controls preserve remote-input focus.

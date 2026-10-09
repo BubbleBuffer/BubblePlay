@@ -10,12 +10,12 @@ import {
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
-import { CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, shouldFallbackToWssOnMissingRtp, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY } from "/media.js";
+import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
 import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
-  rememberedRtcFailure, rtpCodecMimeTypes,
+  rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes,
 } from "/transport.js";
 import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
 import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyName, shortcutsFor } from "/chrome.js";
@@ -104,7 +104,7 @@ function browserStorage() {
   try { return window.localStorage; } catch { return null; }
 }
 // ?transport= always wins; only auto mode consults the remembered RTC failure.
-const startOnRememberedWss = rememberedRtcFailure(requestedTransport, browserStorage());
+const startOnRememberedWss = rememberedRtcFailure(requestedTransport, rtcFailureStorage());
 // One versioned settings record (settings.js); ?quality= still wins for a page.
 const settings = loadSettings(browserStorage());
 function persistSettings() { saveSettings(browserStorage(), settings); }
@@ -296,7 +296,8 @@ function firstFrameRequestId() {
 }
 function sendFirstFrameRequest() {
   if (!firstFrameHandshake.requestId || ws?.readyState !== WebSocket.OPEN) return false;
-  sendSignal({ type: "first-frame", protocol: 1, phase: "request", requestId: firstFrameHandshake.requestId, transport: firstFrameHandshake.transport, ...(firstFrameHandshake.epoch ? { epoch: firstFrameHandshake.epoch } : {}) });
+  if (!sendSignal({ type: "first-frame", protocol: 1, phase: "request", requestId: firstFrameHandshake.requestId, transport: firstFrameHandshake.transport, ...(firstFrameHandshake.epoch ? { epoch: firstFrameHandshake.epoch } : {}) })) return false;
+  if (firstFrameHandshake.transport === "webrtc") rtcStartupFallback?.requestSent();
   return true;
 }
 function armFirstFrameWatchdog() {
@@ -322,6 +323,7 @@ function armFirstFrameWatchdog() {
 }
 function startFirstFrameHandshake(reason, forceNew = false) {
   if (ws?.readyState !== WebSocket.OPEN) return;
+  if (!usingWssMedia && !rtcOfferSignaled) return;
   const transport = usingWssMedia ? "wss" : "webrtc";
   const epoch = usingWssMedia ? mediaEpoch : null;
   if (!forceNew && firstFrameHandshake.requestId && firstFrameHandshake.transport === transport && firstFrameHandshake.epoch === epoch && firstFrameHandshake.phase !== "failed") return;
@@ -357,6 +359,10 @@ function markFirstFramePresented(presentedGeneration = null, presentedViewportRe
   if (firstFrameHandshake.presented) return true;
   if (usingWssMedia) wssStartupRecoveries = 0;
   firstFrameHandshake.presented = true;
+  if (!usingWssMedia) {
+    rtcStartupFallback?.stop();
+    forgetRtcFailure(rtcFailureStorage());
+  }
   hasPresentedFrame = true;
   document.body.classList.add("has-presented-frame");
   firstFrameHandshake.phase = "presented";
@@ -390,6 +396,7 @@ function handleFirstFrameMessage(message) {
   }
   if (!message || message.protocol !== 1 || message.requestId !== firstFrameHandshake.requestId) return;
   if (message.phase === "admitted") {
+    if (!firstFrameHandshake.admitted && !usingWssMedia) rtcStartupFallback?.progress();
     firstFrameHandshake.admitted = true;
     firstFrameHandshake.generation = Number.isInteger(message.generation) ? message.generation : firstFrameHandshake.generation;
     firstFrameHandshake.phase = "in-flight";
@@ -721,8 +728,8 @@ let wssPresentedIdentityFramesRemaining = 0;
 let wssTimestampFallbackLogged = false;
 const hybridTileCache = new HybridTileCache();
 const hevcTileCache = new HevcTileCache();
-let iceFallbackTimer = null;
-let rtpFallbackTimer = null;
+let rtcStartupFallback = null;
+let rtcOfferSignaled = false;
 let clientLogSequence = 0;
 let signalingRegistered = false;
 let signalingRegisteredAtMs = null;
@@ -781,7 +788,7 @@ function reconnectSignaling(reason) {
   if (terminalSignalingFailure) return;
   if (reconnectTimer || ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
   hudState.ws = `reconnecting (${reason})`;
-  reconnectTimer = setTimeout(() => {
+  const connect = () => {
     reconnectTimer = null;
     const generation = ++signalingGeneration;
     const socketUrl = signalingSocketUrl();
@@ -816,7 +823,9 @@ function reconnectSignaling(reason) {
     };
     socket.onerror = () => { if (ws === socket) { hudState.ws = "error"; recordSignalingError("socket-error", "WebSocket signaling error"); debugTrace("signaling-error", { generation }); } };
     socket.onmessage = (ev) => handleSignal(socket, generation, ev);
-  }, 250);
+  };
+  if (reason === "startup") connect();
+  else reconnectTimer = setTimeout(connect, 250);
 }
 
 function signalingSocketUrl() {
@@ -892,6 +901,7 @@ async function handleSignal(socket, generation, ev) {
         await candidate.setRemoteDescription({ type: "answer", sdp: msg.sdp });
         if (!isCurrentPeer(peer, candidate)) return;
         remoteDescriptionSet = true;
+        rtcStartupFallback?.progress();
         hudState.ice = "answer";
         const queued = pendingRemoteIce;
         pendingRemoteIce = [];
@@ -1027,6 +1037,7 @@ function restartPeer(reason, reconnect = true) {
   pendingRemoteIce = [];
   remoteDescriptionSet = false;
   offerSent = false;
+  rtcOfferSignaled = false;
   hudState.ice = reason;
   hud.classList.add("bad");
   if (ws?.readyState === WebSocket.OPEN) {
@@ -1075,8 +1086,7 @@ function cleanupPeer() {
 }
 
 function clearWssTimers() {
-  clearTimeout(iceFallbackTimer); iceFallbackTimer = null;
-  clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
+  rtcStartupFallback?.stop(); rtcStartupFallback = null;
   clearWssKeyframeWatchdog();
   clearInterval(wssV4.heartbeatTimer); wssV4.heartbeatTimer = null;
   clearTimeout(wssReconnectTimer); wssReconnectTimer = null;
@@ -1472,9 +1482,17 @@ function beginWssRecovery(reason, requestId = null) {
 
 function handleRtcPeerConnectionState(generation, candidate, state) {
   if (!isCurrentPeer(generation, candidate)) return;
+  rtcStartupFallback?.progress();
+  if (state === "connected" && !usingWssMedia) startFirstFrameHandshake("peer-connected");
   const action = rtcPeerEndAction({ usingWssMedia, connectionState: state });
   if (action === "end-peer") endRtcPeerOnly(`rtc-${state}`);
   else if (action === "recycle") {
+    // A terminal failure is evidence of an unusable RTC path. Auto mode must
+    // retain WSS rescue without treating a still-connecting peer as failed.
+    if (requestedTransport === TRANSPORT.AUTO) {
+      if (!wssSelected) switchToWss("rtc-failed");
+      return;
+    }
     hudState.ice = state;
     hud.classList.add("bad");
     if (ws?.readyState === WebSocket.OPEN) ws.close(1000, "rtc-failed");
@@ -1494,8 +1512,7 @@ function endRtcPeerOnly(reason) {
   try { pc.close(); } catch {}
   pc = null;
   closingPeer = false;
-  clearTimeout(iceFallbackTimer); iceFallbackTimer = null;
-  clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
+  rtcStartupFallback?.stop(); rtcStartupFallback = null;
   debugTrace("rtc-peer-ended", { reason });
   sendClientLog("warn", "rtc-peer-ended", { reason, transport: "wss" });
 }
@@ -1503,7 +1520,7 @@ function endRtcPeerOnly(reason) {
 function switchToWss(reason) {
   if (usingWssMedia) return;
   // Auto mode only reaches here when WebRTC could not start in this browser.
-  rememberRtcFailure(browserStorage());
+  rememberRtcFailure(rtcFailureStorage());
   sendClientLog("warn", "rtc-failed-switch-to-wss", { reason, remembered: true });
   wssSelected = true;
   hudState.ice = `wss (${reason})`;
@@ -1703,10 +1720,21 @@ async function startPeer(generation = peerGeneration) {
     }
   }
   pc = candidate;
+  rtcStartupFallback?.stop();
+  rtcOfferSignaled = false;
   if (requestedTransport === TRANSPORT.AUTO) {
-    iceFallbackTimer = setTimeout(() => {
-      if (isCurrentPeer(generation, candidate) && !connected) switchToWss("ice-timeout");
-    }, 4_000);
+    rtcStartupFallback = createRtcStartupFallback({
+      isCurrent: () => isCurrentPeer(generation, candidate) && !usingWssMedia && !wssSelected,
+      snapshot: () => ({
+        connected: ["connected", "completed"].includes(candidate.iceConnectionState),
+        peerConnected: candidate.connectionState === "connected",
+        framesReceived,
+        nativeFramesPresented: nativePresentation?.generation === generation ? nativePresentation.framesPresented : 0,
+      }),
+      getStats: () => candidate.getStats(),
+      onFallback: () => switchToWss("no-rtp"),
+      onHealthy: () => forgetRtcFailure(rtcFailureStorage()),
+    });
   }
 
   // Receive-only video; the browser offers, the host answers (locked).
@@ -1747,12 +1775,12 @@ async function startPeer(generation = peerGeneration) {
   const updateInputReady = () => { const wasReady=inputReady; inputReady = dc?.readyState === "open" && motionDc?.readyState === "open"; hudState.control = dc?.readyState || "closed"; hudState.motion = motionDc?.readyState || "closed"; hudState.dc = inputReady ? "open" : "closed"; if (!wasReady && inputReady) onInputReady(); };
   const laneClosed = () => {
     if (!isCurrentPeer(generation, candidate) || closingPeer) return;
-    if (rtcPeerEndAction({ usingWssMedia, laneClosed: true }) === "end-peer") return endRtcPeerOnly("input-lane-closed");
+    if (wssSelected || rtcPeerEndAction({ usingWssMedia, laneClosed: true }) === "end-peer") return endRtcPeerOnly("input-lane-closed");
     releaseInput(false); recycleSignaling("input-lane-closed"); restartPeer("input-lane-closed", false);
   };
-  channel.onopen = () => { if (isCurrentPeer(generation, candidate)) updateInputReady(); };
+  channel.onopen = () => { if (isCurrentPeer(generation, candidate)) { rtcStartupFallback?.progress(); updateInputReady(); } };
   channel.onclose = laneClosed;
-  motionChannel.onopen = () => { if (isCurrentPeer(generation, candidate)) updateInputReady(); };
+  motionChannel.onopen = () => { if (isCurrentPeer(generation, candidate)) { rtcStartupFallback?.progress(); updateInputReady(); } };
   motionChannel.onclose = laneClosed;
   channel.onerror = (e) => { if (isCurrentPeer(generation, candidate)) hudState.dc = `err:${e.message || ""}`; };
   channel.onmessage = (event) => { if (isCurrentPeer(generation, candidate)) handleCursorState(event.data); };
@@ -1777,26 +1805,18 @@ async function startPeer(generation = peerGeneration) {
   candidate.oniceconnectionstatechange = () => {
     if (!isCurrentPeer(generation, candidate)) return;
     hudState.ice = candidate.iceConnectionState;
+    rtcStartupFallback?.progress();
     connected = candidate.iceConnectionState === "connected" || candidate.iceConnectionState === "completed";
+    if (candidate.iceConnectionState === "failed" && requestedTransport === TRANSPORT.AUTO
+        && !usingWssMedia && !wssSelected && !["new", "connecting"].includes(candidate.connectionState)) {
+      switchToWss("ice-failed");
+      return;
+    }
     if (connected) {
-      clearTimeout(iceFallbackTimer); iceFallbackTimer = null;
-      if (requestedTransport === TRANSPORT.AUTO) {
-        rtpFallbackTimer = setTimeout(() => {
-          if (!isCurrentPeer(generation, candidate)) return;
-          // Check the current native presentation epoch as well as the shared
-          // receive counter before abandoning a peer that may be playing.
-          const nativeFramesPresented = nativePresentation?.generation === generation
-            ? nativePresentation.framesPresented
-            : 0;
-          if (shouldFallbackToWssOnMissingRtp({ connected, framesReceived, nativeFramesPresented })) {
-            switchToWss("no-rtp");
-          } else {
-            forgetRtcFailure(browserStorage());
-          }
-        }, 2_000);
-      }
       hud.classList.remove("bad");
       if (!mobilePointerDevice) requestPointerLock();
+      // Usually idempotent with the offer-time request. If slow ICE outlasted
+      // both watchdog intervals, renew the failed handshake once media can flow.
       startFirstFrameHandshake("ice-connected");
     }
   };
@@ -1808,7 +1828,10 @@ async function startPeer(generation = peerGeneration) {
     if (!isCurrentPeer(generation, candidate)) return;
     await candidate.setLocalDescription(offer);
     if (!isCurrentPeer(generation, candidate)) return;
-    sendSignal({ type: "offer", sdp: offer.sdp });
+    if (sendSignal({ type: "offer", sdp: offer.sdp })) {
+      rtcOfferSignaled = true;
+      startFirstFrameHandshake("offer-sent");
+    }
   } catch (e) {
     if (isCurrentPeer(generation, candidate)) restartPeer(`offer:${e.message || e}`);
   }
@@ -2533,7 +2556,7 @@ function startNativeVideo(track, generation = peerGeneration) {
       // A presented native frame is the concrete media arrival signal for this
       // peer epoch: cancel the RTC auto-fallback exactly like feedDecoder does
       // for the encoded path, and surface the frame in the received counter.
-      clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
+      rtcStartupFallback?.stop();
       markFirstFramePresented();
       const gap = lastFrameAt === null ? null : now - lastFrameAt;
       if (nativePresentation.firstFrameAtMs === null) nativePresentation.firstFrameAtMs = Date.now();
@@ -2641,7 +2664,7 @@ document.addEventListener("visibilitychange", () => {
 function feedDecoder(chunk, generation) {
   // An encoded frame is the concrete RTP/media arrival signal. Do not cancel
   // auto fallback merely because a track object was announced.
-  clearTimeout(rtpFallbackTimer); rtpFallbackTimer = null;
+  rtcStartupFallback?.stop();
   if (generation !== latencyGuard.generation) { hudState.dropped++; return; }
   const data = new Uint8Array(chunk.data);
   const isKey = chunk.type === "key";

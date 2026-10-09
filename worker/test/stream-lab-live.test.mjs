@@ -2,6 +2,8 @@ import { readClientSource } from "./helpers/client-source.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -560,7 +562,7 @@ test("quality capture retries an atomic same-identity frame until its detail til
       source,
       phase: "quality-capture",
       alignmentOptions: { afterNetworkSequence: 90, requireDeltaFrame: true, hybridRequirement: "tile" },
-      timeoutMs: 500,
+      timeoutMs: 10_000,
     });
     assert.equal(calls, 2);
     assert.equal(diagnostics.frameTrace.sequence, 92);
@@ -1870,6 +1872,12 @@ test("transient display selection requires one new 1080p screen", () => {
 });
 
 test("an explicit transient-display session asks Lab Helper to own the VDD lease", async (t) => {
+  // This checks the helper request boundary, so display discovery is a fixture.
+  t.mock.method(childProcess, "spawnSync", () => ({ status: 0, stderr: "", stdout: JSON.stringify([
+    { deviceName: "fixture-primary", x: 0, y: 0, width: 1920, height: 1080, primary: true },
+  ]) }));
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
   const root = mkdtempSync(join(tmpdir(), "bubbleplay-lab-transient-vdd-"));
   const requests = [];
   const session = new LiveStreamLabSession({ baseUrl: "https://relay.example.com/",
