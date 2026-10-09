@@ -3,3 +3,8 @@
 # are produced from the driver DLLs by scripts/make-nvenc-stubs.ps1 (one-time per machine).
 [env]
 NVIDIA_VIDEO_CODEC_SDK_PATH = { value = "sdk-stub", relative = true }
+
+# The global ~/.cargo config switches to rust-lld, which mis-parses the
+# Windows resource (.res) link args and the MSVC lib path. Keep MSVC link.exe here.
+[target.x86_64-pc-windows-msvc]
+linker = "link.exe"
