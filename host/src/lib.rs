@@ -1,5 +1,6 @@
 //! Shared host runtime. Binaries use these modules instead of recompiling them.
 pub mod admin_agent;
+pub mod admin_mode;
 pub mod secure_helper;
 pub mod agent_client;
 pub mod agent_runtime;

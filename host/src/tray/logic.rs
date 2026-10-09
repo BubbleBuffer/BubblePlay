@@ -222,17 +222,20 @@ impl Write for SharedLog {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TraySettings {
-    pub admin_mode: bool,
     pub start_at_login: bool,
 }
 
 impl Default for TraySettings {
     fn default() -> Self {
         Self {
-            admin_mode: false,
             start_at_login: true,
         }
     }
+}
+
+/// A connected viewer cannot request additional rights; revocation stays available.
+pub fn admin_menu_enabled(admin_on: bool, viewer_connected: bool) -> bool {
+    admin_on || !viewer_connected
 }
 
 impl TraySettings {
@@ -602,28 +605,54 @@ mod tests {
     }
 
     #[test]
+    fn admin_menu_disallows_enabling_during_viewer_session() {
+        assert!(admin_menu_enabled(false, false));
+        assert!(!admin_menu_enabled(false, true));
+        assert!(admin_menu_enabled(true, false));
+        assert!(admin_menu_enabled(true, true));
+    }
+
+    #[test]
+    fn legacy_tray_json_admin_mode_is_ignored_and_never_written() {
+        for legacy in ["true", "false", "null", "123", "\"invalid\""] {
+            let settings: TraySettings = serde_json::from_str(&format!(
+                "{{\"adminMode\":{legacy},\"startAtLogin\":false}}"
+            ))
+            .unwrap();
+            assert!(!settings.start_at_login);
+            assert_eq!(
+                serde_json::to_value(settings).unwrap(),
+                serde_json::json!({"startAtLogin":false})
+            );
+        }
+    }
+
+    #[test]
     fn settings_default_roundtrip_and_tolerate_garbage() {
         let dir = temp_dir("settings");
         let path = dir.join("tray.json");
         assert_eq!(TraySettings::load(&path), TraySettings::default());
         assert!(TraySettings::default().start_at_login);
-        assert!(!TraySettings::default().admin_mode);
         let settings = TraySettings {
-            admin_mode: true,
             start_at_login: false,
         };
         settings.save(&path).unwrap();
         assert_eq!(TraySettings::load(&path), settings);
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"adminMode\": true"));
+        assert!(!text.contains("adminMode"));
         fs::write(&path, b"{\"adminMode\": true}").unwrap();
         assert_eq!(
             TraySettings::load(&path),
             TraySettings {
-                admin_mode: true,
                 start_at_login: true
             }
         );
+        fs::write(
+            &path,
+            b"{\"adminMode\": \"ignored\", \"startAtLogin\": false}",
+        )
+        .unwrap();
+        assert!(!TraySettings::load(&path).start_at_login);
         fs::write(&path, b"not json").unwrap();
         assert_eq!(TraySettings::load(&path), TraySettings::default());
         let _ = fs::remove_dir_all(dir);
@@ -835,10 +864,6 @@ mod tests {
     #[test]
     fn every_viewer_start_launches_helper_with_admin_off_or_on_even_after_failure() {
         for admin_mode in [false, true] {
-            let settings = TraySettings {
-                admin_mode,
-                ..TraySettings::default()
-            };
             let mut gate = ViewerGate::default();
             let mut helper = SecureHelperStatus::NeedsUpdate {
                 reason: "old startup failure".into(),
@@ -868,7 +893,7 @@ mod tests {
             );
             assert_eq!(launches, 2);
             assert_eq!(helper, SecureHelperStatus::Starting);
-            assert_eq!(settings.admin_mode, admin_mode);
+            assert!(admin_menu_enabled(admin_mode, false));
         }
     }
 

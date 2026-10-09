@@ -38,6 +38,7 @@ pub use bubbleplay_host::admin_agent::protocol::{AGENT_MUTEX, AGENT_STOP_EVENT, 
 /// (`%ProgramFiles%\BubblePlay\agent\bubbleplay_admin_agent.exe`).
 pub const AGENT_TASK: &str = r"\BubblePlay\AdminAgent";
 pub const SECURE_HELPER_TASK: &str = r"\BubblePlay\SecureDesktop";
+pub const ADMIN_MODE_OFF_TASK: &str = r"\BubblePlay\AdminModeOff";
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const RUN_VALUE: &str = "BubblePlayTray";
 
@@ -289,6 +290,17 @@ pub fn run_secure_helper_task() -> Result<()> {
     if !out.status.success() {
         bail!(
             "SecureDesktop task launch failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+pub fn run_admin_mode_off_task() -> Result<()> {
+    let out = schtasks(&["/run", "/tn", ADMIN_MODE_OFF_TASK])?;
+    if !out.status.success() {
+        bail!(
+            "AdminModeOff task launch failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }

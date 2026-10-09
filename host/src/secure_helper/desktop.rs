@@ -26,7 +26,6 @@ use windows::{
         Foundation::{GetLastError, SetLastError, HANDLE, HWND, LPARAM, WIN32_ERROR, WPARAM},
         Graphics::Gdi::*,
         System::{
-            Com::CoTaskMemFree,
             StationsAndDesktops::{EnumDesktopWindows, GetThreadDesktop},
             Threading::GetCurrentThreadId,
         },
@@ -38,7 +37,6 @@ use windows::{
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
             },
             Input::KeyboardAndMouse::*,
-            Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
             WindowsAndMessaging::{
                 DispatchMessageW, DrawIconEx, GetCursorInfo, GetIconInfo, GetSystemMetrics,
                 GetWindowThreadProcessId, PeekMessageW, PostMessageW, CURSORINFO, CURSOR_SHOWING,
@@ -244,47 +242,16 @@ impl Worker {
         self.thread.as_ref().is_none_or(|t| t.is_finished())
     }
 }
-/// Re-resolve the console identity/profile on every request; SYSTEM never
-/// consults its own LOCALAPPDATA or a path supplied by the pipe client.
+/// Re-resolve the console identity on every request and read the protected
+/// policy anew. A prior client's SID cannot authorize a new console user.
 pub fn admin_mode(sid: &str) -> bool {
-    let Ok((token, user)) = trust::console_user() else {
+    let Ok((_token, user)) = trust::console_user() else {
         return false;
     };
     if user != sid {
         return false;
     }
-    let Ok(p) =
-        (unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, Some(token.0)) })
-    else {
-        return false;
-    };
-    let path = unsafe { p.to_string() };
-    unsafe { CoTaskMemFree(Some(p.0.cast())) };
-    let Ok(path) = path else {
-        return false;
-    };
-    let path = std::path::PathBuf::from(path)
-        .join("BubblePlay")
-        .join("tray.json");
-    // Cap a user-writable config before parsing; never log its contents.
-    let Ok(f) = std::fs::File::open(path) else {
-        return false;
-    };
-    use std::io::Read;
-    let mut b = Vec::new();
-    if f.take(65537).read_to_end(&mut b).is_err() || b.len() > 65536 {
-        return false;
-    }
-    parse_admin_mode(&b)
-}
-fn parse_admin_mode(b: &[u8]) -> bool {
-    if b.len() > 65536 {
-        return false;
-    }
-    serde_json::from_slice::<serde_json::Value>(b)
-        .ok()
-        .and_then(|v| v.get("adminMode").and_then(|v| v.as_bool()))
-        .unwrap_or(false)
+    crate::admin_mode::effective_for_sid(&user)
 }
 fn inject(records: &[Record]) -> (usize, u32) {
     let v: Vec<INPUT> = records
@@ -872,20 +839,6 @@ mod tests {
         }));
         assert!(release.iter().all(|r| r.validate().is_ok()));
         assert!(h.take_release().is_empty());
-    }
-    #[test]
-    fn unreadable_or_invalid_policy_is_off() {
-        assert!(parse_admin_mode(br#"{"adminMode":true}"#));
-        for b in [
-            &b""[..],
-            &b"{"[..],
-            &br#"{}"#[..],
-            &br#"{"adminMode":false}"#[..],
-            &br#"{"adminMode":"true"}"#[..],
-        ] {
-            assert!(!parse_admin_mode(b));
-        }
-        assert!(!parse_admin_mode(&vec![b' '; 65537]));
     }
     #[test]
     fn full_queues_cannot_block_teardown() {

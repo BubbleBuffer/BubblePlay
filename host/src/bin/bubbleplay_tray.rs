@@ -57,16 +57,17 @@ use bubbleplay_host::secure_helper::protocol::{
     PROTOCOL_MAX as SECURE_PROTOCOL_MAX, PROTOCOL_MIN as SECURE_PROTOCOL_MIN,
 };
 use logic::{
-    admin_mode_line, run_key_command, secure_helper_should_launch, start_secure_helper_for_viewer,
-    status_line, unix_ms_now, AgentStatus, HostState, SecureHelperStatus, SharedLog, TraySettings,
-    ViewerGate, AGENT_UPDATE_LABEL, SECURE_HELPER_UPDATE_LABEL,
+    admin_menu_enabled, admin_mode_line, run_key_command, secure_helper_should_launch,
+    start_secure_helper_for_viewer, status_line, unix_ms_now, AgentStatus, HostState,
+    SecureHelperStatus, SharedLog, TraySettings, ViewerGate, AGENT_UPDATE_LABEL,
+    SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
     acquire_single_instance, agent_task_exists, create_manual_event, data_dir, end_agent_task,
-    host_exe_beside, named_mutex_exists, open_folder, read_run_value, run_agent_task,
-    run_elevated_and_wait, run_secure_helper_task, secure_helper_task_exists, set_event,
-    set_run_value, sha256_file, wide, Handle, AGENT_MUTEX, AGENT_STOP_EVENT, SECURE_HELPER_TASK,
-    TRAY_MUTEX,
+    host_exe_beside, named_mutex_exists, open_folder, read_run_value, run_admin_mode_off_task,
+    run_agent_task, run_elevated_and_wait, run_secure_helper_task, secure_helper_task_exists,
+    set_event, set_run_value, sha256_file, wide, Handle, AGENT_MUTEX, AGENT_STOP_EVENT,
+    SECURE_HELPER_TASK, TRAY_MUTEX,
 };
 use supervisor::{HostEvent, SupervisorConfig, SupervisorThread};
 use update::{
@@ -78,6 +79,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_QUIT_REQUEST: u32 = WM_APP + 2;
 /// Posted when the elevated agent update finished; WPARAM = exit code.
 const WM_AGENT_UPDATED: u32 = WM_APP + 3;
+const WM_ADMIN_CHANGED: u32 = WM_APP + 4;
 const TIMER_ID: usize = 1;
 
 const CMD_STATUS: usize = 1;
@@ -273,6 +275,8 @@ struct App {
     data: PathBuf,
     settings_path: PathBuf,
     settings: TraySettings,
+    admin_on: bool,
+    admin_change_running: bool,
     test_mode: bool,
     host_log: SharedLog,
     user: Option<SupervisorThread>,
@@ -446,7 +450,7 @@ impl App {
                 tracing::info!(
                     trigger,
                     task = SECURE_HELPER_TASK,
-                    admin_mode = self.settings.admin_mode,
+                    admin_mode = self.admin_on,
                     "secure helper task started"
                 );
             }
@@ -640,7 +644,7 @@ impl App {
     /// Admin mode is on and a viewer session is active (or ended less than
     /// the idle grace ago).
     fn agent_wanted(&self) -> bool {
-        self.settings.admin_mode && self.viewers.wants_agent(Instant::now())
+        self.admin_on && self.viewers.wants_agent(Instant::now())
     }
 
     /// Run the agent only while Admin mode is on and a viewer is connected:
@@ -648,7 +652,7 @@ impl App {
     /// more than the idle grace ago. Until it answers (and while it is not
     /// running) the host injects at user level.
     fn gate_agent(&mut self) {
-        if !self.settings.admin_mode {
+        if !self.admin_on {
             self.stop_agent();
             return;
         }
@@ -812,6 +816,7 @@ impl App {
 
     fn agent_updated(&mut self, code: u32) {
         self.agent_update_running = false;
+        self.refresh_admin_mode();
         if code == 0 {
             tracing::info!("privileged helper update finished");
             self.secure_helper = if self.test_mode || secure_helper_task_exists() {
@@ -826,7 +831,7 @@ impl App {
             if self.agent_wanted() {
                 self.announce_ready = true;
                 self.start_agent();
-            } else if self.settings.admin_mode {
+            } else if self.admin_on {
                 self.announce_ready = true;
                 self.set_agent(AgentStatus::Armed);
             } else {
@@ -847,8 +852,81 @@ impl App {
     }
 
     fn apply_mode(&mut self) {
+        self.refresh_admin_mode();
         self.start_user();
         self.gate_agent();
+    }
+
+    fn refresh_admin_mode(&mut self) {
+        let enabled = bubbleplay_host::admin_mode::effective_for_console();
+        if self.admin_on != enabled {
+            self.admin_on = enabled;
+            self.announce_ready = enabled;
+            self.gate_agent();
+        }
+    }
+
+    fn change_admin_mode(&mut self) {
+        self.refresh_admin_mode();
+        if self.admin_change_running
+            || !admin_menu_enabled(self.admin_on, self.viewers.viewer_connected())
+            || self.test_mode
+        {
+            return;
+        }
+        let turn_on = !self.admin_on;
+        let Some(helper) = bubbleplay_host::secure_helper::trust::installed_image() else {
+            tracing::warn!("admin mode helper path unavailable");
+            return;
+        };
+        // The elevated command must always use the protected installed image.
+        if turn_on {
+            if let Err(error) = bubbleplay_host::secure_helper::trust::protected_image(&helper) {
+                tracing::warn!(%error, "admin mode helper unavailable");
+                return;
+            }
+        }
+        self.admin_change_running = true;
+        let window = self.hwnd.0 as usize;
+        let spawned = std::thread::Builder::new()
+            .name("admin-mode".into())
+            .spawn(move || {
+                let result = if turn_on {
+                    run_elevated_and_wait(&helper, "--set-admin-mode on", helper.parent().unwrap())
+                        .and_then(|code| {
+                            anyhow::ensure!(code == 0, "admin mode setter exit {code}");
+                            Ok(())
+                        })
+                } else {
+                    run_admin_mode_off_task().and_then(|()| {
+                        // schtasks returns after dispatch. Wait for the protected
+                        // policy to reflect the task's write before refreshing.
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while bubbleplay_host::admin_mode::effective_for_console() {
+                            anyhow::ensure!(
+                                Instant::now() < deadline,
+                                "AdminModeOff task timed out"
+                            );
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        Ok(())
+                    })
+                };
+                if let Err(error) = result {
+                    tracing::info!(%error, "admin mode change declined or failed");
+                }
+                let _ = unsafe {
+                    PostMessageW(
+                        Some(HWND(window as _)),
+                        WM_ADMIN_CHANGED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                };
+            });
+        if spawned.is_err() {
+            self.admin_change_running = false;
+        }
     }
 
     fn update_state_path(&self) -> PathBuf {
@@ -1086,6 +1164,7 @@ impl App {
     }
 
     fn tick(&mut self) {
+        self.refresh_admin_mode();
         self.watch_update();
         self.gate_agent();
         self.check_agent(false);
@@ -1124,10 +1203,7 @@ impl App {
     fn handle_command(&mut self, command: usize) {
         match command {
             CMD_ADMIN => {
-                self.settings.admin_mode = !self.settings.admin_mode;
-                self.save_settings();
-                self.announce_ready = self.settings.admin_mode;
-                self.apply_mode();
+                self.change_admin_mode();
             }
             CMD_AGENT_UPDATE | CMD_SECURE_HELPER_UPDATE => self.update_agent(),
             CMD_LOGIN => {
@@ -1165,6 +1241,7 @@ fn show_menu(hwnd: HWND) {
     let Some((
         status,
         admin,
+        admin_enabled,
         admin_line,
         login,
         agent_update,
@@ -1174,18 +1251,21 @@ fn show_menu(hwnd: HWND) {
         error,
         can_roll_back,
     )) = with_app(|app| {
+        app.refresh_admin_mode();
         app.check_agent(true);
         app.check_secure_helper(true);
         let agent_update = if app.agent_update_running {
             Some((MF_STRING | MF_GRAYED, "Admin agent update running..."))
-        } else if app.settings.admin_mode && app.agent.needs_update() {
+        } else if app.admin_on && app.agent.needs_update() {
             Some((MF_STRING, AGENT_UPDATE_LABEL))
         } else {
             None
         };
         (
             status_line(&app.state(), &app.agent),
-            app.settings.admin_mode,
+            app.admin_on,
+            admin_menu_enabled(app.admin_on, app.viewers.viewer_connected())
+                && !app.admin_change_running,
             admin_mode_line(&app.agent),
             app.settings.start_at_login,
             agent_update,
@@ -1221,11 +1301,17 @@ fn show_menu(hwnd: HWND) {
         }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         item(
-            if admin {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            },
+            MF_STRING
+                | if admin {
+                    MF_CHECKED
+                } else {
+                    windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS(0)
+                }
+                | if admin_enabled {
+                    windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS(0)
+                } else {
+                    MF_GRAYED
+                },
             CMD_ADMIN,
             "Admin mode",
         );
@@ -1292,6 +1378,15 @@ unsafe extern "system" fn window_proc(
         }
         WM_TIMER => {
             with_app(|app| app.tick());
+            LRESULT(0)
+        }
+        WM_ADMIN_CHANGED => {
+            with_app(|app| {
+                app.admin_change_running = false;
+                app.refresh_admin_mode();
+                app.apply_mode();
+                app.tick();
+            });
             LRESULT(0)
         }
         WM_AGENT_UPDATED => {
@@ -1386,6 +1481,8 @@ fn run_tray() -> Result<i32> {
         data: data.clone(),
         settings_path,
         settings,
+        admin_on: bubbleplay_host::admin_mode::effective_for_console(),
+        admin_change_running: false,
         test_mode,
         host_log: SharedLog::new(logs.join("host.log")),
         user: None,

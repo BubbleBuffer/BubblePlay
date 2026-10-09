@@ -1,5 +1,5 @@
 //! Owner-run live secure-desktop probe. Unit tests never start a helper or UAC.
-//! Holds the authenticated exclusive Host slot throughout both policy scenarios.
+//! Holds the authenticated exclusive Host slot through policy restoration.
 use anyhow::{bail, ensure, Context, Result};
 use bubbleplay_host::{
     admin_agent::{
@@ -9,6 +9,7 @@ use bubbleplay_host::{
         },
         trust,
     },
+    admin_mode,
     desktop_session::{DesktopKind, InputDesktop},
     input::DesktopRegion,
     secure_helper::{
@@ -29,9 +30,14 @@ use std::{
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::CloseHandle,
+        Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND},
         System::{
             Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED},
+            Registry::{
+                RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+                HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_64KEY, REG_DWORD,
+                REG_VALUE_TYPE,
+            },
             RemoteDesktop::{
                 WTSEnumerateProcessesW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
                 WTS_PROCESS_INFOW,
@@ -222,6 +228,26 @@ fn closure_in_deadline(closed: bool, observed: Instant, deadline: Instant) -> bo
 fn cleanup_complete(trigger_finished: bool, default: bool, no_consent: bool) -> bool {
     trigger_finished && default && no_consent
 }
+fn policy_acknowledged(value: &Value, run_id: &str, id: u32) -> bool {
+    value["run_id"] == run_id && value["id"] == id && value["success"] == true
+}
+fn check_wrapper(args: &Args) -> Result<()> {
+    let value: Value =
+        serde_json::from_slice(&fs::read(args.out.join("policy-wrapper.json")).context(
+            "protected policy requires host/scripts/test-secure-desktop.ps1; use that wrapper",
+        )?)?;
+    let pid = value["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok());
+    ensure!(
+        value["run_id"] == args.run_id
+            && pid.is_some_and(|pid| pid != std::process::id()
+                && trust::process_image_path(pid).is_some()
+                && trust::process_session_id(pid) == Some(trust::current_session_id())),
+        "missing matching live wrapper; use host/scripts/test-secure-desktop.ps1"
+    );
+    Ok(())
+}
 fn receipt_json(receipt: &InputReceipt) -> Value {
     json!({"id":receipt.id,"received":receipt.received,"accepted":receipt.accepted,"applied":receipt.applied,"error_code":receipt.error_code,"reason":receipt.reason})
 }
@@ -292,10 +318,6 @@ impl ConfigBackup {
             json!({})
         };
         ensure!(value.is_object(), "tray.json must be a JSON object");
-        ensure!(
-            value.get("adminMode").is_none_or(Value::is_boolean),
-            "tray.json adminMode must be boolean"
-        );
         Ok(Self {
             path: path.to_path_buf(),
             bytes,
@@ -458,8 +480,77 @@ struct Harness {
     attempt: Option<UacAttempt>,
     run_id: String,
     mutation_marked: bool,
+    policy_request: u32,
 }
 impl Harness {
+    /// The owner-run wrapper performs UAC preparation/restoration while we
+    /// retain the exclusive Host and keep the helper alive. Never inject into
+    /// these owner-approved policy prompts.
+    fn policy_step(&mut self, action: &str) -> Result<()> {
+        self.policy_request += 1;
+        let id = self.policy_request;
+        let request = self.out.join(format!("policy-request-{id}.json"));
+        let response = self.out.join(format!("policy-response-{id}.json"));
+        atomic_write(
+            &request,
+            &serde_json::to_vec(&json!({"run_id":self.run_id,"id":id,"action":action}))?,
+        )?;
+        // Approval is local and may take time. The wrapper is responsible for
+        // waiting for the elevated process before acknowledging this request.
+        // Do not time out and release Host while an owner approval is still
+        // pending. Only the wrapper's post-process acknowledgement ends this
+        // wait, so an unacknowledged prompt cannot outlive the probe.
+        loop {
+            self.link.tick(true, self.region, Instant::now());
+            if response.exists() {
+                let value: Value = serde_json::from_slice(&fs::read(&response)?)?;
+                ensure!(
+                    policy_acknowledged(&value, &self.run_id, id),
+                    "owner policy step {action} failed or acknowledgement identity mismatched: {}",
+                    value["error"]
+                );
+                ensure!(
+                    InputDesktop::open()?.kind() == DesktopKind::Default
+                        && consent_processes()?.is_empty(),
+                    "policy step left a consent window or secure desktop open"
+                );
+                return Ok(());
+            }
+            thread::sleep(PAUSE);
+        }
+    }
+    fn mark_mutation(&mut self) -> Result<()> {
+        if !self.mutation_marked {
+            let marker = json!({"run_id":self.run_id,"settings_path":self.config.path,"exclusive_host_claimed":true,"pid":std::process::id()});
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.out.join("mutation-authorized.json"))?;
+            file.write_all(&serde_json::to_vec(&marker)?)?;
+            file.sync_all()?;
+            self.mutation_marked = true;
+        }
+        Ok(())
+    }
+    fn set_policy(&mut self, enabled: bool) -> Result<()> {
+        if enabled {
+            self.policy_step("on")?;
+        } else {
+            // Wrapper runs the protected task as the normal user, then waits
+            // for task completion so a queued OFF cannot race the next ON.
+            self.policy_step("off")?;
+        }
+        let deadline = Instant::now() + CLOSE_TIMEOUT;
+        while admin_mode::effective_for_console() != enabled {
+            self.link.tick(true, self.region, Instant::now());
+            ensure!(
+                Instant::now() < deadline,
+                "HKLM policy did not become {enabled}"
+            );
+            thread::sleep(PAUSE);
+        }
+        Ok(())
+    }
     fn state(&mut self) -> Result<SecureState> {
         self.link.tick(true, self.region, Instant::now());
         if let Some(frame) = self.link.take_frame() {
@@ -673,19 +764,17 @@ impl Harness {
         self.attempt = None;
         Ok(report)
     }
-    fn scenario(&mut self, admin: bool, report: &mut Value) -> Result<()> {
+    fn scenario(
+        &mut self,
+        admin: bool,
+        legacy: bool,
+        name: &str,
+        report: &mut Value,
+    ) -> Result<()> {
         self.baseline()?;
-        if !self.mutation_marked {
-            let marker = json!({"run_id":self.run_id,"settings_path":self.config.path,"exclusive_host_claimed":true,"pid":std::process::id()});
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(self.out.join("mutation-authorized.json"))?;
-            file.write_all(&serde_json::to_vec(&marker)?)?;
-            file.sync_all()?;
-            self.mutation_marked = true;
-        }
-        self.config.set_mode(admin)?;
+        self.mark_mutation()?;
+        self.set_policy(admin)?;
+        self.config.set_mode(legacy)?;
         // Policy is read by the helper on each secure-desktop request. We wait
         // for advertised capabilities below; a local write is not policy proof.
         check_no_viewer(&self.host_log)?;
@@ -698,10 +787,9 @@ impl Harness {
         );
         report["epoch"] = json!(state.desktop_epoch);
         let first = self.wait_frame(state.desktop_epoch, 0, 0)?;
-        let prefix = if admin { "on" } else { "off" };
-        let name = format!("{prefix}-first-secure.png");
-        save_png(&self.out.join(&name), &first)?;
-        report["first_frame"] = frame_json(&first, &name);
+        let first_name = format!("{name}-first-secure.png");
+        save_png(&self.out.join(&first_name), &first)?;
+        report["first_frame"] = frame_json(&first, &first_name);
         if !admin {
             self.send(&escape(), false, report, Instant::now())?;
             self.send(&movement(32768, 32768), false, report, Instant::now())?;
@@ -726,8 +814,9 @@ impl Harness {
             );
             // The first frame can predate the consent dialog's fade-in; this
             // one shows whether the dialog itself is captured.
-            save_png(&self.out.join("off-before-deny.png"), frame)?;
-            report["before_deny_frame"] = frame_json(frame, "off-before-deny.png");
+            let before_deny = format!("{name}-before-deny.png");
+            save_png(&self.out.join(&before_deny), frame)?;
+            report["before_deny_frame"] = frame_json(frame, &before_deny);
             report["uac_remained_after_2s"] = json!(true);
             let close_started = Instant::now();
             report["deny"] = self.deny(close_started)?;
@@ -811,16 +900,92 @@ impl Harness {
     }
 }
 fn start_task() -> Result<()> {
+    run_task(TASK)
+}
+fn run_task(task: &str) -> Result<()> {
     let output = std::process::Command::new(system_directory()?.join("schtasks.exe"))
-        .args(["/run", "/tn", TASK])
+        .args(["/run", "/tn", task])
         .creation_flags(0x08000000)
         .output()?;
     ensure!(
         output.status.success(),
-        "installed helper task did not start: {}",
+        "installed task {task} did not start: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
+}
+/// Prove that the normal desktop process cannot obtain registry write access.
+/// If an unexpectedly writable key is found, attempt to write its existing
+/// bytes so a failed assertion cannot enable Admin mode or corrupt the value.
+fn non_elevated_write_denied() -> Result<Value> {
+    ensure!(
+        !trust::is_process_elevated(),
+        "registry denial check must be unelevated"
+    );
+    let path = wide(admin_mode::REGISTRY_KEY);
+    let name = wide("AdminMode");
+    let mut key = HKEY::default();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(path.as_ptr()),
+            None,
+            KEY_SET_VALUE | KEY_WOW64_64KEY,
+            &mut key,
+        )
+    };
+    if opened == ERROR_ACCESS_DENIED {
+        return Ok(
+            json!({"success":true,"elevated":false,"error_code":opened.0,"stage":"open-for-write"}),
+        );
+    }
+    opened
+        .ok()
+        .context("non-elevated registry write preflight")?;
+    let result = (|| {
+        let mut read_key = HKEY::default();
+        unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(path.as_ptr()),
+                None,
+                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &mut read_key,
+            )
+        }
+        .ok()?;
+        let mut kind = REG_VALUE_TYPE::default();
+        let mut data = vec![0u8; 65536];
+        let mut len = data.len() as u32;
+        let query = unsafe {
+            RegQueryValueExW(
+                read_key,
+                PCWSTR(name.as_ptr()),
+                None,
+                Some(&mut kind),
+                Some(data.as_mut_ptr()),
+                Some(&mut len),
+            )
+        };
+        let _ = unsafe { RegCloseKey(read_key) };
+        if query == ERROR_FILE_NOT_FOUND {
+            kind = REG_DWORD;
+            data = 0u32.to_le_bytes().to_vec();
+        } else {
+            query.ok()?;
+            data.truncate(len as usize);
+        }
+        let written =
+            unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, kind, Some(&data)) };
+        ensure!(
+            written == ERROR_ACCESS_DENIED,
+            "non-elevated AdminMode write must fail with access denied, got {}",
+            written.0
+        );
+        Ok(json!({"success":true,"elevated":false,"error_code":written.0,"stage":"set-value"}))
+    })();
+    let _ = unsafe { RegCloseKey(key) };
+    result
 }
 fn acquire(region: DesktopRegion) -> Result<SecureHelperLink> {
     match SecureHelperLink::connect_host(region) {
@@ -856,6 +1021,7 @@ fn execute(args: &Args, report: &mut Value) -> Result<()> {
         trust::current_session_id() == unsafe { WTSGetActiveConsoleSessionId() },
         "probe must run in the active console session"
     );
+    check_wrapper(args)?;
     check_no_viewer(&args.host_log)?;
     let config = ConfigBackup::read(&args.settings)?;
     report["config"] = json!({"path":args.settings,"original_exists":config.bytes.is_some(),"read_valid":true,"restored":true});
@@ -873,14 +1039,21 @@ fn execute(args: &Args, report: &mut Value) -> Result<()> {
         attempt: None,
         run_id: args.run_id.clone(),
         mutation_marked: false,
+        policy_request: 0,
     };
     harness.baseline()?;
     report["ownership"] = json!({"basis":"baseline-no-consent/single-pending-consent","assumption":"no concurrent local UAC launches or tray settings changes during this probe"});
     report["baseline"] = json!({"exclusive_authenticated_host_slot":true,"default":true,"no_consent":true,"no_viewer_in_log":true});
     let result: Result<()> = (|| {
-        for admin in [false, true] {
-            let mut scenario = json!({"admin_mode":admin,"success":false,"receipts":[]});
-            let result = harness.scenario(admin, &mut scenario);
+        harness.mark_mutation()?;
+        report["non_elevated_registry_write"] = non_elevated_write_denied()?;
+        for (admin, legacy, name) in [
+            (false, false, "off"),
+            (false, true, "legacy-json-on-hklm-off"),
+            (true, false, "on"),
+        ] {
+            let mut scenario = json!({"name":name,"admin_mode":admin,"tray_json_admin_mode":legacy,"success":false,"receipts":[]});
+            let result = harness.scenario(admin, legacy, name, &mut scenario);
             if let Err(error) = &result {
                 scenario["error"] = json!(format!("{error:#}"));
             }
@@ -896,6 +1069,19 @@ fn execute(args: &Args, report: &mut Value) -> Result<()> {
         Ok(value) => value.clone(),
         Err(error) => json!({"success":false,"error":format!("{error:#}")}),
     };
+    // Settle our synthetic UAC request before requesting owner elevation for
+    // exact policy restoration; the Host connection is still held here.
+    let policy_restored = if harness.mutation_marked && cleanup.is_ok() {
+        harness.policy_step("restore")
+    } else if !harness.mutation_marked {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("policy restoration deferred: consent cleanup failed; wrapper must restore after local cleanup"))
+    };
+    report["registry"] = json!({"restored":policy_restored.is_ok()});
+    if let Err(error) = &policy_restored {
+        report["registry"]["restore_error"] = json!(format!("{error:#}"));
+    }
     report["mutation_marker"] = json!({"run_id":args.run_id,"written":harness.mutation_marked});
     let restored = harness.config.restore();
     report["config"]["restored"] = json!(restored.is_ok());
@@ -906,6 +1092,7 @@ fn execute(args: &Args, report: &mut Value) -> Result<()> {
     drop(harness);
     result?;
     cleanup?;
+    policy_restored?;
     restored?;
     Ok(())
 }
@@ -959,6 +1146,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn policy_ack_requires_exact_run_request_and_success() {
+        let mut ack = json!({"run_id":"owner-run", "id":2, "success":true});
+        assert!(policy_acknowledged(&ack, "owner-run", 2));
+        assert!(!policy_acknowledged(&ack, "another-run", 2));
+        assert!(!policy_acknowledged(&ack, "owner-run", 1));
+        ack["success"] = json!(false);
+        assert!(!policy_acknowledged(&ack, "owner-run", 2));
+        ack["success"] = json!("true");
+        assert!(!policy_acknowledged(&ack, "owner-run", 2));
+        assert!(!policy_acknowledged(&json!({}), "owner-run", 2));
+    }
     #[test]
     fn allowlist_has_only_escape_pair_and_absolute_move() {
         assert!(safe_records(&escape()));

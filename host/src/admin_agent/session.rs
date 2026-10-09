@@ -23,6 +23,16 @@ pub const RECORD_BURST: f64 = 8_192.0;
 /// Performs the actual `SendInput`; returns (records applied, last error).
 pub trait Injector {
     fn inject(&mut self, records: &[Record]) -> (u32, i32);
+    /// Production checks protected policy on each request; fake injectors
+    /// remain pure for offline tests.
+    fn policy_allowed(&self) -> bool {
+        true
+    }
+    /// Cleanup receives only releases generated from this session's applied
+    /// records. It must remain possible after permission is withdrawn.
+    fn release_held(&mut self, records: &[Record]) -> (u32, i32) {
+        self.inject(records)
+    }
 }
 
 /// Token bucket.
@@ -229,6 +239,9 @@ impl<I: Injector> Session<I> {
 
     pub fn on_frame(&mut self, kind: u8, payload: &[u8], now: Instant) -> Outcome {
         self.stats.frames += 1;
+        if !self.injector.policy_allowed() {
+            return Outcome::ReplyAndClose(self.refuse(RefuseCode::Invalid));
+        }
         let message = match ClientMessage::decode(kind, payload) {
             Ok(message) => message,
             Err(_) => return Outcome::ReplyAndClose(self.refuse(RefuseCode::Invalid)),
@@ -294,7 +307,7 @@ impl<I: Injector> Session<I> {
             return 0;
         }
         let records = self.held.take_release();
-        let (applied, _) = self.injector.inject(&records);
+        let (applied, _) = self.injector.release_held(&records);
         applied as usize
     }
 }
@@ -302,6 +315,71 @@ impl<I: Injector> Session<I> {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    #[test]
+    fn revoked_policy_refuses_requests_but_releases_only_applied_held_input() {
+        use std::{cell::Cell, rc::Rc};
+        struct Guarded {
+            allowed: Rc<Cell<bool>>,
+            applied: Rc<Cell<usize>>,
+            released: Rc<Cell<usize>>,
+        }
+        impl Injector for Guarded {
+            fn inject(&mut self, records: &[Record]) -> (u32, i32) {
+                assert!(self.allowed.get());
+                self.applied.set(self.applied.get() + records.len());
+                (records.len() as u32, 0)
+            }
+            fn policy_allowed(&self) -> bool {
+                self.allowed.get()
+            }
+            fn release_held(&mut self, records: &[Record]) -> (u32, i32) {
+                assert!(records.iter().all(|r| matches!(r, Record::Key { flags, .. }
+                    if flags & KEYEVENTF_KEYUP != 0)));
+                self.released.set(self.released.get() + records.len());
+                (records.len() as u32, 0)
+            }
+        }
+        let allowed = Rc::new(Cell::new(true));
+        let applied = Rc::new(Cell::new(0));
+        let released = Rc::new(Cell::new(0));
+        let mut session = Session::new(
+            Guarded {
+                allowed: allowed.clone(),
+                applied: applied.clone(),
+                released: released.clone(),
+            },
+            true,
+            42,
+            Instant::now(),
+        );
+        let (kind, payload) = hello(1, 1, Role::Host);
+        assert!(matches!(
+            session.on_frame(kind, &payload, Instant::now()),
+            Outcome::Reply(_)
+        ));
+        let (kind, payload) = inject(vec![Record::Key {
+            vk: 0x41,
+            scan: 0,
+            flags: 0,
+        }]);
+        session.on_frame(kind, &payload, Instant::now());
+        assert_eq!(applied.get(), 1);
+        allowed.set(false);
+        assert!(matches!(
+            session.on_frame(kind, &payload, Instant::now()),
+            Outcome::ReplyAndClose(_)
+        ));
+        assert_eq!(applied.get(), 1);
+        assert_eq!(session.release_held(), 1);
+        assert_eq!(released.get(), 1);
+        assert_eq!(session.release_held(), 0);
+        let (kind, payload) = frame(&ClientMessage::Ping);
+        assert!(matches!(
+            session.on_frame(kind, &payload, Instant::now()),
+            Outcome::ReplyAndClose(_)
+        ));
+    }
 
     use super::super::protocol::{
         ClientMessage, KIND_HELLO, KIND_INJECT, KIND_PING, MOUSEEVENTF_MOVE,

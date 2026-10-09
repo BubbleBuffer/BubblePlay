@@ -1,6 +1,6 @@
 # Secure desktop (UAC prompts, lock screen)
 
-Status: approved 2026-10-08; Milestones A and B implemented in the working tree, live qualification pending.
+Status: approved 2026-10-08 (Admin mode storage revised 2026-10-08); Milestones A and B implemented, protected Admin mode in progress.
 
 ## Current state
 
@@ -10,7 +10,7 @@ Status: approved 2026-10-08; Milestones A and B implemented in the working tree,
 - The optional `bubbleplay_secure_helper.exe` runs as SYSTEM in the active console session. The tray starts `\BubblePlay\SecureDesktop` when a viewer connects, whether Admin mode is on or off. The task launches the protected Program Files copy with `--launch`; it duplicates its SYSTEM token into the console session and starts `--serve` on `winsta0\default`. A per-session mutex prevents duplicate servers. The helper exits after host disconnect or 30 seconds without a host; tray version probes do not extend its lifetime.
 - A fresh worker binds to the input desktop on each transition. Only Winlogon is captured: the selected monitor rectangle is copied with GDI at most 10 times per second, sent on image changes, and refreshed once per second. The worker composites the secure desktop cursor into the image; its movement participates in change detection. Two shared-memory slots carry bounded BGRA images; notifications and acknowledgments identify each slot/sequence/desktop epoch. The host copies and validates each image, uploads it to a texture on its own encoder device, and uses its existing capture/encode pipeline. Default-desktop media remains DDA in the user host. Entry and verified DDA recovery on exit each force a new generation and keyframe.
 - While helper frames are available the host announces `state:"active"`, `desktop:"secure"`, `reason:"desktop-switched"`, `secureKind` and `secureCapabilities`. Kind or Admin-mode capability changes resend the state within the same generation. A missing, failed or incompatible helper falls back to Milestone A's unavailable secure state with capabilities `[]`.
-- Admin mode runs `bubbleplay_admin_agent.exe` as the elevated user (task `\BubblePlay\AdminAgent`, `HighestAvailable`) for normal-desktop elevated windows. The secure helper independently reads the console user's `%LOCALAPPDATA%\BubblePlay\tray.json` on each request; missing, unreadable or invalid `adminMode` means off. Off allows view and, for UAC only, deny. On additionally permits pointer, keyboard and Unicode text input. Host and helper both drop input without that capability; clipboard and file paste are suspended on secure desktops.
+- Admin mode uses protected `HKLM\SOFTWARE\BubblePlay` values `AdminMode` and `AdminModeSid`, effective only for the current console user; `tray.json` grants no rights. The tray enables it through UAC, disables it through the SYSTEM `\BubblePlay\AdminModeOff` task, and disables enabling while a viewer is connected. The admin agent and secure helper re-read the policy for each request. Off allows secure view and UAC deny; on additionally permits pointer, keyboard and Unicode input and runs the elevated admin agent for normal-desktop elevated windows.
 - The helper's local pipe and read-only user mapping allow SYSTEM and the console user SID only and reject remote clients. A version handshake precedes requests; client session/SID checks meet the admin agent's checks. The host verifies the server session, SYSTEM pipe owner, exact protected image path and ACL. Medium-integrity token queries failed live despite the launcher's token DACL, so pipe ownership supplies the SYSTEM check. Setup checks effective task rights because Task Scheduler normalizes the SDDL. Setup grants the installing user task read/execute and SYSTEM/Administrators full control. The tray offers an update when protocol versions do not overlap, attempts the task on every viewer start regardless of Admin mode or prior helper status, and logs launch and probe results.
 - Clients: the browser (`receiver.js`, `#desktop-state` card, `#secure-deny`) and Android (`SecureBanner`, `net/SecureDesktop.kt`) show a top banner while `desktop:"secure"`: "Admin prompt open on the PC", "PC is locked" or "Secure screen open on the PC", a line saying whether the screen is hidden, view-only or usable, and a "Deny prompt" button only when `deny` is in the capabilities. The button sends `secure-action` once and shows the `secure-action-result` (or "no answer from the PC" after 8 s).
 - The repo still has the retired SYSTEM broker/agent path (`bubbleplay_broker`, `bubbleplay_agent`, `service_runtime.rs`, `privileged_backend.rs`). It captured Winlogon with GDI and encoded inside the SYSTEM agent. It is excluded from the release and was never validated live on Winlogon.
@@ -28,6 +28,9 @@ Status: approved 2026-10-08; Milestones A and B implemented in the working tree,
 3. **Permission levels, enforced in the helper:**
    - Admin mode off: view only, plus one "Deny" action that cancels the current UAC prompt. The action takes no coordinates or keys; the helper finds the consent window itself. The lock screen is view only.
    - Admin mode on: full mouse and keyboard on the secure desktop, including the lock screen.
+   - Admin mode is stored where only administrators can write (`HKLM\SOFTWARE\BubblePlay`, values `AdminMode` and `AdminModeSid`). The helper, the tray and the admin agent all read it from there; `tray.json` no longer grants anything.
+   - Turning it on needs a UAC prompt. A remote viewer with Admin mode off can only Deny that prompt, so a session can never raise its own rights. The tray greys out "turn on" while a viewer is connected.
+   - Turning it off is one click with no prompt: the tray runs a SYSTEM task that can only clear the value.
 4. Without the helper, behaviour is (1) only.
 
 ## Milestone A validation and owner test
@@ -125,7 +128,10 @@ recovery target on the prior monitor. Task launch/ACLs, cross-session rejection,
 secure pixels, protected input and Windows consent cancellation remain live
 qualification requirements.
 
+## Decisions
+
+- 2026-10-08: Admin mode moves from user-writable `tray.json` to an admin-only HKLM value. Reason: a remote viewer controls the user's desktop and could flip the tray menu item, gaining input on UAC prompts and the lock screen. Supersedes the earlier "residual risk" note.
+
 ## Open questions
 
 - Which cancel mechanism (targeted `WM_CLOSE` or `IDCANCEL` on the consent window) works on Windows 11 24H2+; must be qualified live and fail closed.
-- Admin mode lives in user-writable `tray.json`, so a process running as the user could turn it on. This is the same trust level as the admin agent today; document as residual risk.

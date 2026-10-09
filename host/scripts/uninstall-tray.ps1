@@ -6,7 +6,8 @@
 .DESCRIPTION
     Elevated part (ONE UAC prompt, only when something machine-wide is
     installed): unregister the \BubblePlay\AdminAgent and \BubblePlay\SecureDesktop tasks, delete
-    %ProgramFiles%\BubblePlay\agent, and remove leftovers of the old elevated
+    %ProgramFiles%\BubblePlay\agent, the AdminModeOff task and
+    HKLM\SOFTWARE\BubblePlay policy key, and remove leftovers of the old elevated
     host path (\BubblePlay\ElevatedHost, %ProgramFiles%\BubblePlay\elevated).
     %ProgramFiles%\BubblePlay is removed when it ends up empty.
 
@@ -36,7 +37,9 @@ $MachineDir = Join-Path $ProgramFilesRoot 'BubblePlay'
 $AgentDir = Join-Path $MachineDir 'agent'
 $LegacyElevatedDir = Join-Path $MachineDir 'elevated'
 $TaskPath = '\BubblePlay\'
-$Tasks = @('AdminAgent', 'SecureDesktop', 'ElevatedHost')
+$Tasks = @('AdminAgent', 'SecureDesktop', 'AdminModeOff', 'ElevatedHost')
+$AdminModeRegistryPath = 'SOFTWARE\BubblePlay'
+$AdminModeKey = 'HKLM:\SOFTWARE\BubblePlay'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValue = 'BubblePlayTray'
 $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BubblePlay'
@@ -64,10 +67,23 @@ function Invoke-Schtasks([string[]]$Arguments) {
 
 function Test-Task([string]$Name) { (Invoke-Schtasks @('/query', '/tn', "$TaskPath$Name")) -eq 0 }
 
+function Test-AdminModeKeyExists {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey($AdminModeRegistryPath, $false)
+        if ($null -eq $key) { return $false }
+        $key.Dispose()
+        return $true
+    }
+    catch { return $true } # Inaccessible policy still requires elevated removal.
+    finally { $base.Dispose() }
+}
+
 function Get-MachineWork {
     $work = @()
     foreach ($name in $Tasks) { if (Test-Task $name) { $work += "unregister task $TaskPath$name" } }
     foreach ($dir in @($AgentDir, $LegacyElevatedDir)) { if (Test-Path -LiteralPath $dir) { $work += "delete $dir" } }
+    if (Test-AdminModeKeyExists) { $work += "delete $AdminModeKey" }
     return , $work
 }
 
@@ -104,6 +120,15 @@ function Invoke-MachineSteps {
             Write-Step 'machine-files' 'done' "Deleted $dir."
         }
         else { Write-Step 'machine-files' 'planned' "Delete $dir." }
+    }
+    if (Test-AdminModeKeyExists) {
+        if ($PSCmdlet.ShouldProcess($AdminModeKey, 'Delete protected Admin mode policy key')) {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+            try { $base.DeleteSubKeyTree($AdminModeRegistryPath, $false) }
+            finally { $base.Dispose() }
+            Write-Step 'admin-mode-policy' 'done' "Deleted $AdminModeKey."
+        }
+        else { Write-Step 'admin-mode-policy' 'planned' "Delete $AdminModeKey." }
     }
     if ((Test-Path -LiteralPath $MachineDir) -and -not (Get-ChildItem -LiteralPath $MachineDir -Force | Select-Object -First 1)) {
         if ($PSCmdlet.ShouldProcess($MachineDir, 'Delete empty folder')) { Remove-Item -Force -LiteralPath $MachineDir }

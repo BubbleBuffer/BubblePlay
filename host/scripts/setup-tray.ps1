@@ -27,6 +27,10 @@
         run and end it). The tray starts it while Admin mode is on.
       - Install bubbleplay_secure_helper.exe beside the admin agent; register
         \BubblePlay\SecureDesktop as SYSTEM, action --launch, no triggers.
+        Create HKLM\SOFTWARE\BubblePlay with protected DACL (SYSTEM and
+        Administrators full control, Users read only), initialised AdminMode=0.
+        Register \BubblePlay\AdminModeOff as SYSTEM, --set-admin-mode off,
+        no triggers. Both SYSTEM tasks use the same protected DACL.
         Its protected task DACL grants only this installing user read+execute
         and SYSTEM/Administrators full control, and is verified after setup.
       - Remove the old elevated whole-host path: the \BubblePlay\ElevatedHost
@@ -99,6 +103,9 @@ $UserScripts = @('setup-tray.ps1', 'uninstall-tray.ps1')
 $TaskPath = '\BubblePlay\'
 $AgentTaskName = 'AdminAgent'
 $HelperTaskName = 'SecureDesktop'
+$AdminModeOffTaskName = 'AdminModeOff'
+$AdminModeRegistryPath = 'SOFTWARE\BubblePlay'
+$AdminModeKey = 'HKLM:\SOFTWARE\BubblePlay'
 $LegacyTaskName = 'ElevatedHost'
 $LaunchTaskName = 'LaunchTray'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -474,22 +481,14 @@ function Set-UserRegistration {
     }
     else { Add-Step 'uninstall-entry' 'planned' "Register $UninstallKey (UninstallString: $uninstallCommand)" }
 
-    # tray.json
-    $settings = [ordered]@{ adminMode = $false; startAtLogin = $true }
-    if (Test-Path -LiteralPath $TraySettingsPath) {
-        try {
-            $old = Get-Content -Raw -LiteralPath $TraySettingsPath | ConvertFrom-Json
-            if ($old.PSObject.Properties['adminMode']) { $settings.adminMode = [bool]$old.adminMode }
-        }
-        catch { }
-    }
-    if ($SkipAgent) { $settings.adminMode = $false }
+    # Admin mode is machine policy; never retain or migrate tray.json adminMode.
+    $settings = [ordered]@{ startAtLogin = $true }
     if ($PSCmdlet.ShouldProcess($TraySettingsPath, 'Write startAtLogin=true')) {
         New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
         [IO.File]::WriteAllText($TraySettingsPath, ($settings | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-        Add-Step 'tray-settings' 'done' "adminMode=$($settings.adminMode), startAtLogin=true"
+        Add-Step 'tray-settings' 'done' 'startAtLogin=true'
     }
-    else { Add-Step 'tray-settings' 'planned' "Write $TraySettingsPath (adminMode=$($settings.adminMode), startAtLogin=true)." }
+    else { Add-Step 'tray-settings' 'planned' "Write $TraySettingsPath (startAtLogin=true)." }
 }
 
 function Start-Tray {
@@ -564,8 +563,8 @@ function Get-AgentAclFindings {
 function Get-MachineWork([bool]$ConfigNeedsMachine) {
     $work = [Collections.Generic.List[string]]::new()
     if ($SkipAgent) {
-        if ((Test-Task $AgentTaskName) -or (Test-Task $HelperTaskName) -or (Test-Path -LiteralPath $AgentDir)) {
-            $work.Add("remove privileged helpers (tasks $TaskPath$AgentTaskName and $TaskPath$HelperTaskName, $AgentDir) because of -SkipAgent")
+        if ((Test-Task $AgentTaskName) -or (Test-Task $HelperTaskName) -or (Test-Task $AdminModeOffTaskName) -or (Test-AdminModeKeyExists) -or (Test-Path -LiteralPath $AgentDir)) {
+            $work.Add("remove privileged helpers (tasks $TaskPath$AgentTaskName, $TaskPath$HelperTaskName and $TaskPath$AdminModeOffTaskName, $AdminModeKey, $AgentDir) because of -SkipAgent")
         }
     }
     else {
@@ -583,6 +582,8 @@ function Get-MachineWork([bool]$ConfigNeedsMachine) {
         if ((Get-AgentAclFindings).Count -gt 0) { $work.Add("repair the privileged helper folder ACL in $AgentDir") }
         if (-not (Test-Task $AgentTaskName)) { $work.Add("register on-demand task $TaskPath$AgentTaskName (user $UserName, RunLevel Highest, user may only query/run/end it)") }
         if (-not (Test-SecureTaskCurrent)) { $work.Add("register/repair on-demand task $TaskPath$HelperTaskName (SYSTEM, --launch; protected DACL: this user read+execute, SYSTEM/Administrators full; verified)") }
+        if (-not (Test-SystemHelperTaskCurrent $AdminModeOffTaskName '--set-admin-mode off')) { $work.Add("register/repair on-demand task $TaskPath$AdminModeOffTaskName (SYSTEM, --set-admin-mode off; protected DACL: this user read+execute, SYSTEM/Administrators full; verified)") }
+        if (-not (Test-AdminModeKeyCurrent)) { $work.Add("create/repair $AdminModeKey (protected DACL: SYSTEM/Administrators full, Users read only; initialise AdminMode DWORD=0; no tray.json migration)") }
     }
     if (Test-Task $LegacyTaskName) { $work.Add("remove the old elevated-host task $TaskPath$LegacyTaskName") }
     if (Test-Path -LiteralPath $LegacyElevatedDir) { $work.Add("remove the old elevated host copy $LegacyElevatedDir") }
@@ -650,7 +651,7 @@ function Assert-RemovableAgentDir {
 
 function Install-Agent {
     if ($SkipAgent) {
-        foreach ($name in @($AgentTaskName, $HelperTaskName)) {
+        foreach ($name in @($AgentTaskName, $HelperTaskName, $AdminModeOffTaskName)) {
             if ((Test-Task $name) -and $PSCmdlet.ShouldProcess("$TaskPath$name", 'Unregister (because -SkipAgent)')) {
                 Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $name -Confirm:$false
             }
@@ -659,6 +660,7 @@ function Install-Agent {
             Assert-RemovableAgentDir
             Remove-Item -Recurse -Force -LiteralPath $AgentDir
         }
+        Remove-AdminModeKey
         Add-Step 'agent' 'skipped' '-SkipAgent given; Admin mode and secure-desktop helper unavailable.'
         return
     }
@@ -721,17 +723,19 @@ function Test-SecureTaskDacl([string]$Actual) {
     return $userCanRun
 }
 
-function Test-SecureTaskCurrent {
+function Test-SystemHelperTaskCurrent([string]$Name, [string]$Arguments) {
     try {
-        $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $HelperTaskName -ErrorAction Stop
+        $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $Name -ErrorAction Stop
         if ($task.Principal.UserId -notin @('SYSTEM', 'S-1-5-18', 'NT AUTHORITY\SYSTEM') -or $task.Actions.Count -ne 1 -or
-            -not (Test-SamePath $task.Actions[0].Execute $HelperExe) -or $task.Actions[0].Arguments -ne '--launch' -or $task.Triggers) { return $false }
+            -not (Test-SamePath $task.Actions[0].Execute $HelperExe) -or $task.Actions[0].Arguments -ne $Arguments -or $task.Triggers) { return $false }
         $scheduler = New-Object -ComObject Schedule.Service
         $scheduler.Connect()
-        return Test-SecureTaskDacl ($scheduler.GetFolder($TaskPath.TrimEnd('\')).GetTask($HelperTaskName).GetSecurityDescriptor(4))
+        return Test-SecureTaskDacl ($scheduler.GetFolder($TaskPath.TrimEnd('\')).GetTask($Name).GetSecurityDescriptor(4))
     }
     catch { return $false }
 }
+
+function Test-SecureTaskCurrent { Test-SystemHelperTaskCurrent $HelperTaskName '--launch' }
 
 function Register-SecureTask {
     if ($SkipAgent) { return }
@@ -752,6 +756,111 @@ function Register-SecureTask {
     $task.SetSecurityDescriptor((Get-SecureTaskSddl), 0)
     if (-not (Test-SecureTaskCurrent)) { throw 'SecureDesktop task principal/action/DACL verification failed.' }
     Add-Step 'secure-task' 'done' "Registered and verified $fullName (SYSTEM; user read+execute only)."
+}
+
+function Register-AdminModeOffTask {
+    if ($SkipAgent) { return }
+    $fullName = "$TaskPath$AdminModeOffTaskName"
+    if (-not $PSCmdlet.ShouldProcess($fullName, 'Register on-demand SYSTEM Admin mode OFF task and verify its DACL')) {
+        Add-Step 'admin-mode-off-task' 'planned' "Register $fullName -> `"$HelperExe`" --set-admin-mode off (SYSTEM, no triggers; only $UserSid read+execute, SYSTEM/Administrators full; verified)."
+        return
+    }
+    $findings = Get-AgentAclFindings
+    if (-not (Test-Path -LiteralPath $HelperExe) -or $findings.Count -gt 0) { throw "Secure helper missing or unsafe: $($findings -join '; ')" }
+    $action = New-ScheduledTaskAction -Execute $HelperExe -Argument '--set-admin-mode off' -WorkingDirectory $AgentDir
+    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Priority 4
+    Register-ScheduledTask -TaskPath $TaskPath -TaskName $AdminModeOffTaskName -Action $action -Principal $principal -Settings $settings -Description 'BubblePlay Admin mode OFF only (on demand; never enables input).' -Force | Out-Null
+    $scheduler = New-Object -ComObject Schedule.Service
+    $scheduler.Connect()
+    $task = $scheduler.GetFolder($TaskPath.TrimEnd('\')).GetTask($AdminModeOffTaskName)
+    $task.SetSecurityDescriptor((Get-SecureTaskSddl), 0)
+    if (-not (Test-SystemHelperTaskCurrent $AdminModeOffTaskName '--set-admin-mode off')) { throw 'AdminModeOff task principal/action/DACL verification failed.' }
+    Add-Step 'admin-mode-off-task' 'done' "Registered and verified $fullName (SYSTEM; user read+execute only)."
+}
+
+# Explicit Registry64 matches the protected helper even from 32-bit PowerShell.
+function Open-AdminModeRegistry {
+    [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+}
+
+function Test-AdminModeKeyExists {
+    $base = Open-AdminModeRegistry
+    try {
+        $key = $base.OpenSubKey($AdminModeRegistryPath, $false)
+        if ($null -eq $key) { return $false }
+        $key.Dispose()
+        return $true
+    }
+    catch { return $true } # Access denied still needs an elevated removal/repair.
+    finally { $base.Dispose() }
+}
+
+function Test-AdminModeKeyCurrent {
+    $base = Open-AdminModeRegistry
+    try {
+        $key = $base.OpenSubKey($AdminModeRegistryPath, $false)
+        if ($null -eq $key) { return $false }
+        try {
+            if ($key.GetValueKind('AdminMode') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { return $false }
+            $acl = $key.GetAccessControl()
+            if (-not $acl.AreAccessRulesProtected -or $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-32-544') { return $false }
+            $expected = @{ 'S-1-5-18' = [Security.AccessControl.RegistryRights]::FullControl; 'S-1-5-32-544' = [Security.AccessControl.RegistryRights]::FullControl; 'S-1-5-32-545' = [Security.AccessControl.RegistryRights]::ReadKey }
+            $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+            if ($rules.Count -ne $expected.Count) { return $false }
+            foreach ($rule in $rules) {
+                $sid = $rule.IdentityReference.Value
+                if (-not $expected.ContainsKey($sid) -or $rule.IsInherited -or $rule.AccessControlType -ne 'Allow' -or $rule.RegistryRights -ne $expected[$sid]) { return $false }
+                $expected.Remove($sid)
+            }
+            return $expected.Count -eq 0
+        }
+        finally { $key.Dispose() }
+    }
+    catch { return $false }
+    finally { $base.Dispose() }
+}
+
+function Install-AdminModeKey {
+    if ($SkipAgent) { return }
+    if (-not $PSCmdlet.ShouldProcess($AdminModeKey, 'Create/repair protected policy key and initialise AdminMode DWORD=0 (no tray.json migration)')) {
+        Add-Step 'admin-mode-policy' 'planned' "Create/repair $AdminModeKey; protected DACL SYSTEM/Administrators full, Users read only; AdminMode DWORD=0."
+        return
+    }
+    $acl = [Security.AccessControl.RegistrySecurity]::new()
+    $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($entry in @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'), @('S-1-5-32-545', 'ReadKey'))) {
+        $acl.AddAccessRule([Security.AccessControl.RegistryAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]$entry[0], [Security.AccessControl.RegistryRights]$entry[1],
+                [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow))
+    }
+    $base = Open-AdminModeRegistry
+    try {
+        $key = $base.CreateSubKey($AdminModeRegistryPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+            [Microsoft.Win32.RegistryOptions]::None, $acl)
+        try {
+            $key.SetAccessControl($acl)
+            $key.SetValue('AdminMode', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
+        }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+    if (-not (Test-AdminModeKeyCurrent)) { throw 'Admin mode registry type/owner/protected DACL verification failed.' }
+    Add-Step 'admin-mode-policy' 'done' "$AdminModeKey initialised OFF; protected DACL verified."
+}
+
+function Remove-AdminModeKey {
+    if (-not (Test-AdminModeKeyExists)) { return }
+    if (-not $PSCmdlet.ShouldProcess($AdminModeKey, 'Delete protected Admin mode policy (because -SkipAgent)')) {
+        Add-Step 'admin-mode-policy' 'planned' "Remove $AdminModeKey (because -SkipAgent)."
+        return
+    }
+    $base = Open-AdminModeRegistry
+    try { $base.DeleteSubKeyTree($AdminModeRegistryPath, $false) }
+    finally { $base.Dispose() }
+    Add-Step 'admin-mode-policy' 'done' "Removed $AdminModeKey."
 }
 
 function Register-AgentTask {
@@ -899,6 +1008,8 @@ function Invoke-MachineSteps([bool]$ConfigNeedsMachine) {
     Install-Agent
     Register-AgentTask
     Register-SecureTask
+    Install-AdminModeKey
+    Register-AdminModeOffTask
     Remove-LegacyElevated
     if (-not $AgentOnly) { Remove-BubblePlayServices }
 }

@@ -229,57 +229,80 @@ fn is_signaled(handle: &Handle) -> bool {
 }
 
 /// `SendInput` for validated protocol records.
-struct SendInputInjector;
+struct SendInputInjector {
+    /// True only for the existing explicitly isolated, unelevated dev path.
+    isolated_dev: bool,
+    sid: String,
+}
 
 impl Injector for SendInputInjector {
     fn inject(&mut self, records: &[Record]) -> (u32, i32) {
-        let inputs: Vec<INPUT> = records
-            .iter()
-            .map(|record| match *record {
-                Record::Mouse {
-                    dx,
-                    dy,
-                    data,
-                    flags,
-                } => INPUT {
-                    r#type: INPUT_MOUSE,
-                    Anonymous: INPUT_0 {
-                        mi: MOUSEINPUT {
-                            dx,
-                            dy,
-                            mouseData: data,
-                            dwFlags: MOUSE_EVENT_FLAGS(flags),
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                },
-                Record::Key { vk, scan, flags } => INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(vk),
-                            wScan: scan,
-                            dwFlags: KEYBD_EVENT_FLAGS(flags),
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                },
-            })
-            .collect();
-        if inputs.is_empty() {
-            return (0, 0);
+        if !self.policy_allowed() {
+            return (0, windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32);
         }
-        // SAFETY: inputs is a valid slice of fully initialized INPUTs.
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        let error = if sent as usize == inputs.len() {
-            0
-        } else {
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-        };
-        (sent, error)
+        send_input(records)
     }
+    fn policy_allowed(&self) -> bool {
+        if self.isolated_dev {
+            return !trust::is_process_elevated();
+        }
+        trust::current_session_id() == bubbleplay_host::secure_helper::trust::console()
+            && bubbleplay_host::admin_mode::console_sid().is_ok_and(|sid| sid == self.sid)
+            && bubbleplay_host::admin_mode::effective_for_sid(&self.sid)
+    }
+    fn release_held(&mut self, records: &[Record]) -> (u32, i32) {
+        // Only Session's tracked releases reach here; remote records always
+        // go through inject(), including remote key/button UP requests.
+        send_input(records)
+    }
+}
+fn send_input(records: &[Record]) -> (u32, i32) {
+    let inputs: Vec<INPUT> = records
+        .iter()
+        .map(|record| match *record {
+            Record::Mouse {
+                dx,
+                dy,
+                data,
+                flags,
+            } => INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx,
+                        dy,
+                        mouseData: data,
+                        dwFlags: MOUSE_EVENT_FLAGS(flags),
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+            Record::Key { vk, scan, flags } => INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        wScan: scan,
+                        dwFlags: KEYBD_EVENT_FLAGS(flags),
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+        })
+        .collect();
+    if inputs.is_empty() {
+        return (0, 0);
+    }
+    // SAFETY: inputs is a valid slice of fully initialized INPUTs.
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    let error = if sent as usize == inputs.len() {
+        0
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    };
+    (sent, error)
 }
 
 type SharedSession = Arc<Mutex<Session<SendInputInjector>>>;
@@ -288,6 +311,7 @@ struct Agent {
     pipe: String,
     security: SecurityDescriptor,
     elevated: bool,
+    sid: String,
     range: (u16, u16),
     sessions: Mutex<Vec<SharedSession>>,
     active: AtomicUsize,
@@ -300,6 +324,12 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Agent {
+    fn injector(&self) -> SendInputInjector {
+        SendInputInjector {
+            isolated_dev: !self.elevated,
+            sid: self.sid.clone(),
+        }
+    }
     fn create_instance(&self, first: bool) -> std::io::Result<Handle> {
         let name = wide(self.pipe.as_str());
         let attributes = self.security.attributes();
@@ -367,6 +397,11 @@ impl Agent {
                 }
             }
             let mut client_pid = 0u32;
+            if !self.injector().policy_allowed() {
+                tracing::info!("Admin mode off; rejecting client");
+                let _ = unsafe { DisconnectNamedPipe(instance.0) };
+                continue;
+            }
             // SAFETY: connected pipe handle and out-pointer.
             let _ = unsafe { GetNamedPipeClientProcessId(instance.0, &mut client_pid) };
             let image = trust::process_image_path(client_pid);
@@ -435,7 +470,7 @@ impl Agent {
                 });
         }
         let session: SharedSession = Arc::new(Mutex::new(Session::with_range(
-            SendInputInjector,
+            self.injector(),
             self.elevated,
             // SAFETY: trivial query.
             unsafe { GetCurrentProcessId() },
@@ -625,6 +660,7 @@ fn run() -> i32 {
         pipe: protocol::pipe_name(trust::current_session_id(), scope.as_deref()),
         security,
         elevated,
+        sid,
         range,
         sessions: Mutex::new(Vec::new()),
         active: AtomicUsize::new(0),
