@@ -505,7 +505,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         lastStatus = status
         this.status.text = status.text
         this.status.setTextColor(
-            when (status.state) {
+            if (status.inputWarning) STATUS_PENDING else when (status.state) {
                 Session.State.CONNECTED, Session.State.STATIC -> 0xFFB8F5C8.toInt()
                 Session.State.ERROR -> 0xFFFFB4A8.toInt()
                 else -> STATUS_PENDING

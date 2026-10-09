@@ -22,6 +22,7 @@ pub mod frame_damage;
 pub mod hevc_tiles;
 pub mod hybrid;
 pub mod input;
+pub mod input_diagnostics;
 pub mod input_proxy_client;
 pub mod input_proxy_protocol;
 pub mod input_proxy_runtime;

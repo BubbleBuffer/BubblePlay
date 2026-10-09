@@ -69,6 +69,10 @@ export function validInputStatus(message, role, raw) {
   if (message.lastErrorCode !== undefined &&
       (!Number.isInteger(message.lastErrorCode) || message.lastErrorCode < -0x8000_0000 ||
        message.lastErrorCode > 0x7fff_ffff)) return false;
+  if (Object.hasOwn(message, "reason") &&
+      ![null, "admin-required", "admin-unavailable"].includes(message.reason)) return false;
+  if (Object.hasOwn(message, "route") &&
+      !["local", "admin", "secure"].includes(message.route)) return false;
   return message.lastSequence === undefined ||
     (Number.isInteger(message.lastSequence) && message.lastSequence >= 0 && message.lastSequence <= 0xffff);
 }

@@ -23,6 +23,22 @@ Status: approved 2026-10-08 (Admin mode storage revised 2026-10-08); Milestones 
 
 ## Intent
 
+On Default, the existing 250 ms foreground sample checks the window process's
+integrity level and UIAccess on foreground changes. A target above the host's
+integrity level, or with UIAccess, produces an additive `input-status` warning:
+`reason:"admin-required"` when Admin mode is off, or `"admin-unavailable"`
+when Admin mode is on and its helper is unavailable. `route` identifies
+`local`, `admin` or `secure`; `reason:null` clears the warning. Warnings do not
+disable client controls. An unavailable admin agent does not fall back to
+local injection for a known protected target; Winlogon retains its exclusive
+SYSTEM helper route and per-request protected policy.
+
+One-second input diagnostics count received packet kinds before input gates,
+drops by reason, injection routes and SendInput requested/applied events and
+errors. Flow/drop transitions identify the reason; logs contain no key codes,
+typed text or coordinates. These diagnostics support incident investigation;
+the WhatsApp blackout's cause remains unproven.
+
 1. **Survive the prompt.** A secure-desktop switch keeps the viewer session open. The client shows "Admin prompt open on the PC" (or "PC is locked"). The host polls for the normal desktop every 500 ms and resumes on the same monitor.
 2. **Secure-desktop helper.** An optional `bubbleplay_secure_helper.exe`, installed once with admin rights, runs with a SYSTEM token in the console session only while a viewer is connected. A SYSTEM scheduled task launches it; there is no permanent service. It captures the secure desktop (GDI, low frame rate, on change) and hands BGRA frames to the host through shared memory; the host encodes them with its normal encoder.
 3. **Permission levels, enforced in the helper:**

@@ -76,7 +76,7 @@ class Session(
 
     enum class State { CONNECTING, CONNECTED, STATIC, RECONNECTING, ERROR }
 
-    data class Status(val state: State, val text: String)
+    data class Status(val state: State, val text: String, val inputWarning: Boolean = false)
 
     /** Live values for the settings view's Diagnostics (null: not known yet). */
     data class Diagnostics(
@@ -129,6 +129,7 @@ class Session(
     @Volatile private var awaitingFrame = true
     private var desktopKind = "default"
     private var secureDesktop: SecureDesktop? = null
+    private val inputWarning = InputStatusWarning()
     private var desktopGeneration: Int? = null
     private var hasPresented = false
     private val clipboardReceiver = ClipboardReceiver()
@@ -353,6 +354,7 @@ class Session(
     private fun signalingDown(id: Int, httpCode: Int?, why: String) {
         if (!link.lost(id)) return
         Log.i(TAG, "signaling down: $why (http=$httpCode)")
+        inputWarning.reset()
         sigOpen = false
         registered = false
         sig = null
@@ -464,6 +466,11 @@ class Session(
                 clipboardEnabled = msg.optInt("protocol") == 1 && msg.optBoolean("clipboard")
             }
             "desktop-state" -> handleDesktopState(msg)
+            "input-status" -> {
+                val update = InputStatusUpdate.parse(msg) ?: return
+                inputWarning.apply(update)
+                publishStatus()
+            }
             "secure-action-result" -> if (msg.optString("action") == "deny") {
                 val ok = msg.optBoolean("ok")
                 val reason = msg.optString("reason").take(120)
@@ -496,6 +503,7 @@ class Session(
             "peer-left" -> {
                 // The host went away: start a fresh signaling epoch, as the browser does.
                 Log.i(TAG, "peer-left: recycling signaling")
+                inputWarning.reset()
                 link.reset()
                 try { sig?.close(1000, "peer-left") } catch (_: Exception) {}
                 sig = null; sigOpen = false; registered = false
@@ -939,13 +947,16 @@ class Session(
         if (!sigOpen || !registered) return Status(if (sigReconnecting) State.RECONNECTING else State.CONNECTING, if (sigReconnecting) "Reconnecting…" else "Connecting…")
         if (!desktopAvailable) return Status(State.ERROR, "Desktop unavailable")
         if (mediaOpen && !hostPresent && framesPresented == 0L) return Status(State.CONNECTING, "Waiting for host…")
-        return when (V4.status(mediaOpen, mediaReconnecting, framesPresented, lastFrameAt, now())) {
+        val status = when (V4.status(mediaOpen, mediaReconnecting, framesPresented, lastFrameAt, now())) {
             V4.Status.CONNECTED -> Status(State.CONNECTED, "Connected · ${streamLabel()}")
             V4.Status.PAUSED_STATIC -> Status(State.STATIC, "Connected · static")
             V4.Status.RECONNECTING -> Status(State.RECONNECTING, "Reconnecting media…")
             V4.Status.STARTING -> Status(State.CONNECTING, "Starting stream…")
             V4.Status.CONNECTING -> Status(State.CONNECTING, "Connecting…")
         }
+        val warning = inputWarning.text
+        return if (warning != null && status.state in setOf(State.CONNECTED, State.STATIC))
+            status.copy(text = warning, inputWarning = true) else status
     }
 
     private fun streamLabel(): String {

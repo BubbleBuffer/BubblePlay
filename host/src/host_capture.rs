@@ -306,6 +306,11 @@ impl LocalCaptureSource {
             .acquire(timeout)?;
         Ok(frame.map(|(frame, changed, recovered)| {
             let recovered = finish_normal_recovery(&mut self.normal_recovery_pending, recovered);
+            if let Some(region) = frame.desktop_region() {
+                self.region = region;
+                self.width = region.width;
+                self.height = region.height;
+            }
             (frame, changed, recovered)
         }))
     }
@@ -540,11 +545,9 @@ pub(super) fn privileged_input_ready_after_presentation(
     presented_generation: u32,
     current_generation: u32,
 ) -> bool {
-    !privileged
-        || (capture_available
-            && state.available
-            && state.input == "enabled"
-            && presented_generation == current_generation)
+    presented_generation == current_generation
+        && capture_available
+        && (!privileged || (state.available && state.input == "enabled"))
 }
 
 pub(super) enum PrivilegedEvent {

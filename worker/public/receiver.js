@@ -153,6 +153,7 @@ let secureDenyState = { pending: false, error: "" };
 let desktopInputState = "enabled";
 let desktopGeneration = null;
 let latestInputStatus = null;
+let inputStatusReason = null;
 let hostCapabilities = { serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false };
 let hostCapabilitiesGeneration = 0;
 let hasPresentedFrame = false;
@@ -601,8 +602,11 @@ function renderConnectionStatus() {
   else if (hudState.ws === "error") { state = "error"; label = "Connection error"; }
   connectionStatusDetail = label.replace(" · ", " via ");
   // The strip shows a short state; transport and round trip go in the tooltip.
-  const shortLabel = label.split(" · ")[0];
-  const detail = [connectionStatusDetail,
+  const warning = desktopAvailable && desktopKind === "default" && !terminalSignalingFailure
+    ? inputStatusReason === "admin-required" ? "This window needs Admin mode — turn it on at the PC"
+      : inputStatusReason === "admin-unavailable" ? "Admin mode helper isn't responding" : "" : "";
+  const shortLabel = warning || label.split(" · ")[0];
+  const detail = [warning, connectionStatusDetail,
     hudState.rtt !== "…" ? `round trip ${hudState.rtt} ms` : null,
     monitorList.find(m => m.selected)?.name || null].filter(Boolean).join(" · ");
   if (connectionStatus.dataset.state !== state) connectionStatus.dataset.state = state;
@@ -611,6 +615,7 @@ function renderConnectionStatus() {
   const retry = document.getElementById("connection-retry");
   if (retry.hidden !== (state !== "error")) retry.hidden = state !== "error";
   document.getElementById("session-strip").classList.toggle("status-error", state === "error");
+  document.getElementById("session-strip").classList.toggle("status-warning", !!warning);
 }
 let connectionStatusDetail = "Connecting…";
 function qualityHudText() {
@@ -790,6 +795,8 @@ function reconnectSignaling(reason) {
   hudState.ws = `reconnecting (${reason})`;
   const connect = () => {
     reconnectTimer = null;
+    latestInputStatus = null;
+    inputStatusReason = null;
     const generation = ++signalingGeneration;
     const socketUrl = signalingSocketUrl();
     debugTrace("signaling-construct", {
@@ -810,6 +817,8 @@ function reconnectSignaling(reason) {
     socket.onclose = (event) => {
       if (ws !== socket || generation !== signalingGeneration) return;
       hudState.ws = "closed";
+      latestInputStatus = null;
+      inputStatusReason = null;
       signalingRegistered = false;
       recordSignalingError("socket-close", `WebSocket closed (${event.code})`, { code: event.code, reason: event.reason || "" });
       debugTrace("signaling-close", { generation, code: event.code, reason: event.reason || "" });
@@ -838,6 +847,8 @@ function signalingSocketUrl() {
 
 function recycleSignaling(reason) {
   if (terminalSignalingFailure) return;
+  latestInputStatus = null;
+  inputStatusReason = null;
   invalidatePendingMonitorRequest(reason);
   const renderedAgeMs = lastRenderedDueMs === null ? null : performance.now() - lastRenderedDueMs;
   const diagnostic = createSignalingRecycleDiagnostic({
@@ -949,8 +960,18 @@ async function handleSignal(socket, generation, ev) {
       }
       break;
     case "input-status": {
+      if (Object.hasOwn(msg, "reason") && ![null, "admin-required", "admin-unavailable"].includes(msg.reason)) break;
+      if (Object.hasOwn(msg, "route") && !["local", "admin", "secure"].includes(msg.route)) break;
       const previousFailures = latestInputStatus?.failedPackets || 0;
-      latestInputStatus = msg;
+      // Foreground warning updates carry empty receipt counters. Preserve the
+      // receipt diagnostics and failure baseline until a receipt arrives.
+      const warningOnly = Object.hasOwn(msg, "reason") && ["receivedPackets", "acceptedPackets",
+        "failedPackets", "droppedPackets", "releasedInputs", "requestedEvents", "appliedEvents"]
+        .every(field => msg[field] === 0);
+      if (!warningOnly) latestInputStatus = msg;
+      // Receipt-only updates omit reason; only an explicit null clears it.
+      if (Object.hasOwn(msg, "reason")) inputStatusReason = msg.reason;
+      renderConnectionStatus();
       if ((msg.failedPackets || 0) > previousFailures) sendClientLog("error", "host-input-application-failed", {
         generation: msg.generation, requestedEvents: msg.requestedEvents,
         appliedEvents: msg.appliedEvents, failedPackets: msg.failedPackets,

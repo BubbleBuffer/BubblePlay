@@ -2,8 +2,9 @@
 //!
 //! `AdminAgentLink` is used by the host's `InputSink`: every `SendInput`
 //! batch goes to the elevated agent when one is connected and speaks a
-//! compatible protocol version; otherwise the caller injects locally at user
-//! level. Connection attempts are lazy (on input) and spaced out, so a host
+//! compatible protocol version; otherwise the caller chooses whether local
+//! injection is permitted for the foreground target. Connection attempts are
+//! lazy (on input) and spaced out, so a host
 //! without Admin mode pays one failed `CreateFile` every few seconds at most.
 
 use std::fs::File;
@@ -336,6 +337,10 @@ impl AdminAgentLink {
         self.attempts
     }
 
+    pub(crate) fn allows_development_agent(&self) -> bool {
+        self.allow_dev
+    }
+
     fn fail(&mut self, error: LinkError, now: Instant) {
         let was_connected = matches!(self.state, LinkState::Connected(_));
         let changed = match &self.state {
@@ -347,12 +352,12 @@ impl AdminAgentLink {
         if was_connected || changed {
             match &error {
                 LinkError::Unavailable(_) if !was_connected => {
-                    tracing::debug!(%error, "using user-level input")
+                    tracing::debug!(%error, "admin agent unavailable")
                 }
                 LinkError::Incompatible { .. } | LinkError::Untrusted(_) => {
-                    tracing::warn!(%error, "using user-level input")
+                    tracing::warn!(%error, "admin agent unavailable")
                 }
-                _ => tracing::info!(%error, "using user-level input"),
+                _ => tracing::info!(%error, "admin agent unavailable"),
             }
         }
         self.connection = None;
@@ -390,7 +395,8 @@ impl AdminAgentLink {
     }
 
     /// Inject through the agent. `None` means nothing was sent and the
-    /// caller must inject locally; `Some((applied, error))` is the agent's
+    /// caller may inject locally if the foreground target permits it;
+    /// `Some((applied, error))` is the agent's
     /// receipt (possibly partial, like `SendInput`).
     pub fn inject(&mut self, records: &[Record]) -> Option<(u32, i32)> {
         if records.is_empty() || records.iter().any(|record| record.validate().is_err()) {

@@ -638,6 +638,23 @@ test("relays only bounded applied-input receipts from the host", async () => {
   assert.deepEqual(host.messages, []);
 });
 
+test("relays additive input warnings and explicit clears, rejecting invalid enums", async () => {
+  const { room, sockets: [client, host] } = createRoom();
+  const receipt = { type: "input-status", protocol: 1, generation: 4,
+    receivedPackets: 0, acceptedPackets: 0, failedPackets: 0, droppedPackets: 0,
+    releasedInputs: 0, requestedEvents: 0, appliedEvents: 0 };
+  const accepted = [];
+  for (const [reason, route] of [["admin-required", "local"], ["admin-unavailable", "admin"], [null, "secure"]]) {
+    const message = JSON.stringify({ ...receipt, reason, route });
+    accepted.push(message);
+    await room.webSocketMessage(host, message);
+  }
+  await room.webSocketMessage(host, JSON.stringify({ ...receipt, reason: "other", route: "local" }));
+  await room.webSocketMessage(host, JSON.stringify({ ...receipt, reason: null, route: "other" }));
+  assert.deepEqual(client.messages, accepted);
+  assert.deepEqual(host.messages, []);
+});
+
 test("relays only bounded privileged capability and secure desktop state from the host", async () => {
   const { room, sockets: [client, host] } = createRoom();
   const capability = JSON.stringify({ type: "host-capabilities", serviceMode: true, coldBoot: true, secureDesktop: true, secureText: true });

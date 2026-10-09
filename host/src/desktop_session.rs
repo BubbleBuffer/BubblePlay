@@ -18,7 +18,10 @@ use windows::Win32::System::StationsAndDesktops::{
     SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_JOURNALPLAYBACK,
     DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS, HDESK, UOI_NAME,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThreadId, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     WINSTA_ENUMDESKTOPS, WINSTA_READATTRIBUTES, WINSTA_WRITEATTRIBUTES,
 };
@@ -130,6 +133,93 @@ pub struct InputSecurityContext {
     pub thread_desktop: String,
     pub winsta_input_access: bool,
     pub desktop_input_access: bool,
+}
+
+/// Only the token properties relevant to normal-desktop UIPI. A successful
+/// token query does not establish that a particular input event was applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessInputPrivilege {
+    pub integrity_rid: u32,
+    pub ui_access: bool,
+}
+
+impl ProcessInputPrivilege {
+    pub fn requires_admin_from(self, host: Self) -> bool {
+        self.integrity_rid > host.integrity_rid || self.ui_access
+    }
+
+    fn from_process(process: HANDLE) -> Result<Self> {
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
+            .context("OpenProcessToken for foreground privilege")?;
+        let token = TokenHandle(token);
+        Ok(Self {
+            integrity_rid: token_integrity_rid(token.0)?,
+            ui_access: token_u32(token.0, TokenUIAccess)? != 0,
+        })
+    }
+}
+
+/// Called on the existing foreground housekeeping cadence. Token inspection
+/// happens only when HWND/PID changes, including windows ignored by following
+/// (for example, a modal dialog or a window during a drag).
+pub struct ForegroundPrivilegeTracker {
+    host: Option<ProcessInputPrivilege>,
+    identity: Option<(isize, u32)>,
+    target: Option<ProcessInputPrivilege>,
+}
+
+impl Default for ForegroundPrivilegeTracker {
+    fn default() -> Self {
+        Self {
+            host: ProcessInputPrivilege::from_process(unsafe { GetCurrentProcess() }).ok(),
+            identity: None,
+            target: None,
+        }
+    }
+}
+
+impl ForegroundPrivilegeTracker {
+    pub fn pid(&self) -> Option<u32> {
+        self.identity.map(|(_, pid)| pid)
+    }
+
+    pub fn refresh(&mut self) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+        let window = unsafe { GetForegroundWindow() };
+        let mut pid = 0;
+        if !window.is_invalid() {
+            unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+        }
+        let identity = (pid != 0).then_some((window.0 as isize, pid));
+        if self.identity == identity {
+            return false;
+        }
+        self.identity = identity;
+        self.target = identity.and_then(|(_, pid)| {
+            let process =
+                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+            let process = TokenHandle(process);
+            ProcessInputPrivilege::from_process(process.0).ok()
+        });
+        tracing::info!(
+            foreground_pid = identity.map(|(_, pid)| pid),
+            host_integrity = self.host.map(|token| token.integrity_rid),
+            foreground_integrity = self.target.map(|token| token.integrity_rid),
+            foreground_ui_access = self.target.map(|token| token.ui_access),
+            privilege_known = self.host.is_some() && self.target.is_some(),
+            "remote input foreground privilege changed"
+        );
+        true
+    }
+
+    pub fn requires_admin(&self) -> bool {
+        self.target
+            .zip(self.host)
+            .is_some_and(|(target, host)| target.requires_admin_from(host))
+    }
 }
 
 impl BoundInputDesktop {
@@ -500,6 +590,32 @@ fn user_object_name(handle: HANDLE) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_privilege_compares_integrity_and_ui_access_to_host() {
+        let medium = ProcessInputPrivilege {
+            integrity_rid: 0x2000,
+            ui_access: false,
+        };
+        let high = ProcessInputPrivilege {
+            integrity_rid: 0x3000,
+            ui_access: false,
+        };
+        let low = ProcessInputPrivilege {
+            integrity_rid: 0x1000,
+            ui_access: false,
+        };
+        let ui_access = ProcessInputPrivilege {
+            ui_access: true,
+            ..medium
+        };
+        assert!(!medium.requires_admin_from(medium));
+        assert!(!low.requires_admin_from(medium));
+        assert!(high.requires_admin_from(medium));
+        assert!(ui_access.requires_admin_from(medium));
+        assert!(!medium.requires_admin_from(high));
+        assert!(!high.requires_admin_from(high));
+    }
 
     #[test]
     fn secure_or_unknown_input_desktop_blocks_a_dda_recovery_frame() {

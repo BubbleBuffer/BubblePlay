@@ -750,8 +750,9 @@ body.has-presented-frame #secure-deny { margin: 0; }
   .secure-short { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
   #secure-desktop-status { position: absolute; left: 4px; top: 4px; height: 12px; padding: 0 3px; font-size: 8px; }
 
-  /* An error lifts the status above the bar with its label and Retry. */
-  #session-strip.status-error .strip-status {
+  /* Errors and input warnings reuse the status above the bar. */
+  #session-strip.status-error .strip-status,
+  #session-strip.status-warning .strip-status {
     position: absolute;
     left: 8px;
     right: 8px;
@@ -765,7 +766,9 @@ body.has-presented-frame #secure-deny { margin: 0; }
     border-left: 3px solid var(--paw-pink);
     border-radius: 8px 12px 7px 10px;
   }
-  #session-strip.status-error #connection-status-label { position: static; width: auto; height: auto; clip: auto; }
+  #session-strip.status-error #connection-status-label,
+  #session-strip.status-warning #connection-status-label { position: static; width: auto; height: auto; clip: auto; }
+  #session-strip.status-warning #connection-status { white-space: normal; }
   #session-strip.status-error #connection-retry { height: 34px; margin-left: auto; }
 
   .strip-actions { flex: 1 1 auto; justify-content: space-around; gap: 0; }

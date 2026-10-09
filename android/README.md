@@ -32,6 +32,7 @@ On a fresh install, enter your own relay address before connecting. Existing sav
 - **Session:**
   - The screen stays on and the app runs immersive (both are settings).
   - A status line shows state, codec and size. Tap it to reconnect after an error. Full screen and touch mode can also be switched from the bar for the current session only.
+  - Foreground windows that need Admin mode show “This window needs Admin mode — turn it on at the PC” in that status line. An unavailable Admin mode helper shows “Admin mode helper isn’t responding”. The warning clears when the host clears its reason, and controls stay enabled. Optional `input-status` reason and route fields are validated; older receipt-only messages preserve the current warning.
   - The session is stopped 30 s after the app leaves the foreground (see "Known limits").
   - **Resume:** when the app pauses, it copies the current video frame (`PixelCopy`). On return that frame stays on screen, dimmed, with a "Reconnecting…" label, until the first live frame is presented; it then fades out over 150 ms. If the copy failed, the screen is black until the stream returns. The frame is kept across the 30 s background stop and dropped on Disconnect or Sign out.
   - **Reconnect in the background:** while the app is in the background, lost signaling or media sockets are not reconnected. On return (`onStart`) the backoff resets and any held or waiting retry runs at once.

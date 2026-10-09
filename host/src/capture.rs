@@ -321,6 +321,7 @@ pub enum CapturedFrame<'a> {
     Desktop {
         frame: DesktopFrame<'a>,
         metadata: &'a mut DamageMetadata,
+        region: DesktopRegion,
     },
     IdleSnapshot {
         device: &'a ID3D11Device,
@@ -337,6 +338,15 @@ pub enum CapturedFrame<'a> {
 }
 
 impl CapturedFrame<'_> {
+    /// Physical bounds of the DDA output that produced this frame, including
+    /// geometry changed during recreation before this frame was acquired.
+    pub fn desktop_region(&self) -> Option<DesktopRegion> {
+        match self {
+            Self::Desktop { region, .. } => Some(*region),
+            _ => None,
+        }
+    }
+
     pub fn is_idle_snapshot(&self) -> bool {
         matches!(self, Self::IdleSnapshot { .. })
     }
@@ -391,7 +401,10 @@ impl CapturedFrame<'_> {
     /// Fetch/process damage only after admitting this frame for encoding.
     /// Buffers live with Capture and are reused by subsequent acquisitions.
     pub fn prepare_damage(&mut self) {
-        if let Self::Desktop { frame, metadata } = self {
+        if let Self::Desktop {
+            frame, metadata, ..
+        } = self
+        {
             metadata.prepare(frame, false);
         }
     }
@@ -400,7 +413,10 @@ impl CapturedFrame<'_> {
     /// Move destinations stay separate so scroll/motion classification is
     /// conservative too; no per-tile processing is performed here.
     pub fn prepare_damage_union(&mut self) {
-        if let Self::Desktop { frame, metadata } = self {
+        if let Self::Desktop {
+            frame, metadata, ..
+        } = self
+        {
             metadata.prepare(frame, true);
         }
     }
@@ -1530,6 +1546,7 @@ impl Capture {
             CapturedFrame::Desktop {
                 frame,
                 metadata: &mut self.damage_metadata,
+                region: DesktopRegion::new(self.origin_x, self.origin_y, self.width, self.height),
             },
             is_new,
             recovered,

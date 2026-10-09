@@ -6,6 +6,14 @@ The approved BubblePlay mark appears on launcher icons, login pages and the Wind
 
 ## Browser
 
+The existing connection status shows "This window needs Admin mode — turn it
+on at the PC" for `input-status.reason:"admin-required"`, and "Admin mode
+helper isn't responding" for `"admin-unavailable"`. Android uses its existing
+status line for the same warning. Controls stay enabled; explicit `reason:null`
+clears the warning, while receipt-only messages preserve it. Host diagnostics
+count input kinds, drop reasons, routes and injection results without logging
+key codes, text or coordinates.
+
 The browser opens its signaling socket immediately on startup and requests the first frame just after sending the WebRTC offer, with the existing five-second first-frame watchdog. Automatic no-RTP fallback waits at least five seconds from the latest first-frame request and the last startup progress, requires connected ICE and peer state, and checks that neither RTP nor a presented frame has arrived; a terminal RTC failure also selects WSS in automatic mode. A remembered fallback lives only in the current tab's sessionStorage, so a new tab session tries WebRTC again. Explicit transport choices and transient disconnections retain their existing policies. Each relay socket still checks current approval and login validity before admission.
 
 Desktop pointers use a 32 px top strip. Touch pointers use a 48 px bottom bar plus its seam. Desktop actions include Monitors, Shortcuts, Files, Fullscreen and Settings; clipboard retry and zoom reset appear only when needed. Touch adds Keyboard, Touch mode, Keys, Arrows and More.

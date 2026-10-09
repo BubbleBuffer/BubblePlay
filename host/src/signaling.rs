@@ -714,6 +714,16 @@ pub enum SignalMsg {
         last_error_code: Option<i32>,
         #[serde(rename = "lastSequence", skip_serializing_if = "Option::is_none")]
         last_sequence: Option<u16>,
+        /// Omitted on receipt-only messages. Routing announcements explicitly
+        /// send null to clear an earlier warning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<crate::input::InputStatusReason>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_input_route"
+        )]
+        route: Option<crate::input::InputRoute>,
     },
     #[serde(rename = "secure-action")]
     SecureAction {
@@ -1215,6 +1225,41 @@ impl Drop for WorkerVersionMonitor {
     fn drop(&mut self) {
         let _ = self.stop.send(());
     }
+}
+
+fn deserialize_input_route<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::input::InputRoute>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    crate::input::InputRoute::deserialize(deserializer).map(Some)
+}
+
+fn input_routing_status_message(
+    generation: u32,
+    status: crate::input::InputRoutingStatus,
+) -> serde_json::Value {
+    let mut message = serde_json::to_value(SignalMsg::InputStatus {
+        protocol: 1,
+        generation,
+        received_packets: 0,
+        accepted_packets: 0,
+        failed_packets: 0,
+        dropped_packets: 0,
+        released_inputs: 0,
+        requested_events: 0,
+        applied_events: 0,
+        last_error_code: None,
+        last_sequence: None,
+        reason: status.reason,
+        route: Some(status.route),
+    })
+    .expect("input status serializes");
+    if status.reason.is_none() {
+        message["reason"] = serde_json::Value::Null;
+    }
+    message
 }
 
 impl Signaling {
@@ -1956,6 +2001,8 @@ impl Signaling {
             applied_events,
             last_error_code,
             last_sequence,
+            reason: None,
+            route: None,
         };
         if self
             .ws
@@ -1966,6 +2013,16 @@ impl Signaling {
         {
             let _ = self.ws.flush();
         }
+    }
+
+    /// An additive input-status announcement. Existing receipt-only messages
+    /// omit reason/route and cannot clear a foreground warning.
+    pub fn send_input_routing_status(
+        &mut self,
+        generation: u32,
+        status: crate::input::InputRoutingStatus,
+    ) {
+        self.send_text(&input_routing_status_message(generation, status).to_string());
     }
 
     pub fn send_host_capabilities(
@@ -3298,6 +3355,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn input_status_validates_additive_privilege_fields_and_clear() {
+        use crate::input::{InputRoute, InputRoutingStatus, InputStatusReason};
+        let status = InputRoutingStatus {
+            reason: Some(InputStatusReason::AdminRequired),
+            route: InputRoute::Local,
+        };
+        let warning = super::input_routing_status_message(7, status);
+        assert_eq!(warning["reason"], "admin-required");
+        assert_eq!(warning["route"], "local");
+        assert!(serde_json::from_value::<SignalMsg>(warning.clone()).is_ok());
+        let clear = super::input_routing_status_message(
+            7,
+            InputRoutingStatus {
+                reason: None,
+                route: InputRoute::Admin,
+            },
+        );
+        assert!(clear["reason"].is_null());
+        assert_eq!(clear["route"], "admin");
+        assert!(serde_json::from_value::<SignalMsg>(clear).is_ok());
+        for (field, value) in [
+            ("reason", serde_json::json!("elevated")),
+            ("route", serde_json::json!("system")),
+            ("reason", serde_json::json!(true)),
+            ("route", serde_json::json!(7)),
+            ("route", serde_json::Value::Null),
+        ] {
+            let mut invalid = warning.clone();
+            invalid[field] = value;
+            assert!(serde_json::from_value::<SignalMsg>(invalid).is_err());
+        }
     }
 
     #[test]

@@ -140,6 +140,12 @@ func validSignalMessage(m map[string]json.RawMessage, role, epoch string, length
 		if !host || length > 1024 || !protocol(m, 1) || !uint32Value(m, "generation") {
 			return false
 		}
+		if has(m, "reason") && !bytes.Equal(bytes.TrimSpace(m["reason"]), []byte("null")) && str(m, "reason") != "admin-required" && str(m, "reason") != "admin-unavailable" {
+			return false
+		}
+		if has(m, "route") && str(m, "route") != "local" && str(m, "route") != "admin" && str(m, "route") != "secure" {
+			return false
+		}
 		for _, key := range []string{"receivedPackets", "acceptedPackets", "failedPackets", "droppedPackets", "releasedInputs", "requestedEvents", "appliedEvents"} {
 			if !integer(m, key, 0, 9007199254740991) {
 				return false

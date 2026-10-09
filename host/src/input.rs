@@ -35,6 +35,10 @@ use tracing::{debug, info, warn};
 use crate::admin_agent::client::AdminAgentLink;
 use crate::admin_agent::protocol::Record;
 use crate::clipboard;
+pub use crate::input_diagnostics::{
+    InputDiagnosticCounters, InputDropReason, InputRoute, InputRoutingStatus, InputStatusReason,
+};
+use crate::input_diagnostics::{InputFlowTransitions, InputStatusChanges};
 use windows::Win32::Foundation::{
     CloseHandle, SetLastError, ERROR_INVALID_PARAMETER, HANDLE, POINT, WAIT_ABANDONED,
     WAIT_OBJECT_0, WIN32_ERROR,
@@ -1287,6 +1291,14 @@ pub struct InputSink {
         Option<std::sync::Arc<std::sync::Mutex<crate::secure_helper::client::SecureHelperLink>>>,
     secure_desktop: bool,
     secure_input_allowed: bool,
+    foreground_privilege: crate::desktop_session::ForegroundPrivilegeTracker,
+    admin_enabled: bool,
+    status_changes: InputStatusChanges,
+    diagnostics: InputDiagnosticCounters,
+    input_flow: InputFlowTransitions,
+    geometry_valid: bool,
+    diagnostics_foreground_pid: Option<u32>,
+    development_agent: bool,
 }
 
 /// Clipboard state exists only where the sink runs as the interactive user
@@ -1453,6 +1465,10 @@ pub struct CursorTracker {
 }
 
 impl CursorTracker {
+    pub fn region(&self) -> DesktopRegion {
+        self.region
+    }
+
     pub fn new(width: u32, height: u32, now: Instant) -> Self {
         Self::for_region(DesktopRegion::new(0, 0, width, height), now)
     }
@@ -1800,6 +1816,37 @@ fn keyboard_input(key: HeldKey, up: bool) -> KEYBDINPUT {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_count_receipts_before_secure_gate_and_do_not_double_count() {
+        let mut sink = super::InputSink::new();
+        sink.set_secure_desktop(true, false);
+        sink.note_packet_received(&[super::TYPE_KEY_DOWN, 65, 0]);
+        sink.handle_counted(&[super::TYPE_KEY_DOWN, 65, 0]);
+        sink.handle(&[super::TYPE_TEXT, b'x']);
+        let counters = sink.take_diagnostics();
+        assert_eq!(counters.received_by_kind[super::TYPE_KEY_DOWN as usize], 1);
+        assert_eq!(counters.received_by_kind[super::TYPE_TEXT as usize], 1);
+        assert_eq!(
+            counters.drops_by_reason[super::InputDropReason::SecurePolicy as usize],
+            2
+        );
+        assert_eq!(counters.route_calls, [0, 0, 0]);
+    }
+
+    #[test]
+    fn invalid_absolute_mapping_is_diagnosed_before_injection() {
+        let mut sink = super::InputSink::new();
+        sink.set_absolute_region(super::DesktopRegion::new(0, 0, 0, 1080));
+        let outcome = sink.handle(&[super::TYPE_MOUSE_ABS, 0, 0, 0, 0]);
+        assert_eq!(outcome.application.requested, 0);
+        let counters = sink.take_diagnostics();
+        assert_eq!(
+            counters.drops_by_reason[super::InputDropReason::MappingInvalid as usize],
+            1
+        );
+        assert_eq!(counters.route_calls, [0, 0, 0]);
+    }
+
     #[test]
     fn secure_absolute_coordinates_are_not_normalized_against_default_desktop() {
         let selected = super::DesktopRegion::new(1920, 0, 1920, 1080);
@@ -2874,12 +2921,27 @@ impl InputSink {
             secure_helper: None,
             secure_desktop: false,
             secure_input_allowed: false,
+            foreground_privilege: Default::default(),
+            admin_enabled: false,
+            status_changes: Default::default(),
+            diagnostics: Default::default(),
+            input_flow: Default::default(),
+            geometry_valid: true,
+            diagnostics_foreground_pid: None,
+            development_agent: false,
         }
     }
 
     /// Route injection through the Admin-mode agent when it is available;
-    /// every batch falls back to local (user-level) `SendInput` otherwise.
+    /// Ordinary targets fall back locally when unavailable. A known target
+    /// requiring Admin mode never falls back from an unavailable admin agent.
     pub fn with_admin_agent(mut self, link: Option<AdminAgentLink>) -> Self {
+        // Existing explicitly opted-in development agents run unelevated in
+        // isolated integration tests. Production agents retain protected
+        // console-bound policy enforcement on every request.
+        self.development_agent = link
+            .as_ref()
+            .is_some_and(AdminAgentLink::allows_development_agent);
         self.admin_agent = link;
         self
     }
@@ -2923,21 +2985,128 @@ impl InputSink {
     }
 
     pub fn set_absolute_region(&mut self, region: DesktopRegion) {
+        self.geometry_valid = region.width > 0 && region.height > 0;
         self.absolute_region = region.sanitized();
         self.state.last_absolute_position = None;
     }
 
+    pub fn absolute_region(&self) -> DesktopRegion {
+        self.absolute_region
+    }
+
+    /// Reuse the foreground sampler's 250 ms tick; no new polling timer.
+    /// Connection attempts remain lazy on input, so this cannot block capture
+    /// waiting for an agent handshake. Idle means pending, not observed failure.
+    pub fn refresh_foreground_status(&mut self) {
+        if self.foreground_privilege.refresh() {
+            self.log_diagnostics();
+            self.diagnostics_foreground_pid = self.foreground_privilege.pid();
+        }
+        self.admin_enabled = crate::admin_mode::effective_for_console();
+    }
+
+    pub fn take_status_change(&mut self) -> Option<InputRoutingStatus> {
+        let status = if self.secure_desktop {
+            InputRoutingStatus {
+                reason: None,
+                route: InputRoute::Secure,
+            }
+        } else {
+            let unavailable = self.admin_agent.as_ref().is_none_or(|link| {
+                matches!(
+                    link.state(),
+                    crate::admin_agent::client::LinkState::Fallback(_)
+                )
+            });
+            InputRoutingStatus::normal(
+                self.foreground_privilege.requires_admin(),
+                self.admin_enabled,
+                unavailable,
+            )
+        };
+        self.status_changes.observe(status)
+    }
+
+    /// A fresh viewer needs the current warning even when focus did not change.
+    pub fn reset_status_delivery(&mut self) {
+        self.status_changes.reset();
+    }
+
+    /// Call at transport receipt, before readiness, desktop or native-drag gates.
+    /// The normal handle methods do this for callers without an outer gate.
+    pub fn note_packet_received(&mut self, data: &[u8]) {
+        self.diagnostics.received(data.first().copied());
+    }
+
+    pub fn note_packet_drop(&mut self, reason: InputDropReason) {
+        self.diagnostics.dropped(reason);
+        self.note_input_flow(Some(reason));
+    }
+
+    /// Coalescing reduces injection work; it is not a blocked-input transition.
+    pub fn note_packets_coalesced(&mut self, count: usize) {
+        self.diagnostics.coalesced_packets = self
+            .diagnostics
+            .coalesced_packets
+            .saturating_add(count as u64);
+    }
+
+    fn note_input_flow(&mut self, reason: Option<InputDropReason>) {
+        let previous_reason = self.input_flow.reason();
+        if let Some(transition) = self.input_flow.observe(reason) {
+            match transition {
+                Some(reason) => warn!(reason = reason.name(), "remote input started dropping"),
+                None => info!(
+                    reason = previous_reason.map(InputDropReason::name),
+                    "remote input flowing again"
+                ),
+            }
+        }
+    }
+
+    pub fn take_diagnostics(&mut self) -> InputDiagnosticCounters {
+        std::mem::take(&mut self.diagnostics)
+    }
+
+    pub fn log_diagnostics(&mut self) {
+        let counters = self.take_diagnostics();
+        if !counters.is_empty() {
+            info!(
+                foreground_pid = self.diagnostics_foreground_pid,
+                received_by_kind = ?counters.named_receipts(),
+                drops_by_reason = ?counters.named_drops(),
+                local_calls = counters.route_calls[0],
+                admin_calls = counters.route_calls[1],
+                secure_submissions = counters.route_calls[2],
+                requested_events = counters.requested_events,
+                applied_events = counters.applied_events,
+                short_calls = counters.short_calls,
+                error_calls = counters.error_calls,
+                coalesced_packets = counters.coalesced_packets,
+                "remote input diagnostics"
+            );
+        }
+    }
+
     /// Handle one data-channel packet. Malformed packets are logged and dropped.
     pub fn handle(&mut self, data: &[u8]) -> InputOutcome {
+        self.note_packet_received(data);
+        self.handle_counted(data)
+    }
+
+    /// Receipt was already counted before a caller's gates/coalescing.
+    pub fn handle_counted(&mut self, data: &[u8]) -> InputOutcome {
         if self.secure_desktop
             && (!self.secure_input_allowed || data.first() == Some(&TYPE_CLIPBOARD))
         {
+            self.note_packet_drop(InputDropReason::SecurePolicy);
             if !self.secure_input_allowed {
                 self.note_secure_input_drop(data, "no_input_capability");
             }
             return InputOutcome::default();
         }
         let Some(command) = decode(data) else {
+            self.note_packet_drop(InputDropReason::Malformed);
             debug!(kind = ?data.first(), bytes = data.len(), "malformed or unknown input packet");
             return InputOutcome::default();
         };
@@ -2947,10 +3116,17 @@ impl InputSink {
     /// During a native drag, preserve releases without introducing another
     /// press, paste or pointer move into the attached Windows input queue.
     pub fn handle_release_only(&mut self, data: &[u8]) -> InputOutcome {
+        self.note_packet_received(data);
+        self.handle_release_only_counted(data)
+    }
+
+    pub fn handle_release_only_counted(&mut self, data: &[u8]) -> InputOutcome {
         if self.secure_desktop && !self.secure_input_allowed {
+            self.note_packet_drop(InputDropReason::SecurePolicy);
             return InputOutcome::default();
         }
         let Some(command) = decode(data) else {
+            self.note_packet_drop(InputDropReason::Malformed);
             return InputOutcome::default();
         };
         if let Command::ButtonsAt(seq, _, _, _) = &command {
@@ -3006,6 +3182,7 @@ impl InputSink {
                     outcome.cursor_changed = true;
                 } else {
                     self.stats.stale_motion_dropped += 1;
+                    self.note_packet_drop(InputDropReason::StaleSequence);
                 }
             }
             Command::Absolute(seq, x, y) => {
@@ -3017,6 +3194,7 @@ impl InputSink {
                     outcome.cursor_changed = true;
                 } else {
                     self.stats.stale_motion_dropped += 1;
+                    self.note_packet_drop(InputDropReason::StaleSequence);
                 }
             }
             Command::ButtonsAt(seq, x, y, mask) => {
@@ -3105,7 +3283,17 @@ impl InputSink {
             // Submission is asynchronous. Never fall back to user/admin-agent
             // injection for secure input, even when the helper disappears.
             if !accepted {
+                self.note_packet_drop(if self.secure_input_allowed {
+                    InputDropReason::SecureHelperUnavailable
+                } else {
+                    InputDropReason::SecurePolicy
+                });
                 application.observe(expected, 0, crate::admin_agent::client::ERROR_AGENT_LOST);
+            } else {
+                // This is a submission route, not a Windows receipt. Actual
+                // secure application counts remain the helper's v2 receipts.
+                self.diagnostics.route(InputRoute::Secure);
+                self.note_input_flow(None);
             }
             return application;
         }
@@ -3113,9 +3301,22 @@ impl InputSink {
         // input batch. Never send secure-desktop input through either normal
         // user SendInput or the elevated normal-desktop admin agent.
         if !crate::desktop_session::input_desktop_is_default() {
+            self.note_packet_drop(InputDropReason::NonDefaultDesktop);
+            if let Some(suppressed) = self.failure_log.admit(Instant::now()) {
+                warn!(
+                    reason = InputDropReason::NonDefaultDesktop.name(),
+                    suppressed, "remote input blocked by desktop guard"
+                );
+            }
             return InputApplication::default();
         }
-        let via_agent = self.admin_agent.as_mut().and_then(|link| {
+        let requires_admin = self.foreground_privilege.requires_admin();
+        let via_agent = if self.admin_enabled || self.development_agent {
+            self.admin_agent.as_mut()
+        } else {
+            None
+        }
+        .and_then(|link| {
             let records = inputs
                 .iter()
                 .map(input_record)
@@ -3123,8 +3324,18 @@ impl InputSink {
             link.inject(&records)
         });
         let (sent, error_code) = match via_agent {
-            Some(receipt) => receipt,
+            Some(receipt) => {
+                self.diagnostics.route(InputRoute::Admin);
+                receipt
+            }
+            None if requires_admin && self.admin_enabled => {
+                self.note_packet_drop(InputDropReason::AdminUnavailable);
+                let mut application = InputApplication::default();
+                application.observe(expected, 0, crate::admin_agent::client::ERROR_AGENT_LOST);
+                return application;
+            }
             None => {
+                self.diagnostics.route(InputRoute::Local);
                 unsafe { SetLastError(WIN32_ERROR(0)) };
                 let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
                 // SendInput does not reliably set a useful error for UIPI
@@ -3135,7 +3346,17 @@ impl InputSink {
             }
         };
         let error = std::io::Error::from_raw_os_error(error_code);
+        self.diagnostics.receipt(expected, sent, error_code);
         if sent != expected {
+            self.note_packet_drop(if requires_admin && !self.admin_enabled {
+                InputDropReason::AdminRequired
+            } else if via_agent.is_some()
+                && error_code == crate::admin_agent::client::ERROR_AGENT_LOST
+            {
+                InputDropReason::AdminUnavailable
+            } else {
+                InputDropReason::InjectionFailed
+            });
             if let Some(suppressed) = self.failure_log.admit(Instant::now()) {
                 warn!(
                     operation,
@@ -3146,6 +3367,8 @@ impl InputSink {
                     "Windows input injection failed"
                 );
             }
+        } else {
+            self.note_input_flow(None);
         }
         let mut application = InputApplication::default();
         application.observe(expected, sent, error_code);
@@ -3164,12 +3387,14 @@ impl InputSink {
 
     fn clipboard_chunk(&mut self, chunk: ClipboardChunk) -> InputApplication {
         let Some(sync) = self.clipboard.as_mut() else {
+            self.note_packet_drop(InputDropReason::ClipboardDisabled);
             debug!("clipboard packet ignored: clipboard sync is disabled for this sink");
             return InputApplication::default();
         };
         let (text, paste) = match sync.assembly.push(chunk) {
             ClipboardProgress::Pending => return InputApplication::default(),
             ClipboardProgress::Rejected => {
+                self.note_packet_drop(InputDropReason::ClipboardRejected);
                 warn!("browser clipboard transfer rejected (out of order, oversized or not UTF-8)");
                 return InputApplication::default();
             }
@@ -3270,6 +3495,10 @@ impl InputSink {
     }
 
     fn mouse_abs(&mut self, x: u16, y: u16) -> InputApplication {
+        if !self.geometry_valid {
+            self.note_packet_drop(InputDropReason::MappingInvalid);
+            return InputApplication::default();
+        }
         let virtual_desktop = if self.secure_desktop {
             self.absolute_region
         } else {

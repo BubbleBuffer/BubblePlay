@@ -51,6 +51,7 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
     constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
   }
   const context = vm.createContext({ WebSocket: Socket, URL,
+    inputStatusReason: "admin-required", latestInputStatus: { failedPackets: 2 },
     terminalSignalingFailure: false, reconnectTimer: null, ws: null,
     signalingGeneration: 0, signalingRegistered: false,
     hudState: {}, hud: { classList: { add() {} } }, labRun: null,
@@ -62,8 +63,12 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
   vm.runInContext(fn + '\nreconnectSignaling("startup");', context);
   assert.equal(sockets.length, 1);
   assert.equal(timers.length, 0);
+  assert.equal(context.inputStatusReason, null);
+  assert.equal(context.latestInputStatus, null);
+  context.inputStatusReason = "admin-unavailable";
   sockets[0].readyState = 3;
   sockets[0].onclose({ code: 1006 });
+  assert.equal(context.inputStatusReason, null);
   assert.equal(sockets.length, 1);
   assert.equal(timers[0].delay, 250);
   timers[0].fn();
