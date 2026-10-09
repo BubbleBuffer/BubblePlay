@@ -535,6 +535,7 @@ fn composite_cursor(dc: HDC, region: Region) {
         let _ = unsafe { DeleteObject(icon.hbmMask.into()) };
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn run(
     session: u32,
     sid: &str,
@@ -736,8 +737,8 @@ fn run(
                             available,
                             epoch,
                         });
-                        if last_hash != Some(h) || sent.elapsed() >= Duration::from_secs(1) {
-                            if events
+                        if (last_hash != Some(h) || sent.elapsed() >= Duration::from_secs(1))
+                            && events
                                 .try_send(Event::Pixels {
                                     input_id: last_applied_input_id,
                                     region,
@@ -746,10 +747,9 @@ fn run(
                                     epoch,
                                 })
                                 .is_ok()
-                            {
-                                last_hash = Some(h);
-                                sent = Instant::now();
-                            }
+                        {
+                            last_hash = Some(h);
+                            sent = Instant::now();
                         }
                     }
                     Err(_) => {

@@ -106,7 +106,10 @@ enum ActiveDamageSubmission {
 
 enum ActiveDamageCollection<'a> {
     Ready(&'a [u32]),
+    // Only the tests build the non-ready collection outcomes.
+    #[cfg_attr(not(test), allow(dead_code))]
     Unavailable,
+    #[cfg_attr(not(test), allow(dead_code))]
     Failed,
 }
 
@@ -359,9 +362,12 @@ impl TemporalDiffAnalyzer {
         );
         let context =
             unsafe { device.GetImmediateContext() }.context("temporal-diff GetImmediateContext")?;
-        let shader = compile_shader(device, PCSTR(b"main\0".as_ptr()), "temporal-diff")?;
-        let active_shader =
-            compile_shader(device, PCSTR(b"active_main\0".as_ptr()), "active-tile-diff")?;
+        let shader = compile_shader(device, PCSTR(c"main".as_ptr().cast()), "temporal-diff")?;
+        let active_shader = compile_shader(
+            device,
+            PCSTR(c"active_main".as_ptr().cast()),
+            "active-tile-diff",
+        )?;
         let first = create_history_texture(device, width, height)?;
         let second = create_history_texture(device, width, height)?;
         let first_view = create_texture_view(device, &first)?;
@@ -489,7 +495,7 @@ impl TemporalDiffAnalyzer {
                 deferred_readback.max_pending_age_frames = Some(
                     deferred_readback
                         .max_pending_age_frames
-                        .map_or(0, |current| current.max(0)),
+                        .map_or(0, |current| current),
                 );
                 if deferred_readback.verdicts.is_empty() {
                     QuiescentValidationStatus::Pending
@@ -754,9 +760,8 @@ impl TemporalDiffAnalyzer {
     ) -> Result<(ActiveDamageSubmission, DeferredReadbackActivity)> {
         let requests = validation_requests
             .iter()
-            .cloned()
             .take(MAX_ACTIVE_TILES)
-            .filter(|request| {
+            .filter(|&request| {
                 let tile = request.source;
                 tile.left < tile.right
                     && tile.top < tile.bottom
@@ -765,6 +770,7 @@ impl TemporalDiffAnalyzer {
                     && tile.right.div_ceil(CTB_SIZE) - tile.left / CTB_SIZE <= 4
                     && tile.bottom.div_ceil(CTB_SIZE) - tile.top / CTB_SIZE <= 4
             })
+            .cloned()
             .collect::<Vec<_>>();
         let mut deferred = DeferredReadbackActivity::default();
         for slot in 0..self.active_readback_buffers.len() {
@@ -986,11 +992,11 @@ fn compile_shader(
         D3DCompile(
             TEMPORAL_DIFF_SHADER.as_ptr().cast::<c_void>(),
             TEMPORAL_DIFF_SHADER.len(),
-            PCSTR(b"bubbleplay-temporal-diff\0".as_ptr()),
+            PCSTR(c"bubbleplay-temporal-diff".as_ptr().cast()),
             None,
             None::<&ID3DInclude>,
             entry_point,
-            PCSTR(b"cs_5_0\0".as_ptr()),
+            PCSTR(c"cs_5_0".as_ptr().cast()),
             0,
             0,
             &mut bytecode,
@@ -1153,6 +1159,7 @@ fn active_tile_ctb_bounds(width: u32, height: u32, tiles: &[DamageRect]) -> Vec<
         .collect()
 }
 
+#[cfg(test)]
 fn active_damage_after_collection(
     tiles: &[DamageRect],
     collection: ActiveDamageCollection<'_>,

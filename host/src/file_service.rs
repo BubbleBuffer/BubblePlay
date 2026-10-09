@@ -2019,7 +2019,7 @@ mod tests {
         assert_eq!(first["items"][0]["name"], "a.txt");
         assert_eq!(first["items"][0]["size"], 3);
         // A new request replaces the offer; an empty one withdraws it.
-        write_spool_request(&dir, &[b.clone()]).unwrap();
+        write_spool_request(&dir, std::slice::from_ref(&b)).unwrap();
         poll_spool(&shared, &dir);
         publish_offer(&shared, "clipboard", Vec::new());
         let state = lock(&shared);

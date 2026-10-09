@@ -378,7 +378,7 @@ impl<B: AgentBackend> AgentCore<B> {
             session_generation: identity.session_generation,
             config_revision: identity.config_revision,
         };
-        let permit_is_new = self.last_permit_id.map_or(true, |last| {
+        let permit_is_new = self.last_permit_id.is_none_or(|last| {
             self.active_config
                 .is_some_and(|active| active.session_generation != identity.session_generation)
                 || wrapping_newer_u64(identity.permit_id, last)
@@ -504,10 +504,13 @@ impl<B: AgentBackend> AgentCore<B> {
         let desktop_available = self
             .desktop
             .is_some_and(|desktop| desktop != DesktopKind::Other);
-        if self.suspended && self.lease_active(now) && desktop_available && self.desktop_ready {
-            if self.backend.resume().is_ok() {
-                self.suspended = false;
-            }
+        if self.suspended
+            && self.lease_active(now)
+            && desktop_available
+            && self.desktop_ready
+            && self.backend.resume().is_ok()
+        {
+            self.suspended = false;
         }
     }
 

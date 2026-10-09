@@ -465,7 +465,7 @@ mod codec_policy_tests {
 
     #[test]
     fn persistent_resources_reuse_only_the_exact_registered_texture() {
-        let first = 1usize as *mut std::ffi::c_void;
+        let first = std::ptr::dangling_mut::<std::ffi::c_void>();
         let second = 2usize as *mut std::ffi::c_void;
         assert_eq!(
             resource_registration_action(ResourceMode::PerFrame, Some(first), first),
@@ -1197,6 +1197,7 @@ impl Nvenc {
             preset,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_preset_native(
         device: *mut c_void,
         width: u32,
@@ -1220,6 +1221,7 @@ impl Nvenc {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_preset_native_codec(
         device: *mut c_void,
         width: u32,
@@ -1244,6 +1246,7 @@ impl Nvenc {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_options_native_codec(
         device: *mut c_void,
         width: u32,
@@ -1834,7 +1837,7 @@ impl Nvenc {
         // after encode_picture returns).
         let mut lock: NV_ENC_LOCK_BITSTREAM = unsafe { zeroed() };
         lock.version = NV_ENC_LOCK_BITSTREAM_VER;
-        lock.outputBitstream = self.bitstream as *mut c_void;
+        lock.outputBitstream = self.bitstream;
         let lock_started = std::time::Instant::now();
         let st = unsafe { (ENCODE_API.lock_bitstream)(self.session, &mut lock) };
         let locked = st.result_without_string().context("NvEncLockBitstream");

@@ -137,7 +137,7 @@ impl ReconstructionFeedbackAnalyzer {
             "reconstruction feedback dimensions must be nonzero"
         );
         ensure!(
-            width % 2 == 0 && height % 2 == 0,
+            width.is_multiple_of(2) && height.is_multiple_of(2),
             "NV12 reconstruction dimensions must be even"
         );
         let columns = width.div_ceil(CTB_SIZE);
@@ -396,11 +396,11 @@ fn compile_shader(device: &ID3D11Device) -> Result<ID3D11ComputeShader> {
         D3DCompile(
             RECONSTRUCTION_ERROR_SHADER.as_ptr().cast::<c_void>(),
             RECONSTRUCTION_ERROR_SHADER.len(),
-            PCSTR(b"bubbleplay-reconstruction-feedback\0".as_ptr()),
+            PCSTR(c"bubbleplay-reconstruction-feedback".as_ptr().cast()),
             None,
             None::<&ID3DInclude>,
-            PCSTR(b"main\0".as_ptr()),
-            PCSTR(b"cs_5_0\0".as_ptr()),
+            PCSTR(c"main".as_ptr().cast()),
+            PCSTR(c"cs_5_0".as_ptr().cast()),
             0,
             0,
             &mut bytecode,

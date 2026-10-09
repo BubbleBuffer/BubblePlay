@@ -298,9 +298,9 @@ fn launch_user_process(path: &Path, session_id: u32, generation: u32) -> Result<
     })
 }
 
-fn spawn_response_reader(
-    stdout: File,
-) -> Result<(Receiver<io::Result<(u64, Response)>>, JoinHandle<()>)> {
+type ResponseReader = (Receiver<io::Result<(u64, Response)>>, JoinHandle<()>);
+
+fn spawn_response_reader(stdout: File) -> Result<ResponseReader> {
     let (sender, receiver) = mpsc::sync_channel(8);
     let join = thread::Builder::new()
         .name("bubbleplay-input-proxy-reader".into())
@@ -351,14 +351,14 @@ fn sibling_proxy_path(agent_path: &Path) -> PathBuf {
 }
 
 fn anonymous_pipe() -> Result<(OwnedHandle, OwnedHandle)> {
-    let mut attributes = SECURITY_ATTRIBUTES {
+    let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
         bInheritHandle: true.into(),
     };
     let mut read = HANDLE::default();
     let mut write = HANDLE::default();
-    unsafe { CreatePipe(&mut read, &mut write, Some(&mut attributes), 64 * 1024) }
+    unsafe { CreatePipe(&mut read, &mut write, Some(&attributes), 64 * 1024) }
         .context("create private input proxy pipe")?;
     Ok((OwnedHandle::new(read)?, OwnedHandle::new(write)?))
 }

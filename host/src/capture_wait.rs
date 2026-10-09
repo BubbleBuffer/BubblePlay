@@ -24,6 +24,241 @@ use crate::activity::Activity;
 
 const ACQUIRE_TIMEOUT_MS: u32 = 100;
 
+/// A notification-only observer survives cursor-hook parking. It never
+/// acquires a DDA frame, samples pixels, or polls a healthy output.
+pub struct CaptureInvalidation {
+    state: Arc<InvalidationState>,
+    thread_id: u32,
+    #[cfg(test)]
+    window: usize,
+    thread: Option<JoinHandle<()>>,
+}
+
+struct InvalidationState {
+    invalidated: AtomicBool,
+    display_state: std::sync::atomic::AtomicU32,
+    activity: Mutex<Activity>,
+}
+
+impl InvalidationState {
+    fn notify(&self) {
+        if !self.invalidated.swap(true, Ordering::AcqRel) {
+            self.activity.lock().unwrap().notify();
+        }
+    }
+
+    fn record_display_state(&self, display_state: u32) {
+        let previous = self.display_state.swap(display_state, Ordering::AcqRel);
+        // The initial ON notification and ON-to-dim transitions do not
+        // invalidate duplication. Sleep and wake must invalidate it.
+        if previous != display_state && (previous == 0 || display_state == 0) {
+            self.notify();
+        }
+    }
+}
+
+thread_local! {
+    static INVALIDATION_STATE: std::cell::RefCell<Option<Arc<InvalidationState>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+// Keep the existing windows feature set. These user32 exports accept a
+// window recipient; their C signatures match the Power module projections.
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn RegisterPowerSettingNotification(
+        recipient: windows::Win32::Foundation::HANDLE,
+        setting: *const windows::core::GUID,
+        flags: u32,
+    ) -> windows::Win32::Foundation::HANDLE;
+    fn UnregisterPowerSettingNotification(registration: windows::Win32::Foundation::HANDLE) -> i32;
+}
+
+#[repr(C)]
+struct DisplayPowerSettingHeader {
+    setting: windows::core::GUID,
+    data_length: u32,
+}
+
+unsafe extern "system" fn invalidation_window(
+    window: windows::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    INVALIDATION_STATE.with(|state| {
+        let state = state.borrow();
+        let Some(state) = state.as_ref() else { return };
+        if message == WM_DISPLAYCHANGE {
+            state.notify();
+        } else if message == WM_POWERBROADCAST {
+            if wparam.0 == PBT_POWERSETTINGCHANGE as usize && lparam.0 != 0 {
+                let payload = lparam.0 as *const u8;
+                let setting = payload.cast::<DisplayPowerSettingHeader>().read_unaligned();
+                if setting.setting
+                    == windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE
+                    && setting.data_length == std::mem::size_of::<u32>() as u32
+                {
+                    let display_state = payload
+                        .add(std::mem::size_of::<DisplayPowerSettingHeader>())
+                        .cast::<u32>()
+                        .read_unaligned();
+                    state.record_display_state(display_state);
+                }
+            } else if matches!(
+                wparam.0 as u32,
+                PBT_APMSUSPEND | PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND
+            ) {
+                state.notify();
+            }
+        }
+    });
+    DefWindowProcW(window, message, wparam, lparam)
+}
+
+unsafe extern "system" fn invalidation_desktop(
+    _: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _: u32,
+    _: windows::Win32::Foundation::HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    INVALIDATION_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.notify();
+        }
+    });
+}
+
+impl CaptureInvalidation {
+    pub fn new(activity: Activity) -> io::Result<Self> {
+        use windows::core::w;
+        use windows::Win32::Foundation::{GetLastError, HINSTANCE};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let state = Arc::new(InvalidationState {
+            invalidated: AtomicBool::new(false),
+            display_state: std::sync::atomic::AtomicU32::new(u32::MAX),
+            activity: Mutex::new(activity),
+        });
+        let worker = state.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = thread::Builder::new().name("capture-invalidation".into()).spawn(move || unsafe {
+            INVALIDATION_STATE.with(|state| *state.borrow_mut() = Some(worker));
+            let setup = (|| -> windows::core::Result<_> {
+                let module = GetModuleHandleW(None)?;
+                let instance = HINSTANCE(module.0);
+                let class = w!("BubblePlayCaptureInvalidation");
+                let definition = WNDCLASSW {
+                    lpfnWndProc: Some(invalidation_window),
+                    hInstance: instance,
+                    lpszClassName: class,
+                    ..Default::default()
+                };
+                if RegisterClassW(&definition) == 0 && GetLastError().0 != 1410 {
+                    return Err(windows::core::Error::from_thread());
+                }
+                // Broadcast display/power messages require a top-level
+                // window; message-only HWNDs do not receive them. No SHOW
+                // style is used, so this window never appears to the user.
+                let window = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(), class, w!(""), WINDOW_STYLE::default(),
+                    0, 0, 0, 0, None, None, Some(instance), None,
+                )?;
+                let hook = SetWinEventHook(
+                    EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH, None,
+                    Some(invalidation_desktop), 0, 0, WINEVENT_OUTOFCONTEXT,
+                );
+                if hook.is_invalid() {
+                    let error = windows::core::Error::from_thread();
+                    let _ = DestroyWindow(window);
+                    return Err(error);
+                }
+                let power = RegisterPowerSettingNotification(
+                    windows::Win32::Foundation::HANDLE(window.0),
+                    &windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE, 0,
+                );
+                if power.is_invalid() {
+                    tracing::warn!("display power notifications unavailable; display/desktop notifications remain active");
+                }
+                Ok((window, hook, power))
+            })();
+            let (window, hook, power) = match setup {
+                Ok(resources) => resources,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let _ = ready_tx.send(Ok((GetCurrentThreadId(), window.0 as usize)));
+            let mut message = MSG::default();
+            while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            if !power.is_invalid() {
+                let _ = UnregisterPowerSettingNotification(power);
+            }
+            let _ = UnhookWinEvent(hook);
+            let _ = DestroyWindow(window);
+        })?;
+        let (thread_id, _window) = match ready_rx.recv() {
+            Ok(Ok(identity)) => identity,
+            other => {
+                let _ = thread.join();
+                return Err(io::Error::other(format!(
+                    "capture notification startup: {other:?}"
+                )));
+            }
+        };
+        Ok(Self {
+            state,
+            thread_id,
+            #[cfg(test)]
+            window: _window,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn take(&self) -> bool {
+        self.state.invalidated.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn set_activity(&self, activity: Activity) {
+        let mut notifier = self.state.activity.lock().unwrap();
+        *notifier = activity;
+        if self.state.invalidated.load(Ordering::Acquire) {
+            notifier.notify();
+        }
+    }
+
+    pub fn display_is_off(&self) -> bool {
+        self.state.display_state.load(Ordering::Acquire) == 0
+    }
+}
+
+impl Drop for CaptureInvalidation {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                    self.thread_id,
+                    windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                    windows::Win32::Foundation::WPARAM::default(),
+                    windows::Win32::Foundation::LPARAM::default(),
+                );
+            }
+            let _ = thread.join();
+        }
+    }
+}
+
 trait Backend: Send + 'static {
     type Frame: Send;
     fn acquire(&mut self) -> Result<Option<Self::Frame>, CaptureError>;
@@ -459,6 +694,76 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn hidden_notification_window_wakes_owner_and_shuts_down() {
+        let activity = Activity::new().unwrap();
+        let observer = CaptureInvalidation::new(activity.clone()).unwrap();
+        observer.take();
+        let short_setting = DisplayPowerSettingHeader {
+            setting: windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE,
+            data_length: 0,
+        };
+        unsafe {
+            // An unrelated/short notification has only the header. The
+            // handler must not read a display-state DWORD beyond it.
+            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                windows::Win32::Foundation::HWND(observer.window as *mut _),
+                windows::Win32::UI::WindowsAndMessaging::WM_POWERBROADCAST,
+                Some(windows::Win32::Foundation::WPARAM(
+                    windows::Win32::UI::WindowsAndMessaging::PBT_POWERSETTINGCHANGE as usize,
+                )),
+                Some(windows::Win32::Foundation::LPARAM(
+                    &short_setting as *const _ as isize,
+                )),
+            );
+            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                windows::Win32::Foundation::HWND(observer.window as *mut _),
+                windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE,
+                None,
+                None,
+            );
+        }
+        assert!(observer.take());
+        assert!(!observer.take());
+        activity.wait(Duration::ZERO, &[]).unwrap();
+        drop(observer);
+    }
+
+    #[test]
+    fn display_power_notifications_coalesce_sleep_and_wake_without_polling() {
+        let state = InvalidationState {
+            invalidated: AtomicBool::new(false),
+            display_state: std::sync::atomic::AtomicU32::new(u32::MAX),
+            activity: Mutex::new(Activity::new().unwrap()),
+        };
+        state.record_display_state(1);
+        state.record_display_state(2);
+        assert!(!state.invalidated.load(Ordering::Acquire));
+        state.record_display_state(0);
+        state.record_display_state(0);
+        assert!(state.invalidated.swap(false, Ordering::AcqRel));
+        assert!(!state.invalidated.swap(false, Ordering::AcqRel));
+        state.record_display_state(1);
+        assert!(state.invalidated.swap(false, Ordering::AcqRel));
+    }
+
+    #[test]
+    fn parked_waiter_preserves_release_errors_without_new_acquisition() {
+        let mut h = Harness::new();
+        h.frames.send(1).unwrap();
+        h.waiter.request_frame();
+        drop(h.frame());
+        h.fail_release.store(true, Ordering::SeqCst);
+        h.waiter.set_enabled(false);
+        h.activity.wait(Duration::from_secs(2), &[]).unwrap();
+        assert!(matches!(h.waiter.poll(), Err(CaptureError::AccessLost)));
+        h.waiter.request_frame();
+        h.activity.wait(Duration::from_millis(120), &[]).unwrap();
+        assert_eq!(h.acquires.load(Ordering::SeqCst), 1);
+        assert_eq!(h.releases.load(Ordering::SeqCst), 1);
+        h.waiter.stop().unwrap();
+    }
 
     struct MockBackend {
         frames: Receiver<u32>,

@@ -518,6 +518,7 @@ pub(super) fn same_viewport_geometry(left: ViewportCrop, right: ViewportCrop) ->
         && left.height == right.height
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn viewport_from_q16(
     revision: u32,
     enabled: bool,

@@ -583,6 +583,7 @@ fn drain_outputs(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transport_loop(
     socket: UdpSocket,
     host_addr: Option<SocketAddr>,

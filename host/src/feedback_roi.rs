@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(plan.reason, FeedbackPlanReason::Applied);
         assert_eq!(plan.funded_ctbs, 0);
         let map = plan.map.expect("headroom QP map");
-        assert!(map.values.iter().any(|delta| *delta == -5));
+        assert!(map.values.contains(&-5));
         assert!(map.values.iter().all(|delta| *delta <= 0));
     }
 

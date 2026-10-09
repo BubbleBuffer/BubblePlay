@@ -226,6 +226,7 @@ impl Scaler {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_target(
         device: &ID3D11Device,
         video_device: &ID3D11VideoDevice,
@@ -450,6 +451,7 @@ impl Scaler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn blit(
         device: &ID3D11Device,
         video_device: &ID3D11VideoDevice,
@@ -495,9 +497,11 @@ impl Scaler {
                 Some(&source),
             );
         }
-        let mut stream = D3D11_VIDEO_PROCESSOR_STREAM::default();
-        stream.Enable = true.into();
-        stream.pInputSurface = ManuallyDrop::new(Some(input_view));
+        let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: true.into(),
+            pInputSurface: ManuallyDrop::new(Some(input_view)),
+            ..Default::default()
+        };
         let blt = unsafe {
             video_context.VideoProcessorBlt(
                 &target.processor,
@@ -509,7 +513,7 @@ impl Scaler {
         unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
         blt.map_err(|e| win("VideoProcessorBlt", e))?;
         Ok(ScaleOutput {
-            texture: target.texture.as_raw() as *mut c_void,
+            texture: target.texture.as_raw(),
             scale_us: started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             width,
             height,

@@ -44,8 +44,7 @@ use windows_service::service_control_handler::{
     self, ServiceControlHandlerResult, ServiceStatusHandle,
 };
 
-#[path = "vdd.rs"]
-mod vdd;
+use crate::vdd;
 
 pub const START_WAIT_HINT: Duration = Duration::from_secs(10);
 const STOP_WAIT_HINT: Duration = Duration::from_secs(5);
@@ -98,6 +97,12 @@ pub struct RuntimeDecision {
 #[derive(Debug)]
 pub struct ServiceLifecycle {
     phase: ServicePhase,
+}
+
+impl Default for ServiceLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ServiceLifecycle {
@@ -748,10 +753,10 @@ fn bubbleplay_data_dir() -> PathBuf {
 fn open_supervised_log(component: &str, stream: &str) -> Result<File> {
     let path = supervised_log_path_in(&bubbleplay_data_dir(), component, stream);
     let directory = path.parent().context("supervised log has no parent")?;
-    validate_protected_path(&directory)?;
-    fs::create_dir_all(&directory)
+    validate_protected_path(directory)?;
+    fs::create_dir_all(directory)
         .with_context(|| format!("creating protected log directory {}", directory.display()))?;
-    validate_protected_path(&directory)?;
+    validate_protected_path(directory)?;
     validate_protected_path(&path)?;
     let previous = directory.join(format!("{component}.{stream}.previous.log"));
     validate_protected_path(&previous)?;
@@ -1027,7 +1032,7 @@ fn validate_protected_path(path: &Path) -> Result<()> {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         bail!("DPAPI ciphertext has an odd hexadecimal length");
     }
     value

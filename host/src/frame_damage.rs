@@ -92,12 +92,10 @@ pub fn analyze_hevc_qp_delta_map(
             (u64::from(left - crop.left) * u64::from(output_width) / u64::from(crop_width)) as u32;
         let output_top =
             (u64::from(top - crop.top) * u64::from(output_height) / u64::from(crop_height)) as u32;
-        let output_right =
-            ((u64::from(right - crop.left) * u64::from(output_width) + u64::from(crop_width) - 1)
-                / u64::from(crop_width)) as u32;
-        let output_bottom =
-            ((u64::from(bottom - crop.top) * u64::from(output_height) + u64::from(crop_height) - 1)
-                / u64::from(crop_height)) as u32;
+        let output_right = (u64::from(right - crop.left) * u64::from(output_width))
+            .div_ceil(u64::from(crop_width)) as u32;
+        let output_bottom = (u64::from(bottom - crop.top) * u64::from(output_height))
+            .div_ceil(u64::from(crop_height)) as u32;
         for row in output_top / CTB..output_bottom.div_ceil(CTB).min(rows) {
             for column in output_left / CTB..output_right.div_ceil(CTB).min(columns) {
                 changed[(row * columns + column) as usize] = true;

@@ -289,12 +289,10 @@ impl Controller {
         None
     }
     pub fn tick(&mut self, now: Instant) -> Option<Decision> {
-        let Some(bwe) = self.filtered else {
-            return None;
-        };
+        let bwe = self.filtered?;
         let qos_missing = self
             .last_qos
-            .map_or(true, |at| now.duration_since(at) > Duration::from_secs(3));
+            .is_none_or(|at| now.duration_since(at) > Duration::from_secs(3));
         let threshold = match self.profile {
             Profile::Mobile => 1_200_000.0,
             Profile::Low => 2_200_000.0,
@@ -302,7 +300,7 @@ impl Controller {
             Profile::Full => f64::INFINITY,
         };
         if !qos_missing
-            && self.upgrade_blocked_until.map_or(true, |at| now >= at)
+            && self.upgrade_blocked_until.is_none_or(|at| now >= at)
             && match self.profile {
                 Profile::Mobile => self.cap >= 500_000,
                 Profile::Low => self.cap >= 1_000_000,
@@ -346,7 +344,7 @@ impl Controller {
         }
         if self
             .last_up
-            .map_or(false, |at| now.duration_since(at) < Duration::from_secs(1))
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
         {
             return None;
         }

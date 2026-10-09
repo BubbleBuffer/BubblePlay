@@ -201,6 +201,7 @@ fn interactive_desktop_available() -> bool {
 /// A UI must return only after its window has closed. Cancellation is polled
 /// by the UI thread; the signaling loop never waits for user input.
 pub trait ApprovalUi {
+    #[allow(clippy::result_unit_err)]
     fn start(
         &mut self,
         request: ApprovalRequest,

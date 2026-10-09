@@ -45,7 +45,7 @@ use windows_capture::encoder::{ImageEncoder, ImageEncoderPixelFormat, ImageForma
 use windows_capture::monitor::Monitor;
 
 use crate::activity::Activity;
-use crate::capture_wait::{DdaWaiter, RawDesktopFrame};
+use crate::capture_wait::{CaptureInvalidation, DdaWaiter, RawDesktopFrame};
 use crate::frame_damage::DamageRect;
 use crate::input::DesktopRegion;
 
@@ -69,11 +69,13 @@ pub struct Capture {
     /// Backoff deadline for a failed AccessLost recreation. Keeping this as
     /// state avoids sleeping inside `acquire()` and starving the RTC pump.
     next_recreate_attempt: Instant,
-    /// A recreated duplication is not healthy until it yields a real frame.
+    /// A replacement stays unavailable until a real frame or an authorized
+    /// GDI snapshot verifies that the normal desktop can be captured.
     awaiting_recovery_frame: bool,
     /// If a replacement immediately loses access, discard the complete
     /// D3D11/duplication session on the next attempt.
     fresh_recreate_required: bool,
+    recreate_failed: bool,
     /// Retained for AccessLost recreation. `None` = primary monitor.
     monitor_filter: Option<String>,
     /// The selected output's DeviceName used by the GDI idle snapshot.
@@ -84,6 +86,7 @@ pub struct Capture {
     desktop_check: DesktopCheck,
     event_activity: Option<Activity>,
     waiter: Option<DdaWaiter>,
+    invalidation: Option<CaptureInvalidation>,
     availability: CaptureAvailability,
     availability_transition: Option<CaptureAvailability>,
 }
@@ -139,6 +142,7 @@ pub struct MonitorInfo {
 
 const IDLE_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(250);
 pub const CAPTURE_RECOVERY_INTERVAL: Duration = Duration::from_millis(500);
+const PARKED_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const DESKTOP_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Empty producer polls use this bounded housekeeping deadline. Real-frame
@@ -194,6 +198,19 @@ pub fn capture_error_is_unavailable(error: &CaptureError) -> bool {
 
 fn idle_snapshot_retry_due(now: Instant, retry_at: Instant) -> bool {
     now >= retry_at
+}
+
+fn recovery_attempt_due(pending: bool, now: Instant, retry_at: Instant) -> bool {
+    pending && now >= retry_at
+}
+
+fn snapshot_can_verify_recovery(
+    pending_recreate: bool,
+    awaiting_recovery_frame: bool,
+    recreate_failed: bool,
+    has_api: bool,
+) -> bool {
+    !pending_recreate && awaiting_recovery_frame && !recreate_failed && has_api
 }
 
 fn supports_idle_snapshot_rotation(rotation: DXGI_MODE_ROTATION) -> bool {
@@ -328,6 +345,7 @@ pub enum CapturedFrame<'a> {
         texture: ID3D11Texture2D,
         width: u32,
         height: u32,
+        region: DesktopRegion,
     },
     SecureSnapshot {
         device: &'a ID3D11Device,
@@ -342,7 +360,7 @@ impl CapturedFrame<'_> {
     /// geometry changed during recreation before this frame was acquired.
     pub fn desktop_region(&self) -> Option<DesktopRegion> {
         match self {
-            Self::Desktop { region, .. } => Some(*region),
+            Self::Desktop { region, .. } | Self::IdleSnapshot { region, .. } => Some(*region),
             _ => None,
         }
     }
@@ -1189,6 +1207,7 @@ impl Capture {
                 },
             awaiting_recovery_frame: false,
             fresh_recreate_required: false,
+            recreate_failed: unavailable,
             // Pin the selected physical output; "primary" may resolve to a
             // different monitor after a desktop/topology transition.
             monitor_filter: Some(dev.clone()),
@@ -1199,6 +1218,7 @@ impl Capture {
             desktop_check: DesktopCheck::new(Instant::now()),
             event_activity: None,
             waiter: None,
+            invalidation: None,
             availability: if unavailable {
                 CaptureAvailability::Unavailable
             } else {
@@ -1256,6 +1276,7 @@ impl Capture {
             self.next_recreate_attempt = Instant::now();
             self.awaiting_recovery_frame = false;
             self.fresh_recreate_required = false;
+            self.recreate_failed = false;
             self.availability = CaptureAvailability::Active;
             info!(
                 width = self.width,
@@ -1286,6 +1307,7 @@ impl Capture {
         self.next_recreate_attempt = Instant::now();
         self.awaiting_recovery_frame = false;
         self.fresh_recreate_required = false;
+        self.recreate_failed = false;
         self.idle_snapshot = IdleSnapshotState::new(Instant::now());
         self.idle_gdi = None;
         self.desktop_check = DesktopCheck::new(Instant::now());
@@ -1307,6 +1329,108 @@ impl Capture {
         self.availability
     }
 
+    /// A short join grace may hide a transient loss, but never a failed
+    /// recreation. This is a recovery hint, not authorization for pixels.
+    pub fn can_recover_for_join(&self) -> bool {
+        !self
+            .invalidation
+            .as_ref()
+            .is_some_and(CaptureInvalidation::display_is_off)
+            && (self.availability == CaptureAvailability::Active
+                || (!self.recreate_failed
+                    && (self.pending_recreate || self.awaiting_recovery_frame)))
+    }
+
+    /// Healthy parked capture has no maintenance timer. Windows display,
+    /// power and desktop notifications wake its owner when invalidated.
+    pub fn parked_maintenance_deadline(&self) -> Option<Instant> {
+        self.pending_recreate.then_some(self.next_recreate_attempt)
+    }
+
+    /// Recover a known lost duplication without requesting desktop frames.
+    /// A replacement remains unavailable until an authorized frame or GDI
+    /// snapshot verifies it on viewer join.
+    pub fn maintain_parked(&mut self, now: Instant) -> Result<()> {
+        self.set_capture_demand(false);
+        if let Some(waiter) = self.waiter.as_ref() {
+            match waiter.poll() {
+                Ok(frame) => drop(frame),
+                Err(error) if capture_error_is_unavailable(&error) => {
+                    self.mark_unavailable();
+                    self.next_recreate_attempt = now;
+                }
+                Err(error) => return Err(anyhow::anyhow!("parked capture waiter: {error:?}")),
+            }
+        }
+        self.consume_invalidation(now);
+        if !recovery_attempt_due(self.pending_recreate, now, self.next_recreate_attempt) {
+            return Ok(());
+        }
+        // Never open duplication on a secure desktop, even if the event was
+        // queued on Default or the source's cached desktop state is stale.
+        if !self.desktop_check.refresh(true)
+            || self
+                .invalidation
+                .as_ref()
+                .is_some_and(CaptureInvalidation::display_is_off)
+        {
+            self.next_recreate_attempt = now + PARKED_RECOVERY_INTERVAL;
+            return Ok(());
+        }
+        self.attempt_recovery(now, PARKED_RECOVERY_INTERVAL);
+        Ok(())
+    }
+
+    fn consume_invalidation(&mut self, now: Instant) {
+        if self
+            .invalidation
+            .as_ref()
+            .is_some_and(CaptureInvalidation::take)
+        {
+            self.mark_unavailable();
+            self.next_recreate_attempt = now;
+            self.fresh_recreate_required = true;
+            self.awaiting_recovery_frame = false;
+            self.idle_gdi = None;
+        }
+    }
+
+    fn attempt_recovery(&mut self, now: Instant, retry_delay: Duration) -> bool {
+        if !recovery_attempt_due(self.pending_recreate, now, self.next_recreate_attempt) {
+            return !self.pending_recreate;
+        }
+        if self
+            .invalidation
+            .as_ref()
+            .is_some_and(CaptureInvalidation::display_is_off)
+        {
+            self.next_recreate_attempt = now + retry_delay;
+            return false;
+        }
+        match self.recreate(self.fresh_recreate_required) {
+            Ok(()) => {
+                self.pending_recreate = false;
+                self.awaiting_recovery_frame = true;
+                self.fresh_recreate_required = false;
+                self.recreate_failed = false;
+                self.availability =
+                    availability_after(self.availability, CaptureRecoveryEvent::SessionRecreated);
+                true
+            }
+            Err(error) => {
+                self.next_recreate_attempt = now + retry_delay;
+                self.fresh_recreate_required = true;
+                self.recreate_failed = true;
+                debug!(
+                    ?error,
+                    retry_ms = retry_delay.as_millis(),
+                    "DDA recreate still unavailable"
+                );
+                false
+            }
+        }
+    }
+
     /// The helper observed Winlogon before DDA reported its own access loss.
     /// Keep the selected output/device, but never reuse its desktop pixels.
     pub fn suspend_for_secure_desktop(&mut self) {
@@ -1322,6 +1446,9 @@ impl Capture {
     }
 
     fn mark_unavailable(&mut self) {
+        if self.availability != CaptureAvailability::Unavailable {
+            self.recreate_failed = false;
+        }
         self.pending_recreate = true;
         self.next_recreate_attempt = Instant::now() + CAPTURE_RECOVERY_INTERVAL;
         self.availability = CaptureAvailability::Unavailable;
@@ -1331,6 +1458,14 @@ impl Capture {
     /// Enable before the first acquisition so this serve instance can poll
     /// completed frames without blocking signaling or input processing.
     pub fn enable_event_capture(&mut self, activity: Activity) {
+        if let Some(invalidation) = self.invalidation.as_ref() {
+            invalidation.set_activity(activity.clone());
+        } else {
+            match CaptureInvalidation::new(activity.clone()) {
+                Ok(invalidation) => self.invalidation = Some(invalidation),
+                Err(error) => warn!(%error, "capture display/power notifications unavailable"),
+            }
+        }
         self.event_activity = Some(activity);
     }
 
@@ -1391,6 +1526,7 @@ impl Capture {
         timeout: Duration,
     ) -> Result<Option<(CapturedFrame<'a>, bool, bool)>> {
         let now = Instant::now();
+        self.consume_invalidation(now);
         let recovery_check = self.event_activity.is_none()
             || self.awaiting_recovery_frame
             || (self.pending_recreate && now >= self.next_recreate_attempt);
@@ -1402,37 +1538,8 @@ impl Capture {
             return Ok(None);
         }
         // Deferred recovery from a previous AccessLost (see field doc).
-        if self.pending_recreate {
-            if Instant::now() < self.next_recreate_attempt {
-                return Ok(None);
-            }
-            match self.recreate(self.fresh_recreate_required) {
-                Ok(()) => {
-                    self.pending_recreate = false;
-                    self.awaiting_recovery_frame = true;
-                    self.fresh_recreate_required = false;
-                    self.availability = availability_after(
-                        self.availability,
-                        CaptureRecoveryEvent::SessionRecreated,
-                    );
-                }
-                Err(e) => {
-                    // Recreation can legitimately fail for a while: a UAC
-                    // secure-desktop switch or a locked screen invalidates the
-                    // session AND denies new ones until the desktop is back.
-                    // Never kill or block the stream over this — the RTC loop
-                    // keeps pumping while we wait for the next retry deadline.
-                    let delay = CAPTURE_RECOVERY_INTERVAL;
-                    self.next_recreate_attempt = Instant::now() + delay;
-                    self.fresh_recreate_required = true;
-                    debug!(
-                        ?e,
-                        retry_ms = delay.as_millis(),
-                        "DDA recreate still unavailable"
-                    );
-                    return Ok(None);
-                }
-            }
+        if self.pending_recreate && !self.attempt_recovery(now, CAPTURE_RECOVERY_INTERVAL) {
+            return Ok(None);
         }
         // Never sleep across the next desktop-switch check deadline.
         let timeout = timeout.min(
@@ -1471,8 +1578,11 @@ impl Capture {
                 // Disjoint field write; `self.api` is borrowed for 'a by the
                 // (absent) Ok frame, so no `&mut self` calls here.
                 self.pending_recreate = true;
-                let delay = CAPTURE_RECOVERY_INTERVAL;
-                self.next_recreate_attempt = Instant::now() + delay;
+                // The first join acquisition can discover a loss that was
+                // silent while parked. Try its replacement on the next poll,
+                // rather than adding the normal failed-retry backoff.
+                self.next_recreate_attempt = Instant::now();
+                self.recreate_failed = self.awaiting_recovery_frame;
                 if self.awaiting_recovery_frame {
                     self.fresh_recreate_required = true;
                 }
@@ -1538,7 +1648,9 @@ impl Capture {
                 availability_after(self.availability, CaptureRecoveryEvent::FrameAcquired);
             self.awaiting_recovery_frame = false;
             self.fresh_recreate_required = false;
+            self.recreate_failed = false;
             info!("DDA capture produced a verified recovery frame");
+            self.availability_transition = None;
         }
 
         self.damage_metadata.reset();
@@ -1557,13 +1669,34 @@ impl Capture {
     /// DDA has not produced an initial desktop texture. Failure is nonfatal
     /// and retried after a short backoff.
     pub fn take_idle_snapshot_frame(&mut self) -> Option<CapturedFrame<'_>> {
-        // A snapshot cannot prove DDA recovery and must never expose pixels
-        // while the normal desktop source is unavailable.
-        if self.availability == CaptureAvailability::Unavailable {
+        self.take_idle_snapshot_frame_with_recovery()
+            .map(|(frame, _)| frame)
+    }
+
+    /// A successfully recreated session may verify its recovery with an
+    /// immediate GDI snapshot, even when the static desktop never presents.
+    /// Failed recreation and secure desktops still cannot supply snapshots.
+    pub fn take_idle_snapshot_frame_with_recovery(&mut self) -> Option<(CapturedFrame<'_>, bool)> {
+        let now = Instant::now();
+        self.consume_invalidation(now);
+        if self.availability == CaptureAvailability::Unavailable
+            && !snapshot_can_verify_recovery(
+                self.pending_recreate,
+                self.awaiting_recovery_frame,
+                self.recreate_failed,
+                self.api.is_some(),
+            )
+        {
             return None;
         }
-        let now = Instant::now();
         if !self.idle_snapshot.is_due(now) {
+            return None;
+        }
+        if self
+            .invalidation
+            .as_ref()
+            .is_some_and(CaptureInvalidation::display_is_off)
+        {
             return None;
         }
         if !self.desktop_check.refresh(true) {
@@ -1572,6 +1705,15 @@ impl Capture {
         }
         match self.capture_idle_snapshot() {
             Ok(texture) => {
+                if self
+                    .invalidation
+                    .as_ref()
+                    .is_some_and(CaptureInvalidation::display_is_off)
+                {
+                    drop(texture);
+                    self.consume_invalidation(now);
+                    return None;
+                }
                 if !self.desktop_check.refresh(true) {
                     drop(texture);
                     self.suspend_for_secure_desktop();
@@ -1579,20 +1721,44 @@ impl Capture {
                     return None;
                 }
                 self.idle_snapshot.on_snapshot_copied(now);
+                let recovered = self.availability == CaptureAvailability::Unavailable;
+                if recovered {
+                    self.availability = CaptureAvailability::Active;
+                    self.awaiting_recovery_frame = false;
+                    self.fresh_recreate_required = false;
+                    self.recreate_failed = false;
+                    self.availability_transition = None;
+                    info!("normal capture produced an authorized GDI recovery snapshot");
+                }
                 debug!(
                     width = self.width,
                     height = self.height,
                     monitor = %self.monitor_device_name,
                     "captured idle-desktop snapshot frame"
                 );
-                Some(CapturedFrame::IdleSnapshot {
-                    device: self.api.as_ref().expect("DDA session present").device(),
-                    texture,
-                    width: self.width,
-                    height: self.height,
-                })
+                Some((
+                    CapturedFrame::IdleSnapshot {
+                        device: self.api.as_ref().expect("DDA session present").device(),
+                        texture,
+                        width: self.width,
+                        height: self.height,
+                        region: DesktopRegion::new(
+                            self.origin_x,
+                            self.origin_y,
+                            self.width,
+                            self.height,
+                        ),
+                    },
+                    recovered,
+                ))
             }
             Err(e) => {
+                if self.awaiting_recovery_frame {
+                    self.recreate_failed = true;
+                    self.pending_recreate = true;
+                    self.fresh_recreate_required = true;
+                    self.next_recreate_attempt = now + CAPTURE_RECOVERY_INTERVAL;
+                }
                 self.idle_snapshot.on_snapshot_failed(now);
                 warn!(
                     ?e,
@@ -1664,7 +1830,20 @@ impl Capture {
     }
 
     fn recreate(&mut self, force_fresh: bool) -> Result<()> {
-        self.stop_waiter()?;
+        if let Err(error) = self.stop_waiter() {
+            // A release can discover the same invalidation after the owner's
+            // last poll. The joined waiter has dropped its duplication refs;
+            // access loss is expected here and must not defer replacement.
+            // Live-frame ownership, panics and IO failures still abort it.
+            if error
+                .downcast_ref::<CaptureError>()
+                .is_some_and(capture_error_is_unavailable)
+            {
+                debug!(%error, "lost duplication reported during waiter shutdown");
+            } else {
+                return Err(error);
+            }
+        }
         self.idle_gdi = None;
         self.desktop_check = DesktopCheck::new(Instant::now());
         // The crate's recovery API drops IDXGIOutputDuplication before asking
@@ -2006,11 +2185,9 @@ mod tests {
         assert_eq!(super::CAPTURE_RECOVERY_INTERVAL, Duration::from_millis(500));
     }
 
-    #[test]
-    fn unavailable_capture_refuses_monitor_switch_and_retains_recovery_output() {
-        let now = Instant::now();
+    fn capture_without_native_session(now: Instant) -> super::Capture {
         let selected = r"\\.\DISPLAY6";
-        let mut capture = super::Capture {
+        super::Capture {
             api: None,
             width: 1920,
             height: 1080,
@@ -2024,6 +2201,7 @@ mod tests {
             next_recreate_attempt: now + Duration::from_secs(30),
             awaiting_recovery_frame: false,
             fresh_recreate_required: false,
+            recreate_failed: false,
             monitor_filter: Some(selected.into()),
             monitor_device_name: selected.into(),
             idle_snapshot: IdleSnapshotState::new(now),
@@ -2032,9 +2210,17 @@ mod tests {
             desktop_check: super::DesktopCheck::new(now),
             event_activity: None,
             waiter: None,
+            invalidation: None,
             availability: CaptureAvailability::Unavailable,
             availability_transition: None,
-        };
+        }
+    }
+
+    #[test]
+    fn unavailable_capture_refuses_monitor_switch_and_retains_recovery_output() {
+        let now = Instant::now();
+        let selected = r"\\.\DISPLAY6";
+        let mut capture = capture_without_native_session(now);
         assert!(capture.switch_monitor(r"\\.\DISPLAY1").is_err());
         assert!(capture.switch_monitor(selected).is_err());
         assert_eq!(capture.monitor_selector(), selected);
@@ -2049,7 +2235,75 @@ mod tests {
     }
 
     #[test]
-    fn recreated_session_cannot_report_active_before_a_real_frame() {
+    fn healthy_parked_capture_has_no_deadline_or_native_work() {
+        let now = Instant::now();
+        let mut capture = capture_without_native_session(now);
+        capture.pending_recreate = false;
+        capture.availability = CaptureAvailability::Active;
+        assert!(capture.can_recover_for_join());
+        assert_eq!(capture.parked_maintenance_deadline(), None);
+        // No native API/device exists in this fixture. Any attempted frame,
+        // snapshot or healthy output query would fail or panic.
+        for seconds in 0..10 {
+            capture
+                .maintain_parked(now + Duration::from_secs(seconds))
+                .unwrap();
+        }
+        assert_eq!(capture.stats(), (0, 0));
+        assert_eq!(capture.availability(), CaptureAvailability::Active);
+    }
+
+    #[test]
+    fn parked_recreation_runs_only_when_lost_and_retry_is_due() {
+        let now = Instant::now();
+        let deadline = now + super::PARKED_RECOVERY_INTERVAL;
+        assert!(!super::recovery_attempt_due(false, deadline, now));
+        assert!(!super::recovery_attempt_due(true, now, deadline));
+        assert!(super::recovery_attempt_due(true, deadline, deadline));
+        let mut capture = capture_without_native_session(now);
+        capture.maintain_parked(now).unwrap();
+        assert_eq!(
+            capture.parked_maintenance_deadline(),
+            Some(now + Duration::from_secs(30))
+        );
+        assert_eq!(capture.stats(), (0, 0));
+    }
+
+    #[test]
+    fn failed_recreation_ends_join_grace_until_a_replacement_succeeds() {
+        let now = Instant::now();
+        let mut capture = capture_without_native_session(now);
+        assert!(capture.can_recover_for_join());
+        capture.recreate_failed = true;
+        assert!(!capture.can_recover_for_join());
+        capture.pending_recreate = false;
+        capture.awaiting_recovery_frame = true;
+        assert!(!capture.can_recover_for_join());
+        capture.recreate_failed = false;
+        assert!(capture.can_recover_for_join());
+        assert_eq!(capture.availability(), CaptureAvailability::Unavailable);
+    }
+
+    #[test]
+    fn only_a_successful_replacement_allows_gdi_to_verify_recovery() {
+        assert!(super::snapshot_can_verify_recovery(
+            false, true, false, true
+        ));
+        for (pending, awaiting, failed, has_api) in [
+            (true, false, false, false),
+            (true, true, false, true),
+            (false, true, true, true),
+            (false, true, false, false),
+            (false, false, false, true),
+        ] {
+            assert!(!super::snapshot_can_verify_recovery(
+                pending, awaiting, failed, has_api
+            ));
+        }
+    }
+
+    #[test]
+    fn recreated_session_cannot_report_active_without_verified_pixels() {
         let unavailable = availability_after(
             CaptureAvailability::Active,
             CaptureRecoveryEvent::AccessLost,

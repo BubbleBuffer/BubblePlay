@@ -36,8 +36,10 @@ fn parsec_attached_count() -> u32 {
     let mut n = 0u32;
     let mut i = 0u32;
     loop {
-        let mut d = DISPLAY_DEVICEW::default();
-        d.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+        let mut d = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
         let ok = unsafe { EnumDisplayDevicesW(None, i, &mut d, 0) };
         if !ok.as_bool() {
             break;

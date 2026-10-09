@@ -136,7 +136,7 @@ impl VddKeepalive {
                     failures = 0;
                 } else {
                     failures += 1;
-                    if failures == 1 || failures % 100 == 0 {
+                    if failures == 1 || failures.is_multiple_of(100) {
                         warn!(failures, call_ms, "VDD ping failed");
                     }
                 }

@@ -160,9 +160,7 @@ impl HeadlessCursorSupport {
                         applied: *settings,
                     })?;
                     let result = write_mouse_keys(settings);
-                    if result.is_ok() {
-                        claimed = Some(path);
-                    } else if !remove_cursor_marker(&path, std::process::id()) {
+                    if result.is_ok() || !remove_cursor_marker(&path, std::process::id()) {
                         claimed = Some(path);
                     }
                     result
@@ -1443,9 +1441,9 @@ impl CursorState {
         data[1..3].copy_from_slice(&self.acknowledged_sequence.unwrap_or(0).to_le_bytes());
         data[3..5].copy_from_slice(&self.x.to_le_bytes());
         data[5..7].copy_from_slice(&self.y.to_le_bytes());
-        data[7] = u8::from(self.acknowledged_sequence.is_some()) * CURSOR_ACK_VALID
-            | u8::from(self.in_bounds) * CURSOR_IN_BOUNDS
-            | u8::from(self.visible) * CURSOR_VISIBLE;
+        data[7] = (u8::from(self.acknowledged_sequence.is_some()) * CURSOR_ACK_VALID)
+            | (u8::from(self.in_bounds) * CURSOR_IN_BOUNDS)
+            | (u8::from(self.visible) * CURSOR_VISIBLE);
         data
     }
 }
@@ -2906,6 +2904,12 @@ mod tests {
             map_monitor_absolute_to_virtual(u16::MAX, u16::MAX, selected, desktop);
         assert!(right > 26_000 && right < 26_300);
         assert!(bottom > 62_000 && bottom < 62_200);
+    }
+}
+
+impl Default for InputSink {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

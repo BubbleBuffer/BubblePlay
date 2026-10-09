@@ -212,7 +212,7 @@ mod tests {
                 let rows = (rect.top..rect.bottom)
                     .map(|y| {
                         let line = (y as i32 + offset + 10_000) as u64;
-                        if line % 3 == 0 {
+                        if line.is_multiple_of(3) {
                             0
                         } else {
                             line * 1_000_003 + column * 7_919
@@ -260,7 +260,7 @@ mod tests {
                 (
                     tile,
                     (0..TILE_SIZE as u64)
-                        .map(|r| r * 31 + tile as u64 * 977 + 1 << 40)
+                        .map(|r| (r * 31 + tile as u64 * 977 + 1) << 40)
                         .collect(),
                 )
             })

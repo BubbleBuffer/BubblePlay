@@ -35,6 +35,68 @@ fn finish_normal_recovery(pending: &mut bool, recovered: bool) -> bool {
     recovered || pending
 }
 
+const JOIN_RECOVERY_GRACE: Duration = Duration::from_secs(1);
+
+/// Status replay waits briefly for a recoverable Default source. This never
+/// grants media/input authorization: desktop_state still requires a frame.
+#[derive(Default)]
+struct JoinRecoveryWindow {
+    deadline: Option<Instant>,
+    exhausted: bool,
+}
+
+impl JoinRecoveryWindow {
+    fn begin(&mut self, secure: bool, recoverable: bool, now: Instant) {
+        if !secure && recoverable && !self.exhausted && self.deadline.is_none() {
+            self.deadline = Some(now + JOIN_RECOVERY_GRACE);
+        }
+    }
+
+    fn suppress(
+        &self,
+        available: bool,
+        secure: bool,
+        recoverable: bool,
+        viewer_attached: bool,
+        now: Instant,
+    ) -> bool {
+        !available
+            && !secure
+            && recoverable
+            && (!viewer_attached || self.deadline.is_some_and(|deadline| now < deadline))
+    }
+
+    fn take_failed(
+        &mut self,
+        available: bool,
+        secure: bool,
+        recoverable: bool,
+        now: Instant,
+    ) -> bool {
+        if secure {
+            self.deadline = None;
+            return false;
+        }
+        if available {
+            if self.deadline.is_some_and(|deadline| now >= deadline) {
+                self.deadline = None;
+                self.exhausted = true;
+            }
+            return false;
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| !recoverable || now >= deadline)
+        {
+            self.deadline = None;
+            self.exhausted = true;
+            return true;
+        }
+        false
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
 pub(super) enum CaptureSource {
     Local(LocalCaptureSource),
     Privileged(PrivilegedSource),
@@ -60,6 +122,7 @@ pub(super) struct LocalCaptureSource {
     event_activity: Option<bubbleplay_host::activity::Activity>,
     capture_demand: bool,
     snapshot_wake: SnapshotDeadlineWake,
+    join_recovery: JoinRecoveryWindow,
 }
 
 impl LocalCaptureSource {
@@ -92,6 +155,7 @@ impl LocalCaptureSource {
             event_activity: None,
             capture_demand: false,
             snapshot_wake: SnapshotDeadlineWake::default(),
+            join_recovery: JoinRecoveryWindow::default(),
         })
     }
 
@@ -153,14 +217,51 @@ impl LocalCaptureSource {
 
     pub(super) fn take_availability_transition(&mut self) -> Option<capture::CaptureAvailability> {
         if std::mem::take(&mut self.secure_loss_pending) {
+            self.join_recovery.deadline = None;
             if let Some(capture) = self.capture.as_mut() {
                 let _ = capture.take_availability_transition();
             }
             return Some(capture::CaptureAvailability::Unavailable);
         }
-        self.capture
+        let transition = self
+            .capture
             .as_mut()
-            .and_then(Capture::take_availability_transition)
+            .and_then(Capture::take_availability_transition);
+        let available = !self.normal_recovery_pending
+            && self.capture.as_ref().is_none_or(|capture| {
+                capture.availability() == capture::CaptureAvailability::Active
+            });
+        let secure = self.secure_state.as_ref().is_some_and(|state| state.secure);
+        let recoverable = self.can_recover_for_join();
+        let now = Instant::now();
+        if self
+            .join_recovery
+            .take_failed(available, secure, recoverable, now)
+        {
+            return Some(capture::CaptureAvailability::Unavailable);
+        }
+        transition
+    }
+
+    pub(super) fn unavailable_announcement_deferred(
+        &self,
+        viewer_attached: bool,
+        now: Instant,
+    ) -> bool {
+        let secure = self.secure_state.as_ref().is_some_and(|state| state.secure);
+        self.join_recovery.suppress(
+            false,
+            secure,
+            self.can_recover_for_join(),
+            viewer_attached,
+            now,
+        )
+    }
+
+    fn can_recover_for_join(&self) -> bool {
+        self.capture
+            .as_ref()
+            .is_none_or(Capture::can_recover_for_join)
     }
 
     fn tick_secure(&mut self, viewer: bool, now: Instant) {
@@ -306,6 +407,10 @@ impl LocalCaptureSource {
             .acquire(timeout)?;
         Ok(frame.map(|(frame, changed, recovered)| {
             let recovered = finish_normal_recovery(&mut self.normal_recovery_pending, recovered);
+            self.join_recovery = JoinRecoveryWindow {
+                deadline: None,
+                exhausted: true,
+            };
             if let Some(region) = frame.desktop_region() {
                 self.region = region;
                 self.width = region.width;
@@ -730,6 +835,64 @@ impl CaptureSource {
         Ok(())
     }
 
+    pub(super) fn end_viewer_session(&mut self) {
+        if let Self::Local(source) = self {
+            source.join_recovery = JoinRecoveryWindow::default();
+        }
+    }
+
+    pub(super) fn defer_recoverable_join_state(&mut self, now: Instant) -> bool {
+        let state = self.desktop_state();
+        let Self::Local(source) = self else {
+            return false;
+        };
+        let secure = source
+            .secure_state
+            .as_ref()
+            .is_some_and(|state| state.secure);
+        let recoverable = source.can_recover_for_join();
+        source.join_recovery.begin(secure, recoverable, now);
+        source
+            .join_recovery
+            .suppress(state.available, secure, recoverable, true, now)
+    }
+
+    pub(super) fn maintain_parked(&mut self, viewer_attached: bool, now: Instant) -> Result<()> {
+        if let Self::Local(source) = self {
+            if !viewer_attached
+                && !source
+                    .secure_state
+                    .as_ref()
+                    .is_some_and(|state| state.secure)
+            {
+                if let Some(capture) = source.capture.as_mut() {
+                    capture.maintain_parked(now)?;
+                    source.width = capture.width();
+                    source.height = capture.height();
+                    source.region = capture.region();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn parked_maintenance_deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Local(source)
+                if !source
+                    .secure_state
+                    .as_ref()
+                    .is_some_and(|state| state.secure) =>
+            {
+                source
+                    .capture
+                    .as_ref()
+                    .and_then(Capture::parked_maintenance_deadline)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn request_event_frame_at(&mut self, not_before: Instant) -> Result<()> {
         if let Self::Local(source) = self {
             if source.capture_demand
@@ -752,11 +915,14 @@ impl CaptureSource {
             return None;
         }
         let mut deadline = source.next_desktop_check;
+        if let Some(join) = source.join_recovery.deadline {
+            deadline = deadline.min(join);
+        }
         if let Some(capture) = source.capture.as_ref() {
             // The session owns its recovery-probe deadline. Capture's cached
             // desktop timer can stay expired between those probes, so it is
             // never a separate reason to wake this producer.
-            if snapshot_eligible && capture.availability() == capture::CaptureAvailability::Active {
+            if snapshot_eligible && capture.can_recover_for_join() {
                 if let Some(snapshot) = source
                     .snapshot_wake
                     .deadline(capture.idle_snapshot_deadline(), Instant::now())
@@ -768,19 +934,38 @@ impl CaptureSource {
         Some(deadline)
     }
 
+    #[cfg(test)]
     pub(super) fn take_idle_snapshot_frame(&mut self) -> Option<capture::CapturedFrame<'_>> {
+        self.take_idle_snapshot_frame_with_recovery()
+            .map(|(frame, _)| frame)
+    }
+
+    pub(super) fn take_idle_snapshot_frame_with_recovery(
+        &mut self,
+    ) -> Option<(capture::CapturedFrame<'_>, bool)> {
         match self {
             Self::Local(source)
-                if !source.normal_recovery_pending
-                    && !source
-                        .secure_state
-                        .as_ref()
-                        .is_some_and(|state| state.secure) =>
+                if !source
+                    .secure_state
+                    .as_ref()
+                    .is_some_and(|state| state.secure) =>
             {
-                source
+                let (frame, recovered) = source
                     .capture
-                    .as_mut()
-                    .and_then(Capture::take_idle_snapshot_frame)
+                    .as_mut()?
+                    .take_idle_snapshot_frame_with_recovery()?;
+                let recovered =
+                    finish_normal_recovery(&mut source.normal_recovery_pending, recovered);
+                // A healthy snapshot can beat the first waiter response. Keep
+                // the original bound in case that response discovers a loss
+                // which Windows did not announce while parked.
+                if recovered {
+                    source.join_recovery = JoinRecoveryWindow {
+                        deadline: None,
+                        exhausted: true,
+                    };
+                }
+                Some((frame, recovered))
             }
             _ => None,
         }
@@ -1140,6 +1325,49 @@ mod agent_encode_recovery_tests {
     }
 
     #[test]
+    fn session_replay_does_not_announce_unavailable_for_healthy_or_recoverable_capture() {
+        let now = Instant::now();
+        let mut healthy = JoinRecoveryWindow::default();
+        healthy.begin(false, true, now);
+        assert!(!healthy.suppress(true, false, true, true, now));
+        assert!(!healthy.take_failed(true, false, true, now));
+        let mut recovering = JoinRecoveryWindow::default();
+        recovering.begin(false, true, now);
+        assert!(recovering.suppress(false, false, true, true, now));
+        // An offer replay and media start share one bound, even if repeated.
+        recovering.begin(false, true, now + Duration::from_millis(900));
+        assert!(recovering.take_failed(false, false, true, now + JOIN_RECOVERY_GRACE));
+        recovering.begin(false, true, now + JOIN_RECOVERY_GRACE);
+        assert!(!recovering.suppress(false, false, true, true, now + JOIN_RECOVERY_GRACE));
+    }
+
+    #[test]
+    fn parked_recoverable_status_waits_for_pixels_but_real_failure_stays_visible() {
+        let now = Instant::now();
+        let parked = JoinRecoveryWindow::default();
+        assert!(parked.suppress(false, false, true, false, now));
+        assert!(!parked.suppress(false, false, false, false, now));
+        assert!(!parked.suppress(false, true, true, false, now));
+        assert!(!parked.suppress(false, false, true, true, now));
+    }
+
+    #[test]
+    fn real_failure_and_secure_desktop_are_never_hidden_by_join_recovery() {
+        let now = Instant::now();
+        let mut failed = JoinRecoveryWindow::default();
+        failed.begin(false, false, now);
+        assert!(!failed.suppress(false, false, false, true, now));
+        let mut recovering = JoinRecoveryWindow::default();
+        recovering.begin(false, true, now);
+        assert!(!recovering.suppress(false, false, false, true, now));
+        assert!(recovering.take_failed(false, false, false, now));
+        let mut secure = JoinRecoveryWindow::default();
+        secure.begin(true, true, now);
+        assert!(!secure.suppress(false, true, true, true, now));
+        assert!(!secure.take_failed(false, true, true, now));
+    }
+
+    #[test]
     fn secure_source_pins_monitor_and_requires_frame_before_input() {
         let mut source = LocalCaptureSource {
             capture: None,
@@ -1167,6 +1395,7 @@ mod agent_encode_recovery_tests {
             event_activity: None,
             capture_demand: false,
             snapshot_wake: SnapshotDeadlineWake::default(),
+            join_recovery: JoinRecoveryWindow::default(),
         };
         assert!(source.switch_monitor("DISPLAY1").is_err());
         assert_eq!(source.selector, "DISPLAY2");
@@ -1231,6 +1460,7 @@ mod agent_encode_recovery_tests {
                 event_activity: None,
                 capture_demand: false,
                 snapshot_wake: SnapshotDeadlineWake::default(),
+                join_recovery: JoinRecoveryWindow::default(),
             };
             source.observe_desktop(helper, false, "uac");
             assert_eq!(

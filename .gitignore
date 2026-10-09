@@ -4,6 +4,10 @@ target/
 /host/target-*/
 Cargo.lock.bak
 host/sdk-stub/
+# Leftovers from failed rust-lld links.
+/host/*.rcgu.*
+/host/symbols.exe
+/host/symbols.lib
 /host/rollback/
 
 # Node / wrangler

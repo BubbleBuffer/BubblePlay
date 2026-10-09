@@ -25,7 +25,7 @@ fn main() {
     }
 
     for (i, m) in monitors.iter().enumerate() {
-        let mut api = match DxgiDuplicationApi::new(m.clone()) {
+        let mut api = match DxgiDuplicationApi::new(*m) {
             Ok(api) => api,
             Err(e) => {
                 println!("[{i}] session create FAILED: {e:?}");

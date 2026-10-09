@@ -568,9 +568,8 @@ pub fn write_frame<W: Write>(
 /// EOF after any part of a frame is a protocol error.
 pub fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Frame>, ProtocolError> {
     let mut header = [0u8; HEADER_LEN];
-    match read_first_byte(reader, &mut header[0])? {
-        false => return Ok(None),
-        true => {}
+    if !read_first_byte(reader, &mut header[0])? {
+        return Ok(None);
     }
     if read_count(reader, &mut header[1..])? != HEADER_LEN - 1 {
         return Err(ProtocolError::TruncatedHeader);

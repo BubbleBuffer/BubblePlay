@@ -302,7 +302,7 @@ fn foreground_sample_live(
 
 fn announce_capture_state(
     signaling: &mut Signaling,
-    capture: &CaptureSource,
+    capture: &mut CaptureSource,
     generation: u32,
     reason: &str,
 ) {
@@ -319,6 +319,12 @@ fn announce_capture_state(
     if !capture.is_privileged() && !state.available {
         if let Some(kind) = bubbleplay_host::desktop_session::secure_desktop_kind() {
             signaling.send_secure_desktop_state(kind, &[], generation);
+            return;
+        }
+    }
+    if matches!(reason, "wss-session-start" | "offer-state-replay") {
+        capture.request_idle_snapshot();
+        if capture.defer_recoverable_join_state(Instant::now()) {
             return;
         }
     }
@@ -728,7 +734,7 @@ fn run_spike(args: &Args) -> Result<()> {
             continue;
         };
         if encoder.is_none() {
-            let dev = frame.device().as_raw() as *mut core::ffi::c_void;
+            let dev = frame.device().as_raw();
             encoder = Some(Nvenc::new(
                 dev,
                 frame.width(),
@@ -749,7 +755,7 @@ fn run_spike(args: &Args) -> Result<()> {
         bytes += encoded.data.len() as u64;
         lat_sum_us += encoded.encode_us;
         lat_max_us = lat_max_us.max(encoded.encode_us);
-        if frames % 60 == 0 {
+        if frames.is_multiple_of(60) {
             info!(
                 frames,
                 avg_ms = format!("{:.2}", lat_sum_us as f64 / frames as f64 / 1000.0),
@@ -1227,7 +1233,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             );
                             announce_capture_state(
                                 &mut signaling,
-                                &capture,
+                                &mut capture,
                                 media_generation,
                                 "monitor-switched",
                             );
@@ -1255,6 +1261,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             input_sink.release_all();
             capture.release_input();
             capture.set_capture_demand(false)?;
+            capture.end_viewer_session();
             carried_input.reset();
             remote_input_ready = false;
             viewer_attached = false;
@@ -1341,6 +1348,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }
         if !first_iteration {
             let mut deadlines = vec![next_ping, next_benchmark_refresh, next_input_log];
+            if !viewer_attached {
+                if let Some(deadline) = capture.parked_maintenance_deadline() {
+                    deadlines.push(deadline);
+                }
+            }
             // An absent/incompatible lease intentionally leaves status retry
             // due immediately. Only schedule it while a sample can be sent.
             if benchmark_lease.active().is_some_and(|profile| {
@@ -1625,6 +1637,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             viewer_attached && (ice_connected || wss_peer_live),
             loop_now,
         );
+        capture.maintain_parked(viewer_attached, loop_now)?;
         let secure_helper_ready = capture.secure_helper_ready();
         if secure_helper_ready != last_secure_helper_ready {
             signaling.send_host_capabilities(
@@ -1769,7 +1782,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     CaptureAvailability::Unavailable => {
                         capture_available = false;
                         next_local_recovery_probe = Instant::now();
-                        pending_first_frame = None;
+                        if !source
+                            .unavailable_announcement_deferred(viewer_attached, Instant::now())
+                        {
+                            pending_first_frame = None;
+                        }
                         carried_input.reset();
                         input_sink.release_all();
                         latest_idr = None;
@@ -1786,7 +1803,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             bubbleplay_host::desktop_session::secure_desktop_kind()
                         {
                             signaling.send_secure_desktop_state(kind, &[], media_generation);
-                        } else {
+                        } else if !source
+                            .unavailable_announcement_deferred(viewer_attached, Instant::now())
+                        {
                             signaling.send_desktop_state(
                                 "unavailable",
                                 media_generation,
@@ -2515,7 +2534,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                     announce_capture_state(
                         &mut signaling,
-                        &capture,
+                        &mut capture,
                         media_generation,
                         "offer-state-replay",
                     );
@@ -3078,7 +3097,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 // state across WSS epochs.
                                 announce_capture_state(
                                     &mut signaling,
-                                    &capture,
+                                    &mut capture,
                                     media_generation,
                                     "wss-session-start",
                                 );
@@ -3922,8 +3941,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             let captured = match capture.acquire(Duration::ZERO)? {
                 Some(frame) => Some(frame),
                 None if should_snapshot_idle_desktop(media_ready, latest_idr.is_none()) => capture
-                    .take_idle_snapshot_frame()
-                    .map(|frame| (frame, true, false)),
+                    .take_idle_snapshot_frame_with_recovery()
+                    .map(|(frame, recovered)| (frame, true, recovered)),
                 None => None,
             };
             if let Some((mut frame, is_new, recovered)) = captured {
@@ -3937,8 +3956,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         );
                     }
                     capture_available = true;
-                    pending_first_frame = None;
                     media_generation = media_generation.wrapping_add(1).max(1);
+                    if frame.is_secure_snapshot() {
+                        pending_first_frame = None;
+                    } else if let Some(pending) = pending_first_frame.as_mut() {
+                        pending.generation = media_generation;
+                        pending.admitted = false;
+                        pending.rtc_idr_id = None;
+                    }
                     media_sequence = 0;
                     latest_idr = None;
                     pending_transition_idr = None;
@@ -4033,7 +4058,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 let main10 = active_benchmark_profile.is_some_and(|profile| profile.encoder.main10);
-                let dev = frame.device().as_raw() as *mut core::ffi::c_void;
+                let dev = frame.device().as_raw();
                 // WSS v4 owns keyframes (start / peer / request), so its
                 // encoder runs without periodic IDRs. NVENC cannot change the
                 // GOP in place: recreate the session when the mode differs.
@@ -4051,7 +4076,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     pending_transition_idr = None;
                     next_idr = Instant::now();
                 }
-                if encoder.as_ref().map_or(true, |e| !e.is_for_device(dev)) {
+                if encoder.as_ref().is_none_or(|e| !e.is_for_device(dev)) {
                     if encoder.is_some() {
                         warn!("capture D3D11 device changed; invalidating scaler and IDR state");
                         scaler = None;
@@ -6078,11 +6103,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             .filter(|_| Instant::now() >= next_wss_stats)
         {
             let encoded_total = wss_idr_count.saturating_add(wss_delta_count);
-            let idr_percent = if encoded_total == 0 {
-                0
-            } else {
-                wss_idr_count.saturating_mul(100) / encoded_total
-            };
+            let idr_percent = wss_idr_count
+                .saturating_mul(100)
+                .checked_div(encoded_total)
+                .unwrap_or(0);
             let capture_stats = capture.local_capture_stats().unwrap_or(last_capture_stats);
             let capture_acquired = capture_stats.0.saturating_sub(last_capture_stats.0);
             let capture_new = capture_stats.1.saturating_sub(last_capture_stats.1);

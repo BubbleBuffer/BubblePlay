@@ -302,7 +302,7 @@ pub fn build_host_args(config: &StoredHostConfig) -> Vec<OsString> {
 
 pub fn decode_hex(value: &str) -> Result<Vec<u8>> {
     let value = value.trim();
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         anyhow::bail!("DPAPI ciphertext has an odd hexadecimal length");
     }
     value

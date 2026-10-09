@@ -163,7 +163,7 @@ fn pseudo_glyph_bit(code: u32, x: u32, y: u32) -> bool {
         return (code.wrapping_add(x * 3).wrapping_add(y * 5) & 3) == 0;
     }
     let mixed =
-        code.wrapping_mul(0x45d9_f3b).rotate_left((y * 3 + x) & 31) ^ (x * 0x9e37) ^ (y * 0x7f4a);
+        code.wrapping_mul(0x045d_9f3b).rotate_left((y * 3 + x) & 31) ^ (x * 0x9e37) ^ (y * 0x7f4a);
     mixed & 1 != 0
 }
 
@@ -225,6 +225,7 @@ fn create_ui_texture(device: &ID3D11Device) -> Result<ID3D11Texture2D> {
     texture.context("CreateTexture2D(refinement input) returned no texture")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_and_measure(
     encoder: &mut Nvenc,
     feedback: &mut ReconstructionFeedbackAnalyzer,
@@ -295,7 +296,7 @@ fn run_sequence(
     rate_control: RateControlMode,
     refinement_pulse: bool,
 ) -> Result<Vec<FrameMeasurement>> {
-    let mut feedback = ReconstructionFeedbackAnalyzer::new(&device, WIDTH, HEIGHT)?;
+    let mut feedback = ReconstructionFeedbackAnalyzer::new(device, WIDTH, HEIGHT)?;
     let mut options = EncoderOptions::production(Preset::P3);
     options.roi_mode = RoiMode::Feedback;
     options.rate_control = rate_control;

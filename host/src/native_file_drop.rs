@@ -1181,10 +1181,8 @@ unsafe fn wake_drag(wake: &DragWake, native_thread: u32) {
     let mut process = 0;
     let thread = GetWindowThreadProcessId(capture, Some(&mut process));
     let owned = !capture.0.is_null() && thread == native_thread && process == std::process::id();
-    if !owned {
-        if !wake.warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(target = ?capture, thread, process, "native OLE continuation has no owned capture");
-        }
+    if !owned && !wake.warned.swap(true, Ordering::AcqRel) {
+        tracing::warn!(target = ?capture, thread, process, "native OLE continuation has no owned capture");
     }
     if owned && !wake.down_sent.load(Ordering::Acquire) {
         let mut rect = RECT::default();

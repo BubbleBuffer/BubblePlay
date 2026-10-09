@@ -218,6 +218,7 @@ pub(super) fn quiescent_immediate_damage_rects<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn create_local_encoder(
     device: *mut core::ffi::c_void,
     width: u32,
@@ -258,6 +259,7 @@ pub(super) fn create_local_encoder(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn configure_encoder_profile(
     encoder: &mut Option<Nvenc>,
     device: *mut core::ffi::c_void,
@@ -305,6 +307,7 @@ pub(super) fn configure_encoder_profile(
 /// Recreate a known-good encoder contract and force its recovery IDR. This is
 /// intentionally separate from a target transition: callers only commit the
 /// target after its IDR has been admitted by the transport pump.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn recreate_and_encode_profile(
     encoder: &mut Option<Nvenc>,
     device: *mut core::ffi::c_void,
@@ -398,7 +401,7 @@ pub(super) fn prepare_profile_texture_with_resource(
         );
         if scaler
             .as_ref()
-            .map_or(true, |current| !current.is_for_device(device))
+            .is_none_or(|current| !current.is_for_device(device))
         {
             *scaler = Some(
                 Scaler::new(device, input_width, input_height)
@@ -428,7 +431,7 @@ pub(super) fn prepare_profile_texture_with_resource(
         );
         if full_profile_uses_native_texture(profile, desc.Width, desc.Height, resource_mode) {
             return Ok(ScaleOutput {
-                texture: texture.as_raw() as *mut core::ffi::c_void,
+                texture: texture.as_raw(),
                 scale_us: 0,
                 width: desc.Width,
                 height: desc.Height,
@@ -437,7 +440,7 @@ pub(super) fn prepare_profile_texture_with_resource(
     }
     if scaler
         .as_ref()
-        .map_or(true, |current| !current.is_for_device(device))
+        .is_none_or(|current| !current.is_for_device(device))
     {
         *scaler = Some(
             Scaler::new(device, input_width, input_height)
@@ -451,6 +454,7 @@ pub(super) fn prepare_profile_texture_with_resource(
         .context("D3D11 video scale")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_video_mode_texture(
     scaler: &mut Option<Scaler>,
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
@@ -499,7 +503,7 @@ pub(super) fn prepare_video_mode_texture(
             mode.height
         );
         return Ok(ScaleOutput {
-            texture: texture.as_raw() as *mut core::ffi::c_void,
+            texture: texture.as_raw(),
             scale_us: 0,
             width: desc.Width,
             height: desc.Height,
@@ -641,6 +645,7 @@ pub(super) fn apply_wss_adjustment(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_profile_texture_with_crop(
     scaler: &mut Option<Scaler>,
     device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
@@ -675,7 +680,7 @@ pub(super) fn prepare_profile_texture_with_crop(
     }
     if scaler
         .as_ref()
-        .map_or(true, |current| !current.is_for_device(device))
+        .is_none_or(|current| !current.is_for_device(device))
     {
         *scaler = Some(
             Scaler::new(device, input_width, input_height)

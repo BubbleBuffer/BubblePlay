@@ -794,6 +794,7 @@ impl AgentBackend for RealAgentBackend {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum FrameSource {
     Default(Option<Capture>),
     Secure(Option<SecureCapture>),

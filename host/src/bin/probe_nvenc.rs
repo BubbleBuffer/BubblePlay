@@ -86,7 +86,7 @@ fn main() {
     let mut params: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = unsafe { std::mem::zeroed() };
     params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
     params.deviceType = NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX;
-    params.device = device.as_raw() as *mut core::ffi::c_void;
+    params.device = device.as_raw();
     params.apiVersion = NVENCAPI_VERSION;
     let mut session: *mut core::ffi::c_void = core::ptr::null_mut();
     let st = unsafe { (ENCODE_API.open_encode_session_ex)(&mut params, &mut session) };

@@ -1,7 +1,6 @@
 use crate::encode::{EncodedFrame, EncoderOptions, Nvenc, Preset, ResourceMode, VideoCodec};
 use crate::frame_damage::DamageRect;
 use anyhow::{bail, ensure, Context, Result};
-use core::ffi::c_void;
 use std::time::Instant;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
@@ -58,7 +57,7 @@ impl HevcTileEncoder {
         options.gop_seconds = 1;
         options.resource_mode = ResourceMode::Persistent;
         let encoder = Nvenc::new_with_options_native_codec(
-            device.as_raw() as *mut c_void,
+            device.as_raw(),
             HEVC_TILE_DIMENSION,
             HEVC_TILE_DIMENSION,
             HEVC_TILE_DIMENSION,
@@ -123,7 +122,7 @@ impl HevcTileEncoder {
         self.encoder.force_idr();
         let frame = self
             .encoder
-            .encode_texture(self.texture.as_raw() as *mut c_void)
+            .encode_texture(self.texture.as_raw())
             .context("encode 128x128 HEVC tile IDR")?;
         if !frame.is_idr {
             bail!("HEVC tile encoder did not return an IDR");

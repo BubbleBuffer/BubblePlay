@@ -110,10 +110,7 @@ fn main() {
         Some("--send-files") => send_files(args.map(PathBuf::from).collect()),
         Some(_) => Ok(2),
     };
-    std::process::exit(match code {
-        Ok(code) => code,
-        Err(_) => 1,
-    });
+    std::process::exit(code.unwrap_or(1));
 }
 
 /// Named-object / window-class name for this instance. With
@@ -201,7 +198,7 @@ fn send_files(paths: Vec<PathBuf>) -> Result<i32> {
 }
 
 fn quit_running_tray() -> Result<i32> {
-    let class = wide(&scoped(WINDOW_CLASS));
+    let class = wide(scoped(WINDOW_CLASS));
     // SAFETY: class is NUL-terminated.
     let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }) else {
         return Ok(0);
@@ -242,7 +239,7 @@ impl TrayIcon {
             let module = GetModuleHandleW(PCWSTR::null()).context("GetModuleHandleW")?;
             LoadImageW(
                 Some(module.into()),
-                PCWSTR(1usize as *const u16),
+                PCWSTR(std::ptr::dangling::<u16>()),
                 IMAGE_ICON,
                 size.0,
                 size.1,
@@ -1442,7 +1439,7 @@ fn run_tray() -> Result<i32> {
     // SAFETY: standard window-class registration and hidden window creation.
     let hwnd = unsafe {
         let instance = GetModuleHandleW(PCWSTR::null()).context("GetModuleHandleW")?;
-        let class = wide(&scoped(WINDOW_CLASS));
+        let class = wide(scoped(WINDOW_CLASS));
         let wc = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),

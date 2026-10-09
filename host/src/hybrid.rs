@@ -1629,7 +1629,7 @@ mod tests {
             output_width: 256,
             output_height: 128,
         };
-        let remapped = planner.plan(256, 128, zoomed, &[], &vec![0; 8 * 4]);
+        let remapped = planner.plan(256, 128, zoomed, &[], &[0; 8 * 4]);
 
         assert!(remapped.clear);
         assert!(remapped.history_preserved);
@@ -1701,7 +1701,7 @@ mod tests {
     #[test]
     fn quiescent_plan_reports_edge_geometry_mismatch() {
         let mut planner = QuiescentTilePlanner::default();
-        let plan = planner.plan(256, 128, full_view(1, 0), &[], &vec![1; 31]);
+        let plan = planner.plan(256, 128, full_view(1, 0), &[], &[1; 31]);
 
         assert_eq!(plan.edge_score_cells, 31);
         assert_eq!(plan.expected_edge_score_cells, 32);
@@ -2248,7 +2248,7 @@ mod tests {
             planner.plan(256, 128, full_view(1, 0), &[], &edges);
         }
         planner.mark_output_stale();
-        let recovery = planner.plan(256, 128, full_view(1, 0), &[], &vec![0; 8 * 4]);
+        let recovery = planner.plan(256, 128, full_view(1, 0), &[], &[0; 8 * 4]);
         assert!(recovery.clear);
         assert!(recovery.history_preserved);
         assert_eq!(recovery.candidates.len(), 2);

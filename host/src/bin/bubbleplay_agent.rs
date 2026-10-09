@@ -70,21 +70,6 @@ fn main() -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod service_log_tests {
-    use super::*;
-
-    #[test]
-    fn repeated_pipe_errors_are_bounded_and_report_the_suppressed_count() {
-        let start = Instant::now();
-        let mut gate = ErrorLogGate::default();
-        assert_eq!(gate.admit(start), Some(0));
-        assert_eq!(gate.admit(start + Duration::from_secs(1)), None);
-        assert_eq!(gate.admit(start + Duration::from_secs(2)), None);
-        assert_eq!(gate.admit(start + SESSION_ERROR_LOG_INTERVAL), Some(2));
-    }
-}
-
 fn run_stdio() -> Result<()> {
     let runtime = spawn_agent_runtime(BoundaryBackend::default(), WindowsInputDesktopSource);
     let input = runtime.control.clone();
@@ -240,4 +225,19 @@ fn write_output<W: Write>(writer: &mut W, sequence: &mut u32, message: &Message)
     writer.flush().context("flush agent IPC frame")?;
     *sequence = sequence.wrapping_add(1).max(1);
     Ok(())
+}
+
+#[cfg(test)]
+mod service_log_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_pipe_errors_are_bounded_and_report_the_suppressed_count() {
+        let start = Instant::now();
+        let mut gate = ErrorLogGate::default();
+        assert_eq!(gate.admit(start), Some(0));
+        assert_eq!(gate.admit(start + Duration::from_secs(1)), None);
+        assert_eq!(gate.admit(start + Duration::from_secs(2)), None);
+        assert_eq!(gate.admit(start + SESSION_ERROR_LOG_INTERVAL), Some(2));
+    }
 }

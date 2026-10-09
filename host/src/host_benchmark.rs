@@ -145,6 +145,7 @@ pub(super) fn record_benchmark_hybrid_plan(
     window.analysis_max_us = ordered.last().copied();
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record_benchmark_hybrid_validation(
     window: &mut Option<BenchHybridActivity>,
     submit_samples_us: &mut Vec<u32>,

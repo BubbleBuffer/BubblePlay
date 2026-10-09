@@ -4,10 +4,10 @@
 //! - host -> worker: {type:"hello", token, role:"host"}
 //! - worker -> host: {type:"hello-ok"} | {type:"error", message}
 //! - relayed: {type:"offer", sdp} (client -> host via worker),
-//!            {type:"answer", sdp} (host -> client),
-//!            {type:"ice", candidate} (both directions),
-//!            {type:"peer-left"},
-//!            {type:"ping"} (keepalive — consumed, never relayed)
+//!   {type:"answer", sdp} (host -> client),
+//!   {type:"ice", candidate} (both directions),
+//!   {type:"peer-left"},
+//!   {type:"ping"} (keepalive — consumed, never relayed)
 //!
 //! The socket runs non-blocking; call `poll()` once per loop iteration.
 
@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::windows::io::{AsRawSocket, RawSocket};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -311,6 +311,7 @@ fn u32_is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn host_capabilities_message(
     service_mode: bool,
     cold_boot: bool,
@@ -530,6 +531,7 @@ pub struct BenchHybridActivity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 pub enum SignalMsg {
     Hello {
         token: String,
@@ -1214,10 +1216,7 @@ impl WorkerVersionMonitor {
     }
 
     fn changed(&self) -> Option<(String, String)> {
-        match self.changes.try_recv() {
-            Ok(change) => Some(change),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        self.changes.try_recv().ok()
     }
 }
 
@@ -1670,6 +1669,7 @@ impl Signaling {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn send_quality(
         &mut self,
         profile: &str,
@@ -1845,6 +1845,7 @@ impl Signaling {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn send_media_view(
         &mut self,
         state: &str,

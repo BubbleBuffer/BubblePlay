@@ -547,9 +547,7 @@ impl DelayRateController {
             return None;
         }
         self.capacity_target_bps = target_bps;
-        let Some(target_bps) = target_bps else {
-            return None;
-        };
+        let target_bps = target_bps?;
         self.clean_since = now;
         self.last_increase = now;
         self.clean_samples = 0;
