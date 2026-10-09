@@ -15,9 +15,14 @@ internal class MediaLeg {
     }
 }
 
-/** One forced-IDR retry and one media restart per attached decoder surface. */
+/**
+ * One forced-IDR retry and one media restart per attached decoder surface.
+ * Misses count only while signaling is up: a slow host or relay reconnect is
+ * not a decoder-surface failure.
+ */
 internal class SurfaceRecovery {
-    enum class Action { NONE, KEYFRAME, RESTART, EXHAUSTED }
+    /** WAIT: signaling is down; check again later without counting a miss. */
+    enum class Action { NONE, WAIT, KEYFRAME, RESTART, EXHAUSTED }
     private var generation = -1L
     private var waiting = false
     private var misses = 0
@@ -41,8 +46,10 @@ internal class SurfaceRecovery {
         return true
     }
 
-    fun missed(generation: Long): Action {
+    fun missed(generation: Long, signalingUp: Boolean = true): Action {
         if (this.generation != generation || !waiting) return Action.NONE
+        // Counting restarts once signaling is back, so each step gets its full window.
+        if (!signalingUp) { misses = 0; return Action.WAIT }
         return when (++misses) {
             1 -> Action.KEYFRAME
             2 -> Action.RESTART

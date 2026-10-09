@@ -54,6 +54,8 @@ class Session(
         fun onRemoteClipboard(text: String)
         fun onMonitors(monitors: List<Monitor>, error: String?)
         fun onVideoSize(width: Int, height: Int)
+        /** A live frame reached the surface: the first of this session, or the first since the surface changed. */
+        fun onLiveFrame()
         /** Input became usable after a presented frame (sync the cursor). */
         fun onInputReady()
         /** The secure desktop (UAC prompt, lock screen) and what the viewer may do there; null when it closes. */
@@ -114,7 +116,8 @@ class Session(
     private val liveness = SignalLiveness(V4.HEARTBEAT_MS)
     @Volatile private var sigOpen = false
     @Volatile private var registered = false
-    private var sigBackoff = 0L
+    private val sigRetry = ReconnectLoop()
+    private var sigRetryTimer: Runnable? = null
     private var sigReconnecting = false
     private var mediaEpoch: String? = null
 
@@ -137,10 +140,13 @@ class Session(
     private var mediaOpen = false
     private var mediaEverOpened = false
     private var mediaReconnecting = false
-    private var mediaBackoff = 0L
+    private val mediaRetry = ReconnectLoop()
+    private var mediaRetryTimer: Runnable? = null
     private var hostPresent = false
     private val surfaceRecovery = SurfaceRecovery()
     private var surfaceWatchdog: Runnable? = null
+    /** Report the next presented frame (first one of this session or on a new surface). */
+    private var reportLiveFrame = true
     private var mediaLastSend = 0L
     private var mediaLastInbound = 0L
     private val gate = V4ReceiveGate()
@@ -360,10 +366,46 @@ class Session(
 
     private fun scheduleSignalingReconnect(why: String) {
         if (!running || terminal != null) return
-        sigBackoff = V4.nextBackoffMs(sigBackoff)
         sigReconnecting = true
-        Log.i(TAG, "signaling reconnect in ${sigBackoff}ms ($why)")
-        handler.postDelayed({ openSignaling() }, sigBackoff)
+        cancelSigRetryTimer()
+        val delay = sigRetry.schedule()
+        if (delay == null) { Log.i(TAG, "signaling reconnect held until foreground ($why)"); return }
+        Log.i(TAG, "signaling reconnect in ${delay}ms ($why)")
+        val retry = Runnable {
+            sigRetryTimer = null
+            if (sigRetry.fire()) openSignaling() else Log.i(TAG, "signaling reconnect held until foreground ($why)")
+        }
+        sigRetryTimer = retry
+        handler.postDelayed(retry, delay)
+    }
+
+    private fun cancelSigRetryTimer() {
+        sigRetryTimer?.let { handler.removeCallbacks(it) }
+        sigRetryTimer = null
+    }
+
+    /**
+     * The app entered (true) or left (false) the foreground. In the background no
+     * reconnect is attempted; on return the backoff resets and a held or pending
+     * retry runs immediately.
+     */
+    fun setForeground(value: Boolean) = handler.post {
+        if (!value) {
+            sigRetry.background(); mediaRetry.background()
+            return@post
+        }
+        val sigOwed = sigRetry.foreground()
+        val mediaOwed = mediaRetry.foreground()
+        if (!running) return@post
+        if (sigOwed) {
+            cancelSigRetryTimer()
+            Log.i(TAG, "foreground: signaling reconnect now")
+            openSignaling()
+        }
+        if (mediaOwed) {
+            cancelMediaRetryTimer()
+            if (registered && media == null) { Log.i(TAG, "foreground: media reconnect now"); startMedia() }
+        }
     }
 
     private fun authRequired() {
@@ -386,8 +428,14 @@ class Session(
                 val epoch = msg.optString("mediaEpoch").takeIf { Regex("^[a-f0-9]{32}$").matches(it) }
                 if (!link.helloOk(id, epoch)) return
                 registered = true
-                sigBackoff = 0
+                sigRetry.succeeded()
                 sigReconnecting = false
+                // Surface misses were not counted while signaling was down: give the
+                // waiting surface a full window from here.
+                surfaceRecovery.waitingGeneration()?.let { generation ->
+                    surfaceWatchdog?.let { handler.removeCallbacks(it) }
+                    armSurfaceWatchdog(generation)
+                }
                 // A new signaling epoch: the old media socket belongs to the old
                 // epoch, and the host needs a fresh first-frame handshake before it
                 // accepts input again (it ignores input until then).
@@ -455,7 +503,7 @@ class Session(
                 resetFirstFrame()
                 desktopKind = "default"; secureDesktop = null
                 main.post { listener.onInputLost(); listener.onSecureDesktop(null); listener.onFileCapability(null); listener.onFileEpoch(null) }
-                sigBackoff = 0
+                sigRetry.resetBackoff()
                 scheduleSignalingReconnect("peer-left")
             }
             "error" -> {
@@ -615,10 +663,28 @@ class Session(
         }
         Log.w(TAG, "startup recovery: $reason")
         closeMedia()
-        mediaBackoff = V4.nextBackoffMs(mediaBackoff)
+        scheduleMediaRetry("startup-recovery")
+    }
+
+    /** Reopens /media-ws after the backoff, for the current media leg only; held while backgrounded. */
+    private fun scheduleMediaRetry(why: String) {
         mediaReconnecting = true
+        cancelMediaRetryTimer()
+        val delay = mediaRetry.schedule()
+        if (delay == null) { Log.i(TAG, "media reconnect held until foreground ($why)"); return }
         val id = mediaId
-        handler.postDelayed({ if (running && registered && id == mediaId) startMedia() }, mediaBackoff)
+        val retry = Runnable {
+            mediaRetryTimer = null
+            if (!mediaRetry.fire()) { Log.i(TAG, "media reconnect held until foreground ($why)"); return@Runnable }
+            if (running && registered && id == mediaId && media == null) startMedia()
+        }
+        mediaRetryTimer = retry
+        handler.postDelayed(retry, delay)
+    }
+
+    private fun cancelMediaRetryTimer() {
+        mediaRetryTimer?.let { handler.removeCallbacks(it) }
+        mediaRetryTimer = null
     }
 
     // ---- media (v4) -------------------------------------------------------------
@@ -685,7 +751,7 @@ class Session(
                 link.mediaUp = true
                 mediaEverOpened = true
                 mediaReconnecting = false
-                mediaBackoff = 0
+                mediaRetry.succeeded()
                 // Anything in flight on the old socket is gone: restart from a keyframe.
                 gate.reset(if (reconnect) "reconnect" else "connect")
                 decoder.dropPending()
@@ -741,14 +807,13 @@ class Session(
         hostPresent = false
         media = null
         if (!running || !registered || !surfaceRecovery.canRestartMedia()) return
-        mediaBackoff = V4.nextBackoffMs(mediaBackoff)
-        mediaReconnecting = true
-        val id = mediaId
-        handler.postDelayed({ if (id == mediaId && media == null) openMedia() }, mediaBackoff)
+        scheduleMediaRetry("media-down")
     }
 
     private fun closeMedia() {
         mediaLeg.invalidate()
+        cancelMediaRetryTimer()
+        mediaRetry.cancel()
         resetFirstFrame() // Neither early presentation nor admission can outlive its media leg.
         try { media?.close(1000, "client-close") } catch (_: Exception) {}
         media = null
@@ -765,6 +830,7 @@ class Session(
             surfaceWatchdog?.let { handler.removeCallbacks(it) }
             surfaceWatchdog = null
             surfaceRecovery.changed(generation, attached)
+            reportLiveFrame = true
             if (attached && running) {
                 Log.i(TAG, "surface attached generation=$generation")
                 armSurfaceWatchdog(generation)
@@ -786,7 +852,8 @@ class Session(
     private fun armSurfaceWatchdog(generation: Long) {
         val watchdog = Runnable {
             if (!running) return@Runnable
-            when (surfaceRecovery.missed(generation)) {
+            when (surfaceRecovery.missed(generation, signalingUp = sigOpen && registered)) {
+                SurfaceRecovery.Action.WAIT -> armSurfaceWatchdog(generation)
                 SurfaceRecovery.Action.KEYFRAME -> {
                     Log.w(TAG, "surface timeout generation=$generation: retry forced keyframe")
                     requestKeyframe("surface-timeout", force = true)
@@ -816,6 +883,10 @@ class Session(
         handler.post {
             if (mediaLeg != mediaId) return@post
             framesPresented++
+            if (reportLiveFrame) {
+                reportLiveFrame = false
+                main.post { listener.onLiveFrame() }
+            }
             markPresented(generation, mediaLeg)
         }
     }

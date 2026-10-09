@@ -85,6 +85,7 @@
     <string name="mode_direct">Direct</string>
     <string name="confirm_disconnect">Disconnect from the desktop?</string>
     <string name="status_paused">Paused. Tap to reconnect.</string>
+    <string name="status_reconnecting">Reconnecting…</string>
     <string name="monitor_failed">Screen switch failed: %1$s</string>
     <string name="clipboard_empty">The phone clipboard is empty</string>
     <string name="paste_failed">Paste did not go through (not connected or too large)</string>

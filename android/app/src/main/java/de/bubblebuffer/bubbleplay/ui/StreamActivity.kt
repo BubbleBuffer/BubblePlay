@@ -16,13 +16,17 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.PorterDuff
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.Choreographer
+import android.view.PixelCopy
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.InputDevice
@@ -39,6 +43,7 @@ import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import de.bubblebuffer.bubbleplay.R
@@ -76,6 +81,13 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private lateinit var root: FrameLayout
     private lateinit var stage: FrameLayout
     private lateinit var video: SurfaceView
+    /** The last frame over the stream after a background trip, until a live frame is presented. */
+    private val frozen = FrozenFrame<Bitmap>()
+    private lateinit var frozenLayer: FrameLayout
+    private lateinit var frozenImage: ImageView
+    private lateinit var frozenLabel: TextView
+    /** When the activity last came to the foreground (0: logged already); for the resume timing log. */
+    private var foregroundAt = 0L
     private lateinit var cursorView: CursorView
     private lateinit var status: TextView
     private lateinit var secureBanner: SecureBanner
@@ -195,6 +207,18 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             pivotX = 0f; pivotY = 0f
         }
         stage.addView(video, FrameLayout.LayoutParams(1, 1))
+        // Frozen last frame: the image copies the video's layout and transform
+        // (relayout/applyViewport), so letterbox and zoom match exactly.
+        frozenLayer = FrameLayout(this).apply { visibility = View.GONE }
+        frozenImage = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_XY
+            pivotX = 0f; pivotY = 0f
+            setColorFilter(FROZEN_DIM, PorterDuff.Mode.SRC_ATOP)
+        }
+        frozenLayer.addView(frozenImage, FrameLayout.LayoutParams(1, 1))
+        frozenLabel = TextView(this).apply { styleStatusPill(this); setTextColor(STATUS_PENDING); setText(R.string.status_reconnecting) }
+        frozenLayer.addView(frozenLabel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+        stage.addView(frozenLayer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         cursorView = CursorView(this)
         stage.addView(cursorView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         stage.setOnTouchListener { _, event -> onStageTouch(event) }
@@ -207,10 +231,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         root.addView(keyboardView, FrameLayout.LayoutParams(1, 1))
 
         status = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 12f
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            setBackgroundColor(0x99000000.toInt())
+            styleStatusPill(this)
             setOnClickListener { onStatusTapped() }
         }
         root.addView(status, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
@@ -350,14 +371,18 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onStart() {
         super.onStart()
+        foregroundAt = SystemClock.elapsedRealtime()
         main.removeCallbacks(backgroundDisconnect)
         if (session == null) startSession()
+        // Reconnect now (backoff reset) if a retry was held or waiting.
+        session?.setForeground(true)
     }
 
     override fun onPause() {
         observeLocalClipboard()
         resumed = false
         remoteClipboard.foreground = false
+        captureFrozenFrame() // the surface still holds the last frame here
         super.onPause()
         quickBar.release()
         input?.releaseAll()
@@ -376,7 +401,62 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override fun onStop() {
         super.onStop()
         // Keep the session for a short background trip (app switch), then let go.
+        // Meanwhile it does not reconnect lost sockets.
+        session?.setForeground(false)
         main.postDelayed(backgroundDisconnect, BACKGROUND_GRACE_MS)
+    }
+
+    // ---- frozen last frame ---------------------------------------------------------
+    /** Copies the current video frame (asynchronously) for display after a background trip. */
+    private fun captureFrozenFrame() {
+        val target = surface
+        if (videoWidth <= 0 || videoHeight <= 0 || target == null || !target.isValid || session == null) return
+        val token = frozen.captureStarted() ?: return
+        // No larger than the stream nor than it appears on screen (zoom included).
+        val scale = minOf(1f, video.width * video.scaleX / videoWidth, video.height * video.scaleY / videoHeight).coerceAtLeast(0.1f)
+        val bitmap = try {
+            Bitmap.createBitmap((videoWidth * scale).roundToInt().coerceAtLeast(1), (videoHeight * scale).roundToInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        } catch (_: OutOfMemoryError) { frozen.captured(token, null); return }
+        try {
+            PixelCopy.request(video, bitmap, { result ->
+                if (result != PixelCopy.SUCCESS) Log.i(TAG, "frozen frame capture failed: $result")
+                if (isDestroyed) return@request
+                if (frozen.captured(token, bitmap.takeIf { result == PixelCopy.SUCCESS })) showFrozen()
+            }, main)
+        } catch (e: IllegalArgumentException) {
+            Log.i(TAG, "frozen frame capture failed", e)
+            frozen.captured(token, null)
+        }
+    }
+
+    private fun showFrozen() {
+        val image = frozen.snapshot ?: return
+        frozenLayer.animate().cancel()
+        frozenImage.setImageBitmap(image)
+        frozenLayer.alpha = 1f
+        frozenLayer.visibility = View.VISIBLE
+        updateFrozenLabel()
+    }
+
+    private fun hideFrozen(fade: Boolean) {
+        frozenLayer.animate().cancel()
+        if (frozenLayer.visibility != View.VISIBLE) return
+        val done = Runnable {
+            frozenLayer.visibility = View.GONE
+            frozenImage.setImageDrawable(null)
+        }
+        if (fade) frozenLayer.animate().alpha(0f).setDuration(FROZEN_FADE_MS).withEndAction(done).start() else done.run()
+    }
+
+    /** "Reconnecting…" on the frozen frame, unless the status line reports an error. */
+    private fun updateFrozenLabel() {
+        frozenLabel.visibility = if (lastStatus?.state == Session.State.ERROR) View.GONE else View.VISIBLE
+    }
+
+    /** An explicit disconnect or sign-out: the next connection must not show this desktop. */
+    private fun clearFrozen() {
+        frozen.clear()
+        hideFrozen(fade = false)
     }
 
     override fun onDestroy() {
@@ -400,7 +480,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             keyboardShown -> toggleKeyboard()
             else -> AlertDialog.Builder(this)
                 .setMessage(R.string.confirm_disconnect)
-                .setPositiveButton(R.string.key_disconnect) { _, _ -> finish() }
+                .setPositiveButton(R.string.key_disconnect) { _, _ -> disconnect() }
                 .setNegativeButton(android.R.string.cancel, null)
                 .show()
         }
@@ -417,6 +497,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         surface = null
         session?.decoder?.detachSurfaceBlocking()
+        if (frozen.surfaceLost()) showFrozen()
     }
 
     // ---- Session.Listener (main thread) --------------------------------------------
@@ -427,9 +508,19 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             when (status.state) {
                 Session.State.CONNECTED, Session.State.STATIC -> 0xFFB8F5C8.toInt()
                 Session.State.ERROR -> 0xFFFFB4A8.toInt()
-                else -> 0xFFFFE08A.toInt()
+                else -> STATUS_PENDING
             },
         )
+        if (::frozenLabel.isInitialized) updateFrozenLabel()
+    }
+
+    override fun onLiveFrame() {
+        val wasFrozen = frozen.livePresented()
+        if (wasFrozen) hideFrozen(fade = true)
+        if (foregroundAt != 0L) {
+            Log.i(TAG, "foreground to first live frame ${SystemClock.elapsedRealtime() - foregroundAt} ms (frozen frame shown=$wasFrozen)")
+            foregroundAt = 0L
+        }
     }
 
     override fun onAuthRequired() {
@@ -555,14 +646,21 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             lp.leftMargin = viewport.contentX.roundToInt(); lp.topMargin = viewport.contentY.roundToInt()
             video.layoutParams = lp
         }
+        val flp = frozenImage.layoutParams as FrameLayout.LayoutParams
+        if (flp.width != lp.width || flp.height != lp.height || flp.leftMargin != lp.leftMargin || flp.topMargin != lp.topMargin) {
+            flp.width = lp.width; flp.height = lp.height; flp.leftMargin = lp.leftMargin; flp.topMargin = lp.topMargin
+            frozenImage.layoutParams = flp
+        }
         applyViewport()
     }
 
     private fun applyViewport() {
         val z = viewport.zoom
-        video.scaleX = z; video.scaleY = z
-        video.translationX = viewport.x + viewport.contentX * (z - 1f)
-        video.translationY = viewport.y + viewport.contentY * (z - 1f)
+        for (view in listOf(video, frozenImage)) {
+            view.scaleX = z; view.scaleY = z
+            view.translationX = viewport.x + viewport.contentX * (z - 1f)
+            view.translationY = viewport.y + viewport.contentY * (z - 1f)
+        }
         renderCursor()
         if (viewport.zoomed != barZoomed) { barZoomed = viewport.zoomed; quickBar.render() }
     }
@@ -924,6 +1022,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     override fun disconnect() {
+        clearFrozen()
         finish()
     }
 
@@ -1004,6 +1103,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun signOut() {
         closeSettings()
+        clearFrozen()
         stopSession()
         Prefs.signOut(config) {
             startActivity(Intent(this, MainActivity::class.java)
@@ -1164,7 +1264,20 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).roundToInt()
 
+    /** The status line's look, shared by the frozen-frame "Reconnecting…" label. */
+    private fun styleStatusPill(view: TextView) {
+        view.setTextColor(Color.WHITE)
+        view.textSize = 12f
+        view.setPadding(dp(10), dp(4), dp(10), dp(4))
+        view.setBackgroundColor(0x99000000.toInt())
+    }
+
     companion object {
+        private const val TAG = "BubblePlayStream"
+        private const val STATUS_PENDING = 0xFFFFE08A.toInt()
+        /** About 35 % black over the frozen frame. */
+        private const val FROZEN_DIM = 0x59000000
+        private const val FROZEN_FADE_MS = 150L
         private const val BACKGROUND_GRACE_MS = 30_000L
         private const val SCROLL_DP_PER_NOTCH = 40f
         private const val MONITOR_REFRESH_MS = 1_500L

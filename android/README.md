@@ -33,6 +33,10 @@ On a fresh install, enter your own relay address before connecting. Existing sav
   - The screen stays on and the app runs immersive (both are settings).
   - A status line shows state, codec and size. Tap it to reconnect after an error. Full screen and touch mode can also be switched from the bar for the current session only.
   - The session is stopped 30 s after the app leaves the foreground (see "Known limits").
+  - **Resume:** when the app pauses, it copies the current video frame (`PixelCopy`). On return that frame stays on screen, dimmed, with a "Reconnecting…" label, until the first live frame is presented; it then fades out over 150 ms. If the copy failed, the screen is black until the stream returns. The frame is kept across the 30 s background stop and dropped on Disconnect or Sign out.
+  - **Reconnect in the background:** while the app is in the background, lost signaling or media sockets are not reconnected. On return (`onStart`) the backoff resets and any held or waiting retry runs at once.
+  - **Surface watchdog:** the 2 s steps (forced keyframe, media restart, give up) count only while signaling is up, and restart from the next `hello-ok`, so a slow host reconnect does not end in "Stream recovery stopped".
+  - logcat (`BubblePlayStream`) logs `foreground to first live frame N ms` on each return.
 
 Code layout (`app/src/main/java/de/bubblebuffer/bubbleplay/`):
 
@@ -125,6 +129,7 @@ Cleartext HTTP is allowed only for `10.0.2.2`, `127.0.0.1` and `localhost`. See 
 - **Cursor appearance:** the separate two-byte type-129 packet and Android system pointer mappings match `fixtures/cursor-types.json`; unknown kinds fall back to the arrow. Type-128 position packets keep their eight-byte format. Touch/trackpad and captured mice draw semantic overlay glyphs; uncaptured mice use Android system pointers. Android maps Progress to Wait and UpArrow to Arrow; the overlay distinguishes them. Only explicit Hidden suppresses the trackpad cursor, preserving older hosts' visibility behavior.
 - **Settings:** `Prefs` defaults, version 1 to 2 migration (codec spellings normalized, last touch mode kept as the default), malformed values; pointer-speed mapping; tap-to-click off.
 - **File transfer:** every packet, rejected case, receiver session and signaling case in `fixtures/file-transfer-contract.json`; the send window and ACK pacing; size and hash mismatch; MediaStore names; share-intent parsing.
+- **Resume:** the reconnect loop (backoff reset on start, no attempts while in the background), the surface watchdog not counting while signaling is down, and the frozen-frame overlay state (shown on return with a snapshot, cleared on the first presented frame, dropped on disconnect).
 - **Also covered:** clipboard chunking and reassembly, the touch gesture state machine and viewport, input coalescing and text splitting, and IME text reconciliation.
 
 ## Historical lab measurements (2026-09-30)
