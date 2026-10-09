@@ -4,7 +4,7 @@
 [env]
 NVIDIA_VIDEO_CODEC_SDK_PATH = { value = "sdk-stub", relative = true }
 
-# The global ~/.cargo config switches to rust-lld, which mis-parses the
-# Windows resource (.res) link args and the MSVC lib path. Keep MSVC link.exe here.
-[target.x86_64-pc-windows-msvc]
-linker = "link.exe"
+# aws-lc-sys (via str0m/dimpl) emits cc's ATL-MFC lib dir, "C:\Program Files\...\atlmfc\lib\x64",
+# as an unquoted -L/LIBPATH; rust-lld splits it at the spaces. This flag makes aws-lc-sys link
+# its crypto archive with +whole-archive and skip that search path. Trade-off: larger exe.
+AWS_LC_SYS_LINK_WHOLE_ARCHIVE = "1"
