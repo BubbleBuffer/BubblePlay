@@ -3,6 +3,7 @@
 //! sender, so a slow network cannot extend encoder latency.
 
 use std::net::{SocketAddr, UdpSocket};
+use std::os::windows::io::AsRawSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -14,10 +15,12 @@ use str0m::net::{Protocol, Receive};
 use str0m::{Input, Output};
 use tracing::{debug, info, warn};
 
+use crate::activity::Activity;
 use crate::rtc::{RtcAction, RtcSession};
+use crate::stun;
 
 pub const AU_QUEUE_BOUND: usize = 1;
-const UDP_POLL_CEILING: Duration = Duration::from_millis(4);
+const MAPPING_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 /// How long a media-carrying RTC peer may sit in ICE Disconnected before the
 /// session gives up on it. Short Wi-Fi hiccups recover inside this window.
 pub const RTC_DISCONNECT_GRACE: Duration = Duration::from_secs(5);
@@ -128,6 +131,10 @@ pub enum TransportCommand {
     Offer(String),
     RemoteCandidate(String),
     CursorStateReliable([u8; 8]),
+    /// End the current peer while retaining the transport socket and thread.
+    ResetPeer,
+    /// Background DNS resolution completed for NAT mapping maintenance.
+    StunServer(SocketAddr),
     Shutdown,
 }
 
@@ -135,8 +142,16 @@ pub enum TransportEvent {
     Answer(String),
     OfferRejected,
     Action(RtcAction),
-    AccessUnitWritten { id: u64, is_idr: bool },
-    AccessUnitNotAdmitted { id: u64, is_idr: bool },
+    AccessUnitWritten {
+        id: u64,
+        is_idr: bool,
+    },
+    AccessUnitNotAdmitted {
+        id: u64,
+        is_idr: bool,
+    },
+    /// All previous peer events precede this reset acknowledgement.
+    PeerReset,
     Stopped,
 }
 
@@ -146,10 +161,12 @@ pub struct TransportPump {
     // must never be discarded because the RTP pacer is temporarily busy.
     command_tx: Sender<TransportCommand>,
     event_rx: Receiver<TransportEvent>,
+    event_activity: Arc<Mutex<Option<Activity>>>,
     cursor_latest: Arc<Mutex<Option<[u8; 8]>>>,
     cursor_feedback_coalesced: Arc<AtomicU64>,
     cursor_kind_latest: Arc<Mutex<ReliableCursorKind>>,
     stop: Arc<AtomicBool>,
+    wake: Activity,
     join: Option<JoinHandle<()>>,
 }
 
@@ -158,6 +175,7 @@ pub struct AccessUnitSender {
     tx: SyncSender<AccessUnit>,
     reserved_or_queued: Arc<AtomicBool>,
     skipped_before_encode: Arc<AtomicU64>,
+    wake: Activity,
 }
 
 pub struct AccessUnitReservation {
@@ -196,6 +214,9 @@ impl AccessUnitReservation {
                 .store(false, Ordering::Release);
         }
         self.active = false;
+        if admitted {
+            self.sender.wake.notify();
+        }
         admitted
     }
 }
@@ -217,16 +238,24 @@ impl TransportPump {
         mapped_addr: Option<SocketAddr>,
         initial_bitrate: u32,
     ) -> Self {
+        let wait = Activity::new().expect("create RTC wake socket");
+        let wake = wait.clone();
         let (au_tx, au_rx) = mpsc::sync_channel(AU_QUEUE_BOUND);
         let au_sender = AccessUnitSender {
             tx: au_tx,
             reserved_or_queued: Arc::new(AtomicBool::new(false)),
             skipped_before_encode: Arc::new(AtomicU64::new(0)),
+            wake: wake.clone(),
         };
         let transport_gate = au_sender.reserved_or_queued.clone();
         let transport_skips = au_sender.skipped_before_encode.clone();
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
+        let event_activity = Arc::new(Mutex::new(None));
+        let event_tx = EventSender {
+            tx: event_tx,
+            activity: event_activity.clone(),
+        };
         let cursor_latest = Arc::new(Mutex::new(None));
         let cursor_feedback_coalesced = Arc::new(AtomicU64::new(0));
         let transport_cursor_latest = cursor_latest.clone();
@@ -252,6 +281,7 @@ impl TransportPump {
                     transport_cursor_latest,
                     transport_cursor_coalesced,
                     transport_cursor_kind,
+                    wait,
                 ) {
                     warn!(?error, "RTC transport pump stopped with error");
                 }
@@ -262,10 +292,12 @@ impl TransportPump {
             au_sender,
             command_tx,
             event_rx,
+            event_activity,
             cursor_latest,
             cursor_feedback_coalesced,
             cursor_kind_latest,
             stop,
+            wake,
             join: Some(join),
         }
     }
@@ -276,12 +308,43 @@ impl TransportPump {
         self.au_sender.reserve()
     }
     pub fn command(&self, command: TransportCommand) -> bool {
-        try_send_command(&self.command_tx, command)
+        let sent = try_send_command(&self.command_tx, command);
+        if sent {
+            self.wake.notify();
+        }
+        sent
+    }
+
+    /// Resolve outside the pump; every Binding uses the persistent media socket.
+    pub fn set_stun_server(&self, server: &str) -> Result<()> {
+        let server = server.to_owned();
+        let commands = self.command_tx.clone();
+        let wake = self.wake.clone();
+        thread::Builder::new()
+            .name("bubbleplay-stun-resolve".into())
+            .spawn(move || {
+                use std::net::ToSocketAddrs;
+                match server
+                    .to_socket_addrs()
+                    .map(|mut addresses| addresses.find(SocketAddr::is_ipv4))
+                {
+                    Ok(Some(address)) => {
+                        if commands.send(TransportCommand::StunServer(address)).is_ok() {
+                            wake.notify();
+                        }
+                    }
+                    Ok(None) => warn!("STUN refresh DNS returned no IPv4 address"),
+                    Err(error) => warn!(?error, "STUN refresh DNS failed"),
+                }
+            })
+            .context("spawn STUN refresh resolution")?;
+        Ok(())
     }
     /// Publish routine cursor telemetry without ever building a queue. The RTC
     /// thread consumes the newest state on its next bounded transport wake.
     pub fn publish_cursor_state(&self, state: [u8; 8]) {
         replace_latest_cursor(&self.cursor_latest, state, &self.cursor_feedback_coalesced);
+        self.wake.notify();
     }
     /// Reliable type changes use a separate latest-only slot. Keep the last
     /// delivered kind too, so a fresh RTC offer can replay it when control opens.
@@ -290,7 +353,17 @@ impl TransportPump {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .publish(kind);
+        self.wake.notify();
     }
+    /// Attach the producer wake before waiting for transport events.
+    pub fn set_activity(&self, activity: Activity) {
+        *self
+            .event_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(activity.clone());
+        activity.notify();
+    }
+
     pub fn try_event(&self) -> Option<TransportEvent> {
         self.event_rx.try_recv().ok()
     }
@@ -298,6 +371,7 @@ impl TransportPump {
     pub fn shutdown(mut self) {
         // Shutdown is out-of-band so a signaling backlog cannot delay join.
         self.stop.store(true, Ordering::Release);
+        self.wake.notify();
         drop(self.au_sender);
         drop(self.command_tx);
         if let Some(join) = self.join.take() {
@@ -364,6 +438,43 @@ enum DeadEpochAction {
     StopNegotiated,
 }
 
+struct MappingRefresh {
+    server: SocketAddr,
+    transaction: Option<[u8; 12]>,
+    next_request: Instant,
+}
+
+impl MappingRefresh {
+    fn new(server: SocketAddr, now: Instant) -> Self {
+        Self {
+            server,
+            transaction: None,
+            next_request: now,
+        }
+    }
+
+    fn tick(&mut self, socket: &UdpSocket, now: Instant) {
+        if now < self.next_request {
+            return;
+        }
+        let (request, transaction) = stun::binding_request();
+        self.next_request = now + MAPPING_REFRESH_INTERVAL;
+        match socket.send_to(&request, self.server) {
+            Ok(_) => self.transaction = Some(transaction),
+            Err(error) => debug!(?error, "STUN mapping refresh send failed"),
+        }
+    }
+
+    fn response(&mut self, bytes: &[u8], source: SocketAddr) -> Option<SocketAddr> {
+        if source != self.server {
+            return None;
+        }
+        let mapped = stun::parse_binding_response(bytes, self.transaction.as_ref()?)?;
+        self.transaction = None;
+        Some(mapped)
+    }
+}
+
 fn dead_epoch_action(alive: bool, offer_active: bool) -> DeadEpochAction {
     match (alive, offer_active) {
         (true, _) => DeadEpochAction::Continue,
@@ -385,7 +496,31 @@ fn schedule_timeout(deadline: Instant, now: Instant, offer_active: bool) -> Inst
     }
 }
 
-fn emit(tx: &Sender<TransportEvent>, event: TransportEvent) {
+#[derive(Clone)]
+struct EventSender {
+    tx: Sender<TransportEvent>,
+    activity: Arc<Mutex<Option<Activity>>>,
+}
+
+impl EventSender {
+    fn send(
+        &self,
+        event: TransportEvent,
+    ) -> std::result::Result<(), mpsc::SendError<TransportEvent>> {
+        let result = self.tx.send(event);
+        if let Some(activity) = self
+            .activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            activity.notify();
+        }
+        result
+    }
+}
+
+fn emit(tx: &EventSender, event: TransportEvent) {
     // This is an unbounded MPSC hand-off: it never blocks the pacer and a
     // critical offer/answer/ICE/input/admission event cannot vanish on a full
     // bounded queue. Receiver disconnection is terminal and observed by the
@@ -422,7 +557,7 @@ fn fresh_epoch(
 fn drain_outputs(
     rtc: &mut RtcSession,
     socket: &UdpSocket,
-    events: Option<&Sender<TransportEvent>>,
+    events: Option<&EventSender>,
     mut counters: Option<&mut TransportCounters>,
 ) -> Result<Instant> {
     loop {
@@ -451,22 +586,24 @@ fn drain_outputs(
 fn transport_loop(
     socket: UdpSocket,
     host_addr: Option<SocketAddr>,
-    mapped: Option<SocketAddr>,
+    mut mapped: Option<SocketAddr>,
     bitrate: u32,
     au_rx: Receiver<AccessUnit>,
     au_gate: Arc<AtomicBool>,
     skipped_before_encode: Arc<AtomicU64>,
     command_rx: Receiver<TransportCommand>,
-    events: Sender<TransportEvent>,
+    events: EventSender,
     stop: Arc<AtomicBool>,
     cursor_latest: Arc<Mutex<Option<[u8; 8]>>>,
     cursor_feedback_coalesced: Arc<AtomicU64>,
     cursor_kind_latest: Arc<Mutex<ReliableCursorKind>>,
+    wait: Activity,
 ) -> Result<()> {
     socket
         .set_nonblocking(true)
         .context("make media socket nonblocking")?;
     let mut offer_active = false;
+    let mut mapping_refresh: Option<MappingRefresh> = None;
     let mut rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
     let mut timeout = schedule_timeout(
         drain_outputs(&mut rtc, &socket, Some(&events), None)?,
@@ -492,8 +629,14 @@ fn transport_loop(
         match command_rx.try_recv() {
             Ok(_) if stop_takes_priority(stop.load(Ordering::Acquire)) => break,
             Ok(TransportCommand::Offer(sdp)) => {
+                if let Some(refresh) = &mut mapping_refresh {
+                    refresh.next_request = Instant::now();
+                }
                 rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
-                cursor_kind_latest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).replay();
+                cursor_kind_latest
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replay();
                 reliable_cursor_pending = None;
                 cursor_latest
                     .lock()
@@ -512,9 +655,33 @@ fn transport_loop(
                 }
                 mutated = true;
             }
+            Ok(TransportCommand::ResetPeer) => {
+                offer_active = false;
+                reliable_cursor_pending = None;
+                cursor_latest
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                while let Ok(au) = au_rx.try_recv() {
+                    emit(
+                        &events,
+                        TransportEvent::AccessUnitNotAdmitted {
+                            id: au.id,
+                            is_idr: au.is_idr,
+                        },
+                    );
+                }
+                au_gate.store(false, Ordering::Release);
+                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+                emit(&events, TransportEvent::PeerReset);
+                mutated = true;
+            }
             Ok(TransportCommand::RemoteCandidate(candidate)) => {
                 rtc.add_remote_candidate(&candidate);
                 mutated = true;
+            }
+            Ok(TransportCommand::StunServer(server)) => {
+                mapping_refresh = Some(MappingRefresh::new(server, Instant::now()));
             }
             Ok(TransportCommand::CursorStateReliable(state)) => {
                 reliable_cursor_pending = Some(state)
@@ -526,6 +693,9 @@ fn transport_loop(
         }
         if !running {
             break;
+        }
+        if let Some(refresh) = &mut mapping_refresh {
+            refresh.tick(&socket, Instant::now());
         }
         match dead_epoch_action(rtc.alive(), offer_active) {
             DeadEpochAction::Continue => {}
@@ -541,15 +711,22 @@ fn transport_loop(
             }
             DeadEpochAction::StopNegotiated => {
                 emit(&events, TransportEvent::Action(RtcAction::Closed));
-                break;
+                offer_active = false;
+                continue;
             }
         }
         if !mutated {
-            let kind = cursor_kind_latest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).next();
+            let kind = cursor_kind_latest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .next();
             if let Some(kind) = kind {
                 match rtc.write_cursor_state(true, &kind) {
                     Ok(true) => {
-                        cursor_kind_latest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).delivered(kind);
+                        cursor_kind_latest
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .delivered(kind);
                         counters.cursor_feedback_sent += 1;
                         mutated = true;
                     }
@@ -644,6 +821,16 @@ fn transport_loop(
         if !mutated {
             match socket.recv_from(&mut buffer) {
                 Ok((n, source)) => {
+                    if let Some(address) = mapping_refresh
+                        .as_mut()
+                        .and_then(|refresh| refresh.response(&buffer[..n], source))
+                    {
+                        if mapped != Some(address) {
+                            info!(%address, "refreshed STUN mapping for next RTC offer");
+                            mapped = Some(address);
+                        }
+                        continue;
+                    }
                     // Without a host address there are no candidates, so
                     // nothing inbound can belong to the RTC session.
                     if let (Ok(contents), Some(destination)) = (buffer[..n].try_into(), host_addr) {
@@ -667,7 +854,7 @@ fn transport_loop(
             }
         }
         let now = Instant::now();
-        if !mutated && now >= timeout {
+        if !mutated && offer_active && now >= timeout {
             let late = now.duration_since(timeout).as_micros() as u64;
             if late != 0 {
                 deadline_late_count += 1;
@@ -726,64 +913,111 @@ fn transport_loop(
             );
             continue;
         }
-        // std has no select over UDP + channels.  This bounded receive wakes
-        // immediately for producer/control work and never uses a 1 ms sleep;
-        // UDP is rechecked at a small ceiling while str0m deadlines win.
-        let wait = timeout
-            .saturating_duration_since(Instant::now())
-            .min(UDP_POLL_CEILING);
-        match command_rx.recv_timeout(wait) {
-            _ if stop_takes_priority(stop.load(Ordering::Acquire)) => break,
-            Ok(TransportCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                running = false
-            }
-            Ok(command) => {
-                match command {
-                    TransportCommand::Offer(s) => {
-                        rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
-                        cursor_kind_latest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).replay();
-                        reliable_cursor_pending = None;
-                        cursor_latest
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .take();
-                        match rtc.accept_offer(&s) {
-                            Ok(answer) => {
-                                offer_active = true;
-                                emit(&events, TransportEvent::Answer(answer));
-                            }
-                            Err(e) => {
-                                offer_active = false;
-                                warn!(?e, "rejecting SDP offer");
-                                emit(&events, TransportEvent::OfferRejected);
-                            }
-                        }
-                    }
-                    TransportCommand::RemoteCandidate(c) => rtc.add_remote_candidate(&c),
-                    TransportCommand::CursorStateReliable(state) => {
-                        reliable_cursor_pending = Some(state)
-                    }
-                    TransportCommand::Shutdown => {}
-                };
-                timeout = schedule_timeout(
-                    drain_outputs(&mut rtc, &socket, Some(&events), Some(&mut counters))?,
-                    Instant::now(),
-                    offer_active,
-                );
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        // Media datagrams and every producer/control publication wake this
+        // wait immediately. An idle pump has no RTC deadlines to service.
+        let mut deadline = if offer_active {
+            timeout.min(next_log)
+        } else {
+            next_log
+        };
+        if let Some(refresh) = &mapping_refresh {
+            deadline = deadline.min(refresh.next_request);
         }
+        let sockets = if offer_active || mapping_refresh.is_some() {
+            vec![(socket.as_raw_socket(), false)]
+        } else {
+            vec![]
+        };
+        wait.wait(deadline.saturating_duration_since(Instant::now()), &sockets)?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapping_refresh_uses_media_socket_and_validates_server_and_transaction() {
+        let media = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let now = Instant::now();
+        let mut refresh = super::MappingRefresh::new(server.local_addr().unwrap(), now);
+        refresh.tick(&media, now);
+        let mut request = [0u8; 20];
+        let (size, source) = server.recv_from(&mut request).unwrap();
+        assert_eq!(size, 20);
+        assert_eq!(source, media.local_addr().unwrap());
+        let mut response = [0u8; 32];
+        response[..20].copy_from_slice(&request);
+        response[..2].copy_from_slice(&0x0101u16.to_be_bytes());
+        response[2..4].copy_from_slice(&12u16.to_be_bytes());
+        response[20..22].copy_from_slice(&0x0020u16.to_be_bytes());
+        response[22..24].copy_from_slice(&8u16.to_be_bytes());
+        response[25] = 1;
+        response[26..28].copy_from_slice(&(4444u16 ^ 0x2112).to_be_bytes());
+        for (index, byte) in [203u8, 0, 113, 9].into_iter().enumerate() {
+            response[28 + index] = byte ^ request[4 + index];
+        }
+        assert_eq!(
+            refresh.response(&response, media.local_addr().unwrap()),
+            None
+        );
+        let mut wrong_transaction = response;
+        wrong_transaction[8] ^= 1;
+        assert_eq!(
+            refresh.response(&wrong_transaction, server.local_addr().unwrap()),
+            None
+        );
+        assert_eq!(
+            refresh.response(&response, server.local_addr().unwrap()),
+            Some("203.0.113.9:4444".parse().unwrap())
+        );
+        assert_eq!(
+            refresh.response(&response, server.local_addr().unwrap()),
+            None
+        );
+        server.set_nonblocking(true).unwrap();
+        refresh.tick(&media, now + Duration::from_secs(1));
+        assert_eq!(
+            server.recv_from(&mut request).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        refresh.tick(&media, now + super::MAPPING_REFRESH_INTERVAL);
+        assert_eq!(server.recv_from(&mut request).unwrap().0, 20);
+    }
+
+    #[test]
+    fn resetting_a_peer_keeps_the_pump_alive_and_wakes_the_producer() {
+        let activity = crate::activity::Activity::new().unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let pump = super::TransportPump::spawn(socket, None, None, 2_000_000);
+        pump.set_activity(activity.clone());
+        for _ in 0..2 {
+            assert!(pump.command(super::TransportCommand::ResetPeer));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match pump.try_event() {
+                    Some(super::TransportEvent::PeerReset) => break,
+                    Some(super::TransportEvent::Stopped) => panic!("reset stopped reusable pump"),
+                    Some(_) => {}
+                    None => {
+                        assert!(Instant::now() < deadline, "reset acknowledgement timed out");
+                        activity
+                            .wait(deadline.saturating_duration_since(Instant::now()), &[])
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        pump.shutdown();
+    }
+
     use super::{
-        ReliableCursorKind,
         dead_epoch_action, emit, replace_latest_cursor, schedule_timeout, stop_takes_priority,
-        try_admit_access_unit, try_send_command, DeadEpochAction, RtcPeerDecision,
-        RtcPeerLifecycle, TransportCounters, TransportEvent, RTC_DISCONNECT_GRACE,
+        try_admit_access_unit, try_send_command, DeadEpochAction, ReliableCursorKind,
+        RtcPeerDecision, RtcPeerLifecycle, TransportCounters, TransportEvent, RTC_DISCONNECT_GRACE,
     };
 
     #[test]
@@ -805,12 +1039,12 @@ mod tests {
         slot.publish([129, 2]); // Explicit sync replays even an unchanged kind.
         assert_eq!(slot.next(), Some([129, 2]));
     }
-    use std::time::{Duration, Instant};
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{channel, sync_channel},
         Mutex,
     };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn rtc_epoch_without_a_host_address_starts_without_candidates() {
@@ -878,6 +1112,10 @@ mod tests {
     #[test]
     fn lifecycle_events_survive_a_busy_consumer_without_blocking_the_sender() {
         let (tx, rx) = channel();
+        let tx = super::EventSender {
+            tx,
+            activity: std::sync::Arc::new(Mutex::new(None)),
+        };
         for _ in 0..1_000 {
             emit(&tx, TransportEvent::Stopped);
         }
@@ -939,6 +1177,9 @@ mod tests {
             now + std::time::Duration::from_secs(1)
         );
         assert_eq!(schedule_timeout(now, now, true), now);
-        assert_eq!(schedule_timeout(now - std::time::Duration::from_millis(1), now, true), now);
+        assert_eq!(
+            schedule_timeout(now - std::time::Duration::from_millis(1), now, true),
+            now
+        );
     }
 }

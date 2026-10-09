@@ -53,11 +53,11 @@ pub(super) fn accept_session_codec(current: VideoCodec, requested: VideoCodec) -
     current == requested || matches!((current, requested), (VideoCodec::Hevc, VideoCodec::H264))
 }
 
-/// Poll the one-shot idle snapshot state only after a peer can receive it.
+/// Poll the one-shot idle snapshot state for a live peer or its first prewarm.
 /// The capture state remains authoritative after an IDR is cached because
 /// viewport transitions can explicitly re-arm one activation frame.
-pub(super) fn should_snapshot_idle_desktop(ice_connected: bool, _latest_idr_missing: bool) -> bool {
-    ice_connected
+pub(super) fn should_snapshot_idle_desktop(media_ready: bool, latest_idr_missing: bool) -> bool {
+    media_ready || latest_idr_missing
 }
 
 pub(super) fn capture_admission_ready(
@@ -91,12 +91,25 @@ pub(super) fn encoder_benchmark_contract_changed(
     encoder_available && applied_profile_revision != desired_profile_revision
 }
 
-pub(super) fn producer_poll_interval(media_demand_active: bool) -> Duration {
-    if media_demand_active {
-        Duration::from_millis(1)
-    } else {
-        Duration::from_secs(1)
-    }
+/// Socket/channel activity interrupts this bounded housekeeping wait.
+pub(super) fn producer_wait_duration(
+    now: Instant,
+    deadlines: impl IntoIterator<Item = Instant>,
+) -> Duration {
+    deadlines
+        .into_iter()
+        .fold(Duration::from_millis(100), |wait, deadline| {
+            wait.min(deadline.saturating_duration_since(now))
+        })
+}
+
+pub(super) fn frame_admission_wake_at(
+    next_admission: Instant,
+    frame_interval: Duration,
+) -> Instant {
+    next_admission
+        .checked_sub(frame_interval / 2)
+        .unwrap_or(next_admission)
 }
 
 pub(super) fn frame_admission_due(
@@ -209,6 +222,15 @@ pub(super) struct ProfileTransition {
 pub(super) struct CachedIdr {
     pub(super) data: Vec<u8>,
     pub(super) mode: VideoMode,
+    /// Local Default pixels need fresh authorization before cached replay.
+    /// Secure helper and privileged Agent frames retain their own policy.
+    pub(super) requires_default: bool,
+}
+
+impl CachedIdr {
+    pub(super) fn replay_authorized(&self, default_check: impl FnOnce() -> bool) -> bool {
+        !self.requires_default || default_check()
+    }
 }
 
 /// A profile IDR has been encoded and accepted by the one-slot AU queue, but
@@ -438,10 +460,27 @@ pub(super) struct PendingFirstFrame {
     pub(super) epoch: Option<String>,
     pub(super) generation: u32,
     pub(super) admitted: bool,
+    pub(super) rtc_idr_id: Option<u64>,
     pub(super) armed_at: Instant,
 }
 
 impl PendingFirstFrame {
+    pub(super) fn reject_rtc_access_unit(&mut self, id: u64) {
+        if !self.admitted && self.rtc_idr_id == Some(id) {
+            self.rtc_idr_id = None;
+        }
+    }
+    pub(super) fn admit_rtc_access_unit(&mut self, generation: u32, id: u64) -> bool {
+        if self.transport != "webrtc"
+            || self.generation != generation
+            || self.admitted
+            || self.rtc_idr_id != Some(id)
+        {
+            return false;
+        }
+        self.admitted = true;
+        true
+    }
     /// Bind a WSS startup request to the generation of the first IDR that was
     /// actually accepted by the current media egress. Viewport and codec
     /// transitions may legitimately advance the generation after the request

@@ -14,7 +14,9 @@ mod host_session;
 use host_session::*;
 mod host_benchmark;
 use host_benchmark::*;
+mod producer_wait;
 
+use bubbleplay_host::activity::Activity;
 use bubbleplay_host::agent_client;
 use bubbleplay_host::benchmark;
 use bubbleplay_host::capture;
@@ -261,15 +263,29 @@ fn parse_args() -> Result<Args> {
     Ok(args)
 }
 
-fn local_recovery_probe_due(privileged: bool, available: bool, now: Instant, deadline: Instant) -> bool {
+fn local_recovery_probe_due(
+    privileged: bool,
+    available: bool,
+    now: Instant,
+    deadline: Instant,
+) -> bool {
     !privileged && !available && now >= deadline
 }
 
-fn announce_capture_state(signaling: &mut Signaling, capture: &CaptureSource, generation: u32, reason: &str) {
+fn announce_capture_state(
+    signaling: &mut Signaling,
+    capture: &CaptureSource,
+    generation: u32,
+    reason: &str,
+) {
     let state = capture.desktop_state();
     if let Some(secure) = capture.secure_state() {
-        signaling.send_secure_desktop_state_status(state.available, secure.kind,
-            if state.available { &secure.caps } else { &[] }, generation);
+        signaling.send_secure_desktop_state_status(
+            state.available,
+            secure.kind,
+            if state.available { &secure.caps } else { &[] },
+            generation,
+        );
         return;
     }
     if !capture.is_privileged() && !state.available {
@@ -279,8 +295,15 @@ fn announce_capture_state(signaling: &mut Signaling, capture: &CaptureSource, ge
         }
     }
     signaling.send_desktop_state_kind(
-        if state.available { "active" } else { "unavailable" },
-        Some(state.desktop), Some(state.input), generation, reason,
+        if state.available {
+            "active"
+        } else {
+            "unavailable"
+        },
+        Some(state.desktop),
+        Some(state.input),
+        generation,
+        reason,
     );
 }
 
@@ -784,6 +807,12 @@ impl ViewerSessionLog {
                 "{}",
                 bubbleplay_host::admin_agent::client::VIEWER_STARTED_MARKER
             );
+        } else if !connected && self.live {
+            self.live = false;
+            info!(
+                "{}",
+                bubbleplay_host::admin_agent::client::VIEWER_ENDED_MARKER
+            );
         }
     }
 }
@@ -810,7 +839,7 @@ fn end_rtc_peer(
 ) {
     *ice_connected = false;
     pending_candidates.clear();
-    let _ = pump.command(TransportCommand::Shutdown);
+    let _ = pump.command(TransportCommand::ResetPeer);
     info!(reason, "RTC peer ended; the WSS session continues");
 }
 
@@ -901,7 +930,21 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         .unwrap_or_else(|| {
             Controller::adaptive(Profile::Full, args.max_bitrate_bps, 6_000_000, stream_mode)
         });
+    let activity = Activity::new().context("producer activity wait")?;
+    let cursor_wake = producer_wait::CursorWake::new(activity.clone());
+    if let Err(error) = &cursor_wake {
+        warn!(%error, "cursor notifications unavailable; retaining 16 ms cursor sampling");
+    }
+    capture.set_event_activity(activity.clone());
+    if let Some(helper) = capture.secure_helper() {
+        helper
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_activity(activity.clone());
+    }
     let pump = TransportPump::spawn(socket, host_addr, mapped_addr, quality.target());
+    pump.set_activity(activity.clone());
+    pump.set_stun_server(STUN_SERVER)?;
     let mut encoder: Option<Nvenc> = None;
     let mut active_codec = VideoCodec::preferred();
     let mut wss_media: Option<WssMediaEgress> = None;
@@ -937,10 +980,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut cursor_kind_tracker = CursorKindTracker::new(Instant::now());
     let mut latest_cursor_kind: Option<[u8; 2]> = None;
     let mut next_cursor_poll = Instant::now();
+    let mut next_cursor_event_sample = Instant::now();
     let mut next_input_log = Instant::now() + Duration::from_secs(1);
     let mut latest_idr: Option<CachedIdr> = None;
     let mut replay = CachedIdrReplay::default();
     let mut ice_connected = false;
+    let mut viewer_attached = false;
+    let mut rtc_reset_pending = false;
     let mut rtc_peer = RtcPeerLifecycle::default();
     let mut offer_accepted = false;
     let mut offer_in_flight = false;
@@ -1044,12 +1090,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut pending_wss_idr: Option<PendingWssIdr> = None;
     let mut pending_lab_quality_keyframe: Option<String> = None;
     let mut pending_first_frame: Option<PendingFirstFrame> = None;
+    let mut completed_first_frame: Option<(String, u32, String, Option<String>)> = None;
+    let mut startup_idr_claimable = true;
+    let mut startup_idr_admitted: Option<(u32, &'static str)> = None;
+    let mut startup_idr_submitted: Option<(u32, &'static str, u64)> = None;
     let mut pending_viewport_idr: Option<PendingViewportIdr> = None;
     let mut viewport_crop: Option<ViewportCrop> = None;
     let mut active_viewport: Option<(u32, u32)> = None;
     let mut viewport_revision = 0u32;
     let mut last_logged_bwe: Option<u32> = None;
     let mut producer_loop_iterations = 0u64;
+    let mut producer_window_started = Instant::now();
     let mut last_capture_stats = (0u64, 0u64);
     let mut viewer_session = ViewerSessionLog::default();
     // Follow active window: per signaling session, off until the client asks.
@@ -1071,76 +1122,229 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         };
         ($selector:expr, $carry_input:expr) => {{
             let selector: &str = $selector;
-            if !capture_available || !capture.desktop_state().available || capture.desktop_state().desktop == "secure" {
-                signaling.send_monitor_error(selector, "desktop unavailable; monitor selection is suspended");
+            if !capture_available
+                || !capture.desktop_state().available
+                || capture.desktop_state().desktop == "secure"
+            {
+                signaling.send_monitor_error(
+                    selector,
+                    "desktop unavailable; monitor selection is suspended",
+                );
             } else {
-            carried_input.begin_switch($carry_input);
-            if !$carry_input {
-                input_sink.release_all();
-                capture.release_input();
-            }
-            remote_input_ready = false;
-            latest_cursor_kind = None;
-            cursor_kind_tracker.reset();
-            signaling.send_desktop_state("unavailable", media_generation, "monitor-switch");
-            media_generation = media_generation.wrapping_add(1).max(1);
-            media_sequence = 0;
-            latest_idr = None;
-            pending_transition_idr = None;
-            pending_wss_idr = None;
-            pending_viewport_idr = None;
-            encoder = None;
-            scaler = None;
-            next_admission = Instant::now();
-            next_idr = Instant::now();
-            match capture.switch_monitor(selector) {
-                Ok(completed) => {
-                    // Local capture completes synchronously. The
-                    // privileged Agent returns false and must prove
-                    // the newly selected monitor with
-                    // CaptureHealth::Active before input/media are
-                    // advertised ready.
-                    capture_available = completed;
-                    if completed {
-                        // The client owns the display choice for
-                        // the lifetime of the host process: a
-                        // later session reopens the same monitor.
-                        selection.remember(capture.monitor_selector());
-                        input_sink.set_absolute_region(capture.region());
-                        cursor_tracker =
-                            CursorTracker::for_region(capture.region(), Instant::now());
-                        signaling.send_desktop_state(
-                            "active",
-                            media_generation,
-                            "monitor-switched",
+                carried_input.begin_switch($carry_input);
+                if !$carry_input {
+                    input_sink.release_all();
+                    capture.release_input();
+                }
+                remote_input_ready = false;
+                latest_cursor_kind = None;
+                cursor_kind_tracker.reset();
+                signaling.send_desktop_state("unavailable", media_generation, "monitor-switch");
+                media_generation = media_generation.wrapping_add(1).max(1);
+                media_sequence = 0;
+                latest_idr = None;
+                pending_transition_idr = None;
+                pending_wss_idr = None;
+                pending_viewport_idr = None;
+                encoder = None;
+                scaler = None;
+                next_admission = Instant::now();
+                next_idr = Instant::now();
+                match capture.switch_monitor(selector) {
+                    Ok(completed) => {
+                        // Local capture completes synchronously. The
+                        // privileged Agent returns false and must prove
+                        // the newly selected monitor with
+                        // CaptureHealth::Active before input/media are
+                        // advertised ready.
+                        capture_available = completed;
+                        if completed {
+                            // The client owns the display choice for
+                            // the lifetime of the host process: a
+                            // later session reopens the same monitor.
+                            selection.remember(capture.monitor_selector());
+                            input_sink.set_absolute_region(capture.region());
+                            cursor_tracker =
+                                CursorTracker::for_region(capture.region(), Instant::now());
+                            signaling.send_desktop_state(
+                                "active",
+                                media_generation,
+                                "monitor-switched",
+                            );
+                        }
+                        if let Ok(monitors) = capture.monitors() {
+                            signaling.send_monitor_list(monitors);
+                        }
+                        info!(
+                            monitor = selector,
+                            generation = media_generation,
+                            "live monitor switch complete"
                         );
                     }
-                    if let Ok(monitors) = capture.monitors() {
-                        signaling.send_monitor_list(monitors);
+                    Err(error) => {
+                        capture_available = capture.desktop_state().available;
+                        signaling.send_monitor_error(selector, &error.to_string());
+                        if let Ok(monitors) = capture.monitors() {
+                            signaling.send_monitor_list(monitors);
+                        }
+                        warn!(
+                            monitor = selector,
+                            ?error,
+                            "live monitor switch failed; retaining previous capture"
+                        );
                     }
-                    info!(
-                        monitor = selector,
-                        generation = media_generation,
-                        "live monitor switch complete"
-                    );
                 }
-                Err(error) => {
-                    capture_available = capture.desktop_state().available;
-                    signaling.send_monitor_error(selector, &error.to_string());
-                    if let Ok(monitors) = capture.monitors() {
-                        signaling.send_monitor_list(monitors);
-                    }
-                    warn!(
-                        monitor = selector,
-                        ?error,
-                        "live monitor switch failed; retaining previous capture"
-                    );
-                }
-            }
             }
         }};
     }
+    macro_rules! park_viewer {
+        ($reason:expr) => {{
+            file_drag_preview.cancel();
+            if let Some(pending) = pending_native_drop.take() {
+                pending.request.reject("viewer-disconnected");
+            }
+            input_sink.release_all();
+            capture.release_input();
+            capture.set_capture_demand(false)?;
+            carried_input.reset();
+            remote_input_ready = false;
+            viewer_attached = false;
+            viewer_session.observe(false);
+            ice_connected = false;
+            offer_accepted = false;
+            offer_in_flight = false;
+            pending_candidates.clear();
+            ensure!(
+                pump.command(TransportCommand::ResetPeer),
+                "RTC transport stopped during peer reset"
+            );
+            rtc_reset_pending = true;
+            rtc_peer = RtcPeerLifecycle::default();
+            replay = CachedIdrReplay::default();
+            latest_idr = None;
+            pending_first_frame = None;
+            completed_first_frame = None;
+            startup_idr_claimable = true;
+            startup_idr_admitted = None;
+            startup_idr_submitted = None;
+            pending_transition_idr = None;
+            pending_wss_idr = None;
+            pending_viewport_idr = None;
+            pending_lab_quality_keyframe = None;
+            follow_state = None;
+            signaling.set_follow(false);
+            viewport_crop = None;
+            active_viewport = None;
+            viewport_revision = 0;
+            profiles.announced = None;
+            tile_tracker = None;
+            tile_hasher = None;
+            scroll_detector = None;
+            v4_pacer = V4Pacer::default();
+            if let Some(encoder) = encoder.as_mut() {
+                encoder.force_idr();
+            }
+            next_admission = Instant::now();
+            info!(
+                reason = $reason,
+                encoder_warm = encoder.is_some(),
+                "viewer left; host pipeline remains warm"
+            );
+        }};
+    }
+    let mut first_iteration = true;
     'session: loop {
+        let wait_now = Instant::now();
+        let wss_peer_live = viewer_attached
+            && wss_media.as_ref().is_some_and(|egress| {
+                let stats = egress.stats();
+                stats.connected && stats.peer_present
+            });
+        let capture_demand = viewer_attached
+            && (offer_in_flight || offer_accepted || ice_connected || wss_peer_live);
+        let waiting_mode = profiles
+            .staged
+            .map(|(mode, _)| mode)
+            .unwrap_or(profiles.active);
+        let waiting_interval = Duration::from_secs_f64(1.0 / (waiting_mode.fps as f64).max(1.0));
+        let admission_wake = frame_admission_wake_at(next_admission, waiting_interval);
+        let urgent_capture = latest_idr.is_none()
+            || profiles.staged().is_some()
+            || encoder.as_ref().is_some_and(Nvenc::idr_pending);
+        let recovery_due = viewer_attached
+            && local_recovery_probe_due(
+                capture.is_privileged(),
+                capture_available,
+                wait_now,
+                next_local_recovery_probe,
+            );
+        capture.set_capture_demand(capture_demand || recovery_due)?;
+        if capture_demand || recovery_due {
+            capture.request_event_frame_at(if urgent_capture || recovery_due {
+                wait_now
+            } else {
+                admission_wake.max(wait_now)
+            })?;
+        }
+        if let Ok(wake) = &cursor_wake {
+            wake.set_active(capture_demand && !capture.is_privileged());
+        }
+        if !first_iteration {
+            let mut deadlines = vec![next_ping, next_benchmark_refresh, next_input_log];
+            // An absent/incompatible lease intentionally leaves status retry
+            // due immediately. Only schedule it while a sample can be sent.
+            if benchmark_lease.active().is_some_and(|profile| {
+                active_codec == VideoCodec::Hevc
+                    && benchmark_mode_matches(profile.stream_mode, stream_mode)
+            }) {
+                deadlines.push(next_benchmark_status);
+            }
+            if capture_demand {
+                if !capture.is_privileged() && capture.desktop_state().desktop != "secure" {
+                    deadlines.push(next_cursor_poll);
+                    if cursor_wake
+                        .as_ref()
+                        .is_ok_and(|wake| wake.changed_pending())
+                    {
+                        deadlines.push(next_cursor_event_sample);
+                    }
+                }
+                if capture.is_privileged() && next_admission > wait_now {
+                    deadlines.push(next_admission);
+                }
+                if wss_media.is_some() {
+                    deadlines.push(next_wss_stats);
+                }
+                if let Some(deadline) = capture.next_event_deadline(should_snapshot_idle_desktop(
+                    ice_connected || wss_peer_live,
+                    latest_idr.is_none(),
+                )) {
+                    deadlines.push(deadline);
+                }
+                if follow_state.is_some()
+                    && capture_available
+                    && capture.desktop_state().desktop != "secure"
+                    && (ice_connected || wss_media.is_some())
+                {
+                    deadlines.push(next_follow_sample);
+                    if edge_monitors.is_some() {
+                        deadlines.push(next_edge_sample);
+                    }
+                }
+                if file_service.is_some() {
+                    deadlines.push(next_file_rate_update);
+                }
+            }
+            if viewer_attached && !capture_available {
+                deadlines.push(next_local_recovery_probe);
+            }
+            if args.fixed_bitrate_bps.is_none() && wss_media.is_none() {
+                deadlines.push(next_quality_tick);
+            }
+            let wait = producer_wait_duration(wait_now, deadlines);
+            activity.wait(wait, &[(signaling.read_socket(), false)])?;
+        }
+        first_iteration = false;
         producer_loop_iterations = producer_loop_iterations.saturating_add(1);
         let loop_now = Instant::now();
         if loop_now >= next_benchmark_refresh {
@@ -1365,16 +1569,30 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 benchmark_status_now + benchmark_status_retry_delay(status_sent);
         }
         capture.tick(loop_now)?;
-        capture.tick_secure(ice_connected || wss_media.is_some(), loop_now);
+        capture.tick_secure(
+            viewer_attached && (ice_connected || wss_peer_live),
+            loop_now,
+        );
         let secure_helper_ready = capture.secure_helper_ready();
         if secure_helper_ready != last_secure_helper_ready {
-            signaling.send_host_capabilities(args.privileged_agent, args.privileged_agent,
-                args.privileged_agent || secure_helper_ready, secure_helper_ready);
+            signaling.send_host_capabilities(
+                args.privileged_agent,
+                args.privileged_agent,
+                args.privileged_agent || secure_helper_ready,
+                secure_helper_ready,
+            );
             last_secure_helper_ready = secure_helper_ready;
         }
-        input_sink.set_secure_desktop(capture.secure_state().is_some(), capture.secure_input_allowed());
+        input_sink.set_secure_desktop(
+            capture.secure_state().is_some(),
+            capture.secure_input_allowed(),
+        );
         if let Some(link) = capture.secure_helper() {
-            while let Some(result) = link.lock().unwrap_or_else(|error| error.into_inner()).take_deny_result() {
+            while let Some(result) = link
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take_deny_result()
+            {
                 signaling.send_secure_action_result(result.ok, &result.reason);
             }
         }
@@ -1494,8 +1712,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         if let CaptureSource::Local(source) = &mut capture {
-            if let Some(state) = source.take_availability_transition()
-            {
+            if let Some(state) = source.take_availability_transition() {
                 match state {
                     CaptureAvailability::Unavailable => {
                         capture_available = false;
@@ -1509,12 +1726,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         pending_viewport_idr = None;
                         encoder = None;
                         scaler = None;
-                        if let Some(secure) = source.secure_state.as_ref().filter(|state| state.secure) {
+                        if let Some(secure) =
+                            source.secure_state.as_ref().filter(|state| state.secure)
+                        {
                             signaling.send_secure_desktop_state(secure.kind, &[], media_generation);
-                        } else if let Some(kind) = bubbleplay_host::desktop_session::secure_desktop_kind() {
+                        } else if let Some(kind) =
+                            bubbleplay_host::desktop_session::secure_desktop_kind()
+                        {
                             signaling.send_secure_desktop_state(kind, &[], media_generation);
                         } else {
-                            signaling.send_desktop_state("unavailable", media_generation, "capture-unavailable");
+                            signaling.send_desktop_state(
+                                "unavailable",
+                                media_generation,
+                                "capture-unavailable",
+                            );
                         }
                         warn!(
                             generation = media_generation,
@@ -1556,18 +1781,34 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 secure_announcement = bubbleplay_host::desktop_session::secure_desktop_kind()
                     .map(|kind| (false, kind, vec![]));
                 next_secure_state_poll = loop_now + capture::CAPTURE_RECOVERY_INTERVAL;
-            } else if last_secure_announcement.as_ref().is_some_and(|(active, _, _)| !active) {
+            } else if last_secure_announcement
+                .as_ref()
+                .is_some_and(|(active, _, _)| !active)
+            {
                 secure_announcement = last_secure_announcement.clone();
             }
         }
         if secure_announcement != last_secure_announcement {
             if let Some((active, kind, caps)) = &secure_announcement {
                 signaling.send_secure_desktop_state_status(*active, kind, caps, media_generation);
-                info!(active, kind, ?caps, generation = media_generation, "secure desktop capabilities changed");
+                info!(
+                    active,
+                    kind,
+                    ?caps,
+                    generation = media_generation,
+                    "secure desktop capabilities changed"
+                );
             }
             last_secure_announcement = secure_announcement;
         }
         while let Some(event) = pump.try_event() {
+            if matches!(event, TransportEvent::PeerReset) {
+                rtc_reset_pending = false;
+                continue;
+            }
+            if rtc_reset_pending {
+                continue;
+            }
             // After an RTC-only teardown the pump's trailing events (Closed,
             // Stopped) belong to the dead peer, not to the WSS session.
             if rtc_peer.ended() {
@@ -1599,8 +1840,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         end_rtc_peer(&pump, &mut ice_connected, &mut pending_candidates, reason);
                     }
                     RtcPeerDecision::EndSession => {
-                        warn!(reason, "RTC peer ended the RTC-carried session");
-                        break 'session;
+                        park_viewer!(reason);
                     }
                 }
                 continue;
@@ -1611,7 +1851,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     offer_in_flight = false;
                     offer_accepted = true;
                 }
-                TransportEvent::OfferRejected => break 'session,
+                TransportEvent::OfferRejected => {
+                    park_viewer!("offer-rejected");
+                }
                 TransportEvent::Action(RtcAction::InputControlReady) => {
                     if let Some(kind) = latest_cursor_kind {
                         pump.publish_cursor_kind(kind);
@@ -1621,7 +1863,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     rtc_peer.on_connected();
                     ice_connected = true;
                     replay.on_ice_connected();
-                    next_idr = Instant::now();
+                    next_idr = Instant::now() + IDR_INTERVAL;
                     if let Some(kind) = latest_cursor_kind {
                         pump.publish_cursor_kind(kind);
                     }
@@ -1636,7 +1878,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         active_codec = codec;
                         encoder = None;
                         latest_idr = None;
-                        pending_first_frame = None;
+                        startup_idr_admitted = None;
+                        startup_idr_submitted = None;
+                        if let Some(pending) = pending_first_frame
+                            .as_mut()
+                            .filter(|pending| pending.transport == "webrtc" && !pending.admitted)
+                        {
+                            pending.rtc_idr_id = None;
+                        }
                         pending_transition_idr = None;
                         next_idr = Instant::now();
                     }
@@ -1684,11 +1933,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         &mut input_sink,
                         &mut capture,
                     );
-                    if !capture_available || !remote_input_ready || !capture.secure_input_allowed() {
+                    if !capture_available || !remote_input_ready || !capture.secure_input_allowed()
+                    {
                         if let Some(state) = capture.secure_state() {
-                            input_sink.note_secure_input_drop(&data, if state.caps.contains(&"input") {
-                                "not_ready"
-                            } else { "no_input_capability" });
+                            input_sink.note_secure_input_drop(
+                                &data,
+                                if state.caps.contains(&"input") {
+                                    "not_ready"
+                                } else {
+                                    "no_input_capability"
+                                },
+                            );
                         }
                         carried_input.observe_gated(&data);
                         continue;
@@ -1712,7 +1967,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             pump.publish_cursor_kind(encoded);
                         }
                     }
-                    if outcome.cursor_feedback_requested() && capture.desktop_state().desktop != "secure" {
+                    if outcome.cursor_feedback_requested()
+                        && capture.desktop_state().desktop != "secure"
+                    {
                         if let Some(state) =
                             cursor_tracker.sample(outcome.accepted_sequence, Instant::now())
                         {
@@ -1728,11 +1985,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
                 TransportEvent::AccessUnitWritten { id, is_idr: true } => {
                     replay.on_fresh_idr_admitted();
-                    if let Some(pending) = pending_first_frame
-                        .as_mut()
-                        .filter(|pending| pending.transport == "webrtc" && !pending.admitted)
-                    {
-                        pending.admitted = true;
+                    if startup_idr_submitted == Some((media_generation, "webrtc", id)) {
+                        startup_idr_admitted = Some((media_generation, "webrtc"));
+                        startup_idr_submitted = None;
+                    }
+                    if let Some(pending) = pending_first_frame.as_mut().and_then(|pending| {
+                        pending
+                            .admit_rtc_access_unit(media_generation, id)
+                            .then_some(pending)
+                    }) {
                         signaling.send_first_frame(
                             "admitted",
                             &pending.request_id,
@@ -1764,6 +2025,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 TransportEvent::AccessUnitNotAdmitted { id, is_idr } => {
+                    if let Some(pending) = pending_first_frame.as_mut() {
+                        pending.reject_rtc_access_unit(id);
+                    }
+                    if startup_idr_submitted.is_some_and(|(_, _, submitted)| submitted == id) {
+                        startup_idr_submitted = None;
+                    }
                     let pending =
                         rejected_transition_requires_recovery(&pending_transition_idr, id);
                     if pending {
@@ -1786,10 +2053,21 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         let cursor_now = Instant::now();
+        // Keep event bursts coalesced until the existing 16 ms cursor cadence
+        // allows sampling; a high-polling mouse must not recreate a 1 ms loop.
+        let cursor_changed = cursor_now >= next_cursor_event_sample
+            && cursor_wake.as_ref().is_ok_and(|wake| wake.take_changed());
         cursor_kind_tracker.set_active(
-            !capture.is_privileged() && capture_available && capture.desktop_state().desktop != "secure" && (ice_connected || wss_media.is_some()),
+            !capture.is_privileged()
+                && capture_available
+                && capture.desktop_state().desktop != "secure"
+                && (ice_connected || wss_media.is_some()),
         );
-        if !capture.is_privileged() && capture.desktop_state().desktop != "secure" && cursor_now >= next_cursor_poll {
+        if viewer_attached
+            && !capture.is_privileged()
+            && capture.desktop_state().desktop != "secure"
+            && (cursor_changed || cursor_now >= next_cursor_poll)
+        {
             if let Some(state) = cursor_tracker.sample(None, cursor_now) {
                 v4_pointer_norm = state.in_bounds.then_some((state.x, state.y));
                 pump.publish_cursor_state(state.encode());
@@ -1798,7 +2076,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
             }
             if capture_available && capture.desktop_state().desktop != "secure" {
-                if let Some(kind) = cursor_kind_tracker.sample(false, cursor_now) {
+                if let Some(kind) = cursor_kind_tracker.sample(cursor_changed, cursor_now) {
                     let encoded = kind.encode();
                     latest_cursor_kind = Some(encoded);
                     signaling.send_binary(&encoded);
@@ -1807,12 +2085,22 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             } else {
                 cursor_kind_tracker.reset();
             }
-            next_cursor_poll = cursor_now + Duration::from_millis(16);
+            next_cursor_poll = cursor_now
+                + Duration::from_millis(
+                    if cursor_wake.as_ref().is_ok_and(|wake| wake.available()) {
+                        100
+                    } else {
+                        16
+                    },
+                );
+            next_cursor_event_sample = cursor_now + Duration::from_millis(16);
         }
-        viewer_session.observe(ice_connected || wss_media.is_some());
+        viewer_session.observe(viewer_attached && (ice_connected || wss_peer_live));
         if let Some(follow) = follow_state.as_mut() {
             let now = Instant::now();
-            let viewer_live = capture_available && capture.desktop_state().desktop != "secure" && (ice_connected || wss_media.is_some());
+            let viewer_live = capture_available
+                && capture.desktop_state().desktop != "secure"
+                && (ice_connected || wss_media.is_some());
             if !viewer_live {
                 edge_monitors = None;
             } else if edge_monitors.is_some() && now >= next_edge_sample {
@@ -1930,7 +2218,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }
         if let Some(files) = file_service.as_ref() {
             // The file socket pairs on the live WSS media epoch.
-            files.set_epoch(wss_media.as_ref().and(active_wss_epoch.as_deref()));
+            files.set_epoch(if viewer_attached {
+                wss_media.as_ref().and(active_wss_epoch.as_deref())
+            } else {
+                None
+            });
             if cursor_now >= next_file_rate_update {
                 let cap = wss_media.as_ref().map_or(0, |egress| {
                     file_rate_cap_bps(
@@ -1945,8 +2237,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             for text in &outbox.signals {
                 signaling.send_text(text);
             }
-            let desktop =
-                !capture.is_privileged() && bubbleplay_host::clipboard::input_desktop_is_default();
+            let desktop = (!outbox.drops.is_empty() || pending_native_drop.is_some())
+                && !capture.is_privileged()
+                && bubbleplay_host::clipboard::input_desktop_is_default();
             let view = NativeDropView {
                 ready: remote_input_ready
                     && capture_available
@@ -2062,7 +2355,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
             }
             for _ in 0..outbox.pastes {
-                if remote_input_ready && capture_available && capture.desktop_state().desktop != "secure" {
+                if remote_input_ready
+                    && capture_available
+                    && capture.desktop_state().desktop != "secure"
+                {
                     input_sink.paste();
                 } else {
                     info!("file paste skipped: remote input is not ready");
@@ -2112,6 +2408,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         while let Some(event) = signal_events.next() {
             match event {
                 SignalEvent::Offer(sdp) => {
+                    if !viewer_attached {
+                        if let Some(egress) = wss_media.take() {
+                            egress.shutdown();
+                        }
+                        active_wss_epoch = None;
+                    }
+                    viewer_attached = true;
+                    if !args.privileged_agent {
+                        remote_input_ready = capture_available;
+                    }
                     if let Some(kind) = latest_cursor_kind {
                         signaling.send_binary(&kind);
                         pump.publish_cursor_kind(kind);
@@ -2130,7 +2436,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     if let Ok(monitors) = capture.monitors() {
                         signaling.send_monitor_list(monitors);
                     }
-                    announce_capture_state(&mut signaling, &capture, media_generation, "offer-state-replay");
+                    announce_capture_state(
+                        &mut signaling,
+                        &capture,
+                        media_generation,
+                        "offer-state-replay",
+                    );
                     if rtc_peer.ended() {
                         warn!("ignoring an RTC offer after the RTC peer ended under WSS");
                     } else if should_forward_offer(ice_connected, offer_accepted, offer_in_flight) {
@@ -2172,30 +2483,96 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             {
                                 continue;
                             }
-                            if (transport == "wss") != wss_media.is_some()
-                                || (transport == "webrtc") != (wss_media.is_none() && ice_connected)
-                            {
+                            if (transport == "wss") != wss_media.is_some() {
                                 continue;
                             }
                             if transport == "wss" && epoch.as_deref() != active_wss_epoch.as_deref()
                             {
                                 continue;
                             }
+                            // Requests may precede ICE. A retry of the same
+                            // handshake joins/reports its existing IDR.
+                            if let Some(pending) = pending_first_frame.as_ref().filter(|pending| {
+                                pending.request_id == request_id
+                                    && pending.transport == transport
+                                    && pending.epoch == epoch
+                                    && pending.generation == media_generation
+                            }) {
+                                if pending.admitted {
+                                    signaling.send_first_frame(
+                                        "admitted",
+                                        &request_id,
+                                        pending.generation,
+                                        Some(&transport),
+                                        epoch.as_deref(),
+                                        Some(active_codec.name()),
+                                    );
+                                }
+                                continue;
+                            }
+                            if completed_first_frame.as_ref().is_some_and(
+                                |(id, generation, media, completed_epoch)| {
+                                    id == &request_id
+                                        && *generation == media_generation
+                                        && media == &transport
+                                        && completed_epoch == &epoch
+                                },
+                            ) {
+                                signaling.send_first_frame(
+                                    "ready",
+                                    &request_id,
+                                    media_generation,
+                                    Some(&transport),
+                                    epoch.as_deref(),
+                                    Some(active_codec.name()),
+                                );
+                                continue;
+                            }
                             let now = Instant::now();
+                            viewer_attached = true;
+                            let submitted_id = startup_idr_submitted
+                                .filter(|(generation, media, _)| {
+                                    *generation == media_generation && *media == transport
+                                })
+                                .map(|(_, _, id)| id);
+                            let startup_admitted =
+                                startup_idr_admitted.is_some_and(|(generation, media)| {
+                                    generation == media_generation && media == transport
+                                });
+                            let reuse_startup = startup_idr_claimable
+                                && ((transport == "webrtc" && latest_idr.is_some())
+                                    || submitted_id.is_some()
+                                    || startup_admitted);
+                            let admitted = reuse_startup && startup_admitted;
                             pending_first_frame = Some(PendingFirstFrame {
                                 request_id,
                                 transport,
                                 epoch,
                                 generation: media_generation,
-                                admitted: false,
+                                admitted,
+                                rtc_idr_id: submitted_id,
                                 armed_at: now,
                             });
-                            replay.on_keyframe_requested(now);
-                            if let Some(enc) = encoder.as_mut() {
-                                enc.force_idr();
+                            if admitted {
+                                let pending = pending_first_frame.as_ref().expect("request armed");
+                                signaling.send_first_frame(
+                                    "admitted",
+                                    &pending.request_id,
+                                    media_generation,
+                                    Some(&pending.transport),
+                                    pending.epoch.as_deref(),
+                                    Some(active_codec.name()),
+                                );
+                            } else if !reuse_startup {
+                                latest_idr = None;
+                                capture.request_idle_snapshot();
+                                if let Some(enc) = encoder.as_mut() {
+                                    enc.force_idr();
+                                }
+                                next_idr = now;
+                                next_admission = now;
                             }
-                            next_idr = now;
-                            next_admission = now;
+                            startup_idr_claimable = false;
                             info!(
                                 generation = media_generation,
                                 ?codec,
@@ -2241,6 +2618,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 &mut input_sink,
                                 &mut capture,
                             );
+                            completed_first_frame =
+                                Some((request_id, generation, transport, epoch));
                             pending_first_frame = None;
                             info!(generation, "first-frame handshake ready");
                         }
@@ -2281,7 +2660,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         file_drag_preview.control(control, Instant::now());
                     }
                 }
-                SignalEvent::PeerLeft => break 'session,
+                SignalEvent::PeerLeft => {
+                    park_viewer!("peer-left");
+                }
                 SignalEvent::Qos {
                     seq: _,
                     at_ms: _,
@@ -2326,7 +2707,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     // Coalescing cannot consume sequences or motion behind
                     // the presentation/native-drag gate. Preserve releases
                     // and every other signal event at their original boundary.
-                    let packets = if capture_available && remote_input_ready
+                    let packets = if capture_available
+                        && remote_input_ready
                         && !bubbleplay_host::native_file_drop::drag_active()
                     {
                         input_coalescer.coalesce(packets)
@@ -2341,11 +2723,19 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             &mut input_sink,
                             &mut capture,
                         );
-                        if !capture_available || !remote_input_ready || !capture.secure_input_allowed() {
+                        if !capture_available
+                            || !remote_input_ready
+                            || !capture.secure_input_allowed()
+                        {
                             if let Some(state) = capture.secure_state() {
-                                input_sink.note_secure_input_drop(&data, if state.caps.contains(&"input") {
-                                    "not_ready"
-                                } else { "no_input_capability" });
+                                input_sink.note_secure_input_drop(
+                                    &data,
+                                    if state.caps.contains(&"input") {
+                                        "not_ready"
+                                    } else {
+                                        "no_input_capability"
+                                    },
+                                );
                             }
                             carried_input.observe_gated(&data);
                             continue;
@@ -2368,17 +2758,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 pump.publish_cursor_kind(encoded);
                             }
                         }
-                        if outcome.cursor_feedback_requested() && capture.desktop_state().desktop != "secure" {
+                        if outcome.cursor_feedback_requested()
+                            && capture.desktop_state().desktop != "secure"
+                        {
                             if let Some(state) =
                                 cursor_tracker.sample(outcome.accepted_sequence, Instant::now())
                             {
                                 // WSS mode uses the authenticated signaling socket
                                 // for cursor feedback; the Worker relays binary in
                                 // the opposite direction without JSON wrapping.
-                                signaling.send_cursor_state(
-                                    state.encode(),
-                                    outcome.feedback_reliable,
-                                );
+                                signaling
+                                    .send_cursor_state(state.encode(), outcome.feedback_reliable);
                                 if outcome.sync_requested {
                                     info!(ack = ?state.acknowledged_sequence, in_bounds = state.in_bounds, os_visible = state.visible, "WSS cursor feedback sent");
                                 }
@@ -2387,11 +2777,26 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 SignalEvent::SecureDeny => {
-                    let allowed = capture.desktop_state().available && capture.secure_state().is_some_and(|state|
-                        state.available && state.kind == "uac" && state.caps.contains(&"deny"));
-                    let queued = allowed && capture.secure_helper().is_some_and(|link|
-                        link.lock().unwrap_or_else(|error| error.into_inner()).deny_consent());
-                    if !queued { signaling.send_secure_action_result(false, if allowed { "helper-unavailable" } else { "deny-unavailable" }); }
+                    let allowed = capture.desktop_state().available
+                        && capture.secure_state().is_some_and(|state| {
+                            state.available && state.kind == "uac" && state.caps.contains(&"deny")
+                        });
+                    let queued = allowed
+                        && capture.secure_helper().is_some_and(|link| {
+                            link.lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .deny_consent()
+                        });
+                    if !queued {
+                        signaling.send_secure_action_result(
+                            false,
+                            if allowed {
+                                "helper-unavailable"
+                            } else {
+                                "deny-unavailable"
+                            },
+                        );
+                    }
                 }
                 SignalEvent::MediaControl {
                     action,
@@ -2502,6 +2907,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         continue;
                     }
                     if action == "start" {
+                        viewer_attached = true;
+                        if !args.privileged_agent {
+                            remote_input_ready = capture_available;
+                        }
                         if let Some(requested_epoch) =
                             epoch.as_deref().filter(|value| valid_media_epoch(value))
                         {
@@ -2522,6 +2931,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 media_generation = media_generation.wrapping_add(1).max(1);
                                 media_sequence = 0;
                                 latest_idr = None;
+                                completed_first_frame = None;
+                                startup_idr_claimable = true;
+                                startup_idr_admitted = None;
+                                startup_idr_submitted = None;
                                 pending_first_frame = None;
                                 pending_transition_idr = None;
                                 pending_wss_idr = None;
@@ -2561,6 +2974,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         };
                         match connect_result {
                             Ok(egress) => {
+                                egress.set_activity(activity.clone());
                                 if args.privileged_agent {
                                     remote_input_ready = false;
                                     carried_input.reset();
@@ -2574,7 +2988,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 // current capture state at every media start
                                 // so the client cannot retain stale overlay
                                 // state across WSS epochs.
-                                announce_capture_state(&mut signaling, &capture, media_generation, "wss-session-start");
+                                announce_capture_state(
+                                    &mut signaling,
+                                    &capture,
+                                    media_generation,
+                                    "wss-session-start",
+                                );
                                 signaling.send_host_capabilities(
                                     args.privileged_agent,
                                     args.privileged_agent,
@@ -2889,7 +3308,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
             RtcPeerDecision::EndSession => {
                 warn!("RTC peer did not reconnect within the disconnect grace");
-                break 'session;
+                park_viewer!("ice-grace-expired");
             }
         }
         if offer_accepted && !rtc_peer.ended() {
@@ -2924,12 +3343,21 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 warn!(generation = pending.generation, transport = %pending.transport, reason, "first-frame handshake failed");
             }
         }
-        let media_ready = ice_connected || wss_media.is_some();
+        let wss_ready = viewer_attached
+            && wss_media.as_ref().is_some_and(|egress| {
+                let stats = egress.stats();
+                stats.connected && stats.peer_present
+            });
+        let media_ready = viewer_attached && (ice_connected || wss_ready);
         let wss_v4_events = wss_media
             .as_ref()
             .map(WssMediaEgress::take_events)
             .unwrap_or_default();
-        if let Some(reason) = wss_v4_events.keyframe.as_deref() {
+        if let Some(reason) = wss_v4_events
+            .keyframe
+            .as_deref()
+            .filter(|_| viewer_attached)
+        {
             // The receiver lost (or never had) its reference: encode a fresh
             // IDR even when the desktop is static. v4 never replays a cached
             // IDR, whose sequence would not match the receiver's chain.
@@ -2992,7 +3420,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
             }
         }
-        if media_ready && replay.is_due(now, latest_idr.is_some()) {
+        if viewer_attached
+            && ice_connected
+            && wss_media.is_none()
+            && replay.is_due(now, latest_idr.is_some())
+        {
             if let Some(cached) = latest_idr.as_ref() {
                 let expected = profiles
                     .staged
@@ -3002,8 +3434,18 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     latest_idr = None;
                     continue 'session;
                 }
-                if ice_connected && wss_media.is_none() {
-                    if let Some(reservation) = pump.reserve_access_unit() {
+                if let Some(reservation) = pump.reserve_access_unit() {
+                    if !cached.replay_authorized(
+                        bubbleplay_host::desktop_session::input_desktop_is_default,
+                    ) {
+                        latest_idr = None;
+                        capture.request_idle_snapshot();
+                        if let Some(encoder) = encoder.as_mut() {
+                            encoder.force_idr();
+                        }
+                        next_idr = now;
+                        next_admission = now;
+                    } else {
                         let id = next_au_id;
                         next_au_id += 1;
                         if reservation.submit(AccessUnit {
@@ -3015,6 +3457,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             pending_transition_idr =
                                 cached_replay_transition(&profiles, cached.mode, id);
                             replay.on_replayed();
+                            startup_idr_submitted = Some((media_generation, "webrtc", id));
+                            if let Some(pending) = pending_first_frame.as_mut().filter(|pending| {
+                                pending.transport == "webrtc"
+                                    && !pending.admitted
+                                    && pending.generation == media_generation
+                            }) {
+                                pending.rtc_idr_id.get_or_insert(id);
+                            }
+                            next_idr = now + IDR_INTERVAL;
                         }
                     }
                 }
@@ -3022,26 +3473,31 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }
         // Reserve the RTC queue only when RTC is active. WSS owns a separately
         // bounded media socket, so it is never gated by an unused RTC slot.
-        let rtc_reservation = if ice_connected && wss_media.is_none() {
+        let rtc_reservation = if viewer_attached && ice_connected && wss_media.is_none() {
             pump.reserve_access_unit()
         } else {
             None
         };
-        let negotiation_active = offer_in_flight || offer_accepted;
-        let media_demand_active = negotiation_active || ice_connected || wss_media.is_some();
+        let negotiation_active = viewer_attached && (offer_in_flight || offer_accepted);
         let prewarm_needed = negotiation_active && !ice_connected && latest_idr.is_none();
-        let local_recovery_probe = local_recovery_probe_due(
-            capture.is_privileged(), capture_available, now, next_local_recovery_probe,
-        );
-        if local_recovery_probe || capture_admission_ready(
-            capture_available,
-            capture.is_privileged() && !capture_available,
-            negotiation_active,
-            ice_connected,
-            wss_media.is_some(),
-            rtc_reservation.is_some(),
-            prewarm_needed,
-        ) {
+        let local_recovery_probe = viewer_attached
+            && local_recovery_probe_due(
+                capture.is_privileged(),
+                capture_available,
+                now,
+                next_local_recovery_probe,
+            );
+        if local_recovery_probe
+            || capture_admission_ready(
+                capture_available,
+                capture.is_privileged() && !capture_available,
+                negotiation_active,
+                ice_connected,
+                wss_ready,
+                rtc_reservation.is_some(),
+                prewarm_needed,
+            )
+        {
             if local_recovery_probe {
                 next_local_recovery_probe = now + capture::CAPTURE_RECOVERY_INTERVAL;
             }
@@ -3249,6 +3705,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     latest_idr = Some(CachedIdr {
                         data: access.data.clone(),
                         mode,
+                        requires_default: false,
                     });
                 }
                 let id = permit_id;
@@ -3276,6 +3733,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 );
                         }
                         if access.keyframe {
+                            startup_idr_admitted = Some((media_generation, "wss"));
                             wss_idr_count = wss_idr_count.saturating_add(1);
                             if let Some(pending) = pending_first_frame.as_mut() {
                                 if pending.admit_wss_access_unit(media_generation, true) {
@@ -3326,6 +3784,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             is_idr: access.keyframe,
                         }) && access.keyframe
                         {
+                            startup_idr_submitted = Some((media_generation, "webrtc", id));
+                            if let Some(pending) = pending_first_frame.as_mut().filter(|pending| {
+                                pending.transport == "webrtc"
+                                    && pending.generation == media_generation
+                                    && !pending.admitted
+                            }) {
+                                pending.rtc_idr_id.get_or_insert(id);
+                            }
                             if transition {
                                 pending_transition_idr = Some(PendingSubmittedIdr {
                                     id,
@@ -3383,19 +3849,34 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     next_idr = Instant::now();
                     if frame.is_secure_snapshot() {
                         if let Some(state) = &secure_frame_state {
-                            signaling.send_secure_desktop_state_status(true, state.kind, &state.caps, media_generation);
+                            signaling.send_secure_desktop_state_status(
+                                true,
+                                state.kind,
+                                &state.caps,
+                                media_generation,
+                            );
                             info!(active = true, kind = state.kind, caps = ?state.caps,
                                 generation = media_generation, "secure desktop capabilities changed");
                             last_secure_announcement = Some((true, state.kind, state.caps.clone()));
                         }
                     } else {
-                        signaling.send_desktop_state_kind("active", Some("default"), Some("enabled"), media_generation, "capture-recovered");
+                        signaling.send_desktop_state_kind(
+                            "active",
+                            Some("default"),
+                            Some("enabled"),
+                            media_generation,
+                            "capture-recovered",
+                        );
                         last_secure_announcement = None;
                     }
                     info!(
                         generation = media_generation,
                         secure_frame = frame.is_secure_snapshot(),
-                        desktop = if frame.is_secure_snapshot() { "secure" } else { "default" },
+                        desktop = if frame.is_secure_snapshot() {
+                            "secure"
+                        } else {
+                            "default"
+                        },
                         "desktop capture recovered from verified frame; waiting for fresh IDR"
                     );
                 }
@@ -3403,10 +3884,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 // A verified frame may close recovery while the peer has no
                 // room for media; keep the fresh-IDR request armed for the
                 // next admitted capture without encoding this probe.
-                if local_recovery_probe && !capture_admission_ready(
-                    true, false, negotiation_active, ice_connected,
-                    wss_media.is_some(), rtc_reservation.is_some(), prewarm_needed,
-                ) {
+                if local_recovery_probe
+                    && !capture_admission_ready(
+                        true,
+                        false,
+                        negotiation_active,
+                        ice_connected,
+                        wss_media.is_some(),
+                        rtc_reservation.is_some(),
+                        prewarm_needed,
+                    )
+                {
                     continue 'session;
                 }
                 let is_idle_snapshot = frame.is_idle_snapshot();
@@ -3432,6 +3920,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         TileQualityTracker::new(now, frame.width(), frame.height())
                     });
                     if is_new && !is_idle_snapshot {
+                        frame.prepare_damage_union();
                         tracker.note_damage(now, frame.damage());
                         v4_pacer.on_capture(
                             now,
@@ -3497,10 +3986,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     },
                 );
                 let frame_interval = Duration::from_secs_f64(1.0 / (mode.fps as f64).max(1.0));
+                // A waiter result can arrive after the loop's earlier clock
+                // sample. Admit against its actual consumption time.
+                let now = Instant::now();
                 let urgent = latest_idr.is_none() || transition;
                 if (is_new && frame_admission_due(now, next_admission, frame_interval, urgent))
                     || (!is_new && urgent)
                 {
+                    frame.prepare_damage();
                     // v4 tile quality: hash the dirty tiles (damage-sized
                     // readback), skip a repaint that changes nothing the
                     // receiver shows, and plan a refine of settled debt tiles.
@@ -3542,10 +4035,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 match hasher.hash_tiles(frame.texture(), tracker.grid(), &to_hash) {
                                     Ok((hashes, rows, elapsed_us)) => {
                                         tile_hash_us = tile_hash_us.saturating_add(elapsed_us);
-                                        if hash_all {
+                                        if hash_all && !hashes.is_empty() {
                                             hashed = Some(hashes);
                                         }
-                                        row_hashes = Some(rows);
+                                        if !rows.is_empty() {
+                                            row_hashes = Some(rows);
+                                        }
                                     }
                                     Err(error) => {
                                         warn!(
@@ -3663,6 +4158,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                         benchmark_skips = benchmark_skips.saturating_add(1);
                                         wss_preencode_skips_total =
                                             wss_preencode_skips_total.saturating_add(1);
+                                        capture.request_idle_followup_snapshot(frame_interval);
                                         continue 'session;
                                     }
                                     Err(WssReserveOutcome::Stopped) => {
@@ -3678,6 +4174,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 benchmark_skips = benchmark_skips.saturating_add(1);
                                 wss_preencode_skips_total =
                                     wss_preencode_skips_total.saturating_add(1);
+                                capture.request_idle_followup_snapshot(frame_interval);
                                 continue 'session;
                             }
                             Err(WssReserveOutcome::RequireKeyframe) => {
@@ -3685,6 +4182,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 benchmark_skips = benchmark_skips.saturating_add(1);
                                 wss_preencode_skips_total =
                                     wss_preencode_skips_total.saturating_add(1);
+                                capture.request_idle_followup_snapshot(frame_interval);
                                 continue 'session;
                             }
                             Err(WssReserveOutcome::Stopped) => {
@@ -5221,12 +5719,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         latest_idr = Some(CachedIdr {
                             data: encoded.data.clone(),
                             mode,
+                            requires_default: !frame.is_secure_snapshot(),
                         });
                     }
                     capture.cancel_idle_followup_snapshot();
-                    let v4_session = wss_media.is_some();
                     match idle_snapshot_completion_order(
-                        encoded.is_idr && (is_idle_snapshot || v4_session),
+                        encoded.is_idr,
                         request_quiescent_transition_followup,
                     ) {
                         IdleSnapshotCompletionOrder::None => {}
@@ -5274,6 +5772,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             wss_reservation.set_meta(meta);
                             wss_reservation.set_refine(wss_v4_refine_frame && !encoded.is_idr);
                             if matches!(wss_reservation.submit(payload), WssSubmitOutcome::Queued) {
+                                if encoded.is_idr {
+                                    startup_idr_admitted = Some((media_generation, "wss"));
+                                }
                                 if encoded.is_idr {
                                     let reason = wss_v4_key_reason
                                         .take()
@@ -5435,6 +5936,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 is_idr: encoded.is_idr,
                             }) && encoded.is_idr
                             {
+                                startup_idr_submitted = Some((media_generation, "webrtc", id));
+                                if let Some(pending) =
+                                    pending_first_frame.as_mut().filter(|pending| {
+                                        pending.transport == "webrtc"
+                                            && !pending.admitted
+                                            && pending.generation == media_generation
+                                    })
+                                {
+                                    pending.rtc_idr_id.get_or_insert(id);
+                                }
                                 if let Some(reason) = fallback_reason {
                                     pending_transition_idr =
                                         Some(PendingSubmittedIdr { id, mode, reason });
@@ -5450,7 +5961,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
             }
-        } else if media_demand_active {
+        } else if capture_demand {
             skipped_before_encode += 1;
         }
         if skipped_before_encode != 0 && Instant::now() >= next_skip_log {
@@ -5481,6 +5992,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 wss_idr_count,
                 wss_delta_count,
                 idr_percent,
+                span_ms = producer_window_started.elapsed().as_millis() as u64,
                 producer_loop_iterations,
                 capture_acquired,
                 capture_new,
@@ -5546,20 +6058,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             wss_v4_qp_window = (0, 0, 0);
             next_wss_stats = Instant::now() + Duration::from_secs(1);
             producer_loop_iterations = 0;
+            producer_window_started = Instant::now();
             wss_preencode_skips = 0;
             wss_submission_failures = 0;
             wss_idr_count = 0;
             wss_delta_count = 0;
             wss_max_access_unit_bytes = 0;
         }
-        // This bounds producer polling only; the RTC transport is a separate
-        // thread and continues to wake on its own timers and channels.
-        let poll_interval = producer_poll_interval(media_demand_active);
-        std::thread::sleep(if !capture_available && !capture.is_privileged() {
-            poll_interval.min(capture::CAPTURE_RECOVERY_INTERVAL)
-        } else {
-            poll_interval
-        });
+        // Every path, including an early continue, reaches the activity wait
+        // at the top of the next iteration. DDA waits on its acquisition thread.
     }
     file_drag_preview.cancel();
     if let Some(pending) = pending_native_drop.take() {
@@ -5823,7 +6330,7 @@ mod tests {
         fallback_mode, frame_admission_due, full_profile_uses_native_texture,
         idle_snapshot_completion_order, lab_quality_keyframe_request,
         privileged_input_ready_after_presentation, privileged_no_frame_retry_delay,
-        producer_poll_interval, quiescent_damage_rects, quiescent_immediate_damage_rects,
+        producer_wait_duration, quiescent_damage_rects, quiescent_immediate_damage_rects,
         quiescent_transition_followup_needed, quiescent_transition_upsert_allowed,
         quiescent_validation_requests, record_benchmark_encode_stages,
         record_benchmark_feedback_plan, record_benchmark_feedback_submission,
@@ -6999,6 +7506,7 @@ mod tests {
             epoch: Some("a".repeat(32)),
             generation: 1,
             admitted: false,
+            rtc_idr_id: None,
             armed_at: Instant::now(),
         };
         assert!(!pending.admit_wss_access_unit(4, false));
@@ -7017,10 +7525,48 @@ mod tests {
             epoch: None,
             generation: 2,
             admitted: false,
+            rtc_idr_id: None,
             armed_at: Instant::now(),
         };
         assert!(!pending.admit_wss_access_unit(3, true));
         assert_eq!((pending.generation, pending.admitted), (2, false));
+    }
+
+    #[test]
+    fn rtc_first_frame_requires_its_submitted_idr_and_current_generation_once() {
+        let mut pending = PendingFirstFrame {
+            request_id: "firstFrame_rtc".into(),
+            transport: "webrtc".into(),
+            epoch: None,
+            generation: 3,
+            admitted: false,
+            rtc_idr_id: Some(42),
+            armed_at: Instant::now(),
+        };
+        assert!(!pending.admit_rtc_access_unit(2, 42));
+        assert!(!pending.admit_rtc_access_unit(3, 41));
+        pending.reject_rtc_access_unit(41);
+        assert_eq!(pending.rtc_idr_id, Some(42));
+        pending.reject_rtc_access_unit(42);
+        assert_eq!(pending.rtc_idr_id, None);
+        pending.rtc_idr_id = Some(43);
+        assert!(!pending.admit_rtc_access_unit(3, 42));
+        assert!(pending.admit_rtc_access_unit(3, 43));
+        assert!(!pending.admit_rtc_access_unit(3, 43));
+    }
+
+    #[test]
+    fn wss_first_frame_cannot_claim_an_rtc_receipt() {
+        let mut pending = PendingFirstFrame {
+            request_id: "firstFrame_wss".into(),
+            transport: "wss".into(),
+            epoch: Some("b".repeat(32)),
+            generation: 3,
+            admitted: false,
+            rtc_idr_id: Some(42),
+            armed_at: Instant::now(),
+        };
+        assert!(!pending.admit_rtc_access_unit(3, 42));
     }
 
     #[test]
@@ -7073,8 +7619,9 @@ mod tests {
         assert!(replay.is_due(start + STATIC_REPLAY_DELAY, true));
     }
     #[test]
-    fn idle_desktop_snapshot_polling_only_needs_a_connected_peer() {
-        assert!(!should_snapshot_idle_desktop(false, true));
+    fn idle_desktop_snapshot_polling_supports_first_prewarm_and_live_retry() {
+        assert!(should_snapshot_idle_desktop(false, true));
+        assert!(!should_snapshot_idle_desktop(false, false));
         assert!(should_snapshot_idle_desktop(true, false));
         assert!(should_snapshot_idle_desktop(true, true));
     }
@@ -7096,13 +7643,23 @@ mod tests {
     #[test]
     fn unavailable_local_capture_probes_without_media_admission_every_500ms() {
         let now = Instant::now();
-        assert!(!capture_admission_ready(false, false, true, true, false, false, false));
+        assert!(!capture_admission_ready(
+            false, false, true, true, false, false, false
+        ));
         assert!(super::local_recovery_probe_due(false, false, now, now));
         let deadline = now + super::capture::CAPTURE_RECOVERY_INTERVAL;
-        assert!(!super::local_recovery_probe_due(false, false, now, deadline));
-        assert!(super::local_recovery_probe_due(false, false, deadline, deadline));
-        assert!(!super::local_recovery_probe_due(false, true, deadline, deadline));
-        assert!(!super::local_recovery_probe_due(true, false, deadline, deadline));
+        assert!(!super::local_recovery_probe_due(
+            false, false, now, deadline
+        ));
+        assert!(super::local_recovery_probe_due(
+            false, false, deadline, deadline
+        ));
+        assert!(!super::local_recovery_probe_due(
+            false, true, deadline, deadline
+        ));
+        assert!(!super::local_recovery_probe_due(
+            true, false, deadline, deadline
+        ));
     }
 
     #[test]
@@ -7125,9 +7682,17 @@ mod tests {
     }
 
     #[test]
-    fn idle_producer_uses_a_coarser_poll_interval() {
-        assert_eq!(producer_poll_interval(false), Duration::from_secs(1));
-        assert_eq!(producer_poll_interval(true), Duration::from_millis(1));
+    fn producer_wait_is_bounded_by_housekeeping_and_due_work() {
+        let now = Instant::now();
+        assert_eq!(producer_wait_duration(now, []), Duration::from_millis(100));
+        assert_eq!(
+            producer_wait_duration(now, [now + Duration::from_millis(17)]),
+            Duration::from_millis(17)
+        );
+        assert_eq!(
+            producer_wait_duration(now, [now - Duration::from_millis(1)]),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -7246,8 +7811,26 @@ mod tests {
         let cached = CachedIdr {
             data: vec![1, 2, 3],
             mode: state.active,
+            requires_default: true,
         };
         assert_eq!(cached.mode, VideoMode::native(2560, 1440, 30));
+    }
+
+    #[test]
+    fn cached_default_replay_rechecks_authorization_after_desktop_transition() {
+        let mut cached = CachedIdr {
+            data: vec![1, 2, 3],
+            mode: VideoMode::native(1920, 1080, 30),
+            requires_default: true,
+        };
+        let default_desktop = std::cell::Cell::new(true);
+        assert!(cached.replay_authorized(|| default_desktop.get()));
+        default_desktop.set(false);
+        assert!(!cached.replay_authorized(|| default_desktop.get()));
+        cached.requires_default = false;
+        assert!(cached.replay_authorized(|| {
+            panic!("helper and Agent caches retain their source authorization")
+        }));
     }
 
     #[test]

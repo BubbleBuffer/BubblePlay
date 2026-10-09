@@ -38,7 +38,9 @@ impl RtcTimerPeriod {
 
 impl Drop for RtcTimerPeriod {
     fn drop(&mut self) {
-        unsafe { windows::Win32::Media::timeEndPeriod(1); }
+        unsafe {
+            windows::Win32::Media::timeEndPeriod(1);
+        }
     }
 }
 

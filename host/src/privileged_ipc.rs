@@ -449,13 +449,19 @@ pub enum Message {
         text: String,
     },
     /// Base64 PNG chunks, bounded to an 8 MiB image.
-    ClipboardPng { id: u32, index: u16, count: u16, text: String },
+    ClipboardPng {
+        id: u32,
+        index: u16,
+        count: u16,
+        text: String,
+    },
 }
 
 /// Clipboard chunks stay well inside the control payload limit.
 pub const MAX_CLIPBOARD_CHUNK_BYTES: usize = crate::clipboard::HOST_CHUNK_BYTES;
 const MAX_CLIPBOARD_CHUNKS: u16 = 64;
-const MAX_PNG_CHUNKS: u16 = crate::clipboard_image::MAX_PNG_WIRE_BYTES.div_ceil(MAX_CLIPBOARD_CHUNK_BYTES) as u16;
+const MAX_PNG_CHUNKS: u16 =
+    crate::clipboard_image::MAX_PNG_WIRE_BYTES.div_ceil(MAX_CLIPBOARD_CHUNK_BYTES) as u16;
 
 impl Message {
     pub fn kind(&self) -> MessageKind {
@@ -820,11 +826,26 @@ fn encode_message(message: &Message) -> Result<Vec<u8>, ProtocolError> {
         Message::RecoverableError(error) | Message::FatalError(error) => {
             encode_agent_error(&mut out, error);
         }
-        Message::ClipboardText { id, index, count, text }
-        | Message::ClipboardPng { id, index, count, text } => {
+        Message::ClipboardText {
+            id,
+            index,
+            count,
+            text,
+        }
+        | Message::ClipboardPng {
+            id,
+            index,
+            count,
+            text,
+        } => {
             if text.len() > MAX_CLIPBOARD_CHUNK_BYTES
                 || *count == 0
-                || *count > if kind == MessageKind::ClipboardPng { MAX_PNG_CHUNKS } else { MAX_CLIPBOARD_CHUNKS }
+                || *count
+                    > if kind == MessageKind::ClipboardPng {
+                        MAX_PNG_CHUNKS
+                    } else {
+                        MAX_CLIPBOARD_CHUNKS
+                    }
                 || index >= count
             {
                 return malformed(kind, "invalid clipboard chunk");
@@ -944,12 +965,14 @@ fn decode_message(kind: MessageKind, payload: &[u8]) -> Result<Message, Protocol
             }
             Message::MonitorList(monitors)
         }
-        MessageKind::CursorKind => Message::CursorKind(
-            crate::input::CursorKind::from_id(input.u8()?).ok_or(ProtocolError::MalformedPayload {
-                kind,
-                reason: "unknown cursor kind",
-            })?,
-        ),
+        MessageKind::CursorKind => {
+            Message::CursorKind(crate::input::CursorKind::from_id(input.u8()?).ok_or(
+                ProtocolError::MalformedPayload {
+                    kind,
+                    reason: "unknown cursor kind",
+                },
+            )?)
+        }
         MessageKind::Cursor => {
             let acknowledged_sequence = input.u16()?;
             let acknowledged = input.bool()?;
@@ -1027,7 +1050,15 @@ fn decode_message(kind: MessageKind, payload: &[u8]) -> Result<Message, Protocol
             let index = input.u16()?;
             let count = input.u16()?;
             let text = input.rest();
-            if count == 0 || count > if kind == MessageKind::ClipboardPng { MAX_PNG_CHUNKS } else { MAX_CLIPBOARD_CHUNKS } || index >= count {
+            if count == 0
+                || count
+                    > if kind == MessageKind::ClipboardPng {
+                        MAX_PNG_CHUNKS
+                    } else {
+                        MAX_CLIPBOARD_CHUNKS
+                    }
+                || index >= count
+            {
                 return malformed(kind, "invalid clipboard chunk position");
             }
             if text.len() > MAX_CLIPBOARD_CHUNK_BYTES {
@@ -1039,8 +1070,21 @@ fn decode_message(kind: MessageKind, payload: &[u8]) -> Result<Message, Protocol
                     reason: "clipboard chunk is not UTF-8",
                 })?
                 .to_owned();
-            if kind == MessageKind::ClipboardPng { Message::ClipboardPng { id, index, count, text } }
-            else { Message::ClipboardText { id, index, count, text } }
+            if kind == MessageKind::ClipboardPng {
+                Message::ClipboardPng {
+                    id,
+                    index,
+                    count,
+                    text,
+                }
+            } else {
+                Message::ClipboardText {
+                    id,
+                    index,
+                    count,
+                    text,
+                }
+            }
         }
     };
     input.finish()?;

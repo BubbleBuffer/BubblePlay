@@ -1001,15 +1001,22 @@ pub struct InputPacketCoalescer {
 
 impl InputPacketCoalescer {
     pub fn observe_release_only(&mut self, data: &[u8]) {
-        if matches!(decode(data), Some(Command::ButtonsAt(..) | Command::CursorSync(..))) {
+        if matches!(
+            decode(data),
+            Some(Command::ButtonsAt(..) | Command::CursorSync(..))
+        ) {
             self.observe(data);
         }
     }
 
     pub fn observe(&mut self, data: &[u8]) {
         let sequence = match decode(data) {
-            Some(Command::Motion(seq, ..) | Command::Absolute(seq, ..)
-                | Command::ButtonsAt(seq, ..) | Command::CursorSync(seq)) => seq,
+            Some(
+                Command::Motion(seq, ..)
+                | Command::Absolute(seq, ..)
+                | Command::ButtonsAt(seq, ..)
+                | Command::CursorSync(seq),
+            ) => seq,
             _ => return,
         };
         if newer_sequence(self.last_sequence, sequence) {
@@ -1026,8 +1033,16 @@ impl InputPacketCoalescer {
                 Some(Command::Motion(seq, ..) | Command::Absolute(seq, ..)) => Some(seq),
                 _ => None,
             };
-            let motion = matches!(command, Some(Command::Rel(..) | Command::Abs(..)
-                | Command::Wheel(..) | Command::Motion(..) | Command::Absolute(..)));
+            let motion = matches!(
+                command,
+                Some(
+                    Command::Rel(..)
+                        | Command::Abs(..)
+                        | Command::Wheel(..)
+                        | Command::Motion(..)
+                        | Command::Absolute(..)
+                )
+            );
             let before = self.last_sequence;
             let accepted = sequence.is_none_or(|seq| newer_sequence(before, seq));
             if motion && accepted {
@@ -1119,20 +1134,33 @@ mod packet_coalescing_tests {
             motion(3, -5, 2, 1, 20),
         ]);
         assert_eq!(output.len(), 2);
-        assert_eq!(decode(&output[0]), Some(Command::Motion(1, 20_000, -5, 7, 120)));
-        assert_eq!(decode(&output[1]), Some(Command::Motion(3, 19_995, 10, -2, -20)));
+        assert_eq!(
+            decode(&output[0]),
+            Some(Command::Motion(1, 20_000, -5, 7, 120))
+        );
+        assert_eq!(
+            decode(&output[1]),
+            Some(Command::Motion(3, 19_995, 10, -2, -20))
+        );
         let legacy = coalescer.coalesce(vec![
-            packet(TYPE_MOUSE_REL, &[3, 5]), packet(TYPE_MOUSE_REL, &[-1, 2]),
-            packet(TYPE_WHEEL, &[120]), packet(TYPE_WHEEL, &[-40]),
+            packet(TYPE_MOUSE_REL, &[3, 5]),
+            packet(TYPE_MOUSE_REL, &[-1, 2]),
+            packet(TYPE_WHEEL, &[120]),
+            packet(TYPE_WHEEL, &[-40]),
         ]);
-        assert_eq!(legacy, vec![packet(TYPE_MOUSE_REL, &[2, 7]), packet(TYPE_WHEEL, &[80])]);
+        assert_eq!(
+            legacy,
+            vec![packet(TYPE_MOUSE_REL, &[2, 7]), packet(TYPE_WHEEL, &[80])]
+        );
     }
 
     #[test]
     fn coalescing_keeps_controls_and_mixed_absolute_relative_order() {
         let controls = vec![
-            vec![TYPE_BUTTONS, 1], packet(TYPE_KEY_DOWN, &[65]),
-            vec![TYPE_TEXT, b'x'], vec![TYPE_RELEASE_ALL],
+            vec![TYPE_BUTTONS, 1],
+            packet(TYPE_KEY_DOWN, &[65]),
+            vec![TYPE_TEXT, b'x'],
+            vec![TYPE_RELEASE_ALL],
             packet(TYPE_CURSOR_SYNC, &[3]),
         ];
         for control in controls {
@@ -1142,14 +1170,18 @@ mod packet_coalescing_tests {
             let c = motion(3, 5, 0, 0, 0);
             let d = packet(TYPE_ABSOLUTE_V2, &[4, 500, 600]);
             let e = packet(TYPE_ABSOLUTE_V2, &[5, 700, 800]);
-            assert_eq!(coalescer.coalesce(vec![a, b.clone(), c.clone(), control.clone(), d, e.clone()]),
-                vec![b, c, control, e]);
+            assert_eq!(
+                coalescer.coalesce(vec![a, b.clone(), c.clone(), control.clone(), d, e.clone()]),
+                vec![b, c, control, e]
+            );
         }
         let click = vec![TYPE_BUTTONS_AT, 10, 0, 100, 0, 200, 0, 1];
         let mut coalescer = InputPacketCoalescer::default();
         let after = motion(11, 9, 0, 0, 0);
-        assert_eq!(coalescer.coalesce(vec![motion(9, 3, 0, 0, 0), click.clone(), after.clone()]),
-            vec![motion(9, 3, 0, 0, 0), click, after]);
+        assert_eq!(
+            coalescer.coalesce(vec![motion(9, 3, 0, 0, 0), click.clone(), after.clone()]),
+            vec![motion(9, 3, 0, 0, 0), click, after]
+        );
     }
 
     #[test]
@@ -1159,10 +1191,15 @@ mod packet_coalescing_tests {
         let output = coalescer.coalesce(vec![motion(u16::MAX, 2, 0, 0, 0), motion(0, 3, 0, 0, 0)]);
         assert_eq!(output, vec![motion(0, 5, 0, 0, 0)]);
         let output = coalescer.coalesce(vec![
-            motion(u16::MAX, 100, 0, 0, 0), motion(0, 100, 0, 0, 0),
-            motion(1, 4, 0, 0, 0), motion(2, 6, 0, 0, 0),
+            motion(u16::MAX, 100, 0, 0, 0),
+            motion(0, 100, 0, 0, 0),
+            motion(1, 4, 0, 0, 0),
+            motion(2, 6, 0, 0, 0),
         ]);
-        let mut sink_state = InputState { last_motion_sequence: Some(0), ..Default::default() };
+        let mut sink_state = InputState {
+            last_motion_sequence: Some(0),
+            ..Default::default()
+        };
         let mut displacement = 0;
         for packet in output {
             if let Some(Command::Motion(seq, dx, ..)) = decode(&packet) {
@@ -1181,24 +1218,32 @@ mod packet_coalescing_tests {
 
     #[test]
     fn coalescing_splits_sequence_windows_and_preserves_stale_rejection() {
-        let mut coalescer = InputPacketCoalescer { last_sequence: Some(0) };
+        let mut coalescer = InputPacketCoalescer {
+            last_sequence: Some(0),
+        };
         let output = coalescer.coalesce(vec![
-            motion(1, 1, 0, 0, 0), motion(16_384, 1, 0, 0, 0),
-            motion(32_767, 1, 0, 0, 0), motion(32_768, 1, 0, 0, 0),
+            motion(1, 1, 0, 0, 0),
+            motion(16_384, 1, 0, 0, 0),
+            motion(32_767, 1, 0, 0, 0),
+            motion(32_768, 1, 0, 0, 0),
             motion(40_000, 1, 0, 0, 0),
         ]);
-        assert_eq!(output, vec![motion(32_767, 3, 0, 0, 0), motion(40_000, 2, 0, 0, 0)]);
+        assert_eq!(
+            output,
+            vec![motion(32_767, 3, 0, 0, 0), motion(40_000, 2, 0, 0, 0)]
+        );
         let rejected = motion(40_000u16.wrapping_add(0x8000), 100, 0, 0, 0);
         let accepted = motion(40_001, 5, 0, 0, 0);
-        assert_eq!(coalescer.coalesce(vec![rejected.clone(), accepted.clone()]), vec![rejected, accepted]);
+        assert_eq!(
+            coalescer.coalesce(vec![rejected.clone(), accepted.clone()]),
+            vec![rejected, accepted]
+        );
     }
 
     #[test]
     fn cancelled_motion_reaches_the_sink_and_requests_cursor_acknowledgement() {
         let mut coalescer = InputPacketCoalescer::default();
-        let packets = coalescer.coalesce(vec![
-            motion(1, 5, 0, 0, 0), motion(2, -5, 0, 0, 0),
-        ]);
+        let packets = coalescer.coalesce(vec![motion(1, 5, 0, 0, 0), motion(2, -5, 0, 0, 0)]);
         assert_eq!(packets, vec![motion(2, 0, 0, 0, 0)]);
         let mut sink = InputSink::new();
         let outcome = sink.handle(&packets[0]);
@@ -1217,7 +1262,8 @@ mod packet_coalescing_tests {
     fn fully_cancelled_motion_and_wheels_still_acknowledge_sequence_wrap() {
         let mut coalescer = InputPacketCoalescer::default();
         let packets = coalescer.coalesce(vec![
-            motion(u16::MAX, 5, -2, 120, -120), motion(0, -5, 2, -120, 120),
+            motion(u16::MAX, 5, -2, 120, -120),
+            motion(0, -5, 2, -120, 120),
         ]);
         assert_eq!(packets, vec![motion(0, 0, 0, 0, 0)]);
         let mut sink = InputSink::new();
@@ -1237,7 +1283,8 @@ pub struct InputSink {
     clipboard: Option<ClipboardSync>,
     /// Admin mode: the elevated agent injects on our behalf when reachable.
     admin_agent: Option<AdminAgentLink>,
-    secure_helper: Option<std::sync::Arc<std::sync::Mutex<crate::secure_helper::client::SecureHelperLink>>>,
+    secure_helper:
+        Option<std::sync::Arc<std::sync::Mutex<crate::secure_helper::client::SecureHelperLink>>>,
     secure_desktop: bool,
     secure_input_allowed: bool,
 }
@@ -1512,7 +1559,11 @@ fn map_monitor_absolute_to_virtual(
 }
 
 fn absolute_coordinates_for_input(
-    secure: bool, x: u16, y: u16, monitor: DesktopRegion, normal_virtual: DesktopRegion,
+    secure: bool,
+    x: u16,
+    y: u16,
+    monitor: DesktopRegion,
+    normal_virtual: DesktopRegion,
 ) -> (u16, u16) {
     if secure {
         // Secure protocol v2 carries capture-region coordinates. Only the
@@ -1754,22 +1805,34 @@ mod tests {
         let selected = super::DesktopRegion::new(1920, 0, 1920, 1080);
         let normal = super::DesktopRegion::new(0, 0, 3840, 1080);
         for point in [(0, 0), (32768, 32768), (65535, 65535)] {
-            assert_eq!(super::absolute_coordinates_for_input(true, point.0, point.1, selected, normal), point);
+            assert_eq!(
+                super::absolute_coordinates_for_input(true, point.0, point.1, selected, normal),
+                point
+            );
         }
-        assert_ne!(super::absolute_coordinates_for_input(false, 32768, 32768, selected, normal), (32768, 32768));
+        assert_ne!(
+            super::absolute_coordinates_for_input(false, 32768, 32768, selected, normal),
+            (32768, 32768)
+        );
     }
     #[test]
     fn secure_input_is_dropped_without_capability_and_never_falls_back() {
         let mut sink = super::InputSink::new();
         sink.set_secure_desktop(true, false);
-        for packet in [vec![super::TYPE_KEY_DOWN, 65, 0], vec![super::TYPE_TEXT, b'x']] {
+        for packet in [
+            vec![super::TYPE_KEY_DOWN, 65, 0],
+            vec![super::TYPE_TEXT, b'x'],
+        ] {
             assert_eq!(sink.handle(&packet), super::InputOutcome::default());
         }
         sink.set_secure_desktop(true, true);
         let result = sink.handle(&[super::TYPE_TEXT, b'x']);
         assert_eq!(result.application.applied, 0);
         assert!(result.application.requested > 0);
-        assert_eq!(sink.handle(&[super::TYPE_CLIPBOARD]), super::InputOutcome::default());
+        assert_eq!(
+            sink.handle(&[super::TYPE_CLIPBOARD]),
+            super::InputOutcome::default()
+        );
         assert!(sink.poll_clipboard(false).is_none());
     }
     use super::{
@@ -1803,7 +1866,10 @@ mod tests {
         carry.observe_forwarded(&[7, 8, 0, 1, 0, 2, 0, 0, 0, 0, 0]);
         assert!(sink_state.accept_motion(8));
         assert_eq!(sink_state.buttons, 0, "resumed motion cannot keep dragging");
-        assert!(!carry.take_resume_release(true, true), "release is consumed once");
+        assert!(
+            !carry.take_resume_release(true, true),
+            "release is consumed once"
+        );
     }
 
     #[test]
@@ -2818,7 +2884,12 @@ impl InputSink {
         self
     }
 
-    pub fn with_secure_helper(mut self, link: Option<std::sync::Arc<std::sync::Mutex<crate::secure_helper::client::SecureHelperLink>>>) -> Self {
+    pub fn with_secure_helper(
+        mut self,
+        link: Option<
+            std::sync::Arc<std::sync::Mutex<crate::secure_helper::client::SecureHelperLink>>,
+        >,
+    ) -> Self {
         self.secure_helper = link;
         self
     }
@@ -2827,7 +2898,9 @@ impl InputSink {
         if self.secure_desktop != secure || (self.secure_input_allowed && !input_allowed) {
             self.release_all();
             self.state = InputState::default();
-            if let Some(sync) = self.clipboard.as_mut() { sync.assembly = ClipboardAssembly::default(); }
+            if let Some(sync) = self.clipboard.as_mut() {
+                sync.assembly = ClipboardAssembly::default();
+            }
         }
         self.secure_desktop = secure;
         self.secure_input_allowed = input_allowed;
@@ -2843,7 +2916,9 @@ impl InputSink {
     /// New host clipboard text since the previous poll (never echoes text
     /// this sink set from the browser). `reset` starts a new baseline.
     pub fn poll_clipboard(&mut self, reset: bool) -> Option<clipboard::ClipboardContent> {
-        if self.secure_desktop { return None; }
+        if self.secure_desktop {
+            return None;
+        }
         self.clipboard.as_mut()?.watcher.poll(reset)
     }
 
@@ -2854,8 +2929,12 @@ impl InputSink {
 
     /// Handle one data-channel packet. Malformed packets are logged and dropped.
     pub fn handle(&mut self, data: &[u8]) -> InputOutcome {
-        if self.secure_desktop && (!self.secure_input_allowed || data.first() == Some(&TYPE_CLIPBOARD)) {
-            if !self.secure_input_allowed { self.note_secure_input_drop(data, "no_input_capability"); }
+        if self.secure_desktop
+            && (!self.secure_input_allowed || data.first() == Some(&TYPE_CLIPBOARD))
+        {
+            if !self.secure_input_allowed {
+                self.note_secure_input_drop(data, "no_input_capability");
+            }
             return InputOutcome::default();
         }
         let Some(command) = decode(data) else {
@@ -2868,7 +2947,9 @@ impl InputSink {
     /// During a native drag, preserve releases without introducing another
     /// press, paste or pointer move into the attached Windows input queue.
     pub fn handle_release_only(&mut self, data: &[u8]) -> InputOutcome {
-        if self.secure_desktop && !self.secure_input_allowed { return InputOutcome::default(); }
+        if self.secure_desktop && !self.secure_input_allowed {
+            return InputOutcome::default();
+        }
         let Some(command) = decode(data) else {
             return InputOutcome::default();
         };
@@ -2979,18 +3060,28 @@ impl InputSink {
     /// Count rejected injection records without retaining or logging values.
     pub fn note_secure_input_drop(&mut self, data: &[u8], reason: &'static str) {
         let count = match decode(data) {
-            Some(Command::Key(..) | Command::ScanKey(..) | Command::Abs(..) | Command::Absolute(..)) => 1,
+            Some(
+                Command::Key(..) | Command::ScanKey(..) | Command::Abs(..) | Command::Absolute(..),
+            ) => 1,
             Some(Command::Rel(dx, dy)) => usize::from(dx != 0 || dy != 0),
             Some(Command::Wheel(delta)) => usize::from(delta != 0),
             Some(Command::Text(text)) => text.encode_utf16().count().saturating_mul(2),
-            Some(Command::Motion(_, dx, dy, wx, wy)) => usize::from(dx != 0 || dy != 0) + usize::from(wx != 0) + usize::from(wy != 0),
+            Some(Command::Motion(_, dx, dy, wx, wy)) => {
+                usize::from(dx != 0 || dy != 0) + usize::from(wx != 0) + usize::from(wy != 0)
+            }
             Some(Command::Buttons(mask)) => (self.state.buttons ^ mask).count_ones() as usize,
-            Some(Command::ButtonsAt(_, _, _, mask)) => 1 + (self.state.buttons ^ mask).count_ones() as usize,
-            Some(Command::ReleaseAll) => self.state.pressed_keys.len() + self.state.buttons.count_ones() as usize,
+            Some(Command::ButtonsAt(_, _, _, mask)) => {
+                1 + (self.state.buttons ^ mask).count_ones() as usize
+            }
+            Some(Command::ReleaseAll) => {
+                self.state.pressed_keys.len() + self.state.buttons.count_ones() as usize
+            }
             _ => 0,
         };
         if let Some(link) = &self.secure_helper {
-            link.lock().unwrap_or_else(|error| error.into_inner()).note_input_drop(count as u64, reason);
+            link.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .note_input_drop(count as u64, reason);
         }
     }
 
@@ -3000,14 +3091,22 @@ impl InputSink {
         }
         let expected = inputs.len().min(u32::MAX as usize) as u32;
         if self.secure_desktop {
-            let accepted = self.secure_input_allowed && self.secure_helper.as_ref().is_some_and(|link| {
-                let Some(records) = inputs.iter().map(input_record).collect::<Option<Vec<_>>>() else { return false; };
-                link.lock().unwrap_or_else(|error| error.into_inner()).send_input(&records)
-            });
+            let accepted = self.secure_input_allowed
+                && self.secure_helper.as_ref().is_some_and(|link| {
+                    let Some(records) = inputs.iter().map(input_record).collect::<Option<Vec<_>>>()
+                    else {
+                        return false;
+                    };
+                    link.lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .send_input(&records)
+                });
             let mut application = InputApplication::default();
             // Submission is asynchronous. Never fall back to user/admin-agent
             // injection for secure input, even when the helper disappears.
-            if !accepted { application.observe(expected, 0, crate::admin_agent::client::ERROR_AGENT_LOST); }
+            if !accepted {
+                application.observe(expected, 0, crate::admin_agent::client::ERROR_AGENT_LOST);
+            }
             return application;
         }
         // The desktop can switch between the serve-loop observation and this
@@ -3108,7 +3207,9 @@ impl InputSink {
     /// Inject Ctrl+V for whatever the host clipboard holds now (file
     /// transfer: a paste-purpose upload already placed its files there).
     pub fn paste(&mut self) -> InputApplication {
-        if self.secure_desktop { return InputApplication::default(); }
+        if self.secure_desktop {
+            return InputApplication::default();
+        }
         let inputs: Vec<INPUT> = self
             .state
             .paste_plan()
@@ -3169,9 +3270,18 @@ impl InputSink {
     }
 
     fn mouse_abs(&mut self, x: u16, y: u16) -> InputApplication {
-        let virtual_desktop = if self.secure_desktop { self.absolute_region }
-            else { virtual_desktop_region().unwrap_or(self.absolute_region) };
-        let (x, y) = absolute_coordinates_for_input(self.secure_desktop, x, y, self.absolute_region, virtual_desktop);
+        let virtual_desktop = if self.secure_desktop {
+            self.absolute_region
+        } else {
+            virtual_desktop_region().unwrap_or(self.absolute_region)
+        };
+        let (x, y) = absolute_coordinates_for_input(
+            self.secure_desktop,
+            x,
+            y,
+            self.absolute_region,
+            virtual_desktop,
+        );
         let input = INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {

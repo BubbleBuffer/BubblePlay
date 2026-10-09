@@ -20,7 +20,10 @@ pub const RELAY_URL_RULE: &str = "the relay URL must use wss:// (or https://); c
 pub fn require_secure_relay_url(url: &str) -> Result<()> {
     // Uri normalises HTTP schemes but preserves WebSocket schemes. Reject
     // uppercase at the boundary so every host/tray transport uses one rule.
-    if url.split_once(':').is_some_and(|(scheme, _)| scheme.bytes().any(|b| b.is_ascii_uppercase())) {
+    if url
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.bytes().any(|b| b.is_ascii_uppercase()))
+    {
         bail!("relay URL scheme must be lowercase; {RELAY_URL_RULE}");
     }
     let uri = Uri::try_from(url)

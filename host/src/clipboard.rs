@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
-    SetClipboardData, RegisterClipboardFormatW,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -232,7 +232,10 @@ impl ClipboardContent {
         use base64::Engine;
         match self {
             Self::Text(text) => (false, text.clone()),
-            Self::Png(bytes) => (true, base64::engine::general_purpose::STANDARD.encode(bytes)),
+            Self::Png(bytes) => (
+                true,
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            ),
         }
     }
 }
@@ -240,25 +243,37 @@ impl ClipboardContent {
 // Copies bounded clipboard memory while the clipboard is open. Windows owns
 // the handle; unlock it before closing and never free it.
 fn clipboard_bytes(format: u32, limit: usize) -> Result<Option<Vec<u8>>> {
-    let Ok(handle) = (unsafe { GetClipboardData(format) }) else { return Ok(None); };
+    let Ok(handle) = (unsafe { GetClipboardData(format) }) else {
+        return Ok(None);
+    };
     let memory = HGLOBAL(handle.0);
     let size = unsafe { GlobalSize(memory) };
-    if size == 0 || size > limit { bail!("clipboard image exceeds memory limit"); }
+    if size == 0 || size > limit {
+        bail!("clipboard image exceeds memory limit");
+    }
     let source = unsafe { GlobalLock(memory) } as *const u8;
-    if source.is_null() { bail!("GlobalLock failed for clipboard image"); }
+    if source.is_null() {
+        bail!("GlobalLock failed for clipboard image");
+    }
     let bytes = unsafe { std::slice::from_raw_parts(source, size) }.to_vec();
     let _ = unsafe { GlobalUnlock(memory) };
     Ok(Some(bytes))
 }
 
 pub fn read_content() -> Result<Option<ClipboardContent>> {
-    if !input_desktop_is_default() { bail!("clipboard is unavailable outside the default desktop"); }
+    if !input_desktop_is_default() {
+        bail!("clipboard is unavailable outside the default desktop");
+    }
     {
         let _guard = OpenClipboardGuard::open()?;
         let png_format = unsafe { RegisterClipboardFormatW(windows::core::w!("PNG")) };
         if png_format != 0 {
-            if let Some(bytes) = read_image_format(png_format, crate::clipboard_image::MAX_PNG_BYTES) {
-                if crate::clipboard_image::valid_png(&bytes) { return Ok(Some(ClipboardContent::Png(bytes))); }
+            if let Some(bytes) =
+                read_image_format(png_format, crate::clipboard_image::MAX_PNG_BYTES)
+            {
+                if crate::clipboard_image::valid_png(&bytes) {
+                    return Ok(Some(ClipboardContent::Png(bytes)));
+                }
             }
         }
     }
@@ -271,7 +286,11 @@ pub fn read_content() -> Result<Option<ClipboardContent>> {
         if let Some(bytes) = bytes {
             match crate::clipboard_image::dib_to_png(&bytes) {
                 Ok(png) => return Ok(Some(ClipboardContent::Png(png))),
-                Err(error) => tracing::debug!(?error, format, "unsupported clipboard image; checking fallback format"),
+                Err(error) => tracing::debug!(
+                    ?error,
+                    format,
+                    "unsupported clipboard image; checking fallback format"
+                ),
             }
         }
     }
@@ -286,7 +305,10 @@ fn read_image_format(format: u32, limit: usize) -> Option<Vec<u8>> {
         Ok(bytes) => bytes,
         // Format/size failures are permanent for this sequence. Only a busy
         // OpenClipboard or text renderer is retried by the watcher.
-        Err(error) => { tracing::debug!(?error, format, "clipboard image format rejected"); None }
+        Err(error) => {
+            tracing::debug!(?error, format, "clipboard image format rejected");
+            None
+        }
     }
 }
 
@@ -358,7 +380,11 @@ impl ClipboardWatcher {
         self.finish_read(previous, result)
     }
 
-    fn finish_read(&mut self, previous: Option<u32>, result: Result<Option<ClipboardContent>>) -> Option<ClipboardContent> {
+    fn finish_read(
+        &mut self,
+        previous: Option<u32>,
+        result: Result<Option<ClipboardContent>>,
+    ) -> Option<ClipboardContent> {
         match result {
             Ok(content) => content,
             Err(error) => {
@@ -381,10 +407,16 @@ mod tests {
         let mut watcher = ClipboardWatcher::default();
         assert!(!watcher.observe(5, true));
         assert!(watcher.observe(6, false));
-        assert_eq!(watcher.finish_read(Some(5), Err(anyhow::anyhow!("busy"))), None);
+        assert_eq!(
+            watcher.finish_read(Some(5), Err(anyhow::anyhow!("busy"))),
+            None
+        );
         assert!(watcher.observe(6, false), "busy copy gets another attempt");
         assert_eq!(watcher.finish_read(Some(5), Ok(None)), None);
-        assert!(!watcher.observe(6, false), "unsupported image does not spin");
+        assert!(
+            !watcher.observe(6, false),
+            "unsupported image does not spin"
+        );
     }
 
     #[test]

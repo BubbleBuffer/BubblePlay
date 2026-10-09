@@ -98,6 +98,10 @@ pub struct WssMediaEgress {
 }
 
 impl WssMediaEgress {
+    pub fn set_activity(&self, activity: crate::activity::Activity) {
+        self.link.set_activity(activity);
+    }
+
     /// Connect the single media socket for `epoch`, authenticating the HTTP
     /// upgrade with `Authorization: Bearer <bearer>`.
     pub fn connect(
@@ -423,9 +427,8 @@ mod tests {
             request.headers().get(AUTHORIZATION).unwrap(),
             "Bearer host-bearer"
         );
-        let lab =
-            socket_request_with_worker_version(LAB_URL, "b", EPOCH, None, HostSocket::File)
-                .unwrap();
+        let lab = socket_request_with_worker_version(LAB_URL, "b", EPOCH, None, HostSocket::File)
+            .unwrap();
         assert!(lab
             .uri()
             .to_string()
@@ -478,7 +481,10 @@ mod tests {
     #[test]
     fn host_sockets_refuse_cleartext_except_to_a_loopback_relay() {
         for kind in [HostSocket::Media, HostSocket::File] {
-            for url in ["ws://192.168.1.20:8787/host-ws", "http://worker.example/host-ws"] {
+            for url in [
+                "ws://192.168.1.20:8787/host-ws",
+                "http://worker.example/host-ws",
+            ] {
                 let error =
                     socket_request_with_worker_version(url, "host-bearer", EPOCH, None, kind)
                         .unwrap_err()

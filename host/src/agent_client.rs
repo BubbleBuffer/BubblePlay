@@ -7,10 +7,12 @@
 //! generation/revision results before they reach the network transport.
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::{ffi::c_void, os::windows::io::AsRawHandle};
 
+use crate::activity::Activity;
 use anyhow::{bail, Context, Result};
 
 use crate::privileged_ipc::{read_frame, write_frame, Message, PermitIdentity};
@@ -30,6 +32,37 @@ enum PipeEvent {
     Message(Message),
     Closed,
     Failed(String),
+}
+
+#[derive(Clone, Default)]
+struct EventWake(Arc<Mutex<Option<Activity>>>);
+
+impl EventWake {
+    fn attach(&self, activity: Activity) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(activity.clone());
+        // Readers may already have published events before attachment. The
+        // producer must inspect those queues even without another pipe read.
+        activity.notify();
+    }
+
+    fn notify(&self) {
+        let activity = self
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(activity) = activity {
+            activity.notify();
+        }
+    }
+}
+
+fn publish_event(events: &SyncSender<PipeEvent>, wake: &EventWake, event: PipeEvent) -> bool {
+    let published = events.send(event).is_ok();
+    // Notify only after queue publication, including when a full queue made
+    // send block. A failed send also exposes a stopped reader to its owner.
+    wake.notify();
+    published
 }
 
 struct ControlWrite {
@@ -74,6 +107,7 @@ pub struct AgentClient {
     lease_id: u64,
     next_lease: Instant,
     permits: PermitGate,
+    event_wake: EventWake,
 }
 
 impl AgentClient {
@@ -97,9 +131,20 @@ impl AgentClient {
         let (control_tx, control_events) = mpsc::sync_channel(EVENT_CAPACITY);
         let (media_tx, media_events) = mpsc::sync_channel(MEDIA_CAPACITY);
         let (control_writes, control_write_rx) = mpsc::sync_channel(CONTROL_CAPACITY);
+        let event_wake = EventWake::default();
         let workers = vec![
-            spawn_control_pump(control_writer, control_write_rx, control_tx)?,
-            spawn_reader("bubbleplay-agent-media-reader", media_reader, media_tx)?,
+            spawn_control_pump(
+                control_writer,
+                control_write_rx,
+                control_tx,
+                event_wake.clone(),
+            )?,
+            spawn_reader(
+                "bubbleplay-agent-media-reader",
+                media_reader,
+                media_tx,
+                event_wake.clone(),
+            )?,
         ];
         let lease_id = lease_id();
         let mut client = Self {
@@ -111,6 +156,7 @@ impl AgentClient {
             lease_id,
             next_lease: Instant::now() + LEASE_RENEW_INTERVAL,
             permits: PermitGate::default(),
+            event_wake,
         };
         client
             .send_with_timeout(
@@ -122,6 +168,12 @@ impl AgentClient {
             )
             .context("start Agent lease")?;
         Ok(client)
+    }
+
+    /// Wake the producer for every control/media message, error or closure.
+    /// Reattachment also wakes for events already queued by the pipe workers.
+    pub fn set_activity(&self, activity: Activity) {
+        self.event_wake.attach(activity);
     }
 
     pub fn tick(&mut self, now: Instant) -> Result<()> {
@@ -259,6 +311,7 @@ fn spawn_control_pump(
     mut pipe: PipeStream,
     writes: Receiver<ControlWrite>,
     events: SyncSender<PipeEvent>,
+    wake: EventWake,
 ) -> Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("bubbleplay-agent-control-pump".into())
@@ -276,7 +329,7 @@ fn spawn_control_pump(
                 let failed = result.as_ref().err().cloned();
                 let _ = write.result.send(result);
                 if let Some(error) = failed {
-                    let _ = events.send(PipeEvent::Failed(error));
+                    publish_event(&events, &wake, PipeEvent::Failed(error));
                     return;
                 }
             }
@@ -287,22 +340,22 @@ fn spawn_control_pump(
                     progressed = true;
                     match read_frame(&mut pipe) {
                         Ok(Some(frame)) => {
-                            if events.send(PipeEvent::Message(frame.message)).is_err() {
+                            if !publish_event(&events, &wake, PipeEvent::Message(frame.message)) {
                                 return;
                             }
                         }
                         Ok(None) => {
-                            let _ = events.send(PipeEvent::Closed);
+                            publish_event(&events, &wake, PipeEvent::Closed);
                             return;
                         }
                         Err(error) => {
-                            let _ = events.send(PipeEvent::Failed(error.to_string()));
+                            publish_event(&events, &wake, PipeEvent::Failed(error.to_string()));
                             return;
                         }
                     }
                 }
                 Err(error) => {
-                    let _ = events.send(PipeEvent::Failed(error.to_string()));
+                    publish_event(&events, &wake, PipeEvent::Failed(error.to_string()));
                     return;
                 }
             }
@@ -318,22 +371,23 @@ fn spawn_reader(
     name: &'static str,
     mut pipe: PipeStream,
     events: SyncSender<PipeEvent>,
+    wake: EventWake,
 ) -> Result<JoinHandle<()>> {
     thread::Builder::new()
         .name(name.into())
         .spawn(move || loop {
             match read_frame(&mut pipe) {
                 Ok(Some(frame)) => {
-                    if events.send(PipeEvent::Message(frame.message)).is_err() {
+                    if !publish_event(&events, &wake, PipeEvent::Message(frame.message)) {
                         break;
                     }
                 }
                 Ok(None) => {
-                    let _ = events.send(PipeEvent::Closed);
+                    publish_event(&events, &wake, PipeEvent::Closed);
                     break;
                 }
                 Err(error) => {
-                    let _ = events.send(PipeEvent::Failed(error.to_string()));
+                    publish_event(&events, &wake, PipeEvent::Failed(error.to_string()));
                     break;
                 }
             }
@@ -370,6 +424,110 @@ mod tests {
     use std::io::Read;
     use std::os::windows::io::FromRawHandle;
     use std::ptr;
+
+    fn capabilities() -> Message {
+        Message::Capabilities(crate::privileged_ipc::Capabilities {
+            flags: 7,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 60,
+            max_bitrate_bps: 12_000_000,
+        })
+    }
+
+    #[test]
+    fn agent_control_message_interrupts_a_long_producer_activity_wait() {
+        let (client_control, mut agent_control) =
+            crate::privileged_pipe::connected_test_pair(PipeRole::Control).unwrap();
+        let (client_media, _agent_media) =
+            crate::privileged_pipe::connected_test_pair(PipeRole::Media).unwrap();
+        let (trigger_tx, trigger_rx) = mpsc::sync_channel(1);
+        let agent = thread::spawn(move || {
+            assert!(matches!(
+                read_frame(&mut agent_control).unwrap().unwrap().message,
+                Message::RenewLease { .. }
+            ));
+            trigger_rx.recv().unwrap();
+            write_frame(&mut agent_control, 0, 1, &capabilities()).unwrap();
+            // Retain the pipe until client cleanup so a closure cannot be
+            // mistaken for the control message's wake in this test.
+            assert!(matches!(
+                read_frame(&mut agent_control).unwrap().unwrap().message,
+                Message::ReleaseAll
+            ));
+        });
+        let client =
+            AgentClient::from_streams(client_control, client_media, Duration::from_millis(100))
+                .unwrap();
+        let activity = Activity::new().unwrap();
+        client.set_activity(activity.clone());
+        activity.wait(Duration::ZERO, &[]).unwrap(); // Drain the attach pulse.
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            trigger_tx.send(()).unwrap();
+        });
+        let started = Instant::now();
+        activity.wait(Duration::from_secs(5), &[]).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            client.try_event().unwrap(),
+            Some(Message::Capabilities(_))
+        ));
+        trigger.join().unwrap();
+        drop(client);
+        agent.join().unwrap();
+    }
+
+    #[test]
+    fn attach_and_reattach_wake_for_already_published_agent_events() {
+        let wake = EventWake::default();
+        let (events, received) = mpsc::sync_channel(2);
+        assert!(publish_event(
+            &events,
+            &wake,
+            PipeEvent::Message(capabilities())
+        ));
+        assert!(publish_event(&events, &wake, PipeEvent::Closed));
+        for expected_message in [true, false] {
+            let activity = Activity::new().unwrap();
+            wake.attach(activity.clone());
+            let started = Instant::now();
+            activity.wait(Duration::from_secs(5), &[]).unwrap();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let event = received.try_recv().unwrap();
+            assert_eq!(matches!(event, PipeEvent::Message(_)), expected_message);
+        }
+    }
+
+    #[test]
+    fn bounded_agent_queue_notifies_after_backpressure_releases_publication() {
+        let wake = EventWake::default();
+        let activity = Activity::new().unwrap();
+        wake.attach(activity.clone());
+        activity.wait(Duration::ZERO, &[]).unwrap();
+        let (events, received) = mpsc::sync_channel(1);
+        assert!(publish_event(
+            &events,
+            &wake,
+            PipeEvent::Message(capabilities())
+        ));
+        activity.wait(Duration::ZERO, &[]).unwrap();
+        let worker_wake = wake.clone();
+        let worker = thread::spawn(move || {
+            assert!(publish_event(
+                &events,
+                &worker_wake,
+                PipeEvent::Failed("injected pipe failure".into())
+            ));
+        });
+        // The second publication cannot complete until this dequeue.
+        assert!(matches!(received.recv().unwrap(), PipeEvent::Message(_)));
+        let started = Instant::now();
+        activity.wait(Duration::from_secs(5), &[]).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(received.try_recv().unwrap(), PipeEvent::Failed(_)));
+        worker.join().unwrap();
+    }
 
     #[test]
     fn startup_lease_write_completes_while_agent_has_no_inbound_event() {

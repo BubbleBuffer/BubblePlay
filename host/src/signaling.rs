@@ -15,6 +15,7 @@ use crate::capture::MonitorInfo;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -47,18 +48,27 @@ pub struct FileDragPreviewControl {
 
 impl FileDragPreviewControl {
     pub fn valid(&self) -> bool {
-        if self.protocol != 1 || self.drag_id == 0 || self.epoch.len() != 32
-            || !self.epoch.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        if self.protocol != 1
+            || self.drag_id == 0
+            || self.epoch.len() != 32
+            || !self
+                .epoch
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             return false;
         }
         match self.action.as_str() {
             "cancel" => self.drop.is_none() && self.types.is_none(),
-            "update" => self.drop.is_some_and(|point| point.generation != 0)
-                && self.types.as_ref().is_some_and(|types| {
-                    (1..=64).contains(&types.len())
-                        && types.iter().all(|mime| mime.len() <= 96 && mime.bytes().all(|b| b.is_ascii_graphic()))
-                }),
+            "update" => {
+                self.drop.is_some_and(|point| point.generation != 0)
+                    && self.types.as_ref().is_some_and(|types| {
+                        (1..=64).contains(&types.len())
+                            && types.iter().all(|mime| {
+                                mime.len() <= 96 && mime.bytes().all(|b| b.is_ascii_graphic())
+                            })
+                    })
+            }
             _ => false,
         }
     }
@@ -68,16 +78,29 @@ fn valid_file_drag_preview_wire(text: &str, control: &FileDragPreviewControl) ->
     if text.len() > FILE_DRAG_PREVIEW_MAX_BYTES || !control.valid() {
         return false;
     }
-    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(text) else { return false; };
-    if fields.keys().any(|key| !["type", "protocol", "epoch", "dragId", "action", "drop", "types"].contains(&key.as_str())) {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(text) else {
+        return false;
+    };
+    if fields.keys().any(|key| {
+        ![
+            "type", "protocol", "epoch", "dragId", "action", "drop", "types",
+        ]
+        .contains(&key.as_str())
+    }) {
         return false;
     }
     if control.action == "cancel" {
         return !fields.contains_key("drop") && !fields.contains_key("types");
     }
-    fields.get("drop").and_then(serde_json::Value::as_object).is_some_and(|point| {
-        point.len() == 4 && point.keys().all(|key| ["x", "y", "generation", "viewportRevision"].contains(&key.as_str()))
-    })
+    fields
+        .get("drop")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|point| {
+            point.len() == 4
+                && point
+                    .keys()
+                    .all(|key| ["x", "y", "generation", "viewportRevision"].contains(&key.as_str()))
+        })
 }
 
 const V2_REDUNDANT_BENCH_FIELDS: [&str; 12] = [
@@ -289,13 +312,21 @@ fn u32_is_zero(value: &u32) -> bool {
 }
 
 fn host_capabilities_message(
-    service_mode: bool, cold_boot: bool, secure_desktop: bool, secure_text: bool,
-    file_transfer: bool, file_drop: bool, follow_window: Option<bool>,
+    service_mode: bool,
+    cold_boot: bool,
+    secure_desktop: bool,
+    secure_text: bool,
+    file_transfer: bool,
+    file_drop: bool,
+    follow_window: Option<bool>,
     browser_approval_eligible: bool,
 ) -> SignalMsg {
     SignalMsg::HostCapabilities {
         browser_approval: !service_mode && browser_approval_eligible,
-        service_mode, cold_boot, secure_desktop, secure_text,
+        service_mode,
+        cold_boot,
+        secure_desktop,
+        secure_text,
         file_transfer: file_transfer.then_some(crate::file_transfer::PROTOCOL_VERSION),
         file_drop: (!service_mode && file_transfer && file_drop).then_some(1),
         file_drop_preview: (!service_mode && file_transfer && file_drop).then_some(1),
@@ -303,7 +334,9 @@ fn host_capabilities_message(
     }
 }
 
-fn is_false(value: &bool) -> bool { !*value }
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 fn bench_status_wire(msg: &SignalMsg) -> Result<String> {
     let mut value = serde_json::to_value(msg).context("serialize benchmark status value")?;
@@ -683,9 +716,15 @@ pub enum SignalMsg {
         last_sequence: Option<u16>,
     },
     #[serde(rename = "secure-action")]
-    SecureAction { action: String },
+    SecureAction {
+        action: String,
+    },
     #[serde(rename = "secure-action-result")]
-    SecureActionResult { action: String, ok: bool, reason: String },
+    SecureActionResult {
+        action: String,
+        ok: bool,
+        reason: String,
+    },
     #[serde(rename = "host-capabilities")]
     HostCapabilities {
         #[serde(rename = "browserApproval", default, skip_serializing_if = "is_false")]
@@ -710,7 +749,11 @@ pub enum SignalMsg {
         #[serde(rename = "fileDrop", default, skip_serializing_if = "Option::is_none")]
         file_drop: Option<u8>,
         /// Native OLE pre-drop target preview; absent on older/service hosts.
-        #[serde(rename = "fileDropPreview", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "fileDropPreview",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         file_drop_preview: Option<u8>,
         /// Follow active window version (`docs/architecture/follow-active-window.md`);
         /// absent when the host cannot follow the foreground window.
@@ -746,11 +789,17 @@ pub enum SignalMsg {
         index: u16,
         count: u16,
         text: String,
-
     },
     #[serde(rename = "clipboard-image")]
-    ClipboardImage { protocol: u8, id: u32, index: u16, count: u16, text: String,
-        #[serde(rename = "mimeType")] mime_type: String },
+    ClipboardImage {
+        protocol: u8,
+        id: u32,
+        index: u16,
+        count: u16,
+        text: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
     #[serde(rename = "monitor-error")]
     MonitorError {
         selector: String,
@@ -952,7 +1001,8 @@ mod pending_cursor_state_tests {
             y: x + 1,
             in_bounds: true,
             visible: true,
-        }.encode()
+        }
+        .encode()
     }
 
     #[test]
@@ -968,9 +1018,15 @@ mod pending_cursor_state_tests {
     fn reliable_responses_are_distinct_and_supersede_older_routine_state() {
         let mut pending = PendingCursorState::default();
         pending.publish(snapshot(Some(1), 1), false);
-        assert_eq!(pending.publish(snapshot(Some(2), 2), true), Some(snapshot(Some(2), 2)));
+        assert_eq!(
+            pending.publish(snapshot(Some(2), 2), true),
+            Some(snapshot(Some(2), 2))
+        );
         assert_eq!(pending.latest, None);
-        assert_eq!(pending.publish(snapshot(Some(3), 3), true), Some(snapshot(Some(3), 3)));
+        assert_eq!(
+            pending.publish(snapshot(Some(3), 3), true),
+            Some(snapshot(Some(3), 3))
+        );
         pending.publish(snapshot(None, 4), false);
         assert_eq!(pending.latest, Some(snapshot(Some(3), 4)));
     }
@@ -987,9 +1043,16 @@ mod pending_cursor_state_tests {
             visible: false,
         };
         pending.publish(external.encode(), false);
-        assert_eq!(pending.latest.take(), Some(CursorState {
-            acknowledged_sequence: Some(42), ..external
-        }.encode()));
+        assert_eq!(
+            pending.latest.take(),
+            Some(
+                CursorState {
+                    acknowledged_sequence: Some(42),
+                    ..external
+                }
+                .encode()
+            )
+        );
     }
 
     #[test]
@@ -1004,7 +1067,10 @@ mod pending_cursor_state_tests {
         assert_eq!(pending.latest.take(), Some(snapshot(Some(100), 4)));
         // Explicit responses also preserve the watermark without being
         // coalesced together or resurrecting the drained position slot.
-        assert_eq!(pending.publish(snapshot(Some(98), 5), true), Some(snapshot(Some(100), 5)));
+        assert_eq!(
+            pending.publish(snapshot(Some(98), 5), true),
+            Some(snapshot(Some(100), 5))
+        );
         assert_eq!(pending.latest, None);
     }
 
@@ -1034,10 +1100,17 @@ mod pending_cursor_state_tests {
 }
 
 fn valid_secure_action_wire(text: &str) -> bool {
-    if text.len() > 512 { return false; }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return false; };
-    value.as_object().is_some_and(|value| value.len() == 2 && value.get("type") == Some(&serde_json::json!("secure-action"))
-        && value.get("action") == Some(&serde_json::json!("deny")))
+    if text.len() > 512 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    value.as_object().is_some_and(|value| {
+        value.len() == 2
+            && value.get("type") == Some(&serde_json::json!("secure-action"))
+            && value.get("action") == Some(&serde_json::json!("deny"))
+    })
 }
 
 impl PendingCursorState {
@@ -1226,6 +1299,15 @@ impl Signaling {
         self.registered
     }
 
+    /// Readiness wakes the producer for signaling and WSS input immediately.
+    pub fn read_socket(&self) -> RawSocket {
+        match self.ws.get_ref() {
+            MaybeTlsStream::Plain(stream) => stream.as_raw_socket(),
+            MaybeTlsStream::NativeTls(stream) => stream.get_ref().as_raw_socket(),
+            _ => unreachable!("unsupported signaling TLS stream"),
+        }
+    }
+
     /// Drain pending messages without blocking. Call once per main-loop tick.
     pub fn poll(&mut self) -> Result<Vec<SignalEvent>> {
         self.flush_cursor_state();
@@ -1252,7 +1334,10 @@ impl Signaling {
             };
             match msg {
                 Message::Text(text) => {
-                    if let Some(decisions) = self.browser_approval.handle_wire(&text, crate::browser_approval::now_ms()) {
+                    if let Some(decisions) = self
+                        .browser_approval
+                        .handle_wire(&text, crate::browser_approval::now_ms())
+                    {
                         self.send_approval_decisions(decisions);
                         continue;
                     }
@@ -1410,7 +1495,9 @@ impl Signaling {
                         SignalMsg::Error { message } => {
                             warn!(message, "worker error message");
                         }
-                        other => debug!(kind = ?std::mem::discriminant(&other), "ignoring signal message"),
+                        other => {
+                            debug!(kind = ?std::mem::discriminant(&other), "ignoring signal message")
+                        }
                     }
                 }
                 Message::Ping(_) | Message::Pong(_) => {} // tungstenite auto-pongs
@@ -1432,13 +1519,18 @@ impl Signaling {
             bail!("signaling keepalive acknowledgement timed out");
         }
         if self.registered {
-            let decisions = self.browser_approval.poll(crate::browser_approval::now_ms());
+            let decisions = self
+                .browser_approval
+                .poll(crate::browser_approval::now_ms());
             self.send_approval_decisions(decisions);
         }
         Ok(events)
     }
 
-    fn send_approval_decisions(&mut self, decisions: Vec<crate::browser_approval::ApprovalDecision>) {
+    fn send_approval_decisions(
+        &mut self,
+        decisions: Vec<crate::browser_approval::ApprovalDecision>,
+    ) {
         for decision in decisions {
             if let Ok(text) = serde_json::to_string(&decision) {
                 self.send_text(&text);
@@ -1776,28 +1868,66 @@ impl Signaling {
         }
     }
 
-    pub fn send_secure_desktop_state(&mut self, kind: &str, capabilities: &[&str], generation: u32) {
+    pub fn send_secure_desktop_state(
+        &mut self,
+        kind: &str,
+        capabilities: &[&str],
+        generation: u32,
+    ) {
         self.send_secure_desktop_state_status(false, kind, capabilities, generation);
     }
 
-    pub fn send_secure_desktop_state_status(&mut self, active: bool, kind: &str, capabilities: &[&str], generation: u32) {
+    pub fn send_secure_desktop_state_status(
+        &mut self,
+        active: bool,
+        kind: &str,
+        capabilities: &[&str],
+        generation: u32,
+    ) {
         let msg = SignalMsg::DesktopState {
             state: if active { "active" } else { "unavailable" }.into(),
             desktop: Some("secure".into()),
             secure_kind: Some(kind.into()),
-            secure_capabilities: Some(capabilities.iter().map(|value| (*value).to_owned()).collect()),
-            input_state: Some(if active && capabilities.contains(&"input") { "enabled" } else if active { "read-only" } else { "suspended" }.into()),
+            secure_capabilities: Some(
+                capabilities
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+            ),
+            input_state: Some(
+                if active && capabilities.contains(&"input") {
+                    "enabled"
+                } else if active {
+                    "read-only"
+                } else {
+                    "suspended"
+                }
+                .into(),
+            ),
             generation,
-            reason: if active { "desktop-switched" } else { "secure-desktop" }.into(),
+            reason: if active {
+                "desktop-switched"
+            } else {
+                "secure-desktop"
+            }
+            .into(),
         };
         if let Ok(text) = serde_json::to_string(&msg) {
-            if self.ws.send(Message::text(text)).is_ok() { let _ = self.ws.flush(); }
+            if self.ws.send(Message::text(text)).is_ok() {
+                let _ = self.ws.flush();
+            }
         }
     }
 
     pub fn send_secure_action_result(&mut self, ok: bool, reason: &str) {
-        let message = SignalMsg::SecureActionResult { action: "deny".into(), ok, reason: reason.into() };
-        if let Ok(text) = serde_json::to_string(&message) { self.send_text(&text); }
+        let message = SignalMsg::SecureActionResult {
+            action: "deny".into(),
+            ok,
+            reason: reason.into(),
+        };
+        if let Ok(text) = serde_json::to_string(&message) {
+            self.send_text(&text);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1845,9 +1975,16 @@ impl Signaling {
         secure_desktop: bool,
         secure_text: bool,
     ) {
-        let msg = host_capabilities_message(service_mode, cold_boot, secure_desktop, secure_text,
-            self.file_transfer, self.file_drop, self.follow_window,
-            crate::browser_approval::capability_available(service_mode));
+        let msg = host_capabilities_message(
+            service_mode,
+            cold_boot,
+            secure_desktop,
+            secure_text,
+            self.file_transfer,
+            self.file_drop,
+            self.follow_window,
+            crate::browser_approval::capability_available(service_mode),
+        );
         if self
             .ws
             .send(Message::text(
@@ -1878,11 +2015,31 @@ impl Signaling {
         self.send_clipboard_content_chunk(id, index, count, text, false);
     }
 
-    pub fn send_clipboard_content_chunk(&mut self, id: u32, index: u16, count: u16, text: &str, png: bool) {
+    pub fn send_clipboard_content_chunk(
+        &mut self,
+        id: u32,
+        index: u16,
+        count: u16,
+        text: &str,
+        png: bool,
+    ) {
         let msg = if png {
-            SignalMsg::ClipboardImage { protocol: 1, id, index, count, text: text.to_owned(), mime_type: "image/png".to_owned() }
+            SignalMsg::ClipboardImage {
+                protocol: 1,
+                id,
+                index,
+                count,
+                text: text.to_owned(),
+                mime_type: "image/png".to_owned(),
+            }
         } else {
-            SignalMsg::Clipboard { protocol: 1, id, index, count, text: text.to_owned() }
+            SignalMsg::Clipboard {
+                protocol: 1,
+                id,
+                index,
+                count,
+                text: text.to_owned(),
+            }
         };
         if self
             .ws
@@ -3244,22 +3401,31 @@ mod tests {
 
     #[test]
     fn host_capabilities_announce_browser_approval_as_in_contract() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../fixtures/browser-approval-contract.json")).unwrap();
-        let value = serde_json::to_value(super::host_capabilities_message(false, false, false, false, false, false, None, true)).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/browser-approval-contract.json"
+        ))
+        .unwrap();
+        let value = serde_json::to_value(super::host_capabilities_message(
+            false, false, false, false, false, false, None, true,
+        ))
+        .unwrap();
         assert_eq!(value["type"], fixture["capability"]["type"]);
-        assert_eq!(value["browserApproval"], fixture["capability"]["browserApproval"]);
+        assert_eq!(
+            value["browserApproval"],
+            fixture["capability"]["browserApproval"]
+        );
     }
 
     #[test]
     fn host_capabilities_omit_browser_approval_for_ineligible_or_service_hosts() {
         for (service, eligible) in [(false, false), (true, false), (true, true)] {
-            let value = serde_json::to_value(super::host_capabilities_message(service, false, false, false,
-                false, false, None, eligible)).unwrap();
+            let value = serde_json::to_value(super::host_capabilities_message(
+                service, false, false, false, false, false, None, eligible,
+            ))
+            .unwrap();
             assert!(!value.as_object().unwrap().contains_key("browserApproval"));
         }
     }
-
-
 
     #[test]
     fn host_capabilities_advertise_file_transfer_as_in_the_fixture() {
@@ -3306,7 +3472,9 @@ mod tests {
 
     fn preview_wire_valid(text: &str) -> bool {
         match serde_json::from_str::<SignalMsg>(text) {
-            Ok(SignalMsg::FileDragPreview { control }) => super::valid_file_drag_preview_wire(text, &control),
+            Ok(SignalMsg::FileDragPreview { control }) => {
+                super::valid_file_drag_preview_wire(text, &control)
+            }
             _ => false,
         }
     }
@@ -3324,15 +3492,22 @@ mod tests {
         let wire = value.to_string();
         assert!(preview_wire_valid(&wire));
         let message: SignalMsg = serde_json::from_str(&wire).unwrap();
-        let SignalMsg::FileDragPreview { control } = &message else { panic!("typed preview"); };
+        let SignalMsg::FileDragPreview { control } = &message else {
+            panic!("typed preview");
+        };
         assert!(control.valid());
         assert_eq!(control.drag_id, 1);
         assert_eq!(control.drop.unwrap().y, u16::MAX);
         assert_eq!(control.types.as_ref().unwrap(), &["text/plain", ""]);
         assert_eq!(serde_json::to_value(message).unwrap(), value);
-        let cancel = super::FileDragPreviewControl { protocol: 1,
-            epoch: "0123456789abcdef0123456789abcdef".into(), drag_id: u32::MAX,
-            action: "cancel".into(), drop: None, types: None };
+        let cancel = super::FileDragPreviewControl {
+            protocol: 1,
+            epoch: "0123456789abcdef0123456789abcdef".into(),
+            drag_id: u32::MAX,
+            action: "cancel".into(),
+            drop: None,
+            types: None,
+        };
         let wire = serde_json::to_string(&SignalMsg::FileDragPreview { control: cancel }).unwrap();
         assert!(preview_wire_valid(&wire));
         let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
@@ -3343,14 +3518,23 @@ mod tests {
     #[test]
     fn file_drag_preview_rejects_bad_bounds_shapes_and_mime_hints() {
         for (field, bad) in [
-            ("protocol", serde_json::json!(2)), ("dragId", serde_json::json!(0)),
-            ("dragId", serde_json::json!(4294967296u64)), ("dragId", serde_json::json!(1.5)),
-            ("epoch", serde_json::json!("0123456789ABCDEF0123456789ABCDEF")),
-            ("epoch", serde_json::json!("short")), ("action", serde_json::json!("drop")),
-            ("types", serde_json::json!([])), ("types", serde_json::json!(["bad type"])),
-            ("types", serde_json::json!(["text/ü"])), ("types", serde_json::json!(["text/\n"])),
+            ("protocol", serde_json::json!(2)),
+            ("dragId", serde_json::json!(0)),
+            ("dragId", serde_json::json!(4294967296u64)),
+            ("dragId", serde_json::json!(1.5)),
+            (
+                "epoch",
+                serde_json::json!("0123456789ABCDEF0123456789ABCDEF"),
+            ),
+            ("epoch", serde_json::json!("short")),
+            ("action", serde_json::json!("drop")),
+            ("types", serde_json::json!([])),
+            ("types", serde_json::json!(["bad type"])),
+            ("types", serde_json::json!(["text/ü"])),
+            ("types", serde_json::json!(["text/\n"])),
             ("types", serde_json::json!(["a".repeat(97)])),
-            ("types", serde_json::json!(vec![""; 65])), ("types", serde_json::json!([1])),
+            ("types", serde_json::json!(vec![""; 65])),
+            ("types", serde_json::json!([1])),
             ("extra", serde_json::json!(true)),
         ] {
             let mut value = preview_update();
@@ -3358,14 +3542,20 @@ mod tests {
             assert!(!preview_wire_valid(&value.to_string()), "{field}: {value}");
         }
         for (field, bad) in [
-            ("x", serde_json::json!(-1)), ("x", serde_json::json!(65536)),
-            ("y", serde_json::json!(0.5)), ("generation", serde_json::json!(0)),
+            ("x", serde_json::json!(-1)),
+            ("x", serde_json::json!(65536)),
+            ("y", serde_json::json!(0.5)),
+            ("generation", serde_json::json!(0)),
             ("generation", serde_json::json!(4294967296u64)),
-            ("viewportRevision", serde_json::json!(-1)), ("extra", serde_json::json!(0)),
+            ("viewportRevision", serde_json::json!(-1)),
+            ("extra", serde_json::json!(0)),
         ] {
             let mut value = preview_update();
             value["drop"][field] = bad;
-            assert!(!preview_wire_valid(&value.to_string()), "drop {field}: {value}");
+            assert!(
+                !preview_wire_valid(&value.to_string()),
+                "drop {field}: {value}"
+            );
         }
         for missing in ["drop", "types", "protocol", "epoch", "dragId"] {
             let mut value = preview_update();
@@ -3377,7 +3567,10 @@ mod tests {
         assert!(!preview_wire_valid(&cancel.to_string()));
         cancel["drop"] = serde_json::Value::Null;
         cancel["types"] = serde_json::Value::Null;
-        assert!(!preview_wire_valid(&cancel.to_string()), "cancel must omit fields, not null them");
+        assert!(
+            !preview_wire_valid(&cancel.to_string()),
+            "cancel must omit fields, not null them"
+        );
     }
 
     #[test]
@@ -3389,7 +3582,10 @@ mod tests {
         value["types"] = serde_json::json!(vec!["a".repeat(96); 64]);
         let mut wire = value.to_string();
         assert!(preview_wire_valid(&wire));
-        wire.extend(std::iter::repeat_n(' ', super::FILE_DRAG_PREVIEW_MAX_BYTES - wire.len()));
+        wire.extend(std::iter::repeat_n(
+            ' ',
+            super::FILE_DRAG_PREVIEW_MAX_BYTES - wire.len(),
+        ));
         assert!(preview_wire_valid(&wire));
         wire.push(' ');
         assert!(!preview_wire_valid(&wire));
@@ -3405,8 +3601,17 @@ mod tests {
             r#"{"type":"host-capabilities","serviceMode":false,"coldBoot":false,"secureDesktop":false,"secureText":false,"fileTransfer":1,"fileDrop":1}"#,
         ] {
             let message: SignalMsg = serde_json::from_str(text).unwrap();
-            assert!(matches!(&message, SignalMsg::HostCapabilities { file_drop_preview: None, .. }));
-            assert_eq!(serde_json::to_value(message).unwrap(), serde_json::from_str::<serde_json::Value>(text).unwrap());
+            assert!(matches!(
+                &message,
+                SignalMsg::HostCapabilities {
+                    file_drop_preview: None,
+                    ..
+                }
+            ));
+            assert_eq!(
+                serde_json::to_value(message).unwrap(),
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            );
         }
     }
 
@@ -3435,9 +3640,12 @@ mod tests {
     #[test]
     fn secure_desktop_state_serializes_optional_contract_fields() {
         let message = SignalMsg::DesktopState {
-            state: "unavailable".into(), desktop: Some("secure".into()),
-            secure_kind: Some("other".into()), secure_capabilities: Some(vec![]),
-            input_state: Some("suspended".into()), generation: 7,
+            state: "unavailable".into(),
+            desktop: Some("secure".into()),
+            secure_kind: Some("other".into()),
+            secure_capabilities: Some(vec![]),
+            input_state: Some("suspended".into()),
+            generation: 7,
             reason: "secure-desktop".into(),
         };
         let value = serde_json::to_value(message).unwrap();
@@ -3447,7 +3655,9 @@ mod tests {
         let legacy = serde_json::to_value(legacy).unwrap();
         assert!(legacy.get("secureKind").is_none());
         assert!(legacy.get("secureCapabilities").is_none());
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../fixtures/secure-desktop-contract.json")).unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/secure-desktop-contract.json"))
+                .unwrap();
         assert_eq!(value, fixture["desktopStates"][0]);
         for expected in fixture["desktopStates"].as_array().unwrap() {
             let message: SignalMsg = serde_json::from_value(expected.clone()).unwrap();
@@ -3457,7 +3667,9 @@ mod tests {
 
     #[test]
     fn secure_deny_contract_is_parameterless_and_results_roundtrip() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../fixtures/secure-desktop-contract.json")).unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/secure-desktop-contract.json"))
+                .unwrap();
         for message in fixture["secureActions"].as_array().unwrap() {
             assert!(super::valid_secure_action_wire(&message.to_string()));
         }
@@ -3465,9 +3677,15 @@ mod tests {
             let parsed: SignalMsg = serde_json::from_value(message.clone()).unwrap();
             assert_eq!(serde_json::to_value(parsed).unwrap(), *message);
         }
-        assert!(!super::valid_secure_action_wire(r#"{"type":"secure-action","action":"deny","x":0}"#));
-        assert!(!super::valid_secure_action_wire(r#"{"type":"secure-action","action":"allow"}"#));
-        assert!(!super::valid_secure_action_wire(r#"{"type":"secure-action-result","action":"deny"}"#));
+        assert!(!super::valid_secure_action_wire(
+            r#"{"type":"secure-action","action":"deny","x":0}"#
+        ));
+        assert!(!super::valid_secure_action_wire(
+            r#"{"type":"secure-action","action":"allow"}"#
+        ));
+        assert!(!super::valid_secure_action_wire(
+            r#"{"type":"secure-action-result","action":"deny"}"#
+        ));
     }
 
     #[test]

@@ -25,18 +25,9 @@ pub fn discover_mapped_address(socket: &UdpSocket, server: &str) -> Result<Socke
         iter.next().context("no STUN server address")?
     };
 
-    // 20-byte header: type=Binding Request (0x0001), len=0, magic cookie, 96-bit tid.
-    let mut tid = [0u8; 12];
-    for b in tid.iter_mut() {
-        *b = rand_byte();
-    }
-    let mut req = vec![0u8; 20];
-    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // type
-    req[2..4].copy_from_slice(&0u16.to_be_bytes()); // length
-    req[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    req[8..20].copy_from_slice(&tid);
+    let (req, tid) = binding_request();
 
-    // Two attempts, short timeouts.
+    // Three attempts, short timeouts.
     let mut buf = [0u8; 576];
     for attempt in 1..=3 {
         socket.send_to(&req, server_addr).context("stun send")?;
@@ -62,8 +53,23 @@ pub fn discover_mapped_address(socket: &UdpSocket, server: &str) -> Result<Socke
     bail!("STUN discovery failed against {server}");
 }
 
+pub(crate) fn binding_request() -> ([u8; 20], [u8; 12]) {
+    // Binding Request (0x0001), zero length, cookie and 96-bit transaction ID.
+    let mut tid = [0u8; 12];
+    for b in tid.iter_mut() {
+        *b = rand_byte();
+    }
+    let mut req = [0u8; 20];
+    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // type
+    req[2..4].copy_from_slice(&0u16.to_be_bytes()); // length
+    req[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    req[8..20].copy_from_slice(&tid);
+
+    (req, tid)
+}
+
 /// Parse a Binding Success Response; extract XOR-MAPPED-ADDRESS.
-fn parse_binding_response(buf: &[u8], tid: &[u8; 12]) -> Option<SocketAddr> {
+pub(crate) fn parse_binding_response(buf: &[u8], tid: &[u8; 12]) -> Option<SocketAddr> {
     if buf.len() < 20 {
         return None;
     }

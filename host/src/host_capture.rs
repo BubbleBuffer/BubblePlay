@@ -8,6 +8,28 @@ use std::sync::{Arc, Mutex};
 
 pub(super) type SharedSecureHelper = Arc<Mutex<SecureHelperLink>>;
 
+/// An overdue snapshot timer publishes one wake. If transport admission
+/// blocks its attempt, capacity notifications (or bounded housekeeping)
+/// retry the still-due work without repeatedly publishing the same timer.
+#[derive(Default)]
+struct SnapshotDeadlineWake {
+    notified: Option<Instant>,
+}
+
+impl SnapshotDeadlineWake {
+    fn deadline(&mut self, deadline: Option<Instant>, now: Instant) -> Option<Instant> {
+        let deadline = deadline?;
+        if deadline > now {
+            return Some(deadline);
+        }
+        if self.notified == Some(deadline) {
+            return None;
+        }
+        self.notified = Some(deadline);
+        Some(deadline)
+    }
+}
+
 fn finish_normal_recovery(pending: &mut bool, recovered: bool) -> bool {
     let pending = std::mem::take(pending);
     recovered || pending
@@ -32,6 +54,12 @@ pub(super) struct LocalCaptureSource {
     normal_recovery_pending: bool,
     secure_loss_pending: bool,
     next_secure_kind_probe: Instant,
+    next_desktop_check: Instant,
+    desktop_default: bool,
+    helper_secure: bool,
+    event_activity: Option<bubbleplay_host::activity::Activity>,
+    capture_demand: bool,
+    snapshot_wake: SnapshotDeadlineWake,
 }
 
 impl LocalCaptureSource {
@@ -58,12 +86,21 @@ impl LocalCaptureSource {
             normal_recovery_pending: false,
             secure_loss_pending: false,
             next_secure_kind_probe: Instant::now(),
+            next_desktop_check: Instant::now(),
+            desktop_default: false,
+            helper_secure: false,
+            event_activity: None,
+            capture_demand: false,
+            snapshot_wake: SnapshotDeadlineWake::default(),
         })
     }
 
     pub(super) fn ensure_capture(&mut self) -> Result<&mut Capture> {
         if self.capture.is_none() {
             let mut capture = Capture::new(Some(&self.selector)).context("capture init")?;
+            if let Some(activity) = self.event_activity.as_ref() {
+                capture.enable_event_capture(activity.clone());
+            }
             self.width = capture.width();
             self.height = capture.height();
             self.region = capture.region();
@@ -105,6 +142,9 @@ impl LocalCaptureSource {
 
     pub(super) fn request_idle_snapshot(&mut self) {
         self.idle_snapshot_requested = true;
+        if let Some(activity) = self.event_activity.as_ref() {
+            activity.notify();
+        }
         if let Some(capture) = self.capture.as_mut() {
             capture.request_idle_snapshot();
             self.idle_snapshot_requested = false;
@@ -113,43 +153,91 @@ impl LocalCaptureSource {
 
     pub(super) fn take_availability_transition(&mut self) -> Option<capture::CaptureAvailability> {
         if std::mem::take(&mut self.secure_loss_pending) {
-            if let Some(capture) = self.capture.as_mut() { let _ = capture.take_availability_transition(); }
+            if let Some(capture) = self.capture.as_mut() {
+                let _ = capture.take_availability_transition();
+            }
             return Some(capture::CaptureAvailability::Unavailable);
         }
-        self.capture.as_mut().and_then(Capture::take_availability_transition)
+        self.capture
+            .as_mut()
+            .and_then(Capture::take_availability_transition)
     }
 
     fn tick_secure(&mut self, viewer: bool, now: Instant) {
-        let mut link = self.secure_helper.lock().unwrap_or_else(|error| error.into_inner());
+        let mut link = self
+            .secure_helper
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         link.tick(viewer, self.region, now);
         let next = link.state();
         drop(link);
-        let desktop_default = bubbleplay_host::desktop_session::input_desktop_is_default();
-        let mut fallback_kind = self.secure_state.as_ref().map_or("other", |state| state.kind);
-        if !desktop_default && !next.as_ref().is_some_and(|state| state.secure)
-            && now >= self.next_secure_kind_probe {
-            fallback_kind = bubbleplay_host::desktop_session::secure_desktop_kind().unwrap_or("other");
+        // Helper transitions are immediate. The fallback host desktop probe
+        // is bounded to 250 ms rather than repeated on every producer wake.
+        // Compare raw helper observations, not the merged fallback state:
+        // without a helper that fallback can stay secure while next is None.
+        let helper_secure = next.as_ref().is_some_and(|state| state.secure);
+        let helper_transition = self.helper_secure != helper_secure;
+        self.helper_secure = helper_secure;
+        if now >= self.next_desktop_check || helper_transition {
+            self.desktop_default = bubbleplay_host::desktop_session::input_desktop_is_default();
+            self.next_desktop_check = now + Duration::from_millis(250);
+        }
+        let desktop_default = self.desktop_default;
+        let mut fallback_kind = self
+            .secure_state
+            .as_ref()
+            .map_or("other", |state| state.kind);
+        if !desktop_default
+            && !next.as_ref().is_some_and(|state| state.secure)
+            && now >= self.next_secure_kind_probe
+        {
+            fallback_kind =
+                bubbleplay_host::desktop_session::secure_desktop_kind().unwrap_or("other");
             self.next_secure_kind_probe = now + capture::CAPTURE_RECOVERY_INTERVAL;
         }
         self.observe_desktop(next, desktop_default, fallback_kind);
     }
 
-    fn observe_desktop(&mut self, next: Option<SecureState>, desktop_default: bool, fallback_kind: &'static str) {
+    fn observe_desktop(
+        &mut self,
+        next: Option<SecureState>,
+        desktop_default: bool,
+        fallback_kind: &'static str,
+    ) {
         // Neither a missing helper nor a delayed Default report can override
         // the host's observation that the input desktop is not Default.
         let next = if !desktop_default && !next.as_ref().is_some_and(|state| state.secure) {
-            Some(SecureState { secure: true, kind: fallback_kind, caps: vec![], available: false, desktop_epoch: 0 })
-        } else { next };
+            Some(SecureState {
+                secure: true,
+                kind: fallback_kind,
+                caps: vec![],
+                available: false,
+                desktop_epoch: 0,
+            })
+        } else {
+            next
+        };
         let secure = next.as_ref().is_some_and(|state| state.secure);
         let was_secure = self.secure_state.as_ref().is_some_and(|state| state.secure);
-        let epoch_changed = secure && self.secure_state.as_ref().zip(next.as_ref())
-            .is_some_and(|(previous, next)| previous.desktop_epoch != next.desktop_epoch);
+        let epoch_changed = secure
+            && self
+                .secure_state
+                .as_ref()
+                .zip(next.as_ref())
+                .is_some_and(|(previous, next)| previous.desktop_epoch != next.desktop_epoch);
         if secure && !was_secure {
             self.normal_recovery_pending = true;
-            if let Some(capture) = self.capture.as_mut() { capture.suspend_for_secure_desktop(); }
+            if let Some(capture) = self.capture.as_mut() {
+                capture.suspend_for_secure_desktop();
+            }
             self.secure_loss_pending = true;
         }
-        if self.secure_streaming && (epoch_changed || !next.as_ref().is_some_and(|state| state.secure && state.available)) {
+        if self.secure_streaming
+            && (epoch_changed
+                || !next
+                    .as_ref()
+                    .is_some_and(|state| state.secure && state.available))
+        {
             self.secure_streaming = false;
             self.secure_upload = None;
             self.secure_loss_pending = true;
@@ -157,12 +245,23 @@ impl LocalCaptureSource {
         self.secure_state = next;
     }
 
-    fn acquire(&mut self, timeout: Duration) -> Result<Option<(capture::CapturedFrame<'_>, bool, bool)>> {
+    fn acquire(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<(capture::CapturedFrame<'_>, bool, bool)>> {
         if self.secure_state.as_ref().is_some_and(|state| state.secure) {
-            let frame = self.secure_helper.lock().unwrap_or_else(|error| error.into_inner()).take_frame();
+            let frame = self
+                .secure_helper
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take_frame();
             let Some(frame) = frame else { return Ok(None) };
-            if frame.width != self.width || frame.height != self.height
-                || !self.secure_state.as_ref().is_some_and(|state| state.available && state.desktop_epoch == frame.desktop_epoch) {
+            if frame.width != self.width
+                || frame.height != self.height
+                || !self.secure_state.as_ref().is_some_and(|state| {
+                    state.available && state.desktop_epoch == frame.desktop_epoch
+                })
+            {
                 warn!("secure helper frame does not match selected monitor; preserving session without media");
                 self.secure_streaming = false;
                 self.secure_loss_pending = true;
@@ -180,7 +279,10 @@ impl LocalCaptureSource {
                     }
                 }
             }
-            let uploaded = self.secure_upload.as_mut().expect("secure upload present")
+            let uploaded = self
+                .secure_upload
+                .as_mut()
+                .expect("secure upload present")
                 .upload(frame.width, frame.height, frame.stride, &frame.pixels);
             return match uploaded {
                 Ok(frame) => {
@@ -197,7 +299,11 @@ impl LocalCaptureSource {
             };
         }
         self.ensure_capture()?;
-        let frame = self.capture.as_mut().expect("capture initialized").acquire(timeout)?;
+        let frame = self
+            .capture
+            .as_mut()
+            .expect("capture initialized")
+            .acquire(timeout)?;
         Ok(frame.map(|(frame, changed, recovered)| {
             let recovered = finish_normal_recovery(&mut self.normal_recovery_pending, recovered);
             (frame, changed, recovered)
@@ -219,6 +325,7 @@ pub(super) struct PrivilegedSource {
     pub(super) input_state: &'static str,
     pub(super) generation: u32,
     pub(super) reconnect_log: ReconnectLogGate,
+    event_activity: Option<bubbleplay_host::activity::Activity>,
 }
 
 pub(super) const AGENT_RECONNECT_LOG_INTERVAL: Duration = Duration::from_secs(30);
@@ -274,6 +381,7 @@ impl PrivilegedSource {
             input_state: "suspended",
             generation: 0,
             reconnect_log: ReconnectLogGate::default(),
+            event_activity: None,
         }
     }
 
@@ -316,6 +424,9 @@ impl PrivilegedSource {
             .expect("valid one-shot Agent retry policy");
         match AgentClient::connect_with_retry(policy) {
             Ok(mut client) => {
+                if let Some(activity) = self.event_activity.as_ref() {
+                    client.set_activity(activity.clone());
+                }
                 // Refresh topology after every process-boundary recovery. The
                 // browser may have issued its request while the Agent was down.
                 if let Err(error) = client.send(&AgentMessage::ListMonitors) {
@@ -589,12 +700,85 @@ impl CaptureSource {
         }
     }
 
+    pub(super) fn set_event_activity(&mut self, activity: bubbleplay_host::activity::Activity) {
+        match self {
+            Self::Local(source) => {
+                source.event_activity = Some(activity.clone());
+                if let Some(capture) = source.capture.as_mut() {
+                    capture.enable_event_capture(activity);
+                }
+            }
+            Self::Privileged(source) => {
+                source.event_activity = Some(activity.clone());
+                if let Some(client) = source.client.as_ref() {
+                    client.set_activity(activity);
+                }
+            }
+        }
+    }
+
+    pub(super) fn set_capture_demand(&mut self, enabled: bool) -> Result<()> {
+        if let Self::Local(source) = self {
+            source.capture_demand = enabled;
+            if let Some(capture) = source.capture.as_mut() {
+                capture.set_capture_demand(enabled);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn request_event_frame_at(&mut self, not_before: Instant) -> Result<()> {
+        if let Self::Local(source) = self {
+            if source.capture_demand
+                && !source
+                    .secure_state
+                    .as_ref()
+                    .is_some_and(|state| state.secure)
+            {
+                source.ensure_capture()?.request_frame_at(not_before)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn next_event_deadline(&mut self, snapshot_eligible: bool) -> Option<Instant> {
+        let Self::Local(source) = self else {
+            return None;
+        };
+        if !source.capture_demand {
+            return None;
+        }
+        let mut deadline = source.next_desktop_check;
+        if let Some(capture) = source.capture.as_ref() {
+            // The session owns its recovery-probe deadline. Capture's cached
+            // desktop timer can stay expired between those probes, so it is
+            // never a separate reason to wake this producer.
+            if snapshot_eligible && capture.availability() == capture::CaptureAvailability::Active {
+                if let Some(snapshot) = source
+                    .snapshot_wake
+                    .deadline(capture.idle_snapshot_deadline(), Instant::now())
+                {
+                    deadline = deadline.min(snapshot);
+                }
+            }
+        }
+        Some(deadline)
+    }
+
     pub(super) fn take_idle_snapshot_frame(&mut self) -> Option<capture::CapturedFrame<'_>> {
         match self {
-            Self::Local(source) if !source.normal_recovery_pending && !source.secure_state.as_ref().is_some_and(|state| state.secure) => source
-                .capture
-                .as_mut()
-                .and_then(Capture::take_idle_snapshot_frame),
+            Self::Local(source)
+                if !source.normal_recovery_pending
+                    && !source
+                        .secure_state
+                        .as_ref()
+                        .is_some_and(|state| state.secure) =>
+            {
+                source
+                    .capture
+                    .as_mut()
+                    .and_then(Capture::take_idle_snapshot_frame)
+            }
             _ => None,
         }
     }
@@ -615,7 +799,9 @@ impl CaptureSource {
     }
 
     pub(super) fn tick_secure(&mut self, viewer: bool, now: Instant) {
-        if let Self::Local(source) = self { source.tick_secure(viewer, now); }
+        if let Self::Local(source) = self {
+            source.tick_secure(viewer, now);
+        }
     }
 
     pub(super) fn tick(&mut self, now: Instant) -> Result<()> {
@@ -748,11 +934,29 @@ impl CaptureSource {
                 })
             }
             AgentMessage::InputStats(stats) => Some(PrivilegedEvent::InputStatus(stats)),
-            AgentMessage::ClipboardText { id, index, count, text } => Some(PrivilegedEvent::Clipboard {
-                id, index, count, text, png: false,
+            AgentMessage::ClipboardText {
+                id,
+                index,
+                count,
+                text,
+            } => Some(PrivilegedEvent::Clipboard {
+                id,
+                index,
+                count,
+                text,
+                png: false,
             }),
-            AgentMessage::ClipboardPng { id, index, count, text } => Some(PrivilegedEvent::Clipboard {
-                id, index, count, text, png: true,
+            AgentMessage::ClipboardPng {
+                id,
+                index,
+                count,
+                text,
+            } => Some(PrivilegedEvent::Clipboard {
+                id,
+                index,
+                count,
+                text,
+                png: true,
             }),
             AgentMessage::Capabilities(_) | AgentMessage::ConfigAck { .. } => None,
             AgentMessage::RecoverableError(error) => {
@@ -796,13 +1000,23 @@ impl CaptureSource {
                     return PrivilegedDesktopState {
                         available: source.secure_streaming && state.available,
                         desktop: "secure",
-                        input: if source.secure_streaming && state.available && state.caps.contains(&"input") { "enabled" } else if source.secure_streaming && state.available { "read-only" } else { "suspended" },
+                        input: if source.secure_streaming
+                            && state.available
+                            && state.caps.contains(&"input")
+                        {
+                            "enabled"
+                        } else if source.secure_streaming && state.available {
+                            "read-only"
+                        } else {
+                            "suspended"
+                        },
                         agent_generation: 0,
                     };
                 }
-                let available = !source.normal_recovery_pending && source.capture.as_ref().is_none_or(|capture| {
-                    capture.availability() == capture::CaptureAvailability::Active
-                });
+                let available = !source.normal_recovery_pending
+                    && source.capture.as_ref().is_none_or(|capture| {
+                        capture.availability() == capture::CaptureAvailability::Active
+                    });
                 PrivilegedDesktopState {
                     available,
                     desktop: if available { "default" } else { "none" },
@@ -824,7 +1038,10 @@ impl CaptureSource {
     }
 
     pub(super) fn secure_helper(&self) -> Option<SharedSecureHelper> {
-        match self { Self::Local(source) => Some(source.secure_helper.clone()), _ => None }
+        match self {
+            Self::Local(source) => Some(source.secure_helper.clone()),
+            _ => None,
+        }
     }
 
     pub(super) fn secure_helper_ready(&self) -> bool {
@@ -833,11 +1050,15 @@ impl CaptureSource {
     }
 
     pub(super) fn secure_state(&self) -> Option<SecureState> {
-        match self { Self::Local(source) => source.secure_state.clone().filter(|state| state.secure), _ => None }
+        match self {
+            Self::Local(source) => source.secure_state.clone().filter(|state| state.secure),
+            _ => None,
+        }
     }
 
     pub(super) fn secure_input_allowed(&self) -> bool {
-        self.secure_state().is_none_or(|state| self.desktop_state().available && state.caps.contains(&"input"))
+        self.secure_state()
+            .is_none_or(|state| self.desktop_state().available && state.caps.contains(&"input"))
     }
 
     pub(super) fn send_input(&mut self, data: &[u8]) -> Result<bool> {
@@ -871,6 +1092,42 @@ mod agent_encode_recovery_tests {
     use super::*;
 
     #[test]
+    fn privileged_capture_keeps_activity_before_a_client_reconnects() {
+        let mut capture = CaptureSource::Privileged(PrivilegedSource::new(Instant::now()));
+        capture.set_event_activity(bubbleplay_host::activity::Activity::new().unwrap());
+        let CaptureSource::Privileged(source) = capture else {
+            panic!("privileged source changed")
+        };
+        assert!(source.client.is_none());
+        assert!(
+            source.event_activity.is_some(),
+            "reconnected clients need the same producer notifier"
+        );
+    }
+
+    #[test]
+    fn snapshot_deadlines_wake_when_due_once_and_rearm_for_changed_work() {
+        let now = Instant::now();
+        let mut wake = SnapshotDeadlineWake::default();
+        let due = now + Duration::from_millis(34);
+        assert_eq!(wake.deadline(Some(due), now), Some(due));
+        assert_eq!(
+            wake.deadline(Some(due), now + Duration::from_millis(10)),
+            Some(due)
+        );
+        assert_eq!(wake.deadline(Some(due), due), Some(due));
+        // Admission blocked this attempt. The snapshot remains due, but the
+        // unchanged expired timer cannot spin the producer.
+        assert_eq!(wake.deadline(Some(due), due + Duration::from_secs(1)), None);
+        let requested_again = due + Duration::from_secs(1);
+        assert_eq!(
+            wake.deadline(Some(requested_again), requested_again),
+            Some(requested_again)
+        );
+        assert_eq!(wake.deadline(None, requested_again), None);
+    }
+
+    #[test]
     fn secure_exit_recovers_once_with_warm_or_cold_duplication() {
         for dda_recovered in [false, true] {
             let mut pending = true;
@@ -882,12 +1139,31 @@ mod agent_encode_recovery_tests {
     #[test]
     fn secure_source_pins_monitor_and_requires_frame_before_input() {
         let mut source = LocalCaptureSource {
-            capture: None, selector: "DISPLAY2".into(), width: 1920, height: 1080,
-            region: DesktopRegion::new(-1920, 0, 1920, 1080), idle_snapshot_requested: false,
+            capture: None,
+            selector: "DISPLAY2".into(),
+            width: 1920,
+            height: 1080,
+            region: DesktopRegion::new(-1920, 0, 1920, 1080),
+            idle_snapshot_requested: false,
             secure_helper: Arc::new(Mutex::new(SecureHelperLink::new())),
-            secure_state: Some(SecureState { secure: true, kind: "uac", caps: vec!["view", "deny", "input"], available: true, desktop_epoch: 1 }),
-            secure_streaming: false, secure_upload: None, normal_recovery_pending: true, secure_loss_pending: false,
+            secure_state: Some(SecureState {
+                secure: true,
+                kind: "uac",
+                caps: vec!["view", "deny", "input"],
+                available: true,
+                desktop_epoch: 1,
+            }),
+            secure_streaming: false,
+            secure_upload: None,
+            normal_recovery_pending: true,
+            secure_loss_pending: false,
             next_secure_kind_probe: Instant::now(),
+            next_desktop_check: Instant::now(),
+            desktop_default: false,
+            helper_secure: false,
+            event_activity: None,
+            capture_demand: false,
+            snapshot_wake: SnapshotDeadlineWake::default(),
         };
         assert!(source.switch_monitor("DISPLAY1").is_err());
         assert_eq!(source.selector, "DISPLAY2");
@@ -895,33 +1171,74 @@ mod agent_encode_recovery_tests {
         let mut capture = CaptureSource::Local(source);
         assert!(!capture.desktop_state().available);
         assert!(!capture.secure_input_allowed());
-        if let CaptureSource::Local(source) = &mut capture { source.secure_streaming = true; }
+        if let CaptureSource::Local(source) = &mut capture {
+            source.secure_streaming = true;
+        }
         assert!(capture.desktop_state().available);
         assert!(capture.secure_input_allowed());
-        if let CaptureSource::Local(source) = &mut capture { source.secure_state.as_mut().unwrap().caps = vec!["view", "deny"]; }
+        if let CaptureSource::Local(source) = &mut capture {
+            source.secure_state.as_mut().unwrap().caps = vec!["view", "deny"];
+        }
         assert!(!capture.secure_input_allowed());
         assert!(capture.switch_monitor("DISPLAY1").is_err());
-        if let CaptureSource::Local(source) = &mut capture { source.secure_state = None; }
+        if let CaptureSource::Local(source) = &mut capture {
+            source.secure_state = None;
+        }
         assert!(!capture.desktop_state().available);
         assert!(capture.take_idle_snapshot_frame().is_none());
+        // A warm source with no viewer never lazily opens capture or arms a
+        // worker, even if a scheduling call is accidentally made.
+        capture.set_capture_demand(false).unwrap();
+        capture.request_event_frame_at(Instant::now()).unwrap();
+        assert!(capture.next_event_deadline(true).is_none());
+        if let CaptureSource::Local(source) = &capture {
+            assert!(source.capture.is_none());
+        }
     }
 
     #[test]
     fn secure_input_desktop_overrides_missing_or_default_helper_report() {
-        for helper in [None, Some(SecureState {
-            secure: false, kind: "other", caps: vec![], available: false, desktop_epoch: 1,
-        })] {
+        for helper in [
+            None,
+            Some(SecureState {
+                secure: false,
+                kind: "other",
+                caps: vec![],
+                available: false,
+                desktop_epoch: 1,
+            }),
+        ] {
             let mut source = LocalCaptureSource {
-                capture: None, selector: "DISPLAY2".into(), width: 1920, height: 1080,
-                region: DesktopRegion::new(-1920, 0, 1920, 1080), idle_snapshot_requested: false,
-                secure_helper: Arc::new(Mutex::new(SecureHelperLink::new())), secure_state: None,
-                secure_streaming: false, secure_upload: None, normal_recovery_pending: false,
-                secure_loss_pending: false, next_secure_kind_probe: Instant::now(),
+                capture: None,
+                selector: "DISPLAY2".into(),
+                width: 1920,
+                height: 1080,
+                region: DesktopRegion::new(-1920, 0, 1920, 1080),
+                idle_snapshot_requested: false,
+                secure_helper: Arc::new(Mutex::new(SecureHelperLink::new())),
+                secure_state: None,
+                secure_streaming: false,
+                secure_upload: None,
+                normal_recovery_pending: false,
+                secure_loss_pending: false,
+                next_secure_kind_probe: Instant::now(),
+                next_desktop_check: Instant::now(),
+                desktop_default: false,
+                helper_secure: false,
+                event_activity: None,
+                capture_demand: false,
+                snapshot_wake: SnapshotDeadlineWake::default(),
             };
             source.observe_desktop(helper, false, "uac");
-            assert_eq!(source.take_availability_transition(), Some(capture::CaptureAvailability::Unavailable));
+            assert_eq!(
+                source.take_availability_transition(),
+                Some(capture::CaptureAvailability::Unavailable)
+            );
             assert!(source.acquire(Duration::ZERO).unwrap().is_none());
-            assert!(source.capture.is_none(), "must not initialize DDA on the secure input desktop");
+            assert!(
+                source.capture.is_none(),
+                "must not initialize DDA on the secure input desktop"
+            );
             assert!(source.normal_recovery_pending);
             let mut capture = CaptureSource::Local(source);
             assert_eq!(capture.desktop_state().desktop, "secure");
@@ -931,7 +1248,10 @@ mod agent_encode_recovery_tests {
             if let CaptureSource::Local(source) = &mut capture {
                 source.observe_desktop(None, true, "other");
             }
-            assert!(!capture.desktop_state().available, "Default alone is not a recovered DDA frame");
+            assert!(
+                !capture.desktop_state().available,
+                "Default alone is not a recovered DDA frame"
+            );
         }
     }
 
@@ -982,11 +1302,9 @@ mod agent_encode_recovery_tests {
             None
         );
         // A later window reports again and carries the suppressed count.
-        assert!(
-            source
-                .reconnect_log
-                .admit(now + AGENT_RECONNECT_LOG_INTERVAL)
-                .is_some()
-        );
+        assert!(source
+            .reconnect_log
+            .admit(now + AGENT_RECONNECT_LOG_INTERVAL)
+            .is_some());
     }
 }

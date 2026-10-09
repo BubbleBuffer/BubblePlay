@@ -28,7 +28,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_IDENTITY, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_IDENTITY,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGISurface1, DXGI_OUTDUPL_MOVE_RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -42,6 +44,8 @@ use windows_capture::dxgi_duplication_api::{
 use windows_capture::encoder::{ImageEncoder, ImageEncoderPixelFormat, ImageFormat};
 use windows_capture::monitor::Monitor;
 
+use crate::activity::Activity;
+use crate::capture_wait::{DdaWaiter, RawDesktopFrame};
 use crate::frame_damage::DamageRect;
 use crate::input::DesktopRegion;
 
@@ -75,6 +79,11 @@ pub struct Capture {
     /// The selected output's DeviceName used by the GDI idle snapshot.
     monitor_device_name: String,
     idle_snapshot: IdleSnapshotState,
+    idle_gdi: Option<GdiSnapshot>,
+    damage_metadata: DamageMetadata,
+    desktop_check: DesktopCheck,
+    event_activity: Option<Activity>,
+    waiter: Option<DdaWaiter>,
     availability: CaptureAvailability,
     availability_transition: Option<CaptureAvailability>,
 }
@@ -130,6 +139,40 @@ pub struct MonitorInfo {
 
 const IDLE_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(250);
 pub const CAPTURE_RECOVERY_INTERVAL: Duration = Duration::from_millis(500);
+const DESKTOP_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Empty producer polls use this bounded housekeeping deadline. Real-frame
+/// authorization, recovery and acquire errors bypass the cached result.
+struct DesktopCheck {
+    next_check: Instant,
+    is_default: bool,
+}
+
+impl DesktopCheck {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_check: now,
+            is_default: false,
+        }
+    }
+
+    fn due(&self, now: Instant, force: bool) -> bool {
+        force || now >= self.next_check
+    }
+
+    fn refresh(&mut self, force: bool) -> bool {
+        let now = Instant::now();
+        self.refresh_with(now, force, crate::desktop_session::input_desktop_is_default)
+    }
+
+    fn refresh_with(&mut self, now: Instant, force: bool, query: impl FnOnce() -> bool) -> bool {
+        if self.due(now, force) {
+            self.is_default = query();
+            self.next_check = now + DESKTOP_CHECK_INTERVAL;
+        }
+        self.is_default
+    }
+}
 
 /// Windows-capture reports AcquireNextFrame and DuplicateOutput HRESULTs
 /// through WindowsError (sometimes nested inside DirectXError).
@@ -178,6 +221,14 @@ impl IdleSnapshotState {
         self.pending
     }
 
+    fn deadline(&self) -> Option<Instant> {
+        let pending = self.pending.then_some(self.retry_at);
+        match (pending, self.followup_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     fn is_due(&self, now: Instant) -> bool {
         (self.is_pending() && idle_snapshot_retry_due(now, self.retry_at))
             || self
@@ -222,14 +273,54 @@ impl IdleSnapshotState {
 }
 
 /// A capture texture from DDA or the one-shot idle-desktop snapshot.
+pub enum DesktopFrame<'a> {
+    Direct(DxgiDuplicationFrame<'a>),
+    Waited(RawDesktopFrame),
+}
+
+impl DesktopFrame<'_> {
+    fn width(&self) -> u32 {
+        match self {
+            Self::Direct(frame) => frame.width(),
+            Self::Waited(frame) => frame.width(),
+        }
+    }
+    fn height(&self) -> u32 {
+        match self {
+            Self::Direct(frame) => frame.height(),
+            Self::Waited(frame) => frame.height(),
+        }
+    }
+    fn device(&self) -> &ID3D11Device {
+        match self {
+            Self::Direct(frame) => frame.device(),
+            Self::Waited(frame) => frame.device(),
+        }
+    }
+    fn texture(&self) -> &ID3D11Texture2D {
+        match self {
+            Self::Direct(frame) => frame.texture(),
+            Self::Waited(frame) => frame.texture(),
+        }
+    }
+    fn frame_info(&self) -> &windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_FRAME_INFO {
+        match self {
+            Self::Direct(frame) => frame.frame_info(),
+            Self::Waited(frame) => frame.frame_info(),
+        }
+    }
+    fn duplication(&self) -> &windows::Win32::Graphics::Dxgi::IDXGIOutputDuplication {
+        match self {
+            Self::Direct(frame) => frame.duplication(),
+            Self::Waited(frame) => frame.duplication(),
+        }
+    }
+}
+
 pub enum CapturedFrame<'a> {
     Desktop {
-        frame: DxgiDuplicationFrame<'a>,
-        /// Dirty rects plus both ends of every move rect.
-        damage: Option<Vec<DamageRect>>,
-        /// Destinations of DDA move rects (content that was moved, e.g. a
-        /// scroll the compositor reported as a move).
-        moved: Vec<DamageRect>,
+        frame: DesktopFrame<'a>,
+        metadata: &'a mut DamageMetadata,
     },
     IdleSnapshot {
         device: &'a ID3D11Device,
@@ -284,7 +375,7 @@ impl CapturedFrame<'_> {
 
     pub fn damage(&self) -> Option<&[DamageRect]> {
         match self {
-            Self::Desktop { damage, .. } => damage.as_deref(),
+            Self::Desktop { metadata, .. } => metadata.valid.then_some(metadata.damage.as_slice()),
             Self::IdleSnapshot { .. } | Self::SecureSnapshot { .. } => None,
         }
     }
@@ -292,14 +383,35 @@ impl CapturedFrame<'_> {
     /// Destinations of this frame's DDA move rects.
     pub fn moved(&self) -> &[DamageRect] {
         match self {
-            Self::Desktop { moved, .. } => moved,
+            Self::Desktop { metadata, .. } => &metadata.moved,
             Self::IdleSnapshot { .. } | Self::SecureSnapshot { .. } => &[],
+        }
+    }
+
+    /// Fetch/process damage only after admitting this frame for encoding.
+    /// Buffers live with Capture and are reused by subsequent acquisitions.
+    pub fn prepare_damage(&mut self) {
+        if let Self::Desktop { frame, metadata } = self {
+            metadata.prepare(frame, false);
+        }
+    }
+
+    /// Preserve discarded WSS damage with one conservative union rectangle.
+    /// Move destinations stay separate so scroll/motion classification is
+    /// conservative too; no per-tile processing is performed here.
+    pub fn prepare_damage_union(&mut self) {
+        if let Self::Desktop { frame, metadata } = self {
+            metadata.prepare(frame, true);
         }
     }
 
     pub fn encode_png_crop(&mut self, rect: DamageRect) -> Result<Vec<u8>> {
         let Self::Desktop { frame, .. } = self else {
             bail!("lossless detail tiles require a live DDA desktop frame");
+        };
+        let frame = match frame {
+            DesktopFrame::Direct(frame) => frame,
+            DesktopFrame::Waited(frame) => return encode_texture_png_crop(frame.texture(), rect),
         };
         if rect.left >= rect.right
             || rect.top >= rect.bottom
@@ -332,14 +444,22 @@ impl CapturedFrame<'_> {
 pub fn encode_texture_png_crop(texture: &ID3D11Texture2D, rect: DamageRect) -> Result<Vec<u8>> {
     let mut source_desc = D3D11_TEXTURE2D_DESC::default();
     unsafe { texture.GetDesc(&mut source_desc) };
+    let pixel_format = match source_desc.Format {
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => {
+            ImageEncoderPixelFormat::Bgra8
+        }
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => {
+            ImageEncoderPixelFormat::Rgba8
+        }
+        other => bail!("unsupported lossless detail tile format {other:?}"),
+    };
     if rect.left >= rect.right
         || rect.top >= rect.bottom
         || rect.right > source_desc.Width
         || rect.bottom > source_desc.Height
-        || source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
         || source_desc.SampleDesc.Count != 1
     {
-        bail!("lossless detail tile is outside a single-sample BGRA texture");
+        bail!("lossless detail tile is outside a single-sample texture");
     }
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
@@ -386,7 +506,7 @@ pub fn encode_texture_png_crop(texture: &ID3D11Texture2D, rect: DamageRect) -> R
         pack_bgra_rows(bytes, mapped.RowPitch as usize, width, height)
     };
     unsafe { context.Unmap(&staging, 0) };
-    ImageEncoder::new(ImageFormat::Png, ImageEncoderPixelFormat::Bgra8)
+    ImageEncoder::new(ImageFormat::Png, pixel_format)
         .context("create scaled detail PNG encoder")?
         .encode(&packed, width, height)
         .context("encode scaled detail PNG")
@@ -437,64 +557,122 @@ fn move_damage_rects(
     .flatten()
 }
 
-/// The frame's damage (dirty rects and both ends of each move) and the move
-/// destinations on their own.
-fn duplication_damage(
-    frame: &DxgiDuplicationFrame<'_>,
-) -> Result<(Vec<DamageRect>, Vec<DamageRect>)> {
-    let metadata_bytes = frame.frame_info().TotalMetadataBufferSize;
-    if metadata_bytes == 0 {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let duplication = frame.duplication();
-    let mut damage = Vec::new();
+/// Reusable metadata scratch for the live frame. Acquiring a frame resets its
+/// flags without fetching rectangles or allocating buffers.
+#[derive(Default)]
+pub struct DamageMetadata {
+    dirty: Vec<RECT>,
+    moves: Vec<DXGI_OUTDUPL_MOVE_RECT>,
+    damage: Vec<DamageRect>,
+    moved: Vec<DamageRect>,
+    loaded: bool,
+    valid: bool,
+    full: bool,
+}
 
-    let dirty_capacity = (metadata_bytes as usize)
-        .div_ceil(std::mem::size_of::<RECT>())
-        .max(1);
-    let mut dirty = vec![RECT::default(); dirty_capacity];
-    let mut dirty_bytes = 0;
-    unsafe {
-        duplication.GetFrameDirtyRects(
-            (dirty.len() * std::mem::size_of::<RECT>()) as u32,
-            dirty.as_mut_ptr(),
-            &mut dirty_bytes,
-        )
-    }
-    .context("IDXGIOutputDuplication::GetFrameDirtyRects")?;
-    dirty.truncate(dirty_bytes as usize / std::mem::size_of::<RECT>());
-    damage.extend(
-        dirty
-            .into_iter()
-            .filter_map(|rect| clipped_damage_rect(rect, frame.width(), frame.height())),
-    );
+fn union_damage(rects: impl IntoIterator<Item = DamageRect>) -> Option<DamageRect> {
+    rects.into_iter().reduce(|a, b| DamageRect {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
+    })
+}
 
-    let move_capacity = (metadata_bytes as usize)
-        .div_ceil(std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>())
-        .max(1);
-    let mut moves = vec![DXGI_OUTDUPL_MOVE_RECT::default(); move_capacity];
-    let mut move_bytes = 0;
-    unsafe {
-        duplication.GetFrameMoveRects(
-            (moves.len() * std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()) as u32,
-            moves.as_mut_ptr(),
-            &mut move_bytes,
-        )
+impl DamageMetadata {
+    fn reset(&mut self) {
+        self.loaded = false;
+        self.valid = false;
+        self.full = false;
+        self.damage.clear();
+        self.moved.clear();
     }
-    .context("IDXGIOutputDuplication::GetFrameMoveRects")?;
-    moves.truncate(move_bytes as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>());
-    let moved = moves
-        .iter()
-        .filter_map(|movement| {
-            clipped_damage_rect(movement.DestinationRect, frame.width(), frame.height())
-        })
-        .collect();
-    damage.extend(
-        moves
-            .into_iter()
-            .flat_map(|movement| move_damage_rects(movement, frame.width(), frame.height())),
-    );
-    Ok((damage, moved))
+
+    fn load(&mut self, frame: &DesktopFrame<'_>) -> Result<()> {
+        self.loaded = true;
+        let bytes = frame.frame_info().TotalMetadataBufferSize as usize;
+        if bytes == 0 {
+            self.dirty.clear();
+            self.moves.clear();
+            return Ok(());
+        }
+        self.dirty
+            .resize(bytes.div_ceil(std::mem::size_of::<RECT>()), RECT::default());
+        self.moves.resize(
+            bytes.div_ceil(std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()),
+            DXGI_OUTDUPL_MOVE_RECT::default(),
+        );
+        let mut dirty_bytes = 0;
+        let mut move_bytes = 0;
+        let duplication = frame.duplication();
+        unsafe {
+            duplication.GetFrameDirtyRects(
+                (self.dirty.len() * std::mem::size_of::<RECT>()) as u32,
+                self.dirty.as_mut_ptr(),
+                &mut dirty_bytes,
+            )
+        }
+        .context("IDXGIOutputDuplication::GetFrameDirtyRects")?;
+        unsafe {
+            duplication.GetFrameMoveRects(
+                (self.moves.len() * std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()) as u32,
+                self.moves.as_mut_ptr(),
+                &mut move_bytes,
+            )
+        }
+        .context("IDXGIOutputDuplication::GetFrameMoveRects")?;
+        self.dirty
+            .truncate(dirty_bytes as usize / std::mem::size_of::<RECT>());
+        self.moves
+            .truncate(move_bytes as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>());
+        Ok(())
+    }
+
+    fn prepare(&mut self, frame: &DesktopFrame<'_>, union: bool) {
+        if self.full {
+            return;
+        }
+        if !self.loaded {
+            match self.load(frame) {
+                Ok(()) => self.valid = true,
+                Err(error) => {
+                    debug!(?error, "DDA frame damage metadata unavailable");
+                    return;
+                }
+            }
+        }
+        if !self.valid {
+            return;
+        }
+        self.process(frame.width(), frame.height(), union);
+    }
+
+    fn process(&mut self, width: u32, height: u32, union: bool) {
+        self.damage.clear();
+        self.moved.clear();
+        let damage = self
+            .dirty
+            .iter()
+            .filter_map(|rect| clipped_damage_rect(*rect, width, height))
+            .chain(
+                self.moves
+                    .iter()
+                    .flat_map(|movement| move_damage_rects(*movement, width, height)),
+            );
+        if union {
+            self.damage.extend(union_damage(damage));
+        } else {
+            self.damage.extend(damage);
+        }
+        // Retain individual move destinations even on discarded frames. A
+        // bounding box would misclassify unchanged pixels as compositor moves.
+        self.moved.extend(
+            self.moves.iter().filter_map(|movement| {
+                clipped_damage_rect(movement.DestinationRect, width, height)
+            }),
+        );
+        self.full = !union;
+    }
 }
 
 /// GDI-backed capture source used on the Winlogon/UAC desktop where desktop
@@ -522,23 +700,49 @@ impl SecureFrameUpload {
         } else {
             let mut device = None;
             unsafe {
-                D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT, Some(&[D3D_FEATURE_LEVEL_11_0]),
-                    D3D11_SDK_VERSION, Some(&mut device), None, None)
-            }.context("create host device for secure frame upload")?;
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    Some(&[D3D_FEATURE_LEVEL_11_0]),
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    None,
+                )
+            }
+            .context("create host device for secure frame upload")?;
             device.context("secure frame upload returned no host device")?
         };
-        Ok(Self { device, texture: None, size: (0, 0) })
+        Ok(Self {
+            device,
+            texture: None,
+            size: (0, 0),
+        })
     }
 
-    pub fn upload(&mut self, width: u32, height: u32, stride: u32, pixels: &[u8]) -> Result<CapturedFrame<'_>> {
+    pub fn upload(
+        &mut self,
+        width: u32,
+        height: u32,
+        stride: u32,
+        pixels: &[u8],
+    ) -> Result<CapturedFrame<'_>> {
         validate_bgra_upload(width, height, stride, pixels.len())?;
         if self.texture.is_none() || self.size != (width, height) {
             let desc = D3D11_TEXTURE2D_DESC {
-                Width: width, Height: height, MipLevels: 1, ArraySize: 1,
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
                 ..Default::default()
             };
             let mut texture = None;
@@ -548,18 +752,34 @@ impl SecureFrameUpload {
             self.size = (width, height);
         }
         let texture = self.texture.as_ref().expect("secure texture initialized");
-        let context = unsafe { self.device.GetImmediateContext() }.context("secure upload context")?;
+        let context =
+            unsafe { self.device.GetImmediateContext() }.context("secure upload context")?;
         unsafe { context.UpdateSubresource(texture, 0, None, pixels.as_ptr().cast(), stride, 0) };
-        Ok(CapturedFrame::SecureSnapshot { device: &self.device, texture: texture.clone(), width, height })
+        Ok(CapturedFrame::SecureSnapshot {
+            device: &self.device,
+            texture: texture.clone(),
+            width,
+            height,
+        })
     }
 }
 
 fn validate_bgra_upload(width: u32, height: u32, stride: u32, len: usize) -> Result<()> {
     let row = width.checked_mul(4).context("BGRA row overflow")?;
-    let size = (stride as usize).checked_mul(height as usize).context("BGRA size overflow")?;
-    anyhow::ensure!(width > 0 && height > 0 && width <= 16384 && height <= 16384
-        && stride >= row && stride % 4 == 0 && size == len && size <= 256 * 1024 * 1024,
-        "invalid secure BGRA upload dimensions");
+    let size = (stride as usize)
+        .checked_mul(height as usize)
+        .context("BGRA size overflow")?;
+    anyhow::ensure!(
+        width > 0
+            && height > 0
+            && width <= 16384
+            && height <= 16384
+            && stride >= row
+            && stride.is_multiple_of(4)
+            && size == len
+            && size <= 256 * 1024 * 1024,
+        "invalid secure BGRA upload dimensions"
+    );
     Ok(())
 }
 
@@ -632,60 +852,98 @@ fn capture_gdi_texture(
     height: u32,
     monitor_device_name: &str,
 ) -> Result<ID3D11Texture2D> {
-    let desc = gdi_texture_desc(width, height);
-    let mut texture = None;
-    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-        .context("CreateTexture2D(GDI capture)")?;
-    let texture = texture.context("CreateTexture2D(GDI capture) returned no texture")?;
-    let surface: IDXGISurface1 = texture
-        .cast()
-        .context("cast GDI texture to IDXGISurface1")?;
-    let device_name: Vec<u16> = monitor_device_name.encode_utf16().chain(Some(0)).collect();
-    let source_dc = unsafe {
-        CreateDCW(
-            w!("DISPLAY"),
-            PCWSTR(device_name.as_ptr()),
-            PCWSTR::null(),
-            None,
-        )
-    };
-    if source_dc.is_invalid() {
-        bail!("CreateDCW failed for {monitor_device_name}");
+    GdiSnapshot::new(device, width, height, monitor_device_name)?.capture(device)
+}
+
+/// Texture, surface and display DC survive idle-IDR retries. The DXGI target
+/// DC is acquired/released for each copy as required before GPU encoding.
+struct GdiSnapshot {
+    texture: ID3D11Texture2D,
+    surface: IDXGISurface1,
+    source_dc: windows::Win32::Graphics::Gdi::HDC,
+    width: u32,
+    height: u32,
+}
+
+impl Drop for GdiSnapshot {
+    fn drop(&mut self) {
+        let _ = unsafe { DeleteDC(self.source_dc) };
     }
-    let copy_result = (|| -> Result<()> {
-        let target_dc = unsafe { surface.GetDC(true) }.context("IDXGISurface1::GetDC")?;
-        let blit = unsafe {
-            BitBlt(
-                target_dc,
-                0,
-                0,
-                width as i32,
-                height as i32,
-                Some(source_dc),
-                0,
-                0,
-                SRCCOPY | CAPTUREBLT,
+}
+
+impl GdiSnapshot {
+    fn new(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        monitor_device_name: &str,
+    ) -> Result<Self> {
+        let desc = gdi_texture_desc(width, height);
+        let mut texture = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+            .context("CreateTexture2D(GDI capture)")?;
+        let texture = texture.context("CreateTexture2D(GDI capture) returned no texture")?;
+        let surface = texture
+            .cast()
+            .context("cast GDI texture to IDXGISurface1")?;
+        let device_name: Vec<u16> = monitor_device_name.encode_utf16().chain(Some(0)).collect();
+        let source_dc = unsafe {
+            CreateDCW(
+                w!("DISPLAY"),
+                PCWSTR(device_name.as_ptr()),
+                PCWSTR::null(),
+                None,
             )
         };
-        let release = unsafe { surface.ReleaseDC(None) };
-        blit.context("BitBlt desktop into GDI texture")?;
-        release.context("IDXGISurface1::ReleaseDC")?;
-        Ok(())
-    })();
-    match copy_result {
-        Ok(()) => {
-            let _ = unsafe { DeleteDC(source_dc) };
-            Ok(texture)
+        if source_dc.is_invalid() {
+            bail!("CreateDCW failed for {monitor_device_name}");
         }
-        Err(direct_error) => {
-            warn!(
-                ?direct_error,
-                "direct GDI/DXGI capture failed; using CPU DIB fallback"
-            );
-            let fallback = capture_gdi_via_dib(device, &texture, source_dc, width, height);
-            let _ = unsafe { DeleteDC(source_dc) };
-            fallback?;
-            Ok(texture)
+        Ok(Self {
+            texture,
+            surface,
+            source_dc,
+            width,
+            height,
+        })
+    }
+
+    fn capture(&self, device: &ID3D11Device) -> Result<ID3D11Texture2D> {
+        let copy_result = (|| -> Result<()> {
+            let target_dc = unsafe { self.surface.GetDC(true) }.context("IDXGISurface1::GetDC")?;
+            let blit = unsafe {
+                BitBlt(
+                    target_dc,
+                    0,
+                    0,
+                    self.width as i32,
+                    self.height as i32,
+                    Some(self.source_dc),
+                    0,
+                    0,
+                    SRCCOPY | CAPTUREBLT,
+                )
+            };
+            let release = unsafe { self.surface.ReleaseDC(None) };
+            blit.context("BitBlt desktop into GDI texture")?;
+            release.context("IDXGISurface1::ReleaseDC")?;
+            Ok(())
+        })();
+        match copy_result {
+            Ok(()) => Ok(self.texture.clone()),
+            Err(direct_error) => {
+                warn!(
+                    ?direct_error,
+                    "direct GDI/DXGI capture failed; using CPU DIB fallback"
+                );
+                capture_gdi_via_dib(
+                    device,
+                    &self.texture,
+                    self.source_dc,
+                    self.width,
+                    self.height,
+                )?;
+                Ok(self.texture.clone())
+            }
         }
     }
 }
@@ -752,18 +1010,19 @@ fn capture_gdi_via_dib(
                 SRCCOPY | CAPTUREBLT,
             )
         };
-        let upload = if blit.is_ok() {
-            let context = unsafe { device.GetImmediateContext() }
-                .context("get D3D11 context for secure capture fallback")?;
-            unsafe {
-                context.UpdateSubresource(texture, 0, None, bits, width.saturating_mul(4), 0)
-            };
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
+        let upload = match blit {
+            Ok(()) => {
+                let context = unsafe { device.GetImmediateContext() }
+                    .context("get D3D11 context for secure capture fallback")?;
+                unsafe {
+                    context.UpdateSubresource(texture, 0, None, bits, width.saturating_mul(4), 0)
+                };
+                Ok(())
+            }
+            Err(error) => Err(anyhow::anyhow!(
                 "BitBlt into secure capture DIB failed: {}",
-                blit.unwrap_err()
-            ))
+                error
+            )),
         };
         let _ = unsafe { SelectObject(memory_dc, previous) };
         let _ = unsafe { DeleteObject(bitmap.into()) };
@@ -890,7 +1149,9 @@ impl Capture {
         };
         let unavailable = api.is_none();
         let width = api.as_ref().map_or(region.width, DxgiDuplicationApi::width);
-        let height = api.as_ref().map_or(region.height, DxgiDuplicationApi::height);
+        let height = api
+            .as_ref()
+            .map_or(region.height, DxgiDuplicationApi::height);
         let device_obj = api.as_ref().map(|api| api.device().clone());
         info!(width, height, monitor = %dev, unavailable, "DDA source initialized");
         Ok(Self {
@@ -904,7 +1165,12 @@ impl Capture {
             last_present_qpc: 0,
             device_obj,
             pending_recreate: unavailable,
-            next_recreate_attempt: Instant::now() + if unavailable { CAPTURE_RECOVERY_INTERVAL } else { Duration::ZERO },
+            next_recreate_attempt: Instant::now()
+                + if unavailable {
+                    CAPTURE_RECOVERY_INTERVAL
+                } else {
+                    Duration::ZERO
+                },
             awaiting_recovery_frame: false,
             fresh_recreate_required: false,
             // Pin the selected physical output; "primary" may resolve to a
@@ -912,7 +1178,16 @@ impl Capture {
             monitor_filter: Some(dev.clone()),
             monitor_device_name: dev,
             idle_snapshot: IdleSnapshotState::new(Instant::now()),
-            availability: if unavailable { CaptureAvailability::Unavailable } else { CaptureAvailability::Active },
+            idle_gdi: None,
+            damage_metadata: DamageMetadata::default(),
+            desktop_check: DesktopCheck::new(Instant::now()),
+            event_activity: None,
+            waiter: None,
+            availability: if unavailable {
+                CaptureAvailability::Unavailable
+            } else {
+                CaptureAvailability::Active
+            },
             availability_transition: unavailable.then_some(CaptureAvailability::Unavailable),
         })
     }
@@ -946,6 +1221,7 @@ impl Capture {
         let monitor = pick_monitor(Some(selector))?;
         let region = monitor_region(monitor).context("selected monitor bounds")?;
         let dev = monitor.device_name().unwrap_or_default();
+        self.stop_waiter()?;
         if monitor_switch_plan(&self.monitor_device_name, &dev)
             == MonitorSwitchPlan::RecreateCurrent
         {
@@ -995,6 +1271,8 @@ impl Capture {
         self.awaiting_recovery_frame = false;
         self.fresh_recreate_required = false;
         self.idle_snapshot = IdleSnapshotState::new(Instant::now());
+        self.idle_gdi = None;
+        self.desktop_check = DesktopCheck::new(Instant::now());
         self.availability = CaptureAvailability::Active;
         info!(width = self.width, height = self.height, monitor = %self.monitor_device_name, "DDA monitor switched");
         Ok(())
@@ -1016,6 +1294,10 @@ impl Capture {
     /// The helper observed Winlogon before DDA reported its own access loss.
     /// Keep the selected output/device, but never reuse its desktop pixels.
     pub fn suspend_for_secure_desktop(&mut self) {
+        if let Err(error) = self.stop_waiter() {
+            warn!(%error, "capture waiter stop during secure transition failed");
+        }
+        self.idle_gdi = None;
         self.api = None;
         self.mark_unavailable();
         self.fresh_recreate_required = true;
@@ -1030,7 +1312,58 @@ impl Capture {
         self.availability_transition = Some(CaptureAvailability::Unavailable);
     }
 
-    /// Acquire the next frame, blocking up to `timeout`.
+    /// Enable before the first acquisition so this serve instance can poll
+    /// completed frames without blocking signaling or input processing.
+    pub fn enable_event_capture(&mut self, activity: Activity) {
+        self.event_activity = Some(activity);
+    }
+
+    pub fn request_frame(&mut self) -> Result<()> {
+        self.request_frame_at(Instant::now())
+    }
+
+    pub fn request_frame_at(&mut self, not_before: Instant) -> Result<()> {
+        let Some(activity) = self.event_activity.as_ref() else {
+            return Ok(());
+        };
+        if self.pending_recreate {
+            return Ok(());
+        }
+        if self.waiter.is_none() {
+            let Some(api) = self.api.as_ref() else {
+                return Ok(());
+            };
+            self.waiter = Some(DdaWaiter::new(
+                api.duplication().clone(),
+                api.device().clone(),
+                activity.clone(),
+            )?);
+        }
+        let waiter = self.waiter.as_mut().expect("waiter initialized");
+        waiter.set_enabled(true);
+        waiter.request_frame_at(not_before);
+        Ok(())
+    }
+
+    pub fn set_capture_demand(&mut self, enabled: bool) {
+        if let Some(waiter) = self.waiter.as_mut() {
+            waiter.set_enabled(enabled);
+        }
+    }
+
+    fn stop_waiter(&mut self) -> Result<()> {
+        if let Some(mut waiter) = self.waiter.take() {
+            waiter.stop()?;
+        }
+        Ok(())
+    }
+
+    pub fn idle_snapshot_deadline(&self) -> Option<Instant> {
+        self.idle_snapshot.deadline()
+    }
+
+    /// Acquire the next frame, blocking up to `timeout` in synchronous mode
+    /// or polling the outstanding waiter request in event mode.
     ///
     /// `Ok(None)` on timeout (desktop idle). Access-lost and access-denied
     /// enter an unavailable circuit with deferred 500 ms recreation attempts,
@@ -1041,7 +1374,11 @@ impl Capture {
         &'a mut self,
         timeout: Duration,
     ) -> Result<Option<(CapturedFrame<'a>, bool, bool)>> {
-        if !crate::desktop_session::input_desktop_is_default() {
+        let now = Instant::now();
+        let recovery_check = self.event_activity.is_none()
+            || self.awaiting_recovery_frame
+            || (self.pending_recreate && now >= self.next_recreate_attempt);
+        if !self.desktop_check.refresh(recovery_check) {
             if self.availability != CaptureAvailability::Unavailable {
                 self.suspend_for_secure_desktop();
                 warn!("input desktop is not Default; normal capture suspended");
@@ -1081,16 +1418,32 @@ impl Capture {
                 }
             }
         }
+        // Never sleep across the next desktop-switch check deadline.
+        let timeout = timeout.min(
+            self.desktop_check
+                .next_check
+                .saturating_duration_since(Instant::now()),
+        );
         let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-        let frame = match self
-            .api
-            .as_mut()
-            .context("DDA session temporarily unavailable")?
-            .acquire_next_frame(timeout_ms)
-        {
-            Ok(f) => f,
+        let acquired = if self.event_activity.is_some() {
+            match self.waiter.as_mut() {
+                Some(waiter) => waiter.poll().map(|frame| frame.map(DesktopFrame::Waited)),
+                None => Ok(None),
+            }
+        } else {
+            self.api
+                .as_mut()
+                .context("DDA session temporarily unavailable")?
+                .acquire_next_frame(timeout_ms)
+                .map(|frame| Some(DesktopFrame::Direct(frame)))
+        };
+        let frame = match acquired {
+            Ok(Some(f)) => f,
+            Ok(None) => return Ok(None),
             Err(CaptureError::Timeout) => return Ok(None),
             Err(error) if capture_error_is_unavailable(&error) => {
+                self.desktop_check.refresh(true);
+                self.idle_gdi = None;
                 let first_loss = self.availability != CaptureAvailability::Unavailable;
                 if first_loss {
                     warn!(
@@ -1114,14 +1467,17 @@ impl Capture {
                 }
                 return Ok(None);
             }
-            Err(e) => return Err(anyhow::anyhow!("acquire_next_frame: {e:?}")),
+            Err(e) => {
+                self.desktop_check.refresh(true);
+                return Err(anyhow::anyhow!("acquire_next_frame: {e:?}"));
+            }
         };
 
-        // A duplication acquire can yield stale Default pixels on Winlogon.
-        // Recheck after acquire as the desktop may switch during the call.
-        if !crate::desktop_session::normal_frame_is_verified(
-            true, crate::desktop_session::input_desktop_kind(), false,
-        ) {
+        // A frame may have queued on Default before Windows switched to UAC
+        // or lock. Always query the current input desktop before exposing its
+        // texture; the active timer cache cannot authorize a real frame.
+        // The waiter also checks immediately before its actual acquisition.
+        if !self.desktop_check.refresh(true) {
             drop(frame);
             // self.api is borrowed for 'a by the absent returned frame. Update
             // disjoint recovery fields; replace the API only on the next call.
@@ -1134,6 +1490,7 @@ impl Capture {
             self.fresh_recreate_required = true;
             self.awaiting_recovery_frame = false;
             self.next_recreate_attempt = Instant::now() + CAPTURE_RECOVERY_INTERVAL;
+            self.idle_gdi = None;
             return Ok(None);
         }
 
@@ -1168,22 +1525,11 @@ impl Capture {
             info!("DDA capture produced a verified recovery frame");
         }
 
-        let (damage, moved) = if is_new {
-            match duplication_damage(&frame) {
-                Ok((damage, moved)) => (Some(damage), moved),
-                Err(error) => {
-                    debug!(?error, "DDA frame damage metadata unavailable");
-                    (None, Vec::new())
-                }
-            }
-        } else {
-            (None, Vec::new())
-        };
+        self.damage_metadata.reset();
         Ok(Some((
             CapturedFrame::Desktop {
                 frame,
-                damage,
-                moved,
+                metadata: &mut self.damage_metadata,
             },
             is_new,
             recovered,
@@ -1192,21 +1538,24 @@ impl Capture {
 
     /// Return a one-shot GPU-resident snapshot of the selected output when
     /// DDA has not produced an initial desktop texture. Failure is nonfatal
-    /// and retried after a short backoff, leaving the zero-timeout DDA pump
-    /// untouched.
+    /// and retried after a short backoff.
     pub fn take_idle_snapshot_frame(&mut self) -> Option<CapturedFrame<'_>> {
         // A snapshot cannot prove DDA recovery and must never expose pixels
         // while the normal desktop source is unavailable.
-        if self.availability == CaptureAvailability::Unavailable || !crate::desktop_session::input_desktop_is_default() {
+        if self.availability == CaptureAvailability::Unavailable {
             return None;
         }
         let now = Instant::now();
         if !self.idle_snapshot.is_due(now) {
             return None;
         }
+        if !self.desktop_check.refresh(true) {
+            self.suspend_for_secure_desktop();
+            return None;
+        }
         match self.capture_idle_snapshot() {
             Ok(texture) => {
-                if !crate::desktop_session::input_desktop_is_default() {
+                if !self.desktop_check.refresh(true) {
                     drop(texture);
                     self.suspend_for_secure_desktop();
                     warn!("discarded idle snapshot after input desktop left Default");
@@ -1249,6 +1598,9 @@ impl Capture {
     /// cached IDR must always be paired with an explicit snapshot request.
     pub fn request_idle_snapshot(&mut self) {
         self.idle_snapshot.request(Instant::now());
+        if let Some(activity) = self.event_activity.as_ref() {
+            activity.notify();
+        }
     }
 
     /// Schedule one idle capture after a grace period so a deferred GPU
@@ -1257,13 +1609,18 @@ impl Capture {
     /// and never waits for an encoded IDR.
     pub fn request_idle_followup_snapshot(&mut self, delay: Duration) {
         self.idle_snapshot.request_followup(Instant::now(), delay);
+        if delay.is_zero() {
+            if let Some(activity) = self.event_activity.as_ref() {
+                activity.notify();
+            }
+        }
     }
 
     pub fn cancel_idle_followup_snapshot(&mut self) {
         self.idle_snapshot.cancel_followup();
     }
 
-    fn capture_idle_snapshot(&self) -> Result<ID3D11Texture2D> {
+    fn capture_idle_snapshot(&mut self) -> Result<ID3D11Texture2D> {
         let api = self
             .api
             .as_ref()
@@ -1275,15 +1632,24 @@ impl Capture {
                 output.Rotation
             );
         }
-        capture_gdi_texture(
-            api.device(),
-            self.width,
-            self.height,
-            &self.monitor_device_name,
-        )
+        if self.idle_gdi.is_none() {
+            self.idle_gdi = Some(GdiSnapshot::new(
+                api.device(),
+                self.width,
+                self.height,
+                &self.monitor_device_name,
+            )?);
+        }
+        self.idle_gdi
+            .as_ref()
+            .expect("idle GDI initialized")
+            .capture(api.device())
     }
 
     fn recreate(&mut self, force_fresh: bool) -> Result<()> {
+        self.stop_waiter()?;
+        self.idle_gdi = None;
+        self.desktop_check = DesktopCheck::new(Instant::now());
         // The crate's recovery API drops IDXGIOutputDuplication before asking
         // DXGI for its replacement and preserves the D3D11 device. If that
         // fails after a larger display/topology transition, `old` has still
@@ -1340,24 +1706,124 @@ impl Capture {
     }
 }
 
+// Join the acquisition worker before field teardown drops the duplication.
+impl Drop for Capture {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop_waiter() {
+            warn!(%error, "capture waiter stop failed during drop");
+        }
+    }
+}
+
 /// Raw D3D11 texture pointer from a frame, for NVENC register_resource.
 pub fn texture_ptr(frame: &CapturedFrame<'_>) -> *mut c_void {
-    frame.texture().as_raw() as *mut c_void
+    frame.texture().as_raw()
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn desktop_checks_are_bounded_and_recovery_bypasses_cache() {
+        let now = std::time::Instant::now();
+        let state = super::DesktopCheck {
+            next_check: now + super::DESKTOP_CHECK_INTERVAL,
+            is_default: true,
+        };
+        assert!(!state.due(now, false));
+        assert!(!state.due(now + std::time::Duration::from_millis(249), false));
+        assert!(state.due(now + std::time::Duration::from_millis(250), false));
+        assert!(state.due(now, true));
+    }
+
+    #[test]
+    fn queued_frame_cannot_reuse_default_observation_from_before_secure_switch() {
+        let now = std::time::Instant::now();
+        let mut state = super::DesktopCheck {
+            next_check: now + super::DESKTOP_CHECK_INTERVAL,
+            is_default: true,
+        };
+        // Housekeeping may use the cached observation before its deadline.
+        assert!(state.refresh_with(now, false, || panic!("timer probe is not due")));
+        // A real queued frame must query again even in that same interval.
+        // Windows now reports secure (or an unreadable desktop), so the old
+        // Default observation must never authorize delivery of the texture.
+        assert!(!state.refresh_with(now, true, || false));
+        assert!(!state.is_default);
+        // Verified recovery likewise uses a fresh observation, rather than
+        // waiting for the unavailable cached result to expire.
+        assert!(state.refresh_with(now, true, || true));
+    }
+
+    #[test]
+    fn discarded_damage_union_preserves_both_move_ends_and_can_expand_after_admission() {
+        use windows::Win32::Foundation::{POINT, RECT};
+        let mut metadata = super::DamageMetadata::default();
+        metadata.dirty.push(RECT {
+            left: 10,
+            top: 10,
+            right: 20,
+            bottom: 20,
+        });
+        metadata
+            .moves
+            .push(windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_MOVE_RECT {
+                SourcePoint: POINT { x: 80, y: 80 },
+                DestinationRect: RECT {
+                    left: 30,
+                    top: 30,
+                    right: 40,
+                    bottom: 40,
+                },
+            });
+        metadata.process(100, 100, true);
+        assert_eq!(
+            metadata.damage,
+            vec![crate::frame_damage::DamageRect {
+                left: 10,
+                top: 10,
+                right: 90,
+                bottom: 90,
+            }]
+        );
+        assert_eq!(
+            metadata.moved,
+            vec![crate::frame_damage::DamageRect {
+                left: 30,
+                top: 30,
+                right: 40,
+                bottom: 40,
+            }]
+        );
+        assert!(!metadata.full);
+        metadata.process(100, 100, false);
+        assert_eq!(metadata.damage.len(), 3);
+        assert!(metadata.full);
+        let capacity = metadata.damage.capacity();
+        metadata.reset();
+        assert!(!metadata.valid);
+        assert!(!metadata.loaded);
+        assert!(metadata.damage.is_empty());
+        assert_eq!(metadata.damage.capacity(), capacity);
+    }
+
+    #[test]
     fn secure_upload_rejects_malformed_bgra_dimensions() {
         assert!(super::validate_bgra_upload(2, 2, 8, 16).is_ok());
-        for (width, height, stride, len) in [(0, 2, 8, 16), (2, 0, 8, 0), (2, 2, 4, 8), (2, 2, 9, 18), (2, 2, 8, 15), (u32::MAX, 1, 4, 4)] {
+        for (width, height, stride, len) in [
+            (0, 2, 8, 16),
+            (2, 0, 8, 0),
+            (2, 2, 4, 8),
+            (2, 2, 9, 18),
+            (2, 2, 8, 15),
+            (u32::MAX, 1, 4, 4),
+        ] {
             assert!(super::validate_bgra_upload(width, height, stride, len).is_err());
         }
     }
     use super::{
         availability_after, gdi_texture_desc, idle_snapshot_retry_due, monitor_switch_plan,
-        move_damage_rects, pack_bgra_rows, supports_idle_snapshot_rotation,
-        CaptureAvailability, CaptureRecoveryEvent, IdleSnapshotState, MonitorSwitchPlan,
+        move_damage_rects, pack_bgra_rows, supports_idle_snapshot_rotation, CaptureAvailability,
+        CaptureRecoveryEvent, IdleSnapshotState, MonitorSwitchPlan,
     };
 
     #[test]
@@ -1413,6 +1879,28 @@ mod tests {
         assert!(state.is_pending());
         state.on_idr_cached();
         assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn snapshot_ack_stops_startup_deadline_without_erasing_detail_followup() {
+        let now = Instant::now();
+        let mut state = IdleSnapshotState::new(now);
+        assert_eq!(state.deadline(), Some(now));
+        state.on_snapshot_copied(now);
+        assert_eq!(
+            state.deadline(),
+            Some(now + super::IDLE_SNAPSHOT_RETRY_DELAY)
+        );
+        let followup = now + Duration::from_millis(34);
+        state.request_followup(now, Duration::from_millis(34));
+        state.on_idr_cached();
+        assert!(!state.pending);
+        assert_eq!(state.deadline(), Some(followup));
+        assert!(state.is_due(followup));
+        state.on_snapshot_copied(followup);
+        assert_eq!(state.deadline(), None);
+        state.request(followup);
+        assert_eq!(state.deadline(), Some(followup));
     }
 
     #[test]
@@ -1481,8 +1969,8 @@ mod tests {
 
     #[test]
     fn access_denied_and_access_lost_are_source_unavailable() {
-        use windows_capture::dxgi_duplication_api::Error;
         use windows::core::{Error as WindowsError, HRESULT};
+        use windows_capture::dxgi_duplication_api::Error;
         assert!(super::capture_error_is_unavailable(&Error::AccessLost));
         for code in [0x80070005u32, 0x887A0026] {
             assert!(super::capture_error_is_unavailable(&Error::WindowsError(
@@ -1494,9 +1982,9 @@ mod tests {
             WindowsError::from_hresult(HRESULT(0x80070057u32 as i32)),
         )));
         assert!(super::capture_error_is_unavailable(&Error::DirectXError(
-            windows_capture::d3d11::Error::WindowsError(
-                WindowsError::from_hresult(HRESULT(0x80070005u32 as i32)),
-            ),
+            windows_capture::d3d11::Error::WindowsError(WindowsError::from_hresult(HRESULT(
+                0x80070005u32 as i32
+            )),),
         )));
         assert_eq!(super::CAPTURE_RECOVERY_INTERVAL, Duration::from_millis(500));
     }
@@ -1506,19 +1994,37 @@ mod tests {
         let now = Instant::now();
         let selected = r"\\.\DISPLAY6";
         let mut capture = super::Capture {
-            api: None, width: 1920, height: 1080, origin_x: -1920, origin_y: 0,
-            frames_acquired: 0, frames_new: 0, last_present_qpc: 0,
-            device_obj: None, pending_recreate: true,
+            api: None,
+            width: 1920,
+            height: 1080,
+            origin_x: -1920,
+            origin_y: 0,
+            frames_acquired: 0,
+            frames_new: 0,
+            last_present_qpc: 0,
+            device_obj: None,
+            pending_recreate: true,
             next_recreate_attempt: now + Duration::from_secs(30),
-            awaiting_recovery_frame: false, fresh_recreate_required: false,
-            monitor_filter: Some(selected.into()), monitor_device_name: selected.into(),
+            awaiting_recovery_frame: false,
+            fresh_recreate_required: false,
+            monitor_filter: Some(selected.into()),
+            monitor_device_name: selected.into(),
             idle_snapshot: IdleSnapshotState::new(now),
-            availability: CaptureAvailability::Unavailable, availability_transition: None,
+            idle_gdi: None,
+            damage_metadata: super::DamageMetadata::default(),
+            desktop_check: super::DesktopCheck::new(now),
+            event_activity: None,
+            waiter: None,
+            availability: CaptureAvailability::Unavailable,
+            availability_transition: None,
         };
         assert!(capture.switch_monitor(r"\\.\DISPLAY1").is_err());
         assert!(capture.switch_monitor(selected).is_err());
         assert_eq!(capture.monitor_selector(), selected);
-        assert_eq!(capture.region(), crate::input::DesktopRegion::new(-1920, 0, 1920, 1080));
+        assert_eq!(
+            capture.region(),
+            crate::input::DesktopRegion::new(-1920, 0, 1920, 1080)
+        );
         assert!(capture.acquire(Duration::ZERO).unwrap().is_none());
         assert!(capture.take_idle_snapshot_frame().is_none());
         assert_eq!(capture.monitor_filter.as_deref(), Some(selected));

@@ -150,8 +150,12 @@ impl ProxyState {
             }
             Request::PollClipboard { reset } => (
                 match self.input.poll_clipboard(reset) {
-                    Some(crate::clipboard::ClipboardContent::Png(png)) => Response::ClipboardPng { png },
-                    Some(crate::clipboard::ClipboardContent::Text(text)) => Response::Clipboard { text: Some(text) },
+                    Some(crate::clipboard::ClipboardContent::Png(png)) => {
+                        Response::ClipboardPng { png }
+                    }
+                    Some(crate::clipboard::ClipboardContent::Text(text)) => {
+                        Response::Clipboard { text: Some(text) }
+                    }
                     None => Response::Clipboard { text: None },
                 },
                 false,

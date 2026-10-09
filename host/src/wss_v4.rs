@@ -27,6 +27,7 @@
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::TcpStream;
+use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -36,6 +37,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+use crate::activity::Activity;
 use crate::frame_damage::DamageRect;
 use crate::link_capacity::{Capacity, CapacityEstimator};
 use tracing::{debug, info, warn};
@@ -785,6 +787,8 @@ pub struct V4Stats {
 }
 
 struct Shared {
+    producer_activity: Option<Activity>,
+    peer_epoch: u64,
     connected: bool,
     peer_present: bool,
     policy: SendPolicy,
@@ -799,6 +803,7 @@ struct Shared {
 }
 
 struct Outgoing {
+    peer_epoch: u64,
     packet: Vec<u8>,
 }
 
@@ -824,13 +829,17 @@ pub struct V4Link {
     shared: Arc<Mutex<Shared>>,
     tx: SyncSender<Outgoing>,
     stop: Arc<AtomicBool>,
+    activity: Activity,
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl V4Link {
     pub fn spawn(connector: Connector, bitrate_bps: u64, max_bps: u64) -> Result<Self> {
         let now = Instant::now();
+        let activity = Activity::new()?;
         let shared = Arc::new(Mutex::new(Shared {
+            producer_activity: None,
+            peer_epoch: 0,
             connected: false,
             peer_present: false,
             policy: SendPolicy::new(now),
@@ -846,14 +855,16 @@ impl V4Link {
         let (tx, rx) = mpsc::sync_channel(LINK_QUEUE_CAPACITY);
         let thread_shared = shared.clone();
         let thread_stop = stop.clone();
+        let thread_activity = activity.clone();
         let join = thread::Builder::new()
             .name("bubbleplay-wss-v4".into())
-            .spawn(move || link_loop(connector, rx, thread_shared, thread_stop))
+            .spawn(move || link_loop(connector, rx, thread_shared, thread_stop, thread_activity))
             .context("spawn v4 media link")?;
         Ok(Self {
             shared,
             tx,
             stop,
+            activity,
             join: Mutex::new(Some(join)),
         })
     }
@@ -933,8 +944,10 @@ impl V4Link {
             }
         };
         let bytes = packet.len() as u64;
-        match tx.try_send(Outgoing { packet }) {
+        let peer_epoch = shared.peer_epoch;
+        match tx.try_send(Outgoing { peer_epoch, packet }) {
             Ok(()) => {
+                self.activity.notify();
                 shared.policy.on_sent(now, generation, seq, bytes, key);
                 shared.capacity.on_sent(now, generation, seq, bytes);
                 shared.stats.frames_sent += 1;
@@ -949,6 +962,12 @@ impl V4Link {
             }
             Err(TrySendError::Disconnected(_)) => V4Submit::Stopped,
         }
+    }
+
+    /// Wake the producer whenever ACK, keyframe, peer or rate state changes.
+    pub fn set_activity(&self, activity: Activity) {
+        self.lock().producer_activity = Some(activity.clone());
+        activity.notify();
     }
 
     pub fn take_events(&self) -> V4Events {
@@ -975,6 +994,7 @@ impl V4Link {
         self.lock()
             .rate
             .set_bounds(Instant::now(), bitrate_bps, max_bps);
+        self.activity.notify();
     }
 
     pub fn set_frame_size(&self, width: u32, height: u32) {
@@ -1009,6 +1029,7 @@ impl V4Link {
 
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
+        self.activity.notify();
         let join = self
             .join
             .lock()
@@ -1084,6 +1105,9 @@ fn record_rate_decision(shared: &mut Shared, decision: Option<RateDecision>) {
     );
     shared.events.bitrate_bps = Some(decision.bitrate_bps);
     shared.events.bitrate_reason = Some(decision.reason.as_str());
+    if let Some(activity) = &shared.producer_activity {
+        activity.notify();
+    }
 }
 
 fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<()> {
@@ -1103,15 +1127,24 @@ fn would_block(error: &tungstenite::Error) -> bool {
     matches!(error, tungstenite::Error::Io(io) if io.kind() == ErrorKind::WouldBlock)
 }
 
-fn sleep_unless_stopped(stop: &AtomicBool, delay: Duration) {
+fn sleep_unless_stopped(stop: &AtomicBool, activity: &Activity, delay: Duration) {
     let deadline = Instant::now() + delay;
-    while !stop.load(Ordering::Acquire) {
-        let now = Instant::now();
-        if now >= deadline {
+    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        if activity
+            .wait(deadline.saturating_duration_since(Instant::now()), &[])
+            .is_err()
+        {
             break;
         }
-        thread::sleep((deadline - now).min(Duration::from_millis(50)));
     }
+}
+
+fn tcp_socket(ws: &WebSocket<MaybeTlsStream<TcpStream>>) -> Result<RawSocket> {
+    Ok(match ws.get_ref() {
+        MaybeTlsStream::Plain(stream) => stream.as_raw_socket(),
+        MaybeTlsStream::NativeTls(stream) => stream.get_ref().as_raw_socket(),
+        other => bail!("unsupported TLS stream variant: {other:?}"),
+    })
 }
 
 fn link_loop(
@@ -1119,9 +1152,9 @@ fn link_loop(
     rx: Receiver<Outgoing>,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
+    activity: Activity,
 ) {
-    // WSS epochs pace frames with 1 ms sleeps; hold the system timer period
-    // for the lifetime of the media link.
+    // Keep high resolution for controller and socket deadlines during media.
     let _timer = crate::rtc::RtcTimerPeriod::acquire();
     let lock = || shared.lock().unwrap_or_else(|poison| poison.into_inner());
     let mut backoff = Backoff::default();
@@ -1135,7 +1168,7 @@ fn link_loop(
             Err(error) => {
                 let delay = backoff.next_delay();
                 warn!(error = %format!("{error:#}"), ?delay, "WSS v4 media connect failed");
-                sleep_unless_stopped(&stop, delay);
+                sleep_unless_stopped(&stop, &activity, delay);
                 continue;
             }
         };
@@ -1144,6 +1177,7 @@ fn link_loop(
         {
             let mut state = lock();
             let now = Instant::now();
+            state.peer_epoch = state.peer_epoch.wrapping_add(1);
             state.connected = true;
             // Presence is announced by the relay right after hello.
             state.peer_present = false;
@@ -1155,20 +1189,23 @@ fn link_loop(
         }
         first = false;
         info!("WSS v4 media socket connected");
-        let result = serve_socket(&mut ws, &rx, &shared, &stop);
+        let result = serve_socket(&mut ws, &rx, &shared, &stop, &activity);
         {
             let mut state = lock();
             state.connected = false;
             state.peer_present = false;
             state.policy.reset(Instant::now());
             state.capacity.forget_inflight();
+            if let Some(activity) = &state.producer_activity {
+                activity.notify();
+            }
         }
         let _ = ws.close(None);
         let _ = ws.flush();
         if let Err(error) = result {
             let delay = backoff.next_delay();
             warn!(error = %format!("{error:#}"), ?delay, "WSS v4 media socket lost; reconnecting");
-            sleep_unless_stopped(&stop, delay);
+            sleep_unless_stopped(&stop, &activity, delay);
         }
     }
 }
@@ -1177,6 +1214,7 @@ fn flush_blocking(
     ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     shared: &Mutex<Shared>,
     stop: &AtomicBool,
+    activity: &Activity,
 ) -> Result<()> {
     let started = Instant::now();
     loop {
@@ -1192,7 +1230,10 @@ fn flush_blocking(
                 if started.elapsed() >= WRITE_STALL_LIMIT {
                     bail!("v4 media write stalled");
                 }
-                thread::sleep(Duration::from_millis(1));
+                activity.wait(
+                    WRITE_STALL_LIMIT.saturating_sub(started.elapsed()),
+                    &[(tcp_socket(ws)?, true)],
+                )?;
             }
             Err(error) => return Err(error).context("flush v4 media socket"),
         }
@@ -1204,13 +1245,14 @@ fn send_message(
     message: Message,
     shared: &Mutex<Shared>,
     stop: &AtomicBool,
+    activity: &Activity,
 ) -> Result<()> {
     match ws.write(message) {
         Ok(()) => {}
         Err(error) if would_block(&error) => {}
         Err(error) => return Err(error).context("write v4 media socket"),
     }
-    flush_blocking(ws, shared, stop)
+    flush_blocking(ws, shared, stop, activity)
 }
 
 /// Returns true when any inbound message arrived.
@@ -1272,6 +1314,8 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
             state.events.keyframe = Some(reason);
         }
         V4Inbound::MediaPeer { present } => {
+            state.peer_epoch = state.peer_epoch.wrapping_add(1);
+            state.events = V4Events::default();
             state.peer_present = present;
             state.policy.reset(now);
             state.capacity.forget_inflight();
@@ -1281,6 +1325,9 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
         }
         V4Inbound::Ping | V4Inbound::Pong | V4Inbound::HelloOk => {}
     }
+    if let Some(activity) = &state.producer_activity {
+        activity.notify();
+    }
 }
 
 fn serve_socket(
@@ -1288,6 +1335,7 @@ fn serve_socket(
     rx: &Receiver<Outgoing>,
     shared: &Mutex<Shared>,
     stop: &AtomicBool,
+    activity: &Activity,
 ) -> Result<()> {
     let mut last_outbound = Instant::now();
     let mut last_inbound = Instant::now();
@@ -1295,20 +1343,34 @@ fn serve_socket(
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        match rx.recv_timeout(Duration::from_millis(2)) {
-            Ok(outgoing) => {
-                send_message(ws, Message::binary(outgoing.packet), shared, stop)?;
-                last_outbound = Instant::now();
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-        }
+        // Drain control first so queued AUs from a departed peer cannot
+        // escape into the next peer's decoder chain.
         if read_available(ws, shared)? {
             last_inbound = Instant::now();
         }
+        match rx.try_recv() {
+            Ok(outgoing) => {
+                let state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+                let current = outgoing_is_current(&state, &outgoing);
+                drop(state);
+                if current {
+                    send_message(ws, Message::binary(outgoing.packet), shared, stop, activity)?;
+                    last_outbound = Instant::now();
+                }
+                continue;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+        }
         let now = Instant::now();
         if now.saturating_duration_since(last_outbound) >= HEARTBEAT_INTERVAL {
-            send_message(ws, Message::text(r#"{"type":"ping"}"#), shared, stop)?;
+            send_message(
+                ws,
+                Message::text(r#"{"type":"ping"}"#),
+                shared,
+                stop,
+                activity,
+            )?;
             last_outbound = now;
             shared
                 .lock()
@@ -1324,15 +1386,105 @@ fn serve_socket(
             state.stats.ack_timeouts += 1;
             state.capacity.forget_inflight();
         }
-        apply_capacity(&mut state, now);
-        let decision = state.rate.tick(now);
-        record_rate_decision(&mut state, decision);
+        if state.peer_present {
+            apply_capacity(&mut state, now);
+            let decision = state.rate.tick(now);
+            record_rate_decision(&mut state, decision);
+        }
+        let deadline = link_deadline(&state, now, last_outbound, last_inbound);
+        drop(state);
+        activity.wait(
+            deadline.saturating_duration_since(Instant::now()),
+            &[(tcp_socket(ws)?, false)],
+        )?;
     }
+}
+
+fn link_deadline(
+    state: &Shared,
+    now: Instant,
+    last_outbound: Instant,
+    last_inbound: Instant,
+) -> Instant {
+    let mut deadline =
+        (last_outbound + HEARTBEAT_INTERVAL).min(last_inbound + INBOUND_SILENCE_LIMIT);
+    if state.policy.inflight_frames() != 0 {
+        deadline = deadline.min(state.policy.last_progress + ACK_STALL_LIMIT);
+    }
+    if state.peer_present
+        && state.rate.clean_samples != 0
+        && state.rate.bitrate_bps() < state.rate.ceiling_bps()
+    {
+        deadline = deadline.min(
+            (state.rate.clean_since + RATE_CLEAN_INTERVAL)
+                .max(state.rate.last_increase + RATE_CLEAN_INTERVAL),
+        );
+    }
+    // Capacity release/probing has its own aging timers. Only a measured cap
+    // needs this bounded housekeeping; an idle unconstrained link sleeps.
+    if state.peer_present && state.capacity.rate_cap().is_some() {
+        deadline = deadline.min(now + Duration::from_millis(100));
+    }
+    deadline
+}
+
+fn outgoing_is_current(state: &Shared, outgoing: &Outgoing) -> bool {
+    state.peer_present && state.peer_epoch == outgoing.peer_epoch
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn idle_shared(now: Instant) -> Shared {
+        Shared {
+            producer_activity: None,
+            peer_epoch: 0,
+            connected: true,
+            peer_present: false,
+            policy: SendPolicy::new(now),
+            rate: DelayRateController::new(now, 6_000_000, 6_000_000),
+            capacity: CapacityEstimator::new(now),
+            capacity_tick: None,
+            events: V4Events::default(),
+            timestamps: TimestampExtender::default(),
+            frame_size: (0, 0),
+            stats: V4Stats::default(),
+        }
+    }
+
+    #[test]
+    fn idle_link_waits_for_heartbeat_and_inflight_waits_for_ack_deadline() {
+        let now = Instant::now();
+        let mut shared = idle_shared(now);
+        assert_eq!(
+            link_deadline(&shared, now, now, now),
+            now + HEARTBEAT_INTERVAL
+        );
+        shared.policy.on_sent(now, 1, 1, 1_000, true);
+        assert_eq!(link_deadline(&shared, now, now, now), now + ACK_STALL_LIMIT);
+    }
+
+    #[test]
+    fn peer_transition_invalidates_queued_media_and_stale_events() {
+        let now = Instant::now();
+        let shared = Mutex::new(idle_shared(now));
+        handle_inbound(r#"{"type":"media-peer","present":true}"#, &shared);
+        let queued = Outgoing {
+            peer_epoch: shared.lock().unwrap().peer_epoch,
+            packet: vec![1],
+        };
+        assert!(outgoing_is_current(&shared.lock().unwrap(), &queued));
+        shared.lock().unwrap().events.latest_ack = Some((1, 1));
+        handle_inbound(r#"{"type":"media-peer","present":false}"#, &shared);
+        assert!(!outgoing_is_current(&shared.lock().unwrap(), &queued));
+        handle_inbound(r#"{"type":"media-peer","present":true}"#, &shared);
+        let state = shared.lock().unwrap();
+        assert!(!outgoing_is_current(&state, &queued));
+        assert!(state.policy.needs_keyframe());
+        assert_eq!(state.events.latest_ack, None);
+        assert_eq!(state.events.keyframe.as_deref(), Some("peer-joined"));
+    }
 
     fn rect(left: u32, top: u32, right: u32, bottom: u32) -> DamageRect {
         DamageRect {
@@ -1430,12 +1582,12 @@ mod tests {
                 "{text}"
             );
             if let Some(kind) = case.get("kind").and_then(Value::as_str) {
-                let matches = match (kind, parsed.unwrap()) {
-                    ("ack", V4Inbound::Ack { .. }) => true,
-                    ("keyframe", V4Inbound::Keyframe { .. }) => true,
-                    ("ping", V4Inbound::Ping) => true,
-                    _ => false,
-                };
+                let matches = matches!(
+                    (kind, parsed.unwrap()),
+                    ("ack", V4Inbound::Ack { .. })
+                        | ("keyframe", V4Inbound::Keyframe { .. })
+                        | ("ping", V4Inbound::Ping)
+                );
                 assert!(matches, "{text}");
             }
         }
@@ -1753,6 +1905,76 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn next_peer_uses_the_existing_socket_and_wakes_from_idle() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            for round in 0..2 {
+                if round == 1 {
+                    resume_rx.recv().unwrap();
+                }
+                ws.send(Message::text(r#"{"type":"media-peer","present":true}"#))
+                    .unwrap();
+                let packet = loop {
+                    if let Message::Binary(bytes) = ws.read().unwrap() {
+                        break bytes;
+                    }
+                };
+                let (header, _) = decode_packet(&packet).unwrap();
+                assert_eq!(header.generation, round + 1);
+                ws.send(Message::text(format!(
+                    r#"{{"type":"ack","generation":{},"seq":{},"recvTsMs":1}}"#,
+                    header.generation, header.seq
+                )))
+                .unwrap();
+                if round == 0 {
+                    ws.send(Message::text(r#"{"type":"media-peer","present":false}"#))
+                        .unwrap();
+                }
+            }
+            // Leave the connection alive until the host shuts down.
+            while !matches!(ws.read(), Ok(Message::Close(_)) | Err(_)) {}
+        });
+        let connector: Connector = Box::new(move || Ok(tungstenite::connect(url.as_str())?.0));
+        let link = V4Link::spawn(connector, 6_000_000, 6_000_000).unwrap();
+        let activity = Activity::new().unwrap();
+        link.set_activity(activity.clone());
+        for round in 0..2 {
+            if round == 1 {
+                wait_for(|| (!link.stats().peer_present).then_some(()));
+                assert_eq!(link.reserve(true), V4Reserve::Backpressured);
+                resume_tx.send(()).unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if link.take_events().keyframe.as_deref() == Some("peer-joined") {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "peer notice did not wake idle link"
+                );
+                activity
+                    .wait(deadline.saturating_duration_since(Instant::now()), &[])
+                    .unwrap();
+            }
+            assert_eq!(
+                link.submit(1, round + 1, 1, 90_000, true, false, &[0, 0, 1, 0x40]),
+                V4Submit::Queued
+            );
+            if round == 1 {
+                wait_for(|| (link.stats().acks >= 2).then_some(()));
+            }
+        }
+        assert_eq!(link.stats().reconnects, 0);
+        link.shutdown();
+        server.join().unwrap();
     }
 
     /// End-to-end link over a loopback relay stand-in: peer notice ->

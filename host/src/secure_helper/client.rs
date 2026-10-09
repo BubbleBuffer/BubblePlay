@@ -7,6 +7,7 @@ use super::{
     trust,
 };
 use crate::{
+    activity::Activity,
     admin_agent::protocol::{ClientMessage, Record},
     input::DesktopRegion,
 };
@@ -69,6 +70,7 @@ pub struct DenyResult {
 }
 #[derive(Default)]
 struct Snapshot {
+    activity: Option<Activity>,
     state: Option<SecureState>,
     frame: Option<BgraFrame>,
     deny: Option<DenyResult>,
@@ -81,6 +83,33 @@ struct Snapshot {
     receipts: VecDeque<InputReceipt>,
     pending: BTreeMap<u64, u16>,
     counters: super::stats::Counters,
+}
+impl Snapshot {
+    fn notify(&self) {
+        if let Some(activity) = &self.activity {
+            activity.notify();
+        }
+    }
+
+    fn publish_state(&mut self, state: SecureState) {
+        if self.state.as_ref() != Some(&state) {
+            self.frame = None;
+            self.state = Some(state);
+            self.notify();
+        }
+    }
+
+    fn publish_error(&mut self, error: Option<LinkError>) {
+        if self.error != error {
+            self.error = error;
+            self.notify();
+        }
+    }
+
+    fn publish_deny(&mut self, result: DenyResult) {
+        self.deny = Some(result);
+        self.notify();
+    }
 }
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -172,6 +201,13 @@ impl SecureHelperLink {
     pub fn new() -> Self {
         Self::start(Snapshot::default(), None)
     }
+    /// Wake the streaming loop only when the background thread publishes work.
+    /// One notification on attachment also exposes already-queued snapshots.
+    pub fn set_activity(&self, activity: Activity) {
+        let mut snapshot = lock(&self.snapshot);
+        snapshot.activity = Some(activity);
+        snapshot.notify();
+    }
     /// Acquire the real exclusive Host role before an owner-driven live probe
     /// changes policy or opens a prompt. Busy does not disturb the current Host.
     pub fn connect_host(region: DesktopRegion) -> Result<Self, LinkError> {
@@ -205,6 +241,7 @@ impl SecureHelperLink {
     }
     pub fn tick(&mut self, active: bool, region: DesktopRegion, _now: Instant) {
         let mut s = lock(&self.snapshot);
+        let mut changed = s.active != active;
         s.active = active;
         let r = protocol::Region {
             x: region.x,
@@ -213,6 +250,7 @@ impl SecureHelperLink {
             height: region.height,
         };
         if s.region != Some(r) {
+            changed = true;
             s.frame = None;
             s.state = None;
         }
@@ -221,11 +259,14 @@ impl SecureHelperLink {
             s.state = None;
             s.frame = None;
             if s.deny_at.take().is_some() {
-                s.deny = Some(DenyResult {
+                s.publish_deny(DenyResult {
                     ok: false,
                     reason: "viewer-disconnected".into(),
                 });
             }
+        }
+        if changed {
+            s.notify();
         }
     }
     pub fn state(&self) -> Option<SecureState> {
@@ -361,7 +402,7 @@ fn background(
                 .is_some_and(|at| at.elapsed() > Duration::from_secs(5))
             {
                 s.deny_at = None;
-                s.deny = Some(DenyResult {
+                s.publish_deny(DenyResult {
                     ok: false,
                     reason: "deny-timeout".into(),
                 });
@@ -369,9 +410,15 @@ fn background(
             (s.active, s.region)
         };
         if !active {
+            let disconnected = connection.is_some();
             connection = None;
             mapping = None;
-            fail_pending(&mut lock(&shared));
+            let mut s = lock(&shared);
+            fail_pending(&mut s);
+            if disconnected {
+                s.notify();
+            }
+            drop(s);
             while commands.try_recv().is_ok() {}
             std::thread::sleep(Duration::from_millis(10));
             continue;
@@ -384,7 +431,7 @@ fn background(
                     mapping = None;
                     poll_at = Instant::now();
                     last_reply = Instant::now();
-                    lock(&shared).error = None;
+                    lock(&shared).publish_error(None);
                 }
                 Err(e) => {
                     let mut s = lock(&shared);
@@ -393,7 +440,7 @@ fn background(
                     if e != LinkError::Unavailable && s.error.as_ref() != Some(&e) {
                         tracing::warn!(error = ?e, "secure helper connect refused");
                     }
-                    s.error = Some(e);
+                    s.publish_error(Some(e));
                     drop(s);
                     retry = Instant::now() + Duration::from_secs(2);
                 }
@@ -473,10 +520,7 @@ fn background(
                                 desktop_epoch: epoch,
                             };
                             let mut s = lock(&shared);
-                            if s.state.as_ref() != Some(&state) {
-                                s.frame = None;
-                            }
-                            s.state = Some(state);
+                            s.publish_state(state);
                         }
                         Message::Frame {
                             input_id,
@@ -516,12 +560,13 @@ fn background(
                                     pixels,
                                     desktop_epoch: epoch,
                                 });
+                                s.notify();
                             }
                         }
                         Message::Denied { id, ok, reason } => {
                             let mut s = lock(&shared);
                             if id == s.deny_id && s.deny_at.take().is_some() {
-                                s.deny = Some(DenyResult { ok, reason });
+                                s.publish_deny(DenyResult { ok, reason });
                             }
                         }
                         Message::Refused => {}
@@ -540,14 +585,15 @@ fn background(
                 let mut s = lock(&shared);
                 s.state = None;
                 s.frame = None;
-                s.error = Some(LinkError::Protocol);
+                s.publish_error(Some(LinkError::Protocol));
                 fail_pending(&mut s);
                 if s.deny_at.take().is_some() {
-                    s.deny = Some(DenyResult {
+                    s.publish_deny(DenyResult {
                         ok: false,
                         reason: "helper-disconnected".into(),
                     });
                 }
+                s.notify();
                 retry = Instant::now() + Duration::from_secs(2);
                 while commands.try_recv().is_ok() {}
             }
@@ -560,6 +606,7 @@ fn push_receipt(s: &mut Snapshot, r: InputReceipt) {
         s.receipts.pop_front();
     }
     s.receipts.push_back(r);
+    s.notify();
 }
 fn fail_pending(s: &mut Snapshot) {
     for (id, received) in std::mem::take(&mut s.pending) {
@@ -592,6 +639,59 @@ fn safe_probe_records(records: &[Record]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_helper_reports_do_not_keep_the_producer_awake() {
+        let activity = Activity::new().unwrap();
+        let mut snapshot = Snapshot {
+            activity: Some(activity.clone()),
+            ..Default::default()
+        };
+        let state = SecureState {
+            secure: true,
+            kind: "uac",
+            caps: vec!["view", "deny"],
+            available: true,
+            desktop_epoch: 1,
+        };
+        snapshot.publish_state(state.clone());
+        snapshot.publish_error(Some(LinkError::Unavailable));
+        activity.wait(Duration::ZERO, &[]).unwrap();
+        for _ in 0..1_000 {
+            snapshot.publish_state(state.clone());
+            snapshot.publish_error(Some(LinkError::Unavailable));
+            fail_pending(&mut snapshot);
+        }
+        let started = Instant::now();
+        activity.wait(Duration::from_millis(30), &[]).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        snapshot.publish_error(None);
+        let started = Instant::now();
+        activity.wait(Duration::from_secs(2), &[]).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn background_receipts_and_deny_results_wake_the_idle_producer() {
+        let activity = Activity::new().unwrap();
+        let mut snapshot = Snapshot {
+            activity: Some(activity.clone()),
+            ..Default::default()
+        };
+        snapshot.pending.insert(7, 1);
+        fail_pending(&mut snapshot);
+        let started = Instant::now();
+        activity.wait(Duration::from_secs(2), &[]).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(snapshot.receipts.len(), 1);
+        snapshot.publish_deny(DenyResult {
+            ok: false,
+            reason: "deny-timeout".into(),
+        });
+        let started = Instant::now();
+        activity.wait(Duration::from_secs(2), &[]).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn probe_bypass_is_bounded_to_safe_input() {
         use crate::admin_agent::protocol::*;

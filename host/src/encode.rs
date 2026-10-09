@@ -1548,7 +1548,9 @@ impl Nvenc {
     /// driver, reconfiguring `enableMaxQP` back to 0 leaves the old ceiling
     /// in force (probe_nvenc_max_qp).
     pub fn set_max_qp(&mut self, max_qp: Option<u32>) -> Result<()> {
-        let max_qp = max_qp.map(|qp| qp.min(MAX_HEVC_QP)).filter(|qp| *qp < MAX_HEVC_QP);
+        let max_qp = max_qp
+            .map(|qp| qp.min(MAX_HEVC_QP))
+            .filter(|qp| *qp < MAX_HEVC_QP);
         if max_qp == self.max_qp() {
             return Ok(());
         }

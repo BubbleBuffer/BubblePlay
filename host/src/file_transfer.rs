@@ -811,7 +811,9 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&built).unwrap(),
             serde_json::from_str::<Value>(
-                contract["signaling"]["fileOffer"][0]["text"].as_str().unwrap()
+                contract["signaling"]["fileOffer"][0]["text"]
+                    .as_str()
+                    .unwrap()
             )
             .unwrap()
         );
@@ -827,7 +829,9 @@ mod tests {
         };
         value["type"] == "file-offer"
             && value["protocol"] == 1
-            && value["offerId"].as_u64().is_some_and(|id| id <= u32::MAX as u64)
+            && value["offerId"]
+                .as_u64()
+                .is_some_and(|id| id <= u32::MAX as u64)
             && matches!(value["source"].as_str(), Some("clipboard" | "sendto"))
             && items.len() <= MAX_BATCH_FILES as usize
             && items.iter().all(|item| {
@@ -835,7 +839,9 @@ mod tests {
                     && item["name"]
                         .as_str()
                         .is_some_and(|name| !name.is_empty() && name.len() <= MAX_NAME_BYTES)
-                    && item["size"].as_u64().is_some_and(|size| size <= MAX_FILE_BYTES)
+                    && item["size"]
+                        .as_u64()
+                        .is_some_and(|size| size <= MAX_FILE_BYTES)
             })
     }
 
@@ -849,9 +855,15 @@ mod tests {
         }
         assert_eq!(sent_chunks as u64 * MAX_DATA_BYTES as u64, WINDOW_BYTES);
         assert!(!window.can_send(1));
-        assert_eq!(window.on_ack(WINDOW_BYTES + 1), Err(TransferError::Unexpected));
+        assert_eq!(
+            window.on_ack(WINDOW_BYTES + 1),
+            Err(TransferError::Unexpected)
+        );
         window.on_ack(ACK_EVERY_BYTES).unwrap();
-        assert_eq!(window.on_ack(ACK_EVERY_BYTES - 1), Err(TransferError::Unexpected));
+        assert_eq!(
+            window.on_ack(ACK_EVERY_BYTES - 1),
+            Err(TransferError::Unexpected)
+        );
         assert!(window.can_send(ACK_EVERY_BYTES as usize));
         assert!(!window.can_send(ACK_EVERY_BYTES as usize + 1));
 
@@ -974,7 +986,10 @@ mod tests {
             decode(&encode_raw(PacketType::Data, 1, 0, &[])),
             Err(Reject::Payload)
         );
-        assert_eq!(decode(&encode_raw(PacketType::Ack, 1, 3, &[0; 8])), Err(Reject::Seq));
+        assert_eq!(
+            decode(&encode_raw(PacketType::Ack, 1, 3, &[0; 8])),
+            Err(Reject::Seq)
+        );
     }
 
     /// Prints the fixture body; run with
@@ -1124,7 +1139,8 @@ mod tests {
         let mut rejected = Vec::new();
         let mut reject = |name: &str, bytes: Vec<u8>| {
             let reason = decode(&bytes).unwrap_err().code();
-            rejected.push(serde_json::json!({"name": name, "hex": to_hex(&bytes), "reason": reason}));
+            rejected
+                .push(serde_json::json!({"name": name, "hex": to_hex(&bytes), "reason": reason}));
         };
         let with = |at: usize, value: u8| {
             let mut bytes = hex(&accept);
@@ -1138,11 +1154,20 @@ mod tests {
         reject("nonzero-flags", with(5, 1));
         reject("nonzero-reserved", with(7, 1));
         reject("nonzero-seq-on-control", with(12, 1));
-        reject("accept-with-payload", encode_raw(PacketType::Accept, 7, 0, b"x"));
+        reject(
+            "accept-with-payload",
+            encode_raw(PacketType::Accept, 7, 0, b"x"),
+        );
         reject("empty-data", encode_raw(PacketType::Data, 7, 0, &[]));
-        reject("short-ack", encode_raw(PacketType::Ack, 7, 0, &[5, 0, 0, 0]));
+        reject(
+            "short-ack",
+            encode_raw(PacketType::Ack, 7, 0, &[5, 0, 0, 0]),
+        );
         reject("short-done", encode_raw(PacketType::Done, 7, 0, &[0; 16]));
-        reject("offer-not-json", encode_raw(PacketType::Offer, 7, 0, b"{name:"));
+        reject(
+            "offer-not-json",
+            encode_raw(PacketType::Offer, 7, 0, b"{name:"),
+        );
         reject(
             "offer-missing-size",
             encode_raw(

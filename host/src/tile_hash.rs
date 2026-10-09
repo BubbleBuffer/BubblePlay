@@ -11,13 +11,15 @@ use anyhow::{bail, Context, Result};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX, D3D11_CPU_ACCESS_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
     DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
     DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 
 use crate::scroll_detect::TileRows;
 use crate::tile_quality::{hash_rows, TileGrid};
@@ -162,11 +164,25 @@ impl TileHasher {
             }
         }
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context
-                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        let map = unsafe {
+            self.context.Map(
+                &self.staging,
+                0,
+                D3D11_MAP_READ,
+                D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                Some(&mut mapped),
+            )
+        };
+        if map
+            .as_ref()
+            .is_err_and(|error| error.code() == DXGI_ERROR_WAS_STILL_DRAWING)
+        {
+            // The producer must not wait for GPU readback. Missing current
+            // hashes conservatively keep the dirty tiles eligible for encode;
+            // never compare stale staging content against a newer frame.
+            return Ok((Vec::new(), Vec::new(), started.elapsed().as_micros() as u64));
         }
-        .context("map tile hash staging")?;
+        map.context("map tile hash staging")?;
         let pitch = mapped.RowPitch as usize;
         let data = unsafe {
             std::slice::from_raw_parts(mapped.pData.cast::<u8>(), pitch * self.height as usize)

@@ -683,7 +683,10 @@ mod tests {
         // Back to the loop's starting size: still the same (resize) loop.
         assert_eq!(hold(&mut f, t, (1919, 500), M1, 2000, 3000), None);
         // A new loop moves again.
-        assert_eq!(observe_edge(Some(&mut f), None, &ALL, M1, ms(t, 3050)), None);
+        assert_eq!(
+            observe_edge(Some(&mut f), None, &ALL, M1, ms(t, 3050)),
+            None
+        );
         assert_eq!(
             hold(&mut f, t, (1919, 500), M1, 3100, 4000),
             Some((3500, M2))

@@ -60,7 +60,9 @@ pub enum Response {
     Clipboard {
         text: Option<String>,
     },
-    ClipboardPng { png: Vec<u8> },
+    ClipboardPng {
+        png: Vec<u8>,
+    },
 }
 
 pub fn write_request<W: Write>(
@@ -258,7 +260,9 @@ fn decode_response(payload: &[u8]) -> io::Result<Response> {
             })
         }
         3 if body.is_empty() => Ok(Response::Ack),
-        7 if crate::clipboard_image::valid_png(body) => Ok(Response::ClipboardPng { png: body.to_vec() }),
+        7 if crate::clipboard_image::valid_png(body) => {
+            Ok(Response::ClipboardPng { png: body.to_vec() })
+        }
         6 if !body.is_empty() => {
             let has_text = decode_bool(body[0])?;
             let text = &body[1..];
@@ -439,14 +443,20 @@ mod tests {
         {
             let mut encoder = png::Encoder::new(&mut encoder_bytes, 1, 1);
             encoder.set_color(png::ColorType::Rgba);
-            encoder.write_header().unwrap().write_image_data(&[1,2,3,255]).unwrap();
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[1, 2, 3, 255])
+                .unwrap();
         }
         let response = Response::ClipboardPng { png: encoder_bytes };
         let mut wire = Vec::new();
         write_response(&mut wire, 10, &response).unwrap();
         assert_eq!(read_response(&mut wire.as_slice()).unwrap(), (10, response));
-        assert!(decode_response(&[7,0,1,2]).is_err());
-        let oversized = Response::ClipboardPng { png: vec![0; crate::clipboard_image::MAX_PNG_BYTES+65] };
+        assert!(decode_response(&[7, 0, 1, 2]).is_err());
+        let oversized = Response::ClipboardPng {
+            png: vec![0; crate::clipboard_image::MAX_PNG_BYTES + 65],
+        };
         assert!(write_response(&mut Vec::new(), 11, &oversized).is_err());
     }
 

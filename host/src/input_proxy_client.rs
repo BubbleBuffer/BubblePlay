@@ -120,10 +120,15 @@ impl InputProxyClient {
     }
 
     /// Clipboard text the interactive user changed since the last poll.
-    pub fn poll_clipboard(&mut self, reset: bool) -> Result<Option<crate::clipboard::ClipboardContent>> {
+    pub fn poll_clipboard(
+        &mut self,
+        reset: bool,
+    ) -> Result<Option<crate::clipboard::ClipboardContent>> {
         match self.call(Request::PollClipboard { reset })? {
             Response::Clipboard { text } => Ok(text.map(crate::clipboard::ClipboardContent::Text)),
-            Response::ClipboardPng { png } => Ok(Some(crate::clipboard::ClipboardContent::Png(png))),
+            Response::ClipboardPng { png } => {
+                Ok(Some(crate::clipboard::ClipboardContent::Png(png)))
+            }
             response => bail!("input proxy returned unexpected clipboard response: {response:?}"),
         }
     }

@@ -781,8 +781,11 @@ impl AgentBackend for RealAgentBackend {
         // starve the outstanding encode permit. Cursor polling is independent
         // of the GPU, with just one latest kind retained for a slow IPC reader.
         if let Some(worker) = self.input_worker.as_ref() {
-            let kind = worker.cursor_kind_latest.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+            let kind = worker
+                .cursor_kind_latest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
             if let Some(kind) = kind {
                 return Ok(Some(Message::CursorKind(kind)));
             }
@@ -951,12 +954,28 @@ struct InputWorkerState {
     clipboard_id: u32,
 }
 
-fn clipboard_content_messages(id: u32, content: &crate::clipboard::ClipboardContent) -> Vec<Message> {
+fn clipboard_content_messages(
+    id: u32,
+    content: &crate::clipboard::ClipboardContent,
+) -> Vec<Message> {
     let (png, text) = content.wire();
-    clipboard_messages(id, &text).into_iter().map(|message| match message {
-        Message::ClipboardText { id, index, count, text } if png => Message::ClipboardPng { id, index, count, text },
-        message => message,
-    }).collect()
+    clipboard_messages(id, &text)
+        .into_iter()
+        .map(|message| match message {
+            Message::ClipboardText {
+                id,
+                index,
+                count,
+                text,
+            } if png => Message::ClipboardPng {
+                id,
+                index,
+                count,
+                text,
+            },
+            message => message,
+        })
+        .collect()
 }
 
 /// Split host clipboard text into in-order IPC chunks.
@@ -1903,19 +1922,41 @@ mod tests {
     fn host_clipboard_png_uses_dedicated_bounded_ordered_chunks() {
         use base64::Engine;
         let png = vec![42; crate::clipboard_image::MAX_PNG_BYTES];
-        let messages = super::clipboard_content_messages(8, &crate::clipboard::ClipboardContent::Png(png.clone()));
+        let messages = super::clipboard_content_messages(
+            8,
+            &crate::clipboard::ClipboardContent::Png(png.clone()),
+        );
         assert_eq!(messages.len(), 342);
         let mut joined = String::new();
         for (expected, message) in messages.iter().enumerate() {
-            let Message::ClipboardPng { id, index, count, text } = message else { panic!("image became text"); };
+            let Message::ClipboardPng {
+                id,
+                index,
+                count,
+                text,
+            } = message
+            else {
+                panic!("image became text");
+            };
             assert_eq!((*id, *index as usize, *count), (8, expected, 342));
             assert!(text.len() <= crate::privileged_ipc::MAX_CLIPBOARD_CHUNK_BYTES);
             let mut frame = Vec::new();
             crate::privileged_ipc::write_frame(&mut frame, 0, expected as u32, message).unwrap();
-            assert_eq!(crate::privileged_ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap().message, *message);
+            assert_eq!(
+                crate::privileged_ipc::read_frame(&mut frame.as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .message,
+                *message
+            );
             joined.push_str(text);
         }
-        assert_eq!(base64::engine::general_purpose::STANDARD.decode(joined).unwrap(), png);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(joined)
+                .unwrap(),
+            png
+        );
     }
 
     #[test]

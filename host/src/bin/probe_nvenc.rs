@@ -34,8 +34,6 @@ const NV_ENC_PRESET_P1_GUID: GUID = GUID {
     Data4: [0x80, 0xc7, 0x29, 0x88, 0x71, 0x59, 0x0e, 0xbf],
 };
 
-
-
 /// Zero-init like the C SDK (`memset` + set version). `std::mem::zeroed`
 /// trips a validity panic on this union-heavy struct; MaybeUninit works.
 unsafe fn zeroed<T>() -> T {

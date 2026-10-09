@@ -239,7 +239,8 @@ impl<B: AgentBackend> AgentCore<B> {
             | Message::InputStats(_)
             | Message::RecoverableError(_)
             | Message::FatalError(_)
-            | Message::ClipboardText { .. } | Message::ClipboardPng { .. } => {}
+            | Message::ClipboardText { .. }
+            | Message::ClipboardPng { .. } => {}
         }
         events
     }
@@ -872,15 +873,33 @@ mod tests {
     #[test]
     fn clipboard_backpressure_keeps_latest_snapshot_and_other_control() {
         let mut outputs = VecDeque::from([
-            AgentEvent::Control(Message::ClipboardText { id: 1, index: 0, count: 1, text: "old".into() }),
+            AgentEvent::Control(Message::ClipboardText {
+                id: 1,
+                index: 0,
+                count: 1,
+                text: "old".into(),
+            }),
             AgentEvent::Control(Message::ReleaseAll),
-            AgentEvent::Control(Message::ClipboardPng { id: 2, index: 0, count: 2, text: "AAAA".into() }),
-            AgentEvent::Control(Message::ClipboardPng { id: 2, index: 1, count: 2, text: "BBBB".into() }),
+            AgentEvent::Control(Message::ClipboardPng {
+                id: 2,
+                index: 0,
+                count: 2,
+                text: "AAAA".into(),
+            }),
+            AgentEvent::Control(Message::ClipboardPng {
+                id: 2,
+                index: 1,
+                count: 2,
+                text: "BBBB".into(),
+            }),
         ]);
         coalesce_pending_clipboards(&mut outputs);
         assert_eq!(outputs.len(), 3);
         assert_eq!(outputs[0], AgentEvent::Control(Message::ReleaseAll));
-        assert!(outputs.iter().skip(1).all(|event| matches!(event, AgentEvent::Control(Message::ClipboardPng { id: 2, .. }))));
+        assert!(outputs.iter().skip(1).all(|event| matches!(
+            event,
+            AgentEvent::Control(Message::ClipboardPng { id: 2, .. })
+        )));
     }
 
     #[test]
@@ -1545,5 +1564,4 @@ mod tests {
             ])
         );
     }
-
 }
