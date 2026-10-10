@@ -239,7 +239,8 @@ impl TrayIcon {
             let module = GetModuleHandleW(PCWSTR::null()).context("GetModuleHandleW")?;
             LoadImageW(
                 Some(module.into()),
-                PCWSTR(std::ptr::dangling::<u16>()),
+                // MAKEINTRESOURCE(1): the icon resource ID, not a pointer. (`dangling()` is 2.)
+                PCWSTR(std::ptr::without_provenance::<u16>(1)),
                 IMAGE_ICON,
                 size.0,
                 size.1,
