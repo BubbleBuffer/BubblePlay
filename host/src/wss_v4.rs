@@ -28,8 +28,8 @@ use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::os::windows::io::{AsRawSocket, RawSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -91,6 +91,12 @@ const RATE_RTT_SLACK_MS: f64 = 60.0;
 const RATE_RTT_FACTOR: f64 = 2.0;
 const WRITE_STALL_LIMIT: Duration = Duration::from_secs(10);
 const LINK_QUEUE_CAPACITY: usize = INFLIGHT_MAX_FRAMES + 2;
+/// Longest `V4Link::shutdown` waits for its worker before abandoning it. A
+/// worker stuck in DNS, TCP, TLS or upgrade finishes on its own later.
+const LINK_SHUTDOWN_WAIT: Duration = Duration::from_millis(400);
+/// Process-wide cap on media link workers, abandoned ones included.
+const MAX_LINK_WORKERS: usize = 16;
+static LINK_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V4FrameHeader {
@@ -822,13 +828,36 @@ pub enum V4Submit {
 
 pub type Connector = Box<dyn Fn() -> Result<WebSocket<MaybeTlsStream<TcpStream>>> + Send + 'static>;
 
+/// One live media worker in the process-wide budget; released when the worker ends.
+struct WorkerSlot(&'static AtomicUsize);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Claims a worker slot. Abandoned workers keep their slot until their connect returns.
+fn claim_worker_slot(live: &'static AtomicUsize, limit: usize) -> Result<WorkerSlot> {
+    if live
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < limit).then_some(count + 1)
+        })
+        .is_err()
+    {
+        bail!("v4 media link worker budget exhausted ({limit} workers live)");
+    }
+    Ok(WorkerSlot(live))
+}
+
 /// Owns the single v4 media socket on a dedicated thread.
 pub struct V4Link {
     shared: Arc<Mutex<Shared>>,
     tx: SyncSender<Outgoing>,
     stop: Arc<AtomicBool>,
     activity: Activity,
-    join: Mutex<Option<JoinHandle<()>>>,
+    /// The worker and a signal that disconnects when the worker ends.
+    worker: Mutex<Option<(JoinHandle<()>, Receiver<()>)>>,
 }
 
 impl V4Link {
@@ -854,16 +883,25 @@ impl V4Link {
         let thread_shared = shared.clone();
         let thread_stop = stop.clone();
         let thread_activity = activity.clone();
+        let slot =
+            claim_worker_slot(&LINK_WORKERS, MAX_LINK_WORKERS).context("spawn v4 media link")?;
+        let (exit_tx, exit_rx) = mpsc::channel::<()>();
         let join = thread::Builder::new()
             .name("bubbleplay-wss-v4".into())
-            .spawn(move || link_loop(connector, rx, thread_shared, thread_stop, thread_activity))
+            .spawn(move || {
+                // Dropped after `link_loop` returns, even on a panic: the slot
+                // is freed first, then the exit signal disconnects.
+                let _exit = exit_tx;
+                let _slot = slot;
+                link_loop(connector, rx, thread_shared, thread_stop, thread_activity)
+            })
             .context("spawn v4 media link")?;
         Ok(Self {
             shared,
             tx,
             stop,
             activity,
-            join: Mutex::new(Some(join)),
+            worker: Mutex::new(Some((join, exit_rx))),
         })
     }
 
@@ -1026,15 +1064,32 @@ impl V4Link {
     }
 
     pub fn shutdown(&self) {
-        self.stop.store(true, Ordering::Release);
+        {
+            // Set under the state lock: a connect that finishes after this
+            // point sees `stop` before it publishes anything.
+            let _state = self.lock();
+            self.stop.store(true, Ordering::Release);
+        }
         self.activity.notify();
-        let join = self
-            .join
+        let worker = self
+            .worker
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take();
-        if let Some(join) = join {
-            let _ = join.join();
+        let Some((_join, exited)) = worker else {
+            return;
+        };
+        match exited.recv_timeout(LINK_SHUTDOWN_WAIT) {
+            // The signal precedes thread-local cleanup. Even after it arrives,
+            // joining could wait indefinitely for a destructor on that thread.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                // Dropping the handle detaches the worker. It keeps its own
+                // socket, queue and state, and its budget slot, until it ends.
+                warn!(
+                    "WSS v4 media worker did not exit within 400 ms; detaching with its resources"
+                );
+            }
         }
     }
 }
@@ -1174,6 +1229,10 @@ fn link_loop(
         while rx.try_recv().is_ok() {}
         {
             let mut state = lock();
+            // A connect that finished after shutdown is dropped unpublished.
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             let now = Instant::now();
             state.peer_epoch = state.peer_epoch.wrapping_add(1);
             state.connected = true;
@@ -1348,6 +1407,11 @@ fn serve_socket(
         }
         match rx.try_recv() {
             Ok(outgoing) => {
+                // Re-check after the loop-top check: a stop that lands in
+                // between must not reach the wire.
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 let state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
                 let current = outgoing_is_current(&state, &outgoing);
                 drop(state);
@@ -1433,6 +1497,8 @@ fn outgoing_is_current(state: &Shared, outgoing: &Outgoing) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
 
     fn idle_shared(now: Instant) -> Shared {
         Shared {
@@ -2045,5 +2111,145 @@ mod tests {
             1
         );
         link.shutdown();
+    }
+
+    /// Caps the test connector's wait, so the old unbounded join still ends.
+    const TEST_CONNECTOR_CAP: Duration = Duration::from_secs(2);
+
+    /// Drops with the connector, which the worker drops when it ends.
+    struct ExitFlag(Arc<AtomicBool>);
+
+    impl Drop for ExitFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn wait_for_flag(flag: &AtomicBool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Blocks like a stuck connect until `release` or the cap, then returns
+    /// `socket` as a connection, or fails when there is none.
+    fn blocked_connector(
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+        ended: Arc<AtomicBool>,
+        socket: Mutex<Option<TcpStream>>,
+    ) -> Connector {
+        let exit = ExitFlag(ended);
+        Box::new(move || {
+            let _ = &exit;
+            let _ = entered.try_send(());
+            let _ = release.recv_timeout(TEST_CONNECTOR_CAP);
+            match socket.lock().unwrap().take() {
+                Some(stream) => Ok(WebSocket::from_raw_socket(
+                    MaybeTlsStream::Plain(stream),
+                    tungstenite::protocol::Role::Client,
+                    None,
+                )),
+                None => bail!("test connector released without a socket"),
+            }
+        })
+    }
+
+    #[test]
+    fn shutdown_returns_while_a_connect_is_stuck() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let ended = Arc::new(AtomicBool::new(false));
+        let connector = blocked_connector(entered_tx, release_rx, ended.clone(), Mutex::new(None));
+        let link = V4Link::spawn(connector, 2_000_000, 6_000_000).expect("spawn link");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("connector entered");
+
+        let started = Instant::now();
+        link.shutdown();
+        let waited = started.elapsed();
+        let ended_before_release = ended.load(Ordering::Acquire);
+        // Let the abandoned worker's connect fail now, so the test ends cleanly.
+        let _ = release_tx.send(());
+        assert!(
+            !ended_before_release,
+            "shutdown must return before the blocked connector finishes"
+        );
+        assert!(
+            // Allow scheduling slack around the 400 ms shutdown wait while
+            // still rejecting the old join's two-second connector wait.
+            waited < Duration::from_millis(1200),
+            "shutdown waited {waited:?} for a stuck connect"
+        );
+        assert!(wait_for_flag(&ended), "abandoned worker never ended");
+    }
+
+    #[test]
+    fn connect_finishing_after_stop_publishes_and_sends_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let client = TcpStream::connect(listener.local_addr().expect("local addr"))
+            .expect("connect loopback");
+        let (mut peer, _) = listener.accept().expect("accept loopback");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer timeout");
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let ended = Arc::new(AtomicBool::new(false));
+        let connector = blocked_connector(
+            entered_tx,
+            release_rx,
+            ended.clone(),
+            Mutex::new(Some(client)),
+        );
+        let link = V4Link::spawn(connector, 2_000_000, 6_000_000).expect("spawn link");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("connector entered");
+        // Media a published connection would send.
+        link.tx
+            .try_send(Outgoing {
+                peer_epoch: 0,
+                packet: vec![0xAA; 16],
+            })
+            .expect("queue packet");
+
+        link.shutdown();
+        let _ = release_tx.send(());
+        assert!(wait_for_flag(&ended), "worker never ended");
+
+        {
+            let state = link.lock();
+            assert_eq!(state.peer_epoch, 0, "a stopped link published a connection");
+            assert!(!state.connected, "a stopped link is marked connected");
+        }
+        // Dropping the unpublished socket closes it and writes nothing.
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            peer.read(&mut byte).expect("read from peer"),
+            0,
+            "no media or close frame may reach the relay after stop"
+        );
+    }
+
+    #[test]
+    fn worker_budget_refuses_when_full_and_frees_on_release() {
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        let first = claim_worker_slot(&LIVE, 2).expect("first slot");
+        let second = claim_worker_slot(&LIVE, 2).expect("second slot");
+        assert!(
+            claim_worker_slot(&LIVE, 2).is_err(),
+            "budget must refuse a third worker"
+        );
+        drop(first);
+        let third = claim_worker_slot(&LIVE, 2).expect("freed slot is reusable");
+        drop((second, third));
+        assert_eq!(LIVE.load(Ordering::Acquire), 0);
     }
 }

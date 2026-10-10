@@ -39,6 +39,23 @@ errors. Flow/drop transitions identify the reason; logs contain no key codes,
 typed text or coordinates. These diagnostics support incident investigation;
 the WhatsApp blackout's cause remains unproven.
 
+Host admin-agent I/O uses an overlapped local pipe: the hello write and reply
+share a two-second deadline, and each complete injection batch shares a
+500 ms write/reply deadline across chunks. Protocol encoding and flushing
+happen in memory; pipe I/O is overlapped.
+Timeout or uncertain delivery reports agent loss and backs off; input that may
+already have reached the agent is never repeated locally. Protected-target
+`admin-unavailable` reporting and secure-desktop routing remain unchanged.
+Cancelled operations retain their event, buffer and handle until Windows
+reports completion; a fixed lock-free capacity makes stalled cancellation fail
+closed instead of allocating indefinitely or waiting on another thread.
+
+The host secure-helper client shares those overlapped I/O bounds: its hello
+write/reply takes at most two seconds, and each background message uses a
+500 ms read or write deadline. A partial frame stays queued until complete.
+Failures retain the existing unavailable/reconnect behavior and SYSTEM trust
+checks.
+
 1. **Survive the prompt.** A secure-desktop switch keeps the viewer session open. The client shows "Admin prompt open on the PC" (or "PC is locked"). The host polls for the normal desktop every 500 ms and resumes on the same monitor.
 2. **Secure-desktop helper.** An optional `bubbleplay_secure_helper.exe`, installed once with admin rights, runs with a SYSTEM token in the console session only while a viewer is connected. A SYSTEM scheduled task launches it; there is no permanent service. It captures the secure desktop (GDI, low frame rate, on change) and hands BGRA frames to the host through shared memory; the host encodes them with its normal encoder.
 3. **Permission levels, enforced in the helper:**

@@ -15,6 +15,7 @@ use host_session::*;
 mod host_benchmark;
 use host_benchmark::*;
 mod producer_wait;
+mod session_watchdog;
 
 use bubbleplay_host::activity::Activity;
 use bubbleplay_host::agent_client;
@@ -889,6 +890,29 @@ fn unix_time_ms() -> u64 {
 }
 
 fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
+    let watchdog = match session_watchdog::SessionWatchdog::start() {
+        Ok(watchdog) => Some(watchdog),
+        Err(error) => {
+            warn!(%error, "session watchdog unavailable");
+            None
+        }
+    };
+    macro_rules! session_stage {
+        ($stage:ident) => {
+            if let Some(watchdog) = &watchdog {
+                watchdog.mark(session_watchdog::Stage::$stage, line!());
+            }
+        };
+    }
+    macro_rules! session_call {
+        ($stage:ident, $call:expr) => {{
+            let _stage = watchdog
+                .as_ref()
+                .map(|watchdog| watchdog.enter(session_watchdog::Stage::$stage, line!()));
+            $call
+        }};
+    }
+    session_stage!(Startup);
     let worker = args
         .worker
         .clone()
@@ -898,7 +922,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let reset_lab_encoder_on_diagnostic_keyframe =
         std::env::var("BUBBLEPLAY_LAB_RESET_ENCODER_ON_DIAGNOSTIC_KEYFRAME")
             .is_ok_and(|value| value == "1");
-    let mut capture = CaptureSource::open(args, selection.selector())?;
+    let mut capture = session_call!(Capture, CaptureSource::open(args, selection.selector()))?;
     let socket = UdpSocket::bind("0.0.0.0:0").context("bind media socket")?;
     // Host-IP discovery only feeds RTC ICE candidates. WSS media and
     // signaling do not need it, so a failure (e.g. WSAEAFNOSUPPORT on a
@@ -915,7 +939,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     };
     socket.set_nonblocking(false)?;
     let mapped_addr = stun::discover_mapped_address(&socket, STUN_SERVER).ok();
-    let mut signaling = Signaling::connect(&worker, &token, args.host_gate_token.as_deref())?;
+    let mut signaling = session_call!(
+        Signaling,
+        Signaling::connect(&worker, &token, args.host_gate_token.as_deref())
+    )?;
     // File transfer runs only in the user-level host (Downloads, clipboard
     // and Send To belong to the interactive user) and needs the host bearer
     // for `/host-file-ws`.
@@ -1168,7 +1195,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             } else {
                 carried_input.begin_switch($carry_input);
                 if !$carry_input {
-                    input_sink.release_all();
+                    session_call!(Input, input_sink.release_all());
                     capture.release_input();
                 }
                 remote_input_ready = false;
@@ -1258,7 +1285,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             if let Some(pending) = pending_native_drop.take() {
                 pending.request.reject("viewer-disconnected");
             }
-            input_sink.release_all();
+            session_call!(Input, input_sink.release_all());
             capture.release_input();
             capture.set_capture_demand(false)?;
             capture.end_viewer_session();
@@ -1311,6 +1338,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     }
     let mut first_iteration = true;
     'session: loop {
+        session_stage!(CaptureDemand);
         let wait_now = Instant::now();
         let wss_peer_live = viewer_attached
             && wss_media.as_ref().is_some_and(|egress| {
@@ -1406,9 +1434,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 deadlines.push(next_quality_tick);
             }
             let wait = producer_wait_duration(wait_now, deadlines);
-            activity.wait(wait, &[(signaling.read_socket(), false)])?;
+            session_call!(
+                ActivityWait,
+                activity.wait(wait, &[(signaling.read_socket(), false)])
+            )?;
         }
         first_iteration = false;
+        session_stage!(Housekeeping);
         producer_loop_iterations = producer_loop_iterations.saturating_add(1);
         let loop_now = Instant::now();
         if loop_now >= next_benchmark_refresh {
@@ -1632,6 +1664,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             next_benchmark_status =
                 benchmark_status_now + benchmark_status_retry_delay(status_sent);
         }
+        session_stage!(SecureHelper);
         capture.tick(loop_now)?;
         capture.tick_secure(
             viewer_attached && (ice_connected || wss_peer_live),
@@ -1788,7 +1821,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             pending_first_frame = None;
                         }
                         carried_input.reset();
-                        input_sink.release_all();
+                        session_call!(Input, input_sink.release_all());
                         latest_idr = None;
                         pending_transition_idr = None;
                         pending_wss_idr = None;
@@ -1872,6 +1905,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
             last_secure_announcement = secure_announcement;
         }
+        session_stage!(TransportEvents);
         while let Some(event) = pump.try_event() {
             if matches!(event, TransportEvent::PeerReset) {
                 rtc_reset_pending = false;
@@ -2035,7 +2069,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     if capture.send_input(&data)? {
                         continue;
                     }
-                    let outcome = input_sink.handle_counted(&data);
+                    let outcome = session_call!(Input, input_sink.handle_counted(&data));
                     if outcome.sync_requested && capture.desktop_state().desktop != "secure" {
                         if let Some(kind) = cursor_kind_tracker.sample(true, Instant::now()) {
                             let encoded = kind.encode();
@@ -2129,6 +2163,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 _ => {}
             }
         }
+        session_stage!(Foreground);
         let cursor_now = Instant::now();
         // Keep event bursts coalesced until the existing 16 ms cursor cadence
         // allows sampling; a high-polling mouse must not recreate a 1 ms loop.
@@ -2285,6 +2320,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
             }
         }
+        session_stage!(Files);
         if !capture.is_privileged() {
             let viewer_live =
                 capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
@@ -2499,6 +2535,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
             next_quality_tick = now + Duration::from_secs(1);
         }
+        session_stage!(Signaling);
         let mut signal_events = signaling.poll()?.into_iter().peekable();
         while let Some(event) = signal_events.next() {
             match event {
@@ -2855,7 +2892,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         if capture.send_input(&data)? {
                             continue;
                         }
-                        let outcome = input_sink.handle_counted(&data);
+                        let outcome = session_call!(Input, input_sink.handle_counted(&data));
                         if outcome.sync_requested && capture.desktop_state().desktop != "secure" {
                             if let Some(kind) = cursor_kind_tracker.sample(true, Instant::now()) {
                                 let encoded = kind.encode();
@@ -2888,11 +2925,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             state.available && state.kind == "uac" && state.caps.contains(&"deny")
                         });
                     let queued = allowed
-                        && capture.secure_helper().is_some_and(|link| {
-                            link.lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .deny_consent()
-                        });
+                        && session_call!(
+                            SecureHelper,
+                            capture.secure_helper().is_some_and(|link| {
+                                link.lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .deny_consent()
+                            })
+                        );
                     if !queued {
                         signaling.send_secure_action_result(
                             false,
@@ -3408,6 +3448,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 signaling.send_input_routing_status(media_generation, status);
             }
         }
+        session_stage!(Media);
         match rtc_peer.poll(Instant::now(), wss_media.is_some()) {
             RtcPeerDecision::Continue => {}
             RtcPeerDecision::EndPeer => {
@@ -3677,6 +3718,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     width: crop.width,
                     height: crop.height,
                 });
+                session_stage!(Encode);
                 let result = source.encode_agent(AgentMessage::EncodePermit {
                     permit_id,
                     session_generation: media_generation,
@@ -3937,6 +3979,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 next_admission = Instant::now();
                 next_idr = Instant::now();
             }
+            session_stage!(Capture);
             let secure_frame_state = capture.secure_state();
             let captured = match capture.acquire(Duration::ZERO)? {
                 Some(frame) => Some(frame),
@@ -4697,6 +4740,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     });
                     let mut feedback_plan = None;
                     let mut feedback_wire_decision = None;
+                    session_stage!(Encode);
                     let encoded = if let Some(reason) = fallback_reason {
                         match recreate_and_encode_profile(
                             &mut encoder,
@@ -6098,6 +6142,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             skipped_before_encode = 0;
             next_skip_log = Instant::now() + Duration::from_secs(1);
         }
+        session_stage!(Publish);
         if let Some(egress) = wss_media
             .as_ref()
             .filter(|_| Instant::now() >= next_wss_stats)
@@ -6193,11 +6238,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         // Every path, including an early continue, reaches the activity wait
         // at the top of the next iteration. DDA waits on its acquisition thread.
     }
+    session_stage!(Cleanup);
     file_drag_preview.cancel();
     if let Some(pending) = pending_native_drop.take() {
         pending.request.reject("drop-not-ready");
     }
-    input_sink.release_all();
+    session_call!(Input, input_sink.release_all());
     capture.release_input();
     signaling.send_bye();
     if let Some(egress) = wss_media {

@@ -9,27 +9,27 @@ use super::{
 use crate::{
     activity::Activity,
     admin_agent::protocol::{ClientMessage, Record},
+    bounded_pipe::BoundedPipe,
     input::DesktopRegion,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::File,
-    os::windows::io::FromRawHandle,
+    io,
     sync::{
         mpsc::{self, Receiver, SyncSender},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
-use windows::{
-    core::PCWSTR,
-    Win32::{
-        Storage::FileSystem::{
-            CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
-        },
-        System::Pipes::GetNamedPipeServerProcessId,
-    },
-};
+use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, PeekNamedPipe};
+/// Hello and Welcome share one deadline, so a silent helper cannot hold connect.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Each background write or read has its own bound; the loop never waits longer.
+const MESSAGE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Pause between peeks while the handshake waits for its reply.
+const FRAME_POLL: Duration = Duration::from_millis(5);
+const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkError {
     Busy,
@@ -114,44 +114,46 @@ impl Snapshot {
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
-fn connect(role: Role) -> Result<File, LinkError> {
+fn connect(role: Role) -> Result<BoundedPipe, LinkError> {
     let session = crate::admin_agent::trust::current_session_id();
-    let w = trust::wide(protocol::pipe_name(session));
-    let h = unsafe {
-        CreateFileW(
-            PCWSTR(w.as_ptr()),
-            crate::admin_agent::client::PIPE_CLIENT_ACCESS,
-            FILE_SHARE_NONE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0x110000),
-            None,
-        )
-    }
+    let mut pipe = BoundedPipe::open(
+        &protocol::pipe_name(session),
+        crate::admin_agent::client::PIPE_CLIENT_ACCESS,
+        SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+    )
     .map_err(|_| LinkError::Unavailable)?;
-    let mut f = unsafe { File::from_raw_handle(h.0.cast()) };
+    let file = pipe.file().map_err(|_| LinkError::Untrusted)?;
     let mut pid = 0;
-    unsafe { GetNamedPipeServerProcessId(pipe::handle(&f), &mut pid) }
+    unsafe { GetNamedPipeServerProcessId(pipe::handle(file), &mut pid) }
         .map_err(|_| LinkError::Untrusted)?;
     let image = crate::admin_agent::trust::process_image_path(pid).ok_or(LinkError::Untrusted)?;
     if crate::admin_agent::trust::process_session_id(pid) != Some(session)
-        || trust::pipe_owner(pipe::handle(&f)).ok().as_deref() != Some("S-1-5-18")
+        || trust::pipe_owner(pipe::handle(file)).ok().as_deref() != Some("S-1-5-18")
         || trust::protected_image(&image).is_err()
     {
         return Err(LinkError::Untrusted);
     }
-    protocol::write(
-        &mut f,
+    handshake(&mut pipe, role, pid, Instant::now() + HANDSHAKE_TIMEOUT)?;
+    Ok(pipe)
+}
+/// The version handshake for a server whose process has already been verified.
+fn handshake(
+    pipe: &mut BoundedPipe,
+    role: Role,
+    pid: u32,
+    deadline: Instant,
+) -> Result<(), LinkError> {
+    send(
+        pipe,
         &Message::Hello {
             min: protocol::PROTOCOL_MIN,
             max: protocol::PROTOCOL_MAX,
             role: role as u8,
         },
+        deadline,
     )
     .map_err(|_| LinkError::Protocol)?;
-    match pipe::read_deadline(&mut f, Instant::now() + Duration::from_secs(2))
-        .map_err(|_| LinkError::Protocol)?
-    {
+    match read_message_until(pipe, deadline).map_err(|_| LinkError::Protocol)? {
         Message::Welcome {
             version,
             min,
@@ -165,7 +167,7 @@ fn connect(role: Role) -> Result<File, LinkError> {
                 max,
             ) == Some(version) =>
         {
-            Ok(f)
+            Ok(())
         }
         Message::Incompatible { min, max } => Err(LinkError::Incompatible {
             helper_min: min,
@@ -174,6 +176,70 @@ fn connect(role: Role) -> Result<File, LinkError> {
         Message::Busy => Err(LinkError::Busy),
         _ => Err(LinkError::Protocol),
     }
+}
+/// Encode first, so the only I/O is one bounded write.
+fn send(pipe: &mut BoundedPipe, message: &Message, deadline: Instant) -> io::Result<()> {
+    let mut frame = Vec::new();
+    protocol::write(&mut frame, message)?;
+    pipe.write_all_until(&frame, deadline)
+}
+fn send_background(pipe: &mut BoundedPipe, message: &Message) -> io::Result<()> {
+    send(pipe, message, Instant::now() + MESSAGE_TIMEOUT)
+}
+/// True once a whole frame is queued. Only peeks, so a truncated frame stays
+/// in the pipe and nothing blocks waiting for its tail.
+fn frame_queued(pipe: &BoundedPipe) -> io::Result<bool> {
+    let mut header = [0; protocol::HEADER_LEN];
+    let mut read = 0;
+    let mut available = 0;
+    // SAFETY: the handle belongs to this pipe; the buffer is exactly the header.
+    unsafe {
+        PeekNamedPipe(
+            pipe::handle(pipe.file()?),
+            Some(header.as_mut_ptr().cast()),
+            protocol::HEADER_LEN as u32,
+            Some(&mut read),
+            Some(&mut available),
+            None,
+        )
+    }
+    .map_err(|error| io::Error::from_raw_os_error(error.code().0 & 0xffff))?;
+    if (read as usize) < protocol::HEADER_LEN {
+        return Ok(false);
+    }
+    let len = protocol::payload_len(&header)?;
+    Ok(available as usize >= protocol::HEADER_LEN + len)
+}
+/// Reads a frame already known to be queued. Header and payload share one
+/// deadline, and the decode runs over the in-memory copy.
+fn read_frame_until(pipe: &mut BoundedPipe, deadline: Instant) -> io::Result<Message> {
+    let mut frame = vec![0; protocol::HEADER_LEN];
+    pipe.read_exact_until(&mut frame, deadline)?;
+    let len = protocol::payload_len(&frame)?;
+    frame.resize(protocol::HEADER_LEN + len, 0);
+    pipe.read_exact_until(&mut frame[protocol::HEADER_LEN..], deadline)?;
+    protocol::read(&mut frame.as_slice())
+}
+fn read_message_until(pipe: &mut BoundedPipe, deadline: Instant) -> io::Result<Message> {
+    loop {
+        if frame_queued(pipe)? {
+            return read_frame_until(pipe, deadline);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "helper reply timed out",
+            ));
+        }
+        std::thread::sleep(FRAME_POLL);
+    }
+}
+/// Non-blocking poll: a message is returned only when its whole frame is queued.
+fn poll_message(pipe: &mut BoundedPipe) -> io::Result<Option<Message>> {
+    if !frame_queued(pipe)? {
+        return Ok(None);
+    }
+    read_frame_until(pipe, Instant::now() + MESSAGE_TIMEOUT).map(Some)
 }
 pub fn probe() -> Result<(), LinkError> {
     connect(Role::Probe).map(|_| ())
@@ -226,7 +292,7 @@ impl SecureHelperLink {
         };
         Ok(Self::start(snapshot, Some(file)))
     }
-    fn start(initial: Snapshot, file: Option<File>) -> Self {
+    fn start(initial: Snapshot, file: Option<BoundedPipe>) -> Self {
         let snapshot = Arc::new(Mutex::new(initial));
         let (s, r) = mpsc::sync_channel(32);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -383,7 +449,7 @@ fn background(
     shared: Arc<Mutex<Snapshot>>,
     commands: Receiver<Command>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    initial: Option<File>,
+    initial: Option<BoundedPipe>,
 ) {
     let mut connection = initial;
     let mut mapping = None;
@@ -451,7 +517,7 @@ fn background(
                 if Instant::now() >= poll_at {
                     let region = region.ok_or_else(|| anyhow::anyhow!("no region"))?;
                     region.validate()?;
-                    protocol::write(file, &Message::Poll { region })?;
+                    send_background(file, &Message::Poll { region })?;
                     poll_at = Instant::now() + Duration::from_millis(100);
                 }
                 for _ in 0..8 {
@@ -462,7 +528,7 @@ fn background(
                         Command::Input(r, epoch, first_id) => {
                             for (i, chunk) in r.chunks(256).enumerate() {
                                 let (_, records) = ClientMessage::Inject(chunk.to_vec()).encode();
-                                protocol::write(
+                                send_background(
                                     file,
                                     &Message::Input {
                                         id: first_id + i as u64,
@@ -474,12 +540,12 @@ fn background(
                             }
                         }
                         Command::Deny(epoch, id) => {
-                            protocol::write(file, &Message::DenyConsent { epoch, id })?
+                            send_background(file, &Message::DenyConsent { epoch, id })?
                         }
                     }
                 }
                 for _ in 0..16 {
-                    let Some(m) = pipe::poll(file)? else {
+                    let Some(m) = poll_message(file)? else {
                         break;
                     };
                     last_reply = Instant::now();
@@ -546,7 +612,7 @@ fn background(
                                 .ok_or_else(|| anyhow::anyhow!("missing mapping"))?
                                 .copy(info, last)?;
                             last = seq;
-                            protocol::write(file, &Message::Ack { slot, seq })?;
+                            send_background(file, &Message::Ack { slot, seq })?;
                             let mut s = lock(&shared);
                             if s.state.as_ref().is_some_and(|s| {
                                 s.secure && s.available && s.desktop_epoch == epoch
@@ -732,5 +798,162 @@ mod tests {
             flags: KEYEVENTF_UNICODE
         }]));
         assert!(!safe_probe_records(&[]));
+    }
+
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE},
+            Storage::FileSystem::{WriteFile, PIPE_ACCESS_DUPLEX},
+            System::Pipes::{
+                ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_TYPE_BYTE, PIPE_WAIT,
+            },
+        },
+    };
+
+    /// Test-owned listening pipe. It never reaches the real helper: connect()'s
+    /// trust checks are not run, and nothing here can inject input.
+    struct Server(HANDLE);
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            // SAFETY: owned handle, closed once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn private_pipe(suffix: &str) -> (Server, BoundedPipe) {
+        let name = format!(
+            r"\\.\pipe\BubblePlay.SecureHelper.client-{}-{suffix}",
+            std::process::id()
+        );
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: NUL-terminated name, default security, one private instance.
+        let handle = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(wide.as_ptr()),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                None,
+            )
+        };
+        assert!(!handle.is_invalid());
+        let server = Server(handle);
+        let pipe = BoundedPipe::open(
+            &name,
+            crate::admin_agent::client::PIPE_CLIENT_ACCESS,
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+        )
+        .unwrap();
+        // SAFETY: owned listening instance; the client has already connected.
+        let connected = unsafe { ConnectNamedPipe(server.0, None) };
+        assert!(
+            connected.is_ok() || connected.unwrap_err().code() == ERROR_PIPE_CONNECTED.to_hresult()
+        );
+        (server, pipe)
+    }
+
+    /// Writes raw bytes as the helper would, so a test can send a truncated frame.
+    fn helper_write(server: &Server, bytes: &[u8]) {
+        let mut written = 0;
+        // SAFETY: owned server handle; buffer and count outlive the call.
+        unsafe { WriteFile(server.0, Some(bytes), Some(&mut written), None) }.unwrap();
+        assert_eq!(written as usize, bytes.len());
+    }
+
+    fn welcome(pid: u32) -> Message {
+        Message::Welcome {
+            version: protocol::PROTOCOL_MAX,
+            min: protocol::PROTOCOL_MIN,
+            max: protocol::PROTOCOL_MAX,
+            pid,
+        }
+    }
+
+    #[test]
+    fn handshake_accepts_a_matching_welcome() {
+        let (server, mut pipe) = private_pipe("welcome");
+        helper_write(&server, &protocol::encode(&welcome(4321)).unwrap());
+        handshake(
+            &mut pipe,
+            Role::Host,
+            4321,
+            Instant::now() + HANDSHAKE_TIMEOUT,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn silent_helper_fails_the_handshake_on_its_deadline() {
+        let (_server, mut pipe) = private_pipe("silent");
+        let started = Instant::now();
+        let error = handshake(
+            &mut pipe,
+            Role::Host,
+            4321,
+            started + Duration::from_millis(150),
+        )
+        .unwrap_err();
+        assert_eq!(error, LinkError::Protocol);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn truncated_welcome_fails_the_handshake_on_its_deadline() {
+        let (server, mut pipe) = private_pipe("truncated-handshake");
+        let frame = protocol::encode(&welcome(4321)).unwrap();
+        helper_write(&server, &frame[..protocol::HEADER_LEN + 3]);
+        let started = Instant::now();
+        let error = handshake(
+            &mut pipe,
+            Role::Host,
+            4321,
+            started + Duration::from_millis(150),
+        )
+        .unwrap_err();
+        assert_eq!(error, LinkError::Protocol);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn truncated_frame_stays_queued_until_its_tail_arrives() {
+        let (server, mut pipe) = private_pipe("truncated-poll");
+        let frame = protocol::encode(&welcome(4321)).unwrap();
+        helper_write(&server, &frame[..protocol::HEADER_LEN + 3]);
+        let started = Instant::now();
+        assert_eq!(poll_message(&mut pipe).unwrap(), None);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        helper_write(&server, &frame[protocol::HEADER_LEN + 3..]);
+        assert_eq!(poll_message(&mut pipe).unwrap(), Some(welcome(4321)));
+    }
+
+    #[test]
+    fn peer_that_stops_reading_times_out_writes() {
+        let (_server, mut pipe) = private_pipe("write-block");
+        let message = Message::Mapping {
+            name: "x".repeat(protocol::MAX_PAYLOAD - 64),
+        };
+        let started = Instant::now();
+        let mut error = None;
+        for _ in 0..64 {
+            if let Err(e) = send(
+                &mut pipe,
+                &message,
+                Instant::now() + Duration::from_millis(100),
+            ) {
+                error = Some(e);
+                break;
+            }
+        }
+        let error = error.expect("writes to a peer that never reads must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // A timed-out operation poisons the connection; the caller must reconnect.
+        assert!(pipe.file().is_err());
     }
 }

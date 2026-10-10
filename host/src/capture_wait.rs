@@ -580,6 +580,7 @@ fn run<B: Backend>(backend: Arc<Mutex<B>>, shared: Arc<Shared<B>>) -> Result<(),
         }
         drop(state);
         let result = backend.lock().unwrap().acquire();
+        let mut discarded_frame = None;
         let mut state = shared.state.lock().unwrap();
         match result {
             Ok(None) => {} // bounded blocking retry, only while still armed
@@ -600,7 +601,7 @@ fn run<B: Backend>(backend: Arc<Mutex<B>>, shared: Arc<Shared<B>>) -> Result<(),
                     state.requested = false;
                     shared.activity.notify();
                 } else {
-                    drop(frame);
+                    discarded_frame = Some(frame);
                 }
                 held = Some(lease);
             }
@@ -614,6 +615,10 @@ fn run<B: Backend>(backend: Arc<Mutex<B>>, shared: Arc<Shared<B>>) -> Result<(),
                 shared.activity.notify();
             }
         }
+        drop(state);
+        // Native frame destruction can enter the graphics driver. Keep the
+        // producer's state accessible even if that cleanup stalls.
+        drop(discarded_frame);
     }
 }
 
@@ -900,6 +905,112 @@ mod tests {
         h.waiter.stop().unwrap();
         assert!(h.waiter.poll().unwrap().is_none());
         assert_eq!(h.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn discarded_frame_cleanup_does_not_hold_shared_state() {
+        #[derive(Debug)]
+        struct PausedFrame {
+            started: Sender<()>,
+            resume: Receiver<()>,
+            finished: Arc<AtomicBool>,
+        }
+        impl Drop for PausedFrame {
+            fn drop(&mut self) {
+                let _ = self.started.send(());
+                // Also bound cleanup if the test fails before sending resume.
+                let _ = self.resume.recv_timeout(Duration::from_secs(3));
+                self.finished.store(true, Ordering::SeqCst);
+            }
+        }
+        struct PausedBackend {
+            frames: Receiver<PausedFrame>,
+            acquiring: Sender<()>,
+            releases: Arc<AtomicUsize>,
+        }
+        impl Backend for PausedBackend {
+            type Frame = PausedFrame;
+            fn acquire(&mut self) -> Result<Option<Self::Frame>, CaptureError> {
+                let _ = self.acquiring.send(());
+                Ok(self.frames.recv_timeout(Duration::from_secs(2)).ok())
+            }
+            fn release(&mut self) -> Result<(), CaptureError> {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (frames_tx, frames_rx) = mpsc::channel();
+        let (acquiring_tx, acquiring_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let drop_finished = Arc::new(AtomicBool::new(false));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let mut waiter = Waiter::new(
+            PausedBackend {
+                frames: frames_rx,
+                acquiring: acquiring_tx,
+                releases: releases.clone(),
+            },
+            Activity::new().unwrap(),
+        )
+        .unwrap();
+        let shared = waiter.shared.clone();
+        let (startup_tx, startup_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (locking_tx, locking_rx) = mpsc::channel();
+        let (access_tx, access_rx) = mpsc::channel();
+        let accessor = thread::spawn(move || {
+            let _ = startup_tx.send(());
+            if attempt_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                return;
+            }
+            let _ = locking_tx.send(());
+            let state = shared.state.lock().unwrap();
+            let _ = access_tx.send(!state.enabled && state.response.is_none());
+        });
+        // Exclude accessor thread startup from the lock-availability check.
+        startup_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        waiter.request_frame();
+        acquiring_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.set_enabled(false);
+        frames_tx
+            .send(PausedFrame {
+                started: drop_tx,
+                resume: resume_rx,
+                finished: drop_finished.clone(),
+            })
+            .unwrap();
+        drop_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        attempt_tx.send(()).unwrap();
+        let attempting_lock = locking_rx.recv_timeout(Duration::from_secs(1));
+        let accessible_while_paused = access_rx.recv_timeout(Duration::from_secs(1));
+        let still_paused = !drop_finished.load(Ordering::SeqCst);
+        // Unpause before asserting so the old locking behavior also cleans up.
+        let _ = resume_tx.send(());
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let cleanup = thread::spawn(move || {
+            let access_result = accessor.join();
+            let stop_result = waiter.stop();
+            let _ = cleanup_tx.send((access_result, stop_result));
+        });
+        let (access_result, stop_result) = cleanup_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("discarded frame cleanup deadline");
+        drop(cleanup);
+        access_result.unwrap();
+        stop_result.unwrap();
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        attempting_lock.expect("accessor lock-attempt deadline");
+        assert!(
+            matches!(accessible_while_paused, Ok(true)),
+            "state access while frame cleanup was paused: {accessible_while_paused:?}"
+        );
+        assert!(
+            still_paused,
+            "state access must finish before frame cleanup"
+        );
     }
 
     #[test]

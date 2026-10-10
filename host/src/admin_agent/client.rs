@@ -9,20 +9,20 @@
 
 use std::fs::File;
 use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_PIPE_BUSY, HANDLE};
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
-};
-use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, PeekNamedPipe, WaitNamedPipeW};
+use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
+
+use crate::bounded_pipe::BoundedPipe;
 
 use super::protocol::{
     read_frame, write_client, AgentMessage, ClientMessage, Record, RefuseCode, Role,
-    ENV_ALLOW_DEV_AGENT, ENV_PIPE, HEADER_LEN, MAX_RECORDS_PER_FRAME, PROTOCOL_MAX, PROTOCOL_MIN,
+    ENV_ALLOW_DEV_AGENT, ENV_PIPE, HEADER_LEN, MAGIC, MAX_PAYLOAD, MAX_RECORDS_PER_FRAME,
+    PROTOCOL_MAX, PROTOCOL_MIN,
 };
 use super::trust;
 
@@ -95,7 +95,7 @@ pub struct Handshake {
 }
 
 pub struct Connection {
-    file: File,
+    pipe: BoundedPipe,
     pub handshake: Handshake,
 }
 
@@ -103,32 +103,24 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-fn open_pipe(pipe: &str) -> Result<File, LinkError> {
+fn open_pipe(pipe: &str) -> Result<BoundedPipe, LinkError> {
     let name = wide(pipe);
     let mut waited = false;
     loop {
-        // SAFETY: name is NUL-terminated; the handle is owned by the File below.
-        let opened = unsafe {
-            CreateFileW(
-                PCWSTR(name.as_ptr()),
-                PIPE_CLIENT_ACCESS,
-                FILE_SHARE_NONE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAGS_AND_ATTRIBUTES(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION),
-                None,
-            )
-        };
+        let opened = BoundedPipe::open(
+            pipe,
+            PIPE_CLIENT_ACCESS,
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+        );
         match opened {
-            // SAFETY: CreateFileW returned a valid, owned handle.
-            Ok(handle) => return Ok(unsafe { File::from_raw_handle(handle.0 as _) }),
+            Ok(pipe) => return Ok(pipe),
             // The agent is between accepting one client and listening again.
-            Err(error) if !waited && error.code() == ERROR_PIPE_BUSY.to_hresult() => {
+            Err(error) if !waited && error.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
                 waited = true;
                 // SAFETY: NUL-terminated name.
                 let _ = unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), 1_000) };
             }
-            Err(error) => return Err(LinkError::Unavailable(error.message())),
+            Err(error) => return Err(LinkError::Unavailable(error.to_string())),
         }
     }
 }
@@ -170,77 +162,67 @@ fn verify_server(file: &File, allow_dev: bool) -> Result<(), LinkError> {
     Ok(())
 }
 
-fn available(file: &File) -> io::Result<u32> {
-    let mut available = 0u32;
-    // SAFETY: valid pipe handle; only the byte count is requested.
-    unsafe { PeekNamedPipe(handle(file), None, 0, None, Some(&mut available), None) }
-        .map_err(|error| io::Error::from_raw_os_error(error.code().0 & 0xFFFF))?;
-    Ok(available)
-}
-
-/// Read one agent message, failing at `deadline` instead of blocking.
-fn read_reply(file: &mut File, deadline: Instant) -> io::Result<AgentMessage> {
-    let mut spins = 0u32;
-    loop {
-        let bytes = available(file)? as usize;
-        if bytes >= HEADER_LEN {
-            let mut header = [0u8; HEADER_LEN];
-            let mut peeked = 0u32;
-            // SAFETY: header is writable for its length.
-            unsafe {
-                PeekNamedPipe(
-                    handle(file),
-                    Some(header.as_mut_ptr().cast()),
-                    HEADER_LEN as u32,
-                    Some(&mut peeked),
-                    None,
-                    None,
-                )
-            }
-            .map_err(|error| io::Error::from_raw_os_error(error.code().0 & 0xFFFF))?;
-            let len = u16::from_le_bytes([header[6], header[7]]) as usize;
-            if bytes >= HEADER_LEN + len {
-                let (kind, payload) = read_frame(file)?;
-                return AgentMessage::decode(kind, &payload);
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "admin agent reply timed out",
-            ));
-        }
-        spins += 1;
-        if spins < 200 {
-            std::thread::yield_now();
-        } else {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+/// Read a whole frame under the same deadline as its corresponding write.
+fn read_reply(pipe: &mut BoundedPipe, deadline: Instant) -> io::Result<AgentMessage> {
+    let mut header = [0; HEADER_LEN];
+    pipe.read_exact_until(&mut header, deadline)?;
+    if header[..4] != MAGIC || header[5] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid admin agent frame header",
+        ));
     }
+    let len = u16::from_le_bytes([header[6], header[7]]) as usize;
+    if len > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "admin agent payload exceeds limit",
+        ));
+    }
+    let mut frame = Vec::from(header);
+    frame.resize(HEADER_LEN + len, 0);
+    pipe.read_exact_until(&mut frame[HEADER_LEN..], deadline)?;
+    let (kind, payload) = read_frame(&mut frame.as_slice())?;
+    AgentMessage::decode(kind, &payload)
 }
 
+fn send_message(
+    pipe: &mut BoundedPipe,
+    message: &ClientMessage,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut frame = Vec::new();
+    write_client(&mut frame, message)?;
+    pipe.write_all_until(&frame, deadline)
+}
 impl Connection {
     /// Connect, verify the server and perform the versioned hello.
     pub fn open(pipe: &str, allow_dev: bool, role: Role) -> Result<Self, LinkError> {
-        let mut file = open_pipe(pipe)?;
-        verify_server(&file, allow_dev)?;
-        write_client(
-            &mut file,
+        let mut pipe = open_pipe(pipe)?;
+        verify_server(
+            pipe.file()
+                .map_err(|error| LinkError::Failed(error.to_string()))?,
+            allow_dev,
+        )?;
+        let deadline = Instant::now() + HELLO_TIMEOUT;
+        send_message(
+            &mut pipe,
             &ClientMessage::Hello {
                 min: PROTOCOL_MIN,
                 max: PROTOCOL_MAX,
                 role,
             },
+            deadline,
         )
         .map_err(|error| LinkError::Failed(format!("hello: {error}")))?;
-        match read_reply(&mut file, Instant::now() + HELLO_TIMEOUT) {
+        match read_reply(&mut pipe, deadline) {
             Ok(AgentMessage::Welcome {
                 version,
                 agent_pid,
                 elevated,
                 ..
             }) if (PROTOCOL_MIN..=PROTOCOL_MAX).contains(&version) => Ok(Self {
-                file,
+                pipe,
                 handshake: Handshake {
                     version,
                     agent_pid,
@@ -262,12 +244,16 @@ impl Connection {
         }
     }
 
-    fn send_frame(&mut self, records: &[Record]) -> io::Result<()> {
-        write_client(&mut self.file, &ClientMessage::Inject(records.to_vec()))
+    fn send_frame(&mut self, records: &[Record], deadline: Instant) -> io::Result<()> {
+        send_message(
+            &mut self.pipe,
+            &ClientMessage::Inject(records.to_vec()),
+            deadline,
+        )
     }
 
-    fn receipt(&mut self) -> io::Result<AgentMessage> {
-        read_reply(&mut self.file, Instant::now() + INJECT_TIMEOUT)
+    fn receipt(&mut self, deadline: Instant) -> io::Result<AgentMessage> {
+        read_reply(&mut self.pipe, deadline)
     }
 }
 
@@ -341,7 +327,7 @@ impl AdminAgentLink {
         self.allow_dev
     }
 
-    fn fail(&mut self, error: LinkError, now: Instant) {
+    fn fail(&mut self, error: LinkError) {
         let was_connected = matches!(self.state, LinkState::Connected(_));
         let changed = match &self.state {
             LinkState::Fallback(previous) => {
@@ -361,7 +347,8 @@ impl AdminAgentLink {
             }
         }
         self.connection = None;
-        self.retry_at = Some(now + retry_delay(&error));
+        // A slow failed hello must still leave a full backoff interval.
+        self.retry_at = Some(Instant::now() + retry_delay(&error));
         self.state = LinkState::Fallback(error);
     }
 
@@ -388,7 +375,7 @@ impl AdminAgentLink {
                 true
             }
             Err(error) => {
-                self.fail(error, now);
+                self.fail(error);
                 false
             }
         }
@@ -407,15 +394,16 @@ impl AdminAgentLink {
             return None;
         }
         let mut applied_total = 0u32;
-        for (index, chunk) in records.chunks(MAX_RECORDS_PER_FRAME).enumerate() {
+        let deadline = Instant::now() + INJECT_TIMEOUT;
+        for chunk in records.chunks(MAX_RECORDS_PER_FRAME) {
             let connection = self.connection.as_mut()?;
-            if let Err(error) = connection.send_frame(chunk) {
-                // The agent went away before receiving this frame: nothing of
-                // the first frame was applied, so the caller injects locally.
-                self.fail(LinkError::Unavailable(error.to_string()), now);
-                return (index > 0).then_some((applied_total, ERROR_AGENT_LOST));
+            if let Err(error) = connection.send_frame(chunk, deadline) {
+                // A failed/cancelled write may already have delivered bytes.
+                // The receipt is unknown: never repeat this input locally.
+                self.fail(LinkError::Failed(error.to_string()));
+                return Some((applied_total, ERROR_AGENT_LOST));
             }
-            let reply = connection.receipt();
+            let reply = connection.receipt(deadline);
             match reply {
                 Ok(AgentMessage::Injected {
                     requested,
@@ -433,14 +421,11 @@ impl AdminAgentLink {
                 }) => return Some((applied_total, ERROR_AGENT_RATE_LIMITED)),
                 // The frame may have been applied: never repeat it locally.
                 Ok(other) => {
-                    self.fail(
-                        LinkError::Failed(format!("unexpected reply {other:?}")),
-                        now,
-                    );
+                    self.fail(LinkError::Failed(format!("unexpected reply {other:?}")));
                     return Some((applied_total, ERROR_AGENT_LOST));
                 }
                 Err(error) => {
-                    self.fail(LinkError::Failed(error.to_string()), now);
+                    self.fail(LinkError::Failed(error.to_string()));
                     return Some((applied_total, ERROR_AGENT_LOST));
                 }
             }
@@ -462,6 +447,168 @@ pub fn is_agent_image(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_connection(pipe: BoundedPipe) -> Connection {
+        Connection {
+            pipe,
+            handshake: Handshake {
+                version: PROTOCOL_MAX,
+                agent_pid: std::process::id(),
+                elevated: false,
+            },
+        }
+    }
+
+    fn move_one() -> Record {
+        Record::Mouse {
+            dx: 1,
+            dy: 0,
+            data: 0,
+            flags: super::super::protocol::MOUSEEVENTF_MOVE,
+        }
+    }
+
+    #[test]
+    #[ignore = "negative control waits for the legacy path's finite peer watchdog"]
+    fn legacy_synchronous_client_write_exceeds_the_deadline() {
+        use std::os::windows::io::FromRawHandle;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
+        };
+        let name = format!(
+            r"\\.\pipe\BubblePlay.AdminAgent.legacy-control-{}",
+            std::process::id()
+        );
+        let server = test_server::listen(&name);
+        let wide_name = wide(&name);
+        // SAFETY: isolated local test fixture, reproducing the old synchronous flags.
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide_name.as_ptr()),
+                PIPE_CLIENT_ACCESS,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION),
+                None,
+            )
+        }
+        .unwrap();
+        // SAFETY: newly-created uniquely-owned client handle.
+        let mut file = unsafe { File::from_raw_handle(handle.0 as _) };
+        let peer = test_server::hold(server, &[]);
+        let started = Instant::now();
+        let _ = write_client(
+            &mut file,
+            &ClientMessage::Inject(vec![move_one(); MAX_RECORDS_PER_FRAME]),
+        );
+        let elapsed = started.elapsed();
+        drop(peer);
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "negative control did not stall: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "watchdog cleanup was not finite: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn stalled_agent_write_has_a_deadline_even_when_the_pipe_is_full() {
+        let (pipe, peer) = test_server::peer("full", &[]);
+        let mut connection = test_connection(pipe);
+        let started = Instant::now();
+        let error = connection
+            .send_frame(
+                &vec![move_one(); MAX_RECORDS_PER_FRAME],
+                started + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        drop(peer); // releases the peer within a finite watchdog even on failure
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "blocked for {elapsed:?}"
+        );
+        assert!(
+            connection.pipe.file().is_err(),
+            "timed out pipe must be unusable"
+        );
+    }
+
+    #[test]
+    fn stalled_agent_reply_has_a_deadline_without_flushing_the_write() {
+        let (mut pipe, peer) = test_server::peer("silent", &[]);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        send_message(
+            &mut pipe,
+            &ClientMessage::Hello {
+                min: PROTOCOL_MIN,
+                max: PROTOCOL_MAX,
+                role: Role::Host,
+            },
+            deadline,
+        )
+        .unwrap();
+        let error = read_reply(&mut pipe, deadline).unwrap_err();
+        let elapsed = started.elapsed();
+        drop(peer);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "blocked for {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn partial_reply_uses_the_original_deadline() {
+        let mut reply = Vec::new();
+        super::super::protocol::write_agent(
+            &mut reply,
+            &AgentMessage::Injected {
+                requested: 1,
+                applied: 1,
+                error: 0,
+            },
+        )
+        .unwrap();
+        let (mut pipe, peer) = test_server::peer("partial", &reply[..HEADER_LEN + 1]);
+        let started = Instant::now();
+        let error = read_reply(&mut pipe, started + Duration::from_millis(100)).unwrap_err();
+        let elapsed = started.elapsed();
+        drop(peer);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "blocked for {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_first_write_never_falls_back_to_local_input() {
+        let (pipe, peer) = test_server::peer("no-retry", &[]);
+        let mut link = AdminAgentLink::new("unused", true);
+        link.connection = Some(test_connection(pipe));
+        link.state = LinkState::Connected(link.connection.as_ref().unwrap().handshake);
+        let started = Instant::now();
+        let result = link.inject(&vec![move_one(); MAX_RECORDS_PER_FRAME]);
+        let elapsed = started.elapsed();
+        drop(peer);
+        assert_eq!(result, Some((0, ERROR_AGENT_LOST)));
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "blocked for {elapsed:?}"
+        );
+        assert!(matches!(
+            link.state(),
+            LinkState::Fallback(LinkError::Failed(_))
+        ));
+        assert_eq!(link.inject(&[move_one()]), None);
+        assert_eq!(link.attempts(), 0, "failed connection must back off");
+    }
 
     #[test]
     fn missing_agent_falls_back_and_backs_off() {
@@ -485,6 +632,26 @@ mod tests {
         // Within the retry delay no further connection is attempted.
         assert_eq!(link.inject(&[move_one]), None);
         assert_eq!(link.attempts(), 1);
+    }
+
+    #[test]
+    fn slow_failed_attempt_gets_a_full_backoff_after_completion() {
+        let pipe = format!(
+            r"\\.\pipe\BubblePlay.AdminAgent.unit-slow-missing-{}",
+            std::process::id()
+        );
+        let mut link = AdminAgentLink::new(pipe, true);
+        let completed_after = Instant::now();
+        // Advance the attempt's start time without a multi-second sleep.
+        let started = completed_after - Duration::from_secs(3);
+        assert!(!link.ensure_connected(started));
+        assert!(link.retry_at.unwrap() >= completed_after + Duration::from_secs(2));
+        assert!(!link.ensure_connected(Instant::now()));
+        assert_eq!(
+            link.attempts(),
+            1,
+            "queued input must respect the new backoff"
+        );
     }
 
     #[test]
@@ -545,6 +712,11 @@ mod tests {
     }
 
     mod test_server {
+        use super::*;
+        use std::io::Write;
+        use std::os::windows::io::FromRawHandle;
+        use std::sync::mpsc;
+        use std::thread;
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
@@ -554,6 +726,59 @@ mod tests {
         };
 
         pub struct Server(HANDLE);
+
+        /// Worker performs no blocking reads/flushes. Its finite watchdog
+        /// releases a synchronous pre-fix client instead of hanging the suite.
+        pub struct Peer {
+            release: mpsc::Sender<()>,
+            worker: Option<thread::JoinHandle<()>>,
+        }
+
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                let _ = self.release.send(());
+                if let Some(worker) = self.worker.take() {
+                    worker.join().unwrap();
+                }
+            }
+        }
+
+        pub fn peer(suffix: &str, reply_prefix: &[u8]) -> (BoundedPipe, Peer) {
+            let name = format!(
+                r"\\.\pipe\BubblePlay.AdminAgent.bounded-{}-{suffix}",
+                std::process::id()
+            );
+            let server = listen(&name);
+            let pipe = open_pipe(&name).unwrap();
+            let peer = hold(server, reply_prefix);
+            (pipe, peer)
+        }
+
+        pub fn hold(server: Server, reply_prefix: &[u8]) -> Peer {
+            // SAFETY: server's owned, listening pipe. Client already opened it.
+            let connected =
+                unsafe { windows::Win32::System::Pipes::ConnectNamedPipe(server.0, None) };
+            assert!(
+                connected.is_ok()
+                    || connected.unwrap_err().code()
+                        == windows::Win32::Foundation::ERROR_PIPE_CONNECTED.to_hresult()
+            );
+            // SAFETY: move unique server handle into File, suppressing Server's Drop.
+            let mut file = unsafe { File::from_raw_handle(server.0 .0 as _) };
+            std::mem::forget(server);
+            if !reply_prefix.is_empty() {
+                file.write_all(reply_prefix).unwrap();
+            }
+            let (release, wait) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let _ = wait.recv_timeout(Duration::from_millis(1100));
+                drop(file);
+            });
+            Peer {
+                release,
+                worker: Some(worker),
+            }
+        }
 
         impl Drop for Server {
             fn drop(&mut self) {

@@ -5,6 +5,7 @@ pub mod admin_mode;
 pub mod agent_client;
 pub mod agent_runtime;
 pub mod benchmark;
+pub(crate) mod bounded_pipe;
 pub mod browser_approval;
 pub mod capture;
 pub mod capture_wait;

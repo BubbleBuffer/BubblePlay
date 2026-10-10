@@ -26,6 +26,87 @@ use std::ptr;
 
 use anyhow::{bail, ensure, Context, Result};
 use nvidia_video_codec_sdk::safe::ENCODE_API;
+// NVENC's synchronous API has no deadline argument. Observe its actual call
+// boundary from the session watchdog without changing device/resource ownership.
+static NATIVE_OBSERVER_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static NATIVE_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub struct NativeCallObserver(u32);
+
+impl NativeCallObserver {
+    pub fn attach() -> Option<Self> {
+        let thread = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        NATIVE_OBSERVER_THREAD
+            .compare_exchange(
+                0,
+                thread,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| Self(thread))
+    }
+}
+
+impl Drop for NativeCallObserver {
+    fn drop(&mut self) {
+        if NATIVE_OBSERVER_THREAD
+            .compare_exchange(
+                self.0,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            NATIVE_CALL.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+pub fn active_native_call() -> Option<(&'static str, u32)> {
+    let value = NATIVE_CALL.load(std::sync::atomic::Ordering::Acquire);
+    let name = match value as u8 {
+        1 => "NvEncReconfigureEncoder",
+        2 => "NvEncRegisterResource",
+        3 => "NvEncMapInputResource",
+        4 => "NvEncEncodePicture",
+        5 => "NvEncLockBitstream",
+        6 => "NvEncUnlockBitstream",
+        7 => "NvEncUnmapInputResource",
+        8 => "NvEncUnregisterResource",
+        9 => "NvEncDestroyEncoder",
+        10 => "NvEncInitializeEncoder",
+        11 => "NvEncOpenEncodeSessionEx",
+        12 => "NvEncCreateBitstreamBuffer",
+        13 => "NvEncDestroyBitstreamBuffer",
+        _ => return None,
+    };
+    Some((name, (value >> 8) as u32))
+}
+
+fn observe_native_call<T>(id: u8, line: u32, call: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering;
+    let owner = NATIVE_OBSERVER_THREAD.load(Ordering::Acquire);
+    if owner == 0 || owner != unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } {
+        return call();
+    }
+    struct Guard(u64);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            NATIVE_CALL.store(self.0, Ordering::Release);
+        }
+    }
+    let _guard = Guard(NATIVE_CALL.swap((u64::from(line) << 8) | u64::from(id), Ordering::AcqRel));
+    call()
+}
+
+macro_rules! native_call {
+    ($id:expr, $call:expr) => {
+        observe_native_call($id, line!(), || $call)
+    };
+}
+
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     GUID, NVENCAPI_VERSION, NV_ENC_BUFFER_FORMAT, NV_ENC_BUFFER_USAGE, NV_ENC_CAPS,
     NV_ENC_CAPS_PARAM, NV_ENC_CAPS_PARAM_VER, NV_ENC_CONFIG, NV_ENC_CONFIG_VER,
@@ -1340,7 +1421,12 @@ impl Nvenc {
         session_params.device = device;
         session_params.apiVersion = NVENCAPI_VERSION;
         let mut session: *mut c_void = ptr::null_mut();
-        let st = unsafe { (ENCODE_API.open_encode_session_ex)(&mut session_params, &mut session) };
+        let st = unsafe {
+            native_call!(
+                11,
+                (ENCODE_API.open_encode_session_ex)(&mut session_params, &mut session)
+            )
+        };
         st.result_without_string()
             .context("NvEncOpenEncodeSessionEx")?;
         info!("NVENC session opened on capture D3D11 device");
@@ -1426,7 +1512,8 @@ impl Nvenc {
         init.encodeConfig = cfg.as_mut();
         init.tuningInfo = options.tuning.native();
         init.bufferFormat = input_buffer_format(options);
-        let st = unsafe { (ENCODE_API.initialize_encoder)(session, init.as_mut()) };
+        let st =
+            unsafe { native_call!(10, (ENCODE_API.initialize_encoder)(session, init.as_mut())) };
         if let Err(error) = st.result_without_string() {
             let driver_detail = unsafe { (ENCODE_API.get_last_error_string)(session) };
             let driver_detail = (!driver_detail.is_null())
@@ -1448,7 +1535,12 @@ impl Nvenc {
         // 4. Bitstream output buffer.
         let mut bs_params: NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe { zeroed() };
         bs_params.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-        let st = unsafe { (ENCODE_API.create_bitstream_buffer)(session, &mut bs_params) };
+        let st = unsafe {
+            native_call!(
+                12,
+                (ENCODE_API.create_bitstream_buffer)(session, &mut bs_params)
+            )
+        };
         st.result_without_string()
             .context("NvEncCreateBitstreamBuffer")?;
 
@@ -1520,7 +1612,12 @@ impl Nvenc {
         let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
         reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
         reconf.reInitEncodeParams = init;
-        let st = unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) };
+        let st = unsafe {
+            native_call!(
+                1,
+                (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf)
+            )
+        };
         match st.result_without_string() {
             Ok(()) => {
                 *self.cfg = cfg;
@@ -1570,7 +1667,12 @@ impl Nvenc {
         let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
         reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
         reconf.reInitEncodeParams = init;
-        let st = unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) };
+        let st = unsafe {
+            native_call!(
+                1,
+                (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf)
+            )
+        };
         match st.result_without_string() {
             Ok(()) => {
                 *self.cfg = cfg;
@@ -1602,9 +1704,14 @@ impl Nvenc {
         reconf.reInitEncodeParams = init;
         reconf.set_resetEncoder(1);
         reconf.set_forceIDR(1);
-        unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) }
-            .result_without_string()
-            .context("NvEncReconfigureEncoder rate-control reset")?;
+        unsafe {
+            native_call!(
+                1,
+                (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf)
+            )
+        }
+        .result_without_string()
+        .context("NvEncReconfigureEncoder rate-control reset")?;
         *self.cfg = cfg;
         *self.init_params = init;
         self.init_params.encodeConfig = self.cfg.as_mut();
@@ -1639,9 +1746,14 @@ impl Nvenc {
         reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
         reconf.reInitEncodeParams = init;
         reconf.set_resetEncoder(1);
-        unsafe { (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf) }
-            .result_without_string()
-            .context("NvEncReconfigureEncoder profile")?;
+        unsafe {
+            native_call!(
+                1,
+                (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf)
+            )
+        }
+        .result_without_string()
+        .context("NvEncReconfigureEncoder profile")?;
         *self.cfg = cfg;
         *self.init_params = init;
         self.init_params.encodeConfig = self.cfg.as_mut();
@@ -1744,7 +1856,8 @@ impl Nvenc {
         // header); the registered handle belongs in `registeredResource`.
         map.registeredResource = registered;
         let map_started = std::time::Instant::now();
-        let st = unsafe { (ENCODE_API.map_input_resource)(self.session, &mut map) };
+        let st =
+            unsafe { native_call!(3, (ENCODE_API.map_input_resource)(self.session, &mut map)) };
         stage_timings.map_us = map_started.elapsed().as_micros() as u64;
         if let Err(e) = st.result_without_string().context("NvEncMapInputResource") {
             if per_frame_registration {
@@ -1821,7 +1934,7 @@ impl Nvenc {
             None
         };
         let submit_started = std::time::Instant::now();
-        let st = unsafe { (ENCODE_API.encode_picture)(self.session, &mut pic) };
+        let st = unsafe { native_call!(4, (ENCODE_API.encode_picture)(self.session, &mut pic)) };
         stage_timings.submit_us = submit_started.elapsed().as_micros() as u64;
         let res = st.result_without_string().context("NvEncEncodePicture");
         if let Err(e) = res {
@@ -1839,7 +1952,7 @@ impl Nvenc {
         lock.version = NV_ENC_LOCK_BITSTREAM_VER;
         lock.outputBitstream = self.bitstream;
         let lock_started = std::time::Instant::now();
-        let st = unsafe { (ENCODE_API.lock_bitstream)(self.session, &mut lock) };
+        let st = unsafe { native_call!(5, (ENCODE_API.lock_bitstream)(self.session, &mut lock)) };
         let locked = st.result_without_string().context("NvEncLockBitstream");
         stage_timings.lock_us = lock_started.elapsed().as_micros() as u64;
 
@@ -1856,7 +1969,12 @@ impl Nvenc {
                 );
             }
             stage_timings.copy_us = copy_started.elapsed().as_micros() as u64;
-            let st = unsafe { (ENCODE_API.unlock_bitstream)(self.session, self.bitstream) };
+            let st = unsafe {
+                native_call!(
+                    6,
+                    (ENCODE_API.unlock_bitstream)(self.session, self.bitstream)
+                )
+            };
             if let Err(e) = st.result_without_string() {
                 warn!(?e, "unlock_bitstream");
             }
@@ -1929,7 +2047,7 @@ impl Nvenc {
         reg.pitch = 0;
         reg.resourceToRegister = texture;
         reg.bufferFormat = input_buffer_format(self.options);
-        let st = unsafe { (ENCODE_API.register_resource)(self.session, &mut reg) };
+        let st = unsafe { native_call!(2, (ENCODE_API.register_resource)(self.session, &mut reg)) };
         let result = st.result_without_string().context("NvEncRegisterResource");
         timings.register_calls = timings.register_calls.saturating_add(1);
         timings.register_us = timings
@@ -1960,7 +2078,8 @@ impl Nvenc {
             reg.resourceToRegister = texture;
             reg.bufferFormat = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12;
             reg.bufferUsage = NV_ENC_BUFFER_USAGE::NV_ENC_OUTPUT_RECON;
-            let st = unsafe { (ENCODE_API.register_resource)(self.session, &mut reg) };
+            let st =
+                unsafe { native_call!(2, (ENCODE_API.register_resource)(self.session, &mut reg)) };
             st.result_without_string()
                 .context("NvEncRegisterResource(reconstruction output)")?;
             self.persistent_recon_outputs.push(PersistentReconOutput {
@@ -1973,7 +2092,8 @@ impl Nvenc {
         let mut map: NV_ENC_MAP_INPUT_RESOURCE = unsafe { zeroed() };
         map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
         map.registeredResource = registered;
-        let st = unsafe { (ENCODE_API.map_input_resource)(self.session, &mut map) };
+        let st =
+            unsafe { native_call!(3, (ENCODE_API.map_input_resource)(self.session, &mut map)) };
         st.result_without_string()
             .context("NvEncMapInputResource(reconstruction output)")?;
         self.last_recon_mapped = Some(map.mappedResource);
@@ -1985,7 +2105,12 @@ impl Nvenc {
             return;
         }
         let started = std::time::Instant::now();
-        let st = unsafe { (ENCODE_API.unregister_resource)(self.session, registered) };
+        let st = unsafe {
+            native_call!(
+                8,
+                (ENCODE_API.unregister_resource)(self.session, registered)
+            )
+        };
         timings.unregister_calls = timings.unregister_calls.saturating_add(1);
         timings.unregister_us = timings
             .unregister_us
@@ -2003,7 +2128,12 @@ impl Nvenc {
 
     fn unregister_recon_outputs(&mut self) {
         for output in self.persistent_recon_outputs.drain(..) {
-            let st = unsafe { (ENCODE_API.unregister_resource)(self.session, output.registered) };
+            let st = unsafe {
+                native_call!(
+                    8,
+                    (ENCODE_API.unregister_resource)(self.session, output.registered)
+                )
+            };
             if let Err(error) = st.result_without_string() {
                 debug!(?error, "unregister reconstruction output");
             }
@@ -2012,7 +2142,8 @@ impl Nvenc {
 
     fn unmap_recon_output(&mut self) {
         if let Some(mapped) = self.last_recon_mapped.take() {
-            let st = unsafe { (ENCODE_API.unmap_input_resource)(self.session, mapped) };
+            let st =
+                unsafe { native_call!(7, (ENCODE_API.unmap_input_resource)(self.session, mapped)) };
             if let Err(error) = st.result_without_string() {
                 debug!(?error, "unmap reconstruction output");
             }
@@ -2022,7 +2153,8 @@ impl Nvenc {
     fn unmap_current(&mut self) -> u64 {
         let started = std::time::Instant::now();
         if let Some(mapped) = self.last_mapped.take() {
-            let st = unsafe { (ENCODE_API.unmap_input_resource)(self.session, mapped) };
+            let st =
+                unsafe { native_call!(7, (ENCODE_API.unmap_input_resource)(self.session, mapped)) };
             if let Err(e) = st.result_without_string() {
                 debug!(?e, "unmap_input_resource");
             }
@@ -2063,12 +2195,45 @@ impl Drop for Nvenc {
         self.unregister_persistent_input(&mut timings);
         self.unregister_recon_outputs();
         if !self.bitstream.is_null() {
-            let _ = unsafe { (ENCODE_API.destroy_bitstream_buffer)(self.session, self.bitstream) };
+            let _ = unsafe {
+                native_call!(
+                    13,
+                    (ENCODE_API.destroy_bitstream_buffer)(self.session, self.bitstream)
+                )
+            };
             self.bitstream = ptr::null_mut();
         }
         if !self.session.is_null() {
-            let _ = unsafe { (ENCODE_API.destroy_encoder)(self.session) };
+            let _ = unsafe { native_call!(9, (ENCODE_API.destroy_encoder)(self.session)) };
             self.session = ptr::null_mut();
         }
+    }
+}
+
+#[cfg(test)]
+mod native_call_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn a_blocked_reconfigure_boundary_can_be_observed_from_another_thread() {
+        let (ready, observed) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let _observer = NativeCallObserver::attach().unwrap();
+            observe_native_call(1, 1523, || {
+                ready.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(2)).unwrap();
+            });
+            assert_eq!(active_native_call(), None);
+        });
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            active_native_call(),
+            Some(("NvEncReconfigureEncoder", 1523))
+        );
+        release.send(()).unwrap();
+        caller.join().unwrap();
     }
 }
