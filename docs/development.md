@@ -78,6 +78,7 @@ Use Node 22 or newer and stable Rust for Windows MSVC. Install Visual Studio C++
 build tools and the NVIDIA Video Codec SDK, or generate local import libraries
 with `host/scripts/make-nvenc-stubs.ps1` (requires the NVIDIA driver and lib.exe).
 Set `NVIDIA_VIDEO_CODEC_SDK_PATH` to a real SDK to override `host/sdk-stub`.
+Keep the trailing `/` on `sdk-stub/` in `host/.cargo/config.toml`: without it rust-lld drops `/OUT` and writes `*.rcgu.o.rcgu.exe` files into `host/`.
 Run `cargo fetch --locked --manifest-path host/Cargo.toml` and install the locked
 Worker dependencies with `npm --prefix worker ci` once during setup.
 

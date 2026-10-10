@@ -1,8 +1,11 @@
 # Where build.rs / nvidia-video-codec-sdk's build script find nvEncodeAPI.lib + nvcuvid.lib.
 # A real Video Codec SDK install (env override) takes precedence; the generated stubs below
 # are produced from the driver DLLs by scripts/make-nvenc-stubs.ps1 (one-time per machine).
+# The trailing "/" matters: without it the crate's link-search path ends in "\", and rustc
+# writes it into the response file as "...\sdk-stub\"; rust-lld reads that \" as an escaped
+# quote, swallows the following args, and drops /OUT (exes come out as *.rcgu.o.rcgu.exe).
 [env]
-NVIDIA_VIDEO_CODEC_SDK_PATH = { value = "sdk-stub", relative = true }
+NVIDIA_VIDEO_CODEC_SDK_PATH = { value = "sdk-stub/", relative = true }
 
 # aws-lc-sys (via str0m/dimpl) emits cc's ATL-MFC lib dir, "C:\Program Files\...\atlmfc\lib\x64",
 # as an unquoted -L/LIBPATH; rust-lld splits it at the spaces. This flag makes aws-lc-sys link
