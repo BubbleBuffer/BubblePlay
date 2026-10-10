@@ -1,6 +1,8 @@
 use crate::encode::{EncodedFrame, EncoderOptions, Nvenc, Preset, ResourceMode, VideoCodec};
 use crate::frame_damage::DamageRect;
+use crate::gpu_gate::{self, GpuGate};
 use anyhow::{bail, ensure, Context, Result};
+use std::sync::Arc;
 use std::time::Instant;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
@@ -24,14 +26,20 @@ pub struct HevcTileEncoded {
 }
 
 pub struct HevcTileEncoder {
+    // Rust drops fields in declaration order. Unregister the persistent
+    // input before releasing its texture or the device/context references.
+    encoder: Nvenc,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
+    // Same gate as the NVENC session below, so the tile copy and NVENC never overlap.
+    gate: Arc<GpuGate>,
     texture: ID3D11Texture2D,
-    encoder: Nvenc,
 }
 
 impl HevcTileEncoder {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
+        let gate = gpu_gate::for_device(device);
+        let gpu = gate.lock();
         let context =
             unsafe { device.GetImmediateContext() }.context("HEVC tile GetImmediateContext")?;
         let desc = D3D11_TEXTURE2D_DESC {
@@ -56,6 +64,8 @@ impl HevcTileEncoder {
         let mut options = EncoderOptions::production(Preset::P3);
         options.gop_seconds = 1;
         options.resource_mode = ResourceMode::Persistent;
+        // NVENC open takes the same gate itself; release ours first.
+        drop(gpu);
         let encoder = Nvenc::new_with_options_native_codec(
             device.as_raw(),
             HEVC_TILE_DIMENSION,
@@ -71,6 +81,7 @@ impl HevcTileEncoder {
         Ok(Self {
             device: device.clone(),
             context,
+            gate,
             texture,
             encoder,
         })
@@ -106,17 +117,20 @@ impl HevcTileEncoder {
             back: 1,
         };
         let copy_started = Instant::now();
-        unsafe {
-            self.context.CopySubresourceRegion(
-                &self.texture,
-                0,
-                0,
-                0,
-                0,
-                source,
-                0,
-                Some(&source_box),
-            );
+        {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    &self.texture,
+                    0,
+                    0,
+                    0,
+                    0,
+                    source,
+                    0,
+                    Some(&source_box),
+                );
+            }
         }
         let copy_us = copy_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         self.encoder.force_idr();

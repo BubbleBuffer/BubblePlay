@@ -21,8 +21,11 @@ use windows::Win32::Graphics::Dxgi::{
 use windows_capture::dxgi_duplication_api::Error as CaptureError;
 
 use crate::activity::Activity;
+use crate::gpu_gate::{self, GpuGate};
 
-const ACQUIRE_TIMEOUT_MS: u32 = 100;
+// Held under the device gate for at most this long. The worker retries
+// timeouts outside the gate while the request stays armed.
+const ACQUIRE_TIMEOUT_MS: u32 = 16;
 
 /// A notification-only observer survives cursor-hook parking. It never
 /// acquires a DDA frame, samples pixels, or polls a healthy output.
@@ -266,8 +269,27 @@ trait Backend: Send + 'static {
 }
 
 struct NativeBackend {
-    duplication: IDXGIOutputDuplication,
+    duplication: Option<IDXGIOutputDuplication>,
     device: ID3D11Device,
+    gate: Arc<GpuGate>,
+}
+
+impl NativeBackend {
+    fn duplication(&self) -> &IDXGIOutputDuplication {
+        self.duplication.as_ref().expect("live duplication backend")
+    }
+}
+
+impl Drop for NativeBackend {
+    fn drop(&mut self) {
+        // A retained raw frame can outlive a failed waiter stop and the
+        // original capture API. Its final lease then owns the last backend
+        // reference, so this may be the final native duplication release.
+        // Backend ownership is already exclusive here; never acquire a
+        // backend lock while holding the device gate.
+        let _gpu = self.gate.lock();
+        drop(self.duplication.take());
+    }
 }
 
 struct NativeFrame {
@@ -300,10 +322,14 @@ impl Backend for NativeBackend {
         }
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource = None;
-        match unsafe {
-            self.duplication
-                .AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &mut info, &mut resource)
-        } {
+        let acquired = {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.duplication()
+                    .AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &mut info, &mut resource)
+            }
+        };
+        match acquired {
             Ok(()) => {}
             Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
             Err(error) => return Err(windows_error(error)),
@@ -325,14 +351,17 @@ impl Backend for NativeBackend {
         Ok(Some(NativeFrame {
             texture,
             device: self.device.clone(),
-            duplication: self.duplication.clone(),
+            duplication: self.duplication().clone(),
             info,
             desc,
         }))
     }
 
     fn release(&mut self) -> Result<(), CaptureError> {
-        unsafe { self.duplication.ReleaseFrame() }.map_err(windows_error)
+        // acquire() calls this only after its own gate guard has been dropped,
+        // so the gate is never re-entered.
+        let _gpu = self.gate.lock();
+        unsafe { self.duplication().ReleaseFrame() }.map_err(windows_error)
     }
 }
 
@@ -661,10 +690,12 @@ impl DdaWaiter {
         device: ID3D11Device,
         activity: Activity,
     ) -> Result<Self, CaptureError> {
+        let gate = gpu_gate::for_device(&device);
         Waiter::new(
             NativeBackend {
-                duplication,
+                duplication: Some(duplication),
                 device,
+                gate,
             },
             activity,
         )

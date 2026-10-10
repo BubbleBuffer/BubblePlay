@@ -23,9 +23,12 @@
 
 use std::ffi::{c_void, CStr};
 use std::ptr;
+use std::sync::Arc;
 
 use anyhow::{bail, ensure, Context, Result};
 use nvidia_video_codec_sdk::safe::ENCODE_API;
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 // NVENC's synchronous API has no deadline argument. Observe its actual call
 // boundary from the session watchdog without changing device/resource ownership.
 static NATIVE_OBSERVER_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -122,10 +125,12 @@ use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
 };
 use tracing::{debug, info, warn};
 
+use crate::encoder_reconfigure::{EncoderSettings, PendingReconfigure};
 use crate::frame_damage::{
     analyze_hevc_qp_delta_map, analyze_hevc_text_edge_qp_delta_map, DamageRect, HevcQpDeltaMap,
     HevcQpMapDecision, QpMapRejectReason,
 };
+use crate::gpu_gate::{self, GpuGate};
 
 #[cfg(test)]
 mod codec_policy_tests {
@@ -1202,13 +1207,19 @@ fn apply_initialization_options(init: &mut NV_ENC_INITIALIZE_PARAMS, options: En
 pub struct Nvenc {
     session: *mut c_void,
     device: *mut c_void,
+    /// Holds the device alive until `Drop` has destroyed the session; the raw
+    /// `device` pointer alone does not keep it alive. Field drop runs after
+    /// the `Drop` body, so native session cleanup finishes before release.
+    _device_ref: ID3D11Device,
+    /// Same lock as the capture thread for this device. Every NVENC call
+    /// takes it at its public entry point; private helpers assume it is held.
+    gate: Arc<GpuGate>,
     bitstream: *mut c_void,
     width: u32,
     height: u32,
-    fps: u32,
     max_width: u32,
     max_height: u32,
-    bitrate_bps: u32,
+    pending_reconfigure: PendingReconfigure,
     codec: VideoCodec,
     options: EncoderOptions,
     frame_idx: u64,
@@ -1371,6 +1382,10 @@ impl Nvenc {
         infinite_gop: bool,
     ) -> Result<Self> {
         ensure!(!device.is_null(), "null D3D11 device");
+        let device_ref = unsafe { ID3D11Device::from_raw_borrowed(&device) }
+            .context("borrow D3D11 device for NVENC")?
+            .clone();
+        let gate = gpu_gate::for_device(&device_ref);
         ensure!(
             (1..=15).contains(&options.aq_strength),
             "AQ strength must be 1..=15"
@@ -1414,6 +1429,10 @@ impl Nvenc {
             "reconstruction feedback requires HEVC Main"
         );
 
+        gpu_gate::protect_device(&device_ref).context("protect NVENC D3D11 device")?;
+        // Session open, query, init, bitstream and error reads are all NVENC
+        // calls. The guard covers the whole constructor; `Self` does not borrow it.
+        let _gpu = gate.lock();
         // 1. Open session on the D3D11 device.
         let mut session_params: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = unsafe { zeroed() };
         session_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
@@ -1547,13 +1566,20 @@ impl Nvenc {
         Ok(Self {
             session,
             device,
+            _device_ref: device_ref,
+            gate: gate.clone(),
             bitstream: bs_params.bitstreamBuffer,
             width,
             height,
-            fps,
             max_width,
             max_height,
-            bitrate_bps,
+            pending_reconfigure: PendingReconfigure::new(EncoderSettings {
+                bitrate_bps,
+                max_qp: (cfg.rcParams.enableMaxQP() != 0).then_some(cfg.rcParams.maxQP.qpInterP),
+                width,
+                height,
+                fps,
+            }),
             codec,
             options,
             frame_idx: 0,
@@ -1593,54 +1619,19 @@ impl Nvenc {
         self.device == device
     }
 
-    /// Reconfigure the encoder bitrate (BWE clamp). NVENC applies it from the
-    /// next picture onward.
+    /// Queue the latest bitrate (BWE clamp) for the next encode boundary.
+    /// Native application failures are returned by encode, not this setter.
     pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
-        if bitrate_bps == self.bitrate_bps {
-            return Ok(());
-        }
-        let mut cfg = *self.cfg;
-        let (average_bitrate_bps, peak_bitrate_bps) =
-            encoder_rate_control_bitrates(bitrate_bps, self.options.rate_control);
-        cfg.rcParams.averageBitRate = average_bitrate_bps;
-        cfg.rcParams.maxBitRate = peak_bitrate_bps;
-        cfg.rcParams.vbvBufferSize =
-            average_bitrate_bps / self.fps.max(1) * u32::from(self.options.vbv_frames);
-        cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
-        let mut init = *self.init_params;
-        init.encodeConfig = &mut cfg;
-        let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
-        reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-        reconf.reInitEncodeParams = init;
-        let st = unsafe {
-            native_call!(
-                1,
-                (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf)
-            )
-        };
-        match st.result_without_string() {
-            Ok(()) => {
-                *self.cfg = cfg;
-                *self.init_params = init;
-                self.init_params.encodeConfig = self.cfg.as_mut();
-                self.bitrate_bps = bitrate_bps;
-                info!(bitrate_bps, "NVENC bitrate reconfigured");
-                Ok(())
-            }
-            Err(e) => {
-                warn!(bitrate_bps, ?e, "NVENC reconfigure failed");
-                Err(e.into())
-            }
-        }
+        self.pending_reconfigure.set_bitrate(bitrate_bps);
+        Ok(())
     }
 
-    /// Rate-control QP ceiling for every picture type, if one binds.
+    /// Desired rate-control QP ceiling for every picture type, if one binds.
     pub fn max_qp(&self) -> Option<u32> {
-        let qp = self.cfg.rcParams.maxQP.qpInterP;
-        (self.cfg.rcParams.enableMaxQP() != 0 && qp < MAX_HEVC_QP).then_some(qp)
+        self.pending_reconfigure.desired().max_qp
     }
 
-    /// Reconfigure (no reset, no forced IDR) a rate-control QP ceiling for
+    /// Queue (no reset, no forced IDR) a rate-control QP ceiling for
     /// every picture type; `None` lifts it. NVENC applies it from the next
     /// picture onward. Frames may then exceed the CBR target.
     ///
@@ -1648,44 +1639,8 @@ impl Nvenc {
     /// driver, reconfiguring `enableMaxQP` back to 0 leaves the old ceiling
     /// in force (probe_nvenc_max_qp).
     pub fn set_max_qp(&mut self, max_qp: Option<u32>) -> Result<()> {
-        let max_qp = max_qp
-            .map(|qp| qp.min(MAX_HEVC_QP))
-            .filter(|qp| *qp < MAX_HEVC_QP);
-        if max_qp == self.max_qp() {
-            return Ok(());
-        }
-        let mut cfg = *self.cfg;
-        let qp = max_qp.unwrap_or(MAX_HEVC_QP);
-        cfg.rcParams.set_enableMaxQP(1);
-        cfg.rcParams.maxQP = nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_QP {
-            qpInterP: qp,
-            qpInterB: qp,
-            qpIntra: qp,
-        };
-        let mut init = *self.init_params;
-        init.encodeConfig = &mut cfg;
-        let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
-        reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-        reconf.reInitEncodeParams = init;
-        let st = unsafe {
-            native_call!(
-                1,
-                (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf)
-            )
-        };
-        match st.result_without_string() {
-            Ok(()) => {
-                *self.cfg = cfg;
-                *self.init_params = init;
-                self.init_params.encodeConfig = self.cfg.as_mut();
-                info!(?max_qp, "NVENC max QP reconfigured");
-                Ok(())
-            }
-            Err(e) => {
-                warn!(?max_qp, ?e, "NVENC max QP reconfigure failed");
-                Err(e.into())
-            }
-        }
+        self.pending_reconfigure.set_max_qp(max_qp);
+        Ok(())
     }
 
     /// Whether this session was created without periodic IDRs.
@@ -1693,74 +1648,91 @@ impl Nvenc {
         self.infinite_gop
     }
 
-    /// Reset NVENC's rate-control state without changing the active profile.
+    /// Queue a rate-control reset without changing the desired profile.
     /// Stream Lab uses this only for explicitly gated source-quality captures.
     pub fn reset_rate_control(&mut self) -> Result<()> {
-        let mut cfg = *self.cfg;
-        let mut init = *self.init_params;
-        init.encodeConfig = &mut cfg;
-        let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
-        reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-        reconf.reInitEncodeParams = init;
-        reconf.set_resetEncoder(1);
-        reconf.set_forceIDR(1);
-        unsafe {
-            native_call!(
-                1,
-                (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf)
-            )
-        }
-        .result_without_string()
-        .context("NvEncReconfigureEncoder rate-control reset")?;
-        *self.cfg = cfg;
-        *self.init_params = init;
-        self.init_params.encodeConfig = self.cfg.as_mut();
-        self.force_idr_next = true;
-        info!("NVENC rate-control state reset for Stream Lab quality capture");
+        self.pending_reconfigure.reset_rate_control();
         Ok(())
     }
 
-    /// Dimension/fps transition. The host requests its wall-clock IDR on the
-    /// first frame after this succeeds; GOP cadence itself is not reconfigured.
+    /// Queue a validated dimension/fps transition for the next encode boundary.
+    /// That picture is forced to IDR; GOP cadence itself is not reconfigured.
+    /// Native failures surface from encode and use its existing recovery path.
     pub fn reconfigure_profile(&mut self, width: u32, height: u32, fps: u32) -> Result<()> {
         if width > self.max_width || height > self.max_height {
             bail!("profile exceeds native encoder dimensions");
         }
-        if width == self.width && height == self.height && fps == self.fps {
-            return Ok(());
+        self.pending_reconfigure.set_profile(width, height, fps);
+        Ok(())
+    }
+
+    /// Caller holds the device gate. Apply every queued setting in one native
+    /// reconfigure before registering or encoding this frame.
+    fn flush_pending_reconfigure(&mut self) -> Result<()> {
+        let options = self.options;
+        let session = self.session;
+        let previous_cfg = *self.cfg;
+        let previous_init = *self.init_params;
+        let previous_settings = self.pending_reconfigure.applied();
+        let updated = self.pending_reconfigure.flush_with(|plan| {
+            let settings = plan.settings;
+            let mut cfg = previous_cfg;
+            let (average_bitrate_bps, peak_bitrate_bps) =
+                encoder_rate_control_bitrates(settings.bitrate_bps, options.rate_control);
+            cfg.rcParams.averageBitRate = average_bitrate_bps;
+            cfg.rcParams.maxBitRate = peak_bitrate_bps;
+            cfg.rcParams.vbvBufferSize =
+                average_bitrate_bps / settings.fps.max(1) * u32::from(options.vbv_frames);
+            cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
+            if plan.max_qp_changed {
+                // Keep the ceiling enabled when lifting it; disabling it leaves
+                // the old ceiling active on the probed driver.
+                cfg.rcParams.set_enableMaxQP(1);
+                let qp = settings.max_qp.unwrap_or(MAX_HEVC_QP);
+                cfg.rcParams.maxQP = nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_QP {
+                    qpInterP: qp,
+                    qpInterB: qp,
+                    qpIntra: qp,
+                };
+            }
+            let mut init = previous_init;
+            init.encodeWidth = settings.width;
+            init.encodeHeight = settings.height;
+            init.darWidth = settings.width;
+            init.darHeight = settings.height;
+            init.frameRateNum = settings.fps;
+            init.encodeConfig = &mut cfg;
+            let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
+            reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+            reconf.reInitEncodeParams = init;
+            reconf.set_resetEncoder(u32::from(plan.reset_encoder));
+            reconf.set_forceIDR(u32::from(plan.force_idr));
+            unsafe { native_call!(1, (ENCODE_API.reconfigure_encoder)(session, &mut reconf)) }
+                .result_without_string()
+                .context("NvEncReconfigureEncoder pending settings")?;
+            // The native call is synchronous. Do not retain a pointer to this
+            // stack configuration when returning the successful snapshot.
+            init.encodeConfig = ptr::null_mut();
+            Ok::<_, anyhow::Error>((cfg, init, plan))
+        })?;
+        if let Some((cfg, init, plan)) = updated {
+            *self.cfg = cfg;
+            *self.init_params = init;
+            self.init_params.encodeConfig = self.cfg.as_mut();
+            self.width = plan.settings.width;
+            self.height = plan.settings.height;
+            self.force_idr_next |= plan.forces_next_idr();
+            info!(
+                previous_bitrate_bps = previous_settings.bitrate_bps,
+                bitrate_bps = plan.settings.bitrate_bps,
+                max_qp = ?plan.settings.max_qp,
+                width = plan.settings.width,
+                height = plan.settings.height,
+                fps = plan.settings.fps,
+                reset_encoder = plan.reset_encoder,
+                "NVENC pending configuration applied"
+            );
         }
-        let mut cfg = *self.cfg;
-        let (average_bitrate_bps, _) =
-            encoder_rate_control_bitrates(self.bitrate_bps, self.options.rate_control);
-        cfg.rcParams.vbvBufferSize =
-            average_bitrate_bps / fps.max(1) * u32::from(self.options.vbv_frames);
-        cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
-        let mut init = *self.init_params;
-        init.encodeWidth = width;
-        init.encodeHeight = height;
-        init.darWidth = width;
-        init.darHeight = height;
-        init.frameRateNum = fps;
-        init.encodeConfig = &mut cfg;
-        let mut reconf: NV_ENC_RECONFIGURE_PARAMS = unsafe { zeroed() };
-        reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-        reconf.reInitEncodeParams = init;
-        reconf.set_resetEncoder(1);
-        unsafe {
-            native_call!(
-                1,
-                (ENCODE_API.reconfigure_encoder)(self.session, &mut reconf)
-            )
-        }
-        .result_without_string()
-        .context("NvEncReconfigureEncoder profile")?;
-        *self.cfg = cfg;
-        *self.init_params = init;
-        self.init_params.encodeConfig = self.cfg.as_mut();
-        self.width = width;
-        self.height = height;
-        self.fps = fps;
-        self.force_idr_next = true;
         Ok(())
     }
 
@@ -1799,6 +1771,8 @@ impl Nvenc {
         damage: Option<FrameDamage<'_>>,
         reconstruction_texture: Option<*mut c_void>,
     ) -> Result<EncodedFrame> {
+        let gate = self.gate.clone();
+        let _gpu = gate.lock();
         let feedback_enabled = self.options.roi_mode == RoiMode::Feedback;
         ensure!(
             feedback_enabled == reconstruction_texture.is_some(),
@@ -1811,6 +1785,9 @@ impl Nvenc {
         if let Some(texture) = reconstruction_texture {
             ensure!(!texture.is_null(), "null reconstructed-output texture");
         }
+        // Setters only queue state. A failed flush stops this attempt before
+        // registration and preserves the settings for the next encode attempt.
+        self.flush_pending_reconfigure()?;
         let t0 = std::time::Instant::now();
         let mut stage_timings = EncodeStageTimings::default();
 
@@ -2164,6 +2141,8 @@ impl Nvenc {
 
     /// Fetch SPS/PPS (Annex B) — for decoder config / sanity checks.
     pub fn sequence_params(&self) -> Result<Vec<u8>> {
+        let gate = self.gate.clone();
+        let _gpu = gate.lock();
         let mut buf = vec![0u8; 512];
         let mut out_size: u32 = 0;
         let mut payload: NV_ENC_SEQUENCE_PARAM_PAYLOAD = unsafe { zeroed() };
@@ -2178,17 +2157,22 @@ impl Nvenc {
         Ok(buf)
     }
 
+    /// Latest requested bitrate, including a restore queued after a refine.
     pub fn bitrate(&self) -> u32 {
-        self.bitrate_bps
+        self.pending_reconfigure.desired().bitrate_bps
     }
 
+    /// Latest requested frame rate, applied at the next encode boundary.
     pub fn fps(&self) -> u32 {
-        self.fps
+        self.pending_reconfigure.desired().fps
     }
 }
 
 impl Drop for Nvenc {
     fn drop(&mut self) {
+        // Destroy every registration and the session under the device gate.
+        let gate = self.gate.clone();
+        let _gpu = gate.lock();
         self.unmap_recon_output();
         self.unmap_current();
         let mut timings = EncodeStageTimings::default();

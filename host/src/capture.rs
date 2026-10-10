@@ -39,13 +39,17 @@ use windows::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS, HMONITOR, MONITORINFO, SRCCOPY,
 };
 use windows_capture::dxgi_duplication_api::{
-    DxgiDuplicationApi, DxgiDuplicationFormat, DxgiDuplicationFrame, Error as CaptureError,
+    DxgiDuplicationApi, DxgiDuplicationFrame, Error as CaptureError,
 };
 use windows_capture::encoder::{ImageEncoder, ImageEncoderPixelFormat, ImageFormat};
 use windows_capture::monitor::Monitor;
 
 use crate::activity::Activity;
 use crate::capture_wait::{CaptureInvalidation, DdaWaiter, RawDesktopFrame};
+use crate::gpu_gate;
+
+/// Longest AcquireNextFrame wait made while holding the device gate.
+const DIRECT_ACQUIRE_MAX_MS: u32 = 16;
 use crate::frame_damage::DamageRect;
 use crate::input::DesktopRegion;
 
@@ -443,35 +447,9 @@ impl CapturedFrame<'_> {
         let Self::Desktop { frame, .. } = self else {
             bail!("lossless detail tiles require a live DDA desktop frame");
         };
-        let frame = match frame {
-            DesktopFrame::Direct(frame) => frame,
-            DesktopFrame::Waited(frame) => return encode_texture_png_crop(frame.texture(), rect),
-        };
-        if rect.left >= rect.right
-            || rect.top >= rect.bottom
-            || rect.right > frame.width()
-            || rect.bottom > frame.height()
-        {
-            bail!("lossless detail tile is outside the captured frame");
-        }
-        let buffer = frame
-            .buffer_crop(rect.left, rect.top, rect.right, rect.bottom)
-            .context("copy lossless detail tile to CPU")?;
-        let format = match buffer.format() {
-            DxgiDuplicationFormat::Bgra8 | DxgiDuplicationFormat::Bgra8Srgb => {
-                ImageEncoderPixelFormat::Bgra8
-            }
-            DxgiDuplicationFormat::Rgba8 | DxgiDuplicationFormat::Rgba8Srgb => {
-                ImageEncoderPixelFormat::Rgba8
-            }
-            other => bail!("unsupported lossless detail tile format {other:?}"),
-        };
-        let mut packed = Vec::new();
-        let pixels = buffer.as_nopadding_buffer(&mut packed);
-        ImageEncoder::new(ImageFormat::Png, format)
-            .context("create PNG tile encoder")?
-            .encode(pixels, rect.right - rect.left, rect.bottom - rect.top)
-            .context("encode lossless detail tile")
+        // Both frame kinds read through the device gate. The crate's buffer_crop
+        // copies on the device without it, so it is not used.
+        encode_texture_png_crop(frame.texture(), rect)
     }
 }
 
@@ -498,6 +476,28 @@ pub fn encode_texture_png_crop(texture: &ID3D11Texture2D, rect: DamageRect) -> R
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     let device = unsafe { texture.GetDevice() }.context("detail texture GetDevice")?;
+    let gate = gpu_gate::for_device(&device);
+    let packed = {
+        // Copy, map and unmap are device work; PNG encoding is not.
+        let _gpu = gate.lock();
+        readback_bgra_rows(&device, texture, &source_desc, rect, width, height)?
+    };
+    ImageEncoder::new(ImageFormat::Png, pixel_format)
+        .context("create scaled detail PNG encoder")?
+        .encode(&packed, width, height)
+        .context("encode scaled detail PNG")
+}
+
+/// Copies one rectangle to a staging texture and returns it packed. The caller
+/// holds the device gate.
+fn readback_bgra_rows(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+    source_desc: &D3D11_TEXTURE2D_DESC,
+    rect: DamageRect,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
     let context = unsafe { device.GetImmediateContext() }.context("detail GetImmediateContext")?;
     let staging_desc = D3D11_TEXTURE2D_DESC {
         Width: width,
@@ -540,10 +540,7 @@ pub fn encode_texture_png_crop(texture: &ID3D11Texture2D, rect: DamageRect) -> R
         pack_bgra_rows(bytes, mapped.RowPitch as usize, width, height)
     };
     unsafe { context.Unmap(&staging, 0) };
-    ImageEncoder::new(ImageFormat::Png, pixel_format)
-        .context("create scaled detail PNG encoder")?
-        .encode(&packed, width, height)
-        .context("encode scaled detail PNG")
+    Ok(packed)
 }
 
 fn pack_bgra_rows(bytes: &[u8], row_pitch: usize, width: u32, height: u32) -> Vec<u8> {
@@ -639,22 +636,26 @@ impl DamageMetadata {
         let mut dirty_bytes = 0;
         let mut move_bytes = 0;
         let duplication = frame.duplication();
-        unsafe {
-            duplication.GetFrameDirtyRects(
-                (self.dirty.len() * std::mem::size_of::<RECT>()) as u32,
-                self.dirty.as_mut_ptr(),
-                &mut dirty_bytes,
-            )
+        {
+            let gate = gpu_gate::for_device(frame.device());
+            let _gpu = gate.lock();
+            unsafe {
+                duplication.GetFrameDirtyRects(
+                    (self.dirty.len() * std::mem::size_of::<RECT>()) as u32,
+                    self.dirty.as_mut_ptr(),
+                    &mut dirty_bytes,
+                )
+            }
+            .context("IDXGIOutputDuplication::GetFrameDirtyRects")?;
+            unsafe {
+                duplication.GetFrameMoveRects(
+                    (self.moves.len() * std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()) as u32,
+                    self.moves.as_mut_ptr(),
+                    &mut move_bytes,
+                )
+            }
+            .context("IDXGIOutputDuplication::GetFrameMoveRects")?;
         }
-        .context("IDXGIOutputDuplication::GetFrameDirtyRects")?;
-        unsafe {
-            duplication.GetFrameMoveRects(
-                (self.moves.len() * std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()) as u32,
-                self.moves.as_mut_ptr(),
-                &mut move_bytes,
-            )
-        }
-        .context("IDXGIOutputDuplication::GetFrameMoveRects")?;
         self.dirty
             .truncate(dirty_bytes as usize / std::mem::size_of::<RECT>());
         self.moves
@@ -749,6 +750,8 @@ impl SecureFrameUpload {
             .context("create host device for secure frame upload")?;
             device.context("secure frame upload returned no host device")?
         };
+        // Shared with the host encoder; protection must be on before use.
+        gpu_gate::protect_device(&device)?;
         Ok(Self {
             device,
             texture: None,
@@ -780,12 +783,16 @@ impl SecureFrameUpload {
                 ..Default::default()
             };
             let mut texture = None;
+            let gate = gpu_gate::for_device(&self.device);
+            let _gpu = gate.lock();
             unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
                 .context("create host secure frame texture")?;
             self.texture = Some(texture.context("secure frame texture missing")?);
             self.size = (width, height);
         }
         let texture = self.texture.as_ref().expect("secure texture initialized");
+        let gate = gpu_gate::for_device(&self.device);
+        let _gpu = gate.lock();
         let context =
             unsafe { self.device.GetImmediateContext() }.context("secure upload context")?;
         unsafe { context.UpdateSubresource(texture, 0, None, pixels.as_ptr().cast(), stride, 0) };
@@ -838,8 +845,10 @@ impl SecureCapture {
             )
         }
         .context("D3D11CreateDevice(secure capture)")?;
+        let device = device.context("secure D3D11 device was not returned")?;
+        gpu_gate::protect_device(&device)?;
         Ok(Self {
-            device: device.context("secure D3D11 device was not returned")?,
+            device,
             width,
             height,
             monitor_device_name,
@@ -914,8 +923,11 @@ impl GdiSnapshot {
     ) -> Result<Self> {
         let desc = gdi_texture_desc(width, height);
         let mut texture = None;
+        let gate = gpu_gate::for_device(device);
+        let gpu = gate.lock();
         unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
             .context("CreateTexture2D(GDI capture)")?;
+        drop(gpu);
         let texture = texture.context("CreateTexture2D(GDI capture) returned no texture")?;
         let surface = texture
             .cast()
@@ -942,6 +954,9 @@ impl GdiSnapshot {
     }
 
     fn capture(&self, device: &ID3D11Device) -> Result<ID3D11Texture2D> {
+        // The surface DC and BitBlt write the device's GDI-compatible texture.
+        let gate = gpu_gate::for_device(device);
+        let _gpu = gate.lock();
         let copy_result = (|| -> Result<()> {
             let target_dc = unsafe { self.surface.GetDC(true) }.context("IDXGISurface1::GetDC")?;
             let blit = unsafe {
@@ -1046,6 +1061,8 @@ fn capture_gdi_via_dib(
         };
         let upload = match blit {
             Ok(()) => {
+                let gate = gpu_gate::for_device(device);
+                let _gpu = gate.lock();
                 let context = unsafe { device.GetImmediateContext() }
                     .context("get D3D11 context for secure capture fallback")?;
                 unsafe {
@@ -1186,6 +1203,9 @@ impl Capture {
         let height = api
             .as_ref()
             .map_or(region.height, DxgiDuplicationApi::height);
+        if let Some(api) = api.as_ref() {
+            gpu_gate::protect_device(api.device())?;
+        }
         let device_obj = api.as_ref().map(|api| api.device().clone());
         info!(width, height, monitor = %dev, unavailable, "DDA source initialized");
         Ok(Self {
@@ -1298,11 +1318,12 @@ impl Capture {
         self.height = api.height();
         self.origin_x = region.x;
         self.origin_y = region.y;
+        gpu_gate::protect_device(api.device())?;
         self.device_obj = Some(api.device().clone());
         self.last_present_qpc = 0;
         self.monitor_filter = Some(dev.clone());
         self.monitor_device_name = dev;
-        self.api = Some(api);
+        retire_api(self.api.replace(api));
         self.pending_recreate = false;
         self.next_recreate_attempt = Instant::now();
         self.awaiting_recovery_frame = false;
@@ -1438,7 +1459,7 @@ impl Capture {
             warn!(%error, "capture waiter stop during secure transition failed");
         }
         self.idle_gdi = None;
-        self.api = None;
+        retire_api(self.api.take());
         self.mark_unavailable();
         self.fresh_recreate_required = true;
         self.awaiting_recovery_frame = false;
@@ -1554,10 +1575,15 @@ impl Capture {
                 None => Ok(None),
             }
         } else {
-            self.api
+            let api = self
+                .api
                 .as_mut()
-                .context("DDA session temporarily unavailable")?
-                .acquire_next_frame(timeout_ms)
+                .context("DDA session temporarily unavailable")?;
+            // The crate's call also ReleaseFrames the previous frame, so the
+            // whole call is one gated section, bounded to the 16 ms request.
+            let gate = gpu_gate::for_device(api.device());
+            let _gpu = gate.lock();
+            api.acquire_next_frame(timeout_ms.min(DIRECT_ACQUIRE_MAX_MS))
                 .map(|frame| Some(DesktopFrame::Direct(frame)))
         };
         let frame = match acquired {
@@ -1855,12 +1881,12 @@ impl Capture {
         let old_api = self.api.take();
         let api = match (force_fresh, old_api) {
             (true, old) => {
-                drop(old);
+                retire_api(old);
                 let monitor = pick_monitor(self.monitor_filter.as_deref())?;
                 DxgiDuplicationApi::new(monitor)
                     .context("DxgiDuplicationApi fresh-session recreate")?
             }
-            (false, Some(old)) => match old.recreate() {
+            (false, Some(old)) => match recreate_in_place(old) {
                 Ok(api) => api,
                 Err(in_place_error) => {
                     warn!(
@@ -1884,6 +1910,7 @@ impl Capture {
         self.origin_y = region.y;
         // The recreated API has its own device; use it for a possible idle
         // snapshot before the next DDA frame arrives.
+        gpu_gate::protect_device(api.device())?;
         self.device_obj = Some(api.device().clone());
         self.last_present_qpc = 0;
         self.monitor_device_name = monitor.device_name().unwrap_or_default();
@@ -1908,7 +1935,26 @@ impl Drop for Capture {
         if let Err(error) = self.stop_waiter() {
             warn!(%error, "capture waiter stop failed during drop");
         }
+        retire_api(self.api.take());
     }
+}
+
+/// In-place recreate drops the duplication and re-duplicates on the same device,
+/// so it runs under that device's gate.
+fn recreate_in_place(old: DxgiDuplicationApi) -> Result<DxgiDuplicationApi, CaptureError> {
+    let gate = gpu_gate::for_device(old.device());
+    let _gpu = gate.lock();
+    old.recreate()
+}
+
+/// Drops a duplication session and its device under that device's gate. Releasing
+/// the duplication is native work on the device that NVENC may be using. Callers
+/// must have stopped the waiter first, so no worker still owns the duplication.
+fn retire_api(api: Option<DxgiDuplicationApi>) {
+    let Some(api) = api else { return };
+    let gate = gpu_gate::for_device(api.device());
+    let _gpu = gate.lock();
+    drop(api);
 }
 
 /// Raw D3D11 texture pointer from a frame, for NVENC register_resource.

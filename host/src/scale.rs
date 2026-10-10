@@ -9,6 +9,7 @@
 use std::ffi::c_void;
 use std::fmt;
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 use std::time::Instant;
 
 use windows::core::Interface;
@@ -30,6 +31,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_P010, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 
+use crate::gpu_gate::{self, GpuGate};
 use crate::quality::Profile;
 
 fn conversion_color_spaces(
@@ -128,6 +130,9 @@ struct Target {
 
 pub struct Scaler {
     device: ID3D11Device,
+    /// Device gate shared with capture and NVENC; every video-processor call
+    /// (creation and blits) runs under it.
+    gate: Arc<GpuGate>,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     mobile: Target,
@@ -147,6 +152,8 @@ impl Scaler {
         input_width: u32,
         input_height: u32,
     ) -> Result<Self, ScaleError> {
+        let gate = gpu_gate::for_device(device);
+        let gpu = gate.lock();
         let video_device: ID3D11VideoDevice =
             device.cast().map_err(|e| win("ID3D11VideoDevice", e))?;
         let immediate =
@@ -214,8 +221,10 @@ impl Scaler {
             "P010 output",
         )
         .ok();
+        drop(gpu);
         Ok(Self {
             device: device.clone(),
+            gate,
             video_device,
             video_context,
             mobile,
@@ -226,6 +235,7 @@ impl Scaler {
         })
     }
 
+    /// Builds one persistent target. The caller holds the device gate.
     #[allow(clippy::too_many_arguments)]
     fn create_target(
         device: &ID3D11Device,
@@ -400,6 +410,7 @@ impl Scaler {
             Profile::Balanced => &mut self.balanced,
             Profile::Full => &mut self.full,
         };
+        let _gpu = self.gate.lock();
         Self::blit(
             &device,
             &video_device,
@@ -439,6 +450,7 @@ impl Scaler {
             support: 0,
             needed: D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32,
         })?;
+        let _gpu = self.gate.lock();
         Self::blit(
             &device,
             &video_device,

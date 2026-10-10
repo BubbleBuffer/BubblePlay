@@ -5,6 +5,7 @@
 //! texture, so the bus traffic is the damage, not the frame. The staging
 //! texture is allocated once at capture size to avoid a `CreateTexture2D` per
 //! frame; only the copied regions are ever read.
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -21,6 +22,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 
+use crate::gpu_gate::{self, GpuGate};
 use crate::scroll_detect::TileRows;
 use crate::tile_quality::{hash_rows, TileGrid};
 
@@ -63,6 +65,9 @@ pub type TileHashes = Vec<(usize, Option<u64>)>;
 pub struct TileHasher {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
+    /// Device gate: the copies, Map and Unmap run under it. Hashing the mapped
+    /// rows is CPU work on memory this hasher owns, so it runs outside the gate.
+    gate: Arc<GpuGate>,
     staging: ID3D11Texture2D,
     width: u32,
     height: u32,
@@ -98,14 +103,18 @@ impl TileHasher {
             CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
             MiscFlags: 0,
         };
+        let gate = gpu_gate::for_device(device);
+        let gpu = gate.lock();
         let mut staging = None;
         unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) }
             .context("CreateTexture2D(tile hash staging)")?;
         let staging = staging.context("CreateTexture2D(tile hash staging) returned no texture")?;
         let context = unsafe { device.GetImmediateContext() }.context("tile hash context")?;
+        drop(gpu);
         Ok(Self {
             device: device.clone(),
             context,
+            gate,
             staging,
             width: desc.Width,
             height: desc.Height,
@@ -139,39 +148,45 @@ impl TileHasher {
         if tiles.is_empty() {
             return Ok((Vec::new(), Vec::new(), 0));
         }
-        for (row, first, last) in tile_runs(grid, tiles) {
-            let left = grid.tile_rect((row * grid.columns + first) as usize);
-            let right = grid.tile_rect((row * grid.columns + last) as usize);
-            let source_box = D3D11_BOX {
-                left: left.left,
-                top: left.top,
-                front: 0,
-                right: right.right,
-                bottom: left.bottom,
-                back: 1,
-            };
-            unsafe {
-                self.context.CopySubresourceRegion(
-                    &self.staging,
-                    0,
-                    left.left,
-                    left.top,
-                    0,
-                    texture,
-                    0,
-                    Some(&source_box),
-                );
+        {
+            let _gpu = self.gate.lock();
+            for (row, first, last) in tile_runs(grid, tiles) {
+                let left = grid.tile_rect((row * grid.columns + first) as usize);
+                let right = grid.tile_rect((row * grid.columns + last) as usize);
+                let source_box = D3D11_BOX {
+                    left: left.left,
+                    top: left.top,
+                    front: 0,
+                    right: right.right,
+                    bottom: left.bottom,
+                    back: 1,
+                };
+                unsafe {
+                    self.context.CopySubresourceRegion(
+                        &self.staging,
+                        0,
+                        left.left,
+                        left.top,
+                        0,
+                        texture,
+                        0,
+                        Some(&source_box),
+                    );
+                }
             }
         }
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        let map = unsafe {
-            self.context.Map(
-                &self.staging,
-                0,
-                D3D11_MAP_READ,
-                D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
-                Some(&mut mapped),
-            )
+        let map = {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.Map(
+                    &self.staging,
+                    0,
+                    D3D11_MAP_READ,
+                    D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                    Some(&mut mapped),
+                )
+            }
         };
         if map
             .as_ref()
@@ -200,7 +215,10 @@ impl TileHasher {
                 (index, rows)
             })
             .collect();
-        unsafe { self.context.Unmap(&self.staging, 0) };
+        {
+            let _gpu = self.gate.lock();
+            unsafe { self.context.Unmap(&self.staging, 0) };
+        }
         let hashes = rows
             .iter()
             .map(|(index, rows)| (*index, Some(tile_hash_from_rows(rows))))

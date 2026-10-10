@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 use std::slice;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -21,6 +22,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
+
+use crate::gpu_gate::{self, GpuGate};
 
 const CTB_SIZE: u32 = 32;
 
@@ -112,6 +115,8 @@ struct ReadbackTicket {
 
 pub struct ReconstructionFeedbackAnalyzer {
     device: ID3D11Device,
+    /// Device gate: every context, copy, dispatch and readback call runs under it.
+    gate: Arc<GpuGate>,
     context: ID3D11DeviceContext,
     shader: ID3D11ComputeShader,
     input_copy: ID3D11Texture2D,
@@ -149,6 +154,9 @@ impl ReconstructionFeedbackAnalyzer {
             total_ctbs <= 8_160,
             "reconstruction feedback CTB grid exceeds lab bound"
         );
+        // Construction runs once, so the gate covers the whole setup sequence.
+        let gate = gpu_gate::for_device(device);
+        let gpu = gate.lock();
         let context = unsafe { device.GetImmediateContext() }
             .context("reconstruction feedback GetImmediateContext")?;
         let shader = compile_shader(device)?;
@@ -180,8 +188,10 @@ impl ReconstructionFeedbackAnalyzer {
         let error_view = create_error_view(device, &error_buffer, total_ctbs)?;
         let first_readback = create_readback_buffer(device, total_ctbs)?;
         let second_readback = create_readback_buffer(device, total_ctbs)?;
+        drop(gpu);
         Ok(Self {
             device: device.clone(),
+            gate,
             context,
             shader,
             input_copy,
@@ -254,36 +264,37 @@ impl ReconstructionFeedbackAnalyzer {
         };
         let started = Instant::now();
         let recon_index = sequence as usize % self.reconstruction_views.len();
-        unsafe {
-            self.context.CopyResource(&self.input_copy, source);
-        }
         let shader_resources = [
             Some(self.input_view.clone()),
             Some(self.reconstruction_views[recon_index].clone()),
         ];
         let unordered_views = [Some(self.error_view.clone())];
-        unsafe {
-            self.context.CSSetShader(&self.shader, None);
-            self.context
-                .CSSetShaderResources(0, Some(&shader_resources));
-            self.context
-                .CSSetUnorderedAccessViews(0, 1, Some(unordered_views.as_ptr()), None);
-            self.context.Dispatch(self.columns, self.rows, 1);
-            self.context.CSSetShaderResources(0, Some(&[None, None]));
-            self.context.CSSetUnorderedAccessViews(
-                0,
-                1,
-                Some([None::<ID3D11UnorderedAccessView>].as_ptr()),
-                None,
-            );
-            self.context.CSSetShader(None::<&ID3D11ComputeShader>, None);
-            self.context
-                .CopyResource(&self.readback_buffers[readback_slot], &self.error_buffer);
-            // DO_NOT_WAIT collection on the following frame cannot observe
-            // commands that the D3D11 driver still holds in its CPU-side
-            // command buffer. Submit the reducer now without waiting for it,
-            // so frame N's compact CTB result can be collected for frame N+1.
-            self.context.Flush();
+        {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.CopyResource(&self.input_copy, source);
+                self.context.CSSetShader(&self.shader, None);
+                self.context
+                    .CSSetShaderResources(0, Some(&shader_resources));
+                self.context
+                    .CSSetUnorderedAccessViews(0, 1, Some(unordered_views.as_ptr()), None);
+                self.context.Dispatch(self.columns, self.rows, 1);
+                self.context.CSSetShaderResources(0, Some(&[None, None]));
+                self.context.CSSetUnorderedAccessViews(
+                    0,
+                    1,
+                    Some([None::<ID3D11UnorderedAccessView>].as_ptr()),
+                    None,
+                );
+                self.context.CSSetShader(None::<&ID3D11ComputeShader>, None);
+                self.context
+                    .CopyResource(&self.readback_buffers[readback_slot], &self.error_buffer);
+                // DO_NOT_WAIT collection on the following frame cannot observe
+                // commands that the D3D11 driver still holds in its CPU-side
+                // command buffer. Submit the reducer now without waiting for it,
+                // so frame N's compact CTB result can be collected for frame N+1.
+                self.context.Flush();
+            }
         }
         self.submit_order = self.submit_order.wrapping_add(1).max(1);
         self.readbacks[readback_slot] = Some(ReadbackTicket {
@@ -320,14 +331,19 @@ impl ReconstructionFeedbackAnalyzer {
             0
         };
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        let result = unsafe {
-            self.context.Map(
-                &self.readback_buffers[slot],
-                0,
-                D3D11_MAP_READ,
-                flags,
-                Some(&mut mapped),
-            )
+        // A blocking collect (`do_not_wait == false`) waits for GPU completion
+        // while the gate is held; only the DO_NOT_WAIT path is per-frame.
+        let result = {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.Map(
+                    &self.readback_buffers[slot],
+                    0,
+                    D3D11_MAP_READ,
+                    flags,
+                    Some(&mut mapped),
+                )
+            }
         };
         if let Err(error) = result {
             if do_not_wait && error.code() == DXGI_ERROR_WAS_STILL_DRAWING {
@@ -338,7 +354,10 @@ impl ReconstructionFeedbackAnalyzer {
         let total_ctbs = (self.columns * self.rows) as usize;
         let errors =
             unsafe { slice::from_raw_parts(mapped.pData.cast::<u32>(), total_ctbs).to_vec() };
-        unsafe { self.context.Unmap(&self.readback_buffers[slot], 0) };
+        {
+            let _gpu = self.gate.lock();
+            unsafe { self.context.Unmap(&self.readback_buffers[slot], 0) };
+        }
         self.readbacks[slot] = None;
         Ok(Some(ReconstructionErrorFrame {
             sequence: ticket.sequence,

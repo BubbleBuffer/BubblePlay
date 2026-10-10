@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::slice;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -23,6 +24,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 
 use crate::frame_damage::DamageRect;
+use crate::gpu_gate::{self, GpuGate};
 use crate::hybrid::{QuiescentValidationRequest, QuiescentValidationVerdict};
 
 pub const CTB_SIZE: u32 = 32;
@@ -260,6 +262,8 @@ void active_main(
 
 pub struct TemporalDiffAnalyzer {
     device: ID3D11Device,
+    /// Device gate: every context, copy, dispatch and readback call runs under it.
+    gate: Arc<GpuGate>,
     context: ID3D11DeviceContext,
     shader: ID3D11ComputeShader,
     active_shader: ID3D11ComputeShader,
@@ -360,6 +364,9 @@ impl TemporalDiffAnalyzer {
             total_ctbs <= 8_160,
             "temporal-diff CTB grid exceeds the lab bound"
         );
+        // Construction runs once, so the gate covers the whole setup sequence.
+        let gate = gpu_gate::for_device(device);
+        let gpu = gate.lock();
         let context =
             unsafe { device.GetImmediateContext() }.context("temporal-diff GetImmediateContext")?;
         let shader = compile_shader(device, PCSTR(c"main".as_ptr().cast()), "temporal-diff")?;
@@ -385,8 +392,10 @@ impl TemporalDiffAnalyzer {
         let active_score_view = create_score_view(device, &active_score_buffer, MAX_ACTIVE_CTBS)?;
         let first_active_readback = create_readback_buffer(device, MAX_ACTIVE_CTBS)?;
         let second_active_readback = create_readback_buffer(device, MAX_ACTIVE_CTBS)?;
+        drop(gpu);
         Ok(Self {
             device: device.clone(),
+            gate,
             context,
             shader,
             active_shader,
@@ -553,8 +562,11 @@ impl TemporalDiffAnalyzer {
         }
         let current = self.next_texture;
         if !self.primed {
-            unsafe {
-                self.context.CopyResource(&self.textures[current], source);
+            {
+                let _gpu = self.gate.lock();
+                unsafe {
+                    self.context.CopyResource(&self.textures[current], source);
+                }
             }
             self.primed = true;
             self.next_texture = 1 - current;
@@ -610,8 +622,11 @@ impl TemporalDiffAnalyzer {
             });
         }
         let write_readback = self.readback_ring.free_slot();
-        unsafe {
-            self.context.CopyResource(&self.textures[current], source);
+        {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.CopyResource(&self.textures[current], source);
+            }
         }
         let current_view = self.texture_views[current].clone();
         let (active_submission, deferred_readback) = match active_tiles {
@@ -635,37 +650,41 @@ impl TemporalDiffAnalyzer {
                 Some(self.score_view.clone()),
                 Some(self.edge_score_view.clone()),
             ];
-            unsafe {
-                self.context.CSSetShader(&self.shader, None);
-                self.context
-                    .CSSetShaderResources(0, Some(&shader_resources));
-                self.context.CSSetUnorderedAccessViews(
-                    0,
-                    unordered_views.len() as u32,
-                    Some(unordered_views.as_ptr()),
-                    None,
-                );
-                self.context.Dispatch(self.columns, self.rows, 1);
-                self.context.CSSetShaderResources(0, Some(&[None, None]));
-                self.context.CSSetUnorderedAccessViews(
-                    0,
-                    2,
-                    Some(
-                        [
-                            None::<ID3D11UnorderedAccessView>,
-                            None::<ID3D11UnorderedAccessView>,
-                        ]
-                        .as_ptr(),
-                    ),
-                    None,
-                );
-                self.context.CSSetShader(None::<&ID3D11ComputeShader>, None);
-                self.context
-                    .CopyResource(&self.readback_buffers[write_readback], &self.score_buffer);
-                self.context.CopyResource(
-                    &self.edge_readback_buffers[write_readback],
-                    &self.edge_score_buffer,
-                );
+            // Scoped so the gate is released before read_features re-takes it.
+            {
+                let _gpu = self.gate.lock();
+                unsafe {
+                    self.context.CSSetShader(&self.shader, None);
+                    self.context
+                        .CSSetShaderResources(0, Some(&shader_resources));
+                    self.context.CSSetUnorderedAccessViews(
+                        0,
+                        unordered_views.len() as u32,
+                        Some(unordered_views.as_ptr()),
+                        None,
+                    );
+                    self.context.Dispatch(self.columns, self.rows, 1);
+                    self.context.CSSetShaderResources(0, Some(&[None, None]));
+                    self.context.CSSetUnorderedAccessViews(
+                        0,
+                        2,
+                        Some(
+                            [
+                                None::<ID3D11UnorderedAccessView>,
+                                None::<ID3D11UnorderedAccessView>,
+                            ]
+                            .as_ptr(),
+                        ),
+                        None,
+                    );
+                    self.context.CSSetShader(None::<&ID3D11ComputeShader>, None);
+                    self.context
+                        .CopyResource(&self.readback_buffers[write_readback], &self.score_buffer);
+                    self.context.CopyResource(
+                        &self.edge_readback_buffers[write_readback],
+                        &self.edge_score_buffer,
+                    );
+                }
             }
             self.readback_ring.submit(write_readback, frame_index);
             if aligned {
@@ -818,20 +837,23 @@ impl TemporalDiffAnalyzer {
         }
         constants[16] = bounds.len() as u32;
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context.Map(
-                &self.active_bounds_buffer,
-                0,
-                D3D11_MAP_WRITE_DISCARD,
-                0,
-                Some(&mut mapped),
-            )?;
-            std::ptr::copy_nonoverlapping(
-                constants.as_ptr(),
-                mapped.pData.cast::<u32>(),
-                constants.len(),
-            );
-            self.context.Unmap(&self.active_bounds_buffer, 0);
+        {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.Map(
+                    &self.active_bounds_buffer,
+                    0,
+                    D3D11_MAP_WRITE_DISCARD,
+                    0,
+                    Some(&mut mapped),
+                )?;
+                std::ptr::copy_nonoverlapping(
+                    constants.as_ptr(),
+                    mapped.pData.cast::<u32>(),
+                    constants.len(),
+                );
+                self.context.Unmap(&self.active_bounds_buffer, 0);
+            }
         }
         let shader_resources = [
             Some(current_view.clone()),
@@ -839,29 +861,32 @@ impl TemporalDiffAnalyzer {
         ];
         let constant_buffers = [Some(self.active_bounds_buffer.clone())];
         let unordered_views = [Some(self.active_score_view.clone())];
-        unsafe {
-            self.context.CSSetShader(&self.active_shader, None);
-            self.context
-                .CSSetShaderResources(0, Some(&shader_resources));
-            self.context
-                .CSSetConstantBuffers(0, Some(&constant_buffers));
-            self.context
-                .CSSetUnorderedAccessViews(0, 1, Some(unordered_views.as_ptr()), None);
-            self.context
-                .Dispatch((bounds.len() * ACTIVE_CTBS_PER_TILE) as u32, 1, 1);
-            self.context.CSSetShaderResources(0, Some(&[None, None]));
-            self.context.CSSetConstantBuffers(0, Some(&[None]));
-            self.context.CSSetUnorderedAccessViews(
-                0,
-                1,
-                Some([None::<ID3D11UnorderedAccessView>].as_ptr()),
-                None,
-            );
-            self.context.CSSetShader(None::<&ID3D11ComputeShader>, None);
-            self.context.CopyResource(
-                &self.active_readback_buffers[readback_slot],
-                &self.active_score_buffer,
-            );
+        {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.CSSetShader(&self.active_shader, None);
+                self.context
+                    .CSSetShaderResources(0, Some(&shader_resources));
+                self.context
+                    .CSSetConstantBuffers(0, Some(&constant_buffers));
+                self.context
+                    .CSSetUnorderedAccessViews(0, 1, Some(unordered_views.as_ptr()), None);
+                self.context
+                    .Dispatch((bounds.len() * ACTIVE_CTBS_PER_TILE) as u32, 1, 1);
+                self.context.CSSetShaderResources(0, Some(&[None, None]));
+                self.context.CSSetConstantBuffers(0, Some(&[None]));
+                self.context.CSSetUnorderedAccessViews(
+                    0,
+                    1,
+                    Some([None::<ID3D11UnorderedAccessView>].as_ptr()),
+                    None,
+                );
+                self.context.CSSetShader(None::<&ID3D11ComputeShader>, None);
+                self.context.CopyResource(
+                    &self.active_readback_buffers[readback_slot],
+                    &self.active_score_buffer,
+                );
+            }
         }
         self.active_readback_ring.submit(readback_slot, frame_index);
         self.active_validation_batches[readback_slot] = Some(ActiveValidationBatch { requests });
@@ -875,14 +900,17 @@ impl TemporalDiffAnalyzer {
             0
         };
         let mut score_map = D3D11_MAPPED_SUBRESOURCE::default();
-        let mapped = unsafe {
-            self.context.Map(
-                &self.active_readback_buffers[slot],
-                0,
-                D3D11_MAP_READ,
-                flags,
-                Some(&mut score_map),
-            )
+        let mapped = {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.Map(
+                    &self.active_readback_buffers[slot],
+                    0,
+                    D3D11_MAP_READ,
+                    flags,
+                    Some(&mut score_map),
+                )
+            }
         };
         if let Err(error) = mapped {
             if do_not_wait && error.code() == DXGI_ERROR_WAS_STILL_DRAWING {
@@ -893,8 +921,11 @@ impl TemporalDiffAnalyzer {
         let scores = unsafe {
             slice::from_raw_parts(score_map.pData.cast::<u32>(), MAX_ACTIVE_CTBS as usize).to_vec()
         };
-        unsafe {
-            self.context.Unmap(&self.active_readback_buffers[slot], 0);
+        {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.Unmap(&self.active_readback_buffers[slot], 0);
+            }
         }
         Ok(Some(scores))
     }
@@ -910,14 +941,17 @@ impl TemporalDiffAnalyzer {
             0
         };
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        let score_map = unsafe {
-            self.context.Map(
-                &self.readback_buffers[readback],
-                0,
-                D3D11_MAP_READ,
-                flags,
-                Some(&mut mapped),
-            )
+        let score_map = {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.Map(
+                    &self.readback_buffers[readback],
+                    0,
+                    D3D11_MAP_READ,
+                    flags,
+                    Some(&mut mapped),
+                )
+            }
         };
         if let Err(error) = score_map {
             if do_not_wait && error.code() == DXGI_ERROR_WAS_STILL_DRAWING {
@@ -928,29 +962,38 @@ impl TemporalDiffAnalyzer {
         let total_ctbs = (self.columns * self.rows) as usize;
         let scores =
             unsafe { slice::from_raw_parts(mapped.pData.cast::<u32>(), total_ctbs) }.to_vec();
-        unsafe {
-            self.context.Unmap(&self.readback_buffers[readback], 0);
+        {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.Unmap(&self.readback_buffers[readback], 0);
+            }
         }
         let mut edge_mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            let edge_map = self.context.Map(
-                &self.edge_readback_buffers[readback],
-                0,
-                D3D11_MAP_READ,
-                flags,
-                Some(&mut edge_mapped),
-            );
-            if let Err(error) = edge_map {
-                if do_not_wait && error.code() == DXGI_ERROR_WAS_STILL_DRAWING {
-                    return Ok(None);
-                }
-                return Err(error).context("temporal-diff edge readback");
+        let edge_map = {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.Map(
+                    &self.edge_readback_buffers[readback],
+                    0,
+                    D3D11_MAP_READ,
+                    flags,
+                    Some(&mut edge_mapped),
+                )
             }
+        };
+        if let Err(error) = edge_map {
+            if do_not_wait && error.code() == DXGI_ERROR_WAS_STILL_DRAWING {
+                return Ok(None);
+            }
+            return Err(error).context("temporal-diff edge readback");
         }
         let edge_scores =
             unsafe { slice::from_raw_parts(edge_mapped.pData.cast::<u32>(), total_ctbs) }.to_vec();
-        unsafe {
-            self.context.Unmap(&self.edge_readback_buffers[readback], 0);
+        {
+            let _gpu = self.gate.lock();
+            unsafe {
+                self.context.Unmap(&self.edge_readback_buffers[readback], 0);
+            }
         }
         Ok(Some((scores, edge_scores)))
     }
