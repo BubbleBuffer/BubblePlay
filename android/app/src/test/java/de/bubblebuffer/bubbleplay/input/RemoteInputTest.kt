@@ -56,8 +56,10 @@ class RemoteInputTest {
         var queued = 0L
         var accept = true
         var countQueuedBytes = false
+        var gated = false
         val sent = ArrayList<ByteArray>()
         override fun inputOpen() = open
+        override fun inputGated() = gated
         override fun send(bytes: ByteArray): Boolean {
             if (!accept) return false
             sent += bytes
@@ -374,6 +376,81 @@ class RemoteInputTest {
         t.accept = true
         input.flushMotion()
         assertEquals(listOf(7, 4), t.sent.map { it[0].toInt() })
+    }
+
+    // Monitor-transition gate (input closed, transport alive): held input is carried.
+    @Test fun heldKeysAndButtonsSurviveAMonitorGateWithoutRelease() {
+        assertTrue(input.key("KeyA", false))
+        assertTrue(input.buttons(1))
+        t.sent.clear()
+        t.open = false; t.gated = true
+        assertFalse(input.key("KeyB", false))   // refused press is not recorded as held
+        assertFalse(input.buttons(1))           // same button: nothing let go
+        assertFalse(input.cursorSync())
+        t.open = true; t.gated = false
+        input.resumeAfterTransition()
+        assertTrue(t.sent.isEmpty())
+        assertEquals(1, input.buttonMask)
+        assertTrue(input.key("KeyC", false))
+        assertTrue(input.key("KeyA", true))     // the carried key still releases normally
+        assertEquals(listOf(13, 13), t.sent.map { it[0].toInt() })
+    }
+
+    @Test fun keyReleasedDuringMonitorGateSendsReleaseAllOnResume() {
+        input.key("KeyA", false)
+        t.sent.clear()
+        t.open = false; t.gated = true
+        assertFalse(input.key("KeyA", true))
+        t.open = true; t.gated = false
+        input.resumeAfterTransition()
+        assertEquals(listOf(6), t.sent.map { it[0].toInt() })
+        assertTrue(input.key("KeyB", false))
+        assertEquals(listOf(6, 13), t.sent.map { it[0].toInt() })
+    }
+
+    @Test fun buttonReleasedDuringMonitorGateSendsReleaseAllOnResume() {
+        assertTrue(input.buttons(1))
+        t.sent.clear()
+        t.open = false; t.gated = true
+        assertFalse(input.buttons(0))
+        t.open = true; t.gated = false
+        assertEquals(1, input.buttonMask)       // kept until the resume
+        input.resumeAfterTransition()
+        assertEquals(0, input.buttonMask)
+        assertEquals(listOf(6), t.sent.map { it[0].toInt() })
+    }
+
+    @Test fun pendingMotionIsDroppedAtAMonitorGate() {
+        input.motion(10, 10)
+        t.open = false; t.gated = true
+        assertFalse(input.flushMotion())
+        assertFalse(input.hasPendingMotion())
+        t.open = true; t.gated = false
+        input.resumeAfterTransition()
+        assertTrue(t.sent.isEmpty())
+    }
+
+    @Test fun gateThatBecomesADeadTransportReleasesOnReconnect() {
+        input.key("KeyA", false)
+        t.sent.clear()
+        t.open = false; t.gated = true
+        assertFalse(input.key("KeyB", false))
+        t.gated = false                         // transport died during the gate
+        assertFalse(input.key("KeyC", false))
+        t.open = true
+        input.resumeAfterTransition()
+        assertEquals(listOf(6), t.sent.map { it[0].toInt() })
+    }
+
+    // Dead transport or desktop-source change (no gate): held input is released by the next live packet.
+    @Test fun deadTransportReleasesHeldInputOnTheNextLivePacket() {
+        input.key("KeyA", false)
+        t.sent.clear()
+        t.open = false
+        assertFalse(input.key("KeyB", false))
+        t.open = true
+        assertTrue(input.key("KeyC", false))
+        assertEquals(listOf(6, 13), t.sent.map { it[0].toInt() })
     }
 
     @Test fun lostSessionDropsDeferredButtonsAndResynchronizesBeforeFreshInput() {

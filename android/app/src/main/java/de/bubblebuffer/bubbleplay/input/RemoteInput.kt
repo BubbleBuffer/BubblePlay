@@ -11,9 +11,12 @@ import kotlin.math.roundToInt
  * Control packets (keys, buttons, text, clipboard) are sent in order; the
  * WebSocket buffers them. Pointer motion is coalesced and retained under
  * congestion. Deferred motion and reliable controls retain their event order.
- * While the transport is down or input is gated nothing is sent,
- * and the next live packet is preceded by release-all so the host never keeps
- * keys from an earlier session.
+ * While the transport is down nothing is sent, and the next live packet is
+ * preceded by release-all so the host never keeps keys from an earlier session.
+ * A monitor-transition gate (the transport is alive and [Transport.inputGated]
+ * is true) keeps held keys and buttons: refused packets are dropped, pending
+ * motion is discarded, and release-all follows only if held input was let go
+ * during the gate ([resumeAfterTransition]). Like input.js InputController.
  */
 class RemoteInput(
     private val transport: Transport,
@@ -24,6 +27,8 @@ class RemoteInput(
     interface Transport {
         /** True while the signaling socket is open and the host accepts input. */
         fun inputOpen(): Boolean
+        /** True while a monitor transition holds input on a live transport (only consulted when [inputOpen] is false). */
+        fun inputGated(): Boolean = false
         fun send(bytes: ByteArray): Boolean
         fun queuedBytes(): Long
         /** Host understands type-13 scan-code packets. */
@@ -62,7 +67,7 @@ class RemoteInput(
 
     /** True means accepted into this session's ordered queue, including a deferred send. */
     private fun enqueueControl(packet: ByteArray, sequenced: Boolean = false): Boolean {
-        if (!transport.inputOpen()) { discardPending(); needsRelease = true; return false }
+        if (!transport.inputOpen()) return refuse(releasesHeld = false)
         freezeMotion()
         deferred.addLast(Reliable(packet, sequenced))
         drain()
@@ -70,10 +75,35 @@ class RemoteInput(
         return true
     }
 
+    /**
+     * Refuses a packet while input is closed. Dead transport or a desktop-source change: discard
+     * everything and send release-all with the next live packet. Monitor gate: drop pending motion
+     * only; held input is kept, and release-all is marked only when the caller let held input go.
+     */
+    private fun refuse(releasesHeld: Boolean): Boolean {
+        if (gated()) {
+            dropGatedMotion()
+            if (releasesHeld) needsRelease = true
+        } else {
+            discardPending(); needsRelease = true
+        }
+        return false
+    }
+
+    private fun gated() = !transport.inputOpen() && transport.inputGated()
+
+    private fun dropGatedMotion() { clearMotion(); deferred.removeAll { it is Motion } }
+
     /** Physical key by DOM code; scan code on capable hosts, VK otherwise. */
     @Synchronized
     fun key(code: String, up: Boolean): Boolean {
         val packet = KeyMap.packet(code, up, transport.scancodeHost()) ?: return false
+        if (gated()) {
+            // A gated press is not recorded; a release of a key the host still holds needs release-all on resume.
+            val wasHeld = code in held
+            if (up) held.remove(code)
+            return refuse(releasesHeld = up && wasHeld)
+        }
         if (up) held.remove(code) else held.add(code)
         return control(packet)
     }
@@ -113,6 +143,7 @@ class RemoteInput(
 
     @Synchronized
     fun buttons(mask: Int): Boolean {
+        if (gated()) return refuse(releasesHeld = (buttonMask and mask.inv()) != 0)
         if (!control(InputPackets.buttons(mask))) return false
         buttonMask = mask
         return true
@@ -121,6 +152,7 @@ class RemoteInput(
     /** Buttons at an absolute position (normalized 0..65535), with a sequence barrier. */
     @Synchronized
     fun buttonsAt(x: Int, y: Int, mask: Int): Boolean {
+        if (gated()) return refuse(releasesHeld = (buttonMask and mask.inv()) != 0)
         if (!enqueueControl(InputPackets.buttonsAt(0, x.coerceIn(0, 65535), y.coerceIn(0, 65535), mask), sequenced = true)) return false
         buttonMask = mask
         return true
@@ -156,7 +188,7 @@ class RemoteInput(
     }
 
     private fun drain(): Boolean {
-        if (!transport.inputOpen()) { discardPending(); needsRelease = true; return false }
+        if (!transport.inputOpen()) { refuse(releasesHeld = false); return false }
         var sent = false
         while (true) {
             // Keep unfenced motion live so new events can still coalesce into it.
@@ -239,7 +271,23 @@ class RemoteInput(
     @Synchronized
     fun releaseAll(send: Boolean = true) {
         held.clear(); buttonMask = 0; discardPending(); lastSentSequence = null
-        if (send) control(InputPackets.releaseAll()) else needsRelease = true
+        if (send && transport.inputOpen()) control(InputPackets.releaseAll()) else needsRelease = true
+    }
+
+    /**
+     * The monitor-transition gate opened (called before the cursor sync). Sends release-all
+     * only if held input was let go during the gate, so a carried drag continues; then drains
+     * whatever was queued before the gate.
+     */
+    @Synchronized
+    fun resumeAfterTransition() {
+        if (!transport.inputOpen()) return
+        if (needsRelease) {
+            held.clear(); buttonMask = 0; needsRelease = false
+            enqueueControl(InputPackets.releaseAll())
+        } else {
+            drain()
+        }
     }
 
     private fun clearMotion() {

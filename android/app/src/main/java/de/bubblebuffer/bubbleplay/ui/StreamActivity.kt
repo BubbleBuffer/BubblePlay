@@ -606,6 +606,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override fun onInputReady() {
         keyboardView.resetContext()
         cursorReconciler.reset()
+        // Release-all only if held input was let go during a monitor-transition gate; then resync the cursor.
+        input?.resumeAfterTransition()
         input?.cursorSync()
         session?.requestMonitorList()
     }

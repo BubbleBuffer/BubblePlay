@@ -129,6 +129,8 @@ class Session(
     @Volatile private var awaitingFrame = true
     private var desktopKind = "default"
     private var secureDesktop: SecureDesktop? = null
+    // A same-source monitor switch gates input and keeps held input (RemoteInput.Transport.inputGated).
+    @Volatile private var monitorHold = false
     private val inputWarning = InputStatusWarning()
     private var desktopGeneration: Int? = null
     private var hasPresented = false
@@ -283,6 +285,7 @@ class Session(
     // ---- RemoteInput.Transport (any thread) ----------------------------------
     // Input only ever goes out on the current, hello-completed, first-frame-ready socket.
     override fun inputOpen() = link.inputSocket() != null && inputEnabled && desktopAvailable && !awaitingFrame
+    override fun inputGated() = monitorHold && sigOpen && link.inputSocket() != null && inputEnabled && desktopAvailable
     override fun send(bytes: ByteArray): Boolean {
         val socket = link.inputSocket() ?: return false
         liveness.input(now())
@@ -543,17 +546,21 @@ class Session(
         }
         msg.optString("input").takeIf { it in listOf("enabled", "suspended", "read-only") }?.let { inputEnabled = it == "enabled" }
         val reason = msg.optString("reason")
-        val transition = reason == "monitor-switch" || reason == "monitor-switched" ||
+        val monitorSwitch = reason == "monitor-switch" || reason == "monitor-switched"
+        val transition = monitorSwitch ||
             (state == "active" && reason in listOf("desktop-switched", "capture-recovered", "session-changed", "agent-restarted"))
         if (generationChanged || oldDesktopKind != desktopKind || oldAvailable != (state == "active") || transition) {
             main.post { listener.onDesktopChanged() }
         }
         if (transition && hasPresented) {
+            // Monitor switches keep held input; a desktop-source change releases it, as before.
+            monitorHold = monitorSwitch && oldDesktopKind == desktopKind
             desktopAvailable = true
             setAwaiting(true)
             if (state == "active") startFirstFrame("desktop-transition", true)
             return
         }
+        monitorHold = false
         desktopAvailable = state == "active"
         setAwaiting(true)
         if (!desktopAvailable) cancelFirstFrame()
@@ -610,6 +617,7 @@ class Session(
 
     /** Forget the handshake of a finished signaling epoch; input waits for the next one. */
     private fun resetFirstFrame() {
+        monitorHold = false
         cancelFirstFrame()
         ffRequestId = null; ffEpoch = null
         firstFramePresentation.reset()
@@ -650,6 +658,7 @@ class Session(
 
     private fun completePresentation() {
         cancelFirstFrame()
+        monitorHold = false
         val wasAwaiting = awaitingFrame
         setAwaiting(false)
         if (ffAdmitted) sendPresented()
