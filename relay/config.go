@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -69,9 +70,9 @@ func (c *Config) Validate() error {
 		return errors.New("publicURL requires HTTPS; insecure loopback is development only")
 	}
 	c.PublicURL = u.Scheme + "://" + u.Host
-	for _, value := range []string{c.Token, c.HostGateToken, c.AdminToken} {
-		if len(value) < 32 || len(value) > 8192 || strings.ContainsAny(value, "\r\n") {
-			return errors.New("relay credentials must contain at least 32 characters")
+	for _, credential := range []struct{ key, value string }{{"token", c.Token}, {"hostGateToken", c.HostGateToken}, {"adminToken", c.AdminToken}} {
+		if len(credential.value) < 32 || len(credential.value) > 8192 || strings.ContainsAny(credential.value, "\r\n") {
+			return fmt.Errorf("relay config key %q must be 32 to 8192 characters without line breaks", credential.key)
 		}
 	}
 	if !strings.HasPrefix(c.PasswordHash, "$argon2id$") {
