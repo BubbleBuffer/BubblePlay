@@ -9,7 +9,7 @@ This is the quickstart for an unsigned Windows/browser alpha candidate. A public
 - Your own configured BubblePlay relay. The relay address and its two host credentials are required. In a source checkout, relay setup guides are `docs/self-host-docker.md` and `docs/self-host-cloudflare.md`; this packaged quickstart assumes that setup is complete.
 - A visible Windows desktop or an existing compatible virtual display. The download does not install a display or mouse driver.
 
-The host runs as the signed-in Windows user. Secure desktop capture, including lock screens and UAC prompts, is not available.
+The host runs as the signed-in Windows user. Secure desktop capture, including lock screens and UAC prompts, needs the secure-desktop helper. The default install adds it, and `-SkipAgent` leaves it out. Live acceptance of that capture is pending.
 
 Use infrastructure you trust: TLS protects each WebSocket connection, but the relay can inspect stream, input, clipboard and file payloads. WebRTC media uses its own encrypted transport. Browser approval/password credentials are separate from host registration credentials.
 

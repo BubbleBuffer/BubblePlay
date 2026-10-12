@@ -10,4 +10,4 @@ Include what you found, the affected component (Windows host, relay, browser cli
 
 ## Supported versions
 
-BubblePlay is in alpha. Only the latest release and the current `master` branch receive security fixes.
+BubblePlay is in alpha. Until the first release, only the current `master` branch receives security fixes. After the first release, the latest release and the current `master` branch receive security fixes.

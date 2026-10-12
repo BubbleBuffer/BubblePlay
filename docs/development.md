@@ -191,8 +191,9 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   integrity can connect to the pipe and drive elevated windows.
   Turn Admin mode on only when you need it.
 - The SYSTEM helper likewise trusts processes running as the console user:
-  they can connect to its pipe, view secure frames or change user-writable
-  `adminMode` to enable protected input. Exact image/ACL/SYSTEM checks protect
+  they can connect to its pipe, view secure frames and, while Admin mode is on,
+  send protected input. They cannot change the HKLM `AdminMode` policy without
+  elevation. Exact image/ACL/SYSTEM checks protect
   the host from a substituted helper; they do not isolate same-user processes.
   Secure video may reveal a consent identity or lock-screen information to the
   viewer and to a WSS relay. Logs omit frame data and typed text.
