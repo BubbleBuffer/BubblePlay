@@ -823,8 +823,8 @@ function Test-AdminModeKeyCurrent {
 
 function Install-AdminModeKey {
     if ($SkipAgent) { return }
-    if (-not $PSCmdlet.ShouldProcess($AdminModeKey, 'Create/repair protected policy key and initialise AdminMode DWORD=0 (no tray.json migration)')) {
-        Add-Step 'admin-mode-policy' 'planned' "Create/repair $AdminModeKey; protected DACL SYSTEM/Administrators full, Users read only; AdminMode DWORD=0."
+    if (-not $PSCmdlet.ShouldProcess($AdminModeKey, 'Create/repair protected policy key; keep AdminMode if the key was already protected, else initialise DWORD=0 (no tray.json migration)')) {
+        Add-Step 'admin-mode-policy' 'planned' "Create/repair $AdminModeKey; protected DACL SYSTEM/Administrators full, Users read only; AdminMode kept if the key was already protected, else DWORD=0."
         return
     }
     $acl = [Security.AccessControl.RegistrySecurity]::new()
@@ -836,19 +836,22 @@ function Install-AdminModeKey {
                 [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None,
                 [Security.AccessControl.AccessControlType]::Allow))
     }
+    # Keep the owner's choice across updates, but only when the key was already protected:
+    # a value written under a broken DACL could have come from a non-admin, so reset it.
+    $keepExisting = Test-AdminModeKeyCurrent
     $base = Open-AdminModeRegistry
     try {
         $key = $base.CreateSubKey($AdminModeRegistryPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
             [Microsoft.Win32.RegistryOptions]::None, $acl)
         try {
             $key.SetAccessControl($acl)
-            $key.SetValue('AdminMode', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
+            if (-not $keepExisting) { $key.SetValue('AdminMode', 0, [Microsoft.Win32.RegistryValueKind]::DWord) }
         }
         finally { $key.Dispose() }
     }
     finally { $base.Dispose() }
     if (-not (Test-AdminModeKeyCurrent)) { throw 'Admin mode registry type/owner/protected DACL verification failed.' }
-    Add-Step 'admin-mode-policy' 'done' "$AdminModeKey initialised OFF; protected DACL verified."
+    Add-Step 'admin-mode-policy' 'done' "$AdminModeKey $(if ($keepExisting) { 'kept the existing AdminMode value' } else { 'initialised OFF' }); protected DACL verified."
 }
 
 function Remove-AdminModeKey {
