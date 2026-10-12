@@ -17,7 +17,10 @@ import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
   rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes,
 } from "/transport.js";
-import { desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
+import {
+  desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,
+  rtcAdmissionGate, rtcGateOpens, rtcInPlaceCapable, rtpTimestampAtOrAfter, transitionKeyframeVerdict,
+} from "/monitor-selection.js";
 import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyName, shortcutsFor } from "/chrome.js";
 import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
@@ -144,6 +147,8 @@ let desktopAvailable = true;
 let desktopAwaitingFrame = false;
 let suppressDesktopTransitionOverlay = false;
 let transitionNeedsKeyframe = false;
+// requestId whose post-admission keyframe passed the main-thread decode gate.
+let transitionGatePassedToken = null;
 let desktopKind = "default";
 // Secure desktop (UAC prompt, lock screen): what it is and what the host's
 // SYSTEM helper lets this viewer do there ("view", "deny", "input").
@@ -159,7 +164,9 @@ let hostCapabilitiesGeneration = 0;
 let hasPresentedFrame = false;
 let fileDropPresentedGeneration = null;
 let fileDropPresentedViewportRevision = null;
-const firstFrameHandshake = { requestId: null, reason: "", transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, failureReason: "", timer: null };
+// rtpGate: on WebRTC, how presentation of the admitted generation is proven
+// (rtcAdmissionGate in monitor-selection.js); null keeps the legacy rule.
+const firstFrameHandshake = { requestId: null, reason: "", transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, rtpGate: null, failureReason: "", timer: null };
 const labQualityKeyframeAcks = new Map();
 let viewportRevision = 0;
 let viewportTimer = null;
@@ -240,13 +247,20 @@ function handleDesktopState(message) {
   // gated until the new generation presents, and release-all follows only if
   // something held was let go meanwhile (InputController.resumeAfterTransition).
   const alreadyRendering = hudState.presented > 0 || framesDrawn > 0 || firstFrameHandshake.phase === "ready" || firstFrameHandshake.phase === "presented";
-  const transitionPlan = desktopTransitionPlan({ reason: message.reason, state: message.state, usingWss: usingWssMedia, alreadyRendering });
+  const transitionPlan = desktopTransitionPlan({ reason: message.reason, state: message.state, usingWss: usingWssMedia, alreadyRendering, rtcInPlace: rtcInPlaceTransitionCapable() });
   const monitorTransition = transitionPlan?.kind === "monitor";
   const sourceTransition = transitionPlan?.kind === "source";
   if (monitorTransition && alreadyRendering) {
     desktopAvailable = true;
     desktopAwaitingFrame = true;
     suppressDesktopTransitionOverlay = true;
+    if (transitionPlan.action === "restart-peer") {
+      // This browser cannot prove the new monitor's frames on WebRTC.
+      releaseInput(false);
+      renderDesktopState();
+      restartRtcForTransition("monitor-transition");
+      return;
+    }
     inputTransitionHold = true;
     if (motionFrame !== null) cancelAnimationFrame(motionFrame);
     motionFrame = null;
@@ -264,12 +278,13 @@ function handleDesktopState(message) {
     suppressDesktopTransitionOverlay = false;
     releaseInput(false);
     renderDesktopState();
-    // WebRTC does not expose BubblePlay's host media generation. Recreate the
-    // complete receiver epoch so neither native-video jitter buffers nor a
-    // WebCodecs worker can authorize Winlogon/default input with an old frame.
-    // WSS carries an explicit generation and can transition in place.
+    // WSS carries an explicit generation. On WebRTC the admission carries the
+    // new IDR's RTP timestamp and presentation must reach it (rtpGate); a
+    // browser that cannot check that recreates the complete receiver epoch so
+    // no jitter buffer or worker can authorize Winlogon/default input with an
+    // old frame.
     if (transitionPlan.action === "restart-peer") {
-      restartPeerInNewEpoch({ recycleSignaling, restartPeer }, "desktop-source-transition");
+      restartRtcForTransition("desktop-source-transition");
       return;
     }
     startFirstFrameHandshake("desktop-source-transition", true);
@@ -285,7 +300,9 @@ function handleDesktopState(message) {
   releaseInput(false);
   if (!desktopAvailable) sharpScreen.classList.remove("active");
   renderDesktopState();
-  if (desktopAvailable) startFirstFrameHandshake("desktop-state", desktopGenerationChanged);
+  // desktopAwaitingFrame is now set, so a handshake that already presented
+  // (or ended) must be replaced; only one still in flight is reused.
+  if (desktopAvailable) startFirstFrameHandshake("desktop-state", desktopStateNeedsNewHandshake(desktopGenerationChanged));
 }
 function clearFirstFrameWatchdog() {
   if (firstFrameHandshake.timer !== null) clearTimeout(firstFrameHandshake.timer);
@@ -320,7 +337,7 @@ function armFirstFrameWatchdog() {
       firstFrameHandshake.timer = null;
       renderDesktopState();
       recoverWssStartup("presentation-timeout");
-      recoverRtcMonitorTransition("presentation-timeout");
+      recoverRtcInPlaceTransition("presentation-timeout");
     }
   }, 5_000);
 }
@@ -329,6 +346,7 @@ function startFirstFrameHandshake(reason, forceNew = false) {
   if (!usingWssMedia && !rtcOfferSignaled) return;
   const transport = usingWssMedia ? "wss" : "webrtc";
   const epoch = usingWssMedia ? mediaEpoch : null;
+  if (consumeRtcTransitionRestart()) forceNew = true;
   if (!forceNew && firstFrameHandshake.requestId && firstFrameHandshake.transport === transport && firstFrameHandshake.epoch === epoch && firstFrameHandshake.phase !== "failed") return;
   clearFirstFrameWatchdog();
   firstFrameHandshake.requestId = firstFrameRequestId();
@@ -341,6 +359,7 @@ function startFirstFrameHandshake(reason, forceNew = false) {
   firstFrameHandshake.presented = false;
   transitionNeedsKeyframe = false;
   firstFrameHandshake.requireAdmission = forceNew || reason === "desktop-source-transition" || reason === "monitor-transition";
+  firstFrameHandshake.rtpGate = null;
   transitionNeedsKeyframe = firstFrameHandshake.requireAdmission && !usingWssMedia && useWebCodecs;
   firstFrameHandshake.failureReason = "";
   firstFrameHandshake.reason = reason;
@@ -351,15 +370,56 @@ function startFirstFrameHandshake(reason, forceNew = false) {
   sendClientLog("info", "first-frame-request", { reason, transport });
   armFirstFrameWatchdog();
 }
-// An in-place WebRTC monitor transition that never presents falls back to the
-// old full receiver-epoch restart instead of leaving the stream paused.
-function recoverRtcMonitorTransition(reason) {
-  if (usingWssMedia || firstFrameHandshake.reason !== "monitor-transition") return;
-  sendClientLog("warn", "monitor-transition-restart", { reason });
-  restartPeerInNewEpoch({ recycleSignaling, restartPeer }, "monitor-transition");
+// An in-place WebRTC monitor or desktop-source transition that cannot be
+// proven, or never presents, falls back to the full receiver-epoch restart
+// instead of leaving the stream paused. Input stays gated: restartPeer keeps
+// desktopAwaitingFrame until the new peer's own handshake presents.
+const RTC_IN_PLACE_TRANSITIONS = ["monitor-transition", "desktop-source-transition"];
+function recoverRtcInPlaceTransition(reason) {
+  if (usingWssMedia || !RTC_IN_PLACE_TRANSITIONS.includes(firstFrameHandshake.reason)) return;
+  const transition = firstFrameHandshake.reason;
+  sendClientLog("warn", `${transition}-restart`, { reason });
+  restartRtcForTransition(transition);
 }
-function markFirstFramePresented(presentedGeneration = null, presentedViewportRevision = null) {
+// A transition that fell back to a peer restart still needs proof: the new
+// peer's first handshake is forced and requires admission, and it is gated on
+// the admitted RTP timestamp when the host sends one (as a startup handshake,
+// so a missing timestamp cannot loop into another restart).
+let rtcTransitionRestartPending = false;
+function restartRtcForTransition(transition) {
+  rtcTransitionRestartPending = true;
+  restartPeerInNewEpoch({ recycleSignaling, restartPeer }, transition);
+}
+function consumeRtcTransitionRestart() {
+  if (!rtcTransitionRestartPending) return false;
+  rtcTransitionRestartPending = false;
+  return !usingWssMedia;
+}
+// A desktop-state message re-gates input; reuse only a handshake in flight.
+const FIRST_FRAME_IN_FLIGHT = ["starting", "retrying", "in-flight"];
+function desktopStateNeedsNewHandshake(generationChanged) {
+  return Boolean(generationChanged) || !firstFrameHandshake.requestId || !FIRST_FRAME_IN_FLIGHT.includes(firstFrameHandshake.phase);
+}
+// Which WebRTC media path presents frames on this peer.
+function rtcMediaPath() {
+  if (activeVideo) return "native";
+  if (encodedWorker) return "worker";
+  return useWebCodecs ? "decoder" : "native";
+}
+function rtcNativeProofSupport() {
+  const current = nativePresentation?.generation === peerGeneration ? nativePresentation : null;
+  return { rvfc: Boolean(current?.supported), rtpTimestamps: Boolean(current?.rtpTimestamps) };
+}
+function rtcInPlaceTransitionCapable() {
+  if (usingWssMedia) return false;
+  return rtcInPlaceCapable({ path: rtcMediaPath(), ...rtcNativeProofSupport() });
+}
+// proof: { rtpTimestamp } from a native presented frame, or { gatePassed } from
+// a WebCodecs path that already dropped frames until the admitted keyframe.
+function markFirstFramePresented(presentedGeneration = null, presentedViewportRevision = null, proof = null) {
   if (!firstFrameHandshake.presented && firstFrameHandshake.requireAdmission && !firstFrameHandshake.admitted) return false;
+  if (!firstFrameHandshake.presented && firstFrameHandshake.requireAdmission && !usingWssMedia
+      && !rtcGateOpens(firstFrameHandshake.rtpGate, proof)) return false;
   if (!firstFrameHandshake.presented && firstFrameHandshake.requireAdmission
       && Number.isInteger(presentedGeneration)
       && Number.isInteger(firstFrameHandshake.generation)
@@ -412,13 +472,32 @@ function handleFirstFrameMessage(message) {
   }
   if (!message || message.protocol !== 1 || message.requestId !== firstFrameHandshake.requestId) return;
   if (message.phase === "admitted") {
-    if (!firstFrameHandshake.admitted && !usingWssMedia) rtcStartupFallback?.progress();
+    const firstAdmission = !firstFrameHandshake.admitted;
+    if (firstAdmission && !usingWssMedia) rtcStartupFallback?.progress();
+    if (firstAdmission && !usingWssMedia && firstFrameHandshake.requireAdmission) {
+      const plan = rtcAdmissionGate({
+        transition: RTC_IN_PLACE_TRANSITIONS.includes(firstFrameHandshake.reason),
+        path: rtcMediaPath(), admittedRtpTimestamp: message.rtpTimestamp, ...rtcNativeProofSupport(),
+      });
+      if (plan.action === "restart-peer") {
+        recoverRtcInPlaceTransition(plan.reason);
+        return;
+      }
+      firstFrameHandshake.rtpGate = plan.action === "gate" ? { ...plan.gate, token: message.requestId } : null;
+    }
     firstFrameHandshake.admitted = true;
     firstFrameHandshake.generation = Number.isInteger(message.generation) ? message.generation : firstFrameHandshake.generation;
     firstFrameHandshake.phase = "in-flight";
-    if (firstFrameHandshake.requireAdmission && !usingWssMedia && useWebCodecs) {
+    if (firstAdmission && firstFrameHandshake.requireAdmission && !usingWssMedia && useWebCodecs) {
       transitionNeedsKeyframe = true;
-      resyncPipeline("desktop-transition-admitted");
+      transitionGatePassedToken = null;
+      resyncPipeline("desktop-transition-admitted", firstFrameHandshake.rtpGate);
+    }
+    // A native frame may have been presented before this message arrived over
+    // signaling; it counts only if it reached the admitted IDR.
+    if (firstAdmission && firstFrameHandshake.rtpGate?.mode === "native"
+        && rtpTimestampAtOrAfter(nativePresentation?.lastRtpTimestamp, firstFrameHandshake.rtpGate.admittedRtpTimestamp)) {
+      markFirstFramePresented(null, null, { rtpTimestamp: nativePresentation.lastRtpTimestamp });
     }
     renderDesktopState();
     if (firstFrameHandshake.presented) sendSignal({ type: "first-frame", protocol: 1, phase: "presented", requestId: message.requestId, generation: firstFrameHandshake.generation });
@@ -443,7 +522,7 @@ function handleFirstFrameMessage(message) {
     clearFirstFrameWatchdog();
     renderDesktopState();
     recoverWssStartup(firstFrameHandshake.failureReason);
-    recoverRtcMonitorTransition(firstFrameHandshake.failureReason);
+    recoverRtcInPlaceTransition(firstFrameHandshake.failureReason);
   } else if (message.phase === "ready") {
     firstFrameHandshake.phase = "ready";
     clearFirstFrameWatchdog();
@@ -1072,7 +1151,9 @@ function restartPeer(reason, reconnect = true) {
   firstFrameHandshake.phase = "idle";
   firstFrameHandshake.admitted = false;
   firstFrameHandshake.presented = false;
+  firstFrameHandshake.rtpGate = null;
   transitionNeedsKeyframe = false;
+  transitionGatePassedToken = null;
   firstFrameHandshake.failureReason = "";
   desktopAwaitingFrame = true;
   renderDesktopState();
@@ -2519,9 +2600,15 @@ function onTrack(ev, generation = peerGeneration) {
           // This worker belongs to the current peerGeneration. Once it has
           // drawn a frame, presentation is concrete and cannot come from the
           // receiver epoch discarded during a privileged desktop switch.
-          if (workerPresented) markFirstFramePresented();
+          // During a WebRTC transition the worker reports frames drawn after
+          // it passed the admitted keyframe for this request (rtpGate).
+          const gatePassed = message.stats.transitionToken === firstFrameHandshake.requestId && Number(message.stats.transitionDrawn || 0) > 0;
+          if (workerPresented) markFirstFramePresented(null, null, { gatePassed });
         }
-        if (message.type === "resync") { hudState.resyncs++; hudState.dec = `waiting keyframe (${message.reason})`; }
+        if (message.type === "transition-unprovable") {
+          // The admitted keyframe arrived without an RTP timestamp to compare.
+          if (message.token === firstFrameHandshake.requestId) recoverRtcInPlaceTransition("no-frame-rtp-timestamp");
+        } else if (message.type === "resync") { hudState.resyncs++; hudState.dec = `waiting keyframe (${message.reason})`; }
         else if (message.type === "keyframe-requested") {
           hudState.keyframes++;
           hudState.dec = `waiting keyframe (${message.reason || "recovery"})`;
@@ -2583,6 +2670,8 @@ function startNativeVideo(track, generation = peerGeneration) {
     expectedDisplayTime: null,
     processingDurationMs: null,
     lastFrameAtMs: null,
+    rtpTimestamps: false,
+    lastRtpTimestamp: null,
   };
   let lastFrameAt = null;
   let fpsWindowStartedAt = null;
@@ -2603,7 +2692,10 @@ function startNativeVideo(track, generation = peerGeneration) {
       // peer epoch: cancel the RTC auto-fallback exactly like feedDecoder does
       // for the encoded path, and surface the frame in the received counter.
       rtcStartupFallback?.stop();
-      markFirstFramePresented();
+      // metadata.rtpTimestamp proves which host generation this frame is from.
+      const rtpTimestamp = Number.isInteger(metadata.rtpTimestamp) ? metadata.rtpTimestamp >>> 0 : null;
+      if (rtpTimestamp !== null) { nativePresentation.rtpTimestamps = true; nativePresentation.lastRtpTimestamp = rtpTimestamp; }
+      markFirstFramePresented(null, null, { rtpTimestamp });
       const gap = lastFrameAt === null ? null : now - lastFrameAt;
       if (nativePresentation.firstFrameAtMs === null) nativePresentation.firstFrameAtMs = Date.now();
       if (nativePresentation.firstFramePerformanceMs === null) nativePresentation.firstFramePerformanceMs = now;
@@ -2661,6 +2753,7 @@ function startEncodedStreams(receiver, generation = peerGeneration) {
       const wrapped = {
         type: chunk.type,
         timestamp: normalizeEncodedTimestamp(chunk.timestamp, metadata),
+        rtpTimestamp: metadata.rtpTimestamp,
         data: chunk.data,
         generation: latencyGuard.generation,
       };
@@ -2688,7 +2781,9 @@ function dropAndResync(reason) {
   latencyGuard.reset(reason);
 }
 
-function resyncPipeline(reason) {
+// transition: a WebRTC rtpGate ({ token, admittedRtpTimestamp }) the worker
+// enforces on its next keyframe and echoes in stats.transitionToken.
+function resyncPipeline(reason, transition = null) {
   hudState.resyncs++;
   resetRenderPacing();
   if (decoder) {
@@ -2696,7 +2791,8 @@ function resyncPipeline(reason) {
     decoder = null;
   }
   if (encodedWorker) {
-    encodedWorker.postMessage({ type: "resync", generation: latencyGuard.generation, reason });
+    encodedWorker.postMessage({ type: "resync", generation: latencyGuard.generation, reason,
+      ...(transition ? { transition: { token: transition.token, admittedRtpTimestamp: transition.admittedRtpTimestamp ?? null, strict: transition.strict === true } } : {}) });
     hudState.dec = `waiting keyframe (${reason})`;
   } else {
     requestKeyframe(reason);
@@ -2720,11 +2816,15 @@ function feedDecoder(chunk, generation) {
       return;
     }
     if (transitionNeedsKeyframe) {
-      if (!isKey) {
+      const verdict = transitionKeyframeVerdict({ isKey, frameRtpTimestamp: chunk.rtpTimestamp,
+        admittedRtpTimestamp: firstFrameHandshake.rtpGate?.admittedRtpTimestamp, strict: firstFrameHandshake.rtpGate?.strict === true });
+      if (verdict !== "admit") {
         hudState.dropped++;
+        if (verdict === "unprovable") recoverRtcInPlaceTransition("no-frame-rtp-timestamp");
         return;
       }
       transitionNeedsKeyframe = false;
+      transitionGatePassedToken = firstFrameHandshake.requestId;
     }
   }
 
@@ -2874,7 +2974,8 @@ function drawFrame(frame, due = performance.now()) {
     }
     // Mark only after the frame has been copied to its visible canvas. Codec
     // labels and host admission alone are not enough to hide startup UI.
-    markFirstFramePresented(metadata?.generation ?? null, metadata?.cropRevision ?? null);
+    markFirstFramePresented(metadata?.generation ?? null, metadata?.cropRevision ?? null,
+      { gatePassed: transitionGatePassedToken !== null && transitionGatePassedToken === firstFrameHandshake.requestId });
     if (usingWssMedia) framePresentationTelemetry.noteImmediatePresented();
     const renderedAt = performance.now();
     if (metadata?.frameTrace) {

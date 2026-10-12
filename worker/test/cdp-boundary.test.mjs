@@ -220,13 +220,13 @@ test("first-frame startup uses one bounded retry and clears on native or decoded
   assert.match(client, /function cleanupPeer\(\)[\s\S]*resetPresentationCounters\(\)/);
   assert.match(client, /recoverWssStartup/);
   assert.match(client, /monitorTransition/);
-  assert.match(client, /desktopTransitionPlan\(\{ reason: message\.reason, state: message\.state, usingWss: usingWssMedia, alreadyRendering \}\)/);
+  assert.match(client, /desktopTransitionPlan\(\{ reason: message\.reason, state: message\.state, usingWss: usingWssMedia, alreadyRendering, rtcInPlace: rtcInPlaceTransitionCapable\(\) \}\)/);
   assert.match(client, /function startFirstFrameHandshake\(reason, forceNew = false\)/);
   assert.match(client, /firstFrameHandshake.retries < 1/);
   assert.match(client, /}, 5_000\)/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null\)/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)/);
   assert.match(client, /video\.requestVideoFrameCallback/);
-  assert.match(client, /markFirstFramePresented\(\);/);
+  assert.match(client, /markFirstFramePresented\(null, null, \{ rtpTimestamp \}\);/);
   assert.match(client, /lastDecodedDimensions/);
 });
 
@@ -336,7 +336,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /createPopoverController\(\{/);
   assert.match(client, /desktop-unavailable/);
   assert.match(client, /if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null\)[\s\S]*desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)[\s\S]*desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
   assert.doesNotMatch(client, /sharpZoomEnabled\s*&&\s*pointerMode\s*===\s*"desktop"/);
   assert.match(client, /function requestWssMediaStart\(\) \{\s*if \(usingWssMedia\) return;\s*if \(!mediaEpoch\)[\s\S]*ensureMainCanvas\(\);/);
   assert.match(client, /function requestWssMediaStart\(\)[\s\S]*stage\.classList\.remove\("native-video-input"\)/);
@@ -499,27 +499,33 @@ test("desktop source transitions preserve the last frame without authorizing sta
   const client = readClientSource();
   assert.match(client, /const sourceTransition = transitionPlan\?\.kind === "source";/);
   assert.doesNotMatch(client, /sourceTransition = message\.state === "active" && \(secureDesktop \|\|/);
-  // Monitor switches stay in place on both transports and keep held input.
+  // Monitor switches stay in place when the frame generation can be proven and keep held input;
+  // otherwise the WebRTC peer is recycled with input released.
   const monitorBranch = client.match(/if \(monitorTransition && alreadyRendering\) \{[\s\S]*?\r?\n  \}/)?.[0] || "";
   assert.match(monitorBranch, /desktopAwaitingFrame = true;[\s\S]*suppressDesktopTransitionOverlay = true;[\s\S]*inputTransitionHold = true;[\s\S]*startFirstFrameHandshake\("monitor-transition", true\);/);
-  assert.doesNotMatch(monitorBranch, /restartPeerInNewEpoch|releaseInput/);
-  assert.match(client, /function recoverRtcMonitorTransition\(reason\) \{[\s\S]*firstFrameHandshake\.reason !== "monitor-transition"[\s\S]*restartPeerInNewEpoch/);
+  assert.match(monitorBranch, /if \(transitionPlan\.action === "restart-peer"\) \{[\s\S]*releaseInput\(false\);[\s\S]*restartRtcForTransition\("monitor-transition"\);\s*return;\s*\}\s*inputTransitionHold = true;/);
+  assert.match(client, /const RTC_IN_PLACE_TRANSITIONS = \["monitor-transition", "desktop-source-transition"\];/);
+  assert.match(client, /function recoverRtcInPlaceTransition\(reason\) \{[\s\S]*RTC_IN_PLACE_TRANSITIONS\.includes\(firstFrameHandshake\.reason\)[\s\S]*restartPeerInNewEpoch/);
+  // Admission without a provable RTP timestamp falls back to the peer restart.
+  assert.match(client, /const plan = rtcAdmissionGate\(\{[\s\S]*admittedRtpTimestamp: message\.rtpTimestamp[\s\S]*if \(plan\.action === "restart-peer"\) \{\s*recoverRtcInPlaceTransition\(plan\.reason\);\s*return;/);
+  assert.match(client, /requireAdmission && !usingWssMedia\s*&& !rtcGateOpens\(firstFrameHandshake\.rtpGate, proof\)\) return false;/);
   assert.match(client, /if \(inputTransitionHold\) \{\s*inputTransitionHold = false;\s*input\.resumeAfterTransition\(\);/);
   assert.match(client, /if \(sourceTransition && alreadyRendering\) \{[\s\S]*desktopAwaitingFrame = true;[\s\S]*startFirstFrameHandshake\("desktop-source-transition", true\);[\s\S]*return;\s*\}/);
-  assert.match(client, /if \(transitionPlan\.action === "restart-peer"\) \{\s*restartPeerInNewEpoch\(\{ recycleSignaling, restartPeer \}, "desktop-source-transition"\);\s*return;/);
-  assert.match(client, /if \(workerPresented\) markFirstFramePresented\(\)/);
-  assert.match(client, /firstFrameHandshake\.requireAdmission && !usingWssMedia && useWebCodecs[\s\S]*resyncPipeline\("desktop-transition-admitted"\)/);
-  assert.match(client, /if \(!usingWssMedia && firstFrameHandshake\.requireAdmission\) \{[\s\S]*if \(!firstFrameHandshake\.admitted\)[\s\S]*if \(transitionNeedsKeyframe\)[\s\S]*if \(!isKey\)/);
+  assert.match(client, /if \(transitionPlan\.action === "restart-peer"\) \{\s*restartRtcForTransition\("desktop-source-transition"\);\s*return;/);
+  assert.match(client, /function restartRtcForTransition\(transition\) \{\s*rtcTransitionRestartPending = true;\s*restartPeerInNewEpoch\(\{ recycleSignaling, restartPeer \}, transition\);/);
+  assert.match(client, /if \(workerPresented\) markFirstFramePresented\(null, null, \{ gatePassed \}\)/);
+  assert.match(client, /firstFrameHandshake\.requireAdmission && !usingWssMedia && useWebCodecs[\s\S]*resyncPipeline\("desktop-transition-admitted", firstFrameHandshake\.rtpGate\)/);
+  assert.match(client, /if \(!usingWssMedia && firstFrameHandshake\.requireAdmission\) \{[\s\S]*if \(!firstFrameHandshake\.admitted\)[\s\S]*if \(transitionNeedsKeyframe\)[\s\S]*const verdict = transitionKeyframeVerdict\(\{ isKey,[\s\S]*if \(verdict !== \"admit\"\)[\s\S]*if \(verdict === \"unprovable\"\) recoverRtcInPlaceTransition\(\"no-frame-rtp-timestamp\"\);/);
   assert.match(client, /function sendInput\(data, channel\) \{[\s\S]*if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false;/);
   assert.match(client, /firstFrameHandshake\.requireAdmission = forceNew \|\| reason === "desktop-source-transition"/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null\)[\s\S]*requireAdmission && !firstFrameHandshake\.admitted[\s\S]*return false/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)[\s\S]*requireAdmission && !firstFrameHandshake\.admitted[\s\S]*return false/);
   assert.match(client, /presentedGeneration !== firstFrameHandshake\.generation[\s\S]*return false/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null\)[\s\S]*desktopAwaitingFrame = false/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)[\s\S]*desktopAwaitingFrame = false/);
 });
 
 test("monitor control uses the signaling epoch and drops stale confirmations", () => {
   const client = readClientSource();
-  assert.match(client, /import \{ desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch \} from "\/monitor-selection\.js"/);
+  assert.match(client, /import \{\s*desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,[\s\S]*?\} from "\/monitor-selection\.js"/);
   // Both epoch restarts drop an outstanding confirmation instead of latching
   // monitor selection off for the rest of the page.
   assert.match(client, /function recycleSignaling\(reason\) \{[\s\S]*invalidatePendingMonitorRequest\(reason\);/);
@@ -538,7 +544,7 @@ test("an active desktop generation change re-arms the first-frame input gate", (
   assert.match(client, /let desktopGeneration = null/);
   assert.match(handler, /const desktopGenerationChanged = Number\.isInteger\(message\.generation\)[\s\S]*message\.generation !== desktopGeneration/);
   assert.match(handler, /desktopGeneration = message\.generation/);
-  assert.match(handler, /startFirstFrameHandshake\("desktop-state", desktopGenerationChanged\)/);
+  assert.match(handler, /startFirstFrameHandshake\("desktop-state", desktopStateNeedsNewHandshake\(desktopGenerationChanged\)\)/);
   assert.match(client, /firstFrameHandshake\.requireAdmission = forceNew \|\| reason === "desktop-source-transition" \|\| reason === "monitor-transition"/);
 });
 

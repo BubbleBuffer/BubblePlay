@@ -820,5 +820,76 @@
     "exitReason": "capture-recovered",
     "newGenerationOnEntryAndExit": true,
     "reannounceKindAndCapabilitiesWithinGeneration": true
+  },
+  "webrtcInPlaceTransition": {
+    "admitted": {
+      "type": "first-frame",
+      "protocol": 1,
+      "phase": "admitted",
+      "requestId": "firstFrame_rtp1",
+      "transport": "webrtc",
+      "epoch": null,
+      "generation": 12,
+      "sequence": null,
+      "codec": "h264",
+      "reason": null,
+      "rtpTimestamp": 4294960000
+    },
+    "legacyAdmitted": {
+      "type": "first-frame",
+      "protocol": 1,
+      "phase": "admitted",
+      "requestId": "firstFrame_rtp2",
+      "transport": "webrtc",
+      "epoch": null,
+      "generation": 13,
+      "sequence": null,
+      "codec": "h264",
+      "reason": null
+    },
+    "gateCases": [
+      {
+        "name": "stale frame before the admitted IDR",
+        "admitted": 4294960000,
+        "frame": 4294959999,
+        "opens": false
+      },
+      {
+        "name": "the admitted IDR itself",
+        "admitted": 4294960000,
+        "frame": 4294960000,
+        "opens": true
+      },
+      {
+        "name": "later frame",
+        "admitted": 4294960000,
+        "frame": 4294963000,
+        "opens": true
+      },
+      {
+        "name": "later frame after 32-bit wraparound",
+        "admitted": 4294960000,
+        "frame": 3000,
+        "opens": true
+      },
+      {
+        "name": "stale frame from before wraparound",
+        "admitted": 3000,
+        "frame": 4294960000,
+        "opens": false
+      },
+      {
+        "name": "missing frame timestamp",
+        "admitted": 4294960000,
+        "frame": null,
+        "opens": false
+      },
+      {
+        "name": "missing admitted timestamp",
+        "admitted": null,
+        "frame": 4294960000,
+        "opens": false
+      }
+    ]
   }
 }

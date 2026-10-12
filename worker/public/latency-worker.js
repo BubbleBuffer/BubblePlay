@@ -1,14 +1,18 @@
 import { annexBHasIdr, createLatestRenderSlot, createWorkerTimeline, decodeTimestampPatternBits, normalizeEncodedTimestamp } from "/latency.js";
+import { transitionKeyframeVerdict } from "/monitor-selection.js";
 
 let transformer, canvas, ctx, decoder, renderTimer = 0;
 let waitingForKeyframe = true, decodePending = 0, lastKeyframeRequest = -Infinity;
 let baseTimestamp = null, baseWall = 0, lastFpsWall = performance.now(), fpsFrames = 0;
+// WebRTC transition gate from the main thread: drop frames until a keyframe at
+// or after the admitted IDR's RTP timestamp, then count draws for its token.
+let transitionGate = null;
 let renderedDue = null, diagnostics = false, lastStatsAt = 0, lastBarcodeAt = 0, barcodeValue = null, barcodeSequence = null;
 const MAX_DECODE_QUEUE_SIZE = 8;
 const MAX_PACING_DELAY_MS = 0;
 const timeline = createWorkerTimeline({ now: () => performance.now() });
 const renderSlot = createLatestRenderSlot();
-const stats = { renderedTimestamp: null, renderedAgeMs: null, framesDrawn: 0, framesReceived: 0, transformFrames: 0, keyframes: 0, renderReplacements: 0, fps: 0, dropped: 0, resyncs: 0, lastResetReason: null, recovering: true, glassToGlass: null };
+const stats = { renderedTimestamp: null, renderedAgeMs: null, framesDrawn: 0, framesReceived: 0, transformFrames: 0, keyframes: 0, renderReplacements: 0, fps: 0, dropped: 0, resyncs: 0, lastResetReason: null, recovering: true, glassToGlass: null, transitionToken: null, transitionDrawn: 0, transitionPassed: false };
 
 function control(type, extra = {}, force = true) { const now = performance.now(), interval = diagnostics ? 50 : 250; if (!force && now - lastStatsAt < interval) return; lastStatsAt = now; const live = { ...stats, decodePending, decodeQueueSize: decoder?.decodeQueueSize || 0, waitingForKeyframe, codec: pendingCodec, renderedAgeMs: renderedDue === null ? null : Math.max(0, now - renderedDue) }; if (barcodeValue) { const ageMs = ((Date.now() >>> 0) - barcodeValue.timestamp) >>> 0; live.glassToGlass = ageMs < 10_000 ? { ...barcodeValue, ageMs } : null; } self.postMessage({ kind: "control", type, stats: live, ...extra }); }
 function requestKeyframe(reason) {
@@ -35,7 +39,7 @@ function render() {
   const age = performance.now() - item.due;
   if (age > 100) { try { item.frame.close(); } finally { stats.dropped++; reset("render-late"); } return; }
   try { if (canvas.width !== item.frame.displayWidth || canvas.height !== item.frame.displayHeight) { canvas.width = item.frame.displayWidth; canvas.height = item.frame.displayHeight; }
-    ctx.drawImage(item.frame, 0, 0); stats.renderedTimestamp = item.frame.timestamp; renderedDue = item.due; stats.framesDrawn++; stats.recovering = false; fpsFrames++;
+    ctx.drawImage(item.frame, 0, 0); stats.renderedTimestamp = item.frame.timestamp; renderedDue = item.due; stats.framesDrawn++; if (stats.transitionPassed) stats.transitionDrawn++; stats.recovering = false; fpsFrames++;
     if (performance.now() - lastFpsWall >= 1000) { stats.fps = fpsFrames; fpsFrames = 0; lastFpsWall = performance.now(); }
     const now = performance.now(); if (diagnostics && now - lastBarcodeAt >= 100) { lastBarcodeAt = now; barcodeValue = barcode() || barcodeValue; } control("worker-stats", {}, false);
   } finally { try { item.frame.close(); } catch {} }
@@ -67,6 +71,15 @@ function decode(value) {
     rtpTimestamp: metadata.rtpTimestamp, normalizedUs: timestamp, receivedAtMs: performance.now() };
   if (!observed.ok) { reset(observed.reason); return; }
   if (waitingForKeyframe && type !== "key") { stats.dropped++; requestKeyframe("startup-delta"); return; }
+  if (transitionGate) {
+    // After an unprovable keyframe the main thread restarts the peer; keep
+    // dropping until then.
+    if (transitionGate.unprovable) { stats.dropped++; return; }
+    const verdict = transitionKeyframeVerdict({ isKey: type === "key", frameRtpTimestamp: metadata.rtpTimestamp, admittedRtpTimestamp: transitionGate.admittedRtpTimestamp, strict: transitionGate.strict });
+    if (verdict === "unprovable") { transitionGate.unprovable = true; stats.dropped++; control("transition-unprovable", { token: stats.transitionToken }); return; }
+    if (verdict !== "admit") { stats.dropped++; requestKeyframe("transition-keyframe"); return; }
+    transitionGate = null; stats.transitionPassed = true;
+  }
   if (type === "key") pendingCodec = codecFromSps(new Uint8Array(value.data)) || pendingCodec;
   if (!ensureDecoder()) return;
   // decodePending includes frames already accepted by Android's hardware
@@ -80,7 +93,13 @@ function decode(value) {
 self.onmessage = ({ data }) => {
   if (data.type === "capabilities") { let supported = false; try { supported = typeof VideoDecoder !== "undefined" && typeof OffscreenCanvas !== "undefined" && !!new OffscreenCanvas(1, 1).getContext("2d"); } catch {} control("capabilities", { supported }); }
   else if (data.type === "canvas") { canvas = data.canvas; diagnostics = !!data.diagnostics; ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }); if (ctx) control("worker-ready"); else control("worker-init-error", { message: "OffscreenCanvas 2D context unavailable" }); }
-  else if (data.type === "resync") reset(data.reason || "main-resync");
+  else if (data.type === "resync") {
+    if (data.transition && typeof data.transition.token === "string") {
+      transitionGate = { admittedRtpTimestamp: data.transition.admittedRtpTimestamp ?? null, strict: data.transition.strict === true, unprovable: false };
+      stats.transitionToken = data.transition.token; stats.transitionDrawn = 0; stats.transitionPassed = false;
+    }
+    reset(data.reason || "main-resync");
+  }
   else if (data.type === "request-keyframe") requestKeyframe(data.reason);
 };
 self.onrtctransform = ({ transformer: incoming }) => {

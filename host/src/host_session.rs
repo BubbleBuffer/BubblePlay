@@ -225,9 +225,18 @@ pub(super) struct CachedIdr {
     /// Local Default pixels need fresh authorization before cached replay.
     /// Secure helper and privileged Agent frames retain their own policy.
     pub(super) requires_default: bool,
+    /// Media generation the IDR was encoded in. A cached IDR is never replayed
+    /// or reused for admission in another generation: on WebRTC its fresh RTP
+    /// timestamp would otherwise pass the client's in-place transition gate
+    /// with old-desktop pixels.
+    pub(super) generation: u32,
 }
 
 impl CachedIdr {
+    pub(super) fn belongs_to(&self, generation: u32) -> bool {
+        self.generation == generation
+    }
+
     pub(super) fn replay_authorized(&self, default_check: impl FnOnce() -> bool) -> bool {
         !self.requires_default || default_check()
     }
@@ -318,6 +327,18 @@ pub(super) fn rejected_transition_requires_recovery(
     id: u64,
 ) -> bool {
     pending.as_ref().is_some_and(|candidate| candidate.id == id)
+}
+
+/// Host input readiness when a WebRTC offer arrives. The privileged Agent
+/// always waits for presentation; the user host waits too when the offer
+/// starts a new peer, since its helper can stream the secure desktop. An offer
+/// that is not forwarded keeps the user host's previous rule.
+pub(super) fn input_ready_on_offer(
+    privileged: bool,
+    capture_available: bool,
+    starts_peer: bool,
+) -> bool {
+    !privileged && !starts_peer && capture_available
 }
 
 pub(super) fn should_forward_offer(
@@ -461,6 +482,8 @@ pub(super) struct PendingFirstFrame {
     pub(super) generation: u32,
     pub(super) admitted: bool,
     pub(super) rtc_idr_id: Option<u64>,
+    /// RTP timestamp of the admitted WebRTC IDR, repeated on `admitted`.
+    pub(super) rtc_rtp_timestamp: Option<u32>,
     pub(super) armed_at: Instant,
     pub(super) recovery: FirstFrameRecovery,
 }
@@ -501,6 +524,7 @@ impl PendingFirstFrame {
         self.generation = generation;
         self.admitted = false;
         self.rtc_idr_id = None;
+        self.rtc_rtp_timestamp = None;
     }
     pub(super) fn reject_rtc_access_unit(&mut self, id: u64) {
         if !self.admitted && self.rtc_idr_id == Some(id) {
@@ -706,6 +730,7 @@ mod contract_tests {
             generation: 1,
             admitted: true,
             rtc_idr_id: Some(99),
+            rtc_rtp_timestamp: None,
             armed_at: armed,
             recovery: FirstFrameRecovery::default(),
         };

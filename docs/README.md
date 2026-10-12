@@ -9,7 +9,7 @@ Start with a relay setup guide, then install the native Windows host. BubblePlay
 - [Development](development.md) — contributor setup, repository map, builds and checks.
 - [Architecture](architecture/README.md) — runtime components, transports and shared fixtures.
 - [File transfer](architecture/file-transfer.md), [monitor following](architecture/follow-active-window.md) and [session UI](architecture/session-ui.md) — current feature behavior and contracts.
-- [Secure desktop](architecture/secure-desktop.md) — UAC prompts and lock screen.
+- [Secure desktop](architecture/secure-desktop.md) — UAC prompts and lock screen; [in-place desktop transitions on WebRTC](architecture/secure-desktop.md#in-place-desktop-transitions-on-webrtc).
 - [Third-party notices](THIRD-PARTY-NOTICES.md) — locked Windows dependencies and retained license texts.
 - [Release status](release-status.md) — available evidence, alpha limits and acceptance still required.
 - [Android](../android/README.md) — separate mobile client setup and validation scope.

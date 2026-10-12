@@ -73,16 +73,20 @@ test("a dead transport still discards with release-all, unlike the transition ga
   assert.equal(releases(), 1);
 });
 
-test("WebRTC monitor transitions stay on the existing peer; desktop-source transitions recycle it", () => {
-  const base = { usingWss: false, alreadyRendering: true };
+test("WebRTC transitions stay on the existing peer when frames can be proven; otherwise they recycle it", () => {
+  const base = { usingWss: false, alreadyRendering: true, rtcInPlace: true };
   assert.deepEqual(desktopTransitionPlan({ ...base, reason: "monitor-switch", state: "unavailable" }),
     { kind: "monitor", holdInput: true, action: "wait" });
   assert.deepEqual(desktopTransitionPlan({ ...base, reason: "monitor-switched", state: "active" }),
     { kind: "monitor", holdInput: true, action: "handshake" });
-  assert.equal(desktopTransitionPlan({ ...base, usingWss: true, reason: "monitor-switched", state: "active" }).action, "handshake");
+  assert.deepEqual(desktopTransitionPlan({ ...base, rtcInPlace: false, reason: "monitor-switched", state: "active" }),
+    { kind: "monitor", holdInput: false, action: "restart-peer" });
+  assert.equal(desktopTransitionPlan({ ...base, rtcInPlace: false, usingWss: true, reason: "monitor-switched", state: "active" }).action, "handshake");
   for (const reason of ["desktop-switched", "capture-recovered", "session-changed", "agent-restarted"]) {
-    assert.equal(desktopTransitionPlan({ ...base, reason, state: "active" }).action, "restart-peer");
-    assert.equal(desktopTransitionPlan({ ...base, usingWss: true, reason, state: "active" }).action, "handshake");
+    assert.equal(desktopTransitionPlan({ ...base, reason, state: "active" }).action, "handshake");
+    assert.equal(desktopTransitionPlan({ ...base, reason, state: "active" }).holdInput, false);
+    assert.equal(desktopTransitionPlan({ ...base, rtcInPlace: false, reason, state: "active" }).action, "restart-peer");
+    assert.equal(desktopTransitionPlan({ ...base, rtcInPlace: false, usingWss: true, reason, state: "active" }).action, "handshake");
   }
   assert.equal(desktopTransitionPlan({ ...base, reason: "monitor-switched", state: "active", alreadyRendering: false }), null);
   assert.equal(desktopTransitionPlan({ ...base, reason: "desktop-switched", state: "unavailable" }), null);

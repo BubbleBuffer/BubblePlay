@@ -77,6 +77,9 @@ pub struct RtcSession {
     ice_lost: bool,
     /// Base instant for the 90 kHz RTP clock.
     clock_start: Instant,
+    /// Last 90 kHz media time written, kept strictly increasing so every
+    /// access unit written before an IDR has an earlier RTP timestamp.
+    last_rtp_90k: Option<u64>,
     frames_written: u64,
     input_control: Option<ChannelId>,
     input_motion: Option<ChannelId>,
@@ -100,6 +103,7 @@ impl RtcSession {
             ice_connected: false,
             ice_lost: false,
             clock_start: now,
+            last_rtp_90k: None,
             frames_written: 0,
             input_control: None,
             input_motion: None,
@@ -125,6 +129,7 @@ impl RtcSession {
             .accept_offer(offer)
             .context("accept_offer")?;
         self.clock_start = Instant::now();
+        self.last_rtp_90k = None;
         if self.timer_period.is_none() {
             self.timer_period = RtcTimerPeriod::acquire();
         }
@@ -280,21 +285,29 @@ impl RtcSession {
 
     /// Write one Annex B access unit as an RTP media packet.
     ///
-    /// Returns `true` only when the access unit was actually admitted to the
-    /// negotiated video writer. This keeps transport telemetry honest during
-    /// connection setup and teardown.
-    pub fn write_video(&mut self, access_unit: Vec<u8>) -> Result<bool> {
+    /// Returns the 32-bit RTP timestamp only when the access unit was actually
+    /// admitted to the negotiated video writer. This keeps transport telemetry
+    /// honest during connection setup and teardown. str0m copies the 90 kHz
+    /// media time verbatim into the RTP header (truncated to 32 bits), so the
+    /// returned value is the timestamp the browser sees for this frame.
+    pub fn write_video(&mut self, access_unit: Vec<u8>) -> Result<Option<u32>> {
         let (Some(mid), Some(pt)) = (self.video_mid, self.video_pt) else {
-            return Ok(false); // media not negotiated yet
+            return Ok(None); // media not negotiated yet
         };
         let Some(writer) = self.rtc.writer(mid) else {
-            return Ok(false);
+            return Ok(None);
         };
         let elapsed = self.clock_start.elapsed();
-        let rtp_time = MediaTime::from_90khz(((elapsed.as_secs_f64()) * 90_000.0) as u64);
-        writer.write(pt, Instant::now(), rtp_time, access_unit)?;
+        let rtp_90k = next_rtp_90k(self.last_rtp_90k, elapsed);
+        writer.write(
+            pt,
+            Instant::now(),
+            MediaTime::from_90khz(rtp_90k),
+            access_unit,
+        )?;
+        self.last_rtp_90k = Some(rtp_90k);
         self.frames_written += 1;
-        Ok(true)
+        Ok(Some(rtp_90k as u32))
     }
 
     /// Write authoritative cursor feedback on the browser-created input lane.
@@ -324,9 +337,31 @@ impl RtcSession {
     }
 }
 
+/// 90 kHz media time for the next video access unit: the session clock, but
+/// always after the previous write. Two writes inside one 11 us tick would
+/// otherwise share an RTP timestamp, and the browser's first-frame gate relies
+/// on every frame before an admitted IDR carrying an earlier timestamp.
+fn next_rtp_90k(last: Option<u64>, elapsed: std::time::Duration) -> u64 {
+    let clock = (elapsed.as_secs_f64() * 90_000.0) as u64;
+    match last {
+        Some(last) if clock <= last => last + 1,
+        _ => clock,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::preferred_negotiated_codec;
+    use super::{next_rtp_90k, preferred_negotiated_codec};
+    use std::time::Duration;
+
+    #[test]
+    fn rtp_media_time_is_strictly_increasing() {
+        assert_eq!(next_rtp_90k(None, Duration::from_secs(1)), 90_000);
+        // Same 11 us tick, or a clock that did not advance, still moves forward.
+        assert_eq!(next_rtp_90k(Some(90_000), Duration::from_secs(1)), 90_001);
+        assert_eq!(next_rtp_90k(Some(95_000), Duration::from_secs(1)), 95_001);
+        assert_eq!(next_rtp_90k(Some(90_000), Duration::from_secs(2)), 180_000);
+    }
     use crate::encode::VideoCodec;
     use str0m::media::Pt;
 

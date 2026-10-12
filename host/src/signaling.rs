@@ -835,6 +835,15 @@ pub enum SignalMsg {
         codec: Option<String>,
         #[serde(default)]
         reason: Option<String>,
+        /// WebRTC `admitted` only: the 32-bit RTP timestamp of the admitted
+        /// IDR. Browsers open the input gate only for a presented frame at or
+        /// after it. Optional, so older clients ignore it.
+        #[serde(
+            rename = "rtpTimestamp",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        rtp_timestamp: Option<u32>,
     },
     #[serde(rename = "media-control")]
     MediaControl {
@@ -1536,6 +1545,7 @@ impl Signaling {
                             sequence,
                             codec,
                             reason,
+                            ..
                         } => {
                             events.push(SignalEvent::FirstFrame {
                                 protocol,
@@ -2174,17 +2184,32 @@ impl Signaling {
         epoch: Option<&str>,
         codec: Option<&str>,
     ) {
-        let msg = SignalMsg::FirstFrame {
-            protocol: 1,
-            phase: phase.into(),
-            request_id: request_id.into(),
-            transport: transport.map(str::to_owned),
-            epoch: epoch.map(str::to_owned),
-            generation: Some(generation),
-            sequence: None,
-            codec: codec.map(str::to_owned),
-            reason: None,
-        };
+        self.send_first_frame_with_rtp(
+            phase, request_id, generation, transport, epoch, codec, None,
+        );
+    }
+
+    /// `send_first_frame` plus the admitted IDR's RTP timestamp (WebRTC only).
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_first_frame_with_rtp(
+        &mut self,
+        phase: &str,
+        request_id: &str,
+        generation: u32,
+        transport: Option<&str>,
+        epoch: Option<&str>,
+        codec: Option<&str>,
+        rtp_timestamp: Option<u32>,
+    ) {
+        let msg = first_frame_message(
+            phase,
+            request_id,
+            generation,
+            transport,
+            epoch,
+            codec,
+            rtp_timestamp,
+        );
         if self
             .ws
             .send(Message::text(
@@ -2215,6 +2240,7 @@ impl Signaling {
             sequence: None,
             codec: codec.map(str::to_owned),
             reason: Some(reason.chars().take(96).collect()),
+            rtp_timestamp: None,
         };
         if self
             .ws
@@ -2244,6 +2270,7 @@ impl Signaling {
             sequence: Some(sequence),
             codec: Some(codec.into()),
             reason: Some("stream-lab-quality-capture".into()),
+            rtp_timestamp: None,
         };
         if self
             .ws
@@ -2254,6 +2281,30 @@ impl Signaling {
         {
             let _ = self.ws.flush();
         }
+    }
+}
+
+/// A host first-frame handshake message (`ready`, `admitted`, ...).
+fn first_frame_message(
+    phase: &str,
+    request_id: &str,
+    generation: u32,
+    transport: Option<&str>,
+    epoch: Option<&str>,
+    codec: Option<&str>,
+    rtp_timestamp: Option<u32>,
+) -> SignalMsg {
+    SignalMsg::FirstFrame {
+        protocol: 1,
+        phase: phase.into(),
+        request_id: request_id.into(),
+        transport: transport.map(str::to_owned),
+        epoch: epoch.map(str::to_owned),
+        generation: Some(generation),
+        sequence: None,
+        codec: codec.map(str::to_owned),
+        reason: None,
+        rtp_timestamp,
     }
 }
 
@@ -3778,6 +3829,47 @@ mod tests {
             let message: SignalMsg = serde_json::from_value(expected.clone()).unwrap();
             assert_eq!(serde_json::to_value(message).unwrap(), *expected);
         }
+    }
+
+    #[test]
+    fn webrtc_admission_carries_optional_rtp_timestamp() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/secure-desktop-contract.json"))
+                .unwrap();
+        let contract = &fixture["webrtcInPlaceTransition"];
+        let admitted = super::first_frame_message(
+            "admitted",
+            "firstFrame_rtp1",
+            12,
+            Some("webrtc"),
+            None,
+            Some("h264"),
+            Some(4_294_960_000),
+        );
+        assert_eq!(
+            serde_json::to_value(admitted).unwrap(),
+            contract["admitted"]
+        );
+        let legacy = super::first_frame_message(
+            "admitted",
+            "firstFrame_rtp2",
+            13,
+            Some("webrtc"),
+            None,
+            Some("h264"),
+            None,
+        );
+        let legacy = serde_json::to_value(legacy).unwrap();
+        assert!(legacy.get("rtpTimestamp").is_none());
+        assert_eq!(legacy, contract["legacyAdmitted"]);
+        let parsed: SignalMsg = serde_json::from_value(contract["admitted"].clone()).unwrap();
+        assert!(matches!(
+            parsed,
+            SignalMsg::FirstFrame {
+                rtp_timestamp: Some(4_294_960_000),
+                ..
+            }
+        ));
     }
 
     #[test]

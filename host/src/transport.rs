@@ -145,6 +145,8 @@ pub enum TransportEvent {
     AccessUnitWritten {
         id: u64,
         is_idr: bool,
+        /// 32-bit RTP timestamp the video track used for this access unit.
+        rtp_timestamp: u32,
     },
     AccessUnitNotAdmitted {
         id: u64,
@@ -783,7 +785,7 @@ fn transport_loop(
                 au_age_max_us = au_age_max_us.max(age_us);
                 let au_bytes = au.data.len() as u64;
                 match rtc.write_video(au.data) {
-                    Ok(true) => {
+                    Ok(Some(rtp_timestamp)) => {
                         counters.admitted_frames += 1;
                         counters.admitted_bytes = counters.admitted_bytes.saturating_add(au_bytes);
                         debug!(au_age_us = age_us, "RTC access unit written");
@@ -792,10 +794,11 @@ fn transport_loop(
                             TransportEvent::AccessUnitWritten {
                                 id: au.id,
                                 is_idr: au.is_idr,
+                                rtp_timestamp,
                             },
                         );
                     }
-                    Ok(false) => emit(
+                    Ok(None) => emit(
                         &events,
                         TransportEvent::AccessUnitNotAdmitted {
                             id: au.id,

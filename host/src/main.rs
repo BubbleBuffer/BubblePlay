@@ -1155,6 +1155,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut pending_wss_idr: Option<PendingWssIdr> = None;
     let mut pending_lab_quality_keyframe: Option<String> = None;
     let mut pending_first_frame: Option<PendingFirstFrame> = None;
+    // (generation, RTP timestamp) of the startup IDR last admitted on WebRTC.
+    let mut startup_idr_rtp: Option<(u32, u32)> = None;
     let mut completed_first_frame: Option<(String, u32, String, Option<String>)> = None;
     let mut startup_idr_claimable = true;
     let mut startup_idr_admitted: Option<(u32, &'static str)> = None;
@@ -2127,10 +2129,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                     }
                 }
-                TransportEvent::AccessUnitWritten { id, is_idr: true } => {
+                TransportEvent::AccessUnitWritten {
+                    id,
+                    is_idr: true,
+                    rtp_timestamp,
+                } => {
                     replay.on_fresh_idr_admitted();
                     if startup_idr_submitted == Some((media_generation, "webrtc", id)) {
                         startup_idr_admitted = Some((media_generation, "webrtc"));
+                        startup_idr_rtp = Some((media_generation, rtp_timestamp));
                         startup_idr_submitted = None;
                     }
                     if let Some(pending) = pending_first_frame.as_mut().and_then(|pending| {
@@ -2138,13 +2145,18 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             .admit_rtc_access_unit(media_generation, id)
                             .then_some(pending)
                     }) {
-                        signaling.send_first_frame(
+                        pending.rtc_rtp_timestamp = Some(rtp_timestamp);
+                        // The RTP timestamp lets the browser prove that a
+                        // presented frame belongs to this generation before it
+                        // enables input (in-place desktop transitions).
+                        signaling.send_first_frame_with_rtp(
                             "admitted",
                             &pending.request_id,
                             pending.generation,
                             Some("webrtc"),
                             pending.epoch.as_deref(),
                             Some(active_codec.name()),
+                            Some(rtp_timestamp),
                         );
                     }
                     if let Some(pending) = take_matching_transition(&mut pending_transition_idr, id)
@@ -2583,15 +2595,24 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                     viewer_attached = true;
                     display_hold.set_attached(true);
-                    if !args.privileged_agent {
-                        remote_input_ready = capture_available;
-                    }
+                    // An offer that starts a new peer (including a client's
+                    // fallback restart after a desktop transition) keeps
+                    // input off until that peer's first-frame handshake
+                    // presents, in the user host as in the privileged Agent.
+                    let starts_peer = !rtc_peer.ended()
+                        && should_forward_offer(ice_connected, offer_accepted, offer_in_flight);
+                    // A repeated offer never turns input back on by itself.
+                    remote_input_ready = remote_input_ready
+                        && input_ready_on_offer(
+                            args.privileged_agent,
+                            capture_available,
+                            starts_peer,
+                        );
                     if let Some(kind) = latest_cursor_kind {
                         signaling.send_binary(&kind);
                         pump.publish_cursor_kind(kind);
                     }
-                    if args.privileged_agent {
-                        remote_input_ready = false;
+                    if args.privileged_agent || starts_peer {
                         carried_input.reset();
                         capture.release_input();
                     }
@@ -2667,13 +2688,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     && pending.generation == media_generation
                             }) {
                                 if pending.admitted {
-                                    signaling.send_first_frame(
+                                    signaling.send_first_frame_with_rtp(
                                         "admitted",
                                         &request_id,
                                         pending.generation,
                                         Some(&transport),
                                         epoch.as_deref(),
                                         Some(active_codec.name()),
+                                        pending.rtc_rtp_timestamp,
                                     );
                                 }
                                 continue;
@@ -2709,10 +2731,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     generation == media_generation && media == transport
                                 });
                             let reuse_startup = startup_idr_claimable
-                                && ((transport == "webrtc" && latest_idr.is_some())
+                                && ((transport == "webrtc"
+                                    && latest_idr.as_ref().is_some_and(|cached| {
+                                        cached.belongs_to(media_generation)
+                                    }))
                                     || submitted_id.is_some()
                                     || startup_admitted);
                             let admitted = reuse_startup && startup_admitted;
+                            let admitted_rtp = startup_idr_rtp
+                                .filter(|(generation, _)| {
+                                    admitted
+                                        && transport == "webrtc"
+                                        && *generation == media_generation
+                                })
+                                .map(|(_, rtp)| rtp);
                             pending_first_frame = Some(PendingFirstFrame {
                                 request_id,
                                 transport,
@@ -2720,18 +2752,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 generation: media_generation,
                                 admitted,
                                 rtc_idr_id: submitted_id,
+                                rtc_rtp_timestamp: admitted_rtp,
                                 armed_at: now,
                                 recovery: FirstFrameRecovery::default(),
                             });
                             if admitted {
                                 let pending = pending_first_frame.as_ref().expect("request armed");
-                                signaling.send_first_frame(
+                                signaling.send_first_frame_with_rtp(
                                     "admitted",
                                     &pending.request_id,
                                     media_generation,
                                     Some(&pending.transport),
                                     pending.epoch.as_deref(),
                                     Some(active_codec.name()),
+                                    pending.rtc_rtp_timestamp,
                                 );
                             } else if !reuse_startup {
                                 latest_idr = None;
@@ -3649,7 +3683,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     .staged
                     .map(|(mode, _)| mode)
                     .unwrap_or(profiles.active);
-                if cached.mode != expected {
+                if cached.mode != expected || !cached.belongs_to(media_generation) {
                     latest_idr = None;
                     continue 'session;
                 }
@@ -3926,6 +3960,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         data: access.data.clone(),
                         mode,
                         requires_default: false,
+                        generation: media_generation,
                     });
                 }
                 let id = permit_id;
@@ -5957,6 +5992,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             data: encoded.data.clone(),
                             mode,
                             requires_default: !frame.is_secure_snapshot(),
+                            generation: media_generation,
                         });
                     }
                     capture.cancel_idle_followup_snapshot();
@@ -6566,7 +6602,7 @@ mod tests {
         capture_admission_ready, coalesce_quiescent_cache_round_trips, commit_matching_transition,
         effective_idr_interval, encoder_benchmark_contract_changed, encoder_mode_for_capture,
         fallback_mode, frame_admission_due, full_profile_uses_native_texture,
-        idle_snapshot_completion_order, lab_quality_keyframe_request,
+        idle_snapshot_completion_order, input_ready_on_offer, lab_quality_keyframe_request,
         privileged_input_ready_after_presentation, privileged_no_frame_retry_delay,
         producer_wait_duration, quiescent_damage_rects, quiescent_immediate_damage_rects,
         quiescent_transition_followup_needed, quiescent_transition_upsert_allowed,
@@ -7815,6 +7851,7 @@ mod tests {
             generation: 1,
             admitted: false,
             rtc_idr_id: None,
+            rtc_rtp_timestamp: None,
             armed_at: Instant::now(),
             recovery: FirstFrameRecovery::default(),
         };
@@ -7835,6 +7872,7 @@ mod tests {
             generation: 2,
             admitted: false,
             rtc_idr_id: None,
+            rtc_rtp_timestamp: None,
             armed_at: Instant::now(),
             recovery: FirstFrameRecovery::default(),
         };
@@ -7851,6 +7889,7 @@ mod tests {
             generation: 3,
             admitted: false,
             rtc_idr_id: Some(42),
+            rtc_rtp_timestamp: None,
             armed_at: Instant::now(),
             recovery: FirstFrameRecovery::default(),
         };
@@ -7875,6 +7914,7 @@ mod tests {
             generation: 3,
             admitted: false,
             rtc_idr_id: Some(42),
+            rtc_rtp_timestamp: None,
             armed_at: Instant::now(),
             recovery: FirstFrameRecovery::default(),
         };
@@ -8124,8 +8164,50 @@ mod tests {
             data: vec![1, 2, 3],
             mode: state.active,
             requires_default: true,
+            generation: 1,
         };
         assert_eq!(cached.mode, VideoMode::native(2560, 1440, 30));
+    }
+
+    #[test]
+    fn cached_idr_never_crosses_a_media_generation() {
+        let cached = CachedIdr {
+            data: vec![1, 2, 3],
+            mode: VideoMode::native(1920, 1080, 30),
+            requires_default: false,
+            generation: 7,
+        };
+        assert!(cached.belongs_to(7));
+        assert!(
+            !cached.belongs_to(8),
+            "a desktop transition bumps the generation"
+        );
+        assert!(!cached.belongs_to(6));
+    }
+
+    #[test]
+    fn new_peer_offer_keeps_host_input_off_until_presentation() {
+        // User host: a forwarded offer starts a peer and waits for "presented".
+        assert!(!input_ready_on_offer(false, true, true));
+        // An offer the host ignores keeps the previous user-host rule.
+        assert!(input_ready_on_offer(false, true, false));
+        assert!(!input_ready_on_offer(false, false, false));
+        // The privileged Agent always waits.
+        assert!(!input_ready_on_offer(true, true, false));
+        assert!(!input_ready_on_offer(true, true, true));
+        // Presentation of the current generation then enables user-host input.
+        let state = PrivilegedDesktopState {
+            available: true,
+            desktop: "default",
+            input: "enabled",
+            agent_generation: 1,
+        };
+        assert!(privileged_input_ready_after_presentation(
+            false, true, state, 4, 4
+        ));
+        assert!(!privileged_input_ready_after_presentation(
+            false, true, state, 3, 4
+        ));
     }
 
     #[test]
@@ -8134,6 +8216,7 @@ mod tests {
             data: vec![1, 2, 3],
             mode: VideoMode::native(1920, 1080, 30),
             requires_default: true,
+            generation: 1,
         };
         let default_desktop = std::cell::Cell::new(true);
         assert!(cached.replay_authorized(|| default_desktop.get()));
