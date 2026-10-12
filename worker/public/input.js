@@ -101,7 +101,8 @@ export class WheelAccumulator {
     this.y -= this.toUnits(deltaY, deltaMode);
     const x = Math.trunc(this.x), y = Math.trunc(this.y);
     this.x -= x; this.y -= y;
-    return { x: clamp(x, -32768, 32767), y: clamp(y, -32768, 32767) };
+    // The sender splits whole distance into i16 packets; never clamp it here.
+    return { x, y };
   }
 }
 
@@ -209,6 +210,13 @@ export const shouldCorrectCursorDrift = ({ pointerMode, locallyAuthoritative, st
   pointerMode === "desktop" && locallyAuthoritative && now - lastCorrectionAt >= intervalMs &&
   cursorDriftPixels(state, cursor, remote) > tolerancePx;
 const i16 = v => clamp(Math.round(v), -32768, 32767);
+const wholeUnits = v => (Number.isFinite(v) ? Math.round(v) : 0);
+/**
+ * Two-finger translate (finger delta in screen px) to wheel values with the
+ * Android client's natural-scroll sign: fingers moving right send a negative X
+ * (Windows HWHEEL is positive to the right), so content follows the fingers.
+ */
+export const touchTranslateWheel = action => ({ x: -action.dx, y: action.dy });
 
 export const CURSOR_STATE = { ACK_VALID: 1, IN_BOUNDS: 2, VISIBLE: 4 };
 export function decodeCursorState(data) {
@@ -245,8 +253,8 @@ export class InputController {
   constructor({ sendControl = () => false, sendMotion = () => false, motionBuffered = () => 0, backlogLimit = 64,
     controlState = () => "open", scheduleFlush = callback => setTimeout(callback, 16), maxQueuedBytes = 4 * 1024 * 1024 } = {}) {
     Object.assign(this, { sendControl, sendMotion, motionBuffered, backlogLimit, controlState, scheduleFlush, maxQueuedBytes,
-      held: new Set(), buttonMask: 0, seq: 0, lastSentSequence: null, pending: [0, 0, 0, 0], pendingAbsolute: null,
-      queue: [], queuedBytes: 0, needsRelease: false, flushArmed: false, scancode: false,
+      held: new Set(), buttonMask: 0, seq: 0, lastSentSequence: null, lastCursorSequence: null, pending: [0, 0, 0, 0], pendingAbsolute: null, wheelRemainder: [0, 0],
+      queue: [], queuedBytes: 0, needsRelease: false, flushArmed: false, draining: false, motionSending: false, scancode: false,
       stats: { sent: 0, coalesced: 0, dropped: 0, controlSent: 0, controlDropped: 0, controlQueued: 0, releaseResync: 0 } });
   }
   /** Accepts a control packet for in-order delivery; false only when the transport is down. */
@@ -259,8 +267,13 @@ export class InputController {
     this.flushControl();
     return true;
   }
-  /** Sends queued control packets in order while the transport accepts them. */
+  /** Sends queued control packets in order while the transport accepts them. A reentrant call returns at once; the outer drain sends the rest. */
   flushControl() {
+    if (this.draining) return false;
+    this.draining = true;
+    try { return this.drainControl(); } finally { this.draining = false; }
+  }
+  drainControl() {
     this.flushArmed = false;
     while (this.queue.length) {
       const state = this.controlState();
@@ -303,30 +316,99 @@ export class InputController {
   clipboard(text, id, options) { const packets = clipboardPackets(text, id, options); if (!packets) return false; return packets.every(message => this.sendReliable(message)); }
   text(value) { const message = packet.text(value); return message ? this.sendReliable(message) : false; }
   buttons(mask) { this.buttonMask = mask; return this.sendReliable(packet.buttons(mask)); }
-  buttonsAt(x, y, mask) { this.clearMotion(); const sequence = this.seq, message = packet.buttonsAt(sequence, clamp(Math.round(x),0,65535), clamp(Math.round(y),0,65535), mask); if (!this.sendReliable(message)) return false; this.lastSentSequence = sequence; this.seq = (sequence + 1) & 0xffff; this.buttonMask = mask; return true; }
-  cursorSync() { this.clearMotion(); const sequence = this.seq; if (!this.sendReliable(packet.cursorSync(sequence))) return false; this.lastSentSequence = sequence; this.seq = (sequence + 1) & 0xffff; return true; }
-  motion(dx, dy, wx = 0, wy = 0) { if (this.pendingAbsolute) { this.pendingAbsolute = null; } else if (this.pending.some(Boolean)) this.stats.coalesced++; this.pending[0] += dx; this.pending[1] += dy; this.pending[2] += wx; this.pending[3] += wy; }
+  /** Takes the next shared sequence number before its packet is built, so a reentrant send cannot reuse it. */
+  allocSequence() { const sequence = this.seq; this.seq = (sequence + 1) & 0xffff; return sequence; }
+  /** Gives a sequence back when its packet was refused; a number taken meanwhile stays a harmless gap. */
+  releaseSequence(sequence) { if (this.seq === ((sequence + 1) & 0xffff)) this.seq = sequence; }
+  // Pointer barriers drop the pending pointer (absolute target and relative
+  // displacement) but never pending wheel distance: wheel goes out after the barrier.
+  clearPointer() { this.pendingAbsolute = null; this.pending = [0, 0, this.pending[2], this.pending[3]]; }
+  buttonsAt(x, y, mask) {
+    this.clearPointer();
+    const sequence = this.allocSequence(), message = packet.buttonsAt(sequence, clamp(Math.round(x),0,65535), clamp(Math.round(y),0,65535), mask);
+    const undo = this.markSent(sequence, true);
+    if (!this.sendReliable(message)) { undo(); this.releaseSequence(sequence); return false; }
+    this.buttonMask = mask; return true;
+  }
+  cursorSync() {
+    this.clearPointer();
+    const sequence = this.allocSequence(), undo = this.markSent(sequence, true);
+    if (!this.sendReliable(packet.cursorSync(sequence))) { undo(); this.releaseSequence(sequence); return false; }
+    return true;
+  }
+  /**
+   * Records a packet as the latest sent before it goes out, so a reentrant send
+   * made from inside the send is not overwritten. Returns the undo for a refusal.
+   */
+  markSent(sequence, cursor) {
+    const previous = [this.lastSentSequence, this.lastCursorSequence];
+    this.lastSentSequence = sequence; if (cursor) this.lastCursorSequence = sequence;
+    return () => {
+      if (this.lastSentSequence === sequence) this.lastSentSequence = previous[0];
+      if (this.lastCursorSequence === sequence) this.lastCursorSequence = previous[1];
+    };
+  }
+  // A relative displacement supersedes a pending absolute target; wheel distance never does.
+  motion(dx, dy, wx = 0, wy = 0) {
+    if (this.pendingAbsolute && (dx || dy)) this.pendingAbsolute = null; else if (this.pending.some(Boolean)) this.stats.coalesced++;
+    const wheel = [wx, wy].map((value, axis) => {
+      const total = this.wheelRemainder[axis] + (Number.isFinite(value) ? value : 0);
+      const units = Math.trunc(total);
+      this.wheelRemainder[axis] = total - units;
+      return units;
+    });
+    const delta = [wholeUnits(dx), wholeUnits(dy), ...wheel];
+    this.pending = this.pending.map((value, i) => value + delta[i]);
+  }
   motionNow(dx, dy, wx = 0, wy = 0) { this.motion(dx, dy, wx, wy); return this.flushMotion(); }
-  absolute(x, y) { if (this.pendingAbsolute) this.stats.coalesced++; this.pending = [0, 0, 0, 0]; this.pendingAbsolute = [clamp(Math.round(x),0,65535), clamp(Math.round(y),0,65535)]; }
-  clearMotion() { this.pending = [0, 0, 0, 0]; this.pendingAbsolute = null; }
+  // A newer target supersedes earlier position deltas only; pending wheel distance stays.
+  absolute(x, y) { if (this.pendingAbsolute) this.stats.coalesced++; this.pending = [0, 0, this.pending[2], this.pending[3]]; this.pendingAbsolute = [clamp(Math.round(x),0,65535), clamp(Math.round(y),0,65535)]; }
+  clearMotion() { this.pending = [0, 0, 0, 0]; this.pendingAbsolute = null; this.wheelRemainder = [0, 0]; }
   hasPendingMotion() { return Boolean(this.pendingAbsolute) || this.pending.some(Boolean); }
-  // Motion never overtakes queued control (a click/drag must not be reordered).
-  // A congested send keeps the coalesced motion/wheel pending rather than
-  // losing wheel distance or the final pointer position.
+  /**
+   * Motion never overtakes queued control (a click/drag must not be reordered).
+   * One flush sends a pending absolute target, then the relative and wheel
+   * remainder in i16-sized packets; every packet takes the next shared sequence
+   * number. A refused packet keeps its remainder pending, so nothing is lost and
+   * the caller retries while input is ready. Returns true if anything was sent.
+   */
   flushMotion() {
-    const absolute = this.pendingAbsolute, p = this.pending;
-    if (!absolute && !p.some(Boolean)) return false;
+    if (this.motionSending) return false;
+    if (!this.hasPendingMotion()) return false;
     if (this.controlState() === "down") { this.clearMotion(); return false; }
     if (this.queue.length) return false;
-    this.clearMotion();
-    const sequence = this.seq, message = absolute ? packet.absolute(sequence, ...absolute) : packet.motion(sequence, ...p.map(i16));
+    this.motionSending = true;
+    try { return this.sendPendingMotion(); } finally { this.motionSending = false; }
+  }
+  sendPendingMotion() {
     let sent = false;
-    if (this.motionBuffered() <= this.backlogLimit) { try { sent = Boolean(this.sendMotion(message)); } catch { sent = false; } }
-    if (!sent) { this.stats.dropped++; this.pending = p; this.pendingAbsolute = absolute; return false; }
-    this.lastSentSequence = sequence; this.seq = (sequence + 1) & 0xffff; this.stats.sent++; return true;
+    // Bound work in one animation frame even when a large backlog accumulates.
+    // The receiver retries the retained tail on later frames.
+    let budget = 32;
+    if (this.pendingAbsolute) {
+      const [x, y] = this.pendingAbsolute;
+      if (!this.sendMotionPacket(sequence => packet.absolute(sequence, x, y), true)) return false;
+      this.pendingAbsolute = null; sent = true;
+      budget--;
+    }
+    while (budget-- > 0 && this.pending.some(Boolean)) {
+      const chunk = this.pending.map(i16);
+      if (!this.sendMotionPacket(sequence => packet.motion(sequence, ...chunk), chunk[0] !== 0 || chunk[1] !== 0)) break;
+      this.pending = this.pending.map((value, i) => value - chunk[i]); sent = true;
+    }
+    return sent;
+  }
+  sendMotionPacket(build, movesCursor) {
+    const sequence = this.allocSequence(), undo = this.markSent(sequence, movesCursor);
+    let sent = false;
+    if (this.motionBuffered() <= this.backlogLimit) { try { sent = Boolean(this.sendMotion(build(sequence))); } catch { sent = false; } }
+    if (!sent) { undo(); this.stats.dropped++; this.releaseSequence(sequence); return false; }
+    this.stats.sent++;
+    return true;
   }
   releaseAll(send = true) { this.held.clear(); this.buttonMask = 0; this.clearMotion(); if (send) return this.sendReliable(packet.releaseAll()); this.discardControl(0); return false; }
 }
+
 
 /** Reconciles authoritative host cursor samples without rewinding newer input. */
 export class CursorReconciler {

@@ -1341,6 +1341,25 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             );
         }};
     }
+    macro_rules! begin_viewer_input {
+        () => {{
+            session_call!(Input, input_sink.reset_viewer_session());
+            input_coalescer = InputPacketCoalescer::default();
+            signaling.reset_viewer_cursor_state();
+            carried_input.reset();
+            cursor_tracker = CursorTracker::for_region(capture.region(), Instant::now());
+            cursor_kind_tracker.reset();
+            latest_cursor_kind = None;
+            capture.begin_viewer_session();
+            // A replaced Agent lease requires a fresh media identity and its
+            // existing verified-frame/presentation gate before accepting input.
+            media_generation = media_generation.wrapping_add(1).max(1);
+            media_sequence = 0;
+            last_privileged_desktop_state = None;
+            remote_input_ready = !args.privileged_agent && capture_available;
+            info!("viewer input sequence space reset");
+        }};
+    }
     let mut first_iteration = true;
     'session: loop {
         session_stage!(CaptureDemand);
@@ -1747,6 +1766,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     );
                 }
                 PrivilegedEvent::Cursor(encoded) => {
+                    // Pipe feedback from the previous producer may already be
+                    // queued when its lease is replaced. Do not import its ACK
+                    // into the fresh viewer's watermark behind the frame gate.
+                    if !remote_input_ready {
+                        continue;
+                    }
                     signaling.send_cursor_state(encoded, false);
                     if ice_connected {
                         pump.publish_cursor_state(encoded);
@@ -2550,6 +2575,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 SignalEvent::Offer(sdp) => {
                     input_sink.reset_status_delivery();
                     if !viewer_attached {
+                        begin_viewer_input!();
                         if let Some(egress) = wss_media.take() {
                             egress.shutdown();
                         }
@@ -3065,6 +3091,23 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                     if action == "start" {
                         input_sink.reset_status_delivery();
+                        if let Some(requested_epoch) =
+                            epoch.as_deref().filter(|value| valid_media_epoch(value))
+                        {
+                            if viewer_attached
+                                && active_wss_epoch
+                                    .as_deref()
+                                    .is_some_and(|active| active != requested_epoch)
+                            {
+                                // Replacement can arrive without PeerLeft.
+                                // Fence queued/late input on the old RTC peer
+                                // before clearing the producer's stale barrier.
+                                park_viewer!("wss-epoch-replaced");
+                            }
+                            if !viewer_attached {
+                                begin_viewer_input!();
+                            }
+                        }
                         viewer_attached = true;
                         display_hold.set_attached(true);
                         if !args.privileged_agent {

@@ -9,7 +9,7 @@ import {
 } from "/recovery.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
- import { canMoveAbsoluteCursor, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
+ import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
 import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
@@ -675,11 +675,15 @@ function sendInput(data, channel) {
   return false;
 }
 let motionFrame = null;
-function armMotionFlush() { if (motionFrame === null) motionFrame = requestAnimationFrame(() => { motionFrame = null; input.flushMotion(); hudState.motionSent = input.stats.sent; hudState.motionCoalesced = input.stats.coalesced; hudState.motionDropped = input.stats.dropped; }); }
+// A refused motion tail (congestion) stays pending in the controller; retry on the
+// next frame while input is ready, so wheel distance is delivered rather than dropped.
+function armMotionFlush() { if (motionFrame === null) motionFrame = requestAnimationFrame(() => { motionFrame = null; input.flushMotion(); hudState.motionSent = input.stats.sent; hudState.motionCoalesced = input.stats.coalesced; hudState.motionDropped = input.stats.dropped; retryMotionTail(); }); }
+function retryMotionTail() { if (inputReady && input.hasPendingMotion()) armMotionFlush(); }
 function queueMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motion(dx, dy, wheelX, wheelY); armMotionFlush(); }
 function updateMotionHud() { hudState.motionSent = input.stats.sent; hudState.motionCoalesced = input.stats.coalesced; hudState.motionDropped = input.stats.dropped; }
-function queueTouchMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motionNow(dx, dy, wheelX, wheelY); updateMotionHud(); }
-function queueTouchAbsolute(x, y) { input.absolute(x, y); const sent = input.flushMotion(); if (sent) cursorReconciler?.noteSent(input.lastSentSequence); updateMotionHud(); return sent; }
+function queueTouchMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motionNow(dx, dy, wheelX, wheelY); retryMotionTail(); updateMotionHud(); }
+// Reconcile against the cursor sequence, not the last wheel: wheel-only sends never move the pointer.
+function queueTouchAbsolute(x, y) { const before = input.lastCursorSequence; input.absolute(x, y); const sent = input.flushMotion(); if (input.lastCursorSequence !== before) cursorReconciler?.noteSent(input.lastCursorSequence); retryMotionTail(); updateMotionHud(); return sent; }
 function queueAbsolute(x, y) { input.absolute(x, y); armMotionFlush(); }
 function releaseInput(send = true) { input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; renderKeyboardModifiers?.(); }
 let connected = false;
@@ -3473,7 +3477,7 @@ function clearCursorSyncTimer() { if (cursorSyncTimer !== null) clearTimeout(cur
 function requestCursorSync() {
   clearCursorSyncTimer();
   if (pointerMode !== "desktop" || !inputReady) { updatePointerHud(); return; }
-  if (input.cursorSync()) cursorReconciler.noteSent(input.lastSentSequence);
+  if (input.cursorSync()) cursorReconciler.noteSent(input.lastCursorSequence);
   updatePointerHud();
   if (!cursorReconciler.synced) cursorSyncTimer = setTimeout(requestCursorSync, 500);
 }
@@ -3486,7 +3490,7 @@ function handleCursorState(data, source = "rtc") {
   const now=performance.now();
   if (shouldCorrectCursorDrift({pointerMode,locallyAuthoritative:locallyAuthoritativeCursor,state,cursor:remoteCursor,remote:remoteDesktop,now,lastCorrectionAt:lastCursorCorrectionAt})) {
     const point=remoteCursor.absolutePoint();
-    if (input.buttonsAt(point.x,point.y,touchButtons || buttons)) { cursorReconciler.noteSent(input.lastSentSequence); lastCursorCorrectionAt=now; }
+    if (input.buttonsAt(point.x,point.y,touchButtons || buttons)) { cursorReconciler.noteSent(input.lastCursorSequence); lastCursorCorrectionAt=now; }
   }
   if (cursorReconciler.synced) clearCursorSyncTimer();
   touchCursorVisible=shouldShowCursorOverlay({pointerMode, ...cursorReconciler});
@@ -3503,7 +3507,7 @@ function setPointerMode(next, persist=true) {
   if (persist) sendStreamMode("user-mode");
   clearCursorSyncTimer(); updatePointerHud(); renderTouchCursor();
   if (inputReady) {
-    if (input.cursorSync()) cursorReconciler.noteSent(input.lastSentSequence);
+    if (input.cursorSync()) cursorReconciler.noteSent(input.lastCursorSequence);
     if (pointerMode === "desktop") cursorSyncTimer=setTimeout(requestCursorSync,500);
    }
    scheduleSharpViewport("pointer-mode");
@@ -3650,7 +3654,7 @@ function setZoom(next) { syncViewport(); const anchor=mobilePointerDevice && (po
 function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); scheduleSharpViewport("pan"); }
 addEventListener("resize", syncViewportAndFollow);
 function setTouchButtons(mask) { touchButtons=mask; if (inputReady) input.buttons(mask); }
-function setTouchButtonsAtCursor(mask) { const point=remoteCursor.absolutePoint(); touchButtons=mask; if (inputReady && input.buttonsAt(point.x,point.y,mask)) cursorReconciler.noteSent(input.lastSentSequence); updatePointerHud(); }
+function setTouchButtonsAtCursor(mask) { const point=remoteCursor.absolutePoint(); touchButtons=mask; if (inputReady && input.buttonsAt(point.x,point.y,mask)) cursorReconciler.noteSent(input.lastCursorSequence); updatePointerHud(); }
 function dispatchGesture(actions) {
   if (!desktopAvailable || desktopAwaitingFrame) return;
   for (const action of actions) {
@@ -3662,7 +3666,7 @@ function dispatchGesture(actions) {
     else if (action.type === "drag-end" && touchButtons) { if (pointerMode === "desktop" && cursorReconciler.synced) setTouchButtonsAtCursor(0); else setTouchButtons(0); }
     else if (action.type === "right-tap" && inputReady) { if (pointerMode === "desktop") { if (!cursorReconciler.synced) { requestCursorSync(); continue; } setTouchButtonsAtCursor(2); setTouchButtons(0); } else { setTouchButtons(2); setTouchButtons(0); } }
     else if (action.type === "pinch") setZoom(viewport.zoom * action.scale);
-    else if (action.type === "translate") { if (viewport.zoom === 1) { if (inputReady) queueTouchMotion(0,0,action.dx,action.dy); } else panBy(action.dx,action.dy); }
+    else if (action.type === "translate") { if (viewport.zoom === 1) { if (inputReady) { const wheel = touchTranslateWheel(action); queueTouchMotion(0, 0, wheel.x, wheel.y); } } else panBy(action.dx,action.dy); }
   }
   hudState.touch = gestures.cancelled ? "cancelled" : (gestures.dragActive ? "drag" : gestures.mode || (gestures.points.size > 1 ? "two-finger" : gestures.points.size ? "touch" : "…"));
 }

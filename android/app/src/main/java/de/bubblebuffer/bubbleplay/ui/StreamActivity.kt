@@ -51,6 +51,7 @@ import de.bubblebuffer.bubbleplay.input.Chord
 import de.bubblebuffer.bubbleplay.input.CursorReconciler
 import de.bubblebuffer.bubbleplay.input.GestureAction
 import de.bubblebuffer.bubbleplay.input.PointerSpeed
+import de.bubblebuffer.bubbleplay.input.PointerWheel
 import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.input.TouchGestures
 import de.bubblebuffer.bubbleplay.input.TouchMode
@@ -766,8 +767,25 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     // ---- mouse ------------------------------------------------------------------------
     private fun onStageGenericMotion(event: MotionEvent): Boolean {
+        // Wheel and touchpad scroll arrive here while the pointer is uncaptured; once captured they
+        // go to onCapturedPointer instead, so each scroll sample is routed exactly once.
+        if (event.actionMasked == MotionEvent.ACTION_SCROLL && PointerWheel.isPointerSource(event.source)) {
+            if (event.isFromSource(InputDevice.SOURCE_MOUSE)) onMouseEvent(event)
+            onWheel(event)
+            return true
+        }
         if (!event.isFromSource(InputDevice.SOURCE_MOUSE)) return false
         return onMouseEvent(event)
+    }
+
+    /** Wheel or touchpad scroll axes (notches) to WHEEL_DELTA units, sent as a wheel-only motion. */
+    private fun onWheel(event: MotionEvent) {
+        val remote = input ?: return
+        val (wx, wy) = wheel.add(
+            PointerWheel.units(event.getAxisValue(MotionEvent.AXIS_HSCROLL)),
+            PointerWheel.units(event.getAxisValue(MotionEvent.AXIS_VSCROLL)),
+        )
+        if (wx != 0 || wy != 0) { remote.motion(0, 0, wx, wy); scheduleMotionFlush() }
     }
 
     /** An uncaptured mouse asks for pointer capture so motion arrives relative. */
@@ -787,10 +805,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
                 remote.motion(dx.roundToInt(), dy.roundToInt())
                 scheduleMotionFlush()
             }
-            MotionEvent.ACTION_SCROLL -> {
-                val (wx, wy) = wheel.add(event.getAxisValue(MotionEvent.AXIS_HSCROLL) * 120f, event.getAxisValue(MotionEvent.AXIS_VSCROLL) * 120f)
-                if (wx != 0 || wy != 0) { remote.motion(0, 0, wx, wy); scheduleMotionFlush() }
-            }
+            MotionEvent.ACTION_SCROLL -> onWheel(event)
         }
         val mask = mouseMask(event.buttonState)
         if (mask != mouseButtons) {

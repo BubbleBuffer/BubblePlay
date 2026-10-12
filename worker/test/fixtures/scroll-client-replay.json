@@ -1,0 +1,107 @@
+{
+  "description": "Replay of client InputController packets for a scroll session. Each step is applied in order; 'flush' runs flushMotion. Packets are the exact bytes sent, in send order, on the motion lane (sendMotion) or control lane (sendControl). Rust and Android replay the same steps and must produce the same packets.",
+  "steps": [
+    {
+      "op": "absolute",
+      "args": [
+        1000,
+        2000
+      ]
+    },
+    {
+      "op": "flush"
+    },
+    {
+      "op": "motion",
+      "args": [
+        0,
+        0,
+        -30,
+        120
+      ]
+    },
+    {
+      "op": "flush"
+    },
+    {
+      "op": "buttonsAt",
+      "args": [
+        1000,
+        2000,
+        1
+      ]
+    },
+    {
+      "op": "absolute",
+      "args": [
+        1100,
+        2100
+      ]
+    },
+    {
+      "op": "flush"
+    },
+    {
+      "op": "motion",
+      "args": [
+        0,
+        0,
+        60,
+        -240
+      ]
+    },
+    {
+      "op": "flush"
+    },
+    {
+      "op": "buttonsAt",
+      "args": [
+        1100,
+        2100,
+        0
+      ]
+    },
+    {
+      "op": "motion",
+      "args": [
+        0,
+        0,
+        0,
+        15
+      ]
+    },
+    {
+      "op": "flush"
+    }
+  ],
+  "packets": [
+    {
+      "lane": "motion",
+      "hex": "080000e803d007"
+    },
+    {
+      "lane": "motion",
+      "hex": "07010000000000e2ff7800"
+    },
+    {
+      "lane": "control",
+      "hex": "090200e803d00701"
+    },
+    {
+      "lane": "motion",
+      "hex": "0803004c043408"
+    },
+    {
+      "lane": "motion",
+      "hex": "070400000000003c0010ff"
+    },
+    {
+      "lane": "control",
+      "hex": "0905004c04340800"
+    },
+    {
+      "lane": "motion",
+      "hex": "0706000000000000000f00"
+    }
+  ]
+}

@@ -49,6 +49,9 @@ pub trait AgentBackend: Send + 'static {
     fn select_monitor(&mut self, monitor_id: u32) -> Result<()>;
     fn list_monitors(&mut self) -> Result<Option<Message>>;
     fn release_all(&mut self) -> Result<()>;
+    /// Forget the departed producer's sequencing after releasing its input.
+    /// This is an internal backend operation, not a new IPC message.
+    fn reset_input_session(&mut self) -> Result<()>;
     fn suspend(&mut self) -> Result<()>;
     fn resume(&mut self) -> Result<()>;
     fn transition_desktop(
@@ -87,7 +90,6 @@ pub enum AgentEvent {
 
 #[derive(Debug, Clone, Copy)]
 struct Lease {
-    id: u64,
     expires_at: Instant,
 }
 
@@ -100,6 +102,8 @@ struct ActiveConfig {
 pub struct AgentCore<B: AgentBackend> {
     backend: B,
     lease: Option<Lease>,
+    last_producer_lease_id: Option<u64>,
+    input_session_reset_failed: bool,
     active_config: Option<ActiveConfig>,
     require_new_session: bool,
     outstanding: Option<PermitIdentity>,
@@ -122,6 +126,8 @@ impl<B: AgentBackend> AgentCore<B> {
         Self {
             backend,
             lease: None,
+            last_producer_lease_id: None,
+            input_session_reset_failed: false,
             active_config: None,
             require_new_session: false,
             outstanding: None,
@@ -146,15 +152,41 @@ impl<B: AgentBackend> AgentCore<B> {
         self.expire_lease(now, &mut events);
         match message {
             Message::RenewLease { lease_id, .. } => {
-                let replacing = self.lease.is_some_and(|lease| lease.id != lease_id);
+                // Expiry removes authorization, but not producer identity: a
+                // different viewer must also reset a proxy that stayed warm.
+                let replacing = self.last_producer_lease_id.is_some_and(|id| id != lease_id);
                 if replacing {
                     self.release_all();
                     self.suspend();
                     self.cancel_outstanding(NoFrameReason::Backpressured, &mut events);
                     self.require_new_session = self.active_config.is_some();
+                    self.input_ready = false;
+                    self.input_session_reset_failed = match self.backend.reset_input_session() {
+                        Ok(()) => false,
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "privileged input session reset failed; input remains suspended"
+                            );
+                            events.push(AgentEvent::Control(Message::RecoverableError(
+                                AgentError {
+                                    operation: AgentOperation::Input,
+                                    error_code: -1,
+                                    session_generation: self
+                                        .active_config
+                                        .map_or(0, |config| config.session_generation),
+                                    config_revision: self
+                                        .active_config
+                                        .map_or(0, |config| config.config_revision),
+                                    permit_id: None,
+                                },
+                            )));
+                            true
+                        }
+                    };
                 }
+                self.last_producer_lease_id = Some(lease_id);
                 self.lease = Some(Lease {
-                    id: lease_id,
                     // The privileged boundary owns the lease duration. A peer
                     // cannot expand it by placing a larger value on the wire.
                     expires_at: now + LEASE_TTL,
@@ -271,7 +303,10 @@ impl<B: AgentBackend> AgentCore<B> {
                             // can return after expiry; forwarding that stale
                             // health event would reopen input over an
                             // unverified browser frame.
-                            if !self.lease_active(now) || self.outstanding.is_none() {
+                            if !self.lease_active(now)
+                                || self.outstanding.is_none()
+                                || self.input_session_reset_failed
+                            {
                                 return events;
                             }
                             self.input_ready = self.input_capable;
@@ -508,6 +543,7 @@ impl<B: AgentBackend> AgentCore<B> {
             && self.lease_active(now)
             && desktop_available
             && self.desktop_ready
+            && !self.input_session_reset_failed
             && self.backend.resume().is_ok()
         {
             self.suspended = false;
@@ -740,6 +776,9 @@ impl AgentBackend for BoundaryBackend {
     fn release_all(&mut self) -> Result<()> {
         Ok(())
     }
+    fn reset_input_session(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn suspend(&mut self) -> Result<()> {
         Ok(())
     }
@@ -783,6 +822,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeState {
         releases: usize,
+        input_session_resets: usize,
+        fail_input_session_reset: bool,
         suspends: usize,
         resumes: usize,
         inputs: usize,
@@ -798,6 +839,14 @@ mod tests {
     struct FakeBackend(Arc<Mutex<FakeState>>);
 
     impl AgentBackend for FakeBackend {
+        fn reset_input_session(&mut self) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            state.input_session_resets += 1;
+            if state.fail_input_session_reset {
+                anyhow::bail!("input session reset failed");
+            }
+            Ok(())
+        }
         fn configure(&mut self, _config: &MediaConfig) -> Result<()> {
             Ok(())
         }
@@ -1115,7 +1164,15 @@ mod tests {
         core.handle(Message::Input(vec![1]), renewed);
         assert_eq!(state.lock().unwrap().inputs, 0);
 
-        core.handle(permit(12, 3, 4), renewed);
+        // Lease 8 is a new producer, so an old-generation permit cannot
+        // reopen input even though authorization has been renewed.
+        assert!(matches!(
+            core.handle(permit(12, 3, 4), renewed).as_slice(),
+            [AgentEvent::Media(Message::NoFrame { .. })]
+        ));
+        core.handle(Message::Input(vec![1]), renewed);
+        assert_eq!(state.lock().unwrap().inputs, 0);
+        assert!(core.handle(permit(12, 4, 4), renewed).is_empty());
         state
             .lock()
             .unwrap()
@@ -1273,6 +1330,147 @@ mod tests {
             [AgentEvent::Media(Message::NoFrame { .. })]
         ));
         assert!(core.handle(permit(1, 8, 1), now).is_empty());
+    }
+
+    #[test]
+    fn producer_lease_replacement_resets_input_once_and_preserves_ordinary_barriers() {
+        let backend = FakeBackend::default();
+        let state = backend.0.clone();
+        let mut core = AgentCore::new(backend);
+        let now = Instant::now();
+        core.observe_desktop(DesktopKind::Default, now);
+        let renewal = |lease_id| Message::RenewLease {
+            lease_id,
+            ttl_ms: 2_000,
+        };
+        core.handle(renewal(10), now);
+        core.handle(renewal(10), now);
+        core.handle(Message::ReleaseAll, now);
+        core.handle(Message::ConfigureMedia(config(1, 1)), now);
+        core.handle(Message::ConfigureMedia(config(1, 2)), now);
+        core.handle(Message::SelectMonitor { monitor_id: 0 }, now);
+        core.suspend();
+        core.resume_if_allowed(now);
+        assert_eq!(state.lock().unwrap().input_session_resets, 0);
+
+        core.handle(renewal(11), now);
+        core.handle(renewal(11), now);
+        core.handle(Message::ReleaseAll, now);
+        assert_eq!(state.lock().unwrap().input_session_resets, 1);
+        assert!(core.require_new_session);
+        assert!(!core.input_ready);
+    }
+
+    #[test]
+    fn producer_identity_survives_lease_expiry_for_input_session_reset() {
+        let backend = FakeBackend::default();
+        let state = backend.0.clone();
+        let mut core = AgentCore::new(backend);
+        let now = Instant::now();
+        core.observe_desktop(DesktopKind::Default, now);
+        let renewal = |lease_id| Message::RenewLease {
+            lease_id,
+            ttl_ms: 2_000,
+        };
+        core.handle(renewal(10), now);
+        let expired = now + LEASE_TTL + Duration::from_millis(1);
+        core.tick(expired);
+        assert!(core.lease.is_none());
+        core.handle(renewal(10), expired);
+        assert_eq!(state.lock().unwrap().input_session_resets, 0);
+        core.tick(expired + LEASE_TTL + Duration::from_millis(1));
+        core.handle(renewal(11), expired + LEASE_TTL + Duration::from_millis(1));
+        core.handle(renewal(11), expired + LEASE_TTL + Duration::from_millis(2));
+        assert_eq!(state.lock().unwrap().input_session_resets, 1);
+    }
+
+    #[test]
+    fn failed_input_session_reset_stays_suspended_on_same_lease_heartbeat() {
+        let backend = FakeBackend::default();
+        let state = backend.0.clone();
+        let mut core = AgentCore::new(backend);
+        let now = Instant::now();
+        core.observe_desktop(DesktopKind::Default, now);
+        let renewal = |lease_id| Message::RenewLease {
+            lease_id,
+            ttl_ms: 2_000,
+        };
+        core.handle(renewal(10), now);
+        state.lock().unwrap().fail_input_session_reset = true;
+        core.handle(renewal(11), now);
+        core.handle(renewal(11), now);
+        core.handle(permit(1, 1, 1), now);
+        state
+            .lock()
+            .unwrap()
+            .pending_results
+            .push_back(Message::CaptureHealth {
+                state: CaptureState::Active,
+                error_code: 0,
+            });
+        let events = core.tick(now);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Control(Message::CaptureHealth {
+                state: CaptureState::Active,
+                ..
+            })
+        )));
+        core.handle(Message::Input(vec![1]), now);
+        assert!(core.suspended);
+        assert!(!core.input_ready);
+        assert!(core.input_session_reset_failed);
+        assert_eq!(state.lock().unwrap().inputs, 0);
+        assert_eq!(state.lock().unwrap().input_session_resets, 1);
+
+        state.lock().unwrap().fail_input_session_reset = false;
+        core.handle(renewal(12), now);
+        assert!(!core.input_session_reset_failed);
+        assert!(!core.suspended);
+        assert_eq!(state.lock().unwrap().input_session_resets, 2);
+    }
+
+    #[test]
+    fn new_producer_reopens_input_only_after_new_generation_capture_is_verified() {
+        let backend = FakeBackend::default();
+        let state = backend.0.clone();
+        let mut core = AgentCore::new(backend);
+        let now = Instant::now();
+        core.observe_desktop(DesktopKind::Default, now);
+        let renewal = |lease_id| Message::RenewLease {
+            lease_id,
+            ttl_ms: 2_000,
+        };
+        let active = || Message::CaptureHealth {
+            state: CaptureState::Active,
+            error_code: 0,
+        };
+        core.handle(renewal(10), now);
+        core.handle(permit(1, 7, 1), now);
+        state.lock().unwrap().pending_results.push_back(active());
+        core.tick(now);
+        core.handle(Message::Input(vec![1]), now);
+        assert_eq!(state.lock().unwrap().inputs, 1);
+
+        core.handle(renewal(11), now);
+        core.handle(Message::Input(vec![1]), now);
+        assert_eq!(state.lock().unwrap().inputs, 1);
+        assert!(matches!(
+            core.handle(permit(2, 7, 1), now).as_slice(),
+            [AgentEvent::Media(Message::NoFrame { .. })]
+        ));
+        // A delayed health notification from the cancelled producer has no
+        // outstanding new permit and cannot publish readiness.
+        state.lock().unwrap().pending_results.push_back(active());
+        assert!(core.tick(now).is_empty());
+        core.handle(Message::ConfigureMedia(config(8, 1)), now);
+        core.handle(Message::Input(vec![1]), now);
+        assert_eq!(state.lock().unwrap().inputs, 1);
+        core.handle(permit(2, 8, 1), now);
+        state.lock().unwrap().pending_results.push_back(active());
+        core.tick(now);
+        core.handle(Message::Input(vec![1]), now);
+        assert_eq!(state.lock().unwrap().inputs, 2);
     }
 
     #[test]

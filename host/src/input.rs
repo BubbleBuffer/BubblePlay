@@ -1083,6 +1083,14 @@ fn merge_motion_packet(previous: &mut Vec<u8>, next: &[u8]) -> bool {
     if previous[0] != next[0] {
         return false;
     }
+    // Wheel deltas are additive events, with each original sequence as its
+    // replay identity. Merging them would erase identities needed to reject
+    // duplicate arrivals while accepting late wheels past a pointer barrier.
+    if matches!(decode(previous), Some(Command::Motion(_, _, _, wx, wy)) if wx != 0 || wy != 0)
+        || matches!(decode(next), Some(Command::Motion(_, _, _, wx, wy)) if wx != 0 || wy != 0)
+    {
+        return false;
+    }
     let (start, end) = match decode(next) {
         Some(Command::Abs(..) | Command::Absolute(..)) => {
             previous.copy_from_slice(next);
@@ -1115,6 +1123,115 @@ fn merge_motion_packet(previous: &mut Vec<u8>, next: &[u8]) -> bool {
 mod packet_coalescing_tests {
     use super::*;
 
+    fn recording_sink() -> InputSink {
+        let mut sink = InputSink::new();
+        sink.test_injections = Some(Vec::new());
+        sink
+    }
+
+    fn injected_wheels(sink: &InputSink) -> Vec<(u32, i32)> {
+        sink.test_injections
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|record| match record {
+                Record::Mouse { data, flags, .. }
+                    if *flags == MOUSEEVENTF_WHEEL.0 || *flags == MOUSEEVENTF_HWHEEL.0 =>
+                {
+                    Some((*flags, *data as i32))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fresh_client_interleaving_after_warm_viewer_disconnect_injects_every_wheel() {
+        // Both real senders allocate 0,1,... from one counter, incrementing
+        // after each successful absolute/motion/buttons-at send. These traces
+        // are also asserted against InputController and RemoteInput in their
+        // client suites. A previous viewer must not poison that fresh counter.
+        for client in ["browser", "android"] {
+            let mut sink = recording_sink();
+            let mut coalescer = InputPacketCoalescer::default();
+            let previous = packet(TYPE_ABSOLUTE_V2, &[24_000, 100, 200]);
+            coalescer.observe(&previous);
+            sink.handle(&previous);
+            // Only a real viewer replacement resets the producer watermark.
+            sink.reset_viewer_session();
+            coalescer = InputPacketCoalescer::default();
+            sink.take_diagnostics();
+            sink.test_injections.as_mut().unwrap().clear();
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                "../../worker/test/fixtures/scroll-client-replay.json"
+            ))
+            .unwrap();
+            let trace = fixture["packets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    let hex = entry["hex"].as_str().unwrap();
+                    (0..hex.len())
+                        .step_by(2)
+                        .map(|offset| u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap())
+                        .collect()
+                })
+                .collect();
+            for data in coalescer.coalesce(trace) {
+                sink.handle(&data);
+            }
+            let counters = sink.take_diagnostics();
+            assert_eq!(
+                counters.drops_by_reason[InputDropReason::StaleSequence as usize],
+                0,
+                "{client}"
+            );
+            assert_eq!(
+                injected_wheels(&sink),
+                vec![
+                    (MOUSEEVENTF_HWHEEL.0, -30),
+                    (MOUSEEVENTF_WHEEL.0, 120),
+                    (MOUSEEVENTF_HWHEEL.0, 60),
+                    (MOUSEEVENTF_WHEEL.0, -240),
+                    (MOUSEEVENTF_WHEEL.0, 15),
+                ],
+                "{client}"
+            );
+            assert_eq!(sink.state.last_motion_sequence, Some(6));
+        }
+    }
+
+    #[test]
+    fn late_wheel_survives_pointer_barrier_but_duplicate_does_not_scroll_twice() {
+        let mut sink = recording_sink();
+        let mut coalescer = InputPacketCoalescer::default();
+        let trace = vec![
+            packet(TYPE_ABSOLUTE_V2, &[10, 1000, 2000]),
+            motion(11, 3, 4, 0, 120),
+            motion(12, 5, 6, 0, 240),
+            vec![TYPE_BUTTONS_AT, 14, 0, 232, 3, 208, 7, 0],
+            motion(13, 90, 90, -60, -120),
+            motion(11, 3, 4, 0, 120),
+            motion(13, 90, 90, -60, -120),
+            packet(TYPE_ABSOLUTE_V2, &[12, 500, 600]),
+        ];
+        for data in coalescer.coalesce(trace) {
+            sink.handle(&data);
+        }
+        assert_eq!(sink.state.last_motion_sequence, Some(14));
+        assert_eq!(sink.state.last_absolute_position, Some((1000, 2000)));
+        assert_eq!(
+            injected_wheels(&sink),
+            vec![
+                (MOUSEEVENTF_WHEEL.0, 120),
+                (MOUSEEVENTF_WHEEL.0, 240),
+                (MOUSEEVENTF_HWHEEL.0, -60),
+                (MOUSEEVENTF_WHEEL.0, -120),
+            ]
+        );
+    }
+
     fn packet(kind: u8, values: &[i16]) -> Vec<u8> {
         let mut packet = vec![kind];
         for value in values {
@@ -1135,15 +1252,16 @@ mod packet_coalescing_tests {
             motion(2, 20_000, 8, -3, -40),
             motion(3, -5, 2, 1, 20),
         ]);
-        assert_eq!(output.len(), 2);
+        assert_eq!(output.len(), 3);
         assert_eq!(
             decode(&output[0]),
             Some(Command::Motion(1, 20_000, -5, 7, 120))
         );
         assert_eq!(
             decode(&output[1]),
-            Some(Command::Motion(3, 19_995, 10, -2, -20))
+            Some(Command::Motion(2, 20_000, 8, -3, -40))
         );
+        assert_eq!(decode(&output[2]), Some(Command::Motion(3, -5, 2, 1, 20)));
         let legacy = coalescer.coalesce(vec![
             packet(TYPE_MOUSE_REL, &[3, 5]),
             packet(TYPE_MOUSE_REL, &[-1, 2]),
@@ -1267,13 +1385,60 @@ mod packet_coalescing_tests {
             motion(u16::MAX, 5, -2, 120, -120),
             motion(0, -5, 2, -120, 120),
         ]);
-        assert_eq!(packets, vec![motion(0, 0, 0, 0, 0)]);
-        let mut sink = InputSink::new();
-        let outcome = sink.handle(&packets[0]);
+        assert_eq!(packets.len(), 2, "wheel identities survive coalescing");
+        let mut sink = recording_sink();
+        sink.handle(&packets[0]);
+        let outcome = sink.handle(&packets[1]);
         assert_eq!(outcome.accepted_sequence, Some(0));
-        assert_eq!(outcome.application.requested, 0);
+        assert_eq!(outcome.application.requested, 3);
         assert!(outcome.cursor_feedback_requested());
         assert!(outcome.cursor_changed || outcome.sync_requested || outcome.feedback_reliable);
+        assert_eq!(
+            injected_wheels(&sink),
+            vec![
+                (MOUSEEVENTF_HWHEEL.0, 120),
+                (MOUSEEVENTF_WHEEL.0, -120),
+                (MOUSEEVENTF_HWHEEL.0, -120),
+                (MOUSEEVENTF_WHEEL.0, 120),
+            ]
+        );
+    }
+
+    #[test]
+    fn wheel_replay_window_wraps_and_expires_ambiguous_sequences() {
+        let mut window = WheelSequenceWindow::default();
+        assert!(window.accept(u16::MAX - 1));
+        window.observe(0);
+        assert!(window.accept(u16::MAX));
+        assert!(!window.accept(u16::MAX));
+        assert!(window.accept(0));
+        assert!(!window.accept(0x8000));
+        window.observe(0x7fff);
+        window.observe(0xfffe);
+        assert!(
+            window.accept(0xfffe),
+            "same numerical sequence in the next cycle is fresh"
+        );
+        assert!(!window.accept(0xfffe));
+    }
+
+    #[test]
+    fn ordinary_release_retains_pointer_and_wheel_replay_barriers() {
+        let mut sink = recording_sink();
+        sink.handle(&motion(10, 0, 0, 0, 120));
+        sink.handle(&[TYPE_RELEASE_ALL]);
+        sink.handle(&packet(TYPE_CURSOR_SYNC, &[12]));
+        let duplicate = sink.handle(&motion(10, 90, 90, 0, 120));
+        assert_eq!(duplicate.application.requested, 0);
+        let late = sink.handle(&motion(11, 90, 90, 0, -240));
+        assert_eq!(late.accepted_sequence, None);
+        assert!(!late.cursor_changed);
+        assert_eq!(late.application.applied, 1);
+        assert_eq!(sink.state.last_motion_sequence, Some(12));
+        assert_eq!(
+            injected_wheels(&sink),
+            vec![(MOUSEEVENTF_WHEEL.0, 120), (MOUSEEVENTF_WHEEL.0, -240),]
+        );
     }
 }
 
@@ -1297,6 +1462,8 @@ pub struct InputSink {
     geometry_valid: bool,
     diagnostics_foreground_pid: Option<u32>,
     development_agent: bool,
+    #[cfg(test)]
+    test_injections: Option<Vec<Record>>,
 }
 
 /// Clipboard state exists only where the sink runs as the interactive user
@@ -1619,6 +1786,55 @@ struct InputState {
     buttons: u8,
     last_motion_sequence: Option<u16>,
     last_absolute_position: Option<(u16, u16)>,
+    wheel_sequences: WheelSequenceWindow,
+}
+
+/// At-most-once wheel events within the wire's unambiguous u16 half-range.
+/// Position/control watermarks advance this window without consuming wheels.
+/// A stale pointer can therefore still carry an unseen, safely identified wheel.
+struct WheelSequenceWindow {
+    newest: Option<u16>,
+    seen: [u64; 512],
+}
+
+impl Default for WheelSequenceWindow {
+    fn default() -> Self {
+        Self {
+            newest: None,
+            seen: [0; 512],
+        }
+    }
+}
+
+impl WheelSequenceWindow {
+    fn observe(&mut self, sequence: u16) {
+        if let Some(previous) = self.newest {
+            if !newer_sequence(Some(previous), sequence) {
+                return;
+            }
+            // The slot about to enter the window belonged to an event exactly
+            // half a sequence cycle earlier. Clear it before reusing it.
+            for step in 1..=sequence.wrapping_sub(previous) {
+                let slot = usize::from(previous.wrapping_add(step) & 0x7fff);
+                self.seen[slot / 64] &= !(1u64 << (slot % 64));
+            }
+        }
+        self.newest = Some(sequence);
+    }
+
+    fn accept(&mut self, sequence: u16) -> bool {
+        self.observe(sequence);
+        if self.newest.unwrap().wrapping_sub(sequence) >= 0x8000 {
+            // Older than half a cycle is indistinguishable from a future/reused
+            // sequence. Applying such a wheel could replay previous distance.
+            return false;
+        }
+        let slot = usize::from(sequence & 0x7fff);
+        let bit = 1u64 << (slot % 64);
+        let fresh = self.seen[slot / 64] & bit == 0;
+        self.seen[slot / 64] |= bit;
+        fresh
+    }
 }
 
 fn is_control_key(key: HeldKey) -> bool {
@@ -1701,12 +1917,14 @@ impl InputState {
             return false;
         }
         self.last_motion_sequence = Some(sequence);
+        self.wheel_sequences.observe(sequence);
         true
     }
 
     fn advance_motion_barrier(&mut self, sequence: u16) -> bool {
         if newer_sequence(self.last_motion_sequence, sequence) {
             self.last_motion_sequence = Some(sequence);
+            self.wheel_sequences.observe(sequence);
             true
         } else {
             false
@@ -2960,6 +3178,8 @@ impl InputSink {
             geometry_valid: true,
             diagnostics_foreground_pid: None,
             development_agent: false,
+            #[cfg(test)]
+            test_injections: None,
         }
     }
 
@@ -3203,8 +3423,6 @@ impl InputSink {
                     self.stats.relative_packets += 1;
                     self.state.last_absolute_position = None;
                     outcome.application.merge(self.mouse_rel(dx, dy));
-                    outcome.application.merge(self.wheel_horizontal(wx));
-                    outcome.application.merge(self.wheel(wy));
                     outcome.accepted_sequence = Some(seq);
                     // Accepted sequencing itself requires cursor feedback:
                     // coalesced opposing movements can have no net displacement,
@@ -3214,6 +3432,13 @@ impl InputSink {
                 } else {
                     self.stats.stale_motion_dropped += 1;
                     self.note_packet_drop(InputDropReason::StaleSequence);
+                }
+                // Pointer order and wheel distance have different semantics.
+                // Retain unique late wheels, but never replay a duplicate or an
+                // ambiguous event outside the u16 half-range window.
+                if self.state.wheel_sequences.accept(seq) {
+                    outcome.application.merge(self.wheel_horizontal(wx));
+                    outcome.application.merge(self.wheel(wy));
                 }
             }
             Command::Absolute(seq, x, y) => {
@@ -3313,6 +3538,16 @@ impl InputSink {
     ) -> InputApplication {
         if inputs.is_empty() {
             return InputApplication::default();
+        }
+        #[cfg(test)]
+        if let Some(records) = self.test_injections.as_mut() {
+            records.extend(inputs.iter().map(|input| input_record(input).unwrap()));
+            let expected = inputs.len() as u32;
+            self.diagnostics.route(InputRoute::Local);
+            self.diagnostics.receipt(expected, expected, 0);
+            let mut application = InputApplication::default();
+            application.observe(expected, expected, 0);
+            return application;
         }
         let expected = inputs.len().min(u32::MAX as usize) as u32;
         if local_only && self.secure_desktop {
@@ -3664,6 +3899,16 @@ impl InputSink {
         let _ = self.release_all_report();
     }
 
+    /// Only the transport's viewer lifecycle may start a fresh producer's
+    /// sequence space. Ordinary release-all/gating must retain stale barriers.
+    pub fn reset_viewer_session(&mut self) {
+        self.release_all();
+        self.state = InputState::default();
+        if let Some(sync) = self.clipboard.as_mut() {
+            sync.assembly = ClipboardAssembly::default();
+        }
+    }
+
     pub fn release_all_report(&mut self) -> InputApplication {
         let (keys, buttons) = self.state.take_release_plan();
         let mut application = InputApplication::default();
@@ -3714,5 +3959,38 @@ impl InputSink {
 impl Drop for InputSink {
     fn drop(&mut self) {
         self.release_all();
+    }
+}
+
+#[cfg(test)]
+mod local_wheel_regression_tests {
+    use super::*;
+
+    #[test]
+    fn local_motion_v2_emits_vertical_wheel_with_signed_mouse_data() {
+        for delta in [120i16, -120, i16::MIN, i16::MAX] {
+            let mut sink = InputSink::new();
+            assert!(!sink.admin_enabled);
+            assert!(sink.admin_agent.is_none());
+            // Capture the INPUT conversion at the injection seam without
+            // injecting test scrolls into the owner's foreground application.
+            sink.test_injections = Some(Vec::new());
+            let mut packet = vec![TYPE_MOTION_V2];
+            for value in [0u16, 0, 0, 0, delta as u16] {
+                packet.extend_from_slice(&value.to_le_bytes());
+            }
+            let outcome = sink.handle(&packet);
+            assert_eq!(outcome.application.requested, 1);
+            assert_eq!(
+                sink.test_injections.as_ref().unwrap().as_slice(),
+                &[Record::Mouse {
+                    dx: 0,
+                    dy: 0,
+                    data: i32::from(delta) as u32,
+                    flags: MOUSEEVENTF_WHEEL.0
+                },]
+            );
+            assert_eq!(sink.take_diagnostics().route_calls, [1, 0, 0]);
+        }
     }
 }

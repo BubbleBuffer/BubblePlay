@@ -1109,6 +1109,19 @@ mod pending_cursor_state_tests {
         fresh.publish(snapshot(Some(1), 3), false);
         assert_eq!(fresh.latest.take(), Some(snapshot(Some(1), 3)));
     }
+
+    #[test]
+    fn warm_signaling_socket_resets_ack_and_unsent_position_for_new_viewer() {
+        let mut pending = PendingCursorState::default();
+        pending.publish(snapshot(Some(24_000), 1), false);
+        pending.reset();
+        assert_eq!(pending.latest, None);
+        assert_eq!(pending.acknowledged_sequence, None);
+        assert_eq!(
+            pending.publish(snapshot(Some(0), 2), true),
+            Some(snapshot(Some(0), 2))
+        );
+    }
 }
 
 fn valid_secure_action_wire(text: &str) -> bool {
@@ -1126,6 +1139,10 @@ fn valid_secure_action_wire(text: &str) -> bool {
 }
 
 impl PendingCursorState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     fn publish(&mut self, mut state: [u8; 8], reliable: bool) -> Option<[u8; 8]> {
         if state[7] & crate::input::CURSOR_ACK_VALID != 0 {
             let sequence = u16::from_le_bytes([state[1], state[2]]);
@@ -1642,6 +1659,12 @@ impl Signaling {
         if let Some(state) = self.pending_cursor_state.publish(state, reliable) {
             self.send_binary(&state);
         }
+    }
+
+    /// The signaling socket may outlive its viewer. Its retained ACK belongs
+    /// to the old input producer and must not overwrite a fresh client's ACK.
+    pub fn reset_viewer_cursor_state(&mut self) {
+        self.pending_cursor_state.reset();
     }
 
     pub fn flush_cursor_state(&mut self) {

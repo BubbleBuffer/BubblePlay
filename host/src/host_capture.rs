@@ -856,6 +856,19 @@ impl CaptureSource {
         }
     }
 
+    /// Rotate the existing Agent lease only for a new viewer input producer.
+    /// A warm proxy must forget the previous producer's pointer/wheel sequences.
+    pub(super) fn begin_viewer_session(&mut self) {
+        if let Self::Privileged(source) = self {
+            source.input_state = "suspended";
+            if let Some(client) = source.client.as_mut() {
+                if let Err(error) = client.begin_viewer_session() {
+                    source.mark_agent_unavailable(Instant::now(), &error);
+                }
+            }
+        }
+    }
+
     pub(super) fn defer_recoverable_join_state(&mut self, now: Instant) -> bool {
         let state = self.desktop_state();
         let Self::Local(source) = self else {

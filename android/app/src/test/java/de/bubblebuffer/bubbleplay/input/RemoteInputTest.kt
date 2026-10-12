@@ -11,8 +11,46 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
+import java.io.File
 
 class RemoteInputTest {
+    @Test fun largeNativeWheelSampleIsNotClampedBeforePacketSplitting() {
+        val transport = FakeTransport()
+        val remote = RemoteInput(transport)
+        val units = WheelAccumulator().add(60000f, -120000f)
+        remote.motion(0, 0, units.first, units.second)
+        assertTrue(remote.flushMotion())
+        assertEquals(60000, transport.sent.sumOf { signed16(it, 7) })
+        assertEquals(-120000, transport.sent.sumOf { signed16(it, 9) })
+        assertFalse(remote.hasPendingMotion())
+    }
+    @Test fun scrollInterleavingUsesTheSameSharedSequencesAsBrowserReplay() {
+        val fixture = JSONObject(File(
+            File(requireNotNull(System.getProperty("bubbleplay.fixtures"))).parentFile,
+            "worker/test/fixtures/scroll-client-replay.json",
+        ).readText())
+        val transport = FakeTransport()
+        val remote = RemoteInput(transport)
+        val steps = fixture.getJSONArray("steps")
+        for (index in 0 until steps.length()) {
+            val step = steps.getJSONObject(index)
+            val args = step.optJSONArray("args")
+            when (step.getString("op")) {
+                "absolute" -> remote.absolute(args!!.getInt(0), args.getInt(1))
+                "motion" -> remote.motion(args!!.getInt(0), args.getInt(1), args.getInt(2), args.getInt(3))
+                "buttonsAt" -> assertTrue(remote.buttonsAt(args!!.getInt(0), args.getInt(1), args.getInt(2)))
+                "flush" -> assertTrue(remote.flushMotion())
+                else -> error("unknown replay step")
+            }
+        }
+        val packets = fixture.getJSONArray("packets")
+        assertEquals(
+            (0 until packets.length()).map { packets.getJSONObject(it).getString("hex") },
+            transport.sent.map { bytes -> bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) } },
+        )
+        assertEquals(6, remote.lastSentSequence)
+    }
     private class FakeTransport : RemoteInput.Transport {
         var open = true
         var queued = 0L

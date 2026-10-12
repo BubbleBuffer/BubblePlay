@@ -268,6 +268,7 @@ class WheelAccumulator {
         x += unitsX; y += unitsY
         val ix = x.toInt(); val iy = y.toInt()
         x -= ix; y -= iy
-        return ix.coerceIn(-32768, 32767) to iy.coerceIn(-32768, 32767)
+        // RemoteInput splits whole distance into i16 packets without loss.
+        return ix to iy
     }
 }

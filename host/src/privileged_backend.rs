@@ -307,6 +307,7 @@ enum InputWorkerCommand {
     SetRegion(DesktopRegion),
     ListMonitors,
     ReleaseAll,
+    ResetSession,
     Suspend,
     Resume,
     Shutdown,
@@ -635,6 +636,24 @@ impl AgentBackend for RealAgentBackend {
         Ok(())
     }
 
+    fn reset_input_session(&mut self) -> Result<()> {
+        self.pending.retain(|event| {
+            !matches!(
+                event,
+                Message::Cursor(_) | Message::CursorKind(_) | Message::InputStats(_)
+            )
+        });
+        if let Some(worker) = self.input_worker.as_ref() {
+            worker
+                .cursor_kind_latest
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            worker.call(InputWorkerCommand::ResetSession)?;
+        }
+        Ok(())
+    }
+
     fn suspend(&mut self) -> Result<()> {
         self.suspended = true;
         // Fail closed synchronously; this atomic is observed by the
@@ -945,6 +964,7 @@ struct InputWorkerState {
     generation: u32,
     capture_active: Arc<AtomicBool>,
     input_proxy: Option<InputProxyClient>,
+    region: DesktopRegion,
     cursor: CursorTracker,
     cursor_kind: CursorKindTracker,
     suspended: bool,
@@ -1084,6 +1104,7 @@ fn input_worker_main(
                 generation,
                 capture_active,
                 input_proxy,
+                region,
                 cursor: CursorTracker::for_region(region, Instant::now()),
                 cursor_kind: CursorKindTracker::new(Instant::now()),
                 suspended: true,
@@ -1159,6 +1180,7 @@ impl InputWorkerState {
                 if let Some(proxy) = self.input_proxy.as_mut() {
                     proxy.set_region(region)?;
                 }
+                self.region = region;
                 self.cursor = CursorTracker::for_region(region, Instant::now());
                 self.cursor_kind.reset();
                 Ok(Vec::new())
@@ -1167,6 +1189,22 @@ impl InputWorkerState {
             InputWorkerCommand::ReleaseAll => {
                 self.release_all();
                 Ok(vec![self.input_stats()])
+            }
+            InputWorkerCommand::ResetSession => {
+                // Dropping the old client sends the existing Shutdown request
+                // and waits for its process, fencing all old proxy requests.
+                self.suspended = true;
+                drop(self.input_proxy.take());
+                self.last_input_sequence = None;
+                self.cursor = CursorTracker::for_region(self.region, Instant::now());
+                self.cursor_kind.reset();
+                if proxy_input_supported(self.desktop) {
+                    let mut proxy =
+                        InputProxyClient::launch(current_process_session_id()?, self.generation)?;
+                    proxy.set_region(self.region)?;
+                    self.input_proxy = Some(proxy);
+                }
+                Ok(Vec::new())
             }
             InputWorkerCommand::Suspend => {
                 self.release_all();

@@ -187,6 +187,20 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Start a new input producer using the existing lease identity boundary.
+    /// Ordinary heartbeats retain this identity and therefore retain sequencing.
+    pub fn begin_viewer_session(&mut self) -> Result<()> {
+        let next_lease_id = self.lease_id.wrapping_add(1).max(1);
+        self.permits.cancel();
+        self.send(&Message::RenewLease {
+            lease_id: next_lease_id,
+            ttl_ms: 2_000,
+        })?;
+        self.lease_id = next_lease_id;
+        self.next_lease = Instant::now() + LEASE_RENEW_INTERVAL;
+        Ok(())
+    }
+
     pub fn send(&mut self, message: &Message) -> Result<()> {
         self.send_with_timeout(message, CONTROL_WRITE_TIMEOUT)
     }
@@ -433,6 +447,55 @@ mod tests {
             max_fps: 60,
             max_bitrate_bps: 12_000_000,
         })
+    }
+
+    #[test]
+    fn beginning_viewer_rotates_existing_lease_and_cancels_old_permit() {
+        let (writes, requests) = mpsc::sync_channel::<ControlWrite>(1);
+        let (_control_tx, control_events) = mpsc::sync_channel(1);
+        let (_media_tx, media_events) = mpsc::sync_channel(1);
+        let writer = thread::spawn(move || {
+            let renewal = requests.recv().unwrap();
+            assert!(matches!(
+                renewal.message,
+                Message::RenewLease { lease_id: 11, .. }
+            ));
+            renewal.result.send(Ok(())).unwrap();
+            let heartbeat = requests.recv().unwrap();
+            assert!(matches!(
+                heartbeat.message,
+                Message::RenewLease { lease_id: 11, .. }
+            ));
+            heartbeat.result.send(Ok(())).unwrap();
+            let release = requests.recv().unwrap();
+            assert!(matches!(release.message, Message::ReleaseAll));
+            release.result.send(Ok(())).unwrap();
+        });
+        let mut client = AgentClient {
+            control_writes: writes,
+            control_events,
+            media_events,
+            workers: Vec::new(),
+            next_sequence: 1,
+            lease_id: 10,
+            next_lease: Instant::now(),
+            permits: PermitGate::default(),
+            event_wake: EventWake::default(),
+        };
+        client
+            .permits
+            .begin(PermitIdentity {
+                permit_id: 1,
+                session_generation: 1,
+                config_revision: 1,
+            })
+            .unwrap();
+        client.begin_viewer_session().unwrap();
+        assert!(client.permits.outstanding.is_none());
+        client.tick(Instant::now() + LEASE_RENEW_INTERVAL).unwrap();
+        assert_eq!(client.lease_id, 11);
+        drop(client);
+        writer.join().unwrap();
     }
 
     #[test]
