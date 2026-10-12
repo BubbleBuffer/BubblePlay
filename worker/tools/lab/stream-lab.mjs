@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -85,10 +85,11 @@ export function runPreflight(options = {}) {
 }
 
 export function buildCandidateHost(options = {}) {
-  const root = resolve(options.projectRoot ?? projectRoot);
-  const hostRoot = join(root, "host");
-  const executable = join(hostRoot, "target-candidate", "release", "bubbleplay-host.exe");
-  const activityGuard = join(hostRoot, "target-candidate", "release", "bubbleplay_lab_activity_guard.exe");
+  // Windows paths on every host: the candidate host is a Windows executable.
+  const root = win32.resolve(options.projectRoot ?? projectRoot);
+  const hostRoot = win32.join(root, "host");
+  const executable = win32.join(hostRoot, "target-candidate", "release", "bubbleplay-host.exe");
+  const activityGuard = win32.join(hostRoot, "target-candidate", "release", "bubbleplay_lab_activity_guard.exe");
   const runner = options.spawnSync ?? spawnSync;
   const result = runner("cargo", ["build", "--release", "--bin", "bubbleplay-host", "--bin",
     "bubbleplay_lab_activity_guard", "--target-dir", "target-candidate"], {

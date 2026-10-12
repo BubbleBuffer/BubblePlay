@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 
@@ -352,8 +353,10 @@ test("Helper run IDs accept a bare UUID and reject decorated UUIDs", () => {
 });
 
 test("receiver profile is persistent and scoped under LOCALAPPDATA", () => {
-  const profile = persistentReceiverProfile({ LOCALAPPDATA: "C:\\Users\\Tester\\AppData\\Local" });
-  assert.equal(profile, "C:\\Users\\Tester\\AppData\\Local\\BubblePlay\\StreamLab\\Chrome");
+  // Built with the host's separators: runPreflight creates this directory, so it must be a real path on every host.
+  const localAppData = join(tmpdir(), "bubbleplay-local-appdata");
+  const profile = persistentReceiverProfile({ LOCALAPPDATA: localAppData });
+  assert.equal(profile, join(localAppData, "BubblePlay", "StreamLab", "Chrome"));
 });
 
 test("a completed but rejected campaign exits nonzero", () => {
@@ -766,7 +769,7 @@ test("compare CLI reads metrics and persists its decision", () => {
     writeFileSync(baseline, JSON.stringify(fixture({ id: "baseline", ocrCer: 0.08 })));
     writeFileSync(candidate, JSON.stringify(fixture({ id: "candidate", ocrCer: 0.05 })));
     const result = spawnSync(process.execPath, [
-      new URL("../tools/lab/stream-lab.mjs", import.meta.url).pathname.slice(1),
+      fileURLToPath(new URL("../tools/lab/stream-lab.mjs", import.meta.url)),
       "compare", baseline, candidate, "--output", join(root, "comparison.json"),
     ], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);

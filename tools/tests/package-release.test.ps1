@@ -28,7 +28,7 @@ function Write-Fixture([string]$Path, [string]$Text) { [IO.File]::WriteAllText($
 
 try {
     foreach ($dir in @($binaryDir, $scriptDir, $docs)) { [void][IO.Directory]::CreateDirectory($dir) }
-    foreach ($name in @('bubbleplay-host.exe', 'bubbleplay_tray.exe', 'bubbleplay_admin_agent.exe')) {
+    foreach ($name in @('bubbleplay-host.exe', 'bubbleplay_tray.exe', 'bubbleplay_admin_agent.exe', 'bubbleplay_secure_helper.exe')) {
         # Structural x64 PE fixture; never launch these synthetic bytes.
         $bytes = New-Object byte[] 256
         [BitConverter]::GetBytes([uint16]0x5a4d).CopyTo($bytes, 0)
@@ -56,7 +56,7 @@ try {
     $first = & $Builder @parameters
     $zip = [IO.Compression.ZipFile]::OpenRead($first.path)
     try {
-        $expected = @('bubbleplay-host.exe', 'bubbleplay_tray.exe', 'bubbleplay_admin_agent.exe', 'setup-tray.ps1', 'update-tray.ps1', 'uninstall-tray.ps1', 'QUICKSTART.md', 'THIRD-PARTY-NOTICES.md', 'release-manifest.json')
+        $expected = @('bubbleplay-host.exe', 'bubbleplay_tray.exe', 'bubbleplay_admin_agent.exe', 'bubbleplay_secure_helper.exe', 'setup-tray.ps1', 'update-tray.ps1', 'uninstall-tray.ps1', 'QUICKSTART.md', 'THIRD-PARTY-NOTICES.md', 'release-manifest.json')
         Assert ($zip.Entries.Count -eq $expected.Count) 'Only the explicit public allowlist is packaged.'
         foreach ($entry in $zip.Entries) {
             Assert ($expected -ccontains $entry.FullName) "Entry excluded from allowlist: $($entry.FullName)"
@@ -67,7 +67,7 @@ try {
         try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
         Assert ($manifest.sourceDirty -eq $true -and $manifest.sourceState -eq 'uncommitted') 'Dirty candidate is explicitly identified.'
         Assert ($manifest.releaseIntent -eq 'candidate' -and -not $manifest.productLicenseIncluded) 'Candidate does not imply product licensing.'
-        Assert ($manifest.files.Count -eq 8) 'Manifest inventories every payload file.'
+        Assert ($manifest.files.Count -eq 9) 'Manifest inventories every payload file.'
     }
     finally { $zip.Dispose() }
     $count++
@@ -105,7 +105,7 @@ try {
     Expect-Failure { & $Builder @parameters -PublicRelease } 'requires.*LicensePath'
     $parameters.LicensePath = Join-Path $docs 'license'
     $public = & $Builder @parameters -PublicRelease
-    Assert ($public.entries -eq 10) 'Explicit supplied license is included for public release intent.'
+    Assert ($public.entries -eq 11) 'Explicit supplied license is included for public release intent.'
     $count++
 
     $parameters.OutputDir = Join-Path $fixture 'hash-mismatch'
