@@ -15,7 +15,7 @@ The first milestone is one operator, one native Windows host and one desktop bro
 1. Complete independent operator setup on the documented Docker image. The image was built and run on a Linux Docker host on 2026-10-12, with health, login and WebSocket checks passing; the native Windows stream through it is still item 2.
 2. Connect the native Windows host and Chromium receiver through Go: verify frames, cursor/input, clipboard, file transfer, held large native drops, reconnects and slow-peer behavior. Test the intended WebRTC/TURN or restrictive-network routes separately.
 3. Prove a clean Windows installation and removal on another PC. Android needs its own packaged/device acceptance.
-4. Review the exact source and publication history, run hosted CI, select a private vulnerability-reporting channel, and publish versioned source/downloads with hashes and notices.
+4. Publish versioned source/downloads with hashes and notices.
 
 The target is Windows x64, NVIDIA NVENC and desktop Chromium. AMD, Intel and software encoding are not demonstrated. Windows binaries are unsigned; secure desktops, including lock screens and UAC prompts, are outside capture. See [security and privacy](security-and-privacy.md) for relay visibility and elevated-input boundaries.
 
