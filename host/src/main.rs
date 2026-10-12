@@ -16,6 +16,8 @@ mod host_benchmark;
 use host_benchmark::*;
 mod producer_wait;
 mod session_watchdog;
+mod viewer_display;
+use viewer_display::{DisplayWakePolicy, ViewerDisplayHold};
 
 use bubbleplay_host::activity::Activity;
 use bubbleplay_host::agent_client;
@@ -116,7 +118,6 @@ const DEFAULT_BITRATE_BPS: u32 = 1_500_000;
 const MAX_BITRATE_BPS: u32 = 40_000_000;
 const IDR_INTERVAL: Duration = Duration::from_secs(2);
 const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_secs(2);
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 const STATIC_REPLAY_DELAY: Duration = Duration::from_millis(250);
 const WSS_GOP_INTERVAL: Duration = Duration::from_secs(1);
 const WSS_HIGH_BITRATE_BPS: u32 = 6_000_000;
@@ -1048,6 +1049,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut replay = CachedIdrReplay::default();
     let mut ice_connected = false;
     let mut viewer_attached = false;
+    let mut display_hold = ViewerDisplayHold::default();
+    let mut display_wake = DisplayWakePolicy::default();
     let mut rtc_reset_pending = false;
     let mut rtc_peer = RtcPeerLifecycle::default();
     let mut offer_accepted = false;
@@ -1292,6 +1295,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             carried_input.reset();
             remote_input_ready = false;
             viewer_attached = false;
+            display_hold.set_attached(false);
+            display_wake.reset();
             input_sink.reset_status_delivery();
             viewer_session.observe(false);
             ice_connected = false;
@@ -1815,11 +1820,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     CaptureAvailability::Unavailable => {
                         capture_available = false;
                         next_local_recovery_probe = Instant::now();
-                        if !source
-                            .unavailable_announcement_deferred(viewer_attached, Instant::now())
-                        {
-                            pending_first_frame = None;
-                        }
+                        // Keep startup alive through local capture recovery;
+                        // its own watchdog retains a bounded deadline.
                         carried_input.reset();
                         session_call!(Input, input_sink.release_all());
                         latest_idr = None;
@@ -1847,13 +1849,19 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                         warn!(
                             generation = media_generation,
+                            reason = %source.unavailable_reason(),
                             "desktop capture unavailable; input suspended"
                         );
                     }
                     CaptureAvailability::Active => {
                         capture_available = true;
-                        pending_first_frame = None;
                         media_generation = media_generation.wrapping_add(1).max(1);
+                        if let Some(pending) = pending_first_frame.as_mut() {
+                            pending.rebind_after_recovery(media_generation);
+                        }
+                        if display_wake.recovered() {
+                            info!("desktop capture recovered after display wake");
+                        }
                         media_sequence = 0;
                         latest_idr = None;
                         pending_transition_idr = None;
@@ -2548,6 +2556,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         active_wss_epoch = None;
                     }
                     viewer_attached = true;
+                    display_hold.set_attached(true);
                     if !args.privileged_agent {
                         remote_input_ready = capture_available;
                     }
@@ -2663,6 +2672,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             }
                             let now = Instant::now();
                             viewer_attached = true;
+                            display_hold.set_attached(true);
                             let submitted_id = startup_idr_submitted
                                 .filter(|(generation, media, _)| {
                                     *generation == media_generation && *media == transport
@@ -2685,6 +2695,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 admitted,
                                 rtc_idr_id: submitted_id,
                                 armed_at: now,
+                                recovery: FirstFrameRecovery::default(),
                             });
                             if admitted {
                                 let pending = pending_first_frame.as_ref().expect("request armed");
@@ -3055,6 +3066,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     if action == "start" {
                         input_sink.reset_status_delivery();
                         viewer_attached = true;
+                        display_hold.set_attached(true);
                         if !args.privileged_agent {
                             remote_input_ready = capture_available;
                         }
@@ -3475,10 +3487,21 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         let now = Instant::now();
-        if pending_first_frame
-            .as_ref()
-            .is_some_and(|pending| now.duration_since(pending.armed_at) >= FIRST_FRAME_TIMEOUT)
-        {
+        let recovering = !capture.is_privileged() && !capture.desktop_state().available;
+        let wake_default = viewer_attached
+            && recovering
+            && capture.secure_state().is_none()
+            && bubbleplay_host::desktop_session::input_desktop_is_default();
+        if display_wake.attempt_due(viewer_attached, recovering, wake_default, now) {
+            let receipt = input_sink.wake_display();
+            info!(applied = receipt.applied, error_code = ?receipt.last_error_code,
+                "display wake attempted while desktop capture unavailable");
+        }
+        if pending_first_frame.as_mut().is_some_and(|pending| {
+            pending
+                .recovery
+                .expired(pending.armed_at, viewer_attached, recovering, now)
+        }) {
             if let Some(pending) = pending_first_frame.take() {
                 let reason = if pending.admitted {
                     "presentation-timeout"
@@ -3999,13 +4022,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         );
                     }
                     capture_available = true;
+                    if display_wake.recovered() {
+                        info!("desktop capture recovered after display wake");
+                    }
                     media_generation = media_generation.wrapping_add(1).max(1);
                     if frame.is_secure_snapshot() {
                         pending_first_frame = None;
                     } else if let Some(pending) = pending_first_frame.as_mut() {
-                        pending.generation = media_generation;
-                        pending.admitted = false;
-                        pending.rtc_idr_id = None;
+                        pending.rebind_after_recovery(media_generation);
                     }
                     media_sequence = 0;
                     latest_idr = None;
@@ -6513,10 +6537,10 @@ mod tests {
         should_reset_lab_encoder_for_keyframe, should_snapshot_idle_desktop,
         take_matching_transition, temporal_readback_policy, valid_lab_quality_request_id,
         valid_monitor_refresh_control, viewport_from_q16, CachedIdr, CachedIdrReplay,
-        CaptureSelection, IdleSnapshotCompletionOrder, PendingFirstFrame, PendingSubmittedIdr,
-        PrivilegedDesktopState, ProfileTransition, ReconnectLogGate, TemporalReadbackPolicy,
-        VideoMode, ViewportCrop, AGENT_RECONNECT_LOG_INTERVAL, REMEMBERED_MONITOR_MAX_ATTEMPTS,
-        STATIC_REPLAY_DELAY,
+        CaptureSelection, FirstFrameRecovery, IdleSnapshotCompletionOrder, PendingFirstFrame,
+        PendingSubmittedIdr, PrivilegedDesktopState, ProfileTransition, ReconnectLogGate,
+        TemporalReadbackPolicy, VideoMode, ViewportCrop, AGENT_RECONNECT_LOG_INTERVAL,
+        REMEMBERED_MONITOR_MAX_ATTEMPTS, STATIC_REPLAY_DELAY,
     };
     use crate::encode::{
         AqMode, EncodeStageTimings, Multipass, Preset, RateControlMode, ResourceMode, RoiMapReason,
@@ -7749,6 +7773,7 @@ mod tests {
             admitted: false,
             rtc_idr_id: None,
             armed_at: Instant::now(),
+            recovery: FirstFrameRecovery::default(),
         };
         assert!(!pending.admit_wss_access_unit(4, false));
         assert_eq!((pending.generation, pending.admitted), (1, false));
@@ -7768,6 +7793,7 @@ mod tests {
             admitted: false,
             rtc_idr_id: None,
             armed_at: Instant::now(),
+            recovery: FirstFrameRecovery::default(),
         };
         assert!(!pending.admit_wss_access_unit(3, true));
         assert_eq!((pending.generation, pending.admitted), (2, false));
@@ -7783,6 +7809,7 @@ mod tests {
             admitted: false,
             rtc_idr_id: Some(42),
             armed_at: Instant::now(),
+            recovery: FirstFrameRecovery::default(),
         };
         assert!(!pending.admit_rtc_access_unit(2, 42));
         assert!(!pending.admit_rtc_access_unit(3, 41));
@@ -7806,6 +7833,7 @@ mod tests {
             admitted: false,
             rtc_idr_id: Some(42),
             armed_at: Instant::now(),
+            recovery: FirstFrameRecovery::default(),
         };
         assert!(!pending.admit_rtc_access_unit(3, 42));
     }

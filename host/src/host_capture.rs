@@ -35,7 +35,7 @@ fn finish_normal_recovery(pending: &mut bool, recovered: bool) -> bool {
     recovered || pending
 }
 
-const JOIN_RECOVERY_GRACE: Duration = Duration::from_secs(1);
+const JOIN_RECOVERY_GRACE: Duration = Duration::from_secs(2);
 
 /// Status replay waits briefly for a recoverable Default source. This never
 /// grants media/input authorization: desktop_state still requires a frame.
@@ -126,6 +126,19 @@ pub(super) struct LocalCaptureSource {
 }
 
 impl LocalCaptureSource {
+    pub(super) fn unavailable_reason(&self) -> String {
+        if self.secure_state.as_ref().is_some_and(|state| state.secure) {
+            return "secure-desktop".into();
+        }
+        self.capture
+            .as_ref()
+            .and_then(Capture::unavailable_reason)
+            .map_or_else(
+                || "awaiting-default-frame".into(),
+                |reason| reason.to_string(),
+            )
+    }
+
     pub(super) fn open(selector: Option<&str>) -> Result<Self> {
         // Monitor enumeration is cheap and does not create D3D/DDA resources.
         // Resolve geometry now so signaling and cursor contracts remain
@@ -259,9 +272,11 @@ impl LocalCaptureSource {
     }
 
     fn can_recover_for_join(&self) -> bool {
-        self.capture
-            .as_ref()
-            .is_none_or(Capture::can_recover_for_join)
+        self.capture.as_ref().is_none_or(|capture| {
+            capture.can_recover_for_join()
+                || capture.unavailable_reason()
+                    == Some(capture::CaptureUnavailableReason::DisplayOff)
+        })
     }
 
     fn tick_secure(&mut self, viewer: bool, now: Instant) {
@@ -1339,6 +1354,22 @@ mod agent_encode_recovery_tests {
         assert!(recovering.take_failed(false, false, true, now + JOIN_RECOVERY_GRACE));
         recovering.begin(false, true, now + JOIN_RECOVERY_GRACE);
         assert!(!recovering.suppress(false, false, true, true, now + JOIN_RECOVERY_GRACE));
+    }
+
+    #[test]
+    fn parked_join_recovers_silently_but_unavailable_is_announced_after_two_seconds() {
+        let now = Instant::now();
+        let mut normal = JoinRecoveryWindow::default();
+        normal.begin(false, true, now);
+        assert!(normal.suppress(false, false, true, true, now + Duration::from_millis(500)));
+        assert!(!normal.take_failed(true, false, true, now + Duration::from_millis(500)));
+        assert!(!normal.take_failed(true, false, true, now + JOIN_RECOVERY_GRACE));
+        let mut down = JoinRecoveryWindow::default();
+        down.begin(false, true, now);
+        assert!(down.suppress(false, false, true, true, now + Duration::from_millis(1999)));
+        assert!(down.take_failed(false, false, true, now + Duration::from_secs(2)));
+        assert!(!down.suppress(false, false, true, true, now + Duration::from_secs(2)));
+        assert!(!down.take_failed(false, false, true, now + Duration::from_secs(3)));
     }
 
     #[test]

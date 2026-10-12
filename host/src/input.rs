@@ -1390,6 +1390,20 @@ impl InputOutcome {
     }
 }
 
+/// Unlike ordinary relative motion, this intentional zero move must survive
+/// coalescing/no-op filtering so Windows receives a display wake stimulus.
+fn display_wake_input() -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dwFlags: MOUSEEVENTF_MOVE,
+                ..Default::default()
+            },
+        },
+    }
+}
+
 /// What Windows accepted at the `SendInput` boundary for one browser packet.
 /// Packet parsing and motion sequencing are intentionally tracked elsewhere:
 /// neither is proof that Windows applied the requested input.
@@ -1843,6 +1857,19 @@ mod tests {
             1
         );
         assert_eq!(counters.route_calls, [0, 0, 0]);
+    }
+
+    #[test]
+    fn display_wake_is_one_zero_delta_relative_move_and_never_routes_to_secure_helper() {
+        let input = super::display_wake_input();
+        assert_eq!(input.r#type, super::INPUT_MOUSE);
+        let mouse = unsafe { input.Anonymous.mi };
+        assert_eq!((mouse.dx, mouse.dy, mouse.mouseData), (0, 0, 0));
+        assert_eq!(mouse.dwFlags, super::MOUSEEVENTF_MOVE);
+        let mut sink = super::InputSink::new();
+        sink.set_secure_desktop(true, true);
+        assert_eq!(sink.wake_display(), super::InputApplication::default());
+        assert_eq!(sink.take_diagnostics().route_calls, [0, 0, 0]);
     }
 
     #[test]
@@ -3268,10 +3295,29 @@ impl InputSink {
     }
 
     fn send_inputs(&mut self, operation: &'static str, inputs: &[INPUT]) -> InputApplication {
+        self.send_inputs_with_route(operation, inputs, false)
+    }
+
+    /// Wake input stays on the guarded local SendInput route, even with Admin
+    /// mode enabled. It never enters the secure helper or admin agent.
+    pub fn wake_display(&mut self) -> InputApplication {
+        let input = display_wake_input();
+        self.send_inputs_with_route("display-wake", &[input], true)
+    }
+
+    fn send_inputs_with_route(
+        &mut self,
+        operation: &'static str,
+        inputs: &[INPUT],
+        local_only: bool,
+    ) -> InputApplication {
         if inputs.is_empty() {
             return InputApplication::default();
         }
         let expected = inputs.len().min(u32::MAX as usize) as u32;
+        if local_only && self.secure_desktop {
+            return InputApplication::default();
+        }
         if self.secure_desktop {
             let accepted = self.secure_input_allowed
                 && self.secure_helper.as_ref().is_some_and(|link| {
@@ -3314,8 +3360,8 @@ impl InputSink {
             }
             return InputApplication::default();
         }
-        let requires_admin = self.foreground_privilege.requires_admin();
-        let via_agent = if self.admin_enabled || self.development_agent {
+        let requires_admin = !local_only && self.foreground_privilege.requires_admin();
+        let via_agent = if !local_only && (self.admin_enabled || self.development_agent) {
             self.admin_agent.as_mut()
         } else {
             None

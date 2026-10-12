@@ -462,9 +462,46 @@ pub(super) struct PendingFirstFrame {
     pub(super) admitted: bool,
     pub(super) rtc_idr_id: Option<u64>,
     pub(super) armed_at: Instant,
+    pub(super) recovery: FirstFrameRecovery,
+}
+
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
+const FIRST_FRAME_RECOVERY_LIMIT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+pub(super) struct FirstFrameRecovery {
+    recovering: bool,
+    deadline: Option<Instant>,
+}
+
+impl FirstFrameRecovery {
+    pub(super) fn expired(
+        &mut self,
+        armed_at: Instant,
+        viewer_attached: bool,
+        recovering: bool,
+        now: Instant,
+    ) -> bool {
+        if viewer_attached && recovering {
+            self.recovering = true;
+            self.deadline = Some(armed_at + FIRST_FRAME_RECOVERY_LIMIT);
+        } else if self.recovering {
+            self.recovering = false;
+            // Give the recovered source time to encode and present, keeping
+            // the original total bound even after repeated capture losses.
+            self.deadline =
+                Some((now + FIRST_FRAME_TIMEOUT).min(armed_at + FIRST_FRAME_RECOVERY_LIMIT));
+        }
+        now >= self.deadline.unwrap_or(armed_at + FIRST_FRAME_TIMEOUT)
+    }
 }
 
 impl PendingFirstFrame {
+    pub(super) fn rebind_after_recovery(&mut self, generation: u32) {
+        self.generation = generation;
+        self.admitted = false;
+        self.rtc_idr_id = None;
+    }
     pub(super) fn reject_rtc_access_unit(&mut self, id: u64) {
         if !self.admitted && self.rtc_idr_id == Some(id) {
             self.rtc_idr_id = None;
@@ -630,6 +667,62 @@ pub(super) fn encoder_mode_for_capture(
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+    #[test]
+    fn first_frame_timeout_extends_only_for_attached_capture_recovery_and_is_bounded() {
+        let armed = Instant::now();
+        let at = |seconds| armed + Duration::from_secs(seconds);
+        let mut normal = FirstFrameRecovery::default();
+        assert!(!normal.expired(armed, true, false, at(7)));
+        assert!(normal.expired(armed, true, false, at(8)));
+        let mut detached = FirstFrameRecovery::default();
+        assert!(detached.expired(armed, false, true, at(8)));
+        let mut recovering = FirstFrameRecovery::default();
+        assert!(!recovering.expired(armed, true, true, at(8)));
+        assert!(!recovering.expired(armed, true, true, at(29)));
+        assert!(recovering.expired(armed, true, true, at(30)));
+    }
+
+    #[test]
+    fn recovered_first_frame_has_encode_time_without_resetting_total_bound() {
+        let armed = Instant::now();
+        let at = |seconds| armed + Duration::from_secs(seconds);
+        let mut recovery = FirstFrameRecovery::default();
+        assert!(!recovery.expired(armed, true, true, at(8)));
+        assert!(!recovery.expired(armed, true, false, at(15)));
+        assert!(!recovery.expired(armed, true, false, at(22)));
+        assert!(recovery.expired(armed, true, false, at(23)));
+        assert!(!recovery.expired(armed, true, true, at(24)));
+        assert!(!recovery.expired(armed, true, false, at(28)));
+        assert!(recovery.expired(armed, true, false, at(30)));
+    }
+
+    #[test]
+    fn first_frame_recovery_rebinds_admission_and_preserves_request_and_timer() {
+        let armed = Instant::now();
+        let mut pending = PendingFirstFrame {
+            request_id: "join".into(),
+            transport: "webrtc".into(),
+            epoch: None,
+            generation: 1,
+            admitted: true,
+            rtc_idr_id: Some(99),
+            armed_at: armed,
+            recovery: FirstFrameRecovery::default(),
+        };
+        assert!(!pending
+            .recovery
+            .expired(armed, true, true, armed + Duration::from_secs(9)));
+        pending.rebind_after_recovery(2);
+        assert_eq!(pending.request_id, "join");
+        assert_eq!(pending.armed_at, armed);
+        assert_eq!(pending.generation, 2);
+        assert!(!pending.admitted);
+        assert_eq!(pending.rtc_idr_id, None);
+        assert!(pending
+            .recovery
+            .expired(armed, true, true, armed + Duration::from_secs(30)));
+    }
+
     #[test]
     fn shared_epoch_contract() {
         let contract: serde_json::Value =

@@ -16,6 +16,7 @@
 use anyhow::{bail, Context, Result};
 use core::ffi::c_void;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use windows::core::{w, Interface, PCWSTR};
@@ -93,12 +94,61 @@ pub struct Capture {
     invalidation: Option<CaptureInvalidation>,
     availability: CaptureAvailability,
     availability_transition: Option<CaptureAvailability>,
+    /// Cause recorded by the transition that made the source unavailable.
+    /// Cleared when it becomes active; read through `unavailable_reason()`.
+    unavailable_reason: Option<CaptureUnavailableReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureAvailability {
     Active,
     Unavailable,
+}
+
+/// Why the duplication source is unavailable. HRESULTs are the native codes
+/// Windows returned; `None` means the failing call supplied no HRESULT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureUnavailableReason {
+    /// The console display is off; recovery waits for it to power on.
+    DisplayOff,
+    /// A display configuration notification invalidated the duplication.
+    DisplayChanged,
+    /// The input desktop is not Default (UAC, lock screen or another desktop).
+    SecureDesktop,
+    /// DXGI_ERROR_ACCESS_LOST (0x887A0026) from acquire or creation.
+    AccessLost { hresult: u32 },
+    /// E_ACCESSDENIED (0x80070005) from acquire or creation.
+    AccessDenied { hresult: u32 },
+    /// A recreation or verification attempt failed.
+    RecreateFailed { hresult: Option<u32> },
+    /// The duplication was recreated; no verified frame or snapshot has arrived.
+    RecoveryAwaitingFrame,
+}
+
+impl fmt::Display for CaptureUnavailableReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DisplayOff => f.write_str("display off"),
+            Self::DisplayChanged => f.write_str("display configuration changed"),
+            Self::SecureDesktop => f.write_str("input desktop is not Default"),
+            Self::AccessLost { hresult } => {
+                write!(
+                    f,
+                    "DXGI access lost (DXGI_ERROR_ACCESS_LOST, 0x{hresult:08X})"
+                )
+            }
+            Self::AccessDenied { hresult } => {
+                write!(f, "DDA access denied (E_ACCESSDENIED, 0x{hresult:08X})")
+            }
+            Self::RecreateFailed {
+                hresult: Some(hresult),
+            } => {
+                write!(f, "DDA recreation failed (0x{hresult:08X})")
+            }
+            Self::RecreateFailed { hresult: None } => f.write_str("DDA recreation failed"),
+            Self::RecoveryAwaitingFrame => f.write_str("DDA recreated; awaiting verified frame"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,19 +235,90 @@ impl DesktopCheck {
 /// Windows-capture reports AcquireNextFrame and DuplicateOutput HRESULTs
 /// through WindowsError (sometimes nested inside DirectXError).
 pub fn capture_error_is_unavailable(error: &CaptureError) -> bool {
-    if matches!(error, CaptureError::AccessLost) {
-        return true;
+    unavailable_reason_for_error(error).is_some()
+}
+
+const E_ACCESSDENIED_HRESULT: u32 = 0x80070005;
+const DXGI_ERROR_ACCESS_LOST_HRESULT: u32 = 0x887A0026;
+
+fn unavailable_reason_for_hresult(hresult: u32) -> Option<CaptureUnavailableReason> {
+    match hresult {
+        E_ACCESSDENIED_HRESULT => Some(CaptureUnavailableReason::AccessDenied { hresult }),
+        DXGI_ERROR_ACCESS_LOST_HRESULT => Some(CaptureUnavailableReason::AccessLost { hresult }),
+        _ => None,
     }
+}
+
+/// The unavailable reason for a DDA error, or `None` when it is not a
+/// source-unavailable error (timeouts, invalid arguments and so on).
+fn unavailable_reason_for_error(error: &CaptureError) -> Option<CaptureUnavailableReason> {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = source {
+        if matches!(
+            error.downcast_ref::<CaptureError>(),
+            Some(CaptureError::AccessLost)
+        ) {
+            return Some(CaptureUnavailableReason::AccessLost {
+                hresult: DXGI_ERROR_ACCESS_LOST_HRESULT,
+            });
+        }
         if let Some(error) = error.downcast_ref::<windows::core::Error>() {
-            if matches!(error.code().0 as u32, 0x80070005 | 0x887A0026) {
-                return true;
+            if let Some(reason) = unavailable_reason_for_hresult(error.code().0 as u32) {
+                return Some(reason);
             }
         }
         source = error.source();
     }
-    false
+    None
+}
+
+/// Reason for a DDA error that the caller has already classified as
+/// source-unavailable. Anything else is reported as a recreation failure.
+fn dda_error_reason(error: &CaptureError) -> CaptureUnavailableReason {
+    unavailable_reason_for_error(error).unwrap_or(CaptureUnavailableReason::RecreateFailed {
+        hresult: error_chain_hresult(error),
+    })
+}
+
+/// The first HRESULT in an error's source chain.
+fn error_chain_hresult(error: &(dyn std::error::Error + 'static)) -> Option<u32> {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if matches!(
+            error.downcast_ref::<CaptureError>(),
+            Some(CaptureError::AccessLost)
+        ) {
+            return Some(DXGI_ERROR_ACCESS_LOST_HRESULT);
+        }
+        if let Some(error) = error.downcast_ref::<windows::core::Error>() {
+            return Some(error.code().0 as u32);
+        }
+        source = error.source();
+    }
+    None
+}
+
+/// Recreation failures keep the first HRESULT from anyhow's context chain.
+fn recreate_failure_reason(error: &anyhow::Error) -> CaptureUnavailableReason {
+    CaptureUnavailableReason::RecreateFailed {
+        hresult: error.chain().find_map(error_chain_hresult),
+    }
+}
+
+/// What `unavailable_reason()` reports. Display power outranks the recorded
+/// cause, because recovery is gated on it. An active source reports nothing.
+fn reported_unavailable_reason(
+    availability: CaptureAvailability,
+    display_off: bool,
+    recorded: Option<CaptureUnavailableReason>,
+) -> Option<CaptureUnavailableReason> {
+    match availability {
+        CaptureAvailability::Active => None,
+        CaptureAvailability::Unavailable if display_off => {
+            Some(CaptureUnavailableReason::DisplayOff)
+        }
+        CaptureAvailability::Unavailable => recorded,
+    }
 }
 
 fn idle_snapshot_retry_due(now: Instant, retry_at: Instant) -> bool {
@@ -1190,10 +1311,12 @@ impl Capture {
         let monitor = pick_monitor(monitor_filter)?;
         let region = monitor_region(monitor).context("selected monitor bounds")?;
         let dev = monitor.device_name().unwrap_or_default();
+        let mut creation_reason = None;
         let api = match DxgiDuplicationApi::new(monitor) {
             Ok(api) => Some(api),
             Err(error) if capture_error_is_unavailable(&error) => {
                 warn!(?error, monitor = %dev, "DDA creation unavailable; preserving session");
+                creation_reason = Some(dda_error_reason(&error));
                 None
             }
             Err(error) => return Err(error).context("DxgiDuplicationApi::new"),
@@ -1245,6 +1368,7 @@ impl Capture {
                 CaptureAvailability::Active
             },
             availability_transition: unavailable.then_some(CaptureAvailability::Unavailable),
+            unavailable_reason: creation_reason,
         })
     }
 
@@ -1289,7 +1413,7 @@ impl Capture {
             self.monitor_filter = Some(dev.clone());
             if let Err(error) = self.recreate(false) {
                 // Recreate consumes the old duplication even when it fails.
-                self.mark_unavailable();
+                self.mark_unavailable(recreate_failure_reason(&error));
                 return Err(error).context("recreate current monitor duplication");
             }
             self.pending_recreate = false;
@@ -1298,6 +1422,7 @@ impl Capture {
             self.fresh_recreate_required = false;
             self.recreate_failed = false;
             self.availability = CaptureAvailability::Active;
+            self.unavailable_reason = None;
             info!(
                 width = self.width,
                 height = self.height,
@@ -1309,7 +1434,7 @@ impl Capture {
         let api = match DxgiDuplicationApi::new(monitor) {
             Ok(api) => api,
             Err(error) if capture_error_is_unavailable(&error) => {
-                self.mark_unavailable();
+                self.mark_unavailable(dda_error_reason(&error));
                 return Err(error).context("DxgiDuplicationApi::new monitor switch unavailable");
             }
             Err(error) => return Err(error).context("DxgiDuplicationApi::new monitor switch"),
@@ -1333,6 +1458,7 @@ impl Capture {
         self.idle_gdi = None;
         self.desktop_check = DesktopCheck::new(Instant::now());
         self.availability = CaptureAvailability::Active;
+        self.unavailable_reason = None;
         info!(width = self.width, height = self.height, monitor = %self.monitor_device_name, "DDA monitor switched");
         Ok(())
     }
@@ -1348,6 +1474,23 @@ impl Capture {
 
     pub fn availability(&self) -> CaptureAvailability {
         self.availability
+    }
+
+    /// Why the source is unavailable, or `None` when it is active or no cause
+    /// was recorded. Reads only cached state and one display-power flag; it
+    /// makes no capture, desktop or power calls.
+    pub fn unavailable_reason(&self) -> Option<CaptureUnavailableReason> {
+        reported_unavailable_reason(
+            self.availability,
+            self.display_is_off(),
+            self.unavailable_reason,
+        )
+    }
+
+    fn display_is_off(&self) -> bool {
+        self.invalidation
+            .as_ref()
+            .is_some_and(CaptureInvalidation::display_is_off)
     }
 
     /// A short join grace may hide a transient loss, but never a failed
@@ -1377,7 +1520,7 @@ impl Capture {
             match waiter.poll() {
                 Ok(frame) => drop(frame),
                 Err(error) if capture_error_is_unavailable(&error) => {
-                    self.mark_unavailable();
+                    self.mark_unavailable(dda_error_reason(&error));
                     self.next_recreate_attempt = now;
                 }
                 Err(error) => return Err(anyhow::anyhow!("parked capture waiter: {error:?}")),
@@ -1389,7 +1532,11 @@ impl Capture {
         }
         // Never open duplication on a secure desktop, even if the event was
         // queued on Default or the source's cached desktop state is stale.
-        if !self.desktop_check.refresh(true)
+        let on_default = self.desktop_check.refresh(true);
+        if !on_default {
+            self.unavailable_reason = Some(CaptureUnavailableReason::SecureDesktop);
+        }
+        if !on_default
             || self
                 .invalidation
                 .as_ref()
@@ -1408,7 +1555,7 @@ impl Capture {
             .as_ref()
             .is_some_and(CaptureInvalidation::take)
         {
-            self.mark_unavailable();
+            self.mark_unavailable(CaptureUnavailableReason::DisplayChanged);
             self.next_recreate_attempt = now;
             self.fresh_recreate_required = true;
             self.awaiting_recovery_frame = false;
@@ -1430,18 +1577,11 @@ impl Capture {
         }
         match self.recreate(self.fresh_recreate_required) {
             Ok(()) => {
-                self.pending_recreate = false;
-                self.awaiting_recovery_frame = true;
-                self.fresh_recreate_required = false;
-                self.recreate_failed = false;
-                self.availability =
-                    availability_after(self.availability, CaptureRecoveryEvent::SessionRecreated);
+                self.record_recreated();
                 true
             }
             Err(error) => {
-                self.next_recreate_attempt = now + retry_delay;
-                self.fresh_recreate_required = true;
-                self.recreate_failed = true;
+                self.record_recreate_failed(now, retry_delay, &error);
                 debug!(
                     ?error,
                     retry_ms = retry_delay.as_millis(),
@@ -1452,6 +1592,29 @@ impl Capture {
         }
     }
 
+    /// A replacement duplication exists but has not yet produced pixels.
+    fn record_recreated(&mut self) {
+        self.pending_recreate = false;
+        self.awaiting_recovery_frame = true;
+        self.fresh_recreate_required = false;
+        self.recreate_failed = false;
+        self.availability =
+            availability_after(self.availability, CaptureRecoveryEvent::SessionRecreated);
+        self.unavailable_reason = Some(CaptureUnavailableReason::RecoveryAwaitingFrame);
+    }
+
+    fn record_recreate_failed(
+        &mut self,
+        now: Instant,
+        retry_delay: Duration,
+        error: &anyhow::Error,
+    ) {
+        self.next_recreate_attempt = now + retry_delay;
+        self.fresh_recreate_required = true;
+        self.recreate_failed = true;
+        self.unavailable_reason = Some(recreate_failure_reason(error));
+    }
+
     /// The helper observed Winlogon before DDA reported its own access loss.
     /// Keep the selected output/device, but never reuse its desktop pixels.
     pub fn suspend_for_secure_desktop(&mut self) {
@@ -1460,13 +1623,13 @@ impl Capture {
         }
         self.idle_gdi = None;
         retire_api(self.api.take());
-        self.mark_unavailable();
+        self.mark_unavailable(CaptureUnavailableReason::SecureDesktop);
         self.fresh_recreate_required = true;
         self.awaiting_recovery_frame = false;
         self.idle_snapshot = IdleSnapshotState::new(Instant::now());
     }
 
-    fn mark_unavailable(&mut self) {
+    fn mark_unavailable(&mut self, reason: CaptureUnavailableReason) {
         if self.availability != CaptureAvailability::Unavailable {
             self.recreate_failed = false;
         }
@@ -1474,6 +1637,7 @@ impl Capture {
         self.next_recreate_attempt = Instant::now() + CAPTURE_RECOVERY_INTERVAL;
         self.availability = CaptureAvailability::Unavailable;
         self.availability_transition = Some(CaptureAvailability::Unavailable);
+        self.unavailable_reason = Some(reason);
     }
 
     /// Enable before the first acquisition so this serve instance can poll
@@ -1556,6 +1720,7 @@ impl Capture {
                 self.suspend_for_secure_desktop();
                 warn!("input desktop is not Default; normal capture suspended");
             }
+            self.unavailable_reason = Some(CaptureUnavailableReason::SecureDesktop);
             return Ok(None);
         }
         // Deferred recovery from a previous AccessLost (see field doc).
@@ -1591,11 +1756,17 @@ impl Capture {
             Ok(None) => return Ok(None),
             Err(CaptureError::Timeout) => return Ok(None),
             Err(error) if capture_error_is_unavailable(&error) => {
-                self.desktop_check.refresh(true);
+                let on_default = self.desktop_check.refresh(true);
+                self.unavailable_reason = Some(if on_default {
+                    dda_error_reason(&error)
+                } else {
+                    CaptureUnavailableReason::SecureDesktop
+                });
                 self.idle_gdi = None;
                 let first_loss = self.availability != CaptureAvailability::Unavailable;
                 if first_loss {
                     warn!(
+                        reason = %self.unavailable_reason.expect("acquire loss records its cause"),
                         "DDA access lost; capture unavailable until a replacement yields a frame"
                     );
                 } else {
@@ -1638,6 +1809,7 @@ impl Capture {
                 warn!("discarded DDA frame from a non-Default input desktop");
             }
             self.availability = CaptureAvailability::Unavailable;
+            self.unavailable_reason = Some(CaptureUnavailableReason::SecureDesktop);
             self.pending_recreate = true;
             self.fresh_recreate_required = true;
             self.awaiting_recovery_frame = false;
@@ -1672,6 +1844,7 @@ impl Capture {
         if recovered {
             self.availability =
                 availability_after(self.availability, CaptureRecoveryEvent::FrameAcquired);
+            self.unavailable_reason = None;
             self.awaiting_recovery_frame = false;
             self.fresh_recreate_required = false;
             self.recreate_failed = false;
@@ -1750,6 +1923,7 @@ impl Capture {
                 let recovered = self.availability == CaptureAvailability::Unavailable;
                 if recovered {
                     self.availability = CaptureAvailability::Active;
+                    self.unavailable_reason = None;
                     self.awaiting_recovery_frame = false;
                     self.fresh_recreate_required = false;
                     self.recreate_failed = false;
@@ -1784,6 +1958,7 @@ impl Capture {
                     self.pending_recreate = true;
                     self.fresh_recreate_required = true;
                     self.next_recreate_attempt = now + CAPTURE_RECOVERY_INTERVAL;
+                    self.unavailable_reason = Some(recreate_failure_reason(&e));
                 }
                 self.idle_snapshot.on_snapshot_failed(now);
                 warn!(
@@ -2259,6 +2434,7 @@ mod tests {
             invalidation: None,
             availability: CaptureAvailability::Unavailable,
             availability_transition: None,
+            unavailable_reason: None,
         }
     }
 
@@ -2328,6 +2504,176 @@ mod tests {
         capture.recreate_failed = false;
         assert!(capture.can_recover_for_join());
         assert_eq!(capture.availability(), CaptureAvailability::Unavailable);
+    }
+
+    #[test]
+    fn dda_errors_map_to_native_unavailable_reasons() {
+        use super::CaptureUnavailableReason as Reason;
+        use windows::core::{Error as WindowsError, HRESULT};
+        use windows_capture::dxgi_duplication_api::Error;
+        assert_eq!(
+            super::dda_error_reason(&Error::AccessLost),
+            Reason::AccessLost {
+                hresult: 0x887A0026
+            }
+        );
+        assert_eq!(
+            super::unavailable_reason_for_error(&Error::WindowsError(WindowsError::from_hresult(
+                HRESULT(0x80070005u32 as i32)
+            ))),
+            Some(Reason::AccessDenied {
+                hresult: 0x80070005
+            })
+        );
+        assert_eq!(
+            super::unavailable_reason_for_error(&Error::WindowsError(WindowsError::from_hresult(
+                HRESULT(0x887A0026u32 as i32)
+            ))),
+            Some(Reason::AccessLost {
+                hresult: 0x887A0026
+            })
+        );
+        // A wrapped DirectX error keeps the native access-denied code.
+        assert_eq!(
+            super::unavailable_reason_for_error(&Error::DirectXError(
+                windows_capture::d3d11::Error::WindowsError(WindowsError::from_hresult(HRESULT(
+                    0x80070005u32 as i32
+                )))
+            )),
+            Some(Reason::AccessDenied {
+                hresult: 0x80070005
+            })
+        );
+        assert_eq!(super::unavailable_reason_for_error(&Error::Timeout), None);
+        assert_eq!(
+            super::unavailable_reason_for_error(&Error::WindowsError(WindowsError::from_hresult(
+                HRESULT(0x80070057u32 as i32)
+            ))),
+            None
+        );
+        // Non-unavailable errors still report their HRESULT when they cause a
+        // failed recreation.
+        assert_eq!(
+            super::dda_error_reason(&Error::WindowsError(WindowsError::from_hresult(HRESULT(
+                0x80070057u32 as i32
+            )))),
+            Reason::RecreateFailed {
+                hresult: Some(0x80070057)
+            }
+        );
+        assert_eq!(
+            super::dda_error_reason(&Error::Timeout),
+            Reason::RecreateFailed { hresult: None }
+        );
+    }
+
+    #[test]
+    fn recreate_failures_report_the_first_native_code_in_context() {
+        use super::CaptureUnavailableReason as Reason;
+        use anyhow::Context;
+        use windows::core::{Error as WindowsError, HRESULT};
+        use windows_capture::dxgi_duplication_api::Error;
+        let failed: Result<(), Error> = Err(Error::WindowsError(WindowsError::from_hresult(
+            HRESULT(0x887A0022u32 as i32),
+        )));
+        let error = failed
+            .context("DxgiDuplicationApi fresh-session recreate")
+            .unwrap_err();
+        assert_eq!(
+            super::recreate_failure_reason(&error),
+            Reason::RecreateFailed {
+                hresult: Some(0x887A0022)
+            }
+        );
+        assert_eq!(
+            super::recreate_failure_reason(&anyhow::anyhow!("pick_monitor: no display")),
+            Reason::RecreateFailed { hresult: None }
+        );
+    }
+
+    #[test]
+    fn unavailable_state_records_recreate_failure_then_awaiting_frame_then_secure_desktop() {
+        use super::CaptureUnavailableReason as Reason;
+        use windows::core::{Error as WindowsError, HRESULT};
+        let now = Instant::now();
+        let mut capture = capture_without_native_session(now);
+        // The fixture has no recorded transition, so no cause is reported.
+        assert_eq!(capture.unavailable_reason(), None);
+
+        capture.record_recreate_failed(
+            now,
+            Duration::from_millis(500),
+            &anyhow::Error::new(WindowsError::from_hresult(HRESULT(0x887A0022u32 as i32))),
+        );
+        assert_eq!(
+            capture.unavailable_reason(),
+            Some(Reason::RecreateFailed {
+                hresult: Some(0x887A0022)
+            })
+        );
+        assert!(!capture.can_recover_for_join());
+
+        capture.record_recreated();
+        assert_eq!(capture.availability(), CaptureAvailability::Unavailable);
+        assert_eq!(
+            capture.unavailable_reason(),
+            Some(Reason::RecoveryAwaitingFrame)
+        );
+
+        capture.suspend_for_secure_desktop();
+        assert_eq!(capture.availability(), CaptureAvailability::Unavailable);
+        assert_eq!(capture.unavailable_reason(), Some(Reason::SecureDesktop));
+        assert_eq!(capture.stats(), (0, 0));
+    }
+
+    #[test]
+    fn reported_reason_gives_display_power_precedence_and_nothing_when_active() {
+        use super::CaptureUnavailableReason as Reason;
+        use super::{reported_unavailable_reason as report, CaptureAvailability as A};
+        let lost = Some(Reason::AccessLost {
+            hresult: 0x887A0026,
+        });
+        assert_eq!(report(A::Active, true, lost), None);
+        assert_eq!(report(A::Active, false, lost), None);
+        assert_eq!(report(A::Unavailable, true, lost), Some(Reason::DisplayOff));
+        assert_eq!(report(A::Unavailable, true, None), Some(Reason::DisplayOff));
+        assert_eq!(report(A::Unavailable, false, lost), lost);
+        assert_eq!(report(A::Unavailable, false, None), None);
+    }
+
+    #[test]
+    fn unavailable_reasons_render_native_codes_for_logs() {
+        use super::CaptureUnavailableReason as Reason;
+        assert_eq!(
+            Reason::AccessLost {
+                hresult: 0x887A0026
+            }
+            .to_string(),
+            "DXGI access lost (DXGI_ERROR_ACCESS_LOST, 0x887A0026)"
+        );
+        assert_eq!(
+            Reason::AccessDenied {
+                hresult: 0x80070005
+            }
+            .to_string(),
+            "DDA access denied (E_ACCESSDENIED, 0x80070005)"
+        );
+        assert_eq!(
+            Reason::RecreateFailed {
+                hresult: Some(0x887A0022)
+            }
+            .to_string(),
+            "DDA recreation failed (0x887A0022)"
+        );
+        assert_eq!(
+            Reason::RecreateFailed { hresult: None }.to_string(),
+            "DDA recreation failed"
+        );
+        assert_eq!(Reason::DisplayOff.to_string(), "display off");
+        assert_eq!(
+            Reason::SecureDesktop.to_string(),
+            "input desktop is not Default"
+        );
     }
 
     #[test]

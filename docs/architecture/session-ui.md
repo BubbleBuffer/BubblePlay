@@ -4,6 +4,8 @@ The receiver keeps quick actions beside the stream in a docked bar. The stream's
 
 The approved BubblePlay mark appears on launcher icons, login pages and the Windows notification area (with host/input status in its tooltip and menu), outside the session strip; About links to the relay operator's configured source code.
 
+The host keeps the PC display on while a viewer is attached and attempts to wake an unavailable Default desktop with rate-limited local input. A recoverable join defers the existing Desktop unavailable state for at most two seconds, then announces it until verified capture sends active again. The pending first-frame request survives local capture recovery: its usual eight-second timeout extends to at most thirty seconds from the request, with up to eight seconds after recovery inside that bound. Browser and Android use their existing desktop-state messages.
+
 ## Browser
 
 The existing connection status shows "This window needs Admin mode — turn it
