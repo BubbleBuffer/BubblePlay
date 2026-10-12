@@ -22,6 +22,9 @@ func run(args []string) error {
 	if len(args) > 0 && (args[0] == "init" || args[0] == "rotate") {
 		return setupCommand(args[0], args[1:])
 	}
+	if len(args) > 0 && args[0] == "healthcheck" {
+		return healthcheckCommand(args[1:])
+	}
 	f := flag.NewFlagSet("bubbleplay-relay", flag.ContinueOnError)
 	configPath := f.String("config", "/data/config.json", "private relay configuration")
 	if err := f.Parse(args); err != nil {

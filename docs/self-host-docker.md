@@ -50,7 +50,7 @@ docker compose -f relay/compose.example.yaml ps
 curl -s -H 'Host: play.example.com' http://127.0.0.1:8787/healthz
 ```
 
-The expected response is `{"ok":true,"backend":"go"}`. Without the matching Host header the relay returns `404 page not found` by design, so a bare `curl http://127.0.0.1:8787/healthz` is not a failure.
+The expected response is `{"ok":true,"backend":"go"}`. Without the matching Host header the relay returns `404 page not found` by design, so a bare `curl http://127.0.0.1:8787/healthz` is not a failure. The compose file's `healthcheck` runs `/bubbleplay-relay healthcheck`, which sends the public Host header to `/healthz` from inside the container, and `docker compose ps` reports its state.
 
 ## Connect the Windows host and browser
 
