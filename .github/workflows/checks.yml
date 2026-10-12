@@ -67,3 +67,76 @@ jobs:
       - name: Container build
         working-directory: .
         run: docker build -f relay/Dockerfile -t bubbleplay-relay:check .
+
+  host:
+    name: Host checks (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # Read by the nvidia-video-codec-sdk build script. Set for every step, because
+      # clippy and fmt run cargo from the repo root, which skips host/.cargo/config.toml.
+      NVIDIA_VIDEO_CODEC_SDK_PATH: ${{ github.workspace }}/host/sdk-stub/
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt --no-self-update
+          rustup default 1.97.1
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: host -> target
+      - name: Fetch locked crates
+        run: cargo fetch --locked --manifest-path host/Cargo.toml
+      - name: Create NVENC and NVDEC import libraries
+        # The hosted runner has no NVIDIA driver, so there are no driver DLLs to dump.
+        # Import libraries are built from the export names (same lists as the local
+        # host/sdk-stub). Test binaries never load the DLLs: linking only records them.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw 'No Visual Studio with C++ tools found.' }
+          $msvc = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $lib = Join-Path $msvc.FullName 'bin\Hostx64\x64\lib.exe'
+          $out = Join-Path $PWD 'host/sdk-stub'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $libraries = [ordered]@{
+            nvEncodeAPI = @{ dll = 'nvEncodeAPI64'; exports = 'NvEncodeAPICreateInstance NvEncodeAPIGetMaxSupportedVersion NvToolCreateInterface NvToolDestroyInterface NvToolGetApiFunctionCount NvToolGetApiID NvToolGetApiNames NvToolGetInterface NvToolSetApiID NvToolSetInterface' }
+            nvcuvid = @{ dll = 'nvcuvid'; exports = 'CreateEncoderInterface NvToolCreateInterface NvToolDestroyInterface NvToolGetApiFunctionCount NvToolGetApiID NvToolGetApiNames NvToolGetInterface NvToolSetApiID NvToolSetInterface __std_2U4S4U_X08 __std_4U4S4U_X04 cuvidConvertYUVToRGB cuvidConvertYUVToRGBArray cuvidCreateDecoder cuvidCreateVideoParser cuvidCreateVideoSource cuvidCreateVideoSourceW cuvidCtxLock cuvidCtxLockCreate cuvidCtxLockDestroy cuvidCtxUnlock cuvidDecodePicture cuvidDestroyDecoder cuvidDestroyVideoParser cuvidDestroyVideoSource cuvidGetDecodeStatus cuvidGetDecoderCaps cuvidGetSourceAudioFormat cuvidGetSourceVideoFormat cuvidGetVideoFrameSurface cuvidGetVideoSourceState cuvidMapVideoFrame cuvidMapVideoFrame64 cuvidParseVideoData cuvidPrivateOp cuvidReconfigureDecoder cuvidSetVideoSourceState cuvidUnmapVideoFrame cuvidUnmapVideoFrame64' }
+          }
+          foreach ($name in $libraries.Keys) {
+            $def = Join-Path $out "$name.def"
+            @("LIBRARY $($libraries[$name].dll)", 'EXPORTS') + ($libraries[$name].exports -split ' ') | Set-Content -Path $def -Encoding ascii
+            & $lib /def:$def /machine:x64 /nologo "/out:$(Join-Path $out "$name.lib")"
+            if ($LASTEXITCODE -ne 0) { throw "lib.exe failed for $name" }
+          }
+      - name: Host tests and cargo check
+        run: node tools/check.mjs host
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --locked --offline --manifest-path host/Cargo.toml --all-targets -- -D warnings
+      - name: Rustfmt
+        run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
+
+  android:
+    name: Android unit tests and lint (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Gradle unit tests and lint
+        working-directory: android
+        # android/gradlew is committed without the executable bit (mode 100644), so run it via bash.
+        run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug

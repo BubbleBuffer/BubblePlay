@@ -25,7 +25,7 @@ Start with the affected module's checks. Changes to packet semantics should incl
 
 The standalone relay is in `relay/`. It serves the existing browser assets; Windows capture and encoding remain in the Rust host. Use `go test ./...` and `go vet ./...` from `relay/`, then follow its setup guide for a separate development instance. Never reuse production credentials for fixtures.
 
-The CI definition covers browser checks on Node 22/24, synthetic Windows packaging/setup checks in both PowerShell versions, Go race tests and a container build. It does not establish an NVENC host build or a physical desktop-stream test: those need the Windows/NVIDIA build environment and explicit runtime evidence.
+The CI definition covers browser checks on Node 22/24, synthetic Windows packaging/setup checks in both PowerShell versions, Go race tests, a container build, the host's Rust tests, clippy and fmt on a hosted Windows runner, and Android unit tests and lint on a hosted Ubuntu runner. The host job links against generated NVENC/NVDEC import libraries without an NVIDIA driver, so it does not establish an NVENC encode or a physical desktop-stream test: those need the Windows/NVIDIA build environment and explicit runtime evidence.
 
 From the root, run the release tooling checks separately:
 
