@@ -2,7 +2,7 @@
 
 The standalone Go service contains the browser site, authentication, WebRTC signaling and WebSocket video/input/file relay. It needs no Cloudflare account, Node runtime or database. Windows capture and encoding run on the native host.
 
-The implementation has automated authentication and protocol tests, plus a desktop-browser login smoke test. The development machine's Docker engine is offline: an actual container run and native desktop stream against this relay remain to verify before public release.
+The implementation has automated authentication and protocol tests, plus a desktop-browser login smoke test. The image has been built and run on a Linux Docker host (Docker Engine 29.9.0, 2026-10-12): health, login and WebSocket handshakes passed locally and through a tunnel. A native Windows desktop stream against this relay remains to verify before public release.
 
 ## Prepare hosting
 
@@ -23,7 +23,7 @@ docker compose -f relay/compose.example.yaml create relay
 docker compose -f relay/compose.example.yaml cp relay:/data/provision.txt ./relay/provision.txt
 ```
 
-Replace the example origin with your own. Setup asks for a password without echo and generates separate host registration, endpoint and administration credentials. It stores a password hash, not the password. Only when `totp` is enabled does it generate an authenticator seed and include its enrollment URI and Base32 secret in the private provisioning file. Add that secret to an authenticator using six-digit codes, SHA-1 and a 30-second period. Open this file locally. Keep it private and out of backups intended for publication; its default repository path is ignored by Git and the Docker build context.
+Replace the example origin with your own. Setup asks for a password without echo, so run it from an interactive terminal. For scripts, pass `--password-file` pointing at a private file that is mounted into the command with `run -v`. It generates separate host registration, endpoint and administration credentials. It stores a password hash, not the password. Only when `totp` is enabled does it generate an authenticator seed and include its enrollment URI and Base32 secret in the private provisioning file. Add that secret to an authenticator using six-digit codes, SHA-1 and a 30-second period. Open this file locally. Keep it private and out of backups intended for publication; its default repository path is ignored by Git and the Docker build context.
 
 Use `--methods totp,host` to also offer approval on the PC, or `--methods host` to require PC approval for new browsers. `approvalMethods` in `/data/config.json` stores this selection. Older configs without this field retain their methods derived from their existing authenticator secret and ntfy configuration.
 
@@ -42,6 +42,15 @@ Start the relay:
 ```sh
 docker compose -f relay/compose.example.yaml up -d
 ```
+
+Check that it is running. The container should report `running`. The health endpoint answers only for the public origin's Host header, so send that header on the Docker host:
+
+```sh
+docker compose -f relay/compose.example.yaml ps
+curl -s -H 'Host: play.example.com' http://127.0.0.1:8787/healthz
+```
+
+The expected response is `{"ok":true,"backend":"go"}`. Without the matching Host header the relay returns `404 page not found` by design, so a bare `curl http://127.0.0.1:8787/healthz` is not a failure.
 
 ## Connect the Windows host and browser
 
