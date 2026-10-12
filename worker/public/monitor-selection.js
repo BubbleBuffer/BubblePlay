@@ -3,8 +3,8 @@
 // testable without a browser.
 //
 // The host accepts exactly one offer per signaling epoch
-// (host_session.rs should_forward_offer). A WebRTC monitor/source transition
-// therefore has to start a new signaling epoch before restarting the peer:
+// (host_session.rs should_forward_offer). A WebRTC desktop-source transition,
+// or a monitor transition whose in-place handshake failed, therefore has to start a new signaling epoch before restarting the peer:
 // an offer sent into the old epoch is dropped, and the closed peer instead
 // ends the whole host session, which drops the runtime-selected display.
 export function restartPeerInNewEpoch({ recycleSignaling, restartPeer }, reason) {
@@ -31,4 +31,22 @@ export function monitorRequestReadiness({ socketOpen, signalingRegistered, pendi
 export function monitorRequestAfterRestart(pending, reason) {
   if (typeof pending !== "string" || pending.length === 0) return null;
   return { selector: pending, reason: String(reason || "epoch-restart"), invalidated: true };
+}
+
+// A desktop-state transition while a frame is already visible keeps that
+// frame on screen. Monitor switches stay on the existing peer on both
+// transports: the host bumps its media generation and the first-frame
+// handshake (admission plus keyframe gating) proves the new monitor, while
+// held input is carried. Desktop-source changes (secure desktop, Winlogon,
+// session change) recreate the WebRTC peer, because native video exposes no
+// host generation and an old frame must never authorize input on another
+// desktop. Returns null when the message is not such a transition.
+export const DESKTOP_SOURCE_REASONS = Object.freeze(["desktop-switched", "capture-recovered", "session-changed", "agent-restarted"]);
+export function desktopTransitionPlan({ reason, state, usingWss, alreadyRendering }) {
+  if (!alreadyRendering) return null;
+  if (reason === "monitor-switch" || reason === "monitor-switched")
+    return { kind: "monitor", holdInput: true, action: state === "active" ? "handshake" : "wait" };
+  if (state === "active" && DESKTOP_SOURCE_REASONS.includes(reason))
+    return { kind: "source", holdInput: false, action: usingWss ? "handshake" : "restart-peer" };
+  return null;
 }

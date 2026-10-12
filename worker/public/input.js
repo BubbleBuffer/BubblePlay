@@ -257,10 +257,12 @@ export class InputController {
       queue: [], queuedBytes: 0, needsRelease: false, flushArmed: false, draining: false, motionSending: false, scancode: false,
       stats: { sent: 0, coalesced: 0, dropped: 0, controlSent: 0, controlDropped: 0, controlQueued: 0, releaseResync: 0 } });
   }
-  /** Accepts a control packet for in-order delivery; false only when the transport is down. */
-  sendReliable(message) {
+  /** Accepts a control packet for in-order delivery; false only when the transport is down or the transition gate holds input. */
+  sendReliable(message, releasesHeld = false) {
     if (!message) return false;
-    if (this.controlState() === "down") { this.discardControl(1); return false; }
+    const state = this.controlState();
+    if (state === "gated") return this.dropGated(releasesHeld);
+    if (state === "down") { this.discardControl(1); return false; }
     this.queue.push(message); this.queuedBytes += message.byteLength;
     if (this.queuedBytes > this.maxQueuedBytes) { this.discardControl(0); return false; }
     if (this.queue.length > 1) this.stats.controlQueued++;
@@ -278,7 +280,7 @@ export class InputController {
     while (this.queue.length) {
       const state = this.controlState();
       if (state === "down") { this.discardControl(0); return false; }
-      if (state !== "open") break;
+      if (state !== "open") break; // busy, or gated: queued packets wait for resume
       if (this.needsRelease) {
         if (!this.trySend(packet.releaseAll())) break;
         this.needsRelease = false; this.stats.releaseResync++;
@@ -297,10 +299,34 @@ export class InputController {
     this.stats.controlDropped += this.queue.length + extra;
     this.queue = []; this.queuedBytes = 0; this.needsRelease = true;
   }
+  /**
+   * A monitor transition gate ("gated") keeps held keys and buttons. A refused
+   * press is simply dropped; a refused release of input the host holds marks
+   * release-all for resume. Nothing is released at the transition itself.
+   */
+  dropGated(releasesHeld) { this.stats.controlDropped++; if (releasesHeld) this.needsRelease = true; return false; }
+  /** The transition gate opened: release-all only when a held key/button was let go meanwhile, then drain. */
+  resumeAfterTransition() {
+    if (this.needsRelease) {
+      this.needsRelease = false; this.held.clear(); this.buttonMask = 0;
+      this.stats.releaseResync++;
+      this.sendReliable(packet.releaseAll());
+      return true;
+    }
+    if (this.queue.length) this.flushControl();
+    return false;
+  }
   /** The transport died: forget local state; the host releases on its side too. */
   transportDown() { this.discardControl(0); this.held.clear(); this.buttonMask = 0; this.clearMotion(); }
   get controlBacklog() { return this.queue.length; }
-  key(vk, up) { if (up) this.held.delete(vk); else this.held.add(vk); return this.sendReliable(packet.key(vk, up)); }
+  key(vk, up) { return this.heldKey(vk, up, packet.key(vk, up)); }
+  heldKey(id, up, message) {
+    const wasHeld = this.held.has(id);
+    // A gated press is dropped without being recorded; a repeat of a held key keeps it held.
+    if (this.controlState() === "gated") { if (up) this.held.delete(id); return this.dropGated(up && wasHeld); }
+    if (up) this.held.delete(id); else this.held.add(id);
+    return this.sendReliable(message);
+  }
   /** Physical key by KeyboardEvent.code: scan code on capable hosts, VK otherwise. */
   physicalKey(code, up) {
     const key = keyDescriptor(code);
@@ -309,13 +335,14 @@ export class InputController {
       if (!this.scancode) return key.legacyVk === undefined ? false : this.key(key.legacyVk, up);
       if (!key.vk) return false;
     }
-    const id = `code:${code}`;
-    if (up) this.held.delete(id); else this.held.add(id);
-    return this.sendReliable(packet.scanKey(key.scan, key.extended, key.vk, up));
+    return this.heldKey(`code:${code}`, up, packet.scanKey(key.scan, key.extended, key.vk, up));
   }
   clipboard(text, id, options) { const packets = clipboardPackets(text, id, options); if (!packets) return false; return packets.every(message => this.sendReliable(message)); }
   text(value) { const message = packet.text(value); return message ? this.sendReliable(message) : false; }
-  buttons(mask) { this.buttonMask = mask; return this.sendReliable(packet.buttons(mask)); }
+  buttons(mask) {
+    if (this.controlState() === "gated") return this.dropGated((this.buttonMask & ~mask) !== 0);
+    this.buttonMask = mask; return this.sendReliable(packet.buttons(mask));
+  }
   /** Takes the next shared sequence number before its packet is built, so a reentrant send cannot reuse it. */
   allocSequence() { const sequence = this.seq; this.seq = (sequence + 1) & 0xffff; return sequence; }
   /** Gives a sequence back when its packet was refused; a number taken meanwhile stays a harmless gap. */
@@ -325,6 +352,7 @@ export class InputController {
   clearPointer() { this.pendingAbsolute = null; this.pending = [0, 0, this.pending[2], this.pending[3]]; }
   buttonsAt(x, y, mask) {
     this.clearPointer();
+    if (this.controlState() === "gated") return this.dropGated((this.buttonMask & ~mask) !== 0);
     const sequence = this.allocSequence(), message = packet.buttonsAt(sequence, clamp(Math.round(x),0,65535), clamp(Math.round(y),0,65535), mask);
     const undo = this.markSent(sequence, true);
     if (!this.sendReliable(message)) { undo(); this.releaseSequence(sequence); return false; }
@@ -332,6 +360,7 @@ export class InputController {
   }
   cursorSync() {
     this.clearPointer();
+    if (this.controlState() === "gated") return this.dropGated(false);
     const sequence = this.allocSequence(), undo = this.markSent(sequence, true);
     if (!this.sendReliable(packet.cursorSync(sequence))) { undo(); this.releaseSequence(sequence); return false; }
     return true;
@@ -375,7 +404,8 @@ export class InputController {
   flushMotion() {
     if (this.motionSending) return false;
     if (!this.hasPendingMotion()) return false;
-    if (this.controlState() === "down") { this.clearMotion(); return false; }
+    const state = this.controlState();
+    if (state === "down" || state === "gated") { this.clearMotion(); return false; }
     if (this.queue.length) return false;
     this.motionSending = true;
     try { return this.sendPendingMotion(); } finally { this.motionSending = false; }
@@ -406,7 +436,7 @@ export class InputController {
     this.stats.sent++;
     return true;
   }
-  releaseAll(send = true) { this.held.clear(); this.buttonMask = 0; this.clearMotion(); if (send) return this.sendReliable(packet.releaseAll()); this.discardControl(0); return false; }
+  releaseAll(send = true) { const holding = this.held.size > 0 || this.buttonMask !== 0; this.held.clear(); this.buttonMask = 0; this.clearMotion(); if (send) return this.sendReliable(packet.releaseAll(), holding); this.discardControl(0); return false; }
 }
 
 

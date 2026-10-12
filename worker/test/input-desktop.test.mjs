@@ -183,7 +183,7 @@ test("receiver wires physical keys, keyboard lock, wheel accumulation and clipbo
   const client = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /controlState: inputControlState/);
-  assert.match(client, /function inputControlState\(\) \{\s*if \(desktopInputState !== "enabled" \|\| !desktopAvailable \|\| desktopAwaitingFrame\) return "down";/);
+  assert.match(client, /function inputControlState\(\) \{\s*if \(desktopInputState !== "enabled" \|\| !desktopAvailable\) return "down";\s*if \(desktopAwaitingFrame\) return inputTransitionHold && .*\? "gated" : "down";/);
   assert.match(client, /function releaseInput\(send = true\)/);
   assert.match(client, /input\.physicalKey\(e\.code, false\)/);
   assert.match(client, /input\.physicalKey\(e\.code, true\)/);

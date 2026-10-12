@@ -52,7 +52,7 @@ test("rejected presentation cannot replace native drop's accepted generation or 
   const present=(handshake,generation,revision)=>{
     const context={firstFrameHandshake:{presented:false,requireAdmission:true,admitted:true,generation:9,...handshake},
       fileDropPresentedGeneration:7,fileDropPresentedViewportRevision:3,usingWssMedia:true,wssStartupRecoveries:1,
-      hasPresentedFrame:false,desktopAwaitingFrame:true,suppressDesktopTransitionOverlay:true,
+      hasPresentedFrame:false,desktopAwaitingFrame:true,inputTransitionHold:false,suppressDesktopTransitionOverlay:true,
       document:{body:{classList:{add(){}}}},debugTrace(){},clearFirstFrameWatchdog(){},renderDesktopState(){},showContextHint(){}};
     context.result=runInNewContext(`${source}\nmarkFirstFramePresented(${generation},${revision})`,context);
     return context;

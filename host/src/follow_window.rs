@@ -27,7 +27,7 @@ pub const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(1);
 /// Edge-hold sampling cadence, used only while a move loop is active.
 pub const EDGE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 /// How long the cursor must stay at the edge before the stream switches.
-pub const EDGE_HOLD: Duration = Duration::from_millis(400);
+pub const EDGE_HOLD: Duration = Duration::from_millis(250);
 /// The edge zone: the cursor is at most this many pixels from the edge.
 pub const EDGE_ZONE_PX: i32 = 2;
 
@@ -618,29 +618,29 @@ mod tests {
     }
 
     #[test]
-    fn edge_hold_shorter_than_400_ms_does_nothing() {
+    fn edge_hold_shorter_than_250_ms_does_nothing() {
         let t = Instant::now();
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (1919, 500), M1, 0, 350), None);
-        // Leaving the edge before 400 ms restarts the hold.
+        assert_eq!(hold(&mut f, t, (1919, 500), M1, 0, 200), None);
+        // Leaving the edge before 250 ms restarts the hold.
         assert_eq!(
-            observe_edge(Some(&mut f), moving((1000, 500)), &ALL, M1, ms(t, 400)),
+            observe_edge(Some(&mut f), moving((1000, 500)), &ALL, M1, ms(t, 250)),
             None
         );
-        assert_eq!(hold(&mut f, t, (1919, 500), M1, 450, 800), None);
+        assert_eq!(hold(&mut f, t, (1919, 500), M1, 300, 500), None);
     }
 
     #[test]
-    fn edge_hold_of_400_ms_with_a_neighbour_switches() {
+    fn edge_hold_of_250_ms_with_a_neighbour_switches() {
         let t = Instant::now();
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (1918, 500), M1, 0, 1000), Some((400, M2)));
+        assert_eq!(hold(&mut f, t, (1918, 500), M1, 0, 1000), Some((250, M2)));
         // Monitor 2's left edge leads back to monitor 1.
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (1920, 100), M2, 0, 1000), Some((400, M1)));
+        assert_eq!(hold(&mut f, t, (1920, 100), M2, 0, 1000), Some((250, M1)));
         // Bottom edge of monitor 1 over monitor 3.
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (300, 1079), M1, 0, 1000), Some((400, M3)));
+        assert_eq!(hold(&mut f, t, (300, 1079), M1, 0, 1000), Some((250, M3)));
     }
 
     #[test]
@@ -689,7 +689,7 @@ mod tests {
         );
         assert_eq!(
             hold(&mut f, t, (1919, 500), M1, 3100, 4000),
-            Some((3500, M2))
+            Some((3350, M2))
         );
     }
 
@@ -697,11 +697,11 @@ mod tests {
     fn no_second_switch_until_the_cursor_left_the_edge_zone() {
         let t = Instant::now();
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (1919, 500), M1, 0, 400), Some((400, M2)));
-        f.switched(ms(t, 400));
+        assert_eq!(hold(&mut f, t, (1919, 500), M1, 0, 250), Some((250, M2)));
+        f.switched(ms(t, 250));
         // Suppose the stream switched but the cursor is still at monitor 1's
         // edge (current stays M1 here): no repeat, however long.
-        assert_eq!(hold(&mut f, t, (1919, 500), M1, 450, 5000), None);
+        assert_eq!(hold(&mut f, t, (1919, 500), M1, 300, 5000), None);
         // The cursor leaves the zone; holding again switches again.
         assert_eq!(
             observe_edge(Some(&mut f), moving((1800, 500)), &ALL, M1, ms(t, 5050)),
@@ -709,7 +709,7 @@ mod tests {
         );
         assert_eq!(
             hold(&mut f, t, (1919, 500), M1, 5100, 6000),
-            Some((5500, M2))
+            Some((5350, M2))
         );
     }
 
@@ -747,16 +747,16 @@ mod tests {
         let start = 2 * 250;
         assert_eq!(
             hold(&mut f, t, (1919, 500), M1, start + 1000, start + 2000),
-            Some((start + 1400, M2))
+            Some((start + 1250, M2))
         );
-        f.switched(ms(t, start + 1400));
+        f.switched(ms(t, start + 1250));
         // Dropped on monitor 2, the now-streamed monitor: the drop rule names
         // monitor 2 (the caller sees it is already streamed) and never 1.
-        f.observe(Sample::Busy, ms(t, start + 1450));
-        f.observe(win(7, 2), ms(t, start + 1500));
-        let after = f.observe(win(7, 2), ms(t, start + 2500));
+        f.observe(Sample::Busy, ms(t, start + 1300));
+        f.observe(win(7, 2), ms(t, start + 1350));
+        let after = f.observe(win(7, 2), ms(t, start + 2350));
         assert_eq!(after, Some(mon(2)));
-        assert_eq!(f.observe(win(7, 2), ms(t, start + 2750)), None);
+        assert_eq!(f.observe(win(7, 2), ms(t, start + 2600)), None);
     }
 
     #[test]

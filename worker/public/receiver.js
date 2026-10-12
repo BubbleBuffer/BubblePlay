@@ -17,7 +17,7 @@ import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
   rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes,
 } from "/transport.js";
-import { monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
+import { desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch } from "/monitor-selection.js";
 import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyName, shortcutsFor } from "/chrome.js";
 import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
@@ -159,7 +159,7 @@ let hostCapabilitiesGeneration = 0;
 let hasPresentedFrame = false;
 let fileDropPresentedGeneration = null;
 let fileDropPresentedViewportRevision = null;
-const firstFrameHandshake = { requestId: null, transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, failureReason: "", timer: null };
+const firstFrameHandshake = { requestId: null, reason: "", transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, failureReason: "", timer: null };
 const labQualityKeyframeAcks = new Map();
 let viewportRevision = 0;
 let viewportTimer = null;
@@ -235,22 +235,23 @@ function handleDesktopState(message) {
   // the host rebuilds capture and emits the new-generation IDR. The old frame
   // is still a valid visible desktop during that short transition, so do not
   // replace it with the global startup card or restart the handshake.
-  const monitorTransition = message.reason === "monitor-switch" || message.reason === "monitor-switched";
-  const sourceTransition = message.state === "active" && ["desktop-switched", "capture-recovered", "session-changed", "agent-restarted"].includes(message.reason);
+  // Both transports switch monitors in place on the existing peer. Held keys
+  // and buttons survive (the edge-hold drag carries a held window); input is
+  // gated until the new generation presents, and release-all follows only if
+  // something held was let go meanwhile (InputController.resumeAfterTransition).
   const alreadyRendering = hudState.presented > 0 || framesDrawn > 0 || firstFrameHandshake.phase === "ready" || firstFrameHandshake.phase === "presented";
+  const transitionPlan = desktopTransitionPlan({ reason: message.reason, state: message.state, usingWss: usingWssMedia, alreadyRendering });
+  const monitorTransition = transitionPlan?.kind === "monitor";
+  const sourceTransition = transitionPlan?.kind === "source";
   if (monitorTransition && alreadyRendering) {
     desktopAvailable = true;
     desktopAwaitingFrame = true;
     suppressDesktopTransitionOverlay = true;
-    releaseInput(false);
+    inputTransitionHold = true;
+    if (motionFrame !== null) cancelAnimationFrame(motionFrame);
+    motionFrame = null;
     renderDesktopState();
-    if (message.state === "active") {
-      if (!usingWssMedia) {
-        restartPeerInNewEpoch({ recycleSignaling, restartPeer }, "monitor-transition");
-        return;
-      }
-      startFirstFrameHandshake("monitor-transition", true);
-    }
+    if (transitionPlan.action === "handshake") startFirstFrameHandshake("monitor-transition", true);
     return;
   }
   // Keep the last decoded frame visible across UAC/Winlogon/default desktop
@@ -267,7 +268,7 @@ function handleDesktopState(message) {
     // complete receiver epoch so neither native-video jitter buffers nor a
     // WebCodecs worker can authorize Winlogon/default input with an old frame.
     // WSS carries an explicit generation and can transition in place.
-    if (!usingWssMedia) {
+    if (transitionPlan.action === "restart-peer") {
       restartPeerInNewEpoch({ recycleSignaling, restartPeer }, "desktop-source-transition");
       return;
     }
@@ -319,6 +320,7 @@ function armFirstFrameWatchdog() {
       firstFrameHandshake.timer = null;
       renderDesktopState();
       recoverWssStartup("presentation-timeout");
+      recoverRtcMonitorTransition("presentation-timeout");
     }
   }, 5_000);
 }
@@ -341,12 +343,20 @@ function startFirstFrameHandshake(reason, forceNew = false) {
   firstFrameHandshake.requireAdmission = forceNew || reason === "desktop-source-transition" || reason === "monitor-transition";
   transitionNeedsKeyframe = firstFrameHandshake.requireAdmission && !usingWssMedia && useWebCodecs;
   firstFrameHandshake.failureReason = "";
+  firstFrameHandshake.reason = reason;
   desktopAvailable = true;
   desktopAwaitingFrame = true;
   renderDesktopState();
   sendFirstFrameRequest();
   sendClientLog("info", "first-frame-request", { reason, transport });
   armFirstFrameWatchdog();
+}
+// An in-place WebRTC monitor transition that never presents falls back to the
+// old full receiver-epoch restart instead of leaving the stream paused.
+function recoverRtcMonitorTransition(reason) {
+  if (usingWssMedia || firstFrameHandshake.reason !== "monitor-transition") return;
+  sendClientLog("warn", "monitor-transition-restart", { reason });
+  restartPeerInNewEpoch({ recycleSignaling, restartPeer }, "monitor-transition");
 }
 function markFirstFramePresented(presentedGeneration = null, presentedViewportRevision = null) {
   if (!firstFrameHandshake.presented && firstFrameHandshake.requireAdmission && !firstFrameHandshake.admitted) return false;
@@ -374,6 +384,11 @@ function markFirstFramePresented(presentedGeneration = null, presentedViewportRe
   clearFirstFrameWatchdog();
   desktopAwaitingFrame = false;
   suppressDesktopTransitionOverlay = false;
+  if (inputTransitionHold) {
+    inputTransitionHold = false;
+    input.resumeAfterTransition();
+    if (inputReady) onInputReady();
+  }
   renderDesktopState();
   showContextHint();
   if (firstFrameHandshake.admitted && firstFrameHandshake.requestId) {
@@ -428,6 +443,7 @@ function handleFirstFrameMessage(message) {
     clearFirstFrameWatchdog();
     renderDesktopState();
     recoverWssStartup(firstFrameHandshake.failureReason);
+    recoverRtcMonitorTransition(firstFrameHandshake.failureReason);
   } else if (message.phase === "ready") {
     firstFrameHandshake.phase = "ready";
     clearFirstFrameWatchdog();
@@ -648,6 +664,8 @@ let pc = null;
 let lastIceCandidateError = null;
 let dc = null, motionDc = null;
 let inputReady = false;
+// Set while a monitor transition gates input with held keys/buttons kept.
+let inputTransitionHold = false;
 let closingPeer = false;
 let cursorReconciler = null;
 const latchedModifiers = new Set();
@@ -661,7 +679,8 @@ const input = new InputController({
 // congested and discarded only when it is gated or dead; the controller then
 // sends release-all before the next event.
 function inputControlState() {
-  if (desktopInputState !== "enabled" || !desktopAvailable || desktopAwaitingFrame) return "down";
+  if (desktopInputState !== "enabled" || !desktopAvailable) return "down";
+  if (desktopAwaitingFrame) return inputTransitionHold && (dc?.readyState === "open" || (usingWssMedia && ws?.readyState === WebSocket.OPEN)) ? "gated" : "down";
   if (dc?.readyState === "open") return dc.bufferedAmount > 262_144 ? "busy" : "open";
   if (usingWssMedia && ws?.readyState === WebSocket.OPEN) return ws.bufferedAmount > 16_384 ? "busy" : "open";
   return "down";
@@ -685,7 +704,7 @@ function queueTouchMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motionNow(dx, 
 // Reconcile against the cursor sequence, not the last wheel: wheel-only sends never move the pointer.
 function queueTouchAbsolute(x, y) { const before = input.lastCursorSequence; input.absolute(x, y); const sent = input.flushMotion(); if (input.lastCursorSequence !== before) cursorReconciler?.noteSent(input.lastCursorSequence); retryMotionTail(); updateMotionHud(); return sent; }
 function queueAbsolute(x, y) { input.absolute(x, y); armMotionFlush(); }
-function releaseInput(send = true) { input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; renderKeyboardModifiers?.(); }
+function releaseInput(send = true) { inputTransitionHold = false; input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; renderKeyboardModifiers?.(); }
 let connected = false;
 let offerSent = false;
 let peerGeneration = 0;
@@ -2575,6 +2594,8 @@ function startNativeVideo(track, generation = peerGeneration) {
     hudState.dimensions = video.videoWidth && video.videoHeight ? `${video.videoWidth}x${video.videoHeight}` : "…";
   };
   video.addEventListener("loadedmetadata", () => { updateDimensions(); syncViewportAndFollow(); });
+  // An in-place monitor switch can change the stream resolution mid-track.
+  video.addEventListener("resize", () => { updateDimensions(); syncViewportAndFollow(); });
   if (nativePresentation.supported) {
     const onVideoFrame = (now, metadata) => {
       if (generation !== peerGeneration || activeVideo !== video) return;
