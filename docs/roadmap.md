@@ -30,6 +30,11 @@ Built on lane/android-parity (2026-10-13), not yet merged: follow active window 
 ### Typing over laggy connections
 Status: proposed; investigate first.
 Idea from 2026-10-12: on a slow link, typed keys could be buffered and sent in chunks instead of one packet per key. Control packets are already queued in order, so first measure what goes wrong today: lost keys, reordering, or only delay. Then decide between batching key packets and sending text chunks. Applies to Android first, the browser if the same issue shows.
+Idea from 2026-10-13: while keys are buffered or in flight on a slow link, show a small, unobtrusive bar at the bottom edge ("Sending 12 keys…") so the user sees the input was taken and is on its way. It hides when the queue drains and never covers the stream's centre.
+
+### Key events in Game mode
+Status: proposed; investigate first.
+Idea from 2026-10-13: Game mode is underdeveloped. It should send physical key down and up events (scancodes, held state, no auto-repeat from the client) instead of text input, as games expect. Text-style input stays for Work mode. First check what each client sends today (browser, Android, the Windows client). Open points: keyboard layout (scancodes follow the host's layout, so text typed into a game's chat box comes out in the host layout), keys held when focus or the connection is lost (release them all), and Android, whose soft keyboard only gives text.
 
 ## Features
 
