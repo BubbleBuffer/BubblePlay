@@ -100,6 +100,6 @@ Required controls for step 2:
 2. The logon host has its own identity, separate from the user host, so it can be revoked and approved on its own terms.
 3. The first step includes input on the sign-in screen; view-only alone is not the goal.
 4. The pre-login opt-in is independent of Admin mode.
-5. Only already-paired devices may connect before sign-in, and each session still needs a fresh ntfy approval that the PC itself sends (see [device IDs and keys](device-keys.md), which makes the PC the sender of pairing and approval notifications). Pairing is not possible before sign-in. This depends on [device IDs and keys](device-keys.md).
+5. Only already-paired devices may connect before sign-in, and each session still needs a fresh ntfy approval that the PC itself sends (see [device IDs and keys](device-keys.md); the PC sends that approval, while pairing needs a confirmation at the PC or a voucher from a paired device, never ntfy). Pairing is not possible before sign-in. This depends on [device IDs and keys](device-keys.md).
 6. The switch-user screen is out of scope for the first version.
 7. Open until the NVENC probe: if NVENC fails from session 0, choose between a console-session logon host and a software encoder with the probe results.

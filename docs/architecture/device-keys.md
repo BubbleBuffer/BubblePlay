@@ -16,7 +16,7 @@ Code reads on 2026-10-13; no live tests. This is what the plan replaces.
 - **No binding.** Signaling forwards SDP after a size check (`relay/protocol.go` 100-102). Nothing ties the WebRTC DTLS fingerprints, or the WSS stream, to an authenticated party. A relay can impersonate either end, read and inject input and clipboard on `/ws`, and read WSS media ([security and privacy](../security-and-privacy.md)).
 - **Permission gates today** are per PC, not per viewer: Admin mode in `HKLM\SOFTWARE\BubblePlay` (`host/src/admin_mode.rs` 93-102, 217-231), the secure-desktop input gate (`host/src/input.rs` 3556-3584), and file transfer enabled whenever the host gate token is present (`host/src/main.rs` 950-963). There is no view-only mode.
 
-What changes: the endpoints authenticate each other with keys, and the relay only routes and keeps strangers out. Password login, TOTP and host approval, the session cookie and the Android WebView login are deleted. ntfy approval stays at the relay as a [site gate](#site-gate) in front of the browser page, unrelated to device keys. On the PC, ntfy becomes the second factor for pairing a device remotely and for pre-login sessions.
+What changes: the endpoints authenticate each other with keys, and the relay only routes and keeps strangers out. Password login, TOTP and host approval, the session cookie and the Android WebView login are deleted. ntfy approval stays at the relay as a [site gate](#site-gate) in front of the browser page, unrelated to device keys. On the PC, ntfy becomes the second factor for pre-login sessions and a heads-up for waiting pairing requests; remote pairing is approved at the PC or by a voucher from a paired device.
 
 ## Identity
 
@@ -83,7 +83,7 @@ A key file can be imported on several devices. To the PC they are one identity: 
 
 ### Rotation, revocation, loss
 
-- **Rotation:** a device creates a new key and signs a `rotate` statement with the old one, naming the new public key. Each PC it is paired with replaces the entry and keeps its name and permissions. A PC rotating its own key does the same towards its viewers; a viewer that has not seen the statement shows "PC key changed" and refuses, as SSH does. Manual only; no expiry.
+- **Rotation:** a viewer device rotates its ID by vouching for its own new key ([ID rotation](#id-rotation), phase 3). A PC rotating its own key signs a `rotate` statement with the old key naming the new one and sends it to its viewers; a viewer that has not seen the statement shows "PC key changed" and refuses, as SSH does. Manual only; no expiry.
 - **Revocation** is local and immediate: removing a key from the PC's list ends its open session and refuses it from then on. The relay's admission list updates on the next sync.
 - **Lost or stolen device or key file:** revoke the key in the tray. A passphrase-protected file costs the thief an Argon2id guess per try; an unprotected one is usable at once, until revoked.
 - **Lost browser key** (site data cleared, new profile) without an exported copy: the browser is a new device and pairs again. The old row shows "not seen for N days" until revoked.
@@ -103,23 +103,66 @@ Pairing adds a viewer's public key to a PC's trusted list, with a name and permi
 
 This is also the only way to pair the first device on a fresh install, so first setup needs no password.
 
-### B. Remotely, confirmed through ntfy
+### B. Remotely, approved at the PC or by a paired device
 
-For pairing while away from the PC. Off by default (**Allow remote pairing** in the tray); a device paired this way gets view and input only and is flagged "paired remotely" in the tray and in the event log.
+For pairing while away from the PC. Off by default (**Allow remote pairing** in the tray). ntfy does not approve pairing.
 
-1. The viewer asks the relay to pair with a PC ID, without a code. The relay forwards the request only if the PC has remote pairing on (it publishes that flag) and within rate limits: one pending request per PC, a few per client prefix per hour.
-2. Viewer and PC exchange keys; both compute the comparison number. The viewer shows it.
-3. **The PC itself** publishes to the owner's ntfy topic: "Pair 'Work laptop' (ID M3ZD-...) with Office-PC? Number 482 913", with Approve and Deny actions. The relay never sees the number.
-4. The action URLs carry a one-time capability the PC generated for this exact request (bound to the viewer key). They point at the relay, which forwards the click to the PC; the PC accepts only the matching capability, once, before expiry.
-5. The owner compares the number on the phone with the one on the new device and approves.
+1. The new device asks the relay to pair with a PC ID, without a code. The relay forwards the request only if the PC has remote pairing on (it publishes that flag), and within rate limits: one pending request per PC, a few per source prefix per hour, enforced at the relay and again at the PC.
+2. New device and PC exchange keys; both compute the comparison number. The new device shows it.
+3. The PC offers the request to two kinds of approver:
+   - **the PC itself:** a tray notification "Pairing request from 'Work laptop' (ID M3ZD-...), number 482 913", which opens the confirmation in the Devices window;
+   - **paired devices allowed to vouch:** the device in a session gets an in-app prompt over its authenticated control channel; other paired devices see the request under the PC in their app's PC list the next time they open it.
 
-Why this holds against a relay in the middle: if the relay substitutes its own key, the PC's notification shows that key's number, which differs from the one on the owner's device. The relay cannot approve on its own either, because it does not know the capability until the owner clicks, and that click approves only the key in the notification. What it does not cover: an ntfy server and relay run by the same hostile operator could read the capability and approve before the owner. In the self-hosted setup both are the owner's.
+   If ntfy is configured on the PC, it sends a heads-up only: "A pairing request is waiting. Open BubblePlay on a paired device or at the PC." No number, no ID, no approve link.
+4. The owner compares the number with the one on the new device, chooses permissions and approves, either at the PC or on the paired device. On a paired device, approving signs a [voucher](#vouchers).
+5. The PC adds the entry, marked "paired remotely" and, for a voucher, "vouched by <device>", and writes an event log entry. A request nobody approves expires after 10 minutes.
 
-ntfy settings (URL, topic, publish token) move from the relay to the PC: `host.json`, DPAPI-wrapped, set in setup and the tray. The logon host needs the same for its per-session second factor (below).
+Why this holds against a relay in the middle: the approver gets the comparison number from the PC, either on the PC's own screen or over its authenticated control channel, so the relay cannot change it. If the relay substitutes its own key, the approver sees a number that differs from the one on the new device. The relay cannot approve either: only the PC or a signature from a trusted key can.
+
+Pairing traffic (requests, prompts, vouchers) does not take the room's viewer slot; the relay routes these small messages between the PC and admitted devices alongside a running session.
+
+### Vouchers
+
+A voucher is a statement signed by an already-paired device that admits a new key to one PC.
+
+```json
+{
+  "type": "bubbleplay-voucher",
+  "version": 1,
+  "voucher": "B7QK-2M9X-H4PD-R8TN",
+  "subject": { "id": "M3ZD-71QF-XK5A-0H2C", "public": "<base64url>" },
+  "pc": "7HQ2-K9MX-4RTD-P0ZB",
+  "permissions": ["view", "input"],
+  "issued": "2026-10-13T10:02:00Z",
+  "expires": "2026-10-13T10:12:00Z",
+  "nonce": "<the PC's nonce for this pairing request>",
+  "request": "<hash of the pairing transcript>",
+  "signature": "<Ed25519 over the canonical JSON without this field>"
+}
+```
+
+- The paired device shows the new ID, its fingerprint and the comparison number before the owner confirms; permissions are pre-filled with view and input.
+- The PC accepts a voucher only if the signature verifies, the voucher's key is in its trusted list now (not revoked) and allowed to vouch, the PC ID, nonce and request hash match the pending request, it has not expired, and it was not used before.
+- **Ceiling:** a voucher grants at most the voucher's own permissions. "Before sign-in" is never granted by voucher, and so nothing that leads to unattended access; that stays a UAC step at the PC.
+- **Who may vouch:** a per-device switch in the tray. Default on for devices paired at the PC, off for devices paired remotely (open question 1).
+- **Audit:** the PC records who vouched for whom and when; the tray shows the chain, and the event log has each voucher.
+- **Revocation:** revoking a device that vouched for others asks "Also revoke the 2 devices it vouched for?" with **Revoke all** and **Only this one**. It never cascades silently. Devices kept after their voucher was revoked stay paired and show "voucher revoked".
+
+### ID rotation
+
+A device can vouch for its own new key. It creates a new key file and sends the PC a voucher with `"rotate": true`, signed by the old key, plus a signature by the new key over the same voucher to prove it holds the new key. The PC moves the old ID's name, permissions, vouching relations and history to the new ID and revokes the old ID in the same write of the trusted list, then updates the relay's admission list. "Before sign-in" does not move: the PC drops it and the owner grants it again at the PC through UAC. A device paired with several PCs rotates with each one as it next connects, and keeps the old key until every PC on its list has confirmed.
+
+What it is worth:
+
+- **Security, real:** rotate after a suspected exposure, for example after changing the passphrase while an old copy of the file may still exist somewhere, or as routine hygiene.
+- **Privacy, small:** it limits how long the relay can link one ID across time. The PC and the relay still see the same device in the same room from the same IP prefix, so the link is easy to rebuild.
+- **Not a fix for a leaked key:** whoever holds the old key can rotate too, and may do so first. After a leak, revoke at the PC, which removes the old ID and anything rotated from it.
+
+The tray and app UI for rotation is not detailed here.
 
 ### Both relay types
 
-Pairing runs end to end over the signaling socket, so Go and Cloudflare carry it the same way. Each relay needs: routing by PC ID, admission of unpaired devices only for an open pairing window (A) or a PC with remote pairing on (B), forwarding of the ntfy action clicks to the PC, and the new message types. Neither relay holds a password or TOTP seed any more. The relay's own ntfy settings serve only the site gate; the PC's ntfy settings for pairing are separate and may point at the same server and topic.
+Pairing runs end to end over the signaling socket, so Go and Cloudflare carry it the same way. Each relay needs: routing by PC ID, admission of unpaired devices only for an open pairing window (A) or a PC with remote pairing on (B), routing of pairing messages beside a running session, and the new message types. Neither relay holds a password or TOTP seed any more. The relay's own ntfy settings serve only the site gate. The PC has separate ntfy settings (`host.json`, DPAPI-wrapped) for the pairing heads-up and the pre-login second factor; they may point at the same server and topic.
 
 ## Site gate
 
@@ -165,7 +208,7 @@ The transcript is `"bubbleplay-auth-v1"`, the relay origin, the session epoch, b
 
 ## Permissions
 
-Each trusted key has permissions, set at pairing and editable in the tray. The host enforces them after the handshake. Defaults are for pairing at the PC; remote pairing gets view and input only.
+Each trusted key has permissions, set at pairing and editable in the tray. The host enforces them after the handshake. Defaults are for pairing at the PC; remote pairing pre-fills view and input, and a voucher can never exceed the voucher's own permissions or grant "Before sign-in". A separate per-device switch, **May vouch**, is on by default for devices paired at the PC and off for devices paired remotely.
 
 | Permission | Default | Existing gate it maps to |
 | --- | --- | --- |
@@ -192,16 +235,18 @@ This PC   Office-PC   ID 7HQ2-K9MX-4RTD-P0ZB   Relay play.example.com (online)
  Laptop Chrome  M3ZD-71QF-XK5A-0H2C   yesterday 22:14    View Input Clip Files   [Edit] [Revoke]
    └ 2 places:  browser 203.0.113.0/24 yesterday 22:14 · Android 198.51.100.0/24 3 days ago
  Work Edge      9PWE-RT4K-2NV8-JJ6Q   34 days ago        View Input  (remote)    [Edit] [Revoke]
+   └ vouched by Pixel 8, 2026-09-09
  WoL helper     Q4XD-8B2M-ZT7C-1KHR   now                Wake                    [Edit] [Revoke]
 
- [ ] Allow remote pairing (confirmed on your phone via ntfy)      ntfy: ntfy.example.com / bp-pc  [Change]
+ [ ] Allow remote pairing (approve here or on a paired device)    ntfy heads-up: ntfy.example.com / bp-pc  [Change]
 ```
 
 - Each row is one key. A key seen from more than one client kind or network in the last 30 days expands to its recent connections, so a shared key file is visible.
 - **Edit** opens name and permission checkboxes; "Elevated input" and "Before sign-in" are greyed with a note while their machine switch is off, and changing "Before sign-in" asks for UAC.
-- **Revoke** asks once, removes the key, ends its session and syncs the relay list.
+- **Revoke** asks once, removes the key, ends its session and syncs the relay list. If the device vouched for others, the same dialog asks whether to revoke them too.
 - **Pair device** shows the code, the QR and the confirmation from pairing at the PC, inside this window.
-- **Allow remote pairing** is greyed until ntfy is configured.
+- **Allow remote pairing** works without ntfy; ntfy only adds the heads-up. Pending requests appear at the top of the window with the comparison number and **Allow** / **Deny**.
+- **Edit** includes **May vouch**; a vouched device shows its voucher under its row.
 - Last seen comes from the host's own records, not the relay.
 - Native window, like the existing approval dialog, following the BubblePlay product profile.
 
@@ -229,14 +274,16 @@ Kept: the ntfy site gate with the `__Host-gate` cookie and `/__gate/decision`, `
 | Key file shared across devices | Shown per connection in the tray. | One revocation covers all of them. |
 | Malicious or compromised relay splicing a session | Handshake pinned to stored keys; DTLS fingerprints signed; control messages authenticated. | WSS media readable until the E2E phase. Browser clients run relay-served script. |
 | Relay brute-forcing a pairing code | Comparison number confirmed on the PC; code single-use, 5 minutes. | None known. |
-| Relay faking a remote pairing | Comparison number and a one-time capability, both created by the PC, sent through ntfy. | A hostile operator running both relay and ntfy server. |
-| Strangers spamming remote pairing | Off by default; one pending request per PC; per-prefix rate limits at the relay and the PC. | Anyone who knows relay URL and PC ID can trigger a notification within those limits. |
+| Relay faking a remote pairing | Approval only at the PC or by a voucher; the approver gets the comparison number from the PC over a channel the relay cannot change; vouchers bound to the request nonce and transcript, single-use, short expiry. | None known. |
+| Stolen paired device vouching for new keys | Permission ceiling; never "Before sign-in"; vouching off by default for remote-paired devices; revoking asks to cascade to vouched devices; every voucher in the tray chain and the event log. | Until revoked, a stolen device allowed to vouch can add devices within its own permissions. |
+| Leaked key rotated by the attacker | Rotation needs the old key to be trusted; revoking at the PC removes the rotated ID too. | Rotation does not protect against a leaked key; only revocation does. |
+| Strangers spamming remote pairing | Off by default; one pending request per PC; rate limits per PC and per source at the relay and the PC; requests shown as tray or in-app prompts, ntfy heads-up rate-limited. | Requests now also reach paired devices. Anyone who knows relay URL and PC ID can trigger prompts within those limits. |
 | ID squatting at the relay | ID must match the key hash and a signature; first registration needs `TOKEN`. | Denial of service by a holder of `TOKEN`. |
 | Other same-user process on the PC adding a device | Trusted list DPAPI-wrapped; pre-login list needs UAC. | Same residual risk as Admin mode today. |
 | PC key copied by malware running as the user | DPAPI at rest. | A same-user process can read it; same boundary as today's host credentials. |
 | Replay of a handshake or input | Fresh nonces and epoch in the transcript; per-message sequence numbers. | None known. |
 
-Stays prohibited: accepting a key without the PC-side confirmation or the PC-sent ntfy approval; pairing before sign-in; any password or shared-secret login for viewers; treating the site gate as access to a PC; serving any page asset before the site gate; the relay storing names, permissions or the PC's second-factor secrets; writing an unlocked key to disk; any inbound listener on the PC; and everything already prohibited in [unattended access](unattended-access.md#recommendation).
+Stays prohibited: accepting a key without a confirmation at the PC or a valid voucher from a trusted device allowed to vouch; approving a pairing through ntfy; granting "Before sign-in" by voucher or rotation; pairing before sign-in; any password or shared-secret login for viewers; treating the site gate as access to a PC; serving any page asset before the site gate; the relay storing names, permissions or the PC's second-factor secrets; writing an unlocked key to disk; any inbound listener on the PC; and everything already prohibited in [unattended access](unattended-access.md#recommendation).
 
 ## Phased plan
 
@@ -245,15 +292,15 @@ Stays prohibited: accepting a key without the PC-side confirmation or the PC-sen
 | 0 | `fixtures/device-keys-contract.json`: ID derivation, key file vectors (with and without passphrase), message shapes, transcript and signature vectors, for Rust, Go, JS and Kotlin. Check X25519 and Ed25519 in the minimum Chromium; pick and vendor the Argon2id WASM. | S | everything |
 | 1 | Key files on host, browser and Android: create, import, export, passphrase, unlock screen. Hosts register by ID; both relays route rooms by PC ID; tickets for media and file sockets; operator PC-ID list. | M | multiple PCs; logon host and helper as separate IDs |
 | 2 | Pairing at the PC, handshake with DTLS binding and the authenticated control channel, trusted list, tray Devices window, viewer PC lists, relay admission by published IDs. **Cutover:** delete the password, TOTP, host approval, session cookie and `HOST_GATE_TOKEN` paths in relay, worker, browser, host and Android (see above); reduce the site gate to ntfy only, with the minimal wait page, and confirm every asset sits behind it. | L | **Wake-on-LAN** (helper pairs, verifies signed wake requests; all paired keys may wake until phase 3) |
-| 3 | Per-device permissions in the host gates, ntfy on the PC, remote pairing through ntfy, pre-login trusted list and logon host key in ProgramData, per-session second factor for pre-login. | M | **Unattended access** step 2, which needs "Before sign-in", the machine-scoped list and the PC-side second factor |
+| 3 | Per-device permissions in the host gates; ntfy on the PC (heads-up, pre-login second factor); pre-login trusted list and logon host key in ProgramData; remote pairing with approval at the PC or by voucher, the pairing side channel on both relays, revocation cascade and the vouching chain in the tray; ID rotation. | L | **Unattended access** step 2, which needs only the permissions, the pre-login list and the PC-side second factor; those land first within the phase, before vouchers and rotation |
 | 4 | Separate proposal: WSS media and file E2E with the phase 2 keys. | M-L | release-status future work |
 
 Sizes: S under a week, M one to three weeks, L three to six weeks, each with tests against the shared fixture. Phase 2 is one release for all components, since the old login disappears with it.
 
 ## Open questions for the owner
 
-1. **Authenticator codes for remote pairing are not sound against a relay in the middle.** A code typed on the new device either travels unbound (the relay forwards it with its own key) or bound by a MAC that a 6-digit code cannot protect (the relay tries all million codes offline). The design therefore uses ntfy only for remote pairing; an owner without ntfy pairs at the PC. Authenticator codes stay usable for the pre-login second factor, where they travel inside an already authenticated channel. Confirm, or accept authenticator pairing as a weaker option that only trusts the relay.
-2. Remote pairing has no password gate any more: anyone who knows the relay URL and a PC ID can make the owner's phone show a pairing request, within the rate limits. Acceptable, or should remote pairing be limited further (for example only for a few hours after the owner turns it on)? For a browser this needs the site gate first; for the Android app it does not.
+1. May a remotely paired device ever be allowed to vouch? Proposed: only if the owner turns on **May vouch** for it at the PC; never by default.
+2. How long does a voucher stay valid before use? Proposed: 10 minutes, the same as an unanswered pairing request.
 3. AGPL-3.0 asks the relay to offer its source to users who interact with it over a network. The minimal wait page shows no source link, so that it names nothing; the link is behind the gate. Is that acceptable, or should the wait page carry a plain unbranded "Source" link?
 
 ## Decisions
@@ -261,7 +308,14 @@ Sizes: S under a week, M one to three weeks, L three to six weeks, each with tes
 2026-10-13, owner:
 
 1. **Portable key files, SSH-style.** Keys can be exported and imported; each key has an optional passphrase. Browser and Android ask for it on open, and offer **Create key** and **Import key** when there is none. No non-extractable WebCrypto key and no Keystore-bound identity; the Keystore may wrap the file at rest. This supersedes the earlier recommendation of a non-extractable browser key with optional passkeys. Passkeys remain a possible later option, not planned. Consequences above: Ed25519 instead of P-256, the `.bpkey` format with Argon2id and AES-256-GCM, unlocked keys in memory only, and one tray row per key with connections shown per place.
-2. **Remote pairing:** allowed, off by default, view and input only, flagged in the tray. The comparison number goes to the owner's phone through ntfy, sent by the PC, so the relay cannot fake it.
+2. **Remote pairing:** allowed, off by default, view and input only, flagged in the tray. The ntfy approval in the first version of this decision is superseded by decision 6.
 3. **Android fingerprint or PIN per connection:** replaced by the passphrase-on-open rule.
-4. **No legacy path:** the application password, its session login, TOTP login and host approval are deleted at once, with no compatibility mode, no "Require device keys" switch and no migration period. Device keys are the only way to connect. Kept: `TOKEN` for a PC's first registration, and ntfy (on the PC) as the authentication for remote pairing.
+4. **No legacy path:** the application password, its session login, TOTP login and host approval are deleted at once, with no compatibility mode, no "Require device keys" switch and no migration period. Device keys are the only way to connect. Kept: `TOKEN` for a PC's first registration. (ntfy as the authentication for remote pairing is superseded by decision 6.)
 5. **Site gate stays:** ntfy approval in front of the browser page, before the relay serves anything of the site, independent of device keys and not part of the removal. Proposed details above: 30-day gate cookie per browser, a minimal unbranded wait page, Android exempt.
+6. **Remote pairing approval, vouchers and ID rotation** (owner's direction, refined by us). Owner: "Remote pair requires approval on a connected device or the pc itself (either just a on device notification you can confirm or like an actual flow where one paired id can 'vouch' for a new id? This could also allow us to later allow easy switching of device ids (idk if that'd at all be a worthy privacy thing)".
+   1. Approving a remote pairing needs a confirmation at the PC (tray notification with the comparison number) or a voucher from an already-paired device. ntfy no longer approves pairing; at most it sends a heads-up that a request is waiting. This replaces the earlier question about authenticator codes for remote pairing.
+   2. A voucher: the paired device receives the request over its own authenticated session, shows the new ID's fingerprint and the comparison number, and after the owner confirms signs the new public key, its own ID, the PC ID, the granted permissions, an expiry and a nonce. The PC verifies the signature and that the voucher's key is still trusted, records who vouched for whom, and the tray shows the chain.
+   3. A voucher grants at most the voucher's own permissions; "Before sign-in" and unattended rights are never granted by voucher. Vouching is a per-device switch, default on only for devices paired at the PC.
+   4. Revoking a device asks whether to revoke the devices it vouched for; no silent cascade.
+   5. ID rotation: a device vouches for its own new key; the PC moves permissions and history to the new ID and revokes the old one atomically. Real security value after a suspected exposure, small privacy value, no help against a leaked key (the attacker can rotate too; revoke at the PC instead). Phase 3, with remote pairing; tray and app UI not detailed here.
+   6. Pairing-request spam now reaches paired devices too, so requests show as tray or in-app prompts with rate limits per PC and per source. Remote pairing stays off by default.
