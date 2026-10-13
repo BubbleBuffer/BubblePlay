@@ -10,7 +10,8 @@ Start with a relay setup guide, then install the native Windows host. BubblePlay
 - [Architecture](architecture/README.md) — runtime components, transports and shared fixtures.
 - [File transfer](architecture/file-transfer.md), [monitor following](architecture/follow-active-window.md) and [session UI](architecture/session-ui.md) — current feature behavior and contracts.
 - [Secure desktop](architecture/secure-desktop.md) — UAC prompts and lock screen; [in-place desktop transitions on WebRTC](architecture/secure-desktop.md#in-place-desktop-transitions-on-webrtc).
-- [Unattended access](architecture/unattended-access.md) — proposal for remote access before sign-in (pre-login service and restricted logon host); not approved.
+- [Unattended access](architecture/unattended-access.md) — remote access before sign-in (pre-login service and restricted logon host); approved 2026-10-13, waits for device keys.
+- [Device IDs and keys](architecture/device-keys.md) — proposal: per-device keys and IDs, pairing, routing by ID, trusted-device list in the tray; not approved.
 - [Third-party notices](THIRD-PARTY-NOTICES.md) — locked Windows dependencies and retained license texts.
 - [Release status](release-status.md) — available evidence, alpha limits and acceptance still required.
 - [Roadmap](roadmap.md) — planned and deferred work beyond the release blockers, with status per entry.

@@ -44,7 +44,7 @@ The host captures no audio today. Decisions:
 - A new capability flag announces audio, so older clients and hosts keep working without it.
 
 ### Device IDs and keys
-Status: approved in principle 2026-10-13; design proposal in progress.
+Status: approved in principle 2026-10-13; design proposed 2026-10-13, awaiting owner approval.
 Each device (PC host, browser, phone, Wake-on-LAN helper, pre-login logon host) gets a key pair and an ID derived from its public key. The relay routes by ID; the endpoints authenticate each other's keys, like SSH `authorized_keys`. Decisions so far: the trusted-device list lives locally on the PC and is managed there. Recommended defaults until the proposal says otherwise: keys for everyday connections, password and second factor only to pair a new device and as a fallback; one viewer may pair with several PCs; browsers use passkeys, Android uses the Keystore. Design: [device-keys.md](architecture/device-keys.md).
 
 ### Wake-on-LAN
