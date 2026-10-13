@@ -44,7 +44,7 @@ if (["full", "client", "syntax"].includes(profile)) {
 }
 if (["full", "host"].includes(profile)) {
   const env = { ...process.env, NVIDIA_VIDEO_CODEC_SDK_PATH:
-    process.env.NVIDIA_VIDEO_CODEC_SDK_PATH || join(root, "host/sdk-stub") };
+    process.env.NVIDIA_VIDEO_CODEC_SDK_PATH || join(root, "host/sdk-stub/") };
   run("cargo", ["test", "--locked", "--offline", "--manifest-path", "host/Cargo.toml", "--all-targets"], { env });
   run("cargo", ["check", "--locked", "--offline", "--manifest-path", "host/Cargo.toml", "--all-targets"], { env });
 }
