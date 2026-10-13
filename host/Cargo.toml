@@ -9,6 +9,9 @@ build = "build.rs"
 [dependencies]
 windows-capture = "2.0.0"
 nvidia-video-codec-sdk = "0.4.0"
+# Select CUDA bindings before the SDK's auto-detection feature can invoke nvcc.
+# CUDA 12.6 matches the local toolkit; the driver library is loaded at runtime.
+cudarc = { version = "=0.16.6", default-features = false, features = ["cuda-12060", "driver", "std", "dynamic-loading"] }
 str0m = "0.21.0"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",

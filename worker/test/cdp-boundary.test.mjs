@@ -32,7 +32,8 @@ test("external debug attempts report before module imports and across the WSS pr
   const preModule = client.indexOf("window.__bubbleplayDebugTrace");
   const module = client.indexOf('<script type="module">');
   assert.ok(preModule >= 0 && preModule < module, "debug reporter must execute before module imports");
-  const prelude = client.match(/<script>\s*([\s\S]*?)<\/script>\s*<script type="module">/)?.[1] || "";
+  const prelude = client.match(/<script>\s*([\s\S]*?)<\/script>\s*<script type="module">/)?.[1];
+  assert.ok(prelude, "the inline bootstrap prelude must be extracted from the client");
   assert.doesNotThrow(() => new Function(prelude));
   assert.match(client, /fetch\("\/__diag\/client"/);
   assert.match(client, /debugAttempt/);
@@ -46,7 +47,8 @@ test("external debug attempts report before module imports and across the WSS pr
 
 test("a normal page load creates and reports its own diagnostic attempt", () => {
   const client = readClientSource();
-  const prelude = client.match(/<script>\s*([\s\S]*?)<\/script>\s*<script type="module">/)?.[1] || "";
+  const prelude = client.match(/<script>\s*([\s\S]*?)<\/script>\s*<script type="module">/)?.[1];
+  assert.ok(prelude, "the inline bootstrap prelude must be extracted from the client");
   const generatedAttempt = "11111111-2222-4333-8444-555555555555";
   const requests = [];
   const windowObject = {};
@@ -73,9 +75,11 @@ test("a normal page load creates and reports its own diagnostic attempt", () => 
 
 test("forced WSS debugging preserves the original failure instead of falling back", () => {
   const client = readClientSource();
-  const recovery = client.match(/function recoverWssStartup\(reason\) \{([\s\S]*?)\n\}/)?.[1] || "";
+  const recovery = client.match(/function recoverWssStartup\(reason\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(recovery, "recoverWssStartup must be extracted from the client");
   assert.match(recovery, /requestedTransport === TRANSPORT\.WSS[\s\S]*recoverNetworkRoute/);
-  const forced = recovery.match(/if \(requestedTransport === TRANSPORT\.WSS\) \{([\s\S]*?)\n  \}/)?.[1] || "";
+  const forced = recovery.match(/if \(requestedTransport === TRANSPORT\.WSS\) \{([\s\S]*?)\n  \}/)?.[1];
+  assert.ok(forced, "the forced WSS branch must be extracted from recoverWssStartup");
   assert.doesNotMatch(forced, /wssSelected\s*=\s*false|wss-fallback-webrtc/);
 });
 
@@ -113,7 +117,8 @@ test("automatic WSS fallback releases the WebRTC video sink before reclaiming it
   assert.match(client, /function releaseWebRtcVideoSink\(\)[\s\S]*encodedWorker\.terminate\(\)[\s\S]*replaceTransferredCanvas\(\)/);
   assert.match(client, /function requestWssMediaStart\(\)[\s\S]*releaseWebRtcVideoSink\(\);[\s\S]*ensureMainCanvas\(\);/);
   assert.match(client, /const updateDimensions = \(\) => \{\s*if \(generation !== peerGeneration \|\| activeVideo !== video \|\| !nativePresentation\) return;/);
-  const release = client.match(/function releaseWebRtcVideoSink\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
+  const release = client.match(/function releaseWebRtcVideoSink\(\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(release, "releaseWebRtcVideoSink must be extracted from the client");
   assert.doesNotMatch(release, /\bpc\?*\.close|\bdc\?*\.close|\bmotionDc\?*\.close/);
 });
 
@@ -435,7 +440,8 @@ test("peer departure recycles signaling before another peer offer", () => {
 
 test("intentional signaling recycle retains its initiator before invalidating the old epoch", () => {
   const client = readClientSource();
-  const recycle = client.match(/function recycleSignaling\(reason\) \{([\s\S]*?)\n\}/)?.[1] || "";
+  const recycle = client.match(/function recycleSignaling\(reason\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(recycle, "recycleSignaling must be extracted from the client");
   assert.match(recycle, /createSignalingRecycleDiagnostic\(\{/);
   assert.match(recycle, /reason,[\s\S]*signalingGeneration,[\s\S]*signalingRegistered,/);
   assert.match(recycle, /socketReadyState:\s*ws\?\.readyState\s*\?\?\s*null/);
@@ -501,7 +507,8 @@ test("desktop source transitions preserve the last frame without authorizing sta
   assert.doesNotMatch(client, /sourceTransition = message\.state === "active" && \(secureDesktop \|\|/);
   // Monitor switches stay in place when the frame generation can be proven and keep held input;
   // otherwise the WebRTC peer is recycled with input released.
-  const monitorBranch = client.match(/if \(monitorTransition && alreadyRendering\) \{[\s\S]*?\r?\n  \}/)?.[0] || "";
+  const monitorBranch = client.match(/if \(monitorTransition && alreadyRendering\) \{[\s\S]*?\r?\n  \}/)?.[0];
+  assert.ok(monitorBranch, "the monitor-transition branch must be extracted from the client");
   assert.match(monitorBranch, /desktopAwaitingFrame = true;[\s\S]*suppressDesktopTransitionOverlay = true;[\s\S]*inputTransitionHold = true;[\s\S]*startFirstFrameHandshake\("monitor-transition", true\);/);
   assert.match(monitorBranch, /if \(transitionPlan\.action === "restart-peer"\) \{[\s\S]*releaseInput\(false\);[\s\S]*restartRtcForTransition\("monitor-transition"\);\s*return;\s*\}\s*inputTransitionHold = true;/);
   assert.match(client, /const RTC_IN_PLACE_TRANSITIONS = \["monitor-transition", "desktop-source-transition"\];/);
@@ -540,7 +547,8 @@ test("monitor control uses the signaling epoch and drops stale confirmations", (
 
 test("an active desktop generation change re-arms the first-frame input gate", () => {
   const client = readClientSource();
-  const handler = client.match(/function handleDesktopState\(message\) \{[\s\S]*?\n\}/)?.[0] || "";
+  const handler = client.match(/function handleDesktopState\(message\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(handler, "handleDesktopState must be extracted from the client");
   assert.match(client, /let desktopGeneration = null/);
   assert.match(handler, /const desktopGenerationChanged = Number\.isInteger\(message\.generation\)[\s\S]*message\.generation !== desktopGeneration/);
   assert.match(handler, /desktopGeneration = message\.generation/);

@@ -80,7 +80,7 @@ test("a monitor confirmation cannot survive an epoch restart", () => {
 
 test("follow active window: the client sends the saved choice and shows the host's truth", async () => {
   const { readFileSync } = await import("node:fs");
-  const client = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
+  const client = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   // Exact wire shape from docs/architecture/follow-active-window.md.
   assert.match(client, /sendSignal\(\{ type: "media-control", action: "follow", follow: settings\.followWindow, protocol: WSS_PROTOCOL, epoch: mediaEpoch, reason: "user-follow" \}\)/);
   // Capability gate: integer version >= 1; resent once per host-capabilities while on.
@@ -96,5 +96,8 @@ test("follow active window: the client sends the saved choice and shows the host
   assert.match(client, /settings\.followWindow = !followWindowShown\(\);\s*persistSettings\(\);/);
   assert.match(client, /document\.getElementById\("follow-window"\)\.onclick = \(\) => toggleFollowWindow\(\);/);
   // Automatic switches reuse the manual path: no follow-specific desktop-state handling.
-  assert.doesNotMatch(client.match(/function handleDesktopState[\s\S]*?\n}\n/)?.[0] ?? "", /follow/i);
+  const desktopState = client.match(/function handleDesktopState[\s\S]*?\n}\n/)?.[0];
+  assert.ok(desktopState, "handleDesktopState must be extracted from receiver.js");
+  // Comments may describe the rule; only code is forbidden to mention follow.
+  assert.doesNotMatch(desktopState.replace(/(^|\s)\/\/[^\n]*/gm, "$1"), /follow/i);
 });

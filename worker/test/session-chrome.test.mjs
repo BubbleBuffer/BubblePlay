@@ -82,9 +82,10 @@ test("automatic PC clipboard copying defaults on and persists an explicit opt-ou
 });
 
 test("the Monitors popover has a Follow active window switch, hidden until the host announces it", () => {
-  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   const css = readFileSync(new URL("../public/bubbleplay.css", import.meta.url), "utf8");
-  const popover = html.match(/<div id="pop-monitors"[\s\S]*?<\/button>\s*<\/div>\s*<\/div>/)?.[0] ?? "";
+  const popover = html.match(/<div id="pop-monitors"[\s\S]*?<\/button>\s*<\/div>\s*<\/div>/)?.[0];
+  assert.ok(popover, "the #pop-monitors popover must be extracted from index.html");
   // Below the list, behind a separator, hidden by default.
   assert.match(popover, /id="monitor-list"[\s\S]*<div id="follow-window-group" hidden>\s*<div class="pop-divider" role="separator"><\/div>/);
   // A button row (popover ArrowUp/Down and mousedown focus handling apply to buttons).

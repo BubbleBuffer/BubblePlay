@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { campaignCheckpointContract } from "../tools/lab/stream-lab-live.mjs";
 
 const client = readClientSource();
-const runner = readFileSync(new URL("../tools/lab/stream-lab-live.mjs", import.meta.url), "utf8");
+const runner = readFileSync(new URL("../tools/lab/stream-lab-live.mjs", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
 test("diagnostics exposes structured signaling and monitor evidence", () => {
   assert.match(client, /signaling:\s*\{/);
@@ -88,7 +88,8 @@ test("lab quality pass records exact frame traces and rechecks identity after sc
 });
 
 test("performance and parity screenshots remain separate passes", () => {
-  const performanceBody = runner.match(/async collectPerformance\([\s\S]*?\n  async measureActionToPhoton/)?.[0] ?? "";
+  const performanceBody = runner.match(/async collectPerformance\([\s\S]*?\n  async measureActionToPhoton/)?.[0];
+  assert.ok(performanceBody, "collectPerformance must be extracted from stream-lab-live.mjs");
   assert.doesNotMatch(performanceBody, /captureScreenshot|captureViewport/);
   assert.match(runner, /phase:\s*"performance"/);
   assert.match(runner, /phase:\s*"quality"/);
