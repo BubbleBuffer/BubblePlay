@@ -44,8 +44,8 @@ The host captures no audio today. Decisions:
 - A new capability flag announces audio, so older clients and hosts keep working without it.
 
 ### Device IDs and keys
-Status: approved in principle 2026-10-13; design proposed 2026-10-13, awaiting owner approval.
-Each device (PC host, browser, phone, Wake-on-LAN helper, pre-login logon host) gets a key pair and an ID derived from its public key. The relay routes by ID; the endpoints authenticate each other's keys, like SSH `authorized_keys`. Decisions so far: the trusted-device list lives locally on the PC and is managed there. Recommended defaults until the proposal says otherwise: keys for everyday connections, password and second factor only to pair a new device and as a fallback; one viewer may pair with several PCs; browsers use passkeys, Android uses the Keystore. Design: [device-keys.md](architecture/device-keys.md).
+Status: approved 2026-10-13 with decisions; implementation not started.
+Each device (PC host, browser, phone, Wake-on-LAN helper, pre-login logon host) has an Ed25519 key in a portable key file (export, import, optional passphrase) and an ID derived from its public key. The relay routes by ID; the endpoints authenticate each other's keys, like SSH `authorized_keys`. The trusted-device list lives on the PC and is managed in the tray. Device keys are the only way to connect: the application password and its login are deleted without a migration period. Remote pairing is off by default and confirmed on the owner's phone through ntfy sent by the PC. ntfy approval stays as a gate in front of the browser site. Phase 2 unblocks Wake-on-LAN, phase 3 unattended access. Design and decisions: [device-keys.md](architecture/device-keys.md).
 
 ### Wake-on-LAN
 Status: approved 2026-10-12: a small LAN helper sends the packet.

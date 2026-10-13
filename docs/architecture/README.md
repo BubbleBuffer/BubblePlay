@@ -34,7 +34,7 @@ Shared fixtures are the cross-language contract; update them and the affected im
 | [`follow-window-contract.json`](../../fixtures/follow-window-contract.json) | Monitor-follow capability and controls |
 | [`browser-approval-contract.json`](../../fixtures/browser-approval-contract.json) | Host approval messages and login methods ([browser approval](browser-approval.md)) |
 
-See [file transfer](file-transfer.md), [monitor following](follow-active-window.md), [session UI](session-ui.md), and [secure desktop](secure-desktop.md) for the behavior behind these contracts. [Unattended access](unattended-access.md) is approved (2026-10-13) for access before sign-in and waits for [device IDs and keys](device-keys.md), a proposal (not approved) for per-device keys, pairing and routing by ID. Go also consumes [browser-generated packet fixtures](../../relay/testdata/worker-contract.json).
+See [file transfer](file-transfer.md), [monitor following](follow-active-window.md), [session UI](session-ui.md), and [secure desktop](secure-desktop.md) for the behavior behind these contracts. [Unattended access](unattended-access.md) is approved (2026-10-13) for access before sign-in and waits for [device IDs and keys](device-keys.md), approved 2026-10-13: per-device key files, pairing, routing by ID and the ntfy site gate. Go also consumes [browser-generated packet fixtures](../../relay/testdata/worker-contract.json).
 
 ## Development boundaries
 
