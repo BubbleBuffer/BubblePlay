@@ -31,7 +31,7 @@
   <p class="lead">Static review mockups for the native viewer (egui on D3D11, 2026-10-13). Nothing is built yet. Each page has a state switcher (buttons or number keys) and design notes at the bottom.</p>
 
   <div class="pages">
-    <a href="connect.html"><h2><svg class="i lg"><use href="#i-house"/></svg>Connect flow</h2><p>Saved PCs (two home variants), add a PC with password and 6-digit code, sign-in error, Cloudflare approval wait, connecting, connect failed.</p></a>
+    <a href="connect.html"><h2><svg class="i lg"><use href="#i-house"/></svg>Connect flow</h2><p>Device-key model: Your PCs, pairing (enter code, compare number), vouch request, site gate, before-sign-in approval, connecting, connect failed, key refused, ID rotation.</p></a>
     <a href="session.html"><h2><svg class="i lg"><use href="#i-monitor-play"/></svg>Session chrome</h2><p>Collapsed tab, toolbar, monitor picker, stats, capture and release toasts, reconnecting, Admin required, secure desktop.</p></a>
   </div>
 
@@ -39,7 +39,7 @@
     <section>
       <h2>Direction</h2>
       <p>The stream owns the window. Chrome is near-opaque warm duvet, attached to the top edge like a cut tab, and only bright apricot says "live" or "captured". Out of session, the app is calm and left-aligned with one confident Bricolage moment per screen and a single apricot action.</p>
-      <p>What should make it feel better than the browser: native speed (no page loads), keycaps that teach the escape chords, states that always say what survived, and one-click reconnect to the last PC.</p>
+      <p>What should make it feel better than the browser: native speed (no page loads), keycaps that teach the escape chords, states that always say what survived, and one click from Your PCs to the session with that PC's last mode.</p>
     </section>
     <section>
       <h2>Shared tokens</h2>
@@ -56,13 +56,33 @@
   </div>
 
   <div class="q">
+    <h2>Settled from the docs</h2>
+    <ol>
+      <li><b>Relay vs PC.</b> Today one relay is one room, so one PC. With device keys, rooms are keyed by PC ID and one relay can front several PCs; one viewer holds several PCs, each with its relay URL (device-keys.md). The list shows PC ID and online state from the relay.</li>
+      <li><b>Approval code and timeout.</b> Site-gate and browser approval have no code to match: ntfy carries Approve/Deny links. Go relay approvals expire after <code>approvalTTLSeconds</code> (30-120 s, default 90); approval lasts 30 days. Pairing does use codes: a 10-character one-time code (5 minutes) and a 6-digit comparison number on both sides; remote pairing requests expire after 10 minutes.</li>
+      <li><b>Home and mode.</b> Home A is the one. No choices before connecting: the session opens in the PC's last mode, or Game for a new PC; mode changes live in the strip.</li>
+    </ol>
+  </div>
+
+  <div class="q">
     <h2>Open questions for the owner</h2>
     <ol>
-      <li><b>Home screen: A or B?</b> A is a calm list with a detail panel (scales to many PCs). B is a bold stage for the last PC (more character, best with one to three PCs).</li>
-      <li><b>Strip height.</b> The browser strip is 32 px; the mockup uses 42 px for larger native targets. Keep 32 for parity?</li>
-      <li><b>Stats chord.</b> Ctrl+Alt+Shift+S is a proposal; the architecture page only fixes Z and Q.</li>
-      <li><b>Saved PC fields.</b> Is one relay always one PC? The mockup assumes yes and shows no online status, since the client cannot know it without contacting each relay.</li>
-      <li><b>Approval wait.</b> Is there a request code to match on the phone and a timeout? None is shown until the protocol defines one.</li>
+      <li><b>Site gate for the native viewer.</b> The gate covers browser-facing paths and Android is exempt. Is the Windows viewer exempt too? The mockup shows the gate screen in case it is not.</li>
+      <li><b>Windows viewer key storage.</b> The storage table covers browser, Android and the host PC, not a native viewer. Mockup assumes DPAPI, no passphrase, like the host.</li>
+      <li><b>Default mode for a never-used PC.</b> Mockup assumes Game.</li>
+      <li><b>Before sign-in second factor.</b> device-keys.md allows ntfy or an authenticator code checked by the logon host; unattended-access.md says ntfy sent by the PC, and TOTP goes away at cutover. Mockup shows ntfy only.</li>
+      <li><b>Copy and timings the docs leave open:</b> wrong code or mismatched number on pairing, denied vouch, voucher validity (proposed 10 minutes), Cloudflare approval TTL, re-pairing after a revoke, recovery after "PC key changed", and the rotation UI (where Replace key lives).</li>
+      <li><b>Revoked vs unknown.</b> The native socket closes without a reason, so the viewer shows one message for both. Should the relay send a reason?</li>
+      <li><b>Strip height</b> (42 px here, 32 px in the browser) and the proposed stats chord Ctrl+Alt+Shift+S.</li>
+    </ol>
+  </div>
+
+  <div class="q">
+    <h2>What v1 can wire up today</h2>
+    <ol>
+      <li><b>Works with today's relays:</b> connecting, connect failed, the session chrome, and approval wait as browser approval (ntfy or the host dialog "Allow a new browser to sign in?"). Today the client still signs in with the relay password (Go: password plus TOTP; Cloudflare: password), so v1-today needs a plain password step that these mockups no longer draw.</li>
+      <li><b>Waits for device keys in the host and relay:</b> pairing, vouching, PC IDs and online state in Your PCs, several PCs per relay, key refused, PC key changed, ID rotation, before-sign-in approval (also waits for unattended access).</li>
+      <li><b>Site gate:</b> approval exists today as browser approval; the 30-day <code>__Host-gate</code> cookie in front of every path arrives with the device-key cutover.</li>
     </ol>
   </div>
 </div>

@@ -7,10 +7,12 @@
 <link rel="stylesheet" href="mockup.css">
 <style>
   .body { position: absolute; inset: 36px 0 0 0; }
+  .id { font: 400 12px/1 var(--f-mono); letter-spacing: 0.02em; color: var(--ink-muted); }
+  .id.lg { font-size: 15px; color: var(--ink); }
 
-  /* ---------- home A: list + detail ---------- */
-  .home { display: grid; grid-template-columns: 1fr 420px; height: 100%; }
-  .list { padding: 30px 32px 24px 36px; overflow: hidden; }
+  /* ---------- home: list + detail ---------- */
+  .home { display: grid; grid-template-columns: 1fr 400px; height: 100%; }
+  .list { position: relative; padding: 30px 32px 24px 36px; }
   .list-head { display: flex; align-items: end; gap: 16px; margin-bottom: 20px; }
   .list-head h1 { font: 620 28px/1.05 var(--f-display); letter-spacing: -0.025em; margin: 0; }
   .list-head p { margin: 4px 0 0; color: var(--ink-faint); font-size: 13px; }
@@ -18,191 +20,189 @@
   .rows { display: grid; gap: 2px; }
   .row {
     position: relative; display: grid; grid-template-columns: 40px 1fr auto; align-items: center; gap: 14px;
-    padding: 12px 14px 12px 12px; border-radius: var(--r-field); background: transparent; cursor: pointer;
+    padding: 11px 12px 11px 12px; border-radius: var(--r-field); cursor: pointer;
   }
   .row:hover { background: var(--surface-raised); }
   .row.sel { background: var(--surface); }
   .row.sel::before { content: ""; position: absolute; left: -10px; top: 12px; bottom: 12px; width: 3px; border-radius: 2px; background: var(--signal); }
   .row .ico { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 6px 9px 6px 8px; background: var(--surface-muted); color: var(--ink-muted); }
   .row.sel .ico { background: var(--ink); color: var(--signal-ink); }
-  .row .name { font: 720 15px/1.25 var(--f-ui); }
-  .row .meta { font-size: 12px; color: var(--ink-faint); display: flex; gap: 10px; align-items: center; margin-top: 2px; }
-  .row .meta .mono { font-size: 11px; }
-  .row .when { font-size: 12px; color: var(--ink-faint); text-align: right; }
-  .list-foot { position: absolute; left: 36px; bottom: 20px; font-size: 12px; color: var(--ink-faint); display: flex; gap: 8px; align-items: center; }
+  .row .name { font: 720 15px/1.25 var(--f-ui); display: flex; align-items: center; gap: 10px; }
+  .row .meta { font-size: 12px; color: var(--ink-faint); display: flex; gap: 12px; align-items: center; margin-top: 3px; }
+  .row .end { display: flex; align-items: center; gap: 10px; }
+  .row .btn { height: 34px; padding: 0 14px; font-size: 12.5px; }
+  .row .req { position: absolute; right: 12px; top: -7px; }
+  .list-foot { position: absolute; left: 36px; right: 32px; bottom: 18px; display: flex; gap: 10px; align-items: center; padding-top: 12px; border-top: 1px solid var(--thread); font-size: 12px; color: var(--ink-faint); }
+  .list-foot .id { color: var(--ink); }
+  .list-foot .btn { height: 28px; padding: 0 8px; font-size: 12px; }
 
-  .detail {
-    position: relative; background: var(--surface); border-left: 1px solid var(--thread);
-    padding: 30px 30px 24px; display: flex; flex-direction: column;
-  }
+  .detail { position: relative; background: var(--surface); border-left: 1px solid var(--thread); padding: 28px 28px 22px; display: flex; flex-direction: column; }
   .detail .eyebrow { font-size: 12px; font-weight: 720; color: var(--ink-faint); }
-  .detail h2 { font: 650 38px/0.95 var(--f-display); font-stretch: 86%; letter-spacing: -0.035em; margin: 8px 0 8px; }
-  .detail .relay { display: flex; gap: 8px; align-items: center; color: var(--ink-muted); font-size: 12px; }
-  .kv { margin: 22px 0 0; display: grid; gap: 14px; }
-  .kv .k { font: 720 12px/1.3 var(--f-ui); color: var(--ink-muted); margin-bottom: 6px; display: block; }
-  .seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--thread-strong); border-radius: var(--r-control); overflow: hidden; }
-  .seg span { display: flex; align-items: center; justify-content: center; gap: 7px; height: 36px; font: 720 13px/1 var(--f-ui); color: var(--ink-muted); }
-  .seg span + span { border-left: 1px solid var(--thread-strong); }
-  .seg span.on { background: var(--ink); color: var(--signal-ink); }
-  .seg-hint { font-size: 12px; color: var(--ink-faint); margin-top: 6px; }
-  .pair { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; }
-  .select { height: 36px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px 0 12px; border: 1px solid var(--thread-strong); border-radius: var(--r-field); background: var(--surface-raised); font-size: 13px; }
-  .switch { display: inline-flex; align-items: center; gap: 10px; font: 720 13px/1 var(--f-ui); }
-  .switch .trk { width: 40px; height: 22px; border-radius: 4px 5px 4px 5px; border: 1px solid var(--thread-strong); background: var(--surface-raised); position: relative; }
-  .switch .trk::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 3px; background: var(--ink-faint); }
-  .switch.on .trk { background: var(--moss); border-color: var(--moss); }
-  .switch.on .trk::after { left: 20px; background: var(--ink); }
+  .detail h2 { font: 650 36px/0.95 var(--f-display); font-stretch: 86%; letter-spacing: -0.035em; margin: 8px 0 10px; }
+  .facts { display: grid; grid-template-columns: auto 1fr; gap: 9px 16px; margin: 14px 0 0; font-size: 13px; }
+  .facts dt { color: var(--ink-faint); }
+  .facts dd { margin: 0; color: var(--ink); display: flex; align-items: center; gap: 8px; }
   .go { margin-top: auto; display: grid; gap: 10px; }
   .go .btn { width: 100%; }
-  .go .chords { font-size: 12px; color: var(--ink-faint); display: grid; gap: 6px; }
-  .go .chords div { display: flex; justify-content: space-between; align-items: center; }
-  .detail .danger-row { display: flex; gap: 6px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--thread); }
-  .detail .danger-row .btn { height: 32px; padding: 0 10px; font-size: 12px; }
-  .detail .danger-row .btn.forget { margin-left: auto; color: var(--danger); }
+  .go .sub { font-size: 12px; color: var(--ink-faint); }
+  .chords { font-size: 12px; color: var(--ink-faint); display: grid; gap: 6px; }
+  .chords div { display: flex; justify-content: space-between; align-items: center; }
+  .manage { display: flex; gap: 6px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--thread); }
+  .manage .btn { height: 32px; padding: 0 10px; font-size: 12px; }
+  .manage .forget { margin-left: auto; color: var(--danger); }
 
-  /* ---------- home B: device stage ---------- */
-  .stageB { display: grid; grid-template-rows: 1fr auto; height: 100%; }
-  .heroB { position: relative; display: grid; grid-template-columns: 1fr 360px; background: var(--void); overflow: hidden; }
-  .heroB .left { padding: 44px 40px 30px 48px; display: flex; flex-direction: column; }
-  .heroB .eyebrow { font-size: 13px; font-weight: 720; color: var(--ink-faint); display: flex; gap: 10px; align-items: center; }
-  .heroB h1 { font: 710 112px/0.8 var(--f-display); font-stretch: 78%; letter-spacing: -0.045em; margin: 24px 0 18px; }
-  .heroB h1 em { font-style: normal; color: var(--signal); }
-  .heroB .relay { color: var(--ink-muted); font-size: 13px; display: flex; gap: 10px; align-items: center; }
-  .heroB .cta { margin-top: auto; display: flex; gap: 12px; align-items: center; }
-  .heroB .cta .btn.primary { height: 54px; padding: 0 28px; font-size: 16px; }
-  .heroB .cta .chords { font-size: 12px; color: var(--ink-faint); margin-left: 12px; display: grid; gap: 4px; }
-  .heroB .right { background: var(--surface); border-left: 1px solid var(--thread); padding: 30px 26px; display: flex; flex-direction: column; gap: 16px; }
-  .heroB .right h3 { margin: 0; font: 720 12px/1 var(--f-ui); color: var(--ink-faint); }
-  .heroB .seam { position: absolute; left: 0; top: 0; bottom: 0; width: 6px; background: var(--signal); }
-  .shelf { display: flex; gap: 10px; padding: 16px 24px 18px 48px; background: var(--field); border-top: 1px solid var(--thread); }
-  .tile { width: 210px; padding: 12px 14px; border: 1px solid var(--thread-strong); border-radius: var(--r-field); display: grid; gap: 3px; background: var(--surface-raised); }
-  .tile.sel { border-color: var(--signal); box-shadow: inset 0 0 0 1px var(--signal); }
-  .tile .n { font: 720 14px/1.2 var(--f-ui); display: flex; align-items: center; gap: 8px; }
-  .tile .m { font-size: 11px; color: var(--ink-faint); }
-  .tile.add { border-style: dashed; background: transparent; color: var(--ink-muted); align-content: center; }
+  /* vouch request (in the detail panel) */
+  .vouch { position: relative; background: var(--surface); border-left: 1px solid var(--thread); padding: 26px 28px 22px 32px; display: flex; flex-direction: column; }
+  .vouch::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--attention); }
+  .vouch h2 { font: 620 24px/1.05 var(--f-display); letter-spacing: -0.025em; margin: 6px 0 6px; }
+  .vouch p { margin: 0; color: var(--ink-muted); font-size: 13px; }
+  .num { font: 400 34px/1 var(--f-mono); letter-spacing: 0.06em; color: var(--ink); margin: 14px 0 4px; }
+  .perm { display: grid; gap: 8px; margin-top: 14px; }
+  .perm .line { display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+  .perm .line.off { color: var(--ink-faint); }
+  .switch { display: inline-flex; align-items: center; gap: 10px; font: 720 13px/1 var(--f-ui); }
+  .switch .trk { width: 36px; height: 20px; border-radius: 4px 5px 4px 5px; border: 1px solid var(--thread-strong); background: var(--surface-raised); position: relative; }
+  .switch .trk::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 3px; background: var(--ink-faint); }
+  .switch.on .trk { background: var(--moss); border-color: var(--moss); }
+  .switch.on .trk::after { left: 18px; background: var(--ink); }
+  .switch.dis { opacity: 0.45; }
 
-  /* ---------- flow screens (login, approval, connecting) ---------- */
+  /* ---------- flow screens ---------- */
   .flow { display: grid; grid-template-columns: 300px 1fr; height: 100%; }
-  .rail { background: var(--void); padding: 34px 28px; border-right: 1px solid var(--thread); display: flex; flex-direction: column; }
-  .rail .back { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-muted); font-size: 13px; margin-bottom: 32px; }
+  .rail { background: var(--void); padding: 32px 28px; border-right: 1px solid var(--thread); display: flex; flex-direction: column; }
+  .rail .back { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-muted); font-size: 13px; margin-bottom: 30px; }
   .rail h2 { font: 620 30px/1 var(--f-display); letter-spacing: -0.03em; margin: 0 0 8px; }
   .rail p { color: var(--ink-faint); font-size: 13px; margin: 0; }
-  .steps { list-style: none; padding: 0; margin: 32px 0 0; display: grid; gap: 0; }
+  .steps { list-style: none; padding: 0; margin: 30px 0 0; }
   .steps li { position: relative; padding: 0 0 18px 30px; font-size: 13px; color: var(--ink-faint); }
   .steps li::before { content: ""; position: absolute; left: 6px; top: 4px; width: 9px; height: 9px; border-radius: 2px 3px 2px 3px; border: 1.5px solid var(--thread-strong); background: var(--void); }
   .steps li::after { content: ""; position: absolute; left: 11px; top: 17px; bottom: 2px; width: 1px; background: var(--thread); }
   .steps li:last-child::after { display: none; }
-  .steps li b { display: block; font-weight: 720; color: var(--ink-muted); font-size: 13px; }
+  .steps li b { display: block; font-weight: 720; color: var(--ink-muted); }
   .steps li.done::before { background: var(--moss); border-color: var(--moss); }
   .steps li.now b { color: var(--ink); }
   .steps li.now::before { background: var(--signal); border-color: var(--signal); }
-  .steps li.skip { opacity: 0.55; }
-  .rail .foot { margin-top: auto; font-size: 12px; color: var(--ink-faint); }
-  .pane { padding: 40px 56px 32px 52px; display: flex; flex-direction: column; max-width: 640px; }
+  .steps li.bad::before { background: var(--danger); border-color: var(--danger); }
+  .steps li.bad b { color: var(--ink); }
+  .rail .foot { margin-top: auto; font-size: 12px; color: var(--ink-faint); display: grid; gap: 4px; }
+  .pane { padding: 38px 56px 30px 52px; display: flex; flex-direction: column; max-width: 680px; }
   .pane h1 { font: 620 28px/1.05 var(--f-display); letter-spacing: -0.025em; margin: 0 0 6px; }
-  .pane > p.lead { color: var(--ink-muted); margin: 0 0 26px; font-size: 14px; }
+  .pane > p.lead { color: var(--ink-muted); margin: 0 0 24px; font-size: 14px; }
   .form { display: grid; gap: 18px; }
-  .form .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-  .otp { display: flex; gap: 6px; align-items: center; }
-  .otp span { width: 42px; height: 48px; display: grid; place-items: center; font: 400 20px/1 var(--f-mono); background: var(--surface-raised); border: 1px solid var(--thread-strong); border-radius: 5px 8px 5px 7px; }
-  .otp span.cur { outline: 2px solid var(--focus); outline-offset: 1px; }
-  .otp span.cur::after { content: ""; width: 1px; height: 22px; background: var(--ink); }
-  .otp .gap { width: 8px; }
-  .otp.error span { border-color: var(--danger); }
   .actions { display: flex; gap: 10px; align-items: center; margin-top: 26px; }
-  .notice {
-    display: grid; grid-template-columns: auto 1fr; gap: 10px; padding: 12px 14px 12px 12px; border-radius: var(--r-field);
-    background: var(--surface); border: 1px solid var(--thread); font-size: 13px; color: var(--ink-muted);
-  }
-  .notice.err { border-color: rgba(229,177,170,0.45); }
-  .notice.err svg { color: var(--danger); }
+  .or { display: flex; align-items: center; gap: 12px; color: var(--ink-faint); font-size: 12px; }
+  .or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--thread); }
+  .notice { display: grid; grid-template-columns: auto 1fr; gap: 10px; padding: 12px 14px 12px 12px; border-radius: var(--r-field); background: var(--surface); border: 1px solid var(--thread); font-size: 13px; color: var(--ink-muted); }
   .notice b { color: var(--ink); font-weight: 720; }
+  .notice.err { border-color: rgba(229,177,170,0.45); } .notice.err > svg { color: var(--danger); }
+  .notice.warn { border-color: rgba(240,210,156,0.4); } .notice.warn > svg { color: var(--attention); }
+  .notice.info > svg { color: var(--information); }
 
-  .wait { display: grid; grid-template-columns: 64px 1fr; gap: 20px; align-items: start; margin-top: 6px; }
+  .compare { display: grid; grid-template-columns: 1fr; gap: 6px; padding: 18px 20px; background: var(--surface); border-radius: var(--r-panel); border: 1px solid var(--thread); }
+  .compare .k { font: 720 12px/1 var(--f-ui); color: var(--ink-faint); }
+  .compare .num { margin: 6px 0 2px; font-size: 44px; }
+
+  .wait { display: grid; grid-template-columns: 64px 1fr; gap: 20px; align-items: start; }
   .pulse { width: 64px; height: 64px; display: grid; place-items: center; border-radius: 12px 18px 10px 16px; background: var(--surface); color: var(--signal); position: relative; }
   .pulse::after { content: ""; position: absolute; inset: -6px; border-radius: 16px 22px 14px 20px; border: 1.5px solid var(--signal); opacity: 0; animation: ring 2.2s var(--ease) infinite; }
   @keyframes ring { 0% { opacity: 0.7; transform: scale(0.92); } 100% { opacity: 0; transform: scale(1.12); } }
   @media (prefers-reduced-motion: reduce) { .pulse::after { animation: none; opacity: 0.4; } }
-  .ways { display: grid; gap: 10px; margin-top: 18px; }
+  .ways { display: grid; gap: 10px; margin-top: 16px; }
   .way { display: grid; grid-template-columns: 22px 1fr; gap: 12px; padding: 12px 14px; border: 1px solid var(--thread); border-radius: var(--r-field); background: var(--surface-raised); font-size: 13px; color: var(--ink-muted); }
   .way b { color: var(--ink); font-weight: 720; display: block; }
-  .elapsed { font: 400 12px var(--f-mono); color: var(--ink-faint); }
+  .way.dim { opacity: 0.55; }
+  .elapsed { font: 400 12px var(--f-mono); color: var(--ink-faint); margin-top: 2px; }
 
-  .conn { padding: 0; }
   .conn-steps { list-style: none; margin: 18px 0 0; padding: 0; display: grid; gap: 2px; }
   .conn-steps li { display: grid; grid-template-columns: 22px 1fr auto; align-items: center; gap: 12px; height: 40px; padding: 0 12px; border-radius: var(--r-field); color: var(--ink-faint); font-size: 14px; }
-  .conn-steps li.done { color: var(--ink-muted); }
-  .conn-steps li.done svg { color: var(--constructive); }
-  .conn-steps li.now { background: var(--surface); color: var(--ink); font-weight: 720; }
-  .conn-steps li.now svg { color: var(--signal); }
-  .conn-steps li.fail { background: var(--surface); color: var(--ink); font-weight: 720; }
-  .conn-steps li.fail svg { color: var(--danger); }
+  .conn-steps li.done { color: var(--ink-muted); } .conn-steps li.done svg { color: var(--constructive); }
+  .conn-steps li.now { background: var(--surface); color: var(--ink); font-weight: 720; } .conn-steps li.now svg { color: var(--signal); }
+  .conn-steps li.fail { background: var(--surface); color: var(--ink); font-weight: 720; } .conn-steps li.fail svg { color: var(--danger); }
+  .conn-steps li.wait svg { color: var(--ink-faint); }
   .conn-steps .mono { font-size: 11px; color: var(--ink-faint); font-weight: 400; }
   .bar { height: 3px; background: var(--thread); border-radius: 2px; margin-top: 22px; overflow: hidden; }
   .bar i { display: block; height: 100%; width: 62%; background: var(--signal); }
+
+  .two-ids { display: grid; grid-template-columns: 1fr auto 1fr; gap: 14px; align-items: center; padding: 16px 18px; background: var(--surface); border: 1px solid var(--thread); border-radius: var(--r-panel); }
+  .two-ids .k { font: 720 12px/1 var(--f-ui); color: var(--ink-faint); margin-bottom: 8px; display: block; }
+  .two-ids .old { color: var(--ink-faint); text-decoration: line-through; text-decoration-color: var(--thread-strong); }
 </style>
 </head>
 <body>
 <div class="harness">
   <header class="harness-head">
     <h1>Connect flow</h1>
-    <p>BubblePlay Windows viewer, v1 mockup. Window 1100 x 720. Static: nothing here talks to a relay.</p>
+    <p>BubblePlay Windows viewer, device-key model. Window 1100 x 720. Static: nothing here talks to a relay.</p>
     <nav><a href="index.html">Overview</a><a href="connect.html" aria-current="page">Connect flow</a><a href="session.html">Session chrome</a></nav>
   </header>
   <ul class="states" role="toolbar" aria-label="Mockup state">
-    <li><button data-state="home-a" data-caption="<b>Home, variant A (list and detail).</b> Saved PCs on the left, the selected PC and its session defaults on the right. One dominant action: Connect.">Home A: list</button></li>
-    <li><button data-state="home-b" data-caption="<b>Home, variant B (device stage).</b> The last-used PC fills the window as the one character moment; other PCs sit on a shelf. Owner picks A or B.">Home B: stage</button></li>
-    <li><button data-state="login" data-caption="<b>Add a PC: relay address, password and 6-digit code.</b> One screen, because the relay asks for both in one request. The step rail shows approval only applies to Cloudflare relays.">Add PC / sign in</button></li>
-    <li><button data-state="login-err" data-caption="<b>Sign-in failed: wrong code.</b> The password stays filled, only the code is cleared and focused.">Sign-in error</button></li>
-    <li><button data-state="approval" data-caption="<b>Waiting for approval (Cloudflare relay).</b> Shown after the password and code are accepted but the site gate still needs an approval by ntfy or at the PC.">Approval wait</button></li>
-    <li><button data-state="connecting" data-caption="<b>Connecting.</b> Steps follow the real sequence: relay, hello, stream negotiation, first frame. The window switches to the session as soon as the first frame lands.">Connecting</button></li>
-    <li><button data-state="failed" data-caption="<b>Stream did not start.</b> Says which step failed and what is still fine (signed in), then the narrowest next step.">Connect failed</button></li>
+    <li><button data-state="home" data-caption="<b>Your PCs.</b> One click on Connect starts the session with that PC's last mode (or Game for a new PC). No choices before connecting; mode, display, quality and audio live in the session strip.">Your PCs</button></li>
+    <li><button data-state="pair-enter" data-caption="<b>Pair a new PC: enter the PC ID and code.</b> The tray's Pair device shows the PC ID, a one-time 10-character code and a QR for 5 minutes. On Windows you type them or paste the pairing link.">Pair: enter code</button></li>
+    <li><button data-state="pair-confirm" data-caption="<b>Pair a new PC: compare the number.</b> Both sides show the same 6-digit number. Someone at the PC allows it from the tray, or (if remote pairing is on) an already paired device vouches for this one.">Pair: confirm</button></li>
+    <li><button data-state="vouch" data-caption="<b>Vouch, seen from an already paired device.</b> A pairing request for Studio PC arrives on this viewer. It needs the May vouch permission. Before sign-in is never grantable by vouching.">Vouch request</button></li>
+    <li><button data-state="gate" data-caption="<b>Site gate.</b> Sits in front of every browser-facing path on the relay, before any key is shown. Approval by ntfy lasts 30 days. Shown here as it would look if the native viewer is gated too (open question).">Site gate</button></li>
+    <li><button data-state="approval" data-caption="<b>Approval wait: PC at the sign-in screen.</b> Every connection before Windows sign-in needs a fresh approval; a remembered approval never counts.">Approval wait</button></li>
+    <li><button data-state="connecting" data-caption="<b>Connecting.</b> Relay, key handshake, stream, first frame. The window switches to the session as soon as the first frame lands.">Connecting</button></li>
+    <li><button data-state="failed" data-caption="<b>Stream did not start.</b> Says which step failed and what is still fine (the PC accepted this key), then the narrowest next step.">Connect failed</button></li>
+    <li><button data-state="refused" data-caption="<b>Key refused: revoked or unknown.</b> The native socket closes without a reason, so the viewer cannot tell revoked from never-paired. One message covers both and offers to pair again.">Key refused</button></li>
+    <li><button data-state="rotate" data-caption="<b>ID rotation.</b> This viewer replaces its key: each PC confirms the new ID, and the old key is kept until every PC has. A PC that changes its own key without a signed rotation shows PC key changed and is refused.">ID rotation</button></li>
   </ul>
 
   <div class="stage"><div class="stage-inner">
   <div class="win">
     <div class="titlebar">
       <span class="app"><span class="dot"></span>BubblePlay</span>
-      <span class="ctx" data-only="home-a home-b">2 saved PCs</span>
-      <span class="ctx" data-only="login login-err approval">Add a PC</span>
-      <span class="ctx" data-only="connecting failed">Studio PC</span>
+      <span class="ctx" data-only="home vouch">3 PCs</span>
+      <span class="ctx" data-only="pair-enter pair-confirm">Pair a new PC</span>
+      <span class="ctx" data-only="gate approval connecting failed refused">Studio PC</span>
+      <span class="ctx" data-only="rotate">This device</span>
       <span class="caps"><span><svg class="i"><use href="#i-minus"/></svg></span><span><svg class="i"><use href="#i-square"/></svg></span><span><svg class="i"><use href="#i-x"/></svg></span></span>
     </div>
 
-    <!-- ===== Home A ===== -->
-    <div class="body" data-view="home-a">
+    <!-- ===== Home (and vouch request) ===== -->
+    <div class="body" data-view="home vouch">
       <div class="home">
         <div class="list">
           <div class="list-head">
-            <div><h1>Your PCs</h1><p>Saved on this computer. Pick one and connect.</p></div>
-            <button class="btn"><svg class="i"><use href="#i-plus"/></svg>Add a PC</button>
+            <div><h1>Your PCs</h1><p>Paired with this device's key.</p></div>
+            <button class="btn"><svg class="i"><use href="#i-plus"/></svg>Pair a new PC</button>
           </div>
           <div class="rows">
             <div class="row sel">
               <span class="ico"><svg class="i lg"><use href="#i-monitor"/></svg></span>
-              <div><div class="name">Studio PC</div><div class="meta"><span class="mono">play.bubblebuffer.net</span><span>Cloudflare relay</span></div></div>
-              <div class="when"><span class="status-pill online">Signed in</span><div style="margin-top:4px">Last session today, 09:12</div></div>
+              <div><div class="name">Studio PC <span class="status-pill online">Online</span></div>
+                <div class="meta"><span class="id">H4PD-R8TN-B7QK-2M9X</span><span>Last mode Game</span></div></div>
+              <div class="end"><span class="status-pill warn" data-only="vouch">1 pairing request</span><button class="btn primary" data-only="home"><svg class="i sm"><use href="#i-monitor-play"/></svg>Connect</button></div>
             </div>
             <div class="row">
               <span class="ico"><svg class="i lg"><use href="#i-laptop"/></svg></span>
-              <div><div class="name">Living room</div><div class="meta"><span class="mono">100.65.1.40:8443</span><span>Go relay</span></div></div>
-              <div class="when"><span class="status-pill off">Sign-in needed</span><div style="margin-top:4px">Last session 2 Oct</div></div>
+              <div><div class="name">Living room <span class="status-pill online">Online</span></div>
+                <div class="meta"><span class="id">Q2WF-7KXM-JD3R-5PNA</span><span>Last mode Work</span></div></div>
+              <div class="end"><button class="btn">Connect</button></div>
+            </div>
+            <div class="row">
+              <span class="ico"><svg class="i lg"><use href="#i-monitor"/></svg></span>
+              <div><div class="name">Office tower <span class="status-pill off">Offline</span></div>
+                <div class="meta"><span class="id">Z8TC-M1VE-6HQB-W4LS</span><span>Last seen 2 Oct</span></div></div>
+              <div class="end"><button class="btn" disabled>Connect</button></div>
             </div>
           </div>
-          <div class="list-foot"><svg class="i sm"><use href="#i-lock"/></svg>Sign-ins are stored with Windows data protection for this user only.</div>
+          <div class="list-foot">
+            <svg class="i sm"><use href="#i-fingerprint"/></svg>This device<span class="id">K9TR-4WQZ-N6EA-3HYC</span>
+            <button class="btn ghost"><svg class="i sm"><use href="#i-copy"/></svg>Copy</button>
+            <span style="margin-left:auto">Key stored with Windows data protection</span>
+          </div>
         </div>
-        <aside class="detail">
+
+        <aside class="detail" data-only="home">
           <span class="eyebrow">Selected</span>
           <h2>Studio PC</h2>
-          <div class="relay"><svg class="i sm"><use href="#i-cloud"/></svg><span class="mono">play.bubblebuffer.net</span></div>
-          <div class="kv">
-            <div><span class="k">Input mode</span>
-              <div class="seg"><span class="on"><svg class="i sm"><use href="#i-gamepad-2"/></svg>Game</span><span><svg class="i sm"><use href="#i-briefcase"/></svg>Work</span></div>
-              <div class="seg-hint">Game captures mouse and keyboard. Work keeps your cursor and Windows keys local.</div>
-            </div>
-            <div class="pair"><div><span class="k">Quality</span><div class="select" style="width:190px">Auto<svg class="i sm"><use href="#i-chevron-down"/></svg></div></div>
-              <div><span class="k">Audio</span><span class="switch on"><span class="trk"></span>On</span></div></div>
-          </div>
+          <span class="id lg">H4PD-R8TN-B7QK-2M9X</span>
+          <dl class="facts">
+            <dt>Relay</dt><dd><span class="mono" style="font-size:12px">play.bubblebuffer.net</span></dd>
+            <dt>Allowed</dt><dd>View and input</dd>
+            <dt>Last session</dt><dd>Today 09:12, Game mode</dd>
+          </dl>
           <div class="go">
             <button class="btn primary lg"><svg class="i"><use href="#i-monitor-play"/></svg>Connect to Studio PC</button>
             <div class="chords">
@@ -210,138 +210,201 @@
               <div><span>Leave the session</span><span class="chord"><kbd class="key">Ctrl</kbd><i>+</i><kbd class="key">Alt</kbd><i>+</i><kbd class="key">Shift</kbd><i>+</i><kbd class="key">Q</kbd></span></div>
             </div>
           </div>
-          <div class="danger-row">
-            <button class="btn ghost"><svg class="i sm"><use href="#i-pencil"/></svg>Edit</button>
-            <button class="btn ghost"><svg class="i sm"><use href="#i-log-out"/></svg>Sign out</button>
+          <div class="manage">
+            <button class="btn ghost"><svg class="i sm"><use href="#i-pencil"/></svg>Rename</button>
             <button class="btn ghost forget"><svg class="i sm"><use href="#i-trash-2"/></svg>Forget Studio PC</button>
           </div>
         </aside>
+
+        <aside class="vouch" data-only="vouch" hidden>
+          <span class="status-pill warn" style="align-self:start">Pairing request · Studio PC</span>
+          <h2>Vouch for Work laptop?</h2>
+          <p>A new device wants to pair with Studio PC. Only vouch if you know it is yours or someone you trust.</p>
+          <dl class="facts" style="margin-top:14px">
+            <dt>Device</dt><dd>Work laptop</dd>
+            <dt>ID</dt><dd><span class="id" style="color:var(--ink)">M3ZD-8QRA-F2KV-T7WB</span></dd>
+          </dl>
+          <span class="num">482 913</span>
+          <p>The number on Work laptop must match exactly.</p>
+          <div class="perm">
+            <div class="line"><span>View the screen</span><span class="switch on"><span class="trk"></span></span></div>
+            <div class="line"><span>Mouse and keyboard</span><span class="switch on"><span class="trk"></span></span></div>
+            <div class="line off"><span>Before sign-in <span style="font-size:11.5px">(only at the PC)</span></span><span class="switch dis"><span class="trk"></span></span></div>
+          </div>
+          <div class="go" style="margin-top:18px">
+            <button class="btn primary lg"><svg class="i"><use href="#i-user-check"/></svg>Numbers match, vouch</button>
+            <button class="btn">Deny</button>
+            <span class="sub">Request expires in 8:41. You can vouch because Studio PC allows this device to.</span>
+          </div>
+        </aside>
       </div>
     </div>
 
-    <!-- ===== Home B ===== -->
-    <div class="body" data-view="home-b" hidden>
-      <div class="stageB">
-        <div class="heroB">
-          <span class="seam"></span>
-          <div class="left">
-            <span class="eyebrow"><span class="status-pill online">Signed in</span>Last session today, 09:12</span>
-            <h1>Studio<br>PC</h1>
-            <div class="relay"><svg class="i sm"><use href="#i-cloud"/></svg><span class="mono">play.bubblebuffer.net</span><span>Cloudflare relay</span></div>
-            <div class="cta">
-              <button class="btn primary"><svg class="i"><use href="#i-monitor-play"/></svg>Connect</button>
-              <div class="chords">
-                <span class="chord"><kbd class="key">Ctrl</kbd><i>+</i><kbd class="key">Alt</kbd><i>+</i><kbd class="key">Shift</kbd><i>+</i><kbd class="key">Z</kbd>&nbsp; releases mouse and keyboard</span>
-                <span class="chord"><kbd class="key">Ctrl</kbd><i>+</i><kbd class="key">Alt</kbd><i>+</i><kbd class="key">Shift</kbd><i>+</i><kbd class="key">Q</kbd>&nbsp; leaves the session</span>
-              </div>
-            </div>
-          </div>
-          <div class="right">
-            <h3>This session</h3>
-            <div class="seg"><span class="on"><svg class="i sm"><use href="#i-gamepad-2"/></svg>Game</span><span><svg class="i sm"><use href="#i-briefcase"/></svg>Work</span></div>
-            <div><span class="k" style="font:720 12px var(--f-ui);color:var(--ink-muted);display:block;margin-bottom:6px">Quality</span><div class="select">Auto<svg class="i sm"><use href="#i-chevron-down"/></svg></div></div>
-            <span class="switch on"><span class="trk"></span>Audio on</span>
-            <div style="margin-top:auto;display:flex;gap:6px;flex-wrap:wrap">
-              <button class="btn ghost" style="height:32px;font-size:12px;padding:0 10px"><svg class="i sm"><use href="#i-pencil"/></svg>Edit</button>
-              <button class="btn ghost" style="height:32px;font-size:12px;padding:0 10px;color:var(--danger)"><svg class="i sm"><use href="#i-trash-2"/></svg>Forget Studio PC</button>
-            </div>
-          </div>
-        </div>
-        <div class="shelf">
-          <div class="tile sel"><span class="n"><svg class="i sm"><use href="#i-monitor"/></svg>Studio PC</span><span class="m">Signed in · today</span></div>
-          <div class="tile"><span class="n"><svg class="i sm"><use href="#i-laptop"/></svg>Living room</span><span class="m">Sign-in needed · 2 Oct</span></div>
-          <div class="tile add"><span class="n"><svg class="i sm"><use href="#i-plus"/></svg>Add a PC</span></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ===== Login / error / approval / connecting / failed share the step rail ===== -->
-    <div class="body" data-view="login login-err approval connecting failed" hidden>
+    <!-- ===== Flow screens share the step rail ===== -->
+    <div class="body" data-view="pair-enter pair-confirm gate approval connecting failed refused rotate" hidden>
       <div class="flow">
         <aside class="rail">
           <span class="back"><svg class="i sm"><use href="#i-chevron-left"/></svg>Your PCs</span>
-          <h2 data-only="login login-err approval">Add a PC</h2>
-          <h2 data-only="connecting failed">Studio PC</h2>
-          <p data-only="login login-err approval">The relay address, password and code come from the host's BubblePlay setup.</p>
-          <p data-only="connecting failed"><span class="mono">play.bubblebuffer.net</span></p>
-          <ol class="steps" data-only="login login-err">
-            <li class="now"><b>Relay and sign-in</b>Address, password, 6-digit code</li>
-            <li><b>Approval</b>Cloudflare relays only</li>
-            <li><b>Connect</b>Saved for next time</li>
+          <h2 data-only="pair-enter pair-confirm">Pair a new PC</h2>
+          <h2 data-only="gate approval connecting failed refused">Studio PC</h2>
+          <h2 data-only="rotate">This device</h2>
+          <p data-only="pair-enter pair-confirm">On the PC: BubblePlay tray icon, Pair device.</p>
+          <p data-only="gate approval connecting failed refused"><span class="id">H4PD-R8TN-B7QK-2M9X</span></p>
+          <p data-only="rotate">Replace this device's key</p>
+
+          <ol class="steps" data-only="pair-enter">
+            <li class="now"><b>PC ID and code</b>From the tray, valid 5 minutes</li>
+            <li><b>Compare the number</b>Allowed at the PC or vouched</li>
+            <li><b>Done</b>The PC joins Your PCs</li>
+          </ol>
+          <ol class="steps" data-only="pair-confirm">
+            <li class="done"><b>PC ID and code</b>Code accepted</li>
+            <li class="now"><b>Compare the number</b>Waiting for a yes</li>
+            <li><b>Done</b>The PC joins Your PCs</li>
+          </ol>
+          <ol class="steps" data-only="gate">
+            <li class="now"><b>Relay site gate</b>Waiting for the relay owner</li>
+            <li><b>Device key</b>Studio PC checks this device</li>
+            <li><b>Stream</b>Last mode: Game</li>
           </ol>
           <ol class="steps" data-only="approval">
-            <li class="done"><b>Relay and sign-in</b>Password and code accepted</li>
-            <li class="now"><b>Approval</b>Waiting for you to approve</li>
-            <li><b>Connect</b>Saved for next time</li>
+            <li class="done"><b>Device key</b>Accepted by Studio PC</li>
+            <li class="now"><b>Before sign-in approval</b>Needed every time</li>
+            <li><b>Stream</b>Sign-in screen</li>
           </ol>
           <ol class="steps" data-only="connecting failed">
-            <li class="done"><b>Signed in</b>Remembered on this computer</li>
-            <li class="now"><b>Starting the stream</b>Game mode · Auto · audio on</li>
+            <li class="done"><b>Device key</b>Accepted by Studio PC</li>
+            <li class="now"><b>Stream</b>Last mode: Game</li>
           </ol>
-          <div class="foot" data-only="login login-err approval">Need a relay? Set one up on the host first: BubblePlay host setup, Relay.</div>
+          <ol class="steps" data-only="refused">
+            <li class="bad"><b>Device key</b>Not accepted</li>
+            <li><b>Stream</b>Not started</li>
+          </ol>
+          <ol class="steps" data-only="rotate">
+            <li class="done"><b>New key created</b>Today 14:02</li>
+            <li class="now"><b>Each PC confirms</b>2 of 3 so far</li>
+            <li><b>Old key removed</b>After the last PC confirms</li>
+          </ol>
+          <div class="foot"><span>This device</span><span class="id">K9TR-4WQZ-N6EA-3HYC</span></div>
         </aside>
 
-        <section class="pane" data-only="login login-err">
-          <h1>Sign in to the relay</h1>
-          <p class="lead">BubblePlay saves this PC once you are in, so next time it is one click.</p>
+        <!-- pair: enter -->
+        <section class="pane" data-only="pair-enter">
+          <h1>Enter what the PC shows</h1>
+          <p class="lead">Open the BubblePlay tray icon on the PC and choose Pair device. Type the PC ID and code, or paste the pairing link.</p>
           <div class="form">
+            <div class="field"><label>Pairing link</label><div class="input"><svg class="i sm" style="color:var(--ink-faint)"><use href="#i-link"/></svg><span class="ph">https://&lt;relay&gt;/pair#…</span><button class="btn ghost" style="margin-left:auto;height:30px;padding:0 10px;font-size:12px">Paste</button></div></div>
+            <div class="or">or type them</div>
+            <div class="field"><label>PC ID</label><div class="input"><span class="id lg">H4PD-R8TN-B7QK-2M9X</span></div></div>
+            <div class="field"><label>One-time code</label><div class="input focus"><span class="mono" style="font-size:15px;letter-spacing:0.08em">7KQ2-M9X</span><span style="width:1px;height:20px;background:var(--ink)"></span></div><span class="hint">10 characters, shown under the QR. It works once and expires after 5 minutes.</span></div>
             <div class="field"><label>Relay address</label><div class="input"><svg class="i sm" style="color:var(--ink-faint)"><use href="#i-globe"/></svg><span class="mono" style="font-size:13px">play.bubblebuffer.net</span></div></div>
-            <div class="field"><label>Name on this computer <span style="font-weight:450;color:var(--ink-faint)">(optional)</span></label><div class="input">Studio PC</div></div>
-            <div class="field"><label>Password</label><div class="input"><svg class="i sm" style="color:var(--ink-faint)"><use href="#i-key-round"/></svg><span style="letter-spacing:3px">••••••••••••</span><svg class="i sm" style="margin-left:auto;color:var(--ink-faint)"><use href="#i-eye"/></svg></div></div>
-            <div class="field">
-              <label>6-digit code from your authenticator</label>
-              <div class="otp" data-only="login"><span>4</span><span>8</span><span>1</span><span class="gap" style="border:0;background:none;width:8px"></span><span class="cur"></span><span></span><span></span></div>
-              <div class="otp error" data-only="login-err"><span class="cur"></span><span></span><span></span><span class="gap" style="border:0;background:none;width:8px"></span><span></span><span></span><span></span></div>
-            </div>
-            <div class="notice err" data-only="login-err"><svg class="i"><use href="#i-circle-alert"/></svg><div><b>That code didn't match.</b> Your password is still filled in. Codes change every 30 seconds, so enter the one showing now.</div></div>
-            <span class="switch on"><span class="trk"></span>Remember sign-in on this computer</span>
           </div>
-          <div class="actions">
-            <button class="btn primary lg" data-only="login"><svg class="i"><use href="#i-arrow-right"/></svg>Sign in</button>
-            <button class="btn primary lg" data-only="login-err" disabled>Sign in</button>
-            <button class="btn ghost">Cancel</button>
-          </div>
+          <div class="actions"><button class="btn primary lg" disabled><svg class="i"><use href="#i-arrow-right"/></svg>Continue</button><button class="btn ghost">Cancel</button></div>
         </section>
 
+        <!-- pair: confirm -->
+        <section class="pane" data-only="pair-confirm" hidden>
+          <h1>Check this number on the PC</h1>
+          <p class="lead">The PC shows the same number. If it matches, allow it there. If nobody is at the PC, a device already paired with it can vouch for this one.</p>
+          <div class="compare"><span class="k">Number on this device</span><span class="num">482 913</span><span style="font-size:12px;color:var(--ink-faint)">Studio PC · <span class="id">H4PD-R8TN-B7QK-2M9X</span></span></div>
+          <div class="ways">
+            <div class="way"><svg class="i"><use href="#i-monitor-check"/></svg><div><b>At the PC</b>The tray asks: Pair 'DESKTOP-K9TR' (ID K9TR-…)? Number on the device: 482 913. Choose Allow.</div></div>
+            <div class="way"><svg class="i"><use href="#i-user-check"/></svg><div><b>On a paired device</b>Open BubblePlay on a device that may vouch for Studio PC. The request waits under Studio PC for 10 minutes.</div></div>
+          </div>
+          <div class="actions"><button class="btn">Cancel pairing</button><span style="font-size:12px;color:var(--ink-faint)" class="elapsed">Waiting 0:18</span></div>
+        </section>
+
+        <!-- gate -->
+        <section class="pane" data-only="gate" hidden>
+          <h1>Waiting for approval</h1>
+          <p class="lead">This relay asks its owner to approve new visitors before anything else loads. Studio PC has not seen this device's key yet.</p>
+          <div class="wait">
+            <span class="pulse"><svg class="i lg"><use href="#i-bell-ring"/></svg></span>
+            <div>
+              <div style="font:720 15px var(--f-ui)">Approval sent by ntfy</div>
+              <div class="elapsed">Waiting 0:18 · 1:12 left</div>
+              <div class="ways">
+                <div class="way"><svg class="i"><use href="#i-smartphone"/></svg><div><b>On the relay owner's phone</b>The ntfy notification has Approve and Deny. Approval lasts 30 days on this computer.</div></div>
+              </div>
+            </div>
+          </div>
+          <div class="notice" style="margin-top:20px"><svg class="i" style="color:var(--ink-faint)"><use href="#i-info"/></svg><div>If it is not approved in time, the relay shows <b>Not approved</b> and you can ask again.</div></div>
+          <div class="actions"><button class="btn">Cancel</button><span style="font-size:12px;color:var(--ink-faint)">Moves on by itself once approved.</span></div>
+        </section>
+
+        <!-- approval: pre-login -->
         <section class="pane" data-only="approval" hidden>
-          <h1>Approve this sign-in</h1>
-          <p class="lead">This relay sits behind Cloudflare and asks for one more yes before it lets this computer in.</p>
+          <h1>PC is at the sign-in screen</h1>
+          <p class="lead">Connecting before Windows sign-in needs a fresh approval every time, even for a paired device.</p>
           <div class="wait">
             <span class="pulse"><svg class="i lg"><use href="#i-bell-ring"/></svg></span>
             <div>
               <div style="font:720 15px var(--f-ui)">Waiting for approval</div>
               <div class="elapsed">Waiting 0:42</div>
               <div class="ways">
-                <div class="way"><svg class="i"><use href="#i-smartphone"/></svg><div><b>On your phone</b>Open the BubblePlay notification in ntfy and tap Approve.</div></div>
-                <div class="way"><svg class="i"><use href="#i-monitor-check"/></svg><div><b>At the PC</b>Approve the request in the BubblePlay host window.</div></div>
+                <div class="way"><svg class="i"><use href="#i-smartphone"/></svg><div><b>On your phone</b>Studio PC sent an ntfy notification. Tap Approve.</div></div>
               </div>
             </div>
           </div>
-          <div class="actions"><button class="btn">Cancel request</button><span style="font-size:12px;color:var(--ink-faint)">This screen moves on by itself once approved.</span></div>
+          <div class="notice" style="margin-top:20px"><svg class="i" style="color:var(--ink-faint)"><use href="#i-info"/></svg><div>Once you are in, you type the Windows password on the sign-in screen. The PC will note that someone connected before sign-in.</div></div>
+          <div class="actions"><button class="btn">Cancel request</button><span style="font-size:12px;color:var(--ink-faint)">Moves on by itself once approved.</span></div>
         </section>
 
-        <section class="pane conn" data-only="connecting failed" hidden>
-          <div style="padding:40px 56px 32px 52px">
-            <h1 data-only="connecting">Connecting to Studio PC</h1>
-            <h1 data-only="failed">The stream didn't start</h1>
-            <p class="lead" data-only="connecting" style="color:var(--ink-muted);margin:0">This usually takes a second or two.</p>
-            <p class="lead" data-only="failed" style="color:var(--ink-muted);margin:0">The relay answered and you are still signed in, but no video arrived within 8 seconds.</p>
-            <ol class="conn-steps">
-              <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Relay reached<span class="mono">play.bubblebuffer.net</span></li>
-              <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Session opened<span class="mono">epoch 14</span></li>
-              <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Stream negotiated<span class="mono">WebRTC</span></li>
-              <li class="now" data-only="connecting"><svg class="i spin"><use href="#i-loader-circle"/></svg>Waiting for the first frame<span class="mono">1.4 s</span></li>
-              <li class="fail" data-only="failed"><svg class="i"><use href="#i-circle-alert"/></svg>No first frame<span class="mono">8.0 s</span></li>
-            </ol>
-            <div class="bar" data-only="connecting"><i></i></div>
-            <div class="actions" data-only="connecting"><button class="btn">Cancel</button></div>
-            <div class="actions" data-only="failed">
-              <button class="btn primary lg"><svg class="i"><use href="#i-refresh-cw"/></svg>Try again</button>
-              <button class="btn">Try again over WebSocket</button>
-              <button class="btn ghost">Back to your PCs</button>
-            </div>
-            <div class="notice" data-only="failed" style="margin-top:22px"><svg class="i" style="color:var(--information)"><use href="#i-info"/></svg><div>If the PC is on the sign-in screen or asleep, it may not send video. Wake it, then try again.</div></div>
+        <!-- connecting / failed -->
+        <section class="pane" data-only="connecting failed" hidden>
+          <h1 data-only="connecting">Connecting to Studio PC</h1>
+          <h1 data-only="failed">The stream didn't start</h1>
+          <p class="lead" data-only="connecting" style="margin-bottom:0">Game mode, as last time. Change it from the strip once you are in.</p>
+          <p class="lead" data-only="failed" style="margin-bottom:0">Studio PC accepted this device, but no video arrived within 8 seconds.</p>
+          <ol class="conn-steps">
+            <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Relay reached<span class="mono">play.bubblebuffer.net</span></li>
+            <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Device key accepted<span class="mono">K9TR-4WQZ-…</span></li>
+            <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Stream negotiated<span class="mono">WebRTC</span></li>
+            <li class="now" data-only="connecting"><svg class="i spin"><use href="#i-loader-circle"/></svg>Waiting for the first frame<span class="mono">1.4 s</span></li>
+            <li class="fail" data-only="failed"><svg class="i"><use href="#i-circle-alert"/></svg>No first frame<span class="mono">8.0 s</span></li>
+          </ol>
+          <div class="bar" data-only="connecting"><i></i></div>
+          <div class="actions" data-only="connecting"><button class="btn">Cancel</button></div>
+          <div class="actions" data-only="failed">
+            <button class="btn primary lg"><svg class="i"><use href="#i-refresh-cw"/></svg>Try again</button>
+            <button class="btn">Try again over WebSocket</button>
+            <button class="btn ghost">Back to your PCs</button>
           </div>
+          <div class="notice info" data-only="failed" style="margin-top:22px"><svg class="i"><use href="#i-info"/></svg><div>If the PC is asleep or its display is off, it may not send video. Wake it, then try again.</div></div>
+        </section>
+
+        <!-- refused -->
+        <section class="pane" data-only="refused" hidden>
+          <h1>Studio PC didn't accept this device</h1>
+          <p class="lead">Its key is not on Studio PC's list. Either it was removed at the PC, or this device was never paired with it.</p>
+          <ol class="conn-steps">
+            <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Relay reached<span class="mono">play.bubblebuffer.net</span></li>
+            <li class="fail"><svg class="i"><use href="#i-shield-x"/></svg>Device key not accepted<span class="mono">K9TR-4WQZ-…</span></li>
+          </ol>
+          <div class="notice" style="margin-top:18px"><svg class="i" style="color:var(--ink-faint)"><use href="#i-info"/></svg><div>Your other PCs are not affected. To use Studio PC again, pair it from the tray on the PC.</div></div>
+          <div class="actions">
+            <button class="btn primary lg"><svg class="i"><use href="#i-key-round"/></svg>Pair Studio PC again</button>
+            <button class="btn ghost forget" style="color:var(--danger)"><svg class="i sm"><use href="#i-trash-2"/></svg>Forget Studio PC</button>
+          </div>
+          <div class="notice err" style="margin-top:22px"><svg class="i"><use href="#i-shield-alert"/></svg><div><b>Different case: PC key changed.</b> If Studio PC answers with a key BubblePlay doesn't know and no signed rotation, the connection stops before anything is sent. Only pair again if someone at the PC confirms they changed it.</div></div>
+        </section>
+
+        <!-- rotate -->
+        <section class="pane" data-only="rotate" hidden>
+          <h1>Replacing this device's key</h1>
+          <p class="lead">Each PC moves this device's name, permissions and history to the new ID. The old key stays until every PC has confirmed.</p>
+          <div class="two-ids">
+            <div><span class="k">Old ID</span><span class="id old">K9TR-4WQZ-N6EA-3HYC</span></div>
+            <svg class="i" style="color:var(--ink-faint)"><use href="#i-arrow-right"/></svg>
+            <div><span class="k">New ID</span><span class="id lg">P5HM-X2CW-9RTE-D8KJ</span></div>
+          </div>
+          <ol class="conn-steps">
+            <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Studio PC<span class="mono">confirmed 14:02</span></li>
+            <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Living room<span class="mono">confirmed 14:03</span></li>
+            <li class="wait"><svg class="i"><use href="#i-clock"/></svg>Office tower<span class="mono">offline, confirms when it is back</span></li>
+          </ol>
+          <div class="notice info" style="margin-top:18px"><svg class="i"><use href="#i-info"/></svg><div>You can keep connecting while this finishes. If this key file is also on another device, that device stops working once the old key is removed.</div></div>
+          <div class="actions"><button class="btn">Back to your PCs</button></div>
         </section>
       </div>
     </div>
@@ -353,46 +416,34 @@
     <section>
       <h2>Layout</h2>
       <ul>
-        <li>Custom 36 px title bar (borderless window, egui draws caption buttons; hit-testing via <code>WM_NCHITTEST</code>).</li>
-        <li>Home A: broad list field plus a 420 px duvet detail panel; the seam is the panel edge. Variant B: a near-black stage with one 112 px condensed name, a 6 px apricot seam and a shelf of other PCs.</li>
-        <li>Flow screens: a 300 px near-black step rail and a 640 px max form column, left-aligned (no centred card).</li>
-        <li>Saved PC shows only what the client stores: name, relay address and type, sign-in kept or not, last session time. No online/offline dot, because the client cannot know it without contacting each relay.</li>
+        <li>Custom 36 px title bar. Home: broad PC list with a Connect button on every row, plus a 400 px panel for the selected PC. The panel holds facts, not choices.</li>
+        <li>This device's own ID sits in the list footer, because pairing and vouching compare IDs.</li>
+        <li>A vouch request swaps the panel for a request panel with an attention seam; the PC row carries a "1 pairing request" status.</li>
+        <li>Flow screens: a 300 px near-black step rail and a 680 px max column, left-aligned.</li>
       </ul>
     </section>
     <section>
       <h2>Type scale</h2>
       <ul>
-        <li>Stage name (B only): Bricolage 112/0.8, wdth 78, wght 710.</li>
-        <li>Detail name: Bricolage 38/0.95, wdth 86. Screen title: Bricolage 28/1.05, -0.025em.</li>
-        <li>Row name 15/720, body 14/450, label 12-13/720, hint 12/450, all Atkinson Hyperlegible Next.</li>
-        <li>Fragment Mono 11-13 only for addresses, codes, timers and transport evidence.</li>
+        <li>Panel name: Bricolage 36/0.95, wdth 86. Screen titles: Bricolage 28/1.05.</li>
+        <li>Row name 15/720, body 14/450, labels 12-13/720, Atkinson Hyperlegible Next.</li>
+        <li>Fragment Mono for device IDs (12-15), the comparison number (34-44, grouped 3+3), codes, timers.</li>
       </ul>
     </section>
     <section>
-      <h2>Colour tokens</h2>
-      <div class="swatches">
-        <span class="sw"><b style="background:#101214"></b>--void #101214</span>
-        <span class="sw"><b style="background:#26282D"></b>--field #26282D</span>
-        <span class="sw"><b style="background:#2F3138"></b>--surface #2F3138</span>
-        <span class="sw"><b style="background:#30333A"></b>--surface-raised</span>
-        <span class="sw"><b style="background:#F3EFE7"></b>--ink #F3EFE7</span>
-        <span class="sw"><b style="background:#C6BAAC"></b>--ink-muted</span>
-        <span class="sw"><b style="background:#F0A064"></b>--signal #F0A064</span>
-        <span class="sw"><b style="background:#697A6B"></b>--moss #697A6B</span>
-        <span class="sw"><b style="background:#CAD8CD"></b>--constructive</span>
-        <span class="sw"><b style="background:#E5B1AA"></b>--danger</span>
-        <span class="sw"><b style="background:#7AB7FF"></b>--focus #7AB7FF</span>
-        <span class="sw"><b style="background:#DDA39D"></b>--paw (recovery)</span>
-      </div>
-      <p style="margin-top:8px">Apricot appears once per screen: the Connect / Sign in button and the selection marker. Focus stays blue and separate.</p>
+      <h2>Colour</h2>
+      <ul>
+        <li>Apricot: Connect / the one main action per screen, the selection marker, waiting pulses.</li>
+        <li>Attention <code>#F0D29C</code>: pairing requests. Danger <code>#E5B1AA</code>: refused key, PC key changed, Forget. Constructive <code>#CAD8CD</code>: Online and done steps.</li>
+        <li>Every status also has a word (Online, Offline, 1 pairing request).</li>
+      </ul>
     </section>
     <section>
       <h2>Motion and egui cost</h2>
       <ul>
-        <li>Hover 120 ms, screen change 180 ms crossfade plus 8 px slide, <code>cubic-bezier(.2,0,0,1)</code>. Reduced motion: snap, spinner slows.</li>
-        <li>Approval ring: one expanding stroke, 2.2 s loop. Cheap: a rect stroke with animated alpha.</li>
-        <li>Fitted corners (different radius per corner) are supported by egui <code>CornerRadius</code> per corner. Free.</li>
-        <li class="cost">Costly: the 112 px variable-font name needs a pre-rasterised wdth 78 instance (egui has no variable axes); dashed tile border needs a custom painter; the 6-cell code input is a custom widget.</li>
+        <li>Hover 120 ms; screen change 180 ms fade plus 8 px slide; reduced motion snaps.</li>
+        <li>Countdown timers repaint once per second only.</li>
+        <li class="cost">Costly: the segmented code input and paste detection of a pairing link are custom widgets. The ring pulse needs a repaint every frame while visible; cap at 30 Hz.</li>
       </ul>
     </section>
   </div>
