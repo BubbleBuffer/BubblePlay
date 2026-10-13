@@ -138,7 +138,7 @@
   body[data-state^="this-pc"] .rows .row.sel .ico { background: var(--surface-muted); color: var(--ink-muted); }
   body[data-state^="this-pc"] .home { grid-template-columns: 350px 1fr; }
   body[data-state^="this-pc"] .list { padding-right: 20px; }
-  body[data-state^="this-pc"] .list .end, body[data-state^="this-pc"] .list-head .btn, body[data-state^="this-pc"] .list-foot > span:last-child { display: none; }
+  body[data-state^="this-pc"] .list .end, body[data-state^="this-pc"] .list-head .btn, body[data-state^="this-pc"] .list-foot .keynote, body[data-state^="this-pc"] .list-foot .btn[title="Settings"] { display: none; }
   body[data-state^="this-pc"] .rows .row .meta span + span { display: none; }
   .hostp { background: var(--surface); border-left: 1px solid var(--thread); padding: 24px 26px 18px 30px; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto 1fr auto; gap: 0 26px; position: relative; }
   .hostp::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--moss); }
@@ -172,6 +172,13 @@
   .hostp .maint { grid-column: 1 / -1; display: flex; gap: 6px; align-items: center; padding-top: 10px; border-top: 1px solid var(--thread); font-size: 11.5px; color: var(--ink-faint); }
   .hostp .maint .btn { height: 28px; padding: 0 8px; font-size: 12px; }
   .hostp .maint .mono { font-size: 11px; }
+  .tag.draft { color: var(--attention); border-color: rgba(240,210,156,.45); vertical-align: middle; margin-left: 6px; font-family: var(--f-ui); letter-spacing: 0; }
+  h1 .tag.draft { font-size: 11px; position: relative; top: -4px; }
+  .pane .set .line .ctl .btn { height: 34px; }
+  .req-card.done { border-color: var(--thread-strong); background: transparent; }
+  .req-card.done::before { background: var(--thread-strong); }
+  .req-card.done b, .req-card.done .id { color: var(--ink-faint); }
+  .req-card .answered { display: flex; gap: 8px; align-items: center; margin: 10px 0 4px; font: 720 13px/1.3 var(--f-ui); color: var(--constructive); }
 </style>
 </head>
 <body>
@@ -182,17 +189,18 @@
     <nav><a href="index.html">Overview</a><a href="connect.html" aria-current="page">Connect flow</a><a href="session.html">Session chrome</a></nav>
   </header>
   <ul class="states" role="toolbar" aria-label="Mockup state">
-    <li><button data-state="home" data-caption="<b>Your PCs.</b> One click on Connect starts the session with that PC's last mode (or Game for a new PC). No choices before connecting; mode, display, quality and audio live in the session strip.">Your PCs</button></li>
+    <li><button data-state="home" data-caption="<b>Your PCs.</b> One click on Connect starts the session with that PC's last mode (Work for a new PC, the browser client's default). No choices before connecting; mode, display, quality and audio live in the session strip.">Your PCs</button></li>
     <li><button data-state="this-pc" data-caption="<b>This PC: hosting.</b> The app also runs the host on this computer. Pinned above Your PCs; selecting it opens the host panel: status and start/stop, the tray's settings, paired devices. The tray keeps running and shows the same state.">This PC</button></li>
     <li><button data-state="this-pc-request" data-caption="<b>This PC: incoming pairing request.</b> The same decision as the tray notification (compare the number, then Allow or Deny), at the top of the devices column.">This PC: request</button></li>
+    <li><button data-state="this-pc-answered" data-caption="<b>This PC: answered elsewhere.</b> Requests show in the app and at the tray, keyed by request ID. The first answer wins; the other place dismisses itself with who answered.">This PC: answered</button></li>
     <li><button data-state="pair-enter" data-caption="<b>Pair a new PC: enter the PC ID and code.</b> The tray's Pair device shows the PC ID, a one-time 10-character code and a QR for 5 minutes. On Windows you type them or paste the pairing link.">Pair: enter code</button></li>
     <li><button data-state="pair-confirm" data-caption="<b>Pair a new PC: compare the number.</b> Both sides show the same 6-digit number. Someone at the PC allows it from the tray, or (if remote pairing is on) an already paired device vouches for this one.">Pair: confirm</button></li>
     <li><button data-state="vouch" data-caption="<b>Vouch, seen from an already paired device.</b> A pairing request for Studio PC arrives on this viewer. It needs the May vouch permission. Before sign-in is never grantable by vouching.">Vouch request</button></li>
-    <li><button data-state="gate" data-caption="<b>Site gate.</b> Sits in front of every browser-facing path on the relay, before any key is shown. Approval by ntfy lasts 30 days. Shown here as it would look if the native viewer is gated too (open question).">Site gate</button></li>
-    <li><button data-state="approval" data-caption="<b>Approval wait: PC at the sign-in screen.</b> Every connection before Windows sign-in needs a fresh approval; a remembered approval never counts.">Approval wait</button></li>
+    <li><button data-state="approval" data-caption="<b>Approval wait: PC at the sign-in screen.</b> Every connection before Windows sign-in needs a fresh ntfy approval that the PC itself sends; a remembered approval never counts and there is no code to type.">Approval wait</button></li>
     <li><button data-state="connecting" data-caption="<b>Connecting.</b> Relay, key handshake, stream, first frame. The window switches to the session as soon as the first frame lands.">Connecting</button></li>
     <li><button data-state="failed" data-caption="<b>Stream did not start.</b> Says which step failed and what is still fine (the PC accepted this key), then the narrowest next step.">Connect failed</button></li>
     <li><button data-state="refused" data-caption="<b>Key refused: revoked or unknown.</b> The native socket closes without a reason, so the viewer cannot tell revoked from never-paired. One message covers both and offers to pair again.">Key refused</button></li>
+    <li><button data-state="settings" data-caption="<b>Settings.</b> From the gear in the Your PCs footer. Minimal: where this device's key lives, Export and Import, and Replace key (starts ID rotation).">Settings</button></li>
     <li><button data-state="rotate" data-caption="<b>ID rotation.</b> This viewer replaces its key: each PC confirms the new ID, and the old key is kept until every PC has. A PC that changes its own key without a signed rotation shows PC key changed and is refused.">ID rotation</button></li>
   </ul>
 
@@ -200,23 +208,23 @@
   <div class="win">
     <div class="titlebar">
       <span class="app"><span class="dot"></span>BubblePlay</span>
-      <span class="ctx" data-only="home vouch">3 PCs</span><span class="ctx" data-only="this-pc this-pc-request">This PC, hosting</span>
+      <span class="ctx" data-only="home vouch">3 PCs</span><span class="ctx" data-only="this-pc this-pc-request this-pc-answered">This PC, hosting</span>
       <span class="ctx" data-only="pair-enter pair-confirm">Pair a new PC</span>
-      <span class="ctx" data-only="gate approval connecting failed refused">Studio PC</span>
-      <span class="ctx" data-only="rotate">This device</span>
+      <span class="ctx" data-only="approval connecting failed refused">Studio PC</span>
+      <span class="ctx" data-only="rotate settings">This device</span>
       <span class="caps"><span><svg class="i"><use href="#i-minus"/></svg></span><span><svg class="i"><use href="#i-square"/></svg></span><span><svg class="i"><use href="#i-x"/></svg></span></span>
     </div>
 
     <!-- ===== Home (and vouch request) ===== -->
-    <div class="body" data-view="home vouch this-pc this-pc-request">
+    <div class="body" data-view="home vouch this-pc this-pc-request this-pc-answered">
       <div class="home">
         <div class="list">
           <div class="pinned">
             <div class="k"><svg class="i sm"><use href="#i-radio-tower"/></svg>This PC</div>
-            <div class="row host sel" data-only="this-pc this-pc-request">
+            <div class="row host sel" data-only="this-pc this-pc-request this-pc-answered">
               <span class="ico"><svg class="i lg"><use href="#i-server"/></svg></span>
               <div><div class="name">DESKTOP-K9TR <span class="status-pill online">Hosting</span></div>
-                <div class="meta"><span data-only="this-pc">1 viewer connected</span><span class="status-pill warn" data-only="this-pc-request">1 pairing request</span></div></div>
+                <div class="meta"><span data-only="this-pc">1 viewer connected</span><span class="status-pill warn" data-only="this-pc-request">1 pairing request</span><span data-only="this-pc-answered">Request answered on Pixel 8</span></div></div>
               <div class="end"></div>
             </div>
             <div class="row host" data-only="home vouch">
@@ -253,7 +261,8 @@
           <div class="list-foot">
             <svg class="i sm"><use href="#i-fingerprint"/></svg>This device<span class="id">K9TR-4WQZ-N6EA-3HYC</span>
             <button class="btn ghost"><svg class="i sm"><use href="#i-copy"/></svg>Copy</button>
-            <span style="margin-left:auto">Key stored with Windows data protection</span>
+            <span class="keynote" style="margin-left:auto">Key stored with Windows data protection</span>
+            <button class="btn ghost" title="Settings"><svg class="i sm"><use href="#i-settings"/></svg>Settings</button>
           </div>
         </div>
 
@@ -279,7 +288,7 @@
           </div>
         </aside>
 
-        <aside class="hostp" data-only="this-pc this-pc-request" hidden>
+        <aside class="hostp" data-only="this-pc this-pc-request this-pc-answered" hidden>
           <div class="top">
             <div>
               <h2>This PC</h2>
@@ -287,7 +296,7 @@
             </div>
             <div class="ctl">
               <button class="btn"><svg class="i sm"><use href="#i-rotate-ccw"/></svg>Restart</button>
-              <button class="btn"><svg class="i sm"><use href="#i-circle-stop"/></svg>Stop hosting</button>
+              <button class="btn" title="The tray keeps running and can start hosting again"><svg class="i sm"><use href="#i-circle-stop"/></svg>Stop hosting</button>
             </div>
           </div>
           <div>
@@ -296,7 +305,7 @@
               <div class="line"><b>Stream PC sound</b><span class="ctl"><span class="switch on"><span class="trk"></span></span></span><span class="h">Changing it restarts the host and ends the current session.</span></div>
               <div class="line"><b>Admin mode</b><span class="ctl"><span class="switch"><span class="trk"></span></span></span><span class="h">Lets input reach elevated windows. Turning it on asks for one admin prompt.</span></div>
               <div class="line"><b>Start at login</b><span class="ctl"><span class="switch on"><span class="trk"></span></span></span><span class="h">Starts BubblePlay hosting when you sign in to Windows.</span></div>
-              <div class="line"><b>CPU mode</b><span class="ctl"><span class="mini-select">Auto<svg class="i sm"><use href="#i-chevron-down"/></svg></span></span><span class="h">Encoder choice. Options come from the encoders work.</span></div>
+              <div class="line"><b>CPU mode</b><span class="ctl"><span class="switch"><span class="trk"></span></span></span><span class="h">Encodes on the CPU instead of the graphics card. Takes effect after the host restarts.</span></div>
             </div>
           </div>
           <div>
@@ -306,6 +315,12 @@
               <div class="num">482 913</div>
               <div style="font-size:12px;color:var(--ink-faint)">Allow only if Work laptop shows this number.</div>
               <div class="row2"><button class="btn primary">Allow</button><button class="btn">Deny</button><span class="elapsed" style="margin-left:auto;align-self:center">4:12 left</span></div>
+            </div>
+            <div class="req-card done" data-only="this-pc-answered">
+              <b>Pair 'Work laptop'?</b>
+              <div class="id" style="margin-top:4px">ID M3ZD-8QRA-F2KV-T7WB</div>
+              <div class="answered"><svg class="i sm"><use href="#i-circle-check"/></svg>Answered on Pixel 8: allowed</div>
+              <div style="font-size:12px;color:var(--ink-faint)">Closes by itself in a few seconds.</div>
             </div>
             <h3><span>Paired devices</span><button class="btn ghost" style="height:26px;padding:0 8px;font-size:12px"><svg class="i sm"><use href="#i-qr-code"/></svg>Pair a device</button></h3>
             <div class="devs">
@@ -350,16 +365,18 @@
     </div>
 
     <!-- ===== Flow screens share the step rail ===== -->
-    <div class="body" data-view="pair-enter pair-confirm gate approval connecting failed refused rotate" hidden>
+    <div class="body" data-view="pair-enter pair-confirm approval connecting failed refused rotate settings" hidden>
       <div class="flow">
         <aside class="rail">
           <span class="back"><svg class="i sm"><use href="#i-chevron-left"/></svg>Your PCs</span>
           <h2 data-only="pair-enter pair-confirm">Pair a new PC</h2>
-          <h2 data-only="gate approval connecting failed refused">Studio PC</h2>
+          <h2 data-only="approval connecting failed refused">Studio PC</h2>
           <h2 data-only="rotate">This device</h2>
+          <h2 data-only="settings">Settings</h2>
           <p data-only="pair-enter pair-confirm">On the PC: BubblePlay tray icon, Pair device.</p>
-          <p data-only="gate approval connecting failed refused"><span class="id">H4PD-R8TN-B7QK-2M9X</span></p>
+          <p data-only="approval connecting failed refused"><span class="id">H4PD-R8TN-B7QK-2M9X</span></p>
           <p data-only="rotate">Replace this device's key</p>
+          <p data-only="settings">This device's key</p>
 
           <ol class="steps" data-only="pair-enter">
             <li class="now"><b>PC ID and code</b>From the tray, valid 5 minutes</li>
@@ -370,11 +387,6 @@
             <li class="done"><b>PC ID and code</b>Code accepted</li>
             <li class="now"><b>Compare the number</b>Waiting for a yes</li>
             <li><b>Done</b>The PC joins Your PCs</li>
-          </ol>
-          <ol class="steps" data-only="gate">
-            <li class="now"><b>Relay site gate</b>Waiting for the relay owner</li>
-            <li><b>Device key</b>Studio PC checks this device</li>
-            <li><b>Stream</b>Last mode: Game</li>
           </ol>
           <ol class="steps" data-only="approval">
             <li class="done"><b>Device key</b>Accepted by Studio PC</li>
@@ -423,24 +435,6 @@
           <div class="actions"><button class="btn">Cancel pairing</button><span style="font-size:12px;color:var(--ink-faint)" class="elapsed">Waiting 0:18</span></div>
         </section>
 
-        <!-- gate -->
-        <section class="pane" data-only="gate" hidden>
-          <h1>Waiting for approval</h1>
-          <p class="lead">This relay asks its owner to approve new visitors before anything else loads. Studio PC has not seen this device's key yet.</p>
-          <div class="wait">
-            <span class="pulse"><svg class="i lg"><use href="#i-bell-ring"/></svg></span>
-            <div>
-              <div style="font:720 15px var(--f-ui)">Approval sent by ntfy</div>
-              <div class="elapsed">Waiting 0:18 · 1:12 left</div>
-              <div class="ways">
-                <div class="way"><svg class="i"><use href="#i-smartphone"/></svg><div><b>On the relay owner's phone</b>The ntfy notification has Approve and Deny. Approval lasts 30 days on this computer.</div></div>
-              </div>
-            </div>
-          </div>
-          <div class="notice" style="margin-top:20px"><svg class="i" style="color:var(--ink-faint)"><use href="#i-info"/></svg><div>If it is not approved in time, the relay shows <b>Not approved</b> and you can ask again.</div></div>
-          <div class="actions"><button class="btn">Cancel</button><span style="font-size:12px;color:var(--ink-faint)">Moves on by itself once approved.</span></div>
-        </section>
-
         <!-- approval: pre-login -->
         <section class="pane" data-only="approval" hidden>
           <h1>PC is at the sign-in screen</h1>
@@ -451,7 +445,7 @@
               <div style="font:720 15px var(--f-ui)">Waiting for approval</div>
               <div class="elapsed">Waiting 0:42</div>
               <div class="ways">
-                <div class="way"><svg class="i"><use href="#i-smartphone"/></svg><div><b>On your phone</b>Studio PC sent an ntfy notification. Tap Approve.</div></div>
+                <div class="way"><svg class="i"><use href="#i-smartphone"/></svg><div><b>On your phone</b>Studio PC itself sent an ntfy notification for this connection. Tap Approve.</div></div>
               </div>
             </div>
           </div>
@@ -498,9 +492,24 @@
           <div class="notice err" style="margin-top:22px"><svg class="i"><use href="#i-shield-alert"/></svg><div><b>Different case: PC key changed.</b> If Studio PC answers with a key BubblePlay doesn't know and no signed rotation, the connection stops before anything is sent. Only pair again if someone at the PC confirms they changed it.</div></div>
         </section>
 
+
+        <!-- settings -->
+        <section class="pane" data-only="settings" hidden>
+          <h1>This device's key</h1>
+          <p class="lead">Your PCs know this device by this key. It stays on this Windows account, encrypted with Windows data protection.</p>
+          <div class="set" style="max-width:620px">
+            <div class="line"><b>Device ID</b><span class="ctl"><span class="id lg">K9TR-4WQZ-N6EA-3HYC</span></span><span class="h">PCs show this ID when they pair or list this device.</span></div>
+            <div class="line"><b>Key file</b><span class="ctl"><span class="mono" style="font-size:12.5px">%APPDATA%\BubblePlay\client\device.bpkey</span></span><span class="h">Encrypted at rest (DPAPI). Copying the file to another PC or account does not work; use Export.</span></div>
+            <div class="line"><b>Export key</b><span class="ctl"><button class="btn"><svg class="i sm"><use href="#i-download"/></svg>Export&hellip;</button></span><span class="h">Saves a .bpkey file to move this device to a new computer. Anyone with the file can connect as this device, so keep it like a password.</span></div>
+            <div class="line"><b>Import key</b><span class="ctl"><button class="btn"><svg class="i sm"><use href="#i-upload"/></svg>Import&hellip;</button></span><span class="h">Replaces this device's key with one from a .bpkey file. Your PCs then lists the PCs that know the imported key.</span></div>
+            <div class="line"><b>Replace key <span class="tag draft">Draft</span></b><span class="ctl"><button class="btn"><svg class="i sm"><use href="#i-key-round"/></svg>Replace key&hellip;</button></span><span class="h">Makes a new key and ID. Each PC moves this device to the new ID the next time you connect. Use it if the key file may have been copied. If you think it leaked, also remove this device at each PC.</span></div>
+          </div>
+          <div class="actions"><button class="btn ghost">Back to your PCs</button></div>
+        </section>
+
         <!-- rotate -->
         <section class="pane" data-only="rotate" hidden>
-          <h1>Replacing this device's key</h1>
+          <h1>Replacing this device's key <span class="tag draft">Draft copy</span></h1>
           <p class="lead">Each PC moves this device's name, permissions and history to the new ID. The old key stays until every PC has confirmed.</p>
           <div class="two-ids">
             <div><span class="k">Old ID</span><span class="id old">K9TR-4WQZ-N6EA-3HYC</span></div>
@@ -512,7 +521,8 @@
             <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Living room<span class="mono">confirmed 14:03</span></li>
             <li class="wait"><svg class="i"><use href="#i-clock"/></svg>Office tower<span class="mono">offline, confirms when it is back</span></li>
           </ol>
-          <div class="notice info" style="margin-top:18px"><svg class="i"><use href="#i-info"/></svg><div>You can keep connecting while this finishes. If this key file is also on another device, that device stops working once the old key is removed.</div></div>
+          <div class="notice" style="margin-top:14px"><svg class="i" style="color:var(--ink-faint)"><use href="#i-clock"/></svg><div><span class="tag draft">Draft timing</span> No deadline: the old key is kept as long as a PC has not confirmed. After 30 days with a PC still waiting, Your PCs asks: keep waiting, or forget that PC and remove the old key now.</div></div>
+          <div class="notice info" style="margin-top:18px"><svg class="i"><use href="#i-info"/></svg><div><span class="tag draft">Draft</span> You can keep connecting while this finishes. A copy of the old key file stops working once every PC has confirmed. Think the key leaked? Remove this device at each PC too, which also removes the new ID.</div></div>
           <div class="actions"><button class="btn">Back to your PCs</button></div>
         </section>
       </div>
@@ -528,7 +538,20 @@
         <li>A pinned section above Your PCs, not the first row. Hosting is a different job (this computer is the one being reached), so a seam separates it, it never gets a Connect button, and it cannot be sorted or scrolled away among remote PCs.</li>
         <li>Selecting it widens the panel to two columns: settings left, devices and requests right. Build, roll back and logs sit in a quiet footer row.</li>
         <li>Moss marks hosting; apricot stays reserved for connecting and Allow.</li>
-        <li>The tray stays the background presence; this panel reads and writes the same state.</li>
+        <li>The tray stays the background presence and owns tray.json. The app never writes that file; it reads status and changes settings only through the tray's control interface: a per-user, per-session named pipe whose ACL allows only the signed-in user. The tray relays host status to the app.</li>
+        <li>Stop hosting stops the host but keeps the tray running; the tray then shows Stopped and can start hosting again. Quitting the tray is a separate action.</li>
+        <li>CPU mode is one on/off setting that takes effect after a host restart.</li>
+        <li>Approvals show in both the app and the tray, keyed by request ID. The first answer wins; the other place dismisses itself with "Answered on &lt;device&gt;" (the This PC: answered state).</li>
+      </ul>
+    </section>
+    <section>
+      <h2>Settled for this app</h2>
+      <ul>
+        <li>No site gate: the native viewer is exempt, like Android. The gate screen is browser only and is not in this app.</li>
+        <li>Key: %APPDATA%\BubblePlay\client\device.bpkey, DPAPI at rest; Export and Import live in Settings (gear in the list footer), next to Replace key.</li>
+        <li>A new PC opens in Work, the browser client's default.</li>
+        <li>Before sign-in: a fresh ntfy approval sent by the PC itself, nothing else.</li>
+        <li>Everything marked Draft (rotation copy and timings) is for owner review.</li>
       </ul>
     </section>
     <section>
