@@ -1,0 +1,172 @@
+{
+  "spec": "docs/architecture/audio.md",
+  "note": "Host to viewer PC audio. WSS: one Opus packet per binary message on the media socket, distinguished from video by its magic. WebRTC: an Opus audio track on the existing peer (RTP clock 48 kHz).",
+  "magic": "BPA1",
+  "magicHex": "42504131",
+  "version": 1,
+  "headerBytes": 28,
+  "maxPayloadBytes": 1500,
+  "header": [
+    {
+      "offset": 0,
+      "bytes": 4,
+      "field": "magic",
+      "value": "0x42504131"
+    },
+    {
+      "offset": 4,
+      "bytes": 1,
+      "field": "version",
+      "value": 1
+    },
+    {
+      "offset": 5,
+      "bytes": 1,
+      "field": "flags",
+      "note": "bit0 discontinuity: first packet after start or a gap; receivers reset their playout buffer. Other bits must be 0."
+    },
+    {
+      "offset": 6,
+      "bytes": 1,
+      "field": "codec",
+      "value": 1,
+      "note": "1 = Opus"
+    },
+    {
+      "offset": 7,
+      "bytes": 1,
+      "field": "channels",
+      "value": 2
+    },
+    {
+      "offset": 8,
+      "bytes": 4,
+      "field": "sampleRate",
+      "value": 48000
+    },
+    {
+      "offset": 12,
+      "bytes": 4,
+      "field": "seq",
+      "note": "u32, +1 per packet, wraps"
+    },
+    {
+      "offset": 16,
+      "bytes": 8,
+      "field": "captureTsUs",
+      "note": "u64 host capture time, same clock as video captureTsUs"
+    },
+    {
+      "offset": 24,
+      "bytes": 2,
+      "field": "frameSamples",
+      "value": 480,
+      "note": "samples per channel (10 ms)"
+    },
+    {
+      "offset": 26,
+      "bytes": 2,
+      "field": "reserved",
+      "value": 0
+    }
+  ],
+  "byteOrder": "big-endian",
+  "packets": [
+    {
+      "name": "opus-start",
+      "hex": "42504131010101020000bb800000000700000000075bcd1501e00000fcfffe",
+      "accepted": true,
+      "discontinuity": true,
+      "codec": 1,
+      "channels": 2,
+      "sampleRate": 48000,
+      "seq": 7,
+      "captureTsUs": "123456789",
+      "frameSamples": 480,
+      "payloadHex": "fcfffe"
+    },
+    {
+      "name": "opus-continuous",
+      "hex": "42504131010001020000bb80ffffffff00000000000f424001e00000fc",
+      "accepted": true,
+      "discontinuity": false,
+      "codec": 1,
+      "channels": 2,
+      "sampleRate": 48000,
+      "seq": 4294967295,
+      "captureTsUs": "1000000",
+      "frameSamples": 480,
+      "payloadHex": "fc"
+    },
+    {
+      "name": "bad-magic",
+      "hex": "42505634010001020000bb800000000700000000075bcd1501e00000fcfffe",
+      "accepted": false
+    },
+    {
+      "name": "bad-version",
+      "hex": "42504131020001020000bb800000000700000000075bcd1501e00000fcfffe",
+      "accepted": false
+    },
+    {
+      "name": "unknown-flags",
+      "hex": "42504131010201020000bb800000000700000000075bcd1501e00000fcfffe",
+      "accepted": false
+    },
+    {
+      "name": "bad-codec",
+      "hex": "42504131010002020000bb800000000700000000075bcd1501e00000fcfffe",
+      "accepted": false
+    },
+    {
+      "name": "bad-channels",
+      "hex": "42504131010001010000bb800000000700000000075bcd1501e00000fcfffe",
+      "accepted": false
+    },
+    {
+      "name": "bad-sample-rate",
+      "hex": "42504131010001020000ac440000000700000000075bcd1501e00000fcfffe",
+      "accepted": false
+    },
+    {
+      "name": "bad-frame-samples",
+      "hex": "42504131010001020000bb800000000700000000075bcd1503c00000fcfffe",
+      "accepted": false
+    },
+    {
+      "name": "nonzero-reserved",
+      "hex": "42504131010001020000bb800000000700000000075bcd1501e00001fcfffe",
+      "accepted": false
+    },
+    {
+      "name": "empty-payload",
+      "hex": "42504131010001020000bb8000000007000000000000000101e00000",
+      "accepted": false
+    },
+    {
+      "name": "oversized-payload",
+      "hexPrefix": "42504131010001020000bb8000000007000000000000000101e00000",
+      "payloadBytes": 1501,
+      "accepted": false,
+      "note": "header followed by 1501 payload bytes; build the payload in the test"
+    },
+    {
+      "name": "truncated-header",
+      "hex": "42504131010001020000bb80",
+      "accepted": false
+    }
+  ],
+  "signaling": {
+    "hostCapabilities": {
+      "note": "audio is present (1) only when the host has audio enabled; absent otherwise. Viewers show the mute control only when it is present.",
+      "text": "{\"type\":\"host-capabilities\",\"serviceMode\":false,\"coldBoot\":false,\"secureDesktop\":false,\"secureText\":false,\"audio\":1}"
+    },
+    "wssStart": {
+      "note": "client to host; audio:1 opts in to BPA1 packets on the media socket. Sent only by viewers that can decode Opus. Without it the host sends no audio over WSS.",
+      "text": "{\"type\":\"media-control\",\"action\":\"start\",\"protocol\":4,\"epoch\":\"0123456789abcdef0123456789abcdef\",\"codec\":\"h264\",\"streamMode\":\"work\",\"reason\":\"client-start\",\"quality\":\"high\",\"audio\":1}"
+    },
+    "webrtc": {
+      "note": "the browser offer carries a recvonly audio m-line; the host sends Opus on it when audio is enabled. No extra signaling field."
+    }
+  }
+}
