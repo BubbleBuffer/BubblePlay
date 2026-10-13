@@ -217,7 +217,7 @@ Each trusted key has permissions, set at pairing and editable in the tray. The h
 | Clipboard | on | New check in the clipboard control path. |
 | Files | on | Replaces "host gate token present" (`host/src/main.rs` 950-963). |
 | Elevated input | off | Admin mode stays the machine switch in HKLM, set through UAC. Elevated input needs Admin mode **and** this permission. The host enforces the device part, so the residual same-user risk in [security and privacy](../security-and-privacy.md) is unchanged. |
-| Before sign-in | off | The logon host admits only keys with this permission, plus a fresh second factor per session: ntfy approval sent by the logon host, or an authenticator code checked by the logon host and sent inside the authenticated control channel. |
+| Before sign-in | off | The logon host admits only keys with this permission, plus a fresh ntfy approval per session, sent by the logon host itself. |
 | Wake | on | The Wake-on-LAN helper accepts wake requests only from keys the PC marked so. |
 
 **Lists for the logon host and the helper.** The owner edits only in the user host's tray. Giving a key "Before sign-in" writes its ID and public key to `ProgramData\BubblePlay\prelogin\trusted.json` through the same UAC step that turns on pre-login (ACL: SYSTEM, the service SID, Administrators), so a same-user process cannot add pre-login devices. The Wake-on-LAN helper is paired with the PC like a viewer (pairing at the PC); while awake, the PC sends it, end to end, its MAC address and the IDs and keys of devices with "Wake". The helper checks a viewer's signed wake request against that list.
