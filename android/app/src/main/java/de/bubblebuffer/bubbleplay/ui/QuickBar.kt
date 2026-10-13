@@ -57,6 +57,11 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         val switchingMonitor: String?
         /** The host has file transfer v1 (shows Attach). */
         val fileTransfer: Boolean
+        /** The host streams its sound (shows the Sound row). */
+        val soundAvailable: Boolean
+        /** The local Sound setting is On (not muted). */
+        val soundOn: Boolean
+        fun toggleSound()
         val remoteClipboardRow: RemoteClipboard.Row
         fun toggleKeyboard()
         fun toggleTouchMode()
@@ -413,6 +418,12 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
             activity.getString(if (host.immersive) R.string.pop_on else R.string.pop_off), false) {
             host.toggleImmersive()
             // The window insets change after this; re-anchor on the next layout.
+            root.post { reopen(Kind.MORE) }
+        })
+        if (host.soundAvailable) column.addView(listRow(activity.getString(R.string.pop_sound), null,
+            activity.getString(if (host.soundOn) R.string.pop_on else R.string.pop_off), false) {
+            host.toggleSound()
+            // The row shows the state it was built with; rebuild the panel.
             root.post { reopen(Kind.MORE) }
         })
         column.addView(listRow(activity.getString(R.string.pop_settings), null, null, false) {
