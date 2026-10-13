@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Windows viewer mockups - BubblePlay</title>
+<link rel="stylesheet" href="mockup.css">
+<style>
+  .lead { font-size: 15px; color: var(--ink-muted); max-width: 720px; margin: 6px 0 26px; }
+  .pages { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border: 1px solid var(--thread-strong); border-radius: var(--r-panel); overflow: hidden; }
+  .pages a { display: block; padding: 22px 24px 20px; color: var(--ink); text-decoration: none; background: var(--surface); }
+  .pages a + a { border-left: 1px solid var(--thread-strong); }
+  .pages a:hover { background: var(--surface-muted); }
+  .pages a:focus-visible { outline: 2px solid var(--focus); outline-offset: -3px; }
+  .pages h2 { font: 620 24px/1.05 var(--f-display); letter-spacing: -0.025em; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
+  .pages h2 svg { color: var(--signal); }
+  .pages p { margin: 0; color: var(--ink-muted); font-size: 13.5px; }
+  @media (max-width: 700px) { .pages { grid-template-columns: 1fr; } .pages a + a { border-left: 0; border-top: 1px solid var(--thread-strong); } }
+  .q { margin-top: 28px; }
+  .q h2 { font: 620 20px/1.1 var(--f-display); margin: 0 0 10px; }
+  .q ol { margin: 0; padding-left: 20px; color: var(--ink-muted); font-size: 13.5px; display: grid; gap: 6px; max-width: 820px; }
+  .q b { color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="harness">
+  <header class="harness-head">
+    <h1>BubblePlay for Windows: UI mockups</h1>
+    <nav><a href="index.html" aria-current="page">Overview</a><a href="connect.html">Connect flow</a><a href="session.html">Session chrome</a></nav>
+  </header>
+  <p class="lead">Static review mockups for the native viewer (egui on D3D11, 2026-10-13). Nothing is built yet. Each page has a state switcher (buttons or number keys) and design notes at the bottom.</p>
+
+  <div class="pages">
+    <a href="connect.html"><h2><svg class="i lg"><use href="#i-house"/></svg>Connect flow</h2><p>Saved PCs (two home variants), add a PC with password and 6-digit code, sign-in error, Cloudflare approval wait, connecting, connect failed.</p></a>
+    <a href="session.html"><h2><svg class="i lg"><use href="#i-monitor-play"/></svg>Session chrome</h2><p>Collapsed tab, toolbar, monitor picker, stats, capture and release toasts, reconnecting, Admin required, secure desktop.</p></a>
+  </div>
+
+  <div class="notes">
+    <section>
+      <h2>Direction</h2>
+      <p>The stream owns the window. Chrome is near-opaque warm duvet, attached to the top edge like a cut tab, and only bright apricot says "live" or "captured". Out of session, the app is calm and left-aligned with one confident Bricolage moment per screen and a single apricot action.</p>
+      <p>What should make it feel better than the browser: native speed (no page loads), keycaps that teach the escape chords, states that always say what survived, and one-click reconnect to the last PC.</p>
+    </section>
+    <section>
+      <h2>Shared tokens</h2>
+      <p>Same family tokens as <code>worker/public/bubbleplay.css</code>; fonts are copies of <code>worker/public/fonts</code>. Fitted radii: control <code>7 11 6 9</code>, field <code>6 10 6 8</code>, panel <code>12 18 10 16</code>, edge strip <code>0 0 10 12</code>. Spacing on a 4 px base.</p>
+    </section>
+    <section>
+      <h2>Icons</h2>
+      <p>Lucide, verbatim from <code>lucide-static@0.460.0</code> (ISC), bundled as a sprite in <code>icons.js</code>. In egui: rasterise the same SVGs to textures at 16/18/22 px for 1x, 1.5x and 2x DPI.</p>
+    </section>
+    <section>
+      <h2>Out of v1</h2>
+      <p>File transfer and clipboard are not drawn. Their slot is reserved in the strip between Stats and Settings.</p>
+    </section>
+  </div>
+
+  <div class="q">
+    <h2>Open questions for the owner</h2>
+    <ol>
+      <li><b>Home screen: A or B?</b> A is a calm list with a detail panel (scales to many PCs). B is a bold stage for the last PC (more character, best with one to three PCs).</li>
+      <li><b>Strip height.</b> The browser strip is 32 px; the mockup uses 42 px for larger native targets. Keep 32 for parity?</li>
+      <li><b>Stats chord.</b> Ctrl+Alt+Shift+S is a proposal; the architecture page only fixes Z and Q.</li>
+      <li><b>Saved PC fields.</b> Is one relay always one PC? The mockup assumes yes and shows no online status, since the client cannot know it without contacting each relay.</li>
+      <li><b>Approval wait.</b> Is there a request code to match on the phone and a timeout? None is shown until the protocol defines one.</li>
+    </ol>
+  </div>
+</div>
+<script src="icons.js"></script>
+</body>
+</html>

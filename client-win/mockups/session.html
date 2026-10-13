@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session chrome - BubblePlay Windows viewer</title>
+<link rel="stylesheet" href="mockup.css">
+<style>
+  /* ---------- placeholder remote desktop (stands in for the decoded video) ---------- */
+  .video { position: absolute; inset: 0; overflow: hidden; background: linear-gradient(155deg, #56616B 0%, #3A444E 45%, #262D34 100%); transition: filter var(--t-func) var(--ease); }
+  .video .w { position: absolute; background: #E9EAEC; border-radius: 6px; box-shadow: 0 10px 30px rgba(0,0,0,.35); overflow: hidden; }
+  .video .w .tb { height: 26px; background: #D6D8DC; }
+  .video .w .ln { height: 7px; margin: 10px 16px 0; border-radius: 3px; background: #C3C7CD; }
+  .video .w .ln.s { width: 40%; } .video .w .ln.m { width: 66%; } .video .w .ln.a { background: #9FB3C8; width: 30%; }
+  .video .w1 { left: 90px; top: 92px; width: 560px; height: 380px; }
+  .video .w2 { left: 590px; top: 200px; width: 400px; height: 300px; background: #1F2328; }
+  .video .w2 .tb { background: #2B3036; } .video .w2 .ln { background: #3A4048; } .video .w2 .ln.a { background: #5D7A63; }
+  .video .task { position: absolute; left: 0; right: 0; bottom: 0; height: 40px; background: rgba(26,30,35,.92); display: flex; justify-content: center; align-items: center; gap: 8px; }
+  .video .task i { width: 22px; height: 22px; border-radius: 4px; background: #5A6570; } .video .task i:first-child { background: #8FA5BA; }
+  .video .uac { position: absolute; inset: 0; background: rgba(10,12,14,.62); display: none; }
+  .video .uac .dlg { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 420px; height: 240px; background: #2B2F35; border-radius: 8px; }
+  .video .uac .dlg .ln { height: 8px; margin: 22px 24px 0; border-radius: 3px; background: #4B525B; }
+  .video .uac .dlg .ln.s { width: 50%; }
+  body[data-state="secure"] .video .uac { display: block; }
+  body[data-state="reconnecting"] .video { filter: grayscale(.85) brightness(.45); }
+  .cursor { position: absolute; left: 470px; top: 330px; width: 14px; height: 20px; background: #fff; clip-path: polygon(0 0, 0 100%, 28% 76%, 50% 100%, 64% 94%, 44% 70%, 80% 70%); filter: drop-shadow(0 1px 1px rgba(0,0,0,.6)); }
+
+  /* ---------- chrome ---------- */
+  .chrome { position: absolute; inset: 0; pointer-events: none; font-size: 13px; }
+  .chrome > * { pointer-events: auto; }
+  .handle {
+    position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+    height: 26px; display: flex; align-items: center; gap: 8px; padding: 0 12px 1px 10px;
+    background: var(--chrome-bg); border: 1px solid var(--thread-strong); border-top: 0; border-radius: 0 0 8px 10px;
+    color: var(--ink-muted); font: 720 12px/1 var(--f-ui); opacity: .82; box-shadow: var(--chrome-shadow);
+  }
+  .live { width: 7px; height: 7px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 0 3px rgba(240,160,100,.18); }
+  .live.warn { background: var(--attention); box-shadow: 0 0 0 3px rgba(240,210,156,.18); }
+  .handle .mono { font-size: 11px; color: var(--ink); }
+  .handle svg.i { width: 14px; height: 14px; }
+
+  .strip {
+    position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+    height: 42px; display: flex; align-items: center; gap: 2px; padding: 0 5px;
+    background: var(--chrome-bg); border: 1px solid var(--thread-strong); border-top: 0; border-radius: var(--r-strip);
+    box-shadow: var(--chrome-shadow); white-space: nowrap;
+  }
+  .strip .sep { width: 1px; height: 22px; background: var(--thread-strong); margin: 0 5px; }
+  .tb-btn {
+    height: 32px; display: inline-flex; align-items: center; gap: 7px; padding: 0 10px;
+    border-radius: 5px 8px 4px 7px; color: var(--ink-muted); font: 720 12.5px/1 var(--f-ui); cursor: pointer; border: 1px solid transparent;
+  }
+  .tb-btn:hover { background: var(--surface-muted); color: var(--ink); }
+  .tb-btn.open { background: var(--ink); color: var(--signal-ink); }
+  .tb-btn.icon { width: 34px; padding: 0; justify-content: center; }
+  .tb-btn .chev { width: 13px; height: 13px; opacity: .7; }
+  .tb-btn.leave:hover { background: rgba(229,177,170,.14); color: var(--danger); }
+  .tb-btn.focus { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .state-chip { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px 0 8px; font: 720 12.5px/1 var(--f-ui); color: var(--ink); }
+  .state-chip .mono { font-size: 11.5px; color: var(--ink-muted); }
+  .cap { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 8px 0 9px; border-radius: 5px 8px 4px 7px; background: rgba(240,160,100,.12); color: var(--signal); font: 720 12.5px/1 var(--f-ui); }
+  .cap .chord kbd.key { height: 18px; font-size: 10px; padding: 0 4px; }
+  .cap.released { background: transparent; color: var(--ink-muted); border: 1px dashed var(--thread-strong); }
+  .badge-secure { display: inline-flex; align-items: center; gap: 7px; height: 26px; padding: 0 10px; border-radius: 999px; background: rgba(240,210,156,.14); color: var(--attention); font: 720 12px/1 var(--f-ui); }
+
+  /* popover: drops from the strip, attached */
+  .pop {
+    position: absolute; top: 48px; background: var(--surface); border: 1px solid var(--thread-strong);
+    border-radius: var(--r-panel); box-shadow: var(--chrome-shadow-hover); padding: 14px; color: var(--ink);
+  }
+  .pop h3 { margin: 0 0 10px; font: 720 12px/1 var(--f-ui); color: var(--ink-faint); display: flex; justify-content: space-between; }
+  .pop h3 .mono { font-size: 10.5px; }
+  .layout { position: relative; height: 128px; background: var(--void); border-radius: 6px 9px 6px 8px; margin-bottom: 10px; }
+  .mon { position: absolute; display: grid; place-items: center; border: 1.5px solid var(--thread-strong); border-radius: 4px; background: var(--surface-raised); font: 650 20px/1 var(--f-display); color: var(--ink-muted); cursor: pointer; }
+  .mon.cur { border-color: var(--signal); color: var(--ink); background: #3A342F; }
+  .mon.hov { border-color: var(--ink-faint); }
+  .mon small { position: absolute; bottom: 5px; font: 720 10px/1 var(--f-ui); color: var(--signal); }
+  .mlist { display: grid; gap: 2px; }
+  .mrow { display: grid; grid-template-columns: 22px 1fr auto; gap: 10px; align-items: center; height: 40px; padding: 0 10px; border-radius: var(--r-field); font-size: 13px; }
+  .mrow.cur { background: var(--surface-muted); }
+  .mrow .mono { font-size: 11px; color: var(--ink-faint); }
+  .mrow b { font-weight: 720; }
+  .pop .foot { border-top: 1px solid var(--thread); margin-top: 10px; padding-top: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 12.5px; }
+  .switch { display: inline-flex; align-items: center; gap: 10px; font: 720 12.5px/1 var(--f-ui); }
+  .switch .trk { width: 36px; height: 20px; border-radius: 4px 5px 4px 5px; border: 1px solid var(--thread-strong); background: var(--surface-raised); position: relative; }
+  .switch .trk::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 3px; background: var(--ink-faint); }
+  .switch.on .trk { background: var(--moss); border-color: var(--moss); }
+  .switch.on .trk::after { left: 18px; background: var(--ink); }
+
+  /* stats: corner-attached evidence panel */
+  .stats {
+    position: absolute; top: 0; right: 0; width: 268px; background: rgba(16,18,20,.88);
+    border: 1px solid var(--thread-strong); border-top: 0; border-right: 0; border-radius: 0 0 0 12px;
+    padding: 10px 14px 12px; font: 400 11px/1.75 var(--f-mono); color: var(--ink-muted);
+  }
+  .stats .hd { display: flex; justify-content: space-between; align-items: center; font: 720 12px/1 var(--f-ui); color: var(--ink); margin-bottom: 6px; }
+  .stats .hd span:last-child { font: 400 10px var(--f-mono); color: var(--ink-faint); }
+  .stats dl { display: grid; grid-template-columns: auto 1fr; gap: 0 12px; margin: 0; }
+  .stats dt { color: var(--ink-faint); }
+  .stats dd { margin: 0; text-align: right; color: var(--ink); }
+  .stats dd.good { color: var(--constructive); }
+  .stats .spark { margin: 6px 0 2px; height: 34px; border-bottom: 1px solid var(--thread); position: relative; }
+  .stats .spark svg { width: 100%; height: 100%; display: block; }
+  .stats .lg { display: flex; justify-content: space-between; font-size: 10px; color: var(--ink-faint); }
+
+  /* toast: drops below the handle, same top edge */
+  .toast {
+    position: absolute; top: 40px; left: 50%; transform: translateX(-50%);
+    display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: center; padding: 12px 16px 12px 14px;
+    background: var(--chrome-bg); border: 1px solid var(--thread-strong); border-radius: var(--r-panel); box-shadow: var(--chrome-shadow-hover);
+    min-width: 440px; overflow: hidden;
+  }
+  .toast .ic { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 6px 9px 6px 8px; background: rgba(240,160,100,.14); color: var(--signal); }
+  .toast.rel .ic { background: var(--surface-muted); color: var(--ink-muted); }
+  .toast b { display: block; font: 720 14px/1.3 var(--f-ui); }
+  .toast .sub { font-size: 12.5px; color: var(--ink-muted); display: flex; gap: 8px; align-items: center; margin-top: 3px; }
+  .toast .timer { position: absolute; left: 0; bottom: 0; height: 2px; width: 64%; background: var(--signal); opacity: .7; }
+
+  /* recovery card (reconnecting) */
+  .recover {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 460px;
+    background: var(--surface); border: 1px solid var(--thread-strong); border-radius: var(--r-panel); box-shadow: var(--chrome-shadow-hover);
+    padding: 22px 24px 20px 28px; overflow: hidden;
+  }
+  .recover::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: var(--paw); }
+  .recover h2 { font: 620 24px/1.05 var(--f-display); letter-spacing: -0.025em; margin: 0 0 8px; display: flex; gap: 10px; align-items: center; }
+  .recover p { margin: 0 0 6px; color: var(--ink-muted); font-size: 13.5px; }
+  .recover .ev { font: 400 11px var(--f-mono); color: var(--ink-faint); margin: 12px 0 16px; display: flex; gap: 14px; }
+  .recover .row { display: flex; gap: 10px; }
+
+  /* attached banner under the strip (admin required) */
+  .banner {
+    position: absolute; top: 41px; left: 50%; transform: translateX(-50%); width: 620px;
+    display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center;
+    padding: 12px 14px 12px 14px; background: var(--surface); border: 1px solid var(--thread-strong); border-top: 2px solid var(--attention);
+    border-radius: 0 0 12px 14px; box-shadow: var(--chrome-shadow-hover);
+  }
+  .banner > svg { color: var(--attention); width: 22px; height: 22px; }
+  .banner b { display: block; font: 720 14px/1.3 var(--f-ui); }
+  .banner span.s { font-size: 12.5px; color: var(--ink-muted); }
+  .btn.sm { height: 32px; padding: 0 12px; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="harness">
+  <header class="harness-head">
+    <h1>Session chrome</h1>
+    <p>Overlay drawn by egui on the video swap chain. The gradient desktop stands in for the stream.</p>
+    <nav><a href="index.html">Overview</a><a href="connect.html">Connect flow</a><a href="session.html" aria-current="page">Session chrome</a></nav>
+  </header>
+  <ul class="states" role="toolbar" aria-label="Mockup state">
+    <li><button data-state="collapsed" data-caption="<b>Collapsed (resting).</b> Only a 26 px tab on the top edge: live signal, round trip, and a chevron. It fades to 82% and wakes when the pointer rests at the top edge or on the release chord.">Collapsed</button></li>
+    <li><button data-state="toolbar" data-caption="<b>Expanded toolbar.</b> One strip attached to the top edge, grouped by seams: connection, input capture, stream controls, leave. Every control has a label except audio and settings.">Toolbar</button></li>
+    <li><button data-state="monitors" data-caption="<b>Monitor picker.</b> A map of the host's displays plus a list with modes. Current display is marked in words, not only colour. Number keys 1-9 switch while it is open.">Monitor picker</button></li>
+    <li><button data-state="stats" data-caption="<b>Stats overlay.</b> A corner-attached evidence panel, opened from the toolbar or Ctrl+Alt+Shift+S (proposed). Stays up while the strip collapses.">Stats</button></li>
+    <li><button data-state="captured" data-caption="<b>Capture hint toast.</b> Shown each time capture starts, with the release chord as keycaps. Auto-hides after 4 s (the line along the bottom).">Capture toast</button></li>
+    <li><button data-state="released" data-caption="<b>Released toast.</b> After Ctrl+Alt+Shift+Z: the PC no longer gets input; one click on the stream captures again.">Released toast</button></li>
+    <li><button data-state="reconnecting" data-caption="<b>Reconnecting.</b> Last frame frozen and dimmed so nobody mistakes it for live video. The card says what survived before offering to leave.">Reconnecting</button></li>
+    <li><button data-state="admin" data-caption="<b>Admin required.</b> Video keeps playing; input to the elevated window is blocked. Banner hangs from the strip so the stream stays visible. Uses the session-ui copy.">Admin required</button></li>
+    <li><button data-state="secure" data-caption="<b>Secure desktop.</b> A UAC prompt or sign-in screen on the PC. The strip shows a status badge and stays open while the secure desktop is up; collapsed, the tab reads Secure desktop in attention colour.">Secure desktop</button></li>
+  </ul>
+
+  <div class="stage"><div class="stage-inner">
+  <div class="win">
+    <div class="video" aria-hidden="true">
+      <div class="w w1"><div class="tb"></div><div class="ln m"></div><div class="ln"></div><div class="ln s"></div><div class="ln a"></div><div class="ln m"></div><div class="ln"></div><div class="ln s"></div><div class="ln m"></div></div>
+      <div class="w w2"><div class="tb"></div><div class="ln a"></div><div class="ln m"></div><div class="ln"></div><div class="ln s"></div><div class="ln m"></div></div>
+      <div class="task"><i></i><i></i><i></i><i></i><i></i></div>
+      <div class="uac"><div class="dlg"><div class="ln"></div><div class="ln s"></div><div class="ln"></div></div></div>
+      <span class="cursor" data-only="toolbar monitors stats captured released admin"></span>
+    </div>
+
+    <div class="chrome">
+      <!-- collapsed handle -->
+      <div class="handle" data-only="collapsed captured released stats">
+        <span class="live"></span>Studio PC<span class="mono">12 ms</span><svg class="i"><use href="#i-chevron-down"/></svg>
+      </div>
+
+      <!-- expanded strip -->
+      <div class="strip" data-only="toolbar monitors admin reconnecting">
+        <span class="state-chip" data-only="toolbar monitors admin"><span class="live"></span>Studio PC<span class="mono">12 ms</span></span>
+        <span class="state-chip" data-only="reconnecting"><span class="live warn"></span>Reconnecting<span class="mono">attempt 2</span></span>
+        <span class="sep"></span>
+        <span class="cap" data-only="toolbar monitors"><svg class="i sm"><use href="#i-mouse-pointer-2"/></svg>Captured<span class="chord"><kbd class="key">Ctrl</kbd><kbd class="key">Alt</kbd><kbd class="key">Shift</kbd><kbd class="key">Z</kbd></span></span>
+        <span class="cap" data-only="admin" style="background:rgba(240,210,156,.12);color:var(--attention)"><svg class="i sm"><use href="#i-shield-alert"/></svg>Input blocked</span>
+        <span class="cap released" data-only="reconnecting"><svg class="i sm"><use href="#i-pause"/></svg>Input paused</span>
+        <span class="sep"></span>
+        <span class="tb-btn" data-only="toolbar admin reconnecting"><svg class="i sm"><use href="#i-monitor"/></svg>Display 1<svg class="i chev"><use href="#i-chevron-down"/></svg></span>
+        <span class="tb-btn open" data-only="monitors"><svg class="i sm"><use href="#i-monitor"/></svg>Display 1<svg class="i chev"><use href="#i-chevron-up"/></svg></span>
+        <span class="tb-btn"><svg class="i sm"><use href="#i-gamepad-2"/></svg>Game<svg class="i chev"><use href="#i-chevrons-up-down"/></svg></span>
+        <span class="tb-btn"><svg class="i sm"><use href="#i-gauge"/></svg>Auto<svg class="i chev"><use href="#i-chevron-down"/></svg></span>
+        <span class="tb-btn icon" title="Audio on"><svg class="i sm"><use href="#i-volume-2"/></svg></span>
+        <span class="tb-btn focus" data-only="toolbar"><svg class="i sm"><use href="#i-activity"/></svg>Stats</span>
+        <span class="tb-btn" data-only="monitors admin reconnecting"><svg class="i sm"><use href="#i-activity"/></svg>Stats</span>
+        <span class="tb-btn icon" title="Settings"><svg class="i sm"><use href="#i-settings"/></svg></span>
+        <span class="sep"></span>
+        <span class="tb-btn leave"><svg class="i sm"><use href="#i-log-out"/></svg>Leave</span>
+      </div>
+      <div class="strip" data-only="secure">
+        <span class="state-chip"><span class="live"></span>Studio PC<span class="mono">14 ms</span></span>
+        <span class="sep"></span>
+        <span class="badge-secure"><svg class="i sm"><use href="#i-shield-alert"/></svg>Windows secure desktop · protected input</span>
+        <span class="sep"></span>
+        <span class="tb-btn"><svg class="i sm"><use href="#i-monitor"/></svg>Display 1<svg class="i chev"><use href="#i-chevron-down"/></svg></span>
+        <span class="tb-btn"><svg class="i sm"><use href="#i-activity"/></svg>Stats</span>
+        <span class="sep"></span>
+        <span class="tb-btn leave"><svg class="i sm"><use href="#i-log-out"/></svg>Leave</span>
+      </div>
+
+      <!-- monitor picker -->
+      <div class="pop" data-only="monitors" style="left:478px;width:340px">
+        <h3><span>Show display</span><span class="mono">3 on Studio PC</span></h3>
+        <div class="layout">
+          <span class="mon cur" style="left:96px;top:24px;width:118px;height:68px">1<small>Showing</small></span>
+          <span class="mon hov" style="left:218px;top:30px;width:92px;height:52px">2</span>
+          <span class="mon" style="left:24px;top:14px;width:52px;height:92px">3</span>
+        </div>
+        <div class="mlist">
+          <div class="mrow cur"><svg class="i sm" style="color:var(--signal)"><use href="#i-check"/></svg><span><b>Display 1</b> · main</span><span class="mono">2560 x 1440 · 144 Hz</span></div>
+          <div class="mrow"><kbd class="key">2</kbd><span>Display 2</span><span class="mono">1920 x 1080 · 60 Hz</span></div>
+          <div class="mrow"><kbd class="key">3</kbd><span>Display 3</span><span class="mono">1080 x 1920 · 60 Hz</span></div>
+        </div>
+        <div class="foot"><span class="switch"><span class="trk"></span>Follow active window</span><span style="color:var(--ink-faint);font-size:12px">Host supports it</span></div>
+      </div>
+
+      <!-- stats -->
+      <div class="stats" data-only="stats">
+        <div class="hd"><span>Stream</span><span>Ctrl+Alt+Shift+S</span></div>
+        <div class="spark"><svg viewBox="0 0 240 34" preserveAspectRatio="none"><line x1="0" y1="17" x2="240" y2="17" stroke="#3E4148" stroke-dasharray="2 3"/><polyline fill="none" stroke="#F0A064" stroke-width="1.5" points="0,22 10,21 20,23 30,20 40,22 50,21 60,24 70,22 80,21 90,9 100,20 110,22 120,21 130,23 140,22 150,21 160,22 170,20 180,22 190,21 200,23 210,22 220,21 230,22 240,21"/></svg></div>
+        <div class="lg"><span>frame time, last 4 s</span><span>16.7 ms line</span></div>
+        <dl style="margin-top:6px">
+          <dt>round trip</dt><dd class="good">12 ms</dd>
+          <dt>decode</dt><dd>2.1 ms</dd>
+          <dt>frames</dt><dd>143.8 fps</dd>
+          <dt>dropped</dt><dd>3 (0.1%)</dd>
+          <dt>bitrate</dt><dd>38.2 Mb/s</dd>
+          <dt>packet loss</dt><dd>0.0%</dd>
+          <dt>resolution</dt><dd>2560 x 1440</dd>
+          <dt>transport</dt><dd>WebRTC</dd>
+          <dt>present</dt><dd>lowest latency</dd>
+          <dt>audio</dt><dd>Opus 10 ms</dd>
+        </dl>
+      </div>
+
+      <!-- capture toast -->
+      <div class="toast" data-only="captured">
+        <span class="ic"><svg class="i"><use href="#i-mouse-pointer-click"/></svg></span>
+        <div><b>Mouse and keyboard now go to Studio PC</b><span class="sub">Release with <span class="chord"><kbd class="key">Ctrl</kbd><i>+</i><kbd class="key">Alt</kbd><i>+</i><kbd class="key">Shift</kbd><i>+</i><kbd class="key">Z</kbd></span></span></div>
+        <span class="timer"></span>
+      </div>
+      <div class="toast rel" data-only="released">
+        <span class="ic"><svg class="i"><use href="#i-mouse-pointer-2"/></svg></span>
+        <div><b>Mouse and keyboard are back on this computer</b><span class="sub">Click the stream to capture again · <span class="chord"><kbd class="key">Ctrl</kbd><i>+</i><kbd class="key">Alt</kbd><i>+</i><kbd class="key">Shift</kbd><i>+</i><kbd class="key">Q</kbd></span> leaves</span></div>
+        <span class="timer" style="background:var(--ink-faint)"></span>
+      </div>
+
+      <!-- reconnecting -->
+      <div class="recover" data-only="reconnecting">
+        <h2><svg class="i lg spin" style="color:var(--paw)"><use href="#i-refresh-cw"/></svg>Reconnecting to Studio PC</h2>
+        <p>The connection dropped. Apps on the PC keep running, and your sign-in is still valid.</p>
+        <p>Input is paused until the stream is back. The picture behind this card is the last frame, not live.</p>
+        <div class="ev"><span>attempt 2</span><span>offline 6 s</span><span>next try in 2 s</span></div>
+        <div class="row"><button class="btn sm"><svg class="i sm"><use href="#i-refresh-cw"/></svg>Try now</button><button class="btn ghost sm"><svg class="i sm"><use href="#i-log-out"/></svg>Leave session</button></div>
+      </div>
+
+      <!-- admin required -->
+      <div class="banner" data-only="admin">
+        <svg class="i"><use href="#i-shield-alert"/></svg>
+        <div><b>This window needs Admin mode — turn it on at the PC</b><span class="s">The picture keeps streaming. Clicks and keys don't reach this window until Admin mode is on; other windows still work.</span></div>
+        <button class="btn ghost sm">Dismiss</button>
+      </div>
+    </div>
+  </div>
+  </div></div>
+  <p class="caption"></p>
+
+  <div class="notes">
+    <section>
+      <h2>Layout</h2>
+      <ul>
+        <li>All chrome lives on the top edge, centred: a 26 px tab at rest, a 42 px strip when open. Edge-attached (square top corners, fitted bottom corners), not a floating pill.</li>
+        <li>Strip order: connection state, capture state with its chord, Display, Mode, Quality, Audio, Stats, Settings, Leave. Seams separate the four groups; Leave is alone at the end.</li>
+        <li>Popovers drop 6 px below the strip; one open at a time, Esc closes and is not sent to the PC.</li>
+        <li>Stats is corner-attached top right so it never covers the centre of the stream.</li>
+        <li>Windowed mode: the 36 px title bar stays and the tab hangs below it. Post-v1 slots (Files, Clipboard) go between Stats and Settings.</li>
+      </ul>
+    </section>
+    <section>
+      <h2>Type scale</h2>
+      <ul>
+        <li>Recovery title: Bricolage 24/1.05. Toast and banner title: Atkinson 14/720.</li>
+        <li>Strip labels: Atkinson 12.5/720, 32 px targets. Body in cards 13.5/450.</li>
+        <li>Fragment Mono 11 for latency, attempts, modes and all stats values; keycaps Fragment Mono 10-11 with a 2 px bottom thread.</li>
+      </ul>
+    </section>
+    <section>
+      <h2>Colour over video</h2>
+      <ul>
+        <li>Chrome fill <code>rgba(38,40,45,.96)</code>, a near-opaque duvet, so labels pass contrast on any frame. Stats panel <code>rgba(16,18,20,.88)</code>.</li>
+        <li>Apricot <code>#F0A064</code> only for live signal and the captured state. Attention <code>#F0D29C</code> for blocked input and secure desktop. Paw <code>#DDA39D</code> marks recovery. Focus stays <code>#7AB7FF</code>.</li>
+        <li>Every state also has a word: Captured, Input blocked, Input paused, Reconnecting.</li>
+      </ul>
+    </section>
+    <section>
+      <h2>Motion and egui cost</h2>
+      <ul>
+        <li>Tab to strip: 180 ms height and fade from the top edge. Toast: 220 ms drop-in, holds 4 s, 180 ms out. Popover: 120 ms fade plus 4 px. Reduced motion: no slide, fades only.</li>
+        <li>Reveal: pointer rests 150 ms within 6 px of the top edge, or a release chord. Hide 1.2 s after the pointer leaves.</li>
+        <li>Reconnecting dim: desaturate the last frame in the video shader (one uniform). Cheap.</li>
+        <li class="cost">Optional, costs work: background blur behind the strip and cards (extra downsample pass). The design does not need it; near-opaque fills are the default.</li>
+        <li class="cost">egui repaints only on change; the stats sparkline forces a repaint every frame while open. Cap it at 10 Hz.</li>
+      </ul>
+    </section>
+  </div>
+</div>
+<script src="icons.js"></script>
+<script src="mockup.js"></script>
+</body>
+</html>

@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect flow - BubblePlay Windows viewer</title>
+<link rel="stylesheet" href="mockup.css">
+<style>
+  .body { position: absolute; inset: 36px 0 0 0; }
+
+  /* ---------- home A: list + detail ---------- */
+  .home { display: grid; grid-template-columns: 1fr 420px; height: 100%; }
+  .list { padding: 30px 32px 24px 36px; overflow: hidden; }
+  .list-head { display: flex; align-items: end; gap: 16px; margin-bottom: 20px; }
+  .list-head h1 { font: 620 28px/1.05 var(--f-display); letter-spacing: -0.025em; margin: 0; }
+  .list-head p { margin: 4px 0 0; color: var(--ink-faint); font-size: 13px; }
+  .list-head .btn { margin-left: auto; }
+  .rows { display: grid; gap: 2px; }
+  .row {
+    position: relative; display: grid; grid-template-columns: 40px 1fr auto; align-items: center; gap: 14px;
+    padding: 12px 14px 12px 12px; border-radius: var(--r-field); background: transparent; cursor: pointer;
+  }
+  .row:hover { background: var(--surface-raised); }
+  .row.sel { background: var(--surface); }
+  .row.sel::before { content: ""; position: absolute; left: -10px; top: 12px; bottom: 12px; width: 3px; border-radius: 2px; background: var(--signal); }
+  .row .ico { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 6px 9px 6px 8px; background: var(--surface-muted); color: var(--ink-muted); }
+  .row.sel .ico { background: var(--ink); color: var(--signal-ink); }
+  .row .name { font: 720 15px/1.25 var(--f-ui); }
+  .row .meta { font-size: 12px; color: var(--ink-faint); display: flex; gap: 10px; align-items: center; margin-top: 2px; }
+  .row .meta .mono { font-size: 11px; }
+  .row .when { font-size: 12px; color: var(--ink-faint); text-align: right; }
+  .list-foot { position: absolute; left: 36px; bottom: 20px; font-size: 12px; color: var(--ink-faint); display: flex; gap: 8px; align-items: center; }
+
+  .detail {
+    position: relative; background: var(--surface); border-left: 1px solid var(--thread);
+    padding: 30px 30px 24px; display: flex; flex-direction: column;
+  }
+  .detail .eyebrow { font-size: 12px; font-weight: 720; color: var(--ink-faint); }
+  .detail h2 { font: 650 38px/0.95 var(--f-display); font-stretch: 86%; letter-spacing: -0.035em; margin: 8px 0 8px; }
+  .detail .relay { display: flex; gap: 8px; align-items: center; color: var(--ink-muted); font-size: 12px; }
+  .kv { margin: 22px 0 0; display: grid; gap: 14px; }
+  .kv .k { font: 720 12px/1.3 var(--f-ui); color: var(--ink-muted); margin-bottom: 6px; display: block; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--thread-strong); border-radius: var(--r-control); overflow: hidden; }
+  .seg span { display: flex; align-items: center; justify-content: center; gap: 7px; height: 36px; font: 720 13px/1 var(--f-ui); color: var(--ink-muted); }
+  .seg span + span { border-left: 1px solid var(--thread-strong); }
+  .seg span.on { background: var(--ink); color: var(--signal-ink); }
+  .seg-hint { font-size: 12px; color: var(--ink-faint); margin-top: 6px; }
+  .pair { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; }
+  .select { height: 36px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px 0 12px; border: 1px solid var(--thread-strong); border-radius: var(--r-field); background: var(--surface-raised); font-size: 13px; }
+  .switch { display: inline-flex; align-items: center; gap: 10px; font: 720 13px/1 var(--f-ui); }
+  .switch .trk { width: 40px; height: 22px; border-radius: 4px 5px 4px 5px; border: 1px solid var(--thread-strong); background: var(--surface-raised); position: relative; }
+  .switch .trk::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 3px; background: var(--ink-faint); }
+  .switch.on .trk { background: var(--moss); border-color: var(--moss); }
+  .switch.on .trk::after { left: 20px; background: var(--ink); }
+  .go { margin-top: auto; display: grid; gap: 10px; }
+  .go .btn { width: 100%; }
+  .go .chords { font-size: 12px; color: var(--ink-faint); display: grid; gap: 6px; }
+  .go .chords div { display: flex; justify-content: space-between; align-items: center; }
+  .detail .danger-row { display: flex; gap: 6px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--thread); }
+  .detail .danger-row .btn { height: 32px; padding: 0 10px; font-size: 12px; }
+  .detail .danger-row .btn.forget { margin-left: auto; color: var(--danger); }
+
+  /* ---------- home B: device stage ---------- */
+  .stageB { display: grid; grid-template-rows: 1fr auto; height: 100%; }
+  .heroB { position: relative; display: grid; grid-template-columns: 1fr 360px; background: var(--void); overflow: hidden; }
+  .heroB .left { padding: 44px 40px 30px 48px; display: flex; flex-direction: column; }
+  .heroB .eyebrow { font-size: 13px; font-weight: 720; color: var(--ink-faint); display: flex; gap: 10px; align-items: center; }
+  .heroB h1 { font: 710 112px/0.8 var(--f-display); font-stretch: 78%; letter-spacing: -0.045em; margin: 24px 0 18px; }
+  .heroB h1 em { font-style: normal; color: var(--signal); }
+  .heroB .relay { color: var(--ink-muted); font-size: 13px; display: flex; gap: 10px; align-items: center; }
+  .heroB .cta { margin-top: auto; display: flex; gap: 12px; align-items: center; }
+  .heroB .cta .btn.primary { height: 54px; padding: 0 28px; font-size: 16px; }
+  .heroB .cta .chords { font-size: 12px; color: var(--ink-faint); margin-left: 12px; display: grid; gap: 4px; }
+  .heroB .right { background: var(--surface); border-left: 1px solid var(--thread); padding: 30px 26px; display: flex; flex-direction: column; gap: 16px; }
+  .heroB .right h3 { margin: 0; font: 720 12px/1 var(--f-ui); color: var(--ink-faint); }
+  .heroB .seam { position: absolute; left: 0; top: 0; bottom: 0; width: 6px; background: var(--signal); }
+  .shelf { display: flex; gap: 10px; padding: 16px 24px 18px 48px; background: var(--field); border-top: 1px solid var(--thread); }
+  .tile { width: 210px; padding: 12px 14px; border: 1px solid var(--thread-strong); border-radius: var(--r-field); display: grid; gap: 3px; background: var(--surface-raised); }
+  .tile.sel { border-color: var(--signal); box-shadow: inset 0 0 0 1px var(--signal); }
+  .tile .n { font: 720 14px/1.2 var(--f-ui); display: flex; align-items: center; gap: 8px; }
+  .tile .m { font-size: 11px; color: var(--ink-faint); }
+  .tile.add { border-style: dashed; background: transparent; color: var(--ink-muted); align-content: center; }
+
+  /* ---------- flow screens (login, approval, connecting) ---------- */
+  .flow { display: grid; grid-template-columns: 300px 1fr; height: 100%; }
+  .rail { background: var(--void); padding: 34px 28px; border-right: 1px solid var(--thread); display: flex; flex-direction: column; }
+  .rail .back { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-muted); font-size: 13px; margin-bottom: 32px; }
+  .rail h2 { font: 620 30px/1 var(--f-display); letter-spacing: -0.03em; margin: 0 0 8px; }
+  .rail p { color: var(--ink-faint); font-size: 13px; margin: 0; }
+  .steps { list-style: none; padding: 0; margin: 32px 0 0; display: grid; gap: 0; }
+  .steps li { position: relative; padding: 0 0 18px 30px; font-size: 13px; color: var(--ink-faint); }
+  .steps li::before { content: ""; position: absolute; left: 6px; top: 4px; width: 9px; height: 9px; border-radius: 2px 3px 2px 3px; border: 1.5px solid var(--thread-strong); background: var(--void); }
+  .steps li::after { content: ""; position: absolute; left: 11px; top: 17px; bottom: 2px; width: 1px; background: var(--thread); }
+  .steps li:last-child::after { display: none; }
+  .steps li b { display: block; font-weight: 720; color: var(--ink-muted); font-size: 13px; }
+  .steps li.done::before { background: var(--moss); border-color: var(--moss); }
+  .steps li.now b { color: var(--ink); }
+  .steps li.now::before { background: var(--signal); border-color: var(--signal); }
+  .steps li.skip { opacity: 0.55; }
+  .rail .foot { margin-top: auto; font-size: 12px; color: var(--ink-faint); }
+  .pane { padding: 40px 56px 32px 52px; display: flex; flex-direction: column; max-width: 640px; }
+  .pane h1 { font: 620 28px/1.05 var(--f-display); letter-spacing: -0.025em; margin: 0 0 6px; }
+  .pane > p.lead { color: var(--ink-muted); margin: 0 0 26px; font-size: 14px; }
+  .form { display: grid; gap: 18px; }
+  .form .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .otp { display: flex; gap: 6px; align-items: center; }
+  .otp span { width: 42px; height: 48px; display: grid; place-items: center; font: 400 20px/1 var(--f-mono); background: var(--surface-raised); border: 1px solid var(--thread-strong); border-radius: 5px 8px 5px 7px; }
+  .otp span.cur { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .otp span.cur::after { content: ""; width: 1px; height: 22px; background: var(--ink); }
+  .otp .gap { width: 8px; }
+  .otp.error span { border-color: var(--danger); }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 26px; }
+  .notice {
+    display: grid; grid-template-columns: auto 1fr; gap: 10px; padding: 12px 14px 12px 12px; border-radius: var(--r-field);
+    background: var(--surface); border: 1px solid var(--thread); font-size: 13px; color: var(--ink-muted);
+  }
+  .notice.err { border-color: rgba(229,177,170,0.45); }
+  .notice.err svg { color: var(--danger); }
+  .notice b { color: var(--ink); font-weight: 720; }
+
+  .wait { display: grid; grid-template-columns: 64px 1fr; gap: 20px; align-items: start; margin-top: 6px; }
+  .pulse { width: 64px; height: 64px; display: grid; place-items: center; border-radius: 12px 18px 10px 16px; background: var(--surface); color: var(--signal); position: relative; }
+  .pulse::after { content: ""; position: absolute; inset: -6px; border-radius: 16px 22px 14px 20px; border: 1.5px solid var(--signal); opacity: 0; animation: ring 2.2s var(--ease) infinite; }
+  @keyframes ring { 0% { opacity: 0.7; transform: scale(0.92); } 100% { opacity: 0; transform: scale(1.12); } }
+  @media (prefers-reduced-motion: reduce) { .pulse::after { animation: none; opacity: 0.4; } }
+  .ways { display: grid; gap: 10px; margin-top: 18px; }
+  .way { display: grid; grid-template-columns: 22px 1fr; gap: 12px; padding: 12px 14px; border: 1px solid var(--thread); border-radius: var(--r-field); background: var(--surface-raised); font-size: 13px; color: var(--ink-muted); }
+  .way b { color: var(--ink); font-weight: 720; display: block; }
+  .elapsed { font: 400 12px var(--f-mono); color: var(--ink-faint); }
+
+  .conn { padding: 0; }
+  .conn-steps { list-style: none; margin: 18px 0 0; padding: 0; display: grid; gap: 2px; }
+  .conn-steps li { display: grid; grid-template-columns: 22px 1fr auto; align-items: center; gap: 12px; height: 40px; padding: 0 12px; border-radius: var(--r-field); color: var(--ink-faint); font-size: 14px; }
+  .conn-steps li.done { color: var(--ink-muted); }
+  .conn-steps li.done svg { color: var(--constructive); }
+  .conn-steps li.now { background: var(--surface); color: var(--ink); font-weight: 720; }
+  .conn-steps li.now svg { color: var(--signal); }
+  .conn-steps li.fail { background: var(--surface); color: var(--ink); font-weight: 720; }
+  .conn-steps li.fail svg { color: var(--danger); }
+  .conn-steps .mono { font-size: 11px; color: var(--ink-faint); font-weight: 400; }
+  .bar { height: 3px; background: var(--thread); border-radius: 2px; margin-top: 22px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 62%; background: var(--signal); }
+</style>
+</head>
+<body>
+<div class="harness">
+  <header class="harness-head">
+    <h1>Connect flow</h1>
+    <p>BubblePlay Windows viewer, v1 mockup. Window 1100 x 720. Static: nothing here talks to a relay.</p>
+    <nav><a href="index.html">Overview</a><a href="connect.html" aria-current="page">Connect flow</a><a href="session.html">Session chrome</a></nav>
+  </header>
+  <ul class="states" role="toolbar" aria-label="Mockup state">
+    <li><button data-state="home-a" data-caption="<b>Home, variant A (list and detail).</b> Saved PCs on the left, the selected PC and its session defaults on the right. One dominant action: Connect.">Home A: list</button></li>
+    <li><button data-state="home-b" data-caption="<b>Home, variant B (device stage).</b> The last-used PC fills the window as the one character moment; other PCs sit on a shelf. Owner picks A or B.">Home B: stage</button></li>
+    <li><button data-state="login" data-caption="<b>Add a PC: relay address, password and 6-digit code.</b> One screen, because the relay asks for both in one request. The step rail shows approval only applies to Cloudflare relays.">Add PC / sign in</button></li>
+    <li><button data-state="login-err" data-caption="<b>Sign-in failed: wrong code.</b> The password stays filled, only the code is cleared and focused.">Sign-in error</button></li>
+    <li><button data-state="approval" data-caption="<b>Waiting for approval (Cloudflare relay).</b> Shown after the password and code are accepted but the site gate still needs an approval by ntfy or at the PC.">Approval wait</button></li>
+    <li><button data-state="connecting" data-caption="<b>Connecting.</b> Steps follow the real sequence: relay, hello, stream negotiation, first frame. The window switches to the session as soon as the first frame lands.">Connecting</button></li>
+    <li><button data-state="failed" data-caption="<b>Stream did not start.</b> Says which step failed and what is still fine (signed in), then the narrowest next step.">Connect failed</button></li>
+  </ul>
+
+  <div class="stage"><div class="stage-inner">
+  <div class="win">
+    <div class="titlebar">
+      <span class="app"><span class="dot"></span>BubblePlay</span>
+      <span class="ctx" data-only="home-a home-b">2 saved PCs</span>
+      <span class="ctx" data-only="login login-err approval">Add a PC</span>
+      <span class="ctx" data-only="connecting failed">Studio PC</span>
+      <span class="caps"><span><svg class="i"><use href="#i-minus"/></svg></span><span><svg class="i"><use href="#i-square"/></svg></span><span><svg class="i"><use href="#i-x"/></svg></span></span>
+    </div>
+
+    <!-- ===== Home A ===== -->
+    <div class="body" data-view="home-a">
+      <div class="home">
+        <div class="list">
+          <div class="list-head">
+            <div><h1>Your PCs</h1><p>Saved on this computer. Pick one and connect.</p></div>
+            <button class="btn"><svg class="i"><use href="#i-plus"/></svg>Add a PC</button>
+          </div>
+          <div class="rows">
+            <div class="row sel">
+              <span class="ico"><svg class="i lg"><use href="#i-monitor"/></svg></span>
+              <div><div class="name">Studio PC</div><div class="meta"><span class="mono">play.bubblebuffer.net</span><span>Cloudflare relay</span></div></div>
+              <div class="when"><span class="status-pill online">Signed in</span><div style="margin-top:4px">Last session today, 09:12</div></div>
+            </div>
+            <div class="row">
+              <span class="ico"><svg class="i lg"><use href="#i-laptop"/></svg></span>
+              <div><div class="name">Living room</div><div class="meta"><span class="mono">100.65.1.40:8443</span><span>Go relay</span></div></div>
+              <div class="when"><span class="status-pill off">Sign-in needed</span><div style="margin-top:4px">Last session 2 Oct</div></div>
+            </div>
+          </div>
+          <div class="list-foot"><svg class="i sm"><use href="#i-lock"/></svg>Sign-ins are stored with Windows data protection for this user only.</div>
+        </div>
+        <aside class="detail">
+          <span class="eyebrow">Selected</span>
+          <h2>Studio PC</h2>
+          <div class="relay"><svg class="i sm"><use href="#i-cloud"/></svg><span class="mono">play.bubblebuffer.net</span></div>
+          <div class="kv">
+            <div><span class="k">Input mode</span>
+              <div class="seg"><span class="on"><svg class="i sm"><use href="#i-gamepad-2"/></svg>Game</span><span><svg class="i sm"><use href="#i-briefcase"/></svg>Work</span></div>
+              <div class="seg-hint">Game captures mouse and keyboard. Work keeps your cursor and Windows keys local.</div>
+            </div>
+            <div class="pair"><div><span class="k">Quality</span><div class="select" style="width:190px">Auto<svg class="i sm"><use href="#i-chevron-down"/></svg></div></div>
+              <div><span class="k">Audio</span><span class="switch on"><span class="trk"></span>On</span></div></div>
+          </div>
+          <div class="go">
+            <button class="btn primary lg"><svg class="i"><use href="#i-monitor-play"/></svg>Connect to Studio PC</button>
+            <div class="chords">
+              <div><span>Release mouse and keyboard</span><span class="chord"><kbd class="key">Ctrl</kbd><i>+</i><kbd class="key">Alt</kbd><i>+</i><kbd class="key">Shift</kbd><i>+</i><kbd class="key">Z</kbd></span></div>
+              <div><span>Leave the session</span><span class="chord"><kbd class="key">Ctrl</kbd><i>+</i><kbd class="key">Alt</kbd><i>+</i><kbd class="key">Shift</kbd><i>+</i><kbd class="key">Q</kbd></span></div>
+            </div>
+          </div>
+          <div class="danger-row">
+            <button class="btn ghost"><svg class="i sm"><use href="#i-pencil"/></svg>Edit</button>
+            <button class="btn ghost"><svg class="i sm"><use href="#i-log-out"/></svg>Sign out</button>
+            <button class="btn ghost forget"><svg class="i sm"><use href="#i-trash-2"/></svg>Forget Studio PC</button>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+    <!-- ===== Home B ===== -->
+    <div class="body" data-view="home-b" hidden>
+      <div class="stageB">
+        <div class="heroB">
+          <span class="seam"></span>
+          <div class="left">
+            <span class="eyebrow"><span class="status-pill online">Signed in</span>Last session today, 09:12</span>
+            <h1>Studio<br>PC</h1>
+            <div class="relay"><svg class="i sm"><use href="#i-cloud"/></svg><span class="mono">play.bubblebuffer.net</span><span>Cloudflare relay</span></div>
+            <div class="cta">
+              <button class="btn primary"><svg class="i"><use href="#i-monitor-play"/></svg>Connect</button>
+              <div class="chords">
+                <span class="chord"><kbd class="key">Ctrl</kbd><i>+</i><kbd class="key">Alt</kbd><i>+</i><kbd class="key">Shift</kbd><i>+</i><kbd class="key">Z</kbd>&nbsp; releases mouse and keyboard</span>
+                <span class="chord"><kbd class="key">Ctrl</kbd><i>+</i><kbd class="key">Alt</kbd><i>+</i><kbd class="key">Shift</kbd><i>+</i><kbd class="key">Q</kbd>&nbsp; leaves the session</span>
+              </div>
+            </div>
+          </div>
+          <div class="right">
+            <h3>This session</h3>
+            <div class="seg"><span class="on"><svg class="i sm"><use href="#i-gamepad-2"/></svg>Game</span><span><svg class="i sm"><use href="#i-briefcase"/></svg>Work</span></div>
+            <div><span class="k" style="font:720 12px var(--f-ui);color:var(--ink-muted);display:block;margin-bottom:6px">Quality</span><div class="select">Auto<svg class="i sm"><use href="#i-chevron-down"/></svg></div></div>
+            <span class="switch on"><span class="trk"></span>Audio on</span>
+            <div style="margin-top:auto;display:flex;gap:6px;flex-wrap:wrap">
+              <button class="btn ghost" style="height:32px;font-size:12px;padding:0 10px"><svg class="i sm"><use href="#i-pencil"/></svg>Edit</button>
+              <button class="btn ghost" style="height:32px;font-size:12px;padding:0 10px;color:var(--danger)"><svg class="i sm"><use href="#i-trash-2"/></svg>Forget Studio PC</button>
+            </div>
+          </div>
+        </div>
+        <div class="shelf">
+          <div class="tile sel"><span class="n"><svg class="i sm"><use href="#i-monitor"/></svg>Studio PC</span><span class="m">Signed in · today</span></div>
+          <div class="tile"><span class="n"><svg class="i sm"><use href="#i-laptop"/></svg>Living room</span><span class="m">Sign-in needed · 2 Oct</span></div>
+          <div class="tile add"><span class="n"><svg class="i sm"><use href="#i-plus"/></svg>Add a PC</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Login / error / approval / connecting / failed share the step rail ===== -->
+    <div class="body" data-view="login login-err approval connecting failed" hidden>
+      <div class="flow">
+        <aside class="rail">
+          <span class="back"><svg class="i sm"><use href="#i-chevron-left"/></svg>Your PCs</span>
+          <h2 data-only="login login-err approval">Add a PC</h2>
+          <h2 data-only="connecting failed">Studio PC</h2>
+          <p data-only="login login-err approval">The relay address, password and code come from the host's BubblePlay setup.</p>
+          <p data-only="connecting failed"><span class="mono">play.bubblebuffer.net</span></p>
+          <ol class="steps" data-only="login login-err">
+            <li class="now"><b>Relay and sign-in</b>Address, password, 6-digit code</li>
+            <li><b>Approval</b>Cloudflare relays only</li>
+            <li><b>Connect</b>Saved for next time</li>
+          </ol>
+          <ol class="steps" data-only="approval">
+            <li class="done"><b>Relay and sign-in</b>Password and code accepted</li>
+            <li class="now"><b>Approval</b>Waiting for you to approve</li>
+            <li><b>Connect</b>Saved for next time</li>
+          </ol>
+          <ol class="steps" data-only="connecting failed">
+            <li class="done"><b>Signed in</b>Remembered on this computer</li>
+            <li class="now"><b>Starting the stream</b>Game mode · Auto · audio on</li>
+          </ol>
+          <div class="foot" data-only="login login-err approval">Need a relay? Set one up on the host first: BubblePlay host setup, Relay.</div>
+        </aside>
+
+        <section class="pane" data-only="login login-err">
+          <h1>Sign in to the relay</h1>
+          <p class="lead">BubblePlay saves this PC once you are in, so next time it is one click.</p>
+          <div class="form">
+            <div class="field"><label>Relay address</label><div class="input"><svg class="i sm" style="color:var(--ink-faint)"><use href="#i-globe"/></svg><span class="mono" style="font-size:13px">play.bubblebuffer.net</span></div></div>
+            <div class="field"><label>Name on this computer <span style="font-weight:450;color:var(--ink-faint)">(optional)</span></label><div class="input">Studio PC</div></div>
+            <div class="field"><label>Password</label><div class="input"><svg class="i sm" style="color:var(--ink-faint)"><use href="#i-key-round"/></svg><span style="letter-spacing:3px">••••••••••••</span><svg class="i sm" style="margin-left:auto;color:var(--ink-faint)"><use href="#i-eye"/></svg></div></div>
+            <div class="field">
+              <label>6-digit code from your authenticator</label>
+              <div class="otp" data-only="login"><span>4</span><span>8</span><span>1</span><span class="gap" style="border:0;background:none;width:8px"></span><span class="cur"></span><span></span><span></span></div>
+              <div class="otp error" data-only="login-err"><span class="cur"></span><span></span><span></span><span class="gap" style="border:0;background:none;width:8px"></span><span></span><span></span><span></span></div>
+            </div>
+            <div class="notice err" data-only="login-err"><svg class="i"><use href="#i-circle-alert"/></svg><div><b>That code didn't match.</b> Your password is still filled in. Codes change every 30 seconds, so enter the one showing now.</div></div>
+            <span class="switch on"><span class="trk"></span>Remember sign-in on this computer</span>
+          </div>
+          <div class="actions">
+            <button class="btn primary lg" data-only="login"><svg class="i"><use href="#i-arrow-right"/></svg>Sign in</button>
+            <button class="btn primary lg" data-only="login-err" disabled>Sign in</button>
+            <button class="btn ghost">Cancel</button>
+          </div>
+        </section>
+
+        <section class="pane" data-only="approval" hidden>
+          <h1>Approve this sign-in</h1>
+          <p class="lead">This relay sits behind Cloudflare and asks for one more yes before it lets this computer in.</p>
+          <div class="wait">
+            <span class="pulse"><svg class="i lg"><use href="#i-bell-ring"/></svg></span>
+            <div>
+              <div style="font:720 15px var(--f-ui)">Waiting for approval</div>
+              <div class="elapsed">Waiting 0:42</div>
+              <div class="ways">
+                <div class="way"><svg class="i"><use href="#i-smartphone"/></svg><div><b>On your phone</b>Open the BubblePlay notification in ntfy and tap Approve.</div></div>
+                <div class="way"><svg class="i"><use href="#i-monitor-check"/></svg><div><b>At the PC</b>Approve the request in the BubblePlay host window.</div></div>
+              </div>
+            </div>
+          </div>
+          <div class="actions"><button class="btn">Cancel request</button><span style="font-size:12px;color:var(--ink-faint)">This screen moves on by itself once approved.</span></div>
+        </section>
+
+        <section class="pane conn" data-only="connecting failed" hidden>
+          <div style="padding:40px 56px 32px 52px">
+            <h1 data-only="connecting">Connecting to Studio PC</h1>
+            <h1 data-only="failed">The stream didn't start</h1>
+            <p class="lead" data-only="connecting" style="color:var(--ink-muted);margin:0">This usually takes a second or two.</p>
+            <p class="lead" data-only="failed" style="color:var(--ink-muted);margin:0">The relay answered and you are still signed in, but no video arrived within 8 seconds.</p>
+            <ol class="conn-steps">
+              <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Relay reached<span class="mono">play.bubblebuffer.net</span></li>
+              <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Session opened<span class="mono">epoch 14</span></li>
+              <li class="done"><svg class="i"><use href="#i-circle-check"/></svg>Stream negotiated<span class="mono">WebRTC</span></li>
+              <li class="now" data-only="connecting"><svg class="i spin"><use href="#i-loader-circle"/></svg>Waiting for the first frame<span class="mono">1.4 s</span></li>
+              <li class="fail" data-only="failed"><svg class="i"><use href="#i-circle-alert"/></svg>No first frame<span class="mono">8.0 s</span></li>
+            </ol>
+            <div class="bar" data-only="connecting"><i></i></div>
+            <div class="actions" data-only="connecting"><button class="btn">Cancel</button></div>
+            <div class="actions" data-only="failed">
+              <button class="btn primary lg"><svg class="i"><use href="#i-refresh-cw"/></svg>Try again</button>
+              <button class="btn">Try again over WebSocket</button>
+              <button class="btn ghost">Back to your PCs</button>
+            </div>
+            <div class="notice" data-only="failed" style="margin-top:22px"><svg class="i" style="color:var(--information)"><use href="#i-info"/></svg><div>If the PC is on the sign-in screen or asleep, it may not send video. Wake it, then try again.</div></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+  </div></div>
+  <p class="caption"></p>
+
+  <div class="notes">
+    <section>
+      <h2>Layout</h2>
+      <ul>
+        <li>Custom 36 px title bar (borderless window, egui draws caption buttons; hit-testing via <code>WM_NCHITTEST</code>).</li>
+        <li>Home A: broad list field plus a 420 px duvet detail panel; the seam is the panel edge. Variant B: a near-black stage with one 112 px condensed name, a 6 px apricot seam and a shelf of other PCs.</li>
+        <li>Flow screens: a 300 px near-black step rail and a 640 px max form column, left-aligned (no centred card).</li>
+        <li>Saved PC shows only what the client stores: name, relay address and type, sign-in kept or not, last session time. No online/offline dot, because the client cannot know it without contacting each relay.</li>
+      </ul>
+    </section>
+    <section>
+      <h2>Type scale</h2>
+      <ul>
+        <li>Stage name (B only): Bricolage 112/0.8, wdth 78, wght 710.</li>
+        <li>Detail name: Bricolage 38/0.95, wdth 86. Screen title: Bricolage 28/1.05, -0.025em.</li>
+        <li>Row name 15/720, body 14/450, label 12-13/720, hint 12/450, all Atkinson Hyperlegible Next.</li>
+        <li>Fragment Mono 11-13 only for addresses, codes, timers and transport evidence.</li>
+      </ul>
+    </section>
+    <section>
+      <h2>Colour tokens</h2>
+      <div class="swatches">
+        <span class="sw"><b style="background:#101214"></b>--void #101214</span>
+        <span class="sw"><b style="background:#26282D"></b>--field #26282D</span>
+        <span class="sw"><b style="background:#2F3138"></b>--surface #2F3138</span>
+        <span class="sw"><b style="background:#30333A"></b>--surface-raised</span>
+        <span class="sw"><b style="background:#F3EFE7"></b>--ink #F3EFE7</span>
+        <span class="sw"><b style="background:#C6BAAC"></b>--ink-muted</span>
+        <span class="sw"><b style="background:#F0A064"></b>--signal #F0A064</span>
+        <span class="sw"><b style="background:#697A6B"></b>--moss #697A6B</span>
+        <span class="sw"><b style="background:#CAD8CD"></b>--constructive</span>
+        <span class="sw"><b style="background:#E5B1AA"></b>--danger</span>
+        <span class="sw"><b style="background:#7AB7FF"></b>--focus #7AB7FF</span>
+        <span class="sw"><b style="background:#DDA39D"></b>--paw (recovery)</span>
+      </div>
+      <p style="margin-top:8px">Apricot appears once per screen: the Connect / Sign in button and the selection marker. Focus stays blue and separate.</p>
+    </section>
+    <section>
+      <h2>Motion and egui cost</h2>
+      <ul>
+        <li>Hover 120 ms, screen change 180 ms crossfade plus 8 px slide, <code>cubic-bezier(.2,0,0,1)</code>. Reduced motion: snap, spinner slows.</li>
+        <li>Approval ring: one expanding stroke, 2.2 s loop. Cheap: a rect stroke with animated alpha.</li>
+        <li>Fitted corners (different radius per corner) are supported by egui <code>CornerRadius</code> per corner. Free.</li>
+        <li class="cost">Costly: the 112 px variable-font name needs a pre-rasterised wdth 78 instance (egui has no variable axes); dashed tile border needs a custom painter; the 6-cell code input is a custom widget.</li>
+      </ul>
+    </section>
+  </div>
+</div>
+<script src="icons.js"></script>
+<script src="mockup.js"></script>
+</body>
+</html>
