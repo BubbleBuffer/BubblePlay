@@ -1,12 +1,13 @@
 //! Binary-owned encode boundary; preserves existing streaming policy.
 use super::{
-    bail, benchmark, ensure, frame_damage, hybrid, quality, warn, AqMode, BenchmarkAqMode,
+    bail, benchmark, ensure, frame_damage, hybrid, info, quality, warn, AqMode, BenchmarkAqMode,
     BenchmarkHybridCacheMode, BenchmarkMultipass, BenchmarkPreset, BenchmarkResourceMode,
     BenchmarkRoiMode, BenchmarkTuning, CachedIdr, CachedIdrReplay, CapturedFrame, Context,
-    Controller, Decision, EncodedFrame, EncoderOptions, FrameDamage, Instant, Interface, Multipass,
-    Nvenc, Preset, Profile, ProfileTransition, QuiescentTilePlanner, RateControlMode, ResourceMode,
-    Result, RoiMode, ScaleOutput, Scaler, Signaling, Tuning, VideoCodec, VideoMode, ViewportCrop,
-    ViewportGeometry, WssAdjustment, RECT, STATIC_REPLAY_DELAY,
+    Controller, Decision, EncodedFrame, EncoderCapabilities, EncoderOptions, EncoderPreference,
+    FrameDamage, Instant, Interface, Multipass, Nvenc, Preset, Profile, ProfileTransition,
+    QuiescentTilePlanner, RateControlMode, ResourceMode, Result, RoiMode, ScaleOutput, Scaler,
+    Signaling, Tuning, VideoCodec, VideoEncoder, VideoMode, ViewportCrop, ViewportGeometry,
+    WssAdjustment, RECT, STATIC_REPLAY_DELAY,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -218,8 +219,69 @@ pub(super) fn quiescent_immediate_damage_rects<'a>(
     }
 }
 
+/// Whether frames take the P010 Main10 conversion. The created encoder's
+/// capabilities gate unsupported Main10 before any P010 texture is prepared.
+pub(super) fn main10_conversion(wanted: bool, encoder: EncoderCapabilities) -> bool {
+    wanted && encoder.main10
+}
+
+/// The normal NVENC recovery path keeps its prepared input and does no extra
+/// scaling. Only a Main10 input falling back to an 8-bit encoder needs BGRA.
+pub(super) fn optional_bgra_recovery_input<T>(
+    main10_input: bool,
+    capabilities: EncoderCapabilities,
+    prepare_bgra: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    if main10_input && !capabilities.main10 {
+        prepare_bgra().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The selected encoder's codec is what goes on the wire. Media Foundation
+/// emits H.264 only, so the session codec follows the encoder that exists.
+pub(super) fn adopt_encoder_codec(active: &mut VideoCodec, encoder: Option<&VideoEncoder>) {
+    let Some(encoder) = encoder else {
+        return;
+    };
+    let codec = encoder.codec();
+    if codec != *active {
+        info!(
+            from = active.name(),
+            to = codec.name(),
+            backend = encoder.backend_name(),
+            "encoder cannot emit the session codec; using its codec"
+        );
+        *active = codec;
+    }
+}
+
+pub(super) fn rtc_encoder_capabilities(
+    mut capabilities: super::EncoderCapabilities,
+    session_codec: VideoCodec,
+) -> super::EncoderCapabilities {
+    // Preserve the existing one-way session downgrade on a warm reconnect.
+    capabilities.hevc &= session_codec == VideoCodec::Hevc;
+    capabilities
+}
+
+pub(super) fn ensure_rtc_encoder_codec(
+    wss_active: bool,
+    negotiated: Option<VideoCodec>,
+    actual: VideoCodec,
+) -> Result<()> {
+    ensure!(
+        wss_active || negotiated.is_none_or(|codec| codec == actual),
+        "encoder codec changed to {}; fresh RTC negotiation required",
+        actual.name()
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_local_encoder(
+    preference: EncoderPreference,
     device: *mut core::ffi::c_void,
     width: u32,
     height: u32,
@@ -231,37 +293,63 @@ pub(super) fn create_local_encoder(
     codec: VideoCodec,
     benchmark_profile: Option<&benchmark::BenchmarkProfile>,
     infinite_gop: bool,
-) -> Result<Nvenc> {
-    if let Some(profile) = benchmark_profile {
-        return Nvenc::new_with_options_native_codec(
-            device,
-            width,
-            height,
-            native_width,
-            native_height,
-            fps,
-            profile.bitrate_bps,
-            benchmark_encoder_options(profile),
-            codec,
-        );
-    }
-    create_encoder_with_fallback(
+) -> Result<VideoEncoder> {
+    // Media Foundation takes only the bitrate and GOP from a benchmark profile.
+    let mf_bitrate_bps = benchmark_profile.map_or(bitrate_bps, |profile| profile.bitrate_bps);
+    let gop_seconds = benchmark_profile.map_or(
+        EncoderOptions::production(requested).gop_seconds,
+        |profile| profile.gop_seconds,
+    );
+    let encoder = VideoEncoder::select(
         device,
         width,
         height,
-        native_width,
-        native_height,
         fps,
-        bitrate_bps,
-        requested,
-        codec,
+        mf_bitrate_bps,
         infinite_gop,
-    )
+        u32::from(gop_seconds),
+        preference,
+        || {
+            if let Some(profile) = benchmark_profile {
+                return Nvenc::new_with_options_native_codec(
+                    device,
+                    width,
+                    height,
+                    native_width,
+                    native_height,
+                    fps,
+                    profile.bitrate_bps,
+                    benchmark_encoder_options(profile),
+                    codec,
+                );
+            }
+            create_encoder_with_fallback(
+                device,
+                width,
+                height,
+                native_width,
+                native_height,
+                fps,
+                bitrate_bps,
+                requested,
+                codec,
+                infinite_gop,
+            )
+        },
+    )?;
+    if benchmark_profile.is_some() && !encoder.capabilities().roi_qp_map {
+        info!(
+            backend = encoder.backend_name(),
+            "benchmark encoder options skipped: preset, rate control, multipass, AQ, ROI, Main10 and resource mode are NVENC-only"
+        );
+    }
+    Ok(encoder)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn configure_encoder_profile(
-    encoder: &mut Option<Nvenc>,
+    encoder: &mut Option<VideoEncoder>,
+    preference: EncoderPreference,
     device: *mut core::ffi::c_void,
     mode: VideoMode,
     native_width: u32,
@@ -271,7 +359,7 @@ pub(super) fn configure_encoder_profile(
     codec: VideoCodec,
     benchmark_profile: Option<&benchmark::BenchmarkProfile>,
 ) -> Result<()> {
-    let infinite_gop = encoder.as_ref().is_some_and(Nvenc::infinite_gop);
+    let infinite_gop = encoder.as_ref().is_some_and(VideoEncoder::infinite_gop);
     let reconfigure = encoder
         .as_mut()
         .context("encoder unavailable")?
@@ -280,11 +368,12 @@ pub(super) fn configure_encoder_profile(
         warn!(
             ?e,
             profile = mode.label,
-            "NVENC profile reconfigure failed; recreating once"
+            "encoder profile reconfigure failed; recreating once"
         );
         *encoder = None;
         *encoder = Some(
             create_local_encoder(
+                preference,
                 device,
                 mode.width,
                 mode.height,
@@ -297,7 +386,7 @@ pub(super) fn configure_encoder_profile(
                 benchmark_profile,
                 infinite_gop,
             )
-            .with_context(|| format!("recreate NVENC for {}", mode.label))?,
+            .with_context(|| format!("recreate encoder for {}", mode.label))?,
         );
     }
     encoder.as_mut().expect("configured above").force_idr();
@@ -309,21 +398,25 @@ pub(super) fn configure_encoder_profile(
 /// target after its IDR has been admitted by the transport pump.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn recreate_and_encode_profile(
-    encoder: &mut Option<Nvenc>,
+    encoder: &mut Option<VideoEncoder>,
+    preference: EncoderPreference,
     device: *mut core::ffi::c_void,
     mode: VideoMode,
     native_width: u32,
     native_height: u32,
     bitrate_bps: u32,
     preset: Preset,
-    codec: VideoCodec,
+    codec: &mut VideoCodec,
     benchmark_profile: Option<&benchmark::BenchmarkProfile>,
     texture: *mut core::ffi::c_void,
     reconstruction_texture: Option<*mut core::ffi::c_void>,
+    main10_input: bool,
+    prepare_bgra: impl FnOnce() -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
 ) -> Result<EncodedFrame> {
-    let infinite_gop = encoder.as_ref().is_some_and(Nvenc::infinite_gop);
+    let infinite_gop = encoder.as_ref().is_some_and(VideoEncoder::infinite_gop);
     *encoder = None;
     let mut replacement = create_local_encoder(
+        preference,
         device,
         mode.width,
         mode.height,
@@ -332,10 +425,17 @@ pub(super) fn recreate_and_encode_profile(
         mode.fps,
         bitrate_bps,
         preset,
-        codec,
+        *codec,
         benchmark_profile,
         infinite_gop,
     )?;
+    // Record the actual codec before any input preparation/encode can fail.
+    // The next producer pass must not retry an unsupported HEVC contract.
+    adopt_encoder_codec(codec, Some(&replacement));
+    let bgra =
+        optional_bgra_recovery_input(main10_input, replacement.capabilities(), prepare_bgra)?;
+    // `bgra` owns a COM reference until the synchronous encode completes.
+    let texture = bgra.as_ref().map_or(texture, Interface::as_raw);
     replacement.force_idr();
     let encoded = if let Some(reconstruction_texture) = reconstruction_texture {
         replacement.encode_texture_with_feedback(texture, None, reconstruction_texture)?
@@ -531,12 +631,58 @@ pub(super) fn prepare_video_mode_texture(
     Ok(output)
 }
 
+/// Recreate the same visible frame in BGRA after the replacement backend is
+/// known to need it. Retain the surface even when the scaler owns its target.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_recovery_bgra_texture(
+    scaler: &mut Option<Scaler>,
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    input_width: u32,
+    input_height: u32,
+    mode: VideoMode,
+    crop: Option<ViewportCrop>,
+) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D> {
+    let output = if crop.is_some() && mode.label != "native" {
+        prepare_profile_texture_with_crop(
+            scaler,
+            device,
+            texture,
+            input_width,
+            input_height,
+            mode.profile,
+            crop,
+            false,
+        )?
+    } else {
+        prepare_video_mode_texture(
+            scaler,
+            device,
+            texture,
+            input_width,
+            input_height,
+            mode,
+            false,
+            ResourceMode::PerFrame,
+        )?
+    };
+    ensure!(
+        output.width == mode.width && output.height == mode.height,
+        "BGRA recovery texture does not match the replacement encoder"
+    );
+    unsafe {
+        windows::Win32::Graphics::Direct3D11::ID3D11Texture2D::from_raw_borrowed(&output.texture)
+    }
+    .context("BGRA recovery texture is null")
+    .cloned()
+}
+
 pub(super) fn apply_quality_decision(
     quality: &mut Controller,
     decision: Decision,
     profiles: &mut ProfileTransition,
     latest_idr: &mut Option<CachedIdr>,
-    encoder: &mut Option<Nvenc>,
+    encoder: &mut Option<VideoEncoder>,
     signaling: &mut Signaling,
 ) {
     let now = Instant::now();
@@ -546,7 +692,7 @@ pub(super) fn apply_quality_decision(
             warn!(
                 ?e,
                 bitrate_bps = decision.target_bps,
-                "NVENC bitrate update failed"
+                "encoder bitrate update failed"
             );
             applied = false;
         }
@@ -558,7 +704,7 @@ pub(super) fn apply_quality_decision(
     let reason = decision.reason.label();
     let applied_bitrate = encoder
         .as_ref()
-        .map(Nvenc::bitrate)
+        .map(VideoEncoder::bitrate)
         .unwrap_or(decision.target_bps);
     let staged = profiles.stage(decision.profile, reason);
     if staged {
@@ -590,7 +736,7 @@ pub(super) fn apply_wss_adjustment(
     encoder_bitrate_bps: u32,
     profiles: &mut ProfileTransition,
     latest_idr: &mut Option<CachedIdr>,
-    encoder: &mut Option<Nvenc>,
+    encoder: &mut Option<VideoEncoder>,
     signaling: &mut Signaling,
 ) -> bool {
     let adjustment = WssAdjustment {
@@ -606,7 +752,7 @@ pub(super) fn apply_wss_adjustment(
             warn!(
                 ?error,
                 bitrate_bps = encoder_bitrate_bps,
-                "WSS NVENC bitrate update failed"
+                "WSS encoder bitrate update failed"
             );
             return false;
         }
@@ -635,7 +781,7 @@ pub(super) fn apply_wss_adjustment(
             active.fps,
             encoder
                 .as_ref()
-                .map(Nvenc::bitrate)
+                .map(VideoEncoder::bitrate)
                 .unwrap_or(adjustment.target_bps),
             quality.bwe(),
             adjustment.reason,

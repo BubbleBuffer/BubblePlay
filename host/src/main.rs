@@ -1,4 +1,4 @@
-//! BubblePlay host: DXGI capture -> NVENC H.264 -> str0m WebRTC -> browser.
+//! BubblePlay host: DXGI capture -> NVENC / Media Foundation -> WebRTC / WSS.
 //!
 //! Modes:
 //! - `spike`: M1 verification. Capture primary monitor, encode with NVENC,
@@ -47,6 +47,9 @@ use bubbleplay_host::tile_quality::{refine_qp_map, RefinePlan, TileQualityTracke
 use bubbleplay_host::tile_schedule::{pointer_pixels, PaceDecision, V4Pacer};
 use bubbleplay_host::transport;
 use bubbleplay_host::vdd;
+use bubbleplay_host::video_encoder::{
+    EncoderCapabilities, EncoderOverride, EncoderPreference, VideoEncoder,
+};
 use bubbleplay_host::wss_media;
 
 use std::collections::VecDeque;
@@ -176,6 +179,17 @@ struct Args {
     privileged_agent: bool,
     audio: bool,
     benchmark_profile: Option<PathBuf>,
+    cpu_mode: bool,
+    encoder: EncoderOverride,
+}
+
+impl Args {
+    fn encoder_preference(&self) -> EncoderPreference {
+        EncoderPreference {
+            cpu_mode: self.cpu_mode,
+            encoder: self.encoder,
+        }
+    }
 }
 
 fn parse_args() -> Result<Args> {
@@ -200,6 +214,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
         privileged_agent: false,
         audio: true,
         benchmark_profile: None,
+        cpu_mode: false,
+        encoder: EncoderOverride::Auto,
     };
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -229,8 +245,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
                     it.next().context("--benchmark-profile value")?,
                 ))
             }
+            "--cpu-mode" => args.cpu_mode = true,
+            // Diagnostic override for the encoder backend; not in --help.
+            "--encoder" => args.encoder = it.next().context("--encoder value")?.parse()?,
             "-h" | "--help" => {
-                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--host-gate-token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--privileged-agent] [--no-audio] [--benchmark-profile absolute-path]");
+                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--host-gate-token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--privileged-agent] [--no-audio] [--benchmark-profile absolute-path] [--cpu-mode]");
                 std::process::exit(0);
             }
             other => bail!("unknown argument: {other}"),
@@ -725,7 +744,7 @@ fn run_spike(args: &Args) -> Result<()> {
     let mut capture = Capture::new(args.monitor.as_deref()).context("capture init")?;
 
     // First acquire pins the D3D11 device.
-    let mut encoder: Option<Nvenc> = None;
+    let mut encoder: Option<VideoEncoder> = None;
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(&args.out).with_context(|| format!("create {}", args.out))?,
     );
@@ -743,12 +762,16 @@ fn run_spike(args: &Args) -> Result<()> {
         };
         if encoder.is_none() {
             let dev = frame.device().as_raw();
-            encoder = Some(Nvenc::new(
+            encoder = Some(VideoEncoder::select(
                 dev,
                 frame.width(),
                 frame.height(),
                 60,
                 args.bitrate_bps,
+                false,
+                u32::from(EncoderOptions::production(Preset::P3).gop_seconds),
+                args.encoder_preference(),
+                || Nvenc::new(dev, frame.width(), frame.height(), 60, args.bitrate_bps),
             )?);
             let spspps = encoder.as_ref().unwrap().sequence_params()?;
             info!(len = spspps.len(), "SPS/PPS available");
@@ -888,7 +911,7 @@ fn end_rtc_peer(
 }
 
 /// Live producer/session loop.  The transport pump exclusively owns str0m and
-/// the media UDP socket; this thread owns capture, D3D scaling and NVENC.
+/// the media UDP socket; this thread owns capture, D3D scaling and encoding.
 fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1018,7 +1041,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     pump.set_stun_server(STUN_SERVER)?;
     let rtc_audio_sink = pump.audio_sink();
     let mut wss_audio_sink = None;
-    let mut encoder: Option<Nvenc> = None;
+    let mut encoder: Option<VideoEncoder> = None;
     let mut active_codec = VideoCodec::preferred();
     let mut wss_media: Option<WssMediaEgress> = None;
     let mut active_wss_epoch: Option<String> = None;
@@ -1071,6 +1094,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut rtc_peer = RtcPeerLifecycle::default();
     let mut offer_accepted = false;
     let mut offer_in_flight = false;
+    // Negotiate only after the first local encoder has proved its capabilities.
+    let mut pending_encoder_offer: Option<String> = None;
+    let mut negotiated_video_codec: Option<VideoCodec> = None;
     let mut pending_candidates = VecDeque::new();
     let mut next_admission = Instant::now();
     let mut next_idr = Instant::now();
@@ -1335,6 +1361,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             ice_connected = false;
             offer_accepted = false;
             offer_in_flight = false;
+            pending_encoder_offer = None;
+            negotiated_video_codec = None;
             pending_candidates.clear();
             ensure!(
                 pump.command(TransportCommand::ResetPeer),
@@ -1412,7 +1440,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         let admission_wake = frame_admission_wake_at(next_admission, waiting_interval);
         let urgent_capture = latest_idr.is_none()
             || profiles.staged().is_some()
-            || encoder.as_ref().is_some_and(Nvenc::idr_pending);
+            || encoder.as_ref().is_some_and(VideoEncoder::idr_pending);
         let recovery_due = viewer_attached
             && local_recovery_probe_due(
                 capture.is_privileged(),
@@ -2043,6 +2071,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 TransportEvent::Action(RtcAction::VideoCodecSelected(codec)) => {
+                    negotiated_video_codec = Some(codec);
                     if codec != active_codec && accept_session_codec(active_codec, codec) {
                         info!(
                             from = active_codec.name(),
@@ -2205,7 +2234,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             mode.fps,
                             encoder
                                 .as_ref()
-                                .map(Nvenc::bitrate)
+                                .map(VideoEncoder::bitrate)
                                 .unwrap_or(quality.target()),
                             quality.bwe(),
                             reason,
@@ -2669,8 +2698,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     if rtc_peer.ended() {
                         warn!("ignoring an RTC offer after the RTC peer ended under WSS");
                     } else if should_forward_offer(ice_connected, offer_accepted, offer_in_flight) {
-                        if !pump.command(TransportCommand::Offer(sdp)) {
-                            break 'session;
+                        if capture.is_privileged() {
+                            // The privileged encoder remains directly NVENC-owned.
+                            if !pump.command(TransportCommand::Offer(sdp)) {
+                                break 'session;
+                            }
+                        } else {
+                            // Validate the current capture device even on a warm
+                            // reconnect before advertising encoder capabilities.
+                            // A warm codec downgrade still follows MediaAdded,
+                            // which invalidates the retained encoder and IDR.
+                            if encoder.is_none() {
+                                active_codec = rtc::initial_offer_codec(&sdp, active_codec);
+                            }
+                            pending_encoder_offer = Some(sdp);
                         }
                         offer_in_flight = true;
                     }
@@ -3566,8 +3607,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 reason.as_deref(),
                             ) {
                                 if lab_quality_request.is_some() {
-                                    enc.reset_rate_control()
-                                        .context("resetting Stream Lab NVENC rate-control state")?;
+                                    enc.reset_rate_control().context(
+                                        "resetting Stream Lab encoder rate-control state",
+                                    )?;
                                 } else {
                                     warn!("ignoring Stream Lab encoder reset without a valid request id");
                                 }
@@ -3759,7 +3801,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         mode.fps,
                         encoder
                             .as_ref()
-                            .map(Nvenc::bitrate)
+                            .map(VideoEncoder::bitrate)
                             .unwrap_or(quality.target()),
                         quality.bwe(),
                         reason,
@@ -3827,6 +3869,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         } else {
             None
         };
+        if capture.is_privileged() {
+            if let Some(sdp) = pending_encoder_offer.take() {
+                // A local offer may be deferred while capture hands over to
+                // the privileged source, whose encoder remains NVENC-owned.
+                ensure!(
+                    pump.command(TransportCommand::Offer(sdp)),
+                    "RTC transport stopped before privileged encoder negotiation"
+                );
+            }
+        }
         let negotiation_active = viewer_attached && (offer_in_flight || offer_accepted);
         let prewarm_needed = negotiation_active && !ice_connected && latest_idr.is_none();
         let local_recovery_probe = viewer_attached
@@ -4298,7 +4350,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         );
                     }
                 }
-                let main10 = active_benchmark_profile.is_some_and(|profile| profile.encoder.main10);
                 let dev = frame.device().as_raw();
                 // WSS v4 owns keyframes (start / peer / request), so its
                 // encoder runs without periodic IDRs. NVENC cannot change the
@@ -4310,7 +4361,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 {
                     info!(
                         infinite_gop = want_infinite_gop,
-                        "recreating NVENC for the WSS v4 GOP mode"
+                        "recreating encoder for the WSS v4 GOP mode"
                     );
                     encoder = None;
                     latest_idr = None;
@@ -4327,7 +4378,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                     let mode =
                         encoder_mode_for_capture(&mut profiles, frame.width(), frame.height());
-                    encoder = Some(create_local_encoder(
+                    let created = create_local_encoder(
+                        args.encoder_preference(),
                         dev,
                         mode.width,
                         mode.height,
@@ -4339,9 +4391,42 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         active_codec,
                         active_benchmark_profile,
                         want_infinite_gop,
-                    )?);
+                    )?;
+                    adopt_encoder_codec(&mut active_codec, Some(&created));
+                    encoder = Some(created);
                     encoder_benchmark_profile_revision = desired_encoder_benchmark_profile_revision;
                 }
+                if let Some(sdp) = pending_encoder_offer.take() {
+                    let capabilities = encoder
+                        .as_ref()
+                        .expect("encoder selected above")
+                        .capabilities();
+                    ensure!(
+                        pump.command(TransportCommand::OfferWithCapabilities(
+                            sdp,
+                            rtc_encoder_capabilities(capabilities, active_codec),
+                        )),
+                        "RTC transport stopped before encoder negotiation"
+                    );
+                }
+                ensure_rtc_encoder_codec(
+                    wss_media.is_some(),
+                    negotiated_video_codec,
+                    active_codec,
+                )?;
+                // An H.264-only backend disables HEVC benchmark leases before
+                // preparing textures or reporting a benchmark contract.
+                let active_benchmark_profile = active_benchmark_profile.filter(|_| {
+                    encoder
+                        .as_ref()
+                        .is_some_and(|encoder| encoder.capabilities().hevc)
+                });
+                let main10 = main10_conversion(
+                    active_benchmark_profile.is_some_and(|profile| profile.encoder.main10),
+                    encoder
+                        .as_ref()
+                        .map_or(EncoderCapabilities::MF, VideoEncoder::capabilities),
+                );
                 let old_mode = profiles.active;
                 let mut mode = profiles.staged.map(|(m, _)| m).unwrap_or(old_mode);
                 let transition = profiles.staged().is_some();
@@ -4437,7 +4522,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             .unwrap_or_else(|| dirty.iter().map(|&tile| (tile, None)).collect());
                         let classification = tracker.classify(&tile_hashes);
                         tile_changed = classification.changed;
-                        let key_due = urgent || encoder.as_ref().is_some_and(Nvenc::idr_pending);
+                        let key_due =
+                            urgent || encoder.as_ref().is_some_and(VideoEncoder::idr_pending);
                         v4_pacer.begin_frame(
                             now,
                             wss_media.as_ref().and_then(|egress| egress.capacity()),
@@ -4453,7 +4539,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     plan,
                                     v4_pointer,
                                     !tile_changed.is_empty(),
-                                    encoder.as_ref().is_some_and(Nvenc::refine_qp_map_enabled),
+                                    encoder
+                                        .as_ref()
+                                        .is_some_and(VideoEncoder::refine_qp_map_enabled),
                                 );
                                 if wss_v4_refine_plan.is_none() {
                                     refine_wait = v4_pacer.refine_retry_after();
@@ -4573,13 +4661,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     if wss_forced_idr
                         || latest_idr.is_none()
                         || transition
-                        || encoder.as_ref().is_some_and(Nvenc::idr_pending)
+                        || encoder.as_ref().is_some_and(VideoEncoder::idr_pending)
                     {
                         wss_v4_refine_plan = None;
                     }
                     let wss_v4_refine_frame = wss_v4_refine_plan.is_some();
                     // A fallback is a separate transaction: first prepare a
-                    // texture for its exact dimensions, then recreate NVENC
+                    // texture for its exact dimensions, then recreate the encoder
                     // for that same mode, and only commit after its IDR is
                     // admitted by the transport.
                     let mut fallback_reason = None;
@@ -4640,6 +4728,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         && fallback_reason.is_none()
                         && configure_encoder_profile(
                             &mut encoder,
+                            args.encoder_preference(),
                             dev,
                             mode,
                             frame.width(),
@@ -4657,6 +4746,33 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         );
                         mode = fallback_mode(old_mode, frame.width(), frame.height(), true);
                         fallback_reason = Some("encoder-fallback");
+                    }
+                    adopt_encoder_codec(&mut active_codec, encoder.as_ref());
+                    ensure_rtc_encoder_codec(
+                        wss_media.is_some(),
+                        negotiated_video_codec,
+                        active_codec,
+                    )?;
+                    if (main10
+                        && encoder
+                            .as_ref()
+                            .is_some_and(|encoder| !encoder.capabilities().main10))
+                        || (active_benchmark_profile.is_some() && active_codec != VideoCodec::Hevc)
+                    {
+                        // A reconfiguration can replace NVENC with MF after
+                        // this pass already prepared P010 or benchmark state.
+                        // Start again with the actual encoder's 8-bit contract.
+                        latest_idr = None;
+                        pending_transition_idr = None;
+                        pending_wss_idr = None;
+                        pending_viewport_idr = None;
+                        next_admission = now;
+                        next_idr = now;
+                        if let Some(encoder) = encoder.as_mut() {
+                            encoder.force_idr();
+                        }
+                        capture.request_idle_followup_snapshot(Duration::ZERO);
+                        continue 'session;
                     }
                     if fallback_reason.is_some() {
                         // The target texture is never passed to the fallback
@@ -4712,6 +4828,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         encoder.as_mut().unwrap().force_idr();
                         next_idr = now + IDR_INTERVAL;
                     }
+                    // Benchmark ROI and HEVC tile features need an NVENC-only
+                    // capability; another backend leaves them off for this frame.
+                    let encoder_caps = encoder
+                        .as_ref()
+                        .map_or(EncoderCapabilities::MF, VideoEncoder::capabilities);
                     let static_hybrid_enabled = active_benchmark_profile.is_some_and(|profile| {
                         profile.schema_version == 2
                             && profile.implementation_variant
@@ -4720,26 +4841,28 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             && !profile.encoder.main10
                             && wss_media.is_some()
                     });
-                    let feedback_roi_enabled = active_benchmark_profile.is_some_and(|profile| {
-                        profile.schema_version == 2
-                            && profile.implementation_variant
-                                == benchmark::BenchmarkImplementationVariant::Candidate
-                            && matches!(
-                                profile.effective_roi_mode(),
-                                BenchmarkRoiMode::Feedback | BenchmarkRoiMode::FeedbackHeadroom
-                            )
-                            && !profile.encoder.main10
-                            && wss_media.is_some()
-                            && stream_mode == StreamMode::Work
-                    });
+                    let feedback_roi_enabled = encoder_caps.roi_qp_map
+                        && encoder_caps.refine_feedback
+                        && active_benchmark_profile.is_some_and(|profile| {
+                            profile.schema_version == 2
+                                && profile.implementation_variant
+                                    == benchmark::BenchmarkImplementationVariant::Candidate
+                                && matches!(
+                                    profile.effective_roi_mode(),
+                                    BenchmarkRoiMode::Feedback | BenchmarkRoiMode::FeedbackHeadroom
+                                )
+                                && !profile.encoder.main10
+                                && wss_media.is_some()
+                                && stream_mode == StreamMode::Work
+                        });
                     let feedback_headroom_enabled =
                         active_benchmark_profile.is_some_and(|profile| {
                             feedback_roi_enabled
                                 && profile.effective_roi_mode()
                                     == BenchmarkRoiMode::FeedbackHeadroom
                         });
-                    let hevc_quiescent_tiles_enabled =
-                        active_benchmark_profile.is_some_and(|profile| {
+                    let hevc_quiescent_tiles_enabled = encoder_caps.hevc_tiles
+                        && active_benchmark_profile.is_some_and(|profile| {
                             profile.schema_version == 2
                                 && profile.implementation_variant
                                     == benchmark::BenchmarkImplementationVariant::Candidate
@@ -4942,18 +5065,34 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     let encoded = if let Some(reason) = fallback_reason {
                         match recreate_and_encode_profile(
                             &mut encoder,
+                            args.encoder_preference(),
                             dev,
                             mode,
                             frame.width(),
                             frame.height(),
                             quality.target(),
                             preset,
-                            active_codec,
+                            &mut active_codec,
                             active_benchmark_profile,
                             scaled.texture,
                             feedback_reconstruction_texture,
+                            main10,
+                            || {
+                                prepare_recovery_bgra_texture(
+                                    &mut scaler,
+                                    frame.device(),
+                                    frame.texture(),
+                                    frame.width(),
+                                    frame.height(),
+                                    mode,
+                                    viewport_crop,
+                                )
+                            },
                         ) {
-                            Ok(encoded) => encoded,
+                            Ok(encoded) => {
+                                adopt_encoder_codec(&mut active_codec, encoder.as_ref());
+                                encoded
+                            }
                             Err(error) => {
                                 warn!(
                                     ?error,
@@ -4967,8 +5106,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             }
                         }
                     } else {
-                        let temporal_roi_enabled =
-                            active_benchmark_profile.is_some_and(|profile| {
+                        let temporal_roi_enabled = encoder_caps.roi_qp_map
+                            && active_benchmark_profile.is_some_and(|profile| {
                                 profile.schema_version == 2
                                     && profile.implementation_variant
                                         == benchmark::BenchmarkImplementationVariant::Candidate
@@ -4998,7 +5137,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     && !wss_forced_idr
                                     && latest_idr.is_some()
                                     && !transition
-                                    && !encoder.as_ref().is_some_and(Nvenc::idr_pending) =>
+                                    && !encoder.as_ref().is_some_and(VideoEncoder::idr_pending) =>
                             {
                                 v4_pacer.pointer_tiles(&tracker.grid(), v4_pointer, &tile_changed)
                             }
@@ -5006,7 +5145,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         };
                         let wss_v4_qp_map = if (wss_v4_refine_frame
                             || !wss_v4_pointer_tiles.is_empty())
-                            && encoder.as_ref().is_some_and(Nvenc::refine_qp_map_enabled)
+                            && encoder
+                                .as_ref()
+                                .is_some_and(VideoEncoder::refine_qp_map_enabled)
                         {
                             let lowered = if wss_v4_refine_frame {
                                 wss_v4_refine_plan
@@ -5289,7 +5430,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                         let wss_v4_boost = wss_v4_refine_frame
                             || (tile_tracker.is_some()
-                                && encoder.as_ref().is_some_and(Nvenc::idr_pending));
+                                && encoder.as_ref().is_some_and(VideoEncoder::idr_pending));
                         let refine_restore_bps = if wss_v4_boost {
                             let enc = encoder.as_mut().unwrap();
                             let base = enc.bitrate();
@@ -5383,18 +5524,32 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 };
                                 match recreate_and_encode_profile(
                                     &mut encoder,
+                                    args.encoder_preference(),
                                     dev,
                                     mode,
                                     frame.width(),
                                     frame.height(),
                                     quality.target(),
                                     preset,
-                                    active_codec,
+                                    &mut active_codec,
                                     active_benchmark_profile,
                                     fallback_texture.texture,
                                     None,
+                                    main10,
+                                    || {
+                                        prepare_recovery_bgra_texture(
+                                            &mut scaler,
+                                            frame.device(),
+                                            frame.texture(),
+                                            frame.width(),
+                                            frame.height(),
+                                            mode,
+                                            viewport_crop,
+                                        )
+                                    },
                                 ) {
                                     Ok(encoded) => {
+                                        adopt_encoder_codec(&mut active_codec, encoder.as_ref());
                                         fallback_reason.get_or_insert(reason);
                                         encoded
                                     }
@@ -5409,6 +5564,27 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             }
                         }
                     };
+                    ensure_rtc_encoder_codec(
+                        wss_media.is_some(),
+                        negotiated_video_codec,
+                        active_codec,
+                    )?;
+                    if active_benchmark_profile.is_some() && active_codec != VideoCodec::Hevc {
+                        // Late recovery selected an H.264-only backend. The
+                        // next pass drops the HEVC lease before using any
+                        // reconstruction, ROI or hybrid benchmark state.
+                        latest_idr = None;
+                        pending_transition_idr = None;
+                        pending_wss_idr = None;
+                        pending_viewport_idr = None;
+                        next_admission = now;
+                        next_idr = now;
+                        if let Some(encoder) = encoder.as_mut() {
+                            encoder.force_idr();
+                        }
+                        capture.request_idle_followup_snapshot(Duration::ZERO);
+                        continue 'session;
+                    }
                     if feedback_roi_enabled {
                         if encoded.is_idr {
                             feedback_roi_planner
@@ -6414,7 +6590,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 text_tiles = classes.text,
                 scroll_tiles = classes.scroll,
                 video_tiles = classes.video,
-                max_qp = encoder.as_ref().and_then(Nvenc::max_qp).unwrap_or(0),
+                max_qp = encoder.as_ref().and_then(VideoEncoder::max_qp).unwrap_or(0),
                 paced_skips = pacing.paced_skips,
                 refines_deferred = pacing.refines_deferred,
                 refines_trimmed = pacing.refines_trimmed,
@@ -6554,6 +6730,148 @@ mod tests {
         assert!(!args.audio);
         assert_eq!(args.mode, "serve");
         assert_eq!(args.worker.as_deref(), Some("wss://example.test"));
+    }
+
+    #[test]
+    fn encoder_cli_defaults_to_auto_and_accepts_cpu_mode_and_override() {
+        let defaults = super::parse_args_from(std::iter::empty()).unwrap();
+        assert!(!defaults.cpu_mode);
+        assert_eq!(
+            defaults.encoder_preference(),
+            super::EncoderPreference::default()
+        );
+        assert_eq!(
+            defaults.encoder_preference().encoder,
+            super::EncoderOverride::Auto
+        );
+        let args = super::parse_args_from(
+            ["--cpu-mode", "--encoder", "mf-sw"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            args.encoder_preference(),
+            super::EncoderPreference {
+                cpu_mode: true,
+                encoder: super::EncoderOverride::MfSoftware,
+            }
+        );
+    }
+
+    #[test]
+    fn encoder_cli_rejects_unknown_backend() {
+        let error = super::parse_args_from(["--encoder", "amf"].into_iter().map(str::to_owned))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("--encoder must be"));
+    }
+
+    #[test]
+    fn mf_keeps_the_session_on_h264_when_hevc_is_requested() {
+        // Media Foundation emits H.264 only. An HEVC request must not switch a
+        // session that is already on H.264, and an H.264 session stays put.
+        assert_eq!(
+            super::EncoderCapabilities::MF.effective_codec(super::VideoCodec::Hevc),
+            super::VideoCodec::H264
+        );
+        assert!(!super::accept_session_codec(
+            super::VideoCodec::H264,
+            super::VideoCodec::Hevc
+        ));
+        assert!(super::accept_session_codec(
+            super::VideoCodec::Hevc,
+            super::VideoCodec::H264
+        ));
+    }
+
+    #[test]
+    fn rtc_reconnect_preserves_the_session_downgrade_and_rejects_codec_mismatch() {
+        use super::{EncoderCapabilities, VideoCodec};
+        assert!(!super::rtc_encoder_capabilities(EncoderCapabilities::MF, VideoCodec::Hevc).hevc);
+        assert!(
+            !super::rtc_encoder_capabilities(EncoderCapabilities::NVENC, VideoCodec::H264).hevc
+        );
+        assert!(super::rtc_encoder_capabilities(EncoderCapabilities::NVENC, VideoCodec::Hevc).hevc);
+        assert!(super::ensure_rtc_encoder_codec(false, None, VideoCodec::H264).is_ok());
+        assert!(
+            super::ensure_rtc_encoder_codec(false, Some(VideoCodec::H264), VideoCodec::H264)
+                .is_ok()
+        );
+        assert!(
+            super::ensure_rtc_encoder_codec(false, Some(VideoCodec::Hevc), VideoCodec::H264)
+                .is_err()
+        );
+        assert!(
+            super::ensure_rtc_encoder_codec(true, Some(VideoCodec::Hevc), VideoCodec::H264).is_ok()
+        );
+    }
+
+    #[test]
+    fn encoder_cli_accepts_every_backend_name_and_rejects_a_missing_value() {
+        use super::EncoderOverride;
+        for (name, expected) in [
+            ("auto", EncoderOverride::Auto),
+            ("nvenc", EncoderOverride::Nvenc),
+            ("mf-hw", EncoderOverride::MfHardware),
+            ("mf-sw", EncoderOverride::MfSoftware),
+        ] {
+            let args =
+                super::parse_args_from(["--encoder", name].into_iter().map(str::to_owned)).unwrap();
+            assert_eq!(args.encoder, expected, "--encoder {name}");
+            assert!(!args.cpu_mode);
+        }
+        assert!(super::parse_args_from(["--encoder"].into_iter().map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn encoder_capabilities_decide_the_emitted_codec_and_features() {
+        use super::VideoCodec;
+        let nvenc = super::EncoderCapabilities::NVENC;
+        let mf = super::EncoderCapabilities::MF;
+        for requested in [VideoCodec::Hevc, VideoCodec::H264] {
+            assert_eq!(nvenc.effective_codec(requested), requested);
+            assert_eq!(mf.effective_codec(requested), VideoCodec::H264);
+        }
+        assert!(nvenc.supports(VideoCodec::Hevc));
+        assert!(!mf.supports(VideoCodec::Hevc));
+        assert!(mf.supports(VideoCodec::H264));
+        // Media Foundation has no Main10, QP map, feedback or HEVC tiles.
+        assert!(!(mf.main10 || mf.roi_qp_map || mf.refine_feedback || mf.hevc_tiles));
+        assert!(nvenc.main10 && nvenc.roi_qp_map && nvenc.refine_feedback && nvenc.hevc_tiles);
+    }
+
+    #[test]
+    fn main10_conversion_follows_the_created_encoder() {
+        let nvenc = super::EncoderCapabilities::NVENC;
+        let mf = super::EncoderCapabilities::MF;
+        assert!(!super::main10_conversion(false, mf));
+        assert!(!super::main10_conversion(false, nvenc));
+        assert!(super::main10_conversion(true, nvenc));
+        assert!(!super::main10_conversion(true, mf));
+    }
+
+    #[test]
+    fn recovery_bgra_provider_is_lazy_and_only_runs_for_main10_to_8bit() {
+        for (main10, capabilities) in [
+            (false, super::EncoderCapabilities::MF),
+            (false, super::EncoderCapabilities::NVENC),
+            (true, super::EncoderCapabilities::NVENC),
+        ] {
+            let input = super::optional_bgra_recovery_input::<&str>(main10, capabilities, || {
+                panic!("existing NVENC/BGRA input must not trigger extra scaling")
+            })
+            .unwrap();
+            assert!(input.is_none());
+        }
+        let calls = std::cell::Cell::new(0);
+        let input =
+            super::optional_bgra_recovery_input(true, super::EncoderCapabilities::MF, || {
+                calls.set(calls.get() + 1);
+                Ok("retained BGRA")
+            })
+            .unwrap();
+        assert_eq!(input, Some("retained BGRA"));
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

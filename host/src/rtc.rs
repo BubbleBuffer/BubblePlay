@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::audio::AudioFrame;
 use crate::encode::VideoCodec;
+use crate::video_encoder::EncoderCapabilities;
 
 /// Keep Windows timed channel waits usable for the RTP pacer's deadlines.
 /// Acquire only for a negotiated RTC epoch; Drop also covers errors/teardown.
@@ -46,9 +47,41 @@ impl Drop for RtcTimerPeriod {
     }
 }
 
-fn preferred_negotiated_codec(hevc: Option<Pt>, h264: Option<Pt>) -> Option<(VideoCodec, Pt)> {
-    hevc.map(|pt| (VideoCodec::Hevc, pt))
-        .or_else(|| h264.map(|pt| (VideoCodec::H264, pt)))
+fn preferred_negotiated_codec(
+    hevc: Option<Pt>,
+    h264: Option<Pt>,
+    capabilities: EncoderCapabilities,
+) -> Option<(VideoCodec, Pt)> {
+    hevc.filter(|_| capabilities.hevc)
+        .map(|pt| (VideoCodec::Hevc, pt))
+        .or_else(|| {
+            h264.filter(|_| capabilities.h264)
+                .map(|pt| (VideoCodec::H264, pt))
+        })
+}
+
+/// Avoid prewarming HEVC for an offer that contains only H.264 video.
+/// The RTC session still parses and validates the complete SDP before answering.
+pub fn initial_offer_codec(sdp: &str, current: VideoCodec) -> VideoCodec {
+    let Ok(offer) = SdpOffer::from_sdp_string(sdp) else {
+        return current;
+    };
+    let (mut hevc, mut h264) = (false, false);
+    for media in &offer.media_lines {
+        if !media.disabled && media.typ.to_string() == "video" && media.direction().is_receiving() {
+            for payload in media.rtp_params() {
+                if media.pts.contains(&payload.pt()) {
+                    hevc |= payload.spec().codec == Codec::H265;
+                    h264 |= payload.spec().codec == Codec::H264;
+                }
+            }
+        }
+    }
+    if h264 && !hevc {
+        VideoCodec::H264
+    } else {
+        current
+    }
 }
 
 /// Events the run loop cares about, extracted from str0m's Output::Event.
@@ -101,12 +134,21 @@ pub struct RtcSession {
     input_control: Option<ChannelId>,
     input_motion: Option<ChannelId>,
     timer_period: Option<RtcTimerPeriod>,
+    encoder_capabilities: EncoderCapabilities,
 }
 
 impl RtcSession {
     pub fn new(now: Instant, initial_bitrate_bps: u32) -> Self {
+        Self::new_with_capabilities(now, initial_bitrate_bps, EncoderCapabilities::NVENC)
+    }
+
+    pub fn new_with_capabilities(
+        now: Instant,
+        initial_bitrate_bps: u32,
+        encoder_capabilities: EncoderCapabilities,
+    ) -> Self {
         let rtc = Rtc::builder()
-            .enable_h265(true)
+            .enable_h265(encoder_capabilities.hevc)
             // Initial BWE estimate must match the encoder's starting bitrate
             // (8 Mbps default) so congestion control doesn't fight the encoder
             // out of the gate; TWCC/REMB feedback then adjusts from there.
@@ -128,6 +170,7 @@ impl RtcSession {
             input_control: None,
             input_motion: None,
             timer_period: None,
+            encoder_capabilities,
         }
     }
 
@@ -238,7 +281,11 @@ impl RtcSession {
                             }
                         }
                     }
-                    if let Some((codec, pt)) = preferred_negotiated_codec(hevc, high.or(fallback)) {
+                    if let Some((codec, pt)) = preferred_negotiated_codec(
+                        hevc,
+                        high.or(fallback),
+                        self.encoder_capabilities,
+                    ) {
                         self.video_codec = Some(codec);
                         self.video_pt = Some(pt);
                         info!(mid = %added.mid, ?pt, codec = codec.name(), "video send media added");
@@ -482,14 +529,145 @@ mod tests {
         let hevc = Pt::new_with_value(102);
         let h264 = Pt::new_with_value(96);
         assert_eq!(
-            preferred_negotiated_codec(Some(hevc), Some(h264)),
+            preferred_negotiated_codec(
+                Some(hevc),
+                Some(h264),
+                crate::video_encoder::EncoderCapabilities::NVENC
+            ),
             Some((VideoCodec::Hevc, hevc))
         );
         assert_eq!(
-            preferred_negotiated_codec(None, Some(h264)),
+            preferred_negotiated_codec(
+                None,
+                Some(h264),
+                crate::video_encoder::EncoderCapabilities::NVENC
+            ),
             Some((VideoCodec::H264, h264))
         );
-        assert_eq!(preferred_negotiated_codec(None, None), None);
+        assert_eq!(
+            preferred_negotiated_codec(
+                None,
+                None,
+                crate::video_encoder::EncoderCapabilities::NVENC
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn h264_only_encoder_ignores_offered_hevc() {
+        use crate::video_encoder::EncoderCapabilities;
+        let hevc = Pt::new_with_value(102);
+        let h264 = Pt::new_with_value(96);
+        assert_eq!(
+            preferred_negotiated_codec(Some(hevc), Some(h264), EncoderCapabilities::MF),
+            Some((VideoCodec::H264, h264))
+        );
+        assert_eq!(
+            preferred_negotiated_codec(Some(hevc), None, EncoderCapabilities::MF),
+            None
+        );
+    }
+
+    #[test]
+    fn h264_only_video_offer_is_prewarmed_in_h264() {
+        use str0m::media::Direction;
+        for (hevc, expected) in [(false, VideoCodec::H264), (true, VideoCodec::Hevc)] {
+            let mut viewer = str0m::Rtc::builder()
+                .enable_h265(hevc)
+                .build(std::time::Instant::now());
+            let mut change = viewer.sdp_api();
+            change.add_media(
+                super::MediaKind::Video,
+                Direction::RecvOnly,
+                None,
+                None,
+                None,
+            );
+            let (offer, _) = change.apply().unwrap();
+            let sdp = offer.to_sdp_string();
+            assert_eq!(super::initial_offer_codec(&sdp, VideoCodec::Hevc), expected);
+            assert_eq!(
+                super::initial_offer_codec(&sdp, VideoCodec::H264),
+                VideoCodec::H264
+            );
+        }
+        assert_eq!(
+            super::initial_offer_codec("invalid SDP", VideoCodec::Hevc),
+            VideoCodec::Hevc
+        );
+    }
+
+    #[test]
+    fn sdp_answer_and_selected_payload_follow_encoder_capabilities() {
+        use crate::video_encoder::EncoderCapabilities;
+        use str0m::media::{Direction, MediaAdded};
+        let now = std::time::Instant::now();
+        let mut viewer = str0m::Rtc::builder().enable_h265(true).build(now);
+        let mut change = viewer.sdp_api();
+        let offered_mid = change.add_media(
+            super::MediaKind::Video,
+            Direction::RecvOnly,
+            None,
+            None,
+            None,
+        );
+        let (offer, _) = change.apply().unwrap();
+        let sdp = offer.to_sdp_string();
+        assert!(sdp.contains("H265/90000"));
+        assert!(sdp.contains("H264/90000"));
+        for (capabilities, expected) in [
+            (EncoderCapabilities::MF, VideoCodec::H264),
+            (EncoderCapabilities::NVENC, VideoCodec::Hevc),
+        ] {
+            let mut host = super::RtcSession::new_with_capabilities(now, 2_000_000, capabilities);
+            let answer = host.accept_offer(&sdp).unwrap();
+            let video = answer
+                .split("m=video ")
+                .nth(1)
+                .expect("answer has a video section")
+                .split("\r\nm=")
+                .next()
+                .unwrap();
+            assert_eq!(video.contains("H265/90000"), capabilities.hevc);
+            assert!(video.contains("H264/90000"));
+            assert!(video.contains(&format!("a=mid:{offered_mid}")));
+            let direction = host.rtc.media(offered_mid).unwrap().direction();
+            assert_eq!(direction, Direction::SendOnly);
+            assert!(video.lines().any(|line| line == "a=sendonly"));
+
+            // str0m defers MediaAdded until SRTP is ready. This fixture tests
+            // negotiated SDP and payload selection without an ICE/DTLS peer,
+            // so feed the event using the actual negotiated mid/direction.
+            let action = host.on_event(str0m::Event::MediaAdded(MediaAdded {
+                mid: offered_mid,
+                kind: super::MediaKind::Video,
+                direction,
+                simulcast: None,
+            }));
+            assert!(matches!(
+                action,
+                Some(super::RtcAction::VideoCodecSelected(codec)) if codec == expected
+            ));
+            assert_eq!(host.video_mid, Some(offered_mid));
+            assert_eq!(host.video_codec, Some(expected));
+            let selected_pt = host.video_pt.expect("selected video payload");
+            let codec_name = match expected {
+                VideoCodec::H264 => "H264",
+                VideoCodec::Hevc => "H265",
+            };
+            assert!(video
+                .lines()
+                .any(|line| { line == format!("a=rtpmap:{selected_pt} {codec_name}/90000") }));
+            // The selected payload must also be offered by the answer's m-line.
+            assert!(video
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .skip(2)
+                .any(|payload| payload == selected_pt.to_string()));
+        }
     }
 
     fn timing(seq: u32, capture_ts_us: u64, rtp_48k: u64) -> super::AudioTiming {
