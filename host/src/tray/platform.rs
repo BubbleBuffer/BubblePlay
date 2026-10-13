@@ -260,21 +260,49 @@ fn schtasks(args: &[&str]) -> Result<std::process::Output> {
         .context("running schtasks.exe")
 }
 
-pub fn agent_task_exists() -> bool {
-    schtasks(&["/query", "/tn", AGENT_TASK])
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+pub fn ensure_agent_task() -> Result<()> {
+    let out = schtasks(&["/query", "/tn", AGENT_TASK])?;
+    if !out.status.success() {
+        bail!(
+            "admin agent task {AGENT_TASK} missing or unavailable (query exit {:?}): {} {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 pub fn run_agent_task() -> Result<()> {
     let out = schtasks(&["/run", "/tn", AGENT_TASK])?;
     if !out.status.success() {
         bail!(
-            "schtasks /run failed: {}",
+            "schtasks /run failed (exit {:?}): {} {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(())
+}
+
+/// Read the task's execution result after a failed hello. This is diagnostic
+/// only; querying the task cannot launch or stop it. PowerShell supplies the
+/// numeric result without relying on localized schtasks column labels.
+pub fn agent_task_result() -> String {
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let exe = PathBuf::from(system).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    match Command::new(exe)
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+            r"$ErrorActionPreference='Stop'; (Get-ScheduledTaskInfo -TaskPath '\BubblePlay\' -TaskName 'AdminAgent').LastTaskResult"])
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(out) if out.status.success() => format!("; task result {}", String::from_utf8_lossy(&out.stdout).trim()),
+        Ok(out) => format!("; task result query failed (exit {:?}): {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim()),
+        Err(error) => format!("; task result query failed: {error}"),
+    }
 }
 
 /// The SYSTEM task launches an independent session process. The host pipe

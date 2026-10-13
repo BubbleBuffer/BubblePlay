@@ -48,6 +48,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use bubbleplay_host::admin_agent::client::{probe, ProbeResult, AGENT_EXE};
+use bubbleplay_host::admin_agent::demand::{active_from_env, publish_failure_in, StartRetry};
 use bubbleplay_host::admin_agent::protocol::{
     pipe_name, scoped_name, ENV_ALLOW_DEV_AGENT, ENV_PIPE, PROTOCOL_MAX, PROTOCOL_MIN,
 };
@@ -63,7 +64,7 @@ use logic::{
     SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
-    acquire_single_instance, agent_task_exists, create_manual_event, data_dir, end_agent_task,
+    acquire_single_instance, create_manual_event, data_dir, end_agent_task, ensure_agent_task,
     host_exe_beside, named_mutex_exists, open_folder, read_run_value, run_admin_mode_off_task,
     run_agent_task, run_elevated_and_wait, run_secure_helper_task, secure_helper_task_exists,
     set_event, set_run_value, sha256_file, wide, Handle, AGENT_MUTEX, AGENT_STOP_EVENT,
@@ -93,11 +94,9 @@ const CMD_BUILD: usize = 8;
 const CMD_AGENT_UPDATE: usize = 9;
 const CMD_SECURE_HELPER_UPDATE: usize = 10;
 
-/// Time the agent gets to answer after its task was started.
+/// Time the secure helper gets to answer after its task was started.
 const AGENT_START_GRACE: Duration = Duration::from_secs(15);
-/// Minimum spacing between automatic re-runs of the agent task.
-const AGENT_RERUN_INTERVAL: Duration = Duration::from_secs(30);
-/// How often a running agent is re-probed (version + trust).
+/// How often the secure helper is re-probed (version + trust).
 const AGENT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// Left behind by the removed elevated-host runner.
 const STALE_HEARTBEAT_FILE: &str = "elevated-runner.json";
@@ -282,10 +281,11 @@ struct App {
     secure_helper: SecureHelperStatus,
     helper_started: Option<Instant>,
     helper_last_probe: Option<Instant>,
-    /// Viewer sessions seen in the host log: the agent runs only around them.
+    /// Viewer state reconciled with the host demand signal on every tick.
     viewers: ViewerGate,
-    /// When the agent task was last started.
+    /// When the agent task was started or an existing agent was adopted.
     agent_started: Option<Instant>,
+    agent_retry: StartRetry,
     last_probe: Option<Instant>,
     /// Test mode only: the unelevated `--dev` agent the tray spawned.
     agent_child: Option<std::process::Child>,
@@ -563,9 +563,7 @@ impl App {
             self.agent_child = Some(child);
             return Ok(());
         }
-        if !agent_task_exists() {
-            return Err("the admin agent is not installed".into());
-        }
+        ensure_agent_task().map_err(|error| format!("{error:#}"))?;
         run_agent_task().map_err(|error| format!("{error:#}"))
     }
 
@@ -598,17 +596,30 @@ impl App {
     }
 
     fn start_agent(&mut self) {
+        tracing::warn!(task = platform::AGENT_TASK, pipe = %self.agent_pipe, "admin agent start attempt");
         match self.launch_agent() {
             Ok(()) => {
-                tracing::info!(pipe = %self.agent_pipe, "admin agent started");
+                tracing::warn!(
+                    task = platform::AGENT_TASK,
+                    "admin agent start attempt accepted"
+                );
                 self.agent_started = Some(Instant::now());
                 self.last_probe = None;
                 self.set_agent(AgentStatus::Starting);
             }
             Err(reason) => {
+                tracing::warn!(%reason, "admin agent start attempt failed");
+                self.report_agent_failure(&reason);
                 self.agent_started = None;
                 self.set_agent(AgentStatus::NeedsUpdate { reason });
             }
+        }
+        self.agent_retry.attempt_finished(Instant::now());
+    }
+
+    fn report_agent_failure(&self, reason: &str) {
+        if let Err(error) = publish_failure_in(&self.data, Some(reason)) {
+            tracing::warn!(%error, "cannot publish admin agent input diagnostic");
         }
     }
 
@@ -645,104 +656,91 @@ impl App {
         self.admin_on && self.viewers.wants_agent(Instant::now())
     }
 
-    /// Run the agent only while Admin mode is on and a viewer is connected:
-    /// start it on the first viewer session, stop it once the last one ended
-    /// more than the idle grace ago. Until it answers (and while it is not
-    /// running) the host injects at user level.
+    /// Keep an already running agent during idle grace, but only start or
+    /// retry while the host currently reports an active viewer.
     fn gate_agent(&mut self) {
+        self.viewers
+            .observe_active(active_from_env(), Instant::now());
         if !self.admin_on {
             self.stop_agent();
+            let _ = publish_failure_in(&self.data, None);
             return;
         }
-        if self.agent_update_running {
-            return;
-        }
-        if self.agent_wanted() {
-            if matches!(self.agent, AgentStatus::Off | AgentStatus::Armed) {
-                tracing::info!("viewer session active: starting admin agent");
-                self.start_agent();
-            }
+        if self.agent_update_running || self.agent_wanted() {
             return;
         }
         if self.agent_started.is_some() || self.agent_child.is_some() {
             tracing::info!("no viewer session: stopping admin agent");
             self.stop_agent_process();
         }
-        // A pending "needs update" stays until the user runs the update.
+        let _ = publish_failure_in(&self.data, None);
         if !self.agent.needs_update() {
             self.set_agent(AgentStatus::Armed);
         }
     }
 
-    /// Track the agent: probe it (version + trust), re-run it if it died,
-    /// and flag it for update when it is missing, incompatible or silent.
+    /// Current demand, not a log edge or prior status, drives recovery. A
+    /// running agent is never launched twice, even if its hello is silent.
     fn check_agent(&mut self, force_probe: bool) {
-        if !self.agent_wanted() || self.agent_update_running {
+        let needed = self.admin_on && active_from_env();
+        if !needed || self.agent_update_running {
             return;
         }
-        let in_grace = self
-            .agent_started
-            .is_some_and(|started| started.elapsed() < AGENT_START_GRACE);
-        if self.agent_running() {
-            let due = force_probe
-                || self.agent == AgentStatus::Starting
-                || self
-                    .last_probe
-                    .is_none_or(|at| at.elapsed() >= AGENT_PROBE_INTERVAL);
-            if !due {
-                return;
-            }
-            self.last_probe = Some(Instant::now());
-            match probe(&self.agent_pipe, self.test_mode) {
-                ProbeResult::Ready(handshake) => {
-                    if self.agent != AgentStatus::Ready {
-                        tracing::info!(
-                            version = handshake.version,
-                            agent_pid = handshake.agent_pid,
-                            elevated = handshake.elevated,
-                            "admin agent ready"
-                        );
-                    }
-                    self.set_agent(AgentStatus::Ready);
-                }
-                ProbeResult::Incompatible {
-                    agent_min,
-                    agent_max,
-                } => {
-                    // Useless to the host: stop it rather than keep an
-                    // elevated process around.
-                    self.stop_agent_process();
-                    self.set_agent(AgentStatus::NeedsUpdate {
-                        reason: format!(
-                            "the admin agent speaks protocol {agent_min}-{agent_max}, the host needs {PROTOCOL_MIN}-{PROTOCOL_MAX}"
-                        ),
-                    });
-                }
-                ProbeResult::Unavailable(error) => {
-                    if self.agent == AgentStatus::Starting && !in_grace {
-                        self.set_agent(AgentStatus::NeedsUpdate {
-                            reason: format!("the admin agent does not answer ({error})"),
-                        });
-                    } else {
-                        tracing::debug!(%error, "admin agent probe failed");
-                    }
-                }
-            }
+        let now = Instant::now();
+        let running = self.agent_running();
+        let due = force_probe
+            || self
+                .last_probe
+                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(5));
+        if !due {
             return;
         }
-        match &self.agent {
-            AgentStatus::NeedsUpdate { .. } | AgentStatus::Off | AgentStatus::Armed => {}
-            AgentStatus::Starting if in_grace => {}
-            AgentStatus::Starting => self.set_agent(AgentStatus::NeedsUpdate {
-                reason: "the admin agent did not start".into(),
-            }),
-            AgentStatus::Ready => {
-                let due = self
-                    .agent_started
-                    .is_none_or(|started| started.elapsed() >= AGENT_RERUN_INTERVAL);
-                if due {
-                    tracing::warn!("admin agent is gone; re-running its task");
+        self.last_probe = Some(now);
+        match probe(&self.agent_pipe, self.test_mode) {
+            ProbeResult::Ready(handshake) => {
+                if self.agent != AgentStatus::Ready {
+                    tracing::warn!(
+                        version = handshake.version,
+                        agent_pid = handshake.agent_pid,
+                        elevated = handshake.elevated,
+                        "admin agent ready"
+                    );
+                }
+                let _ = publish_failure_in(&self.data, None);
+                self.agent_started.get_or_insert(now);
+                self.set_agent(AgentStatus::Ready);
+            }
+            ProbeResult::Incompatible {
+                agent_min,
+                agent_max,
+            } => {
+                let reason = format!("the admin agent speaks protocol {agent_min}-{agent_max}, the host needs {PROTOCOL_MIN}-{PROTOCOL_MAX}");
+                self.report_agent_failure(&reason);
+                self.set_agent(AgentStatus::NeedsUpdate { reason });
+            }
+            ProbeResult::Unavailable(error) => {
+                let retry = self
+                    .agent_retry
+                    .should_start(Instant::now(), needed, running);
+                if !retry && !running {
+                    return;
+                }
+                let result = if self.test_mode || (self.agent_started.is_none() && !running) {
+                    String::new()
+                } else {
+                    platform::agent_task_result()
+                };
+                let reason = format!("the admin agent does not answer ({error}){result}");
+                self.report_agent_failure(&reason);
+                // Keep transient startup failure in diagnostics without a new balloon.
+                if self.agent != AgentStatus::Starting {
+                    tracing::warn!(%reason, "admin agent probe failed");
+                }
+                if retry {
+                    tracing::warn!(%reason, "admin agent needed; scheduling start");
                     self.start_agent();
+                } else if running {
+                    self.set_agent(AgentStatus::NeedsUpdate { reason });
                 }
             }
         }
@@ -828,7 +826,7 @@ impl App {
             self.helper_last_probe = None;
             if self.agent_wanted() {
                 self.announce_ready = true;
-                self.start_agent();
+                self.check_agent(true);
             } else if self.admin_on {
                 self.announce_ready = true;
                 self.set_agent(AgentStatus::Armed);
@@ -1496,6 +1494,7 @@ fn run_tray() -> Result<i32> {
         helper_last_probe: None,
         viewers: ViewerGate::default(),
         agent_started: None,
+        agent_retry: StartRetry::default(),
         last_probe: None,
         agent_child: None,
         agent_update_running: false,

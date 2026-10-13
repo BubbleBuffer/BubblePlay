@@ -459,8 +459,8 @@ pub const AGENT_IDLE_GRACE: Duration = Duration::from_secs(30);
 
 /// Decides when the Admin mode agent should run: while a viewer session is
 /// active, and for [`AGENT_IDLE_GRACE`] after the last one ended. Fed from
-/// the host's "viewer session started/ended" log lines; a host exit ends
-/// every session.
+/// the host's "viewer session started/ended" log lines and reconciled with
+/// the current demand signal; a host exit ends every session.
 #[derive(Debug, Clone, Default)]
 pub struct ViewerGate {
     sessions: u32,
@@ -468,6 +468,17 @@ pub struct ViewerGate {
 }
 
 impl ViewerGate {
+    /// Reconcile with current host state, including after a tray restart or
+    /// filtered/missed lifecycle logs. Repeated snapshots do not extend grace.
+    pub fn observe_active(&mut self, active: bool, now: Instant) {
+        if active {
+            self.sessions = 1;
+            self.idle_since = None;
+        } else {
+            self.on_host_exited(now);
+        }
+    }
+
     pub fn on_started(&mut self) {
         self.sessions = self.sessions.saturating_add(1);
         self.idle_since = None;
@@ -789,6 +800,19 @@ mod tests {
             AGENT_UPDATE_LABEL,
             "Admin agent needs update (one admin prompt)"
         );
+    }
+
+    #[test]
+    fn viewer_snapshot_recovers_without_an_edge_and_idle_does_not_extend_grace() {
+        let now = Instant::now();
+        let mut gate = ViewerGate::default();
+        gate.observe_active(true, now);
+        assert!(gate.viewer_connected());
+        gate.observe_active(false, now + Duration::from_secs(1));
+        assert!(!gate.viewer_connected());
+        assert!(gate.wants_agent(now + Duration::from_secs(29)));
+        gate.observe_active(false, now + Duration::from_secs(30));
+        assert!(!gate.wants_agent(now + Duration::from_secs(31)));
     }
 
     #[test]

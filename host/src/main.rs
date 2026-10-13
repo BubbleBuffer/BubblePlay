@@ -830,7 +830,8 @@ impl LocalClipboardPoll {
 /// Logs the tray's viewer markers: "viewer session started" once a viewer's
 /// media transport (RTC or WSS) is first up in this session, and "viewer
 /// session ended" when the session ends by any path (peer left, error). The
-/// tray runs the Admin mode agent only between the two.
+/// tray uses these edges for lifecycle logging; current admin demand is
+/// published independently so filtering INFO cannot suppress startup.
 #[derive(Default)]
 struct ViewerSessionLog {
     live: bool,
@@ -1170,6 +1171,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut producer_window_started = Instant::now();
     let mut last_capture_stats = (0u64, 0u64);
     let mut viewer_session = ViewerSessionLog::default();
+    // Current demand is control state, independent of filtered lifecycle logs.
+    // The host holds this object so a new tray can discover an active viewer.
+    let admin_demand = bubbleplay_host::admin_agent::demand::DemandSignal::from_env()?;
+    let mut last_routing_status = None;
+    let mut last_admin_failure = None;
+    let mut next_admin_diagnostic = Instant::now();
     // Follow active window: per signaling session, off until the client asks.
     let mut follow_state: Option<FollowWindow> = None;
     let mut next_follow_sample = Instant::now();
@@ -1301,6 +1308,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             display_wake.reset();
             input_sink.reset_status_delivery();
             viewer_session.observe(false);
+            admin_demand.observe(false)?;
             ice_connected = false;
             offer_accepted = false;
             offer_in_flight = false;
@@ -2253,6 +2261,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             next_cursor_event_sample = cursor_now + Duration::from_millis(16);
         }
         viewer_session.observe(viewer_attached && (ice_connected || wss_peer_live));
+        admin_demand.observe(viewer_attached)?;
         // Share follow-window's existing cadence even when following is off.
         // Token inspection is cached until foreground HWND/PID changes.
         let foreground_sample_now = Instant::now();
@@ -3533,8 +3542,29 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }
         signaling.flush_cursor_state();
         if viewer_attached && !capture.is_privileged() {
-            if let Some(status) = input_sink.take_status_change() {
-                signaling.send_input_routing_status(media_generation, status);
+            let changed = input_sink.take_status_change();
+            if let Some(status) = changed {
+                last_routing_status = Some(status);
+            }
+            let diagnostic_due = Instant::now() >= next_admin_diagnostic;
+            if changed.is_some() || diagnostic_due {
+                next_admin_diagnostic = Instant::now() + Duration::from_millis(250);
+                if let Some(status) = last_routing_status {
+                    let detail =
+                        if status.reason == Some(input::InputStatusReason::AdminUnavailable) {
+                            bubbleplay_host::admin_agent::demand::failure_from_env()
+                        } else {
+                            None
+                        };
+                    if changed.is_some() || detail != last_admin_failure {
+                        signaling.send_input_routing_status(
+                            media_generation,
+                            status,
+                            detail.as_deref(),
+                        );
+                        last_admin_failure = detail;
+                    }
+                }
             }
         }
         session_stage!(Media);

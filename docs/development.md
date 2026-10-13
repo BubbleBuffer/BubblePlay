@@ -145,21 +145,29 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   Recovery starts a new generation with a keyframe. See
   [the secure-desktop contract](architecture/secure-desktop.md); live UAC/lock
   qualification is still pending.
-- The agent runs only while Admin mode is on and a viewer is connected. The
-  host logs "viewer session started" once a viewer's media transport (RTC or
-  WSS) is up and "viewer session ended" when that session ends. The tray
-  starts the task on the first session. It stops the agent 30 s after the last
-  session ended (a reconnect or page reload within that time keeps it
-  running), when Admin mode is turned off, or when the tray goes away. A host
-  exit counts as the session ending. The menu shows "Admin mode: armed (starts
-  when a viewer connects)", "starting" or "active". Until the agent answers
-  (about 1 s after start, plus up to 2 s until the host's next connection
-  attempt), the host injects at user level, so no input is dropped, but it
-  does not reach elevated windows yet.
+- The tray owns agent startup and checks the host's current viewer demand
+  independently of INFO logging and "viewer session started/ended" log edges.
+  With Admin mode on and an active viewer, an agent that does not answer
+  triggers an idempotent `\BubblePlay\AdminAgent` task attempt; retries are
+  at least 5 s apart. A session-scoped, host-owned event publishes demand and
+  survives tray reconnection without replaying log edges. Launch/probe failures
+  remain visible in logs and the additive input-status `detail` field (task
+  query/launch codes, task result, or hello failure), and the
+  host retains its protected-target `input-status` reason `admin-unavailable`
+  until the agent answers. Trust and protocol checks still apply.
+  The tray keeps a running agent for 30 s after the last session ends (a
+  reconnect or page reload within that time keeps it running); this idle
+  grace does not launch or retry an unavailable agent without an active
+  viewer. It stops the agent when the grace expires, Admin mode is turned
+  off, or the tray goes away. A host exit counts as the session ending.
+  While the agent is unavailable, user-level targets still receive input;
+  known protected targets remain blocked instead of falling back to local
+  injection.
 - Agent versioning: the pipe protocol is versioned (`host/src/admin_agent`).
-  If the agent is missing, does not start, or speaks another protocol version,
-  the host injects at user level and the tray offers "Admin agent needs update
-  (one admin prompt)", which reruns `setup-tray.ps1 -AgentOnly` elevated.
+  Missing installations or incompatible versions offer "Admin agent needs
+  update (one admin prompt)", which reruns `setup-tray.ps1 -AgentOnly`
+  elevated. Runtime launch failures do not suppress subsequent bounded
+  retries while Admin mode and viewer demand remain active.
 - Secure desktop: `setup-tray.ps1 -IncludeAgent` / `-AgentOnly` installs the
   admin agent and SYSTEM secure helper together in the same elevated child.
   The tray starts `\BubblePlay\SecureDesktop` for every viewer session,

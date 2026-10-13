@@ -28,8 +28,9 @@ use super::trust;
 
 /// Agent binary name; the host only talks to a server running this image.
 pub const AGENT_EXE: &str = "bubbleplay_admin_agent.exe";
-/// Host log line once a viewer's media transport is up. The tray runs the
-/// agent (Admin mode) only between this line and [`VIEWER_ENDED_MARKER`].
+/// Host log line once a viewer's media transport is up, used for tray
+/// lifecycle logging. Admin startup uses current demand independently of
+/// this line and [`VIEWER_ENDED_MARKER`].
 pub const VIEWER_STARTED_MARKER: &str = "viewer session started";
 /// Host log line when that viewer session ends (peer left, error or exit).
 pub const VIEWER_ENDED_MARKER: &str = "viewer session ended";

@@ -1264,6 +1264,7 @@ where
 fn input_routing_status_message(
     generation: u32,
     status: crate::input::InputRoutingStatus,
+    detail: Option<&str>,
 ) -> serde_json::Value {
     let mut message = serde_json::to_value(SignalMsg::InputStatus {
         protocol: 1,
@@ -1283,6 +1284,8 @@ fn input_routing_status_message(
     .expect("input status serializes");
     if status.reason.is_none() {
         message["reason"] = serde_json::Value::Null;
+    } else if let Some(detail) = detail {
+        message["detail"] = serde_json::Value::String(detail.to_owned());
     }
     message
 }
@@ -2055,8 +2058,15 @@ impl Signaling {
         &mut self,
         generation: u32,
         status: crate::input::InputRoutingStatus,
+        detail: Option<&str>,
     ) {
-        self.send_text(&input_routing_status_message(generation, status).to_string());
+        let message = input_routing_status_message(generation, status, detail);
+        // Keep the existing reason/UI contract; detail is content-free launch
+        // evidence for diagnostics, never a new user-facing status reason.
+        if let Some(detail) = detail {
+            tracing::warn!(reason = "admin-unavailable", detail, "admin input status");
+        }
+        self.send_text(&message.to_string());
     }
 
     pub fn send_host_capabilities(
@@ -3433,13 +3443,29 @@ mod tests {
     }
 
     #[test]
+    fn admin_start_failure_detail_keeps_existing_status_reason() {
+        use crate::input::{InputRoute, InputRoutingStatus, InputStatusReason};
+        let warning = super::input_routing_status_message(
+            7,
+            InputRoutingStatus {
+                reason: Some(InputStatusReason::AdminUnavailable),
+                route: InputRoute::Admin,
+            },
+            Some("task result 2; hello timeout"),
+        );
+        assert_eq!(warning["reason"], "admin-unavailable");
+        assert_eq!(warning["detail"], "task result 2; hello timeout");
+        assert!(serde_json::from_value::<SignalMsg>(warning).is_ok());
+    }
+
+    #[test]
     fn input_status_validates_additive_privilege_fields_and_clear() {
         use crate::input::{InputRoute, InputRoutingStatus, InputStatusReason};
         let status = InputRoutingStatus {
             reason: Some(InputStatusReason::AdminRequired),
             route: InputRoute::Local,
         };
-        let warning = super::input_routing_status_message(7, status);
+        let warning = super::input_routing_status_message(7, status, None);
         assert_eq!(warning["reason"], "admin-required");
         assert_eq!(warning["route"], "local");
         assert!(serde_json::from_value::<SignalMsg>(warning.clone()).is_ok());
@@ -3449,6 +3475,7 @@ mod tests {
                 reason: None,
                 route: InputRoute::Admin,
             },
+            None,
         );
         assert!(clear["reason"].is_null());
         assert_eq!(clear["route"], "admin");
