@@ -31,7 +31,7 @@
   <p class="lead">Static review mockups for the native viewer (egui on D3D11, 2026-10-13). Nothing is built yet. Each page has a state switcher (buttons or number keys) and design notes at the bottom.</p>
 
   <div class="pages">
-    <a href="connect.html"><h2><svg class="i lg"><use href="#i-house"/></svg>Connect flow</h2><p>Device-key model: Your PCs, pairing (enter code, compare number), vouch request, site gate, before-sign-in approval, connecting, connect failed, key refused, ID rotation.</p></a>
+    <a href="connect.html"><h2><svg class="i lg"><use href="#i-house"/></svg>Connect flow</h2><p>Device-key model: Your PCs, pairing (enter code, compare number), vouch request, site gate, before-sign-in approval, connecting, connect failed, key refused, ID rotation, and This PC (hosting this computer: status, tray settings, paired devices, pairing requests).</p></a>
     <a href="session.html"><h2><svg class="i lg"><use href="#i-monitor-play"/></svg>Session chrome</h2><p>Collapsed tab, toolbar, monitor picker, stats, capture and release toasts, reconnecting, Admin required, secure desktop.</p></a>
   </div>
 
@@ -83,6 +83,35 @@
       <li><b>Works with today's relays:</b> connecting, connect failed, the session chrome, and approval wait as browser approval (ntfy or the host dialog "Allow a new browser to sign in?"). Today the client still signs in with the relay password (Go: password plus TOTP; Cloudflare: password), so v1-today needs a plain password step that these mockups no longer draw.</li>
       <li><b>Waits for device keys in the host and relay:</b> pairing, vouching, PC IDs and online state in Your PCs, several PCs per relay, key refused, PC key changed, ID rotation, before-sign-in approval (also waits for unattended access).</li>
       <li><b>Site gate:</b> approval exists today as browser approval; the 30-day <code>__Host-gate</code> cookie in front of every path arrives with the device-key cutover.</li>
+    </ol>
+  </div>
+
+  <div class="q">
+    <h2>This PC: the tray today, mapped to the app</h2>
+    <ol>
+      <li><b>Status line</b> (Starting, Running, Restarting in N s, Stopped, Stopped (not configured)) &rarr; the status pill in the This PC row and panel.</li>
+      <li><b>Viewer connected</b> (host stdout markers and the Admin agent demand event) &rarr; "Pixel 8 connected since 09:12" and the Connected tag on that device.</li>
+      <li><b>Restart host</b> &rarr; Restart. <b>Quit</b> (also <code>--quit</code>) ends the tray and the host &rarr; Stop hosting / Start hosting. The tray has no stop that keeps the tray running.</li>
+      <li><b>Stream PC sound</b> (tray.json, restarts the host), <b>Admin mode</b> (UAC helper on, scheduled task off), <b>Start at login</b> (tray.json plus HKCU Run) &rarr; the three switches.</li>
+      <li><b>Host build line</b>, <b>Roll back host</b>, <b>Open logs folder</b> &rarr; the footer row.</li>
+      <li><b>Admin agent / secure helper "needs update"</b> lines and the <b>secure desktop</b> status &rarr; an inline notice in the panel when they apply (not drawn).</li>
+      <li><b>Balloons</b> (Admin mode, update failed or rolled back) &rarr; the same messages as notices in the panel; the tray keeps its balloons.</li>
+      <li><b>"Allow a new browser to sign in?"</b> is a host window, not the tray; the pairing request card uses the same decision.</li>
+    </ol>
+    <h2 style="margin-top:22px">Missing today</h2>
+    <ol>
+      <li><b>No control interface.</b> The tray takes only <code>--quit</code> and the <code>--send-files</code> spool: no pipe, no localhost HTTP. Everything the panel reads or changes needs the local control interface: status, viewer connected, start, stop, restart, roll back, the three switches, build and update state, browser approval decisions. Admin mode off alone could run the existing scheduled task; on needs the elevated helper (one UAC prompt from the app).</li>
+      <li><b>CPU mode</b> is not in the tray or the host yet (encoders lane).</li>
+      <li><b>Paired devices, revoke, May vouch, pairing requests and the PC ID</b> wait for device keys.</li>
+      <li>Open logs folder needs no endpoint (the app opens <code>%LOCALAPPDATA%\BubblePlay\logs</code> itself).</li>
+    </ol>
+    <h2 style="margin-top:22px">Open questions (This PC)</h2>
+    <ol>
+      <li><b>Who owns settings?</b> The tray keeps tray.json in memory and overwrites it on save, so a direct edit from the app is lost. Should all writes go through the tray (or host) over the control interface?</li>
+      <li><b>Where does the control interface live:</b> in the tray (which supervises the host) or in the host?</li>
+      <li><b>Stop hosting:</b> stop the host but keep the tray running (new), or quit both like today?</li>
+      <li><b>CPU mode options</b> and whether changing it restarts the host like Stream PC sound.</li>
+      <li><b>Approvals in two places:</b> when the app is open, does a pairing request or browser approval still show the tray notification or host window too, and does deciding in one close the other?</li>
     </ol>
   </div>
 </div>

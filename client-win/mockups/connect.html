@@ -126,6 +126,52 @@
   .two-ids { display: grid; grid-template-columns: 1fr auto 1fr; gap: 14px; align-items: center; padding: 16px 18px; background: var(--surface); border: 1px solid var(--thread); border-radius: var(--r-panel); }
   .two-ids .k { font: 720 12px/1 var(--f-ui); color: var(--ink-faint); margin-bottom: 8px; display: block; }
   .two-ids .old { color: var(--ink-faint); text-decoration: line-through; text-decoration-color: var(--thread-strong); }
+
+  /* ---------- This PC (pinned host section) ---------- */
+  .pinned { margin: -6px 0 18px; padding-bottom: 16px; border-bottom: 1px solid var(--thread-strong); }
+  .pinned .k { font: 720 12px/1 var(--f-ui); color: var(--ink-faint); margin: 0 0 8px 2px; display: flex; gap: 8px; align-items: center; }
+  .row.host .ico { background: rgba(105,122,107,.35); color: var(--constructive); }
+  .row.host.sel .ico { background: var(--moss); color: var(--ink); }
+  .row.host.sel::before { background: var(--moss); }
+  body[data-state^="this-pc"] .rows .row.sel { background: transparent; }
+  body[data-state^="this-pc"] .rows .row.sel::before { display: none; }
+  body[data-state^="this-pc"] .rows .row.sel .ico { background: var(--surface-muted); color: var(--ink-muted); }
+  body[data-state^="this-pc"] .home { grid-template-columns: 350px 1fr; }
+  body[data-state^="this-pc"] .list { padding-right: 20px; }
+  body[data-state^="this-pc"] .list .end, body[data-state^="this-pc"] .list-head .btn, body[data-state^="this-pc"] .list-foot > span:last-child { display: none; }
+  body[data-state^="this-pc"] .rows .row .meta span + span { display: none; }
+  .hostp { background: var(--surface); border-left: 1px solid var(--thread); padding: 24px 26px 18px 30px; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto 1fr auto; gap: 0 26px; position: relative; }
+  .hostp::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--moss); }
+  .hostp .top { grid-column: 1 / -1; display: flex; align-items: flex-start; gap: 16px; padding-bottom: 16px; margin-bottom: 14px; border-bottom: 1px solid var(--thread); }
+  .hostp h2 { font: 650 32px/0.95 var(--f-display); font-stretch: 86%; letter-spacing: -0.035em; margin: 0 0 8px; }
+  .hostp .top .st { display: flex; gap: 10px; align-items: center; font-size: 13px; color: var(--ink-muted); flex-wrap: wrap; }
+  .hostp .top .ctl { margin-left: auto; display: flex; gap: 8px; }
+  .hostp .top .ctl .btn { height: 36px; padding: 0 12px; font-size: 12.5px; }
+  .hostp h3 { font: 720 12px/1 var(--f-ui); color: var(--ink-faint); margin: 0 0 8px; display: flex; justify-content: space-between; align-items: center; min-height: 26px; }
+  .set .line { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--thread); }
+  .set .line:last-child { border-bottom: 0; }
+  .set .line b { font: 720 13px/1.3 var(--f-ui); }
+  .set .line span.h { grid-column: 1; font-size: 11.5px; color: var(--ink-faint); line-height: 1.35; }
+  .set .line .ctl { grid-row: 1 / span 2; grid-column: 2; }
+  .mini-select { height: 30px; display: inline-flex; align-items: center; gap: 8px; padding: 0 8px 0 10px; border: 1px solid var(--thread-strong); border-radius: var(--r-field); background: var(--surface-raised); font-size: 12.5px; }
+  .devs { display: grid; gap: 2px; }
+  .dev { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 7px 8px; border-radius: var(--r-field); align-items: center; }
+  .dev:hover { background: var(--surface-raised); }
+  .dev b { font: 720 13px/1.3 var(--f-ui); display: flex; gap: 8px; align-items: center; }
+  .dev .m { font-size: 11.5px; color: var(--ink-faint); display: flex; gap: 8px; }
+  .dev .act { grid-row: 1 / span 2; grid-column: 2; display: flex; gap: 6px; align-items: center; }
+  .dev .act .btn { height: 28px; padding: 0 8px; font-size: 12px; }
+  .dev .act .revoke { color: var(--danger); }
+  .tag { font: 720 10.5px/1 var(--f-ui); color: var(--ink-faint); border: 1px solid var(--thread-strong); border-radius: 4px; padding: 3px 5px; }
+  .req-card { position: relative; padding: 12px 14px 12px 16px; margin-bottom: 12px; border: 1px solid rgba(240,210,156,.4); border-radius: var(--r-field); background: var(--surface-raised); overflow: hidden; }
+  .req-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--attention); }
+  .req-card b { font: 720 13.5px/1.3 var(--f-ui); }
+  .req-card .num { font-size: 26px; margin: 6px 0 4px; }
+  .req-card .row2 { display: flex; gap: 8px; margin-top: 10px; }
+  .req-card .row2 .btn { height: 32px; padding: 0 12px; font-size: 12.5px; }
+  .hostp .maint { grid-column: 1 / -1; display: flex; gap: 6px; align-items: center; padding-top: 10px; border-top: 1px solid var(--thread); font-size: 11.5px; color: var(--ink-faint); }
+  .hostp .maint .btn { height: 28px; padding: 0 8px; font-size: 12px; }
+  .hostp .maint .mono { font-size: 11px; }
 </style>
 </head>
 <body>
@@ -137,6 +183,8 @@
   </header>
   <ul class="states" role="toolbar" aria-label="Mockup state">
     <li><button data-state="home" data-caption="<b>Your PCs.</b> One click on Connect starts the session with that PC's last mode (or Game for a new PC). No choices before connecting; mode, display, quality and audio live in the session strip.">Your PCs</button></li>
+    <li><button data-state="this-pc" data-caption="<b>This PC: hosting.</b> The app also runs the host on this computer. Pinned above Your PCs; selecting it opens the host panel: status and start/stop, the tray's settings, paired devices. The tray keeps running and shows the same state.">This PC</button></li>
+    <li><button data-state="this-pc-request" data-caption="<b>This PC: incoming pairing request.</b> The same decision as the tray notification (compare the number, then Allow or Deny), at the top of the devices column.">This PC: request</button></li>
     <li><button data-state="pair-enter" data-caption="<b>Pair a new PC: enter the PC ID and code.</b> The tray's Pair device shows the PC ID, a one-time 10-character code and a QR for 5 minutes. On Windows you type them or paste the pairing link.">Pair: enter code</button></li>
     <li><button data-state="pair-confirm" data-caption="<b>Pair a new PC: compare the number.</b> Both sides show the same 6-digit number. Someone at the PC allows it from the tray, or (if remote pairing is on) an already paired device vouches for this one.">Pair: confirm</button></li>
     <li><button data-state="vouch" data-caption="<b>Vouch, seen from an already paired device.</b> A pairing request for Studio PC arrives on this viewer. It needs the May vouch permission. Before sign-in is never grantable by vouching.">Vouch request</button></li>
@@ -152,7 +200,7 @@
   <div class="win">
     <div class="titlebar">
       <span class="app"><span class="dot"></span>BubblePlay</span>
-      <span class="ctx" data-only="home vouch">3 PCs</span>
+      <span class="ctx" data-only="home vouch">3 PCs</span><span class="ctx" data-only="this-pc this-pc-request">This PC, hosting</span>
       <span class="ctx" data-only="pair-enter pair-confirm">Pair a new PC</span>
       <span class="ctx" data-only="gate approval connecting failed refused">Studio PC</span>
       <span class="ctx" data-only="rotate">This device</span>
@@ -160,11 +208,26 @@
     </div>
 
     <!-- ===== Home (and vouch request) ===== -->
-    <div class="body" data-view="home vouch">
+    <div class="body" data-view="home vouch this-pc this-pc-request">
       <div class="home">
         <div class="list">
+          <div class="pinned">
+            <div class="k"><svg class="i sm"><use href="#i-radio-tower"/></svg>This PC</div>
+            <div class="row host sel" data-only="this-pc this-pc-request">
+              <span class="ico"><svg class="i lg"><use href="#i-server"/></svg></span>
+              <div><div class="name">DESKTOP-K9TR <span class="status-pill online">Hosting</span></div>
+                <div class="meta"><span data-only="this-pc">1 viewer connected</span><span class="status-pill warn" data-only="this-pc-request">1 pairing request</span></div></div>
+              <div class="end"></div>
+            </div>
+            <div class="row host" data-only="home vouch">
+              <span class="ico"><svg class="i lg"><use href="#i-server"/></svg></span>
+              <div><div class="name">DESKTOP-K9TR <span class="status-pill online">Hosting</span></div>
+                <div class="meta"><span>Pixel 8 connected</span><span>Admin mode off</span></div></div>
+              <div class="end"><button class="btn ghost"><svg class="i sm"><use href="#i-settings"/></svg>Manage</button></div>
+            </div>
+          </div>
           <div class="list-head">
-            <div><h1>Your PCs</h1><p>Paired with this device's key.</p></div>
+            <div><h1>Your PCs</h1><p>Other PCs paired with this device's key.</p></div>
             <button class="btn"><svg class="i"><use href="#i-plus"/></svg>Pair a new PC</button>
           </div>
           <div class="rows">
@@ -213,6 +276,52 @@
           <div class="manage">
             <button class="btn ghost"><svg class="i sm"><use href="#i-pencil"/></svg>Rename</button>
             <button class="btn ghost forget"><svg class="i sm"><use href="#i-trash-2"/></svg>Forget Studio PC</button>
+          </div>
+        </aside>
+
+        <aside class="hostp" data-only="this-pc this-pc-request" hidden>
+          <div class="top">
+            <div>
+              <h2>This PC</h2>
+              <div class="st"><span class="status-pill online">Running</span><span>Pixel 8 connected since 09:12</span><span class="id">PC ID W5NJ-C2RD-9PXF-6KAE</span></div>
+            </div>
+            <div class="ctl">
+              <button class="btn"><svg class="i sm"><use href="#i-rotate-ccw"/></svg>Restart</button>
+              <button class="btn"><svg class="i sm"><use href="#i-circle-stop"/></svg>Stop hosting</button>
+            </div>
+          </div>
+          <div>
+            <h3>Hosting settings</h3>
+            <div class="set">
+              <div class="line"><b>Stream PC sound</b><span class="ctl"><span class="switch on"><span class="trk"></span></span></span><span class="h">Changing it restarts the host and ends the current session.</span></div>
+              <div class="line"><b>Admin mode</b><span class="ctl"><span class="switch"><span class="trk"></span></span></span><span class="h">Lets input reach elevated windows. Turning it on asks for one admin prompt.</span></div>
+              <div class="line"><b>Start at login</b><span class="ctl"><span class="switch on"><span class="trk"></span></span></span><span class="h">Starts BubblePlay hosting when you sign in to Windows.</span></div>
+              <div class="line"><b>CPU mode</b><span class="ctl"><span class="mini-select">Auto<svg class="i sm"><use href="#i-chevron-down"/></svg></span></span><span class="h">Encoder choice. Options come from the encoders work.</span></div>
+            </div>
+          </div>
+          <div>
+            <div class="req-card" data-only="this-pc-request">
+              <b>Pair 'Work laptop'?</b>
+              <div class="id" style="margin-top:4px">ID M3ZD-8QRA-F2KV-T7WB</div>
+              <div class="num">482 913</div>
+              <div style="font-size:12px;color:var(--ink-faint)">Allow only if Work laptop shows this number.</div>
+              <div class="row2"><button class="btn primary">Allow</button><button class="btn">Deny</button><span class="elapsed" style="margin-left:auto;align-self:center">4:12 left</span></div>
+            </div>
+            <h3><span>Paired devices</span><button class="btn ghost" style="height:26px;padding:0 8px;font-size:12px"><svg class="i sm"><use href="#i-qr-code"/></svg>Pair a device</button></h3>
+            <div class="devs">
+              <div class="dev"><b>Pixel 8 <span class="status-pill live">Connected</span></b><span class="m"><span class="id">P6XA-91LD</span><span>View, input</span></span>
+                <span class="act"><span class="switch on" title="May vouch"><span class="trk"></span></span><button class="btn ghost revoke">Revoke</button></span></div>
+              <div class="dev"><b>Studio laptop</b><span class="m"><span class="id">J4HN-0TCV</span><span>Seen today</span></span>
+                <span class="act"><span class="switch" title="May vouch"><span class="trk"></span></span><button class="btn ghost revoke">Revoke</button></span></div>
+              <div class="dev" data-only="this-pc"><b>Old tablet <span class="tag">vouched by Pixel 8</span></b><span class="m"><span class="id">E2YR-5QBW</span><span>Not seen for 41 days</span></span>
+                <span class="act"><span class="switch" title="May vouch"><span class="trk"></span></span><button class="btn ghost revoke">Revoke</button></span></div>
+            </div>
+            <div style="font-size:11.5px;color:var(--ink-faint);margin-top:6px;text-align:right">Switch: may vouch for new devices</div>
+          </div>
+          <div class="maint">
+            <span>Host build <span class="mono">3f9c2e1</span>: good</span>
+            <button class="btn ghost" style="margin-left:auto"><svg class="i sm"><use href="#i-undo-2"/></svg>Roll back host</button>
+            <button class="btn ghost"><svg class="i sm"><use href="#i-folder-open"/></svg>Open logs folder</button>
           </div>
         </aside>
 
@@ -413,6 +522,15 @@
   <p class="caption"></p>
 
   <div class="notes">
+    <section>
+      <h2>This PC</h2>
+      <ul>
+        <li>A pinned section above Your PCs, not the first row. Hosting is a different job (this computer is the one being reached), so a seam separates it, it never gets a Connect button, and it cannot be sorted or scrolled away among remote PCs.</li>
+        <li>Selecting it widens the panel to two columns: settings left, devices and requests right. Build, roll back and logs sit in a quiet footer row.</li>
+        <li>Moss marks hosting; apricot stays reserved for connecting and Allow.</li>
+        <li>The tray stays the background presence; this panel reads and writes the same state.</li>
+      </ul>
+    </section>
     <section>
       <h2>Layout</h2>
       <ul>
