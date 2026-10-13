@@ -13,11 +13,13 @@ str0m = "0.21.0"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Media",
+    "Win32_Media_Audio",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     "Win32_System_Ole",
     "Win32_System_SystemServices",
     "Win32_System_DataExchange",
@@ -56,6 +58,7 @@ png = "0.18"
 base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opus = "0.4.0"
 
 [profile.release]
 lto = "thin"
