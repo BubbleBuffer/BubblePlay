@@ -10,6 +10,7 @@ import {
   parseAudioPacket,
   probeOpusDecode,
   soundButtonView,
+  sumAudioStats,
 } from "../public/audio.js";
 
 const contract = JSON.parse(readFileSync(new URL("../../fixtures/audio-contract.json", import.meta.url), "utf8"));
@@ -111,6 +112,19 @@ test("sequence wraps at u32 without a reset; gaps and discontinuities reset the 
   near(playout.schedule(5, 0.01), 5.04, "after gap");
   assert.equal(playout.receive(4, true), "reset", "discontinuity flag on the expected seq");
   near(playout.schedule(6, 0.01), 6.04, "after discontinuity");
+});
+
+test("playout counts mid-stream resets only, not the first packet or an explicit reset", () => {
+  const playout = new AudioPlayout();
+  playout.receive(1);
+  assert.equal(playout.resets, 0, "first packet");
+  playout.receive(3);
+  assert.equal(playout.resets, 1, "gap");
+  playout.receive(4, true);
+  assert.equal(playout.resets, 2, "discontinuity");
+  playout.reset();
+  playout.receive(9);
+  assert.equal(playout.resets, 2, "explicit reset and the next first packet");
 });
 
 test("playout re-anchors after an underrun instead of scheduling in the past", () => {
@@ -220,6 +234,70 @@ test("WSS player drops output once the queue is more than 150 ms ahead", () => {
   for (let i = 0; i < 20; i++) decoder.output(fakeAudioData());
   assert.ok(player.dropped > 0);
   assert.ok(env.sources.length < 20);
+});
+
+test("WSS player stats count packets, payload bytes, rejects, frames, cap drops and resets", () => {
+  const env = fakeAudioEnv();
+  const player = playerFor(env);
+  const zero = { packets: 0, payloadBytes: 0, rejected: 0, failures: 0, framesDecoded: 0,
+    framesScheduled: 0, droppedCap: 0, scheduleResets: 0 };
+  assert.deepEqual(player.stats(), zero);
+
+  const good = packetBytes(contract.packets[0]);
+  player.push(good);
+  assert.equal(player.stats().packets, 1);
+  assert.equal(player.stats().payloadBytes, 3, "fcfffe is three Opus bytes");
+  assert.equal(player.stats().scheduleResets, 0, "first packet is not a reset");
+
+  // The same packet again is a sequence gap: one mid-stream reset.
+  player.push(good);
+  assert.equal(player.stats().scheduleResets, 1);
+  assert.equal(player.stats().payloadBytes, 6);
+
+  assert.equal(player.push(packetBytes(contract.packets.find(packet => packet.name === "bad-magic"))), "rejected");
+  assert.equal(player.stats().packets, 3);
+  assert.equal(player.stats().rejected, 1);
+  assert.equal(player.stats().payloadBytes, 6, "rejected bytes are not counted");
+
+  const [decoder] = env.decoders;
+  env.contexts[0].currentTime = 0;
+  for (let i = 0; i < 20; i++) decoder.output(fakeAudioData());
+  const after = player.stats();
+  assert.equal(after.framesDecoded, 20);
+  assert.equal(after.framesScheduled + after.droppedCap, 20, "every decoded frame is scheduled or dropped");
+  assert.ok(after.droppedCap > 0);
+  assert.equal(after.failures, 0);
+});
+
+test("WSS player counts a decoder failure once and keeps counting after it restarts", () => {
+  const env = fakeAudioEnv();
+  env.createDecoder = () => { throw new Error("no decoder"); };
+  const errors = [];
+  const player = new WssAudioPlayer({
+    createContext: env.createContext, createDecoder: env.createDecoder, createChunk: env.createChunk,
+    onError: error => errors.push(error),
+  });
+  assert.equal(player.push(packetBytes(contract.packets[0])), "rejected");
+  assert.equal(errors.length, 1);
+  assert.equal(player.stats().failures, 1);
+  assert.equal(player.stats().rejected, 0, "a valid packet that failed to start is not a parse reject");
+  assert.equal(player.stats().packets, 1);
+});
+
+test("sumAudioStats adds player snapshots and treats missing ones as zero", () => {
+  const env = fakeAudioEnv();
+  const first = playerFor(env);
+  first.push(packetBytes(contract.packets[0]));
+  const second = playerFor(env);
+  second.push(packetBytes(contract.packets.find(packet => packet.name === "bad-magic")));
+  const total = sumAudioStats(first.stats(), null, second.stats());
+  assert.equal(total.packets, 2);
+  assert.equal(total.rejected, 1);
+  assert.equal(total.payloadBytes, 3);
+  assert.deepEqual(sumAudioStats(), {
+    packets: 0, payloadBytes: 0, rejected: 0, failures: 0, framesDecoded: 0,
+    framesScheduled: 0, droppedCap: 0, scheduleResets: 0,
+  });
 });
 
 function fakeTarget() {
@@ -355,6 +433,10 @@ test("the strip sound button sits before fullscreen, hidden until the host annou
   assert.match(receiver, /\.\.\.\(audioDecodable \? \{ audio: 1 \} : \{\}\)/);
   assert.match(receiver, /if \(isAudioPacket\(data\)\) \{/);
   assert.match(receiver, /if \(ev\.track\.kind === "audio"\) \{/);
+  // The audio inbound-rtp is read alongside the unchanged video selection.
+  assert.match(receiver, /s\.type === "inbound-rtp" && \(s\.kind === "video" \|\| s\.mediaType === "video"\)/);
+  assert.match(receiver, /s\.type === "inbound-rtp" && \(s\.kind === "audio" \|\| s\.mediaType === "audio"\)/);
+  assert.match(receiver, /audio: audioSnapshot\(\),/);
   const video = receiver.indexOf('candidate.addTransceiver("video", { direction: "recvonly" });');
   const audio = receiver.indexOf('candidate.addTransceiver("audio", { direction: "recvonly" });');
   assert.ok(video > 0 && audio > video, "audio transceiver right after video");

@@ -24,7 +24,7 @@ import {
 import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyName, shortcutsFor } from "/chrome.js";
 import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
-import { SoundController, WssAudioPlayer, isAudioPacket, probeOpusDecode, soundButtonView } from "/audio.js";
+import { SoundController, WssAudioPlayer, isAudioPacket, probeOpusDecode, soundButtonView, sumAudioStats } from "/audio.js";
 import { FileTransferClient } from "/file-client.js";
 import { createFileDragPreviewController, filesFromPaste, installFileTransferUi, mapFileDropPoint } from "/file-ui.js";
 
@@ -168,6 +168,8 @@ let hostCapabilitiesGeneration = 0;
 let hostAudioCapable = false; // host-capabilities.audio === 1
 let wssAudioPlayer = null;
 let wssAudioSinkAttached = false;
+let wssAudioRetired = sumAudioStats(); // counters from players already stopped
+let latestInboundAudio = null; // WebRTC inbound-rtp for the audio track
 const soundController = new SoundController({ target: document, onChange: () => renderSoundSlot() });
 let hasPresentedFrame = false;
 let fileDropPresentedGeneration = null;
@@ -1409,12 +1411,23 @@ function createWssAudioPlayer() {
 }
 
 function stopWssAudio() {
+  if (wssAudioPlayer) wssAudioRetired = sumAudioStats(wssAudioRetired, wssAudioPlayer.stats());
   wssAudioPlayer?.stop();
   wssAudioPlayer = null;
   if (wssAudioSinkAttached) {
     wssAudioSinkAttached = false;
     soundController.detachSink("wss");
   }
+}
+
+// Diagnostics: "off" without the host capability, otherwise the controller state.
+function audioSnapshot() {
+  return {
+    announced: hostAudioCapable,
+    controller: hostAudioCapable ? soundController.state : "off",
+    wss: sumAudioStats(wssAudioRetired, wssAudioPlayer?.stats()),
+    webrtc: latestInboundAudio ? { ...latestInboundAudio } : null,
+  };
 }
 
 function startWssV4() {
@@ -2267,6 +2280,7 @@ if (diagnosticsEnabled) {
           presentation: framePresentationTelemetry.snapshot(),
           hybrid: activeWssHybridCache().snapshot(),
         },
+        audio: audioSnapshot(),
         viewport: viewportHealthSnapshot(),
         signaling: {
           registered: signalingRegistered,
@@ -2543,7 +2557,7 @@ setInterval(async () => {
     // generation lets consumers reject them as decode evidence.
     latestRtcProfileGeneration = sampledGeneration;
     hudState.route = deriveCandidateRoute(latestRtcProfile);
-    let inbound = null, rtt = null;
+    let inbound = null, rtt = null, inboundAudio = null;
     stats.forEach((s) => {
       if (s.type === "candidate-pair" && s.state === "succeeded" && s.nominated) {
         if (typeof s.currentRoundTripTime === "number" && s.currentRoundTripTime >= 0) {
@@ -2551,9 +2565,21 @@ setInterval(async () => {
         }
       } else if (s.type === "inbound-rtp" && (s.kind === "video" || s.mediaType === "video")) {
         inbound = s;
+      } else if (s.type === "inbound-rtp" && (s.kind === "audio" || s.mediaType === "audio")) {
+        inboundAudio = s;
       }
     });
     const atMs = Date.now();
+    latestInboundAudio = inboundAudio ? {
+      generation: peerGeneration,
+      atMs,
+      packetsReceived: inboundAudio.packetsReceived,
+      packetsLost: inboundAudio.packetsLost,
+      totalSamplesReceived: inboundAudio.totalSamplesReceived,
+      concealedSamples: inboundAudio.concealedSamples,
+      jitterBufferDelay: inboundAudio.jitterBufferDelay,
+      jitterBufferEmittedCount: inboundAudio.jitterBufferEmittedCount,
+    } : null;
     const currentInbound = inbound ? {
       generation: peerGeneration,
       atMs,

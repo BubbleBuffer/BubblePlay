@@ -20,6 +20,8 @@ export const AUDIO_LEAD_MS = 40;
 export const AUDIO_MAX_AHEAD_MS = 150;
 const MAX_SAFE_TIMESTAMP = 9_007_199_254_740_991n;
 const GESTURE_EVENTS = ["pointerdown", "click", "keydown"];
+const AUDIO_STAT_KEYS = ["packets", "payloadBytes", "rejected", "failures", "framesDecoded",
+  "framesScheduled", "droppedCap", "scheduleResets"];
 
 function bytesOf(value) {
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
@@ -68,6 +70,9 @@ export class AudioPlayout {
   constructor({ leadS = AUDIO_LEAD_MS / 1000, maxAheadS = AUDIO_MAX_AHEAD_MS / 1000 } = {}) {
     this.leadS = leadS;
     this.maxAheadS = maxAheadS;
+    // Mid-stream resets (a gap or a discontinuity flag). The first packet and
+    // reset() calls are not counted.
+    this.resets = 0;
     this.reset();
   }
 
@@ -79,6 +84,7 @@ export class AudioPlayout {
   /** @returns {"accept"|"reset"} */
   receive(seq, discontinuity = false) {
     const reset = discontinuity || this.expectedSeq === null || seq !== this.expectedSeq;
+    if (reset && this.expectedSeq !== null) this.resets++;
     if (reset) this.nextAt = null;
     this.expectedSeq = (seq + 1) >>> 0;
     return reset ? "reset" : "accept";
@@ -108,14 +114,20 @@ export class WssAudioPlayer {
     this.decoder = null;
     this.muted = false;
     this.dropped = 0;
+    this.counts = Object.fromEntries(AUDIO_STAT_KEYS.map(key => [key, 0]));
   }
 
   get running() { return this.decoder !== null; }
 
   /** @returns {"decoded"|"muted"|"rejected"} Sequence tracking continues while muted. */
   push(packet) {
+    this.counts.packets++;
     const audio = parseAudioPacket(packet);
-    if (!audio) return "rejected";
+    if (!audio) {
+      this.counts.rejected++;
+      return "rejected";
+    }
+    this.counts.payloadBytes += audio.data.byteLength;
     this.playout.receive(audio.seq, audio.discontinuity);
     if (!this.#ensure()) return "rejected";
     if (this.muted) return "muted";
@@ -130,6 +142,21 @@ export class WssAudioPlayer {
       return "rejected";
     }
     return "decoded";
+  }
+
+  /**
+   * Plain counters since this player was created. packets = every BPA1 packet
+   * pushed; payloadBytes = Opus bytes of parsed packets; rejected = failed
+   * parseAudioPacket; failures = decoder/context errors (each one stops the
+   * player); framesDecoded = AudioDecoder output; framesScheduled and droppedCap
+   * split those frames; scheduleResets = mid-stream gap or discontinuity resets.
+   */
+  stats() {
+    return {
+      ...this.counts,
+      droppedCap: this.dropped,
+      scheduleResets: this.playout.resets ?? 0,
+    };
   }
 
   setMuted(muted) {
@@ -176,6 +203,7 @@ export class WssAudioPlayer {
   }
 
   #output(audioData) {
+    this.counts.framesDecoded++;
     if (!this.context) { audioData.close?.(); return; }
     try {
       const { numberOfChannels: channels, numberOfFrames: frames, sampleRate } = audioData;
@@ -190,6 +218,7 @@ export class WssAudioPlayer {
         this.dropped++;
         return;
       }
+      this.counts.framesScheduled++;
       const source = this.context.createBufferSource();
       source.buffer = buffer;
       source.connect(this.gain);
@@ -202,9 +231,20 @@ export class WssAudioPlayer {
   }
 
   #fail(error) {
+    this.counts.failures++;
     this.onError(error);
     this.stop();
   }
+}
+
+/** Sums stats() objects. Missing or null sets count as zero. */
+export function sumAudioStats(...sets) {
+  const total = Object.fromEntries(AUDIO_STAT_KEYS.map(key => [key, 0]));
+  for (const set of sets) {
+    if (!set) continue;
+    for (const key of AUDIO_STAT_KEYS) total[key] += set[key] ?? 0;
+  }
+  return total;
 }
 
 /** Resolves true when this browser can decode the BPA1 Opus configuration. */
