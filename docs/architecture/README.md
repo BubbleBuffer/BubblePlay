@@ -22,6 +22,8 @@ The `/host-ws` and `/ws` sockets carry registration, session signaling, desktop 
 
 WSS v4 sends one encoded access unit per binary message, with a 28-byte header describing codec, generation, sequence, capture time and dimensions. The receiver returns frame ACKs and keyframe requests on that media socket. Generation/sequence gates prevent stale deltas from being presented after recovery or a monitor switch. Host feedback controls capture/encoding admission instead of accumulating a queue of old frames.
 
+The browser WebCodecs receiver identifies H.264 or HEVC from Annex B keyframe NAL headers and immediately reconfigures on a codec change, decoding that same keyframe even when the WSS header still names the previous codec. WebRTC offers H.264 after HEVC when HEVC is preferred, so an H.264-only host can answer.
+
 Shared fixtures are the cross-language contract; update them and the affected implementations together:
 
 | Fixture | Contract |
