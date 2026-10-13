@@ -30,6 +30,19 @@ class IconExportsTest(unittest.TestCase):
                 with Image.open(icons.BRANDING / "small" / f"{size}.png") as png:
                     self.assertEqual(image.tobytes(), png.convert("RGBA").tobytes())
 
+    def test_large_frames_carry_the_kit_colours(self):
+        def near(image, colour):
+            target = icons.hex_rgb(colour)
+            return sum(p[3] == 255 and max(abs(a - b) for a, b in zip(p[:3], target)) <= 8
+                       for p in image.getdata())
+        with Image.open(icons.OUT / "bubbleplay.ico") as ico:
+            frame48 = ico.ico.getimage((48, 48)).convert("RGBA")
+            frame256 = ico.ico.getimage((256, 256)).convert("RGBA")
+        for colour in ("#282A2F", "#F2EBDD"):
+            self.assertGreaterEqual(near(frame48, colour), 3, colour)
+        for colour in ("#282A2F", "#FFFAF1", "#DE945F", "#F2EBDD"):
+            self.assertGreaterEqual(near(frame256, colour), 20, colour)
+
     def test_rendered_launcher_stays_in_safe_circle(self):
         master_hash = hashlib.sha256(icons.MASTER.read_bytes()).hexdigest()
         with Image.open(icons.RES / "drawable-xxxhdpi/ic_launcher_foreground.png") as foreground:
