@@ -27,6 +27,10 @@ Status: done 2026-10-12. Android now follows the browser's carry rule: held keys
 Status: approved 2026-10-12 for all four: follow active window (including edge-hold drags), game mode, background survival and keyboard lock.
 Built on lane/android-parity (2026-10-13), not yet merged: follow active window in the switch-screen popover, Work/Game pointer modes (Game uses Android pointer capture), keyboard capture (Esc and Win combinations; Android keeps Win alone, Alt+Tab and Print Screen), and a `dataSync` foreground service that keeps the session and transfers alive in the background with a Disconnect notification, falling back to the 30 s background stop. Still browser-only: desktop file drops with preview.
 
+### Compose UI and Game controls
+Status: planned; starts after the encoders and Windows-client lanes are further along.
+Decided 2026-10-14: the Android UI (today plain Views built in code, no layouts) moves to Jetpack Compose step by step, through ComposeView interop. The SurfaceView video path and the networking stay as they are. The session overlays and the new Game controls come first. Ruled out: a WebView UI (the touch routing and the JS bridge sit in the game-input path), egui on Android (weak IME), Flutter (rewrite). Game controls: an on-screen gamepad and virtual keys with editable layouts, a key bar (Esc, Tab, Win, F-keys, modifiers), real key down/up from hardware keyboards and gamepads, and touch controls hidden while a physical controller is in use. Shares design tokens with the browser and Windows clients. Claude designs it with mockups for the owner first; no Codex for UI.
+
 ### Typing over laggy connections
 Status: proposed; investigate first.
 Idea from 2026-10-12: on a slow link, typed keys could be buffered and sent in chunks instead of one packet per key. Control packets are already queued in order, so first measure what goes wrong today: lost keys, reordering, or only delay. Then decide between batching key packets and sending text chunks. Applies to Android first, the browser if the same issue shows.
