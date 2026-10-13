@@ -11,7 +11,10 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::wss_v4::{V4Events, V4Link, V4Reserve, V4Stats, V4Submit, V4_HEADER_BYTES};
+use crate::audio::AudioFrame;
+use crate::wss_v4::{
+    V4AudioSubmit, V4Events, V4Link, V4Reserve, V4Stats, V4Submit, V4_HEADER_BYTES,
+};
 use anyhow::{bail, Context, Result};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::{header::AUTHORIZATION, HeaderName, HeaderValue, Request};
@@ -102,6 +105,14 @@ impl WssMediaEgress {
         self.link.set_activity(activity);
     }
 
+    /// Submit from the capture thread, independently of video producer work.
+    pub fn audio_sink(&self) -> Arc<dyn Fn(crate::audio::AudioFrame) + Send + Sync> {
+        let link = self.link.clone();
+        Arc::new(move |frame| {
+            link.submit_audio(frame);
+        })
+    }
+
     /// Connect the single media socket for `epoch`, authenticating the HTTP
     /// upgrade with `Authorization: Bearer <bearer>`.
     pub fn connect(
@@ -162,6 +173,16 @@ impl WssMediaEgress {
 
     pub fn set_frame_size(&self, width: u32, height: u32) {
         self.link.set_frame_size(width, height);
+    }
+
+    /// Opt the BPA1 audio lane in (`audio:1` from the viewer's start) or out.
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        self.link.set_audio_enabled(enabled);
+    }
+
+    /// Queue one audio frame; it never waits on or affects video admission.
+    pub fn submit_audio(&self, frame: AudioFrame) -> V4AudioSubmit {
+        self.link.submit_audio(frame)
     }
 
     pub fn wire_payload_bytes(&self, access_unit_bytes: usize) -> u64 {

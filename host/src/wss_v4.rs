@@ -38,6 +38,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::activity::Activity;
+use crate::audio::AudioFrame;
 use crate::frame_damage::DamageRect;
 use crate::link_capacity::{Capacity, CapacityEstimator};
 use tracing::{debug, info, warn};
@@ -62,6 +63,12 @@ pub const INFLIGHT_MAX_FRAMES: usize = 4;
 /// in-flight frames so sending can resume. This never forces a keyframe; a
 /// receiver whose decoder chain broke asks for one (seq gap / decode error).
 pub const ACK_STALL_LIMIT: Duration = Duration::from_secs(3);
+/// Audio (BPA1) lane: pending packets are bounded to this many (10 ms each);
+/// the oldest is dropped when a new one arrives.
+pub const AUDIO_QUEUE_FRAMES: usize = 10;
+/// An oldest unacked video frame older than this suspends audio sends until an
+/// ACK retires video. Audio never enters video admission, budget or keyframes.
+pub const AUDIO_STALL_LIMIT: Duration = Duration::from_secs(1);
 /// Idle heartbeat on the media socket.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Declare the socket dead after this long without any inbound message
@@ -349,6 +356,17 @@ impl SendPolicy {
 
     pub fn inflight_bytes(&self) -> u64 {
         self.inflight_bytes
+    }
+
+    /// The oldest video frame still awaiting its ACK: (generation, seq, age).
+    pub fn oldest_unacked(&self, now: Instant) -> Option<(u32, u32, Duration)> {
+        self.inflight.front().map(|frame| {
+            (
+                frame.generation,
+                frame.seq,
+                now.saturating_duration_since(frame.sent_at),
+            )
+        })
     }
 
     pub fn on_sent(&mut self, now: Instant, generation: u32, seq: u32, bytes: u64, key: bool) {
@@ -788,6 +806,13 @@ pub struct V4Stats {
     pub rate_cap_bps: u64,
     /// Total time the capacity bound the producer (budget, pacing, ceiling).
     pub constrained_ms: u64,
+    /// BPA1 audio packets written to the media socket.
+    pub audio_frames_sent: u64,
+    pub audio_bytes_sent: u64,
+    /// Audio frames dropped: queue overflow, stall, disconnect or encode error.
+    pub audio_frames_dropped: u64,
+    /// Audio sends are suspended by an unacked video stall.
+    pub audio_suspended: bool,
 }
 
 struct Shared {
@@ -804,6 +829,54 @@ struct Shared {
     timestamps: TimestampExtender,
     frame_size: (u16, u16),
     stats: V4Stats,
+    audio: AudioLane,
+}
+
+impl Shared {
+    /// Latch the audio stall once the oldest unacked video frame is older than
+    /// `AUDIO_STALL_LIMIT`. Must run before anything that can drop that frame
+    /// from the in-flight window (ACK retirement, stall expiry).
+    fn observe_audio(&mut self, now: Instant) {
+        self.audio.observe(self.policy.oldest_unacked(now));
+    }
+
+    /// The next audio packet to write, or `None` while audio is not sendable
+    /// (no opted-in current peer, stalled, or empty).
+    fn next_audio(&mut self, now: Instant) -> Option<AudioFrame> {
+        self.observe_audio(now);
+        if !(self.connected && self.peer_present) {
+            return None;
+        }
+        self.audio.take_next()
+    }
+
+    /// Accept one audio frame into the lane. Touches no video state.
+    fn queue_audio(&mut self, now: Instant, frame: AudioFrame) -> V4AudioSubmit {
+        if !self.audio.enabled {
+            return V4AudioSubmit::Disabled;
+        }
+        self.observe_audio(now);
+        if !(self.connected && self.peer_present) || self.audio.stalled {
+            self.audio.mark_gap(1);
+            return V4AudioSubmit::Unavailable;
+        }
+        self.audio.push(frame);
+        V4AudioSubmit::Queued
+    }
+}
+
+/// Retire ACKed video frames. Audio's stall is settled against the window
+/// before and after the ACK: retiring frames is progress, and an ACK covering
+/// the fence frame clears it even after SendPolicy expired that frame. A frame
+/// that is still too old re-latches the stall. Video policy is unchanged.
+fn retire_video(state: &mut Shared, now: Instant, generation: u32, seq: u32) -> Option<AckOutcome> {
+    state.observe_audio(now);
+    let before = state.policy.inflight_frames();
+    let outcome = state.policy.on_ack(now, generation, seq);
+    let progressed = state.policy.inflight_frames() < before;
+    state.audio.on_ack(progressed, generation, seq);
+    state.observe_audio(now);
+    outcome
 }
 
 struct Outgoing {
@@ -824,6 +897,117 @@ pub enum V4Submit {
     Queued,
     DroppedRequireIdr,
     Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V4AudioSubmit {
+    Queued,
+    /// Audio is not opted in on this link; nothing is kept.
+    Disabled,
+    /// No opted-in peer on a live socket, or video is stalled: dropped.
+    Unavailable,
+    Stopped,
+}
+
+/// Send-side audio lane. Audio shares the socket writer with video but none of
+/// its admission: no in-flight budget, no keyframe requests, no video queue.
+#[derive(Debug, Default)]
+struct AudioLane {
+    /// Set by the coordinator from the viewer's `audio:1` start; off by default.
+    enabled: bool,
+    queue: VecDeque<AudioFrame>,
+    /// Something was dropped, stalled or reset: the next packet is marked
+    /// discontinuous so the receiver resets its playout buffer.
+    gap: bool,
+    /// Latched when the oldest unacked video frame passed `AUDIO_STALL_LIMIT`.
+    /// Cleared by video progress, by an ACK covering `fence`, or by a new
+    /// socket / peer (`link_reset`). An expired video window does not clear it.
+    stalled: bool,
+    /// (generation, seq) of the oldest unacked video frame when the stall
+    /// latched. Kept after SendPolicy expires that frame, so its late ACK can
+    /// still end the stall. Set only while `stalled`.
+    fence: Option<(u32, u32)>,
+    /// Audio frames dropped for any reason, reported in `V4Stats`.
+    dropped: u64,
+}
+
+impl AudioLane {
+    fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.discard();
+        }
+    }
+
+    fn mark_gap(&mut self, dropped: u64) {
+        self.dropped += dropped;
+        self.gap = true;
+    }
+
+    /// Drop the whole backlog; the next packet carries the discontinuity flag.
+    fn discard(&mut self) {
+        let count = self.queue.len() as u64;
+        self.queue.clear();
+        self.mark_gap(count);
+    }
+
+    /// Bounded queue: when full, the oldest pending frame goes.
+    fn push(&mut self, frame: AudioFrame) {
+        if self.queue.len() >= AUDIO_QUEUE_FRAMES {
+            self.queue.pop_front();
+            self.mark_gap(1);
+        }
+        self.queue.push_back(frame);
+    }
+
+    /// Latch the stall when the oldest unacked video frame is too old, fencing
+    /// on that frame. A stall drops the backlog so audio resumes fresh rather
+    /// than behind a delay.
+    fn observe(&mut self, oldest: Option<(u32, u32, Duration)>) {
+        if self.stalled {
+            return;
+        }
+        if let Some((generation, seq, age)) = oldest {
+            if age > AUDIO_STALL_LIMIT {
+                self.stalled = true;
+                self.fence = Some((generation, seq));
+                self.discard();
+            }
+        }
+    }
+
+    /// Settle the stall against one inbound video ACK. Retiring video frames is
+    /// progress. An ACK for the fence generation whose seq reaches the fence
+    /// frame also clears it, even after that frame expired. Any other ACK is
+    /// stale for audio and leaves the stall latched.
+    fn on_ack(&mut self, progressed: bool, generation: u32, seq: u32) {
+        let covers_fence = self.fence.is_some_and(|(fence_generation, fence_seq)| {
+            fence_generation == generation && seq_reached(seq, fence_seq)
+        });
+        if progressed || covers_fence {
+            self.stalled = false;
+            self.fence = None;
+        }
+    }
+
+    /// A new media socket or peer epoch: video in flight belongs to the old
+    /// one, so the stall, its fence and the backlog go with it.
+    fn link_reset(&mut self) {
+        self.stalled = false;
+        self.fence = None;
+        self.discard();
+    }
+
+    fn take_next(&mut self) -> Option<AudioFrame> {
+        if !self.enabled || self.stalled {
+            return None;
+        }
+        let mut frame = self.queue.pop_front()?;
+        if std::mem::take(&mut self.gap) {
+            frame.discontinuity = true;
+        }
+        Some(frame)
+    }
 }
 
 pub type Connector = Box<dyn Fn() -> Result<WebSocket<MaybeTlsStream<TcpStream>>> + Send + 'static>;
@@ -877,6 +1061,7 @@ impl V4Link {
             timestamps: TimestampExtender::default(),
             frame_size: (0, 0),
             stats: V4Stats::default(),
+            audio: AudioLane::default(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(LINK_QUEUE_CAPACITY);
@@ -1000,6 +1185,27 @@ impl V4Link {
         }
     }
 
+    /// Opt the audio lane in or out. Off (the default) keeps no audio and sends
+    /// no BPA1 packets. Turning it off drops the backlog.
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        self.lock().audio.set_enabled(enabled);
+        self.activity.notify();
+    }
+
+    /// Queue one audio frame for the socket writer, which sends it ahead of any
+    /// video. Never touches the video queue, the in-flight budget or keyframe
+    /// state, and never requests a keyframe.
+    pub fn submit_audio(&self, frame: AudioFrame) -> V4AudioSubmit {
+        if self.stop.load(Ordering::Acquire) {
+            return V4AudioSubmit::Stopped;
+        }
+        let outcome = self.lock().queue_audio(Instant::now(), frame);
+        if outcome == V4AudioSubmit::Queued {
+            self.activity.notify();
+        }
+        outcome
+    }
+
     /// Wake the producer whenever ACK, keyframe, peer or rate state changes.
     pub fn set_activity(&self, activity: Activity) {
         self.lock().producer_activity = Some(activity.clone());
@@ -1049,6 +1255,8 @@ impl V4Link {
             peer_present: shared.peer_present,
             inflight_frames: shared.policy.inflight_frames(),
             inflight_bytes: shared.policy.inflight_bytes(),
+            audio_frames_dropped: shared.audio.dropped,
+            audio_suspended: shared.audio.stalled,
             bitrate_bps: shared.rate.bitrate_bps(),
             min_rtt_ms: shared.rate.min_rtt_ms().unwrap_or(0.0),
             capacity_bps: shared
@@ -1240,6 +1448,7 @@ fn link_loop(
             state.peer_present = false;
             state.policy.reset(now);
             state.capacity.forget_inflight();
+            state.audio.link_reset();
             if !first {
                 state.stats.reconnects += 1;
             }
@@ -1253,6 +1462,7 @@ fn link_loop(
             state.peer_present = false;
             state.policy.reset(Instant::now());
             state.capacity.forget_inflight();
+            state.audio.link_reset();
             if let Some(activity) = &state.producer_activity {
                 activity.notify();
             }
@@ -1346,7 +1556,7 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
             state.stats.acks += 1;
             state.capacity.on_ack(now, generation, seq);
             apply_capacity(&mut state, now);
-            if let Some(outcome) = state.policy.on_ack(now, generation, seq) {
+            if let Some(outcome) = retire_video(&mut state, now, generation, seq) {
                 let rtt_ms = outcome.rtt.as_secs_f64() * 1_000.0;
                 state.stats.last_rtt_ms = rtt_ms;
                 // Keyframes carry their own serialization delay; only deltas
@@ -1376,6 +1586,7 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
             state.peer_present = present;
             state.policy.reset(now);
             state.capacity.forget_inflight();
+            state.audio.link_reset();
             if present {
                 state.events.keyframe = Some("peer-joined".into());
             }
@@ -1385,6 +1596,60 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
     if let Some(activity) = &state.producer_activity {
         activity.notify();
     }
+}
+
+/// What one audio pass wrote, and whether it stopped at its bound.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AudioPass {
+    sent: bool,
+    /// The pass used its whole bound, so more audio may be ready. The serve
+    /// loop comes back for it without waiting, after control and video.
+    more: bool,
+}
+
+/// Write up to one queue's worth of audio packets, ahead of video. The bound
+/// keeps a continuously refilled audio producer from starving queued video
+/// and control/housekeeping on this writer. Audio waits only on the stall
+/// rule and the opt-in; it takes no video admission.
+fn send_audio(
+    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    shared: &Mutex<Shared>,
+    stop: &AtomicBool,
+    activity: &Activity,
+) -> Result<AudioPass> {
+    let mut pass = AudioPass::default();
+    for _ in 0..AUDIO_QUEUE_FRAMES {
+        if stop.load(Ordering::Acquire) {
+            return Ok(pass);
+        }
+        let next = shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .next_audio(Instant::now());
+        let Some(frame) = next else {
+            return Ok(pass);
+        };
+        let packet = match crate::audio::encode_packet(&frame) {
+            Ok(packet) => packet,
+            Err(error) => {
+                debug!(error = %format!("{error:#}"), "dropped unencodable audio frame");
+                shared
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .audio
+                    .mark_gap(1);
+                continue;
+            }
+        };
+        let bytes = packet.len() as u64;
+        send_message(ws, Message::binary(packet), shared, stop, activity)?;
+        let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.stats.audio_frames_sent += 1;
+        state.stats.audio_bytes_sent += bytes;
+        pass.sent = true;
+    }
+    pass.more = true;
+    Ok(pass)
 }
 
 fn serve_socket(
@@ -1404,6 +1669,12 @@ fn serve_socket(
         // escape into the next peer's decoder chain.
         if read_available(ws, shared)? {
             last_inbound = Instant::now();
+        }
+        // Audio goes ahead of video on this writer, bounded per pass; it has
+        // its own queue.
+        let audio = send_audio(ws, shared, stop, activity)?;
+        if audio.sent {
+            last_outbound = Instant::now();
         }
         match rx.try_recv() {
             Ok(outgoing) => {
@@ -1444,6 +1715,8 @@ fn serve_socket(
             bail!("v4 media socket silent");
         }
         let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        // Latch the audio stall before expiry can forget the stalled frames.
+        state.observe_audio(now);
         if state.policy.expire(now) {
             state.stats.ack_timeouts += 1;
             state.capacity.forget_inflight();
@@ -1455,6 +1728,10 @@ fn serve_socket(
         }
         let deadline = link_deadline(&state, now, last_outbound, last_inbound);
         drop(state);
+        // A full audio pass may have left packets ready: don't wait on them.
+        if audio.more {
+            continue;
+        }
         activity.wait(
             deadline.saturating_duration_since(Instant::now()),
             &[(tcp_socket(ws)?, false)],
@@ -1514,7 +1791,353 @@ mod tests {
             timestamps: TimestampExtender::default(),
             frame_size: (0, 0),
             stats: V4Stats::default(),
+            audio: AudioLane::default(),
         }
+    }
+
+    fn audio_frame(seq: u32) -> AudioFrame {
+        AudioFrame {
+            seq,
+            capture_ts_us: u64::from(seq) * 10_000,
+            discontinuity: false,
+            payload: vec![0xfc, 0xff, 0xfe],
+        }
+    }
+
+    #[test]
+    fn socket_writer_sends_opted_in_audio_ahead_of_queued_video() {
+        use tungstenite::protocol::Role;
+
+        for enabled in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let now = Instant::now();
+            let mut state = idle_shared(now);
+            state.peer_present = true;
+            state.audio.set_enabled(enabled);
+            state.queue_audio(now, audio_frame(7));
+            let shared = Arc::new(Mutex::new(state));
+            let (tx, rx) = mpsc::sync_channel(1);
+            let video = encode_packet(
+                &V4FrameHeader {
+                    key: true,
+                    refine: false,
+                    codec: 2,
+                    generation: 1,
+                    seq: 1,
+                    capture_ts_us: 0,
+                    width: 0,
+                    height: 0,
+                },
+                &[1],
+            )
+            .unwrap();
+            tx.send(Outgoing {
+                peer_epoch: 0,
+                packet: video,
+            })
+            .unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let activity = Activity::new().unwrap();
+            let worker = {
+                let shared = shared.clone();
+                let stop = stop.clone();
+                let activity = activity.clone();
+                thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut socket = WebSocket::from_raw_socket(
+                        MaybeTlsStream::Plain(stream),
+                        Role::Server,
+                        None,
+                    );
+                    set_nonblocking(&mut socket).unwrap();
+                    serve_socket(&mut socket, &rx, &shared, &stop, &activity)
+                })
+            };
+            let stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut viewer = WebSocket::from_raw_socket(stream, Role::Client, None);
+            let mut packets = Vec::new();
+            for _ in 0..if enabled { 2 } else { 1 } {
+                packets.push(viewer.read());
+                if packets.last().unwrap().is_err() {
+                    break;
+                }
+            }
+            stop.store(true, Ordering::Release);
+            activity.notify();
+            worker.join().unwrap().unwrap();
+            let packets: Vec<_> = packets.into_iter().map(Result::unwrap).collect();
+            let magic: Vec<_> = packets
+                .iter()
+                .map(|message| {
+                    let Message::Binary(bytes) = message else {
+                        panic!("expected binary media")
+                    };
+                    bytes[..4].to_vec()
+                })
+                .collect();
+            let expected = if enabled {
+                vec![b"BPA1".to_vec(), b"BPV4".to_vec()]
+            } else {
+                vec![b"BPV4".to_vec()]
+            };
+            assert_eq!(magic, expected);
+        }
+    }
+
+    #[test]
+    fn audio_is_absent_without_opt_in() {
+        let now = Instant::now();
+        let mut shared = idle_shared(now);
+        shared.peer_present = true;
+        assert_eq!(
+            shared.queue_audio(now, audio_frame(1)),
+            V4AudioSubmit::Disabled
+        );
+        assert!(shared.audio.queue.is_empty());
+        assert!(shared.next_audio(now).is_none());
+        assert_eq!(shared.stats.audio_frames_sent, 0);
+
+        shared.audio.set_enabled(true);
+        assert_eq!(
+            shared.queue_audio(now, audio_frame(2)),
+            V4AudioSubmit::Queued
+        );
+        shared.audio.set_enabled(false);
+        assert!(shared.audio.queue.is_empty());
+        assert!(shared.next_audio(now).is_none());
+    }
+
+    #[test]
+    fn audio_needs_a_live_opted_in_peer() {
+        let now = Instant::now();
+        let mut shared = idle_shared(now);
+        shared.audio.set_enabled(true);
+        // Peer not present yet: dropped, and the next sent packet is a gap.
+        assert_eq!(
+            shared.queue_audio(now, audio_frame(1)),
+            V4AudioSubmit::Unavailable
+        );
+        assert!(shared.audio.queue.is_empty());
+        shared.peer_present = true;
+        shared.queue_audio(now, audio_frame(2));
+        assert!(shared.next_audio(now).unwrap().discontinuity);
+    }
+
+    #[test]
+    fn audio_never_enters_video_admission_or_requests_keyframes() {
+        let now = Instant::now();
+        let mut shared = idle_shared(now);
+        shared.peer_present = true;
+        shared.audio.set_enabled(true);
+        // A keyframe, then a full window of deltas: over budget and frame cap.
+        shared.policy.on_sent(now, 1, 1, 1_000, true);
+        for seq in 2..=(1 + INFLIGHT_MAX_FRAMES as u32) {
+            shared.policy.on_sent(now, 1, seq, 1_000, false);
+        }
+        let bitrate = shared.rate.bitrate_bps();
+        assert_eq!(
+            shared.policy.admit(false, bitrate),
+            Admission::Backpressured
+        );
+        assert!(!shared.policy.needs_keyframe());
+
+        for seq in 0..3 {
+            assert_eq!(
+                shared.queue_audio(now, audio_frame(seq)),
+                V4AudioSubmit::Queued
+            );
+        }
+
+        assert_eq!(shared.audio.queue.len(), 3);
+        assert_eq!(shared.policy.inflight_frames(), INFLIGHT_MAX_FRAMES + 1);
+        assert_eq!(
+            shared.policy.admit(false, bitrate),
+            Admission::Backpressured
+        );
+        assert!(!shared.policy.needs_keyframe());
+        assert_eq!(shared.stats.skipped_budget, 0);
+        assert_eq!(shared.stats.frames_sent, 0);
+    }
+
+    #[test]
+    fn audio_queue_drops_oldest_and_marks_the_next_packet() {
+        let now = Instant::now();
+        let mut shared = idle_shared(now);
+        shared.peer_present = true;
+        shared.audio.set_enabled(true);
+        for seq in 0..12 {
+            assert_eq!(
+                shared.queue_audio(now, audio_frame(seq)),
+                V4AudioSubmit::Queued
+            );
+        }
+        assert_eq!(shared.audio.queue.len(), AUDIO_QUEUE_FRAMES);
+        assert_eq!(shared.audio.dropped, 2);
+        let first = shared.next_audio(now).unwrap();
+        assert_eq!(first.seq, 2);
+        assert!(first.discontinuity);
+        let second = shared.next_audio(now).unwrap();
+        assert_eq!(second.seq, 3);
+        assert!(!second.discontinuity);
+    }
+
+    #[test]
+    fn audio_suspends_past_one_second_and_resumes_only_on_ack() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut shared = idle_shared(t0);
+        shared.peer_present = true;
+        shared.audio.set_enabled(true);
+        shared.policy.on_sent(t0, 1, 5, 1_000, true);
+
+        assert_eq!(
+            shared.queue_audio(at(900), audio_frame(1)),
+            V4AudioSubmit::Queued
+        );
+        // Oldest unacked video (gen 1, seq 5) is 1.1 s old: audio stalls, the
+        // backlog goes, and the stalled frame becomes the fence.
+        assert_eq!(
+            shared.queue_audio(at(1_100), audio_frame(2)),
+            V4AudioSubmit::Unavailable
+        );
+        assert!(shared.audio.stalled);
+        assert_eq!(shared.audio.fence, Some((1, 5)));
+        assert!(shared.audio.queue.is_empty());
+        assert!(shared.next_audio(at(1_100)).is_none());
+
+        // The 3 s window expiry forgets frame 5 but must not resume audio.
+        shared.observe_audio(at(3_100));
+        assert!(shared.policy.expire(at(3_100)));
+        shared.observe_audio(at(3_100));
+        assert!(shared.audio.stalled);
+        assert_eq!(
+            shared.queue_audio(at(3_100), audio_frame(3)),
+            V4AudioSubmit::Unavailable
+        );
+
+        // The late ACK for the expired frame covers the fence: audio resumes.
+        retire_video(&mut shared, at(3_150), 1, 5);
+        assert!(!shared.audio.stalled);
+        assert_eq!(shared.audio.fence, None);
+        assert_eq!(
+            shared.queue_audio(at(3_150), audio_frame(4)),
+            V4AudioSubmit::Queued
+        );
+        let resumed = shared.next_audio(at(3_150)).unwrap();
+        assert_eq!(resumed.seq, 4);
+        assert!(resumed.discontinuity);
+    }
+
+    #[test]
+    fn stale_acks_do_not_clear_the_audio_stall() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut shared = idle_shared(t0);
+        shared.peer_present = true;
+        shared.audio.set_enabled(true);
+        shared.policy.on_sent(t0, 1, 5, 1_000, true);
+        shared.observe_audio(at(1_100));
+        assert!(shared.audio.stalled);
+        shared.policy.expire(at(3_100));
+        shared.observe_audio(at(3_100));
+
+        // Another generation, older or newer, never covers the fence.
+        retire_video(&mut shared, at(3_110), 0, 5);
+        assert!(shared.audio.stalled);
+        retire_video(&mut shared, at(3_120), 2, 5);
+        assert!(shared.audio.stalled);
+        // Same generation but behind the fence: frame 5 was never ACKed.
+        retire_video(&mut shared, at(3_130), 1, 4);
+        assert!(shared.audio.stalled);
+        retire_video(&mut shared, at(3_140), 1, 0);
+        assert!(shared.audio.stalled);
+        // Wrapped-behind seq (u32::MAX is 6 behind seq 5) is not a cover either.
+        retire_video(&mut shared, at(3_145), 1, u32::MAX);
+        assert!(shared.audio.stalled);
+        assert_eq!(shared.audio.fence, Some((1, 5)));
+        assert_eq!(
+            shared.queue_audio(at(3_150), audio_frame(6)),
+            V4AudioSubmit::Unavailable
+        );
+        // Stale ACKs are not video progress either: video policy is untouched.
+        assert_eq!(shared.policy.inflight_frames(), 0);
+        assert!(!shared.policy.needs_keyframe());
+
+        // The matching ACK for the fence frame clears the stall.
+        retire_video(&mut shared, at(3_160), 1, 5);
+        assert!(!shared.audio.stalled);
+        assert_eq!(shared.audio.fence, None);
+    }
+
+    #[test]
+    fn video_progress_after_expiry_resumes_audio() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut shared = idle_shared(t0);
+        shared.peer_present = true;
+        shared.audio.set_enabled(true);
+        shared.policy.on_sent(t0, 1, 5, 1_000, true);
+        shared.observe_audio(at(1_100));
+        assert!(shared.audio.stalled);
+        shared.policy.expire(at(3_100));
+        shared.observe_audio(at(3_100));
+
+        // A fresh generation's frame is ACKed: retiring it is video progress.
+        shared.policy.on_sent(at(3_200), 2, 1, 1_000, true);
+        retire_video(&mut shared, at(3_300), 2, 1);
+        assert!(!shared.audio.stalled);
+        assert_eq!(shared.audio.fence, None);
+        assert_eq!(
+            shared.queue_audio(at(3_300), audio_frame(7)),
+            V4AudioSubmit::Queued
+        );
+        assert_eq!(shared.next_audio(at(3_300)).unwrap().seq, 7);
+    }
+
+    #[test]
+    fn audio_stall_is_not_latched_by_young_video() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut shared = idle_shared(t0);
+        shared.peer_present = true;
+        shared.audio.set_enabled(true);
+        shared.policy.on_sent(t0, 1, 1, 1_000, true);
+        // Exactly one second is not over the limit.
+        shared.observe_audio(at(1_000));
+        assert!(!shared.audio.stalled);
+        assert_eq!(
+            shared.queue_audio(at(1_000), audio_frame(1)),
+            V4AudioSubmit::Queued
+        );
+        assert!(shared.next_audio(at(1_000)).is_some());
+    }
+
+    #[test]
+    fn new_socket_or_peer_clears_the_stall_and_backlog() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut shared = idle_shared(t0);
+        shared.peer_present = true;
+        shared.audio.set_enabled(true);
+        shared.policy.on_sent(t0, 1, 1, 1_000, true);
+        shared.observe_audio(at(1_500));
+        assert!(shared.audio.stalled);
+
+        // The stalled frame belonged to the old socket.
+        shared.policy.reset(at(1_500));
+        assert_eq!(shared.audio.fence, Some((1, 1)));
+        shared.audio.link_reset();
+        assert!(!shared.audio.stalled);
+        assert_eq!(shared.audio.fence, None);
+        assert_eq!(
+            shared.queue_audio(at(1_500), audio_frame(2)),
+            V4AudioSubmit::Queued
+        );
+        assert!(shared.next_audio(at(1_500)).unwrap().discontinuity);
     }
 
     #[test]

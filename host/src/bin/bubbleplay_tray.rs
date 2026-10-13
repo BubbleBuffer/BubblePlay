@@ -92,6 +92,7 @@ const CMD_ROLLBACK: usize = 7;
 const CMD_BUILD: usize = 8;
 const CMD_AGENT_UPDATE: usize = 9;
 const CMD_SECURE_HELPER_UPDATE: usize = 10;
+const CMD_AUDIO: usize = 11;
 
 /// Time the agent gets to answer after its task was started.
 const AGENT_START_GRACE: Duration = Duration::from_secs(15);
@@ -1187,6 +1188,18 @@ impl App {
         self.start_user();
     }
 
+    /// The host reads the setting when it spawns, so applying it restarts the
+    /// host. That ends a connected viewer's session.
+    fn toggle_audio(&mut self) {
+        self.settings.audio = !self.settings.audio;
+        self.save_settings();
+        tracing::info!(
+            audio = self.settings.audio,
+            "PC sound setting changed; restarting host"
+        );
+        self.restart_host();
+    }
+
     fn shutdown(&mut self) {
         if self.shut_down {
             return;
@@ -1209,6 +1222,7 @@ impl App {
                 self.save_settings();
                 self.sync_run_key();
             }
+            CMD_AUDIO => self.toggle_audio(),
             CMD_RESTART => self.restart_host(),
             CMD_ROLLBACK => self.roll_back("requested from tray menu", false),
             CMD_LOGS => open_folder(&logs_dir(&self.data)),
@@ -1242,6 +1256,7 @@ fn show_menu(hwnd: HWND) {
         admin_enabled,
         admin_line,
         login,
+        audio,
         agent_update,
         helper_line,
         helper_update,
@@ -1266,6 +1281,7 @@ fn show_menu(hwnd: HWND) {
                 && !app.admin_change_running,
             admin_mode_line(&app.agent),
             app.settings.start_at_login,
+            app.settings.audio,
             agent_update,
             app.secure_helper.line(),
             if app.agent_update_running {
@@ -1331,6 +1347,15 @@ fn show_menu(hwnd: HWND) {
             },
             CMD_LOGIN,
             "Start at login",
+        );
+        item(
+            if audio {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            },
+            CMD_AUDIO,
+            "Stream PC sound",
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING, CMD_RESTART, "Restart host");

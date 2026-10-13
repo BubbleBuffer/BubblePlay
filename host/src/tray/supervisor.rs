@@ -6,7 +6,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::HANDLE;
 
-use super::logic::{build_host_args, Backoff, HostState, SharedLog, StoredHostConfig};
+use super::logic::{
+    build_host_args, Backoff, HostState, SharedLog, StoredHostConfig, TraySettings,
+};
 use super::platform::{dpapi_unprotect_hex, KillOnCloseJob};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -134,14 +136,21 @@ fn load(config: &SupervisorConfig) -> Result<(StoredHostConfig, Secrets)> {
     ))
 }
 
+/// `tray.json` sits beside `host.json` in the per-user data directory.
+fn tray_settings_path(host_config: &Path) -> PathBuf {
+    host_config.with_file_name("tray.json")
+}
+
 fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
     if !config.host_exe.is_file() {
         anyhow::bail!("host executable missing: {}", config.host_exe.display());
     }
     let (stored, secrets) = load(config)?;
+    // Read at every spawn, so a changed setting applies on the next host start.
+    let audio = TraySettings::load(&tray_settings_path(&config.host_config)).audio;
     let mut command = Command::new(&config.host_exe);
     command
-        .args(build_host_args(&stored))
+        .args(build_host_args(&stored, audio))
         .env("BUBBLEPLAY_TOKEN", &secrets.token)
         .env("RUST_BACKTRACE", "1")
         // Panics keep backtraces; anyhow errors (logged on every retry) do not.
@@ -324,6 +333,15 @@ impl Drop for SupervisorThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_settings_sit_beside_host_config() {
+        let host = Path::new(r"C:\Users\me\AppData\Local\BubblePlay\host.json");
+        assert_eq!(
+            tray_settings_path(host),
+            PathBuf::from(r"C:\Users\me\AppData\Local\BubblePlay\tray.json")
+        );
+    }
 
     #[test]
     fn host_lines_map_to_events() {

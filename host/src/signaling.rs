@@ -321,6 +321,7 @@ fn host_capabilities_message(
     file_drop: bool,
     follow_window: Option<bool>,
     browser_approval_eligible: bool,
+    audio_enabled: bool,
 ) -> SignalMsg {
     SignalMsg::HostCapabilities {
         browser_approval: !service_mode && browser_approval_eligible,
@@ -332,11 +333,16 @@ fn host_capabilities_message(
         file_drop: (!service_mode && file_transfer && file_drop).then_some(1),
         file_drop_preview: (!service_mode && file_transfer && file_drop).then_some(1),
         follow_window: follow_window.map(|_| crate::follow_window::PROTOCOL_VERSION),
+        audio: audio_enabled.then_some(1),
     }
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn u8_is_zero(value: &u8) -> bool {
+    *value == 0
 }
 
 fn bench_status_wire(msg: &SignalMsg) -> Result<String> {
@@ -775,6 +781,9 @@ pub enum SignalMsg {
             skip_serializing_if = "Option::is_none"
         )]
         follow_window: Option<u8>,
+        /// PC sound protocol version; absent when disabled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio: Option<u8>,
     },
     #[serde(rename = "monitor-list")]
     MonitorList {
@@ -879,6 +888,9 @@ pub enum SignalMsg {
         /// `action: "follow"`: turn follow active window on or off.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         follow: Option<bool>,
+        /// Only `audio: 1` on a protocol-4 start opts into BPA1 packets.
+        #[serde(default, skip_serializing_if = "u8_is_zero")]
+        audio: u8,
     },
     #[serde(rename = "peer-left")]
     PeerLeft,
@@ -972,6 +984,7 @@ pub enum SignalEvent {
         height_q16: Option<u16>,
         monitor: Option<String>,
         follow: Option<bool>,
+        audio: bool,
     },
     MediaView {
         state: String,
@@ -1191,6 +1204,7 @@ pub struct Signaling {
     /// otherwise the session's follow state, sent in monitor-list.
     follow_window: Option<bool>,
     browser_approval: crate::browser_approval::BrowserApproval,
+    audio_enabled: bool,
 }
 
 struct WorkerVersionMonitor {
@@ -1332,6 +1346,7 @@ impl Signaling {
             file_drop: false,
             follow_window: None,
             browser_approval: Default::default(),
+            audio_enabled: false,
         })
     }
 
@@ -1348,6 +1363,10 @@ impl Signaling {
     /// host-capabilities messages; follow starts off.
     pub fn set_follow_window_supported(&mut self, supported: bool) {
         self.follow_window = supported.then_some(false);
+    }
+
+    pub fn set_audio_enabled(&mut self, enabled: bool) {
+        self.audio_enabled = enabled;
     }
 
     /// Record the session's follow state for later monitor-list messages.
@@ -1490,6 +1509,7 @@ impl Signaling {
                             height_q16,
                             monitor,
                             follow,
+                            audio,
                         } => {
                             events.push(SignalEvent::MediaControl {
                                 action,
@@ -1508,6 +1528,7 @@ impl Signaling {
                                 height_q16,
                                 monitor,
                                 follow,
+                                audio: audio == 1,
                             });
                         }
                         SignalMsg::MediaView {
@@ -2075,6 +2096,7 @@ impl Signaling {
             self.file_drop,
             self.follow_window,
             crate::browser_approval::capability_available(service_mode),
+            self.audio_enabled,
         );
         if self
             .ws
@@ -3551,6 +3573,7 @@ mod tests {
             file_drop: None,
             file_drop_preview: None,
             follow_window: None,
+            audio: None,
         };
         let encoded = serde_json::to_value(message).unwrap();
         let object = encoded.as_object().unwrap();
@@ -3572,7 +3595,7 @@ mod tests {
         ))
         .unwrap();
         let value = serde_json::to_value(super::host_capabilities_message(
-            false, false, false, false, false, false, None, true,
+            false, false, false, false, false, false, None, true, false,
         ))
         .unwrap();
         assert_eq!(value["type"], fixture["capability"]["type"]);
@@ -3586,7 +3609,7 @@ mod tests {
     fn host_capabilities_omit_browser_approval_for_ineligible_or_service_hosts() {
         for (service, eligible) in [(false, false), (true, false), (true, true)] {
             let value = serde_json::to_value(super::host_capabilities_message(
-                service, false, false, false, false, false, None, eligible,
+                service, false, false, false, false, false, None, eligible, false,
             ))
             .unwrap();
             assert!(!value.as_object().unwrap().contains_key("browserApproval"));
@@ -3608,6 +3631,7 @@ mod tests {
             file_drop: None,
             file_drop_preview: None,
             follow_window: None,
+            audio: None,
         };
         assert_eq!(
             serde_json::to_string(&message).unwrap(),
@@ -3629,6 +3653,7 @@ mod tests {
             file_drop: Some(1),
             file_drop_preview: Some(1),
             follow_window: None,
+            audio: None,
         };
         let encoded = serde_json::to_value(message).unwrap();
         assert_eq!(encoded["fileTransfer"], 1);
@@ -3799,6 +3824,67 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn audio_capability_matches_fixture_and_is_optional() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/audio-contract.json")).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            fixture["signaling"]["hostCapabilities"]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let enabled = super::host_capabilities_message(
+            false, false, false, false, false, false, None, false, true,
+        );
+        assert_eq!(serde_json::to_value(enabled).unwrap(), expected);
+        let disabled = super::host_capabilities_message(
+            false, false, false, false, false, false, None, false, false,
+        );
+        let wire = serde_json::to_string(&disabled).unwrap();
+        assert!(wire.len() < 512);
+        assert!(serde_json::from_str::<serde_json::Value>(&wire)
+            .unwrap()
+            .get("audio")
+            .is_none());
+        let parsed: SignalMsg = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
+        let all = super::host_capabilities_message(
+            false,
+            false,
+            true,
+            true,
+            true,
+            true,
+            Some(false),
+            true,
+            true,
+        );
+        assert!(serde_json::to_string(&all).unwrap().len() < 512);
+    }
+
+    #[test]
+    fn media_start_audio_opt_in_matches_fixture_and_defaults_off() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/audio-contract.json")).unwrap();
+        let text = fixture["signaling"]["wssStart"]["text"].as_str().unwrap();
+        let message: SignalMsg = serde_json::from_str(text).unwrap();
+        assert!(matches!(&message, SignalMsg::MediaControl {
+            action, protocol: Some(4), audio: 1, ..
+        } if action == "start"));
+        assert_eq!(serde_json::to_value(message).unwrap()["audio"], 1);
+        for value in [None, Some(serde_json::json!(0)), Some(serde_json::json!(2))] {
+            let mut start: serde_json::Value = serde_json::from_str(text).unwrap();
+            if let Some(value) = value {
+                start["audio"] = value;
+            } else {
+                start.as_object_mut().unwrap().remove("audio");
+            }
+            let parsed: SignalMsg = serde_json::from_value(start).unwrap();
+            assert!(matches!(parsed, SignalMsg::MediaControl {audio, ..} if audio != 1));
+        }
+    }
+
     fn follow_fixture() -> serde_json::Value {
         serde_json::from_str(include_str!("../../fixtures/follow-window-contract.json")).unwrap()
     }
@@ -3909,6 +3995,7 @@ mod tests {
             file_drop: None,
             file_drop_preview: None,
             follow_window: Some(crate::follow_window::PROTOCOL_VERSION),
+            audio: None,
         };
         assert_eq!(
             serde_json::to_string(&message).unwrap(),
@@ -3930,6 +4017,7 @@ mod tests {
             file_drop: None,
             file_drop_preview: None,
             follow_window: None,
+            audio: None,
         };
         assert_eq!(
             serde_json::to_string(&message).unwrap(),
