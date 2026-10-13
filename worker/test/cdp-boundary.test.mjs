@@ -303,7 +303,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /settings\.quality = qualityPreset;\s*persistSettings\(\);/);
   assert.match(client, /<select id="quality"/);
   assert.match(client, /action: "quality"/);
-  assert.match(client, /quality: qualityPreset === "auto" \? "high" : qualityPreset }\);/);
+  assert.match(client, /quality: qualityPreset === "auto" \? "high" : qualityPreset, \.\.\.\(audioDecodable \? \{ audio: 1 \} : \{\}\) \}\);/);
   assert.match(client, /streamMode: streamModeValue\(\)/);
   assert.match(client, /<option value="auto">Auto<\/option>/);
   assert.match(client, /function mediaSocketUrl\(\)/);

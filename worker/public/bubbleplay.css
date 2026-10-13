@@ -387,6 +387,10 @@ body.is-fullscreen .fs-enter,
 body.mode-game .mode-work-icon { display: none !important; }
 body.is-fullscreen .fs-exit,
 body.mode-game .mode-game-icon { display: block !important; }
+/* Sound button: the muted glyph while muted or blocked (receiver.js renderSoundSlot). */
+.sound-off,
+#strip-sound.sound-muted .sound-on { display: none !important; }
+#strip-sound.sound-muted .sound-off { display: block !important; }
 
 .latch-label {
   position: absolute;
