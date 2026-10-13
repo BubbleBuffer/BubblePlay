@@ -482,9 +482,11 @@ mod tests {
             EncoderCapabilities::NVENC.effective_codec(VideoCodec::Hevc),
             VideoCodec::Hevc
         );
-        assert!(!EncoderCapabilities::MF.main10);
-        assert!(!EncoderCapabilities::MF.roi_qp_map);
-        assert!(!EncoderCapabilities::MF.refine_feedback);
-        assert!(!EncoderCapabilities::MF.hevc_tiles);
+        const {
+            assert!(!EncoderCapabilities::MF.main10);
+            assert!(!EncoderCapabilities::MF.roi_qp_map);
+            assert!(!EncoderCapabilities::MF.refine_feedback);
+            assert!(!EncoderCapabilities::MF.hevc_tiles);
+        }
     }
 }
