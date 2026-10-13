@@ -25,7 +25,7 @@ Status: done 2026-10-12. Android now follows the browser's carry rule: held keys
 
 ### Feature parity with the browser
 Status: approved 2026-10-12 for all four: follow active window (including edge-hold drags), game mode, background survival and keyboard lock.
-The browser has these and Android does not: follow active window, game mode (captured relative mouse), keyboard lock and desktop file drops with preview. Android also stops the session 30 s after the app is backgrounded, and file transfers end with the session. Background survival means a foreground service keeps the session and transfers alive while backgrounded, within Android's limits.
+Built on lane/android-parity (2026-10-13), not yet merged: follow active window in the switch-screen popover, Work/Game pointer modes (Game uses Android pointer capture), keyboard capture (Esc and Win combinations; Android keeps Win alone, Alt+Tab and Print Screen), and a `dataSync` foreground service that keeps the session and transfers alive in the background with a Disconnect notification, falling back to the 30 s background stop. Still browser-only: desktop file drops with preview.
 
 ### Typing over laggy connections
 Status: proposed; investigate first.

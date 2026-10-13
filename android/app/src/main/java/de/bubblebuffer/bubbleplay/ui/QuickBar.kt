@@ -58,6 +58,9 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         /** The host has file transfer v1 (shows Attach). */
         val fileTransfer: Boolean
         val remoteClipboardRow: RemoteClipboard.Row
+        /** Follow active window as shown (host state, else the saved choice); null hides the row (host cannot follow). */
+        val followWindow: Boolean?
+        fun toggleFollowWindow()
         fun toggleKeyboard()
         fun toggleTouchMode()
         fun resetZoom()
@@ -340,6 +343,16 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
                 line.isActivated = m.selected
                 column.addView(line)
             }
+        }
+        host.followWindow?.let { follow ->
+            column.addView(divider())
+            val state = activity.getString(if (follow) R.string.pop_on else R.string.pop_off)
+            val line = listRow(activity.getString(R.string.pop_follow_window), activity.getString(R.string.pop_follow_window_detail), state, false) {
+                host.toggleFollowWindow()
+            }
+            line.contentDescription = activity.getString(R.string.pop_follow_window_state, state)
+            line.isActivated = follow
+            column.addView(line)
         }
         return fixedWidth(column, 280)
     }

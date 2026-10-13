@@ -78,6 +78,26 @@ class Prefs(private val store: PrefStore) {
         get() = store.getBoolean(KEY_TAP_TO_CLICK) ?: true
         set(value) = store.edit { putBoolean(KEY_TAP_TO_CLICK, value) }
 
+    /** Pointer mode for a physical mouse: game (captured, relative) instead of work (absolute pointer). */
+    var gameMode: Boolean
+        get() = store.getBoolean(KEY_GAME_MODE) ?: false
+        set(value) = store.edit { putBoolean(KEY_GAME_MODE, value) }
+
+    /** Background survival: a foreground service keeps the session open while the app is in the background. */
+    var stayConnected: Boolean
+        get() = store.getBoolean(KEY_STAY_CONNECTED) ?: true
+        set(value) = store.edit { putBoolean(KEY_STAY_CONNECTED, value) }
+
+    /** Keyboard lock: Win combinations and Esc from a hardware keyboard go to the PC (hold Esc to release a captured mouse). */
+    var keyboardLock: Boolean
+        get() = store.getBoolean(KEY_KEYBOARD_LOCK) ?: true
+        set(value) = store.edit { putBoolean(KEY_KEYBOARD_LOCK, value) }
+
+    /** Follow active window: the host switches to the monitor of the focused window (capable hosts only). */
+    var followWindow: Boolean
+        get() = store.getBoolean(KEY_FOLLOW_WINDOW) ?: false
+        set(value) = store.edit { putBoolean(KEY_FOLLOW_WINDOW, value) }
+
     var startFullscreen: Boolean
         get() = store.getBoolean(KEY_START_FULLSCREEN) ?: true
         set(value) = store.edit { putBoolean(KEY_START_FULLSCREEN, value) }
@@ -137,6 +157,10 @@ class Prefs(private val store: PrefStore) {
         const val KEY_DIRECT_TOUCH = "directTouch"
         const val KEY_POINTER_SPEED = "pointerSpeed"
         const val KEY_TAP_TO_CLICK = "tapToClick"
+        const val KEY_GAME_MODE = "gameMode"
+        const val KEY_FOLLOW_WINDOW = "followWindow"
+        const val KEY_KEYBOARD_LOCK = "keyboardLock"
+        const val KEY_STAY_CONNECTED = "stayConnected"
         const val KEY_START_FULLSCREEN = "startFullscreen"
         const val KEY_KEEP_SCREEN_ON = "keepScreenOn"
         const val KEY_AUTO_COPY_REMOTE_CLIPBOARD = "autoCopyRemoteClipboard"

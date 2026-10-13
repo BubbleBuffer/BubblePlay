@@ -47,9 +47,11 @@ import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import de.bubblebuffer.bubbleplay.R
+import de.bubblebuffer.bubbleplay.input.CaptureClick
 import de.bubblebuffer.bubbleplay.input.Chord
 import de.bubblebuffer.bubbleplay.input.CursorReconciler
 import de.bubblebuffer.bubbleplay.input.GestureAction
+import de.bubblebuffer.bubbleplay.input.MetaSync
 import de.bubblebuffer.bubbleplay.input.PointerSpeed
 import de.bubblebuffer.bubbleplay.input.PointerWheel
 import de.bubblebuffer.bubbleplay.input.RemoteInput
@@ -71,7 +73,7 @@ import kotlin.math.roundToInt
  * (trackpad / direct), IME and hardware keyboard, captured mouse, clipboard,
  * and the quick-action bar ([QuickBar]).
  */
-class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink, QuickBar.Host, TransferDock.Host, SettingsView.Host {
+class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, KeyboardInputView.Sink, QuickBar.Host, TransferDock.Host, SettingsView.Host, KeepAlive.Owner {
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
     private lateinit var config: ServerConfig
@@ -136,6 +138,14 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private var mouseButtons = 0
     private var mouseActive = false
     private var motionFramePosted = false
+    /** Physical mouse pointer mode: game captures it for relative motion, work points absolutely. */
+    private var gameMode = false
+    private val captureClick = CaptureClick()
+    /** Keyboard lock on: holding Esc for [ESC_HOLD_MS] releases a captured mouse (the Esc itself goes to the PC). */
+    private val escapeRelease = Runnable { releaseMouseCapture() }
+    /** Keyboard lock off: the Esc that released the mouse; its key-up stays local too. */
+    private var escapeSwallowed = false
+    private val metaSync = MetaSync()
 
     // QuickBar.Host state.
     override var keyboardShown = false
@@ -153,8 +163,14 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override val latched: Set<String> get() = latchSet
     override val fileTransfer: Boolean get() = fileCapability == true
     override val remoteClipboardRow: RemoteClipboard.Row get() = remoteClipboard.row
+    // Follow active window: shown only for a capable host; the host's reported state wins over the saved choice.
+    private var followCapable = false
+    private var hostFollow: Boolean? = null
+    override val followWindow: Boolean? get() = if (followCapable) hostFollow ?: prefs.followWindow else null
 
     private val backgroundDisconnect = Runnable { stopSession() }
+    /** Between onStop and onStart: the app is in the background. */
+    private var stopped = false
     private val longPress = Runnable { apply(gestures.onLongPress(SystemClock.uptimeMillis())) }
     private val monitorRefresh = Runnable { session?.requestMonitorList() }
     private val motionFrame = Choreographer.FrameCallback {
@@ -171,8 +187,10 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         gestures.mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
         gestures.tapToClick = prefs.tapToClick
         pointerGain = PointerSpeed.gain(prefs.pointerSpeed)
+        gameMode = prefs.gameMode
         immersive = prefs.startFullscreen
         buildViews()
+        KeepAlive.owner = this
         clipboardManager.addPrimaryClipChangedListener(clipboardChanged)
         files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, { if (config.isLab) null else Prefs.cookieHeader(config) }, fileListener)
         enterImmersive() // also sets up edge-to-edge and the cutout mode
@@ -202,6 +220,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             // ViewGroup normally asks its topmost child first. The full-size
             // cursor overlay must not replace the stream's semantic mouse icon.
             override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? = pointerIcon
+            override fun onPointerCaptureChange(hasCapture: Boolean) { super.onPointerCaptureChange(hasCapture); mouseCaptureChanged(hasCapture) }
         }
         video = SurfaceView(this).apply {
             holder.addCallback(this@StreamActivity)
@@ -338,12 +357,46 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         session = s
         input = RemoteInput(s, cursorReconciler::noteSent, ::scheduleMotionFlush)
         surface?.let { s.decoder.setSurface(it) }
+        s.setFollow(prefs.followWindow)
+        s.setStreamMode(gameMode)
         cursorReconciler.reset()
         onCursorType(CursorKind.Arrow)
         renderCursor()
         s.start()
         defaultMonitorChecked = false
         applyKeepScreenOn()
+        startKeepAlive()
+    }
+
+    /**
+     * Background survival: the foreground service starts with the session,
+     * while this screen is in the foreground (Android refuses it later).
+     */
+    private fun startKeepAlive() {
+        if (session == null || !prefs.stayConnected || KeepAlive.active) return
+        askNotifications()
+        SessionService.start(this, config.base.host)
+    }
+
+    /** Android 13+: the session notification and download notices need the permission; asked once per screen. */
+    private fun askNotifications() {
+        if (Build.VERSION.SDK_INT >= 33 && !DownloadNotifier.canNotify(this) && !askedNotifications) {
+            askedNotifications = true
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFY)
+        }
+    }
+
+    /** Disconnect from the session notification. */
+    override fun onKeepAliveDisconnect() {
+        disconnect()
+    }
+
+    /** The service was refused or reached Android's time limit: back to the 30 s background stop. */
+    override fun onKeepAliveEnded() {
+        if (!stopped || session == null) return
+        session?.setForeground(false)
+        main.removeCallbacks(backgroundDisconnect)
+        main.postDelayed(backgroundDisconnect, BACKGROUND_GRACE_MS)
     }
 
     private fun applyKeepScreenOn() {
@@ -355,14 +408,18 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         keyboardView.resetContext()
         remoteClipboard.localAction()
         quickBar.release()
-        // No background transfers in v1: the session's end cancels them.
+        // Transfers belong to the session: its end cancels them.
         files?.cancelAll()
         currentOffer = null
         transferDock.clear()
         input?.releaseAll()
+        metaSync.reset()
         session?.stop()
+        if (KeepAlive.active) SessionService.stop(this)
         session = null
         input = null
+        followCapable = false
+        hostFollow = null
         cursorReconciler.reset()
         onCursorType(CursorKind.Arrow)
         renderCursor()
@@ -372,6 +429,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onStart() {
         super.onStart()
+        stopped = false
         foregroundAt = SystemClock.elapsedRealtime()
         main.removeCallbacks(backgroundDisconnect)
         if (session == null) startSession()
@@ -387,6 +445,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         super.onPause()
         quickBar.release()
         input?.releaseAll()
+        metaSync.reset()
         cursorReconciler.reset()
         keyboardView.resetContext()
         latchSet.clear(); activeLatched.clear(); latchesChanged()
@@ -401,7 +460,10 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onStop() {
         super.onStop()
-        // Keep the session for a short background trip (app switch), then let go.
+        stopped = true
+        // The foreground service keeps the session, its transfers and reconnects alive.
+        if (session != null && KeepAlive.active) return
+        // Without it: keep the session for a short background trip (app switch), then let go.
         // Meanwhile it does not reconnect lost sockets.
         session?.setForeground(false)
         main.postDelayed(backgroundDisconnect, BACKGROUND_GRACE_MS)
@@ -468,6 +530,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             transferDock.onDestroy()
             stopSession()
         }
+        if (KeepAlive.owner === this) KeepAlive.owner = null
         files?.shutdown()
         files = null
         super.onDestroy()
@@ -618,6 +681,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         // nothing stays "down" and the next packet starts with a release-all.
         quickBar.release()
         input?.releaseAll(send = false)
+        metaSync.reset()
         cursorReconciler.reset()
         gestures.cancel()
         main.removeCallbacks(longPress)
@@ -790,10 +854,72 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         if (wx != 0 || wy != 0) { remote.motion(0, 0, wx, wy); scheduleMotionFlush() }
     }
 
-    /** An uncaptured mouse asks for pointer capture so motion arrives relative. */
+    /**
+     * A physical mouse outside pointer capture. Work mode: it points where it is
+     * over the stream (absolute packets, the system pointer shows the remote
+     * shape). Game mode: a click on the stream captures it (that click is not
+     * sent); captured motion is relative ([onCapturedPointer]).
+     */
     private fun onMouseEvent(event: MotionEvent): Boolean {
-        if (!stage.hasPointerCapture() && hasWindowFocus()) stage.requestPointerCapture()
+        if (gameMode) {
+            val press = event.actionMasked == MotionEvent.ACTION_DOWN || event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS
+            if (press && !stage.hasPointerCapture() && hasWindowFocus() && settingsView == null) {
+                captureClick.captureRequested(mouseMask(event.buttonState))
+                stage.requestPointerCapture()
+            }
+            return true
+        }
+        pointAbsolute(event)
         return true
+    }
+
+    /** Work mode: the remote pointer follows the mouse's position over the stream; buttons go with that position. */
+    private fun pointAbsolute(event: MotionEvent) {
+        val remote = input ?: return
+        if (videoWidth <= 0 || videoHeight <= 0) return
+        setMouseActive(false)
+        val (nx, ny) = viewport.toNormalized(event.x, event.y)
+        val x = nx.coerceIn(0f, 1f)
+        val y = ny.coerceIn(0f, 1f)
+        if (x != cursorX || y != cursorY) {
+            cursorX = x; cursorY = y
+            remote.absoluteNormalized(x, y)
+            renderCursor()
+            scheduleMotionFlush()
+        }
+        val mask = mouseMask(event.buttonState)
+        if (mask != mouseButtons) {
+            mouseButtons = mask
+            buttonsAtCursor(remote, mask)
+        }
+    }
+
+    /** Pointer capture began or ended (Esc, a touch, focus loss, settings, or the mode changing). */
+    private fun mouseCaptureChanged(captured: Boolean) {
+        if (captured) {
+            transferDock.showNotice(getString(if (prefs.keyboardLock) R.string.mouse_captured_hold_esc else R.string.mouse_captured_esc))
+            return
+        }
+        main.removeCallbacks(escapeRelease)
+        captureClick.reset()
+        setMouseActive(false)
+        if (mouseButtons != 0) {
+            mouseButtons = 0
+            input?.let { it.flushMotion(); it.buttons(0); if (it.hasPendingInput()) scheduleMotionFlush() }
+        }
+    }
+
+    private fun releaseMouseCapture() {
+        if (stage.hasPointerCapture()) stage.releasePointerCapture()
+    }
+
+    /** Work or game pointer mode for a physical mouse; also tells the host (game streams at up to 60 fps). */
+    private fun applyPointerMode() {
+        val game = prefs.gameMode
+        if (game == gameMode) return
+        gameMode = game
+        session?.setStreamMode(game)
+        if (!game) releaseMouseCapture()
     }
 
     private fun onCapturedPointer(event: MotionEvent): Boolean {
@@ -809,7 +935,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             }
             MotionEvent.ACTION_SCROLL -> onWheel(event)
         }
-        val mask = mouseMask(event.buttonState)
+        val mask = captureClick.filter(mouseMask(event.buttonState))
         if (mask != mouseButtons) {
             keyboardView.resetContext()
             mouseButtons = mask
@@ -836,10 +962,42 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val hardware = device != null && !device.isVirtual && event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD
         // While settings are open, keys belong to the settings view (text field, focus, Back).
         if (hardware && settingsView == null && event.isFromSource(InputDevice.SOURCE_KEYBOARD) && KeyMap.ANDROID_TO_CODE.containsKey(event.keyCode)) {
-            sendKey(event)
+            if (event.keyCode == KeyEvent.KEYCODE_ESCAPE && escapeForCapture(event)) return true
+            sendHardwareKey(event)
             return true
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * Esc while the mouse is captured. Keyboard lock off: Esc releases the
+     * mouse and stays on the phone (down and up). On: Esc goes to the PC, and
+     * holding it for [ESC_HOLD_MS] releases the mouse. True when consumed here.
+     */
+    private fun escapeForCapture(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_UP) main.removeCallbacks(escapeRelease)
+        if (escapeSwallowed) {
+            if (event.action == KeyEvent.ACTION_UP) escapeSwallowed = false
+            return true
+        }
+        if (!stage.hasPointerCapture()) return false
+        if (!prefs.keyboardLock) {
+            if (event.action == KeyEvent.ACTION_DOWN) { escapeSwallowed = true; releaseMouseCapture() }
+            return true
+        }
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) main.postDelayed(escapeRelease, ESC_HOLD_MS)
+        return false
+    }
+
+    /** A hardware key; with keyboard lock on, Win combinations Android delivers without their Win press get one ([MetaSync]). */
+    private fun sendHardwareKey(event: KeyEvent) {
+        val code = KeyMap.ANDROID_TO_CODE[event.keyCode] ?: return
+        val up = event.action == KeyEvent.ACTION_UP
+        if (code == "MetaLeft" || code == "MetaRight") metaSync.observeMeta(code, up)
+        if (!prefs.keyboardLock || code in KeyMap.MODIFIERS || input == null) { sendKey(event); return }
+        if (event.action == KeyEvent.ACTION_DOWN && metaSync.beforeDown(event.isMetaPressed)) input?.key(MetaSync.META, false)
+        sendKey(event)
+        if (up && metaSync.afterUp()) input?.key(MetaSync.META, true)
     }
 
     /** Soft-keyboard key events (Enter, Backspace, some IMEs send every key). */
@@ -1013,6 +1171,26 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         quickBar.monitorsChanged()
     }
 
+    override fun toggleFollowWindow() {
+        val enabled = !(followWindow ?: return)
+        prefs.followWindow = enabled
+        hostFollow = null
+        session?.setFollow(enabled)
+        quickBar.monitorsChanged()
+    }
+
+    override fun onFollowCapability(enabled: Boolean) {
+        followCapable = enabled
+        hostFollow = null
+        quickBar.monitorsChanged()
+    }
+
+    override fun onFollowState(follow: Boolean) {
+        if (hostFollow == follow) return
+        hostFollow = follow
+        quickBar.monitorsChanged()
+    }
+
     override fun pastePhoneClipboard() {
         keyboardView.resetContext()
         remoteClipboard.localAction()
@@ -1095,6 +1273,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             }
             SettingsView.Setting.POINTER_SPEED -> pointerGain = PointerSpeed.gain(prefs.pointerSpeed)
             SettingsView.Setting.TAP_TO_CLICK -> gestures.tapToClick = prefs.tapToClick
+            SettingsView.Setting.POINTER_MODE -> applyPointerMode()
+            SettingsView.Setting.KEYBOARD_LOCK -> main.removeCallbacks(escapeRelease)
+            SettingsView.Setting.BACKGROUND -> if (prefs.stayConnected) startKeepAlive() else if (KeepAlive.active) SessionService.stop(this)
             SettingsView.Setting.FULLSCREEN -> if (immersive != prefs.startFullscreen) toggleImmersive()
             SettingsView.Setting.KEEP_SCREEN_ON -> applyKeepScreenOn()
             SettingsView.Setting.DEFAULT_MONITOR -> {
@@ -1207,10 +1388,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val offer = currentOffer ?: return
         currentOffer = null
         transferDock.showOffer(null)
-        if (Build.VERSION.SDK_INT >= 33 && !DownloadNotifier.canNotify(this) && !askedNotifications) {
-            askedNotifications = true
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFY)
-        }
+        askNotifications()
         files?.download(offer)
     }
 
@@ -1296,6 +1474,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         private const val FROZEN_DIM = 0x59000000
         private const val FROZEN_FADE_MS = 150L
         private const val BACKGROUND_GRACE_MS = 30_000L
+        private const val ESC_HOLD_MS = 1_000L
         private const val SCROLL_DP_PER_NOTCH = 40f
         private const val MONITOR_REFRESH_MS = 1_500L
         private const val REQUEST_ATTACH = 41
