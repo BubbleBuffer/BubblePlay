@@ -1,6 +1,6 @@
 # Unattended access (before sign-in)
 
-Status: proposed 2026-10-12. Design only; no code until the owner approves or rejects it. Roadmap entry: [Unattended access](../roadmap.md#unattended-access).
+Status: approved 2026-10-13 (option B). Implementation waits for the [device IDs and keys](device-keys.md) design and the NVENC probe. Roadmap entry: [Unattended access](../roadmap.md#unattended-access).
 
 Goal: a viewer can reach the PC when no user is signed in (after a reboot, after sign-out, at the "switch user" screen) and sign in remotely. Related: [secure desktop](secure-desktop.md), [security and privacy](../security-and-privacy.md).
 
@@ -95,4 +95,11 @@ Required controls for step 2:
 
 ## Decisions
 
-None yet.
+2026-10-13, owner approved option B with the recommended answers:
+1. Option B: the pre-login service plus a restricted logon host. Option A stays a documented workaround.
+2. The logon host has its own identity, separate from the user host, so it can be revoked and approved on its own terms.
+3. The first step includes input on the sign-in screen; view-only alone is not the goal.
+4. The pre-login opt-in is independent of Admin mode.
+5. Only already-paired devices may connect before sign-in, and each session still needs a fresh second factor (ntfy or authenticator, whichever the relay offers). Pairing is not possible before sign-in. This depends on [device IDs and keys](device-keys.md).
+6. The switch-user screen is out of scope for the first version.
+7. Open until the NVENC probe: if NVENC fails from session 0, choose between a console-session logon host and a software encoder with the probe results.

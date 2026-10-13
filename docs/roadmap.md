@@ -2,7 +2,7 @@
 
 Work beyond the [release blockers](release-status.md#before-publication), from a gap review on 2026-10-12. Each entry has a status: proposed, approved YYYY-MM-DD, in progress, done YYYY-MM-DD, deferred or dropped. Done entries link to the page that now describes the feature.
 
-Current focus: first hosted CI run; next the device ID and key proposal, audio and Android parity, then Wake-on-LAN and unattended access.
+Current focus: audio, Android parity and the device ID and key proposal in parallel; then Wake-on-LAN and unattended access, which build on device keys.
 
 ## Testing and CI
 
@@ -43,13 +43,17 @@ The host captures no audio today. Decisions:
 - No A/V sync beyond low latency on both streams; audio is not held back to match video.
 - A new capability flag announces audio, so older clients and hosts keep working without it.
 
+### Device IDs and keys
+Status: approved in principle 2026-10-13; design proposal in progress.
+Each device (PC host, browser, phone, Wake-on-LAN helper, pre-login logon host) gets a key pair and an ID derived from its public key. The relay routes by ID; the endpoints authenticate each other's keys, like SSH `authorized_keys`. Decisions so far: the trusted-device list lives locally on the PC and is managed there. Recommended defaults until the proposal says otherwise: keys for everyday connections, password and second factor only to pair a new device and as a fallback; one viewer may pair with several PCs; browsers use passkeys, Android uses the Keystore. Design: [device-keys.md](architecture/device-keys.md).
+
 ### Wake-on-LAN
 Status: approved 2026-10-12: a small LAN helper sends the packet.
-An asleep PC cannot be reached. A magic packet has to come from a device on the same LAN, because the relay and the viewer are not on it. A small helper runs on any always-on LAN box (Docker image or a single binary), stays connected to the relay with its own credential, and sends the magic packet when an authenticated viewer asks. The host registers its MAC address while awake. Open: how the helper authenticates to each relay type, and the viewer's wake button when the host is offline.
+An asleep PC cannot be reached. A magic packet has to come from a device on the same LAN, because the relay and the viewer are not on it. A small helper runs on any always-on LAN box (Docker image or a single binary), stays connected to the relay with its own credential, and sends the magic packet when an authenticated viewer asks. The host registers its MAC address while awake. The helper authenticates as a paired device under device IDs and keys. Open: the viewer's wake button when the host is offline.
 
 ### Unattended access
-Status: design doc first (decided 2026-10-12); no code until the proposal is approved.
-The host starts at Windows sign-in, so a signed-in user is required. Lock-screen and UAC capture are helper-based and pending live acceptance. A service-based host that works before sign-in is a larger change with its own security review. Proposal: [unattended-access.md](architecture/unattended-access.md) (proposed 2026-10-12, awaiting owner approval).
+Status: approved 2026-10-13 (option B). Waits for device IDs and keys, then an NVENC-from-session-0 probe.
+The host starts at Windows sign-in, so a signed-in user is required. Lock-screen and UAC capture are helper-based and pending live acceptance. A service-based host that works before sign-in is a larger change with its own security review. Design and decisions: [unattended-access.md](architecture/unattended-access.md).
 
 ### More encoders and host platforms
 Status: deferred.
