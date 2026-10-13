@@ -1030,8 +1030,8 @@ fn main() -> Result<()> {
                 let size = pair[1].to_str().context("size is not Unicode")?;
                 let (width, height) = size.split_once('x').context("size must be <width>x<height>")?;
                 let geometry = Geometry { width: width.parse()?, height: height.parse()? };
-                ensure!(geometry.width >= 256 && geometry.width <= 4096 && geometry.width % 2 == 0
-                    && geometry.height >= 128 && geometry.height <= 2304 && geometry.height % 2 == 0,
+                ensure!(geometry.width >= 256 && geometry.width <= 4096 && geometry.width.is_multiple_of(2)
+                    && geometry.height >= 128 && geometry.height <= 2304 && geometry.height.is_multiple_of(2),
                     "unsupported synthetic patch geometry");
                 decode_geometry = Some(geometry);
             }
