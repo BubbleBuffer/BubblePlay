@@ -1,6 +1,6 @@
 # Native Windows client
 
-Status: proposed 2026-10-13 (phase 0, stack choice waiting for approval). Nothing is built yet; `client-win/` holds only the build-output junction.
+Status: stack A approved 2026-10-13. The decode spike is running. Nothing is built yet; `client-win/` holds only the build-output junction.
 
 ## Goal
 
@@ -64,7 +64,7 @@ Nothing in the protocol depends on a browser. Cookies, the Origin header and the
 - **Effort:** heavy build (prebuilt native artifact, clang, copied rustflags; MSVC steps unverified). It doesn't help WSS v4 at all.
 - **Verdict:** the host is str0m, so libwebrtc brings mostly weight and a jitter buffer we would then fight.
 
-## Recommendation
+## Recommendation (approved 2026-10-13)
 
 Stack A: all Rust, str0m and WSS v4 behind one transport trait, D3D11 hardware decode, a D3D11 flip-model swap chain, a low-level keyboard hook and egui on D3D11. Reasons:
 
@@ -85,11 +85,17 @@ Proposed build order once approved:
 
 Proposed spike (throwaway, about half a day): Media Foundation H.264 and HEVC decode into D3D11 versus the D3D11 video decoding API through FFmpeg, measuring submit-to-texture and texture-to-present times on this PC with a recorded BubblePlay access-unit stream. It settles the decode route, not the stack.
 
-## Open questions for the owner
+## Decisions
 
-- Approve stack A, or prefer B for the UI ceiling at the cost of size and latency?
-- Decode route: Media Foundation (no extra licensing; HEVC needs the Store extension on some PCs) or FFmpeg d3d11va (LGPL DLLs, about 20 MB, HEVC everywhere)? The spike can inform this.
-- Transport priority: WebRTC is direct peer-to-peer and the browser's default. WSS v4 is simpler and goes through the relay. Should v1 ship both with auto fallback like the browser, or WSS v4 only?
-- Which relay does v1 target first, Go or Cloudflare? The Cloudflare site gate needs an ntfy or host approval wait screen.
-- Packaging: inside the existing Windows ZIP or installer, or separate?
-- Where do saved devices and the remembered session cookie live? Proposal: per-user `%APPDATA%\BubblePlay\client\`, with cookies protected by DPAPI. This brushes against auth, so it needs a decision.
+All dated 2026-10-13.
+
+- **Transports.** v1 ships both. WSS v4 is built first, then WebRTC with auto fallback, matching the browser.
+- **Relays.** The Go relay comes first. Cloudflare, with the approval wait screen, is required before v1 is called done.
+- **Packaging.** For v1 the client is a separate portable exe. Installer integration is decided later.
+- **Local storage.** Saved devices and the remembered session cookie live in `%APPDATA%\BubblePlay\client\`. The cookies are protected with DPAPI.
+- **Codecs.** H.264 is first-class, because hosts with Media Foundation encoders produce only H.264 and the host will follow codec changes on keyframes. The client must work on a PC without the HEVC extension, by checking at startup which decoders are installed.
+- **Decode route.** The spike decides it. Media Foundation wins if it is within about 1 ms of FFmpeg d3d11va and HEVC works on this PC. The HEVC Video Extension 2.5.33 is installed on this PC.
+
+## Open questions
+
+- None open. Stack A (all Rust, egui on D3D11) was approved 2026-10-13.
