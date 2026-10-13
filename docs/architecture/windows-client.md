@@ -1,6 +1,6 @@
 # Native Windows client
 
-Status: stack A approved 2026-10-13. The decode spike is running. Nothing is built yet; `client-win/` holds only the build-output junction.
+Status: stack A approved 2026-10-13. Decode route: Media Foundation (spike 2026-10-14). Nothing is built yet; `client-win/` holds only the build-output junction.
 
 ## Goal
 
@@ -94,7 +94,7 @@ All dated 2026-10-13.
 - **Packaging.** For v1 the client is a separate portable exe. Installer integration is decided later.
 - **Local storage.** Saved devices and the remembered session cookie live in `%APPDATA%\BubblePlay\client\`. The cookies are protected with DPAPI.
 - **Codecs.** H.264 is first-class, because hosts with Media Foundation encoders produce only H.264 and the host will follow codec changes on keyframes. The client must work on a PC without the HEVC extension, by checking at startup which decoders are installed.
-- **Decode route.** The spike decides it. Media Foundation wins if it is within about 1 ms of FFmpeg d3d11va and HEVC works on this PC. The HEVC Video Extension 2.5.33 is installed on this PC.
+- **Decode route: Media Foundation** (2026-10-14, from the spike in [`client-win/spikes/decode-latency`](../../client-win/spikes/decode-latency/README.md)). Median submit-to-presented is within 0.3 ms of FFmpeg d3d11va for both codecs on the GTX 1660 Super (H.264 about 4.5 ms, HEVC about 3.3 ms, present-on-decode). MF H.264 has much tighter tails (p99 about 11 ms against 54 ms). Both backends show HEVC stalls of 100-500 ms. The machine was under heavy memory and build load during the runs, so the tails are not reliable; a quiet-machine rerun is still owed. The MF HEVC MFT here has no ICodecAPI; low latency is set through the `MF_LOW_LATENCY` attribute instead. FFmpeg stays out of the client.
 
 ## Open questions
 
