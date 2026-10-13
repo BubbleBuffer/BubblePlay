@@ -520,7 +520,7 @@ mod tests {
             ));
         });
         let client =
-            AgentClient::from_streams(client_control, client_media, Duration::from_millis(100))
+            AgentClient::from_streams(client_control, client_media, CONTROL_STARTUP_WRITE_TIMEOUT)
                 .unwrap();
         let activity = Activity::new().unwrap();
         client.set_activity(activity.clone());

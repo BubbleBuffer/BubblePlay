@@ -108,6 +108,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private var files: FileTransfers? = null
     private var fileCapability: Boolean? = null
     @Volatile private var fileEpoch: String? = null
+    // Host sound (BPA1): capability from host-capabilities; the Sound row shows only when it is present.
+    private var soundCapability = false
     private var currentOffer: FileWire.Offer? = null
     /** Uploads asked for before the host said it can take files (share sheet, picker after a reconnect). */
     private val pendingUploads = ArrayList<Pair<List<Uri>, String>>()
@@ -162,6 +164,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override val zoomed: Boolean get() = viewport.zoomed
     override val latched: Set<String> get() = latchSet
     override val fileTransfer: Boolean get() = fileCapability == true
+    override val soundAvailable: Boolean get() = soundCapability
+    override val soundOn: Boolean get() = session?.soundMuted != true
     override val remoteClipboardRow: RemoteClipboard.Row get() = remoteClipboard.row
     // Follow active window: shown only for a capable host; the host's reported state wins over the saved choice.
     private var followCapable = false
@@ -435,6 +439,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         if (session == null) startSession()
         // Reconnect now (backoff reset) if a retry was held or waiting.
         session?.setForeground(true)
+        session?.setSoundForeground(true)
     }
 
     override fun onPause() {
@@ -466,6 +471,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         // Without it: keep the session for a short background trip (app switch), then let go.
         // Meanwhile it does not reconnect lost sockets.
         session?.setForeground(false)
+        session?.setSoundForeground(false)
         main.postDelayed(backgroundDisconnect, BACKGROUND_GRACE_MS)
     }
 
@@ -1157,6 +1163,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         root.requestApplyInsets()
     }
 
+    override fun toggleSound() {
+        val s = session ?: return
+        s.setSoundMuted(!s.soundMuted)
+    }
+
     override fun refreshMonitors() {
         session?.requestMonitorList()
     }
@@ -1369,6 +1380,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             }
             null -> { currentOffer = null; transferDock.showOffer(null) }
         }
+    }
+
+    override fun onSoundCapability(enabled: Boolean) {
+        soundCapability = enabled
+        quickBar.render()
     }
 
     override fun onFileEpoch(epoch: String?) {

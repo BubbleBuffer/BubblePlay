@@ -1,6 +1,6 @@
 # Third-party notices
 
-This Windows release uses the following 170 locked Rust dependency versions and adapted ParsecVDD code. The inventory covers the entire resolved Windows Cargo graph, including build dependencies; it is intentionally broader than the code linked into the executables.
+This Windows release uses the following 172 locked Rust dependency versions and adapted ParsecVDD code. The inventory covers the entire resolved Windows Cargo graph, including build dependencies; it is intentionally broader than the code linked into the executables.
 
 The license expressions below are the upstream declarations. All discovered license, notice, copying and copyright files are retained in full; no alternative licensing choice is asserted. Identical source texts share an appendix entry.
 
@@ -8,180 +8,182 @@ The license expressions below are the upstream declarations. All discovered lice
 
 | Package | Upstream license expression | Retained texts |
 | --- | --- | --- |
-| adler2@2.0.1 | 0BSD OR MIT OR Apache-2.0 | [LICENSE-0BSD](#license-text-72); [LICENSE-APACHE](#license-text-75); [LICENSE-MIT](#license-text-18) |
-| aead@0.5.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-103); [LICENSE-MIT](#license-text-85) |
-| aes@0.8.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-137) |
-| aho-corasick@1.1.5 | Unlicense OR MIT | [COPYING](#license-text-1); [LICENSE-MIT](#license-text-12) |
-| anyhow@1.0.104 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| arrayvec@0.7.8 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-43) |
-| asn1-rs-derive@0.6.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-93) |
-| asn1-rs-impl@0.2.0 | MIT/Apache-2.0 | [asn1-rs-impl-0.2.0-LICENSE-MIT.txt](#license-text-93); [asn1-rs-impl-0.2.0-LICENSE-APACHE.txt](#license-text-94) |
-| asn1-rs@0.7.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-93) |
-| autocfg@1.5.1 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-21) |
-| aws-lc-rs@1.17.3 | ISC AND (Apache-2.0 OR ISC) | [LICENSE](#license-text-106) |
-| aws-lc-sys@0.43.0 | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | [LICENSE](#license-text-60); [aws-lc/LICENSE](#license-text-87); [aws-lc/third_party/fiat/LICENSE](#license-text-36) |
-| base16ct@0.2.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-8) |
-| base64@0.22.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-11) |
-| base64ct@1.8.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-25) |
-| bit-vec@0.9.1 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-69); [LICENSE-MIT](#license-text-135) |
-| bitflags@2.13.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-57) |
-| block-buffer@0.12.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-88) |
-| bytes@1.12.1 | MIT | [LICENSE](#license-text-38) |
-| cc@1.4.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-32) |
-| ccm@0.5.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-80) |
-| cfg-if@1.0.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-32) |
-| chacha20@0.10.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-109) |
-| cipher@0.4.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-52) |
-| cmake@0.1.58 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-32) |
-| combine@4.6.7 | MIT | [LICENSE](#license-text-89) |
-| const-oid@0.10.2 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-61) |
-| const-oid@0.9.6 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-110) |
-| cpufeatures@0.2.17 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-101) |
-| cpufeatures@0.3.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-101) |
-| crc-catalog@2.5.0 | MIT OR Apache-2.0 | [LICENSES/Apache-2.0.txt](#license-text-122); [LICENSES/MIT.txt](#license-text-53) |
-| crc32fast@1.5.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-114); [LICENSE-MIT](#license-text-54) |
-| crc@3.4.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-40); [LICENSE-MIT](#license-text-28) |
-| crossbeam-deque@0.8.7 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-49) |
-| crossbeam-epoch@0.9.20 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-49) |
-| crossbeam-utils@0.8.22 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-49) |
-| crypto-common@0.1.7 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-29) |
-| crypto-common@0.2.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-121) |
-| ctr@0.9.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-56) |
-| cudarc@0.16.6 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| data-encoding@2.11.1 | MIT | [LICENSE](#license-text-107) |
-| der-parser@10.0.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-93) |
-| der@0.7.10 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-100) |
-| der_derive@0.7.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-110) |
-| deranged@0.5.8 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-133); [LICENSE-MIT](#license-text-17) |
-| digest@0.11.3 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-102) |
-| dimpl@0.7.2 | MIT OR Apache-2.0 | [LICENSE-APACHE.txt](#license-text-115); [LICENSE-MIT.txt](#license-text-51) |
-| displaydoc@0.2.7 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-18) |
-| dunce@1.0.5 | CC0-1.0 OR MIT-0 OR Apache-2.0 | [LICENSE](#license-text-91) |
-| either@1.17.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-63) |
-| fastrand@2.5.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-18) |
-| fdeflate@0.3.7 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-10); [LICENSE-MIT](#license-text-116) |
-| find-msvc-tools@0.1.10 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-32) |
-| flagset@0.4.7 | Apache-2.0 | [LICENSE](#license-text-119) |
-| flate2@1.1.10 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-3) |
-| fs_extra@1.3.0 | MIT | [LICENSE](#license-text-19) |
-| generic-array@0.14.7 | MIT | [LICENSE](#license-text-111) |
-| getrandom@0.3.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-23) |
-| getrandom@0.4.3 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-47) |
-| http@1.5.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-77); [LICENSE-MIT](#license-text-126) |
-| httparse@1.10.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-33) |
-| hybrid-array@0.4.14 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-59) |
-| inout@0.1.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-26) |
-| is@0.10.0 | MIT OR Apache-2.0 | [LICENSE-MIT.txt via str0m@0.21.0](#license-text-51); [src/packet/LICENSE-APACHE.txt via str0m@0.21.0](#license-text-94) |
-| itoa@1.0.18 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| jobserver@0.1.35 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-32) |
-| lazy_static@1.5.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-4) |
-| libloading@0.8.9 | ISC | [LICENSE](#license-text-104) |
-| lock_api@0.4.14 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-118) |
-| log@0.4.33 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-57) |
-| matchers@0.2.0 | MIT | [LICENSE](#license-text-92) |
-| memchr@2.8.3 | Unlicense OR MIT | [COPYING](#license-text-1); [LICENSE-MIT](#license-text-12) |
-| minimal-lexical@0.2.1 | MIT/Apache-2.0 | [LICENSE-APACHE](#license-text-69); [LICENSE-MIT](#license-text-18); [LICENSE.md](#license-text-124) |
-| miniz_oxide@0.8.9 | MIT OR Zlib OR Apache-2.0 | [LICENSE](#license-text-34); [LICENSE-APACHE.md](#license-text-10); [LICENSE-MIT.md](#license-text-64); [LICENSE-ZLIB.md](#license-text-7) |
-| miniz_oxide@0.9.1 | MIT OR Zlib OR Apache-2.0 | [LICENSE](#license-text-34); [LICENSE-APACHE.md](#license-text-10); [LICENSE-MIT.md](#license-text-64); [LICENSE-ZLIB.md](#license-text-7) |
-| native-tls@0.2.18 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-114); [LICENSE-MIT](#license-text-134) |
-| nom@7.1.3 | MIT | [LICENSE](#license-text-44) |
-| nom@8.0.0 | MIT | [LICENSE](#license-text-44) |
-| nu-ansi-term@0.50.3 | MIT | [LICENSE](#license-text-22) |
-| num-bigint@0.4.8 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-57) |
-| num-conv@0.2.2 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-10); [LICENSE-MIT](#license-text-129) |
-| num-integer@0.1.46 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-57) |
-| num-traits@0.2.19 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-57) |
-| nvidia-video-codec-sdk@0.4.0 | MIT | [LICENSE](#license-text-125) |
-| oid-registry@0.8.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-93) |
-| once_cell@1.21.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-18) |
-| parking_lot@0.12.5 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-118) |
-| parking_lot_core@0.9.12 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-118) |
-| pem-rfc7468@0.7.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-81) |
-| pin-project-lite@0.2.17 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-10); [LICENSE-MIT](#license-text-18) |
-| pkcs8@0.10.2 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-100) |
-| png@0.18.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-131) |
-| powerfmt@0.2.0 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-13); [LICENSE-MIT](#license-text-5) |
-| ppv-lite86@0.2.21 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-2); [LICENSE-MIT](#license-text-42) |
-| proc-macro2@1.0.107 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| quote@1.0.47 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| rand@0.10.2 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-82); [LICENSE-APACHE](#license-text-30); [LICENSE-MIT](#license-text-15) |
-| rand@0.9.5 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-82); [LICENSE-APACHE](#license-text-30); [LICENSE-MIT](#license-text-15) |
-| rand_chacha@0.9.0 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-82); [LICENSE-APACHE](#license-text-30); [LICENSE-MIT](#license-text-15) |
-| rand_core@0.10.1 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-84); [LICENSE-APACHE](#license-text-58); [LICENSE-MIT](#license-text-76) |
-| rand_core@0.9.5 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-82); [LICENSE-APACHE](#license-text-58); [LICENSE-MIT](#license-text-15) |
-| rayon-core@1.13.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-4) |
-| rayon@1.12.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-4) |
-| rcgen@0.14.8 | MIT OR Apache-2.0 | [LICENSE](#license-text-127) |
-| regex-automata@0.4.18 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-57) |
-| regex-syntax@0.8.11 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-57); [src/unicode_tables/LICENSE-UNICODE](#license-text-62) |
-| rustc-hash@2.1.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-86); [LICENSE-MIT](#license-text-27) |
-| rusticata-macros@4.1.0 | MIT/Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-93) |
-| rustls-pki-types@1.15.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-39); [LICENSE-MIT](#license-text-83) |
-| schannel@0.1.29 | MIT | [LICENSE.md](#license-text-98) |
-| scopeguard@1.2.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-138) |
-| sctp-proto@0.10.3 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-68); [LICENSE-MIT](#license-text-65) |
-| sec1@0.7.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-41) |
-| serde@1.0.229 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| serde_core@1.0.229 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| serde_derive@1.0.229 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| serde_json@1.0.151 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| sha1@0.11.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-70) |
-| sharded-slab@0.1.7 | MIT | [LICENSE](#license-text-132) |
-| shlex@2.0.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-48); [LICENSE-MIT](#license-text-37) |
-| signature@2.2.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-105) |
-| simd-adler32@0.3.10 | MIT | [LICENSE.md](#license-text-35) |
-| slab@0.4.12 | MIT | [LICENSE](#license-text-79) |
-| smallvec@1.15.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-9) |
-| spki@0.7.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-117) |
-| str0m-aws-lc-rs@0.5.0 | MIT OR Apache-2.0 | [LICENSE-MIT.txt via str0m@0.21.0](#license-text-51); [src/packet/LICENSE-APACHE.txt via str0m@0.21.0](#license-text-94) |
-| str0m-proto@0.6.0 | MIT OR Apache-2.0 | [LICENSE-MIT.txt via str0m@0.21.0](#license-text-51); [src/packet/LICENSE-APACHE.txt via str0m@0.21.0](#license-text-94) |
-| str0m@0.21.0 | MIT OR Apache-2.0 | [LICENSE-MIT.txt](#license-text-51); [src/packet/LICENSE-APACHE.txt](#license-text-94) |
-| subtle@2.6.1 | BSD-3-Clause | [LICENSE](#license-text-120) |
-| syn@2.0.119 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| syn@3.0.3 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| synstructure@0.13.2 | MIT | [LICENSE](#license-text-16) |
-| thiserror-impl@2.0.19 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| thiserror@2.0.19 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18) |
-| thread_local@1.1.10 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-118) |
-| time-core@0.1.9 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-10); [LICENSE-MIT](#license-text-20) |
-| time-macros@0.2.32 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-10); [LICENSE-MIT](#license-text-20) |
-| time@0.3.55 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-10); [LICENSE-MIT](#license-text-20) |
-| tracing-attributes@0.1.31 | MIT | [LICENSE](#license-text-74) |
-| tracing-core@0.1.36 | MIT | [LICENSE](#license-text-74); [src/spin/LICENSE](#license-text-50) |
-| tracing-log@0.2.0 | MIT | [LICENSE](#license-text-74) |
-| tracing-subscriber@0.3.23 | MIT | [LICENSE](#license-text-74) |
-| tracing@0.1.44 | MIT | [LICENSE](#license-text-74) |
-| tungstenite@0.30.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-67) |
-| typenum@1.20.1 | MIT OR Apache-2.0 | [LICENSE](#license-text-123); [LICENSE-APACHE](#license-text-46); [LICENSE-MIT](#license-text-96) |
-| unicode-ident@1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | [LICENSE-APACHE](#license-text-55); [LICENSE-MIT](#license-text-18); [LICENSE-UNICODE](#license-text-136) |
-| untrusted@0.7.1 | ISC | [LICENSE.txt](#license-text-66) |
-| version_check@0.9.5 | MIT/Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-108) |
-| widestring@1.2.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-95); [LICENSE-MIT](#license-text-45) |
-| windows-capture@2.0.0 | MIT | [LICENCE](#license-text-128) |
-| windows-collections@0.3.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-core@0.62.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-future@0.3.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-implement@0.60.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-interface@0.59.3 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-link@0.2.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-numerics@0.3.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-result@0.4.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-service@0.8.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-73); [LICENSE-MIT](#license-text-31) |
-| windows-strings@0.5.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-sys@0.61.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows-threading@0.2.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| windows@0.62.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-112); [license-mit](#license-text-113) |
-| x509-cert@0.2.5 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-81) |
-| x509-parser@0.18.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-93) |
-| yasna@0.6.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-94); [LICENSE-MIT](#license-text-24) |
-| zerocopy@0.8.56 | BSD-2-Clause OR Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-90); [LICENSE-BSD](#license-text-71); [LICENSE-MIT](#license-text-14) |
-| zeroize@1.9.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-119); [LICENSE-MIT](#license-text-78) |
-| zlib-rs@0.6.8 | Zlib | [LICENSE](#license-text-130) |
-| zmij@1.0.23 | MIT | [LICENSE-MIT](#license-text-18) |
+| adler2@2.0.1 | 0BSD OR MIT OR Apache-2.0 | [LICENSE-0BSD](#license-text-74); [LICENSE-APACHE](#license-text-77); [LICENSE-MIT](#license-text-19) |
+| aead@0.5.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-105); [LICENSE-MIT](#license-text-87) |
+| aes@0.8.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-139) |
+| aho-corasick@1.1.5 | Unlicense OR MIT | [COPYING](#license-text-1); [LICENSE-MIT](#license-text-13) |
+| anyhow@1.0.104 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| arrayvec@0.7.8 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-44) |
+| asn1-rs-derive@0.6.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-95) |
+| asn1-rs-impl@0.2.0 | MIT/Apache-2.0 | [asn1-rs-impl-0.2.0-LICENSE-MIT.txt](#license-text-95); [asn1-rs-impl-0.2.0-LICENSE-APACHE.txt](#license-text-96) |
+| asn1-rs@0.7.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-95) |
+| autocfg@1.5.1 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-22) |
+| aws-lc-rs@1.17.3 | ISC AND (Apache-2.0 OR ISC) | [LICENSE](#license-text-108) |
+| aws-lc-sys@0.43.0 | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | [LICENSE](#license-text-62); [aws-lc/LICENSE](#license-text-89); [aws-lc/third_party/fiat/LICENSE](#license-text-37) |
+| base16ct@0.2.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-9) |
+| base64@0.22.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-12) |
+| base64ct@1.8.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-26) |
+| bit-vec@0.9.1 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-71); [LICENSE-MIT](#license-text-137) |
+| bitflags@2.13.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-58) |
+| block-buffer@0.12.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-90) |
+| bytes@1.12.1 | MIT | [LICENSE](#license-text-39) |
+| cc@1.4.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-33) |
+| ccm@0.5.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-82) |
+| cfg-if@1.0.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-33) |
+| chacha20@0.10.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-111) |
+| cipher@0.4.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-53) |
+| cmake@0.1.58 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-33) |
+| combine@4.6.7 | MIT | [LICENSE](#license-text-91) |
+| const-oid@0.10.2 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-63) |
+| const-oid@0.9.6 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-112) |
+| cpufeatures@0.2.17 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-103) |
+| cpufeatures@0.3.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-103) |
+| crc-catalog@2.5.0 | MIT OR Apache-2.0 | [LICENSES/Apache-2.0.txt](#license-text-124); [LICENSES/MIT.txt](#license-text-54) |
+| crc32fast@1.5.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-116); [LICENSE-MIT](#license-text-55) |
+| crc@3.4.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-41); [LICENSE-MIT](#license-text-29) |
+| crossbeam-deque@0.8.7 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-50) |
+| crossbeam-epoch@0.9.20 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-50) |
+| crossbeam-utils@0.8.22 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-50) |
+| crypto-common@0.1.7 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-30) |
+| crypto-common@0.2.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-123) |
+| ctr@0.9.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-57) |
+| cudarc@0.16.6 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| data-encoding@2.11.1 | MIT | [LICENSE](#license-text-109) |
+| der-parser@10.0.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-95) |
+| der@0.7.10 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-102) |
+| der_derive@0.7.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-112) |
+| deranged@0.5.8 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-135); [LICENSE-MIT](#license-text-18) |
+| digest@0.11.3 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-104) |
+| dimpl@0.7.2 | MIT OR Apache-2.0 | [LICENSE-APACHE.txt](#license-text-117); [LICENSE-MIT.txt](#license-text-52) |
+| displaydoc@0.2.7 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-19) |
+| dunce@1.0.5 | CC0-1.0 OR MIT-0 OR Apache-2.0 | [LICENSE](#license-text-93) |
+| either@1.17.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-65) |
+| fastrand@2.5.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-19) |
+| fdeflate@0.3.7 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-11); [LICENSE-MIT](#license-text-118) |
+| find-msvc-tools@0.1.10 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-33) |
+| flagset@0.4.7 | Apache-2.0 | [LICENSE](#license-text-121) |
+| flate2@1.1.10 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-4) |
+| fs_extra@1.3.0 | MIT | [LICENSE](#license-text-20) |
+| generic-array@0.14.7 | MIT | [LICENSE](#license-text-113) |
+| getrandom@0.3.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-101); [LICENSE-MIT](#license-text-24) |
+| getrandom@0.4.3 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-101); [LICENSE-MIT](#license-text-48) |
+| http@1.5.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-79); [LICENSE-MIT](#license-text-128) |
+| httparse@1.10.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-34) |
+| hybrid-array@0.4.14 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-61) |
+| inout@0.1.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-27) |
+| is@0.10.0 | MIT OR Apache-2.0 | [LICENSE-MIT.txt via str0m@0.21.0](#license-text-52); [src/packet/LICENSE-APACHE.txt via str0m@0.21.0](#license-text-96) |
+| itoa@1.0.18 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| jobserver@0.1.35 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-33) |
+| lazy_static@1.5.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-5) |
+| libloading@0.8.9 | ISC | [LICENSE](#license-text-106) |
+| lock_api@0.4.14 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-120) |
+| log@0.4.33 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-58) |
+| matchers@0.2.0 | MIT | [LICENSE](#license-text-94) |
+| memchr@2.8.3 | Unlicense OR MIT | [COPYING](#license-text-1); [LICENSE-MIT](#license-text-13) |
+| minimal-lexical@0.2.1 | MIT/Apache-2.0 | [LICENSE-APACHE](#license-text-71); [LICENSE-MIT](#license-text-19); [LICENSE.md](#license-text-126) |
+| miniz_oxide@0.8.9 | MIT OR Zlib OR Apache-2.0 | [LICENSE](#license-text-35); [LICENSE-APACHE.md](#license-text-11); [LICENSE-MIT.md](#license-text-66); [LICENSE-ZLIB.md](#license-text-8) |
+| miniz_oxide@0.9.1 | MIT OR Zlib OR Apache-2.0 | [LICENSE](#license-text-35); [LICENSE-APACHE.md](#license-text-11); [LICENSE-MIT.md](#license-text-66); [LICENSE-ZLIB.md](#license-text-8) |
+| native-tls@0.2.18 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-116); [LICENSE-MIT](#license-text-136) |
+| nom@7.1.3 | MIT | [LICENSE](#license-text-45) |
+| nom@8.0.0 | MIT | [LICENSE](#license-text-45) |
+| nu-ansi-term@0.50.3 | MIT | [LICENSE](#license-text-23) |
+| num-bigint@0.4.8 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-58) |
+| num-conv@0.2.2 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-11); [LICENSE-MIT](#license-text-131) |
+| num-integer@0.1.46 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-58) |
+| num-traits@0.2.19 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-58) |
+| nvidia-video-codec-sdk@0.4.0 | MIT | [LICENSE](#license-text-127) |
+| oid-registry@0.8.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-95) |
+| once_cell@1.21.4 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-19) |
+| opus@0.4.0 | MIT/Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-59) |
+| opusic-sys@0.7.5 | BSD-3-Clause | [LICENSE](#license-text-2); [opus/COPYING](#license-text-2) |
+| parking_lot@0.12.5 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-120) |
+| parking_lot_core@0.9.12 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-120) |
+| pem-rfc7468@0.7.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-83) |
+| pin-project-lite@0.2.17 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-11); [LICENSE-MIT](#license-text-19) |
+| pkcs8@0.10.2 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-102) |
+| png@0.18.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-133) |
+| powerfmt@0.2.0 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-14); [LICENSE-MIT](#license-text-6) |
+| ppv-lite86@0.2.21 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-3); [LICENSE-MIT](#license-text-43) |
+| proc-macro2@1.0.107 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| quote@1.0.47 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| rand@0.10.2 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-84); [LICENSE-APACHE](#license-text-31); [LICENSE-MIT](#license-text-16) |
+| rand@0.9.5 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-84); [LICENSE-APACHE](#license-text-31); [LICENSE-MIT](#license-text-16) |
+| rand_chacha@0.9.0 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-84); [LICENSE-APACHE](#license-text-31); [LICENSE-MIT](#license-text-16) |
+| rand_core@0.10.1 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-86); [LICENSE-APACHE](#license-text-60); [LICENSE-MIT](#license-text-78) |
+| rand_core@0.9.5 | MIT OR Apache-2.0 | [COPYRIGHT](#license-text-84); [LICENSE-APACHE](#license-text-60); [LICENSE-MIT](#license-text-16) |
+| rayon-core@1.13.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-5) |
+| rayon@1.12.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-5) |
+| rcgen@0.14.8 | MIT OR Apache-2.0 | [LICENSE](#license-text-129) |
+| regex-automata@0.4.18 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-58) |
+| regex-syntax@0.8.11 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-58); [src/unicode_tables/LICENSE-UNICODE](#license-text-64) |
+| rustc-hash@2.1.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-88); [LICENSE-MIT](#license-text-28) |
+| rusticata-macros@4.1.0 | MIT/Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-95) |
+| rustls-pki-types@1.15.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-40); [LICENSE-MIT](#license-text-85) |
+| schannel@0.1.29 | MIT | [LICENSE.md](#license-text-100) |
+| scopeguard@1.2.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-140) |
+| sctp-proto@0.10.3 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-70); [LICENSE-MIT](#license-text-67) |
+| sec1@0.7.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-42) |
+| serde@1.0.229 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| serde_core@1.0.229 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| serde_derive@1.0.229 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| serde_json@1.0.151 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| sha1@0.11.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-72) |
+| sharded-slab@0.1.7 | MIT | [LICENSE](#license-text-134) |
+| shlex@2.0.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-49); [LICENSE-MIT](#license-text-38) |
+| signature@2.2.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-107) |
+| simd-adler32@0.3.10 | MIT | [LICENSE.md](#license-text-36) |
+| slab@0.4.12 | MIT | [LICENSE](#license-text-81) |
+| smallvec@1.15.2 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-10) |
+| spki@0.7.3 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-119) |
+| str0m-aws-lc-rs@0.5.0 | MIT OR Apache-2.0 | [LICENSE-MIT.txt via str0m@0.21.0](#license-text-52); [src/packet/LICENSE-APACHE.txt via str0m@0.21.0](#license-text-96) |
+| str0m-proto@0.6.0 | MIT OR Apache-2.0 | [LICENSE-MIT.txt via str0m@0.21.0](#license-text-52); [src/packet/LICENSE-APACHE.txt via str0m@0.21.0](#license-text-96) |
+| str0m@0.21.0 | MIT OR Apache-2.0 | [LICENSE-MIT.txt](#license-text-52); [src/packet/LICENSE-APACHE.txt](#license-text-96) |
+| subtle@2.6.1 | BSD-3-Clause | [LICENSE](#license-text-122) |
+| syn@2.0.119 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| syn@3.0.3 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| synstructure@0.13.2 | MIT | [LICENSE](#license-text-17) |
+| thiserror-impl@2.0.19 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| thiserror@2.0.19 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19) |
+| thread_local@1.1.10 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-120) |
+| time-core@0.1.9 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-11); [LICENSE-MIT](#license-text-21) |
+| time-macros@0.2.32 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-11); [LICENSE-MIT](#license-text-21) |
+| time@0.3.55 | MIT OR Apache-2.0 | [LICENSE-Apache](#license-text-11); [LICENSE-MIT](#license-text-21) |
+| tracing-attributes@0.1.31 | MIT | [LICENSE](#license-text-76) |
+| tracing-core@0.1.36 | MIT | [LICENSE](#license-text-76); [src/spin/LICENSE](#license-text-51) |
+| tracing-log@0.2.0 | MIT | [LICENSE](#license-text-76) |
+| tracing-subscriber@0.3.23 | MIT | [LICENSE](#license-text-76) |
+| tracing@0.1.44 | MIT | [LICENSE](#license-text-76) |
+| tungstenite@0.30.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-69) |
+| typenum@1.20.1 | MIT OR Apache-2.0 | [LICENSE](#license-text-125); [LICENSE-APACHE](#license-text-47); [LICENSE-MIT](#license-text-98) |
+| unicode-ident@1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | [LICENSE-APACHE](#license-text-56); [LICENSE-MIT](#license-text-19); [LICENSE-UNICODE](#license-text-138) |
+| untrusted@0.7.1 | ISC | [LICENSE.txt](#license-text-68) |
+| version_check@0.9.5 | MIT/Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-110) |
+| widestring@1.2.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-97); [LICENSE-MIT](#license-text-46) |
+| windows-capture@2.0.0 | MIT | [LICENCE](#license-text-130) |
+| windows-collections@0.3.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-core@0.62.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-future@0.3.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-implement@0.60.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-interface@0.59.3 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-link@0.2.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-numerics@0.3.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-result@0.4.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-service@0.8.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-75); [LICENSE-MIT](#license-text-32) |
+| windows-strings@0.5.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-sys@0.61.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows-threading@0.2.1 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| windows@0.62.2 | MIT OR Apache-2.0 | [license-apache-2.0](#license-text-114); [license-mit](#license-text-115) |
+| x509-cert@0.2.5 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-99); [LICENSE-MIT](#license-text-83) |
+| x509-parser@0.18.1 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-95) |
+| yasna@0.6.0 | MIT OR Apache-2.0 | [LICENSE-APACHE](#license-text-96); [LICENSE-MIT](#license-text-25) |
+| zerocopy@0.8.56 | BSD-2-Clause OR Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-92); [LICENSE-BSD](#license-text-73); [LICENSE-MIT](#license-text-15) |
+| zeroize@1.9.0 | Apache-2.0 OR MIT | [LICENSE-APACHE](#license-text-121); [LICENSE-MIT](#license-text-80) |
+| zlib-rs@0.6.8 | Zlib | [LICENSE](#license-text-132) |
+| zmij@1.0.23 | MIT | [LICENSE-MIT](#license-text-19) |
 
 ## Adapted ParsecVDD code
 
-The original MIT license and copyright attribution are retained in [license text 6](#license-text-6).
+The original MIT license and copyright attribution are retained in [license text 7](#license-text-7).
 
 ## Retained license and notice texts
 
@@ -205,6 +207,64 @@ You may use this code under the terms of either license.
 <a id="license-text-2"></a>
 
 ### License text 2
+
+Original file SHA-256: `01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551`.
+
+Sources:
+
+- opusic-sys@0.7.5/LICENSE
+- opusic-sys@0.7.5/opus/COPYING
+
+```text
+Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,
+                    Jean-Marc Valin, Timothy B. Terriberry,
+                    CSIRO, Gregory Maxwell, Mark Borgerding,
+                    Erik de Castro Lopo, Mozilla, Amazon
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Opus is subject to the royalty-free patent licenses which are
+specified at:
+
+Xiph.Org Foundation:
+https://datatracker.ietf.org/ipr/1524/
+
+Microsoft Corporation:
+https://datatracker.ietf.org/ipr/1914/
+
+Broadcom Corporation:
+https://datatracker.ietf.org/ipr/1526/
+```
+
+<a id="license-text-3"></a>
+
+### License text 3
 
 Original file SHA-256: `0218327e7a480793ffdd4eb792379a9709e5c135c7ba267f709d6f6d4d70af0a`.
 
@@ -416,9 +476,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-3"></a>
+<a id="license-text-4"></a>
 
-### License text 3
+### License text 4
 
 Original file SHA-256: `025436edff4cfcdde17a5811fdea78892d8482efd1abdec5a17872d07a4f2112`.
 
@@ -454,9 +514,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-4"></a>
+<a id="license-text-5"></a>
 
-### License text 4
+### License text 5
 
 Original file SHA-256: `0621878e61f0d0fda054bcbe02df75192c28bde1ecc8289cbd86aeba2dd72720`.
 
@@ -494,9 +554,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-5"></a>
+<a id="license-text-6"></a>
 
-### License text 5
+### License text 6
 
 Original file SHA-256: `070dbc7dda03a29296f2d58bdb9b7331af90f2abc9f31df22875d1eabaf29852`.
 
@@ -526,9 +586,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-6"></a>
+<a id="license-text-7"></a>
 
-### License text 6
+### License text 7
 
 Original file SHA-256: `07f43d69ee782cf5046a49ae56ce725236cf3a169008e0039a08ab88f641af23`.
 
@@ -560,9 +620,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-7"></a>
+<a id="license-text-8"></a>
 
-### License text 7
+### License text 8
 
 Original file SHA-256: `0a54e647fe54104658b5e563c04c6f9edf251710e47bce692e0bd990a4ddaa39`.
 
@@ -588,9 +648,9 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-<a id="license-text-8"></a>
+<a id="license-text-9"></a>
 
-### License text 8
+### License text 9
 
 Original file SHA-256: `0aa8963e105e8b6e02f634484145d4e5b0f42d0a6dd05c16f8148f033383adef`.
 
@@ -627,9 +687,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-9"></a>
+<a id="license-text-10"></a>
 
-### License text 9
+### License text 10
 
 Original file SHA-256: `0b28172679e0009b655da42797c03fd163a3379d5cfa67ba1f1655e974a2a1a9`.
 
@@ -665,9 +725,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-10"></a>
+<a id="license-text-11"></a>
 
-### License text 10
+### License text 11
 
 Original file SHA-256: `0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594`.
 
@@ -862,9 +922,9 @@ Sources:
    END OF TERMS AND CONDITIONS
 ```
 
-<a id="license-text-11"></a>
+<a id="license-text-12"></a>
 
-### License text 11
+### License text 12
 
 Original file SHA-256: `0dd882e53de11566d50f8e8e2d5a651bcf3fabee4987d70f306233cf39094ba7`.
 
@@ -896,9 +956,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-<a id="license-text-12"></a>
+<a id="license-text-13"></a>
 
-### License text 12
+### License text 13
 
 Original file SHA-256: `0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f`.
 
@@ -931,9 +991,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-<a id="license-text-13"></a>
+<a id="license-text-14"></a>
 
-### License text 13
+### License text 14
 
 Original file SHA-256: `155420c6403d4e0fca34105e3c03fdd6939b64c393c7ec6f95f5b72c5474eab0`.
 
@@ -1146,9 +1206,9 @@ Sources:
    limitations under the License.
 ```
 
-<a id="license-text-14"></a>
+<a id="license-text-15"></a>
 
-### License text 14
+### License text 15
 
 Original file SHA-256: `1a2f5c12ddc934d58956aa5dbdd3255fe55fd957633ab7d0d39e4f0daa73f7df`.
 
@@ -1185,9 +1245,9 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-<a id="license-text-15"></a>
+<a id="license-text-16"></a>
 
-### License text 15
+### License text 16
 
 Original file SHA-256: `209fbbe0ad52d9235e37badf9cadfe4dbdc87203179c0899e738b39ade42177b`.
 
@@ -1227,9 +1287,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-16"></a>
+<a id="license-text-17"></a>
 
-### License text 16
+### License text 17
 
 Original file SHA-256: `219920e865eee70b7dcfc948a86b099e7f4fe2de01bcca2ca9a20c0a033f2b59`.
 
@@ -1247,9 +1307,9 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-17"></a>
+<a id="license-text-18"></a>
 
-### License text 17
+### License text 18
 
 Original file SHA-256: `231c837c45eb53f108fb48929e488965bc4fcc14e9ea21d35f50e6b99d98685b`.
 
@@ -1279,9 +1339,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-18"></a>
+<a id="license-text-19"></a>
 
-### License text 18
+### License text 19
 
 Original file SHA-256: `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`.
 
@@ -1335,9 +1395,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-19"></a>
+<a id="license-text-20"></a>
 
-### License text 19
+### License text 20
 
 Original file SHA-256: `251ea8ccb1205ce5fa847d6e264d6b6753af62de2cecf2fd9abc0eb02c7c83fc`.
 
@@ -1369,9 +1429,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-20"></a>
+<a id="license-text-21"></a>
 
-### License text 20
+### License text 21
 
 Original file SHA-256: `2537228d9a1b44a5dc595241349cae7090b326c8de165aaf89bfddef4a00d0fc`.
 
@@ -1403,9 +1463,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-21"></a>
+<a id="license-text-22"></a>
 
-### License text 21
+### License text 22
 
 Original file SHA-256: `27995d58ad5c1145c1a8cd86244ce844886958a35eb2b78c6b772748669999ac`.
 
@@ -1441,9 +1501,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-22"></a>
+<a id="license-text-23"></a>
 
-### License text 22
+### License text 23
 
 Original file SHA-256: `284465860407420254e39be4e1bdcaaf2e7f2d18e06f9bab75bc75341a5d8501`.
 
@@ -1476,9 +1536,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-23"></a>
+<a id="license-text-24"></a>
 
-### License text 23
+### License text 24
 
 Original file SHA-256: `29e9fe5074bd27e0e5d5d110394fbbcd841baee2651a3c4b4560a632702cede4`.
 
@@ -1515,9 +1575,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-24"></a>
+<a id="license-text-25"></a>
 
-### License text 24
+### License text 25
 
 Original file SHA-256: `2a7df90e60fd5512b8bca35d3ce90e068f21c52d962855053fd1d9e2e7ca0f16`.
 
@@ -1535,9 +1595,9 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-25"></a>
+<a id="license-text-26"></a>
 
-### License text 25
+### License text 26
 
 Original file SHA-256: `2d1c57bff28344b9e698f51063bc8509799cc4c99a4e0cf2aa3f7e7c3e1f9a9d`.
 
@@ -1574,9 +1634,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-26"></a>
+<a id="license-text-27"></a>
 
-### License text 26
+### License text 27
 
 Original file SHA-256: `304b898acad7f02e03d6d8832d682a3b43ee729ab5d3a069af5a36979083b6b4`.
 
@@ -1613,9 +1673,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-27"></a>
+<a id="license-text-28"></a>
 
-### License text 27
+### License text 28
 
 Original file SHA-256: `30fefc3a7d6a0041541858293bcbea2dde4caa4c0a5802f996a7f7e8c0085652`.
 
@@ -1649,9 +1709,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-28"></a>
+<a id="license-text-29"></a>
 
-### License text 28
+### License text 29
 
 Original file SHA-256: `3488679340a49ecc34d342c4009d2dabf76f4a21f12aec2ca99b15805d656544`.
 
@@ -1683,9 +1743,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-29"></a>
+<a id="license-text-30"></a>
 
-### License text 29
+### License text 30
 
 Original file SHA-256: `3521672491a3479422d5fe1aca6645dd2984090f85da6e5205abfb18fb7a6897`.
 
@@ -1721,9 +1781,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-30"></a>
+<a id="license-text-31"></a>
 
-### License text 30
+### License text 31
 
 Original file SHA-256: `35242e7a83f69875e6edeff02291e688c97caafe2f8902e4e19b49d3e78b4cab`.
 
@@ -1912,9 +1972,9 @@ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 END OF TERMS AND CONDITIONS
 ```
 
-<a id="license-text-31"></a>
+<a id="license-text-32"></a>
 
-### License text 31
+### License text 32
 
 Original file SHA-256: `35b228510156c3d7bf94b129c81b7e3cc72d347586e632be15686232b342562a`.
 
@@ -1950,9 +2010,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-32"></a>
+<a id="license-text-33"></a>
 
-### License text 32
+### License text 33
 
 Original file SHA-256: `378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397`.
 
@@ -1992,9 +2052,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-33"></a>
+<a id="license-text-34"></a>
 
-### License text 33
+### License text 34
 
 Original file SHA-256: `391a5396cec6230bfabd4ef4eb2350eb895bc5efce377a2218f5702ed020d3e3`.
 
@@ -2025,9 +2085,9 @@ THE SOFTWARE.
 
 ```
 
-<a id="license-text-34"></a>
+<a id="license-text-35"></a>
 
-### License text 34
+### License text 35
 
 Original file SHA-256: `4108245a1f2df9d4e94df8abed5b4ba0759bb2f9b40a6b939f1be141077ae50b`.
 
@@ -2064,9 +2124,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-35"></a>
+<a id="license-text-36"></a>
 
-### License text 35
+### License text 36
 
 Original file SHA-256: `42a35170233e83e18856792e748de4c1ce4a63b2afce9a370c89ef3fe23f9f2d`.
 
@@ -2098,9 +2158,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-36"></a>
+<a id="license-text-37"></a>
 
-### License text 36
+### License text 37
 
 Original file SHA-256: `43e358d7b6eb109d0f51f7b3a090fd82607965767c25fadee39e922475de2061`.
 
@@ -2133,9 +2193,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-37"></a>
+<a id="license-text-38"></a>
 
-### License text 37
+### License text 38
 
 Original file SHA-256: `4455bf75a91154108304cb283e0fea9948c14f13e20d60887cf2552449dea3b1`.
 
@@ -2167,9 +2227,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-<a id="license-text-38"></a>
+<a id="license-text-39"></a>
 
-### License text 38
+### License text 39
 
 Original file SHA-256: `45f522cacecb1023856e46df79ca625dfc550c94910078bd8aec6e02880b3d42`.
 
@@ -2205,9 +2265,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-39"></a>
+<a id="license-text-40"></a>
 
-### License text 39
+### License text 40
 
 Original file SHA-256: `45fd05c4865e7c350b98ad7ac50e1b15462d49af4a91e9b0c9dd933dc9a69742`.
 
@@ -2419,9 +2479,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-40"></a>
+<a id="license-text-41"></a>
 
-### License text 40
+### License text 41
 
 Original file SHA-256: `470355a7eed93fcc4281ec2e0f82ca3b94e7af1e4d83629f91de8cfac34d750e`.
 
@@ -2633,9 +2693,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-41"></a>
+<a id="license-text-42"></a>
 
-### License text 41
+### License text 42
 
 Original file SHA-256: `4a883ecc3bb1010faed542bf63d53e530fea5e5e12cf676aed588784298ba929`.
 
@@ -2671,9 +2731,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-42"></a>
+<a id="license-text-43"></a>
 
-### License text 42
+### License text 43
 
 Original file SHA-256: `4cada0bd02ea3692eee6f16400d86c6508bbd3bafb2b65fed0419f36d4f83e8f`.
 
@@ -2709,9 +2769,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-43"></a>
+<a id="license-text-44"></a>
 
-### License text 43
+### License text 44
 
 Original file SHA-256: `4da95ec4ecb65b738d470b7d762894ad9c97da93e6cbfb18b570fc2c96f4b871`.
 
@@ -2747,9 +2807,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-44"></a>
+<a id="license-text-45"></a>
 
-### License text 44
+### License text 45
 
 Original file SHA-256: `4dbda04344456f09a7a588140455413a9ac59b6b26a1ef7cdf9c800c012d87f0`.
 
@@ -2781,9 +2841,9 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-45"></a>
+<a id="license-text-46"></a>
 
-### License text 45
+### License text 46
 
 Original file SHA-256: `508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1`.
 
@@ -2813,9 +2873,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-46"></a>
+<a id="license-text-47"></a>
 
-### License text 46
+### License text 47
 
 Original file SHA-256: `516b24e051bf5630880ebbd55c40a25ce9552ebaf8970a53e8976eb70e522406`.
 
@@ -3027,9 +3087,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-47"></a>
+<a id="license-text-48"></a>
 
-### License text 47
+### License text 48
 
 Original file SHA-256: `523a42c25d245dde9c015f882cec7f4555aad883382a6cf19b4b7d9b2cd5419b`.
 
@@ -3066,9 +3126,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-48"></a>
+<a id="license-text-49"></a>
 
-### License text 48
+### License text 49
 
 Original file SHA-256: `553fffcd9b1cb158bc3e9edc35da85ca5c3b3d7d2e61c883ebcfa8a65814b583`.
 
@@ -3092,9 +3152,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-49"></a>
+<a id="license-text-50"></a>
 
-### License text 49
+### License text 50
 
 Original file SHA-256: `5734ed989dfca1f625b40281ee9f4530f91b2411ec01cb748223e7eb87e201ab`.
 
@@ -3134,9 +3194,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-50"></a>
+<a id="license-text-51"></a>
 
-### License text 50
+### License text 51
 
 Original file SHA-256: `58545fed1565e42d687aecec6897d35c6d37ccb71479a137c0deb2203e125c79`.
 
@@ -3168,9 +3228,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-51"></a>
+<a id="license-text-52"></a>
 
-### License text 51
+### License text 52
 
 Original file SHA-256: `5b460f37be48ac4cf2181596181cc6cae432fc2caae05944873f380730829a4b`.
 
@@ -3192,9 +3252,9 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-52"></a>
+<a id="license-text-53"></a>
 
-### License text 52
+### License text 53
 
 Original file SHA-256: `5c7bd92d1f096f12203dc1b601e3cb17484fa1b023e30b6b8edcc80e416237ec`.
 
@@ -3230,9 +3290,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-53"></a>
+<a id="license-text-54"></a>
 
-### License text 53
+### License text 54
 
 Original file SHA-256: `5ef8fcfb6cccec8fcae043c834099a60c8b7406408db576e026d2b7e67dc5cf5`.
 
@@ -3264,9 +3324,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-54"></a>
+<a id="license-text-55"></a>
 
-### License text 54
+### License text 55
 
 Original file SHA-256: `61d383b05b87d78f94d2937e2580cce47226d17823c0430fbcad09596537efcf`.
 
@@ -3298,9 +3358,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-55"></a>
+<a id="license-text-56"></a>
 
-### License text 55
+### License text 56
 
 Original file SHA-256: `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`.
 
@@ -3500,9 +3560,9 @@ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 END OF TERMS AND CONDITIONS
 ```
 
-<a id="license-text-56"></a>
+<a id="license-text-57"></a>
 
-### License text 56
+### License text 57
 
 Original file SHA-256: `63af4bea227c94d021e99427f6ca3a4b8efddadcca93ab6130f708cf6138cf68`.
 
@@ -3539,9 +3599,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-57"></a>
+<a id="license-text-58"></a>
 
-### License text 57
+### License text 58
 
 Original file SHA-256: `6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb`.
 
@@ -3583,9 +3643,41 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-58"></a>
+<a id="license-text-59"></a>
 
-### License text 58
+### License text 59
+
+Original file SHA-256: `6b3b465fa69075348ee5ffc9ba6afa93402743a4a942a463404fac25257bd3ed`.
+
+Sources:
+
+- opus@0.4.0/LICENSE-MIT
+
+```text
+Copyright (c) 2016 Tad Hardesty
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+<a id="license-text-60"></a>
+
+### License text 60
 
 Original file SHA-256: `6df43f6f4b5d4587f3d8d71e45532c688fd168afa5fe89d571cb32fa09c4ef51`.
 
@@ -3784,9 +3876,9 @@ APPENDIX: How to apply the Apache License to your work.
    identification within third-party archives.
 ```
 
-<a id="license-text-59"></a>
+<a id="license-text-61"></a>
 
-### License text 59
+### License text 61
 
 Original file SHA-256: `70c9d40f1f9545c3f133b8a67206e89da850f6468eed072281bb3701514114a9`.
 
@@ -3822,9 +3914,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-60"></a>
+<a id="license-text-62"></a>
 
-### License text 60
+### License text 62
 
 Original file SHA-256: `728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e`.
 
@@ -4151,9 +4243,9 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
-<a id="license-text-61"></a>
+<a id="license-text-63"></a>
 
-### License text 61
+### License text 63
 
 Original file SHA-256: `73b9dc2e79c7308998dd30296e073aefaefb944a68fb89aa412c23c0edcabcaa`.
 
@@ -4189,9 +4281,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-62"></a>
+<a id="license-text-64"></a>
 
-### License text 62
+### License text 64
 
 Original file SHA-256: `74db5baf44a41b1000312c673544b3374e4198af5605c7f9080a402cec42cfa3`.
 
@@ -4259,9 +4351,9 @@ use or other dealings in these Data Files or Software without prior
 written authorization of the copyright holder.
 ```
 
-<a id="license-text-63"></a>
+<a id="license-text-65"></a>
 
-### License text 63
+### License text 65
 
 Original file SHA-256: `7576269ea71f767b99297934c0b2367532690f8c4badc695edf8e04ab6a1e545`.
 
@@ -4297,9 +4389,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-64"></a>
+<a id="license-text-66"></a>
 
-### License text 64
+### License text 66
 
 Original file SHA-256: `799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d`.
 
@@ -4335,9 +4427,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-65"></a>
+<a id="license-text-67"></a>
 
-### License text 65
+### License text 67
 
 Original file SHA-256: `7a6631daa22a9f1772e4a474ede9c3374a6c7a89b61c8b5973f7fd5ccd5cee8c`.
 
@@ -4370,9 +4462,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-66"></a>
+<a id="license-text-68"></a>
 
-### License text 66
+### License text 68
 
 Original file SHA-256: `7abd9b6960dcf7d4d0a48606a5b71bfe37d472db68d70637f3a58a56785f1621`.
 
@@ -4396,9 +4488,9 @@ Sources:
 // OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-<a id="license-text-67"></a>
+<a id="license-text-69"></a>
 
-### License text 67
+### License text 69
 
 Original file SHA-256: `7fea0ee51a4ca5d5cea7464135fd55e8b09caf3a61da3d451ac8a22af95c033f`.
 
@@ -4429,9 +4521,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-<a id="license-text-68"></a>
+<a id="license-text-70"></a>
 
-### License text 68
+### License text 70
 
 Original file SHA-256: `814d11eba59f964bca7e74ef94f0d1eff1d5f322f895fb9b5d7e06f77debf3b2`.
 
@@ -4644,9 +4736,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-69"></a>
+<a id="license-text-71"></a>
 
-### License text 69
+### License text 71
 
 Original file SHA-256: `8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90`.
 
@@ -4859,9 +4951,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-70"></a>
+<a id="license-text-72"></a>
 
-### License text 70
+### License text 72
 
 Original file SHA-256: `831e0f43ad0bf014c1c4fec5767aae470434c1d66d6e671be2d823e729063e25`.
 
@@ -4900,9 +4992,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-71"></a>
+<a id="license-text-73"></a>
 
-### License text 71
+### License text 73
 
 Original file SHA-256: `83c1763356e822adde0a2cae748d938a73fdc263849ccff6b27776dff213bd32`.
 
@@ -4937,9 +5029,9 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-<a id="license-text-72"></a>
+<a id="license-text-74"></a>
 
-### License text 72
+### License text 74
 
 Original file SHA-256: `861399f8c21c042b110517e76dc6b63a2b334276c8cf17412fc3c8908ca8dc17`.
 
@@ -4962,9 +5054,9 @@ AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
 OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-<a id="license-text-73"></a>
+<a id="license-text-75"></a>
 
-### License text 73
+### License text 75
 
 Original file SHA-256: `8695bd4ec08757990eda494e8b31e71c368a164caa42e0cc8aae38bc28de6114`.
 
@@ -5176,9 +5268,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-74"></a>
+<a id="license-text-76"></a>
 
-### License text 74
+### License text 76
 
 Original file SHA-256: `898b1ae9821e98daf8964c8d6c7f61641f5f5aa78ad500020771c0939ee0dea1`.
 
@@ -5218,9 +5310,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-75"></a>
+<a id="license-text-77"></a>
 
-### License text 75
+### License text 77
 
 Original file SHA-256: `8ada45cd9f843acf64e4722ae262c622a2b3b3007c7310ef36ac1061a30f6adb`.
 
@@ -5432,9 +5524,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-76"></a>
+<a id="license-text-78"></a>
 
-### License text 76
+### License text 78
 
 Original file SHA-256: `8b6e9feec03e7c9a5facb26855cecd31662bf989b636bcfe79521bdf8ac863f0`.
 
@@ -5470,9 +5562,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-77"></a>
+<a id="license-text-79"></a>
 
-### License text 77
+### License text 79
 
 Original file SHA-256: `8bb1b50b0e5c9399ae33bd35fab2769010fa6c14e8860c729a52295d84896b7a`.
 
@@ -5684,9 +5776,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-78"></a>
+<a id="license-text-80"></a>
 
-### License text 78
+### License text 80
 
 Original file SHA-256: `8c7516d4b27b1e495be5e38b612298b63de48d05f49cdac94f70f3cd70f8864b`.
 
@@ -5722,9 +5814,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-79"></a>
+<a id="license-text-81"></a>
 
-### License text 79
+### License text 81
 
 Original file SHA-256: `8ce0830173fdac609dfb4ea603fdc002c2f4af0dc9b1a005653f5da9cf534b18`.
 
@@ -5760,9 +5852,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-80"></a>
+<a id="license-text-82"></a>
 
-### License text 80
+### License text 82
 
 Original file SHA-256: `904801faf3f1850328af8e1aa1047b9190cc22ed40df5c87f2d93d17f847ef67`.
 
@@ -5798,9 +5890,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-81"></a>
+<a id="license-text-83"></a>
 
-### License text 81
+### License text 83
 
 Original file SHA-256: `90c503b61dee04e1449c323ec34c229dfb68d7adcb96c7e140ee55f70fce2d8e`.
 
@@ -5837,9 +5929,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-82"></a>
+<a id="license-text-84"></a>
 
-### License text 82
+### License text 84
 
 Original file SHA-256: `90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5`.
 
@@ -5865,9 +5957,9 @@ The Rand project includes code from the Rust project
 published under these same licenses.
 ```
 
-<a id="license-text-83"></a>
+<a id="license-text-85"></a>
 
-### License text 83
+### License text 85
 
 Original file SHA-256: `9117d922e667125508dde62b02c1f57ed22f5ad21eb536aa2e2d99e1c796e639`.
 
@@ -5903,9 +5995,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-84"></a>
+<a id="license-text-86"></a>
 
-### License text 84
+### License text 86
 
 Original file SHA-256: `92b81db30f7ab6d693e0af5661a40d273ca1947e891123ed823924192c10cbc7`.
 
@@ -5925,9 +6017,9 @@ licensed under the Apache License, Version 2.0 <LICENSE-APACHE> or
 <LICENSE-MIT> or <http://opensource.org/licenses/MIT>, at your option.
 ```
 
-<a id="license-text-85"></a>
+<a id="license-text-87"></a>
 
-### License text 85
+### License text 87
 
 Original file SHA-256: `949ab7b3e7140fee216f06fe3a2bd67d68dd511f8ea73c1e01c98cb348e9c8ae`.
 
@@ -5964,9 +6056,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-86"></a>
+<a id="license-text-88"></a>
 
-### License text 86
+### License text 88
 
 Original file SHA-256: `95bd3988beee069fa2848f648dab43cc6e0b2add2ad6bcb17360caf749802bcc`.
 
@@ -6153,9 +6245,9 @@ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 END OF TERMS AND CONDITIONS
 ```
 
-<a id="license-text-87"></a>
+<a id="license-text-89"></a>
 
-### License text 87
+### License text 89
 
 Original file SHA-256: `977c541bd25ffe36975dde25c028c0cd15ddf3d08243983b58e8a6a3d9447523`.
 
@@ -6482,9 +6574,9 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. 
 ````
 
-<a id="license-text-88"></a>
+<a id="license-text-90"></a>
 
-### License text 88
+### License text 90
 
 Original file SHA-256: `98181e7249d0c01737645ec982499ce99a0f07eb8f7d625b8840d799d10dbc01`.
 
@@ -6520,9 +6612,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-89"></a>
+<a id="license-text-91"></a>
 
-### License text 89
+### License text 91
 
 Original file SHA-256: `9bbc1b3dc4674a9ebb12c2a62f54fe3c08672539717f8d05828f684b6cc419a3`.
 
@@ -6555,9 +6647,9 @@ THE SOFTWARE.
 
 ```
 
-<a id="license-text-90"></a>
+<a id="license-text-92"></a>
 
-### License text 90
+### License text 92
 
 Original file SHA-256: `9d185ac6703c4b0453974c0d85e9eee43e6941009296bb1f5eb0b54e2329e9f3`.
 
@@ -6770,9 +6862,9 @@ Sources:
 
 ```
 
-<a id="license-text-91"></a>
+<a id="license-text-93"></a>
 
-### License text 91
+### License text 93
 
 Original file SHA-256: `a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499`.
 
@@ -6904,9 +6996,9 @@ express Statement of Purpose.
     this CC0 or use of the Work.
 ```
 
-<a id="license-text-92"></a>
+<a id="license-text-94"></a>
 
-### License text 92
+### License text 94
 
 Original file SHA-256: `a47129d738752a6ae52247fea645b42cb320d19e9327f1eb2d1a7f99d9455ad3`.
 
@@ -6936,9 +7028,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-93"></a>
+<a id="license-text-95"></a>
 
-### License text 93
+### License text 95
 
 Original file SHA-256: `a5c61b93b6ee1d104af9920cf020ff3c7efe818e31fe562c72261847a728f513`.
 
@@ -6980,9 +7072,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-94"></a>
+<a id="license-text-96"></a>
 
-### License text 94
+### License text 96
 
 Original file SHA-256: `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`.
 
@@ -7018,6 +7110,7 @@ Sources:
 - num-traits@0.2.19/LICENSE-APACHE
 - oid-registry@0.8.1/LICENSE-APACHE
 - once_cell@1.21.4/LICENSE-APACHE
+- opus@0.4.0/LICENSE-APACHE
 - parking_lot@0.12.5/LICENSE-APACHE
 - parking_lot_core@0.9.12/LICENSE-APACHE
 - png@0.18.1/LICENSE-APACHE
@@ -7241,9 +7334,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-95"></a>
+<a id="license-text-97"></a>
 
-### License text 95
+### License text 97
 
 Original file SHA-256: `a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9`.
 
@@ -7430,9 +7523,9 @@ Sources:
    END OF TERMS AND CONDITIONS
 ```
 
-<a id="license-text-96"></a>
+<a id="license-text-98"></a>
 
-### License text 96
+### License text 98
 
 Original file SHA-256: `a825bd853ab71619a4923d7b4311221427848070ff44d990da39b0b274c1683f`.
 
@@ -7464,9 +7557,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-97"></a>
+<a id="license-text-99"></a>
 
-### License text 97
+### License text 99
 
 Original file SHA-256: `a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5`.
 
@@ -7703,9 +7796,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-98"></a>
+<a id="license-text-100"></a>
 
-### License text 98
+### License text 100
 
 Original file SHA-256: `aa72991ac35b4de0034da0afe943e62b48c4092fc2ba13ae47806d8e9a4ad551`.
 
@@ -7723,9 +7816,9 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-99"></a>
+<a id="license-text-101"></a>
 
-### License text 99
+### License text 101
 
 Original file SHA-256: `aaff376532ea30a0cd5330b9502ad4a4c8bf769c539c87ffe78819d188a18ebf`.
 
@@ -7938,9 +8031,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-<a id="license-text-100"></a>
+<a id="license-text-102"></a>
 
-### License text 100
+### License text 102
 
 Original file SHA-256: `ad64fcb9589f162720f3cc5010ad76ca6ad3764e11861f9192c489df176bb71d`.
 
@@ -7977,9 +8070,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-101"></a>
+<a id="license-text-103"></a>
 
-### License text 101
+### License text 103
 
 Original file SHA-256: `ae9baa7beea910273c2f384c2a6b721fb7bd02bda3436074a1072e4ee689f985`.
 
@@ -8016,9 +8109,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-102"></a>
+<a id="license-text-104"></a>
 
-### License text 102
+### License text 104
 
 Original file SHA-256: `af59cea35d7f5e2777a713b8d155d65efa2c339eb43f3c14e868c6ac8506edad`.
 
@@ -8055,9 +8148,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-103"></a>
+<a id="license-text-105"></a>
 
-### License text 103
+### License text 105
 
 Original file SHA-256: `b1cf9a3333ca78152b859012cd4a804156e5243e9ca20ad1df7327ba5ea7405c`.
 
@@ -8270,9 +8363,9 @@ limitations under the License.
 
 ```
 
-<a id="license-text-104"></a>
+<a id="license-text-106"></a>
 
-### License text 104
+### License text 106
 
 Original file SHA-256: `b29f8b01452350c20dd1af16ef83b598fea3053578ccc1c7a0ef40e57be2620f`.
 
@@ -8295,9 +8388,9 @@ NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE US
 THIS SOFTWARE.
 ```
 
-<a id="license-text-105"></a>
+<a id="license-text-107"></a>
 
-### License text 105
+### License text 107
 
 Original file SHA-256: `b3470648aff02beb36d7a53240fc9260ed80ed93bd43bace6b67d7ef7336ee33`.
 
@@ -8333,9 +8426,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-106"></a>
+<a id="license-text-108"></a>
 
-### License text 106
+### License text 108
 
 Original file SHA-256: `b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7`.
 
@@ -8548,9 +8641,9 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-<a id="license-text-107"></a>
+<a id="license-text-109"></a>
 
-### License text 107
+### License text 109
 
 Original file SHA-256: `b68ad1a3367b825447089e1f8d6829b97f47a89eb78d2f4ebaef4672f5606186`.
 
@@ -8583,9 +8676,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-108"></a>
+<a id="license-text-110"></a>
 
-### License text 108
+### License text 110
 
 Original file SHA-256: `b7e650f3fce5c53249d1cdc608b54df156a97edd636cf9d23498d0cfe7aec63e`.
 
@@ -8615,9 +8708,9 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-109"></a>
+<a id="license-text-111"></a>
 
-### License text 109
+### License text 111
 
 Original file SHA-256: `b8c6939380a400f53e11923d50fcc4dd2fa1ba8339fd9d04cda38a0251b6c9b0`.
 
@@ -8653,9 +8746,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-110"></a>
+<a id="license-text-112"></a>
 
-### License text 110
+### License text 112
 
 Original file SHA-256: `bada9e7ed8dc00d63502053c455d7c8d7575dfb7e8277a2a832531844d900682`.
 
@@ -8692,9 +8785,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-111"></a>
+<a id="license-text-113"></a>
 
-### License text 111
+### License text 113
 
 Original file SHA-256: `c09aae9d3c77b531f56351a9947bc7446511d6b025b3255312d3e3442a9a7583`.
 
@@ -8726,9 +8819,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-112"></a>
+<a id="license-text-114"></a>
 
-### License text 112
+### License text 114
 
 Original file SHA-256: `c16f8dcf1a368b83be78d826ea23de4079fe1b4469a0ab9ee20563f37ff3d44b`.
 
@@ -8951,9 +9044,9 @@ Sources:
    limitations under the License.
 ```
 
-<a id="license-text-113"></a>
+<a id="license-text-115"></a>
 
-### License text 113
+### License text 115
 
 Original file SHA-256: `c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383`.
 
@@ -8996,9 +9089,9 @@ Sources:
     SOFTWARE
 ```
 
-<a id="license-text-114"></a>
+<a id="license-text-116"></a>
 
-### License text 114
+### License text 116
 
 Original file SHA-256: `c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08`.
 
@@ -9212,9 +9305,9 @@ Sources:
 
 ```
 
-<a id="license-text-115"></a>
+<a id="license-text-117"></a>
 
-### License text 115
+### License text 117
 
 Original file SHA-256: `c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4`.
 
@@ -9426,9 +9519,9 @@ Sources:
    limitations under the License.
 ```
 
-<a id="license-text-116"></a>
+<a id="license-text-118"></a>
 
-### License text 116
+### License text 118
 
 Original file SHA-256: `c77a4cf9da729987d0fe7ccd811e3bd27393914ddf3d23467c18cc22954513b3`.
 
@@ -9464,9 +9557,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-117"></a>
+<a id="license-text-119"></a>
 
-### License text 117
+### License text 119
 
 Original file SHA-256: `c995204cc6bad2ed67dd41f7d89bb9f1a9d48e0edd745732b30640d7912089a4`.
 
@@ -9502,9 +9595,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-118"></a>
+<a id="license-text-120"></a>
 
-### License text 118
+### License text 120
 
 Original file SHA-256: `c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5`.
 
@@ -9543,9 +9636,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-119"></a>
+<a id="license-text-121"></a>
 
-### License text 119
+### License text 121
 
 Original file SHA-256: `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`.
 
@@ -9759,9 +9852,9 @@ Sources:
    limitations under the License.
 ```
 
-<a id="license-text-120"></a>
+<a id="license-text-122"></a>
 
-### License text 120
+### License text 122
 
 Original file SHA-256: `d1fc1bc0d155df60b2e7705b6b2ae02a05c96f948e1cec6e2fb86360b09f346b`.
 
@@ -9801,9 +9894,9 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
 ```
 
-<a id="license-text-121"></a>
+<a id="license-text-123"></a>
 
-### License text 121
+### License text 123
 
 Original file SHA-256: `d2e7ec5355c96eeade56b09187ceb48a6a30299da3ce7531a66d3d11405ab963`.
 
@@ -9839,9 +9932,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-122"></a>
+<a id="license-text-124"></a>
 
-### License text 122
+### License text 124
 
 Original file SHA-256: `d3cdb764b98283ee7c3a3cea8d374e2a2957322374378d1f3263f4d512741fc3`.
 
@@ -10053,9 +10146,9 @@ Sources:
    limitations under the License.
 ```
 
-<a id="license-text-123"></a>
+<a id="license-text-125"></a>
 
-### License text 123
+### License text 125
 
 Original file SHA-256: `db11fec9946737df39ca3898d9cd8c10ec6f6c3a884a6802b0ad0b81b4e8f23a`.
 
@@ -10067,9 +10160,9 @@ Sources:
 MIT OR Apache-2.0
 ```
 
-<a id="license-text-124"></a>
+<a id="license-text-126"></a>
 
-### License text 124
+### License text 126
 
 Original file SHA-256: `dbe1fff0fb1314b6af94f161511406275cf01c5a32441fbf24528a57a051d599`.
 
@@ -10117,9 +10210,9 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-<a id="license-text-125"></a>
+<a id="license-text-127"></a>
 
-### License text 125
+### License text 127
 
 Original file SHA-256: `dbf62ec5583e35c01ecabf8acfc4ea019d14b02971fdc483994f45c4d9876463`.
 
@@ -10137,9 +10230,9 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-126"></a>
+<a id="license-text-128"></a>
 
-### License text 126
+### License text 128
 
 Original file SHA-256: `dc91f8200e4b2a1f9261035d4c18c33c246911a6c0f7b543d75347e61b249cff`.
 
@@ -10175,9 +10268,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-127"></a>
+<a id="license-text-129"></a>
 
-### License text 127
+### License text 129
 
 Original file SHA-256: `debe6fed7ac143217c7f533759c54b14f18cd01d5fe195c51d83c2ae2d136cb4`.
 
@@ -10402,9 +10495,9 @@ Apache License, version 2.0
    END OF TERMS AND CONDITIONS
 ```
 
-<a id="license-text-128"></a>
+<a id="license-text-130"></a>
 
-### License text 128
+### License text 130
 
 Original file SHA-256: `e11eff681f6f0eb76dbea5787b100d646e4eb5d711e50cb5c9032595f6ca6a68`.
 
@@ -10436,9 +10529,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-129"></a>
+<a id="license-text-131"></a>
 
-### License text 129
+### License text 131
 
 Original file SHA-256: `e2e245f2b566d0bfafb0f6a04c16b82d710c4e6e7d799e39bb4ef6e541b85b98`.
 
@@ -10468,9 +10561,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-130"></a>
+<a id="license-text-132"></a>
 
-### License text 130
+### License text 132
 
 Original file SHA-256: `e72111c52b7d96ebe25348dee19f0744f444d3c95ae6b1ecb6ccaecc5bce05ba`.
 
@@ -10500,9 +10593,9 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-<a id="license-text-131"></a>
+<a id="license-text-133"></a>
 
-### License text 131
+### License text 133
 
 Original file SHA-256: `eaf40297c75da471f7cda1f3458e8d91b4b2ec866e609527a13acfa93b638652`.
 
@@ -10538,9 +10631,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-132"></a>
+<a id="license-text-134"></a>
 
-### License text 132
+### License text 134
 
 Original file SHA-256: `eafbfa606bc005ed7fd2f623d65af17ffe4ef7c017221ac14405bf4140771ea9`.
 
@@ -10570,9 +10663,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-<a id="license-text-133"></a>
+<a id="license-text-135"></a>
 
-### License text 133
+### License text 135
 
 Original file SHA-256: `edd65bdd88957a205c47d53fa499eed8865a70320f0f03f6391668cb304ea376`.
 
@@ -10785,9 +10878,9 @@ Sources:
    limitations under the License.
 ```
 
-<a id="license-text-134"></a>
+<a id="license-text-136"></a>
 
-### License text 134
+### License text 136
 
 Original file SHA-256: `f2ad7982ddbfa8c45eb965315718c55b70b9cc311b49afacb50d5fe84173ae2c`.
 
@@ -10817,9 +10910,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-<a id="license-text-135"></a>
+<a id="license-text-137"></a>
 
-### License text 135
+### License text 137
 
 Original file SHA-256: `f51ac2c59a222f7476ce507ca879960e2b64ea64bb2786eefdbeb7b0b538d1b7`.
 
@@ -10855,9 +10948,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-136"></a>
+<a id="license-text-138"></a>
 
-### License text 136
+### License text 138
 
 Original file SHA-256: `f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1`.
 
@@ -10907,9 +11000,9 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-<a id="license-text-137"></a>
+<a id="license-text-139"></a>
 
-### License text 137
+### License text 139
 
 Original file SHA-256: `f7e8ab639afef15573680c97f796166835cbeb3865175882fea41c60d106b733`.
 
@@ -10945,9 +11038,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-<a id="license-text-138"></a>
+<a id="license-text-140"></a>
 
-### License text 138
+### License text 140
 
 Original file SHA-256: `fb77f0a9c53e473abe5103c8632ef9f0f2874d4fb3f17cb2d8c661aab9cee9d7`.
 

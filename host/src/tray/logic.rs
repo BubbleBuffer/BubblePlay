@@ -223,12 +223,15 @@ impl Write for SharedLog {
 #[serde(rename_all = "camelCase", default)]
 pub struct TraySettings {
     pub start_at_login: bool,
+    /// Send PC sound to the viewer. Missing from older files means on.
+    pub audio: bool,
 }
 
 impl Default for TraySettings {
     fn default() -> Self {
         Self {
             start_at_login: true,
+            audio: true,
         }
     }
 }
@@ -285,8 +288,9 @@ impl StoredHostConfig {
 }
 
 /// Command-line arguments for `bubbleplay-host.exe`. Secrets never appear
-/// here; they travel as environment variables.
-pub fn build_host_args(config: &StoredHostConfig) -> Vec<OsString> {
+/// here; they travel as environment variables. `audio` comes from
+/// `TraySettings`; `--no-audio` is passed only when it is off.
+pub fn build_host_args(config: &StoredHostConfig, audio: bool) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("--mode"),
         OsString::from("serve"),
@@ -296,6 +300,9 @@ pub fn build_host_args(config: &StoredHostConfig) -> Vec<OsString> {
     if let Some(monitor) = config.monitor.as_deref().filter(|m| !m.is_empty()) {
         args.push(OsString::from("--monitor"));
         args.push(OsString::from(monitor));
+    }
+    if !audio {
+        args.push(OsString::from("--no-audio"));
     }
     args
 }
@@ -633,7 +640,7 @@ mod tests {
             assert!(!settings.start_at_login);
             assert_eq!(
                 serde_json::to_value(settings).unwrap(),
-                serde_json::json!({"startAtLogin":false})
+                serde_json::json!({"startAtLogin":false,"audio":true})
             );
         }
     }
@@ -646,6 +653,7 @@ mod tests {
         assert!(TraySettings::default().start_at_login);
         let settings = TraySettings {
             start_at_login: false,
+            audio: true,
         };
         settings.save(&path).unwrap();
         assert_eq!(TraySettings::load(&path), settings);
@@ -655,7 +663,8 @@ mod tests {
         assert_eq!(
             TraySettings::load(&path),
             TraySettings {
-                start_at_login: true
+                start_at_login: true,
+                audio: true,
             }
         );
         fs::write(
@@ -666,6 +675,31 @@ mod tests {
         assert!(!TraySettings::load(&path).start_at_login);
         fs::write(&path, b"not json").unwrap();
         assert_eq!(TraySettings::load(&path), TraySettings::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn audio_setting_defaults_on_and_roundtrips_explicitly() {
+        let dir = temp_dir("audio-setting");
+        let path = dir.join("tray.json");
+        // Missing field in an existing file: audio stays on.
+        fs::write(&path, b"{\"startAtLogin\": false}").unwrap();
+        assert_eq!(
+            TraySettings::load(&path),
+            TraySettings {
+                start_at_login: false,
+                audio: true,
+            }
+        );
+        // Explicit off survives a save and load.
+        let off = TraySettings {
+            start_at_login: true,
+            audio: false,
+        };
+        off.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"audio\": false"));
+        assert_eq!(TraySettings::load(&path), off);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -680,7 +714,7 @@ mod tests {
 
     #[test]
     fn host_args_never_include_secrets() {
-        let args = build_host_args(&config());
+        let args = build_host_args(&config(), true);
         assert_eq!(
             args,
             ["--mode", "serve", "--worker", "wss://play.example/host-ws"]
@@ -694,13 +728,43 @@ mod tests {
         assert!(!args.iter().any(|a| a.to_string_lossy().contains("01AB")));
         let mut with_monitor = config();
         with_monitor.monitor = Some("primary".into());
-        let args = build_host_args(&with_monitor);
+        let args = build_host_args(&with_monitor, true);
         assert_eq!(
             &args[4..],
             &[OsString::from("--monitor"), OsString::from("primary")]
         );
         with_monitor.monitor = Some(String::new());
-        assert_eq!(build_host_args(&with_monitor).len(), 4);
+        assert_eq!(build_host_args(&with_monitor, true).len(), 4);
+    }
+
+    #[test]
+    fn host_args_pass_no_audio_only_when_audio_is_off() {
+        let on = build_host_args(&config(), true);
+        assert!(!on.iter().any(|a| a == "--no-audio"));
+        let off = build_host_args(&config(), false);
+        assert_eq!(
+            off,
+            [
+                "--mode",
+                "serve",
+                "--worker",
+                "wss://play.example/host-ws",
+                "--no-audio",
+            ]
+            .map(OsString::from)
+            .to_vec()
+        );
+        // With a monitor, --no-audio follows it.
+        let mut with_monitor = config();
+        with_monitor.monitor = Some("primary".into());
+        assert_eq!(
+            &build_host_args(&with_monitor, false)[4..],
+            &[
+                OsString::from("--monitor"),
+                OsString::from("primary"),
+                OsString::from("--no-audio"),
+            ]
+        );
     }
 
     #[test]

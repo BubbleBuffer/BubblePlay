@@ -2,6 +2,7 @@
 //! str0m and the media UDP socket; the D3D/NVENC producer only owns an AU
 //! sender, so a slow network cannot extend encoder latency.
 
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::windows::io::AsRawSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,10 +17,13 @@ use str0m::{Input, Output};
 use tracing::{debug, info, warn};
 
 use crate::activity::Activity;
+use crate::audio::AudioFrame;
 use crate::rtc::{RtcAction, RtcSession};
 use crate::stun;
 
 pub const AU_QUEUE_BOUND: usize = 1;
+/// Five 10 ms frames: at most 50 ms of PC audio waits behind a stalled pump.
+const AUDIO_QUEUE_BOUND: usize = 5;
 const MAPPING_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 /// How long a media-carrying RTC peer may sit in ICE Disconnected before the
 /// session gives up on it. Short Wi-Fi hiccups recover inside this window.
@@ -108,15 +112,50 @@ struct TransportCounters {
     admitted_frames: u64,
     admitted_bytes: u64,
     cursor_feedback_sent: u64,
+    audio_frames_written: u64,
+    audio_frames_not_admitted: u64,
 }
 
 impl TransportCounters {
     fn has_media_activity(&self, producer_skipped: u64, au_age_count: u64) -> bool {
         self.tx_packets != 0
             || self.admitted_frames != 0
+            || self.audio_frames_written != 0
             || self.cursor_feedback_sent != 0
             || producer_skipped != 0
             || au_age_count != 0
+    }
+}
+
+/// PC audio waiting for the RTP audio track. It is separate from the video
+/// slot. When full it drops the oldest frame, so latency stays bounded.
+#[derive(Default)]
+struct AudioQueue {
+    frames: VecDeque<AudioFrame>,
+    dropped: u64,
+}
+
+impl AudioQueue {
+    fn push(&mut self, frame: AudioFrame) {
+        if self.frames.len() >= AUDIO_QUEUE_BOUND {
+            self.frames.pop_front();
+            self.dropped += 1;
+        }
+        self.frames.push_back(frame);
+    }
+
+    fn pop(&mut self) -> Option<AudioFrame> {
+        self.frames.pop_front()
+    }
+
+    /// Called when the peer is replaced or reset, so a new peer never plays
+    /// sound captured for the old one.
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+
+    fn take_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.dropped)
     }
 }
 
@@ -167,6 +206,7 @@ pub struct TransportPump {
     cursor_latest: Arc<Mutex<Option<[u8; 8]>>>,
     cursor_feedback_coalesced: Arc<AtomicU64>,
     cursor_kind_latest: Arc<Mutex<ReliableCursorKind>>,
+    audio_queue: Arc<Mutex<AudioQueue>>,
     stop: Arc<AtomicBool>,
     wake: Activity,
     join: Option<JoinHandle<()>>,
@@ -264,6 +304,8 @@ impl TransportPump {
         let transport_cursor_coalesced = cursor_feedback_coalesced.clone();
         let cursor_kind_latest = Arc::new(Mutex::new(ReliableCursorKind::default()));
         let transport_cursor_kind = cursor_kind_latest.clone();
+        let audio_queue = Arc::new(Mutex::new(AudioQueue::default()));
+        let transport_audio = audio_queue.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let join = thread::Builder::new()
@@ -283,6 +325,7 @@ impl TransportPump {
                     transport_cursor_latest,
                     transport_cursor_coalesced,
                     transport_cursor_kind,
+                    transport_audio,
                     wait,
                 ) {
                     warn!(?error, "RTC transport pump stopped with error");
@@ -298,6 +341,7 @@ impl TransportPump {
             cursor_latest,
             cursor_feedback_coalesced,
             cursor_kind_latest,
+            audio_queue,
             stop,
             wake,
             join: Some(join),
@@ -308,6 +352,28 @@ impl TransportPump {
     /// reference frame is still waiting, so the producer must skip this frame.
     pub fn reserve_access_unit(&self) -> Option<AccessUnitReservation> {
         self.au_sender.reserve()
+    }
+
+    /// Queue one PC-audio frame for the audio track and wake the pump. Frames
+    /// that are not admitted (no negotiated Opus track, or ICE not connected)
+    /// are discarded by the pump. Video is unaffected.
+    pub fn submit_audio(&self, frame: AudioFrame) {
+        push_audio(&self.audio_queue, &self.wake, frame);
+    }
+
+    /// Audio submission for a thread that must not depend on the video
+    /// producer. The sink performs the same bounded push and wake as
+    /// `submit_audio`, and discards frames once the pump has been shut down.
+    pub fn audio_sink(&self) -> Arc<dyn Fn(AudioFrame) + Send + Sync> {
+        let queue = self.audio_queue.clone();
+        let wake = self.wake.clone();
+        let stop = self.stop.clone();
+        Arc::new(move |frame| {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            push_audio(&queue, &wake, frame);
+        })
     }
     pub fn command(&self, command: TransportCommand) -> bool {
         let sent = try_send_command(&self.command_tx, command);
@@ -380,6 +446,15 @@ impl TransportPump {
             let _ = join.join();
         }
     }
+}
+
+/// Bounded oldest-drop push shared by `submit_audio` and `audio_sink`.
+fn push_audio(queue: &Mutex<AudioQueue>, wake: &Activity, frame: AudioFrame) {
+    queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(frame);
+    wake.notify();
 }
 
 /// Non-blocking bounded admission. `false` is the producer's explicit
@@ -600,6 +675,7 @@ fn transport_loop(
     cursor_latest: Arc<Mutex<Option<[u8; 8]>>>,
     cursor_feedback_coalesced: Arc<AtomicU64>,
     cursor_kind_latest: Arc<Mutex<ReliableCursorKind>>,
+    audio_queue: Arc<Mutex<AudioQueue>>,
     wait: Activity,
 ) -> Result<()> {
     socket
@@ -635,6 +711,10 @@ fn transport_loop(
                 if let Some(refresh) = &mut mapping_refresh {
                     refresh.next_request = Instant::now();
                 }
+                audio_queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
                 rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
                 cursor_kind_latest
                     .lock()
@@ -675,6 +755,10 @@ fn transport_loop(
                     );
                 }
                 au_gate.store(false, Ordering::Release);
+                audio_queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
                 rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
                 emit(&events, TransportEvent::PeerReset);
                 mutated = true;
@@ -823,6 +907,28 @@ fn transport_loop(
             }
         }
         if !mutated {
+            let frame = audio_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop();
+            if let Some(frame) = frame {
+                // Only an accepted write is a mutation that needs a drain; a
+                // frame dropped before negotiation or ICE leaves the peer untouched.
+                match rtc.write_audio(frame) {
+                    Ok(true) => {
+                        counters.audio_frames_written += 1;
+                        mutated = true;
+                    }
+                    Ok(false) => counters.audio_frames_not_admitted += 1,
+                    Err(error) => {
+                        warn!(?error, "write audio frame");
+                        counters.audio_frames_not_admitted += 1;
+                        mutated = true;
+                    }
+                }
+            }
+        }
+        if !mutated {
             match socket.recv_from(&mut buffer) {
                 Ok((n, source)) => {
                     if let Some(address) = mapping_refresh
@@ -872,6 +978,10 @@ fn transport_loop(
         if now >= next_log {
             let producer_skipped = skipped_before_encode.swap(0, Ordering::Relaxed);
             let cursor_coalesced = cursor_feedback_coalesced.swap(0, Ordering::Relaxed);
+            let audio_dropped = audio_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take_dropped();
             if counters.has_media_activity(producer_skipped, au_age_count) {
                 info!(
                     tx_packets = counters.tx_packets,
@@ -886,6 +996,9 @@ fn transport_loop(
                     producer_skipped_before_encode = producer_skipped,
                     cursor_feedback_sent = counters.cursor_feedback_sent,
                     cursor_feedback_coalesced = cursor_coalesced,
+                    audio_frames_written = counters.audio_frames_written,
+                    audio_frames_not_admitted = counters.audio_frames_not_admitted,
+                    audio_frames_dropped = audio_dropped,
                     au_age_us_sum = au_age_sum_us,
                     au_age_count,
                     au_age_us_max = au_age_max_us,
@@ -896,6 +1009,7 @@ fn transport_loop(
             } else {
                 debug!(
                     cursor_feedback_coalesced = cursor_coalesced,
+                    audio_frames_dropped = audio_dropped,
                     deadline_late_count,
                     deadline_late_us_max = deadline_late_max_us,
                     "RTC transport idle"
@@ -939,6 +1053,38 @@ fn transport_loop(
 
 #[cfg(test)]
 mod tests {
+    use super::{AudioQueue, AUDIO_QUEUE_BOUND};
+    use crate::audio::AudioFrame;
+
+    fn audio_frame(seq: u32) -> AudioFrame {
+        AudioFrame {
+            seq,
+            capture_ts_us: u64::from(seq) * 10_000,
+            discontinuity: seq == 0,
+            payload: vec![0xfc, 0xff, 0xfe],
+        }
+    }
+
+    #[test]
+    fn audio_queue_drops_oldest_frame_and_clears_on_reset() {
+        let mut queue = AudioQueue::default();
+        for seq in 0..(AUDIO_QUEUE_BOUND as u32 + 2) {
+            queue.push(audio_frame(seq));
+        }
+        // The two oldest frames were dropped; the newest AUDIO_QUEUE_BOUND remain in order.
+        assert_eq!(queue.take_dropped(), 2);
+        assert_eq!(queue.take_dropped(), 0);
+        let remaining: Vec<u32> = std::iter::from_fn(|| queue.pop())
+            .map(|frame| frame.seq)
+            .collect();
+        assert_eq!(remaining, vec![2, 3, 4, 5, 6]);
+
+        // A peer reset discards pending audio rather than sending it to the new peer.
+        queue.push(audio_frame(7));
+        queue.clear();
+        assert!(queue.pop().is_none());
+    }
+
     #[test]
     fn mapping_refresh_uses_media_socket_and_validates_server_and_transaction() {
         let media = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

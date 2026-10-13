@@ -174,10 +174,15 @@ struct Args {
     monitor: Option<String>,
     vdd: bool,
     privileged_agent: bool,
+    audio: bool,
     benchmark_profile: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
     let mut args = Args {
         mode: "serve".to_string(),
         worker: None,
@@ -193,9 +198,9 @@ fn parse_args() -> Result<Args> {
         monitor: None,
         vdd: false,
         privileged_agent: false,
+        audio: true,
         benchmark_profile: None,
     };
-    let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--mode" => args.mode = it.next().context("--mode value")?,
@@ -218,13 +223,14 @@ fn parse_args() -> Result<Args> {
             "--monitor" => args.monitor = Some(it.next().context("--monitor value")?),
             "--vdd" => args.vdd = true,
             "--privileged-agent" => args.privileged_agent = true,
+            "--no-audio" => args.audio = false,
             "--benchmark-profile" => {
                 args.benchmark_profile = Some(PathBuf::from(
                     it.next().context("--benchmark-profile value")?,
                 ))
             }
             "-h" | "--help" => {
-                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--host-gate-token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--privileged-agent] [--benchmark-profile absolute-path]");
+                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--host-gate-token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--privileged-agent] [--no-audio] [--benchmark-profile absolute-path]");
                 std::process::exit(0);
             }
             other => bail!("unknown argument: {other}"),
@@ -965,6 +971,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     // Follow active window needs the interactive user's foreground window,
     // so only the local (tray) capture path advertises it.
     signaling.set_follow_window_supported(!capture.is_privileged());
+    signaling.set_audio_enabled(args.audio);
     let mut next_file_rate_update = Instant::now();
     let mut file_drag_preview = FileDragPreviewState::default();
     let mut pending_native_drop: Option<PendingNativeDrop> = None;
@@ -1009,6 +1016,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let pump = TransportPump::spawn(socket, host_addr, mapped_addr, quality.target());
     pump.set_activity(activity.clone());
     pump.set_stun_server(STUN_SERVER)?;
+    let rtc_audio_sink = pump.audio_sink();
+    let mut wss_audio_sink = None;
     let mut encoder: Option<Nvenc> = None;
     let mut active_codec = VideoCodec::preferred();
     let mut wss_media: Option<WssMediaEgress> = None;
@@ -1016,6 +1025,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut media_generation = 1u32;
     let mut media_sequence = 0u32;
     let media_clock_start = Instant::now();
+    // Audio belongs to the viewer session, independently of desktop/video epochs.
+    let mut audio_capture: Option<bubbleplay_host::audio::AudioCapture> = None;
+    let mut rtc_audio_requested = false;
+    let mut wss_audio_requested = false;
+    let mut next_audio_start = Instant::now();
+    let mut audio_start_failed = false;
     let mut scaler: Option<Scaler> = None;
     let preset = if args.preset == "p1" {
         Preset::P1
@@ -1304,6 +1319,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             carried_input.reset();
             remote_input_ready = false;
             viewer_attached = false;
+            if let Some(egress) = &wss_media {
+                egress.set_audio_enabled(false);
+            }
+            audio_capture = None;
+            rtc_audio_requested = false;
+            wss_audio_requested = false;
+            wss_audio_sink = None;
+            audio_start_failed = false;
             display_hold.set_attached(false);
             display_wake.reset();
             input_sink.reset_status_delivery();
@@ -2006,6 +2029,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     if let Some(kind) = latest_cursor_kind {
                         pump.publish_cursor_kind(kind);
                     }
+                }
+                TransportEvent::Action(RtcAction::AudioReady) => {
+                    rtc_audio_requested = true;
                 }
                 TransportEvent::Action(RtcAction::IceConnected) => {
                     rtc_peer.on_connected();
@@ -3041,6 +3067,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     height_q16,
                     monitor,
                     follow,
+                    audio,
                 } => {
                     if action == "follow" {
                         let Some(enabled) = follow else {
@@ -3189,6 +3216,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             }
                         }
                     }
+                    if action == "start"
+                        && active_wss_epoch.as_deref() == epoch.as_deref()
+                        && wss_media.is_some()
+                    {
+                        // Remember opt-in for this media epoch across repeated starts.
+                        wss_audio_requested |= audio && protocol == Some(4);
+                        if let Some(egress) = &wss_media {
+                            egress.set_audio_enabled(args.audio && wss_audio_requested);
+                        }
+                    }
                     if action == "start" && wss_media.is_none() {
                         let Some(bearer) = args.host_gate_token.as_deref() else {
                             warn!("WSS media requested but --host-gate-token is missing");
@@ -3220,6 +3257,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         match connect_result {
                             Ok(egress) => {
                                 egress.set_activity(activity.clone());
+                                wss_audio_requested = audio && protocol == Some(4);
+                                egress.set_audio_enabled(args.audio && wss_audio_requested);
+                                wss_audio_sink = Some(egress.audio_sink());
                                 if args.privileged_agent {
                                     remote_input_ready = false;
                                     carried_input.reset();
@@ -3541,6 +3581,32 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         signaling.flush_cursor_state();
+        let audio_wanted =
+            args.audio && viewer_attached && (wss_audio_requested || rtc_audio_requested);
+        if audio_wanted && audio_capture.is_none() && Instant::now() >= next_audio_start {
+            match bubbleplay_host::audio::AudioCapture::start(media_clock_start, activity.clone()) {
+                Ok(capture) => audio_capture = Some(capture),
+                Err(error) => {
+                    if !audio_start_failed {
+                        warn!(%error, "audio capture thread unavailable; video continues");
+                        audio_start_failed = true;
+                    }
+                    next_audio_start = Instant::now() + Duration::from_secs(1);
+                }
+            }
+        }
+        if let Some(capture) = &audio_capture {
+            // The capture thread submits directly into a transport's bounded
+            // audio queue. Video capture/encoding cannot delay these submissions.
+            let sink = if wss_media.is_some() {
+                wss_audio_requested
+                    .then(|| wss_audio_sink.clone())
+                    .flatten()
+            } else {
+                rtc_audio_requested.then(|| rtc_audio_sink.clone())
+            };
+            capture.set_sink(sink);
+        }
         if viewer_attached && !capture.is_privileged() {
             let changed = input_sink.take_status_change();
             if let Some(status) = changed {
@@ -6379,6 +6445,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     session_call!(Input, input_sink.release_all());
     capture.release_input();
     signaling.send_bye();
+    drop(audio_capture);
     if let Some(egress) = wss_media {
         egress.shutdown();
     }
@@ -6469,6 +6536,26 @@ fn physical_monitor_count() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audio_cli_defaults_on_and_accepts_no_audio() {
+        assert!(super::parse_args_from(std::iter::empty()).unwrap().audio);
+        let args = super::parse_args_from(
+            [
+                "--mode",
+                "serve",
+                "--worker",
+                "wss://example.test",
+                "--no-audio",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(!args.audio);
+        assert_eq!(args.mode, "serve");
+        assert_eq!(args.worker.as_deref(), Some("wss://example.test"));
+    }
+
     #[test]
     fn prepared_drop_input_keeps_motion_and_cleanup_but_invalidates_actions() {
         for packet in [

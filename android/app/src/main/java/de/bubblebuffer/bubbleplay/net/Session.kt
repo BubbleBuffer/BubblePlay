@@ -6,9 +6,11 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import de.bubblebuffer.bubbleplay.input.RemoteInput
+import de.bubblebuffer.bubbleplay.media.AudioPlayer
 import de.bubblebuffer.bubbleplay.media.VideoDecoder
 import de.bubblebuffer.bubbleplay.protocol.ClipboardReceiver
 import de.bubblebuffer.bubbleplay.protocol.CursorState
+import de.bubblebuffer.bubbleplay.protocol.AudioWire
 import de.bubblebuffer.bubbleplay.protocol.CursorKind
 import de.bubblebuffer.bubbleplay.protocol.FileWire
 import de.bubblebuffer.bubbleplay.protocol.FollowWindow
@@ -71,6 +73,8 @@ class Session(
         fun onFileCapability(enabled: Boolean?)
         /** The signaling epoch the file socket pairs on (null: none). */
         fun onFileEpoch(epoch: String?)
+        /** Host sound (BPA1) from host-capabilities; false when the host does not stream sound. */
+        fun onSoundCapability(enabled: Boolean)
         /** A host `file-offer`; an empty item list withdraws it. */
         fun onFileOffer(offer: FileWire.Offer)
         /** Follow active window: whether the host can follow (false while no capable host is known). */
@@ -101,6 +105,12 @@ class Session(
     private val handler = Handler(thread.looper)
     private val main = Handler(Looper.getMainLooper())
     val decoder = VideoDecoder(this)
+    // Host sound: created on the first BPA1 packet and released with the media leg.
+    private var audio: AudioPlayer? = null
+    /** Local mute of the host's sound. Not persisted: each session starts unmuted. */
+    @Volatile var soundMuted = false
+        private set
+    private var soundForeground = true
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -479,7 +489,8 @@ class Session(
             }
             "host-capabilities" -> {
                 val files = msg.optInt("fileTransfer") >= 1
-                main.post { listener.onFileCapability(files) }
+                val sound = msg.optInt("audio") >= 1
+                main.post { listener.onFileCapability(files); listener.onSoundCapability(sound) }
                 followCapable = FollowWindow.capable(msg)
                 val follow = followCapable
                 main.post { listener.onFollowCapability(follow) }
@@ -545,7 +556,7 @@ class Session(
                 resetFirstFrame()
                 desktopKind = "default"; secureDesktop = null
                 followCapable = false
-                main.post { listener.onInputLost(); listener.onSecureDesktop(null); listener.onFileCapability(null); listener.onFileEpoch(null); listener.onFollowCapability(false) }
+                main.post { listener.onInputLost(); listener.onSecureDesktop(null); listener.onFileCapability(null); listener.onSoundCapability(false); listener.onFileEpoch(null); listener.onFollowCapability(false) }
                 sigRetry.resetBackoff()
                 scheduleSignalingReconnect("peer-left")
             }
@@ -764,7 +775,9 @@ class Session(
                 val packet = bytes.toByteArray()
                 mediaPost(id) {
                     mediaLastInbound = now()
-                    onPacket(packet, (receivedAt - startedAt) / 1_000_000.0)
+                    // BPA1 audio shares the socket: no ACK, and it never reaches the v4 gate.
+                    if (AudioWire.isAudio(packet)) onAudioPacket(packet)
+                    else onPacket(packet, (receivedAt - startedAt) / 1_000_000.0)
                 }
             }
 
@@ -805,9 +818,9 @@ class Session(
                 gate.reset(if (reconnect) "reconnect" else "connect")
                 decoder.dropPending()
                 if (mediaLeg.startHost()) {
-                    sendSig(JSONObject().put("type", "media-control").put("action", "start").put("protocol", V4.VERSION)
+                    sendSig(AudioWire.optIn(JSONObject().put("type", "media-control").put("action", "start").put("protocol", V4.VERSION)
                         .put("epoch", mediaEpoch).put("codec", preferredCodec).put("streamMode", streamMode)
-                        .put("reason", "client-start").put("quality", "high"))
+                        .put("reason", "client-start").put("quality", "high"), AudioPlayer.decoderAvailable))
                     startFirstFrame("wss-host-start", true)
                 }
                 if (reconnect) requestKeyframe("reconnect", force = true)
@@ -837,6 +850,26 @@ class Session(
         }
         decoder.submit(frame, mediaId)
     }
+
+    private fun onAudioPacket(packet: ByteArray) {
+        val parsed = AudioWire.parse(packet) ?: return
+        if (!AudioPlayer.decoderAvailable) return
+        val player = audio ?: AudioPlayer(soundAudible()).also { audio = it }
+        player.offer(parsed)
+    }
+
+    /** Local mute, the activity's stopped state: the sound is silenced, its packets are still decoded. */
+    fun setSoundMuted(muted: Boolean) {
+        soundMuted = muted
+        handler.post { audio?.setAudible(soundAudible()) }
+    }
+
+    fun setSoundForeground(value: Boolean) = handler.post {
+        soundForeground = value
+        audio?.setAudible(soundAudible())
+    }
+
+    private fun soundAudible() = !soundMuted && soundForeground
 
     private fun requestKeyframe(reason: String, force: Boolean = false) {
         val now = now()
@@ -871,6 +904,8 @@ class Session(
         hostPresent = false
         gate.reset("connect")
         decoder.dropPending()
+        audio?.release()
+        audio = null
     }
 
     // ---- decoder callbacks (decoder thread) -------------------------------------

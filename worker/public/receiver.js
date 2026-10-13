@@ -24,6 +24,7 @@ import {
 import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyName, shortcutsFor } from "/chrome.js";
 import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
+import { SoundController, WssAudioPlayer, isAudioPacket, probeOpusDecode, soundButtonView, sumAudioStats } from "/audio.js";
 import { FileTransferClient } from "/file-client.js";
 import { createFileDragPreviewController, filesFromPaste, installFileTransferUi, mapFileDropPoint } from "/file-ui.js";
 
@@ -101,6 +102,8 @@ const labRun = parseLabRun(params);
 const labCompatibilityId = labRun ? STREAM_LAB_COMPATIBILITY.id : null;
 // Media-control messages carry the WSS protocol version (v4 is the only one).
 const WSS_PROTOCOL = V4_VERSION;
+// Opus decode is probed once. The WSS start opts in to BPA1 audio only when it can decode.
+const wssAudioDecodable = probeOpusDecode(globalThis.AudioDecoder);
 const useWebCodecs = params.get("decoderPath") === "webcodecs";
 const requestedTransport = parseTransport(params);
 function browserStorage() {
@@ -161,6 +164,13 @@ let latestInputStatus = null;
 let inputStatusReason = null;
 let hostCapabilities = { serviceMode: false, coldBoot: false, secureDesktop: false, secureText: false };
 let hostCapabilitiesGeneration = 0;
+// Local PC sound (audio.js). Sinks: the WebRTC <audio> element and the WSS player.
+let hostAudioCapable = false; // host-capabilities.audio === 1
+let wssAudioPlayer = null;
+let wssAudioSinkAttached = false;
+let wssAudioRetired = sumAudioStats(); // counters from players already stopped
+let latestInboundAudio = null; // WebRTC inbound-rtp for the audio track
+const soundController = new SoundController({ target: document, onChange: () => renderSoundSlot() });
 let hasPresentedFrame = false;
 let fileDropPresentedGeneration = null;
 let fileDropPresentedViewportRevision = null;
@@ -1105,6 +1115,9 @@ async function handleSignal(socket, generation, ev) {
       renderFilesSlot();
       // Follow active window: show the switch and resend a saved "on" per connect.
       applyFollowCapability(msg);
+      // Local PC sound: the strip button shows only when the host streams audio.
+      hostAudioCapable = Number.isInteger(msg.audio) && msg.audio >= 1;
+      renderSoundSlot();
       if (wssSelected && !usingWssMedia) requestWssMediaStart();
       break;
     case "file-offer":
@@ -1178,6 +1191,7 @@ function cleanupPeer() {
   fileDropPresentedGeneration = null;
   fileDropPresentedViewportRevision = null;
   if (usingWssMedia) stopWssMedia();
+  soundController.detachSink("rtc");
   clearWssTimers();
   closingPeer = true;
   releaseInput();
@@ -1220,6 +1234,7 @@ function clearWssTimers() {
 function stopWssMedia() {
   usingWssMedia = false;
   clearWssTimers();
+  stopWssAudio();
   wssDecoderEpoch++;
   try { wssV4.socket?.close(1000, "switch"); } catch {}
   Object.assign(wssV4, { socket: null, socketOpen: false, everOpened: false, hostPresent: false, reconnecting: false,
@@ -1315,6 +1330,7 @@ function openWssV4Socket() {
     wssV4.socketOpen = false;
     wssV4.hostPresent = false;
     wssV4.socket = null;
+    stopWssAudio();
     hudState.ice = "wss v4 reconnecting";
     debugTrace("media-v4-close", { code: event.code, reason: event.reason || "", wasClean: event.wasClean });
     scheduleWssV4Reconnect("socket-close");
@@ -1326,6 +1342,11 @@ function openWssV4Socket() {
 }
 
 function onWssV4Packet(data) {
+  // BPA1 audio shares the media socket. It skips the v4 counters, ACK and gate.
+  if (isAudioPacket(data)) {
+    onWssAudioPacket(data);
+    return;
+  }
   wssMediaReceivedBytes += data.byteLength;
   wssMediaReceivedPackets++;
   const frame = parseFrameV4(data);
@@ -1361,6 +1382,52 @@ function onWssV4Packet(data) {
     data: frame.data,
     frameTrace: { sequence: frame.seq, receivedAtMs: nowMs, refine: frame.refine },
   });
+}
+
+function onWssAudioPacket(data) {
+  wssAudioPlayer ??= createWssAudioPlayer();
+  if (wssAudioPlayer.push(data) === "rejected") {
+    recordWssPacketRejection("audio-invalid-packet");
+    return;
+  }
+  if (!wssAudioSinkAttached) {
+    wssAudioSinkAttached = true;
+    const player = wssAudioPlayer;
+    soundController.attachSink("wss", {
+      start: () => player.resume(),
+      setMuted: muted => player.setMuted(muted),
+      stop: () => player.stop(),
+    });
+  }
+}
+
+function createWssAudioPlayer() {
+  return new WssAudioPlayer({
+    createContext: () => new AudioContext({ latencyHint: "interactive", sampleRate: 48000 }),
+    createDecoder: init => new AudioDecoder(init),
+    createChunk: init => new EncodedAudioChunk(init),
+    onError: error => sendClientLog("warn", "wss-audio-error", { name: error?.name || "error" }),
+  });
+}
+
+function stopWssAudio() {
+  if (wssAudioPlayer) wssAudioRetired = sumAudioStats(wssAudioRetired, wssAudioPlayer.stats());
+  wssAudioPlayer?.stop();
+  wssAudioPlayer = null;
+  if (wssAudioSinkAttached) {
+    wssAudioSinkAttached = false;
+    soundController.detachSink("wss");
+  }
+}
+
+// Diagnostics: "off" without the host capability, otherwise the controller state.
+function audioSnapshot() {
+  return {
+    announced: hostAudioCapable,
+    controller: hostAudioCapable ? soundController.state : "off",
+    wss: sumAudioStats(wssAudioRetired, wssAudioPlayer?.stats()),
+    webrtc: latestInboundAudio ? { ...latestInboundAudio } : null,
+  };
 }
 
 function startWssV4() {
@@ -1517,7 +1584,7 @@ async function maybeStartWssHost() {
   hudState.ice = wssV4.socketOpen ? "wss" : "wss connecting";
   if (wssStartedHost || wssStartInFlight || !wssV4.socketOpen) return;
   wssStartInFlight = true;
-  const codec = await selectWssCodec();
+  const [codec, audioDecodable] = await Promise.all([selectWssCodec(), wssAudioDecodable]);
   if (!codec) {
     wssStartInFlight = false;
     return;
@@ -1530,7 +1597,7 @@ async function maybeStartWssHost() {
   wssStartInFlight = false;
   sendSignal({ type: "media-control", action: "start", protocol: WSS_PROTOCOL, epoch: mediaEpoch,
     codec, streamMode: streamModeValue(), reason: "client-start",
-    quality: qualityPreset === "auto" ? "high" : qualityPreset });
+    quality: qualityPreset === "auto" ? "high" : qualityPreset, ...(audioDecodable ? { audio: 1 } : {}) });
   startFirstFrameHandshake("wss-host-start");
   scheduleSharpViewport(fullFrameDiagnostic ? "diagnostic-full-frame" : "wss-start");
 }
@@ -1629,6 +1696,7 @@ function handleRtcPeerConnectionState(generation, candidate, state) {
 // Input already falls back to the signaling socket when the lanes are gone.
 function endRtcPeerOnly(reason) {
   if (!pc) return;
+  soundController.detachSink("rtc");
   closingPeer = true;
   try { dc?.close(); } catch {}
   try { motionDc?.close(); } catch {}
@@ -1864,6 +1932,8 @@ async function startPeer(generation = peerGeneration) {
 
   // Receive-only video; the browser offers, the host answers (locked).
   const transceiver = candidate.addTransceiver("video", { direction: "recvonly" });
+  // PC sound: receive-only Opus after the video m-line. Audio is not gated on video.
+  candidate.addTransceiver("audio", { direction: "recvonly" });
   transceiver.receiver.playoutDelayHint = 0; // minimal jitter buffer
   // playoutDelayHint is advisory and Chromium may still grow hundreds of
   // milliseconds of buffer. jitterBufferTarget is the explicit millisecond
@@ -2210,6 +2280,7 @@ if (diagnosticsEnabled) {
           presentation: framePresentationTelemetry.snapshot(),
           hybrid: activeWssHybridCache().snapshot(),
         },
+        audio: audioSnapshot(),
         viewport: viewportHealthSnapshot(),
         signaling: {
           registered: signalingRegistered,
@@ -2486,7 +2557,7 @@ setInterval(async () => {
     // generation lets consumers reject them as decode evidence.
     latestRtcProfileGeneration = sampledGeneration;
     hudState.route = deriveCandidateRoute(latestRtcProfile);
-    let inbound = null, rtt = null;
+    let inbound = null, rtt = null, inboundAudio = null;
     stats.forEach((s) => {
       if (s.type === "candidate-pair" && s.state === "succeeded" && s.nominated) {
         if (typeof s.currentRoundTripTime === "number" && s.currentRoundTripTime >= 0) {
@@ -2494,9 +2565,21 @@ setInterval(async () => {
         }
       } else if (s.type === "inbound-rtp" && (s.kind === "video" || s.mediaType === "video")) {
         inbound = s;
+      } else if (s.type === "inbound-rtp" && (s.kind === "audio" || s.mediaType === "audio")) {
+        inboundAudio = s;
       }
     });
     const atMs = Date.now();
+    latestInboundAudio = inboundAudio ? {
+      generation: peerGeneration,
+      atMs,
+      packetsReceived: inboundAudio.packetsReceived,
+      packetsLost: inboundAudio.packetsLost,
+      totalSamplesReceived: inboundAudio.totalSamplesReceived,
+      concealedSamples: inboundAudio.concealedSamples,
+      jitterBufferDelay: inboundAudio.jitterBufferDelay,
+      jitterBufferEmittedCount: inboundAudio.jitterBufferEmittedCount,
+    } : null;
     const currentInbound = inbound ? {
       generation: peerGeneration,
       atMs,
@@ -2543,6 +2626,10 @@ setInterval(async () => {
 
 function onTrack(ev, generation = peerGeneration) {
   if (generation !== peerGeneration) return;
+  if (ev.track.kind === "audio") {
+    attachRtcAudio(ev.track, generation);
+    return;
+  }
   const receiver = ev.receiver;
   const transceiver = pc.getTransceivers().find((t) => t.receiver === receiver);
 
@@ -2642,6 +2729,21 @@ function onTrack(ev, generation = peerGeneration) {
 
   // An explicit WebCodecs request can still fall back to native video.
   startNativeVideo(ev.track, generation);
+}
+
+// PC sound over WebRTC: a hidden, unmuted element per peer. Muting is local.
+function attachRtcAudio(track, generation = peerGeneration) {
+  if (generation !== peerGeneration) return;
+  const element = document.createElement("audio");
+  element.autoplay = true;
+  element.hidden = true;
+  document.body.appendChild(element);
+  element.srcObject = new MediaStream([track]);
+  soundController.attachSink("rtc", {
+    start: () => element.play().then(() => true, () => false),
+    setMuted: muted => { element.muted = muted; },
+    stop: () => { element.pause(); element.srcObject = null; element.remove(); },
+  });
 }
 
 function startNativeVideo(track, generation = peerGeneration) {
@@ -3953,8 +4055,20 @@ const stripActions = {
   files: (button, viaKeyboard) => openPanel("pop-files", button, viaKeyboard),
   more: (button, viaKeyboard) => openPanel("pop-more", button, viaKeyboard),
   settings: (_button, viaKeyboard) => openPanel("settings-panel", stripSettingsButton, viaKeyboard),
+  sound: () => soundController.toggle(),
   fullscreen: () => { popovers.close(); toggleFullscreen(); },
 };
+// Local PC sound button: shown only with the host's audio capability; the muted
+// glyph shows while muted or blocked (soundButtonView).
+const stripSound = document.getElementById("strip-sound");
+function renderSoundSlot() {
+  const view = soundButtonView({ capable: hostAudioCapable, state: soundController.state });
+  stripSound.hidden = view.hidden;
+  stripSound.setAttribute("aria-pressed", String(view.pressed));
+  stripSound.setAttribute("aria-label", view.label);
+  stripSound.title = view.label;
+  stripSound.classList.toggle("sound-muted", view.silent);
+}
 document.querySelectorAll("[data-ui-action]").forEach(button => {
   // A pointer press must not move keyboard focus off the remote input surface.
   button.addEventListener("mousedown", e => e.preventDefault());

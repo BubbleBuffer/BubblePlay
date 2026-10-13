@@ -34,14 +34,16 @@ Idea from 2026-10-12: on a slow link, typed keys could be buffered and sent in c
 ## Features
 
 ### Audio streaming
-Status: approved 2026-10-12: PC sound only, no microphone.
-The host captures no audio today. Decisions:
+Status: approved 2026-10-12: PC sound only, no microphone. Implemented 2026-10-13; live qualification pending. Current state: [audio.md](architecture/audio.md).
+Decisions:
 - The host captures the default playback device with WASAPI loopback and encodes Opus at 48 kHz stereo in 10 ms frames.
 - WebRTC carries it as an audio track on the existing peer. The WSS media path carries it as its own message type, so Android gets audio too.
 - The viewer plays it with a mute toggle in the session UI. Audio starts unmuted when the browser allows it, otherwise on the first click.
 - The host has a setting to turn audio off. Without it, PC sound goes to the viewer whenever a session is open.
 - No A/V sync beyond low latency on both streams; audio is not held back to match video.
 - A new capability flag announces audio, so older clients and hosts keep working without it.
+- Audio follows the session, not the desktop: it keeps playing across monitor and secure-desktop transitions.
+- The off switch is the tray's **Stream PC sound** item; mute in the viewer is local and starts unmuted each session.
 
 ### Device IDs and keys
 Status: approved 2026-10-13 with decisions; implementation not started.
