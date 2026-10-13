@@ -54,7 +54,7 @@ import kotlin.math.roundToInt
 
 /**
  * The settings view (`docs/architecture/session-ui.md`, "Settings view (Android)"):
- * Connection, Touch, Display, Video, Clipboard, Diagnostics, About. It is a view, not an
+ * Connection, Touch, Mouse and keyboard, Display, Video, Clipboard, Diagnostics, About. It is a view, not an
  * activity, so opening it from the stream keeps the session (an activity on
  * top would start the 30 s background disconnect). Every change is written to
  * [Prefs] at once and reported through [Host.onSettingChanged] so the host
@@ -76,7 +76,7 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         fun closeSettings()
     }
 
-    enum class Setting { SERVER, TOUCH_MODE, POINTER_SPEED, TAP_TO_CLICK, FULLSCREEN, KEEP_SCREEN_ON, DEFAULT_MONITOR, CODEC, AUTO_COPY_REMOTE_CLIPBOARD }
+    enum class Setting { SERVER, TOUCH_MODE, POINTER_SPEED, TAP_TO_CLICK, POINTER_MODE, KEYBOARD_LOCK, BACKGROUND, FULLSCREEN, KEEP_SCREEN_ON, DEFAULT_MONITOR, CODEC, AUTO_COPY_REMOTE_CLIPBOARD }
 
     private val density = resources.displayMetrics.density
     private val timers = Handler(Looper.getMainLooper())
@@ -182,6 +182,9 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         signOutRow = actionRow(R.string.settings_sign_out, signOutDetail, DANGER) { confirmSignOut() }
         column.addView(signOutRow)
         renderSignOut()
+        column.addView(switchRow(R.string.settings_stay_connected, R.string.settings_stay_connected_detail, prefs.stayConnected) {
+            prefs.stayConnected = it; host.onSettingChanged(Setting.BACKGROUND)
+        })
 
         section(R.string.settings_touch)
         column.addView(fieldLabel(R.string.settings_touch_mode))
@@ -192,6 +195,17 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         column.addView(slider())
         column.addView(switchRow(R.string.settings_tap_to_click, R.string.settings_tap_to_click_detail, prefs.tapToClick) {
             prefs.tapToClick = it; host.onSettingChanged(Setting.TAP_TO_CLICK)
+        })
+
+        section(R.string.settings_mouse_keyboard)
+        column.addView(fieldLabel(R.string.settings_pointer_mode))
+        column.addView(segmented(
+            listOf(false to R.string.settings_pointer_work, true to R.string.settings_pointer_game),
+            prefs.gameMode, R.string.settings_pointer_mode,
+        ) { prefs.gameMode = it; host.onSettingChanged(Setting.POINTER_MODE) })
+        column.addView(detailText(activity.getString(R.string.settings_pointer_mode_detail)).apply { setPadding(0, dp(6), 0, 0) })
+        column.addView(switchRow(R.string.settings_keyboard_lock, R.string.settings_keyboard_lock_detail, prefs.keyboardLock) {
+            prefs.keyboardLock = it; host.onSettingChanged(Setting.KEYBOARD_LOCK)
         })
 
         section(R.string.settings_display)

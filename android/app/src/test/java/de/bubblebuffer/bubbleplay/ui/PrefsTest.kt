@@ -39,6 +39,10 @@ class PrefsTest {
         assertTrue(prefs.startFullscreen)
         assertTrue(prefs.keepScreenOn)
         assertEquals("", prefs.defaultMonitor)
+        assertFalse("work mode, like the browser", prefs.gameMode)
+        assertFalse(prefs.followWindow)
+        assertTrue(prefs.keyboardLock)
+        assertTrue(prefs.stayConnected)
         assertEquals(Prefs.VERSION, store.map[Prefs.KEY_VERSION])
         assertNull("a fresh install has no relay to contact", prefs.serverConfig())
     }
@@ -135,5 +139,32 @@ class PrefsTest {
     fun malformedAutomaticRemoteClipboardPreferenceDefaultsOn() {
         val store = MapStore(hashMapOf(Prefs.KEY_VERSION to Prefs.VERSION, Prefs.KEY_AUTO_COPY_REMOTE_CLIPBOARD to "off"))
         assertTrue(Prefs(store).autoCopyRemoteClipboard)
+    }
+
+    @Test
+    fun parityTogglesRoundTripAndIgnoreMalformedValues() {
+        val store = MapStore()
+        val prefs = Prefs(store)
+        prefs.gameMode = true
+        prefs.followWindow = true
+        prefs.keyboardLock = false
+        prefs.stayConnected = false
+        val again = Prefs(store)
+        assertTrue(again.gameMode)
+        assertTrue(again.followWindow)
+        assertFalse(again.keyboardLock)
+        assertFalse(again.stayConnected)
+
+        val bad = Prefs(MapStore(hashMapOf(
+            Prefs.KEY_VERSION to Prefs.VERSION,
+            Prefs.KEY_GAME_MODE to "yes",
+            Prefs.KEY_FOLLOW_WINDOW to 1,
+            Prefs.KEY_KEYBOARD_LOCK to "off",
+            Prefs.KEY_STAY_CONNECTED to 0,
+        )))
+        assertFalse(bad.gameMode)
+        assertFalse(bad.followWindow)
+        assertTrue(bad.keyboardLock)
+        assertTrue(bad.stayConnected)
     }
 }

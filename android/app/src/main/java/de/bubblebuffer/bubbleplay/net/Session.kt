@@ -11,6 +11,7 @@ import de.bubblebuffer.bubbleplay.protocol.ClipboardReceiver
 import de.bubblebuffer.bubbleplay.protocol.CursorState
 import de.bubblebuffer.bubbleplay.protocol.CursorKind
 import de.bubblebuffer.bubbleplay.protocol.FileWire
+import de.bubblebuffer.bubbleplay.protocol.FollowWindow
 import de.bubblebuffer.bubbleplay.protocol.V4
 import de.bubblebuffer.bubbleplay.protocol.V4ReceiveGate
 import okhttp3.OkHttpClient
@@ -72,6 +73,10 @@ class Session(
         fun onFileEpoch(epoch: String?)
         /** A host `file-offer`; an empty item list withdraws it. */
         fun onFileOffer(offer: FileWire.Offer)
+        /** Follow active window: whether the host can follow (false while no capable host is known). */
+        fun onFollowCapability(enabled: Boolean)
+        /** The host's follow state from `monitor-list.follow`. */
+        fun onFollowState(follow: Boolean)
     }
 
     enum class State { CONNECTING, CONNECTED, STATIC, RECONNECTING, ERROR }
@@ -132,6 +137,11 @@ class Session(
     // A same-source monitor switch gates input and keeps held input (RemoteInput.Transport.inputGated).
     @Volatile private var monitorHold = false
     private val inputWarning = InputStatusWarning()
+    // Follow active window: the wanted state (sent on every capable connect) and the host's capability.
+    @Volatile private var followWanted = false
+    /** "work" (absolute pointer, desktop frame rate) or "game" (captured mouse); the host caps work at 30 fps. */
+    @Volatile private var streamMode = MODE_WORK
+    private var followCapable = false
     private var desktopGeneration: Int? = null
     private var hasPresented = false
     private val clipboardReceiver = ClipboardReceiver()
@@ -275,6 +285,21 @@ class Session(
     /** Ask the host's SYSTEM helper to cancel the open UAC prompt (never approves it). */
     fun denySecurePrompt() = handler.post {
         if ("deny" in (secureDesktop?.capabilities ?: emptySet())) sendSig(JSONObject().put("type", "secure-action").put("action", "deny"))
+    }
+
+    /** Pointer mode for the host's stream policy; sent now when signaling is up, and on every connect. */
+    fun setStreamMode(game: Boolean) = handler.post {
+        val mode = if (game) MODE_GAME else MODE_WORK
+        if (mode == streamMode) return@post
+        streamMode = mode
+        if (mediaEpoch != null) sendSig(JSONObject().put("type", "media-control").put("action", "mode").put("protocol", V4.VERSION)
+            .put("epoch", mediaEpoch).put("streamMode", mode).put("reason", "user-mode"))
+    }
+
+    /** Follow active window on or off; sent now when the host can follow, and again on every connect. */
+    fun setFollow(enabled: Boolean) = handler.post {
+        followWanted = enabled
+        if (followCapable) sendSig(FollowWindow.control(enabled, mediaEpoch))
     }
 
     fun requestMonitorList() = handler.post {
@@ -449,12 +474,17 @@ class Session(
                 mediaEpoch = epoch
                 main.post { listener.onFileEpoch(epoch) }
                 sendSig(JSONObject().put("type", "media-control").put("action", "mode").put("protocol", V4.VERSION)
-                    .put("epoch", mediaEpoch).put("streamMode", "work").put("reason", "signaling-start"))
+                    .put("epoch", mediaEpoch).put("streamMode", streamMode).put("reason", "signaling-start"))
                 startMedia()
             }
             "host-capabilities" -> {
                 val files = msg.optInt("fileTransfer") >= 1
                 main.post { listener.onFileCapability(files) }
+                followCapable = FollowWindow.capable(msg)
+                val follow = followCapable
+                main.post { listener.onFollowCapability(follow) }
+                // Host follow state starts off for each signaling session: resend a wanted "on".
+                if (follow && followWanted) sendSig(FollowWindow.control(true, mediaEpoch))
                 if (!mediaOpen && media == null && registered) startMedia()
             }
             "pong" -> {
@@ -498,6 +528,7 @@ class Session(
                     Monitor(selector, m.optString("name").ifEmpty { selector }, m.optInt("width"), m.optInt("height"), m.optBoolean("selected"))
                 }
                 main.post { listener.onMonitors(monitors, null) }
+                FollowWindow.listState(msg)?.let { follow -> main.post { listener.onFollowState(follow) } }
             }
             "monitor-error" -> {
                 val reason = msg.optString("reason").ifEmpty { "unknown error" }.take(180)
@@ -513,7 +544,8 @@ class Session(
                 closeMedia()
                 resetFirstFrame()
                 desktopKind = "default"; secureDesktop = null
-                main.post { listener.onInputLost(); listener.onSecureDesktop(null); listener.onFileCapability(null); listener.onFileEpoch(null) }
+                followCapable = false
+                main.post { listener.onInputLost(); listener.onSecureDesktop(null); listener.onFileCapability(null); listener.onFileEpoch(null); listener.onFollowCapability(false) }
                 sigRetry.resetBackoff()
                 scheduleSignalingReconnect("peer-left")
             }
@@ -774,7 +806,7 @@ class Session(
                 decoder.dropPending()
                 if (mediaLeg.startHost()) {
                     sendSig(JSONObject().put("type", "media-control").put("action", "start").put("protocol", V4.VERSION)
-                        .put("epoch", mediaEpoch).put("codec", preferredCodec).put("streamMode", "work")
+                        .put("epoch", mediaEpoch).put("codec", preferredCodec).put("streamMode", streamMode)
                         .put("reason", "client-start").put("quality", "high"))
                     startFirstFrame("wss-host-start", true)
                 }
@@ -990,6 +1022,8 @@ class Session(
 
     companion object {
         private const val TAG = "BubblePlaySession"
+        const val MODE_WORK = "work"
+        const val MODE_GAME = "game"
         private const val PING_STALE_MS = 10_000L
 
         /** "hevc" when a hardware HEVC decoder exists, else "h264" (override with a setting). */
