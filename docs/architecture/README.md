@@ -32,6 +32,7 @@ Shared fixtures are the cross-language contract; update them and the affected im
 | [`cursor-types.json`](../../fixtures/cursor-types.json) | Reliable semantic cursor kinds; position packets remain separate |
 | [`file-transfer-contract.json`](../../fixtures/file-transfer-contract.json) | File packets, validation limits and socket behavior |
 | [`follow-window-contract.json`](../../fixtures/follow-window-contract.json) | Monitor-follow capability and controls |
+| [`audio-contract.json`](../../fixtures/audio-contract.json) | PC sound packets, opt-in and capability ([audio](audio.md)) |
 | [`browser-approval-contract.json`](../../fixtures/browser-approval-contract.json) | Host approval messages and login methods ([browser approval](browser-approval.md)) |
 
 See [file transfer](file-transfer.md), [monitor following](follow-active-window.md), [session UI](session-ui.md), and [secure desktop](secure-desktop.md) for the behavior behind these contracts. [Unattended access](unattended-access.md) is a proposal (not approved) for access before sign-in. Go also consumes [browser-generated packet fixtures](../../relay/testdata/worker-contract.json).

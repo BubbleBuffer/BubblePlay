@@ -8,6 +8,7 @@ Start with a relay setup guide, then install the native Windows host. BubblePlay
 - [Security and privacy](security-and-privacy.md) — authentication, relay visibility and platform boundaries.
 - [Development](development.md) — contributor setup, repository map, builds and checks.
 - [Architecture](architecture/README.md) — runtime components, transports and shared fixtures.
+- [PC sound](architecture/audio.md) — host capture, Opus, WebRTC/WSS audio and the tray setting.
 - [File transfer](architecture/file-transfer.md), [monitor following](architecture/follow-active-window.md) and [session UI](architecture/session-ui.md) — current feature behavior and contracts.
 - [Secure desktop](architecture/secure-desktop.md) — UAC prompts and lock screen; [in-place desktop transitions on WebRTC](architecture/secure-desktop.md#in-place-desktop-transitions-on-webrtc).
 - [Unattended access](architecture/unattended-access.md) — proposal for remote access before sign-in (pre-login service and restricted logon host); not approved.
