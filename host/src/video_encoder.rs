@@ -12,7 +12,7 @@ use windows::core::Interface;
 use windows::core::{s, w};
 use windows::Win32::Foundation::FreeLibrary;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 use crate::encode::{EncodedFrame, FrameDamage, Nvenc, VideoCodec};
@@ -100,6 +100,114 @@ pub enum EncoderBackend {
     MfSoftware,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderAdapter {
+    pub luid: u64,
+    pub vendor_id: u32,
+}
+
+pub fn encoder_adapter(adapter: &IDXGIAdapter) -> Result<EncoderAdapter> {
+    let desc = unsafe { adapter.GetDesc() }?;
+    Ok(EncoderAdapter {
+        luid: (u64::from(desc.AdapterLuid.HighPart as u32) << 32)
+            | u64::from(desc.AdapterLuid.LowPart),
+        vendor_id: desc.VendorId,
+    })
+}
+
+pub fn device_encoder_adapter(device: *mut c_void) -> Result<EncoderAdapter> {
+    let device =
+        unsafe { ID3D11Device::from_raw_borrowed(&device) }.context("null capture D3D11 device")?;
+    let dxgi: IDXGIDevice = device.cast()?;
+    encoder_adapter(&unsafe { dxgi.GetAdapter() }?)
+}
+
+/// Discovery belongs to an adapter, not to a frame or encoder session. An
+/// unchanged adapter reuses the result across parked capture and recovery.
+#[derive(Default)]
+pub struct EncoderDiscoveryCache {
+    entries: Vec<(EncoderAdapter, EncoderBackend)>,
+}
+
+impl EncoderDiscoveryCache {
+    pub fn resolve(
+        &mut self,
+        adapter: EncoderAdapter,
+        preference: EncoderPreference,
+    ) -> Result<EncoderBackend> {
+        self.resolve_with(adapter, || discover_encoder_backend(adapter, preference))
+    }
+
+    fn resolve_with(
+        &mut self,
+        adapter: EncoderAdapter,
+        probe: impl FnOnce() -> Result<EncoderBackend>,
+    ) -> Result<EncoderBackend> {
+        if let Some((_, backend)) = self
+            .entries
+            .iter()
+            .find(|(key, _)| key.luid == adapter.luid)
+        {
+            return Ok(*backend);
+        }
+        let backend = probe()?;
+        self.entries.push((adapter, backend));
+        Ok(backend)
+    }
+
+    pub fn record_actual(&mut self, adapter: EncoderAdapter, backend: EncoderBackend) {
+        if let Some((_, selected)) = self
+            .entries
+            .iter_mut()
+            .find(|(key, _)| key.luid == adapter.luid)
+        {
+            *selected = backend;
+        }
+    }
+}
+
+fn discover_encoder_backend(
+    adapter: EncoderAdapter,
+    preference: EncoderPreference,
+) -> Result<EncoderBackend> {
+    let order = selection_order(preference);
+    let mut failures = Vec::new();
+    if order.contains(&EncoderBackend::Nvenc) {
+        // This proves driver API availability, not that every NVIDIA SKU can
+        // initialize every requested encode profile. The factory still checks.
+        if adapter.vendor_id == 0x10de {
+            match probe_nvenc_api() {
+                Ok(()) => return Ok(EncoderBackend::Nvenc),
+                Err(error) => failures.push(format!("NVENC unavailable: {error:#}")),
+            }
+        } else {
+            failures.push("capture adapter is not NVIDIA".to_owned());
+        }
+    }
+    if order
+        .iter()
+        .any(|backend| *backend != EncoderBackend::Nvenc)
+    {
+        match crate::mf_encode::probe_availability(Some(adapter.luid)) {
+            Ok(available) => {
+                if let Some(error) = &available.hardware_error {
+                    info!(%error, "Media Foundation hardware discovery unavailable; checking software registration");
+                }
+                for backend in order {
+                    if (*backend == EncoderBackend::MfHardware && available.hardware)
+                        || (*backend == EncoderBackend::MfSoftware && available.software)
+                    {
+                        return Ok(*backend);
+                    }
+                }
+                failures.push("no requested Media Foundation H.264 encoder registered".to_owned());
+            }
+            Err(error) => failures.push(format!("Media Foundation unavailable: {error:#}")),
+        }
+    }
+    bail!("no video encoder: {}", failures.join("; "))
+}
+
 /// CPU mode always forces software, including when a diagnostic override is set.
 pub fn selection_order(preference: EncoderPreference) -> &'static [EncoderBackend] {
     use EncoderBackend::*;
@@ -145,14 +253,23 @@ impl VideoEncoder {
         infinite_gop: bool,
         gop_seconds: u32,
         preference: EncoderPreference,
+        discovered: Option<EncoderBackend>,
         mut create_nvenc: impl FnMut() -> Result<Nvenc>,
     ) -> Result<Self> {
         let mut unavailable = Vec::new();
-        for backend in selection_order(preference) {
+        for backend in selection_order(preference)
+            .iter()
+            .skip_while(|backend| discovered.is_some_and(|selected| selected != **backend))
+        {
             let result = match backend {
-                EncoderBackend::Nvenc => probe_nvenc_api()
-                    .and_then(|()| create_nvenc())
-                    .map(Self::Nvenc),
+                EncoderBackend::Nvenc => {
+                    let available = if discovered.is_none() {
+                        probe_nvenc_api()
+                    } else {
+                        Ok(())
+                    };
+                    available.and_then(|()| create_nvenc()).map(Self::Nvenc)
+                }
                 EncoderBackend::MfHardware | EncoderBackend::MfSoftware => MfEncoder::new_with_gop(
                     device,
                     width,
@@ -205,6 +322,14 @@ impl VideoEncoder {
         match self {
             Self::Nvenc(_) => EncoderCapabilities::NVENC,
             Self::Mf(_) => EncoderCapabilities::MF,
+        }
+    }
+
+    pub fn backend(&self) -> EncoderBackend {
+        match self {
+            Self::Nvenc(_) => EncoderBackend::Nvenc,
+            Self::Mf(encoder) if encoder.hardware() => EncoderBackend::MfHardware,
+            Self::Mf(_) => EncoderBackend::MfSoftware,
         }
     }
 
@@ -412,6 +537,52 @@ fn adapter_name(device: *mut c_void) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_is_cached_by_adapter_across_warm_reconnect_and_recovery() {
+        let first = EncoderAdapter {
+            luid: 10,
+            vendor_id: 0x10de,
+        };
+        let second = EncoderAdapter {
+            luid: 20,
+            vendor_id: 0x8086,
+        };
+        let mut cache = EncoderDiscoveryCache::default();
+        assert_eq!(
+            cache
+                .resolve_with(first, || Ok(EncoderBackend::Nvenc))
+                .unwrap(),
+            EncoderBackend::Nvenc
+        );
+        assert_eq!(
+            cache
+                .resolve_with(first, || panic!("unchanged adapter must not be re-probed"))
+                .unwrap(),
+            EncoderBackend::Nvenc
+        );
+        assert_eq!(
+            cache
+                .resolve_with(second, || Ok(EncoderBackend::MfHardware))
+                .unwrap(),
+            EncoderBackend::MfHardware
+        );
+        cache.record_actual(first, EncoderBackend::MfSoftware);
+        assert_eq!(
+            cache
+                .resolve_with(first, || panic!("actual fallback must remain cached"))
+                .unwrap(),
+            EncoderBackend::MfSoftware
+        );
+        assert_eq!(
+            cache
+                .resolve_with(second, || panic!(
+                    "returning to an adapter must reuse discovery"
+                ))
+                .unwrap(),
+            EncoderBackend::MfHardware
+        );
+    }
 
     #[test]
     fn auto_prefers_nvenc_then_hardware_then_software() {

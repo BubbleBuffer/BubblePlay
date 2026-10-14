@@ -409,6 +409,7 @@ fn selection_preflight(
             false,
             2,
             preference,
+            None,
             || {
                 assert!(
                     !preference.cpu_mode,

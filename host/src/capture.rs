@@ -33,7 +33,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_IDENTITY,
     DXGI_SAMPLE_DESC,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGISurface1, DXGI_OUTDUPL_MOVE_RECT};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGISurface1, DXGI_OUTDUPL_MOVE_RECT,
+};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDCW, CreateDIBSection, DeleteDC, DeleteObject,
     GetMonitorInfoW, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
@@ -1202,6 +1204,33 @@ fn capture_gdi_via_dib(
     })();
     let _ = unsafe { DeleteDC(memory_dc) };
     result
+}
+
+/// Resolve the selected display's adapter without creating capture resources
+/// or waiting for Desktop Duplication to produce a frame.
+pub fn monitor_adapter(filter: Option<&str>) -> Result<IDXGIAdapter1> {
+    let device_name = pick_monitor(filter)?.device_name()?;
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }?;
+    let mut adapter_index = 0;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(adapter_index) } {
+        let mut output_index = 0;
+        while let Ok(output) = unsafe { adapter.EnumOutputs(output_index) } {
+            let desc = unsafe { output.GetDesc() }?;
+            let length = desc
+                .DeviceName
+                .iter()
+                .position(|&v| v == 0)
+                .unwrap_or(desc.DeviceName.len());
+            if String::from_utf16_lossy(&desc.DeviceName[..length])
+                .eq_ignore_ascii_case(&device_name)
+            {
+                return Ok(adapter);
+            }
+            output_index += 1;
+        }
+        adapter_index += 1;
+    }
+    bail!("selected display {device_name} has no DXGI adapter")
 }
 
 /// Resolve a monitor from an optional filter: `None` or `"primary"` picks the

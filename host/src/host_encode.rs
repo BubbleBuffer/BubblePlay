@@ -3,11 +3,11 @@ use super::{
     bail, benchmark, ensure, frame_damage, hybrid, info, quality, warn, AqMode, BenchmarkAqMode,
     BenchmarkHybridCacheMode, BenchmarkMultipass, BenchmarkPreset, BenchmarkResourceMode,
     BenchmarkRoiMode, BenchmarkTuning, CachedIdr, CachedIdrReplay, CapturedFrame, Context,
-    Controller, Decision, EncodedFrame, EncoderCapabilities, EncoderOptions, EncoderPreference,
-    FrameDamage, Instant, Interface, Multipass, Nvenc, Preset, Profile, ProfileTransition,
-    QuiescentTilePlanner, RateControlMode, ResourceMode, Result, RoiMode, ScaleOutput, Scaler,
-    Signaling, Tuning, VideoCodec, VideoEncoder, VideoMode, ViewportCrop, ViewportGeometry,
-    WssAdjustment, RECT, STATIC_REPLAY_DELAY,
+    Controller, Decision, EncodedFrame, EncoderBackend, EncoderCapabilities, EncoderOptions,
+    EncoderPreference, FrameDamage, Instant, Interface, Multipass, Nvenc, Preset, Profile,
+    ProfileTransition, QuiescentTilePlanner, RateControlMode, ResourceMode, Result, RoiMode,
+    ScaleOutput, Scaler, Signaling, Tuning, VideoCodec, VideoEncoder, VideoMode, ViewportCrop,
+    ViewportGeometry, WssAdjustment, RECT, STATIC_REPLAY_DELAY,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -257,13 +257,18 @@ pub(super) fn adopt_encoder_codec(active: &mut VideoCodec, encoder: Option<&Vide
     }
 }
 
-pub(super) fn rtc_encoder_capabilities(
-    mut capabilities: super::EncoderCapabilities,
-    session_codec: VideoCodec,
-) -> super::EncoderCapabilities {
-    // Preserve the existing one-way session downgrade on a warm reconnect.
-    capabilities.hevc &= session_codec == VideoCodec::Hevc;
-    capabilities
+/// NVENC retains master's immediate legacy offer path. MF declares H.264
+/// capabilities before capture/encoder activation, even on a static desktop.
+pub(super) fn startup_offer_command(
+    sdp: String,
+    backend: EncoderBackend,
+) -> super::TransportCommand {
+    match backend {
+        EncoderBackend::Nvenc => super::TransportCommand::Offer(sdp),
+        EncoderBackend::MfHardware | EncoderBackend::MfSoftware => {
+            super::TransportCommand::OfferWithCapabilities(sdp, EncoderCapabilities::MF)
+        }
+    }
 }
 
 pub(super) fn ensure_rtc_encoder_codec(
@@ -282,6 +287,7 @@ pub(super) fn ensure_rtc_encoder_codec(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_local_encoder(
     preference: EncoderPreference,
+    discovered: EncoderBackend,
     device: *mut core::ffi::c_void,
     width: u32,
     height: u32,
@@ -309,6 +315,7 @@ pub(super) fn create_local_encoder(
         infinite_gop,
         u32::from(gop_seconds),
         preference,
+        Some(discovered),
         || {
             if let Some(profile) = benchmark_profile {
                 return Nvenc::new_with_options_native_codec(
@@ -350,6 +357,7 @@ pub(super) fn create_local_encoder(
 pub(super) fn configure_encoder_profile(
     encoder: &mut Option<VideoEncoder>,
     preference: EncoderPreference,
+    discovered: &mut EncoderBackend,
     device: *mut core::ffi::c_void,
     mode: VideoMode,
     native_width: u32,
@@ -374,6 +382,7 @@ pub(super) fn configure_encoder_profile(
         *encoder = Some(
             create_local_encoder(
                 preference,
+                *discovered,
                 device,
                 mode.width,
                 mode.height,
@@ -388,6 +397,7 @@ pub(super) fn configure_encoder_profile(
             )
             .with_context(|| format!("recreate encoder for {}", mode.label))?,
         );
+        *discovered = encoder.as_ref().expect("replacement selected").backend();
     }
     encoder.as_mut().expect("configured above").force_idr();
     Ok(())
@@ -400,6 +410,7 @@ pub(super) fn configure_encoder_profile(
 pub(super) fn recreate_and_encode_profile(
     encoder: &mut Option<VideoEncoder>,
     preference: EncoderPreference,
+    discovered: &mut EncoderBackend,
     device: *mut core::ffi::c_void,
     mode: VideoMode,
     native_width: u32,
@@ -417,6 +428,7 @@ pub(super) fn recreate_and_encode_profile(
     *encoder = None;
     let mut replacement = create_local_encoder(
         preference,
+        *discovered,
         device,
         mode.width,
         mode.height,
@@ -429,6 +441,7 @@ pub(super) fn recreate_and_encode_profile(
         benchmark_profile,
         infinite_gop,
     )?;
+    *discovered = replacement.backend();
     // Record the actual codec before any input preparation/encode can fail.
     // The next producer pass must not retry an unsupported HEVC contract.
     adopt_encoder_codec(codec, Some(&replacement));

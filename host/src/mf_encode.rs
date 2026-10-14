@@ -178,6 +178,22 @@ impl Runtime {
         Ok(manager)
     }
     fn enumerate(&self, device: &ID3D11Device, adapter_only: bool) -> Result<Vec<IMFActivate>> {
+        let luid = if adapter_only {
+            let dxgi: IDXGIDevice = device.cast()?;
+            let desc = unsafe { dxgi.GetAdapter()?.GetDesc() }?;
+            Some(
+                (u64::from(desc.AdapterLuid.HighPart as u32) << 32)
+                    | u64::from(desc.AdapterLuid.LowPart),
+            )
+        } else {
+            None
+        };
+        self.enumerate_types(
+            (MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0) as u32,
+            luid,
+        )
+    }
+    fn enumerate_types(&self, flags: u32, adapter_luid: Option<u64>) -> Result<Vec<IMFActivate>> {
         let input = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
             guidSubtype: MFVideoFormat_NV12,
@@ -186,17 +202,12 @@ impl Runtime {
             guidMajorType: MFMediaType_Video,
             guidSubtype: MFVideoFormat_H264,
         };
-        let flags = (MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0) as u32;
         let mut raw: *mut *mut c_void = ptr::null_mut();
         let mut count = 0;
-        let result = if adapter_only {
+        let result = if let Some(luid) = adapter_luid {
             let enumerate = self
                 .enumerate_adapter
                 .context("MFTEnum2 unavailable on this Windows version")?;
-            let dxgi: IDXGIDevice = device.cast()?;
-            let desc = unsafe { dxgi.GetAdapter()?.GetDesc() }?;
-            let luid = (u64::from(desc.AdapterLuid.HighPart as u32) << 32)
-                | u64::from(desc.AdapterLuid.LowPart);
             let attributes = self.attributes()?;
             unsafe { attributes.SetUINT64(&MFT_ENUM_ADAPTER_LUID, luid) }?;
             unsafe {
@@ -234,9 +245,52 @@ impl Runtime {
             }
             unsafe { CoTaskMemFree(Some(raw.cast())) };
         }
-        result.ok().context("enumerate hardware H.264 MFT")?;
+        result.ok().context("enumerate NV12 -> H.264 MFT")?;
         Ok(activations)
     }
+}
+
+/// Registered transforms, not proof that a driver accepts our low-latency configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MfAvailability {
+    pub hardware: bool,
+    pub software: bool,
+    pub hardware_error: Option<String>,
+}
+
+/// Enumerate without activating an encoder or creating a D3D device/frame.
+/// A supplied LUID restricts hardware discovery to that adapter. Missing
+/// adapter enumeration preserves independently discovered software availability.
+pub fn probe_availability(adapter_luid: Option<u64>) -> Result<MfAvailability> {
+    let _com = ComApartment::enter()?;
+    let runtime = Runtime::get()?;
+    let software = runtime
+        .enumerate_types(
+            (MFT_ENUM_FLAG_SYNCMFT.0 | MFT_ENUM_FLAG_SORTANDFILTER.0) as u32,
+            None,
+        )?
+        .iter()
+        .any(|activation| unsafe {
+            activation
+                .GetGUID(&MFT_TRANSFORM_CLSID_Attribute)
+                .is_ok_and(|clsid| clsid == CLSID_MICROSOFT_H264)
+        });
+    let (hardware, hardware_error) = match runtime.enumerate_types(
+        (MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0) as u32,
+        adapter_luid,
+    ) {
+        Ok(activations) => (!activations.is_empty(), None),
+        Err(error) => {
+            let detail = format!("{error:#}");
+            warn!(%detail, ?adapter_luid, "MF hardware availability enumeration failed");
+            (false, Some(detail))
+        }
+    };
+    Ok(MfAvailability {
+        hardware,
+        software,
+        hardware_error,
+    })
 }
 
 struct ComApartment(bool);
@@ -791,6 +845,9 @@ impl MfEncoder {
     }
     pub fn implementation_name(&self) -> &str {
         &self.transform.name
+    }
+    pub fn hardware(&self) -> bool {
+        self.hardware
     }
     pub fn force_idr(&mut self) {
         self.force_idr_next = true;

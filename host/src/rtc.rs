@@ -60,30 +60,6 @@ fn preferred_negotiated_codec(
         })
 }
 
-/// Avoid prewarming HEVC for an offer that contains only H.264 video.
-/// The RTC session still parses and validates the complete SDP before answering.
-pub fn initial_offer_codec(sdp: &str, current: VideoCodec) -> VideoCodec {
-    let Ok(offer) = SdpOffer::from_sdp_string(sdp) else {
-        return current;
-    };
-    let (mut hevc, mut h264) = (false, false);
-    for media in &offer.media_lines {
-        if !media.disabled && media.typ.to_string() == "video" && media.direction().is_receiving() {
-            for payload in media.rtp_params() {
-                if media.pts.contains(&payload.pt()) {
-                    hevc |= payload.spec().codec == Codec::H265;
-                    h264 |= payload.spec().codec == Codec::H264;
-                }
-            }
-        }
-    }
-    if h264 && !hevc {
-        VideoCodec::H264
-    } else {
-        current
-    }
-}
-
 /// Events the run loop cares about, extracted from str0m's Output::Event.
 pub enum RtcAction {
     IceConnected,
@@ -566,35 +542,6 @@ mod tests {
         assert_eq!(
             preferred_negotiated_codec(Some(hevc), None, EncoderCapabilities::MF),
             None
-        );
-    }
-
-    #[test]
-    fn h264_only_video_offer_is_prewarmed_in_h264() {
-        use str0m::media::Direction;
-        for (hevc, expected) in [(false, VideoCodec::H264), (true, VideoCodec::Hevc)] {
-            let mut viewer = str0m::Rtc::builder()
-                .enable_h265(hevc)
-                .build(std::time::Instant::now());
-            let mut change = viewer.sdp_api();
-            change.add_media(
-                super::MediaKind::Video,
-                Direction::RecvOnly,
-                None,
-                None,
-                None,
-            );
-            let (offer, _) = change.apply().unwrap();
-            let sdp = offer.to_sdp_string();
-            assert_eq!(super::initial_offer_codec(&sdp, VideoCodec::Hevc), expected);
-            assert_eq!(
-                super::initial_offer_codec(&sdp, VideoCodec::H264),
-                VideoCodec::H264
-            );
-        }
-        assert_eq!(
-            super::initial_offer_codec("invalid SDP", VideoCodec::Hevc),
-            VideoCodec::Hevc
         );
     }
 

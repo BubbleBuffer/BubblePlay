@@ -48,7 +48,8 @@ use bubbleplay_host::tile_schedule::{pointer_pixels, PaceDecision, V4Pacer};
 use bubbleplay_host::transport;
 use bubbleplay_host::vdd;
 use bubbleplay_host::video_encoder::{
-    EncoderCapabilities, EncoderOverride, EncoderPreference, VideoEncoder,
+    device_encoder_adapter, encoder_adapter, EncoderBackend, EncoderCapabilities,
+    EncoderDiscoveryCache, EncoderOverride, EncoderPreference, VideoEncoder,
 };
 use bubbleplay_host::wss_media;
 
@@ -771,6 +772,7 @@ fn run_spike(args: &Args) -> Result<()> {
                 false,
                 u32::from(EncoderOptions::production(Preset::P3).gop_seconds),
                 args.encoder_preference(),
+                None,
                 || Nvenc::new(dev, frame.width(), frame.height(), 60, args.bitrate_bps),
             )?);
             let spspps = encoder.as_ref().unwrap().sequence_params()?;
@@ -954,6 +956,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         std::env::var("BUBBLEPLAY_LAB_RESET_ENCODER_ON_DIAGNOSTIC_KEYFRAME")
             .is_ok_and(|value| value == "1");
     let mut capture = session_call!(Capture, CaptureSource::open(args, selection.selector()))?;
+    let mut encoder_discovery = EncoderDiscoveryCache::default();
+    let mut discovered_adapter = if let Some(selector) = capture.monitor_selector() {
+        let adapter = capture::monitor_adapter(Some(&selector))?;
+        Some(encoder_adapter(&adapter.cast()?)?)
+    } else {
+        None
+    };
+    let mut discovered_backend = match discovered_adapter {
+        Some(adapter) => encoder_discovery.resolve(adapter, args.encoder_preference())?,
+        None => EncoderBackend::Nvenc,
+    };
     let socket = UdpSocket::bind("0.0.0.0:0").context("bind media socket")?;
     // Host-IP discovery only feeds RTC ICE candidates. WSS media and
     // signaling do not need it, so a failure (e.g. WSAEAFNOSUPPORT on a
@@ -1094,8 +1107,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut rtc_peer = RtcPeerLifecycle::default();
     let mut offer_accepted = false;
     let mut offer_in_flight = false;
-    // Negotiate only after the first local encoder has proved its capabilities.
-    let mut pending_encoder_offer: Option<String> = None;
     let mut negotiated_video_codec: Option<VideoCodec> = None;
     let mut pending_candidates = VecDeque::new();
     let mut next_admission = Instant::now();
@@ -1361,7 +1372,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             ice_connected = false;
             offer_accepted = false;
             offer_in_flight = false;
-            pending_encoder_offer = None;
             negotiated_video_codec = None;
             pending_candidates.clear();
             ensure!(
@@ -2704,14 +2714,21 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 break 'session;
                             }
                         } else {
-                            // Validate the current capture device even on a warm
-                            // reconnect before advertising encoder capabilities.
-                            // A warm codec downgrade still follows MediaAdded,
-                            // which invalidates the retained encoder and IDR.
-                            if encoder.is_none() {
-                                active_codec = rtc::initial_offer_codec(&sdp, active_codec);
+                            let selector = capture
+                                .monitor_selector()
+                                .context("local capture selector")?;
+                            let adapter = capture::monitor_adapter(Some(&selector))?;
+                            let adapter = encoder_adapter(&adapter.cast()?)?;
+                            if discovered_adapter != Some(adapter) {
+                                discovered_backend = encoder_discovery
+                                    .resolve(adapter, args.encoder_preference())?;
+                                discovered_adapter = Some(adapter);
                             }
-                            pending_encoder_offer = Some(sdp);
+                            // Answer at master's offer site, without waiting for
+                            // a DDA frame or changing NVENC's prewarm codec.
+                            if !pump.command(startup_offer_command(sdp, discovered_backend)) {
+                                break 'session;
+                            }
                         }
                         offer_in_flight = true;
                     }
@@ -3869,16 +3886,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         } else {
             None
         };
-        if capture.is_privileged() {
-            if let Some(sdp) = pending_encoder_offer.take() {
-                // A local offer may be deferred while capture hands over to
-                // the privileged source, whose encoder remains NVENC-owned.
-                ensure!(
-                    pump.command(TransportCommand::Offer(sdp)),
-                    "RTC transport stopped before privileged encoder negotiation"
-                );
-            }
-        }
         let negotiation_active = viewer_attached && (offer_in_flight || offer_accepted);
         let prewarm_needed = negotiation_active && !ice_connected && latest_idr.is_none();
         let local_recovery_probe = viewer_attached
@@ -4369,6 +4376,12 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     next_idr = Instant::now();
                 }
                 if encoder.as_ref().is_none_or(|e| !e.is_for_device(dev)) {
+                    let adapter = device_encoder_adapter(dev)?;
+                    if discovered_adapter != Some(adapter) {
+                        discovered_backend =
+                            encoder_discovery.resolve(adapter, args.encoder_preference())?;
+                        discovered_adapter = Some(adapter);
+                    }
                     if encoder.is_some() {
                         warn!("capture D3D11 device changed; invalidating scaler and IDR state");
                         scaler = None;
@@ -4380,6 +4393,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         encoder_mode_for_capture(&mut profiles, frame.width(), frame.height());
                     let created = create_local_encoder(
                         args.encoder_preference(),
+                        discovered_backend,
                         dev,
                         mode.width,
                         mode.height,
@@ -4393,21 +4407,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         want_infinite_gop,
                     )?;
                     adopt_encoder_codec(&mut active_codec, Some(&created));
+                    discovered_backend = created.backend();
+                    encoder_discovery.record_actual(adapter, discovered_backend);
                     encoder = Some(created);
                     encoder_benchmark_profile_revision = desired_encoder_benchmark_profile_revision;
-                }
-                if let Some(sdp) = pending_encoder_offer.take() {
-                    let capabilities = encoder
-                        .as_ref()
-                        .expect("encoder selected above")
-                        .capabilities();
-                    ensure!(
-                        pump.command(TransportCommand::OfferWithCapabilities(
-                            sdp,
-                            rtc_encoder_capabilities(capabilities, active_codec),
-                        )),
-                        "RTC transport stopped before encoder negotiation"
-                    );
                 }
                 ensure_rtc_encoder_codec(
                     wss_media.is_some(),
@@ -4729,6 +4732,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         && configure_encoder_profile(
                             &mut encoder,
                             args.encoder_preference(),
+                            &mut discovered_backend,
                             dev,
                             mode,
                             frame.width(),
@@ -4748,6 +4752,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         fallback_reason = Some("encoder-fallback");
                     }
                     adopt_encoder_codec(&mut active_codec, encoder.as_ref());
+                    if transition {
+                        if let Some(adapter) = discovered_adapter {
+                            encoder_discovery.record_actual(adapter, discovered_backend);
+                        }
+                    }
                     ensure_rtc_encoder_codec(
                         wss_media.is_some(),
                         negotiated_video_codec,
@@ -5066,6 +5075,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         match recreate_and_encode_profile(
                             &mut encoder,
                             args.encoder_preference(),
+                            &mut discovered_backend,
                             dev,
                             mode,
                             frame.width(),
@@ -5094,6 +5104,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 encoded
                             }
                             Err(error) => {
+                                if let Some(adapter) = discovered_adapter {
+                                    encoder_discovery.record_actual(adapter, discovered_backend);
+                                }
                                 warn!(
                                     ?error,
                                     ?reason,
@@ -5525,6 +5538,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 match recreate_and_encode_profile(
                                     &mut encoder,
                                     args.encoder_preference(),
+                                    &mut discovered_backend,
                                     dev,
                                     mode,
                                     frame.width(),
@@ -5554,6 +5568,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                         encoded
                                     }
                                     Err(error) => {
+                                        if let Some(adapter) = discovered_adapter {
+                                            encoder_discovery
+                                                .record_actual(adapter, discovered_backend);
+                                        }
                                         warn!(?error, "fallback encoder recovery failed; retaining session for retry");
                                         latest_idr = None;
                                         pending_transition_idr = None;
@@ -5564,6 +5582,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             }
                         }
                     };
+                    if fallback_reason.is_some() {
+                        if let Some(adapter) = discovered_adapter {
+                            encoder_discovery.record_actual(adapter, discovered_backend);
+                        }
+                    }
                     ensure_rtc_encoder_codec(
                         wss_media.is_some(),
                         negotiated_video_codec,
@@ -6785,13 +6808,62 @@ mod tests {
     }
 
     #[test]
+    fn startup_offer_is_answered_without_any_capture_frame() {
+        use super::EncoderBackend;
+        use str0m::media::{Direction, MediaKind};
+        for backend in [
+            EncoderBackend::Nvenc,
+            EncoderBackend::MfHardware,
+            EncoderBackend::MfSoftware,
+        ] {
+            let mut viewer = str0m::Rtc::builder()
+                .enable_h265(true)
+                .build(std::time::Instant::now());
+            let mut change = viewer.sdp_api();
+            change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+            let (offer, _) = change.apply().unwrap();
+            let command = super::startup_offer_command(offer.to_sdp_string(), backend);
+            assert!(matches!(
+                (&command, backend),
+                (super::TransportCommand::Offer(_), EncoderBackend::Nvenc)
+                    | (
+                        super::TransportCommand::OfferWithCapabilities(_, _),
+                        EncoderBackend::MfHardware | EncoderBackend::MfSoftware
+                    )
+            ));
+            // Use the production command channel and actual answer event. No
+            // CaptureSource, D3D device, encoder or desktop frame is created.
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let pump = super::TransportPump::spawn(socket, None, None, 2_000_000);
+            assert!(pump.command(command));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let answer = loop {
+                match pump.try_event() {
+                    Some(super::TransportEvent::Answer(answer)) => break answer,
+                    Some(super::TransportEvent::Stopped) => {
+                        panic!("transport stopped before answering frame-free offer")
+                    }
+                    _ => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "offer required a capture frame or failed to answer"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            };
+            assert!(answer.contains("H264/90000"));
+            assert_eq!(
+                answer.contains("H265/90000"),
+                backend == EncoderBackend::Nvenc
+            );
+            pump.shutdown();
+        }
+    }
+
+    #[test]
     fn rtc_reconnect_preserves_the_session_downgrade_and_rejects_codec_mismatch() {
-        use super::{EncoderCapabilities, VideoCodec};
-        assert!(!super::rtc_encoder_capabilities(EncoderCapabilities::MF, VideoCodec::Hevc).hevc);
-        assert!(
-            !super::rtc_encoder_capabilities(EncoderCapabilities::NVENC, VideoCodec::H264).hevc
-        );
-        assert!(super::rtc_encoder_capabilities(EncoderCapabilities::NVENC, VideoCodec::Hevc).hevc);
+        use super::VideoCodec;
         assert!(super::ensure_rtc_encoder_codec(false, None, VideoCodec::H264).is_ok());
         assert!(
             super::ensure_rtc_encoder_codec(false, Some(VideoCodec::H264), VideoCodec::H264)
