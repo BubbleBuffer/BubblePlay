@@ -406,6 +406,23 @@ impl VideoEncoder {
         }
     }
 
+    pub fn cpu_conversion(&self) -> bool {
+        matches!(self, Self::Mf(e) if !e.hardware() && e.converter_name().starts_with("BGRA"))
+    }
+
+    /// CPU-only source geometry/damage contract. The texture remains capture's
+    /// native BGRA surface; software conversion owns the output dimensions.
+    pub fn encode_cpu_texture(
+        &mut self,
+        texture: *mut c_void,
+        damage: Option<&[crate::frame_damage::DamageRect]>,
+    ) -> Result<EncodedFrame> {
+        match self {
+            Self::Mf(e) if !e.hardware() => e.encode_texture_with_damage(texture, damage),
+            _ => bail!("CPU texture submission requires Microsoft software H.264"),
+        }
+    }
+
     pub fn encode_texture_with_feedback(
         &mut self,
         texture: *mut c_void,
@@ -767,3 +784,5 @@ mod tests {
         }
     }
 }
+#[path = "cpu_policy.rs"]
+pub mod cpu_policy;

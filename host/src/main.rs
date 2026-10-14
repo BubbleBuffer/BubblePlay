@@ -47,6 +47,7 @@ use bubbleplay_host::tile_quality::{refine_qp_map, RefinePlan, TileQualityTracke
 use bubbleplay_host::tile_schedule::{pointer_pixels, PaceDecision, V4Pacer};
 use bubbleplay_host::transport;
 use bubbleplay_host::vdd;
+use bubbleplay_host::video_encoder::cpu_policy::{CpuDamage, CpuPacing, CpuTarget};
 use bubbleplay_host::video_encoder::{
     device_encoder_adapter, encoder_adapter, EncoderBackend, EncoderCapabilities,
     EncoderDiscoveryCache, EncoderOverride, EncoderPreference, VideoEncoder,
@@ -118,6 +119,17 @@ use wss_media::{
 };
 
 const STUN_SERVER: &str = "stun.l.google.com:19302";
+
+/// CPU conversion reads capture's native surface and owns the output size.
+/// Use the same source contract for initial preparation and error recovery.
+fn cpu_mode_texture(frame: &CapturedFrame<'_>, mode: VideoMode) -> ScaleOutput {
+    ScaleOutput {
+        texture: texture_ptr(frame),
+        scale_us: 0,
+        width: mode.width,
+        height: mode.height,
+    }
+}
 const DEFAULT_BITRATE_BPS: u32 = 1_500_000;
 const MAX_BITRATE_BPS: u32 = 40_000_000;
 const IDR_INTERVAL: Duration = Duration::from_secs(2);
@@ -1080,6 +1092,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     };
     let mut profiles =
         ProfileTransition::new_for_mode(Profile::Full, quality.profile(), stream_mode);
+    let mut cpu_pacing = CpuPacing::from_env(Instant::now());
+    let mut cpu_damage = CpuDamage::default();
+    let mut cpu_requested_mode: Option<VideoMode> = None;
+    let mut cpu_applied_mode: Option<VideoMode> = None;
     // Only an unprivileged local host runs as the interactive user; the
     // service path syncs clipboard inside the input proxy instead.
     // Admin mode: the tray points the user-level host at the elevated input
@@ -4367,10 +4383,24 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 let dev = frame.device().as_raw();
+                if discovered_backend == EncoderBackend::MfSoftware {
+                    if recovered {
+                        cpu_damage.invalidate();
+                    }
+                    if is_new {
+                        frame.prepare_damage_union();
+                        cpu_damage.note((frame.width(), frame.height()), frame.damage());
+                    }
+                }
                 // WSS v4 owns keyframes (start / peer / request), so its
                 // encoder runs without periodic IDRs. NVENC cannot change the
                 // GOP in place: recreate the session when the mode differs.
-                let want_infinite_gop = wss_media.is_some() && active_benchmark_profile.is_none();
+                let transport_infinite_gop =
+                    wss_media.is_some() && active_benchmark_profile.is_none();
+                let mut want_infinite_gop = transport_infinite_gop
+                    || encoder.as_ref().is_some_and(|e| {
+                        e.is_for_device(dev) && e.backend() == EncoderBackend::MfSoftware
+                    });
                 if encoder
                     .as_ref()
                     .is_some_and(|e| e.is_for_device(dev) && e.infinite_gop() != want_infinite_gop)
@@ -4404,6 +4434,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                     let mode =
                         encoder_mode_for_capture(&mut profiles, frame.width(), frame.height());
+                    want_infinite_gop =
+                        transport_infinite_gop || discovered_backend == EncoderBackend::MfSoftware;
                     let created = create_local_encoder(
                         args.encoder_preference(),
                         discovered_backend,
@@ -4447,6 +4479,64 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 );
                 let old_mode = profiles.active;
                 let mut mode = profiles.staged.map(|(m, _)| m).unwrap_or(old_mode);
+                let cpu_conversion = encoder.as_ref().is_some_and(VideoEncoder::cpu_conversion);
+                if cpu_conversion && viewport_crop.is_none() {
+                    if cpu_applied_mode != Some(mode) {
+                        cpu_requested_mode = Some(mode);
+                    }
+                    let requested = cpu_requested_mode.unwrap_or(mode);
+                    let target = cpu_pacing.target(
+                        (frame.width(), frame.height()),
+                        CpuTarget {
+                            width: requested.width,
+                            height: requested.height,
+                            fps: requested.fps,
+                        },
+                        Instant::now(),
+                    );
+                    let label = if (target.width, target.height, target.fps)
+                        == (requested.width, requested.height, requested.fps)
+                    {
+                        requested.label
+                    } else {
+                        match (target.height, target.fps) {
+                            (720, 60) => "720p60",
+                            (720, 30) => "720p30",
+                            (540, 30) => "540p30",
+                            (540, 60) => "540p60",
+                            (540, 24) => "540p24",
+                            (480, 24) => "480p24",
+                            _ => "native",
+                        }
+                    };
+                    let capped = VideoMode {
+                        label,
+                        width: target.width,
+                        height: target.height,
+                        fps: target.fps,
+                        ..requested
+                    };
+                    cpu_applied_mode = Some(capped);
+                    if capped != mode {
+                        if (capped.width, capped.height, capped.fps)
+                            != (old_mode.width, old_mode.height, old_mode.fps)
+                        {
+                            info!(
+                                width = capped.width,
+                                height = capped.height,
+                                fps = capped.fps,
+                                previous_width = old_mode.width,
+                                previous_height = old_mode.height,
+                                previous_fps = old_mode.fps,
+                                "CPU output target changed; scheduling IDR"
+                            );
+                        }
+                        mode = capped;
+                        // CPU scaling has its own trustworthy texture path, so
+                        // the GPU scaler's pinned native fallback is irrelevant.
+                        profiles.staged = (capped != old_mode).then_some((capped, "cpu-pressure"));
+                    }
+                }
                 let transition = profiles.staged().is_some();
                 let encoder_resource_mode = active_benchmark_profile.map_or(
                     ResourceMode::PerFrame,
@@ -4689,7 +4779,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     // for that same mode, and only commit after its IDR is
                     // admitted by the transport.
                     let mut fallback_reason = None;
-                    let mut scaled = match if viewport_crop.is_some() && mode.label != "native" {
+                    let mut scaled = match if cpu_conversion && viewport_crop.is_none() {
+                        Ok(cpu_mode_texture(&frame, mode))
+                    } else if viewport_crop.is_some() && mode.label != "native" {
                         prepare_profile_texture_with_crop(
                             &mut scaler,
                             frame.device(),
@@ -4808,16 +4900,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         // The target texture is never passed to the fallback
                         // encoder, even if both textures happen to share a
                         // device.  That contract prevents dimension drift.
-                        scaled = match prepare_video_mode_texture(
-                            &mut scaler,
-                            frame.device(),
-                            frame.texture(),
-                            frame.width(),
-                            frame.height(),
-                            mode,
-                            main10,
-                            encoder_resource_mode,
-                        ) {
+                        scaled = match if cpu_conversion && viewport_crop.is_none() {
+                            Ok(cpu_mode_texture(&frame, mode))
+                        } else {
+                            prepare_video_mode_texture(
+                                &mut scaler,
+                                frame.device(),
+                                frame.texture(),
+                                frame.width(),
+                                frame.height(),
+                                mode,
+                                main10,
+                                encoder_resource_mode,
+                            )
+                        } {
                             Ok(output) => output,
                             Err(error) => {
                                 warn!(
@@ -4827,16 +4923,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 mode =
                                     fallback_mode(old_mode, frame.width(), frame.height(), false);
                                 fallback_reason = Some("scaler-fallback");
-                                match prepare_video_mode_texture(
-                                    &mut scaler,
-                                    frame.device(),
-                                    frame.texture(),
-                                    frame.width(),
-                                    frame.height(),
-                                    mode,
-                                    main10,
-                                    encoder_resource_mode,
-                                ) {
+                                match if cpu_conversion && viewport_crop.is_none() {
+                                    Ok(cpu_mode_texture(&frame, mode))
+                                } else {
+                                    prepare_video_mode_texture(
+                                        &mut scaler,
+                                        frame.device(),
+                                        frame.texture(),
+                                        frame.width(),
+                                        frame.height(),
+                                        mode,
+                                        main10,
+                                        encoder_resource_mode,
+                                    )
+                                } {
                                     Ok(output) => output,
                                     Err(native_error) => {
                                         warn!(?native_error, "native fallback texture preparation failed; retaining session for retry");
@@ -5479,19 +5579,29 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         } else {
                             None
                         };
-                        let encode_result =
-                            if let Some(reconstruction_texture) = feedback_reconstruction_texture {
-                                encoder.as_mut().unwrap().encode_texture_with_feedback(
-                                    scaled.texture,
-                                    frame_damage,
-                                    reconstruction_texture,
-                                )
+                        let encode_result = if cpu_conversion && viewport_crop.is_none() {
+                            let damage = if is_idle_snapshot {
+                                None
                             } else {
-                                encoder
-                                    .as_mut()
-                                    .unwrap()
-                                    .encode_texture_with_damage(scaled.texture, frame_damage)
+                                cpu_damage.rects()
                             };
+                            encoder
+                                .as_mut()
+                                .unwrap()
+                                .encode_cpu_texture(scaled.texture, damage)
+                        } else if let Some(reconstruction_texture) = feedback_reconstruction_texture
+                        {
+                            encoder.as_mut().unwrap().encode_texture_with_feedback(
+                                scaled.texture,
+                                frame_damage,
+                                reconstruction_texture,
+                            )
+                        } else {
+                            encoder
+                                .as_mut()
+                                .unwrap()
+                                .encode_texture_with_damage(scaled.texture, frame_damage)
+                        };
                         if let Some(base) = refine_restore_bps {
                             if let Err(error) = encoder.as_mut().unwrap().set_bitrate(base) {
                                 warn!(?error, "WSS v4 refine bitrate restore failed");
@@ -5520,16 +5630,22 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 );
                                 mode = fallback_mode(old_mode, frame.width(), frame.height(), true);
                                 let reason = "encoder-fallback";
-                                let fallback_texture = match prepare_video_mode_texture(
-                                    &mut scaler,
-                                    frame.device(),
-                                    frame.texture(),
-                                    frame.width(),
-                                    frame.height(),
-                                    mode,
-                                    main10,
-                                    encoder_resource_mode,
-                                ) {
+                                let fallback_texture = match if cpu_conversion
+                                    && viewport_crop.is_none()
+                                {
+                                    Ok(cpu_mode_texture(&frame, mode))
+                                } else {
+                                    prepare_video_mode_texture(
+                                        &mut scaler,
+                                        frame.device(),
+                                        frame.texture(),
+                                        frame.width(),
+                                        frame.height(),
+                                        mode,
+                                        main10,
+                                        encoder_resource_mode,
+                                    )
+                                } {
                                     Ok(output) => output,
                                     Err(error) => {
                                         warn!(?error, "scaled fallback unavailable; recovering exact native mode");
@@ -5540,16 +5656,20 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                             false,
                                         );
                                         fallback_reason = Some("scaler-fallback");
-                                        match prepare_video_mode_texture(
-                                            &mut scaler,
-                                            frame.device(),
-                                            frame.texture(),
-                                            frame.width(),
-                                            frame.height(),
-                                            mode,
-                                            main10,
-                                            encoder_resource_mode,
-                                        ) {
+                                        match if cpu_conversion && viewport_crop.is_none() {
+                                            Ok(cpu_mode_texture(&frame, mode))
+                                        } else {
+                                            prepare_video_mode_texture(
+                                                &mut scaler,
+                                                frame.device(),
+                                                frame.texture(),
+                                                frame.width(),
+                                                frame.height(),
+                                                mode,
+                                                main10,
+                                                encoder_resource_mode,
+                                            )
+                                        } {
                                             Ok(output) => output,
                                             Err(native_error) => {
                                                 warn!(?native_error, "native fallback texture preparation failed; retaining session for retry");
@@ -5578,15 +5698,19 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     None,
                                     main10,
                                     || {
-                                        prepare_recovery_bgra_texture(
-                                            &mut scaler,
-                                            frame.device(),
-                                            frame.texture(),
-                                            frame.width(),
-                                            frame.height(),
-                                            mode,
-                                            viewport_crop,
-                                        )
+                                        if cpu_conversion && viewport_crop.is_none() {
+                                            Ok(frame.texture().clone())
+                                        } else {
+                                            prepare_recovery_bgra_texture(
+                                                &mut scaler,
+                                                frame.device(),
+                                                frame.texture(),
+                                                frame.width(),
+                                                frame.height(),
+                                                mode,
+                                                viewport_crop,
+                                            )
+                                        }
                                     },
                                 ) {
                                     Ok(encoded) => {
@@ -5618,6 +5742,26 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 adapter,
                                 discovered_backend,
                                 &discovery_reason,
+                            );
+                        }
+                    }
+                    if cpu_conversion && viewport_crop.is_none() {
+                        cpu_damage.converted();
+                        if cpu_pacing.observe(
+                            encoded.encode_us,
+                            CpuTarget {
+                                width: mode.width,
+                                height: mode.height,
+                                fps: mode.fps,
+                            },
+                            Instant::now(),
+                        ) {
+                            info!(
+                                work_us = encoded.encode_us,
+                                width = mode.width,
+                                height = mode.height,
+                                fps = mode.fps,
+                                "CPU frame pressure changed resolution/fps cap"
                             );
                         }
                     }
