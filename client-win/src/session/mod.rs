@@ -2,13 +2,17 @@
 
 mod app;
 mod decode;
+#[cfg(feature = "dev-login")]
+mod dev_login;
+pub(crate) mod input_dev;
+mod metrics;
 mod options;
 mod order;
 mod pacing;
 mod stats;
 
 pub use options::DevOptions;
-pub use stats::SessionStats;
+pub use stats::{SessionInputState, SessionStats};
 
 use std::{
     collections::BTreeMap,
@@ -136,13 +140,26 @@ impl Drop for Running {
 }
 
 pub fn run_dev(options: DevOptions) -> Result<()> {
+    if options.input_only {
+        return input_dev::run(options);
+    }
+    // Authentication happens once before any window or reconnect worker starts.
+    // Reconnects reuse this jar and never repeat the single-use TOTP POST.
+    #[cfg(feature = "dev-login")]
+    let cookies = if let Some(login) = &options.login {
+        dev_login::login(login)?
+    } else {
+        CookieJar::new()
+    };
+    #[cfg(not(feature = "dev-login"))]
+    let cookies = CookieJar::new();
     let started = Instant::now();
     let pacing = pacing::Pacing::new(started);
     pacing.mark("runtime_start");
     let _runtime = MediaRuntime::new()?;
     pacing.mark("runtime_ready");
     pacing.mark("shell_create_start");
-    let shell = Shell::new(ShellConfig {
+    let mut shell = Shell::new(ShellConfig {
         title: "BubblePlay".into(),
         size: (crate::ui::theme::WINDOW_W, crate::ui::theme::WINDOW_H),
         min_size: (760.0, 520.0),
@@ -172,13 +189,13 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
     relay
         .set_scheme(scheme)
         .map_err(|_| anyhow::anyhow!("invalid WebSocket scheme"))?;
-    let config = NetConfig::new(
+    let mut config = NetConfig::new(
         relay.to_string(),
         match codec {
             Codec::H264 => net::Codec::H264,
             Codec::Hevc => net::Codec::Hevc,
         },
-        CookieJar::new(),
+        cookies,
     );
     let wake = shell.wake_handle();
     let media_stats = MediaStats::new();
@@ -188,8 +205,26 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
         transport: transport.clone(),
     };
     let stop = Arc::new(AtomicBool::new(false));
+    let input_link = net::InputLink::new(Arc::new({
+        let wake = wake.clone();
+        move || wake.wake()
+    }));
+    config.input = Some(input_link.clone());
+    config.stream_mode = Some(options.mode.stream_mode().into());
+    let input_capture = crate::input::SessionInput::new(
+        options.mode,
+        input_link.clone(),
+        stop.clone(),
+        Arc::new({
+            let wake = wake.clone();
+            move || wake.wake()
+        }),
+    );
+    let capture_status = input_capture.status();
+    shell.set_input_capture(Box::new(input_capture));
     let diagnostics = Arc::new(Mutex::new(Diagnostics::default()));
     let metadata: Arc<Mutex<BTreeMap<i64, FrameMeta>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let presentation_metrics = metrics::PresentationMetrics::default();
     let (event_tx, event_rx) = mpsc::sync_channel(8);
     let (feedback_tx, feedback_rx) = mpsc::channel();
     let mut video = VideoRenderer::new(
@@ -209,6 +244,7 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
         let metadata = metadata.clone();
         let feedback = feedback_tx.clone();
         let diagnostics = diagnostics.clone();
+        let metrics = presentation_metrics.clone();
         move |pts, at| {
             pacing.record("first_blit", pts, at);
             let meta = {
@@ -218,6 +254,7 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
                 meta
             };
             if let Some(meta) = meta {
+                metrics.presented(meta.received_at, at);
                 let _ = feedback.send(DecoderFeedback::Presented {
                     local_epoch: meta.local_epoch,
                     generation: meta.generation,
@@ -387,9 +424,11 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
             let summary_snapshot = summary_snapshot.clone();
             let stats = stats.clone();
             let pacing = pacing.clone();
+            let metrics = presentation_metrics.clone();
             move || {
                 let (snapshot, at) =
                     SummarySnapshot::capture(&stats, started, "dev_app_before_close");
+                metrics.freeze();
                 pacing.record("summary_snapshot", 0, at);
                 *summary_snapshot.lock().unwrap() = Some(snapshot);
             }
@@ -408,6 +447,7 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
         snapshot
     });
     let mut last_window = summary.sample;
+    presentation_metrics.freeze();
     drop(running);
     last_window.totals = stats.snapshot().totals;
     let mut document = report(
@@ -419,6 +459,14 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
         hevc_available,
     );
     document["pacing"] = pacing.snapshot();
+    document["input"] = serde_json::to_value(input_link.snapshot())?;
+    document["capture_state"] = serde_json::to_value(capture_status.snapshot())?;
+    let stats_summary = presentation_metrics.summary(
+        &last_window,
+        &input_link.snapshot(),
+        &diagnostics.lock().unwrap().errors,
+    );
+    document["session_summary"] = stats_summary.clone();
     document["arrival_times_last_second_ms"] = serde_json::json!(summary.arrival_times_ms);
     document["arrival_window_end_ms"] = serde_json::json!(summary.end_ms);
     document["summary_window_end_ms"] = serde_json::json!(summary.end_ms);
@@ -435,6 +483,10 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
     if let Some(path) = options.stats_path {
         std::fs::write(&path, format!("{text}\n"))
             .with_context(|| format!("write {}", path.display()))?;
+    }
+    #[cfg(feature = "dev-login")]
+    if let Some(path) = options.stats_out_path {
+        metrics::write_summary(&path, &stats_summary)?;
     }
     shell_result?;
     if last_window.totals.presented == 0 {

@@ -83,6 +83,7 @@ async fn main() -> ExitCode {
         exit_after: args.exit_after,
         drain: Duration::from_millis(args.drain_ms),
         max_connections: 8,
+        input_record: args.input_record,
     };
     let snapshot = match server::serve(listener, config).await {
         Ok(snapshot) => snapshot,

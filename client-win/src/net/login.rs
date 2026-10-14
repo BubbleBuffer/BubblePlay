@@ -44,6 +44,11 @@ pub async fn login_with_cookies(
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20));
+    // Even protocol-level retries must be off for the single-use dev TOTP.
+    #[cfg(feature = "dev-login")]
+    {
+        builder = builder.retry(reqwest::retry::never());
+    }
     if endpoint.is_loopback() {
         // A loopback relay never goes through a system proxy.
         builder = builder.no_proxy();

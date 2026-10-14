@@ -25,6 +25,7 @@ usage: fake-wss-host [--stream h264|hevc] [options]
   --generation-at SECONDS   bump the generation once, at or after this time
   --socket-drop-at SECONDS  close both sockets once; the next hello is a new epoch
   --stats PATH              also write the JSON report to PATH
+  --input-record PATH       write each binary message received on /ws as a JSON line
 
 Injections must fire at least one second before the drain window ends.
 The JSON report goes to stdout. Listen address and progress go to stderr.
@@ -40,6 +41,8 @@ pub struct Args {
     pub port: u16,
     pub injections: Injections,
     pub stats: Option<PathBuf>,
+    /// Where binary inputs received on `/ws` are recorded, one JSON line each.
+    pub input_record: Option<PathBuf>,
 }
 
 /// `Ok(None)` for `--help`.
@@ -51,6 +54,7 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
     let mut port = 8787u16;
     let mut injections = Injections::default();
     let mut stats = None;
+    let mut input_record = None;
 
     let mut iter = raw.iter();
     while let Some(flag) = iter.next() {
@@ -90,6 +94,7 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
                 injections.socket_drop_at = Some(seconds("--socket-drop-at", &value()?)?)
             }
             "--stats" => stats = Some(PathBuf::from(value()?)),
+            "--input-record" => input_record = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -128,6 +133,7 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
         port,
         injections,
         stats,
+        input_record,
     }))
 }
 
@@ -273,5 +279,15 @@ mod tests {
             ok(&["--stats", "out.json"]).stats.as_deref(),
             Some(std::path::Path::new("out.json"))
         );
+    }
+
+    #[test]
+    fn input_record_path_is_kept_and_needs_a_value() {
+        assert!(ok(&[]).input_record.is_none());
+        assert_eq!(
+            ok(&["--input-record", "inputs.jsonl"]).input_record.as_deref(),
+            Some(std::path::Path::new("inputs.jsonl"))
+        );
+        assert!(args(&["--input-record"]).is_err());
     }
 }

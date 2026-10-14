@@ -11,6 +11,7 @@ mod mock;
 mod shell;
 mod ui;
 mod net; mod media; mod session;
+mod input;
 
 use std::path::PathBuf;
 
@@ -23,7 +24,7 @@ fn main() -> anyhow::Result<()> {
         match a.as_str() {
             "--ui-demo" => demo = true,
             "--shots" => shots = args.next().map(PathBuf::from),
-            _ => {}
+            _ => anyhow::bail!("unknown flag: {a}"),
         }
     }
     if !demo {

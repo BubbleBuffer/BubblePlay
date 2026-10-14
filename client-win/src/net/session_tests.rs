@@ -891,7 +891,7 @@ fn plaintext_and_malformed_relays_are_refused_before_any_socket() {
         ("http://relay.example", "plain"),
         ("http://10.0.0.5:8787", "plain"),
         ("ws://10.0.0.5:8787", "plain"),
-        ("http://localhost:8787", "plain"),
+        ("http://localhost.example:8787", "plain"),
         ("https://relay.example/path", "malformed"),
     ];
     for (relay, kind) in cases {

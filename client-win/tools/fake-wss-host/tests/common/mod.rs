@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,6 +100,37 @@ pub async fn spawn_many(
     exit_after: Duration,
     drain: Duration,
 ) -> Harness {
+    spawn_with(sources, injections, exit_after, drain, None).await
+}
+
+/// A run that also records every binary message received on `/ws` to `record`.
+pub async fn spawn_recording(
+    source: Arc<dyn Source>,
+    exit_after: Duration,
+    drain: Duration,
+    record: &Path,
+) -> Harness {
+    spawn_with(
+        vec![source],
+        no_injections(),
+        exit_after,
+        drain,
+        Some(record.to_path_buf()),
+    )
+    .await
+}
+
+pub fn no_injections() -> Injections {
+    Injections::default()
+}
+
+async fn spawn_with(
+    sources: Vec<Arc<dyn Source>>,
+    injections: Injections,
+    exit_after: Duration,
+    drain: Duration,
+    input_record: Option<PathBuf>,
+) -> Harness {
     let listener = server::bind("127.0.0.1:0".parse().unwrap())
         .await
         .expect("bind loopback");
@@ -111,6 +143,7 @@ pub async fn spawn_many(
         exit_after,
         drain,
         max_connections: 8,
+        input_record,
     };
     Harness {
         addr,
@@ -140,13 +173,42 @@ pub async fn send_json(ws: &mut Ws, value: Value) {
         .expect("send");
 }
 
+/// The next binary message's bytes, or `None` after `wait` or on close. Text
+/// messages are skipped.
+pub async fn next_binary(ws: &mut Ws, wait: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        match timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(Message::Binary(bytes)))) => return Some(bytes.to_vec()),
+            Ok(Some(Ok(_))) => continue,
+            _ => return None,
+        }
+    }
+}
+
+/// Inbound packet records, excluding the separately marked lifecycle rows.
+pub fn read_records(path: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(path).expect("read input record");
+    text.lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("each record is one JSON line"))
+        .filter(|row| row["type"].is_number())
+        .collect()
+}
+
 /// The next text message parsed as JSON, or `None` after `wait` or on close.
 pub async fn next_json(ws: &mut Ws, wait: Duration) -> Option<Value> {
     let deadline = Instant::now() + wait;
     loop {
         let remaining = deadline.checked_duration_since(Instant::now())?;
         match timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => return serde_json::from_str(&text).ok(),
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).ok()?;
+                if value["type"] == "input-capabilities" {
+                    continue;
+                }
+                return Some(value);
+            }
             Ok(Some(Ok(Message::Binary(_)))) | Ok(Some(Ok(_))) => continue,
             _ => return None,
         }

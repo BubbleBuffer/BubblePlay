@@ -4,7 +4,9 @@
 //! worker's `media-v4.js` and the recorded spike streams.
 
 pub mod cli;
+pub mod cursor;
 pub mod evidence;
+pub mod input_record;
 pub mod model;
 pub mod protocol;
 pub mod report;

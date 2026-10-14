@@ -45,6 +45,9 @@ pub struct NetConfig {
     pub codec: Codec,
     /// Session cookies from [`crate::net::login`] (or a retained jar).
     pub cookies: CookieJar,
+    /// Optional native input mailbox, scoped to each /ws epoch.
+    pub input: Option<super::InputLink>,
+    pub stream_mode: Option<String>,
 }
 
 impl NetConfig {
@@ -53,6 +56,8 @@ impl NetConfig {
             relay: relay.into(),
             codec,
             cookies,
+            input: None,
+            stream_mode: None,
         }
     }
 }
@@ -94,7 +99,12 @@ impl RelayEndpoint {
         {
             return Err(NetError::InvalidRelayUrl(input.to_owned()));
         }
-        if !secure && url.host_str() != Some("127.0.0.1") {
+        let plaintext_allowed = url.host_str() == Some("127.0.0.1");
+        #[cfg(feature = "dev-login")]
+        let plaintext_allowed = plaintext_allowed
+            || matches!(url.host(), Some(url::Host::Domain("localhost")))
+            || matches!(url.host(),Some(url::Host::Ipv6(ip)) if ip==std::net::Ipv6Addr::LOCALHOST);
+        if !secure && !plaintext_allowed {
             return Err(NetError::PlaintextRefused(input.to_owned()));
         }
         Ok(Self {
@@ -113,9 +123,14 @@ impl RelayEndpoint {
         self.secure
     }
 
-    /// True for the plaintext loopback endpoint (never routed through a system proxy).
+    /// Loopback endpoints, including TLS, never use a system proxy.
     pub fn is_loopback(&self) -> bool {
-        !self.secure
+        url::Url::parse(&self.origin).is_ok_and(|url| match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+            Some(url::Host::Domain(host)) => host == "localhost",
+            _ => false,
+        })
     }
 
     /// A WebSocket URL on this relay, for example `wss://relay.example/ws`.
@@ -158,14 +173,13 @@ mod tests {
 
     #[test]
     fn plaintext_to_any_other_host_is_refused() {
-        for url in [
-            "http://localhost:8787",
+        let refused = [
             "http://127.0.0.2",
             "http://192.168.1.10",
-            "http://[::1]:8787",
             "http://127.0.0.1.example.test",
             "http://relay.example",
-        ] {
+        ];
+        for url in refused {
             assert!(
                 matches!(
                     RelayEndpoint::parse(url),
@@ -173,6 +187,17 @@ mod tests {
                 ),
                 "{url} must be refused as plaintext"
             );
+        }
+        #[cfg(not(feature = "dev-login"))]
+        for url in ["http://localhost:8787", "http://[::1]:8787"] {
+            assert!(matches!(
+                RelayEndpoint::parse(url),
+                Err(NetError::PlaintextRefused(_))
+            ));
+        }
+        #[cfg(feature = "dev-login")]
+        for url in ["http://localhost:8787", "http://[::1]:8787"] {
+            assert!(RelayEndpoint::parse(url).is_ok());
         }
     }
 

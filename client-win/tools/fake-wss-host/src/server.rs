@@ -7,8 +7,9 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -20,6 +21,8 @@ use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
+use crate::cursor;
+use crate::input_record::{Received, Recorder};
 use crate::model::{
     Action, Counters, Emitted, Injections, Model, ModelConfig, Recovery, Source, StartOutcome,
 };
@@ -47,6 +50,8 @@ pub struct ServerConfig {
     /// No new frames in the last `drain` before `exit_after`, so ACKs settle.
     pub drain: Duration,
     pub max_connections: usize,
+    /// Record every binary message received on `/ws` to this file.
+    pub input_record: Option<PathBuf>,
 }
 
 /// Everything the report needs, taken once the hub has finished.
@@ -92,6 +97,7 @@ enum Event {
     },
     Binary {
         id: u64,
+        bytes: Vec<u8>,
     },
     Closed {
         id: u64,
@@ -111,6 +117,13 @@ struct FirstFrame {
     ready_sent: bool,
 }
 
+/// Progress through `cursor::SCRIPT`, armed by an accepted `start`.
+#[derive(Debug, Clone, Copy)]
+struct CursorScript {
+    armed: Instant,
+    next: usize,
+}
+
 struct Hub {
     model: Model,
     run_start: Instant,
@@ -127,6 +140,10 @@ struct Hub {
     /// that follows is answered with a failure, as the browser's order implies.
     start_refused: bool,
     draining: bool,
+    cursor: Option<CursorScript>,
+    recorder: Option<Recorder>,
+    /// The first recording failure; recording stops and the run fails.
+    record_error: Option<String>,
 }
 
 impl Hub {
@@ -157,6 +174,56 @@ impl Hub {
         self.model.counters.rejected_control += 1;
     }
 
+    /// Record one binary message from `/ws`, with the epoch current at receipt.
+    fn record_input(&mut self, bytes: &[u8], now: Instant) {
+        if self.recorder.is_none() {
+            return;
+        }
+        let received_ms = self.elapsed(now).as_secs_f64() * 1000.0;
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
+        let received = Received {
+            epoch: self.epoch.as_deref(),
+            received_ms,
+            unix_ms,
+            bytes,
+        };
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        if let Err(error) = recorder.record(received) {
+            self.recorder = None;
+            self.record_error = Some(format!("cannot record input: {error}"));
+        }
+    }
+    fn input_disconnected(&mut self, reason: &str, now: Instant) {
+        let elapsed = self.elapsed(now).as_secs_f64() * 1000.0;
+        if let Some(recorder) = self.recorder.as_mut() {
+            if let Err(error) = recorder.disconnect(self.epoch.as_deref(), reason, elapsed) {
+                self.record_error = Some(format!("cannot record disconnect: {error}"));
+            }
+        }
+    }
+
+    /// Send every scripted cursor packet that is due, in order, to `/ws`.
+    fn send_cursor_script(&mut self, now: Instant) {
+        let Some(mut script) = self.cursor else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(script.armed);
+        while let Some(&(at_ms, packet)) = cursor::SCRIPT.get(script.next) {
+            if elapsed < Duration::from_millis(at_ms) {
+                break;
+            }
+            script.next += 1;
+            if let Some(signal) = self.signal {
+                self.send(signal, Outbound::Binary(packet.encode()));
+            }
+        }
+        self.cursor = (script.next < cursor::SCRIPT.len()).then_some(script);
+    }
+
     fn detach_media(&mut self, reason: &'static str) {
         if let Some(media) = self.media.take() {
             self.model.media_detach();
@@ -184,9 +251,16 @@ impl Hub {
                 Some(Kind::Media) => self.on_media_text(id, &text, now),
                 None => {}
             },
-            Event::Binary { id } => {
-                if self.conns.contains_key(&id) {
-                    self.reject();
+            Event::Binary { id, bytes } => {
+                if let Some(kind) = self.conns.get(&id).map(|c| c.kind) {
+                    if kind == Kind::Signal {
+                        if !crate::input_record::classify(&bytes).valid {
+                            self.reject();
+                        }
+                        self.record_input(&bytes, now);
+                    } else {
+                        self.reject();
+                    }
                 }
             }
             Event::Closed { id } => self.on_closed(id),
@@ -206,10 +280,12 @@ impl Hub {
             }
         }
         if self.signal == Some(id) {
+            self.input_disconnected("signal-closed", Instant::now());
             self.detach_media("signal-closed");
             self.signal = None;
             self.model.stop();
             self.first_frame = None;
+            self.cursor = None;
             self.set_epoch(None);
         }
     }
@@ -249,6 +325,9 @@ impl Hub {
         if role != "client" || already {
             return self.reject();
         }
+        if self.epoch.is_some() {
+            self.input_disconnected("epoch-rotated", now);
+        }
         self.detach_media("epoch-rotated");
         if let Some(old) = self.signal.take() {
             if old != id {
@@ -262,6 +341,7 @@ impl Hub {
         self.signal = Some(id);
         self.first_frame = None;
         self.start_refused = false;
+        self.cursor = None;
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.hello = true;
         }
@@ -298,9 +378,15 @@ impl Hub {
                         self.send(id, Outbound::Text(msg));
                     }
                 }
-                StartOutcome::Started | StartOutcome::AlreadyStreaming => {
-                    self.start_refused = false
+                StartOutcome::Started => {
+                    self.start_refused = false;
+                    self.cursor = Some(CursorScript {
+                        armed: now,
+                        next: 0,
+                    });
+                    self.send(id,Outbound::Text(serde_json::json!({"type":"input-capabilities","protocol":1,"scancode":true,"clipboard":false}).to_string()));
                 }
+                StartOutcome::AlreadyStreaming => self.start_refused = false,
             },
             "stop" => self.model.stop(),
             "keyframe" => {
@@ -405,6 +491,7 @@ impl Hub {
     /// The socket-drop injection: both sockets go, the epoch is cleared, and
     /// the client has to say hello again to get a new one.
     fn drop_sockets(&mut self) {
+        self.input_disconnected("socket-drop", Instant::now());
         if let Some(signal) = self.signal.take() {
             self.close_conn(signal, "socket-drop");
         }
@@ -412,6 +499,7 @@ impl Hub {
             self.close_conn(media, "socket-drop");
         }
         self.first_frame = None;
+        self.cursor = None;
         self.set_epoch(None);
     }
 
@@ -449,6 +537,7 @@ impl Hub {
             self.draining = true;
             self.model.set_draining();
         }
+        self.send_cursor_script(now);
         let in_flight = self.model.in_flight();
         if elapsed >= self.exit_after && (in_flight == 0 || elapsed >= self.exit_after + HARD_TAIL)
         {
@@ -463,6 +552,7 @@ impl Hub {
     }
 
     fn finish(mut self, now: Instant) -> Snapshot {
+        self.input_disconnected("run-complete", now);
         let in_flight_at_exit = self.model.in_flight();
         let elapsed_ms = self.elapsed(now).as_secs_f64() * 1000.0;
         let ids: Vec<u64> = self.conns.keys().copied().collect();
@@ -480,7 +570,8 @@ impl Hub {
     }
 }
 
-async fn run_hub(mut hub: Hub, mut events: mpsc::Receiver<Event>) -> Snapshot {
+/// Returns the snapshot and the first input-recording error, if any.
+async fn run_hub(mut hub: Hub, mut events: mpsc::Receiver<Event>) -> (Snapshot, Option<String>) {
     let mut ticker = tokio::time::interval(hub.model.frame_period());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -496,7 +587,8 @@ async fn run_hub(mut hub: Hub, mut events: mpsc::Receiver<Event>) -> Snapshot {
             }
         }
     }
-    hub.finish(Instant::now())
+    let record_error = hub.record_error.take();
+    (hub.finish(Instant::now()), record_error)
 }
 
 fn query_value(query: &str, key: &str) -> Option<String> {
@@ -572,8 +664,8 @@ async fn connection(
                         break;
                     }
                 }
-                Some(Ok(Message::Binary(_))) => {
-                    let _ = events.send(Event::Binary { id }).await;
+                Some(Ok(Message::Binary(bytes))) => {
+                    let _ = events.send(Event::Binary { id, bytes: bytes.to_vec() }).await;
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(_)) => {}
@@ -605,6 +697,14 @@ async fn connection(
 pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapshot> {
     let mirror: EpochMirror = Arc::new(Mutex::new(None));
     let (events_tx, events_rx) = mpsc::channel(EVENT_DEPTH);
+    let recorder = config
+        .input_record
+        .as_deref()
+        .map(|path| {
+            Recorder::create(path)
+                .with_context(|| format!("cannot create input record {}", path.display()))
+        })
+        .transpose()?;
     let run_start = Instant::now();
     let model = Model::new(ModelConfig {
         sources: config.sources,
@@ -627,13 +727,16 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
         first_frame: None,
         start_refused: false,
         draining: false,
+        cursor: None,
+        recorder,
+        record_error: None,
     };
     let mut hub_task = tokio::spawn(run_hub(hub, events_rx));
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let mut conns: JoinSet<()> = JoinSet::new();
     let mut next_id = 0u64;
 
-    let snapshot = loop {
+    let (snapshot, record_error) = loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((tcp, _)) = accepted else { continue };
@@ -659,6 +762,9 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
     })
     .await;
     conns.shutdown().await;
+    if let Some(error) = record_error {
+        anyhow::bail!(error);
+    }
     Ok(snapshot)
 }
 

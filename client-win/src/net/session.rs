@@ -148,6 +148,7 @@ enum Wake {
     Media(Option<Result<Message, tungstenite::Error>>),
     Signal(Option<Result<Message, tungstenite::Error>>),
     Tick,
+    Input,
 }
 
 /// Per-socket send and receive times, for heartbeats and dead detection.
@@ -175,6 +176,14 @@ impl Lane {
         self.last_sent = Instant::now();
         Ok(())
     }
+    async fn send_binary(&mut self, bytes: Vec<u8>) -> Result<(), Halt> {
+        self.tx
+            .send(Message::Binary(bytes.into()))
+            .await
+            .map_err(|error| Halt::from(NetError::Socket(error.to_string())))?;
+        self.last_sent = Instant::now();
+        Ok(())
+    }
 }
 
 /// State of one `/ws` epoch: the wire epoch, the first-frame handshake and the
@@ -187,6 +196,34 @@ struct Epoch {
     presented: bool,
     first_frame_deadline: Option<Instant>,
     first_frame_retried: bool,
+    first_frame_pending: bool,
+    input_generation: Option<u32>,
+    desktop_available: bool,
+    desktop_enabled: bool,
+    desktop_generation: Option<u64>,
+}
+
+impl Epoch {
+    fn regate_desktop(&mut self, generation: Option<u64>, timeout: Duration) -> bool {
+        let changed = generation.is_some() && generation != self.desktop_generation;
+        // Reuse only a handshake in flight, matching desktopStateNeedsNewHandshake.
+        let restart = changed
+            || self.presented
+            || !self.desktop_available
+            || (self.desktop_available && self.first_frame_deadline.is_none());
+        if restart {
+            self.input_generation = None;
+            self.presented = false;
+            self.request_id = new_request_id();
+            self.first_frame_retried = false;
+            self.first_frame_pending = self.desktop_available;
+            self.first_frame_deadline = self.desktop_available.then(|| Instant::now() + timeout);
+        }
+        if generation.is_some() {
+            self.desktop_generation = generation;
+        }
+        restart
+    }
 }
 
 struct Link {
@@ -319,6 +356,9 @@ impl Session {
     /// Start a new `/ws` epoch. Frames from older epochs are stale from here on.
     fn begin_epoch(&mut self) {
         self.local_epoch += 1;
+        if let Some(input) = &self.config.input {
+            input.begin_epoch(self.local_epoch);
+        }
         self.stats.local_epoch.store(self.local_epoch, Relaxed);
         count(&self.stats.attempts);
         let reason = if self.ever_opened {
@@ -384,7 +424,13 @@ impl Session {
         );
         // Media must be registered before the host is asked to start. The
         // relay can otherwise discard start or frames on an unpaired socket.
-        signal.send(start_message(&wire, codec)).await?;
+        let mut start = start_message(&wire, codec);
+        if let Some(mode) = &self.config.stream_mode {
+            let mut value: Value = serde_json::from_str(&start).expect("locally encoded start");
+            value["streamMode"] = json!(mode);
+            start = value.to_string();
+        }
+        signal.send(start).await?;
         signal.send(first_frame_request(&request_id, &wire)).await?;
         let first_frame_deadline = Instant::now() + self.timing.first_frame;
 
@@ -404,6 +450,11 @@ impl Session {
                 presented: false,
                 first_frame_deadline: Some(first_frame_deadline),
                 first_frame_retried: false,
+                first_frame_pending: false,
+                input_generation: None,
+                desktop_available: true,
+                desktop_enabled: true,
+                desktop_generation: None,
             },
         };
         self.serve(&mut link, signal_rx, media_rx).await
@@ -424,6 +475,10 @@ impl Session {
                     item = media_rx.next() => Wake::Media(item),
                     item = signal_rx.next() => Wake::Signal(item),
                     _ = sleep(self.timing.tick) => Wake::Tick,
+                    _ = async {
+                        if let Some(input) = &self.config.input { input.notify.notified().await; }
+                        else { std::future::pending::<()>().await; }
+                    } => Wake::Input,
                 };
                 match wake {
                     Wake::Media(item) => {
@@ -434,14 +489,26 @@ impl Session {
                     Wake::Signal(item) => {
                         let inbound = classify(item, "signal")?;
                         link.signal.last_seen = Instant::now();
-                        self.on_signal(inbound)?;
+                        self.on_signal(link, inbound)?;
                     }
-                    Wake::Tick => {}
+                    Wake::Tick | Wake::Input => {}
                 }
                 self.tick(link).await?;
             }
         }
         .await;
+        // A media drop leaves /ws writable; release there before reconnect.
+        // If /ws itself died, delivery cannot be proved. The next epoch starts
+        // with release-all, and the host releases when its peer disconnects.
+        if let Some(input) = &self.config.input {
+            input.set_ready(false);
+            if timeout(SHUTDOWN_CLOSE, link.signal.send_binary(vec![6]))
+                .await
+                .is_ok_and(|result| result.is_ok())
+            {
+                input.sent(true);
+            }
+        }
         if matches!(result, Err(Halt::Stop)) {
             self.shutdown(link, &mut signal_rx, &mut media_rx).await;
         }
@@ -545,6 +612,9 @@ impl Session {
             }
         };
         self.stats.record_received(received_at);
+        if let Some(input) = &self.config.input {
+            input.dimensions(header.width as u32, header.height as u32);
+        }
 
         // ACK before the gate: every valid frame is acknowledged, dropped or not.
         let recv_ts_ms = self.started.elapsed().as_secs_f64() * 1000.0;
@@ -602,19 +672,100 @@ impl Session {
         }
     }
 
-    fn on_signal(&self, inbound: Inbound) -> Result<(), Halt> {
+    fn on_signal(&mut self, link: &mut Link, inbound: Inbound) -> Result<(), Halt> {
         match inbound {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(Halt::from(NetError::RelayError(message)));
+                }
+                if self.input_control(link, &text) {
+                    return Ok(());
                 }
                 match parse_relay_control(&text) {
                     Some(RelayControl::Pong) => {}
                     _ => count(&self.stats.rejected_controls),
                 }
             }
-            Inbound::Binary(_) => count(&self.stats.rejected_controls),
+            Inbound::Binary(data) => {
+                if !self
+                    .config
+                    .input
+                    .as_ref()
+                    .is_some_and(|input| input.receive(&data))
+                {
+                    count(&self.stats.rejected_controls);
+                }
+            }
             Inbound::Other => {}
+        }
+        Ok(())
+    }
+    fn input_control(&mut self, link: &mut Link, text: &str) -> bool {
+        if self.config.input.is_none() || text.len() > 16384 {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return false;
+        };
+        match value["type"].as_str() {
+            Some("input-capabilities") => {
+                self.config
+                    .input
+                    .as_ref()
+                    .unwrap()
+                    .capabilities(value["protocol"] == 1 && value["scancode"] == true);
+                true
+            }
+            Some("desktop-state")
+                if matches!(value["state"].as_str(), Some("active" | "unavailable")) =>
+            {
+                link.epoch.desktop_available = value["state"] == "active";
+                if let Some(input) = value["input"].as_str() {
+                    if matches!(input, "enabled" | "suspended" | "read-only") {
+                        link.epoch.desktop_enabled = input == "enabled";
+                    }
+                }
+                if link
+                    .epoch
+                    .regate_desktop(value["generation"].as_u64(), self.timing.first_frame)
+                {
+                    self.reset_gate("desktop-state");
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    async fn drain_input(&mut self, link: &mut Link) -> Result<(), Halt> {
+        let Some(input) = self.config.input.clone() else {
+            return Ok(());
+        };
+        let ready = link.epoch.host_present
+            && link.epoch.desktop_available
+            && link.epoch.desktop_enabled
+            && link.epoch.input_generation.is_some()
+            && link.epoch.input_generation == self.gate_generation;
+        let was_ready = input.snapshot().ready;
+        input.set_ready(ready);
+        if was_ready && !ready {
+            link.signal.send_binary(vec![6]).await?;
+            input.sent(true);
+        }
+        if ready {
+            for _ in 0..128 {
+                let Some(packet) = input.next() else {
+                    break;
+                };
+                let release = packet == [6];
+                let sent_at = Instant::now();
+                let absolute = packet.first() == Some(&8);
+                if absolute {
+                    input.absolute_sent(&packet, sent_at);
+                }
+                link.signal.send_binary(packet).await?;
+                input.sent(release);
+            }
         }
         Ok(())
     }
@@ -625,7 +776,17 @@ impl Session {
         if self.stop_requested() {
             return Err(Halt::Stop);
         }
+        if std::mem::take(&mut link.epoch.first_frame_pending) {
+            link.signal
+                .send(first_frame_request(
+                    &link.epoch.request_id,
+                    &link.epoch.wire,
+                ))
+                .await?;
+            self.pending_keyframe = Some("desktop-state".into());
+        }
         self.drain_feedback(link).await?;
+        self.drain_input(link).await?;
         self.flush_reset()?;
         self.send_pending_keyframe(link).await?;
 
@@ -683,6 +844,7 @@ impl Session {
                 if self.gate_generation != Some(generation) {
                     return Ok(());
                 }
+                link.epoch.input_generation = Some(generation);
                 link.epoch.first_frame_deadline = None;
                 if !link.epoch.presented {
                     link.epoch.presented = true;
@@ -937,4 +1099,42 @@ fn relay_error(text: &str) -> Option<String> {
             .unwrap_or("relay error")
             .to_owned(),
     )
+}
+
+#[cfg(test)]
+mod input_readiness_tests {
+    use super::*;
+    #[test]
+    fn desktop_state_reuses_inflight_but_never_completed_or_unavailable_presentation() {
+        let mut epoch = Epoch {
+            wire: "epoch".into(),
+            request_id: "original".into(),
+            codec: Codec::H264,
+            host_present: true,
+            presented: false,
+            first_frame_deadline: Some(Instant::now() + Duration::from_secs(10)),
+            first_frame_retried: false,
+            first_frame_pending: false,
+            input_generation: None,
+            desktop_available: true,
+            desktop_enabled: true,
+            desktop_generation: Some(7),
+        };
+        assert!(!epoch.regate_desktop(Some(7), Duration::from_secs(10)));
+        assert_eq!(epoch.request_id, "original");
+        epoch.presented = true;
+        epoch.input_generation = Some(7);
+        epoch.first_frame_deadline = None;
+        assert!(epoch.regate_desktop(Some(7), Duration::from_secs(10)));
+        assert!(epoch.input_generation.is_none() && epoch.first_frame_pending && !epoch.presented);
+        assert_ne!(epoch.request_id, "original");
+        epoch.desktop_available = false;
+        assert!(epoch.regate_desktop(Some(7), Duration::from_secs(10)));
+        assert!(!epoch.first_frame_pending && epoch.first_frame_deadline.is_none());
+        epoch.desktop_available = true;
+        assert!(epoch.regate_desktop(Some(7), Duration::from_secs(10)));
+        assert!(epoch.first_frame_pending && epoch.input_generation.is_none());
+        assert!(epoch.regate_desktop(Some(8), Duration::from_secs(10)));
+        assert_eq!(epoch.desktop_generation, Some(8));
+    }
 }

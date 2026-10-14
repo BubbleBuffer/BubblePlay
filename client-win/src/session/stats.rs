@@ -15,6 +15,10 @@ pub struct SessionStats {
     pub(crate) transport: Arc<TransportStats>,
 }
 
+/// Input capture state is intentionally separate from model/UI state in this
+/// step. Session owners can retain this handle for later chrome wiring.
+pub type SessionInputState = crate::input::CaptureStatus;
+
 impl SessionStats {
     pub fn snapshot(&self) -> StatsSnapshot {
         let mut stats = self.media.snapshot(Instant::now());
