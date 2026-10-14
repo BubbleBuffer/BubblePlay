@@ -2432,6 +2432,12 @@ fn worker_version_probe_url(url: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     if uri.scheme_str() != Some("wss") {
+        // A cleartext relay is allowed only on loopback (a local test relay);
+        // it has no Worker to probe, so it runs without a version monitor.
+        if uri.scheme_str() == Some("ws") && crate::relay_url::require_secure_relay_url(url).is_ok()
+        {
+            return Ok(None);
+        }
         bail!("Worker version probe requires a wss signaling URL");
     }
     let authority = uri
@@ -2554,8 +2560,8 @@ mod tests {
         bench_status_wire, keepalive_expired, signaling_request,
         signaling_request_with_worker_version, worker_version_changed, worker_version_probe_url,
         BenchEncodeStages, BenchHybridActivity, BenchRoiActivity, BenchStageTiming,
-        BenchStatusEffective, BenchStatusEncoder, SignalMsg, BENCH_STATUS_MAX_BYTES,
-        KEEPALIVE_TIMEOUT, V2_REDUNDANT_BENCH_FIELDS,
+        BenchStatusEffective, BenchStatusEncoder, SignalMsg, WorkerVersionMonitor,
+        BENCH_STATUS_MAX_BYTES, KEEPALIVE_TIMEOUT, V2_REDUNDANT_BENCH_FIELDS,
     };
     use std::time::{Duration, Instant};
 
@@ -2649,6 +2655,47 @@ mod tests {
             None
         );
         assert!(worker_version_probe_url("https://play.example/host-ws").is_err());
+    }
+
+    #[test]
+    fn cleartext_loopback_relay_runs_without_a_worker_version_monitor() {
+        for url in [
+            "ws://127.0.0.1:8788/host-ws",
+            "ws://127.5.6.7:8788/host-ws",
+            "ws://[::1]:8788/host-ws",
+            "ws://localhost:8788/host-ws",
+        ] {
+            assert_eq!(worker_version_probe_url(url).unwrap(), None, "{url}");
+            assert!(
+                WorkerVersionMonitor::spawn(url, "token", None, None)
+                    .unwrap()
+                    .is_none(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_non_loopback_relay_still_refuses_a_worker_version_monitor() {
+        for url in [
+            "ws://192.168.1.20:8788/host-ws",
+            "ws://play.example/host-ws",
+            "ws://localhost.evil.com/host-ws",
+        ] {
+            let error = worker_version_probe_url(url).unwrap_err().to_string();
+            assert!(error.contains("requires a wss signaling URL"), "{error}");
+            assert!(
+                WorkerVersionMonitor::spawn(url, "token", None, None).is_err(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn wss_relay_gets_a_worker_version_monitor() {
+        let monitor =
+            WorkerVersionMonitor::spawn("wss://play.example/host-ws", "token", None, None).unwrap();
+        assert!(monitor.is_some());
     }
 
     #[test]
