@@ -43,6 +43,8 @@ See [file transfer](file-transfer.md), [monitor following](follow-active-window.
 
 See [host performance](performance.md) for the event-driven producer, damage/tile path and warm reconnect behavior.
 
+See [encoders](encoders.md) for backend selection, the shared bitstream contract, CPU mode and its diagnostic knobs.
+
 The browser uses small modules for settings, session chrome, monitor selection, cursor translation, clipboard and files. The host separates capture adapters, encoding, session policy and telemetry from its main event loop. The lab separates process/browser orchestration from lifecycle and measurement logic.
 
 Deterministic fixture tests establish packet and state contracts. They do not establish capture-driver behavior, elevated input, physical display output or a deployed relay's interoperability. Use the [development guide](../development.md) for build commands, [Worker lab guide](../../worker/README.md#closed-loop-stream-lab) for isolated Windows acceptance, and [release status](../release-status.md) for remaining public-release checks.
