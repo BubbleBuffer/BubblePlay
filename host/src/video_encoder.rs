@@ -126,7 +126,7 @@ pub fn device_encoder_adapter(device: *mut c_void) -> Result<EncoderAdapter> {
 /// unchanged adapter reuses the result across parked capture and recovery.
 #[derive(Default)]
 pub struct EncoderDiscoveryCache {
-    entries: Vec<(EncoderAdapter, EncoderBackend)>,
+    entries: Vec<(EncoderAdapter, EncoderBackend, String)>,
 }
 
 impl EncoderDiscoveryCache {
@@ -141,27 +141,42 @@ impl EncoderDiscoveryCache {
     fn resolve_with(
         &mut self,
         adapter: EncoderAdapter,
-        probe: impl FnOnce() -> Result<EncoderBackend>,
+        probe: impl FnOnce() -> Result<(EncoderBackend, String)>,
     ) -> Result<EncoderBackend> {
-        if let Some((_, backend)) = self
+        if let Some((_, backend, _)) = self
             .entries
             .iter()
-            .find(|(key, _)| key.luid == adapter.luid)
+            .find(|(key, _, _)| key.luid == adapter.luid)
         {
             return Ok(*backend);
         }
-        let backend = probe()?;
-        self.entries.push((adapter, backend));
+        let (backend, reason) = probe()?;
+        self.entries.push((adapter, backend, reason));
         Ok(backend)
     }
 
-    pub fn record_actual(&mut self, adapter: EncoderAdapter, backend: EncoderBackend) {
-        if let Some((_, selected)) = self
+    pub fn reason(&self, adapter: EncoderAdapter) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(key, _, _)| key.luid == adapter.luid)
+            .map(|(_, _, reason)| reason.as_str())
+    }
+
+    pub fn record_actual(
+        &mut self,
+        adapter: EncoderAdapter,
+        backend: EncoderBackend,
+        reason: &str,
+    ) {
+        if let Some((_, selected, stored_reason)) = self
             .entries
             .iter_mut()
-            .find(|(key, _)| key.luid == adapter.luid)
+            .find(|(key, _, _)| key.luid == adapter.luid)
         {
             *selected = backend;
+            if stored_reason.as_str() != reason {
+                reason.clone_into(stored_reason);
+            }
         }
     }
 }
@@ -169,7 +184,7 @@ impl EncoderDiscoveryCache {
 fn discover_encoder_backend(
     adapter: EncoderAdapter,
     preference: EncoderPreference,
-) -> Result<EncoderBackend> {
+) -> Result<(EncoderBackend, String)> {
     let order = selection_order(preference);
     let mut failures = Vec::new();
     if order.contains(&EncoderBackend::Nvenc) {
@@ -177,11 +192,11 @@ fn discover_encoder_backend(
         // initialize every requested encode profile. The factory still checks.
         if adapter.vendor_id == 0x10de {
             match probe_nvenc_api() {
-                Ok(()) => return Ok(EncoderBackend::Nvenc),
+                Ok(()) => return Ok((EncoderBackend::Nvenc, String::new())),
                 Err(error) => failures.push(format!("NVENC unavailable: {error:#}")),
             }
         } else {
-            failures.push("capture adapter is not NVIDIA".to_owned());
+            failures.push("NVENC unavailable: capture adapter is not NVIDIA".to_owned());
         }
     }
     if order
@@ -193,11 +208,20 @@ fn discover_encoder_backend(
                 if let Some(error) = &available.hardware_error {
                     info!(%error, "Media Foundation hardware discovery unavailable; checking software registration");
                 }
+                if order.contains(&EncoderBackend::MfHardware) && !available.hardware {
+                    failures.push(format!(
+                        "Media Foundation hardware H.264 unavailable: {}",
+                        available
+                            .hardware_error
+                            .as_deref()
+                            .unwrap_or("no encoder registered for the capture adapter")
+                    ));
+                }
                 for backend in order {
                     if (*backend == EncoderBackend::MfHardware && available.hardware)
                         || (*backend == EncoderBackend::MfSoftware && available.software)
                     {
-                        return Ok(*backend);
+                        return Ok((*backend, failures.join("; ")));
                     }
                 }
                 failures.push("no requested Media Foundation H.264 encoder registered".to_owned());
@@ -241,6 +265,37 @@ pub enum VideoEncoder {
     Mf(MfEncoder),
 }
 
+fn encoder_selection_reason(
+    preference: EncoderPreference,
+    backend: EncoderBackend,
+    failures: &str,
+) -> String {
+    if preference.cpu_mode {
+        " (CPU mode forced by tray setting)".to_owned()
+    } else if preference.encoder != EncoderOverride::Auto {
+        " (diagnostic override)".to_owned()
+    } else if backend == EncoderBackend::MfSoftware {
+        if failures.is_empty() {
+            "; no hardware encoder".to_owned()
+        } else {
+            format!("; no hardware encoder: {failures}")
+        }
+    } else if failures.is_empty() {
+        String::new()
+    } else {
+        format!("; {failures}")
+    }
+}
+
+fn append_selection_failures(reason: &mut String, unavailable: &[String]) {
+    if !unavailable.is_empty() {
+        if !reason.is_empty() {
+            reason.push_str("; ");
+        }
+        reason.push_str(&unavailable.join("; "));
+    }
+}
+
 impl VideoEncoder {
     /// The caller owns NVENC's existing preset and benchmark fallback policy.
     #[allow(clippy::too_many_arguments)]
@@ -254,6 +309,7 @@ impl VideoEncoder {
         gop_seconds: u32,
         preference: EncoderPreference,
         discovered: Option<EncoderBackend>,
+        discovery_reason: &mut String,
         mut create_nvenc: impl FnMut() -> Result<Nvenc>,
     ) -> Result<Self> {
         let mut unavailable = Vec::new();
@@ -284,17 +340,8 @@ impl VideoEncoder {
             };
             match result {
                 Ok(encoder) => {
-                    let reason = if preference.cpu_mode {
-                        " (CPU mode forced by tray setting)".to_owned()
-                    } else if preference.encoder != EncoderOverride::Auto {
-                        " (diagnostic override)".to_owned()
-                    } else if unavailable.is_empty() {
-                        String::new()
-                    } else if *backend == EncoderBackend::MfSoftware {
-                        format!("; no hardware encoder: {}", unavailable.join("; "))
-                    } else {
-                        format!("; {}", unavailable.join("; "))
-                    };
+                    append_selection_failures(discovery_reason, &unavailable);
+                    let reason = encoder_selection_reason(preference, *backend, discovery_reason);
                     match &encoder {
                         Self::Nvenc(_) => {
                             let adapter = adapter_name(device)
@@ -315,7 +362,8 @@ impl VideoEncoder {
                 )),
             }
         }
-        bail!("no video encoder: {}", unavailable.join("; "))
+        append_selection_failures(discovery_reason, &unavailable);
+        bail!("no video encoder: {}", discovery_reason)
     }
 
     pub fn capabilities(&self) -> EncoderCapabilities {
@@ -539,6 +587,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_selection_logs_keep_discovery_and_actual_fallback_reasons() {
+        let auto = EncoderPreference::default();
+        let nvenc = "NVENC unavailable: capture adapter is not NVIDIA";
+        assert_eq!(
+            encoder_selection_reason(auto, EncoderBackend::MfHardware, nvenc),
+            format!("; {nvenc}")
+        );
+        let mut reasons = nvenc.to_owned();
+        append_selection_failures(
+            &mut reasons,
+            &["Media Foundation hardware H.264 unavailable: initialization failed".to_owned()],
+        );
+        let software = encoder_selection_reason(auto, EncoderBackend::MfSoftware, &reasons);
+        assert!(software.contains("no hardware encoder"));
+        assert!(software.contains(nvenc));
+        assert!(
+            software.contains("Media Foundation hardware H.264 unavailable: initialization failed")
+        );
+        assert_eq!(
+            encoder_selection_reason(
+                EncoderPreference {
+                    cpu_mode: true,
+                    encoder: EncoderOverride::Nvenc
+                },
+                EncoderBackend::MfSoftware,
+                &reasons
+            ),
+            " (CPU mode forced by tray setting)"
+        );
+        let adapter = EncoderAdapter {
+            luid: 42,
+            vendor_id: 0x8086,
+        };
+        let mut cache = EncoderDiscoveryCache::default();
+        cache
+            .resolve_with(adapter, || {
+                Ok((EncoderBackend::MfHardware, nvenc.to_owned()))
+            })
+            .unwrap();
+        cache.record_actual(adapter, EncoderBackend::MfSoftware, &reasons);
+        assert_eq!(cache.reason(adapter), Some(reasons.as_str()));
+        assert_eq!(
+            cache
+                .resolve_with(adapter, || panic!("cached fallback must not re-probe"))
+                .unwrap(),
+            EncoderBackend::MfSoftware
+        );
+    }
+
+    #[test]
     fn discovery_is_cached_by_adapter_across_warm_reconnect_and_recovery() {
         let first = EncoderAdapter {
             luid: 10,
@@ -551,7 +649,7 @@ mod tests {
         let mut cache = EncoderDiscoveryCache::default();
         assert_eq!(
             cache
-                .resolve_with(first, || Ok(EncoderBackend::Nvenc))
+                .resolve_with(first, || Ok((EncoderBackend::Nvenc, String::new())))
                 .unwrap(),
             EncoderBackend::Nvenc
         );
@@ -563,11 +661,19 @@ mod tests {
         );
         assert_eq!(
             cache
-                .resolve_with(second, || Ok(EncoderBackend::MfHardware))
+                .resolve_with(second, || Ok((
+                    EncoderBackend::MfHardware,
+                    "NVENC unavailable".to_owned()
+                )))
                 .unwrap(),
             EncoderBackend::MfHardware
         );
-        cache.record_actual(first, EncoderBackend::MfSoftware);
+        cache.record_actual(
+            first,
+            EncoderBackend::MfSoftware,
+            "NVENC and hardware unavailable",
+        );
+        assert_eq!(cache.reason(first), Some("NVENC and hardware unavailable"));
         assert_eq!(
             cache
                 .resolve_with(first, || panic!("actual fallback must remain cached"))

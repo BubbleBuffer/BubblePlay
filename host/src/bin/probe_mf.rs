@@ -480,6 +480,7 @@ fn selection_preflight(
             2,
             preference,
             None,
+            &mut String::new(),
             || {
                 assert!(
                     !preference.cpu_mode,

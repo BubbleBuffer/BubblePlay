@@ -292,6 +292,7 @@ pub(super) fn ensure_rtc_encoder_codec(
 pub(super) fn create_local_encoder(
     preference: EncoderPreference,
     discovered: EncoderBackend,
+    discovery_reason: &mut String,
     device: *mut core::ffi::c_void,
     width: u32,
     height: u32,
@@ -320,6 +321,7 @@ pub(super) fn create_local_encoder(
         u32::from(gop_seconds),
         preference,
         Some(discovered),
+        discovery_reason,
         || {
             if let Some(profile) = benchmark_profile {
                 return Nvenc::new_with_options_native_codec(
@@ -362,6 +364,7 @@ pub(super) fn configure_encoder_profile(
     encoder: &mut Option<VideoEncoder>,
     preference: EncoderPreference,
     discovered: &mut EncoderBackend,
+    discovery_reason: &mut String,
     device: *mut core::ffi::c_void,
     mode: VideoMode,
     native_width: u32,
@@ -387,6 +390,7 @@ pub(super) fn configure_encoder_profile(
             create_local_encoder(
                 preference,
                 *discovered,
+                discovery_reason,
                 device,
                 mode.width,
                 mode.height,
@@ -415,6 +419,7 @@ pub(super) fn recreate_and_encode_profile(
     encoder: &mut Option<VideoEncoder>,
     preference: EncoderPreference,
     discovered: &mut EncoderBackend,
+    discovery_reason: &mut String,
     device: *mut core::ffi::c_void,
     mode: VideoMode,
     native_width: u32,
@@ -433,6 +438,7 @@ pub(super) fn recreate_and_encode_profile(
     let mut replacement = create_local_encoder(
         preference,
         *discovered,
+        discovery_reason,
         device,
         mode.width,
         mode.height,

@@ -773,6 +773,7 @@ fn run_spike(args: &Args) -> Result<()> {
                 u32::from(EncoderOptions::production(Preset::P3).gop_seconds),
                 args.encoder_preference(),
                 None,
+                &mut String::new(),
                 || Nvenc::new(dev, frame.width(), frame.height(), 60, args.bitrate_bps),
             )?);
             let spspps = encoder.as_ref().unwrap().sequence_params()?;
@@ -967,6 +968,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         Some(adapter) => encoder_discovery.resolve(adapter, args.encoder_preference())?,
         None => EncoderBackend::Nvenc,
     };
+    let mut discovery_reason = discovered_adapter
+        .and_then(|adapter| encoder_discovery.reason(adapter))
+        .unwrap_or_default()
+        .to_owned();
     let socket = UdpSocket::bind("0.0.0.0:0").context("bind media socket")?;
     // Host-IP discovery only feeds RTC ICE candidates. WSS media and
     // signaling do not need it, so a failure (e.g. WSAEAFNOSUPPORT on a
@@ -2723,6 +2728,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 discovered_backend = encoder_discovery
                                     .resolve(adapter, args.encoder_preference())?;
                                 discovered_adapter = Some(adapter);
+                                discovery_reason = encoder_discovery
+                                    .reason(adapter)
+                                    .unwrap_or_default()
+                                    .to_owned();
                             }
                             // Answer at master's offer site, without waiting for
                             // a DDA frame or changing NVENC's prewarm codec.
@@ -4381,6 +4390,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         discovered_backend =
                             encoder_discovery.resolve(adapter, args.encoder_preference())?;
                         discovered_adapter = Some(adapter);
+                        discovery_reason = encoder_discovery
+                            .reason(adapter)
+                            .unwrap_or_default()
+                            .to_owned();
                     }
                     if encoder.is_some() {
                         warn!("capture D3D11 device changed; invalidating scaler and IDR state");
@@ -4394,6 +4407,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     let created = create_local_encoder(
                         args.encoder_preference(),
                         discovered_backend,
+                        &mut discovery_reason,
                         dev,
                         mode.width,
                         mode.height,
@@ -4408,7 +4422,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     )?;
                     adopt_encoder_codec(&mut active_codec, Some(&created));
                     discovered_backend = created.backend();
-                    encoder_discovery.record_actual(adapter, discovered_backend);
+                    encoder_discovery.record_actual(adapter, discovered_backend, &discovery_reason);
                     encoder = Some(created);
                     encoder_benchmark_profile_revision = desired_encoder_benchmark_profile_revision;
                 }
@@ -4734,6 +4748,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             &mut encoder,
                             args.encoder_preference(),
                             &mut discovered_backend,
+                            &mut discovery_reason,
                             dev,
                             mode,
                             frame.width(),
@@ -4755,7 +4770,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     adopt_encoder_codec(&mut active_codec, encoder.as_ref());
                     if transition {
                         if let Some(adapter) = discovered_adapter {
-                            encoder_discovery.record_actual(adapter, discovered_backend);
+                            encoder_discovery.record_actual(
+                                adapter,
+                                discovered_backend,
+                                &discovery_reason,
+                            );
                         }
                     }
                     ensure_rtc_encoder_codec(
@@ -5078,6 +5097,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             &mut encoder,
                             args.encoder_preference(),
                             &mut discovered_backend,
+                            &mut discovery_reason,
                             dev,
                             mode,
                             frame.width(),
@@ -5107,7 +5127,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             }
                             Err(error) => {
                                 if let Some(adapter) = discovered_adapter {
-                                    encoder_discovery.record_actual(adapter, discovered_backend);
+                                    encoder_discovery.record_actual(
+                                        adapter,
+                                        discovered_backend,
+                                        &discovery_reason,
+                                    );
                                 }
                                 warn!(
                                     ?error,
@@ -5541,6 +5565,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     &mut encoder,
                                     args.encoder_preference(),
                                     &mut discovered_backend,
+                                    &mut discovery_reason,
                                     dev,
                                     mode,
                                     frame.width(),
@@ -5571,8 +5596,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     }
                                     Err(error) => {
                                         if let Some(adapter) = discovered_adapter {
-                                            encoder_discovery
-                                                .record_actual(adapter, discovered_backend);
+                                            encoder_discovery.record_actual(
+                                                adapter,
+                                                discovered_backend,
+                                                &discovery_reason,
+                                            );
                                         }
                                         warn!(?error, "fallback encoder recovery failed; retaining session for retry");
                                         latest_idr = None;
@@ -5586,7 +5614,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     };
                     if fallback_reason.is_some() {
                         if let Some(adapter) = discovered_adapter {
-                            encoder_discovery.record_actual(adapter, discovered_backend);
+                            encoder_discovery.record_actual(
+                                adapter,
+                                discovered_backend,
+                                &discovery_reason,
+                            );
                         }
                     }
                     ensure_rtc_encoder_codec(
