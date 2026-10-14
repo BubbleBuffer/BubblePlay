@@ -44,3 +44,10 @@ windows = { version = "0.62", features = [
 
 [profile.release]
 debug = "line-tables-only"
+
+# --- UI track: layout and snapshot tests ---
+# TOML cannot reopen [dependencies]' neighbour table from inside the UI block
+# above, so the UI test dependencies live in their own block here.
+[dev-dependencies]
+egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
+# --- end UI track tests ---

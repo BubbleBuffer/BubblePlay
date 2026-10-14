@@ -88,6 +88,10 @@ pub const STRIP_H: f32 = 42.0;
 /// Collapsed session tab height.
 pub const TAB_H: f32 = 26.0;
 pub const CONTROL_H: f32 = 36.0;
+/// Small buttons: inline row actions. 32 px is the smallest hit target.
+pub const CONTROL_SM_H: f32 = 32.0;
+/// One line of UI text, and the minimum height of a row of widgets.
+pub const LINE_H: f32 = 20.0;
 pub const CONTROL_LG_H: f32 = 44.0;
 pub const FIELD_H: f32 = 40.0;
 pub const RAIL_W: f32 = 300.0;

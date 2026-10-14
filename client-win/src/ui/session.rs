@@ -15,6 +15,7 @@ use egui::{
     Pos2, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui,
 };
 
+use super::contract;
 use super::icons::Icons;
 use super::theme;
 use super::widgets::{self, BtnKind, BtnSize};
@@ -202,7 +203,7 @@ fn live_dot(ui: &mut Ui, color: Color32, ring: Color32) {
 }
 
 /// Connection chip: live dot, name, mono evidence. `warn` is the reconnecting dot.
-fn chip(ui: &mut Ui, warn: bool, name: &str, evidence: &str) {
+fn chip(ui: &mut Ui, warn: bool, name: &str, evidence: &str, compact: bool) {
     let (dot, ring) = if warn {
         (theme::ATTENTION, tint(theme::ATTENTION, 46))
     } else {
@@ -212,8 +213,12 @@ fn chip(ui: &mut Ui, warn: bool, name: &str, evidence: &str) {
         ui.spacing_mut().item_spacing.x = 8.0;
         live_dot(ui, dot, ring);
         label(ui, name, theme::bold(12.5), theme::INK);
-        label(ui, evidence, theme::mono(11.5), theme::INK_MUTED);
-    });
+        if !compact {
+            label(ui, evidence, theme::mono(11.5), theme::INK_MUTED);
+        }
+    })
+    .response
+    .on_hover_text(evidence);
 }
 
 /// Seam between strip groups: 1 px by 22 px, 5 px either side.
@@ -297,14 +302,14 @@ fn tb_btn(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str) -> Response {
         (Color32::TRANSPARENT, theme::INK_MUTED)
     };
 
-    let p = ui.painter();
+    let p = ui.painter().clone();
     if bg != Color32::TRANSPARENT {
         p.rect_filled(rect, SEAM_R, bg);
     }
     let cy = rect.center().y;
     let mut x = if icon_only { rect.center().x - 7.0 } else { rect.left() + 10.0 };
     if let Some(name) = b.icon {
-        icons.paint(p, Rect::from_center_size(pos2(x + 7.0, cy), vec2(14.0, 14.0)), name, fg);
+        icons.paint(&p, Rect::from_center_size(pos2(x + 7.0, cy), vec2(14.0, 14.0)), name, fg);
         x += icon_w + 7.0;
     }
     if let Some(t) = b.label {
@@ -312,8 +317,9 @@ fn tb_btn(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str) -> Response {
         x += label_w + 7.0;
     }
     if let Some(name) = b.chev {
-        icons.paint(p, Rect::from_center_size(pos2(x + 6.5, cy), vec2(13.0, 13.0)), name, fg.linear_multiply(0.7));
+        icons.paint(&p, Rect::from_center_size(pos2(x + 6.5, cy), vec2(13.0, 13.0)), name, fg.linear_multiply(0.7));
     }
+    contract::mark_widget(&resp, egui::WidgetType::Button, "button", b.label.unwrap_or(if tip.is_empty() { "button" } else { tip }));
     if tip.is_empty() {
         resp
     } else {
@@ -384,7 +390,12 @@ enum Cap {
     Released,
 }
 
-fn cap(ui: &mut Ui, cx: &Cx, kind: Cap) {
+/// Below this window width the strip goes compact: no release chord in the
+/// capture group and no word on the quality button, so the strip still fits
+/// the 760 px minimum window.
+const STRIP_COMPACT_BELOW: f32 = 1000.0;
+
+fn cap(ui: &mut Ui, cx: &Cx, kind: Cap, compact: bool) {
     let (icon, text, fg, bg, keys) = match kind {
         Cap::Captured => ("mouse-pointer-2", "Captured", theme::SIGNAL, tint(theme::SIGNAL, 31), true),
         Cap::Blocked => ("shield-alert", "Input blocked", theme::ATTENTION, tint(theme::ATTENTION, 31), false),
@@ -402,9 +413,13 @@ fn cap(ui: &mut Ui, cx: &Cx, kind: Cap) {
         ui.set_min_height(BTN_H);
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            widgets::icon(ui, cx, icon, 14.0, fg);
-            label(ui, text, theme::bold(12.5), fg);
-            if keys {
+            widgets::icon(ui, cx, icon, 14.0, fg).on_hover_text(text);
+            // Compact keeps the word only for the normal Captured state; the
+            // others show their icon, with the word on hover.
+            if !compact || kind == Cap::Captured {
+                label(ui, text, theme::bold(12.5), fg);
+            }
+            if keys && !compact {
                 widgets::chord(ui, &["Ctrl", "Alt", "Shift", "Z"]);
             }
         });
@@ -434,48 +449,55 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
     let reconnecting = matches!(sess.link, Link::Reconnecting { .. });
     let admin = sess.notice == Some(SessionNotice::AdminRequired);
     let picker = view == StripView::MonitorPicker;
+    let compact = ctx.content_rect().width() < STRIP_COMPACT_BELOW;
     egui::Area::new(Id::new("session.strip"))
         .order(Order::Foreground)
         .anchor(Align2::CENTER_TOP, vec2(0.0, 0.0))
         .show(ctx, |ui| {
-            let f = strip_frame().show(ui, |ui| {
+            let f = contract::framed(ui, "strip", strip_frame(), |ui| {
                 ui.set_min_height(theme::STRIP_H);
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     if reconnecting {
-                        chip(ui, true, "Reconnecting", &format!("attempt {}", attempt_of(sess)));
+                        chip(ui, true, "Reconnecting", &format!("attempt {}", attempt_of(sess)), compact);
                     } else {
-                        chip(ui, false, &sess.pc_name, &format!("{} ms", sess.rtt_ms));
+                        chip(ui, false, &sess.pc_name, &format!("{} ms", sess.rtt_ms), compact);
                     }
                     seam(ui);
                     if reconnecting {
-                        cap(ui, cx, Cap::Paused);
+                        cap(ui, cx, Cap::Paused, compact);
                     } else if admin {
-                        cap(ui, cx, Cap::Blocked);
+                        cap(ui, cx, Cap::Blocked, compact);
                     } else if sess.captured {
-                        cap(ui, cx, Cap::Captured);
+                        cap(ui, cx, Cap::Captured, compact);
                     } else {
-                        cap(ui, cx, Cap::Released);
+                        cap(ui, cx, Cap::Released, compact);
                     }
                     seam(ui);
                     display_btn(ui, cx, sess, picker, o);
-                    // Mode: Work / Game, one of them selected.
-                    for (mode, text, icon) in [
-                        (StreamMode::Work, "Work", "briefcase"),
-                        (StreamMode::Game, "Game", "gamepad-2"),
-                    ] {
-                        let r = keep(
-                            o,
-                            tb_btn(
-                                ui,
-                                cx.icons,
-                                Btn { icon: Some(icon), label: Some(text), chev: None, open: sess.mode == mode, leave: false },
-                                "",
-                            ),
-                        );
-                        if r.clicked() && sess.mode != mode {
-                            o.acts.push(Action::SetMode(mode));
-                        }
+                    // Mode: one button showing the current mode (mockup
+                    // `Game` with chevrons-up-down); a click switches to the other.
+                    let (mtext, micon, mnext) = match sess.mode {
+                        StreamMode::Work => ("Work", "briefcase", StreamMode::Game),
+                        StreamMode::Game => ("Game", "gamepad-2", StreamMode::Work),
+                    };
+                    let m = keep(
+                        o,
+                        tb_btn(
+                            ui,
+                            cx.icons,
+                            Btn {
+                                icon: Some(micon),
+                                label: if compact { None } else { Some(mtext) },
+                                chev: Some("chevrons-up-down"),
+                                open: false,
+                                leave: false,
+                            },
+                            "Stream mode: click to switch",
+                        ),
+                    );
+                    if m.clicked() {
+                        o.acts.push(Action::SetMode(mnext));
                     }
                     // Quality cycles Auto, Sharp, Smooth (no menu in the mockup).
                     let (qtext, qnext) = match sess.quality {
@@ -488,7 +510,13 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
                         tb_btn(
                             ui,
                             cx.icons,
-                            Btn { icon: Some("gauge"), label: Some(qtext), chev: Some("chevron-down"), open: false, leave: false },
+                            Btn {
+                                icon: Some("gauge"),
+                                label: if compact { None } else { Some(qtext) },
+                                chev: if compact { None } else { Some("chevron-down") },
+                                open: false,
+                                leave: false,
+                            },
                             "Picture quality: click to change",
                         ),
                     );
@@ -551,11 +579,11 @@ fn secure_strip(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, s
         .order(Order::Foreground)
         .anchor(Align2::CENTER_TOP, vec2(0.0, 0.0))
         .show(ctx, |ui| {
-            let f = strip_frame().show(ui, |ui| {
+            let f = contract::framed(ui, "strip", strip_frame(), |ui| {
                 ui.set_min_height(theme::STRIP_H);
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    chip(ui, false, &sess.pc_name, &format!("{} ms", sess.rtt_ms));
+                    chip(ui, false, &sess.pc_name, &format!("{} ms", sess.rtt_ms), false);
                     seam(ui);
                     secure_badge(ui, cx);
                     seam(ui);
@@ -943,13 +971,13 @@ fn recovery(ctx: &egui::Context, cx: &Cx, sess: &Session, o: &mut Picks) {
         .order(Order::Foreground)
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .show(ctx, |ui| {
-            let f = Frame::NONE
+            let frame = Frame::NONE
                 .fill(theme::SURFACE)
                 .stroke(Stroke::new(1.0, theme::THREAD_STRONG))
                 .corner_radius(theme::R_PANEL)
                 .shadow(theme::CHROME_SHADOW)
-                .inner_margin(Margin { left: 28, right: 24, top: 22, bottom: 20 })
-                .show(ui, |ui| {
+                .inner_margin(Margin { left: 28, right: 24, top: 22, bottom: 20 });
+            let f = contract::framed(ui, "recover", frame, |ui| {
                     ui.set_width(460.0 - 52.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
@@ -988,7 +1016,9 @@ fn recovery(ctx: &egui::Context, cx: &Cx, sess: &Session, o: &mut Picks) {
             let r = f.response.rect;
             ui.painter().rect_filled(
                 Rect::from_min_size(r.left_top(), vec2(5.0, r.height())),
-                CornerRadius::ZERO,
+                // Follows the card's rounded left corners (a square seam
+                // poked out past them).
+                CornerRadius { nw: theme::R_PANEL.nw, sw: theme::R_PANEL.sw, ne: 0, se: 0 },
                 theme::PAW,
             );
         });

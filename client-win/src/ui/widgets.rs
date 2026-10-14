@@ -14,6 +14,7 @@ use egui::{
     Rect, Response, Sense, Shadow, Stroke, StrokeKind, Ui, Vec2, WidgetText,
 };
 
+use super::contract;
 use super::theme;
 use super::Cx;
 use crate::model::{ConnStep, StepStatus};
@@ -83,7 +84,11 @@ pub fn install_style(ctx: &egui::Context) {
         style.visuals = visuals.clone();
         style.spacing.item_spacing = vec2(theme::SP2, theme::SP2);
         style.spacing.button_padding = vec2(theme::SP3, theme::SP2);
-        style.spacing.interact_size.y = theme::CONTROL_H;
+        // The minimum height of a row of widgets. egui's default use of the
+        // control height (36) made every text line in a `horizontal` 36 px
+        // tall, which broke the 4 px rhythm and pushed second lines out of
+        // their cards. Buttons and fields set their own heights.
+        style.spacing.interact_size.y = theme::LINE_H;
     });
 }
 
@@ -111,7 +116,8 @@ pub fn titlebar(root: &mut egui::Ui, cx: &mut Cx, context: &str, demo_label: Opt
             let dot = Rect::from_center_size(pos2(x + 4.0, cy), Vec2::splat(8.0));
             painter.rect_filled(dot, R_DOT, theme::SIGNAL);
             x += 16.0;
-            let app = painter.text(
+            let app = contract::paint_text(
+                ui,
                 pos2(x, cy),
                 Align2::LEFT_CENTER,
                 "BubblePlay",
@@ -119,7 +125,8 @@ pub fn titlebar(root: &mut egui::Ui, cx: &mut Cx, context: &str, demo_label: Opt
                 theme::INK,
             );
             x = app.right() + 12.0;
-            let ctx_rect = painter.text(
+            let ctx_rect = contract::paint_text(
+                ui,
                 pos2(x, cy),
                 Align2::LEFT_CENTER,
                 context,
@@ -128,7 +135,7 @@ pub fn titlebar(root: &mut egui::Ui, cx: &mut Cx, context: &str, demo_label: Opt
             );
             x = ctx_rect.right() + 12.0;
             if let Some(d) = demo_label {
-                painter.text(pos2(x, cy), Align2::LEFT_CENTER, d, theme::mono(11.0), theme::INK_FAINT);
+                contract::paint_text(ui, pos2(x, cy), Align2::LEFT_CENTER, d, theme::mono(11.0), theme::INK_FAINT);
             }
 
             let maximise_icon = if cx.window.maximized { "copy" } else { "square" };
@@ -159,10 +166,12 @@ pub fn titlebar(root: &mut egui::Ui, cx: &mut Cx, context: &str, demo_label: Opt
                 let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(CAPTION_ICON));
                 cx.icons.paint(&painter, icon_rect, icon_name, fg);
                 cx.out.no_drag.push(rect);
+                contract::mark_widget(&resp, egui::WidgetType::Button, "caption", icon_name);
                 if resp.clicked() {
                     cx.out.command = Some(command);
                 }
             }
+            contract::mark(ui.ctx(), ui.unique_id(), contract::ROW, "titlebar", bar);
         });
 }
 
@@ -180,7 +189,7 @@ pub enum BtnKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BtnSize {
-    /// 28 px: inline row actions, footers.
+    /// 32 px: inline row actions, footers (the smallest hit target).
     Small,
     /// 36 px: default.
     Normal,
@@ -188,19 +197,33 @@ pub enum BtnSize {
     Large,
 }
 
+fn btn_metrics(size: BtnSize) -> (f32, f32, f32) {
+    match size {
+        BtnSize::Small => (theme::CONTROL_SM_H, theme::size::SMALL, 12.0),
+        BtnSize::Normal => (theme::CONTROL_H, theme::size::LABEL, 16.0),
+        BtnSize::Large => (theme::CONTROL_LG_H, theme::size::BODY, 20.0),
+    }
+}
+
+/// The natural width of a [`button`] (outside justified layouts).
+pub fn button_width(ui: &Ui, size: BtnSize, icon: Option<&str>, label: &str) -> f32 {
+    let (_, font_size, pad) = btn_metrics(size);
+    let icon_w = if icon.is_some() { theme::ICON_SM + theme::SP2 } else { 0.0 };
+    pad * 2.0 + icon_w + text_width(ui, label, theme::bold(font_size), theme::INK)
+}
+
 /// A button with an optional Lucide icon before the label.
 pub fn button(ui: &mut Ui, cx: &Cx, kind: BtnKind, size: BtnSize, icon: Option<&str>, label: &str) -> Response {
     let enabled = ui.is_enabled();
-    let (height, font_size, pad) = match size {
-        BtnSize::Small => (28.0, theme::size::SMALL, 12.0),
-        BtnSize::Normal => (theme::CONTROL_H, theme::size::LABEL, 16.0),
-        BtnSize::Large => (theme::CONTROL_LG_H, theme::size::BODY, 20.0),
-    };
+    let (height, font_size, pad) = btn_metrics(size);
     let font = theme::bold(font_size);
     let text_w = text_width(ui, label, font.clone(), theme::INK);
     let icon_w = if icon.is_some() { theme::ICON_SM + theme::SP2 } else { 0.0 };
-    let (rect, resp) =
-        ui.allocate_exact_size(vec2(pad * 2.0 + icon_w + text_w, height), Sense::click());
+    // In a justified layout (the main action of a panel) the button takes
+    // the full width, as the mockups' block buttons do.
+    let natural = pad * 2.0 + icon_w + text_w;
+    let width = if ui.layout().horizontal_justify() { ui.available_width().max(natural) } else { natural };
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
 
     let hovered = enabled && resp.hovered();
     let pressed = enabled && resp.is_pointer_button_down_on();
@@ -249,7 +272,40 @@ pub fn button(ui: &mut Ui, cx: &Cx, kind: BtnKind, size: BtnSize, icon: Option<&
         x += icon_w;
     }
     painter.text(pos2(x, cy), Align2::LEFT_CENTER, label, font, fg);
+    contract::mark_widget(&resp, egui::WidgetType::Button, "button", label);
 
+    if enabled {
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// A square 36 px button with only a Lucide icon; `label` is the tooltip
+/// and the accessible name.
+pub fn icon_button(ui: &mut Ui, cx: &Cx, kind: BtnKind, icon_name: &str, label: &str) -> Response {
+    let enabled = ui.is_enabled();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(theme::CONTROL_H), Sense::click());
+    let hovered = enabled && resp.hovered();
+    let (fill, border, fg) = match kind {
+        BtnKind::Primary => {
+            let fill = if hovered { theme::SIGNAL.lerp_to_gamma(theme::INK, 0.08) } else { theme::SIGNAL };
+            (fill, fill, theme::SIGNAL_INK)
+        }
+        _ => {
+            let fill = if hovered { theme::SURFACE_MUTED } else { theme::SURFACE_RAISED };
+            (fill, theme::THREAD_STRONG, theme::INK)
+        }
+    };
+    let painter = ui.painter().clone();
+    if resp.has_focus() {
+        painter.rect_stroke(rect.expand(2.0), theme::R_CONTROL, Stroke::new(2.0, theme::FOCUS), StrokeKind::Outside);
+    }
+    painter.rect(rect, theme::R_CONTROL, dim(enabled, fill), Stroke::new(1.0, dim(enabled, border)), StrokeKind::Inside);
+    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(theme::ICON_SM));
+    cx.icons.paint(&painter, icon_rect, icon_name, dim(enabled, fg));
+    contract::mark_widget(&resp, egui::WidgetType::Button, "button", label);
+    let resp = resp.on_hover_text(label);
     if enabled {
         resp.on_hover_cursor(CursorIcon::PointingHand)
     } else {
@@ -278,6 +334,11 @@ pub enum PillKind {
     Bad,
 }
 
+/// Width of a status pill with `text`.
+pub fn pill_width(ui: &Ui, text: &str) -> f32 {
+    9.0 + 6.0 + 6.0 + text_width(ui, text, theme::bold(theme::size::HINT), theme::INK) + 9.0
+}
+
 /// Status pill: dot + word. The only round shape in the system.
 pub fn pill(ui: &mut Ui, kind: PillKind, text: &str) -> Response {
     let (color, filled) = match kind {
@@ -302,15 +363,19 @@ pub fn pill(ui: &mut Ui, kind: PillKind, text: &str) -> Response {
         painter.circle_stroke(dot, 2.25, Stroke::new(1.5, color));
     }
     painter.text(pos2(rect.left() + 21.0, cy), Align2::LEFT_CENTER, text, font, color);
+    contract::mark_widget(&resp, egui::WidgetType::Label, "pill", text);
     resp
 }
+
+/// Width of a [`switch`].
+pub const SWITCH_W: f32 = 36.0;
 
 /// On/off switch (moss when on). Returns a response; `.clicked()` means
 /// the user asked to flip it. The caller does not mutate `on`; it sends an
 /// action and the next snapshot carries the new value.
 pub fn switch(ui: &mut Ui, on: bool) -> Response {
     let enabled = ui.is_enabled();
-    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 20.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(SWITCH_W, 20.0), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, on, theme::T_FAST);
 
     let track = theme::SURFACE_RAISED.lerp_to_gamma(theme::MOSS, t);
@@ -331,6 +396,7 @@ pub fn switch(ui: &mut Ui, on: bool) -> Response {
         StrokeKind::Inside,
     );
     painter.rect_filled(knob_rect, R_KNOB, dim(enabled, knob));
+    contract::mark_widget(&resp, egui::WidgetType::Checkbox, "switch", if on { "on" } else { "off" });
 
     if enabled {
         resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -353,7 +419,8 @@ pub fn chord(ui: &mut Ui, keys: &[&str]) {
     let seps = keys.len().saturating_sub(1) as f32;
     let total: f32 = key_widths.iter().sum::<f32>() + seps * (plus_w + 6.0);
 
-    let (rect, _) = ui.allocate_exact_size(vec2(total, KEY_H), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(total, KEY_H), Sense::hover());
+    contract::mark_widget(&resp, egui::WidgetType::Label, "chord", &keys.join("+"));
     let painter = ui.painter().clone();
     let cy = rect.center().y;
     let mut x = rect.left();
@@ -388,7 +455,7 @@ pub fn id_text(ui: &mut Ui, id: &str, large: bool) -> Response {
     } else {
         (theme::size::ID, theme::INK_MUTED)
     };
-    ui.label(spaced(id, theme::mono(size), color, 0.02))
+    contract::text(ui, spaced(id, theme::mono(size), color, 0.02), false)
 }
 
 /// Any monospace evidence text (codes, timers, paths).
@@ -423,12 +490,13 @@ pub fn notice(ui: &mut Ui, cx: &Cx, kind: NoticeKind, icon_name: &str, add: impl
         NoticeKind::Error => (theme::DANGER, theme::DANGER, theme::DANGER.gamma_multiply(0.45)),
     };
     // Padding 12 / 14 / 12 / 12 from the mockup, plus the 3 px seam on the left.
-    let out = egui::Frame::NONE
+    let frame = egui::Frame::NONE
         .fill(theme::SURFACE_RAISED)
         .stroke(Stroke::new(1.0, border))
         .corner_radius(theme::R_FIELD)
-        .inner_margin(Margin { left: 15, right: 14, top: 12, bottom: 12 })
-        .show(ui, |ui| {
+        .inner_margin(Margin { left: 15, right: 14, top: 12, bottom: 12 });
+    let out = contract::framed(ui, "notice", frame, |ui| {
+            ui.set_width(ui.available_width());
             top_row(ui, |ui| {
                 icon(ui, cx, icon_name, theme::ICON, icon_color);
                 ui.add_space(theme::SP2 + 2.0);
@@ -449,6 +517,11 @@ pub fn notice(ui: &mut Ui, cx: &Cx, kind: NoticeKind, icon_name: &str, add: impl
     out.response
 }
 
+/// Width of a [`tag`] with `text`.
+pub fn tag_width(ui: &Ui, text: &str) -> f32 {
+    text_width(ui, text, theme::bold(10.5), theme::INK) + 12.0
+}
+
 /// Small bordered tag, e.g. "vouched by Pixel 8"; `draft` uses the
 /// attention colour for "Draft" labels.
 pub fn tag(ui: &mut Ui, text: &str, draft: bool) -> Response {
@@ -464,6 +537,7 @@ pub fn tag(ui: &mut Ui, text: &str, draft: bool) -> Response {
     let painter = ui.painter();
     painter.rect(rect, theme::R_COMPACT, Color32::TRANSPARENT, Stroke::new(1.0, border), StrokeKind::Inside);
     painter.galley(rect.min + vec2(6.0, 4.0), galley, fg);
+    contract::mark_widget(&resp, egui::WidgetType::Label, "tag", text);
     resp
 }
 
@@ -479,12 +553,12 @@ pub fn field(ui: &mut Ui, cx: &Cx, label: &str, icon_name: Option<&str>, focused
         ui.spacing_mut().item_spacing.y = 6.0;
         ui.label(egui::RichText::new(label).font(theme::bold(theme::size::SMALL)).color(theme::INK_MUTED));
         let border = if focused { theme::INK_FAINT } else { theme::THREAD_STRONG };
-        let out = egui::Frame::NONE
+        let frame = egui::Frame::NONE
             .fill(theme::SURFACE_RAISED)
             .stroke(Stroke::new(1.0, border))
             .corner_radius(theme::R_FIELD)
-            .inner_margin(Margin::symmetric(12, 0))
-            .show(ui, |ui| {
+            .inner_margin(Margin::symmetric(12, 0));
+        let out = contract::framed(ui, "field", frame, |ui| {
                 // One line of FIELD_H - 2 (inside the 1 px border). A row of
                 // exactly that height; `horizontal_centered` would claim all
                 // the remaining height of the pane.
@@ -564,6 +638,7 @@ pub fn conn_steps(ui: &mut Ui, cx: &Cx, steps: &[ConnStep]) {
             ui.add_space(2.0);
         }
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+        contract::row_at(ui, "conn-step", rect, |ui| {
         let (icon_name, icon_color, label_color, label_font, bg) = match s.status {
             StepStatus::Done => ("circle-check", theme::CONSTRUCTIVE, theme::INK_MUTED, theme::body(14.0), None),
             StepStatus::Now => ("loader-circle", theme::SIGNAL, theme::INK, theme::bold(14.0), Some(theme::SURFACE)),
@@ -586,20 +661,23 @@ pub fn conn_steps(ui: &mut Ui, cx: &Cx, steps: &[ConnStep]) {
         } else {
             cx.icons.paint(&painter, icon_rect, icon_name, icon_color);
         }
-        painter.text(
+        contract::paint_text(
+            ui,
             pos2(rect.left() + 12.0 + STEP_COL + 12.0, cy),
             Align2::LEFT_CENTER,
             &s.label,
             label_font,
             label_color,
         );
-        painter.text(
+        contract::paint_text(
+            ui,
             pos2(rect.right() - 12.0, cy),
             Align2::RIGHT_CENTER,
             &s.detail,
             theme::mono(theme::size::HINT),
             theme::INK_FAINT,
         );
+        });
     }
 }
 

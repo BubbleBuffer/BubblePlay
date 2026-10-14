@@ -15,6 +15,7 @@ use crate::model::{Action, AppState, Backend};
 use crate::shell::{FrameRequests, ShellApp, WindowCommand, WindowInfo};
 
 pub mod theme;
+pub mod contract;
 pub mod fonts;
 pub mod icons;
 pub mod widgets;
@@ -128,6 +129,21 @@ impl App {
         self.ui = UiState { demo_label: Some(label), ..ui };
         self.demo = Some(Demo { driver, index: 0, shots, settle: 0, started: Instant::now() });
         self
+    }
+
+    /// Demo mode: show scene `index` now and return its label. The layout
+    /// tests step through the scenes with this instead of F12.
+    pub fn demo_scene(&mut self, index: usize) -> Option<String> {
+        let demo = self.demo.as_mut()?;
+        demo.index = index % demo.driver.len();
+        let (label, ui) = demo.driver.scene(demo.index);
+        self.ui = UiState { demo_label: Some(label.clone()), ..ui };
+        Some(label)
+    }
+
+    /// Number of demo scenes (0 outside demo mode).
+    pub fn demo_len(&self) -> usize {
+        self.demo.as_ref().map_or(0, |d| d.driver.len())
     }
 
     fn demo_step(&mut self, ctx: &egui::Context, out: &mut FrameRequests) {

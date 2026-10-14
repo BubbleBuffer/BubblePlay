@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use egui::{
     pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, RichText, Sense, Stroke, TextEdit,
-    Ui,
+    Ui, UiBuilder,
 };
 
+use super::contract;
 use super::theme;
 use super::widgets::{self, BtnKind, BtnSize, NoticeKind};
 use super::{Cx, UiState};
@@ -311,6 +312,7 @@ fn connecting(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, mode: Str
         |ui, cx| {
             title_row(ui, &format!("Connecting to {pc}"), None);
             lead_tight(ui, &format!("{mode_text} mode, as last time. Change it from the strip once you are in."));
+            ui.add_space(12.0);
             widgets::conn_steps(ui, cx, steps);
             indeterminate_bar(ui);
             actions(ui, |ui| {
@@ -344,6 +346,7 @@ fn failed(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, steps: &[Conn
         |ui, cx| {
             title_row(ui, "The stream didn't start", None);
             lead_tight(ui, message);
+            ui.add_space(12.0);
             widgets::conn_steps(ui, cx, steps);
             actions(ui, |ui| {
                 if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("refresh-cw"), "Try again").clicked() {
@@ -424,20 +427,26 @@ fn refused(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str) -> bool {
             });
             ui.add_space(22.0);
             widgets::notice(ui, cx, NoticeKind::Error, "shield-alert", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Different case: PC key changed.").font(theme::bold(13.0)).color(theme::INK));
-                    ui.label(
-                        RichText::new(format!(
-                            " If {pc} answers with a key BubblePlay doesn't know and no signed rotation, the connection stops before anything is sent. Only pair again if someone at the PC confirms they changed it."
-                        ))
-                        .font(theme::body(13.0))
-                        .color(theme::INK_MUTED),
-                    );
-                });
+                // One paragraph with a bold lead-in run: two labels in a
+                // wrapped row broke the second one onto its own block.
+                let mut job = egui::text::LayoutJob::default();
+                let fmt = |font: egui::FontId, color| egui::TextFormat { font_id: font, color, ..Default::default() };
+                job.append("Different case: PC key changed.", 0.0, fmt(theme::bold(13.0), theme::INK));
+                job.append(
+                    &format!(
+                        " If {pc} answers with a key BubblePlay doesn't know and no signed rotation, the connection stops before anything is sent. Only pair again if someone at the PC confirms they changed it."
+                    ),
+                    0.0,
+                    fmt(theme::body(13.0), theme::INK_MUTED),
+                );
+                ui.label(job);
             });
         },
     )
 }
+
+/// Card width below which the old and new IDs stack.
+const ROTATE_SIDE_BY_SIDE_W: f32 = 380.0;
 
 fn rotate(ui: &mut Ui, cx: &mut Cx, state: &AppState, old_id: &str, new_id: &str, pcs: &[RotatePc]) -> bool {
     let total = pcs.len();
@@ -478,7 +487,7 @@ fn rotate(ui: &mut Ui, cx: &mut Cx, state: &AppState, old_id: &str, new_id: &str
                 theme::R_PANEL,
                 Margin { left: 18, right: 18, top: 16, bottom: 16 },
                 |ui| {
-                    ui.horizontal(|ui| {
+                    let old = |ui: &mut Ui| {
                         ui.vertical(|ui| {
                             widgets::section_label(ui, "Old ID");
                             ui.label(
@@ -488,25 +497,40 @@ fn rotate(ui: &mut Ui, cx: &mut Cx, state: &AppState, old_id: &str, new_id: &str
                                     .strikethrough(),
                             );
                         });
-                        ui.add_space(14.0);
-                        widgets::icon(ui, cx, "arrow-right", theme::ICON, theme::INK_FAINT);
-                        ui.add_space(14.0);
+                    };
+                    let new = |ui: &mut Ui| {
                         ui.vertical(|ui| {
                             widgets::section_label(ui, "New ID");
                             widgets::id_text(ui, new_id, true);
                         });
-                    });
+                    };
+                    // Old -> New side by side needs about 360 px; a narrower
+                    // card stacks them (no down arrow in the icon set).
+                    if ui.available_width() >= ROTATE_SIDE_BY_SIDE_W {
+                        ui.horizontal(|ui| {
+                            old(ui);
+                            ui.add_space(14.0);
+                            widgets::icon(ui, cx, "arrow-right", theme::ICON, theme::INK_FAINT);
+                            ui.add_space(14.0);
+                            new(ui);
+                        });
+                    } else {
+                        old(ui);
+                        ui.add_space(10.0);
+                        new(ui);
+                    }
                 },
             );
             ui.add_space(16.0);
             widgets::conn_steps(ui, cx, &conn);
             ui.add_space(14.0);
             widgets::notice(ui, cx, NoticeKind::Neutral, "clock", |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
                     widgets::tag(ui, "Draft timing", true);
+                    ui.add_space(6.0);
                     ui.label(
                         RichText::new(
-                            " No deadline: the old key is kept as long as a PC has not confirmed. After 30 days with a PC still waiting, Your PCs asks: keep waiting, or forget that PC and remove the old key now.",
+                            "No deadline: the old key is kept as long as a PC has not confirmed. After 30 days with a PC still waiting, Your PCs asks: keep waiting, or forget that PC and remove the old key now.",
                         )
                         .font(theme::body(13.0))
                         .color(theme::INK_MUTED),
@@ -515,11 +539,12 @@ fn rotate(ui: &mut Ui, cx: &mut Cx, state: &AppState, old_id: &str, new_id: &str
             });
             ui.add_space(18.0);
             widgets::notice(ui, cx, NoticeKind::Info, "info", |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
                     widgets::tag(ui, "Draft", true);
+                    ui.add_space(6.0);
                     ui.label(
                         RichText::new(
-                            " You can keep connecting while this finishes. A copy of the old key file stops working once every PC has confirmed. Think the key leaked? Remove this device at each PC too, which also removes the new ID.",
+                            "You can keep connecting while this finishes. A copy of the old key file stops working once every PC has confirmed. Think the key leaked? Remove this device at each PC too, which also removes the new ID.",
                         )
                         .font(theme::body(13.0))
                         .color(theme::INK_MUTED),
@@ -556,23 +581,44 @@ pub(super) fn layout(
         .frame(Frame::NONE.fill(theme::RAIL).inner_margin(Margin { left: 28, right: 28, top: 32, bottom: 28 }))
         .show(ui, |ui| {
             back = widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("chevron-left"), "Your PCs").clicked();
-            ui.add_space(30.0);
-            rail(ui, cx);
+            let short = ui.available_height() < 520.0;
+            ui.add_space(if short { 16.0 } else { 30.0 });
+            // The rail body scrolls when the window is too short for it, so
+            // the device footer stays inside the window.
+            let body_h = (ui.available_height() - 52.0).max(0.0);
+            contract::scroll(
+                ui,
+                "rail-body",
+                egui::ScrollArea::vertical().max_height(body_h).auto_shrink([false, true]),
+                |ui| rail(ui, cx),
+            );
             let spare = ui.available_height() - 44.0;
             if spare > 0.0 {
                 ui.add_space(spare);
             }
             ui.label(RichText::new("This device").font(theme::body(12.0)).color(theme::INK_FAINT));
             widgets::id_text(ui, device_id, false);
+            contract::mark(ui.ctx(), ui.unique_id(), contract::BOX, "rail", ui.max_rect());
         })
         .response
         .rect;
     ui.painter().vline(rail_rect.right(), rail_rect.y_range(), Stroke::new(1.0, theme::THREAD));
 
     Frame::NONE.inner_margin(Margin { left: 52, right: 56, top: 38, bottom: 30 }).show(ui, |ui| {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width(theme::PANE_MAX_W);
-            pane(ui, cx);
+        // The viewport width, measured outside the scroll area: inside it the
+        // content ui keeps the previous frame's widest item as its width (and
+        // its clip rect is wider than the viewport), so the pane is pinned to
+        // this width in an explicit child ui; otherwise content runs past the
+        // window at the minimum size.
+        // Bounded by the window too: the parent ui can be wider than it.
+        let window_w = ui.ctx().content_rect().right() - 56.0 - ui.max_rect().left();
+        let w = (ui.available_width().min(window_w) - ui.spacing().scroll.allocated_width()).min(theme::PANE_MAX_W);
+        contract::scroll(ui, "pane", egui::ScrollArea::vertical().auto_shrink([false, false]), |ui| {
+            let top = ui.max_rect().min;
+            ui.scope_builder(UiBuilder::new().max_rect(Rect::from_min_size(top, vec2(w, f32::INFINITY))), |ui| {
+                ui.set_max_width(w);
+                pane(ui, cx);
+            });
         });
     });
     back
@@ -594,12 +640,27 @@ fn steps_block(ui: &mut Ui, cx: &Cx, steps: &[(&str, &str, StepStatus)]) {
 
 /// Pane title with an optional tag beside it (Draft, Temporary).
 pub(super) fn title_row(ui: &mut Ui, text: &str, tag: Option<(&str, bool)>) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(text).font(theme::display(theme::size::TITLE)).color(theme::INK));
+    let title = RichText::new(text).font(theme::display(theme::size::TITLE)).color(theme::INK);
+    let title_w = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), theme::display(theme::size::TITLE), theme::INK)
+        .size()
+        .x;
+    let tag_w = tag.map(|(t, _)| widgets::tag_width(ui, t) + ui.spacing().item_spacing.x).unwrap_or(0.0);
+    if title_w + tag_w <= ui.available_width() {
+        ui.horizontal(|ui| {
+            ui.label(title);
+            if let Some((t, draft)) = tag {
+                widgets::tag(ui, t, draft);
+            }
+        });
+    } else {
+        // Narrow pane: the title wraps and the tag goes under it.
+        ui.add(egui::Label::new(title).wrap());
         if let Some((t, draft)) = tag {
             widgets::tag(ui, t, draft);
         }
-    });
+    }
     ui.add_space(6.0);
 }
 
@@ -614,11 +675,12 @@ pub(super) fn lead_tight(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).font(theme::body(theme::size::BODY)).color(theme::INK_MUTED));
 }
 
-/// The button row under a pane: 26 px above, 10 px between buttons.
+/// The button row under a pane: 26 px above, 10 px between buttons. In a
+/// narrow pane the buttons wrap onto a second line, 10 px below.
 pub(super) fn actions(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     ui.add_space(26.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
         add(ui);
     });
 }
@@ -633,7 +695,8 @@ fn top_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 }
 
 fn card(ui: &mut Ui, fill: Color32, border: Color32, radius: CornerRadius, pad: Margin, add: impl FnOnce(&mut Ui)) {
-    Frame::NONE.fill(fill).stroke(Stroke::new(1.0, border)).corner_radius(radius).inner_margin(pad).show(ui, |ui| {
+    let frame = Frame::NONE.fill(fill).stroke(Stroke::new(1.0, border)).corner_radius(radius).inner_margin(pad);
+    contract::framed(ui, "card", frame, |ui| {
         ui.set_width(ui.available_width());
         add(ui);
     });
@@ -724,11 +787,11 @@ fn text_field(
 /// the failed step), which the shared `conn_steps` widget cannot do.
 fn refused_row(ui: &mut Ui, cx: &Cx, icon: &str, color: Color32, label: &str, detail: &str, failed: bool) {
     let fill = if failed { theme::SURFACE } else { Color32::TRANSPARENT };
-    Frame::NONE
+    let frame = Frame::NONE
         .fill(fill)
         .corner_radius(theme::R_FIELD)
-        .inner_margin(Margin { left: 12, right: 12, top: 0, bottom: 0 })
-        .show(ui, |ui| {
+        .inner_margin(Margin { left: 12, right: 12, top: 0, bottom: 0 });
+    contract::framed(ui, "check-row", frame, |ui| {
             ui.set_width(ui.available_width());
             // A 40 px row; `horizontal_centered` would claim all remaining height.
             ui.allocate_ui_with_layout(vec2(ui.available_width(), 40.0), Layout::left_to_right(Align::Center), |ui| {
@@ -754,9 +817,16 @@ fn pulse(ui: &mut Ui, cx: &Cx) {
     ui.ctx().request_repaint_after(Duration::from_millis(33));
     let p = ui.painter();
     p.rect_filled(rect, theme::R_PANEL, theme::SURFACE);
-    let radius = (32.0 + 6.0) * (0.92 + 0.20 * phase);
+    // Mockup `.pulse::after`: a rounded-square ring 6 px out (radii
+    // 16/22/14/20) that grows and fades; it was a circle before.
+    let grow = 6.0 * (0.4 + 0.8 * phase);
     let alpha = 0.7 * (1.0 - phase);
-    p.circle_stroke(rect.center(), radius, Stroke::new(1.5, theme::SIGNAL.linear_multiply(alpha)));
+    p.rect_stroke(
+        rect.expand(grow),
+        egui::CornerRadius { nw: 16, ne: 22, se: 14, sw: 20 },
+        Stroke::new(1.5, theme::SIGNAL.linear_multiply(alpha)),
+        egui::StrokeKind::Middle,
+    );
     cx.icons.paint(p, Rect::from_center_size(rect.center(), vec2(22.0, 22.0)), "bell-ring", theme::SIGNAL);
 }
 
