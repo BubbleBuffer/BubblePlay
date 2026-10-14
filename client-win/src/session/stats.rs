@@ -1,0 +1,30 @@
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::{
+    media::{MediaStats, StatsSnapshot},
+    net::TransportStats,
+};
+
+/// Small polling boundary for the UI. Receipt/drop/keyframe counters come from
+/// the socket, while decoder and drawing timings come from the media pipeline.
+/// Thus receive FPS includes frames ACKed and then refused by the receive gate.
+#[derive(Clone)]
+pub struct SessionStats {
+    pub(crate) media: MediaStats,
+    pub(crate) transport: Arc<TransportStats>,
+}
+
+impl SessionStats {
+    pub fn snapshot(&self) -> StatsSnapshot {
+        let mut stats = self.media.snapshot(Instant::now());
+        let net = self.transport.snapshot();
+        stats.received_fps = net.received_fps;
+        stats.keyframe_requests_1s = net.keyframe_requests_1s as u32;
+        stats.drops_1s += (net.gate_drops_1s + net.queue_overflows_1s) as u32;
+        stats.totals.received = net.frames_received;
+        stats.totals.keyframe_requests = net.keyframe_requests;
+        stats.totals.dropped += net.gate_drops + net.queue_overflows;
+        stats
+    }
+}

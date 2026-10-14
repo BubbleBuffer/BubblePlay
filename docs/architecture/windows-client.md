@@ -1,6 +1,25 @@
 # Native Windows client
 
-Status: stack A approved 2026-10-13. Decode route: Media Foundation (spike 2026-10-14). Nothing is built yet; `client-win/` holds only the build-output junction.
+Status: stack A approved 2026-10-13. Decode route: Media Foundation (spike 2026-10-14). The native shell and WSS v4 development path are implemented in `client-win/`.
+
+## Current state
+
+Step 1 implements the two-socket WSS v4 handshake, epoch validation, BPV4 parsing, ACK-before-gate, keyframe requests, heartbeats and reconnect. Plain relay login is a tested function retaining both relay cookies; its UI remains with the UI track. Media Foundation decodes to NV12 textures on the shell's shared D3D11 device. The latest-frame mailbox wakes the shell, and a video processor crops, scales and letterboxes the newest output before egui. `SessionStats::snapshot()` exposes one-second rates and latency percentiles.
+
+Run the built binaries from `client-win/` in separate terminals. The fake host selects the recording requested by start:
+
+```powershell
+.\target\debug\fake-wss-host.exe --streams-dir F:\build\spike-streams --port 19764 --exit-after 35 --stats F:\build\fake-host.json
+.\target\debug\bubbleplay-client.exe --dev-wss ws://127.0.0.1:19764 --codec h264 --exit-after 30 --stats F:\build\native-client.json
+```
+
+Use `--codec hevc` when a hardware HEVC decoder is installed; `auto` currently picks H.264. The separate fake-host crate is `tools/fake-wss-host/`. Its `--seq-gap-at 5 --generation-at 10 --socket-drop-at 15` flags exercise recovery; injection offsets currently start at host launch. Both Cargo builds require the shared FIFO build lock and the existing target junction.
+
+Validated on 2026-10-14: 109 client tests passed with none ignored, including all 1,200 H.264 and 1,200 HEVC outputs drawn with zero errors/drops and visible 1920×1080 cropped from 1920×1088 allocations. The final stats-boundary build and four timed run types passed. All 74 fake-host tests passed after TCP_NODELAY and the stop/late-ACK correction.
+
+Thirty-second H.264 and HEVC baselines ended at 58 and 59 presented FPS, with every frame ACKed and zero decode/draw errors. The detailed isolated H.264 run without PNG capture reached 60/60/60 FPS; its final ten seconds had 600 decodes and 595 new-video Present returns. Sequence-gap, generation-change and socket-drop runs passed for both codecs, recovered in under 0.33 seconds to first draw, and reconnected with a new epoch. Optional PNG capture caused large stalls in earlier measurements; omit `--capture` for pacing checks. Timed-exit rolling stats now freeze in the closing frame rather than after shell teardown.
+
+Limits: no WebRTC, audio or input; audio is never requested. Colour conversion assumes limited-range BT.709. Polled presentation statistics count successful new-frame VP blits; raw-counter DXGI traces additionally measure CPU Present return, which does not prove scanout. The shell contract is sufficient for this slice; exact wake consumption/latency admission would need an optional observer for deeper profiling. The old 12.5-second connection offset did not reproduce; its exact breakdown remains unknown. Real-relay TLS/login and real-host stop behaviour have not been live-qualified. Quality and monitor actions remain for later steps.
 
 ## Goal
 

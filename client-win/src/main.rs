@@ -10,10 +10,12 @@ mod model;
 mod mock;
 mod shell;
 mod ui;
+mod net; mod media; mod session;
 
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
+    if let Some(dev) = session::DevOptions::from_args(std::env::args().skip(1))? { return session::run_dev(dev); }
     let mut demo = false;
     let mut shots: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
