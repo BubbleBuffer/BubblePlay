@@ -584,6 +584,314 @@ fn run_cpu_bench(
     Ok(())
 }
 
+/// Isolated inbox-MFT experiment. This deliberately owns its transform so the
+/// property is set before streaming without adding a production encoder knob.
+fn run_intra_refresh_bench(
+    device: &ID3D11Device,
+    args: &[String],
+    size: (u32, u32),
+    output: Option<&PathBuf>,
+    refresh: u32,
+) -> Result<()> {
+    use bubbleplay_host::mf_color::{bgra_to_nv12_scaled, CpuConversionOptions, CpuConverter};
+    use std::mem::ManuallyDrop;
+    use windows::core::GUID;
+    use windows::Win32::Media::MediaFoundation::*;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+
+    let (width, height) = size;
+    let frames: usize = argument(args, "--frames")?.unwrap_or("360").parse()?;
+    let content = argument(args, "--content")?.unwrap_or("full");
+    ensure!(
+        frames > 1 && height >= 192 && matches!(content, "full" | "dirty" | "colour"),
+        "intra-refresh experiment needs >1 frames, height>=192, content full/dirty/colour"
+    );
+    ensure!(
+        !args
+            .iter()
+            .any(|a| matches!(a.as_str(), "--adaptive" | "--pipeline" | "--output-size")),
+        "intra-refresh experiment uses fixed geometry and serial conversion"
+    );
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+    let _apartment = Apartment;
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL)? };
+    struct Foundation;
+    impl Drop for Foundation {
+        fn drop(&mut self) {
+            let _ = unsafe { MFShutdown() };
+        }
+    }
+    let _foundation = Foundation;
+    let encoder: IMFTransform = unsafe {
+        CoCreateInstance(
+            &GUID::from_u128(0x6ca50344_051a_4ded_9779_a43305165e35),
+            None,
+            CLSCTX_INPROC_SERVER,
+        )?
+    };
+    let codec: ICodecAPI = encoder.cast()?;
+    unsafe { encoder.GetAttributes()?.SetUINT32(&MF_LOW_LATENCY, 1)? };
+    for (key, value) in [
+        (
+            CODECAPI_AVEncCommonRateControlMode,
+            VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32),
+        ),
+        (CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32)),
+        (CODECAPI_AVLowLatencyMode, VARIANT::from(true)),
+        (CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(6_000_000u32)),
+        (CODECAPI_AVEncCommonBufferSize, VARIANT::from(12_500u32)),
+        (CODECAPI_AVEncMPVGOPSize, VARIANT::from(u32::MAX)),
+        (CODECAPI_AVEncMPVSceneDetection, VARIANT::from(0u32)),
+        (CODECAPI_AVEncH264CABACEnable, VARIANT::from(true)),
+        (CODECAPI_AVEncCommonQualityVsSpeed, VARIANT::from(0u32)),
+    ] {
+        let result = unsafe { codec.SetValue(&key, &value) };
+        if key == CODECAPI_AVEncMPVDefaultBPictureCount || key == CODECAPI_AVEncMPVSceneDetection {
+            // Production also treats these two requests as optional; the
+            // bitstream checks still require no B pictures or unsolicited IDRs.
+            if let Err(error) = result {
+                println!("INTRA_OPTIONAL key={key:?} result={error:?}");
+            }
+        } else {
+            result.with_context(|| format!("intra experiment setting {key:?}"))?;
+        }
+    }
+    let media_type = |subtype: &GUID| -> Result<IMFMediaType> {
+        let media = unsafe { MFCreateMediaType()? };
+        unsafe {
+            media.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            media.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+            media.SetUINT64(
+                &MF_MT_FRAME_SIZE,
+                (u64::from(width) << 32) | u64::from(height),
+            )?;
+            media.SetUINT64(&MF_MT_FRAME_RATE, (60u64 << 32) | 1)?;
+            media.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
+            media.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        }
+        Ok(media)
+    };
+    let out_type = media_type(&MFVideoFormat_H264)?;
+    let in_type = media_type(&MFVideoFormat_NV12)?;
+    unsafe {
+        out_type.SetUINT32(&MF_MT_AVG_BITRATE, 6_000_000)?;
+        out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, 100)?;
+        encoder.SetOutputType(0, &out_type, 0)?;
+        in_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;
+        in_type.SetUINT32(&MF_MT_SAMPLE_SIZE, width * height * 3 / 2)?;
+        in_type.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
+        in_type.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+        in_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        in_type.SetUINT32(
+            &MF_MT_YUV_MATRIX,
+            if width <= 768 && height <= 576 {
+                MFVideoTransferMatrix_BT601.0 as u32
+            } else {
+                MFVideoTransferMatrix_BT709.0 as u32
+            },
+        )?;
+        encoder.SetInputType(0, &in_type, 0)?;
+    }
+    let requested = VARIANT::from(refresh); // VT_UI4, including explicit baseline 0.
+    let set_hr = unsafe {
+        (Interface::vtable(&codec).SetValue)(
+            codec.as_raw(),
+            &CODECAPI_AVEncVideoGradualIntraRefresh,
+            &requested,
+        )
+    };
+    let readback = unsafe { codec.GetValue(&CODECAPI_AVEncVideoGradualIntraRefresh) };
+    println!("INTRA_REFRESH requested={refresh} SetValue={set_hr:?} GetValue={readback:?} before_streaming=true");
+    unsafe {
+        encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+        encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+    }
+    let texture = fixture(device, width, height)?;
+    let context = unsafe { device.GetImmediateContext()? };
+    let gate = gpu_gate::for_device(device);
+    let mut converter = CpuConverter::new(device, width, height)?;
+    let pixels: Vec<_> = (0..36)
+        .map(|n| bench_pixels(width, height, n, content == "full"))
+        .collect();
+    if content != "colour" {
+        let mut scalar = Vec::new();
+        let mut simd = Vec::new();
+        for (options, bytes) in [
+            (
+                CpuConversionOptions {
+                    simd: false,
+                    damage: false,
+                    threads: 1,
+                },
+                &mut scalar,
+            ),
+            (CpuConversionOptions::from_env(), &mut simd),
+        ] {
+            bgra_to_nv12_scaled(
+                &pixels[0],
+                width as usize * 4,
+                width as usize,
+                height as usize,
+                width as usize,
+                height as usize,
+                options,
+                bytes,
+            )?;
+        }
+        ensure!(scalar == simd, "intra-refresh scalar/SIMD colour mismatch");
+    }
+    let mut nv12 = Vec::new();
+    let mut sizes = Vec::new();
+    let mut idr_sizes = Vec::new();
+    let mut p_sizes = Vec::new();
+    let mut stream = Vec::new();
+    let mut csv = String::from("frame,bytes,idr,i_slices,p_slices\n");
+    let mut non_idr_i_frames = Vec::new();
+    let (mut i_total, mut p_total) = (0usize, 0usize);
+    for frame in 0..frames {
+        if content != "colour" {
+            let _gpu = gate.lock();
+            unsafe {
+                context.UpdateSubresource(
+                    &texture,
+                    0,
+                    None,
+                    pixels[frame % 36].as_ptr().cast(),
+                    width * 4,
+                    0,
+                )
+            };
+        }
+        let damage = bench_damage(width, height, frame);
+        converter.convert_frame(
+            &texture,
+            width,
+            height,
+            (content == "dirty" && frame > 0).then_some(damage.as_slice()),
+            &mut nv12,
+        )?;
+        let sample = unsafe { MFCreateSample()? };
+        let buffer = unsafe { MFCreateMemoryBuffer(nv12.len() as u32)? };
+        let mut ptr = std::ptr::null_mut();
+        unsafe {
+            buffer.Lock(&mut ptr, None, None)?;
+            std::ptr::copy_nonoverlapping(nv12.as_ptr(), ptr, nv12.len());
+            buffer.Unlock()?;
+            buffer.SetCurrentLength(nv12.len() as u32)?;
+            sample.AddBuffer(&buffer)?;
+            sample.SetSampleTime(frame as i64 * 10_000_000 / 60)?;
+            sample.SetSampleDuration(10_000_000 / 60)?;
+        }
+        let forced = frame == 0 || frame == frames / 2;
+        if forced {
+            unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32))? };
+        }
+        unsafe { encoder.ProcessInput(0, &sample, 0)? };
+        let info = unsafe { encoder.GetOutputStreamInfo(0)? };
+        let out_sample = unsafe { MFCreateSample()? };
+        let capacity = info.cbSize.max(width * height * 2).max(65536);
+        let out_buffer = unsafe {
+            if info.cbAlignment > 1 {
+                MFCreateAlignedMemoryBuffer(capacity, info.cbAlignment - 1)?
+            } else {
+                MFCreateMemoryBuffer(capacity)?
+            }
+        };
+        unsafe { out_sample.AddBuffer(&out_buffer)? };
+        let mut out = MFT_OUTPUT_DATA_BUFFER {
+            pSample: ManuallyDrop::new(Some(out_sample)),
+            ..Default::default()
+        };
+        let mut status = 0;
+        let result =
+            unsafe { encoder.ProcessOutput(0, std::slice::from_mut(&mut out), &mut status) };
+        let sample = unsafe { ManuallyDrop::take(&mut out.pSample) };
+        unsafe { ManuallyDrop::drop(&mut out.pEvents) };
+        result?;
+        ensure!(
+            out.dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE.0 as u32 == 0,
+            "incomplete AU"
+        );
+        let sample = sample.context("missing encoded sample")?;
+        ensure!(
+            unsafe { sample.GetSampleTime()? } == frame as i64 * 10_000_000 / 60,
+            "reordered output"
+        );
+        let buffer = unsafe { sample.ConvertToContiguousBuffer()? };
+        let mut len = 0;
+        unsafe { buffer.Lock(&mut ptr, None, Some(&mut len))? };
+        let mut data = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
+        unsafe { buffer.Unlock()? };
+        let inspection = inspect_access_unit(&data)?;
+        if inspection.is_idr && !(inspection.sps_before_idr && inspection.pps_before_idr) {
+            let media = unsafe { encoder.GetOutputCurrentType(0)? };
+            let mut sequence =
+                vec![0; unsafe { media.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER)? } as usize];
+            unsafe { media.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut sequence, None)? };
+            let nals = annex_b_nals(&data)?;
+            let insert = if nals[0][0] & 31 == 9 {
+                nals[0].as_ptr() as usize - data.as_ptr() as usize + nals[0].len()
+            } else {
+                0
+            };
+            data.splice(insert..insert, sequence);
+        }
+        validate_bench_au(&data, forced, size)?;
+        let (mut i, mut p) = (0usize, 0usize);
+        for nal in annex_b_nals(&data)? {
+            if matches!(nal[0] & 31, 1 | 5) {
+                let mut bits = SpsBits::new(nal);
+                bits.ue()?;
+                match bits.ue()? % 5 {
+                    0 => p += 1,
+                    2 => i += 1,
+                    _ => anyhow::bail!("unexpected slice type"),
+                }
+            }
+        }
+        if !forced && i > 0 {
+            non_idr_i_frames.push(frame);
+        }
+        i_total += i;
+        p_total += p;
+        sizes.push(data.len());
+        if forced {
+            idr_sizes.push(data.len());
+        } else {
+            p_sizes.push(data.len());
+        }
+        csv.push_str(&format!("{frame},{},{forced},{i},{p}\n", data.len()));
+        if frame == 0 {
+            if let Some(dir) = output {
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(dir.join("intra-first-au.h264"), &data)?;
+            }
+        }
+        stream.extend_from_slice(&data);
+    }
+    sizes.sort_unstable();
+    println!("PASS INTRA_BENCH value={refresh} content={content} frames={frames} AU_mean={:.3} AU_p95={} AU_max={} IDR_sizes={idr_sizes:?} P_max={} I_slices={i_total} P_slices={p_total} non_IDR_I_frames={non_idr_i_frames:?} High=100 AnnexB=true AU_per_frame=1 B=0 SPS_PPS_every_IDR=true colour_scalar_parity={} macroblocks_parsed=false",
+        sizes.iter().sum::<usize>() as f64 / frames as f64, sizes[(frames * 95).div_ceil(100)-1], sizes[frames-1], p_sizes.iter().max().unwrap_or(&0), content != "colour");
+    println!("INTRA_REFRESH after_streaming_GetValue={:?}", unsafe {
+        codec.GetValue(&CODECAPI_AVEncVideoGradualIntraRefresh)
+    });
+    if let Some(dir) = output {
+        std::fs::write(dir.join("intra-sizes.csv"), csv)?;
+        std::fs::write(dir.join("intra-stream.h264"), stream)?;
+    }
+    Ok(())
+}
+
 fn run_unchanged_bench(
     device: &ID3D11Device,
     source: (u32, u32),
@@ -1226,6 +1534,19 @@ fn main() -> Result<()> {
         !warp && !no_video_support
     );
     let device = create_device(warp, no_video_support)?;
+    if let Some(value) = argument(&args, "--intra-refresh")? {
+        ensure!(
+            software_only && warp,
+            "--intra-refresh requires --software-only --warp"
+        );
+        return run_intra_refresh_bench(
+            &device,
+            &args,
+            (width, height),
+            output.as_ref(),
+            value.parse()?,
+        );
+    }
     if args.iter().any(|a| a == "--bench") {
         ensure!(software_only, "--bench requires --software-only");
         return run_cpu_bench(&device, &args, (width, height), output.as_ref());
