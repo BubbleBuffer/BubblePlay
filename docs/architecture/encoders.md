@@ -180,7 +180,6 @@ The `BP_CPU_*` variables are read when the converter and encoder are built. The 
 - **Privileged and cropped paths keep the old preparation.** They get no fused scaling and no adaptation.
 - **Quality/speed above 0 is not qualified.** At 100, the HD matrix error is about 87 code values. The cause is unresolved.
 - **NVENC performance is not benchmarked in this lane.** NVENC's encode and config code is unchanged.
-- **The CPU path has not run on a live host.** No tray toggle, real capture, network stream or protected desktop has been tested. Viewer measurements are pending.
-- **The master baseline for the lab-helper suite was not run.** The suite passes on this branch. Its result on master is unknown.
+- **CPU mode is tested on a VM only.** The live host runs above were on VM 105, started with `--cpu-mode`. The tray toggle, a GPU-less physical PC and the protected desktop have not been tested live.
 
 See [the architecture index](README.md) for the other pages.
