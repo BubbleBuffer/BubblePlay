@@ -67,8 +67,13 @@ Status: approved 2026-10-13 (option B). Waits for device IDs and keys, then an N
 The host starts at Windows sign-in, so a signed-in user is required. Lock-screen and UAC capture are helper-based and pending live acceptance. A service-based host that works before sign-in is a larger change with its own security review. Design and decisions: [unattended-access.md](architecture/unattended-access.md).
 
 ### More encoders and host platforms
-Status: deferred.
-Only NVIDIA NVENC on Windows x64 is supported. AMD, Intel and software encoding, and macOS or Linux hosts, are not planned for the first alpha.
+Status: done 2026-10-14 for Windows (merged from lane/encoders).
+Encoding is pluggable:
+- NVENC first.
+- Then a Media Foundation hardware encoder, which is experimental and untested on AMD and Intel.
+- Then the Windows software H.264 encoder ("CPU mode"), which can also be forced from the tray.
+
+On a GPU-less test VM, CPU mode streams at the VM's capture rate (about 22 fps) with 25 ms mean latency, using 3-6% host CPU. Streaming the UAC secure desktop in CPU mode is not working yet; the cause is under investigation. See [encoders.md](architecture/encoders.md). macOS and Linux hosts are not planned for the first alpha.
 
 ## Documentation
 
