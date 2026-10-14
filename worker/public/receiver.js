@@ -12,10 +12,10 @@ import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
-import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
+import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
-  rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes,
+  orderRtpCodecPreferences, rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes,
 } from "/transport.js";
 import {
   desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,
@@ -1818,15 +1818,23 @@ function noteWssFailure(reason) {
 }
 
 function decodeWssFrame(frame) {
-  if (frame.codec !== (codecSession.codec === "hevc" ? CODEC.HEVC : CODEC.H264)) return;
   if (typeof VideoDecoder === "undefined") { noteWssFailure("webcodecs-unsupported"); return; }
+  const detectedCodec = detectAnnexBCodec(frame.data, { key: frame.key });
+  const headerCodec = frame.codec === CODEC.HEVC ? "hevc" : "h264";
+  if (!frame.key && (detectedCodec || headerCodec) !== codecSession.codec) return;
   const prepared = prepareHybridWssFrame(frame, {
-    active: activeWssHybridMode(),
+    active: activeWssHybridMode() && detectedCodec !== "h264",
     cache: activeWssHybridCache(),
   });
   if (!prepared) {
     noteWssFailure("hybrid-frame-invalid");
     return;
+  }
+  const bitstreamCodec = detectedCodec || detectAnnexBCodec(prepared.data, { key: frame.key });
+  const codec = bitstreamCodec || headerCodec;
+  if (codec !== codecSession.codec) {
+    if (!frame.key || !bitstreamCodec) return;
+    followDecoderCodec(codec);
   }
   if (prepared.activity && (prepared.activity.upserts || prepared.activity.invalidations ||
       prepared.activity.clears || prepared.activity.pngBytes)) {
@@ -1942,13 +1950,15 @@ async function startPeer(generation = peerGeneration) {
     try { transceiver.receiver.jitterBufferTarget = 0; } catch { /* older implementation */ }
   }
 
-  // Prefer HEVC for a fresh page. H.264 is only selected after the one local
-  // capability/decode fallback; no selection is persisted between sessions.
+  // Prefer HEVC for a fresh page, with H.264 after it so an H.264-only host can
+  // still answer. The preference and capability/decode fallback are page-local;
+  // no selection is persisted between sessions.
   try {
     const caps = RTCRtpReceiver.getCapabilities("video");
-    const wanted = rtpCodecMimeTypes(codecSession.codec);
-    const codec = caps && caps.codecs.filter((c) => wanted.includes(c.mimeType.toLowerCase()));
-    if (codec && codec.length) {
+    const codec = orderRtpCodecPreferences(caps?.codecs, codecSession.codec);
+    const primary = rtpCodecMimeTypes(codecSession.codec);
+    const primaryAvailable = codec.some((c) => primary.includes(c.mimeType.toLowerCase()));
+    if (codec.length && primaryAvailable) {
       transceiver.setCodecPreferences(codec);
     } else if (codecSession.codec === "hevc" && codecSession.fallbackToH264()) {
       offerSent = false;
@@ -2905,6 +2915,26 @@ document.addEventListener("visibilitychange", () => {
   if (useWebCodecs && document.visibilityState === "visible") latencyGuard.reset("visibility-resume");
 });
 
+function followDecoderCodec(codec) {
+  const previousCodec = codecSession.codec;
+  if (!codecSession.followBitstreamCodec(codec)) return;
+  clearWssKeyframeWatchdog();
+  wssDecoderEpoch++;
+  try { decoder?.close(); } catch {}
+  decoder = null;
+  // Keep the admitted keyframe's generation and ordering gate. A full resync
+  // would request another keyframe and discard the one that proves the codec.
+  while (latencyGuard.decodeFrames > 0) latencyGuard.releaseDecode();
+  resetRenderPacing();
+  wssDecodeSequenceByTimestamp.clear();
+  wssFrameMeta = new WeakMap();
+  wssPresentedFrameTraces.clear();
+  clearWssHybridCaches();
+  wssNoOutputFailures = 0;
+  if (wssRecoveryState === "awaiting-keyframe-output") wssRecoveryState = "awaiting-keyframe";
+  sendClientLog("info", "decoder-keyframe-codec-change", { previousCodec, codec });
+}
+
 function feedDecoder(chunk, generation) {
   // An encoded frame is the concrete RTP/media arrival signal. Do not cancel
   // auto fallback merely because a track object was announced.
@@ -2930,9 +2960,16 @@ function feedDecoder(chunk, generation) {
     }
   }
 
+  const bitstreamCodec = usingWssMedia ? null : detectAnnexBCodec(data, { key: isKey });
+  const codecName = bitstreamCodec || chunk.codec || codecSession.codec;
+  if (codecName !== codecSession.codec) {
+    if (!isKey || !bitstreamCodec) { hudState.dropped++; return; }
+    followDecoderCodec(codecName);
+  }
+
   if (!decoder) {
     // WSS HEVC is Annex-B and has no decoder description/config record.
-    const codec = chunk.codec === "hevc" ? activeWssHevcCodec() : (avcCodecFromSps(data) || "avc1.64002A");
+    const codec = codecName === "hevc" ? activeWssHevcCodec() : (avcCodecFromSps(data) || "avc1.64002A");
     resetRenderPacing();
     const decoderEpoch = ++wssDecoderEpoch;
     decoder = new VideoDecoder({
@@ -2974,7 +3011,12 @@ function feedDecoder(chunk, generation) {
         }
         latencyGuard.releaseDecode(); onDecodedFrame(frame);
       },
-      error: (e) => { sendClientLog("error", "decoder-error", { message: String(e?.message || e) }); hudState.dec = `err:${e.message}`; if (usingWssMedia) noteWssFailure("decode-error"); else dropAndResync("decoder-error"); },
+      error: (e) => {
+        if (decoderEpoch !== wssDecoderEpoch) return;
+        sendClientLog("error", "decoder-error", { message: String(e?.message || e) });
+        hudState.dec = `err:${e.message}`;
+        if (usingWssMedia) noteWssFailure("decode-error"); else dropAndResync("decoder-error");
+      },
     });
     try {
       decoder.configure({
@@ -2990,6 +3032,7 @@ function feedDecoder(chunk, generation) {
     } catch (e) {
       sendClientLog("error", "decoder-config-error", { message: String(e?.message || e), codec });
       hudState.dec = `cfg:${e.message}`;
+      try { decoder.close(); } catch {}
       decoder = null;
       if (usingWssMedia) noteWssFailure("configure-unsupported");
       return;

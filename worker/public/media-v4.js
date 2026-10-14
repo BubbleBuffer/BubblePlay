@@ -33,6 +33,42 @@ function bytesOf(value) {
   return null;
 }
 
+/** Identify Annex B video from NAL headers, ignoring leading AUD/SEI NALs. */
+export function detectAnnexBCodec(value, { key = true } = {}) {
+  const bytes = bytesOf(value);
+  if (!bytes) return null;
+  let hevcSlice = false;
+  for (let i = 0; i + 3 < bytes.length; i++) {
+    if (bytes[i] !== 0 || bytes[i + 1] !== 0) continue;
+    const startBytes = bytes[i + 2] === 1 ? 3
+      : bytes[i + 2] === 0 && bytes[i + 3] === 1 ? 4 : 0;
+    if (!startBytes) continue;
+    const nalStart = i + startBytes;
+    i = nalStart - 1;
+    if (nalStart >= bytes.length || (bytes[nalStart] & 0x80)) continue;
+    const avcType = bytes[nalStart] & 0x1f;
+    const hevcType = (bytes[nalStart] >> 1) & 0x3f;
+    // Base-layer HEVC has a two-byte header and a nonzero temporal_id_plus1.
+    // This also keeps an AVC slice (0x41) from looking like an HEVC VPS.
+    const hevcHeader = nalStart + 1 < bytes.length &&
+      (bytes[nalStart] & 1) === 0 && (bytes[nalStart + 1] & 0xf8) === 0 &&
+      (bytes[nalStart + 1] & 7) !== 0;
+    if (avcType === 5 || avcType === 7) return "h264";
+    if (hevcHeader && ((hevcType >= 19 && hevcType <= 21) ||
+        (hevcType >= 32 && hevcType <= 34))) return "hevc";
+    if (!key && avcType === 1) return "h264";
+    if (!key && hevcHeader && hevcType <= 9) {
+      if (avcType !== 6) return "hevc";
+      hevcSlice = true;
+      continue;
+    }
+    // HEVC IDR type 20 overlaps AVC PPS type 8; prefer the HEVC header.
+    if (avcType === 8) return "h264";
+  }
+  // AVC SEI can resemble an HEVC slice; the actual AVC slice is decisive.
+  return hevcSlice ? "hevc" : null;
+}
+
 /** Parse one v4 packet; returns null for anything the contract rejects. */
 export function parseFrameV4(packet) {
   const bytes = bytesOf(packet);

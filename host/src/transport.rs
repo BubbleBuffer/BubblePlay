@@ -20,6 +20,7 @@ use crate::activity::Activity;
 use crate::audio::AudioFrame;
 use crate::rtc::{RtcAction, RtcSession};
 use crate::stun;
+use crate::video_encoder::EncoderCapabilities;
 
 pub const AU_QUEUE_BOUND: usize = 1;
 /// Five 10 ms frames: at most 50 ms of PC audio waits behind a stalled pump.
@@ -168,6 +169,8 @@ pub struct AccessUnit {
 
 pub enum TransportCommand {
     Offer(String),
+    /// The producer has selected the actual local encoder before negotiation.
+    OfferWithCapabilities(String, EncoderCapabilities),
     RemoteCandidate(String),
     CursorStateReliable([u8; 8]),
     /// End the current peer while retaining the transport socket and thread.
@@ -615,8 +618,9 @@ fn fresh_epoch(
     host_addr: Option<SocketAddr>,
     mapped: Option<SocketAddr>,
     bitrate: u32,
+    capabilities: EncoderCapabilities,
 ) -> Result<RtcSession> {
-    let mut rtc = RtcSession::new(Instant::now(), bitrate);
+    let mut rtc = RtcSession::new_with_capabilities(Instant::now(), bitrate, capabilities);
     let Some(host_addr) = host_addr else {
         return Ok(rtc);
     };
@@ -683,7 +687,8 @@ fn transport_loop(
         .context("make media socket nonblocking")?;
     let mut offer_active = false;
     let mut mapping_refresh: Option<MappingRefresh> = None;
-    let mut rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+    let mut encoder_capabilities = EncoderCapabilities::NVENC;
+    let mut rtc = fresh_epoch(&socket, host_addr, mapped, bitrate, encoder_capabilities)?;
     let mut timeout = schedule_timeout(
         drain_outputs(&mut rtc, &socket, Some(&events), None)?,
         Instant::now(),
@@ -707,7 +712,21 @@ fn transport_loop(
         let mut mutated = false;
         match command_rx.try_recv() {
             Ok(_) if stop_takes_priority(stop.load(Ordering::Acquire)) => break,
-            Ok(TransportCommand::Offer(sdp)) => {
+            Ok(
+                command @ (TransportCommand::Offer(_)
+                | TransportCommand::OfferWithCapabilities(_, _)),
+            ) => {
+                let sdp = match command {
+                    TransportCommand::Offer(sdp) => {
+                        encoder_capabilities = EncoderCapabilities::NVENC;
+                        sdp
+                    }
+                    TransportCommand::OfferWithCapabilities(sdp, capabilities) => {
+                        encoder_capabilities = capabilities;
+                        sdp
+                    }
+                    _ => unreachable!(),
+                };
                 if let Some(refresh) = &mut mapping_refresh {
                     refresh.next_request = Instant::now();
                 }
@@ -715,7 +734,7 @@ fn transport_loop(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clear();
-                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate, encoder_capabilities)?;
                 cursor_kind_latest
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -759,7 +778,7 @@ fn transport_loop(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clear();
-                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate, encoder_capabilities)?;
                 emit(&events, TransportEvent::PeerReset);
                 mutated = true;
             }
@@ -788,7 +807,7 @@ fn transport_loop(
             DeadEpochAction::Continue => {}
             DeadEpochAction::RenewIdle => {
                 info!("renewing expired idle RTC epoch");
-                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate, encoder_capabilities)?;
                 timeout = schedule_timeout(
                     drain_outputs(&mut rtc, &socket, Some(&events), Some(&mut counters))?,
                     Instant::now(),
@@ -1199,7 +1218,14 @@ mod tests {
     #[test]
     fn rtc_epoch_without_a_host_address_starts_without_candidates() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        assert!(super::fresh_epoch(&socket, None, None, 2_000_000).is_ok());
+        assert!(super::fresh_epoch(
+            &socket,
+            None,
+            None,
+            2_000_000,
+            crate::video_encoder::EncoderCapabilities::NVENC
+        )
+        .is_ok());
     }
 
     #[test]

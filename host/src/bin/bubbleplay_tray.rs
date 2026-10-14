@@ -94,6 +94,7 @@ const CMD_BUILD: usize = 8;
 const CMD_AGENT_UPDATE: usize = 9;
 const CMD_SECURE_HELPER_UPDATE: usize = 10;
 const CMD_AUDIO: usize = 11;
+const CMD_CPU_MODE: usize = 12;
 
 /// Time the secure helper gets to answer after its task was started.
 const AGENT_START_GRACE: Duration = Duration::from_secs(15);
@@ -1198,6 +1199,18 @@ impl App {
         self.restart_host();
     }
 
+    /// Same as `toggle_audio`: the host reads `cpu_mode` at spawn, so applying
+    /// it restarts the host and ends a connected viewer's session.
+    fn toggle_cpu_mode(&mut self) {
+        self.settings.cpu_mode = !self.settings.cpu_mode;
+        self.save_settings();
+        tracing::info!(
+            cpu_mode = self.settings.cpu_mode,
+            "CPU mode setting changed; restarting host"
+        );
+        self.restart_host();
+    }
+
     fn shutdown(&mut self) {
         if self.shut_down {
             return;
@@ -1221,6 +1234,7 @@ impl App {
                 self.sync_run_key();
             }
             CMD_AUDIO => self.toggle_audio(),
+            CMD_CPU_MODE => self.toggle_cpu_mode(),
             CMD_RESTART => self.restart_host(),
             CMD_ROLLBACK => self.roll_back("requested from tray menu", false),
             CMD_LOGS => open_folder(&logs_dir(&self.data)),
@@ -1255,6 +1269,7 @@ fn show_menu(hwnd: HWND) {
         admin_line,
         login,
         audio,
+        cpu_mode,
         agent_update,
         helper_line,
         helper_update,
@@ -1280,6 +1295,7 @@ fn show_menu(hwnd: HWND) {
             admin_mode_line(&app.agent),
             app.settings.start_at_login,
             app.settings.audio,
+            app.settings.cpu_mode,
             agent_update,
             app.secure_helper.line(),
             if app.agent_update_running {
@@ -1354,6 +1370,15 @@ fn show_menu(hwnd: HWND) {
             },
             CMD_AUDIO,
             "Stream PC sound",
+        );
+        item(
+            if cpu_mode {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            },
+            CMD_CPU_MODE,
+            "CPU mode",
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING, CMD_RESTART, "Restart host");

@@ -18,6 +18,14 @@ fn main() {
         Ok("msvc"),
         "BubblePlay icon resources currently require the Windows MSVC toolchain"
     );
+    // The SDK uses an import library even though its function table is lazy.
+    // Delay every final binary's NVIDIA import so non-NVIDIA PCs can reach
+    // local encoder selection. This also covers the privileged-host binary.
+    println!("cargo:rustc-link-lib=delayimp");
+    // Standalone diagnostic bins do not all link this package's library, so
+    // pass the helper library to their final links explicitly as well.
+    println!("cargo:rustc-link-arg=delayimp.lib");
+    println!("cargo:rustc-link-arg=/DELAYLOAD:nvEncodeAPI64.dll");
     let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let icon = root

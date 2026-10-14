@@ -147,10 +147,10 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
     }
     let (stored, secrets) = load(config)?;
     // Read at every spawn, so a changed setting applies on the next host start.
-    let audio = TraySettings::load(&tray_settings_path(&config.host_config)).audio;
+    let settings = TraySettings::load(&tray_settings_path(&config.host_config));
     let mut command = Command::new(&config.host_exe);
     command
-        .args(build_host_args(&stored, audio))
+        .args(build_host_args(&stored, settings.audio, settings.cpu_mode))
         .env("BUBBLEPLAY_TOKEN", &secrets.token)
         .env("RUST_BACKTRACE", "1")
         // Panics keep backtraces; anyhow errors (logged on every retry) do not.
