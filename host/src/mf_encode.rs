@@ -7,10 +7,11 @@
 
 use crate::{
     encode::{EncodeStageTimings, EncodedFrame},
+    frame_damage::DamageRect,
     gpu_gate::{self, GpuGate},
     mf_color::{matrix_for_nvenc, ColorMatrix, CpuConverter, Nv12Converter},
 };
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::{
     ffi::c_void,
     mem::ManuallyDrop,
@@ -21,8 +22,8 @@ use std::{
 use tracing::{debug, info, warn};
 use windows::core::{s, w, Interface, GUID, HRESULT, PCSTR};
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D, D3D11_TEXTURE2D_DESC};
+use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice, DXGI_ADAPTER_FLAG_SOFTWARE};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -297,12 +298,189 @@ pub fn probe_availability(adapter_luid: Option<u64>) -> Result<MfAvailability> {
 /// conversion is submission-only unless the diagnostic completion wait is enabled.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MfFrameTimings {
+    /// Whole conversion stage: VideoProcessor blit, or CPU route including readback.
     pub conversion_readback_us: u64,
+    /// CPU route only: BGRA staging readback. Zero for GPU conversion.
+    pub readback_us: u64,
+    /// CPU route only: BGRA -> NV12 conversion. Zero for GPU conversion.
+    pub cpu_conversion_us: u64,
     pub input_pack_us: u64,
     pub mft_encode_us: u64,
     pub output_processing_us: u64,
     pub total_us: u64,
     pub conversion_gpu_completion_waited: bool,
+}
+
+/// Software MFT worker-thread request. `HalfCores` retains the old comparison setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MftWorkerThreads {
+    HalfCores,
+    Explicit(u32),
+    /// Omit the property entirely and let the MFT choose.
+    MftDefault,
+}
+impl MftWorkerThreads {
+    /// Value written to `CODECAPI_AVEncNumWorkerThreads`, or `None` to omit it.
+    pub fn count(self, parallelism: usize) -> Option<u32> {
+        match self {
+            Self::HalfCores => Some((parallelism / 2).clamp(1, 8) as u32),
+            Self::Explicit(count) => Some(count),
+            Self::MftDefault => None,
+        }
+    }
+}
+
+/// Software-MFT-only knobs. Hardware encoders never read these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftwareMftTuning {
+    pub worker_threads: MftWorkerThreads,
+    /// `CODECAPI_AVEncCommonQualityVsSpeed`, 0..=100.
+    pub quality_speed: u32,
+    pub cabac: bool,
+    /// Diagnostic `false` is multi-frame mode: output may be delayed, which the
+    /// one-input-one-picture contract rejects.
+    pub low_latency: bool,
+}
+impl Default for SoftwareMftTuning {
+    fn default() -> Self {
+        Self {
+            worker_threads: MftWorkerThreads::MftDefault,
+            quality_speed: 0,
+            cabac: true,
+            low_latency: true,
+        }
+    }
+}
+
+/// Software-path environment. Parsed once per encoder; recreation reuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftwareEnv {
+    pub tuning: SoftwareMftTuning,
+    /// `BP_CPU_WARP_BYPASS`: default `true` skips the VideoProcessor attempt on WARP.
+    pub warp_bypass: bool,
+    /// `BP_CPU_FORCE_CONVERSION=1`: software MFT always converts on the CPU.
+    pub force_cpu_conversion: bool,
+}
+impl Default for SoftwareEnv {
+    fn default() -> Self {
+        Self {
+            tuning: SoftwareMftTuning::default(),
+            warp_bypass: true,
+            force_cpu_conversion: false,
+        }
+    }
+}
+impl SoftwareEnv {
+    pub fn from_env() -> (Self, Vec<String>) {
+        Self::parse(|name| std::env::var(name).ok())
+    }
+    /// Invalid values fall back to the default and return a warning each.
+    /// Empty values count as unset.
+    pub fn parse(get: impl Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+        let raw = |name: &str| {
+            get(name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let worker_threads = match raw("BP_CPU_MFT_THREADS").as_deref() {
+            None => MftWorkerThreads::MftDefault,
+            Some("half") => MftWorkerThreads::HalfCores,
+            Some("1") => MftWorkerThreads::Explicit(1),
+            Some("2") => MftWorkerThreads::Explicit(2),
+            Some("4") => MftWorkerThreads::Explicit(4),
+            Some("default") => MftWorkerThreads::MftDefault,
+            Some(other) => {
+                warnings.push(format!(
+                    "BP_CPU_MFT_THREADS={other:?} ignored; expected 1, 2, 4, default or half"
+                ));
+                MftWorkerThreads::MftDefault
+            }
+        };
+        let quality_speed = match raw("BP_CPU_MFT_QUALITY_SPEED") {
+            None => 0,
+            Some(value) => match value.parse::<u32>() {
+                Ok(speed) if speed <= 100 => speed,
+                _ => {
+                    warnings.push(format!(
+                        "BP_CPU_MFT_QUALITY_SPEED={value:?} ignored; expected 0..=100"
+                    ));
+                    0
+                }
+            },
+        };
+        let cabac = bool_flag(
+            raw("BP_CPU_MFT_CABAC"),
+            "BP_CPU_MFT_CABAC",
+            true,
+            &mut warnings,
+        );
+        let low_latency = bool_flag(
+            raw("BP_CPU_MFT_LOW_LATENCY"),
+            "BP_CPU_MFT_LOW_LATENCY",
+            true,
+            &mut warnings,
+        );
+        let warp_bypass = bool_flag(
+            raw("BP_CPU_WARP_BYPASS"),
+            "BP_CPU_WARP_BYPASS",
+            true,
+            &mut warnings,
+        );
+        let force_cpu_conversion = bool_flag(
+            raw("BP_CPU_FORCE_CONVERSION"),
+            "BP_CPU_FORCE_CONVERSION",
+            false,
+            &mut warnings,
+        );
+        (
+            Self {
+                tuning: SoftwareMftTuning {
+                    worker_threads,
+                    quality_speed,
+                    cabac,
+                    low_latency,
+                },
+                warp_bypass,
+                force_cpu_conversion,
+            },
+            warnings,
+        )
+    }
+}
+fn bool_flag(value: Option<String>, name: &str, default: bool, warnings: &mut Vec<String>) -> bool {
+    match value.as_deref() {
+        None => default,
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => {
+            warnings.push(format!("{name}={other:?} ignored; expected 1 or 0"));
+            default
+        }
+    }
+}
+
+/// Outcome of one software ICodecAPI knob. Only `Verified` means the readback matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KnobStatus {
+    /// Set succeeded and GetValue returned the requested value.
+    Verified,
+    /// Set succeeded but GetValue returned a different value.
+    Mismatch,
+    /// Set succeeded; the value could not be read back.
+    ReadbackFailed(String),
+    /// Encoder rejected the set. `readback` holds what it still reports, if readable.
+    Rejected(String),
+    /// Property deliberately not written (`MftDefault`).
+    Omitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnobReport {
+    pub knob: &'static str,
+    pub requested: String,
+    pub readback: Option<String>,
+    pub status: KnobStatus,
 }
 
 struct ComApartment(bool);
@@ -337,6 +515,8 @@ struct Transform {
     name: String,
     label: String,
     gate: Arc<GpuGate>,
+    /// Software-only readbacks; empty for hardware.
+    knobs: Vec<KnobReport>,
 }
 impl Drop for Transform {
     fn drop(&mut self) {
@@ -371,6 +551,75 @@ fn set_codec(
             Ok(())
         }
         Err(error) => Err(error).with_context(|| format!("MF {label}")),
+    }
+}
+
+/// Writes one software knob, then reads it back. Never claims success without a matching readback.
+fn software_knob<T: PartialEq + std::fmt::Display>(
+    codec: &ICodecAPI,
+    property: &GUID,
+    knob: &'static str,
+    requested: T,
+    value: VARIANT,
+    read: impl Fn(&VARIANT) -> windows::core::Result<T>,
+) -> KnobReport {
+    let set = unsafe { codec.SetValue(property, &value) };
+    let read_back = unsafe { codec.GetValue(property) }.and_then(|actual| read(&actual));
+    let (readback, status) = match (set, read_back) {
+        (Err(error), read_back) => (
+            read_back.ok().map(|actual| actual.to_string()),
+            KnobStatus::Rejected(error.to_string()),
+        ),
+        (Ok(()), Ok(actual)) => {
+            let status = if actual == requested {
+                KnobStatus::Verified
+            } else {
+                KnobStatus::Mismatch
+            };
+            (Some(actual.to_string()), status)
+        }
+        (Ok(()), Err(error)) => (None, KnobStatus::ReadbackFailed(error.to_string())),
+    };
+    let report = KnobReport {
+        knob,
+        requested: requested.to_string(),
+        readback,
+        status,
+    };
+    log_knob(&report);
+    report
+}
+/// The property is omitted on purpose; the readback only reports what the MFT chose.
+fn omitted_worker_threads_knob(codec: &ICodecAPI) -> KnobReport {
+    let readback = unsafe { codec.GetValue(&CODECAPI_AVEncNumWorkerThreads) }
+        .ok()
+        .and_then(|value| u32::try_from(&value).ok())
+        .map(|value| value.to_string());
+    let report = KnobReport {
+        knob: "worker threads",
+        requested: "default (property omitted)".into(),
+        readback,
+        status: KnobStatus::Omitted,
+    };
+    log_knob(&report);
+    report
+}
+fn log_knob(report: &KnobReport) {
+    match &report.status {
+        KnobStatus::Verified | KnobStatus::Omitted => info!(
+            knob = report.knob,
+            requested = %report.requested,
+            readback = ?report.readback,
+            status = ?report.status,
+            "MF software tuning knob"
+        ),
+        _ => warn!(
+            knob = report.knob,
+            requested = %report.requested,
+            readback = ?report.readback,
+            status = ?report.status,
+            "MF software tuning knob did not verify"
+        ),
     }
 }
 
@@ -423,9 +672,13 @@ impl Transform {
         bitrate: u32,
         infinite_gop: bool,
         gop_seconds: u8,
+        tuning: SoftwareMftTuning,
     ) -> Result<Self> {
         let gate = gpu_gate::for_device(device);
         let _gpu = gate.lock();
+        // Software-only knobs; hardware keeps the fixed values below.
+        let software = activation.is_none();
+        let mut knobs = Vec::new();
         let attributes = unsafe { encoder.GetAttributes() }.context("MF encoder attributes")?;
         let is_async = unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0;
         let events = if is_async {
@@ -442,7 +695,12 @@ impl Transform {
             activation.is_none() || is_async,
             "hardware MF encoder must expose asynchronous events"
         );
-        let _ = unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) };
+        let low_latency_attribute = if software {
+            u32::from(tuning.low_latency)
+        } else {
+            1
+        };
+        let _ = unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, low_latency_attribute) };
         let codec: ICodecAPI = encoder.cast().context("MF encoder ICodecAPI")?;
         set_codec(
             &codec,
@@ -458,13 +716,30 @@ impl Transform {
             "zero B pictures",
             false,
         )?;
-        set_codec(
-            &codec,
-            &CODECAPI_AVLowLatencyMode,
-            VARIANT::from(true),
-            "low latency VT_BOOL TRUE",
-            true,
-        )?;
+        if software {
+            let report = software_knob(
+                &codec,
+                &CODECAPI_AVLowLatencyMode,
+                "low latency",
+                tuning.low_latency,
+                VARIANT::from(tuning.low_latency),
+                |value: &VARIANT| bool::try_from(value),
+            );
+            let rejected = matches!(report.status, KnobStatus::Rejected(_));
+            knobs.push(report);
+            // Default low latency stays required, as before the tuning envs existed.
+            if rejected && tuning.low_latency {
+                bail!("MF low latency VT_BOOL TRUE rejected by software encoder");
+            }
+        } else {
+            set_codec(
+                &codec,
+                &CODECAPI_AVLowLatencyMode,
+                VARIANT::from(true),
+                "low latency VT_BOOL TRUE",
+                true,
+            )?;
+        }
         set_codec(
             &codec,
             &CODECAPI_AVEncCommonMeanBitRate,
@@ -493,29 +768,50 @@ impl Transform {
             "disable scene-detection IDRs",
             false,
         )?;
-        set_codec(
-            &codec,
-            &CODECAPI_AVEncH264CABACEnable,
-            VARIANT::from(true),
-            "CABAC",
-            false,
-        )?;
-        set_codec(
-            &codec,
-            &CODECAPI_AVEncCommonQualityVsSpeed,
-            VARIANT::from(0u32),
-            "quality/speed",
-            false,
-        )?;
-        if activation.is_none() {
-            let workers = std::thread::available_parallelism()
-                .map(|n| (n.get() / 2).clamp(1, 8) as u32)
+        if software {
+            knobs.push(software_knob(
+                &codec,
+                &CODECAPI_AVEncH264CABACEnable,
+                "CABAC",
+                tuning.cabac,
+                VARIANT::from(tuning.cabac),
+                |value: &VARIANT| bool::try_from(value),
+            ));
+            knobs.push(software_knob(
+                &codec,
+                &CODECAPI_AVEncCommonQualityVsSpeed,
+                "quality/speed",
+                tuning.quality_speed,
+                VARIANT::from(tuning.quality_speed),
+                |value: &VARIANT| u32::try_from(value),
+            ));
+            let parallelism = std::thread::available_parallelism()
+                .map(|n| n.get())
                 .unwrap_or(1);
+            match tuning.worker_threads.count(parallelism) {
+                Some(workers) => knobs.push(software_knob(
+                    &codec,
+                    &CODECAPI_AVEncNumWorkerThreads,
+                    "worker threads",
+                    workers,
+                    VARIANT::from(workers),
+                    |value: &VARIANT| u32::try_from(value),
+                )),
+                None => knobs.push(omitted_worker_threads_knob(&codec)),
+            }
+        } else {
             set_codec(
                 &codec,
-                &CODECAPI_AVEncNumWorkerThreads,
-                VARIANT::from(workers),
-                "bounded worker threads",
+                &CODECAPI_AVEncH264CABACEnable,
+                VARIANT::from(true),
+                "CABAC",
+                false,
+            )?;
+            set_codec(
+                &codec,
+                &CODECAPI_AVEncCommonQualityVsSpeed,
+                VARIANT::from(0u32),
+                "quality/speed",
                 false,
             )?;
         }
@@ -576,6 +872,7 @@ impl Transform {
             name,
             label,
             gate,
+            knobs,
         })
     }
 
@@ -692,6 +989,14 @@ pub struct MfEncoder {
     cpu_conversion_forced: bool,
     diagnostic_gpu_completion: bool,
     last_timings: MfFrameTimings,
+    /// Parsed once; carried into recreated encoders.
+    software_env: SoftwareEnv,
+    /// Capture adapter is WARP (Microsoft Basic Render Driver) or software-flagged.
+    warp: bool,
+    /// Source geometry the CPU converter was built for.
+    cpu_source: (u32, u32),
+    /// Source and output geometry of the last CPU frame, for damage reuse.
+    cpu_damage_key: Option<((u32, u32), (u32, u32))>,
     // COM initialization remains alive until all encoder interfaces are gone.
     _com: ComApartment,
 }
@@ -728,6 +1033,38 @@ impl MfEncoder {
         hardware: bool,
         gop_seconds: u8,
     ) -> Result<Self> {
+        let (env, warnings) = SoftwareEnv::from_env();
+        for warning in warnings {
+            warn!(%warning, "MF software tuning env ignored");
+        }
+        Self::new_with_software_env(
+            device,
+            width,
+            height,
+            fps,
+            bitrate,
+            infinite_gop,
+            hardware,
+            gop_seconds,
+            env,
+        )
+    }
+    /// Explicit software env, for probes that must not depend on process env.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_software_env(
+        device: *mut c_void,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        infinite_gop: bool,
+        hardware: bool,
+        gop_seconds: u8,
+        env: SoftwareEnv,
+    ) -> Result<Self> {
+        // Software IDRs belong to the host, including its RTC keyframe timer.
+        // A frame-count GOP could otherwise insert an IDR between those requests.
+        let infinite_gop = infinite_gop || !hardware;
         ensure!(!device.is_null(), "MF requires a capture D3D11 device");
         validate_profile(width, height, fps)?;
         ensure!(
@@ -740,13 +1077,34 @@ impl MfEncoder {
             .context("MF capture device")?
             .clone();
         gpu_gate::protect_device(&device)?;
-        let converter = match Nv12Converter::new(&device, width, height, fps) {
-            Ok(converter) => Some(converter),
-            Err(error) if !hardware => {
-                warn!(%error, "MF software uses CPU BGRA -> NV12 conversion");
+        let adapter = match adapter_kind(&device) {
+            Ok(adapter) => Some(adapter),
+            Err(error) => {
+                warn!(%error, "MF could not inspect the capture adapter; WARP detection skipped");
                 None
             }
-            Err(error) => return Err(error).context("hardware MF GPU NV12 converter"),
+        };
+        let warp = adapter.is_some_and(AdapterKind::is_warp);
+        // Hardware keeps its VideoProcessor path whatever the software envs say.
+        let skip_video_processor =
+            !hardware && (env.force_cpu_conversion || (warp && env.warp_bypass));
+        let converter = if skip_video_processor {
+            info!(
+                warp,
+                ?adapter,
+                forced = env.force_cpu_conversion,
+                "MF software skips VideoProcessor; CPU BGRA -> NV12 conversion"
+            );
+            None
+        } else {
+            match Nv12Converter::new(&device, width, height, fps) {
+                Ok(converter) => Some(converter),
+                Err(error) if !hardware => {
+                    warn!(%error, "MF software uses CPU BGRA -> NV12 conversion");
+                    None
+                }
+                Err(error) => return Err(error).context("hardware MF GPU NV12 converter"),
+            }
         };
         let transform = if hardware {
             let mut failures = Vec::new();
@@ -777,6 +1135,7 @@ impl MfEncoder {
                             bitrate,
                             infinite_gop,
                             gop_seconds,
+                            env.tuning,
                         )
                     })();
                     match result {
@@ -818,10 +1177,11 @@ impl MfEncoder {
                 bitrate,
                 infinite_gop,
                 gop_seconds,
+                env.tuning,
             )?
         };
         let cpu_converter = if converter.is_none() {
-            Some(CpuConverter::new(&device, width, height)?)
+            Some(make_cpu_converter(&device, width, height)?)
         } else {
             None
         };
@@ -852,9 +1212,13 @@ impl MfEncoder {
             gop_seconds,
             force_idr_next: true,
             frame_index: 0,
-            cpu_conversion_forced: false,
+            cpu_conversion_forced: !hardware && env.force_cpu_conversion,
             diagnostic_gpu_completion: false,
             last_timings: MfFrameTimings::default(),
+            software_env: env,
+            warp,
+            cpu_source: (width, height),
+            cpu_damage_key: None,
             _com: com,
         })
     }
@@ -884,7 +1248,9 @@ impl MfEncoder {
             !self.hardware,
             "CPU conversion diagnostic requires the software MFT"
         );
-        self.cpu_converter = Some(CpuConverter::new(&self.device, self.width, self.height)?);
+        self.cpu_converter = Some(make_cpu_converter(&self.device, self.width, self.height)?);
+        self.cpu_source = (self.width, self.height);
+        self.cpu_damage_key = None;
         self.converter = None;
         self.cpu_conversion_forced = true;
         Ok(())
@@ -895,6 +1261,38 @@ impl MfEncoder {
     }
     pub fn last_frame_timings(&self) -> MfFrameTimings {
         self.last_timings
+    }
+    /// Per-knob requested vs readback for the software MFT. Empty for hardware.
+    pub fn software_tuning_report(&self) -> &[KnobReport] {
+        &self.transform.knobs
+    }
+    /// Probe-only capability query. Preserve S_FALSE rather than allowing the
+    /// generated Result<()> binding to erase its unsupported status.
+    pub fn software_intra_refresh_status(&self) -> Result<(HRESULT, String)> {
+        ensure!(
+            !self.hardware,
+            "software intra-refresh query requires inbox MFT"
+        );
+        let supported = unsafe {
+            (Interface::vtable(&self.transform.codec).IsSupported)(
+                self.transform.codec.as_raw(),
+                &CODECAPI_AVEncVideoGradualIntraRefresh,
+            )
+        };
+        let value = unsafe {
+            self.transform
+                .codec
+                .GetValue(&CODECAPI_AVEncVideoGradualIntraRefresh)
+        };
+        Ok((supported, format!("{value:?}")))
+    }
+    /// Software env in force for this encoder, including recreations.
+    pub fn software_env(&self) -> SoftwareEnv {
+        self.software_env
+    }
+    /// True when the capture adapter is WARP or software-flagged.
+    pub fn warp_detected(&self) -> bool {
+        self.warp
     }
     pub fn force_idr(&mut self) {
         self.force_idr_next = true;
@@ -947,7 +1345,7 @@ impl MfEncoder {
             let (width, height, fps) =
                 self.desired_profile
                     .unwrap_or((self.width, self.height, self.fps));
-            let mut replacement = Self::new_with_gop(
+            let mut replacement = Self::new_with_software_env(
                 self.device.as_raw(),
                 width,
                 height,
@@ -956,6 +1354,7 @@ impl MfEncoder {
                 self.infinite_gop,
                 self.hardware,
                 self.gop_seconds,
+                self.software_env,
             )?;
             if self.cpu_conversion_forced {
                 replacement.force_cpu_conversion()?;
@@ -991,46 +1390,146 @@ impl MfEncoder {
         Ok(data)
     }
     pub fn encode_texture(&mut self, texture: *mut c_void) -> Result<EncodedFrame> {
+        self.encode_texture_with_damage(texture, None)
+    }
+    /// `damage` only informs software CPU conversion; hardware converts the whole frame.
+    pub fn encode_texture_with_damage(
+        &mut self,
+        texture: *mut c_void,
+        damage: Option<&[DamageRect]>,
+    ) -> Result<EncodedFrame> {
         ensure!(!texture.is_null(), "MF input texture is null");
         self.apply_pending()?;
         let started = Instant::now();
         let input =
             unsafe { ID3D11Texture2D::from_raw_borrowed(&texture) }.context("MF input texture")?;
-        let nv12_texture = if self.hardware {
-            let nv12 = self
-                .converter
-                .as_ref()
-                .context("MF hardware converter missing")?
-                .convert(input)?;
-            if self.diagnostic_gpu_completion {
-                self.converter.as_mut().unwrap().wait_for_completion()?;
-            }
-            Some(nv12)
+        let conversion = if self.hardware {
+            self.convert_hardware(input)?
         } else {
-            let converted = if let Some(converter) = &mut self.converter {
-                converter
-                    .convert(input)
-                    .and_then(|_| converter.readback(&mut self.nv12))
-            } else {
-                Err(anyhow::anyhow!("GPU NV12 converter unavailable"))
-            };
-            if let Err(error) = converted {
-                if self.cpu_converter.is_none() {
-                    warn!(%error, "MF software GPU NV12 readback failed; switching to CPU conversion");
-                    self.cpu_converter =
-                        Some(CpuConverter::new(&self.device, self.width, self.height)?);
-                    self.converter = None;
-                }
-                self.cpu_converter
-                    .as_ref()
-                    .unwrap()
-                    .convert(input, &mut self.nv12)?;
-            }
-            None
+            self.convert_software(input, damage)?
         };
         let conversion_readback_us = started.elapsed().as_micros() as u64;
+        self.encode_converted(started, conversion, conversion_readback_us)
+    }
+    /// Software-only: encode an NV12 frame already at the encoder's size. Skips
+    /// conversion; bitstream packing and MFT handling are unchanged.
+    pub fn encode_nv12(&mut self, bytes: &[u8]) -> Result<EncodedFrame> {
+        ensure!(!self.hardware, "encode_nv12 is software-only");
+        self.apply_pending()?;
+        ensure!(
+            bytes.len() == nv12_len(self.width, self.height),
+            "NV12 input must be {}x{} ({} bytes)",
+            self.width,
+            self.height,
+            nv12_len(self.width, self.height)
+        );
+        let started = Instant::now();
+        self.nv12.clear();
+        self.nv12.extend_from_slice(bytes);
+        // The CPU buffer no longer matches any previous frame's damage.
+        self.cpu_damage_key = None;
+        let conversion = ConversionOutput {
+            gpu_nv12: None,
+            readback_us: 0,
+            cpu_conversion_us: 0,
+        };
+        let conversion_readback_us = started.elapsed().as_micros() as u64;
+        self.encode_converted(started, conversion, conversion_readback_us)
+    }
+
+    fn convert_hardware(&mut self, input: &ID3D11Texture2D) -> Result<ConversionOutput> {
+        let nv12 = self
+            .converter
+            .as_ref()
+            .context("MF hardware converter missing")?
+            .convert(input)?;
+        if self.diagnostic_gpu_completion {
+            self.converter.as_mut().unwrap().wait_for_completion()?;
+        }
+        Ok(ConversionOutput {
+            gpu_nv12: Some(nv12),
+            readback_us: 0,
+            cpu_conversion_us: 0,
+        })
+    }
+
+    fn convert_software(
+        &mut self,
+        input: &ID3D11Texture2D,
+        damage: Option<&[DamageRect]>,
+    ) -> Result<ConversionOutput> {
+        let source = texture_size(input)?;
+        let output = (self.width, self.height);
+        if software_video_processor_eligible(
+            self.converter.is_some(),
+            self.cpu_conversion_forced,
+            source,
+            output,
+        ) {
+            let converter = self
+                .converter
+                .as_mut()
+                .context("GPU NV12 converter missing")?;
+            let result = converter
+                .convert(input)
+                .and_then(|_| converter.readback(&mut self.nv12));
+            match result {
+                Ok(()) => {
+                    self.cpu_damage_key = None;
+                    return Ok(ConversionOutput {
+                        gpu_nv12: None,
+                        readback_us: 0,
+                        cpu_conversion_us: 0,
+                    });
+                }
+                Err(error) => {
+                    warn!(%error, "MF software GPU NV12 readback failed; switching to CPU conversion");
+                    self.converter = None;
+                }
+            }
+        }
+        self.convert_cpu(input, source, damage)
+    }
+
+    fn convert_cpu(
+        &mut self,
+        input: &ID3D11Texture2D,
+        source: (u32, u32),
+        damage: Option<&[DamageRect]>,
+    ) -> Result<ConversionOutput> {
+        let output = (self.width, self.height);
+        // Recreate the staging converter only when the source geometry changes.
+        if self.cpu_converter.is_none() || self.cpu_source != source {
+            self.cpu_converter = Some(make_cpu_converter(&self.device, source.0, source.1)?);
+            self.cpu_source = source;
+            self.cpu_damage_key = None;
+        }
+        let damage = if cpu_damage_reusable(self.cpu_damage_key, source, output) {
+            damage
+        } else {
+            None
+        };
+        let timings = self
+            .cpu_converter
+            .as_mut()
+            .context("MF CPU converter missing")?
+            .convert_frame(input, output.0, output.1, damage, &mut self.nv12)?;
+        self.cpu_damage_key = Some((source, output));
+        Ok(ConversionOutput {
+            gpu_nv12: None,
+            readback_us: timings.readback_us,
+            cpu_conversion_us: timings.conversion_us,
+        })
+    }
+
+    fn encode_converted(
+        &mut self,
+        started: Instant,
+        conversion: ConversionOutput,
+        conversion_readback_us: u64,
+    ) -> Result<EncodedFrame> {
         let input_pack_started = Instant::now();
-        let buffer = if let Some(nv12) = nv12_texture {
+        let buffer = if let Some(nv12) = conversion.gpu_nv12 {
             self.runtime.surface_buffer(&nv12)?
         } else {
             let buffer = self.runtime.buffer(self.nv12.len() as u32, 0)?;
@@ -1118,6 +1617,8 @@ impl MfEncoder {
         let total_us = started.elapsed().as_micros() as u64;
         self.last_timings = MfFrameTimings {
             conversion_readback_us,
+            readback_us: conversion.readback_us,
+            cpu_conversion_us: conversion.cpu_conversion_us,
             input_pack_us,
             mft_encode_us,
             output_processing_us,
@@ -1138,6 +1639,79 @@ impl MfEncoder {
             frame_avg_qp,
         })
     }
+}
+
+/// Adapter identity from `IDXGIDevice::GetAdapter` and `IDXGIAdapter1::GetDesc1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterKind {
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub software: bool,
+}
+impl AdapterKind {
+    /// Microsoft Basic Render Driver (WARP) is vendor 0x1414, device 0x8c, or software-flagged.
+    pub fn is_warp(self) -> bool {
+        self.software || (self.vendor_id == 0x1414 && self.device_id == 0x8c)
+    }
+}
+fn adapter_kind(device: &ID3D11Device) -> Result<AdapterKind> {
+    let dxgi: IDXGIDevice = device.cast().context("MF capture device DXGI interface")?;
+    let adapter: IDXGIAdapter1 = unsafe { dxgi.GetAdapter() }
+        .context("MF capture adapter")?
+        .cast()
+        .context("MF capture adapter DXGI 1.1 interface")?;
+    let desc = unsafe { adapter.GetDesc1() }.context("MF capture adapter description")?;
+    Ok(AdapterKind {
+        vendor_id: desc.VendorId,
+        device_id: desc.DeviceId,
+        software: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+    })
+}
+
+/// Software VideoProcessor runs only when a converter exists, no CPU route is
+/// forced, and the input already matches the output geometry. Otherwise CPU.
+fn software_video_processor_eligible(
+    has_converter: bool,
+    cpu_forced: bool,
+    source: (u32, u32),
+    output: (u32, u32),
+) -> bool {
+    has_converter && !cpu_forced && source == output
+}
+
+/// Damage is reusable only when the CPU NV12 buffer came from a CPU frame of the
+/// same source and output geometry. Otherwise the full frame is converted.
+fn cpu_damage_reusable(
+    previous: Option<((u32, u32), (u32, u32))>,
+    source: (u32, u32),
+    output: (u32, u32),
+) -> bool {
+    previous == Some((source, output))
+}
+
+fn nv12_len(width: u32, height: u32) -> usize {
+    width as usize * height as usize * 3 / 2
+}
+
+fn texture_size(texture: &ID3D11Texture2D) -> Result<(u32, u32)> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut desc) };
+    Ok((desc.Width, desc.Height))
+}
+
+/// Single construction point for the CPU converter. Source size, not output size.
+fn make_cpu_converter(device: &ID3D11Device, width: u32, height: u32) -> Result<CpuConverter> {
+    CpuConverter::new(device, width, height)
+}
+
+/// Per-frame output of the conversion stage.
+struct ConversionOutput {
+    /// GPU NV12 texture (hardware or VideoProcessor). `None` means NV12 is in `MfEncoder::nv12`.
+    gpu_nv12: Option<ID3D11Texture2D>,
+    /// CPU route only.
+    readback_us: u64,
+    /// CPU route only.
+    cpu_conversion_us: u64,
 }
 
 fn validate_profile(width: u32, height: u32, fps: u32) -> Result<()> {
@@ -1445,5 +2019,153 @@ mod tests {
         assert_eq!(gop_frames(60, 4, false), 240);
         assert_eq!(one_frame_buffer(12_000_000, 30), 50_000);
         assert_eq!(one_frame_buffer(12_000_001, 30), 50_001);
+    }
+    fn parse_pairs(pairs: &[(&str, &str)]) -> (SoftwareEnv, Vec<String>) {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        SoftwareEnv::parse(|name| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        })
+    }
+    #[test]
+    fn software_env_unset_and_empty_use_measured_defaults() {
+        let (env, warnings) = parse_pairs(&[]);
+        assert_eq!(env, SoftwareEnv::default());
+        assert!(warnings.is_empty());
+        assert_eq!(env.tuning.worker_threads, MftWorkerThreads::MftDefault);
+        assert_eq!(env.tuning.quality_speed, 0);
+        assert!(env.tuning.cabac && env.tuning.low_latency);
+        assert!(env.warp_bypass && !env.force_cpu_conversion);
+        let (empty, warnings) = parse_pairs(&[
+            ("BP_CPU_MFT_THREADS", "  "),
+            ("BP_CPU_MFT_CABAC", ""),
+            ("BP_CPU_WARP_BYPASS", ""),
+        ]);
+        assert_eq!(empty, SoftwareEnv::default());
+        assert!(warnings.is_empty());
+    }
+    #[test]
+    fn software_env_parses_each_documented_value() {
+        let (env, warnings) = parse_pairs(&[
+            ("BP_CPU_MFT_THREADS", "4"),
+            ("BP_CPU_MFT_QUALITY_SPEED", "100"),
+            ("BP_CPU_MFT_CABAC", "0"),
+            ("BP_CPU_MFT_LOW_LATENCY", "0"),
+            ("BP_CPU_WARP_BYPASS", "0"),
+            ("BP_CPU_FORCE_CONVERSION", "1"),
+        ]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(env.tuning.worker_threads, MftWorkerThreads::Explicit(4));
+        assert_eq!(env.tuning.quality_speed, 100);
+        assert!(!env.tuning.cabac && !env.tuning.low_latency);
+        assert!(!env.warp_bypass && env.force_cpu_conversion);
+        for (value, threads) in [
+            ("1", MftWorkerThreads::Explicit(1)),
+            ("2", MftWorkerThreads::Explicit(2)),
+            ("default", MftWorkerThreads::MftDefault),
+            ("half", MftWorkerThreads::HalfCores),
+        ] {
+            let (env, warnings) = parse_pairs(&[("BP_CPU_MFT_THREADS", value)]);
+            assert!(warnings.is_empty());
+            assert_eq!(env.tuning.worker_threads, threads);
+        }
+    }
+    #[test]
+    fn software_env_rejects_invalid_values_back_to_defaults_with_warnings() {
+        for pairs in [
+            vec![("BP_CPU_MFT_THREADS", "3")],
+            vec![("BP_CPU_MFT_THREADS", "8")],
+            vec![("BP_CPU_MFT_QUALITY_SPEED", "101")],
+            vec![("BP_CPU_MFT_QUALITY_SPEED", "-1")],
+            vec![("BP_CPU_MFT_CABAC", "true")],
+            vec![("BP_CPU_MFT_LOW_LATENCY", "2")],
+            vec![("BP_CPU_WARP_BYPASS", "no")],
+            vec![("BP_CPU_FORCE_CONVERSION", "yes")],
+        ] {
+            let (env, warnings) = parse_pairs(&pairs);
+            assert_eq!(env, SoftwareEnv::default(), "{pairs:?}");
+            assert_eq!(warnings.len(), 1, "{pairs:?}");
+        }
+    }
+    #[test]
+    fn worker_thread_count_follows_request_and_parallelism() {
+        assert_eq!(MftWorkerThreads::HalfCores.count(16), Some(8));
+        assert_eq!(MftWorkerThreads::HalfCores.count(8), Some(4));
+        assert_eq!(MftWorkerThreads::HalfCores.count(2), Some(1));
+        assert_eq!(MftWorkerThreads::HalfCores.count(1), Some(1));
+        assert_eq!(MftWorkerThreads::Explicit(2).count(16), Some(2));
+        assert_eq!(MftWorkerThreads::MftDefault.count(16), None);
+    }
+    #[test]
+    fn warp_is_identified_by_vendor_device_or_software_flag() {
+        let warp = AdapterKind {
+            vendor_id: 0x1414,
+            device_id: 0x8c,
+            software: false,
+        };
+        assert!(warp.is_warp());
+        assert!(AdapterKind {
+            software: true,
+            vendor_id: 0x10de,
+            device_id: 0x2684
+        }
+        .is_warp());
+        assert!(!AdapterKind {
+            software: false,
+            vendor_id: 0x10de,
+            device_id: 0x2684
+        }
+        .is_warp());
+        assert!(!AdapterKind {
+            software: false,
+            vendor_id: 0x1414,
+            device_id: 0x8d
+        }
+        .is_warp());
+    }
+    #[test]
+    fn software_video_processor_requires_matching_geometry_and_no_forced_cpu() {
+        assert!(software_video_processor_eligible(
+            true,
+            false,
+            (1920, 1080),
+            (1920, 1080)
+        ));
+        // A size mismatch forces the CPU route rather than a hardware-style rejection.
+        assert!(!software_video_processor_eligible(
+            true,
+            false,
+            (2560, 1440),
+            (1920, 1080)
+        ));
+        assert!(!software_video_processor_eligible(
+            true,
+            true,
+            (1920, 1080),
+            (1920, 1080)
+        ));
+        assert!(!software_video_processor_eligible(
+            false,
+            false,
+            (1920, 1080),
+            (1920, 1080)
+        ));
+    }
+    #[test]
+    fn damage_is_reused_only_for_the_same_source_and_output_geometry() {
+        let key = Some(((2560, 1440), (1920, 1080)));
+        assert!(cpu_damage_reusable(key, (2560, 1440), (1920, 1080)));
+        assert!(!cpu_damage_reusable(key, (1920, 1080), (1920, 1080)));
+        assert!(!cpu_damage_reusable(None, (2560, 1440), (1920, 1080)));
+    }
+    #[test]
+    fn nv12_length_matches_packed_planes() {
+        assert_eq!(nv12_len(640, 480), 640 * 480 * 3 / 2);
+        assert_eq!(nv12_len(2, 2), 6);
     }
 }
