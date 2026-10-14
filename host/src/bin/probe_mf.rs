@@ -3,7 +3,7 @@ use anyhow::{ensure, Context, Result};
 use bubbleplay_host::{
     encode::{EncoderOptions, Nvenc, Preset, VideoCodec},
     gpu_gate,
-    mf_encode::{annex_b_nals, inspect_access_unit, MfEncoder},
+    mf_encode::{annex_b_nals, inspect_access_unit, probe_availability, MfEncoder, MfFrameTimings},
     video_encoder::{EncoderCapabilities, EncoderOverride, EncoderPreference, VideoEncoder},
 };
 use std::{ffi::c_void, path::PathBuf, time::Instant};
@@ -25,6 +25,22 @@ const COLOR_PATCHES: [[u8; 3]; 8] = [
     [0, 255, 255],
     [255, 0, 255],
 ];
+
+#[derive(Clone, Copy, Default)]
+struct ConversionDiagnostic {
+    force_cpu: bool,
+    require_video_processor: bool,
+    gpu_completion: bool,
+}
+
+fn timing_summary(samples: &[MfFrameTimings], metric: impl Fn(&MfFrameTimings) -> u64) -> String {
+    let mut values: Vec<u64> = samples.iter().map(metric).collect();
+    values.sort_unstable();
+    let average = values.iter().sum::<u64>() as f64 / values.len() as f64 / 1000.0;
+    let p50 = values[(values.len() * 50).div_ceil(100) - 1] as f64 / 1000.0;
+    let p95 = values[(values.len() * 95).div_ceil(100) - 1] as f64 / 1000.0;
+    format!("avg:{average:.3}/p50:{p50:.3}/p95:{p95:.3}ms")
+}
 
 fn create_device(warp: bool, no_video_support: bool) -> Result<ID3D11Device> {
     let mut device = None;
@@ -94,6 +110,7 @@ fn create_device(warp: bool, no_video_support: bool) -> Result<ID3D11Device> {
     Ok(device)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     device: &ID3D11Device,
     hardware: bool,
@@ -101,6 +118,7 @@ fn run(
     width: u32,
     height: u32,
     properties: bool,
+    diagnostic: ConversionDiagnostic,
 ) -> Result<()> {
     let (fps, bitrate) = (30u32, 6_000_000u32);
     let gate = gpu_gate::for_device(device);
@@ -137,6 +155,17 @@ fn run(
         hardware,
         2,
     )?;
+    if diagnostic.force_cpu {
+        encoder.force_cpu_conversion()?;
+    }
+    encoder.set_diagnostic_gpu_completion(diagnostic.gpu_completion);
+    if diagnostic.require_video_processor {
+        ensure!(
+            encoder.converter_name().starts_with("D3D11 VideoProcessor"),
+            "requested VideoProcessor conversion unavailable: {}",
+            encoder.converter_name()
+        );
+    }
     println!(
         "backend={} implementation={} init_ms={:.2}",
         encoder.backend_name(),
@@ -157,6 +186,8 @@ fn run(
     let mut stream = Vec::new();
     let mut elapsed_us = 0u64;
     let mut idrs = Vec::new();
+    let mut timings = Vec::with_capacity(60);
+    let mut timing_csv = String::from("frame,converter,conversion_readback_us,input_pack_us,mft_encode_us,output_processing_us,total_us,gpu_completion_waited,idr\n");
     for frame in 0..60usize {
         for y in 0..height as usize {
             for x in 0..width as usize {
@@ -193,6 +224,30 @@ fn run(
             .encode_texture(texture.as_raw())
             .with_context(|| format!("encode synthetic frame {frame}"))?;
         let inspect = inspect_access_unit(&encoded.data)?;
+        let timing = encoder.last_frame_timings();
+        ensure!(
+            timing.total_us == encoded.encode_us,
+            "frame {frame}: timing total mismatch"
+        );
+        if diagnostic.require_video_processor {
+            ensure!(
+                encoder.converter_name().starts_with("D3D11 VideoProcessor"),
+                "frame {frame}: VideoProcessor fell back to {}",
+                encoder.converter_name()
+            );
+        }
+        timing_csv.push_str(&format!(
+            "{frame},\"{}\",{},{},{},{},{},{},{}\n",
+            encoder.converter_name(),
+            timing.conversion_readback_us,
+            timing.input_pack_us,
+            timing.mft_encode_us,
+            timing.output_processing_us,
+            timing.total_us,
+            timing.conversion_gpu_completion_waited,
+            encoded.is_idr
+        ));
+        timings.push(timing);
         ensure!(
             inspect.access_units == 1 && !inspect.has_b_slice,
             "frame {frame}: one AU and no B-slices required"
@@ -235,6 +290,14 @@ fn run(
     );
     println!("PASS backend={} inputs=60 access_units=60 idrs={idrs:?} b_slices=0 profile_idc=100 annex_b=true avg_encode_ms={:.3} bytes={}",
         encoder.backend_name(),elapsed_us as f64/60.0/1000.0,stream.len());
+    println!("TIMINGS backend={} converter={} dimensions={width}x{height} frames=60 debug_assertions={} conversion_mode={} conversion_readback={} mft_encode_including_input_output_wait={} input_pack={} output_processing={} total={}",
+        encoder.backend_name(), encoder.converter_name(), cfg!(debug_assertions),
+        if !hardware { "blocking readback/CPU conversion complete" } else if timings.iter().all(|t| t.conversion_gpu_completion_waited) { "GPU completion diagnostic; includes 1ms polling overhead" } else { "GPU submission only; GPU execution may overlap MFT" },
+        timing_summary(&timings, |t| t.conversion_readback_us),
+        timing_summary(&timings, |t| t.mft_encode_us),
+        timing_summary(&timings, |t| t.input_pack_us),
+        timing_summary(&timings, |t| t.output_processing_us),
+        timing_summary(&timings, |t| t.total_us));
     if let Some(dir) = output {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(if hardware {
@@ -244,6 +307,13 @@ fn run(
         });
         std::fs::write(&path, &stream)?;
         println!("synthetic stream: {}", path.display());
+        let timing_path = dir.join(if hardware {
+            "mf-hardware-timings.csv"
+        } else {
+            "mf-software-timings.csv"
+        });
+        std::fs::write(&timing_path, timing_csv)?;
+        println!("per-frame timing CSV: {}", timing_path.display());
     }
     if properties {
         run_properties(device, &mut encoder, &texture, output, hardware)?;
@@ -508,6 +578,42 @@ fn main() -> Result<()> {
     let properties = args.iter().any(|a| a == "--properties");
     let preflight = args.iter().any(|a| a == "--selection-preflight");
     let cpu_mode = args.iter().any(|a| a == "--cpu-mode");
+    if args.iter().any(|a| a == "--availability-only") {
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }?;
+        let mut luid = None;
+        for index in 0..64 {
+            let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+                break;
+            };
+            let desc = unsafe { adapter.GetDesc1() }?;
+            if desc.VendorId == 0x10de {
+                luid = Some(
+                    (u64::from(desc.AdapterLuid.HighPart as u32) << 32)
+                        | u64::from(desc.AdapterLuid.LowPart),
+                );
+                break;
+            }
+        }
+        let luid = luid.context("availability probe requires the synthetic NVIDIA adapter")?;
+        let started = Instant::now();
+        let availability = probe_availability(Some(luid))?;
+        println!("MF availability adapter_luid={luid:#x} result={availability:?} elapsed_ms={:.3} encoder_activated=false d3d_device_created=false frames=0",
+            started.elapsed().as_secs_f64() * 1000.0);
+        return Ok(());
+    }
+    let diagnostic = ConversionDiagnostic {
+        force_cpu: args.iter().any(|a| a == "--force-cpu-conversion"),
+        require_video_processor: args.iter().any(|a| a == "--require-video-processor"),
+        gpu_completion: args.iter().any(|a| a == "--timing-gpu-completion"),
+    };
+    ensure!(
+        !diagnostic.force_cpu || software_only,
+        "--force-cpu-conversion requires --software-only"
+    );
+    ensure!(
+        !(diagnostic.force_cpu && diagnostic.require_video_processor),
+        "forced CPU conversion conflicts with required VideoProcessor"
+    );
     let (width, height) = if let Some(i) = args.iter().position(|a| a == "--size") {
         let (w, h) = args
             .get(i + 1)
@@ -548,10 +654,26 @@ fn main() -> Result<()> {
         return selection_preflight(&device, width, height, cpu_mode);
     }
     if !hardware_only {
-        run(&device, false, output.as_ref(), width, height, properties)?;
+        run(
+            &device,
+            false,
+            output.as_ref(),
+            width,
+            height,
+            properties,
+            diagnostic,
+        )?;
     }
     if !software_only {
-        run(&device, true, output.as_ref(), width, height, properties)?;
+        run(
+            &device,
+            true,
+            output.as_ref(),
+            width,
+            height,
+            properties,
+            diagnostic,
+        )?;
     }
     Ok(())
 }

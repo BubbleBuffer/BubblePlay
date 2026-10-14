@@ -20,7 +20,11 @@ pub fn matrix_for_nvenc(width: u32, height: u32) -> ColorMatrix {
     }
 }
 use anyhow::{ensure, Context, Result};
-use std::{mem::ManuallyDrop, sync::Arc};
+use std::{
+    mem::ManuallyDrop,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -36,6 +40,7 @@ pub struct Nv12Converter {
     output: ID3D11Texture2D,
     output_view: ID3D11VideoProcessorOutputView,
     staging: Option<ID3D11Texture2D>,
+    completion_query: Option<ID3D11Query>,
     width: u32,
     height: u32,
 }
@@ -169,6 +174,7 @@ impl Nv12Converter {
             output,
             output_view,
             staging: None,
+            completion_query: None,
             width,
             height,
         })
@@ -213,6 +219,59 @@ impl Nv12Converter {
         unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
         result.context("MF BGRA -> NV12 VideoProcessorBlt")?;
         Ok(self.output.clone())
+    }
+
+    /// Diagnostic barrier: attribute completed GPU conversion to its own stage.
+    /// Production callers do not use this barrier. Polling never retains GpuGate.
+    pub fn wait_for_completion(&mut self) -> Result<()> {
+        {
+            let _gpu = self.gate.lock();
+            if self.completion_query.is_none() {
+                let desc = D3D11_QUERY_DESC {
+                    Query: D3D11_QUERY_EVENT,
+                    MiscFlags: 0,
+                };
+                let mut query = None;
+                unsafe { self.device.CreateQuery(&desc, Some(&mut query)) }?;
+                self.completion_query =
+                    Some(query.context("GPU conversion completion query missing")?);
+            }
+            unsafe {
+                self.context.End(self.completion_query.as_ref().unwrap());
+                self.context.Flush();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = {
+                let _gpu = self.gate.lock();
+                unsafe {
+                    // The binding's Result<()> erases S_FALSE. Query status
+                    // directly, allowing the runtime to flush pending commands;
+                    // DONOTFLUSH polling can otherwise remain pending forever.
+                    (Interface::vtable(&self.context).GetData)(
+                        self.context.as_raw(),
+                        self.completion_query.as_ref().unwrap().as_raw(),
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                    )
+                }
+            };
+            if status == windows::core::HRESULT(0) {
+                return Ok(());
+            }
+            status.ok().context("GPU conversion completion GetData")?;
+            ensure!(
+                status == windows::core::HRESULT(1),
+                "GPU conversion completion returned unexpected status {status:?}"
+            );
+            ensure!(
+                Instant::now() < deadline,
+                "GPU conversion completion timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     pub fn readback(&mut self, dest: &mut Vec<u8>) -> Result<()> {

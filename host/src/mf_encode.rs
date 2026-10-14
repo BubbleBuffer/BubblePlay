@@ -293,6 +293,18 @@ pub fn probe_availability(adapter_luid: Option<u64>) -> Result<MfAvailability> {
     })
 }
 
+/// Wall-clock stages for the last successful frame. Production hardware
+/// conversion is submission-only unless the diagnostic completion wait is enabled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MfFrameTimings {
+    pub conversion_readback_us: u64,
+    pub input_pack_us: u64,
+    pub mft_encode_us: u64,
+    pub output_processing_us: u64,
+    pub total_us: u64,
+    pub conversion_gpu_completion_waited: bool,
+}
+
 struct ComApartment(bool);
 impl ComApartment {
     fn enter() -> Result<Self> {
@@ -677,6 +689,9 @@ pub struct MfEncoder {
     gop_seconds: u8,
     force_idr_next: bool,
     frame_index: u64,
+    cpu_conversion_forced: bool,
+    diagnostic_gpu_completion: bool,
+    last_timings: MfFrameTimings,
     // COM initialization remains alive until all encoder interfaces are gone.
     _com: ComApartment,
 }
@@ -837,6 +852,9 @@ impl MfEncoder {
             gop_seconds,
             force_idr_next: true,
             frame_index: 0,
+            cpu_conversion_forced: false,
+            diagnostic_gpu_completion: false,
+            last_timings: MfFrameTimings::default(),
             _com: com,
         })
     }
@@ -848,6 +866,35 @@ impl MfEncoder {
     }
     pub fn hardware(&self) -> bool {
         self.hardware
+    }
+    pub fn converter_name(&self) -> &'static str {
+        if self.converter.is_some() {
+            if self.hardware {
+                "D3D11 VideoProcessor -> GPU NV12"
+            } else {
+                "D3D11 VideoProcessor -> NV12 staging readback"
+            }
+        } else {
+            "BGRA staging readback -> CPU NV12"
+        }
+    }
+    /// Diagnostic only; production selection continues to prefer VideoProcessor.
+    pub fn force_cpu_conversion(&mut self) -> Result<()> {
+        ensure!(
+            !self.hardware,
+            "CPU conversion diagnostic requires the software MFT"
+        );
+        self.cpu_converter = Some(CpuConverter::new(&self.device, self.width, self.height)?);
+        self.converter = None;
+        self.cpu_conversion_forced = true;
+        Ok(())
+    }
+    /// Diagnostic timing barrier only; disabled on the production path.
+    pub fn set_diagnostic_gpu_completion(&mut self, enabled: bool) {
+        self.diagnostic_gpu_completion = enabled;
+    }
+    pub fn last_frame_timings(&self) -> MfFrameTimings {
+        self.last_timings
     }
     pub fn force_idr(&mut self) {
         self.force_idr_next = true;
@@ -900,7 +947,7 @@ impl MfEncoder {
             let (width, height, fps) =
                 self.desired_profile
                     .unwrap_or((self.width, self.height, self.fps));
-            let replacement = Self::new_with_gop(
+            let mut replacement = Self::new_with_gop(
                 self.device.as_raw(),
                 width,
                 height,
@@ -910,6 +957,10 @@ impl MfEncoder {
                 self.hardware,
                 self.gop_seconds,
             )?;
+            if self.cpu_conversion_forced {
+                replacement.force_cpu_conversion()?;
+            }
+            replacement.diagnostic_gpu_completion = self.diagnostic_gpu_completion;
             *self = replacement;
         } else if self.applied_bitrate != self.desired_bitrate {
             let _gpu = self.transform.gate.lock();
@@ -945,13 +996,16 @@ impl MfEncoder {
         let started = Instant::now();
         let input =
             unsafe { ID3D11Texture2D::from_raw_borrowed(&texture) }.context("MF input texture")?;
-        let buffer = if self.hardware {
+        let nv12_texture = if self.hardware {
             let nv12 = self
                 .converter
                 .as_ref()
                 .context("MF hardware converter missing")?
                 .convert(input)?;
-            self.runtime.surface_buffer(&nv12)?
+            if self.diagnostic_gpu_completion {
+                self.converter.as_mut().unwrap().wait_for_completion()?;
+            }
+            Some(nv12)
         } else {
             let converted = if let Some(converter) = &mut self.converter {
                 converter
@@ -972,6 +1026,13 @@ impl MfEncoder {
                     .unwrap()
                     .convert(input, &mut self.nv12)?;
             }
+            None
+        };
+        let conversion_readback_us = started.elapsed().as_micros() as u64;
+        let input_pack_started = Instant::now();
+        let buffer = if let Some(nv12) = nv12_texture {
+            self.runtime.surface_buffer(&nv12)?
+        } else {
             let buffer = self.runtime.buffer(self.nv12.len() as u32, 0)?;
             write_buffer(&buffer, &self.nv12)?;
             buffer
@@ -983,6 +1044,8 @@ impl MfEncoder {
             sample.SetSampleTime(timestamp)?;
             sample.SetSampleDuration(10_000_000 / i64::from(self.fps))?;
         }
+        let input_pack_us = input_pack_started.elapsed().as_micros() as u64;
+        let mft_started = Instant::now();
         let deadline = Instant::now() + EVENT_TIMEOUT;
         self.transform.wait_event(false, deadline)?;
         let submit_started = Instant::now();
@@ -1013,6 +1076,8 @@ impl MfEncoder {
             .output(self.runtime, self.width * self.height * 2)?;
         self.transform.output_credit = self.transform.output_credit.saturating_sub(1);
         let lock_us = output_started.elapsed().as_micros() as u64;
+        let mft_encode_us = mft_started.elapsed().as_micros() as u64;
+        let processing_started = Instant::now();
         let output_time =
             unsafe { output.GetSampleTime() }.context("MF encoded sample timestamp")?;
         ensure!(
@@ -1049,10 +1114,20 @@ impl MfEncoder {
         }
         self.frame_index += 1;
         self.force_idr_next = false;
+        let output_processing_us = processing_started.elapsed().as_micros() as u64;
+        let total_us = started.elapsed().as_micros() as u64;
+        self.last_timings = MfFrameTimings {
+            conversion_readback_us,
+            input_pack_us,
+            mft_encode_us,
+            output_processing_us,
+            total_us,
+            conversion_gpu_completion_waited: !self.hardware || self.diagnostic_gpu_completion,
+        };
         Ok(EncodedFrame {
             data,
             is_idr: inspection.is_idr,
-            encode_us: started.elapsed().as_micros() as u64,
+            encode_us: total_us,
             qp_map: None,
             roi_activity: None,
             stage_timings: EncodeStageTimings {
