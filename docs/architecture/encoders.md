@@ -130,7 +130,27 @@ Raw data is in `F:\build\encoder-task\cpu\`, outside the repository.
 
 ### End-to-end on VM 105
 
-Pending: viewer measurements.
+Measured 2026-10-14 on the release host. VM 105 has no GPU: its display adapter is Basic Display Adapter (WARP). The VM runs at 1280x800 on an i5-1135G7 with four cores. A headless Chrome viewer runs on another PC through an SSH tunnel to the VM's relay. The content is a timestamp test page, full screen in Edge on the VM. Each run lasts 60 s. Results are WSS unless noted.
+
+| Config | Viewer fps mean (p5) | Latency mean / p95 (ms) | Host CPU mean (% of 4 cores) |
+| --- | ---: | ---: | ---: |
+| Auto selection (software MFT; adaptive lowered to 1152x720, then 864x540 at 30 fps) | 21.4 (19) | 24.7 / 53.4 | 4.0 |
+| `--cpu-mode`, defaults | 21.2 (19) | 25.8 / 55.4 | 5.9 |
+| `--cpu-mode`, old unoptimised path (`BP_CPU_SIMD=0 BP_CPU_DAMAGE=0 BP_CPU_ADAPTIVE=0 BP_CPU_MFT_THREADS=half`) | 21.7 (19) | 26.4 / 55.4 | 7.3 |
+| `--cpu-mode`, fixed 540p30 (`BP_CPU_ADAPTIVE=0 BP_CPU_MAX_HEIGHT=540 BP_CPU_MAX_FPS=30`) | 21.5 (20) | 24.4 / 50.9 | 3.5 |
+| `--cpu-mode`, WebRTC (WebCodecs) | 22.0 (receiver counter) | 38.7 / 86.5 | 3.6 |
+
+The old unoptimised path reaches a VM total CPU p95 of 62%. The other configs stay at 28-33%.
+
+On this VM, every config runs at about 22 fps. The source caps the rate. DXGI Desktop Duplication reports only 19-22 new presents per second, while the page renders at 64 rAF/s. Host admission, encoder, transport and viewer keep up with that capture rate with zero skips.
+
+The cap comes from the VM's display stack, likely DWM on the Basic Display Adapter, not from the host. A GPU-less physical PC is unverified.
+
+So on this VM the optimisations show up as lower CPU, not higher fps.
+
+The WebRTC page metric reads about 13 fps. The measuring script's canvas sampling misses frames drawn by the WebCodecs worker. The receiver's own counter is the reliable number.
+
+Rig note: ICE through the SSH tunnel can stay in "checking". This is a test-rig limitation, not a product one.
 
 ## Diagnostic toggles
 
@@ -156,7 +176,7 @@ The `BP_CPU_*` variables are read when the converter and encoder are built. The 
 
 - **AMD and Intel MFTs are untested.** No physical AMD or Intel machine has run the hardware path. Windows N and a machine without MF are not exercised.
 - **NVIDIA MFT is tested on one GPU.** The test GPU is a GTX 1660 SUPER.
-- **Gradual intra refresh is not built.** The inbox software MFT reports the property as supported, with value 0. The code reads the property but never sets it. Support is not confirmed by a refresh bitstream test.
+- **Gradual intra refresh is not used.** The inbox software MFT accepts `CODECAPI_AVEncVideoGradualIntraRefresh` (SetValue returns `S_OK` and the value reads back), but it ignores the value. With values 0, 30 and 60 the streams are byte-identical, and there are no intra slices outside IDRs (`probe_mf --intra-refresh`, PC and VM 105). The host does not use it.
 - **Privileged and cropped paths keep the old preparation.** They get no fused scaling and no adaptation.
 - **Quality/speed above 0 is not qualified.** At 100, the HD matrix error is about 87 code values. The cause is unresolved.
 - **NVENC performance is not benchmarked in this lane.** NVENC's encode and config code is unchanged.
