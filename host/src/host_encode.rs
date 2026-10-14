@@ -272,12 +272,16 @@ pub(super) fn startup_offer_command(
 }
 
 pub(super) fn ensure_rtc_encoder_codec(
+    backend: EncoderBackend,
     wss_active: bool,
     negotiated: Option<VideoCodec>,
     actual: VideoCodec,
 ) -> Result<()> {
     ensure!(
-        wss_active || negotiated.is_none_or(|codec| codec == actual),
+        // NVENC retains master's one-way downgrade and warm offer behavior.
+        backend == EncoderBackend::Nvenc
+            || wss_active
+            || negotiated.is_none_or(|codec| codec == actual),
         "encoder codec changed to {}; fresh RTC negotiation required",
         actual.name()
     );

@@ -4413,6 +4413,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     encoder_benchmark_profile_revision = desired_encoder_benchmark_profile_revision;
                 }
                 ensure_rtc_encoder_codec(
+                    discovered_backend,
                     wss_media.is_some(),
                     negotiated_video_codec,
                     active_codec,
@@ -4758,6 +4759,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                     }
                     ensure_rtc_encoder_codec(
+                        discovered_backend,
                         wss_media.is_some(),
                         negotiated_video_codec,
                         active_codec,
@@ -5588,6 +5590,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                     }
                     ensure_rtc_encoder_codec(
+                        discovered_backend,
                         wss_media.is_some(),
                         negotiated_video_codec,
                         active_codec,
@@ -6863,19 +6866,42 @@ mod tests {
 
     #[test]
     fn rtc_reconnect_preserves_the_session_downgrade_and_rejects_codec_mismatch() {
-        use super::VideoCodec;
-        assert!(super::ensure_rtc_encoder_codec(false, None, VideoCodec::H264).is_ok());
-        assert!(
-            super::ensure_rtc_encoder_codec(false, Some(VideoCodec::H264), VideoCodec::H264)
-                .is_ok()
-        );
-        assert!(
-            super::ensure_rtc_encoder_codec(false, Some(VideoCodec::Hevc), VideoCodec::H264)
-                .is_err()
-        );
-        assert!(
-            super::ensure_rtc_encoder_codec(true, Some(VideoCodec::Hevc), VideoCodec::H264).is_ok()
-        );
+        use super::{EncoderBackend, VideoCodec};
+        for backend in [EncoderBackend::MfHardware, EncoderBackend::MfSoftware] {
+            assert!(
+                super::ensure_rtc_encoder_codec(backend, false, None, VideoCodec::H264).is_ok()
+            );
+            assert!(super::ensure_rtc_encoder_codec(
+                backend,
+                false,
+                Some(VideoCodec::H264),
+                VideoCodec::H264
+            )
+            .is_ok());
+            assert!(super::ensure_rtc_encoder_codec(
+                backend,
+                false,
+                Some(VideoCodec::Hevc),
+                VideoCodec::H264
+            )
+            .is_err());
+            assert!(super::ensure_rtc_encoder_codec(
+                backend,
+                true,
+                Some(VideoCodec::Hevc),
+                VideoCodec::H264
+            )
+            .is_ok());
+        }
+        // A warm NVENC session stays on H.264 when a later offer chooses
+        // HEVC. Preserve master's behavior instead of ending that session.
+        assert!(super::ensure_rtc_encoder_codec(
+            EncoderBackend::Nvenc,
+            false,
+            Some(VideoCodec::Hevc),
+            VideoCodec::H264
+        )
+        .is_ok());
     }
 
     #[test]
