@@ -10,12 +10,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::model::{
-    Action, AnsweredRequest, AppState, Backend, BuildInfo, BuildState, ConnStep, ConnectedViewer,
-    Flow, HostRun, HostSetting, HostSettings, HostStatus, Link, Monitor, Notifier, PairedDevice,
-    PairingRequest, Permission, PcKind, Quality, RemotePc, RotatePc, Session, SessionNotice, Stats,
-    StepStatus, StreamMode, ThisDevice, VouchRequest,
+    Action, Answerer, AnsweredRequest, AppState, Backend, BuildInfo, BuildState, ConnError, ConnStep,
+    ConnectedViewer, EnrollStep, Flow, HostRun, HostSetting, HostSettings, HostStatus, Link, Monitor,
+    Notifier, Outcome, PairedDevice, PairingRequest, PcKind, PcProblem, Permission, Quality, RemotePc,
+    RotatePc, Session, SessionNotice, Stats, StepStatus, StreamMode, ThisDevice, VouchRequest,
 };
-use crate::ui::{DemoDriver, HomeSel, SessionUi, StripView, Toast, UiState, View};
+use crate::ui::{DemoDriver, HomeEdit, HomeSel, SessionUi, StripView, Toast, UiState, View};
 
 // ----------------------------------------------------------- demo data
 
@@ -27,6 +27,10 @@ const RELAY: &str = "play.bubblebuffer.net";
 const STUDIO_ID: &str = "H4PD-R8TN-B7QK-2M9X";
 const LIVING_ID: &str = "Q2WF-7KXM-JD3R-5PNA";
 const OFFICE_ID: &str = "Z8TC-M1VE-6HQB-W4LS";
+/// A PC paired in the demo, never connected to yet.
+const DEN_ID: &str = "R3VK-8MZT-Q1HW-6NCE";
+/// The key file the import scenes pick.
+const IMPORT_FILE: &str = "studio-laptop.bpkey";
 
 const HOST_ID: &str = "W5NJ-C2RD-9PXF-6KAE";
 const REQUEST_ID: &str = "req-m3zd-482913";
@@ -35,7 +39,9 @@ const REQUEST_DEVICE_ID: &str = "M3ZD-8QRA-F2KV-T7WB";
 const REQUEST_NUMBER: u32 = 482_913;
 
 /// The scene labels, in order. `DemoDriver::len` is `LABELS.len()`.
-const LABELS: [&str; 23] = [
+/// 0..=22 keep the numbering of the snapshots before step 4 (7 was the
+/// temporary password step); step 4 scenes follow from 23.
+const LABELS: [&str; 46] = [
     "Your PCs",
     "Vouch request",
     "This PC",
@@ -43,7 +49,7 @@ const LABELS: [&str; 23] = [
     "This PC: answered",
     "Pair: enter code",
     "Pair: confirm",
-    "Password (temporary)",
+    "Pair: approved",
     "Approval wait",
     "Connecting",
     "Connect failed",
@@ -59,6 +65,29 @@ const LABELS: [&str; 23] = [
     "Session: reconnecting",
     "Session: admin required",
     "Session: secure desktop",
+    "Your PCs: empty",
+    "Your PCs: offline",
+    "Your PCs: problems",
+    "Your PCs: rename",
+    "Your PCs: forget",
+    "Set up: new device",
+    "Set up: key created",
+    "Set up: unlock key file",
+    "Set up: import refused",
+    "Pair: code refused",
+    "Pair: remote request",
+    "Pair: remote waiting",
+    "Pair: denied",
+    "Pair: timed out",
+    "Pair: closed at PC",
+    "Approval: denied",
+    "Approval: timed out",
+    "Connect: new PC",
+    "Connect: relay unreachable",
+    "Connect: PC busy",
+    "Connect: connection lost",
+    "Connect: no video decoder",
+    "Connect: PC key changed",
 ];
 
 /// Session sparkline points from session.html (34 px high viewBox, 25
@@ -86,6 +115,7 @@ fn base_state() -> AppState {
                 last_seen: Some("Today 09:12".into()),
                 allowed: "View and input".into(),
                 vouch_request: None,
+                problem: None,
             },
             RemotePc {
                 id: LIVING_ID.into(),
@@ -97,6 +127,7 @@ fn base_state() -> AppState {
                 last_seen: None,
                 allowed: "View and input".into(),
                 vouch_request: None,
+                problem: None,
             },
             RemotePc {
                 id: OFFICE_ID.into(),
@@ -108,6 +139,7 @@ fn base_state() -> AppState {
                 last_seen: Some("2 Oct".into()),
                 allowed: "View and input".into(),
                 vouch_request: None,
+                problem: None,
             },
         ],
         host: Some(host_base()),
@@ -219,6 +251,37 @@ fn failed_steps() -> Vec<ConnStep> {
     ]
 }
 
+/// The PC the pairing scenes add: paired just now, never connected.
+fn den_pc() -> RemotePc {
+    RemotePc {
+        id: DEN_ID.into(),
+        name: "Den PC".into(),
+        kind: PcKind::Desktop,
+        relay: RELAY.into(),
+        online: true,
+        last_mode: None,
+        last_seen: None,
+        allowed: "View and input".into(),
+        vouch_request: None,
+        problem: None,
+    }
+}
+
+fn pair_wait(remote: bool, outcome: Outcome) -> Flow {
+    Flow::PairConfirm {
+        pc_name: "Den PC".into(),
+        pc_id: DEN_ID.into(),
+        number: REQUEST_NUMBER,
+        waiting_secs: if remote { 96 } else { 18 },
+        remote,
+        outcome,
+    }
+}
+
+fn studio_failed(steps: Vec<ConnStep>, error: ConnError) -> Flow {
+    Flow::Failed { pc_id: STUDIO_ID.into(), steps, error }
+}
+
 fn rotate_pcs() -> Vec<RotatePc> {
     vec![
         RotatePc { name: "Studio PC".into(), status: StepStatus::Done, detail: "confirmed 14:02".into() },
@@ -292,9 +355,11 @@ fn session_base() -> Session {
 }
 
 /// The state and UI for scene `index` (0-based, < LABELS.len()).
-fn scene_parts(index: usize) -> (AppState, View, SessionUi) {
+fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
     let mut s = base_state();
     let mut ui = SessionUi::default();
+    let mut edit = None;
+    let key = "K9TR-4WQZ-…";
     let view = match index {
         0 => View::Home(studio_sel()),
         1 => {
@@ -311,7 +376,7 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi) {
             View::Home(HomeSel::ThisPc)
         }
         5 => {
-            s.flow = Some(Flow::PairEnter { error: None });
+            s.flow = Some(Flow::PairEnter { remote: false, error: None });
             View::Home(HomeSel::FirstPc)
         }
         6 => {
@@ -320,19 +385,18 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi) {
                 pc_id: STUDIO_ID.into(),
                 number: REQUEST_NUMBER,
                 waiting_secs: 18,
+                remote: false,
+                outcome: Outcome::Waiting,
             });
             View::Home(HomeSel::FirstPc)
         }
         7 => {
-            s.flow = Some(Flow::Password {
-                pc_name: "Studio PC".into(),
-                relay: RELAY.into(),
-                error: None,
-            });
-            View::Home(studio_sel())
+            s.pcs.push(den_pc());
+            s.flow = Some(pair_wait(false, Outcome::Approved { by: Answerer::Pc }));
+            View::Home(HomeSel::FirstPc)
         }
         8 => {
-            s.flow = Some(Flow::Approval { pc_id: STUDIO_ID.into(), waiting_secs: 42 });
+            s.flow = Some(Flow::Approval { pc_id: STUDIO_ID.into(), waiting_secs: 42, outcome: Outcome::Waiting });
             View::Home(studio_sel())
         }
         9 => {
@@ -344,12 +408,7 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi) {
             View::Home(studio_sel())
         }
         10 => {
-            s.flow = Some(Flow::Failed {
-                pc_id: STUDIO_ID.into(),
-                steps: failed_steps(),
-                message: "Studio PC accepted this device, but no video arrived within 8 seconds."
-                    .into(),
-            });
+            s.flow = Some(studio_failed(failed_steps(), ConnError::NoFirstFrame { secs: 8 }));
             View::Home(studio_sel())
         }
         11 => {
@@ -364,6 +423,135 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi) {
                 pcs: rotate_pcs(),
             });
             View::Settings
+        }
+        23 => {
+            s.pcs.clear();
+            s.host = None;
+            View::Home(HomeSel::FirstPc)
+        }
+        24 => View::Home(HomeSel::Pc(OFFICE_ID.into())),
+        25 => {
+            s.pcs[0].problem = Some(PcProblem::KeyChanged);
+            s.pcs[1].problem = Some(PcProblem::NotAccepted);
+            s.pcs[2].problem = Some(PcProblem::RelayUnreachable);
+            View::Home(studio_sel())
+        }
+        26 => {
+            edit = Some(HomeEdit::Rename(STUDIO_ID.into()));
+            View::Home(studio_sel())
+        }
+        27 => {
+            edit = Some(HomeEdit::ConfirmForget(STUDIO_ID.into()));
+            View::Home(studio_sel())
+        }
+        28..=31 => {
+            s.pcs.clear();
+            s.host = None;
+            let step = match index {
+                28 => EnrollStep::Choose,
+                29 => EnrollStep::Created,
+                30 => EnrollStep::ImportUnlock { file_name: IMPORT_FILE.into(), error: None },
+                _ => EnrollStep::ImportRefused {
+                    file_name: IMPORT_FILE.into(),
+                    reason: "The ID in this file doesn't match its key, so it may have been edited. Export it again on the device it came from.".into(),
+                },
+            };
+            if step != EnrollStep::Created {
+                s.this_device.id.clear();
+            }
+            s.flow = Some(Flow::Enroll(step));
+            View::Home(HomeSel::FirstPc)
+        }
+        32 => {
+            s.flow = Some(Flow::PairEnter {
+                remote: false,
+                error: Some("The PC didn't accept that code. It may have expired (codes last 5 minutes) or been used already. Choose Pair device in the tray for a new one.".into()),
+            });
+            View::Home(HomeSel::FirstPc)
+        }
+        33 => {
+            s.flow = Some(Flow::PairEnter { remote: true, error: None });
+            View::Home(HomeSel::FirstPc)
+        }
+        34 => {
+            s.flow = Some(pair_wait(true, Outcome::Waiting));
+            View::Home(HomeSel::FirstPc)
+        }
+        35 => {
+            s.flow = Some(pair_wait(false, Outcome::Denied { by: Answerer::Pc }));
+            View::Home(HomeSel::FirstPc)
+        }
+        36 => {
+            s.flow = Some(pair_wait(true, Outcome::TimedOut));
+            View::Home(HomeSel::FirstPc)
+        }
+        37 => {
+            s.flow = Some(pair_wait(false, Outcome::Cancelled));
+            View::Home(HomeSel::FirstPc)
+        }
+        38 | 39 => {
+            let outcome = if index == 38 { Outcome::Denied { by: Answerer::Pc } } else { Outcome::TimedOut };
+            s.flow = Some(Flow::Approval { pc_id: STUDIO_ID.into(), waiting_secs: 0, outcome });
+            View::Home(studio_sel())
+        }
+        40 => {
+            s.pcs.push(den_pc());
+            s.flow = Some(Flow::Connecting { pc_id: DEN_ID.into(), mode: StreamMode::Work, steps: connecting_steps() });
+            View::Home(HomeSel::FirstPc)
+        }
+        41 => {
+            s.flow = Some(studio_failed(
+                vec![step("Relay", "no answer after 10 s", StepStatus::Failed)],
+                ConnError::RelayUnreachable,
+            ));
+            View::Home(studio_sel())
+        }
+        42 => {
+            s.flow = Some(studio_failed(
+                vec![
+                    step("Relay reached", RELAY, StepStatus::Done),
+                    step("Device key accepted", key, StepStatus::Done),
+                    step("PC busy", "another viewer is connected", StepStatus::Failed),
+                ],
+                ConnError::PcBusy,
+            ));
+            View::Home(studio_sel())
+        }
+        43 => {
+            s.flow = Some(studio_failed(
+                vec![
+                    step("Session ran", "41 min", StepStatus::Done),
+                    step("Connection dropped", "14:27", StepStatus::Failed),
+                    step("Reconnect", "3 attempts, gave up", StepStatus::Failed),
+                ],
+                ConnError::Lost { attempts: 3 },
+            ));
+            View::Home(studio_sel())
+        }
+        44 => {
+            s.flow = Some(studio_failed(
+                vec![
+                    step("Relay reached", RELAY, StepStatus::Done),
+                    step("Device key accepted", key, StepStatus::Done),
+                    step("Stream negotiated", "WebRTC, H.264", StepStatus::Done),
+                    step("Video decoder", "none found", StepStatus::Failed),
+                ],
+                ConnError::NoHardwareDecoder {
+                    codec: "H.264".into(),
+                    detail: "Media Foundation: no hardware H.264 decoder on Microsoft Basic Display Adapter".into(),
+                },
+            ));
+            View::Home(studio_sel())
+        }
+        45 => {
+            s.flow = Some(studio_failed(
+                vec![
+                    step("Relay reached", RELAY, StepStatus::Done),
+                    step("PC key checked", "doesn't match", StepStatus::Failed),
+                ],
+                ConnError::PcKeyChanged,
+            ));
+            View::Home(studio_sel())
         }
         _ => {
             // Session scenes (14..=22): the view underneath is never shown.
@@ -396,7 +584,7 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi) {
             view
         }
     };
-    (s, view, ui)
+    (s, view, ui, edit)
 }
 
 fn host_mut(s: &mut AppState) -> &mut HostStatus {
@@ -429,9 +617,51 @@ fn notify(shared: &Rc<RefCell<Shared>>) {
 }
 
 /// Applies one user action to the mock state. Actions not listed here
-/// (rename, forget, key export and so on) do nothing in the demo.
+/// (key export, logs folder and so on) do nothing in the demo.
 fn apply(state: &mut AppState, action: Action) {
     match action {
+        Action::Rename { pc_id, name } => {
+            if let Some(pc) = state.pcs.iter_mut().find(|p| p.id == pc_id) {
+                pc.name = name;
+            }
+        }
+        Action::Forget { pc_id } => {
+            state.pcs.retain(|p| p.id != pc_id);
+            state.flow = None;
+        }
+        Action::StartRemotePairing => state.flow = Some(Flow::PairEnter { remote: true, error: None }),
+        Action::SubmitPairing { .. } => state.flow = Some(pair_wait(false, Outcome::Waiting)),
+        Action::RequestRemotePairing { .. } => state.flow = Some(pair_wait(true, Outcome::Waiting)),
+        Action::CreateKey => {
+            state.this_device.id = THIS_DEVICE_ID.into();
+            state.flow = Some(Flow::Enroll(EnrollStep::Created));
+        }
+        Action::ImportKey => {
+            if matches!(state.flow, Some(Flow::Enroll(_))) {
+                state.flow =
+                    Some(Flow::Enroll(EnrollStep::ImportUnlock { file_name: IMPORT_FILE.into(), error: None }));
+            }
+        }
+        Action::UnlockImport { passphrase } => {
+            if passphrase.is_empty() {
+                state.flow = Some(Flow::Enroll(EnrollStep::ImportUnlock {
+                    file_name: IMPORT_FILE.into(),
+                    error: Some("That passphrase doesn't unlock this file.".into()),
+                }));
+            } else {
+                state.this_device.id = THIS_DEVICE_ID.into();
+                state.flow = None;
+            }
+        }
+        Action::Retry => {
+            let pc_id = match &state.flow {
+                Some(Flow::Failed { pc_id, .. } | Flow::Approval { pc_id, .. }) => Some(pc_id.clone()),
+                _ => None,
+            };
+            if let Some(pc_id) = pc_id {
+                apply(state, Action::Connect { pc_id });
+            }
+        }
         Action::Connect { pc_id } => {
             let mode = state
                 .pcs
@@ -441,8 +671,16 @@ fn apply(state: &mut AppState, action: Action) {
                 .unwrap_or_default();
             state.flow = Some(Flow::Connecting { pc_id, mode, steps: connecting_steps() });
         }
-        Action::CancelFlow => state.flow = None,
-        Action::StartPairing => state.flow = Some(Flow::PairEnter { error: None }),
+        Action::CancelFlow => {
+            state.flow = match &state.flow {
+                // Leaving an import goes back to the first-start choice.
+                Some(Flow::Enroll(EnrollStep::ImportUnlock { .. } | EnrollStep::ImportRefused { .. })) => {
+                    Some(Flow::Enroll(EnrollStep::Choose))
+                }
+                _ => None,
+            }
+        }
+        Action::StartPairing => state.flow = Some(Flow::PairEnter { remote: false, error: None }),
         Action::SetHostSetting(setting) => {
             if let Some(host) = state.host.as_mut() {
                 let s = &mut host.settings;
@@ -542,10 +780,10 @@ impl DemoDriver for MockDemo {
     }
     fn scene(&mut self, index: usize) -> (String, UiState) {
         let index = index % LABELS.len();
-        let (state, view, session) = scene_parts(index);
+        let (state, view, session, home_edit) = scene_parts(index);
         self.0.borrow_mut().state = state;
         notify(&self.0);
-        (LABELS[index].to_string(), UiState { view, session, demo_label: None })
+        (LABELS[index].to_string(), UiState { view, session, home_edit, demo_label: None })
     }
 }
 
@@ -557,7 +795,7 @@ mod tests {
     #[test]
     fn scenes_apply_without_panic_and_labels_are_unique() {
         let (_backend, mut demo) = new();
-        assert_eq!(demo.len(), 23);
+        assert_eq!(demo.len(), 46);
         let mut seen = HashSet::new();
         assert_eq!(demo.len(), LABELS.len());
         for (i, expected) in LABELS.iter().enumerate() {
@@ -565,7 +803,7 @@ mod tests {
             assert_eq!(label, *expected);
             assert!(seen.insert(label.clone()), "duplicate scene label: {label}");
         }
-        assert_eq!(seen.len(), 23);
+        assert_eq!(seen.len(), 46);
     }
 
     #[test]
@@ -591,5 +829,47 @@ mod tests {
         let host = backend.snapshot().host.expect("host");
         assert!(host.request.is_none());
         assert!(host.paired.iter().any(|d| d.id == REQUEST_DEVICE_ID));
+    }
+
+    #[test]
+    fn first_start_creates_a_key_and_import_returns_to_the_choice() {
+        let (mut backend, mut demo) = new();
+        demo.scene(28);
+        assert!(backend.snapshot().this_device.id.is_empty());
+        backend.act(Action::ImportKey);
+        assert!(matches!(backend.snapshot().flow, Some(Flow::Enroll(EnrollStep::ImportUnlock { error: None, .. }))));
+        backend.act(Action::UnlockImport { passphrase: String::new() });
+        assert!(matches!(backend.snapshot().flow, Some(Flow::Enroll(EnrollStep::ImportUnlock { error: Some(_), .. }))));
+        backend.act(Action::CancelFlow);
+        assert!(matches!(backend.snapshot().flow, Some(Flow::Enroll(EnrollStep::Choose))));
+        backend.act(Action::CreateKey);
+        let state = backend.snapshot();
+        assert!(matches!(state.flow, Some(Flow::Enroll(EnrollStep::Created))));
+        assert_eq!(state.this_device.id, THIS_DEVICE_ID);
+    }
+
+    #[test]
+    fn rename_forget_and_retry_update_state() {
+        let (mut backend, mut demo) = new();
+        backend.act(Action::Rename { pc_id: STUDIO_ID.into(), name: "Studio".into() });
+        assert_eq!(backend.snapshot().pcs[0].name, "Studio");
+        backend.act(Action::Forget { pc_id: STUDIO_ID.into() });
+        assert!(backend.snapshot().pcs.iter().all(|p| p.id != STUDIO_ID));
+
+        demo.scene(43);
+        backend.act(Action::Retry);
+        assert!(matches!(backend.snapshot().flow, Some(Flow::Connecting { .. })));
+    }
+
+    #[test]
+    fn pairing_requests_lead_to_the_wait() {
+        let (mut backend, _demo) = new();
+        backend.act(Action::StartRemotePairing);
+        assert!(matches!(backend.snapshot().flow, Some(Flow::PairEnter { remote: true, .. })));
+        backend.act(Action::RequestRemotePairing { pc_id: DEN_ID.into(), relay: RELAY.into() });
+        assert!(matches!(
+            backend.snapshot().flow,
+            Some(Flow::PairConfirm { remote: true, outcome: Outcome::Waiting, .. })
+        ));
     }
 }

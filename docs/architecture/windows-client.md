@@ -57,7 +57,9 @@ Step-3 validation on 2026-10-14: default / `dev-login` client unit suites **210 
 
 VM 101: the copied default executable (`SHA256 8607c8ac...ebc6cd85`) ran headless in a one-off interactive task. The WASAPI path attempts three opens during a 3 s run and reports **no default playback endpoint**, `0x80070490`; real rendering, underruns and the device period are **not measured**. No endpoint or driver was installed. The decoder probe exits **1**, writes stats with `error_kind: no_hardware_video_decoder`, and emits exactly one nonempty stderr line: `BubblePlay: no hardware video decoder (H.264): D3D11 device has no ID3D11VideoDevice interface`. Normal session startup was also tested on VM 101 against a copied local fake host: it exits **1** with one stderr line, `BubblePlay: no hardware video decoder (H.264): the shell adapter has no usable D3D11/NV12 decoder`, and writes typed failure stats. This covers the actual shell-device startup path as well as the headless capability probe. Each one-off task is unregistered, its owned processes have exited, and keepawake is removed. Physical playback, device changes and real-host interoperability remain unqualified.
 
-Build/Clippy acceptance: default and `dev-login` client builds, and the fake-host build, pass without warnings. The fake-host all-target Clippy run passes with `-D warnings`. Both client all-target Clippy variants currently fail only at `src/main.rs:60`, `clippy::default_constructed_unit_structs` (`PlaceholderVideo::default()` versus the unit constructor). That UI-demo line is outside this task's permitted main-file changes; its mechanical fix awaits a scope exception. No warnings/lints remain in `src/shell/` or `src/ui/` in the last runs. The parallel UI worker's mock-test range-loop cleanup is present in these checks.
+Build/Clippy acceptance: default and `dev-login` client builds, and the fake-host build, pass without warnings. The fake-host all-target Clippy run passes with `-D warnings`. Both client all-target Clippy variants (default and `dev-login`) pass with `-D warnings` as of step 4.
+
+Step 4 (2026-10-14) adds the login, approval and saved-devices UI against the mock backend; there is still no network code behind it. Connecting uses device-keys pairing plus the before-sign-in approval wait. There is no sign-in, password or TOTP screen, and the Go dev login stays CLI-only. A first start without a key shows Set up (create a key, or import a key file, with a local passphrase unlock or a refusal). Pairing has a code path and a remote-request path, and each ends approved, denied, timed out or closed at the PC. Approval can end denied, timed out or withdrawn. Connect failures are typed (`model::ConnError`): no first frame, relay unreachable, PC busy, connection lost, no hardware video decoder, PC key changed. Your PCs covers the empty list, offline PCs, per-PC problems (`RemotePc::problem`), inline rename and a forget confirmation. A new PC opens in Work, with no mode choice before connecting. The seam the real device-keys backend implements is documented at the top of `src/model.rs`. `--ui-demo` has 46 states. `tests/ui_layout.rs` checks the step-4 scenes and the pairing screens at 1100x720 and at the 760x520 minimum (`NN-name-min.png`).
 
 Backlog: MF software H.264 decode fallback for adapters without `ID3D11VideoDevice` (VMs, RDP, unusual drivers), after the v1 core steps. The current client deliberately has no software decode fallback.
 
@@ -157,7 +159,7 @@ All dated 2026-10-13.
 
 ## UI layout tests
 
-`client-win/tests/ui_layout.rs` renders every `--ui-demo` state (23, from
+`client-win/tests/ui_layout.rs` renders every `--ui-demo` state (46, from
 `src/mock.rs`) with egui_kittest, at 1100x720 and at the 760x520 shell
 minimum, and checks the accesskit tree. The UI marks its containers and
 texts through `src/ui/contract.rs` (`box:`, `row:`, `scroll:` names; a text
@@ -177,7 +179,9 @@ Run on Windows (it needs a wgpu adapter): `cargo test --test ui_layout` in
 
 Snapshots: `snapshots_at_default_size` compares each state at 1100x720 with
 `client-win/tests/snapshots/<state>.png` (threshold 0.8, at most 400 differing
-pixels). After an intended visual change, regenerate them with
+pixels); `snapshots_at_minimum_size` does the same at 760x520 for the
+pairing screens and the step-4 states, as `<state>-min.png`. Snapshots leave
+the demo scene label out of the title bar. After an intended visual change, regenerate them with
 `UPDATE_SNAPSHOTS=1 cargo test --test ui_layout`, look at the new PNGs and
 commit them with the change. The mockup comparison behind the current layout
 is in `client-win/src/ui/REFINEMENT.md`.

@@ -16,6 +16,10 @@
 //! - no more than three texts run together on one line (labelled fields or
 //!   a second line instead).
 //!
+//! Snapshots: every scene at the default size, and the login, pairing,
+//! approval and saved-PC scenes (v1 step 4) at the minimum size too, as
+//! `NN-name-min.png`.
+//!
 //! Update the snapshots with `UPDATE_SNAPSHOTS=1 cargo test --test ui_layout`.
 
 #![allow(dead_code)]
@@ -452,6 +456,30 @@ fn snapshots_at_default_size() {
     for scene in 0..scene_count() {
         let (mut h, name) = harness(scene, FULL);
         results.push(h.try_snapshot_options(name, &options));
+    }
+    let failed: Vec<String> = results.into_iter().filter_map(|r| r.err().map(|e| e.to_string())).collect();
+    for f in &failed {
+        println!("{f}");
+    }
+    assert!(failed.is_empty(), "{} snapshots differ (listed above)", failed.len());
+}
+
+/// Scenes snapshotted at the minimum size as well: the step 4 screens (from
+/// 23 on) and the earlier pairing scenes step 4 changed (enter, confirm,
+/// approved).
+fn min_size_snapshot_scenes() -> Vec<usize> {
+    let mut scenes = vec![5, 6, 7];
+    scenes.extend(23..scene_count());
+    scenes
+}
+
+#[test]
+fn snapshots_at_minimum_size() {
+    let options = SnapshotOptions::new().threshold(0.8).failed_pixel_count_threshold(400);
+    let mut results = Vec::new();
+    for scene in min_size_snapshot_scenes() {
+        let (mut h, name) = harness(scene, min_size());
+        results.push(h.try_snapshot_options(format!("{name}-min"), &options));
     }
     let failed: Vec<String> = results.into_iter().filter_map(|r| r.err().map(|e| e.to_string())).collect();
     for f in &failed {

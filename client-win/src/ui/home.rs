@@ -3,7 +3,8 @@
 //! panel). Mockup: client-win/mockups/connect.html states home, vouch,
 //! this-pc, this-pc-request, this-pc-answered.
 //!
-//! Selection lives in `UiState::view`. Choices the model has no action for
+//! Selection lives in `UiState::view`; a pending rename or forget
+//! confirmation in `UiState::home_edit`. Choices the model has no action for
 //! (the vouch permission switches) and the request clocks are kept in egui's
 //! temp memory, keyed by request ID.
 
@@ -15,11 +16,11 @@ use egui::{pos2, vec2, Align, Color32, Frame, Id, Key, Layout, Margin, Painter, 
 
 use super::contract;
 use super::theme::{self, size};
-use super::widgets::{self, BtnKind, BtnSize, PillKind};
-use super::{Cx, HomeSel, UiState, View};
+use super::widgets::{self, BtnKind, BtnSize, NoticeKind, PillKind};
+use super::{Cx, HomeEdit, HomeSel, UiState, View};
 use crate::model::{
     Action, AnsweredRequest, AppState, BuildState, HostRun, HostSetting, HostStatus, PairedDevice,
-    PairingRequest, PcKind, RemotePc, StreamMode, VouchRequest,
+    PairingRequest, PcKind, PcProblem, RemotePc, StreamMode, VouchRequest,
 };
 
 /// One PC row: 10 px padding, the name line and the sub line (22 each, the
@@ -36,6 +37,9 @@ const END_W: f32 = 140.0;
 /// word in the tooltip), so the ID line keeps its room.
 const NARROW_LIST_W: f32 = 480.0;
 
+/// Detail panel content height below which the shortcut lines are left out.
+const DETAIL_SHORT_H: f32 = 520.0;
+
 /// What the right-hand side and the list highlight.
 enum Target {
     Pc(usize),
@@ -44,6 +48,20 @@ enum Target {
 }
 
 pub fn show(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiState) {
+    // A rename asked for from outside (the demo) opens the row's field, the
+    // same way the Rename button does.
+    if let Some(HomeEdit::Rename(id)) = &us.home_edit {
+        if let Some(pc) = state.pcs.iter().find(|p| &p.id == id) {
+            start_rename(ui.ctx(), pc);
+        }
+        us.home_edit = None;
+    }
+    // A forget confirmation belongs to one PC: drop it once that PC is gone.
+    if let Some(HomeEdit::ConfirmForget(id)) = &us.home_edit {
+        if !state.pcs.iter().any(|p| &p.id == id) {
+            us.home_edit = None;
+        }
+    }
     let target = resolve(state, us);
     let this_pc = matches!(target, Target::ThisPc);
     let full = ui.max_rect();
@@ -58,7 +76,7 @@ pub fn show(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiState) 
             let pc = &state.pcs[i];
             match &pc.vouch_request {
                 Some(req) => vouch_panel(ui, cx, pc, req, right),
-                None => detail_panel(ui, cx, pc, right),
+                None => detail_panel(ui, cx, pc, us, right),
             }
         }
         Target::ThisPc => {
@@ -66,15 +84,7 @@ pub fn show(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiState) 
                 host_panel(ui, cx, host, right);
             }
         }
-        Target::Nothing => {
-            place(ui, right.shrink(28.0), |ui| {
-                ui.label(
-                    RichText::new("No PCs yet. Pair one to connect.")
-                        .font(theme::body(size::LEAD))
-                        .color(theme::INK_MUTED),
-                );
-            });
-        }
+        Target::Nothing => empty_panel(ui, cx, right),
     }
 }
 
@@ -200,13 +210,15 @@ fn list_column(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiStat
                         if let Some(host) = &state.host {
                             pinned_section(ui, cx, host, this_pc, us);
                         }
-                        list_head(ui, cx, this_pc);
+                        // With no PCs, the empty card (or the Get started
+                        // panel) offers pairing; the head keeps to its title.
+                        list_head(ui, cx, this_pc || state.pcs.is_empty());
                         for (i, pc) in state.pcs.iter().enumerate() {
                             pc_row(ui, cx, pc, selected_pc == Some(i), this_pc, us);
                             ui.add_space(2.0);
                         }
                         if state.pcs.is_empty() {
-                            meta_text(ui, "No PCs paired yet.");
+                            empty_list_card(ui, cx, matches!(target, Target::Nothing));
                         }
                     });
             });
@@ -229,26 +241,70 @@ fn pinned_section(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus, this_pc: bo
     ui.add_space(18.0);
 }
 
-fn list_head(ui: &mut egui::Ui, cx: &mut Cx, this_pc: bool) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new("Your PCs").font(theme::display(size::LIST_TITLE)).color(theme::INK));
-            ui.label(
-                RichText::new("Other PCs paired with this device's key.")
-                    .font(theme::body(size::LABEL))
-                    .color(theme::INK_FAINT),
-            );
+/// The list's placeholder when nothing is paired. Beside the Get started
+/// panel it is text only; beside This PC it carries the pairing button.
+fn empty_list_card(ui: &mut egui::Ui, cx: &mut Cx, panel_has_button: bool) {
+    let frame = Frame::NONE
+        .stroke(Stroke::new(1.0, theme::THREAD))
+        .corner_radius(theme::R_PANEL)
+        .inner_margin(Margin { left: 18, right: 18, top: 16, bottom: 16 });
+    contract::framed(ui, "empty-list", frame, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            widgets::icon(ui, cx, "monitor", theme::ICON, theme::INK_FAINT);
+            ui.add_space(4.0);
+            ui.label(RichText::new("No PCs yet").font(theme::bold(size::ROW_NAME)).color(theme::INK));
         });
-        if !this_pc {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("plus"), "Pair a new PC")
-                    .clicked()
-                {
-                    cx.actions.push(Action::StartPairing);
-                }
-            });
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new("A PC shows up here once this device is paired with it.")
+                    .font(theme::body(size::LABEL))
+                    .color(theme::INK_MUTED),
+            )
+            .wrap(),
+        );
+        if !panel_has_button {
+            ui.add_space(12.0);
+            if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("plus"), "Pair a new PC").clicked() {
+                cx.actions.push(Action::StartPairing);
+            }
         }
     });
+}
+
+fn list_head(ui: &mut egui::Ui, cx: &mut Cx, this_pc: bool) {
+    const SUB: &str = "PCs paired with this device.";
+    let heading = |ui: &mut egui::Ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Your PCs").font(theme::display(size::LIST_TITLE)).color(theme::INK));
+            ui.label(RichText::new(SUB).font(theme::body(size::LABEL)).color(theme::INK_FAINT));
+        });
+    };
+    let pair = |ui: &mut egui::Ui, cx: &mut Cx| {
+        if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("plus"), "Pair a new PC").clicked() {
+            cx.actions.push(Action::StartPairing);
+        }
+    };
+    // Beside the heading when both fit.
+    let sub_w = ui.painter().layout_no_wrap(SUB.to_owned(), theme::body(size::LABEL), theme::INK).size().x;
+    let btn_w = widgets::button_width(ui, BtnSize::Normal, Some("plus"), "Pair a new PC");
+    let side_by_side = sub_w + 16.0 + btn_w <= ui.available_width();
+    if this_pc {
+        heading(ui);
+    } else if side_by_side {
+        ui.horizontal(|ui| {
+            heading(ui);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| pair(ui, cx));
+        });
+    } else {
+        // Narrow list: the sub line goes so the button fits beside the title
+        // without pushing the rows down.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Your PCs").font(theme::display(size::LIST_TITLE)).color(theme::INK));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| pair(ui, cx));
+        });
+    }
     ui.add_space(20.0);
 }
 
@@ -387,6 +443,25 @@ fn row_name_with_pill(ui: &mut egui::Ui, name: &str, kind: PillKind, word: &str)
     widgets::pill(ui, kind, word);
 }
 
+/// Whether Connect is offered: the PC is online (or its relay is down, so
+/// trying is the only way to know), and nothing known blocks it.
+fn can_connect(pc: &RemotePc) -> bool {
+    match pc.problem {
+        Some(PcProblem::KeyChanged | PcProblem::NotAccepted) => false,
+        Some(PcProblem::RelayUnreachable) => true,
+        None => pc.online,
+    }
+}
+
+/// A problem's short word on the row's sub line, and its colour.
+fn problem_word(problem: PcProblem) -> (&'static str, Color32) {
+    match problem {
+        PcProblem::RelayUnreachable => ("Relay not answering", theme::ATTENTION),
+        PcProblem::NotAccepted => ("Not accepted", theme::DANGER),
+        PcProblem::KeyChanged => ("PC key changed", theme::DANGER),
+    }
+}
+
 fn pc_meta(pc: &RemotePc) -> String {
     if pc.online {
         format!("Last mode {}", mode_word(pc.last_mode.unwrap_or_default()))
@@ -438,6 +513,9 @@ fn pc_row(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, selected: bool, this_pc
 
     let (pill_kind, pill_word) = if request_inline {
         (PillKind::Warn, "1 pairing request")
+    } else if pc.problem == Some(PcProblem::RelayUnreachable) {
+        // The relay did not answer, so whether the PC is up is unknown.
+        (PillKind::Off, "Unknown")
     } else if pc.online {
         (PillKind::Online, "Online")
     } else {
@@ -448,16 +526,27 @@ fn pc_row(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, selected: bool, this_pc
     let (name_line, sub_line) = row_lines(text);
     contract::row_at(ui, "pc-row-name", name_line, |ui| match editing {
         Some(edit) => {
-            rename_field(ui, cx, pc, edit_key, edit);
+            let reserve = widgets::pill_width(ui, pill_word) + ui.spacing().item_spacing.x;
+            rename_field(ui, cx, pc, edit_key, edit, reserve);
             widgets::pill(ui, pill_kind, pill_word);
         }
         None => row_name_with_pill(ui, &pc.name, pill_kind, pill_word),
     });
     contract::row_at(ui, "pc-row-sub", sub_line, |ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        widgets::id_text(ui, &pc.id, false);
+        // A narrow row has no room for both: the problem is what matters,
+        // and the detail panel shows the ID.
+        if !(narrow && pc.problem.is_some() && !this_pc) {
+            widgets::id_text(ui, &pc.id, false);
+        }
         if !this_pc {
-            meta_line(ui, &pc_meta(pc));
+            match pc.problem {
+                Some(problem) => {
+                    let (word, color) = problem_word(problem);
+                    contract::text(ui, RichText::new(word).font(theme::bold(size::SMALL)).color(color), true);
+                }
+                None => meta_line(ui, &pc_meta(pc)),
+            }
         }
     });
 
@@ -467,7 +556,7 @@ fn pc_row(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, selected: bool, this_pc
             if request_inline {
             } else if pc.vouch_request.is_some() {
                 widgets::pill(ui, PillKind::Warn, "1 pairing request");
-            } else if pc.online {
+            } else if can_connect(pc) {
                 let kind = if selected { BtnKind::Primary } else { BtnKind::Secondary };
                 connect = if narrow {
                     widgets::icon_button(ui, cx, kind, "monitor-play", "Connect").clicked()
@@ -512,7 +601,16 @@ fn start_rename(ctx: &egui::Context, pc: &RemotePc) {
 
 /// The row's name as a single-line input. Enter commits (trimmed; ignored when
 /// empty or unchanged), Esc or losing focus cancels.
-fn rename_field(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, key: Id, mut edit: RenameEdit) {
+/// Width for the rename text: the text plus 48 px, at least 140, at most
+/// what the line leaves after `reserve`.
+fn rename_width(ui: &egui::Ui, text: &str, reserve: f32) -> f32 {
+    let text_w = ui.painter().layout_no_wrap(text.to_owned(), theme::bold(size::ROW_NAME), theme::INK).size().x;
+    let room = (ui.available_width() - reserve - 14.0).max(60.0);
+    (text_w + 48.0).max(140.0).min(room)
+}
+
+/// `reserve` is the width kept to the field's right (the row's pill).
+fn rename_field(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, key: Id, mut edit: RenameEdit, reserve: f32) {
     let text_id = key.with("text");
     if edit.armed {
         edit.armed = false;
@@ -528,13 +626,15 @@ fn rename_field(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, key: Id, mut edit
         .stroke(Stroke::new(1.0, theme::THREAD_STRONG))
         .corner_radius(theme::R_FIELD)
         .inner_margin(Margin::symmetric(6, 0));
+    let width = rename_width(ui, &edit.text, reserve);
     let out = frame.show(ui, |ui| {
         TextEdit::singleline(&mut edit.text)
             .id(text_id)
             .font(theme::bold(size::ROW_NAME))
             .text_color(theme::INK)
             .frame(Frame::NONE)
-            .desired_width(180.0)
+            // The name plus room to type, so the pill stays close.
+            .desired_width(width)
             .show(ui)
             .response
     });
@@ -572,17 +672,28 @@ fn rename_field(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, key: Id, mut edit
 /// nothing paints over another item. The narrow This PC rail drops the icon
 /// and the Settings/key note (mockup `.keynote` hidden) so Copy fits.
 fn list_foot(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiState, this_pc: bool) {
+    // A narrow list (the minimum window) keeps the ID, Copy and an icon-only
+    // Settings; the label and the key note go.
+    let narrow = !this_pc && ui.available_width() < NARROW_LIST_W;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = if this_pc { 6.0 } else { 8.0 };
         if !this_pc {
             widgets::icon(ui, cx, "fingerprint", theme::ICON_SM, theme::INK_FAINT);
         }
-        meta_text(ui, "This device");
+        if !narrow {
+            meta_text(ui, "This device");
+        }
         widgets::id_text(ui, &state.this_device.id, false);
         if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("copy"), "Copy").clicked() {
             ui.ctx().copy_text(state.this_device.id.clone());
         }
-        if !this_pc {
+        if narrow {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if widgets::icon_button(ui, cx, BtnKind::Ghost, "settings", "Settings").clicked() {
+                    us.view = View::Settings;
+                }
+            });
+        } else if !this_pc {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("settings"), "Settings").clicked() {
                     us.view = View::Settings;
@@ -590,7 +701,7 @@ fn list_foot(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiState,
                 ui.add_space(4.0);
                 contract::text(
                     ui,
-                    RichText::new("Key stored with Windows data protection")
+                    RichText::new("Key protected by Windows")
                         .font(theme::body(size::SMALL))
                         .color(theme::INK_FAINT),
                     true,
@@ -642,39 +753,70 @@ fn build_word(state: BuildState) -> &'static str {
 
 // ------------------------------------------------------------ detail (PC)
 
-fn detail_panel(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, rect: Rect) {
+fn detail_panel(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, us: &mut UiState, rect: Rect) {
     let p = ui.painter().clone();
     p.rect_filled(rect, 0.0, theme::SURFACE);
     panel_border(&p, rect);
 
     let inner = Rect::from_min_max(rect.min + vec2(28.0, 28.0), rect.max - vec2(28.0, 22.0));
-    let bottom_h = 200.0;
+    // Short window: the two shortcut lines go (they show in the session's
+    // help too), so the facts and a notice keep their room.
+    let short = inner.height() < DETAIL_SHORT_H;
+    let confirming = us.home_edit == Some(HomeEdit::ConfirmForget(pc.id.clone()));
+    // The forget card needs about 170 px; it takes the actions' place.
+    let bottom_h = match (confirming, short) {
+        (true, true) => 176.0,
+        (false, true) => 118.0,
+        _ => 200.0,
+    };
     let top = Rect::from_min_max(inner.min, pos2(inner.max.x, inner.max.y - bottom_h));
     let bottom = Rect::from_min_max(pos2(inner.min.x, inner.max.y - bottom_h), inner.max);
 
+    // The top scrolls when a notice makes it taller than the window allows.
     place(ui, top, |ui| {
-        widgets::section_label(ui, "Selected");
-        ui.add_space(8.0);
-        ui.label(RichText::new(&pc.name).font(theme::display(size::PANEL_NAME)).color(theme::INK));
-        widgets::id_text(ui, &pc.id, true);
-        ui.add_space(14.0);
-        egui::Grid::new("home_detail_facts").num_columns(2).spacing([16.0, 9.0]).show(ui, |ui| {
-            fact_key(ui, "Relay");
-            widgets::mono_text(ui, &pc.relay, 12.0, theme::INK);
-            ui.end_row();
-            fact_key(ui, "Allowed");
-            fact_text(ui, &pc.allowed);
-            ui.end_row();
-            fact_key(ui, "Last session");
-            fact_text(ui, &last_session(pc));
-            ui.end_row();
+        contract::scroll(ui, "detail-top", egui::ScrollArea::vertical().auto_shrink([false, false]), |ui| {
+            if !short {
+                widgets::section_label(ui, "Selected");
+                ui.add_space(8.0);
+            }
+            ui.label(RichText::new(&pc.name).font(theme::display(size::PANEL_NAME)).color(theme::INK));
+            widgets::id_text(ui, &pc.id, true);
+            ui.add_space(if short { 10.0 } else { 14.0 });
+            egui::Grid::new("home_detail_facts").num_columns(2).spacing([16.0, 9.0]).show(ui, |ui| {
+                fact_key(ui, "Relay");
+                widgets::mono_text(ui, &pc.relay, 12.0, theme::INK);
+                ui.end_row();
+                fact_key(ui, "Allowed");
+                fact_text(ui, &pc.allowed);
+                ui.end_row();
+                fact_key(ui, "Last session");
+                fact_text(ui, &last_session(pc));
+                ui.end_row();
+            });
+            if let Some((kind, icon, text)) = detail_notice(pc) {
+                ui.add_space(if short { 12.0 } else { 18.0 });
+                widgets::notice(ui, cx, kind, icon, |ui| {
+                    ui.label(RichText::new(text).font(theme::body(13.0)).color(theme::INK_MUTED));
+                });
+            }
         });
     });
+
+    if confirming {
+        place(ui, bottom, |ui| forget_confirm(ui, cx, pc, us));
+        return;
+    }
 
     place(ui, bottom, |ui| {
         ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
             let label = format!("Connect to {}", pc.name);
-            if pc.online {
+            if pc.problem == Some(PcProblem::NotAccepted) {
+                // Connecting again would be refused again: pairing is the fix.
+                let again = format!("Pair {} again", pc.name);
+                if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("key-round"), &again).clicked() {
+                    cx.actions.push(Action::StartPairing);
+                }
+            } else if can_connect(pc) {
                 if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("monitor-play"), &label).clicked() {
                     cx.actions.push(Action::Connect { pc_id: pc.id.clone() });
                 }
@@ -682,14 +824,19 @@ fn detail_panel(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, rect: Rect) {
                 widgets::button_disabled(ui, cx, BtnKind::Primary, BtnSize::Large, Some("monitor-play"), &label);
             }
             ui.add_space(10.0);
-            for (what, keys) in [
-                ("Release mouse and keyboard", ["Ctrl", "Alt", "Shift", "Z"]),
-                ("Leave the session", ["Ctrl", "Alt", "Shift", "Q"]),
-            ] {
+            let chords: &[(&str, [&str; 4])] = if short {
+                &[]
+            } else {
+                &[
+                    ("Release mouse and keyboard", ["Ctrl", "Alt", "Shift", "Z"]),
+                    ("Leave the session", ["Ctrl", "Alt", "Shift", "Q"]),
+                ]
+            };
+            for (what, keys) in chords {
                 ui.horizontal(|ui| {
                     meta_text(ui, what);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        widgets::chord(ui, &keys);
+                        widgets::chord(ui, keys);
                     });
                 });
                 ui.add_space(6.0);
@@ -704,9 +851,124 @@ fn detail_panel(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, rect: Rect) {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let forget = format!("Forget {}", pc.name);
                     if widgets::button(ui, cx, BtnKind::Danger, BtnSize::Small, Some("trash-2"), &forget).clicked() {
-                        cx.actions.push(Action::Forget { pc_id: pc.id.clone() });
+                        us.home_edit = Some(HomeEdit::ConfirmForget(pc.id.clone()));
                     }
                 });
+            });
+        });
+    });
+}
+
+/// What the detail panel says about an offline PC or a known problem.
+fn detail_notice(pc: &RemotePc) -> Option<(NoticeKind, &'static str, String)> {
+    let name = &pc.name;
+    match pc.problem {
+        Some(PcProblem::KeyChanged) => Some((
+            NoticeKind::Error,
+            "shield-alert",
+            format!(
+                "{name} answered with a key this device doesn't know, so connecting is blocked. If someone at the PC confirms a reinstall, forget it here and pair again."
+            ),
+        )),
+        Some(PcProblem::NotAccepted) => Some((
+            NoticeKind::Error,
+            "shield-x",
+            format!("{name} no longer accepts this device's key: it was removed at the PC. Pair again from the tray on the PC."),
+        )),
+        Some(PcProblem::RelayUnreachable) => Some((
+            NoticeKind::Info,
+            "wifi-off",
+            format!("{} didn't answer, so BubblePlay can't tell whether {name} is on. Connecting tries again.", pc.relay),
+        )),
+        None if !pc.online => Some((
+            NoticeKind::Neutral,
+            "clock",
+            format!("{name} is offline. It shows as online once it is on and BubblePlay runs on it."),
+        )),
+        None => None,
+    }
+}
+
+/// The forget confirmation in place of the detail panel's actions.
+fn forget_confirm(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, us: &mut UiState) {
+    let frame = Frame::NONE
+        .fill(theme::SURFACE_RAISED)
+        .stroke(Stroke::new(1.0, theme::THREAD_STRONG))
+        .corner_radius(theme::R_PANEL)
+        .inner_margin(Margin { left: 18, right: 18, top: 16, bottom: 16 });
+    contract::framed(ui, "forget-confirm", frame, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(format!("Forget {}?", pc.name)).font(theme::bold(15.0)).color(theme::INK));
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "It leaves Your PCs, and this device drops its pinned key. {} keeps this device on its list until it is removed there.",
+                    pc.name
+                ))
+                .font(theme::body(13.0))
+                .color(theme::INK_MUTED),
+            )
+            .wrap(),
+        );
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            if widgets::button(ui, cx, BtnKind::Danger, BtnSize::Normal, Some("trash-2"), "Forget").clicked() {
+                cx.actions.push(Action::Forget { pc_id: pc.id.clone() });
+                us.home_edit = None;
+            }
+            if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Keep").clicked() {
+                us.home_edit = None;
+            }
+        });
+    });
+}
+
+// ------------------------------------------------------------ empty home
+
+/// The right-hand side before any PC is paired (and this PC doesn't host).
+fn empty_panel(ui: &mut egui::Ui, cx: &mut Cx, rect: Rect) {
+    let p = ui.painter().clone();
+    p.rect_filled(rect, 0.0, theme::SURFACE);
+    panel_border(&p, rect);
+    let inner = Rect::from_min_max(rect.min + vec2(28.0, 28.0), rect.max - vec2(28.0, 22.0));
+    place(ui, inner, |ui| {
+        contract::scroll(ui, "empty-panel", egui::ScrollArea::vertical().auto_shrink([false, false]), |ui| {
+            widgets::section_label(ui, "Get started");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Pair your first PC").font(theme::display(size::PANEL_NAME)).color(theme::INK));
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new("BubblePlay needs to run on the PC you want to reach. Pairing introduces this device to it once.")
+                        .font(theme::body(size::LEAD))
+                        .color(theme::INK_MUTED),
+                )
+                .wrap(),
+            );
+            ui.add_space(18.0);
+            for (n, text) in [
+                ("1", "On the PC, open the BubblePlay tray icon and choose Pair device."),
+                ("2", "Type the PC ID and code here, or paste the pairing link."),
+                ("3", "Check that both show the same number, and allow it at the PC."),
+            ] {
+                ui.horizontal_top(|ui| {
+                    ui.label(RichText::new(n).font(theme::mono(13.0)).color(theme::SIGNAL));
+                    ui.add_space(6.0);
+                    ui.add(egui::Label::new(RichText::new(text).font(theme::body(13.0)).color(theme::INK)).wrap());
+                });
+                ui.add_space(8.0);
+            }
+            ui.add_space(14.0);
+            ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
+                if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("plus"), "Pair a new PC").clicked() {
+                    cx.actions.push(Action::StartPairing);
+                }
+                ui.add_space(8.0);
+                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Normal, None, "Nobody at the PC? Ask remotely").clicked() {
+                    cx.actions.push(Action::StartRemotePairing);
+                }
             });
         });
     });

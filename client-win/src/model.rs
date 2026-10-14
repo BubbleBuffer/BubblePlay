@@ -5,6 +5,35 @@
 //! [`Action`]s back. Everything here is plain data: no handles, no locks.
 //! A backend that changes state on another thread calls the notifier it was
 //! given in [`Backend::set_notifier`] so the shell repaints.
+//!
+//! # Device-keys seam
+//!
+//! The real device-keys backend (docs/architecture/device-keys.md) plugs in
+//! here by implementing [`Backend`]; the UI needs nothing else. What it owes
+//! the UI, step by step (`src/mock.rs` plays each one):
+//!
+//! - **No key yet** (first start): `this_device.id` is empty and `flow` is
+//!   `Flow::Enroll(EnrollStep::Choose)`. [`Action::CreateKey`] leads to
+//!   `EnrollStep::Created`; [`Action::ImportKey`] opens the file picker and
+//!   leads to `ImportUnlock` (the file has a passphrase), `ImportRefused`
+//!   (wrong format, ID or key mismatch) or straight to no flow (a plain
+//!   file). [`Action::UnlockImport`] answers `ImportUnlock`.
+//! - **Pairing** at the PC: [`Action::SubmitPairing`] (link, or PC ID, code
+//!   and relay) leads to `Flow::PairConfirm` with `remote: false` and
+//!   `Outcome::Waiting`; remote pairing: [`Action::RequestRemotePairing`],
+//!   `remote: true`. The backend moves `outcome` to `Approved`, `Denied`,
+//!   `TimedOut` (5 minutes for a code, 10 for a remote request) or
+//!   `Cancelled` (closed at the PC), and on `Approved` adds the PC to `pcs`.
+//!   A code the PC refuses comes back as `Flow::PairEnter { error }`.
+//! - **Connecting**: `Flow::Connecting`, then the session; a failure is
+//!   `Flow::Failed` with a [`ConnError`], a key the PC does not accept is
+//!   `Flow::Refused`. A PC at the sign-in screen first shows
+//!   `Flow::Approval` (before sign-in) until its outcome is known.
+//! - **Saved PCs**: `RemotePc::problem` keeps the last known trouble with a
+//!   PC (from the relay or the last connect) for Your PCs.
+//!
+//! [`Action::CancelFlow`] always means "back": it leaves the flow, except in
+//! the import steps of `Flow::Enroll`, where it returns to `Choose`.
 
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +106,22 @@ pub struct RemotePc {
     pub allowed: String,
     /// A pairing request for this PC that this device could vouch for.
     pub vouch_request: Option<VouchRequest>,
+    /// The last known trouble with this PC, shown on its row and in its
+    /// detail panel. None when the last connect worked (or none was tried).
+    pub problem: Option<PcProblem>,
+}
+
+/// Trouble with a saved PC that Your PCs shows before anyone clicks Connect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PcProblem {
+    /// The PC's relay did not answer, so its online state is unknown.
+    RelayUnreachable,
+    /// The last connect was refused: this device's key is not on the PC's
+    /// list (revoked there, or never paired).
+    NotAccepted,
+    /// The PC answered with a key that does not match the pinned one and no
+    /// signed rotation. Connecting is blocked until it is paired again.
+    KeyChanged,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -203,18 +248,86 @@ pub struct AnsweredRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Flow {
-    /// Temporary until device keys land: the relay password step.
-    Password { pc_name: String, relay: String, error: Option<String> },
-    PairEnter { error: Option<String> },
-    PairConfirm { pc_name: String, pc_id: String, number: u32, waiting_secs: u32 },
+    /// First start without a device key: create or import one.
+    Enroll(EnrollStep),
+    /// Pairing input. `remote: false` takes the PC ID and the one-time code
+    /// from the tray (or the pairing link); `remote: true` asks a PC with
+    /// remote pairing on, by PC ID only.
+    PairEnter { remote: bool, error: Option<String> },
+    /// The pairing wait: the comparison number is shown here and confirmed
+    /// at the PC or by a paired device that vouches.
+    PairConfirm {
+        pc_name: String,
+        pc_id: String,
+        number: u32,
+        waiting_secs: u32,
+        remote: bool,
+        outcome: Outcome,
+    },
     /// PC is at the Windows sign-in screen: a fresh ntfy approval sent by
-    /// the PC itself is needed.
-    Approval { pc_id: String, waiting_secs: u32 },
+    /// the PC itself is needed. `Approved` is never shown: the flow moves on
+    /// to `Connecting`.
+    Approval { pc_id: String, waiting_secs: u32, outcome: Outcome },
     Connecting { pc_id: String, mode: StreamMode, steps: Vec<ConnStep> },
-    Failed { pc_id: String, steps: Vec<ConnStep>, message: String },
+    Failed { pc_id: String, steps: Vec<ConnStep>, error: ConnError },
     /// The PC did not accept this device's key (revoked or never paired).
     Refused { pc_id: String },
     Rotate { old_id: String, new_id: String, pcs: Vec<RotatePc> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnrollStep {
+    /// No key: Create key or Import key file.
+    Choose,
+    /// A new key was made; `AppState::this_device` has its ID and path.
+    Created,
+    /// The chosen key file has a passphrase; it is asked once, then the key
+    /// is kept with Windows data protection like a created one.
+    ImportUnlock { file_name: String, error: Option<String> },
+    /// The file is not a usable key (format, version, or ID and key do not
+    /// match). `reason` is the sentence shown.
+    ImportRefused { file_name: String, reason: String },
+}
+
+/// Where an approval stands.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    Waiting,
+    Approved { by: Answerer },
+    Denied { by: Answerer },
+    /// Nobody answered before the request expired.
+    TimedOut,
+    /// The request was closed at the PC before anyone answered (the tray's
+    /// pairing window closed). Cancelling here leaves the flow instead.
+    Cancelled,
+}
+
+/// Who answered a pairing request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Answerer {
+    /// Someone at the PC (tray or Devices window).
+    Pc,
+    /// A paired device, by name (a voucher).
+    Device(String),
+}
+
+/// Why a connect attempt ended, for `Flow::Failed`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnError {
+    /// Key accepted and stream negotiated, but no video within `secs`.
+    NoFirstFrame { secs: u32 },
+    /// The relay did not answer.
+    RelayUnreachable,
+    /// Another viewer is connected (one viewer per PC).
+    PcBusy,
+    /// A running session dropped and reconnecting gave up.
+    Lost { attempts: u32 },
+    /// This computer has no hardware decoder for the stream's codec
+    /// (`media::NoHardwareVideoDecoder`); `detail` is its one-line reason.
+    NoHardwareDecoder { codec: String, detail: String },
+    /// The PC's key does not match the pinned one and no signed rotation
+    /// came with it ("PC key changed"); nothing was sent.
+    PcKeyChanged,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -319,10 +432,12 @@ pub enum Action {
     RetryWebSocket,
     Forget { pc_id: String },
     Rename { pc_id: String, name: String },
-    SubmitPassword { password: String },
     // pairing (this device joins a PC)
     StartPairing,
+    /// Switch the pairing input to a remote request (no code).
+    StartRemotePairing,
     SubmitPairing { link: Option<String>, pc_id: String, code: String, relay: String },
+    RequestRemotePairing { pc_id: String, relay: String },
     // vouching for another device on a remote PC
     Vouch { request_id: String, accept: bool, permissions: Vec<String> },
     // This PC
@@ -337,6 +452,10 @@ pub enum Action {
     OpenLogsFolder,
     ShowPairDevice,
     // this device's key
+    CreateKey,
+    /// Answers `EnrollStep::ImportUnlock`. The passphrase only unlocks the
+    /// file locally; it is never sent anywhere.
+    UnlockImport { passphrase: String },
     ExportKey,
     ImportKey,
     ReplaceKey,

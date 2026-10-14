@@ -31,14 +31,30 @@ pub use icons::Icons;
 pub struct UiState {
     pub view: View,
     pub session: SessionUi,
+    /// An edit open on a saved PC in Your PCs (rename field, forget check).
+    pub home_edit: Option<HomeEdit>,
     /// Shown small in the title bar in demo mode.
     pub demo_label: Option<String>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
-        Self { view: View::Home(HomeSel::FirstPc), session: SessionUi::default(), demo_label: None }
+        Self {
+            view: View::Home(HomeSel::FirstPc),
+            session: SessionUi::default(),
+            home_edit: None,
+            demo_label: None,
+        }
     }
+}
+
+/// An edit on one saved PC, by PC ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HomeEdit {
+    /// Open the inline rename field on the PC's row (taken on the next frame).
+    Rename(String),
+    /// The detail panel asks "Forget <PC>?" before forgetting it.
+    ConfirmForget(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -135,11 +151,13 @@ impl App {
     /// tests step through the scenes with this instead of F12.
     // Only tests/ui_layout.rs calls this; that crate compiles ui/ itself.
     #[allow(dead_code)]
+    /// The scene label stays out of the title bar here, so snapshots show
+    /// the title bar as it looks in real use; the interactive demo shows it.
     pub fn demo_scene(&mut self, index: usize) -> Option<String> {
         let demo = self.demo.as_mut()?;
         demo.index = index % demo.driver.len();
         let (label, ui) = demo.driver.scene(demo.index);
-        self.ui = UiState { demo_label: Some(label.clone()), ..ui };
+        self.ui = UiState { demo_label: None, ..ui };
         Some(label)
     }
 
@@ -249,8 +267,8 @@ fn titlebar_context(state: &AppState, ui: &UiState) -> String {
         state.pcs.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default()
     };
     match &state.flow {
+        Some(Flow::Enroll(_)) => "Set up this device".into(),
         Some(Flow::PairEnter { .. }) | Some(Flow::PairConfirm { .. }) => "Pair a new PC".into(),
-        Some(Flow::Password { pc_name, .. }) => pc_name.clone(),
         Some(Flow::Approval { pc_id, .. })
         | Some(Flow::Connecting { pc_id, .. })
         | Some(Flow::Failed { pc_id, .. })
