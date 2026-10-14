@@ -1163,31 +1163,22 @@ mod tests {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let pump = super::TransportPump::spawn(socket, None, None, 2_000_000);
         pump.set_activity(activity.clone());
-        for cycle in 0..2 {
-            let started = Instant::now();
+        for _ in 0..2 {
             assert!(pump.command(super::TransportCommand::ResetPeer));
-            // The first acknowledgement includes initial RTC construction and
-            // reset construction, each generating a fresh DTLS certificate.
-            // Keep this a reset/wake contract rather than a cold-start benchmark.
-            let deadline = started + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 match pump.try_event() {
                     Some(super::TransportEvent::PeerReset) => break,
                     Some(super::TransportEvent::Stopped) => panic!("reset stopped reusable pump"),
                     Some(_) => {}
                     None => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "reset {cycle} acknowledgement timed out after {:?}",
-                            started.elapsed()
-                        );
+                        assert!(Instant::now() < deadline, "reset acknowledgement timed out");
                         activity
                             .wait(deadline.saturating_duration_since(Instant::now()), &[])
                             .unwrap();
                     }
                 }
             }
-            eprintln!("reset {cycle} acknowledged after {:?}", started.elapsed());
         }
         pump.shutdown();
     }
