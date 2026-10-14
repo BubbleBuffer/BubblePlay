@@ -21,11 +21,14 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObj
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::d3d::Gfx;
 use super::input::{self, InputState};
-use super::{FrameRequests, Rect, ShellApp, ShellConfig, VideoLayer, WakeHandle, WindowCommand, WindowInfo};
+use super::{
+    FrameRequests, InputCapture, Rect, ShellApp, ShellConfig, VideoLayer, WakeHandle, WindowCommand, WindowInfo,
+};
 
 /// Width of the resize border, in device-independent pixels (scaled by DPI).
 const FRAME_BORDER_DIP: f32 = 6.0;
@@ -78,6 +81,13 @@ pub(super) struct State {
     pub(super) wake: Arc<WakeEvent>,
     pub(super) gfx: Option<Gfx>,
     pub(super) input: InputState,
+    /// The session's input capture (see [`InputCapture`]). It is taken out
+    /// of the state while one of its methods runs, so a message sent back
+    /// into the window procedure from inside it does not reach it again.
+    capture: Option<Box<dyn InputCapture>>,
+    /// `capture.captured()` as of the last check; while true, pointer and
+    /// keyboard input bypass egui and the capture owns the cursor.
+    pub(super) captured: bool,
     /// Drag and no-drag regions of the last rendered frame, in points.
     pub(super) hit_drag: Vec<egui::Rect>,
     pub(super) hit_no_drag: Vec<egui::Rect>,
@@ -107,6 +117,8 @@ impl State {
             wake,
             gfx: None,
             input: InputState::default(),
+            capture: None,
+            captured: false,
             hit_drag: Vec::new(),
             hit_no_drag: Vec::new(),
             cursor: egui::CursorIcon::Default,
@@ -128,6 +140,38 @@ impl State {
 
     pub(super) fn ppp(&self) -> f32 {
         self.dpi as f32 / 96.0
+    }
+
+    /// Re-reads `captured()`. On a change (either way) the window drops its
+    /// own mouse capture and egui's stale pointer, button, key and modifier
+    /// state is cleared, so nothing stays "held" across the switch.
+    fn sync_capture(&mut self) {
+        let now = self.capture.as_ref().is_some_and(|c| c.captured());
+        if now == self.captured {
+            return;
+        }
+        self.captured = now;
+        self.input.reset_for_capture_change();
+        self.frame_due = true;
+        // Last: ReleaseCapture sends WM_CAPTURECHANGED back into the
+        // window procedure.
+        if !self.hwnd.is_invalid() && unsafe { GetCapture() } == self.hwnd {
+            let _ = unsafe { ReleaseCapture() };
+        }
+    }
+
+    /// Gives `on_frame` this frame's video rect in client-area physical
+    /// pixels and returns that rect for the video layer.
+    fn frame_hook(&mut self, video: Option<egui::Rect>, ppo: f32) -> Option<Rect> {
+        let px = to_px(video, ppo);
+        if let Some(mut cap) = self.capture.take() {
+            cap.on_frame(self.hwnd, px);
+            if self.capture.is_none() {
+                self.capture = Some(cap);
+            }
+        }
+        self.sync_capture();
+        px
     }
 
     /// Builds the UI for one frame, draws it and presents. Returns a window
@@ -159,12 +203,8 @@ impl State {
         let ppo = full.pixels_per_point;
         let (render_out, platform, _) = egui_directx11::split_output(full);
 
-        let video_px = req.video.map(|r| Rect {
-            x: r.min.x * ppo,
-            y: r.min.y * ppo,
-            w: r.width() * ppo,
-            h: r.height() * ppo,
-        });
+        // The back buffer is the client area, so these are client pixels.
+        let video_px = self.frame_hook(req.video, ppo);
         self.hit_drag = std::mem::take(&mut req.drag);
         self.hit_no_drag = std::mem::take(&mut req.no_drag);
         self.cursor = platform.cursor_icon;
@@ -179,13 +219,32 @@ impl State {
             }
         }
 
+        let Some(gfx) = self.gfx.as_mut() else { return Ok(None) };
         gfx.draw(render_out, video_px, video, capture.as_deref())?;
         self.next_repaint = if repaint == Duration::MAX { None } else { Instant::now().checked_add(repaint) };
-        if self.input.pointer.is_some() {
+        // While captured, the cursor belongs to the capture.
+        if self.input.pointer.is_some() && !self.captured {
             apply_cursor(self.cursor);
         }
         Ok(command)
     }
+}
+
+/// An egui rect in points to client-area physical pixels.
+fn to_px(video: Option<egui::Rect>, ppo: f32) -> Option<Rect> {
+    video.map(|r| Rect { x: r.min.x * ppo, y: r.min.y * ppo, w: r.width() * ppo, h: r.height() * ppo })
+}
+
+/// Offers a message to the input capture first. `Some` means the capture
+/// consumed it and the window procedure returns that result.
+fn capture_message(st: &mut State, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    let mut cap = st.capture.take()?;
+    let result = cap.on_message(hwnd, msg, wp, lp);
+    if st.capture.is_none() {
+        st.capture = Some(cap);
+    }
+    st.sync_capture();
+    result
 }
 
 /// Renders through the pointers `run` installed. Returns Ok(None) when no
@@ -243,6 +302,13 @@ impl Window {
 
     pub fn wake_handle(&self) -> WakeHandle {
         WakeHandle(self.wake.clone())
+    }
+
+    /// Installs the input capture; it sees every message from the next one.
+    pub fn set_input_capture(&mut self, capture: Box<dyn InputCapture>) {
+        let st = unsafe { &mut *self.ptr };
+        st.capture = Some(capture);
+        st.sync_capture();
     }
 
     /// The D3D11 device the window renders with.
@@ -517,6 +583,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
     let st = &mut *ptr;
 
+    if let Some(result) = capture_message(st, hwnd, msg, wp, lp) {
+        return result;
+    }
     if let Some(result) = input::message(st, hwnd, msg, wp, lp) {
         return result;
     }
@@ -591,7 +660,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_ERASEBKGND => return LRESULT(1),
         WM_SETCURSOR => {
             if (lp.0 & 0xffff) as u32 == HTCLIENT as u32 {
-                apply_cursor(st.cursor);
+                // While captured the capture answers WM_SETCURSOR; if it let
+                // one through, leave the cursor alone (DefWindowProc would
+                // set the class arrow).
+                if !st.captured {
+                    apply_cursor(st.cursor);
+                }
                 return LRESULT(1);
             }
         }
@@ -610,4 +684,119 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         _ => {}
     }
     DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The InputCapture seam without a window: messages go through the same
+    //! two steps the window procedure takes (capture first, then egui), and
+    //! frames through `frame_hook`. The null HWND makes the Win32 side calls
+    //! (TrackMouseEvent, mouse capture) no-ops.
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Log {
+        messages: Vec<u32>,
+        frames: Vec<Option<Rect>>,
+    }
+
+    struct Fake {
+        log: Rc<RefCell<Log>>,
+        captured: Rc<Cell<bool>>,
+        /// The one message this capture consumes (0: none).
+        consume: u32,
+    }
+
+    impl InputCapture for Fake {
+        fn on_message(&mut self, _hwnd: HWND, msg: u32, _wp: WPARAM, _lp: LPARAM) -> Option<LRESULT> {
+            self.log.borrow_mut().messages.push(msg);
+            (msg == self.consume).then_some(LRESULT(7))
+        }
+        fn captured(&self) -> bool {
+            self.captured.get()
+        }
+        fn on_frame(&mut self, _hwnd: HWND, video_px: Option<Rect>) {
+            self.log.borrow_mut().frames.push(video_px);
+        }
+    }
+
+    fn state_with(consume: u32) -> (State, Rc<RefCell<Log>>, Rc<Cell<bool>>) {
+        let mut st = State::new(Arc::new(WakeEvent::new().unwrap()), (760.0, 520.0), 96);
+        let log = Rc::new(RefCell::new(Log::default()));
+        let captured = Rc::new(Cell::new(false));
+        st.capture = Some(Box::new(Fake { log: log.clone(), captured: captured.clone(), consume }));
+        (st, log, captured)
+    }
+
+    /// What the window procedure does before its own message handling.
+    fn deliver(st: &mut State, msg: u32, wp: usize, lp: isize) -> Option<LRESULT> {
+        let (wp, lp) = (WPARAM(wp), LPARAM(lp));
+        capture_message(st, HWND::default(), msg, wp, lp).or_else(|| input::message(st, HWND::default(), msg, wp, lp))
+    }
+
+    fn at(x: isize, y: isize) -> isize {
+        (y << 16) | x
+    }
+
+    fn moves(st: &State) -> usize {
+        st.input.events.iter().filter(|e| matches!(e, egui::Event::PointerMoved(_))).count()
+    }
+
+    #[test]
+    fn consumed_messages_skip_egui() {
+        let (mut st, log, _) = state_with(WM_KEYDOWN);
+        assert_eq!(deliver(&mut st, WM_KEYDOWN, 0x41, 0), Some(LRESULT(7)));
+        assert!(st.input.events.is_empty(), "a consumed key reached egui: {:?}", st.input.events);
+        // Not consumed: the capture still sees it first, then egui gets it.
+        deliver(&mut st, WM_MOUSEMOVE, 0, at(10, 10));
+        assert_eq!(log.borrow().messages, vec![WM_KEYDOWN, WM_MOUSEMOVE]);
+        assert_eq!(moves(&st), 1);
+    }
+
+    #[test]
+    fn egui_is_starved_while_captured() {
+        let (mut st, _, captured) = state_with(0);
+        deliver(&mut st, WM_MOUSEMOVE, 0, at(10, 10));
+        deliver(&mut st, WM_KEYDOWN, 0x41, 0);
+        assert_eq!(moves(&st), 1);
+        st.input.events.clear();
+
+        captured.set(true);
+        assert_eq!(deliver(&mut st, WM_MOUSEMOVE, 0, at(20, 20)), None);
+        assert_eq!(deliver(&mut st, WM_CHAR, 'x' as usize, 0), None);
+        assert_eq!(deliver(&mut st, WM_KEYDOWN, 0x42, 0), None);
+        assert!(st.captured);
+        // The switch released the held key and dropped the pointer; nothing
+        // after it reached egui.
+        let ev = &st.input.events;
+        assert!(
+            matches!(ev.as_slice(), [egui::Event::Key { key: egui::Key::A, pressed: false, .. }, egui::Event::PointerGone]),
+            "events while captured: {ev:?}"
+        );
+        assert_eq!(st.input.pointer, None);
+        assert_eq!(st.input.modifiers, egui::Modifiers::default());
+        st.input.events.clear();
+
+        captured.set(false);
+        deliver(&mut st, WM_MOUSEMOVE, 0, at(30, 30));
+        assert!(!st.captured);
+        assert_eq!(moves(&st), 1, "egui does not get the pointer back: {:?}", st.input.events);
+    }
+
+    #[test]
+    fn on_frame_gets_client_pixels() {
+        let (mut st, log, _) = state_with(0);
+        let video = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
+        let px1 = st.frame_hook(Some(video), 1.0);
+        let px15 = st.frame_hook(Some(video), 1.5);
+        st.frame_hook(None, 1.5);
+        let r1 = Rect { x: 10.0, y: 20.0, w: 300.0, h: 200.0 };
+        let r15 = Rect { x: 15.0, y: 30.0, w: 450.0, h: 300.0 };
+        assert_eq!(px1, Some(r1));
+        assert_eq!(px15, Some(r15));
+        assert_eq!(log.borrow().frames, vec![Some(r1), Some(r15), None]);
+    }
 }

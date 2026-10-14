@@ -27,6 +27,10 @@ pub(super) struct InputState {
     tracking: bool,
     /// Buttons currently held; the window captures the mouse while > 0.
     buttons: u32,
+    /// Which buttons and keys egui saw pressed and not released yet, so a
+    /// capture switch can release them.
+    held: Vec<egui::PointerButton>,
+    keys_down: Vec<egui::Key>,
     high_surrogate: Option<u16>,
 }
 
@@ -60,6 +64,66 @@ impl InputState {
         raw.viewports.insert(egui::ViewportId::ROOT, info);
         raw
     }
+
+    /// Input capture started or ended: release every button and key egui
+    /// still thinks is held (at the last pointer position), drop the
+    /// modifiers and the pointer.
+    pub(super) fn reset_for_capture_change(&mut self) {
+        let pos = self.pointer.unwrap_or(egui::Pos2::ZERO);
+        for button in std::mem::take(&mut self.held) {
+            self.events.push(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+        for key in std::mem::take(&mut self.keys_down) {
+            self.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+        self.buttons = 0;
+        self.modifiers = egui::Modifiers::default();
+        self.high_surrogate = None;
+        self.pointer = None;
+        self.events.push(egui::Event::PointerGone);
+    }
+}
+
+/// Pointer and keyboard messages, which egui does not get while captured.
+fn is_pointer_or_key(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_MOUSEMOVE
+            | WM_MOUSELEAVE
+            | WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_LBUTTONDBLCLK
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_RBUTTONDBLCLK
+            | WM_MBUTTONDOWN
+            | WM_MBUTTONUP
+            | WM_MBUTTONDBLCLK
+            | WM_XBUTTONDOWN
+            | WM_XBUTTONUP
+            | WM_XBUTTONDBLCLK
+            | WM_MOUSEWHEEL
+            | WM_MOUSEHWHEEL
+            | WM_KEYDOWN
+            | WM_KEYUP
+            | WM_SYSKEYDOWN
+            | WM_SYSKEYUP
+            | WM_CHAR
+            | WM_SYSCHAR
+            | WM_DEADCHAR
+            | WM_SYSDEADCHAR
+    )
 }
 
 fn push_text(inp: &mut InputState, text: String) {
@@ -72,6 +136,10 @@ fn push_text(inp: &mut InputState, text: String) {
 /// message is fully handled, None to let DefWindowProc run. Sets `frame_due`
 /// when events were queued.
 pub(super) fn message(st: &mut State, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    if st.captured && is_pointer_or_key(msg) {
+        // The capture did not consume it; it goes to DefWindowProc, not egui.
+        return None;
+    }
     let ppp = st.ppp();
     let before = st.input.events.len();
     let inp = &mut st.input;
@@ -110,11 +178,15 @@ pub(super) fn message(st: &mut State, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let p = pos(lp, ppp);
             inp.pointer = Some(p);
             if down {
+                inp.held.push(button);
                 inp.buttons += 1;
                 unsafe {
                     SetCapture(hwnd);
                 }
             } else {
+                if let Some(i) = inp.held.iter().position(|b| *b == button) {
+                    inp.held.remove(i);
+                }
                 inp.buttons = inp.buttons.saturating_sub(1);
                 if inp.buttons == 0 {
                     let _ = unsafe { ReleaseCapture() };
@@ -154,6 +226,13 @@ pub(super) fn message(st: &mut State, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             inp.modifiers = current_modifiers();
             let mods = inp.modifiers;
             if let Some(key) = key_from_vk(wp.0 as u16) {
+                if pressed {
+                    if !inp.keys_down.contains(&key) {
+                        inp.keys_down.push(key);
+                    }
+                } else {
+                    inp.keys_down.retain(|k| *k != key);
+                }
                 inp.events.push(egui::Event::Key {
                     key,
                     physical_key: None,

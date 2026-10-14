@@ -115,6 +115,33 @@ All dated 2026-10-13.
 - **Codecs.** H.264 is first-class, because hosts with Media Foundation encoders produce only H.264 and the host will follow codec changes on keyframes. The client must work on a PC without the HEVC extension, by checking at startup which decoders are installed.
 - **Decode route: Media Foundation** (2026-10-14, from the spike in [`client-win/spikes/decode-latency`](../../client-win/spikes/decode-latency/README.md)). Median submit-to-presented is within 0.3 ms of FFmpeg d3d11va for both codecs on the GTX 1660 Super (H.264 about 4.5 ms, HEVC about 3.3 ms, present-on-decode). MF H.264 has much tighter tails (p99 about 11 ms against 54 ms). Both backends show HEVC stalls of 100-500 ms. The machine was under heavy memory and build load during the runs, so the tails are not reliable; a quiet-machine rerun is still owed. The MF HEVC MFT here has no ICodecAPI; low latency is set through the `MF_LOW_LATENCY` attribute instead. FFmpeg stays out of the client.
 
+## UI layout tests
+
+`client-win/tests/ui_layout.rs` renders every `--ui-demo` state (23, from
+`src/mock.rs`) with egui_kittest, at 1100x720 and at the 760x520 shell
+minimum, and checks the accesskit tree. The UI marks its containers and
+texts through `src/ui/contract.rs` (`box:`, `row:`, `scroll:` names; a text
+class with its baseline and whether it may truncate). Invariants:
+
+- every item lies inside its container, and siblings in a container do not
+  overlap (scroll bars excepted);
+- nothing lies outside the window, after clipping to scroll viewports;
+- no text is elided unless it was marked as allowed to truncate;
+- buttons are at least 32 px high;
+- texts in one row share a baseline;
+- no run-on line: more than three texts on one line with gaps under 16 px;
+- egui's "First use / Second use of ... ID" warning is not painted.
+
+Run on Windows (it needs a wgpu adapter): `cargo test --test ui_layout` in
+`client-win/`. A failure lists each problem as `[state @size] what: item`.
+
+Snapshots: `snapshots_at_default_size` compares each state at 1100x720 with
+`client-win/tests/snapshots/<state>.png` (threshold 0.8, at most 400 differing
+pixels). After an intended visual change, regenerate them with
+`UPDATE_SNAPSHOTS=1 cargo test --test ui_layout`, look at the new PNGs and
+commit them with the change. The mockup comparison behind the current layout
+is in `client-win/src/ui/REFINEMENT.md`.
+
 ## Open questions
 
 - None open. Stack A (all Rust, egui on D3D11) was approved 2026-10-13.

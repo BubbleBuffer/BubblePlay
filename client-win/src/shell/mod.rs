@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView};
 
 mod d3d;
@@ -76,6 +77,33 @@ pub enum WindowCommand {
     Close,
 }
 
+/// Input capture for a remote session (implemented in `crate::input`).
+///
+/// Contract:
+/// - The WndProc calls [`InputCapture::on_message`] first, for every message
+///   (Raw Input, keys, mouse, focus, activation, WM_SETCURSOR, size/move),
+///   before any egui mapping. `Some(result)` consumes the message: the shell
+///   returns that result and does nothing else with it.
+/// - While [`InputCapture::captured`] is true, the shell withholds pointer and
+///   keyboard events from egui. When it turns false, egui gets them again.
+///   The shell releases its own mouse capture and clears stale egui pointer
+///   state on each transition.
+/// - [`InputCapture::on_frame`] is called once per rendered frame, after the
+///   UI has laid out, with the video rect in client-area physical pixels
+///   (None when no video is shown). The capture uses it for absolute mapping
+///   and ClipCursor.
+/// - The capture owns ClipCursor, cursor visibility and the cursor shape
+///   while captured (it answers WM_SETCURSOR itself). The shell must not
+///   change them then.
+/// - The low-level keyboard hook lives on its own thread inside
+///   `crate::input`, never on the UI/render thread, so it can't be stalled by
+///   a slow frame.
+pub trait InputCapture {
+    fn on_message(&mut self, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT>;
+    fn captured(&self) -> bool;
+    fn on_frame(&mut self, hwnd: HWND, video_px: Option<Rect>);
+}
+
 pub trait ShellApp {
     fn frame(&mut self, ui: &mut egui::Ui, info: WindowInfo, out: &mut FrameRequests);
 }
@@ -107,6 +135,12 @@ impl Shell {
     /// a decoder on another thread (Media Foundation) can share it.
     pub fn device(&self) -> ID3D11Device {
         self.inner.device()
+    }
+
+    /// Installs the session's input capture; it applies from the next message.
+    /// Call before `run`, or never for the home screens.
+    pub fn set_input_capture(&mut self, capture: Box<dyn InputCapture>) {
+        self.inner.set_input_capture(capture)
     }
 
     /// Runs until the window closes.
