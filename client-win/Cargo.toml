@@ -1,0 +1,46 @@
+[package]
+name = "bubbleplay-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "BubblePlay native Windows viewer"
+
+[[bin]]
+name = "bubbleplay-client"
+path = "src/main.rs"
+
+[dependencies]
+# --- UI track: shell, ui, model, mock ---
+# egui-directx11 0.13 pins egui 0.35 and windows 0.62; every D3D11 type the
+# shell hands out (VideoLayer) comes from this windows version.
+egui = "0.35"
+egui-directx11 = "0.13"
+resvg = "0.48"
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_Security",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# --- end UI track ---
+
+
+[profile.release]
+debug = "line-tables-only"
