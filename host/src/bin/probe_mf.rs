@@ -39,7 +39,581 @@ fn timing_summary(samples: &[MfFrameTimings], metric: impl Fn(&MfFrameTimings) -
     let average = values.iter().sum::<u64>() as f64 / values.len() as f64 / 1000.0;
     let p50 = values[(values.len() * 50).div_ceil(100) - 1] as f64 / 1000.0;
     let p95 = values[(values.len() * 95).div_ceil(100) - 1] as f64 / 1000.0;
-    format!("avg:{average:.3}/p50:{p50:.3}/p95:{p95:.3}ms")
+    let p99 = values[(values.len() * 99).div_ceil(100) - 1] as f64 / 1000.0;
+    format!("avg:{average:.3}/p50:{p50:.3}/p95:{p95:.3}/p99:{p99:.3}ms")
+}
+
+fn argument<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>> {
+    args.iter()
+        .position(|a| a == flag)
+        .map(|i| {
+            args.get(i + 1)
+                .map(String::as_str)
+                .context(format!("missing {flag} value"))
+        })
+        .transpose()
+}
+
+fn size_argument(args: &[String], flag: &str) -> Result<Option<(u32, u32)>> {
+    argument(args, flag)?
+        .map(|s| {
+            let (w, h) = s.split_once('x').context("expected WIDTHxHEIGHT")?;
+            Ok((w.parse()?, h.parse()?))
+        })
+        .transpose()
+}
+
+/// Flags also map to the hidden CPU-only host environment controls. Hardware
+/// MFT settings are deliberately independent of these environment variables.
+fn cpu_environment(args: &[String]) -> Result<()> {
+    for (flag, env) in [
+        ("--cpu-simd", "BP_CPU_SIMD"),
+        ("--cpu-damage", "BP_CPU_DAMAGE"),
+        ("--cpu-convert-threads", "BP_CPU_CONVERT_THREADS"),
+        ("--mft-threads", "BP_CPU_MFT_THREADS"),
+        ("--quality-speed", "BP_CPU_MFT_QUALITY_SPEED"),
+        ("--cabac", "BP_CPU_MFT_CABAC"),
+        ("--low-latency", "BP_CPU_MFT_LOW_LATENCY"),
+        ("--warp-bypass", "BP_CPU_WARP_BYPASS"),
+        ("--adaptive-fps", "BP_CPU_ADAPTIVE_FPS"),
+    ] {
+        if let Some(value) = argument(args, flag)? {
+            std::env::set_var(env, value);
+            println!("cpu_control {env}={value}");
+        }
+    }
+    if args.iter().any(|a| a == "--force-cpu-conversion") {
+        std::env::set_var("BP_CPU_FORCE_CONVERSION", "1");
+    }
+    Ok(())
+}
+
+fn bench_pixels(width: u32, height: u32, frame: usize, full: bool) -> Vec<u8> {
+    let mut pixels = vec![0; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            // Desktop-like panels, text strokes, a shaded image and a moving
+            // window. Every full-content frame changes the whole RGB surface.
+            let panel = x < width / 3;
+            let text = panel && y % 24 < 2 && x % 120 < 98;
+            let motion = x >= (frame as u32 * 13) % (width - 96)
+                && x < (frame as u32 * 13) % (width - 96) + 96
+                && y >= height / 3
+                && y < height / 3 + 96;
+            let v = if text {
+                30
+            } else if panel {
+                225
+            } else {
+                48 + ((x / 4 + y / 4) % 128) as u8
+            };
+            let delta = if full { (frame % 37) as u8 } else { 0 };
+            let p = ((y * width + x) * 4) as usize;
+            pixels[p..p + 4].copy_from_slice(&[
+                if motion { 240 } else { v.wrapping_add(delta) },
+                if motion { 180 } else { v.wrapping_add(delta) },
+                if motion { 60 } else { v.wrapping_add(delta) },
+                255,
+            ]);
+        }
+    }
+    pixels
+}
+
+fn bench_damage(
+    width: u32,
+    height: u32,
+    frame: usize,
+) -> Vec<bubbleplay_host::frame_damage::DamageRect> {
+    use bubbleplay_host::frame_damage::DamageRect;
+    [frame.saturating_sub(1) % 36, frame % 36]
+        .map(|n| {
+            let left = (n as u32 * 13) % (width - 96);
+            DamageRect {
+                left,
+                top: height / 3,
+                right: left + 96,
+                bottom: height / 3 + 96,
+            }
+        })
+        .to_vec()
+}
+
+fn validate_bench_au(data: &[u8], forced: bool, size: (u32, u32)) -> Result<()> {
+    let inspect = inspect_access_unit(data)?;
+    ensure!(
+        inspect.access_units == 1 && !inspect.has_b_slice && inspect.is_idr == forced,
+        "bench requires one AU, no B, and IDR only when forced"
+    );
+    if forced {
+        ensure!(
+            inspect.profile_idc == Some(100) && inspect.sps_before_idr && inspect.pps_before_idr,
+            "bench requires High SPS/PPS before every IDR"
+        );
+        for nal in annex_b_nals(data)?.into_iter().filter(|n| n[0] & 31 == 7) {
+            ensure!(
+                check_sps_colour_omission(nal)? == size,
+                "SPS size differs from CPU target {size:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+struct SpsBits {
+    bytes: Vec<u8>,
+    position: usize,
+}
+impl SpsBits {
+    fn new(nal: &[u8]) -> Self {
+        let mut bytes = Vec::new();
+        let mut zeros = 0;
+        for &byte in &nal[1..] {
+            if zeros >= 2 && byte == 3 {
+                zeros = 0;
+                continue;
+            }
+            bytes.push(byte);
+            zeros = if byte == 0 { zeros + 1 } else { 0 };
+        }
+        Self { bytes, position: 0 }
+    }
+    fn bits(&mut self, n: usize) -> Result<u32> {
+        ensure!(
+            n <= 32 && self.position + n <= self.bytes.len() * 8,
+            "truncated SPS"
+        );
+        let mut value = 0;
+        for _ in 0..n {
+            value = (value << 1)
+                | u32::from((self.bytes[self.position / 8] >> (7 - self.position % 8)) & 1);
+            self.position += 1;
+        }
+        Ok(value)
+    }
+    fn flag(&mut self) -> Result<bool> {
+        Ok(self.bits(1)? != 0)
+    }
+    fn ue(&mut self) -> Result<u32> {
+        let mut zeros = 0;
+        while !self.flag()? {
+            zeros += 1;
+            ensure!(zeros < 31, "SPS Exp-Golomb overflow");
+        }
+        Ok((1 << zeros) - 1 + self.bits(zeros)?)
+    }
+    fn se(&mut self) -> Result<i32> {
+        let value = self.ue()?;
+        Ok(if value & 1 != 0 {
+            (value / 2 + 1) as i32
+        } else {
+            -(value as i32 / 2)
+        })
+    }
+}
+
+/// Independent probe check of the established SPS colour omission. Conversion
+/// colour is explicit on the MFT input type, never added to the encoded VUI.
+fn check_sps_colour_omission(nal: &[u8]) -> Result<(u32, u32)> {
+    let mut b = SpsBits::new(nal);
+    ensure!(b.bits(8)? == 100, "SPS profile must remain High");
+    b.bits(16)?;
+    b.ue()?;
+    let chroma = b.ue()?;
+    ensure!(chroma <= 3, "invalid SPS chroma format");
+    if chroma == 3 {
+        b.bits(1)?;
+    }
+    b.ue()?;
+    b.ue()?;
+    b.bits(1)?;
+    if b.flag()? {
+        for i in 0..if chroma == 3 { 12 } else { 8 } {
+            if b.flag()? {
+                let mut last = 8;
+                let mut next = 8;
+                for _ in 0..if i < 6 { 16 } else { 64 } {
+                    if next != 0 {
+                        next = (last + b.se()? + 256) % 256;
+                    }
+                    if next != 0 {
+                        last = next;
+                    }
+                }
+            }
+        }
+    }
+    b.ue()?;
+    match b.ue()? {
+        0 => {
+            b.ue()?;
+        }
+        1 => {
+            b.bits(1)?;
+            b.se()?;
+            b.se()?;
+            let n = b.ue()?;
+            ensure!(n < 256, "invalid POC cycle");
+            for _ in 0..n {
+                b.se()?;
+            }
+        }
+        2 => {}
+        _ => anyhow::bail!("invalid SPS POC type"),
+    }
+    b.ue()?;
+    b.bits(1)?;
+    let coded_width = (b.ue()? + 1) * 16;
+    let map_height = (b.ue()? + 1) * 16;
+    let frame_only = b.flag()?;
+    if !frame_only {
+        b.bits(1)?;
+    }
+    b.bits(1)?;
+    let crop = if b.flag()? {
+        [b.ue()?, b.ue()?, b.ue()?, b.ue()?]
+    } else {
+        [0; 4]
+    };
+    ensure!(chroma == 1, "CPU output must remain 4:2:0");
+    let frame_factor = if frame_only { 1 } else { 2 };
+    let width = coded_width
+        .checked_sub((crop[0] + crop[1]) * 2)
+        .context("invalid SPS horizontal crop")?;
+    let height = (map_height * frame_factor)
+        .checked_sub((crop[2] + crop[3]) * 2 * frame_factor)
+        .context("invalid SPS vertical crop")?;
+    if b.flag()? {
+        if b.flag()? && b.bits(8)? == 255 {
+            b.bits(32)?;
+        }
+        if b.flag()? {
+            b.bits(1)?;
+        }
+        ensure!(
+            !b.flag()?,
+            "SPS introduced video_signal_type/colour description"
+        );
+    }
+    Ok((width, height))
+}
+
+fn run_cpu_bench(
+    device: &ID3D11Device,
+    args: &[String],
+    source: (u32, u32),
+    output: Option<&PathBuf>,
+) -> Result<()> {
+    let (width, height) = source;
+    let (mut out_width, mut out_height) = size_argument(args, "--output-size")?.unwrap_or(source);
+    let mut fps: u32 = argument(args, "--fps")?.unwrap_or("60").parse()?;
+    let frames: usize = argument(args, "--frames")?.unwrap_or("180").parse()?;
+    let warmup: usize = argument(args, "--warmup")?.unwrap_or("30").parse()?;
+    let content = argument(args, "--content")?.unwrap_or("dirty");
+    if matches!(content, "static" | "cursor") {
+        return run_unchanged_bench(device, source, (out_width, out_height), frames, content);
+    }
+    let pipeline = args.iter().any(|a| a == "--pipeline");
+    let shared_pipeline = args.iter().any(|a| a == "--pipeline-shared-device");
+    ensure!(
+        !shared_pipeline || pipeline,
+        "--pipeline-shared-device requires --pipeline"
+    );
+    let adaptive = args.iter().any(|a| a == "--adaptive");
+    let paced = args.iter().any(|a| a == "--paced");
+    ensure!(
+        !(adaptive && pipeline),
+        "adaptive pipeline experiment is not implemented"
+    );
+    use bubbleplay_host::video_encoder::cpu_policy::{CpuPacing, CpuTarget};
+    let requested = CpuTarget {
+        width: out_width,
+        height: out_height,
+        fps,
+    };
+    let mut pacing = CpuPacing::from_env(Instant::now());
+    let mut target = if adaptive {
+        pacing.target(source, requested, Instant::now())
+    } else {
+        requested
+    };
+    (out_width, out_height, fps) = (target.width, target.height, target.fps);
+    ensure!(
+        !pipeline || args.iter().any(|a| a == "--warp"),
+        "pipeline experiment uses WARP devices"
+    );
+    ensure!(
+        frames > 0 && width >= 128 && height >= 192 && matches!(content, "dirty" | "full"),
+        "bench needs positive frames, source >=128x192, content dirty/full"
+    );
+    let texture = fixture(device, width, height)?;
+    let context = unsafe { device.GetImmediateContext() }?;
+    let gate = gpu_gate::for_device(device);
+    let init_started = Instant::now();
+    let mut encoder = MfEncoder::new_with_gop(
+        device.as_raw(),
+        out_width,
+        out_height,
+        fps,
+        6_000_000,
+        !args.iter().any(|a| a == "--finite-gop-request"),
+        false,
+        2,
+    )?;
+    ensure!(
+        encoder.infinite_gop(),
+        "software must keep IDRs host-owned even for a finite-GOP request"
+    );
+    println!(
+        "CPU_INIT elapsed_ms={:.3} intra_refresh_status={:?} tuning={:?}",
+        init_started.elapsed().as_secs_f64() * 1000.0,
+        encoder.software_intra_refresh_status()?,
+        encoder.software_tuning_report()
+    );
+    let mut timings = Vec::with_capacity(frames);
+    let mut intervals = Vec::with_capacity(frames);
+    // Build the captured-like sequence outside the measured region. Both the
+    // serial and pipelined experiments replay exactly the same 36-frame cycle.
+    let pixels = std::sync::Arc::new(
+        (0..36)
+            .map(|n| bench_pixels(width, height, n, content == "full"))
+            .collect::<Vec<_>>(),
+    );
+    // This checks the exact conversion bytes before lossy H.264, for each
+    // measured size/matrix/configuration; decode error is a separate property.
+    {
+        use bubbleplay_host::mf_color::{bgra_to_nv12_scaled, CpuConversionOptions};
+        let mut reference = Vec::new();
+        let mut candidate = Vec::new();
+        bgra_to_nv12_scaled(
+            &pixels[0],
+            width as usize * 4,
+            width as usize,
+            height as usize,
+            out_width as usize,
+            out_height as usize,
+            CpuConversionOptions {
+                simd: false,
+                damage: false,
+                threads: 1,
+            },
+            &mut reference,
+        )?;
+        bgra_to_nv12_scaled(
+            &pixels[0],
+            width as usize * 4,
+            width as usize,
+            height as usize,
+            out_width as usize,
+            out_height as usize,
+            CpuConversionOptions::from_env(),
+            &mut candidate,
+        )?;
+        ensure!(candidate == reference, "CPU scalar/SIMD colour mismatch");
+        println!("PASS CPU_COLOUR exact_scalar_parity=true size={out_width}x{out_height} limited=true matrix={:?}",
+            bubbleplay_host::mf_color::matrix_for_nvenc(out_width,out_height));
+    }
+    let mut csv = String::from("frame,width,height,fps,readback_us,cpu_conversion_us,conversion_readback_us,input_pack_us,mft_encode_us,output_processing_us,total_us,completed_interval_us,idr\n");
+    let mut stream = Vec::new();
+    std::thread::scope(|scope| -> Result<()> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = if pipeline {
+            let pixels = pixels.clone();
+            let capture_device = device.clone();
+            Some(scope.spawn(move || -> Result<()> {
+                use bubbleplay_host::mf_color::CpuConverter;
+                let source_device = if shared_pipeline {
+                    capture_device
+                } else {
+                    create_device(true, false)?
+                };
+                let source_texture = fixture(&source_device, width, height)?;
+                let source_context = unsafe { source_device.GetImmediateContext() }?;
+                let source_gate = gpu_gate::for_device(&source_device);
+                let mut converter = CpuConverter::new(&source_device, width, height)?;
+                let mut nv12 = Vec::new();
+                for frame in 0..warmup + frames {
+                    {
+                        let _gpu = source_gate.lock();
+                        unsafe {
+                            source_context.UpdateSubresource(
+                                &source_texture,
+                                0,
+                                None,
+                                pixels[frame % 36].as_ptr().cast(),
+                                width * 4,
+                                0,
+                            )
+                        };
+                    }
+                    let damage = bench_damage(width, height, frame);
+                    let timing = converter.convert_frame(
+                        &source_texture,
+                        out_width,
+                        out_height,
+                        (frame > 0 && content == "dirty").then_some(damage.as_slice()),
+                        &mut nv12,
+                    )?;
+                    if sender.send((nv12.clone(), timing)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }))
+        } else {
+            drop(sender);
+            None
+        };
+        let mut completed = Instant::now();
+        let mut admission = completed;
+        let measured = (|| -> Result<()> {
+            for frame in 0..warmup + frames {
+                if adaptive {
+                    let next = pacing.target(source, requested, Instant::now());
+                    if next != target {
+                        encoder.reconfigure_profile(next.width, next.height, next.fps)?;
+                        println!("CPU_ADAPT frame={frame} previous={target:?} next={next:?} forces_IDR=true");
+                        target = next;
+                        (out_width, out_height, fps) = (next.width, next.height, next.fps);
+                    }
+                }
+                if paced {
+                    let now = Instant::now();
+                    if admission > now {
+                        std::thread::sleep(admission.duration_since(now));
+                    }
+                }
+                let frame_started = Instant::now();
+                if !pipeline {
+                    {
+                        let _gpu = gate.lock();
+                        unsafe {
+                            context.UpdateSubresource(
+                                &texture,
+                                0,
+                                None,
+                                pixels[frame % 36].as_ptr().cast(),
+                                width * 4,
+                                0,
+                            )
+                        };
+                    }
+                }
+                let forced = frame == 0
+                    || frame == warmup
+                    || frame == warmup + frames / 2
+                    || encoder.idr_pending();
+                if forced {
+                    encoder.force_idr();
+                }
+                let damage = bench_damage(width, height, frame);
+                let mut conversion = None;
+                let encoded = if pipeline {
+                    let (bytes, t) = receiver.recv().context("conversion pipeline ended early")?;
+                    conversion = Some(t);
+                    encoder.encode_nv12(&bytes)?
+                } else {
+                    encoder.encode_texture_with_damage(
+                        texture.as_raw(),
+                        (frame > 0 && content == "dirty").then_some(damage.as_slice()),
+                    )?
+                };
+                let finished = Instant::now();
+                let interval_us = finished.duration_since(completed).as_micros() as u64;
+                completed = finished;
+                validate_bench_au(&encoded.data, forced, (out_width, out_height))?;
+                if adaptive {
+                    pacing.observe(encoder.last_frame_timings().total_us, target, finished);
+                }
+                let period = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+                let scheduled = admission + period;
+                admission = if scheduled + period < frame_started {
+                    frame_started + period
+                } else {
+                    scheduled
+                };
+                if frame >= warmup {
+                    let mut t = encoder.last_frame_timings();
+                    if let Some(c) = conversion {
+                        t.readback_us = c.readback_us;
+                        t.cpu_conversion_us = c.conversion_us;
+                        t.conversion_readback_us += c.readback_us + c.conversion_us;
+                        t.total_us += c.readback_us + c.conversion_us;
+                    }
+                    csv.push_str(&format!(
+                    "{frame},{out_width},{out_height},{fps},{},{},{},{},{},{},{},{interval_us},{}\n",
+                        t.readback_us,
+                        t.cpu_conversion_us,
+                        t.conversion_readback_us,
+                        t.input_pack_us,
+                        t.mft_encode_us,
+                        t.output_processing_us,
+                        t.total_us,
+                        encoded.is_idr
+                    ));
+                    timings.push(t);
+                    intervals.push(MfFrameTimings {
+                        total_us: interval_us,
+                        ..Default::default()
+                    });
+                    stream.extend_from_slice(&encoded.data);
+                }
+            }
+            Ok(())
+        })();
+        drop(receiver);
+        if let Some(worker) = worker {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("conversion worker panicked"))??;
+        }
+        measured
+    })?;
+    println!("PASS CPU_BENCH source={width}x{height} output={out_width}x{out_height} fps={fps} frames={frames} warmup={warmup} content={content} pipeline={pipeline} converter=\"{}\" High=100 AnnexB=true AU_per_frame=1 B=0 forced_IDR_only=true SPS_PPS_every_IDR=true", encoder.converter_name());
+    println!("CPU_THROUGHPUT completed_interval={} fixture_generation_excluded=true texture_upload_included=true pipeline_devices=\"{}\"",timing_summary(&intervals,|t|t.total_us),if shared_pipeline {"shared WARP capture/encoder device and gate"} else if pipeline {"separate WARP capture device"} else {"encoder/capture shared device"});
+    println!("CPU_TIMINGS readback={} cpu_conversion={} conversion_readback={} packing={} mft={} output={} total={}",
+        timing_summary(&timings, |t|t.readback_us), timing_summary(&timings, |t|t.cpu_conversion_us),
+        timing_summary(&timings, |t|t.conversion_readback_us), timing_summary(&timings, |t|t.input_pack_us),
+        timing_summary(&timings, |t|t.mft_encode_us), timing_summary(&timings, |t|t.output_processing_us),
+        timing_summary(&timings, |t|t.total_us));
+    if let Some(dir) = output {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("cpu-timings.csv"), csv)?;
+        std::fs::write(dir.join("cpu-stream.h264"), stream)?;
+    }
+    Ok(())
+}
+
+fn run_unchanged_bench(
+    device: &ID3D11Device,
+    source: (u32, u32),
+    output: (u32, u32),
+    frames: usize,
+    content: &str,
+) -> Result<()> {
+    use bubbleplay_host::mf_color::CpuConverter;
+    let texture = fixture(device, source.0, source.1)?;
+    let mut converter = CpuConverter::new(device, source.0, source.1)?;
+    let mut nv12 = Vec::new();
+    converter.convert_frame(&texture, output.0, output.1, None, &mut nv12)?;
+    let before = nv12.clone();
+    let mut times = Vec::new();
+    for _ in 0..frames {
+        let start = Instant::now();
+        let t = converter.convert_frame(&texture, output.0, output.1, Some(&[]), &mut nv12)?;
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        ensure!(
+            t.readback_us == 0 && t.conversion_us == 0 && nv12 == before,
+            "unchanged frame was converted"
+        );
+        times.push(MfFrameTimings {
+            total_us: elapsed_us,
+            ..Default::default()
+        });
+    }
+    ensure!(!times.is_empty(), "positive --frames required");
+    println!("PASS CPU_UNCHANGED content={content} repeats={frames} readbacks=0 conversions=0 source=DDA-metadata-simulation capture_calls=0 actual_cursor_injection=false timings={}",timing_summary(&times,|t|t.total_us));
+    Ok(())
 }
 
 fn create_device(warp: bool, no_video_support: bool) -> Result<ID3D11Device> {
@@ -572,6 +1146,7 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    cpu_environment(&args)?;
     let software_only = args.iter().any(|a| a == "--software-only");
     let hardware_only = args.iter().any(|a| a == "--hardware-only");
     let warp = args.iter().any(|a| a == "--warp");
@@ -651,6 +1226,10 @@ fn main() -> Result<()> {
         !warp && !no_video_support
     );
     let device = create_device(warp, no_video_support)?;
+    if args.iter().any(|a| a == "--bench") {
+        ensure!(software_only, "--bench requires --software-only");
+        return run_cpu_bench(&device, &args, (width, height), output.as_ref());
+    }
     if preflight {
         return selection_preflight(&device, width, height, cpu_mode);
     }
