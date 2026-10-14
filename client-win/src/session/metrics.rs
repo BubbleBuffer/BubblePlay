@@ -6,7 +6,6 @@ use std::{
     time::Instant,
 };
 const SAMPLES: usize = 8192;
-#[cfg(feature = "dev-login")]
 pub fn write_summary(path: &std::path::Path, value: &serde_json::Value) -> anyhow::Result<()> {
     std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))?;
     Ok(())

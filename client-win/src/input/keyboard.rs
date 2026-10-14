@@ -361,10 +361,10 @@ mod tests {
                 Some(0x30 + u16::from(digit.as_bytes()[0] - b'0'))
             } else if let Some(digit) = code.strip_prefix("Numpad").filter(|s| s.len() == 1) {
                 Some(0x60 + u16::from(digit.as_bytes()[0] - b'0'))
-            } else if let Some(n) = code.strip_prefix('F').and_then(|n| n.parse::<u16>().ok()) {
-                Some(0x6F + n)
             } else {
-                None
+                code.strip_prefix('F')
+                    .and_then(|n| n.parse::<u16>().ok())
+                    .map(|n| 0x6F + n)
             };
             if let Some(expected) = expected {
                 assert_eq!(entry.vk, expected, "{code}");

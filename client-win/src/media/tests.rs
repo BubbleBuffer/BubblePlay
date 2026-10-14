@@ -146,7 +146,7 @@ fn decode_stream(runtime_device: &ID3D11Device, codec: Codec, path: &str) -> Res
         }
         let mut progressed = false;
         if fed < units.len() {
-            if fed < 4 || fed % 300 == 0 {
+            if fed < 4 || fed.is_multiple_of(300) {
                 println!(
                     "{} progress: fed={fed}, outputs={}",
                     codec.name(),

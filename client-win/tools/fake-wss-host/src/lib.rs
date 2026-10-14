@@ -3,6 +3,7 @@
 //! modules are a portable copy of the wire rules in `host/src/wss_v4.rs`, the
 //! worker's `media-v4.js` and the recorded spike streams.
 
+pub mod audio;
 pub mod cli;
 pub mod cursor;
 pub mod evidence;

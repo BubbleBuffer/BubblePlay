@@ -133,6 +133,8 @@ impl App {
 
     /// Demo mode: show scene `index` now and return its label. The layout
     /// tests step through the scenes with this instead of F12.
+    // Only tests/ui_layout.rs calls this; that crate compiles ui/ itself.
+    #[allow(dead_code)]
     pub fn demo_scene(&mut self, index: usize) -> Option<String> {
         let demo = self.demo.as_mut()?;
         demo.index = index % demo.driver.len();
@@ -141,7 +143,9 @@ impl App {
         Some(label)
     }
 
-    /// Number of demo scenes (0 outside demo mode).
+    /// Number of demo scenes (0 outside demo mode). Only the layout tests use it.
+    // Only tests/ui_layout.rs calls this; that crate compiles ui/ itself.
+    #[allow(dead_code)]
     pub fn demo_len(&self) -> usize {
         self.demo.as_ref().map_or(0, |d| d.driver.len())
     }

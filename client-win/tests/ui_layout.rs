@@ -85,7 +85,7 @@ fn harness(scene: usize, size: (f32, f32)) -> (Harness<'static, St>, String) {
                         .max_rect(ctx.content_rect()),
                 );
                 st.out = shell::FrameRequests::default();
-                let info = shell::WindowInfo { maximized: false, focused: true };
+                let info = shell::WindowInfo { maximized: false };
                 <ui::App as shell::ShellApp>::frame(&mut st.app, &mut root, info, &mut st.out);
             },
             st,
@@ -164,7 +164,7 @@ fn walk(node: AccessKitNode<'_>, container: Option<usize>, tree: &mut Tree) {
             let index = tree.containers.len();
             tree.containers.push(Container { name: name.to_owned(), kind, rect, parent: container });
             tree.items.push(Item {
-                desc: format!("{author}"),
+                desc: author.to_string(),
                 rect,
                 container,
                 is_container: Some(index),

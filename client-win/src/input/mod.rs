@@ -14,7 +14,7 @@ use crate::{
 use chords::{Chords, Escape};
 use hook::{KeyEvent, KeyboardHook};
 use state::CaptureState;
-pub use state::{CaptureSnapshot, CaptureStatus, Mode};
+pub use state::{CaptureStatus, Mode};
 use std::{
     collections::BTreeSet,
     sync::{
@@ -245,10 +245,9 @@ impl SessionInput {
         if self.state.mode == Mode::Work
             && self.state.eligible()
             && self.sync_epoch != Some(self.state.epoch)
+            && self.sequenced(|seq| protocol::cursor_sync(seq).to_vec())
         {
-            if self.sequenced(|seq| protocol::cursor_sync(seq).to_vec()) {
-                self.sync_epoch = Some(self.state.epoch);
-            }
+            self.sync_epoch = Some(self.state.epoch);
         }
     }
     fn clip(&mut self, hwnd: HWND) -> anyhow::Result<()> {

@@ -63,6 +63,7 @@ impl ReceiveGate {
         was_accepting
     }
 
+    #[cfg(test)]
     pub fn is_waiting_for_key(&self) -> bool {
         self.waiting_for_key
     }

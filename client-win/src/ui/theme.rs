@@ -71,13 +71,8 @@ pub const R_STRIP: CornerRadius = CornerRadius { nw: 0, ne: 0, se: 10, sw: 12 };
 pub const R_PILL: CornerRadius = CornerRadius::same(255);
 
 // ------------------------------------------------------------ spacing (4 px base)
-pub const SP1: f32 = 4.0;
 pub const SP2: f32 = 8.0;
 pub const SP3: f32 = 12.0;
-pub const SP4: f32 = 16.0;
-pub const SP5: f32 = 20.0;
-pub const SP6: f32 = 24.0;
-pub const SP8: f32 = 32.0;
 
 // ------------------------------------------------------------ sizes
 pub const WINDOW_W: f32 = 1100.0;
@@ -103,8 +98,6 @@ pub const ICON_LG: f32 = 22.0;
 
 // ------------------------------------------------------------ motion (ms)
 pub const T_FAST: f32 = 0.120;
-pub const T_FUNC: f32 = 0.180;
-pub const T_ENTER: f32 = 0.220;
 
 // ------------------------------------------------------------ type
 // Families registered by fonts.rs. Bricolage is a static instance at

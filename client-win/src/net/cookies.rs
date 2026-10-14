@@ -23,6 +23,7 @@ impl CookieJar {
 
     /// Build a jar from `Set-Cookie` header values. Unknown names are ignored, and a
     /// `Max-Age` of zero or less (or an empty value) removes the cookie.
+    #[cfg(any(test, feature = "dev-login"))]
     pub fn from_set_cookie<'a>(headers: impl IntoIterator<Item = &'a str>) -> Self {
         let mut jar = Self::new();
         jar.apply_set_cookie(headers);
@@ -30,6 +31,7 @@ impl CookieJar {
     }
 
     /// Apply `Set-Cookie` header values to this jar (see [`CookieJar::from_set_cookie`]).
+    #[cfg(any(test, feature = "dev-login"))]
     pub fn apply_set_cookie<'a>(&mut self, headers: impl IntoIterator<Item = &'a str>) {
         for header in headers {
             let mut parts = header.split(';');
@@ -59,6 +61,7 @@ impl CookieJar {
     }
 
     /// Store one cookie. Returns `false` (and stores nothing) for names the jar does not keep.
+    #[cfg(test)]
     pub fn insert(&mut self, name: &str, value: &str) -> bool {
         let Some(key) = retained_name(name) else {
             return false;
@@ -71,12 +74,14 @@ impl CookieJar {
         true
     }
 
+    #[cfg(any(test, feature = "dev-login"))]
     pub fn get(&self, name: &str) -> Option<&str> {
         retained_name(name)
             .and_then(|key| self.values.get(key))
             .map(String::as_str)
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
@@ -91,6 +96,7 @@ impl CookieJar {
     }
 }
 
+#[cfg(any(test, feature = "dev-login"))]
 fn retained_name(name: &str) -> Option<&'static str> {
     RETAINED.iter().copied().find(|retained| *retained == name)
 }

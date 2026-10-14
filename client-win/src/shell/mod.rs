@@ -21,6 +21,8 @@ mod input;
 mod placeholder;
 mod window;
 
+// main.rs uses this re-export; the layout test compiles shell/ without main.rs.
+#[allow(unused_imports)]
 pub use placeholder::PlaceholderVideo;
 
 /// A rectangle in physical pixels of the back buffer.
@@ -52,7 +54,6 @@ impl WakeHandle {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowInfo {
     pub maximized: bool,
-    pub focused: bool,
 }
 
 /// Requests the UI makes for this frame.

@@ -139,8 +139,14 @@ where
                             create_started.elapsed().as_secs_f64() * 1000.0
                         );
                         match created {
-                            Ok(decoder) => backend = Some(decoder),
+                            Ok(decoder) => {
+                                eprintln!("BP_DECODER {}", decoder.description());
+                                backend = Some(decoder);
+                            }
                             Err(error) => {
+                                if error.is::<crate::media::NoHardwareVideoDecoder>() {
+                                    return Err(error);
+                                }
                                 (callbacks.error)(format!("decoder creation: {error:#}"));
                                 (callbacks.dropped)(1);
                                 order.reset(epoch);
@@ -204,6 +210,9 @@ where
             Ok(())
         })();
         if let Err(error) = result {
+            if error.is::<crate::media::NoHardwareVideoDecoder>() {
+                return Err(error);
+            }
             (callbacks.error)(format!("decode: {error:#}"));
             (callbacks.dropped)((pending.len() + submitted.len()) as u64);
             pending.clear();
@@ -215,6 +224,20 @@ where
                 local_epoch: epoch,
                 reason: "decoder-error".into(),
             });
+        }
+    }
+    // Give an active MFT a bounded drain before dropping its COM resources.
+    // Capability failures return before this point and never spin on retries.
+    if let Some(decoder) = backend.as_mut() {
+        if decoder.drain().is_ok() {
+            let until = Instant::now() + Duration::from_millis(50);
+            while !DecodeBackend::is_drained(decoder) && Instant::now() < until {
+                match decoder.poll() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                    Err(_) => break,
+                }
+            }
         }
     }
     Ok(())

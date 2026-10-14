@@ -4,16 +4,13 @@
 //! The entry point is [`run`], called on an owned worker thread. The API is
 //! documented in `F:/build/win-client-step1/net-api.md`.
 
-// The shell and decoder use parts of this module as they are integrated; until
-// then some items have no caller yet.
-#![allow(dead_code)]
-
 mod config;
 mod cookies;
 mod error;
 mod events;
 mod gate;
 mod input;
+#[cfg(any(test, feature = "dev-login"))]
 mod login;
 mod protocol;
 mod session;
@@ -27,10 +24,19 @@ mod integration_contract_tests;
 mod session_tests;
 
 pub use config::{Codec, NetConfig};
-pub use cookies::{CookieJar, GATE_COOKIE, SESSION_COOKIE};
-pub use error::{LoginError, NetError};
-pub use events::{DecoderFeedback, NetEvent, ResetEvent, VideoFrame};
-pub use input::{CursorState, InputLink, InputSnapshot};
-pub use login::{login, login_blocking, login_with_cookies, LoginRequest};
+pub use cookies::CookieJar;
+#[cfg(any(test, feature = "dev-login"))]
+pub use cookies::{GATE_COOKIE, SESSION_COOKIE};
+#[cfg(feature = "dev-login")]
+pub use error::LoginError;
+pub use error::NetError;
+pub use events::{DecoderFeedback, NetEvent, VideoFrame};
+pub use input::{InputLink, InputSnapshot};
+#[cfg(feature = "dev-login")]
+pub use login::login_blocking;
+#[cfg(test)]
+pub use login::login_with_cookies;
+#[cfg(any(test, feature = "dev-login"))]
+pub use login::LoginRequest;
 pub use session::run;
-pub use stats::{NetState, TransportSnapshot, TransportStats};
+pub use stats::{NetState, TransportStats};

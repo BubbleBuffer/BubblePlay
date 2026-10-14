@@ -22,9 +22,17 @@ pub struct DevOptions {
     pub mode: crate::input::Mode,
     /// Separate decode-free input qualification window (VM only).
     pub input_only: bool,
+    /// Decode-free, window-free WSS audio harness; fake sink unless explicitly selected.
+    pub audio_only: bool,
+    pub audio_wasapi: bool,
+    pub audio_volume: f32,
+    pub audio_muted: bool,
+    /// Window-free local WASAPI tone test, reserved for VM qualification.
+    pub audio_render_test: bool,
+    /// Window-free hardware decoder capability probe.
+    pub decoder_probe: bool,
     #[cfg(feature = "dev-login")]
     pub login: Option<super::dev_login::DevLogin>,
-    #[cfg(feature = "dev-login")]
     pub stats_out_path: Option<PathBuf>,
 }
 
@@ -41,13 +49,18 @@ impl DevOptions {
         let mut capture_path = None;
         let mut mode = crate::input::Mode::Work;
         let mut input_only = false;
+        let mut audio_only = false;
+        let mut audio_wasapi = false;
+        let mut audio_volume = 1.0f32;
+        let mut audio_muted = false;
+        let mut audio_render_test = false;
+        let mut decoder_probe = false;
         #[cfg(feature = "dev-login")]
         let mut relay = None;
         #[cfg(feature = "dev-login")]
         let mut password_file = None;
         #[cfg(feature = "dev-login")]
         let mut provision_file = None;
-        #[cfg(feature = "dev-login")]
         let mut stats_out_path = None;
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -64,6 +77,21 @@ impl DevOptions {
                     }
                 }
                 "--dev-input-only" => input_only = true,
+                "--dev-audio-only" => audio_only = true,
+                "--dev-audio-wasapi" => audio_wasapi = true,
+                "--audio-mute" => audio_muted = true,
+                "--audio-volume" => {
+                    audio_volume = iter
+                        .next()
+                        .context("--audio-volume requires a value from 0 to 1")?
+                        .parse()
+                        .context("invalid audio volume")?;
+                    if !audio_volume.is_finite() || !(0.0..=1.0).contains(&audio_volume) {
+                        bail!("--audio-volume must be from 0 to 1");
+                    }
+                }
+                "--dev-audio-render-test" => audio_render_test = true,
+                "--dev-decoder-probe" => decoder_probe = true,
                 #[cfg(feature = "dev-login")]
                 "--dev-relay" => {
                     relay = Some(
@@ -83,7 +111,6 @@ impl DevOptions {
                         iter.next().context("--totp-provision requires a path")?,
                     ))
                 }
-                #[cfg(feature = "dev-login")]
                 "--stats-out" => {
                     stats_out_path = Some(PathBuf::from(
                         iter.next().context("--stats-out requires a path")?,
@@ -137,8 +164,8 @@ impl DevOptions {
             if codec == CodecChoice::Hevc {
                 bail!("--dev-relay supports --codec auto or h264");
             }
-            if input_only {
-                bail!("--dev-input-only is a fake-host fixture, not an authenticated relay path");
+            if input_only || audio_only || audio_render_test || decoder_probe {
+                bail!("development harnesses cannot be combined with --dev-relay");
             }
             let mut parsed = super::dev_login::validate_origin(&origin)?;
             let normalized = parsed.origin().ascii_serialization();
@@ -162,24 +189,54 @@ impl DevOptions {
             }
             None
         };
+        if [input_only, audio_only, audio_render_test, decoder_probe]
+            .into_iter()
+            .filter(|v| *v)
+            .count()
+            > 1
+        {
+            bail!("development harness modes are mutually exclusive");
+        }
+        if audio_wasapi && !audio_only {
+            bail!("--dev-audio-wasapi requires --dev-audio-only");
+        }
+        if (audio_only || audio_render_test || decoder_probe) && capture_path.is_some() {
+            bail!("headless modes cannot capture a window");
+        }
+        let url = if audio_render_test || decoder_probe {
+            if url.is_some() {
+                bail!("local device probes do not accept a host URL");
+            }
+            "ws://127.0.0.1".to_string()
+        } else {
+            url.context("missing --dev-wss URL")?
+        };
         Ok(Some(Self {
-            url: url.context("missing --dev-wss URL")?,
+            url,
             codec,
             exit_after,
             stats_path,
             capture_path,
             mode,
             input_only,
+            audio_only,
+            audio_wasapi,
+            audio_volume,
+            audio_muted,
+            audio_render_test,
+            decoder_probe,
             #[cfg(feature = "dev-login")]
             login,
-            #[cfg(feature = "dev-login")]
             stats_out_path,
         }))
     }
 }
 
 fn is_dev_flag(value: &str) -> bool {
-    if value == "--dev-wss" {
+    if matches!(
+        value,
+        "--dev-wss" | "--dev-audio-only" | "--dev-audio-render-test" | "--dev-decoder-probe"
+    ) {
         return true;
     }
     #[cfg(feature = "dev-login")]
@@ -248,6 +305,72 @@ mod tests {
             assert!(parse(&args).is_err(), "{args:?}");
         }
     }
+
+    #[test]
+    fn headless_modes_are_explicit_and_cannot_start_input_or_capture_a_window() {
+        let fake = parse(&[
+            "--dev-wss",
+            "ws://127.0.0.1:19764",
+            "--dev-audio-only",
+            "--stats-out",
+            "audio.json",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(fake.audio_only);
+        assert!(!fake.audio_wasapi && !fake.input_only);
+        assert_eq!(fake.stats_out_path, Some(PathBuf::from("audio.json")));
+        assert!(
+            parse(&["--dev-decoder-probe", "--stats-out", "probe.json"])
+                .unwrap()
+                .unwrap()
+                .decoder_probe
+        );
+        assert!(
+            parse(&["--dev-audio-render-test"])
+                .unwrap()
+                .unwrap()
+                .audio_render_test
+        );
+        for args in [
+            vec![
+                "--dev-wss",
+                "ws://127.0.0.1",
+                "--dev-audio-only",
+                "--dev-input-only",
+            ],
+            vec![
+                "--dev-wss",
+                "ws://127.0.0.1",
+                "--dev-audio-only",
+                "--capture",
+                "bad.png",
+            ],
+            vec!["--dev-decoder-probe", "--dev-wss", "ws://127.0.0.1"],
+            vec!["--dev-audio-only", "--dev-audio-render-test"],
+            vec!["--dev-wss", "ws://127.0.0.1", "--dev-audio-wasapi"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn audio_volume_and_mute_are_local_bounded_controls() {
+        let options = parse(&[
+            "--dev-wss",
+            "ws://127.0.0.1",
+            "--audio-volume",
+            "0.25",
+            "--audio-mute",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.audio_volume, 0.25);
+        assert!(options.audio_muted);
+        for value in ["NaN", "inf", "-0.1", "1.1", "bad"] {
+            assert!(parse(&["--dev-wss", "ws://127.0.0.1", "--audio-volume", value]).is_err());
+        }
+    }
     #[test]
     #[cfg(feature = "dev-login")]
     fn authenticated_relay_derives_websocket_scheme_without_reading_credentials() {
@@ -288,7 +411,9 @@ mod tests {
     #[cfg(not(feature = "dev-login"))]
     #[test]
     fn dev_login_module_and_flags_are_disabled_by_default() {
-        assert!(!cfg!(feature = "dev-login"));
+        const {
+            assert!(!cfg!(feature = "dev-login"));
+        }
         // The auth module declaration and its option fields are cfg-gated;
         // compiling this default build cannot resolve or include that module.
         assert!(!is_dev_flag("--dev-relay"));
@@ -305,6 +430,13 @@ mod tests {
             capture_path: _,
             mode: _,
             input_only: _,
+            audio_only: _,
+            audio_wasapi: _,
+            audio_volume: _,
+            audio_muted: _,
+            audio_render_test: _,
+            decoder_probe: _,
+            stats_out_path: _,
         } = options;
     }
 }

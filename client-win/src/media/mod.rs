@@ -2,7 +2,7 @@
 //!
 //! Data flow: the session thread passes Annex-B access units to a
 //! [`DecodeBackend`] (usually [`MfBackend`]), which returns NV12 textures on the
-//! shared shell device. Decoded frames go to a [`FrameSink`] (the mailbox), and
+//! shared shell device. Decoded frames go to a [`video::FrameSink`] (the mailbox), and
 //! [`VideoRenderer`] draws the newest one as the shell's `VideoLayer`. Nothing
 //! here depends on the transport, and nothing copies frames to the CPU.
 //!
@@ -18,8 +18,11 @@ mod video;
 #[cfg(test)]
 mod tests;
 
-pub use backend::{Codec, DecodeBackend, DecodedFrame, FrameLease};
-pub use mf::{hardware_decoder_available, resolve_codec, CodecRequest, MfBackend};
+pub use backend::{Codec, DecodeBackend, DecodedFrame};
+pub use mf::{
+    availability_report, hardware_decoder_available, resolve_codec, CodecRequest, MfBackend,
+    NoHardwareVideoDecoder,
+};
 pub use runtime::MediaRuntime;
-pub use stats::{MediaStats, StatsSnapshot, Totals};
-pub use video::{FrameSink, TraceFn, VideoRenderer, WakeFn};
+pub use stats::{MediaStats, StatsSnapshot};
+pub use video::VideoRenderer;

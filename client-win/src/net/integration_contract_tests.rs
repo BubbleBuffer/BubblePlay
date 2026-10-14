@@ -153,6 +153,8 @@ async fn serve_connection(
     }
     let path_slot = Arc::new(std::sync::Mutex::new(String::new()));
     let capture = path_slot.clone();
+    // Tungstenite fixes this callback's error type to its HTTP response.
+    #[allow(clippy::result_large_err)]
     let ws = accept_hdr_async(stream, move |request: &Request, response: Response| {
         *capture.lock().unwrap() = request.uri().path().to_owned();
         if request.uri().path() == "/media-ws" {
@@ -503,7 +505,7 @@ fn signaling_start_waits_for_both_media_controls_in_either_order() {
         let second_ready = client
             .seen
             .iter()
-            .rposition(|item| matches!(item, Seen::Ready(_)))
+            .rposition(|item| matches!(item, Seen::Ready(kind) if *kind == if peer_first { "hello-ok" } else { "media-peer" }))
             .unwrap();
         let start = client
             .seen

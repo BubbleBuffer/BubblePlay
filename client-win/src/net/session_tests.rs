@@ -94,8 +94,18 @@ struct Harness {
 }
 
 fn start(scenarios: Vec<Scenario>, timing: Timing, capacity: usize) -> Harness {
+    start_audio(scenarios, timing, capacity, None)
+}
+
+fn start_audio(
+    scenarios: Vec<Scenario>,
+    timing: Timing,
+    capacity: usize,
+    audio: Option<crate::audio::AudioHandle>,
+) -> Harness {
     let relay = FakeRelay::start(scenarios);
-    let config = NetConfig::new(relay.origin.clone(), Codec::H264, cookies());
+    let mut config = NetConfig::new(relay.origin.clone(), Codec::H264, cookies());
+    config.audio = audio;
     let (event_tx, events) = mpsc::sync_channel(capacity);
     let (feedback, feedback_rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -112,6 +122,128 @@ fn start(scenarios: Vec<Scenario>, timing: Timing, capacity: usize) -> Harness {
         stats,
         handle: Some(handle),
     }
+}
+
+fn audio_packet(seq: u32, discontinuity: bool) -> Vec<u8> {
+    let mut encoder =
+        opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio).unwrap();
+    let mut payload = [0; 1500];
+    let len = encoder.encode_float(&[0.0; 960], &mut payload).unwrap();
+    let mut packet = b"BPA1".to_vec();
+    packet.extend_from_slice(&[1, u8::from(discontinuity), 1, 2]);
+    packet.extend_from_slice(&48_000u32.to_be_bytes());
+    packet.extend_from_slice(&seq.to_be_bytes());
+    packet.extend_from_slice(&(u64::from(seq) * 10_000).to_be_bytes());
+    packet.extend_from_slice(&480u16.to_be_bytes());
+    packet.extend_from_slice(&[0, 0]);
+    packet.extend_from_slice(&payload[..len]);
+    packet
+}
+
+#[test]
+fn audio_is_opted_in_and_demuxed_without_video_acks_or_keyframes() {
+    let player = crate::audio::AudioPlayer::new(crate::audio::OutputMode::Fake).unwrap();
+    let audio = player.handle();
+    let steps = vec![
+        Step::Pause(Duration::from_millis(30)),
+        Step::Binary(audio_packet(0, true)),
+        Step::Pause(Duration::from_millis(10)),
+        Step::Binary(audio_packet(2, false)),
+        Step::Binary(audio_packet(1, false)),
+        Step::Binary(b"BPA1malformed".to_vec()),
+        Step::Binary(audio_packet(4, false)),
+    ];
+    let mut first = scenario(EPOCH_A, steps);
+    first.host_present = true;
+    let h = start_audio(vec![first], timing(), 8, Some(audio.clone()));
+    wait_for(|| audio.stats().decoded == 4 && audio.stats().concealed >= 1);
+    assert_eq!(audio.stats().received, 5);
+    assert_eq!(audio.stats().rejected, 1);
+    assert_eq!(audio.stats().late, 0);
+    let log = drain_log(&h.relay.log, QUIET);
+    let signaling = texts(&log, "/ws");
+    assert_eq!(
+        signaling.iter().find(|v| v["action"] == "start").unwrap()["audio"],
+        1
+    );
+    assert!(ack_seqs(&log).is_empty());
+    assert!(keyframe_reasons(&log).is_empty());
+    assert_eq!(h.stats.snapshot().frames_received, 0);
+    assert_eq!(h.stats.snapshot().rejected_packets, 0);
+    h.finish().unwrap();
+}
+
+#[test]
+fn audio_survives_video_regates_and_reconnect_discards_the_old_epoch() {
+    let player = crate::audio::AudioPlayer::new(crate::audio::OutputMode::Fake).unwrap();
+    let audio = player.handle();
+    let mut first = scenario(
+        EPOCH_A,
+        vec![
+            Step::Binary(audio_packet(0, true)),
+            Step::Text(json!({"type":"media-peer","present":true}).to_string()),
+            Step::Binary(frame(false, 9, 88, b"video gap")),
+            Step::Pause(Duration::from_millis(20)),
+            Step::Binary(audio_packet(1, false)),
+        ],
+    );
+    first.host_present = true;
+    let mut second = scenario(
+        EPOCH_B,
+        vec![
+            Step::Binary(audio_packet(0, true)),
+            Step::Binary(audio_packet(1, false)),
+            Step::Binary(audio_packet(2, false)),
+        ],
+    );
+    second.host_present = true;
+    let mut short = timing();
+    short.dead = Duration::from_millis(180);
+    short.heartbeat = Duration::from_secs(10);
+    let h = start_audio(vec![first, second], short, 16, Some(audio.clone()));
+    wait_for(|| audio.stats().epoch >= 2 && audio.stats().decoded >= 4);
+    let epoch = audio.stats().epoch;
+    assert!(!audio.push(epoch - 1, &audio_packet(100, false), Instant::now()));
+    assert_eq!(audio.stats().decode_errors, 0);
+    let log = drain_log(&h.relay.log, QUIET);
+    let starts: Vec<_> = texts(&log, "/ws")
+        .into_iter()
+        .filter(|v| v["action"] == "start")
+        .collect();
+    assert!(starts.len() >= 2);
+    assert!(starts.iter().all(|v| v["audio"] == 1));
+    assert!(starts.iter().any(|v| v["epoch"] == EPOCH_B));
+    h.finish().unwrap();
+}
+
+#[test]
+fn video_generation_and_sequence_gaps_do_not_reset_audio_playout() {
+    let player = crate::audio::AudioPlayer::new(crate::audio::OutputMode::Fake).unwrap();
+    let audio = player.handle();
+    let mut steps = Vec::new();
+    for seq in 0..15 {
+        // Bounded batches avoid relying on the OS's 10 ms sleep precision.
+        if seq == 10 {
+            steps.push(Step::Pause(Duration::from_millis(60)));
+            steps.push(key(1));
+            steps.push(Step::Binary(frame(false, 7, 99, b"sequence gap")));
+            steps.push(Step::Binary(frame(true, 8, 1, b"generation change")));
+        }
+        steps.push(Step::Binary(audio_packet(seq, seq == 0)));
+    }
+    let mut first = scenario(EPOCH_A, steps);
+    first.host_present = true;
+    let h = start_audio(vec![first], timing(), 16, Some(audio.clone()));
+    wait_for(|| audio.stats().received >= 15 && audio.stats().decoded >= 10);
+    let sample = audio.stats();
+    assert_eq!(sample.epoch, 1);
+    assert_eq!(
+        sample.schedule_resets, 1,
+        "only begin_epoch may reset audio: {sample:?}"
+    );
+    assert_eq!(sample.concealed, 0);
+    assert_eq!(sample.dropped, 0);
+    h.finish().unwrap();
 }
 
 impl Harness {

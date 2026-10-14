@@ -24,6 +24,7 @@ fn meta(injections: Injections) -> RunMeta {
         drain_ms: 500,
         bind: String::new(),
         injections,
+        audio: None,
     }
 }
 

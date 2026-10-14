@@ -3,6 +3,7 @@
 use std::fmt;
 
 /// Why a login request did not produce session cookies.
+#[cfg(any(test, feature = "dev-login"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginError {
     /// Wrong password or TOTP (HTTP 401).
@@ -28,6 +29,7 @@ pub enum NetError {
     /// `http://` or `ws://` to a host other than `127.0.0.1` (fatal).
     PlaintextRefused(String),
     /// Login failed (returned by `login`, never by `run`).
+    #[cfg(any(test, feature = "dev-login"))]
     Login(LoginError),
     /// A WebSocket handshake answered 401 or 403; cookies are missing or stale (fatal).
     Auth(u16),
@@ -58,6 +60,7 @@ impl NetError {
     }
 }
 
+#[cfg(any(test, feature = "dev-login"))]
 impl fmt::Display for LoginError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -88,6 +91,7 @@ impl fmt::Display for NetError {
                     "plaintext relay refused (only https, or http to 127.0.0.1): {url}"
                 )
             }
+            #[cfg(any(test, feature = "dev-login"))]
             NetError::Login(error) => write!(f, "{error}"),
             NetError::Auth(status) => write!(f, "relay refused the session (HTTP {status})"),
             NetError::RelayError(message) => write!(f, "relay error: {message}"),
@@ -100,5 +104,6 @@ impl fmt::Display for NetError {
     }
 }
 
+#[cfg(any(test, feature = "dev-login"))]
 impl std::error::Error for LoginError {}
 impl std::error::Error for NetError {}

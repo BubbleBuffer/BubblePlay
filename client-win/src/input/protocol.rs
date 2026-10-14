@@ -5,6 +5,7 @@
 //! Byte layouts follow fixtures/input-contract.json and worker/public/input.js.
 //! Everything here is pure: no Win32, no sockets, no clocks.
 
+#[cfg(test)]
 use std::fmt;
 
 use super::keyboard::PhysicalKey;
@@ -12,25 +13,34 @@ use super::keyboard::PhysicalKey;
 pub const TYPE_KEY_DOWN: u8 = 0;
 pub const TYPE_KEY_UP: u8 = 1;
 pub const TYPE_BUTTONS: u8 = 4;
+#[cfg(test)]
 pub const TYPE_RELEASE_ALL: u8 = 6;
 pub const TYPE_MOTION: u8 = 7;
 pub const TYPE_ABSOLUTE: u8 = 8;
 pub const TYPE_BUTTONS_AT: u8 = 9;
 pub const TYPE_CURSOR_SYNC: u8 = 10;
+#[cfg(test)]
 pub const TYPE_TEXT: u8 = 11;
+#[cfg(test)]
 pub const TYPE_CLIPBOARD: u8 = 12;
 pub const TYPE_SCAN_KEY: u8 = 13;
 
 pub const SCAN_FLAG_UP: u8 = 1;
 pub const SCAN_FLAG_EXTENDED: u8 = 2;
+#[cfg(test)]
 pub const CLIPBOARD_FLAG_PASTE: u8 = 1;
+#[cfg(test)]
 pub const CLIPBOARD_HEADER_BYTES: usize = 8;
+#[cfg(test)]
 pub const CLIPBOARD_CHUNK_BYTES: usize = 8 * 1024;
+#[cfg(test)]
 pub const CLIPBOARD_MAX_CHUNKS: u16 = 128;
+#[cfg(test)]
 pub const MAX_TEXT_BYTES: usize = 512;
 
 /// One decoded browser -> host packet. Borrowed fields point into the input slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum Packet<'a> {
     Key {
         vk: u16,
@@ -70,6 +80,7 @@ pub enum Packet<'a> {
 /// One bounded piece of clipboard text (type 12). Chunks are UTF-8 slices of the
 /// whole text, so a chunk may end inside a code point; only the reassembled text is UTF-8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ClipboardChunk<'a> {
     pub paste: bool,
     pub id: u16,
@@ -79,6 +90,7 @@ pub struct ClipboardChunk<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum PacketError {
     Empty,
     UnknownType(u8),
@@ -89,6 +101,7 @@ pub enum PacketError {
     Clipboard,
 }
 
+#[cfg(test)]
 impl fmt::Display for PacketError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -107,6 +120,7 @@ impl fmt::Display for PacketError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for PacketError {}
 
 // ---- encoders ---------------------------------------------------------------
@@ -121,6 +135,7 @@ pub fn buttons(mask: u8) -> [u8; 2] {
     [TYPE_BUTTONS, mask]
 }
 
+#[cfg(test)]
 pub fn release_all() -> [u8; 1] {
     [TYPE_RELEASE_ALL]
 }
@@ -158,6 +173,7 @@ pub fn cursor_sync(seq: u16) -> [u8; 3] {
 }
 
 /// Text typed by a secure-desktop-safe path (type 11): 1..=512 UTF-8 bytes.
+#[cfg(test)]
 pub fn text(value: &str) -> Option<Vec<u8>> {
     let bytes = value.as_bytes();
     if !(1..=MAX_TEXT_BYTES).contains(&bytes.len()) {
@@ -207,6 +223,7 @@ pub fn clipboard_chunk(id: u16, index: u16, count: u16, bytes: &[u8], paste: boo
 /// Validates and decodes one browser -> host packet with the host's rules.
 /// Accepts exactly what the host accepts for the browser's packet types;
 /// legacy host-only types (2, 3, 5) and host -> browser types (128, 129) are not input packets here.
+#[cfg(test)]
 pub fn parse(data: &[u8]) -> Result<Packet<'_>, PacketError> {
     let &kind = data.first().ok_or(PacketError::Empty)?;
     match kind {
@@ -264,6 +281,7 @@ pub fn parse(data: &[u8]) -> Result<Packet<'_>, PacketError> {
     }
 }
 
+#[cfg(test)]
 fn fixed(data: &[u8], len: usize) -> Result<&[u8], PacketError> {
     if data.len() == len {
         Ok(data)
@@ -275,14 +293,17 @@ fn fixed(data: &[u8], len: usize) -> Result<&[u8], PacketError> {
     }
 }
 
+#[cfg(test)]
 fn u16_at(d: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([d[at], d[at + 1]])
 }
 
+#[cfg(test)]
 fn i16_at(d: &[u8], at: usize) -> i16 {
     i16::from_le_bytes([d[at], d[at + 1]])
 }
 
+#[cfg(test)]
 fn parse_scan_key(data: &[u8]) -> Result<Packet<'_>, PacketError> {
     let d = fixed(data, 6)?;
     let flags = d[1];
@@ -307,6 +328,7 @@ fn parse_scan_key(data: &[u8]) -> Result<Packet<'_>, PacketError> {
     })
 }
 
+#[cfg(test)]
 fn parse_clipboard(data: &[u8]) -> Result<Packet<'_>, PacketError> {
     if !(CLIPBOARD_HEADER_BYTES..=CLIPBOARD_HEADER_BYTES + CLIPBOARD_CHUNK_BYTES)
         .contains(&data.len())
@@ -392,6 +414,7 @@ pub struct Rect {
 /// The largest rect with the source's aspect ratio, centred in `bounds`: the
 /// picture inside a letterboxed (or pillarboxed) window. `None` when any size is
 /// empty or non-finite.
+#[cfg(test)]
 pub fn letterbox(bounds: Rect, source_w: f64, source_h: f64) -> Option<Rect> {
     let positive = |v: f64| v.is_finite() && v > 0.0;
     if !([bounds.w, bounds.h, source_w, source_h]
@@ -437,12 +460,14 @@ fn axis(offset: f64, extent: f64) -> u16 {
 
 /// DOM `deltaMode`: 0 pixels, 1 lines, 2 pages. Unknown modes count as pixels, as in input.js.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum DeltaMode {
     Pixel,
     Line,
     Page,
 }
 
+#[cfg(test)]
 impl DeltaMode {
     pub fn from_dom(mode: u32) -> Self {
         match mode {
@@ -456,6 +481,7 @@ impl DeltaMode {
 /// Converts DOM wheel deltas to WHEEL_DELTA units (120 per notch) and keeps the
 /// fraction of each axis, so smooth or trackpad scrolling loses no distance.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg(test)]
 pub struct WheelAccumulator {
     pub pixels_per_notch: f64,
     pub lines_per_notch: f64,
@@ -464,12 +490,14 @@ pub struct WheelAccumulator {
     y: f64,
 }
 
+#[cfg(test)]
 impl Default for WheelAccumulator {
     fn default() -> Self {
         Self::new(100.0, 3.0, 1.0 / 3.0)
     }
 }
 
+#[cfg(test)]
 impl WheelAccumulator {
     pub fn new(pixels_per_notch: f64, lines_per_notch: f64, pages_per_notch: f64) -> Self {
         Self {
@@ -512,11 +540,13 @@ impl WheelAccumulator {
 
 /// Carries sub-unit wheel distance on pointer motion, as `InputController.motion()` does.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg(test)]
 pub struct WheelResidue {
     x: f64,
     y: f64,
 }
 
+#[cfg(test)]
 impl WheelResidue {
     pub fn reset(&mut self) {
         *self = Self::default();
@@ -528,6 +558,7 @@ impl WheelResidue {
     }
 }
 
+#[cfg(test)]
 fn carry(residue: &mut f64, value: f64) -> i32 {
     let total = *residue + if value.is_finite() { value } else { 0.0 };
     let units = total.trunc();
@@ -537,6 +568,7 @@ fn carry(residue: &mut f64, value: f64) -> i32 {
 
 /// Removes the largest i16 step from `pending`. Loop while `pending != 0` to send
 /// a long distance as several packets (`pending.map(i16)`, then `pending -= chunk`).
+#[cfg(test)]
 pub fn take_i16(pending: &mut i32) -> i16 {
     let step = (*pending).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
     *pending -= i32::from(step);
@@ -797,7 +829,7 @@ mod tests {
         assert_eq!(parse(&[TYPE_TEXT]), Err(PacketError::Text));
         assert_eq!(parse(&[TYPE_TEXT, 0xFF]), Err(PacketError::Text));
         let mut too_long = vec![TYPE_TEXT];
-        too_long.extend(std::iter::repeat(b'a').take(513));
+        too_long.extend(std::iter::repeat_n(b'a', 513));
         assert_eq!(parse(&too_long), Err(PacketError::Text));
     }
 

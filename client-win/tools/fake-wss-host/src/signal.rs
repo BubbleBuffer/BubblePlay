@@ -33,6 +33,8 @@ pub struct MediaControl {
     pub codec: Option<String>,
     pub reason: Option<String>,
     pub request_id: Option<String>,
+    /// The integer `audio` field, if present and an integer. Only `1` opts in.
+    pub audio: Option<u64>,
 }
 
 fn token_ok(value: &str) -> bool {
@@ -108,6 +110,7 @@ pub fn parse_signal(text: &str) -> Result<Signal, &'static str> {
                 codec: optional_str(&value, "codec")?,
                 reason,
                 request_id,
+                audio: value.get("audio").and_then(Value::as_u64),
             }))
         }
         "first-frame" => {
@@ -184,7 +187,7 @@ mod tests {
         for bad in [
             format!(r#"{{"type":"media-control","action":"start","epoch":"{upper}"}}"#),
             format!(r#"{{"type":"media-control","action":"start","epoch":"{short}"}}"#),
-            format!(r#"{{"type":"media-control","action":"keyframe","reason":"has space"}}"#),
+            r#"{"type":"media-control","action":"keyframe","reason":"has space"}"#.to_owned(),
             format!(
                 r#"{{"type":"media-control","action":"keyframe","reason":"{}"}}"#,
                 "x".repeat(65)
@@ -196,10 +199,19 @@ mod tests {
     }
 
     #[test]
-    fn audio_is_never_read_as_an_enabled_request() {
-        // The fake only ever reads `audio`; it is ignored, never acted on.
-        let text = r#"{"type":"media-control","action":"start","protocol":4,"audio":1}"#;
-        assert!(matches!(parse_signal(text), Ok(Signal::MediaControl(_))));
+    fn audio_is_read_as_an_integer_and_only_the_opt_in_value_opts_in() {
+        let read = |field: &str| {
+            let text =
+                format!(r#"{{"type":"media-control","action":"start","protocol":4{field}}}"#);
+            match parse_signal(&text) {
+                Ok(Signal::MediaControl(mc)) => mc.audio,
+                other => panic!("expected media-control, got {other:?}"),
+            }
+        };
+        assert_eq!(read(r#","audio":1"#), Some(1));
+        assert_eq!(read(r#","audio":2"#), Some(2));
+        assert_eq!(read(r#","audio":"1""#), None, "a string is not an opt-in");
+        assert_eq!(read(""), None);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use serde_json::{json, Value};
 
+use crate::audio::{AudioCounters, Script};
 use crate::model::{Injection, Injections, Recovery};
 use crate::server::Snapshot;
 
@@ -25,6 +26,8 @@ pub struct RunMeta {
     pub drain_ms: u64,
     pub bind: String,
     pub injections: Injections,
+    /// The audio lane's script, when `--audio` is given.
+    pub audio: Option<Script>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,7 +41,86 @@ fn check(name: &'static str, pass: bool, detail: String) -> Check {
     Check { name, pass, detail }
 }
 
+/// Video checks for a run with recordings, audio checks when `--audio` is on.
+/// An audio-only run has no video to judge, so only the rejects check applies.
 pub fn checks(meta: &RunMeta, snap: &Snapshot) -> Vec<Check> {
+    let mut out = if meta.streams.is_empty() {
+        vec![check(
+            "no-unhandled-media-rejects",
+            snap.counters.rejected_control == 0,
+            format!(
+                "{} rejected control messages",
+                snap.counters.rejected_control
+            ),
+        )]
+    } else {
+        video_checks(meta, snap)
+    };
+    if let (Some(script), Some(audio)) = (meta.audio, snap.audio.as_ref()) {
+        out.extend(audio_checks(script, audio));
+    }
+    out
+}
+
+fn audio_checks(script: Script, c: &AudioCounters) -> Vec<Check> {
+    let accounted =
+        c.packets_sent + c.lost_by_script + c.queue_dropped + c.send_failed + c.discarded;
+    let mut out = vec![
+        check(
+            "audio-opted-in",
+            c.opt_in_starts >= 1,
+            format!("{} starts with audio:1", c.opt_in_starts),
+        ),
+        check(
+            "audio-sent",
+            c.packets_sent > 0,
+            format!("{} packets, {} bytes", c.packets_sent, c.bytes_sent),
+        ),
+        check(
+            "audio-accounted-for",
+            c.packets_encoded == accounted,
+            format!(
+                "encoded {} = sent {} + lost-by-script {} + queue-dropped {} + send-failed {} + discarded {}",
+                c.packets_encoded,
+                c.packets_sent,
+                c.lost_by_script,
+                c.queue_dropped,
+                c.send_failed,
+                c.discarded
+            ),
+        ),
+        check(
+            "audio-no-send-failures",
+            c.send_failed == 0,
+            format!("{} refused by the socket", c.send_failed),
+        ),
+        check(
+            "audio-discontinuity-marked",
+            c.packets_sent == 0 || c.discontinuities_sent >= 1,
+            format!("{} sent with the discontinuity flag", c.discontinuities_sent),
+        ),
+    ];
+    if let Some(n) = script.loss_every {
+        out.push(check(
+            "audio-loss-script",
+            c.lost_by_script == c.packets_encoded / n,
+            format!(
+                "{} lost of {} encoded, every {n}",
+                c.lost_by_script, c.packets_encoded
+            ),
+        ));
+    }
+    if let Some(n) = script.reorder_every {
+        out.push(check(
+            "audio-reorder-script",
+            c.packets_encoded < n || c.reordered > 0,
+            format!("{} held back for reorder, every {n}", c.reordered),
+        ));
+    }
+    out
+}
+
+fn video_checks(meta: &RunMeta, snap: &Snapshot) -> Vec<Check> {
     let c = &snap.counters;
     let accounted =
         c.frames_retired_by_ack + c.frames_lost_to_disconnect + c.frames_forgotten_on_stall;
@@ -244,9 +326,34 @@ pub fn build(meta: &RunMeta, snap: &Snapshot) -> Value {
             "socket_drops": c.socket_drops,
         },
         "recoveries": recoveries,
+        "audio": audio_json(meta, snap),
         "checks": checks.iter().map(|c| json!({"name": c.name, "pass": c.pass, "detail": c.detail})).collect::<Vec<_>>(),
         "pass": pass,
     })
+}
+
+fn audio_json(meta: &RunMeta, snap: &Snapshot) -> Value {
+    match (meta.audio, snap.audio.as_ref()) {
+        (Some(script), Some(c)) => json!({
+            "enabled": true,
+            "script": {"loss_every": script.loss_every, "reorder_every": script.reorder_every},
+            "opt_in_starts": c.opt_in_starts,
+            "starts": c.starts,
+            "stops": c.stops,
+            "resyncs": c.resyncs,
+            "packets_encoded": c.packets_encoded,
+            "packets_sent": c.packets_sent,
+            "bytes_sent": c.bytes_sent,
+            "discontinuities_sent": c.discontinuities_sent,
+            "lost_by_script": c.lost_by_script,
+            "reordered": c.reordered,
+            "queue_dropped": c.queue_dropped,
+            "send_failed": c.send_failed,
+            "discarded": c.discarded,
+            "encode_errors": c.encode_errors,
+        }),
+        _ => json!({"enabled": false}),
+    }
 }
 
 fn round(value: f64) -> f64 {
@@ -280,6 +387,7 @@ mod tests {
             drain_ms: 1000,
             bind: "127.0.0.1:0".into(),
             injections,
+            audio: None,
         }
     }
 
@@ -300,6 +408,70 @@ mod tests {
             in_flight_at_exit: 0,
             elapsed_ms: 2000.0,
             hard_stop: false,
+            audio: None,
+        }
+    }
+
+    fn audio_meta(script: Script) -> RunMeta {
+        RunMeta {
+            streams: Vec::new(),
+            audio: Some(script),
+            ..meta(Injections::default())
+        }
+    }
+
+    fn audio_counters(encoded: u64, sent: u64, lost: u64) -> AudioCounters {
+        AudioCounters {
+            opt_in_starts: 1,
+            starts: 1,
+            packets_encoded: encoded,
+            packets_sent: sent,
+            bytes_sent: sent * 100,
+            discontinuities_sent: 1,
+            lost_by_script: lost,
+            ..AudioCounters::default()
+        }
+    }
+
+    #[test]
+    fn an_audio_only_run_is_judged_on_audio_alone() {
+        let mut snap = healthy();
+        snap.counters = Counters::default();
+        snap.audio = Some(audio_counters(10, 10, 0));
+        let list = checks(&audio_meta(Script::default()), &snap);
+        assert!(list.iter().all(|c| c.pass), "{list:?}");
+        assert!(list.iter().any(|c| c.name == "audio-sent"));
+        assert!(
+            !list.iter().any(|c| c.name == "frames-sent"),
+            "no video checks"
+        );
+    }
+
+    #[test]
+    fn audio_accounting_and_the_loss_script_are_checked() {
+        let mut snap = healthy();
+        snap.audio = Some(audio_counters(10, 8, 2));
+        let script = Script::new(Some(5), None).expect("script");
+        let list = checks(&meta_with_audio(script), &snap);
+        assert!(list.iter().all(|c| c.pass), "{list:?}");
+        // One packet unaccounted for: the accounting check fails.
+        snap.audio = Some(audio_counters(10, 6, 2));
+        assert!(failed(
+            "audio-accounted-for",
+            &checks(&meta_with_audio(script), &snap)
+        ));
+        // Two lost where the script names one per five: the loss check fails.
+        snap.audio = Some(audio_counters(10, 5, 5));
+        assert!(failed(
+            "audio-loss-script",
+            &checks(&meta_with_audio(script), &snap)
+        ));
+    }
+
+    fn meta_with_audio(script: Script) -> RunMeta {
+        RunMeta {
+            audio: Some(script),
+            ..meta(Injections::default())
         }
     }
 

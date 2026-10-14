@@ -330,8 +330,6 @@ pub enum PillKind {
     Off,
     /// Attention: "1 pairing request".
     Warn,
-    /// Danger.
-    Bad,
 }
 
 /// Width of a status pill with `text`.
@@ -346,7 +344,6 @@ pub fn pill(ui: &mut Ui, kind: PillKind, text: &str) -> Response {
         PillKind::Live => (theme::SIGNAL, true),
         PillKind::Off => (theme::INK_FAINT, false),
         PillKind::Warn => (theme::ATTENTION, true),
-        PillKind::Bad => (theme::DANGER, true),
     };
     let font = theme::bold(theme::size::HINT);
     let text_w = text_width(ui, text, font.clone(), color);
@@ -474,8 +471,6 @@ pub enum NoticeKind {
     Neutral,
     /// Information colour.
     Info,
-    /// Attention seam.
-    Attention,
     /// Danger seam (refused key, PC key changed).
     Error,
 }
@@ -486,7 +481,6 @@ pub fn notice(ui: &mut Ui, cx: &Cx, kind: NoticeKind, icon_name: &str, add: impl
     let (seam, icon_color, border) = match kind {
         NoticeKind::Neutral => (theme::THREAD_STRONG, theme::INK_FAINT, theme::THREAD),
         NoticeKind::Info => (theme::INFORMATION, theme::INFORMATION, theme::THREAD),
-        NoticeKind::Attention => (theme::ATTENTION, theme::ATTENTION, theme::ATTENTION.gamma_multiply(0.4)),
         NoticeKind::Error => (theme::DANGER, theme::DANGER, theme::DANGER.gamma_multiply(0.45)),
     };
     // Padding 12 / 14 / 12 / 12 from the mockup, plus the 3 px seam on the left.

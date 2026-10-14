@@ -29,6 +29,7 @@ impl std::fmt::Debug for LoginRequest<'_> {
 }
 
 /// Log in and return the cookie jar for [`crate::net::NetConfig`].
+#[cfg(any(test, feature = "dev-login"))]
 pub async fn login(relay: &str, request: &LoginRequest<'_>) -> Result<CookieJar, NetError> {
     login_with_cookies(relay, request, &CookieJar::new()).await
 }
@@ -108,6 +109,7 @@ pub async fn login_with_cookies(
 }
 
 /// Blocking wrapper around [`login`] for callers on a plain thread.
+#[cfg(any(test, feature = "dev-login"))]
 pub fn login_blocking(relay: &str, request: &LoginRequest<'_>) -> Result<CookieJar, NetError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

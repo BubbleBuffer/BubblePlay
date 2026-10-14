@@ -7,7 +7,7 @@ use windows::Win32::{
     Foundation::RECT, Graphics::Direct3D11::ID3D11Texture2D, Media::MediaFoundation::IMFSample,
 };
 
-/// Codec of an access unit. [`Codec::wire_id`] is the WSS v4 header byte.
+/// Codec of an access unit (WSS v4 video byte: 1 = HEVC, 2 = H.264).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
     H264,
@@ -16,6 +16,7 @@ pub enum Codec {
 
 impl Codec {
     /// WSS v4 header codec byte: 1 = HEVC, 2 = H.264.
+    #[cfg(test)]
     pub fn wire_id(self) -> u8 {
         match self {
             Codec::H264 => 2,
@@ -24,6 +25,7 @@ impl Codec {
     }
 
     /// Inverse of [`Codec::wire_id`]; `None` for any other value.
+    #[cfg(test)]
     pub fn from_wire_id(id: u8) -> Option<Self> {
         match id {
             1 => Some(Codec::Hevc),
@@ -73,6 +75,8 @@ pub struct DecodedFrame {
     /// Visible image region within the coded NV12 surface, in source pixels.
     pub source_rect: RECT,
     /// Keeps the surface out of the decoder pool until it is safe to reuse.
+    // Ownership keeps the decoder sample alive until GPU work has completed.
+    #[allow(dead_code)]
     pub lease: FrameLease,
 }
 

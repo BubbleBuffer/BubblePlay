@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::audio::Script;
 use crate::model::Injections;
 use crate::stream::Codec;
 
@@ -26,8 +27,13 @@ usage: fake-wss-host [--stream h264|hevc] [options]
   --socket-drop-at SECONDS  close both sockets once; the next hello is a new epoch
   --stats PATH              also write the JSON report to PATH
   --input-record PATH       write each binary message received on /ws as a JSON line
+  --audio                   stream a 440 Hz stereo tone as BPA1 to viewers that opt in
+                            with audio:1 on start; with no recordings, audio only
+  --audio-loss-every N      drop every Nth audio packet on the wire (N >= 2; needs --audio)
+  --audio-reorder-every N   send every Nth audio packet after the next one (N >= 2; needs --audio)
 
-Injections must fire at least one second before the drain window ends.
+Injections must fire at least one second before the drain window ends. Video
+injections need recordings; with none they do not fire.
 The JSON report goes to stdout. Listen address and progress go to stderr.
 Exit codes: 0 every check passed, 1 a check failed, 2 usage or startup error.";
 
@@ -43,6 +49,8 @@ pub struct Args {
     pub stats: Option<PathBuf>,
     /// Where binary inputs received on `/ws` are recorded, one JSON line each.
     pub input_record: Option<PathBuf>,
+    /// The audio lane, when `--audio` is given.
+    pub audio: Option<Script>,
 }
 
 /// `Ok(None)` for `--help`.
@@ -55,6 +63,9 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
     let mut injections = Injections::default();
     let mut stats = None;
     let mut input_record = None;
+    let mut audio_on = false;
+    let mut audio_loss_every = None;
+    let mut audio_reorder_every = None;
 
     let mut iter = raw.iter();
     while let Some(flag) = iter.next() {
@@ -95,9 +106,25 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
             }
             "--stats" => stats = Some(PathBuf::from(value()?)),
             "--input-record" => input_record = Some(PathBuf::from(value()?)),
+            "--audio" => audio_on = true,
+            "--audio-loss-every" => {
+                audio_loss_every = Some(every("--audio-loss-every", &value()?)?)
+            }
+            "--audio-reorder-every" => {
+                audio_reorder_every = Some(every("--audio-reorder-every", &value()?)?)
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
+
+    if !audio_on && (audio_loss_every.is_some() || audio_reorder_every.is_some()) {
+        return Err("--audio-loss-every and --audio-reorder-every need --audio".into());
+    }
+    let audio = if audio_on {
+        Some(Script::new(audio_loss_every, audio_reorder_every)?)
+    } else {
+        None
+    };
 
     if exit_after.is_zero() {
         return Err("--exit-after must be above 0 seconds".into());
@@ -134,7 +161,15 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
         injections,
         stats,
         input_record,
+        audio,
     }))
+}
+
+/// A packet interval for `--audio-*-every`: a whole number, checked by `Script::new`.
+fn every(name: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{name} needs a whole number"))
 }
 
 /// A number of seconds in `0..=MAX_SECONDS`. Anything else, including NaN,
@@ -285,9 +320,50 @@ mod tests {
     fn input_record_path_is_kept_and_needs_a_value() {
         assert!(ok(&[]).input_record.is_none());
         assert_eq!(
-            ok(&["--input-record", "inputs.jsonl"]).input_record.as_deref(),
+            ok(&["--input-record", "inputs.jsonl"])
+                .input_record
+                .as_deref(),
             Some(std::path::Path::new("inputs.jsonl"))
         );
         assert!(args(&["--input-record"]).is_err());
+    }
+
+    #[test]
+    fn audio_is_off_unless_asked_for() {
+        assert!(ok(&[]).audio.is_none());
+        let on = ok(&["--audio"]).audio.expect("audio on");
+        assert_eq!(on, Script::default());
+    }
+
+    #[test]
+    fn audio_scripts_parse_and_need_the_audio_flag() {
+        let script = ok(&[
+            "--audio",
+            "--audio-loss-every",
+            "37",
+            "--audio-reorder-every",
+            "23",
+        ])
+        .audio
+        .expect("audio on");
+        assert_eq!(script.loss_every, Some(37));
+        assert_eq!(script.reorder_every, Some(23));
+        assert!(
+            args(&["--audio-loss-every", "37"]).is_err(),
+            "needs --audio"
+        );
+        assert!(
+            args(&["--audio", "--audio-reorder-every", "1"]).is_err(),
+            "below 2"
+        );
+        assert!(args(&["--audio", "--audio-loss-every", "x"]).is_err());
+        assert!(
+            args(&["--audio", "--audio-loss-every"]).is_err(),
+            "no value"
+        );
+        assert!(
+            args(&["--audio", "--audio-loss-every", "1000001"]).is_err(),
+            "above the bound"
+        );
     }
 }

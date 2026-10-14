@@ -193,7 +193,7 @@ impl State {
             self.maximized,
             self.start.elapsed().as_secs_f64(),
         );
-        let info = WindowInfo { maximized: self.maximized, focused: self.focused };
+        let info = WindowInfo { maximized: self.maximized };
         let mut req = FrameRequests::default();
         let full = gfx.egui_ctx.run_ui(raw, |ui| app.frame(ui, info, &mut req));
         let repaint = full
@@ -396,7 +396,7 @@ unsafe fn wait_index(handles: &[HANDLE], timeout_ms: u32) -> Result<usize> {
 
 fn ms_until(t: Instant, now: Instant) -> u32 {
     let d = t.saturating_duration_since(now);
-    ((d.as_micros() + 999) / 1000).clamp(1, 3_600_000) as u32
+    d.as_micros().div_ceil(1000).clamp(1, 3_600_000) as u32
 }
 
 /// The loop. Draws only when a frame is due (input, wake, resize, or egui's
@@ -659,7 +659,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ERASEBKGND => return LRESULT(1),
         WM_SETCURSOR => {
-            if (lp.0 & 0xffff) as u32 == HTCLIENT as u32 {
+            if (lp.0 & 0xffff) as u32 == HTCLIENT {
                 // While captured the capture answers WM_SETCURSOR; if it let
                 // one through, leave the cursor alone (DefWindowProc would
                 // set the class arrow).

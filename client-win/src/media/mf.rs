@@ -12,7 +12,7 @@
 
 use super::backend::{Codec, DecodeBackend, DecodedFrame, FrameLease};
 use anyhow::{anyhow, bail, Context, Result};
-use std::{mem::ManuallyDrop, ptr};
+use std::{fmt, mem::ManuallyDrop, ptr};
 use windows::{
     core::{IUnknown, Interface, GUID, PWSTR},
     Win32::{
@@ -37,6 +37,56 @@ pub enum CodecRequest {
     Explicit(Codec),
 }
 
+/// A capability failure, distinct from a driver, COM or Media Foundation error.
+/// Callers may downcast an `anyhow::Error` to this type through added context.
+#[derive(Debug)]
+pub struct NoHardwareVideoDecoder {
+    pub codec: Codec,
+    pub reason: &'static str,
+}
+
+impl fmt::Display for NoHardwareVideoDecoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "no hardware video decoder ({}): {}",
+            self.codec.name(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for NoHardwareVideoDecoder {}
+
+fn require_hardware_support(codec: Codec, supported: bool, reason: &'static str) -> Result<()> {
+    if !supported {
+        return Err(NoHardwareVideoDecoder { codec, reason }.into());
+    }
+    Ok(())
+}
+
+// Only use this mapping for the required video interfaces. Other COM queries
+// (fences, DXGI resources, codec configuration) retain their system errors.
+pub(super) fn video_interface_error(
+    codec: Codec,
+    error: windows::core::Error,
+    reason: &'static str,
+) -> anyhow::Error {
+    if error.code() == E_NOINTERFACE {
+        anyhow::Error::from(error).context(NoHardwareVideoDecoder { codec, reason })
+    } else {
+        anyhow::Error::from(error).context(reason)
+    }
+}
+
+fn video_device_error(codec: Codec, error: windows::core::Error) -> anyhow::Error {
+    video_interface_error(
+        codec,
+        error,
+        "D3D11 device has no ID3D11VideoDevice interface",
+    )
+}
+
 /// Resolves a request to a codec whose hardware path is available on `device`.
 /// `Auto` never switches to HEVC, and nothing falls back to CPU decode.
 pub fn resolve_codec(request: CodecRequest, device: &ID3D11Device) -> Result<Codec> {
@@ -44,14 +94,8 @@ pub fn resolve_codec(request: CodecRequest, device: &ID3D11Device) -> Result<Cod
         CodecRequest::Auto => Codec::H264,
         CodecRequest::Explicit(codec) => codec,
     };
-    if hardware_decoder_available(codec, device)? {
-        Ok(codec)
-    } else {
-        bail!(
-            "no hardware {} decoder available on this device",
-            codec.name()
-        )
-    }
+    hardware_decoder_available(codec, device)?;
+    Ok(codec)
 }
 
 struct Candidate {
@@ -174,48 +218,102 @@ pub fn availability_report(codec: Codec) -> Result<Vec<String>> {
     }
 }
 
+/// Check the device's driver path before looking at installed transforms.
+unsafe fn require_driver_profile(codec: Codec, device: &ID3D11Device) -> Result<()> {
+    let video: ID3D11VideoDevice = device.cast().map_err(|e| video_device_error(codec, e))?;
+    let profiles: &[GUID] = match codec {
+        Codec::H264 => &[
+            D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
+            D3D11_DECODER_PROFILE_H264_VLD_FGT,
+        ],
+        Codec::Hevc => &[D3D11_DECODER_PROFILE_HEVC_VLD_MAIN],
+    };
+    for i in 0..video.GetVideoDecoderProfileCount() {
+        let profile = video
+            .GetVideoDecoderProfile(i)
+            .context("GetVideoDecoderProfile")?;
+        if profiles.contains(&profile)
+            && video
+                .CheckVideoDecoderFormat(&profile, DXGI_FORMAT_NV12)
+                .context("CheckVideoDecoderFormat NV12")?
+                .as_bool()
+        {
+            return Ok(());
+        }
+    }
+    require_hardware_support(
+        codec,
+        false,
+        "driver exposes no matching NV12 video decode profile",
+    )
+}
+
+unsafe fn d3d11_aware(transform: &IMFTransform) -> Result<bool> {
+    let attrs = transform.GetAttributes().context("MFT GetAttributes")?;
+    match attrs.GetUINT32(&MF_SA_D3D11_AWARE) {
+        Ok(value) => Ok(value != 0),
+        Err(e) if e.code() == MF_E_ATTRIBUTENOTFOUND => Ok(false),
+        Err(e) => Err(e).context("MFT MF_SA_D3D11_AWARE"),
+    }
+}
+
+// Try every candidate, but do not turn real activation/driver failures into a
+// capability verdict. Keep the first such error and all candidate diagnostics.
+fn candidates_exhausted(codec: Codec, errors: Vec<anyhow::Error>) -> anyhow::Error {
+    let details = errors
+        .iter()
+        .map(|e| format!("{e:#}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(error) = errors
+        .into_iter()
+        .find(|e| !e.is::<NoHardwareVideoDecoder>())
+    {
+        error.context(format!(
+            "No usable D3D11/NV12 {} MFT. {details}",
+            codec.name()
+        ))
+    } else {
+        let error = anyhow::Error::new(NoHardwareVideoDecoder {
+            codec,
+            reason: "no installed decoder supports the required D3D11/NV12 hardware path",
+        });
+        if details.is_empty() {
+            error
+        } else {
+            error.context(details)
+        }
+    }
+}
+
 /// Startup capability check: installed D3D11-aware MFT plus a matching driver
-/// NV12 decode profile. A specific stream is still validated by actual output.
+/// NV12 decode profile. Returns `Ok(true)` if available, or a downcastable
+/// [`NoHardwareVideoDecoder`] when unavailable. Other system errors propagate.
+/// A specific stream is still validated by actual output.
 pub fn hardware_decoder_available(codec: Codec, device: &ID3D11Device) -> Result<bool> {
     unsafe {
-        let video: ID3D11VideoDevice = device.cast()?;
-        let profiles: &[GUID] = match codec {
-            Codec::H264 => &[
-                D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
-                D3D11_DECODER_PROFILE_H264_VLD_FGT,
-            ],
-            Codec::Hevc => &[D3D11_DECODER_PROFILE_HEVC_VLD_MAIN],
-        };
-        let mut driver_supported = false;
-        for i in 0..video.GetVideoDecoderProfileCount() {
-            let profile = video.GetVideoDecoderProfile(i)?;
-            if profiles.contains(&profile)
-                && video
-                    .CheckVideoDecoderFormat(&profile, DXGI_FORMAT_NV12)?
-                    .as_bool()
-            {
-                driver_supported = true;
-                break;
-            }
-        }
-        if !driver_supported {
-            return Ok(false);
-        }
+        require_driver_profile(codec, device)?;
+        let mut errors = Vec::new();
         for candidate in enumerate(codec)? {
-            let aware = candidate
+            let result = candidate
                 .activation
                 .ActivateObject::<IMFTransform>()
-                .ok()
-                .and_then(|t| t.GetAttributes().ok())
-                .and_then(|a| a.GetUINT32(&MF_SA_D3D11_AWARE).ok())
-                .unwrap_or(0)
-                != 0;
+                .context("activate decoder MFT")
+                .and_then(|t| d3d11_aware(&t))
+                .and_then(|aware| {
+                    require_hardware_support(
+                        codec,
+                        aware,
+                        "MFT is not D3D11-aware; software fallback refused",
+                    )
+                });
             let _ = candidate.activation.ShutdownObject();
-            if aware {
-                return Ok(true);
+            match result {
+                Ok(()) => return Ok(true),
+                Err(error) => errors.push(error.context(candidate.identity)),
             }
         }
-        Ok(false)
+        Err(candidates_exhausted(codec, errors))
     }
 }
 
@@ -249,17 +347,18 @@ unsafe impl Send for MfBackend {}
 impl MfBackend {
     pub fn new(codec: Codec, device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
         unsafe {
+            require_driver_profile(codec, device)?;
             let mut errors = Vec::new();
             for candidate in enumerate(codec)? {
                 match Self::try_candidate(&candidate, codec, device, width, height) {
                     Ok(backend) => return Ok(backend),
                     Err(error) => {
                         let _ = candidate.activation.ShutdownObject();
-                        errors.push(format!("{}: {error:#}", candidate.identity));
+                        errors.push(error.context(candidate.identity));
                     }
                 }
             }
-            bail!("No usable D3D11/NV12 {codec:?} MFT. {}", errors.join("\n"))
+            Err(candidates_exhausted(codec, errors))
         }
     }
 
@@ -272,9 +371,11 @@ impl MfBackend {
     ) -> Result<Self> {
         let transform: IMFTransform = candidate.activation.ActivateObject()?;
         let attrs = transform.GetAttributes()?;
-        if attrs.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) == 0 {
-            bail!("MFT is not D3D11-aware; software fallback refused");
-        }
+        require_hardware_support(
+            codec,
+            d3d11_aware(&transform)?,
+            "MFT is not D3D11-aware; software fallback refused",
+        )?;
         let is_async = attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0;
         let events = if is_async {
             attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
@@ -367,7 +468,12 @@ impl MfBackend {
             let sample_flags = (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0
                 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32;
             if info.dwFlags & sample_flags == 0 {
-                bail!("MFT requires caller-provided output buffers; refusing CPU buffer fallback");
+                return Err(NoHardwareVideoDecoder {
+                    codec: self.codec,
+                    reason:
+                        "MFT requires caller-provided output buffers; software fallback refused",
+                }
+                .into());
             }
             let output = self.transform.GetOutputCurrentType(self.output_id)?;
             // Frame size describes the coded frame (for example 1920x1088).
@@ -378,7 +484,11 @@ impl MfBackend {
             self.height = (self.source_rect.bottom - self.source_rect.top) as u32;
             return Ok(());
         }
-        bail!("MFT offers no NV12 output media type")
+        Err(NoHardwareVideoDecoder {
+            codec: self.codec,
+            reason: "MFT offers no NV12 output media type",
+        }
+        .into())
     }
 
     unsafe fn pump_events(&mut self) -> Result<()> {
@@ -649,9 +759,17 @@ impl DecodeBackend for MfBackend {
                     bail!("Expected one DXGI output buffer");
                 }
                 let buffer = sample.GetBufferByIndex(0)?;
-                let dxgi: IMFDXGIBuffer = buffer
-                    .cast()
-                    .context("MFT returned CPU output; fallback refused")?;
+                let dxgi: IMFDXGIBuffer =
+                    buffer.cast().map_err(|error: windows::core::Error| {
+                        if error.code() == E_NOINTERFACE {
+                            anyhow::Error::from(error).context(NoHardwareVideoDecoder {
+                                codec: self.codec,
+                                reason: "MFT returned CPU output; software fallback refused",
+                            })
+                        } else {
+                            anyhow::Error::from(error).context("query decoder output IMFDXGIBuffer")
+                        }
+                    })?;
                 let mut raw = ptr::null_mut();
                 dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw)?;
                 if raw.is_null() {
@@ -669,9 +787,7 @@ impl DecodeBackend for MfBackend {
                     bail!("MFT texture format is {:?}, expected NV12", desc.Format);
                 }
                 if desc.BindFlags & D3D11_BIND_DECODER.0 as u32 == 0 {
-                    bail!(
-                        "MFT texture lacks D3D11_BIND_DECODER; hardware surface evidence missing"
-                    );
+                    return Err(NoHardwareVideoDecoder { codec: self.codec, reason: "MFT texture lacks D3D11_BIND_DECODER; hardware surface evidence missing" }.into());
                 }
                 if self.source_rect.right as u32 > desc.Width
                     || self.source_rect.bottom as u32 > desc.Height
@@ -777,5 +893,116 @@ mod geometry_tests {
         area.OffsetY.value = 0;
         area.OffsetX.fract = 1;
         assert!(aperture_rect(area, (1920, 1088)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod capability_error_tests {
+    use super::*;
+    use windows::Win32::Foundation::E_FAIL;
+
+    #[test]
+    fn missing_video_interface_is_typed_through_context_and_preserves_hresult() {
+        let error = video_device_error(Codec::H264, windows::core::Error::from(E_NOINTERFACE))
+            .context("session decoder startup");
+        let unavailable = error.downcast_ref::<NoHardwareVideoDecoder>().unwrap();
+        assert_eq!(unavailable.codec, Codec::H264);
+        assert!(error.to_string().contains("session decoder startup"));
+        assert!(format!("{error:#}").contains("no hardware video decoder (H.264)"));
+        assert_eq!(
+            error.downcast_ref::<windows::core::Error>().unwrap().code(),
+            E_NOINTERFACE
+        );
+    }
+
+    #[test]
+    fn unrelated_video_device_error_keeps_its_identity() {
+        let error = video_device_error(Codec::Hevc, windows::core::Error::from(E_FAIL));
+        assert!(!error.is::<NoHardwareVideoDecoder>());
+        assert_eq!(
+            error.downcast_ref::<windows::core::Error>().unwrap().code(),
+            E_FAIL
+        );
+    }
+
+    #[test]
+    fn missing_profiles_and_empty_or_nonaware_candidates_are_typed() {
+        let profile_error = require_hardware_support(
+            Codec::H264,
+            false,
+            "driver exposes no matching NV12 video decode profile",
+        )
+        .unwrap_err();
+        assert!(profile_error.is::<NoHardwareVideoDecoder>());
+        assert!(require_hardware_support(Codec::H264, true, "unused").is_ok());
+        let empty = candidates_exhausted(Codec::Hevc, Vec::new());
+        assert_eq!(
+            empty
+                .downcast_ref::<NoHardwareVideoDecoder>()
+                .unwrap()
+                .codec,
+            Codec::Hevc
+        );
+        let nonaware = require_hardware_support(
+            Codec::H264,
+            false,
+            "MFT is not D3D11-aware; software fallback refused",
+        )
+        .unwrap_err();
+        assert!(candidates_exhausted(Codec::H264, vec![nonaware]).is::<NoHardwareVideoDecoder>());
+    }
+
+    #[test]
+    fn failed_candidate_does_not_mask_real_system_error_as_missing_hardware() {
+        let unavailable =
+            require_hardware_support(Codec::H264, false, "missing capability").unwrap_err();
+        let system =
+            anyhow::Error::from(windows::core::Error::from(E_FAIL)).context("decoder activation");
+        let error = candidates_exhausted(Codec::H264, vec![unavailable, system]);
+        assert!(!error.is::<NoHardwareVideoDecoder>());
+        assert_eq!(
+            error.downcast_ref::<windows::core::Error>().unwrap().code(),
+            E_FAIL
+        );
+        assert!(format!("{error:#}").contains("decoder activation"));
+    }
+}
+
+#[cfg(test)]
+mod renderer_capability_error_tests {
+    use super::*;
+    use windows::Win32::Foundation::E_FAIL;
+
+    #[test]
+    fn missing_video_context_interfaces_are_typed_without_hiding_other_errors() {
+        for reason in [
+            "D3D11 device context has no ID3D11VideoContext interface",
+            "D3D11 device context has no ID3D11VideoContext1 interface",
+        ] {
+            let unavailable = video_interface_error(
+                Codec::Hevc,
+                windows::core::Error::from(E_NOINTERFACE),
+                reason,
+            );
+            let typed = unavailable
+                .downcast_ref::<NoHardwareVideoDecoder>()
+                .unwrap();
+            assert_eq!(typed.codec, Codec::Hevc);
+            assert_eq!(typed.reason, reason);
+            assert_eq!(
+                unavailable
+                    .downcast_ref::<windows::core::Error>()
+                    .unwrap()
+                    .code(),
+                E_NOINTERFACE
+            );
+            let other =
+                video_interface_error(Codec::Hevc, windows::core::Error::from(E_FAIL), reason);
+            assert!(!other.is::<NoHardwareVideoDecoder>());
+            assert_eq!(
+                other.downcast_ref::<windows::core::Error>().unwrap().code(),
+                E_FAIL
+            );
+        }
     }
 }

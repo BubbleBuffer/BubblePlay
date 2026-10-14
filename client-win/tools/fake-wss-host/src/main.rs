@@ -17,6 +17,10 @@ use fake_wss_host::report::{self, RunMeta, StreamInfo};
 use fake_wss_host::server::{self, ServerConfig};
 use fake_wss_host::stream::{Codec, Stream};
 
+/// The pacing an audio-only run reports, since it has no recording to set them.
+const AUDIO_ONLY_FPS: u32 = 60;
+const AUDIO_ONLY_BITRATE_BPS: u64 = 20_000_000;
+
 fn usage_error(message: &str) -> ExitCode {
     eprintln!("fake-wss-host: {message}\n\n{USAGE}");
     ExitCode::from(2)
@@ -66,12 +70,17 @@ async fn main() -> ExitCode {
         .map(|s| stream_info(s.as_ref()))
         .collect();
     let offered: Vec<&str> = streams.iter().map(|s| s.codec).collect();
+    let offering = if offered.is_empty() {
+        "audio only".to_owned()
+    } else {
+        offered.join(" + ")
+    };
     eprintln!(
-        "fake-wss-host: ws://{bind}/ws  offering {} @{} fps, {} bps, {} s, injections {:?}",
-        offered.join(" + "),
+        "fake-wss-host: ws://{bind}/ws  offering {offering} @{} fps, {} bps, {} s, audio {:?}, injections {:?}",
         library.fps,
         library.bitrate_bps,
         args.exit_after.as_secs_f64(),
+        args.audio,
         args.injections
     );
 
@@ -84,6 +93,7 @@ async fn main() -> ExitCode {
         drain: Duration::from_millis(args.drain_ms),
         max_connections: 8,
         input_record: args.input_record,
+        audio: args.audio,
     };
     let snapshot = match server::serve(listener, config).await {
         Ok(snapshot) => snapshot,
@@ -102,6 +112,7 @@ async fn main() -> ExitCode {
         drain_ms: args.drain_ms,
         bind,
         injections: args.injections,
+        audio: args.audio,
     };
     let document = report::build(&meta, &snapshot);
     let text = match serde_json::to_string_pretty(&document) {
@@ -157,6 +168,14 @@ fn load_library(args: &Args) -> anyhow::Result<Library> {
         loaded.push((evidence, Arc::new(stream)));
     }
     let Some((first, _)) = loaded.first() else {
+        if args.audio.is_some() && args.constraint.is_none() {
+            // Audio-only: no video is offered, so every `start` is refused.
+            return Ok(Library {
+                sources: Vec::new(),
+                fps: AUDIO_ONLY_FPS,
+                bitrate_bps: AUDIO_ONLY_BITRATE_BPS,
+            });
+        }
         bail!("no recordings to serve in {}", args.streams_dir.display());
     };
     let (fps, bitrate_bps) = (first.fps, first.bitrate_bps);

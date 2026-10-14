@@ -30,6 +30,9 @@ pub trait Source: Send + Sync {
     fn width(&self) -> u32;
     fn height(&self) -> u32;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn is_key(&self, index: usize) -> bool;
     fn has_param_sets(&self, index: usize) -> bool;
     fn next_key_at_or_after(&self, index: usize) -> usize;
@@ -332,12 +335,9 @@ pub struct Model {
 }
 
 impl Model {
+    /// An empty library is an audio-only run: every `start` is refused.
     pub fn new(config: ModelConfig) -> Self {
         let library = config.sources;
-        assert!(
-            !library.is_empty(),
-            "the model needs at least one recording"
-        );
         Self {
             library,
             active: 0,
@@ -363,6 +363,11 @@ impl Model {
     /// The recording that is currently served.
     fn current(&self) -> &dyn Source {
         self.library[self.active].as_ref()
+    }
+
+    /// False for an audio-only run, which has no recording to serve.
+    pub fn has_video(&self) -> bool {
+        !self.library.is_empty()
     }
 
     pub fn frame_period(&self) -> Duration {
@@ -402,6 +407,10 @@ impl Model {
     /// Enable the recording the browser names. With no codec, the active one
     /// stays. A codec with no recording in the library is a mismatch.
     pub fn start(&mut self, codec_value: Option<&str>) -> StartOutcome {
+        if self.library.is_empty() {
+            self.counters.codec_mismatches += 1;
+            return StartOutcome::CodecMismatch;
+        }
         let chosen = match codec_value {
             None => self.active,
             Some(value) => match self
@@ -692,7 +701,7 @@ pub mod tests {
             self.len
         }
         fn is_key(&self, index: usize) -> bool {
-            index % self.gop == 0
+            index.is_multiple_of(self.gop)
         }
         fn has_param_sets(&self, index: usize) -> bool {
             !(self.param_sets_missing && self.is_key(index))
@@ -755,9 +764,8 @@ pub mod tests {
             "no media socket yet"
         );
         model.media_attach();
-        assert_eq!(
+        assert!(
             emitted(model.tick(now)).key,
-            true,
             "the first frame of a session is an IDR"
         );
     }
@@ -1172,6 +1180,26 @@ pub mod tests {
         assert_eq!(frame.index, 0);
         assert_eq!(model.start(Some("av1")), StartOutcome::CodecMismatch);
         assert_eq!(model.counters.codec_mismatches, 1);
+    }
+
+    #[test]
+    fn an_audio_only_library_refuses_every_start_and_never_streams() {
+        let now = Instant::now();
+        let config = ModelConfig {
+            sources: Vec::new(),
+            fps: 60,
+            bitrate_bps: 20_000_000,
+            injections: Injections::default(),
+            run_start: now,
+        };
+        let mut model = Model::new(config);
+        assert!(!model.has_video());
+        model.begin_epoch(now);
+        assert_eq!(model.start(None), StartOutcome::CodecMismatch);
+        assert_eq!(model.start(Some("h264")), StartOutcome::CodecMismatch);
+        model.media_attach();
+        assert!(matches!(model.tick(now), Action::Idle));
+        assert_eq!(model.counters.codec_mismatches, 2);
     }
 
     #[test]

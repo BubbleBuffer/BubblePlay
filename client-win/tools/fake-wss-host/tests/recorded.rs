@@ -67,6 +67,7 @@ fn run_meta(
         drain_ms: 500,
         bind,
         injections,
+        audio: None,
     }
 }
 

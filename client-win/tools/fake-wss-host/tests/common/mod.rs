@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use fake_wss_host::audio::Script;
 use fake_wss_host::model::{Injections, Source};
 use fake_wss_host::protocol::{decode_frame, is_valid_epoch, ReceiveGate};
 use fake_wss_host::server::{self, ServerConfig, Snapshot};
@@ -46,7 +47,7 @@ impl Source for Synthetic {
         self.len
     }
     fn is_key(&self, index: usize) -> bool {
-        index % self.gop == 0
+        index.is_multiple_of(self.gop)
     }
     fn has_param_sets(&self, _index: usize) -> bool {
         true
@@ -100,7 +101,25 @@ pub async fn spawn_many(
     exit_after: Duration,
     drain: Duration,
 ) -> Harness {
-    spawn_with(sources, injections, exit_after, drain, None).await
+    spawn_with(sources, injections, exit_after, drain, None, None).await
+}
+
+/// A run with the audio lane on. `sources` may be empty: an audio-only run.
+pub async fn spawn_audio(
+    sources: Vec<Arc<dyn Source>>,
+    script: Script,
+    exit_after: Duration,
+    drain: Duration,
+) -> Harness {
+    spawn_with(
+        sources,
+        no_injections(),
+        exit_after,
+        drain,
+        None,
+        Some(script),
+    )
+    .await
 }
 
 /// A run that also records every binary message received on `/ws` to `record`.
@@ -116,6 +135,7 @@ pub async fn spawn_recording(
         exit_after,
         drain,
         Some(record.to_path_buf()),
+        None,
     )
     .await
 }
@@ -130,6 +150,7 @@ async fn spawn_with(
     exit_after: Duration,
     drain: Duration,
     input_record: Option<PathBuf>,
+    audio: Option<Script>,
 ) -> Harness {
     let listener = server::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -144,6 +165,7 @@ async fn spawn_with(
         drain,
         max_connections: 8,
         input_record,
+        audio,
     };
     Harness {
         addr,
@@ -246,6 +268,13 @@ pub fn start_message(epoch: &str, codec: &str) -> Value {
     })
 }
 
+/// A protocol-4 start that opts the media epoch in to audio.
+pub fn start_with_audio(epoch: &str, codec: &str) -> Value {
+    let mut value = start_message(epoch, codec);
+    value["audio"] = json!(1);
+    value
+}
+
 /// Start the fake streaming on a fresh session with media attached.
 pub async fn streaming_session(addr: SocketAddr, codec: &str) -> (Ws, Ws, String) {
     let (mut signal, epoch) = signal_hello(addr).await;
@@ -258,7 +287,7 @@ pub async fn streaming_session(addr: SocketAddr, codec: &str) -> (Ws, Ws, String
         .await
         .expect("media-socket peer");
     assert_eq!(peer["type"], "media-peer", "{peer}");
-    assert_eq!(peer["present"], true, "{peer}");
+    assert_eq!(peer["present"].as_bool(), Some(true), "{peer}");
     // The fake also supplies an informational signaling notice; consume it
     // before tests wait for first-frame replies on that lane.
     let _ = next_json(&mut signal, Duration::from_secs(2))

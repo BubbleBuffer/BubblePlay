@@ -1,6 +1,7 @@
 //! WSS development session: network and decode workers feeding the UI shell.
 
 mod app;
+mod audio_dev;
 mod decode;
 #[cfg(feature = "dev-login")]
 mod dev_login;
@@ -11,6 +12,7 @@ mod order;
 mod pacing;
 mod stats;
 
+pub use crate::audio::AudioHandle as SessionAudioControl;
 pub use options::DevOptions;
 pub use stats::{SessionInputState, SessionStats};
 
@@ -38,6 +40,7 @@ use options::CodecChoice;
 #[derive(Default)]
 struct Diagnostics {
     errors: Vec<String>,
+    no_hardware_decoder: Option<(Codec, &'static str)>,
     resets: Vec<serde_json::Value>,
     waiting: Option<(u64, String, Instant)>,
     recoveries: Vec<serde_json::Value>,
@@ -140,6 +143,51 @@ impl Drop for Running {
 }
 
 pub fn run_dev(options: DevOptions) -> Result<()> {
+    let result = if options.audio_only || options.audio_render_test || options.decoder_probe {
+        audio_dev::run(&options)
+    } else {
+        run_windowed(options.clone())
+    };
+    finish_dev(&options, result)
+}
+
+fn finish_dev(options: &DevOptions, result: Result<()>) -> Result<()> {
+    if let Err(error) = &result {
+        if let Some(capability) = error.downcast_ref::<crate::media::NoHardwareVideoDecoder>() {
+            let failure = serde_json::json!({
+                "pass": false, "error_kind": "no_hardware_video_decoder",
+                "errors": [capability.to_string()], "headless": options.decoder_probe,
+                "audio": crate::audio::AudioStats::default(),
+            });
+            write_dev_report(options, &failure)?;
+        }
+    }
+    result
+}
+
+fn write_dev_report(options: &DevOptions, document: &serde_json::Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(document)?;
+    for path in [&options.stats_path, &options.stats_out_path]
+        .into_iter()
+        .flatten()
+    {
+        std::fs::write(path, format!("{text}\n"))
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn probe_available(
+    codec: Codec,
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+) -> Result<bool> {
+    match crate::media::hardware_decoder_available(codec, device) {
+        Err(error) if error.is::<crate::media::NoHardwareVideoDecoder>() => Ok(false),
+        other => other,
+    }
+}
+
+fn run_windowed(options: DevOptions) -> Result<()> {
     if options.input_only {
         return input_dev::run(options);
     }
@@ -167,18 +215,28 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
     pacing.mark("shell_ready");
     let device = shell.device();
     pacing.mark("h264_probe_start");
-    let h264_available = crate::media::hardware_decoder_available(Codec::H264, &device)?;
+    let h264_available = probe_available(Codec::H264, &device)?;
     pacing.mark("h264_probe_end");
     pacing.mark("hevc_probe_start");
-    let hevc_available = crate::media::hardware_decoder_available(Codec::Hevc, &device)?;
+    let hevc_available = probe_available(Codec::Hevc, &device)?;
     pacing.mark("hevc_probe_end");
     let codec = match options.codec {
         CodecChoice::Auto | CodecChoice::H264 if h264_available => Codec::H264,
         CodecChoice::Hevc if hevc_available => Codec::Hevc,
         CodecChoice::Auto | CodecChoice::H264 => {
-            bail!("no hardware H.264 decoder on the shell device")
+            return Err(crate::media::NoHardwareVideoDecoder {
+                codec: Codec::H264,
+                reason: "the shell adapter has no usable D3D11/NV12 decoder",
+            }
+            .into());
         }
-        CodecChoice::Hevc => bail!("no hardware HEVC decoder on the shell device"),
+        CodecChoice::Hevc => {
+            return Err(crate::media::NoHardwareVideoDecoder {
+                codec: Codec::Hevc,
+                reason: "the shell adapter has no usable D3D11/NV12 decoder",
+            }
+            .into())
+        }
     };
     let mut relay = url::Url::parse(&options.url).context("invalid --dev-wss URL")?;
     let scheme = match relay.scheme() {
@@ -200,9 +258,11 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
     let wake = shell.wake_handle();
     let media_stats = MediaStats::new();
     let transport = Arc::new(TransportStats::new());
+    let audio = crate::audio::AudioPlayer::new(crate::audio::OutputMode::Wasapi)?;
     let stats = SessionStats {
         media: media_stats.clone(),
         transport: transport.clone(),
+        audio: audio.handle(),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let input_link = net::InputLink::new(Arc::new({
@@ -211,6 +271,10 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
     }));
     config.input = Some(input_link.clone());
     config.stream_mode = Some(options.mode.stream_mode().into());
+    let audio_control = stats.audio.clone();
+    audio_control.set_volume(options.audio_volume);
+    audio_control.set_muted(options.audio_muted);
+    config.audio = Some(audio_control.clone());
     let input_capture = crate::input::SessionInput::new(
         options.mode,
         input_link.clone(),
@@ -220,7 +284,7 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
             move || wake.wake()
         }),
     );
-    let capture_status = input_capture.status();
+    let capture_status: SessionInputState = input_capture.status();
     shell.set_input_capture(Box::new(input_capture));
     let diagnostics = Arc::new(Mutex::new(Diagnostics::default()));
     let metadata: Arc<Mutex<BTreeMap<i64, FrameMeta>>> = Arc::new(Mutex::new(BTreeMap::new()));
@@ -373,6 +437,12 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
                             .lock()
                             .unwrap()
                             .error(format!("decode worker: {error:#}"));
+                        if let Some(capability) =
+                            error.downcast_ref::<crate::media::NoHardwareVideoDecoder>()
+                        {
+                            diagnostics.lock().unwrap().no_hardware_decoder =
+                                Some((capability.codec, capability.reason));
+                        }
                         stop.store(true, Ordering::Release);
                         wake.wake();
                     }
@@ -449,6 +519,7 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
     let mut last_window = summary.sample;
     presentation_metrics.freeze();
     drop(running);
+    drop(audio);
     last_window.totals = stats.snapshot().totals;
     let mut document = report(
         &last_window,
@@ -461,11 +532,13 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
     document["pacing"] = pacing.snapshot();
     document["input"] = serde_json::to_value(input_link.snapshot())?;
     document["capture_state"] = serde_json::to_value(capture_status.snapshot())?;
-    let stats_summary = presentation_metrics.summary(
+    document["audio"] = serde_json::to_value(audio_control.stats())?;
+    let mut stats_summary = presentation_metrics.summary(
         &last_window,
         &input_link.snapshot(),
         &diagnostics.lock().unwrap().errors,
     );
+    stats_summary["audio"] = serde_json::to_value(audio_control.stats())?;
     document["session_summary"] = stats_summary.clone();
     document["arrival_times_last_second_ms"] = serde_json::json!(summary.arrival_times_ms);
     document["arrival_window_end_ms"] = serde_json::json!(summary.end_ms);
@@ -484,11 +557,13 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
         std::fs::write(&path, format!("{text}\n"))
             .with_context(|| format!("write {}", path.display()))?;
     }
-    #[cfg(feature = "dev-login")]
     if let Some(path) = options.stats_out_path {
         metrics::write_summary(&path, &stats_summary)?;
     }
     shell_result?;
+    if let Some((codec, reason)) = diagnostics.lock().unwrap().no_hardware_decoder {
+        return Err(crate::media::NoHardwareVideoDecoder { codec, reason }.into());
+    }
     if last_window.totals.presented == 0 {
         bail!("no video frames presented; inspect the development stats report");
     }
@@ -564,4 +639,44 @@ fn report(
         "presentation_boundary":"first successful VideoProcessorBlt submission before shell egui/Present; no scanout timing",
         "pass":totals.presented>0 && totals.decode_errors==0 && totals.present_errors==0 && diagnostics.errors.is_empty()
     })
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn no_hardware_failure_remains_typed_and_writes_stats_without_a_window() {
+        let path = std::env::temp_dir().join(format!(
+            "bubbleplay-no-hardware-{}.json",
+            std::process::id()
+        ));
+        let options = DevOptions::from_args([
+            "--dev-decoder-probe".to_string(),
+            "--stats-out".to_string(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .unwrap()
+        .unwrap();
+        let error = crate::media::NoHardwareVideoDecoder {
+            codec: Codec::H264,
+            reason: "test adapter has no ID3D11VideoDevice",
+        };
+        let result = finish_dev(
+            &options,
+            Err(anyhow::Error::new(error).context("capability probe")),
+        );
+        assert!(result
+            .unwrap_err()
+            .is::<crate::media::NoHardwareVideoDecoder>());
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(document["pass"], false);
+        assert_eq!(document["headless"], true);
+        assert_eq!(document["error_kind"], "no_hardware_video_decoder");
+        let message = document["errors"][0].as_str().unwrap();
+        assert!(message.starts_with("no hardware video decoder (H.264)"));
+        assert!(!message.contains(['\n', '\r']));
+    }
 }

@@ -48,6 +48,10 @@ pub struct NetConfig {
     /// Optional native input mailbox, scoped to each /ws epoch.
     pub input: Option<super::InputLink>,
     pub stream_mode: Option<String>,
+    /// Independent bounded audio lane; absent means this receiver cannot play Opus.
+    pub audio: Option<crate::audio::AudioHandle>,
+    /// Disabled only by the decode-free audio development harness.
+    pub video_watchdog: bool,
 }
 
 impl NetConfig {
@@ -58,6 +62,8 @@ impl NetConfig {
             cookies,
             input: None,
             stream_mode: None,
+            audio: None,
+            video_watchdog: true,
         }
     }
 }
@@ -119,11 +125,13 @@ impl RelayEndpoint {
         &self.origin
     }
 
+    #[cfg(test)]
     pub fn is_secure(&self) -> bool {
         self.secure
     }
 
     /// Loopback endpoints, including TLS, never use a system proxy.
+    #[cfg(any(test, feature = "dev-login"))]
     pub fn is_loopback(&self) -> bool {
         url::Url::parse(&self.origin).is_ok_and(|url| match url.host() {
             Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
@@ -143,6 +151,7 @@ impl RelayEndpoint {
     }
 
     /// The HTTP URL for a path on this relay.
+    #[cfg(any(test, feature = "dev-login"))]
     pub fn http_url(&self, path: &str) -> String {
         format!("{}{path}", self.origin)
     }

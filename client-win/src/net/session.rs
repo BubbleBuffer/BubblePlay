@@ -326,7 +326,12 @@ impl Session {
 
     async fn run_loop(&mut self, endpoint: RelayEndpoint) -> Result<(), NetError> {
         loop {
-            match self.attempt(&endpoint).await {
+            let attempt = self.attempt(&endpoint).await;
+            // Clear audio before backoff, including failures on either socket.
+            if let Some(audio) = &self.config.audio {
+                audio.reset_epoch(self.local_epoch);
+            }
+            match attempt {
                 Err(Halt::Stop) => break,
                 Err(Halt::Fatal(error)) => {
                     self.stats.record_error(error.to_string());
@@ -356,6 +361,9 @@ impl Session {
     /// Start a new `/ws` epoch. Frames from older epochs are stale from here on.
     fn begin_epoch(&mut self) {
         self.local_epoch += 1;
+        if let Some(audio) = &self.config.audio {
+            audio.reset_epoch(self.local_epoch);
+        }
         if let Some(input) = &self.config.input {
             input.begin_epoch(self.local_epoch);
         }
@@ -425,9 +433,14 @@ impl Session {
         // Media must be registered before the host is asked to start. The
         // relay can otherwise discard start or frames on an unpaired socket.
         let mut start = start_message(&wire, codec);
-        if let Some(mode) = &self.config.stream_mode {
+        if self.config.stream_mode.is_some() || self.config.audio.is_some() {
             let mut value: Value = serde_json::from_str(&start).expect("locally encoded start");
-            value["streamMode"] = json!(mode);
+            if let Some(mode) = &self.config.stream_mode {
+                value["streamMode"] = json!(mode);
+            }
+            if self.config.audio.is_some() {
+                value["audio"] = json!(1);
+            }
             start = value.to_string();
         }
         signal.send(start).await?;
@@ -448,7 +461,7 @@ impl Session {
                 codec,
                 host_present,
                 presented: false,
-                first_frame_deadline: Some(first_frame_deadline),
+                first_frame_deadline: self.config.video_watchdog.then_some(first_frame_deadline),
                 first_frame_retried: false,
                 first_frame_pending: false,
                 input_generation: None,
@@ -580,6 +593,11 @@ impl Session {
     fn on_media_text(&mut self, link: &mut Link, text: &str) {
         match parse_relay_control(text) {
             Some(RelayControl::MediaPeer { present }) => {
+                if present != link.epoch.host_present {
+                    if let Some(audio) = &self.config.audio {
+                        audio.reset_epoch(self.local_epoch);
+                    }
+                }
                 if present && !link.epoch.host_present {
                     // Same as the browser: the host sends a keyframe once it sees the peer.
                     self.reset_gate("host-joined");
@@ -592,7 +610,7 @@ impl Session {
         }
     }
 
-    /// A BPV4 frame: parse, ACK, then gate and deliver. BPA1 is ignored.
+    /// Demux BPA1 before BPV4: audio never ACKs or changes the video receive gate.
     async fn on_media_packet(
         &mut self,
         link: &mut Link,
@@ -601,7 +619,15 @@ impl Session {
     ) -> Result<(), Halt> {
         let received_at = Instant::now();
         if is_audio_packet(&data) {
-            count(&self.stats.bpa1_ignored);
+            if decode && link.epoch.host_present {
+                if let Some(audio) = &self.config.audio {
+                    audio.push(self.local_epoch, &data, received_at);
+                } else {
+                    count(&self.stats.bpa1_ignored);
+                }
+            } else {
+                count(&self.stats.bpa1_ignored);
+            }
             return Ok(());
         }
         let header = match parse_frame(&data) {

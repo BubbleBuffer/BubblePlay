@@ -13,8 +13,6 @@ use super::config::Codec;
 
 /// `"BPV4"` big-endian.
 pub const V4_MAGIC: u32 = 0x4250_5634;
-/// `"BPA1"` big-endian: audio shares the media socket and is ignored in this step.
-pub const AUDIO_MAGIC: u32 = 0x4250_4131;
 pub const V4_VERSION: u8 = 4;
 pub const V4_HEADER_BYTES: usize = 28;
 pub const V4_MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -45,9 +43,7 @@ pub struct FrameHeader {
 }
 
 /// True when a binary message starts with the BPA1 magic.
-pub fn is_audio_packet(packet: &[u8]) -> bool {
-    packet.len() >= 4 && be_u32(&packet[..4]) == AUDIO_MAGIC
-}
+pub use crate::audio::is_audio_packet;
 
 /// Parse one BPV4 access-unit message. The error names the refused rule.
 pub fn parse_frame(packet: &[u8]) -> Result<(FrameHeader, &[u8]), &'static str> {
@@ -99,6 +95,7 @@ fn be_u64(bytes: &[u8]) -> u64 {
 }
 
 /// A validated client control message (what the relay and host accept from the client).
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientControl {
     Ack {
@@ -114,6 +111,7 @@ pub enum ClientControl {
 }
 
 /// Validate a client control message exactly as `validateClientMessageV4` and the relay do.
+#[cfg(test)]
 pub fn validate_client_control(text: &str) -> Option<ClientControl> {
     if text.len() > V4_MAX_CONTROL_BYTES {
         return None;
@@ -216,6 +214,7 @@ pub fn valid_epoch(value: &str) -> bool {
 }
 
 /// `^[A-Za-z0-9_-]{8,64}$`: a first-frame request id.
+#[cfg(test)]
 pub fn valid_request_id(value: &str) -> bool {
     (8..=64).contains(&value.len())
         && value
@@ -224,6 +223,7 @@ pub fn valid_request_id(value: &str) -> bool {
 }
 
 /// `^[A-Za-z0-9_.:-]{1,64}$`: a keyframe reason.
+#[cfg(test)]
 pub fn valid_reason(reason: &str) -> bool {
     (1..=MAX_REASON_CHARS).contains(&reason.len()) && reason.bytes().all(reason_byte)
 }
@@ -284,10 +284,12 @@ fn base64url_no_pad(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(test)]
 fn only_keys(object: &Map<String, Value>, keys: &[&str]) -> bool {
     object.keys().all(|key| keys.contains(&key.as_str()))
 }
 
+#[cfg(test)]
 fn uint32_value(value: &Value) -> Option<u32> {
     value.as_u64().and_then(|value| u32::try_from(value).ok())
 }
@@ -407,7 +409,7 @@ mod tests {
     const EPOCH_FIXTURE: &str = include_str!("../../../fixtures/wss-contract.json");
 
     fn hex(text: &str) -> Vec<u8> {
-        assert!(text.len() % 2 == 0, "odd hex length");
+        assert!(text.len().is_multiple_of(2), "odd hex length");
         (0..text.len())
             .step_by(2)
             .map(|index| u8::from_str_radix(&text[index..index + 2], 16).expect("valid hex"))
@@ -565,7 +567,7 @@ mod tests {
             V4_MAX_PAYLOAD_BYTES
         );
         assert_eq!(V4_MAGIC.to_be_bytes(), *b"BPV4");
-        assert_eq!(AUDIO_MAGIC.to_be_bytes(), *b"BPA1");
+        assert!(is_audio_packet(b"BPA1"));
     }
 
     fn sample_header(key: bool) -> FrameHeader {

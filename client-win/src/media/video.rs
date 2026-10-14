@@ -8,6 +8,7 @@
 
 use super::{
     backend::{Codec, DecodedFrame},
+    mf::video_interface_error,
     stats::MediaStats,
 };
 use crate::shell::{Rect, VideoLayer};
@@ -15,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use std::{
     collections::VecDeque,
     mem::ManuallyDrop,
+    rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
@@ -82,6 +84,7 @@ impl FrameSink {
 
     /// Publishes the newest decoded frame. If an undrawn frame is still waiting,
     /// it is replaced and counted as a drop; its surface returns to the decoder.
+    #[cfg(test)]
     pub fn push(&self, frame: DecodedFrame) {
         self.push_timed(frame, Instant::now());
     }
@@ -118,8 +121,10 @@ impl FrameSink {
     }
 }
 
+// Selected and in-flight frames are retained only by the UI thread.
+// The cross-thread mailbox transfers an owned DecodedFrame before this point.
 struct Current {
-    frame: Arc<DecodedFrame>,
+    frame: Rc<DecodedFrame>,
     decoded_at: Instant,
     /// Whether this frame has been counted as presented.
     counted: bool,
@@ -137,14 +142,15 @@ struct Processor {
 ///
 /// Thread: the UI thread only. Frames arrive through [`VideoRenderer::sink`].
 pub struct VideoRenderer {
-    device: ID3D11Device,
+    // Retain the device for the renderer lifetime.
+    _device: ID3D11Device,
     video_device: ID3D11VideoDevice,
     fence: ID3D11Fence,
     fence_value: u64,
     shared: Arc<Shared>,
     processor: Option<Processor>,
     current: Option<Current>,
-    in_flight: VecDeque<(u64, Arc<DecodedFrame>)>,
+    in_flight: VecDeque<(u64, Rc<DecodedFrame>)>,
     last_error: Option<String>,
     presented_callback: Option<Arc<dyn Fn(i64, Instant) + Send + Sync>>,
 }
@@ -154,9 +160,30 @@ impl VideoRenderer {
     /// multithread protection. `wake` runs on the decode thread after each frame.
     pub fn new(device: &ID3D11Device, stats: MediaStats, wake: Option<WakeFn>) -> Result<Self> {
         unsafe {
-            let video_device: ID3D11VideoDevice = device
-                .cast()
-                .context("device has no video support (D3D11_CREATE_DEVICE_VIDEO_SUPPORT)")?;
+            let video_device: ID3D11VideoDevice = device.cast().map_err(|e| {
+                video_interface_error(
+                    Codec::H264,
+                    e,
+                    "D3D11 device has no ID3D11VideoDevice interface",
+                )
+            })?;
+            // Fail capability checks before entering the draw loop, where VideoLayer
+            // reports presentation errors through its display/statistics contract.
+            let context = device.GetImmediateContext()?;
+            let _: ID3D11VideoContext = context.cast().map_err(|e| {
+                video_interface_error(
+                    Codec::H264,
+                    e,
+                    "D3D11 device context has no ID3D11VideoContext interface",
+                )
+            })?;
+            let _: ID3D11VideoContext1 = context.cast().map_err(|e| {
+                video_interface_error(
+                    Codec::H264,
+                    e,
+                    "D3D11 device context has no ID3D11VideoContext1 interface",
+                )
+            })?;
             let device5: ID3D11Device5 = device
                 .cast()
                 .context("ID3D11Device5 required for the GPU fence")?;
@@ -164,7 +191,7 @@ impl VideoRenderer {
             device5.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence)?;
             let fence = fence.context("CreateFence returned no fence")?;
             Ok(Self {
-                device: device.clone(),
+                _device: device.clone(),
                 video_device,
                 fence,
                 fence_value: 0,
@@ -195,11 +222,8 @@ impl VideoRenderer {
         *self.shared.trace.lock().unwrap_or_else(|e| e.into_inner()) = callback;
     }
 
-    pub fn stats(&self) -> MediaStats {
-        self.shared.stats.clone()
-    }
-
     /// The most recent draw error, cleared by the next successful draw.
+    #[cfg(test)]
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -235,7 +259,7 @@ impl VideoRenderer {
         };
         let frame = pending.frame;
         self.current = Some(Current {
-            frame: Arc::new(frame),
+            frame: Rc::new(frame),
             decoded_at: pending.decoded_at,
             counted: false,
         });
@@ -244,6 +268,7 @@ impl VideoRenderer {
     unsafe fn ensure_processor(
         &mut self,
         ctx: &ID3D11DeviceContext,
+        codec: Codec,
         input: (u32, u32),
         output: (u32, u32),
     ) -> Result<()> {
@@ -270,7 +295,13 @@ impl VideoRenderer {
         };
         let enumerator = self.video_device.CreateVideoProcessorEnumerator(&desc)?;
         let processor = self.video_device.CreateVideoProcessor(&enumerator, 0)?;
-        let video_context: ID3D11VideoContext = ctx.cast()?;
+        let video_context: ID3D11VideoContext = ctx.cast().map_err(|e| {
+            video_interface_error(
+                codec,
+                e,
+                "D3D11 device context has no ID3D11VideoContext interface",
+            )
+        })?;
         video_context.VideoProcessorSetStreamFrameFormat(
             &processor,
             0,
@@ -279,7 +310,13 @@ impl VideoRenderer {
         video_context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
         // Limited-range BT.709 in, full-range RGB out. Matches the spike; VUI
         // colour signalling is not parsed yet.
-        let video_context1: ID3D11VideoContext1 = ctx.cast()?;
+        let video_context1: ID3D11VideoContext1 = ctx.cast().map_err(|e| {
+            video_interface_error(
+                codec,
+                e,
+                "D3D11 device context has no ID3D11VideoContext1 interface",
+            )
+        })?;
         video_context1.VideoProcessorSetStreamColorSpace1(
             &processor,
             0,
@@ -338,6 +375,7 @@ impl VideoRenderer {
             .trace("vp_ensure_processor_enter", pts, Instant::now());
         let ensure = self.ensure_processor(
             ctx,
+            frame.codec,
             (input_desc.Width, input_desc.Height),
             (back_desc.Width, back_desc.Height),
         );
@@ -397,7 +435,13 @@ impl VideoRenderer {
         let source = frame.source_rect;
         let dest = letterbox(frame.width, frame.height, viewport);
         let target = viewport_rect(viewport);
-        let video_context: ID3D11VideoContext = ctx.cast()?;
+        let video_context: ID3D11VideoContext = ctx.cast().map_err(|e| {
+            video_interface_error(
+                frame.codec,
+                e,
+                "D3D11 device context has no ID3D11VideoContext interface",
+            )
+        })?;
         let vp = &processor.processor;
         video_context.VideoProcessorSetStreamSourceRect(vp, 0, true, Some(&source));
         video_context.VideoProcessorSetStreamDestRect(vp, 0, true, Some(&dest));

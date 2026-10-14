@@ -559,9 +559,10 @@ mod tests {
         let (_backend, mut demo) = new();
         assert_eq!(demo.len(), 23);
         let mut seen = HashSet::new();
-        for i in 0..demo.len() {
+        assert_eq!(demo.len(), LABELS.len());
+        for (i, expected) in LABELS.iter().enumerate() {
             let (label, _ui) = demo.scene(i);
-            assert_eq!(label, LABELS[i]);
+            assert_eq!(label, *expected);
             assert!(seen.insert(label.clone()), "duplicate scene label: {label}");
         }
         assert_eq!(seen.len(), 23);

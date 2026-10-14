@@ -157,6 +157,7 @@ impl MediaStats {
     }
 
     /// The session asked the sender for a keyframe.
+    #[cfg(test)]
     pub fn note_keyframe_request(&self, at: Instant) {
         let mut s = self.lock();
         s.totals.keyframe_requests += 1;

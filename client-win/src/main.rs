@@ -12,11 +12,22 @@ mod shell;
 mod ui;
 mod net; mod media; mod session;
 mod input;
+mod audio;
 
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
-    if let Some(dev) = session::DevOptions::from_args(std::env::args().skip(1))? { return session::run_dev(dev); }
+    if let Some(dev) = session::DevOptions::from_args(std::env::args().skip(1))? {
+        if let Err(error) = session::run_dev(dev) {
+            if let Some(capability) = error.downcast_ref::<media::NoHardwareVideoDecoder>() {
+                eprintln!("BubblePlay: {capability}");
+            } else {
+                eprintln!("BubblePlay: {}", error.to_string().replace(['\r', '\n'], " "));
+            }
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let mut demo = false;
     let mut shots: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
@@ -46,6 +57,6 @@ fn main() -> anyhow::Result<()> {
     model::Backend::set_notifier(&mut backend, std::sync::Arc::new(move || wake.wake()));
 
     let mut app = ui::App::new(Box::new(backend)).with_demo(Box::new(driver), shots);
-    let mut video = shell::PlaceholderVideo::default();
+    let mut video = shell::PlaceholderVideo;
     shell.run(&mut app, &mut video)
 }

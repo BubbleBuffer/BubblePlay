@@ -21,6 +21,7 @@ use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
+use crate::audio::{self, AudioCounters, AudioLane, Script};
 use crate::cursor;
 use crate::input_record::{Received, Recorder};
 use crate::model::{
@@ -52,6 +53,8 @@ pub struct ServerConfig {
     pub max_connections: usize,
     /// Record every binary message received on `/ws` to this file.
     pub input_record: Option<PathBuf>,
+    /// The audio lane's script, when `--audio` is given.
+    pub audio: Option<Script>,
 }
 
 /// Everything the report needs, taken once the hub has finished.
@@ -63,6 +66,8 @@ pub struct Snapshot {
     pub in_flight_at_exit: usize,
     pub elapsed_ms: f64,
     pub hard_stop: bool,
+    /// `None` when the run has no audio lane.
+    pub audio: Option<AudioCounters>,
 }
 
 pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
@@ -144,6 +149,11 @@ struct Hub {
     recorder: Option<Recorder>,
     /// The first recording failure; recording stops and the run fails.
     record_error: Option<String>,
+    /// The audio lane, when the run has one.
+    audio: Option<AudioLane>,
+    /// A protocol-4 start with `audio:1` opted this media epoch in. It stays
+    /// set across media reattaches and is cleared with the epoch.
+    audio_wanted: bool,
 }
 
 impl Hub {
@@ -224,9 +234,51 @@ impl Hub {
         self.cursor = (script.next < cursor::SCRIPT.len()).then_some(script);
     }
 
+    /// Audio runs only while it is wanted and a media socket is attached.
+    fn sync_audio(&mut self, now: Instant) {
+        let wanted = self.audio_wanted && self.media.is_some();
+        if let Some(lane) = self.audio.as_mut() {
+            if wanted {
+                lane.start(now);
+            } else {
+                lane.stop();
+            }
+        }
+    }
+
+    fn stop_audio(&mut self) {
+        if let Some(lane) = self.audio.as_mut() {
+            lane.stop();
+        }
+    }
+
+    /// A protocol-4 start with `audio:1`, whatever the video outcome.
+    fn opt_in_audio(&mut self, now: Instant) {
+        self.audio_wanted = true;
+        if let Some(lane) = self.audio.as_mut() {
+            lane.note_opt_in();
+        }
+        self.sync_audio(now);
+    }
+
+    /// One 10 ms step: encode what is due, then hand the queue to the media socket.
+    fn audio_tick(&mut self, now: Instant) {
+        let (Some(lane), Some(media)) = (self.audio.as_mut(), self.media) else {
+            return;
+        };
+        lane.produce(now);
+        let conns = &self.conns;
+        lane.deliver(|bytes| {
+            conns
+                .get(&media)
+                .is_some_and(|conn| conn.out.try_send(Outbound::Binary(bytes)).is_ok())
+        });
+    }
+
     fn detach_media(&mut self, reason: &'static str) {
         if let Some(media) = self.media.take() {
             self.model.media_detach();
+            self.stop_audio();
             self.close_conn(media, reason);
             if let Some(signal) = self.signal {
                 self.send(signal, Outbound::Text(protocol::media_peer(false)));
@@ -275,6 +327,7 @@ impl Hub {
         if self.media == Some(id) {
             self.media = None;
             self.model.media_detach();
+            self.stop_audio();
             if let Some(signal) = self.signal {
                 self.send(signal, Outbound::Text(protocol::media_peer(false)));
             }
@@ -282,6 +335,7 @@ impl Hub {
         if self.signal == Some(id) {
             self.input_disconnected("signal-closed", Instant::now());
             self.detach_media("signal-closed");
+            self.audio_wanted = false;
             self.signal = None;
             self.model.stop();
             self.first_frame = None;
@@ -329,6 +383,7 @@ impl Hub {
             self.input_disconnected("epoch-rotated", now);
         }
         self.detach_media("epoch-rotated");
+        self.audio_wanted = false;
         if let Some(old) = self.signal.take() {
             if old != id {
                 self.close_conn(old, "superseded");
@@ -346,6 +401,9 @@ impl Hub {
             conn.hello = true;
         }
         self.send(id, Outbound::Text(protocol::hello_ok_signal(&epoch)));
+        if self.audio.is_some() {
+            self.send(id, Outbound::Text(protocol::host_capabilities_audio()));
+        }
     }
 
     fn on_media_control(&mut self, id: u64, control: MediaControl, now: Instant) {
@@ -363,6 +421,12 @@ impl Hub {
                 self.model.counters.stale_epoch_control += 1;
                 return;
             }
+        }
+        if control.action == "start"
+            && control.protocol == Some(MEDIA_PROTOCOL)
+            && audio::opts_in(control.audio)
+        {
+            self.opt_in_audio(now);
         }
         match control.action.as_str() {
             "start" => match self.model.start(control.codec.as_deref()) {
@@ -388,7 +452,11 @@ impl Hub {
                 }
                 StartOutcome::AlreadyStreaming => self.start_refused = false,
             },
-            "stop" => self.model.stop(),
+            "stop" => {
+                self.model.stop();
+                self.audio_wanted = false;
+                self.sync_audio(now);
+            }
             "keyframe" => {
                 let reason = control.reason.as_deref().unwrap_or("unspecified");
                 self.model.keyframe_request(reason, now);
@@ -480,6 +548,7 @@ impl Hub {
             conn.hello = true;
         }
         self.model.media_attach();
+        self.sync_audio(now);
         let registered = self.elapsed(now).as_millis() as u64;
         self.send(id, Outbound::Text(protocol::media_hello_ok(registered)));
         self.send(id, Outbound::Text(protocol::media_peer(true)));
@@ -498,6 +567,8 @@ impl Hub {
         if let Some(media) = self.media.take() {
             self.close_conn(media, "socket-drop");
         }
+        self.audio_wanted = false;
+        self.stop_audio();
         self.first_frame = None;
         self.cursor = None;
         self.set_epoch(None);
@@ -553,6 +624,10 @@ impl Hub {
 
     fn finish(mut self, now: Instant) -> Snapshot {
         self.input_disconnected("run-complete", now);
+        // Stopping counts whatever is still queued or held as discarded, so the
+        // audio accounting identity holds at exit. It also counts as a stop.
+        self.stop_audio();
+        let audio = self.audio.as_ref().map(|lane| lane.counters().clone());
         let in_flight_at_exit = self.model.in_flight();
         let elapsed_ms = self.elapsed(now).as_secs_f64() * 1000.0;
         let ids: Vec<u64> = self.conns.keys().copied().collect();
@@ -566,6 +641,7 @@ impl Hub {
             epochs: self.epochs,
             in_flight_at_exit,
             elapsed_ms,
+            audio,
         }
     }
 }
@@ -574,6 +650,8 @@ impl Hub {
 async fn run_hub(mut hub: Hub, mut events: mpsc::Receiver<Event>) -> (Snapshot, Option<String>) {
     let mut ticker = tokio::time::interval(hub.model.frame_period());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut audio_ticker = tokio::time::interval(audio::FRAME_PERIOD);
+    audio_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             event = events.recv() => match event {
@@ -585,6 +663,7 @@ async fn run_hub(mut hub: Hub, mut events: mpsc::Receiver<Event>) -> (Snapshot, 
                     break;
                 }
             }
+            _ = audio_ticker.tick(), if hub.audio.is_some() => hub.audio_tick(Instant::now()),
         }
     }
     let record_error = hub.record_error.take();
@@ -613,6 +692,8 @@ async fn connection(
 ) {
     let mut kind: Option<Kind> = None;
     let stale_events = events.clone();
+    // tungstenite fixes the callback's Err type, so ErrorResponse cannot be boxed here.
+    #[allow(clippy::result_large_err)]
     let callback = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
         match request.uri().path() {
             "/ws" => {
@@ -706,6 +787,11 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
         })
         .transpose()?;
     let run_start = Instant::now();
+    let audio = config
+        .audio
+        .map(|script| AudioLane::new(script, run_start))
+        .transpose()
+        .context("cannot start the audio encoder")?;
     let model = Model::new(ModelConfig {
         sources: config.sources,
         fps: config.fps,
@@ -730,6 +816,8 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
         cursor: None,
         recorder,
         record_error: None,
+        audio,
+        audio_wanted: false,
     };
     let mut hub_task = tokio::spawn(run_hub(hub, events_rx));
     let slots = Arc::new(Semaphore::new(config.max_connections));

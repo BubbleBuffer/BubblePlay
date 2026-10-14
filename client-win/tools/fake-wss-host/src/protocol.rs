@@ -236,6 +236,20 @@ pub fn pong() -> String {
     json!({"type": "pong"}).to_string()
 }
 
+/// `host-capabilities` advertising optional `audio:1`. Sent after `hello-ok`
+/// only when the fake runs with `--audio`.
+pub fn host_capabilities_audio() -> String {
+    json!({
+        "type": "host-capabilities",
+        "serviceMode": false,
+        "coldBoot": false,
+        "secureDesktop": false,
+        "secureText": false,
+        "audio": 1
+    })
+    .to_string()
+}
+
 /// First-frame handshake notices from the host (`admitted`, `ready`, `failed`).
 pub fn first_frame(
     phase: &str,
@@ -488,6 +502,18 @@ mod tests {
             );
             assert_eq!(relay_accepts_from_host, accepted, "{text}");
         }
+    }
+
+    #[test]
+    fn host_capabilities_audio_matches_the_audio_fixture() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../../fixtures/audio-contract.json")).unwrap();
+        let text = fixture["signaling"]["hostCapabilities"]["text"]
+            .as_str()
+            .unwrap();
+        let expected: Value = serde_json::from_str(text).unwrap();
+        let sent: Value = serde_json::from_str(&host_capabilities_audio()).unwrap();
+        assert_eq!(sent, expected);
     }
 
     #[test]

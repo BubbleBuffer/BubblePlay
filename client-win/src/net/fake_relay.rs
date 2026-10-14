@@ -188,9 +188,14 @@ impl State {
 }
 
 async fn handle(stream: TcpStream, state: Arc<State>, log: Sender<Logged>) {
+    stream
+        .set_nodelay(true)
+        .expect("low-latency fake relay socket");
     let plan: Arc<Mutex<Option<(String, Scenario)>>> = Arc::new(Mutex::new(None));
     let slot = plan.clone();
     let callback_log = log.clone();
+    // Tungstenite fixes this callback's error type to its HTTP response.
+    #[allow(clippy::result_large_err)]
     let accepted = accept_hdr_async(stream, move |request: &Request, response: Response| {
         let path = request.uri().path().to_owned();
         let header = |name: &str| {
