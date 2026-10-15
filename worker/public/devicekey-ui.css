@@ -1,0 +1,165 @@
+/* Device-key screens (devicekey-ui.js). Colours and type come from the tokens in bubbleplay.css. */
+
+.dk-offer[hidden] { display: none; }
+body.has-presented-frame .dk-offer { display: none; }
+
+/* First-open card: non-modal, bottom centre, clear of the touch bar. */
+.dk-offer {
+  position: fixed;
+  z-index: 14;
+  left: 50%;
+  bottom: calc(var(--strip-bottom, 0px) + max(14px, env(safe-area-inset-bottom)));
+  transform: translateX(-50%);
+  width: min(380px, calc(100vw - 32px));
+  padding: 14px 16px 15px;
+  color: var(--milk-cloth);
+  background: var(--duvet);
+  border: 1px solid var(--thread-strong);
+  border-radius: 9px 13px 8px 11px;
+  box-shadow: 0 6px 18px #00000066;
+}
+
+.dk-offer-copy { margin: 0; font-size: 14px; line-height: 1.45; }
+.dk-offer .dk-actions { margin-top: 12px; }
+
+.dk-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.dk-actions button,
+.dk-offer button,
+.dk-dialog button { min-height: 38px; padding: 8px 13px; font-weight: 620; }
+
+.dk-primary {
+  color: var(--duvet-ink) !important;
+  background: var(--bright-apricot) !important;
+  border-color: var(--bright-apricot) !important;
+  font-weight: 720 !important;
+}
+.dk-primary:hover { background: var(--calico-apricot) !important; border-color: var(--calico-apricot) !important; }
+
+.dk-danger-action,
+.dk-copy.dk-danger-action { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
+.dk-danger-action:hover { color: var(--milk-cloth); background: color-mix(in srgb, var(--danger) 18%, var(--dark-surface)); }
+
+.dk-copy { min-height: 30px !important; margin-left: 6px; padding: 4px 9px !important; font-size: 12px !important; }
+
+/* Settings entry ---------------------------------------------------------- */
+
+.dk-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 14px;
+  margin: 0;
+  font-size: 13px;
+}
+.dk-facts dt { color: var(--muted-cream); }
+.dk-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+
+.dk-id {
+  font-family: "Fragment Mono", Consolas, monospace;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  color: var(--milk-cloth);
+  user-select: all;
+}
+
+.dk-status { min-height: 0; }
+.dk-status-error { color: var(--danger); }
+
+/* Dialogs ------------------------------------------------------------------ */
+
+dialog.dk-dialog {
+  box-sizing: border-box;
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 0;
+  overflow: auto;
+  color: var(--milk-cloth);
+  background: var(--duvet);
+  border: 1px solid var(--thread-strong);
+  border-radius: 10px 14px 9px 12px;
+  box-shadow: 0 12px 32px #000000a6;
+}
+dialog.dk-dialog::backdrop { background: #101214b8; }
+dialog.dk-dialog:focus { outline: none; }
+
+.dk-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px 4px;
+}
+.dk-dialog-head h2 {
+  margin: 0;
+  font-family: "Bricolage Grotesque", "Segoe UI", sans-serif;
+  font-size: 20px;
+  font-weight: 620;
+  font-stretch: 88%;
+  letter-spacing: -0.025em;
+}
+.dk-dialog .panel-close { flex: 0 0 auto; }
+
+.dk-dialog-body { padding: 4px 18px 18px; }
+.dk-lead { margin: 6px 0 0; color: var(--muted-cream); font-size: 14px; line-height: 1.5; }
+
+.dk-form .dk-field { display: grid; gap: 6px; margin-top: 14px; }
+.dk-form .field-label { margin: 0; font-size: 13px; }
+.dk-form input:not([type="radio"]):not([type="checkbox"]) {
+  width: 100%;
+  min-height: 44px;
+  padding: 9px 12px;
+  color: var(--milk-cloth);
+  background: var(--dark-surface);
+  border-color: var(--thread-strong);
+  border-radius: 6px 10px 6px 8px;
+}
+.dk-form input[type="file"] { min-height: 44px; padding: 8px 0; color: var(--muted-cream); font-size: 13px; }
+.dk-help { margin: 0; color: var(--muted-cream); font-size: 12px; line-height: 1.45; }
+
+.dk-note {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  color: var(--muted-cream);
+  font-size: 13px;
+  line-height: 1.45;
+  background: var(--dark-surface);
+  border-left: 3px solid var(--bright-apricot);
+  border-radius: 2px 6px 6px 2px;
+}
+
+.dk-radio { display: grid; gap: 8px; margin: 14px 0 0; padding: 0; border: 0; min-width: 0; }
+.dk-radio legend { padding: 0; margin-bottom: 8px; }
+.dk-option {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 3px 11px;
+  padding: 10px 12px;
+  border: 1px solid var(--thread);
+  border-radius: 7px 10px 6px 9px;
+  cursor: pointer;
+}
+.dk-option:hover { background: var(--dark-muted); }
+.dk-option:has(input:checked) { border-color: var(--bright-apricot); }
+.dk-option input { width: 20px; height: 20px; margin: 2px 0 0; accent-color: var(--eye-moss); }
+.dk-option-title { grid-column: 2; font-weight: 600; font-size: 14px; }
+.dk-option-help { grid-column: 2; color: var(--muted-cream); font-size: 12px; line-height: 1.4; }
+
+.dk-error { min-height: 0; margin: 12px 0 0; color: var(--danger); font-size: 13px; line-height: 1.45; }
+.dk-error:empty { display: none; }
+.dk-busy { min-height: 0; margin: 10px 0 0; color: var(--muted-cream); font-size: 13px; }
+.dk-busy:empty { display: none; }
+
+.dk-form .dk-actions { justify-content: flex-end; margin-top: 18px; }
+
+@media (max-width: 700px) {
+  .dk-offer { width: calc(100vw - 32px); }
+  dialog.dk-dialog { width: calc(100vw - 32px); }
+}
+
+@media (pointer: coarse) {
+  .dk-actions button,
+  .dk-offer button,
+  .dk-dialog button,
+  .dk-form input:not([type="radio"]):not([type="checkbox"]) { min-height: 44px; }
+  .dk-option input { width: 22px; height: 22px; }
+}
