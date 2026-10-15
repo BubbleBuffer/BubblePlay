@@ -11,7 +11,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::Value;
+use serde_json::{json, Value};
+
+// Lifetimes in seconds. The client does MF, device, audio and preflight setup
+// before its --exit-after clock; the host's clock starts before client launch.
+// The original 16 s host expired while the 11 s client loop was still running:
+// process startup and final cleanup extend beyond that loop's clock. Bound the
+// whole child lifetime, so slow setup fails explicitly instead of hanging.
+const HOST_BIND_BUDGET_S: u64 = 20;
+const CLIENT_SETUP_BUDGET_S: u64 = 40; // cold process/device/MF startup
+const ESTABLISH_BUDGET_S: u64 = 20; // WSS/ICE establishment inside the client clock
+const EXERCISE_S: u64 = 11; // monitor switch and Game/Work round trip after establishment
+const TEARDOWN_BUDGET_S: u64 = 10; // client shutdown after its clock
+const HOST_MARGIN_S: u64 = 15; // the host must outlive the client's whole bounded life
+const CLIENT_EXIT_S: u64 = ESTABLISH_BUDGET_S + EXERCISE_S;
+const CLIENT_DEADLINE_S: u64 = CLIENT_SETUP_BUDGET_S + CLIENT_EXIT_S + TEARDOWN_BUDGET_S;
+const HOST_EXIT_S: u64 = HOST_BIND_BUDGET_S + CLIENT_DEADLINE_S + HOST_MARGIN_S;
+const HOST_DEADLINE_S: u64 = HOST_BIND_BUDGET_S + HOST_EXIT_S + HOST_MARGIN_S;
 
 struct OwnedChild(Child);
 
@@ -69,7 +85,7 @@ fn run(transport: &str) {
         "--streams-dir",
         "F:/build/spike-streams",
         "--exit-after",
-        "16",
+        &HOST_EXIT_S.to_string(),
         "--port",
         &addr.port().to_string(),
         "--stats",
@@ -81,8 +97,9 @@ fn run(transport: &str) {
     if transport == "webrtc" {
         host_args.push("--webrtc".into());
     }
+    let host_started = Instant::now();
     let mut host = launch(Path::new(&host), &host_args, &root, "host");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = host_started + Duration::from_secs(HOST_BIND_BUDGET_S);
     loop {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
             break;
@@ -94,6 +111,7 @@ fn run(transport: &str) {
         assert!(Instant::now() < deadline, "fake host did not bind loopback");
         thread::sleep(Duration::from_millis(25));
     }
+    let host_bound_s = host_started.elapsed().as_secs_f64();
     let args = [
         "--dev-wss".to_owned(),
         format!("ws://{addr}"),
@@ -104,13 +122,41 @@ fn run(transport: &str) {
         "--codec".into(),
         "h264".into(),
         "--exit-after".into(),
-        "11".into(),
+        CLIENT_EXIT_S.to_string(),
         "--stats-out".into(),
         root.join("client.json").to_str().unwrap().into(),
     ];
+    let client_started = Instant::now();
     let mut client = launch(Path::new(&client), &args, &root, "client");
-    let client_status = client.wait(Duration::from_secs(23));
-    let host_status = host.wait(Duration::from_secs(12));
+    let client_status = client.wait(Duration::from_secs(CLIENT_DEADLINE_S));
+    let client_wall_s = client_started.elapsed().as_secs_f64();
+    let host_alive_at_client_exit = host.0.try_wait().unwrap().is_none();
+    let host_status = host.wait(
+        Duration::from_secs(HOST_DEADLINE_S).saturating_sub(host_started.elapsed()),
+    );
+    let timing = json!({
+        "budgets_s": {
+            "host_bind": HOST_BIND_BUDGET_S,
+            "client_setup": CLIENT_SETUP_BUDGET_S,
+            "establish": ESTABLISH_BUDGET_S,
+            "exercise": EXERCISE_S,
+            "teardown": TEARDOWN_BUDGET_S,
+            "host_margin": HOST_MARGIN_S,
+            "client_exit_after": CLIENT_EXIT_S,
+            "client_deadline": CLIENT_DEADLINE_S,
+            "host_exit_after": HOST_EXIT_S,
+            "host_deadline": HOST_DEADLINE_S,
+        },
+        "host_bound_s": host_bound_s,
+        "client_wall_s": client_wall_s,
+        "host_alive_at_client_exit": host_alive_at_client_exit,
+        "host_wall_s": host_started.elapsed().as_secs_f64(),
+    });
+    fs::write(
+        root.join("harness-timing.json"),
+        serde_json::to_vec_pretty(&timing).unwrap(),
+    )
+    .unwrap();
     let doc: Value = serde_json::from_slice(&fs::read(root.join("client.json")).unwrap()).unwrap();
     assert!(client_status.success(), "client failed: {doc}");
     assert!(
@@ -120,6 +166,11 @@ fn run(transport: &str) {
     );
     let host_doc: Value =
         serde_json::from_slice(&fs::read(root.join("host.json")).unwrap()).unwrap();
+    assert!(
+        host_alive_at_client_exit,
+        "host must outlive the complete client run: {timing}"
+    );
+    assert_eq!(host_doc["epochs"]["issued"], 1);
     assert_eq!(host_doc["monitor"]["switches"], 1);
     assert_eq!(host_doc["monitor"]["switch_failures"], 0);
     assert_eq!(host_doc["stream_mode"]["changes"], 2);
@@ -145,8 +196,11 @@ fn run(transport: &str) {
         doc["transport"]["attempts"], 1,
         "switch must stay in the same signaling epoch"
     );
+    assert_eq!(doc["transport"]["established"], 1);
+    assert_eq!(doc["transport"]["local_epoch"], 1);
     assert!(doc["video"]["decoded"].as_u64().unwrap() > 2);
     if transport == "webrtc" {
+        assert_eq!(host_doc["webrtc"]["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(doc["webrtc"]["selected_transport"], "webrtc");
         assert_eq!(doc["webrtc"]["fallbacks"].as_array().unwrap().len(), 0);
     }

@@ -264,8 +264,12 @@ fn audio_checks(script: Script, c: &AudioCounters) -> Vec<Check> {
 
 fn video_checks(meta: &RunMeta, snap: &Snapshot) -> Vec<Check> {
     let c = &snap.counters;
-    let accounted =
-        c.frames_retired_by_ack + c.frames_lost_to_disconnect + c.frames_forgotten_on_stall;
+    // A monitor switch retires the in-flight frames of the old display on purpose
+    // (`Model::switch_monitor`), so they are accounted, not missing.
+    let accounted = c.frames_retired_by_ack
+        + c.frames_lost_to_disconnect
+        + c.frames_forgotten_on_stall
+        + c.frames_dropped_on_switch;
     let mut out = vec![
         check(
             "frames-sent",
@@ -276,11 +280,12 @@ fn video_checks(meta: &RunMeta, snap: &Snapshot) -> Vec<Check> {
             "frames-accounted-for",
             snap.in_flight_at_exit == 0 && c.frames_sent == accounted,
             format!(
-                "sent {} = acked {} + lost-to-disconnect {} + forgotten {}; in flight at exit {}",
+                "sent {} = acked {} + lost-to-disconnect {} + forgotten {} + dropped-on-switch {}; in flight at exit {}",
                 c.frames_sent,
                 c.frames_retired_by_ack,
                 c.frames_lost_to_disconnect,
                 c.frames_forgotten_on_stall,
+                c.frames_dropped_on_switch,
                 snap.in_flight_at_exit
             ),
         ),
@@ -647,6 +652,30 @@ mod tests {
         let mut snap = healthy();
         snap.counters.frames_sent = 101;
         snap.in_flight_at_exit = 1;
+        assert!(failed(
+            "frames-accounted-for",
+            &checks(&meta(Injections::default()), &snap)
+        ));
+    }
+
+    #[test]
+    fn a_frame_retired_by_a_monitor_switch_is_accounted_not_missing() {
+        let mut snap = healthy();
+        snap.counters.frames_sent = 101;
+        snap.counters.frames_retired_by_ack = 100;
+        snap.counters.frames_dropped_on_switch = 1;
+        snap.counters.monitor_switches = 1;
+        let list = checks(&meta(Injections::default()), &snap);
+        assert!(!failed("frames-accounted-for", &list), "{list:#?}");
+    }
+
+    #[test]
+    fn a_frame_missing_beside_a_monitor_switch_still_fails() {
+        let mut snap = healthy();
+        snap.counters.frames_sent = 102;
+        snap.counters.frames_retired_by_ack = 100;
+        snap.counters.frames_dropped_on_switch = 1;
+        snap.counters.monitor_switches = 1;
         assert!(failed(
             "frames-accounted-for",
             &checks(&meta(Injections::default()), &snap)
