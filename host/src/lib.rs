@@ -14,6 +14,7 @@ pub mod clipboard;
 pub mod clipboard_image;
 pub mod content_class;
 pub mod desktop_session;
+pub mod device_key;
 pub mod encode;
 pub(crate) mod encoder_reconfigure;
 pub mod feedback_roi;
