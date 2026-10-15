@@ -11,9 +11,12 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 use bubbleplay_host::device_key::{DeviceKeyError, KeyFile};
-use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
+use windows::core::{w, BOOL, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontIndirectW, DeleteObject, GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor,
+    COLOR_WINDOW, COLOR_WINDOWTEXT, HBRUSH, HDC, HFONT, TRANSPARENT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
@@ -32,6 +35,8 @@ const ERROR_LABEL: i32 = 203;
 /// Longest passphrase read from a field, in UTF-16 units. Longer input is cut at this length.
 const FIELD_UNITS: usize = 1024;
 const FILE_UNITS: usize = 1024;
+/// The error text colour: RGB(196, 43, 28), the system error red.
+const ERROR_TEXT: COLORREF = COLORREF(0x001C_2BC4);
 const WRONG_PASSPHRASE: &str = "Wrong passphrase. Try again.";
 const CREATE_NOTE: &str =
     "Without a passphrase, anyone with this file can act as this PC. A passphrase is recommended.";
@@ -402,10 +407,13 @@ fn ask_passphrase(
                 return None;
             }
         };
+        let font = message_font();
+        let _ = EnumChildWindows(Some(hwnd), Some(set_child_font), LPARAM(font.0 as isize));
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(Some(focus));
         pump_until_quit(hwnd);
+        let _ = DeleteObject(font.into());
         window.result.take()
     }
 }
@@ -430,6 +438,36 @@ unsafe fn pump_until_quit(dialog: HWND) {
 unsafe fn drain_quit() {
     let mut msg = MSG::default();
     while PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
+}
+
+/// The system message font (usually Segoe UI 9pt), the one the rest of Windows uses. Returns a
+/// null font if the lookup fails; WM_SETFONT then falls back to the default font.
+unsafe fn message_font() -> HFONT {
+    let mut metrics = NONCLIENTMETRICSW {
+        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    let read = SystemParametersInfoW(
+        SPI_GETNONCLIENTMETRICS,
+        metrics.cbSize,
+        Some(std::ptr::addr_of_mut!(metrics).cast::<std::ffi::c_void>()),
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    );
+    if read.is_err() {
+        return HFONT(std::ptr::null_mut());
+    }
+    CreateFontIndirectW(&metrics.lfMessageFont)
+}
+
+/// Gives one child of the passphrase window the message font. The font arrives as the LPARAM.
+unsafe extern "system" fn set_child_font(child: HWND, font: LPARAM) -> BOOL {
+    let _ = SendMessageW(
+        child,
+        WM_SETFONT,
+        Some(WPARAM(font.0 as usize)),
+        Some(LPARAM(1)),
+    );
+    true.into()
 }
 
 /// Creates the labels, fields and buttons. Returns the field that takes focus first.
@@ -488,8 +526,9 @@ unsafe fn create_controls(
             CONFIRM_FIELD,
         )?;
     }
+    let shown = error.is_some();
     let error = wide(error.unwrap_or(""));
-    child(
+    let error_label = child(
         hwnd,
         instance,
         w!("STATIC"),
@@ -498,6 +537,10 @@ unsafe fn create_controls(
         [16, error_top, 428, 34],
         ERROR_LABEL,
     )?;
+    // The error line stays hidden until a wrong passphrase or a mismatch shows it.
+    if !shown {
+        let _ = ShowWindow(error_label, SW_HIDE);
+    }
     child(
         hwnd,
         instance,
@@ -567,6 +610,9 @@ impl PassphraseWindow {
                 let _ = SetDlgItemTextW(hwnd, CONFIRM_FIELD, w!(""));
                 let text = wide(text);
                 let _ = SetDlgItemTextW(hwnd, ERROR_LABEL, PCWSTR(text.as_ptr()));
+                if let Ok(label) = GetDlgItem(Some(hwnd), ERROR_LABEL) {
+                    let _ = ShowWindow(label, SW_SHOW);
+                }
                 if let Ok(field) = GetDlgItem(Some(hwnd), PASSPHRASE_FIELD) {
                     let _ = SetFocus(Some(field));
                 }
@@ -613,6 +659,19 @@ unsafe extern "system" fn passphrase_proc(
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
                 return LRESULT(0);
+            }
+            WM_CTLCOLORSTATIC => {
+                // Labels paint the window colour behind their text, so no grey strips show.
+                let dc = HDC(wp.0 as *mut _);
+                let label = HWND(lp.0 as *mut _);
+                let colour = if GetDlgCtrlID(label) == ERROR_LABEL {
+                    ERROR_TEXT
+                } else {
+                    COLORREF(GetSysColor(COLOR_WINDOWTEXT))
+                };
+                let _ = SetBkMode(dc, TRANSPARENT);
+                let _ = SetTextColor(dc, colour);
+                return LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize);
             }
             WM_DESTROY => {
                 PostQuitMessage(0);
@@ -674,6 +733,7 @@ fn file_dialog(title: &str, default_name: &str, save: bool) -> Option<PathBuf> {
     let mut dialog = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         lpstrFilter: PCWSTR(filter.as_ptr()),
+        nFilterIndex: 1,
         lpstrFile: PWSTR(file.as_mut_ptr()),
         nMaxFile: FILE_UNITS as u32,
         lpstrTitle: PCWSTR(title.as_ptr()),

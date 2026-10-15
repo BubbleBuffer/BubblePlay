@@ -32,17 +32,63 @@ fn main() {
         .join("../branding/out/bubbleplay.ico")
         .canonicalize()
         .expect("run python branding/build-icons.py before building the host");
-    let resource = out.join("bubbleplay.rc");
-    let compiled = out.join("bubbleplay.res");
-    std::fs::write(
-        &resource,
-        format!(
-            "1 ICON \"{}\"\n",
-            icon.display().to_string().replace('\\', "/")
-        ),
-    )
-    .unwrap();
-    let compiler = std::env::var_os("RC")
+    let icon_line = format!(
+        "1 ICON \"{}\"\n",
+        icon.display().to_string().replace('\\', "/")
+    );
+    // Common Controls 6 is embedded in the tray only, so its dialogs and message boxes get the
+    // current Windows look. The host binary keeps its icon-only resource.
+    let manifest = out.join("bubbleplay_tray.manifest");
+    std::fs::write(&manifest, TRAY_MANIFEST).unwrap();
+    let tray_resource = format!(
+        "{icon_line}1 24 \"{}\"\n",
+        manifest.display().to_string().replace('\\', "/")
+    );
+    let host = compile_resource(&out, "bubbleplay-host", &icon_line);
+    let tray = compile_resource(&out, "bubbleplay_tray", &tray_resource);
+    println!(
+        "cargo:rustc-link-arg-bin=bubbleplay-host={}",
+        host.display()
+    );
+    println!(
+        "cargo:rustc-link-arg-bin=bubbleplay_tray={}",
+        tray.display()
+    );
+}
+
+/// Side-by-side assembly that loads Common Controls 6 (themed controls and message boxes).
+const TRAY_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+    </dependentAssembly>
+  </dependency>
+</assembly>
+"#;
+
+/// Compiles the resource script `body` as `name` and returns the compiled `.res` path.
+fn compile_resource(out: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let resource = out.join(format!("{name}.rc"));
+    let compiled = out.join(format!("{name}.res"));
+    std::fs::write(&resource, body).unwrap();
+    let status = std::process::Command::new(rc_compiler())
+        .arg("/nologo")
+        .arg("/fo")
+        .arg(&compiled)
+        .arg(&resource)
+        .status()
+        .expect("Windows SDK rc.exe is required (or set RC)");
+    assert!(
+        status.success(),
+        "Windows resource compilation failed for {name}"
+    );
+    compiled
+}
+
+/// `RC` if set, otherwise the newest Windows SDK `rc.exe` on this build machine.
+fn rc_compiler() -> std::path::PathBuf {
+    std::env::var_os("RC")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             let sdk = std::env::var_os("WindowsSdkDir")
@@ -65,16 +111,5 @@ fn main() {
                 .collect();
             candidates.sort();
             candidates.pop().unwrap_or_else(|| "rc.exe".into())
-        });
-    let status = std::process::Command::new(compiler)
-        .arg("/nologo")
-        .arg("/fo")
-        .arg(&compiled)
-        .arg(&resource)
-        .status()
-        .expect("Windows SDK rc.exe is required (or set RC)");
-    assert!(status.success(), "Windows icon resource compilation failed");
-    for binary in ["bubbleplay-host", "bubbleplay_tray"] {
-        println!("cargo:rustc-link-arg-bin={binary}={}", compiled.display());
-    }
+        })
 }
