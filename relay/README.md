@@ -1,6 +1,6 @@
 # BubblePlay Go relay
 
-One Go service serves the existing public browser assets and pairs one Windows host with one viewer. It supports WebSocket video/input/files and forwards WebRTC SDP/ICE. It requires no Cloudflare, Node runtime or database. The public product does not include the separate private execution companion.
+One Go service serves the existing public browser assets and pairs one Windows host with one viewer per PC room. It supports WebSocket video/input/files and forwards WebRTC SDP/ICE. It requires no Cloudflare, Node runtime or database. The public product does not include the separate private execution companion.
 
 For the operator walkthrough, use [Go/Docker self-hosting](../docs/self-host-docker.md) and the [Windows quickstart](../docs/windows-quickstart.md). This README keeps configuration, administration and development details. The browser source stays in `worker/public/` and is shared by both relay implementations; see [architecture](../docs/architecture/README.md) and [release status](../docs/release-status.md).
 
@@ -60,7 +60,20 @@ To change offered methods, stop the relay and run `rotate --state-dir /data --me
 
 The admin bearer authenticates existing `/__gate/manage/sessions` and `/__gate/manage/auth-sessions` list/delete routes, individual gate-session revocation, and `/__gate/manage/password` for runtime password rotation. Never put it in a URL. Browser logout invalidates its application session; **Forget browser** invalidates approval too. Active browser sockets recheck authorization on every incoming packet and at least every five seconds while idle, so revocation closes the viewer and invalidates related epoch sockets. Runtime password rotation is persisted across restart until the provisioned config hash changes explicitly.
 
-`auth.json` contains hashes and bounded session/rate/replay state. It uses synchronized atomic replacement; no external database is needed. Protect and back up config and state together. Do not run multiple replicas against one directory. Active sockets/media/file operations are volatile and end on relay restart. Media ACKs, files, input and old-epoch control are never replayed. Only the public protocol's bounded pre-host SDP/ICE and idempotent start/monitor/follow requests may wait for the currently connected viewer's host.
+`auth.json` contains hashes, bounded session/rate/replay state and host PC registrations. It uses synchronized atomic replacement; no external database is needed. Protect and back up config and state together. Do not run multiple replicas against one directory. Active sockets/media/file operations are volatile and end on relay restart. Media ACKs, files, input and old-epoch control are never replayed. Only the public protocol's bounded pre-host SDP/ICE and idempotent start/monitor/follow requests may wait for the currently connected viewer's host.
+
+## Host PC registrations
+
+ID hosts connect to `/host-ws?pc=<id>` and send `id` and `public` (unpadded base64url, 32 bytes) in their hello. The URL and hello IDs must agree after canonicalization, and match the key's derived ID. The relay sends a fresh `register-challenge` nonce; the host signs the relay-proof encoding and returns `register-proof`. First registration requires `TOKEN`; remembered PCs can reconnect with their signature alone. A supplied wrong token is always refused. Signaling upgrades still require the `HOST_GATE_TOKEN` bearer. ID-less hosts keep using `/host-ws` and the legacy room.
+
+Each PC has its own viewer/epoch. Viewers target `/ws?pc=<id>` or use the relay's default. Signaling `hello-ok` includes a ticket for media/file hellos; data URLs carry `pc` and `epoch`. Host data sockets accept a bearer or host ticket. Viewer cookies remain required. Tickets expire with their signaling socket, at most 12 hours.
+
+Use the `ADMIN_TOKEN` bearer for:
+
+- `GET /__gate/manage/pcs`: lists `id`, `public`, `firstSeen`, `lastSeen` (Unix milliseconds) and `online`.
+- `DELETE /__gate/manage/pcs/<id>`: removes the PC and closes its host sockets (204); registering again requires `TOKEN`.
+
+The optional `pcs` map in version-1 `auth.json` holds at most 4096 PCs and survives password/factor changes. Keep tickets and tokens out of URLs.
 
 ## Native development and validation
 

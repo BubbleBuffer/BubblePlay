@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -42,6 +43,10 @@ type peer struct {
 	server                           *Relay
 	conn                             *websocket.Conn
 	expected, role, kind, epoch, key string
+	pc                               string
+	hostBearer                       bool
+	ticketHash                       [32]byte
+	ticketExpires                    time.Time
 	queue                            chan wireFrame
 	done                             chan struct{}
 	once                             sync.Once
@@ -131,16 +136,22 @@ func (p *peer) helloAndWait() bool {
 	}
 }
 
+type room struct {
+	pending      [][]byte
+	cachedHost   map[string][]byte
+	currentEpoch string
+}
+
 type Relay struct {
+	room
+	rooms           map[string]*room
+	now             func() time.Time
 	cfg             Config
 	auth            *Auth
 	mu              sync.Mutex
 	peers           map[string]*peer
 	all             map[*peer]bool
 	pendingUpgrades int
-	pending         [][]byte
-	cachedHost      map[string][]byte
-	currentEpoch    string
 	stopped         bool
 	assets          string
 	proxyWarning    sync.Once
@@ -165,7 +176,7 @@ func NewRelay(cfg Config) (*Relay, error) {
 	if err != nil {
 		return nil, errors.New("assets directory unavailable")
 	}
-	s := &Relay{cfg: cfg, auth: a, peers: make(map[string]*peer), all: make(map[*peer]bool), cachedHost: make(map[string][]byte), assets: assets}
+	s := &Relay{cfg: cfg, auth: a, peers: make(map[string]*peer), all: make(map[*peer]bool), room: room{cachedHost: make(map[string][]byte)}, rooms: make(map[string]*room), now: time.Now, assets: assets}
 	a.hostOnline = s.approvalHostOnline
 	a.requestHost = s.requestHostApproval
 	return s, nil
@@ -173,7 +184,7 @@ func NewRelay(cfg Config) (*Relay, error) {
 func (s *Relay) approvalHostOnline() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p := s.peers["signal:host"]
+	p := s.peers[pcPeerKey("signal", "", "host", s.defaultPCLocked())]
 	if s.stopped || p == nil || !p.browserApproval {
 		return false
 	}
@@ -190,7 +201,7 @@ func (s *Relay) requestHostApproval(pending *pendingApproval, agent string) bool
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	host := s.peers["signal:host"]
+	host := s.peers[pcPeerKey("signal", "", "host", s.defaultPCLocked())]
 	if s.stopped || host == nil || !host.browserApproval {
 		return false
 	}
@@ -255,6 +266,9 @@ func (s *Relay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if s.managePCs(w, r) {
+		return
+	}
 	if s.auth.Handle(w, r) {
 		return
 	}
@@ -316,9 +330,29 @@ func (s *Relay) upgrade(w http.ResponseWriter, r *http.Request, kind, role strin
 		http.NotFound(w, r)
 		return
 	}
+	pc := ""
+	query, queryErr := url.ParseQuery(r.URL.RawQuery)
+	if queryErr != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if values, present := query["pc"]; present {
+		var valid bool
+		if len(values) != 1 {
+			http.NotFound(w, r)
+			return
+		}
+		pc, valid = canonicalDeviceID(values[0])
+		if !valid {
+			http.NotFound(w, r)
+			return
+		}
+	}
 	host := role == "host" || role == "version-probe" || strings.HasSuffix(role, "-host")
+	bearer := s.auth.AuthorizedHost(r)
 	if host {
-		if !s.auth.AuthorizedHost(r) {
+		// Data sockets can authenticate by a ticket in hello; signaling always needs the bearer.
+		if kind == "signal" && !bearer {
 			http.NotFound(w, r)
 			return
 		}
@@ -326,15 +360,19 @@ func (s *Relay) upgrade(w http.ResponseWriter, r *http.Request, kind, role strin
 		http.NotFound(w, r)
 		return
 	}
-	epoch := r.URL.Query().Get("epoch")
+	epoch := query.Get("epoch")
 	s.mu.Lock()
-	if s.stopped || len(s.all)+s.pendingUpgrades >= s.cfg.MaxConnections || (kind != "signal" && (!epochPattern.MatchString(epoch) || epoch != s.currentEpoch)) {
+	if role == "client" && !query.Has("pc") {
+		pc = s.defaultPCLocked()
+	}
+	rm := s.findRoomLocked(pc)
+	if s.stopped || len(s.all)+s.pendingUpgrades >= s.cfg.MaxConnections || (kind != "signal" && (!epochPattern.MatchString(epoch) || rm == nil || epoch != rm.currentEpoch)) {
 		s.mu.Unlock()
 		http.NotFound(w, r)
 		return
 	}
 	// Reserve the connection before Upgrade yields, including unauthenticated hello peers.
-	p := &peer{server: s, kind: kind, expected: role, epoch: epoch, queue: make(chan wireFrame, 80), done: make(chan struct{})}
+	p := &peer{server: s, kind: kind, expected: role, epoch: epoch, pc: pc, hostBearer: bearer, queue: make(chan wireFrame, 80), done: make(chan struct{})}
 	if !host {
 		p.authContext = &http.Request{Header: http.Header{"Cookie": {r.Header.Get("Cookie")}}}
 	}
@@ -435,43 +473,107 @@ func (s *Relay) hello(p *peer, data []byte) bool {
 	if len(data) > 16384 || json.Unmarshal(data, &m) != nil || str(m, "type") != "hello" || str(m, "role") != p.expected {
 		return false
 	}
-	if (p.expected == "host" || p.expected == "version-probe") && !secureEqual(str(m, "token"), s.cfg.Token) {
+	public := ""
+	if p.expected == "host" {
+		if p.pc == "" {
+			if has(m, "id") || !secureEqual(str(m, "token"), s.cfg.Token) {
+				return false
+			}
+		} else {
+			id, ok := canonicalDeviceID(str(m, "id"))
+			key, valid := decodeKeyField(str(m, "public"), 32)
+			if !ok || id != p.pc || !valid || deviceID(key) != id {
+				return false
+			}
+			public = str(m, "public")
+			if !s.canRegisterPC(id, public, m) {
+				return false
+			}
+			nonce, err := randomCapability()
+			if err != nil {
+				return false
+			}
+			p.json(map[string]any{"type": "register-challenge", "nonce": nonce})
+			_ = p.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			kind, proof, err := p.conn.ReadMessage()
+			var message map[string]json.RawMessage
+			if err != nil || kind != websocket.TextMessage || len(proof) > 16384 || json.Unmarshal(proof, &message) != nil || str(message, "type") != "register-proof" {
+				return false
+			}
+			signature, ok := decodeKeyField(str(message, "signature"), 64)
+			nonceBytes, _ := decodeKeyField(nonce, 32)
+			if !ok || !validRegistrationProof(s.cfg.PublicURL, nonceBytes, id, key, signature) {
+				return false
+			}
+		}
+	}
+	if p.expected == "version-probe" && !secureEqual(str(m, "token"), s.cfg.Token) {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.stopped {
+	if s.stopped || !s.all[p] || !peerOpen(p) {
 		return false
 	}
+	if public != "" && !s.registerPCLocked(p.pc, public, m) {
+		return false
+	}
+	rm := s.roomLocked(p.pc)
+	if p.kind != "signal" {
+		side := "client"
+		if strings.HasSuffix(p.expected, "-host") {
+			side = "host"
+		}
+		validTicket := s.validTicketLocked(str(m, "ticket"), p.pc, side, p.epoch)
+		if side == "host" && !p.hostBearer && !validTicket {
+			return false
+		}
+		if side == "client" && has(m, "ticket") && !validTicket {
+			return false
+		}
+	}
 	p.role = p.expected
-	p.key = peerKey(p.kind, p.epoch, p.role)
+	p.key = pcPeerKey(p.kind, p.epoch, p.role, p.pc)
 	if p.role == "version-probe" {
 		return true
 	}
-	if p.kind != "signal" && p.epoch != s.currentEpoch {
+	if p.kind != "signal" && p.epoch != rm.currentEpoch {
 		return false
 	}
 	if old := s.peers[p.key]; old != nil {
 		delete(s.peers, p.key)
 		if p.role == "host" {
-			if viewer := s.peers["signal:client"]; viewer != nil {
+			if viewer := s.peers[pcPeerKey("signal", "", "client", p.pc)]; viewer != nil {
 				viewer.json(map[string]any{"type": "peer-left"})
 			}
 		}
 		go old.close(websocket.ClosePolicyViolation, "peer replaced")
 	}
 	if p.role == "client" {
-		s.pending = nil
-		s.currentEpoch = newEpoch()
-		p.epoch = s.currentEpoch
+		rm.pending = nil
+		rm.currentEpoch = newEpoch()
+		p.epoch = rm.currentEpoch
 		for _, old := range s.peers {
-			if old.kind != "signal" {
+			if old.kind != "signal" && old.pc == p.pc {
 				go old.close(websocket.CloseGoingAway, "stale epoch")
 			}
 		}
 	}
 	s.peers[p.key] = p
 	hello := map[string]any{"type": "hello-ok"}
+	if p.kind == "signal" {
+		ticket, err := randomCapability()
+		if err != nil {
+			delete(s.peers, p.key)
+			return false
+		}
+		p.ticketHash = sha256.Sum256([]byte(ticket))
+		p.ticketExpires = s.now().Add(12 * time.Hour)
+		hello["ticket"] = ticket
+		if p.pc != "" {
+			hello["pc"] = p.pc
+		}
+	}
 	if p.role == "client" {
 		hello["mediaEpoch"] = p.epoch
 		hello["iceServers"] = s.iceServers(boolean(m, "turn"))
@@ -481,7 +583,7 @@ func (s *Relay) hello(p *peer, data []byte) bool {
 	}
 	p.json(hello)
 	if p.kind != "signal" {
-		other := s.peers[peerKey(p.kind, p.epoch, otherRole(p.role))]
+		other := s.peers[pcPeerKey(p.kind, p.epoch, otherRole(p.role), p.pc)]
 		event := p.kind + "-peer"
 		p.json(map[string]any{"type": event, "present": other != nil})
 		if other != nil {
@@ -489,42 +591,57 @@ func (s *Relay) hello(p *peer, data []byte) bool {
 		}
 	}
 	if p.role == "client" {
-		for _, capability := range s.cachedHost {
+		for _, capability := range rm.cachedHost {
 			p.send(websocket.TextMessage, capability)
 		}
 	}
 	if p.role == "host" {
-		s.cachedHost = make(map[string][]byte)
-		for _, pending := range s.pending {
+		rm.cachedHost = make(map[string][]byte)
+		for _, pending := range rm.pending {
 			p.send(websocket.TextMessage, pending)
 		}
-		s.pending = nil
+		rm.pending = nil
 	}
 	return true
 }
 func (s *Relay) remove(p *peer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.removePeerLocked(p)
+}
+func (s *Relay) removePeerLocked(p *peer) {
 	delete(s.all, p)
+	defer func() {
+		if p.pc == "" {
+			return
+		}
+		for other := range s.all {
+			if other.pc == p.pc {
+				return
+			}
+		}
+		delete(s.rooms, p.pc)
+	}()
 	if s.peers[p.key] != p {
 		return
 	}
 	delete(s.peers, p.key)
+	rm := s.roomLocked(p.pc)
 	if p.role == "client" {
-		s.pending = nil
-		if s.currentEpoch == p.epoch {
-			s.currentEpoch = ""
+		rm.pending = nil
+		if rm.currentEpoch == p.epoch {
+			rm.currentEpoch = ""
 		}
 		for _, old := range s.peers {
-			if old.kind != "signal" && old.epoch == p.epoch {
+			if old.kind != "signal" && old.pc == p.pc && old.epoch == p.epoch {
 				go old.close(websocket.CloseGoingAway, "viewer departed")
 			}
 		}
 	}
 	if p.role == "host" {
-		s.cachedHost = make(map[string][]byte)
+		rm.cachedHost = make(map[string][]byte)
 	}
-	other := s.peers[peerKey(p.kind, p.epoch, otherRole(p.role))]
+	other := s.peers[pcPeerKey(p.kind, p.epoch, otherRole(p.role), p.pc)]
 	if other == nil {
 		return
 	}
@@ -543,10 +660,11 @@ func (s *Relay) forward(p *peer, kind int, data []byte) bool {
 	if s.stopped || s.peers[p.key] != p {
 		return false
 	}
-	if p.kind != "signal" && p.epoch != s.currentEpoch {
+	rm := s.roomLocked(p.pc)
+	if p.kind != "signal" && p.epoch != rm.currentEpoch {
 		return false
 	}
-	other := s.peers[peerKey(p.kind, p.epoch, otherRole(p.role))]
+	other := s.peers[pcPeerKey(p.kind, p.epoch, otherRole(p.role), p.pc)]
 	if kind == websocket.BinaryMessage {
 		valid := false
 		switch p.kind {
@@ -612,7 +730,7 @@ func (s *Relay) forward(p *peer, kind int, data []byte) bool {
 		if typ == "host-capabilities" {
 			p.browserApproval = boolean(m, "browserApproval")
 		}
-		s.cachedHost[typ] = append([]byte(nil), data...)
+		rm.cachedHost[typ] = append([]byte(nil), data...)
 	}
 	if other != nil {
 		other.send(kind, data)
@@ -620,8 +738,8 @@ func (s *Relay) forward(p *peer, kind int, data []byte) bool {
 	}
 	if p.role == "client" && bufferable(m) {
 		if typ == "media-control" || typ == "first-frame" {
-			kept := s.pending[:0]
-			for _, old := range s.pending {
+			kept := rm.pending[:0]
+			for _, old := range rm.pending {
 				var previous map[string]json.RawMessage
 				_ = json.Unmarshal(old, &previous)
 				if str(previous, "type") == typ && (typ == "first-frame" || str(previous, "action") == str(m, "action")) {
@@ -629,11 +747,11 @@ func (s *Relay) forward(p *peer, kind int, data []byte) bool {
 				}
 				kept = append(kept, old)
 			}
-			s.pending = kept
+			rm.pending = kept
 		}
-		s.pending = append(s.pending, append([]byte(nil), data...))
-		if len(s.pending) > 64 {
-			s.pending = s.pending[1:]
+		rm.pending = append(rm.pending, append([]byte(nil), data...))
+		if len(rm.pending) > 64 {
+			rm.pending = rm.pending[1:]
 		}
 	}
 	return true
