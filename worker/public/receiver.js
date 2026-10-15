@@ -746,6 +746,10 @@ setInterval(() => {
 // ---- signaling --------------------------------------------------------------
 const proto = location.protocol === "https:" ? "wss:" : "ws:";
 let ws = null;
+// Relay credentials belong only to the current signaling session. Never expose
+// the ticket through URLs, diagnostics, settings or debug snapshots.
+let signalingPc = null;
+let signalingTicket = null;
 let signalingGeneration = 0;
 let reconnectTimer = null;
 let terminalSignalingFailure = false;
@@ -932,6 +936,8 @@ function reconnectSignaling(reason) {
       latestInputStatus = null;
       inputStatusReason = null;
       signalingRegistered = false;
+      signalingPc = null;
+      signalingTicket = null;
       recordSignalingError("socket-close", `WebSocket closed (${event.code})`, { code: event.code, reason: event.reason || "" });
       debugTrace("signaling-close", { generation, code: event.code, reason: event.reason || "" });
       hud.classList.add("bad");
@@ -951,9 +957,11 @@ function reconnectSignaling(reason) {
 
 function signalingSocketUrl() {
   const path = labRun ? "/lab-ws" : "/ws";
-  const query = labRun
+  let query = labRun
     ? `?run=${encodeURIComponent(labRun)}&compat=${encodeURIComponent(labCompatibilityId)}`
     : "";
+  const targetPc = (params.get("pc") || "").trim();
+  if (targetPc) query += `${query ? "&" : "?"}pc=${encodeURIComponent(targetPc)}`;
   return `${proto}//${location.host}${path}${query}`;
 }
 
@@ -986,6 +994,8 @@ function recycleSignaling(reason) {
   const socket = ws;
   ws = null;
   signalingRegistered = false;
+  signalingPc = null;
+  signalingTicket = null;
   signalingGeneration++;
   try { socket?.close(1000, reason); } catch {}
   reconnectSignaling(reason);
@@ -1002,6 +1012,8 @@ async function handleSignal(socket, generation, ev) {
   if (["answer", "ice", "quality", "bench-status", "media-view", "desktop-state", "input-status", "host-capabilities", "first-frame", "monitor-list", "monitor-error"].includes(msg.type)) recordHostEvidence(msg.type);
   switch (msg.type) {
     case "hello-ok":
+      signalingPc = typeof msg.pc === "string" && msg.pc ? msg.pc : null;
+      signalingTicket = typeof msg.ticket === "string" && msg.ticket ? msg.ticket : null;
       signalingRegistered = true;
       signalingRegisteredAtMs = Date.now();
       sendClientLog("info", "signaling-registered");
@@ -1295,7 +1307,8 @@ function openWssV4Socket() {
   const current = () => usingWssMedia && wssV4.socket === socket;
   socket.onopen = () => {
     if (!current()) return;
-    socket.send(JSON.stringify({ type: "hello", role: "media-client" }));
+    if (signalingTicket) socket.send(JSON.stringify({ type: "hello", role: "media-client", ticket: signalingTicket }));
+    else socket.send(JSON.stringify({ type: "hello", role: "media-client" }));
     wssV4.lastSendAt = wssV4.lastInboundAt = performance.now();
   };
   socket.onmessage = (event) => {
@@ -1448,6 +1461,7 @@ function startWssV4() {
 function mediaSocketUrl() {
   const path = labRun ? "/lab-media-ws" : "/media-ws";
   const query = new URLSearchParams({ epoch: mediaEpoch });
+  if (signalingPc) query.set("pc", signalingPc);
   if (labRun) {
     query.set("run", labRun);
     query.set("compat", labCompatibilityId);
@@ -3328,7 +3342,7 @@ document.addEventListener("paste", e => {
 }, true);
 // ---- file transfer (hook 5/5) ----------------------------------------------
 // Protocol and state: file-transfer.js / file-client.js; rendering: file-ui.js.
-const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl });
+const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl, socketTicket: () => signalingTicket });
 let nativeFileDropAvailable = false;
 let nativeFileDropPreviewAvailable = false;
 const fileDragPreview = createFileDragPreviewController({
@@ -3348,6 +3362,7 @@ const fileUi = installFileTransferUi({
 function fileSocketUrl() {
   if (!mediaEpoch) return null;
   const query = new URLSearchParams({ epoch: mediaEpoch });
+  if (signalingPc) query.set("pc", signalingPc);
   if (labRun) {
     query.set("run", labRun);
     query.set("compat", labCompatibilityId);

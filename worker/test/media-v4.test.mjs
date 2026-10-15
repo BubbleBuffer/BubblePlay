@@ -243,6 +243,8 @@ test("receiver input stays on the signaling socket and the media socket carries 
   const calls = [...source.matchAll(/sendWssV4\(([^)]*)/g)].map(match => match[1]).filter(arg => arg !== "text");
   assert.equal(calls.length, 3);
   for (const arg of calls) assert.match(arg, /^(ackMessageV4|keyframeMessageV4|'\{"type":"ping"\}')/);
-  assert.equal([...source.matchAll(/(?<!ws)\bsocket\.send\(/g)].length, 2);
+  // Shared media sender, plus the media hello with or without a signaling ticket.
+  assert.equal([...source.matchAll(/(?<!ws)\bsocket\.send\(/g)].length, 3);
+  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-client", ticket: signalingTicket \}\)\)/);
   assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-client" \}\)\)/);
 });
