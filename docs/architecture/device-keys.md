@@ -65,7 +65,7 @@ One text file per key, extension `.bpkey`, UTF-8 JSON:
 | --- | --- | --- | --- |
 | Browser | The `.bpkey` file as created or imported, in IndexedDB for the relay origin. | Asks for the passphrase when the page opens, if the key has one. | **Export key** downloads the file; **Import key** reads one. |
 | Android | `files/device-key.bpkey` in app-private storage, additionally wrapped with a Keystore AES key so a copied file is useless off the phone. Backup stays off. | Asks for the passphrase when the app opens, if the key has one. | Export and import through the system file picker; export unwraps the Keystore layer and writes the portable file. |
-| PC user host | `%LOCALAPPDATA%\BubblePlay\device-key.bpkey`, CurrentUser DPAPI-wrapped, no passphrase, because the host starts unattended at sign-in. | None. | Tray **Export key** asks for an optional export passphrase; **Import key** keeps a PC's ID across a reinstall. |
+| PC user host | `%LOCALAPPDATA%\BubblePlay\device-key.bpkey`, CurrentUser DPAPI-wrapped, no passphrase, because the host starts unattended at sign-in. | None. | Tray menu **Export PC key...** asks for an optional export passphrase; **Import PC key...** keeps a PC's ID across a reinstall. |
 | Pre-login logon host | `ProgramData\BubblePlay\prelogin\device-key.bpkey`, LocalMachine DPAPI, ACL SYSTEM and `NT SERVICE\BubblePlayLogon`. | None. | Not exported; it is created by the elevated pre-login opt-in. Its own ID, as decided in [unattended access](unattended-access.md#decisions). |
 | Wake-on-LAN helper | Key file in its state volume, mode 600, no passphrase. | None. | Plain file. |
 
@@ -249,6 +249,8 @@ This PC   Office-PC   ID 7HQ2-K9MX-4RTD-P0ZB   Relay play.example.com (online)
 - **Edit** includes **May vouch**; a vouched device shows its voucher under its row.
 - Last seen comes from the host's own records, not the relay.
 - Native window, like the existing approval dialog, following the BubblePlay product profile.
+
+**Current state of PC key backup (2026-10-15):** the tray menu has **Export PC key...** and **Import PC key...**, built in `host/src/tray/key_ui.rs`. Export asks for an optional passphrase, typed twice, then saves `<PC ID>.bpkey`. Import reads a `.bpkey`, asks for its passphrase when it is protected, asks to confirm the ID change, replaces the PC key and restarts the host. Both run on their own thread, so the tray stays responsive. Not yet checked on screen.
 
 ## Cutover and removal
 
