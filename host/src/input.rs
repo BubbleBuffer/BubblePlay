@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 use crate::admin_agent::client::AdminAgentLink;
 use crate::admin_agent::protocol::Record;
 use crate::clipboard;
+use crate::clipboard_worker::{ClipboardWorker, Command as ClipboardCommand, Completion};
 pub use crate::input_diagnostics::{
     InputDiagnosticCounters, InputDropReason, InputRoute, InputRoutingStatus, InputStatusReason,
 };
@@ -1469,10 +1470,69 @@ pub struct InputSink {
 /// Clipboard state exists only where the sink runs as the interactive user
 /// (input proxy, unprivileged local host). Elsewhere clipboard packets are
 /// ignored.
-#[derive(Debug, Default)]
 struct ClipboardSync {
     assembly: ClipboardAssembly,
-    watcher: clipboard::ClipboardWatcher,
+    worker: Option<ClipboardWorker>,
+    epoch: u64,
+    next_write: u64,
+    poll_pending: bool,
+    reset_pending: bool,
+    content: Option<clipboard::ClipboardContent>,
+    paste: Option<PendingClipboardPaste>,
+}
+
+struct PendingClipboardPaste {
+    id: u64,
+    foreground: (isize, u32),
+    expires: Instant,
+}
+
+fn foreground_identity() -> (isize, u32) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let window = unsafe { GetForegroundWindow() };
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    (window.0 as isize, pid)
+}
+
+impl Default for ClipboardSync {
+    fn default() -> Self {
+        let worker = match ClipboardWorker::spawn() {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                warn!(%error, "clipboard worker unavailable; ordinary input remains enabled");
+                None
+            }
+        };
+        Self::with_worker(worker)
+    }
+}
+
+impl ClipboardSync {
+    fn with_worker(worker: Option<ClipboardWorker>) -> Self {
+        Self {
+            assembly: ClipboardAssembly::default(),
+            worker,
+            epoch: 0,
+            next_write: 0,
+            poll_pending: false,
+            reset_pending: true,
+            content: None,
+            paste: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.assembly = ClipboardAssembly::default();
+        self.epoch = self.epoch.wrapping_add(1);
+        if let Some(worker) = self.worker.as_ref() {
+            worker.set_epoch(self.epoch);
+        }
+        self.poll_pending = false;
+        self.reset_pending = true;
+        self.content = None;
+        self.paste = None;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1885,6 +1945,21 @@ impl InputState {
     /// Ctrl+V, respecting modifiers the browser user is physically holding.
     fn paste_plan(&mut self) -> Vec<(HeldKey, bool)> {
         let control_held = self.pressed_keys.iter().copied().any(is_control_key);
+        let mut plan = self.release_paste_windows_keys();
+        if !control_held {
+            plan.push((HeldKey::Vk(VK_CONTROL), false));
+        }
+        plan.push((HeldKey::Vk(VK_V), false));
+        plan.push((HeldKey::Vk(VK_V), true));
+        if !control_held {
+            plan.push((HeldKey::Vk(VK_CONTROL), true));
+        }
+        plan
+    }
+
+    /// Mask/release Meta before waiting for a clipboard write. A browser key-up
+    /// arriving during that wait must not open Start and change the paste target.
+    fn release_paste_windows_keys(&mut self) -> Vec<(HeldKey, bool)> {
         let windows_keys: Vec<HeldKey> = self
             .pressed_keys
             .iter()
@@ -1900,14 +1975,6 @@ impl InputState {
                 self.swallowed_releases.insert(key);
                 plan.push((key, true));
             }
-        }
-        if !control_held {
-            plan.push((HeldKey::Vk(VK_CONTROL), false));
-        }
-        plan.push((HeldKey::Vk(VK_V), false));
-        plan.push((HeldKey::Vk(VK_V), true));
-        if !control_held {
-            plan.push((HeldKey::Vk(VK_CONTROL), true));
         }
         plan
     }
@@ -3211,9 +3278,6 @@ impl InputSink {
         if self.secure_desktop != secure || (self.secure_input_allowed && !input_allowed) {
             self.release_all();
             self.state = InputState::default();
-            if let Some(sync) = self.clipboard.as_mut() {
-                sync.assembly = ClipboardAssembly::default();
-            }
         }
         self.secure_desktop = secure;
         self.secure_input_allowed = input_allowed;
@@ -3232,10 +3296,75 @@ impl InputSink {
         if self.secure_desktop {
             return None;
         }
-        self.clipboard.as_mut()?.watcher.poll(reset)
+        if reset {
+            // Establish an outgoing baseline without cancelling clipboard
+            // writes already accepted from this viewer. Session/release gates
+            // invalidate their own epochs separately.
+            let sync = self.clipboard.as_mut()?;
+            sync.content = None;
+            sync.reset_pending = true;
+        }
+        self.finish_clipboard();
+        let sync = self.clipboard.as_mut()?;
+        if !sync.poll_pending {
+            sync.poll_pending = sync.worker.as_ref().is_some_and(|worker| {
+                worker.submit(ClipboardCommand::Poll {
+                    epoch: sync.epoch,
+                    reset: sync.reset_pending,
+                })
+            });
+            if sync.poll_pending {
+                sync.reset_pending = false;
+            }
+        }
+        sync.content.take()
+    }
+
+    /// Only nonblocking queue reads run on the input owner. A delayed clipboard
+    /// renderer must never prevent clicking another window or pressing Alt+Tab.
+    pub fn finish_clipboard(&mut self) {
+        self.finish_clipboard_with_identity(foreground_identity);
+    }
+
+    fn finish_clipboard_with_identity(&mut self, foreground: impl Fn() -> (isize, u32)) {
+        let mut paste = false;
+        if let Some(sync) = self.clipboard.as_mut() {
+            while let Some(completion) = sync.worker.as_ref().and_then(ClipboardWorker::try_recv) {
+                match completion {
+                    Completion::Polled { epoch, content } if epoch == sync.epoch => {
+                        sync.poll_pending = false;
+                        if !sync.reset_pending {
+                            sync.content = content;
+                        }
+                    }
+                    Completion::Written { epoch, id, success } if epoch == sync.epoch => {
+                        if sync.paste.as_ref().is_some_and(|pending| pending.id == id) {
+                            let pending = sync.paste.take().unwrap();
+                            paste = success
+                                && Instant::now() < pending.expires
+                                && pending.foreground.0 != 0
+                                && foreground() == pending.foreground;
+                            if !paste {
+                                debug!("delayed clipboard paste cancelled (write, expiry or focus changed)");
+                            }
+                        }
+                        if !success {
+                            warn!("host clipboard write failed; paste cancelled");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if paste && !self.secure_desktop && !crate::native_file_drop::drag_active() {
+            self.paste_with_operation("clipboard-paste");
+        }
     }
 
     pub fn set_absolute_region(&mut self, region: DesktopRegion) {
+        if let Some(sync) = self.clipboard.as_mut() {
+            sync.paste = None;
+        }
         self.geometry_valid = region.width > 0 && region.height > 0;
         self.absolute_region = region.sanitized();
         self.state.last_absolute_position = None;
@@ -3390,6 +3519,26 @@ impl InputSink {
     }
 
     fn apply(&mut self, command: Command) -> InputOutcome {
+        // Releases of the original Ctrl+V/Meta+V shortcut may arrive while the
+        // write finishes. Preserve those releases and synthesize the eventual
+        // paste from the then-current held state. New actions cancel it.
+        let cancels_paste = match &command {
+            Command::Key(_, up) | Command::ScanKey(_, up) => !up,
+            Command::Buttons(mask) | Command::ButtonsAt(_, _, _, mask) => {
+                mask & !self.state.buttons != 0
+            }
+            Command::Rel(..)
+            | Command::Abs(..)
+            | Command::Absolute(..)
+            | Command::CursorSync(_) => false,
+            Command::Motion(_, _, _, wx, wy) => *wx != 0 || *wy != 0,
+            _ => true,
+        };
+        if cancels_paste {
+            if let Some(sync) = self.clipboard.as_mut() {
+                sync.paste = None;
+            }
+        }
         let mut outcome = InputOutcome::default();
         match command {
             Command::Key(vk, up) => {
@@ -3685,44 +3834,56 @@ impl InputSink {
             }
             ClipboardProgress::Complete { text, paste } => (text, paste),
         };
-        match clipboard::set_text(&text) {
-            Ok(sequence) => sync.watcher.note_own_change(sequence),
-            Err(error) => {
-                warn!(?error, "failed to set host clipboard from browser");
-                let code = error
-                    .downcast_ref::<windows::core::Error>()
-                    .map_or(0, |error| error.code().0);
-                let mut application = InputApplication::default();
-                application.observe(1, 0, code);
-                return application;
-            }
-        }
-        if !paste {
-            return InputApplication::default();
-        }
-        let inputs: Vec<INPUT> = self
-            .state
-            .paste_plan()
-            .into_iter()
-            .map(|(key, up)| INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: keyboard_input(key, up),
-                },
+        sync.next_write = sync.next_write.wrapping_add(1);
+        let id = sync.next_write;
+        let expires = Instant::now() + crate::clipboard_worker::WRITE_LIFETIME;
+        sync.paste = None;
+        let accepted = sync.worker.as_ref().is_some_and(|worker| {
+            worker.submit(ClipboardCommand::Write {
+                epoch: sync.epoch,
+                id,
+                text,
+                deadline: expires,
             })
-            .collect();
-        self.send_inputs("clipboard-paste", &inputs)
+        });
+        if !accepted {
+            self.note_packet_drop(InputDropReason::ClipboardRejected);
+            warn!("clipboard queue unavailable; ordinary input remains enabled");
+        } else if paste {
+            sync.paste = Some(PendingClipboardPaste {
+                id,
+                foreground: foreground_identity(),
+                expires,
+            });
+            let plan = self.state.release_paste_windows_keys();
+            return self.send_key_plan("clipboard-modifiers", plan);
+        }
+        InputApplication::default()
     }
 
     /// Inject Ctrl+V for whatever the host clipboard holds now (file
     /// transfer: a paste-purpose upload already placed its files there).
     pub fn paste(&mut self) -> InputApplication {
+        self.paste_with_operation("file-paste")
+    }
+
+    fn paste_with_operation(&mut self, operation: &'static str) -> InputApplication {
+        if let Some(sync) = self.clipboard.as_mut() {
+            sync.paste = None;
+        }
         if self.secure_desktop {
             return InputApplication::default();
         }
-        let inputs: Vec<INPUT> = self
-            .state
-            .paste_plan()
+        let plan = self.state.paste_plan();
+        self.send_key_plan(operation, plan)
+    }
+
+    fn send_key_plan(
+        &mut self,
+        operation: &'static str,
+        plan: Vec<(HeldKey, bool)>,
+    ) -> InputApplication {
+        let inputs: Vec<INPUT> = plan
             .into_iter()
             .map(|(key, up)| INPUT {
                 r#type: INPUT_KEYBOARD,
@@ -3731,7 +3892,7 @@ impl InputSink {
                 },
             })
             .collect();
-        self.send_inputs("file-paste", &inputs)
+        self.send_inputs(operation, &inputs)
     }
 
     fn text(&mut self, text: &str) -> InputApplication {
@@ -3904,12 +4065,14 @@ impl InputSink {
     pub fn reset_viewer_session(&mut self) {
         self.release_all();
         self.state = InputState::default();
-        if let Some(sync) = self.clipboard.as_mut() {
-            sync.assembly = ClipboardAssembly::default();
-        }
     }
 
     pub fn release_all_report(&mut self) -> InputApplication {
+        if let Some(sync) = self.clipboard.as_mut() {
+            // Blur/disconnect and presentation gates also invalidate clipboard
+            // requests queued before them, without waiting for native work.
+            sync.reset();
+        }
         let (keys, buttons) = self.state.take_release_plan();
         let mut application = InputApplication::default();
         for key in keys {
@@ -3992,5 +4155,222 @@ mod local_wheel_regression_tests {
             );
             assert_eq!(sink.take_diagnostics().route_calls, [1, 0, 0]);
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_responsiveness_tests {
+    use super::*;
+    use std::sync::mpsc::{Receiver, SyncSender};
+
+    fn sink() -> (
+        InputSink,
+        Receiver<ClipboardCommand>,
+        SyncSender<Completion>,
+    ) {
+        let (worker, commands, completions) = ClipboardWorker::test_channels();
+        let mut sink = InputSink::new();
+        sink.test_injections = Some(Vec::new());
+        sink.clipboard = Some(ClipboardSync::with_worker(Some(worker)));
+        (sink, commands, completions)
+    }
+
+    fn write(sink: &mut InputSink) {
+        // Complete one paste-bearing clipboard transfer. No OS clipboard call.
+        sink.handle(&[TYPE_CLIPBOARD, 1, 7, 0, 0, 0, 1, 0, b'h', b'i']);
+        if let Some(paste) = sink.clipboard.as_mut().unwrap().paste.as_mut() {
+            paste.foreground = (123, 99);
+        }
+    }
+
+    fn completed() -> Completion {
+        Completion::Written {
+            epoch: 0,
+            id: 1,
+            success: true,
+        }
+    }
+
+    #[test]
+    fn blocked_clipboard_queues_never_hold_mouse_or_alt_tab_packets() {
+        let (mut sink, _commands, _completions) = sink();
+        let started = Instant::now();
+        // No backend consumes these requests: the clipboard queue fills.
+        for _ in 0..8 {
+            write(&mut sink);
+        }
+        sink.handle(&[TYPE_MOUSE_REL, 1, 0, 0, 0]);
+        sink.handle(&[TYPE_KEY_DOWN, 0x12, 0]); // Alt
+        sink.handle(&[TYPE_KEY_DOWN, 9, 0]); // Tab
+        sink.handle(&[TYPE_KEY_UP, 9, 0]);
+        sink.handle(&[TYPE_KEY_UP, 0x12, 0]);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(sink.test_injections.as_ref().unwrap().len(), 5);
+        assert!(sink.clipboard.as_ref().unwrap().paste.is_none());
+    }
+
+    #[test]
+    fn successful_async_paste_survives_shortcut_keyup_and_happens_once() {
+        let (mut sink, commands, completions) = sink();
+        write(&mut sink);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(ClipboardCommand::Write {
+                epoch: 0,
+                id: 1,
+                ..
+            })
+        ));
+        sink.handle(&[TYPE_KEY_UP, VK_CONTROL as u8, 0]);
+        sink.test_injections.as_mut().unwrap().clear();
+        completions
+            .send(completed())
+            .unwrap_or_else(|_| panic!("completion receiver gone"));
+        sink.finish_clipboard_with_identity(|| (123, 99));
+        let records = sink.test_injections.as_ref().unwrap();
+        assert_eq!(records.len(), 4); // Ctrl down, V down/up, Ctrl up
+        assert!(matches!(
+            records[1],
+            Record::Key {
+                vk: VK_V,
+                flags: 0,
+                ..
+            }
+        ));
+        sink.finish_clipboard_with_identity(|| (123, 99));
+        assert_eq!(sink.test_injections.as_ref().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn delayed_paste_is_cancelled_by_new_actions_focus_expiry_or_failed_write() {
+        for reason in [
+            "key", "button", "scroll", "release", "geometry", "focus", "expired", "failure",
+            "secure", "session",
+        ] {
+            let (mut sink, _commands, completions) = sink();
+            write(&mut sink);
+            match reason {
+                "key" => {
+                    sink.handle(&[TYPE_KEY_DOWN, 65, 0]);
+                    sink.handle(&[TYPE_KEY_UP, 65, 0]);
+                }
+                "button" => {
+                    sink.handle(&[TYPE_BUTTONS, 1]);
+                    sink.handle(&[TYPE_BUTTONS, 0]);
+                }
+                "scroll" => {
+                    sink.handle(&[TYPE_WHEEL, 120, 0]);
+                }
+                "release" => sink.release_all(),
+                "geometry" => sink.set_absolute_region(DesktopRegion::new(1, 0, 1920, 1080)),
+                "expired" => {
+                    sink.clipboard
+                        .as_mut()
+                        .unwrap()
+                        .paste
+                        .as_mut()
+                        .unwrap()
+                        .expires = Instant::now() - Duration::from_secs(1)
+                }
+                "secure" => sink.set_secure_desktop(true, false),
+                "session" => sink.reset_viewer_session(),
+                _ => {}
+            }
+            sink.test_injections.as_mut().unwrap().clear();
+            let completion = if reason == "failure" {
+                Completion::Written {
+                    epoch: 0,
+                    id: 1,
+                    success: false,
+                }
+            } else {
+                completed()
+            };
+            completions
+                .send(completion)
+                .unwrap_or_else(|_| panic!("completion receiver gone"));
+            sink.finish_clipboard_with_identity(|| {
+                if reason == "focus" {
+                    (456, 88)
+                } else {
+                    (123, 99)
+                }
+            });
+            assert!(
+                sink.test_injections.as_ref().unwrap().is_empty(),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_discards_old_clipboard_content_and_retries_a_refused_baseline() {
+        let (mut sink, commands, completions) = sink();
+        // Full queue must not consume the next session's reset/baseline.
+        for _ in 0..4 {
+            write(&mut sink);
+        }
+        sink.reset_viewer_session();
+        assert_eq!(sink.poll_clipboard(true), None);
+        assert!(sink.clipboard.as_ref().unwrap().reset_pending);
+        for _ in 0..4 {
+            commands
+                .try_recv()
+                .unwrap_or_else(|_| panic!("queued write missing"));
+        }
+        completions
+            .send(Completion::Polled {
+                epoch: 0,
+                content: Some(clipboard::ClipboardContent::Text("old session".into())),
+            })
+            .unwrap_or_else(|_| panic!("completion receiver gone"));
+        assert_eq!(sink.poll_clipboard(false), None);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(ClipboardCommand::Poll {
+                epoch: 1,
+                reset: true
+            })
+        ));
+    }
+
+    #[test]
+    fn first_baseline_poll_does_not_cancel_a_current_viewers_paste() {
+        let (mut sink, _commands, completions) = sink();
+        write(&mut sink);
+        assert_eq!(sink.poll_clipboard(true), None);
+        completions
+            .send(completed())
+            .unwrap_or_else(|_| panic!("completion receiver gone"));
+        sink.finish_clipboard_with_identity(|| (123, 99));
+        assert_eq!(sink.test_injections.as_ref().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn async_meta_paste_masks_and_releases_windows_before_the_write_wait() {
+        let (mut sink, _commands, completions) = sink();
+        sink.handle(&[TYPE_KEY_DOWN, VK_LWIN as u8, 0]);
+        sink.test_injections.as_mut().unwrap().clear();
+        write(&mut sink);
+        sink.handle(&[TYPE_KEY_UP, VK_LWIN as u8, 0]);
+        let records = sink.test_injections.as_ref().unwrap();
+        assert_eq!(records.len(), 3, "mask tap and one Windows-key release");
+        assert!(matches!(
+            records[0],
+            Record::Key {
+                vk: VK_MASK,
+                flags: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            records[2],
+            Record::Key { vk: VK_LWIN, flags, .. } if flags == KEYEVENTF_KEYUP.0
+        ));
+        completions
+            .send(completed())
+            .unwrap_or_else(|_| panic!("completion receiver gone"));
+        sink.finish_clipboard_with_identity(|| (123, 99));
+        assert_eq!(sink.test_injections.as_ref().unwrap().len(), 7);
     }
 }
