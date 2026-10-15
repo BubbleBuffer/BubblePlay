@@ -58,6 +58,7 @@
   #visual { position:fixed; inset:0; z-index:1; transform:translate(0); pointer-events:none; }
 </style>
 <link rel="stylesheet" href="/bubbleplay.css">
+<link rel="stylesheet" href="/devicekey-ui.css">
 </head>
 <body class="session-page mode-work">
 <!-- Session strip: docked top row (desktop, ≤32 px) or docked bottom bar (touch).
@@ -167,6 +168,10 @@
     <h3 id="settings-display">Display</h3>
     <label class="setting-row"><span class="setting-text"><span class="setting-label">Default monitor for new sessions</span><span id="session-display" class="setting-help">Waiting for host</span></span><select id="setting-default-monitor"><option value="">Host's choice</option></select></label>
   </section>
+  <section class="settings-section" aria-labelledby="settings-device-key">
+    <h3 id="settings-device-key">Device key</h3>
+    <div id="device-key-settings"></div>
+  </section>
   <section class="settings-section" aria-labelledby="settings-access">
     <h3 id="settings-access">Browser access</h3>
     <p class="setting-help">Sign out keeps this browser approved. Forgetting it requires new browser approval.</p>
@@ -266,6 +271,10 @@
 <script type="module">
   import { loadSourceLink } from "/settings.js";
   loadSourceLink(document.getElementById("about-source"));
+</script>
+<script type="module">
+  import { installDeviceKeyUi } from "/devicekey-ui.js";
+  installDeviceKeyUi();
 </script>
 </body>
 </html>
