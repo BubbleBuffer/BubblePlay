@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.AtomicFile
 import java.io.File
 import java.io.FileNotFoundException
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 
@@ -14,9 +15,13 @@ import java.nio.charset.CodingErrorAction
  * perform disk/crypto work and should be called off the UI thread. Android-only:
  * the actual Keystore and AtomicFile path require device/instrumentation testing.
  */
-class DeviceKeyStore(context: Context) {
-    private val file = AtomicFile(File(context.applicationContext.filesDir, "device-key.bpkey"))
-    private val wrapper = KeystoreKeyWrap()
+class DeviceKeyStore internal constructor(private val path: File) {
+    constructor(context: Context) : this(File(context.applicationContext.filesDir, FILE_NAME))
+
+    // Both are created on first use, so remove() runs on the JVM without Android or Keystore.
+    private val file by lazy { AtomicFile(path) }
+    private val backup by lazy { File(path.path + BACKUP_SUFFIX) }
+    private val wrapper by lazy { KeystoreKeyWrap() }
 
     /** Null only when no local file exists; corruption and missing keys propagate. */
     fun loadPortable(): String? = synchronized(fileLock) {
@@ -24,7 +29,7 @@ class DeviceKeyStore(context: Context) {
             file.openRead().use { it.readBytes() }
         } catch (missing: FileNotFoundException) {
             // Do not mistake an existing but inaccessible file for a new install.
-            if (file.baseFile.exists() || File(file.baseFile.path + ".bak").exists()) throw missing
+            if (path.exists() || backup.exists()) throw missing
             return@synchronized null
         }
         val portableBytes = wrapper.unwrap(envelope)
@@ -59,7 +64,16 @@ class DeviceKeyStore(context: Context) {
         }
     }
 
+    /** Deletes the stored key and AtomicFile's backup. Throws if either file survives. */
+    fun remove() = synchronized(fileLock) {
+        val stuck = listOf(path, backup).filter { it.exists() && !it.delete() }
+        if (stuck.isNotEmpty()) throw IOException("could not delete the device key file")
+    }
+
     companion object {
+        internal const val FILE_NAME = "device-key.bpkey"
+        private const val BACKUP_SUFFIX = ".bak"
+
         // AtomicFile does not provide its own synchronization. Cover all instances.
         private val fileLock = Any()
     }
