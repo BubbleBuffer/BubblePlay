@@ -69,9 +69,8 @@ fn validate_plain(text: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("PC key is not a valid plain device key file"))
 }
 
-/// Explicit replacement for the future Import UI. The caller must supply an unlocked, plain
-/// key file; invalid input or a failed protect/write leaves the existing file intact.
-#[allow(dead_code)] // Called by the forthcoming tray Import UI; no UI is built in this phase.
+/// Replaces the PC key file with the plain key `text` after validating it, as one protected file.
+/// Invalid input or a failed protect/write leaves the existing file intact.
 pub fn replace_pc_key(path: &Path, text: &str) -> Result<()> {
     replace_with_codec(path, text, dpapi_protect_bytes)
 }
@@ -85,6 +84,29 @@ fn replace_with_codec(
     let protected = protect(text.as_bytes()).context("protecting replacement PC key")?;
     write_atomic(path, &protected, true)?;
     Ok(())
+}
+
+/// Renames a key file that cannot be read to `device-key.bpkey.unreadable-<UTC time>` in the same
+/// folder. The bytes are kept, never deleted; a copy already under that name is not overwritten.
+/// Logs the new path only, never the contents.
+pub fn quarantine_unreadable(path: &Path) -> Result<PathBuf> {
+    let stamp = now_rfc3339().replace('-', "").replace(':', "");
+    let base = format!("{FILE_NAME}.unreadable-{stamp}");
+    let mut target = path.with_file_name(&base);
+    let mut copy = 2;
+    while target.exists() {
+        target = path.with_file_name(format!("{base}-{copy}"));
+        copy += 1;
+    }
+    fs::rename(path, &target).context("renaming unreadable PC key")?;
+    tracing::warn!(path = %target.display(), "unreadable PC key renamed before import");
+    Ok(target)
+}
+
+/// Moves a file made by `quarantine_unreadable` back to `path`. Used only when the replacement
+/// failed, so that no PC key is silently created in its place.
+pub fn restore_quarantined(quarantined: &Path, path: &Path) -> Result<()> {
+    fs::rename(quarantined, path).context("restoring unreadable PC key")
 }
 
 struct OwnedTemp(PathBuf);

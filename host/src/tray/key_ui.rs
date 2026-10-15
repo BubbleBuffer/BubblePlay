@@ -183,15 +183,29 @@ pub enum ImportError {
     Failed(String),
 }
 
+/// What an import replaces: the readable PC key and its ID, or a key file that cannot be read.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Previous<'a> {
+    Id(&'a str),
+    Unreadable,
+}
+
+/// The ID of the PC key now at `key_path`, or `None` when the file exists but cannot be read.
+/// A missing file is created first, as the host does at start.
+fn current_id(key_path: &Path) -> Option<String> {
+    let text = load_current(key_path).ok()?;
+    KeyFile::parse(&text).ok().map(|key| key.id().to_string())
+}
+
 /// Checks the `.bpkey` text in `source` and, once `confirm` agrees, replaces the PC key at
 /// `key_path` with its plain form. Nothing is replaced unless every check passes. Returns the new
-/// PC ID. `confirm` gets the old and the new ID. As the host does at start, a missing PC key is
-/// created before the old ID is read.
+/// PC ID. `confirm` gets what is being replaced and the new ID. An unreadable current key is
+/// renamed beside itself, never deleted, before the new key is written.
 pub fn import_key(
     key_path: &Path,
     source: &str,
     passphrase: Option<&str>,
-    confirm: impl FnOnce(&str, &str) -> bool,
+    confirm: impl FnOnce(Previous<'_>, &str) -> bool,
 ) -> std::result::Result<String, ImportError> {
     let file = KeyFile::parse(source).map_err(|error| {
         ImportError::Failed(format!("This is not a BubblePlay key file. {error}"))
@@ -209,23 +223,37 @@ pub fn import_key(
         ImportError::Failed(format!("The key file could not be prepared. {error}"))
     })?;
     let new_id = file.id().to_string();
-    let old_id = load_current(key_path)
-        .ok()
-        .and_then(|current| KeyFile::parse(&current).ok())
-        .map(|key| key.id().to_string())
-        .ok_or_else(|| {
-            ImportError::Failed(
-                "The current PC key could not be read, so nothing was changed.".to_owned(),
-            )
-        })?;
-    if !confirm(&old_id, &new_id) {
+    let old_id = current_id(key_path);
+    let previous = match &old_id {
+        Some(id) => Previous::Id(id.as_str()),
+        None => Previous::Unreadable,
+    };
+    if !confirm(previous, &new_id) {
         return Err(ImportError::Declined);
     }
-    device_key_file::replace_pc_key(key_path, &plain).map_err(|error| {
-        ImportError::Failed(format!(
-            "The PC key was not replaced, so nothing changed. {error:#}"
-        ))
-    })?;
+    let moved = match old_id {
+        Some(_) => None,
+        None => Some(
+            device_key_file::quarantine_unreadable(key_path).map_err(|error| {
+                ImportError::Failed(format!(
+                    "The unreadable PC key could not be renamed, so nothing changed. {error:#}"
+                ))
+            })?,
+        ),
+    };
+    if let Err(error) = device_key_file::replace_pc_key(key_path, &plain) {
+        let text = match moved {
+            None => format!("The PC key was not replaced, so nothing changed. {error:#}"),
+            Some(moved) => match device_key_file::restore_quarantined(&moved, key_path) {
+                Ok(()) => format!("The PC key was not replaced, so nothing changed. {error:#}"),
+                Err(restore) => format!(
+                    "The PC key was not replaced ({error:#}). The unreadable key could not be put back; it is kept at {}. {restore:#}",
+                    moved.display()
+                ),
+            },
+        };
+        return Err(ImportError::Failed(text));
+    }
     Ok(new_id)
 }
 
@@ -280,6 +308,13 @@ pub fn replace_confirm_text(old_id: &str, new_id: &str) -> String {
     }
     format!(
         "Replace this PC's key? The PC ID changes from {old_id} to {new_id}. Viewers that know the old ID will not find this PC until they use the new one."
+    )
+}
+
+/// Confirmation text when the current key file cannot be read. The unreadable file is kept.
+pub fn unreadable_confirm_text(new_id: &str) -> String {
+    format!(
+        "The current PC key can't be read. Replace it? This PC gets a new ID, {new_id}. The unreadable file is kept in the same folder, not deleted."
     )
 }
 
@@ -590,8 +625,11 @@ unsafe extern "system" fn passphrase_proc(
 }
 
 /// Yes/No confirmation for replacing the PC key. The default button is No.
-fn confirm_replace(old_id: &str, new_id: &str) -> bool {
-    let text = wide(replace_confirm_text(old_id, new_id));
+fn confirm_replace(previous: Previous<'_>, new_id: &str) -> bool {
+    let text = wide(match previous {
+        Previous::Id(old_id) => replace_confirm_text(old_id, new_id),
+        Previous::Unreadable => unreadable_confirm_text(new_id),
+    });
     let title = wide(flow_title(Flow::Import));
     // SAFETY: both buffers are null-terminated and outlive the synchronous call.
     let answer = unsafe {
@@ -784,17 +822,71 @@ mod tests {
         let before = fs::read(&key).unwrap();
         let incoming = plain_key("Laptop");
         let mut seen = None;
-        let result = import_key(&key, &incoming, None, |old_id, new_id| {
-            seen = Some((old_id.to_owned(), new_id.to_owned()));
+        let result = import_key(&key, &incoming, None, |previous, new_id| {
+            seen = Some((format!("{previous:?}"), new_id.to_owned()));
             false
         });
         assert!(matches!(result, Err(ImportError::Declined)));
         assert_eq!(fs::read(&key).unwrap(), before);
-        assert_eq!(seen, Some((id_of(&old), id_of(&incoming))));
+        let old_debug = format!("{:?}", Previous::Id(id_of(&old).as_str()));
+        assert_eq!(seen, Some((old_debug, id_of(&incoming))));
 
         let new_id = import_key(&key, &incoming, None, |_, _| true).unwrap();
         assert_eq!(new_id, id_of(&incoming));
         let loaded = load_current(&key).unwrap();
         assert_eq!(id_of(&loaded), new_id);
+    }
+
+    #[test]
+    fn an_unreadable_key_is_renamed_and_replaced_after_confirmation() {
+        let dir = Scratch::new();
+        let key = dir.key();
+        let unreadable = b"corrupt blob".to_vec();
+        fs::write(&key, &unreadable).unwrap();
+        let incoming = plain_key("Laptop");
+        let mut asked = None;
+        let new_id = import_key(&key, &incoming, None, |previous, _| {
+            asked = Some(format!("{previous:?}"));
+            true
+        })
+        .unwrap();
+        assert_eq!(asked.as_deref(), Some("Unreadable"));
+        assert_eq!(new_id, id_of(&incoming));
+        let copies = unreadable_copies(&dir);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(fs::read(&copies[0]).unwrap(), unreadable);
+        assert_eq!(id_of(&load_current(&key).unwrap()), new_id);
+    }
+
+    #[test]
+    fn an_unreadable_key_is_untouched_when_the_replacement_is_declined() {
+        let dir = Scratch::new();
+        let key = dir.key();
+        let unreadable = b"corrupt blob".to_vec();
+        fs::write(&key, &unreadable).unwrap();
+        let result = import_key(&key, &plain_key("Laptop"), None, |_, _| false);
+        assert!(matches!(result, Err(ImportError::Declined)));
+        assert_eq!(fs::read(&key).unwrap(), unreadable);
+        assert!(unreadable_copies(&dir).is_empty());
+    }
+
+    #[test]
+    fn the_unreadable_confirmation_names_the_new_id() {
+        let text = unreadable_confirm_text("NEW2-BBBB");
+        assert!(text.starts_with("The current PC key can't be read. Replace it?"));
+        assert!(text.contains("This PC gets a new ID, NEW2-BBBB."));
+    }
+
+    fn unreadable_copies(dir: &Scratch) -> Vec<PathBuf> {
+        fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("device-key.bpkey.unreadable-")
+            })
+            .collect()
     }
 }
