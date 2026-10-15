@@ -149,6 +149,28 @@ function binding(peer, localFingerprint, remoteFingerprint) {
     signature: b64(crypto.sign(null, signedBytes, privateKey(hex(peer.seedHex), "ed25519"))) };
 }
 const dtls = { viewer: binding(viewer, viewerFingerprint, pcFingerprint), pc: binding(pc, pcFingerprint, viewerFingerprint) };
+
+function relayProofEncoding(vector) {
+  return lengthPrefixed([
+    utf8("bubbleplay-relay-v1"), utf8(vector.role), utf8(vector.origin),
+    Buffer.from(vector.nonce, "base64url"), utf8(vector.id), Buffer.from(vector.public, "base64url"),
+  ]);
+}
+function relayProofVector(name, role, identity, nonceHex) {
+  const vector = { name, role, origin: relayOrigin, nonceHex, nonce: b64(hex(nonceHex)),
+    id: identity.id, public: identity.public };
+  const encoding = relayProofEncoding(vector);
+  const hash = sha256(encoding);
+  return { ...vector, encodingHex: encoding.toString("hex"), sha256Hex: hash.toString("hex"),
+    signature: b64(crypto.sign(null, hash, privateKey(hex(identity.seedHex), "ed25519"))), expected: "valid" };
+}
+const relayHost = relayProofVector("host", "host", ids[1], "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf");
+const relayViewer = relayProofVector("viewer", "viewer", ids[0], "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf");
+// Keep the valid host signature while substituting a different relay origin.
+const relayWrongOrigin = { ...relayHost, name: "wrong-origin", origin: "https://other-relay.example.test", expected: "invalid" };
+const wrongOriginEncoding = relayProofEncoding(relayWrongOrigin);
+relayWrongOrigin.encodingHex = wrongOriginEncoding.toString("hex");
+relayWrongOrigin.sha256Hex = sha256(wrongOriginEncoding).toString("hex");
 const fixture = {
   version: 1,
   notes: "See docs/architecture/device-keys.md, Phase 0 results. TEST ONLY: all private keys, passphrases, salts and nonces are public deterministic vectors; never use them in production. Binary JSON fields use unpadded base64url unless named Hex; plaintextUtf8 and aadUtf8 are exact UTF-8 strings.",
@@ -173,6 +195,16 @@ const fixture = {
       authHost: { type: "auth-host", id: pc.id, public: pc.public, nonce: pc.nonce, ephemeral: pc.ephemeral, signature: b64(pcSignature) },
       authFinish: { type: "auth-finish", signature: b64(viewerSignature) },
       authBind: { type: "auth-bind", signature: dtls.viewer.signature },
+    },
+  },
+  relayProof: {
+    vectors: [relayHost, relayViewer, relayWrongOrigin],
+    messages: {
+      hello: { type: "hello", role: "host", token: "test-only-registration-token", id: relayHost.id, public: relayHost.public },
+      registerChallenge: { type: "register-challenge", nonce: relayHost.nonce },
+      registerProof: { type: "register-proof", signature: relayHost.signature },
+      // TEST ONLY: a deterministic stand-in for the relay's random ticket.
+      helloOk: { type: "hello-ok", ticket: b64(hex("e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")) },
     },
   },
 };

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -111,6 +112,25 @@ type dkcHandshake struct {
 	} `json:"messages"`
 }
 
+type dkcRelayVector struct {
+	Name        string `json:"name"`
+	Role        string `json:"role"`
+	Origin      string `json:"origin"`
+	NonceHex    string `json:"nonceHex"`
+	Nonce       string `json:"nonce"`
+	ID          string `json:"id"`
+	Public      string `json:"public"`
+	EncodingHex string `json:"encodingHex"`
+	SHA256Hex   string `json:"sha256Hex"`
+	Signature   string `json:"signature"`
+	Expected    string `json:"expected"`
+}
+
+type dkcRelayProof struct {
+	Vectors  []dkcRelayVector          `json:"vectors"`
+	Messages map[string]map[string]any `json:"messages"`
+}
+
 type dkcContract struct {
 	IDs      []dkcIdentity `json:"ids"`
 	KeyFiles struct {
@@ -133,7 +153,8 @@ type dkcContract struct {
 			Expected   string     `json:"expected"`
 		} `json:"failures"`
 	} `json:"keyFiles"`
-	Handshake dkcHandshake `json:"handshake"`
+	Handshake  dkcHandshake  `json:"handshake"`
+	RelayProof dkcRelayProof `json:"relayProof"`
 }
 
 func dkcLoad(t *testing.T) dkcContract {
@@ -214,6 +235,17 @@ func dkcConcat(parts ...[]byte) []byte {
 	var out []byte
 	for _, p := range parts {
 		out = append(out, p...)
+	}
+	return out
+}
+
+// dkcLengthPrefixed frames each field with a uint32 big-endian byte length.
+func dkcLengthPrefixed(fields ...[]byte) []byte {
+	var out []byte
+	for _, f := range fields {
+		var n [4]byte
+		binary.BigEndian.PutUint32(n[:], uint32(len(f)))
+		out = dkcConcat(out, n[:], f)
 	}
 	return out
 }
@@ -724,4 +756,124 @@ func dkcCheckParty(t *testing.T, name string, party dkcParty, ident dkcIdentity)
 	eph := dkcX25519(t, party.EphemeralPrivateHex)
 	dkcSame(t, name+" ephemeral", party.Ephemeral, dkcEnc(eph.PublicKey().Bytes()))
 	return priv, eph
+}
+
+func TestDeviceKeysContractRelayProof(t *testing.T) {
+	fixture := dkcLoad(t)
+	hs := fixture.Handshake
+	rp := fixture.RelayProof
+
+	var names []string
+	byName := map[string]dkcRelayVector{}
+	for _, v := range rp.Vectors {
+		names = append(names, v.Name)
+		byName[v.Name] = v
+	}
+	dkcExactlyOnce(t, "relay vectors", names, []string{"host", "viewer", "wrong-origin"})
+	identityOf := map[string]string{"host": "pc", "viewer": "viewer", "wrong-origin": "pc"}
+	roleOf := map[string]string{"host": "host", "viewer": "viewer", "wrong-origin": "host"}
+	expectedOf := map[string]string{"host": "valid", "viewer": "valid", "wrong-origin": "invalid"}
+
+	type relayCheck struct {
+		pub      ed25519.PublicKey
+		sum      []byte
+		sig      []byte
+		encoding []byte
+	}
+	checks := map[string]relayCheck{}
+	for _, v := range rp.Vectors {
+		ident := dkcIdentityNamed(t, fixture, identityOf[v.Name])
+		priv := dkcPrivate(t, ident.SeedHex)
+		pub := dkcPub(priv)
+		dkcSame(t, v.Name+" role", v.Role, roleOf[v.Name])
+		dkcSame(t, v.Name+" expected", v.Expected, expectedOf[v.Name])
+		dkcSame(t, v.Name+" id from identity", v.ID, ident.ID)
+		dkcSame(t, v.Name+" id from public", v.ID, dkcDeviceID(pub))
+		dkcSame(t, v.Name+" public", v.Public, dkcEnc(pub))
+		nonce := dkcB64(t, v.Nonce)
+		if len(nonce) != 32 {
+			t.Errorf("%s nonce is %d bytes, want 32", v.Name, len(nonce))
+		}
+		dkcSame(t, v.Name+" nonceHex", hex.EncodeToString(nonce), v.NonceHex)
+		if v.Expected == "valid" {
+			dkcSame(t, v.Name+" origin", v.Origin, hs.RelayOrigin)
+		} else {
+			dkcSame(t, v.Name+" origin", v.Origin, "https://other-relay.example.test")
+		}
+		encoding := dkcLengthPrefixed([]byte("bubbleplay-relay-v1"), []byte(v.Role), []byte(v.Origin), nonce, []byte(v.ID), pub)
+		dkcSame(t, v.Name+" encoding", hex.EncodeToString(encoding), v.EncodingHex)
+		sum := sha256.Sum256(encoding)
+		dkcSame(t, v.Name+" sha256", hex.EncodeToString(sum[:]), v.SHA256Hex)
+		sig := dkcB64(t, v.Signature)
+		if len(sig) != 64 {
+			t.Errorf("%s signature is %d bytes, want 64", v.Name, len(sig))
+		}
+		if v.Expected == "valid" {
+			dkcSame(t, v.Name+" signature", dkcEnc(ed25519.Sign(priv, sum[:])), v.Signature)
+			if !ed25519.Verify(pub, sum[:], sig) {
+				t.Errorf("%s signature does not verify over the recomputed hash", v.Name)
+			}
+		} else if ed25519.Verify(pub, sum[:], sig) {
+			t.Errorf("%s signature verifies over the changed encoding, want rejection", v.Name)
+		}
+		checks[v.Name] = relayCheck{pub: pub, sum: sum[:], sig: sig, encoding: encoding}
+	}
+
+	host, wrong := checks["host"], checks["wrong-origin"]
+	hostVec, wrongVec := byName["host"], byName["wrong-origin"]
+	dkcSame(t, "wrong-origin signature", wrongVec.Signature, hostVec.Signature)
+	dkcSame(t, "wrong-origin role", wrongVec.Role, hostVec.Role)
+	dkcSame(t, "wrong-origin nonce", wrongVec.Nonce, hostVec.Nonce)
+	dkcSame(t, "wrong-origin id", wrongVec.ID, hostVec.ID)
+	dkcSame(t, "wrong-origin public", wrongVec.Public, hostVec.Public)
+	if bytes.Equal(wrong.encoding, host.encoding) {
+		t.Errorf("wrong-origin encoding equals the host encoding")
+	}
+	// The host signature covers the original encoding and must not cover the substituted origin.
+	if !ed25519.Verify(host.pub, host.sum, host.sig) {
+		t.Errorf("host signature does not verify over the original encoding")
+	}
+	if ed25519.Verify(host.pub, wrong.sum, host.sig) {
+		t.Errorf("host signature verifies over the substituted origin")
+	}
+
+	// Changing role, ID or nonce alone must break the host signature.
+	viewerID := dkcIdentityNamed(t, fixture, "viewer").ID
+	hostNonce := dkcB64(t, hostVec.Nonce)
+	flipped := append([]byte(nil), hostNonce...)
+	flipped[0] ^= 1
+	mutants := map[string][]byte{
+		"role":  dkcLengthPrefixed([]byte("bubbleplay-relay-v1"), []byte("viewer"), []byte(hs.RelayOrigin), hostNonce, []byte(hostVec.ID), host.pub),
+		"id":    dkcLengthPrefixed([]byte("bubbleplay-relay-v1"), []byte("host"), []byte(hs.RelayOrigin), hostNonce, []byte(viewerID), host.pub),
+		"nonce": dkcLengthPrefixed([]byte("bubbleplay-relay-v1"), []byte("host"), []byte(hs.RelayOrigin), flipped, []byte(hostVec.ID), host.pub),
+	}
+	for name, encoding := range mutants {
+		sum := sha256.Sum256(encoding)
+		if ed25519.Verify(host.pub, sum[:], host.sig) {
+			t.Errorf("%s mutation still verifies with the host signature", name)
+		}
+	}
+
+	var keys []string
+	for k := range rp.Messages {
+		keys = append(keys, k)
+	}
+	dkcExactlyOnce(t, "relay messages", keys, []string{"hello", "registerChallenge", "registerProof", "helloOk"})
+	wantShapes := map[string]map[string]any{
+		"hello":             {"type": "hello", "role": "host", "token": "test-only-registration-token", "id": hostVec.ID, "public": hostVec.Public},
+		"registerChallenge": {"type": "register-challenge", "nonce": hostVec.Nonce},
+		"registerProof":     {"type": "register-proof", "signature": hostVec.Signature},
+	}
+	for name, want := range wantShapes {
+		if !reflect.DeepEqual(rp.Messages[name], want) {
+			t.Errorf("relay message %s:\n got  %v\n want %v", name, rp.Messages[name], want)
+		}
+	}
+	if n := len(rp.Messages["helloOk"]); n != 2 {
+		t.Errorf("helloOk has %d fields, want 2 (type, ticket)", n)
+	}
+	dkcSame(t, "helloOk type", dkcStr(t, rp.Messages["helloOk"], "type"), "hello-ok")
+	if n := len(dkcB64(t, dkcStr(t, rp.Messages["helloOk"], "ticket"))); n != 32 {
+		t.Errorf("helloOk ticket is %d bytes, want 32", n)
+	}
 }

@@ -234,5 +234,69 @@
         "signature": "0R94dRISC4LRC9JJ-QyBCc1ud8WxZ_VXostTuF4CEERjyasJDDUOa5wlVCIToBHnDULeyY-7vyADuP80sADfBA"
       }
     }
+  },
+  "relayProof": {
+    "vectors": [
+      {
+        "name": "host",
+        "role": "host",
+        "origin": "https://example.test",
+        "nonceHex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+        "nonce": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "public": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "encodingHex": "00000013627562626c65706c61792d72656c61792d763100000004686f73740000001468747470733a2f2f6578616d706c652e7465737400000020a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf00000013373756482d374d35362d38474a4b2d5931324a000000203d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "sha256Hex": "df2c862f3fa48c91d6e82a02786e2698e979f4495a96f9953664124a93d5fea8",
+        "signature": "uj2YRQ3602XVQfnEt2qj-wQEj2-Qu__4TehqQ2DgidBzCRWYe-BRXp1-9MCIxo_uhhNJ77CL-eRZQdC9PCh6Bw",
+        "expected": "valid"
+      },
+      {
+        "name": "viewer",
+        "role": "viewer",
+        "origin": "https://example.test",
+        "nonceHex": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+        "nonce": "wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t8",
+        "id": "47Z3-3QX1-AJH6-2RKB",
+        "public": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "encodingHex": "00000013627562626c65706c61792d72656c61792d7631000000067669657765720000001468747470733a2f2f6578616d706c652e7465737400000020c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf0000001334375a332d335158312d414a48362d32524b4200000020d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "sha256Hex": "11af7f6619396b695a3752c741399a691b8e621d97c775a1169bb2676dc0da61",
+        "signature": "xtUZN_vvz_xAvZ1W1g8tiKaBhpdqFcjv0hfWq5qsMLZLuuof0WA8hdcwaUM8OZmK6WGfJaZ5AQca6n4kyEgHCQ",
+        "expected": "valid"
+      },
+      {
+        "name": "wrong-origin",
+        "role": "host",
+        "origin": "https://other-relay.example.test",
+        "nonceHex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+        "nonce": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "public": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "encodingHex": "00000013627562626c65706c61792d72656c61792d763100000004686f73740000002068747470733a2f2f6f746865722d72656c61792e6578616d706c652e7465737400000020a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf00000013373756482d374d35362d38474a4b2d5931324a000000203d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "sha256Hex": "1edb5e841c000647490820aef65f74e513cdc564ceeb5e7509ed377ce752689b",
+        "signature": "uj2YRQ3602XVQfnEt2qj-wQEj2-Qu__4TehqQ2DgidBzCRWYe-BRXp1-9MCIxo_uhhNJ77CL-eRZQdC9PCh6Bw",
+        "expected": "invalid"
+      }
+    ],
+    "messages": {
+      "hello": {
+        "type": "hello",
+        "role": "host",
+        "token": "test-only-registration-token",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "public": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"
+      },
+      "registerChallenge": {
+        "type": "register-challenge",
+        "nonce": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8"
+      },
+      "registerProof": {
+        "type": "register-proof",
+        "signature": "uj2YRQ3602XVQfnEt2qj-wQEj2-Qu__4TehqQ2DgidBzCRWYe-BRXp1-9MCIxo_uhhNJ77CL-eRZQdC9PCh6Bw"
+      },
+      "helloOk": {
+        "type": "hello-ok",
+        "ticket": "4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6-_z9_v8"
+      }
+    }
   }
 }

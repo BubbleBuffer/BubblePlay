@@ -18,6 +18,17 @@ const bytes = (value, length) => {
 };
 const digest = value => crypto.createHash("sha256").update(value).digest();
 const text = value => Buffer.from(value, "utf8");
+// uint32 big-endian byte length before each field.
+function lengthPrefixed(fields) {
+  const out = Buffer.alloc(fields.reduce((total, field) => total + 4 + field.length, 0));
+  let offset = 0;
+  for (const field of fields) {
+    out.writeUInt32BE(field.length, offset);
+    field.copy(out, offset + 4);
+    offset += 4 + field.length;
+  }
+  return out;
+}
 function secret(seedHex, curve = "ed25519") {
   const prefix = curve === "ed25519" ? "302e020100300506032b657004220420" : "302e020100300506032b656e04220420";
   const seed = fromHex(seedHex);
@@ -263,4 +274,70 @@ test("four signaling examples have exact shapes and match the handshake", () => 
     nonce: h.pc.nonce, ephemeral: h.pc.ephemeral, signature: h.pcSignature });
   assert.deepEqual(messages.authFinish, { type: "auth-finish", signature: h.viewerSignature });
   assert.deepEqual(messages.authBind, { type: "auth-bind", signature: h.dtls.viewer.signature });
+});
+
+test("relay registration proofs recompute encodings, hashes and signatures", () => {
+  const h = fixture.handshake, rp = fixture.relayProof;
+  assert.deepEqual(Object.keys(rp).sort(), ["messages", "vectors"]);
+  assert.deepEqual(rp.vectors.map(v => v.name), ["host", "viewer", "wrong-origin"]);
+  const vectorNamed = name => rp.vectors.find(v => v.name === name);
+  const identityOf = { host: "pc", viewer: "viewer", "wrong-origin": "pc" };
+  const roleOf = { host: "host", viewer: "viewer", "wrong-origin": "host" };
+  const expectedOf = { host: "valid", viewer: "valid", "wrong-origin": "invalid" };
+  const checked = {};
+  for (const vector of rp.vectors) {
+    assert.deepEqual(Object.keys(vector).sort(), ["encodingHex", "expected", "id", "name", "nonce", "nonceHex", "origin", "public", "role", "sha256Hex", "signature"]);
+    assert.equal(vector.role, roleOf[vector.name]);
+    assert.equal(vector.expected, expectedOf[vector.name]);
+    if (vector.expected === "valid") assert.equal(vector.origin, h.relayOrigin);
+    else assert.notEqual(vector.origin, h.relayOrigin);
+    const ident = fixture.ids.find(identity => identity.name === identityOf[vector.name]);
+    assert.ok(ident, `identity ${identityOf[vector.name]} in fixture.ids`);
+    const pub = rawPublic(secret(ident.seedHex));
+    assert.deepEqual(bytes(vector.public, 32), pub);
+    assert.equal(vector.id, idOf(pub));
+    const nonce = bytes(vector.nonce, 32);
+    assert.equal(nonce.length, 32);
+    assert.deepEqual(nonce, fromHex(vector.nonceHex));
+    const encoding = lengthPrefixed([text("bubbleplay-relay-v1"), text(vector.role), text(vector.origin), nonce, text(vector.id), pub]);
+    assert.equal(encoding.toString("hex"), vector.encodingHex);
+    const hash = digest(encoding);
+    assert.equal(hash.toString("hex"), vector.sha256Hex);
+    const signature = bytes(vector.signature, 64);
+    if (vector.expected === "valid") {
+      assert.deepEqual(crypto.sign(null, hash, secret(ident.seedHex)), signature);
+      assert.equal(crypto.verify(null, hash, publicKey(pub), signature), true);
+    } else {
+      assert.equal(crypto.verify(null, hash, publicKey(pub), signature), false, "signature must not cover the changed origin");
+    }
+    checked[vector.name] = { pub, nonce, encoding, hash, signature };
+  }
+  const host = checked.host, wrong = checked["wrong-origin"];
+  const hostVector = vectorNamed("host"), wrongVector = vectorNamed("wrong-origin");
+  assert.equal(wrongVector.signature, hostVector.signature);
+  for (const field of ["role", "nonce", "id", "public"]) assert.equal(wrongVector[field], hostVector[field], field);
+  assert.notDeepEqual(wrong.encoding, host.encoding);
+  // The host signature is valid for the original encoding and invalid once the origin is substituted.
+  assert.equal(crypto.verify(null, host.hash, publicKey(host.pub), host.signature), true);
+  assert.equal(crypto.verify(null, wrong.hash, publicKey(host.pub), host.signature), false);
+  // Changing role, ID or nonce alone must break the host signature.
+  const viewerId = fixture.ids.find(identity => identity.name === "viewer").id;
+  const flippedNonce = Buffer.from(host.nonce);
+  flippedNonce[0] ^= 1;
+  const mutants = {
+    role: lengthPrefixed([text("bubbleplay-relay-v1"), text("viewer"), text(h.relayOrigin), host.nonce, text(hostVector.id), host.pub]),
+    id: lengthPrefixed([text("bubbleplay-relay-v1"), text("host"), text(h.relayOrigin), host.nonce, text(viewerId), host.pub]),
+    nonce: lengthPrefixed([text("bubbleplay-relay-v1"), text("host"), text(h.relayOrigin), flippedNonce, text(hostVector.id), host.pub]),
+  };
+  for (const [name, encoding] of Object.entries(mutants)) {
+    assert.equal(crypto.verify(null, digest(encoding), publicKey(host.pub), host.signature), false, `${name} mutation still verifies`);
+  }
+  const m = rp.messages;
+  assert.deepEqual(Object.keys(m).sort(), ["hello", "helloOk", "registerChallenge", "registerProof"]);
+  assert.deepEqual(m.hello, { type: "hello", role: "host", token: "test-only-registration-token", id: hostVector.id, public: hostVector.public });
+  assert.deepEqual(m.registerChallenge, { type: "register-challenge", nonce: hostVector.nonce });
+  assert.deepEqual(m.registerProof, { type: "register-proof", signature: hostVector.signature });
+  assert.deepEqual(Object.keys(m.helloOk).sort(), ["ticket", "type"]);
+  assert.equal(m.helloOk.type, "hello-ok");
+  bytes(m.helloOk.ticket, 32);
 });
