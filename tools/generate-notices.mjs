@@ -50,7 +50,7 @@ function licenseFiles(directory) {
   visit(directory);
   return files;
 }
-function addText(file, origin) {
+function readNoticeText(file, origin) {
   assertRegular(file);
   const bytes = fs.readFileSync(file);
   if (!bytes.length || bytes.length > 8 * 1024 * 1024) throw new Error(`Empty or oversized notice source: ${origin}`);
@@ -58,6 +58,10 @@ function addText(file, origin) {
   // License authors' published names/contact details are retained. A local
   // machine path must never leak from build metadata into the public notice.
   if (/C:[\\/]+Users[\\/]+Admin/i.test(text) || text.includes(projectRoot) || text.includes(projectRoot.replaceAll("\\", "/"))) throw new Error(`Personal build path found inside notice text: ${origin}`);
+  return { bytes, text };
+}
+function addText(file, origin) {
+  const { bytes, text } = readNoticeText(file, origin);
   const hash = sha256(bytes);
   if (!blobs.has(hash)) blobs.set(hash, { text, origins: [] });
   blobs.get(hash).origins.push(origin);
@@ -109,7 +113,27 @@ const extra = options["extra-license"] || path.join(projectRoot, "tools", "third
 const extraHash = addText(extra, "adapted ParsecVDD / original MIT license");
 const hashes = [...blobs.keys()].sort(order);
 const ids = new Map(hashes.map((hash, i) => [hash, i + 1]));
+// Hand-kept components outside the Cargo graph. Their texts come from the
+// repository files named here and get their own appended ids.
+const nonCargo = [
+  { name: "hash-wasm", version: "4.12.0", license: "MIT", source: "https://registry.npmjs.org/hash-wasm/-/hash-wasm-4.12.0.tgz", file: "worker/public/vendor/hash-wasm/LICENSE" },
+  { name: "bcprov-jdk18on", version: "1.86", license: "MIT", source: "https://raw.githubusercontent.com/bcgit/bc-java/r1rv86/LICENSE.html", file: "android/licenses/bouncycastle-LICENSE.txt" },
+];
+const extraTexts = nonCargo.map((component, i) => {
+  const { bytes, text } = readNoticeText(path.join(projectRoot, component.file), component.file);
+  return { ...component, id: hashes.length + i + 1, hash: sha256(bytes), text };
+});
 let output = "# Third-party notices\n\n";
+function appendText(id, hash, origins, text) {
+  output += `<a id="license-text-${id}"></a>\n\n### License text ${id}\n\n`;
+  output += `Original file SHA-256: \`${hash}\`.\n\nSources:\n\n`;
+  for (const origin of origins) output += `- ${markdown(origin)}\n`;
+  // A dynamically sized fence preserves texts that contain Markdown fences.
+  const body = text.replaceAll("\r\n", "\n").replaceAll("\r", "\n").replace(/\n?$/, "\n");
+  const runs = body.match(/`+/g) || [];
+  const fence = "`".repeat(Math.max(3, ...runs.map(run => run.length + 1)));
+  output += `\n${fence}text\n${body}${fence}\n\n`;
+}
 output += `This Windows release uses the following ${inventory.length} locked Rust dependency versions and adapted ParsecVDD code. `;
 output += "The inventory covers the entire resolved Windows Cargo graph, including build dependencies; it is intentionally broader than the code linked into the executables.\n\n";
 output += "The license expressions below are the upstream declarations. All discovered license, notice, copying and copyright files are retained in full; no alternative licensing choice is asserted. Identical source texts share an appendix entry.\n\n";
@@ -122,14 +146,14 @@ output += `\n## Adapted ParsecVDD code\n\nThe original MIT license and copyright
 output += "## Retained license and notice texts\n\n";
 for (const hash of hashes) {
   const blob = blobs.get(hash);
-  output += `<a id="license-text-${ids.get(hash)}"></a>\n\n### License text ${ids.get(hash)}\n\n`;
-  output += `Original file SHA-256: \`${hash}\`.\n\nSources:\n\n`;
-  for (const origin of [...new Set(blob.origins)].sort(order)) output += `- ${markdown(origin)}\n`;
-  // A dynamically sized fence preserves texts that contain Markdown fences.
-  const runs = blob.text.match(/`+/g) || [];
-  const fence = "`".repeat(Math.max(3, ...runs.map(run => run.length + 1)));
-  output += `\n${fence}text\n${blob.text.replaceAll("\r\n", "\n").replaceAll("\r", "\n").replace(/\n?$/, "\n")}${fence}\n\n`;
+  appendText(ids.get(hash), hash, [...new Set(blob.origins)].sort(order), blob.text);
 }
+output += "## Additional non-Cargo components\n\n";
+output += "These components sit outside the Cargo graph and are listed by hand. Each licence file is retained in full from the repository path shown; it keeps its own entry even where the text matches a Cargo appendix entry.\n\n";
+output += "| Component | Version | Licence | Source | Repository licence file | Retained text |\n| --- | --- | --- | --- | --- | --- |\n";
+for (const item of extraTexts) output += `| ${markdown(item.name)} | ${markdown(item.version)} | ${markdown(item.license)} | ${markdown(item.source)} | ${markdown(item.file)} | [license text ${item.id}](#license-text-${item.id}) |\n`;
+output += "\n";
+for (const item of extraTexts) appendText(item.id, item.hash, [`${item.name}@${item.version} source: ${item.source}`, `${item.name}@${item.version} repository licence file: ${item.file}`], item.text);
 const target = path.resolve(options.output);
 fs.mkdirSync(path.dirname(target), { recursive: true });
 fs.writeFileSync(target, output, "utf8");

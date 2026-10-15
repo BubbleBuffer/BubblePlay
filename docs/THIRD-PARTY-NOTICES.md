@@ -11910,3 +11910,103 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
+## Additional non-Cargo components
+
+These components sit outside the Cargo graph and are listed by hand. Each licence file is retained in full from the repository path shown; it keeps its own entry even where the text matches a Cargo appendix entry.
+
+| Component | Version | Licence | Source | Repository licence file | Retained text |
+| --- | --- | --- | --- | --- | --- |
+| hash-wasm | 4.12.0 | MIT | https://registry.npmjs.org/hash-wasm/-/hash-wasm-4.12.0.tgz | worker/public/vendor/hash-wasm/LICENSE | [license text 156](#license-text-156) |
+| bcprov-jdk18on | 1.86 | MIT | https://raw.githubusercontent.com/bcgit/bc-java/r1rv86/LICENSE.html | android/licenses/bouncycastle-LICENSE.txt | [license text 157](#license-text-157) |
+
+<a id="license-text-156"></a>
+
+### License text 156
+
+Original file SHA-256: `c14dea172f72f2714284a0ac2ab1b00b5352a01409d58255a46227ffc541debd`.
+
+Sources:
+
+- hash-wasm@4.12.0 source: https://registry.npmjs.org/hash-wasm/-/hash-wasm-4.12.0.tgz
+- hash-wasm@4.12.0 repository licence file: worker/public/vendor/hash-wasm/LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2020 Dani Biró
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Embedded C implementations might use other, similarly permissive licenses.
+Check the beginning of the files from the /src directory.
+
+Special thank you to the authors of original C algorithms:
+- Alexander Peslyak <solar@openwall.com>
+- Aleksey Kravchenko <rhash.admin@gmail.com>
+- Colin Percival
+- Stephan Brumme <create@stephan-brumme.com>
+- Steve Reid <steve@edmweb.com>
+- Samuel Neves <sneves@dei.uc.pt>
+- Solar Designer <solar@openwall.com>
+- Project Nayuki
+- ARM Limited
+- Yanbo Li dreamfly281@gmail.com, goldboar@163.comYanbo Li
+- Mark Adler
+- Yann Collet
+```
+
+<a id="license-text-157"></a>
+
+### License text 157
+
+Original file SHA-256: `afaf5bd0b0d869dc86b71711e1b775b204948634c9710a35a9a70d1613a2ab14`.
+
+Sources:
+
+- bcprov-jdk18on@1.86 source: https://raw.githubusercontent.com/bcgit/bc-java/r1rv86/LICENSE.html
+- bcprov-jdk18on@1.86 repository licence file: android/licenses/bouncycastle-LICENSE.txt
+
+```text
+<html>
+<body bgcolor=#ffffff>
+
+<a href="https://opensource.org/licenses/MIT" >MIT License</a>
+<p>
+Copyright (c) 2000-2026 The Legion of the Bouncy Castle Inc. (https://www.bouncycastle.org)
+</p><p>
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software 
+and associated documentation files (the "Software"), to deal in the Software without restriction, 
+including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+</p><p>
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+</p><p>
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+</p>
+</body>
+</html>
+```
+
