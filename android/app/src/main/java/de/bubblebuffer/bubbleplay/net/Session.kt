@@ -73,6 +73,8 @@ class Session(
         fun onFileCapability(enabled: Boolean?)
         /** The signaling epoch the file socket pairs on (null: none). */
         fun onFileEpoch(epoch: String?)
+        /** The grant of the current signaling session (PC and ticket, session memory only); empty once signaling closed. */
+        fun onViewerGrant(grant: ViewerGrant) {}
         /** Host sound (BPA1) from host-capabilities; false when the host does not stream sound. */
         fun onSoundCapability(enabled: Boolean)
         /** A host `file-offer`; an empty item list withdraws it. */
@@ -135,6 +137,7 @@ class Session(
     private var sigRetryTimer: Runnable? = null
     private var sigReconnecting = false
     private var mediaEpoch: String? = null
+    private val grant = ViewerGrantSlot()
 
     // Host state.
     @Volatile private var scancode = false
@@ -282,6 +285,7 @@ class Session(
             link.reset()
             try { sig?.close(1000, "client-stop") } catch (_: Exception) {}
             sig = null; sigOpen = false; registered = false
+            clearGrant()
             thread.quitSafely()
         }
         decoder.release()
@@ -332,6 +336,8 @@ class Session(
 
     // ---- signaling ------------------------------------------------------------
     private fun openSignaling() {
+        // A new signaling socket starts without the previous one's credentials.
+        clearGrant()
         if (!running || terminal != null) return
         if (config.isLab && config.labCompat == null) {
             val compat = fetchLabCompat()
@@ -348,7 +354,7 @@ class Session(
             override fun onOpen(webSocket: WebSocket, response: Response) = post({ id }) {
                 sigOpen = true
                 liveness.opened(now())
-                sendSig(JSONObject().put("type", "hello").put("role", "client"))
+                sendSig(ServerConfig.signalingHello())
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) = post({ id }) {
@@ -384,6 +390,12 @@ class Session(
         id = link.connecting(socket)
     }
 
+    /** Signaling closed: forget the PC and ticket (session memory only) and tell the listener. */
+    private fun clearGrant() {
+        if (!grant.clear()) return
+        main.post { listener.onViewerGrant(ViewerGrant.NONE) }
+    }
+
     /** Runs [block] on the session thread only if that socket generation is still current. */
     private inline fun post(crossinline gen: () -> Int, crossinline block: () -> Unit) {
         handler.post { if (running && link.isCurrent(gen())) block() }
@@ -396,6 +408,7 @@ class Session(
         sigOpen = false
         registered = false
         sig = null
+        clearGrant()
         // The media socket may keep playing (status: input reconnecting); it is
         // bound to this signaling epoch and is replaced after the next hello-ok.
         resetFirstFrame()
@@ -465,7 +478,11 @@ class Session(
         val msg = try { JSONObject(text) } catch (_: Exception) { return }
         when (msg.optString("type")) {
             "hello-ok" -> {
-                val epoch = msg.optString("mediaEpoch").takeIf { Regex("^[a-f0-9]{32}$").matches(it) }
+                // Every hello-ok on the current socket replaces the credentials, before any early return.
+                if (!link.isCurrent(id)) return
+                val granted = grant.helloOk(msg)
+                main.post { listener.onViewerGrant(granted) }
+                val epoch = ViewerGrant.stringField(msg, "mediaEpoch")?.takeIf { Regex("^[a-f0-9]{32}$").matches(it) }
                 if (!link.helloOk(id, epoch)) return
                 registered = true
                 sigRetry.succeeded()
@@ -552,6 +569,7 @@ class Session(
                 link.reset()
                 try { sig?.close(1000, "peer-left") } catch (_: Exception) {}
                 sig = null; sigOpen = false; registered = false
+                clearGrant()
                 closeMedia()
                 resetFirstFrame()
                 desktopKind = "default"; secureDesktop = null
@@ -562,6 +580,7 @@ class Session(
             }
             "error" -> {
                 terminal = msg.optString("message").ifEmpty { "relay error" }
+                clearGrant()
                 Log.w(TAG, "relay error: $terminal")
                 publishStatus()
             }
@@ -758,11 +777,14 @@ class Session(
         if (!running || !registered || !surfaceRecovery.canRestartMedia()) return
         val id = mediaLeg.open()
         val cookie = if (config.isLab) null else cookieProvider()
-        val request = Request.Builder().url(config.mediaUrl(epoch)).apply { if (cookie != null) header("Cookie", cookie) }.build()
+        val current = grant.current
+        val request = Request.Builder().url(config.mediaUrl(epoch, current.pc)).apply { if (cookie != null) header("Cookie", cookie) }.build()
         media = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = mediaPost(id) {
+                // Signaling closed or replaced the grant while this socket connected: its ticket is stale, so it never sends it.
+                if (grant.current !== current) { webSocket.cancel(); return@mediaPost }
                 mediaLastSend = now(); mediaLastInbound = now()
-                webSocket.send("{\"type\":\"hello\",\"role\":\"media-client\"}")
+                webSocket.send(current.hello("media-client"))
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) = mediaPost(id) {
