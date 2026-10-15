@@ -11,3 +11,7 @@ NVIDIA_VIDEO_CODEC_SDK_PATH = { value = "sdk-stub/", relative = true }
 # as an unquoted -L/LIBPATH; rust-lld splits it at the spaces. This flag makes aws-lc-sys link
 # its crypto archive with +whole-archive and skip that search path. Trade-off: larger exe.
 AWS_LC_SYS_LINK_WHOLE_ARCHIVE = "1"
+
+# rust-lld can report success without producing BubblePlay's Windows executables.
+[target.x86_64-pc-windows-msvc]
+linker = "link.exe"

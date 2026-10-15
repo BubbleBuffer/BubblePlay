@@ -1142,9 +1142,18 @@ async function handleSignal(socket, generation, ev) {
   }
 }
 
+// The host's trickled candidates are bare SDP strings with no mid. Bind each
+// to the first m-line of the remote description (the host bundles everything
+// there); index 0 is the fallback. Without a mid or index the browser throws.
+function remoteIceInit(ice, remoteSdp) {
+  const section = (remoteSdp || "").split(/^m=/m)[1] || "";
+  const mid = /^a=mid:(\S+)/m.exec(section)?.[1];
+  return mid ? { candidate: ice, sdpMid: mid, sdpMLineIndex: 0 } : { candidate: ice, sdpMLineIndex: 0 };
+}
+
 async function addRemoteIce(candidate, generation, ice) {
   try {
-    await candidate.addIceCandidate({ candidate: ice });
+    await candidate.addIceCandidate(remoteIceInit(ice, candidate.remoteDescription?.sdp));
   } catch (e) {
     if (isCurrentPeer(generation, candidate)) console.warn("addIceCandidate", e);
   }

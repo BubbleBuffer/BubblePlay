@@ -2081,6 +2081,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     offer_in_flight = false;
                     offer_accepted = true;
                 }
+                TransportEvent::LocalCandidate(candidate) => {
+                    signaling.send_candidate(&candidate)?;
+                }
                 TransportEvent::OfferRejected => {
                     park_viewer!("offer-rejected");
                 }
