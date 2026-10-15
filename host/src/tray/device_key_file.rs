@@ -90,7 +90,7 @@ fn replace_with_codec(
 /// folder. The bytes are kept, never deleted; a copy already under that name is not overwritten.
 /// Logs the new path only, never the contents.
 pub fn quarantine_unreadable(path: &Path) -> Result<PathBuf> {
-    let stamp = now_rfc3339().replace('-', "").replace(':', "");
+    let stamp = now_rfc3339().replace(['-', ':'], "");
     let base = format!("{FILE_NAME}.unreadable-{stamp}");
     let mut target = path.with_file_name(&base);
     let mut copy = 2;
