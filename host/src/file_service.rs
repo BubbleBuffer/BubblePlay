@@ -1272,6 +1272,14 @@ impl Session {
     /// The last file of a batch is done: put the saved files on the
     /// clipboard, and ask for a paste when the batch was a paste.
     fn finish_batch(&mut self, shared: &Mutex<Shared>) {
+        self.finish_batch_with(shared, crate::clipboard::set_files);
+    }
+
+    fn finish_batch_with(
+        &mut self,
+        shared: &Mutex<Shared>,
+        set_files: impl FnOnce(&[PathBuf]) -> Result<u32>,
+    ) {
         let batch = std::mem::take(&mut self.batch);
         if batch.saved.is_empty() {
             return;
@@ -1283,15 +1291,19 @@ impl Session {
             );
             return;
         }
-        let mut state = lock(shared);
-        match crate::clipboard::set_files(&batch.saved) {
+        let epoch = lock(shared).epoch.clone();
+        // EmptyClipboard may message a hung owner. Never hold the mutex the
+        // input/session thread uses for take_outbox, epochs and rate updates.
+        match set_files(&batch.saved) {
             Ok(seq) => {
+                let mut state = lock(shared);
                 state.own_clipboard_seq = Some(seq);
                 info!(
                     files = batch.saved.len(),
                     "uploaded files placed on the clipboard"
                 );
-                if batch.purpose == Some(Purpose::Paste) {
+                if batch.purpose == Some(Purpose::Paste) && epoch.is_some() && state.epoch == epoch
+                {
                     state.outbox.pastes += 1;
                 }
             }
@@ -1678,6 +1690,31 @@ fn mime_for(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploaded_clipboard_write_does_not_hold_the_input_owners_mutex() {
+        let (mut session, _server, _client, shared, dir) = native_test_session();
+        session.config.clipboard = true;
+        session.batch.saved = vec![dir.join("synthetic.txt")];
+        session.batch.purpose = Some(Purpose::Paste);
+        session.finish_batch_with(&shared, |_| {
+            // The native call can block arbitrarily. Foreground/window work
+            // must not prevent the input owner from reading or changing state.
+            let mut state = shared
+                .try_lock()
+                .expect("clipboard write held session mutex");
+            state.epoch = Some("replacement-viewer".into());
+            Ok(42)
+        });
+        let state = lock(&shared);
+        assert_eq!(state.own_clipboard_seq, Some(42));
+        assert_eq!(
+            state.outbox.pastes, 0,
+            "old viewer must not paste into a new session"
+        );
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

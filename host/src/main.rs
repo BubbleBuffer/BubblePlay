@@ -2118,6 +2118,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     offer_in_flight = false;
                     offer_accepted = true;
                 }
+                TransportEvent::LocalCandidate(candidate) => {
+                    signaling.send_candidate(&candidate)?;
+                }
                 TransportEvent::OfferRejected => {
                     park_viewer!("offer-rejected");
                 }
@@ -2498,11 +2501,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         session_stage!(Files);
-        if !capture.is_privileged() {
-            let viewer_live =
-                capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
-            local_clipboard.poll(viewer_live, cursor_now, &mut input_sink, &mut signaling);
-        }
         if file_drag_preview.desired.is_some() || file_drag_preview.active.is_some() {
             file_drag_preview.tick(
                 NativeDropView {
@@ -3703,6 +3701,16 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         signaling.flush_cursor_state();
+        if !capture.is_privileged() {
+            let viewer_live =
+                capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
+            // Apply queued RTC and WSS actions before a clipboard completion:
+            // a newer press or disconnect must cancel a delayed paste first.
+            if viewer_live {
+                session_call!(Input, input_sink.finish_clipboard());
+            }
+            local_clipboard.poll(viewer_live, Instant::now(), &mut input_sink, &mut signaling);
+        }
         let audio_wanted =
             args.audio && viewer_attached && (wss_audio_requested || rtc_audio_requested);
         if audio_wanted && audio_capture.is_none() && Instant::now() >= next_audio_start {
