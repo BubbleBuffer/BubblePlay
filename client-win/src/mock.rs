@@ -41,7 +41,7 @@ const REQUEST_NUMBER: u32 = 482_913;
 /// The scene labels, in order. `DemoDriver::len` is `LABELS.len()`.
 /// 0..=22 keep the numbering of the snapshots before step 4 (7 was the
 /// temporary password step); step 4 scenes follow from 23.
-const LABELS: [&str; 46] = [
+const LABELS: [&str; 47] = [
     "Your PCs",
     "Vouch request",
     "This PC",
@@ -88,6 +88,7 @@ const LABELS: [&str; 46] = [
     "Connect: connection lost",
     "Connect: no video decoder",
     "Connect: PC key changed",
+    "Approval: withdrawn",
 ];
 
 /// Session sparkline points from session.html (34 px high viewBox, 25
@@ -553,6 +554,10 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
             ));
             View::Home(studio_sel())
         }
+        46 => {
+            s.flow = Some(Flow::Approval { pc_id: STUDIO_ID.into(), waiting_secs: 0, outcome: Outcome::Cancelled });
+            View::Home(studio_sel())
+        }
         _ => {
             // Session scenes (14..=22): the view underneath is never shown.
             let sess = s.session.insert(session_base());
@@ -795,7 +800,7 @@ mod tests {
     #[test]
     fn scenes_apply_without_panic_and_labels_are_unique() {
         let (_backend, mut demo) = new();
-        assert_eq!(demo.len(), 46);
+        assert_eq!(demo.len(), 47);
         let mut seen = HashSet::new();
         assert_eq!(demo.len(), LABELS.len());
         for (i, expected) in LABELS.iter().enumerate() {
@@ -803,7 +808,7 @@ mod tests {
             assert_eq!(label, *expected);
             assert!(seen.insert(label.clone()), "duplicate scene label: {label}");
         }
-        assert_eq!(seen.len(), 46);
+        assert_eq!(seen.len(), 47);
     }
 
     #[test]
