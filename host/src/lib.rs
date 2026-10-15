@@ -12,6 +12,7 @@ pub mod capture;
 pub mod capture_wait;
 pub mod clipboard;
 pub mod clipboard_image;
+mod clipboard_worker;
 pub mod content_class;
 pub mod desktop_session;
 pub mod encode;

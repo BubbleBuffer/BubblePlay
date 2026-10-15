@@ -190,6 +190,9 @@ pub fn run(session_id: u32, generation: u32) -> Result<()> {
     loop {
         let (request_id, request) = read_request(&mut reader).context("read proxy request")?;
         let (response, stop) = state.handle(request_id, request);
+        if !stop {
+            state.input.finish_clipboard();
+        }
         write_response(&mut writer, request_id, &response).context("write proxy response")?;
         if stop {
             return Ok(());
