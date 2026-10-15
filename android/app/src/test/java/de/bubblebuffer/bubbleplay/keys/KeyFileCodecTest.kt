@@ -37,8 +37,15 @@ class KeyFileCodecTest {
 
     @Test
     fun serializeReproducesTheFixtureFiles() {
-        assertTrue(JSONObject(KeyFileCodec.serialize(KeyFileCodec.parse(plainFile.toString()))).similar(plainFile))
-        assertTrue(JSONObject(KeyFileCodec.serialize(KeyFileCodec.parse(protectedFile.toString()))).similar(protectedFile))
+        // Structural maps from the strict parser: field order is ignored, values and nesting are not.
+        assertEquals(
+            KeyJson.parseObject(plainFile.toString()),
+            KeyJson.parseObject(KeyFileCodec.serialize(KeyFileCodec.parse(plainFile.toString()))),
+        )
+        assertEquals(
+            KeyJson.parseObject(protectedFile.toString()),
+            KeyJson.parseObject(KeyFileCodec.serialize(KeyFileCodec.parse(protectedFile.toString()))),
+        )
     }
 
     @Test
