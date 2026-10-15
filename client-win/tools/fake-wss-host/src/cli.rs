@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::audio::Script;
 use crate::model::Injections;
+use crate::monitors;
 use crate::rtc::Knobs;
 use crate::stream::Codec;
 
@@ -39,6 +40,10 @@ usage: fake-wss-host [--stream h264|hevc] [options]
   --stall-first-frame       with --webrtc: channels and audio run, and no video RTP is sent
   --rtc-drop-at SECONDS     with --webrtc: end the RTC session once at this time; /ws and
                             WSS keep running
+  --monitors                two scripted monitors in monitor-list (sent at hello); the
+                            monitor and monitors actions switch and refresh them
+  --monitor-error SELECTOR  with --monitors: a switch to SELECTOR fails with monitor-error
+                            and keeps the previous display (repeatable)
 
 Injections must fire at least one second before the drain window ends. Video
 injections need recordings; with none they do not fire. The RTC drop time is
@@ -62,6 +67,8 @@ pub struct Args {
     pub audio: Option<Script>,
     /// The WebRTC answerer, when `--webrtc` is given.
     pub rtc: Option<Knobs>,
+    /// The monitor surface, when `--monitors` is given.
+    pub monitors: monitors::Knobs,
 }
 
 /// `Ok(None)` for `--help`.
@@ -81,6 +88,8 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
     let mut block_ice = false;
     let mut stall_first_frame = false;
     let mut rtc_drop_at = None;
+    let mut monitors_on = false;
+    let mut monitor_errors: Vec<String> = Vec::new();
 
     let mut iter = raw.iter();
     while let Some(flag) = iter.next() {
@@ -132,6 +141,14 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
             "--block-ice" => block_ice = true,
             "--stall-first-frame" => stall_first_frame = true,
             "--rtc-drop-at" => rtc_drop_at = Some(seconds("--rtc-drop-at", &value()?)?),
+            "--monitors" => monitors_on = true,
+            "--monitor-error" => {
+                let selector = value()?;
+                if monitors::bounded_selector(Some(selector.as_str())).is_none() {
+                    return Err("--monitor-error needs a selector of 1 to 128 bytes".into());
+                }
+                monitor_errors.push(selector.trim().to_owned());
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -142,6 +159,15 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
     if !webrtc_on && (block_ice || stall_first_frame || rtc_drop_at.is_some()) {
         return Err("--block-ice, --stall-first-frame and --rtc-drop-at need --webrtc".into());
     }
+    if !monitors_on && !monitor_errors.is_empty() {
+        return Err("--monitor-error needs --monitors".into());
+    }
+    let mut monitor_knobs = if monitors_on {
+        monitors::Knobs::scripted()
+    } else {
+        monitors::Knobs::default()
+    };
+    monitor_knobs.failing = monitor_errors;
     let audio = if audio_on {
         Some(Script::new(audio_loss_every, audio_reorder_every)?)
     } else {
@@ -191,6 +217,7 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
         input_record,
         audio,
         rtc,
+        monitors: monitor_knobs,
     }))
 }
 

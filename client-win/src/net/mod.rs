@@ -5,6 +5,7 @@
 //! documented in `F:/build/win-client-step1/net-api.md`.
 
 mod config;
+mod controls;
 mod cookies;
 mod error;
 mod events;
@@ -25,6 +26,10 @@ mod integration_contract_tests;
 mod session_tests;
 
 pub use config::{Codec, NetConfig, TransportChoice, AUTO_ICE_CHECKING_TIMEOUT};
+pub use controls::{ModeOutcome, MonitorEntry, PickOutcome, SessionControls};
+/// Only the session tests build a monitor error by name.
+#[cfg(test)]
+pub use controls::MonitorError;
 pub use cookies::CookieJar;
 #[cfg(any(test, feature = "dev-login"))]
 pub use cookies::{GATE_COOKIE, SESSION_COOKIE};

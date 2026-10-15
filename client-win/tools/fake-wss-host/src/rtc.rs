@@ -79,6 +79,10 @@ pub enum Command {
     /// End the session now with a stable reason token. The DTLS close_notify
     /// is sent and drained before the socket closes, so the browser sees `Closed`.
     End(&'static str),
+    /// A monitor switch or a stream-mode change: the next recording keyframe
+    /// starts the new picture. `generation` is the generation it carries (a
+    /// switch); `None` keeps the current one (a mode change). The peer stays up.
+    Reseek { generation: Option<u32> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +158,13 @@ pub struct Report {
     pub turnaround_us_total: u64,
     pub blocked_datagrams: u64,
     pub transmit_errors: u64,
+    /// First-keyframe admissions on this session, one per keyframe that left
+    /// after a start or a `Reseek` (the first keyframe included).
+    pub admissions: u64,
+    /// Generation carried by the last admission.
+    pub admitted_generation: Option<u32>,
+    /// `Reseek` commands applied: monitor switches and mode changes.
+    pub reseeks: u64,
 }
 
 impl Report {
@@ -200,6 +211,9 @@ impl Report {
                 "turnaround_us_max": self.turnaround_us_max,
                 "turnaround_us_mean": mean,
             },
+            "admissions": self.admissions,
+            "admitted_generation": self.admitted_generation,
+            "reseeks": self.reseeks,
             "media_stopped": self.media_stopped,
             "close_notify_sent": self.close_notify_sent,
             "blocked_datagrams": self.blocked_datagrams,
@@ -285,6 +299,11 @@ struct AudioOut {
 
 struct Pump {
     id: u64,
+    /// The generation the next admission carries: the session's own until a switch.
+    generation: u32,
+    /// The next keyframe that leaves is an admission. True until one has left,
+    /// and again after a `Reseek`.
+    want_admission: bool,
     rtc: Rtc,
     socket: UdpSocket,
     local: SocketAddr,
@@ -302,7 +321,7 @@ struct Pump {
     /// When the datagram being handled reached the pump.
     received_at: Instant,
     /// A keyframe was written and its first RTP packet has not left yet.
-    keyframe_pending: bool,
+    keyframe_pending: Option<u32>,
     /// The DTLS close_notify is being drained; the next datagram is it.
     closing: bool,
     report: Report,
@@ -329,6 +348,8 @@ impl Pump {
         let tone = ToneEncoder::new().context("audio encoder")?;
         let pump = Self {
             id,
+            generation: session_generation(id),
+            want_admission: true,
             rtc,
             socket,
             local,
@@ -343,7 +364,7 @@ impl Pump {
             video: None,
             audio: None,
             received_at: offered_at,
-            keyframe_pending: false,
+            keyframe_pending: None,
             closing: false,
             report: Report::default(),
         };
@@ -406,9 +427,8 @@ impl Pump {
         let pt = bytes[1] & 0x7f;
         if self.video.as_ref().and_then(|v| v.wire_pt) == Some(pt) {
             self.report.video_rtp_packets += 1;
-            if std::mem::take(&mut self.keyframe_pending) {
-                return Some(u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]));
-            }
+            let timestamp = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            return take_admission(&mut self.keyframe_pending, timestamp);
         } else if self.audio.as_ref().and_then(|a| a.wire_pt) == Some(pt) {
             self.report.audio_rtp_packets += 1;
         }
@@ -418,18 +438,38 @@ impl Pump {
     /// The keyframe is on the wire: report it with the timestamp the packet
     /// carries, which is what the browser checks presentation against.
     async fn admit(&mut self, rtp_timestamp: u32) {
+        self.want_admission = false;
+        self.report.admissions += 1;
         self.report.admitted_rtp_timestamp = Some(rtp_timestamp);
-        self.report.first_keyframe_ms = Some(self.offered_at.elapsed().as_secs_f64() * 1000.0);
+        self.report.admitted_generation = Some(self.generation);
+        self.report.first_keyframe_ms
+            .get_or_insert(self.offered_at.elapsed().as_secs_f64() * 1000.0);
         let codec = self
             .video
             .as_ref()
             .map_or("", |video| video.source.codec().wire_name());
         let notice = Notice::FirstKeyframe {
-            generation: session_generation(self.id),
+            generation: self.generation,
             rtp_timestamp,
             codec,
         };
         self.notify(notice).await;
+    }
+
+    /// Starts the next picture: the next recording keyframe is written and its
+    /// first packet is admitted again, under `generation` when one is given.
+    /// Nothing is re-offered and the data channels stay open.
+    fn reseek(&mut self, generation: Option<u32>) {
+        if let Some(generation) = generation {
+            self.generation = generation;
+        }
+        self.report.reseeks += 1;
+        self.want_admission = true;
+        self.keyframe_pending = None;
+        if let Some(video) = self.video.as_mut() {
+            let len = video.source.len().max(1);
+            video.index = video.source.next_key_at_or_after(video.index) % len;
+        }
     }
 
     fn receive(&mut self, bytes: &[u8], source: SocketAddr) -> Result<()> {
@@ -637,8 +677,11 @@ impl Pump {
                 video.index = (index + 1) % video.source.len().max(1);
                 self.report.video_frames += 1;
                 // Admission waits for the packet itself; see `admit`.
-                if key && self.report.admitted_rtp_timestamp.is_none() {
-                    self.keyframe_pending = true;
+                if key && self.want_admission {
+                    // str0m 0.21 packetizes this MediaTime directly at 90 kHz.
+                    // Older buffered packets may leave first after a reseek;
+                    // only this written IDR's timestamp proves the transition.
+                    self.keyframe_pending = Some(rtp_90k as u32);
                 }
             }
             Err(_) => self.report.transmit_errors += 1,
@@ -758,6 +801,7 @@ impl Pump {
                 command = commands.recv() => match command {
                     Some(Command::Remote(candidate)) => self.remote_candidate(&candidate),
                     Some(Command::StopMedia) => self.report.media_stopped = true,
+                    Some(Command::Reseek { generation }) => self.reseek(generation),
                     Some(Command::End(reason)) => return reason.into(),
                     None => return "run-complete".into(),
                 },
@@ -795,9 +839,31 @@ pub async fn run(
     pump.report
 }
 
+/// Admit only the written IDR, even when an older packet was already queued.
+fn take_admission(pending: &mut Option<u32>, timestamp: u32) -> Option<u32> {
+    if *pending == Some(timestamp) {
+        pending.take()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_old_video_cannot_admit_a_new_idr_and_each_idr_admits_once() {
+        // Includes RTP wrap: the buffered packet belongs to the previous picture.
+        let mut pending = Some(1500);
+        for old in [u32::MAX - 100, 0, 1499] {
+            assert_eq!(take_admission(&mut pending, old), None);
+            assert_eq!(pending, Some(1500));
+        }
+        assert_eq!(take_admission(&mut pending, 1500), Some(1500));
+        assert_eq!(take_admission(&mut pending, 1500), None);
+        assert_eq!(pending, None);
+    }
 
     fn pt(value: u8) -> Option<Pt> {
         Some(Pt::new_with_value(value))

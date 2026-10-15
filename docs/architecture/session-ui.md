@@ -50,6 +50,16 @@ The Android IME uses a bounded local Editable with real committed text, selectio
 
 Android shows Follow active window in the switch-screen popover when the host advertises `followWindow`, with the same control message and `monitor-list.follow` state as the browser. File uploads use the save/paste route rather than desktop OLE drops. See the [Android guide](../../android/README.md) for layout, settings, signing, tests and device-validation limits.
 
+## Windows
+
+The native Windows client ([windows-client.md](windows-client.md), code in `client-win/src/ui/session.rs`) draws its chrome in egui over the video, attached to the top edge. Every piece floats over the video; nothing shrinks the picture.
+
+- A small collapsed tab sits at the top edge. Opening it shows the toolbar strip: display, Work/Game mode (one button showing the current mode; a click switches to the other), quality, audio, stats and leave. Below 1000 px of window width the strip goes compact (no release chord in the capture group, quality as an icon only).
+- The display button opens the picker ("Show display"): a map of the host's monitors and one row per monitor, with the current one marked. Keys 1-9 pick a display and Esc closes the picker. A pick sends the browser's `monitor` request. Until the host answers, the rows are disabled and a notice says the display is switching. If the host refuses, an error notice shows its reason. The Follow row is not drawn.
+- Mode changes are sent live, as the browser sends them.
+- Quality and audio controls are drawn disabled on a live session (same place and size, with a "not available yet" tooltip) until the client can send those changes.
+- Other pieces: the stats panel, the capture/released toasts, a reconnecting card over a dimmed video, the Admin-required banner and the secure-desktop badge.
+
 ## Input sequencing and scroll
 
 Browser `InputController` and Android `RemoteInput` allocate absolute-v2, motion-v2 and buttons-at packets from one shared wrapping u16 counter. Each successfully sent pointer or wheel packet consumes its own sequence. Absolute position and wheel distance remain independent, including when both arrive in the same frame; an absolute packet is followed by motion-v2 carrying the wheel. Large wheel distances split across i16 packets, and refused tails remain pending for retry. Browser two-finger horizontal scrolling negates finger X, matching Android.

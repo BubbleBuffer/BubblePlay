@@ -45,6 +45,10 @@ pub struct MediaControl {
     pub request_id: Option<String>,
     /// The integer `audio` field, if present and an integer. Only `1` opts in.
     pub audio: Option<u64>,
+    /// `action: "monitor"`: the selector to switch to, as sent (not trimmed).
+    pub monitor: Option<String>,
+    /// `action: "mode"`: `work` or `game`, as sent. Other values are the caller's to refuse.
+    pub stream_mode: Option<String>,
 }
 
 fn token_ok(value: &str) -> bool {
@@ -121,6 +125,8 @@ pub fn parse_signal(text: &str) -> Result<Signal, &'static str> {
                 reason,
                 request_id,
                 audio: value.get("audio").and_then(Value::as_u64),
+                monitor: optional_str(&value, "monitor").ok().flatten(),
+                stream_mode: optional_str(&value, "streamMode").ok().flatten(),
             }))
         }
         "first-frame" => {

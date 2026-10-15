@@ -7,6 +7,7 @@ mod decode;
 mod dev_login;
 mod headless;
 pub(crate) mod input_dev;
+mod live_input;
 mod metrics;
 mod options;
 mod order;
@@ -29,7 +30,7 @@ use std::{
 
 use crate::{
     media::{Codec, MediaRuntime, MediaStats, StatsSnapshot, VideoRenderer},
-    model::{AppState, Backend, Link, Monitor, Quality, Session, Stats},
+    model::{AppState, Backend, Link, Monitor, PcKind, Quality, RemotePc, Session, Stats},
     net::{self, CookieJar, DecoderFeedback, NetConfig, NetState, TransportStats},
     shell::{Shell, ShellConfig},
 };
@@ -291,21 +292,48 @@ fn run_windowed(options: DevOptions) -> Result<()> {
     }));
     config.input = Some(input_link.clone());
     config.stream_mode = Some(options.mode.stream_mode().into());
+    // The network's mode and monitor state, shared with the backend. It starts
+    // at the requested mode. Net-side changes wake the window through the
+    // backend's notifier (`SessionBackend::set_notifier`).
+    let controls = config.controls.clone();
+    controls.initialize_mode(live_input::stream_mode(options.mode));
     let audio_control = stats.audio.clone();
     audio_control.set_volume(options.audio_volume);
     audio_control.set_muted(options.audio_muted);
     config.audio = Some(audio_control.clone());
-    let input_capture = crate::input::SessionInput::new(
+    // The shell's capture follows the pointer mode; it is replaced on mode change.
+    let (input_capture, input_control) = live_input::LiveInput::new(
         options.mode,
-        input_link.clone(),
-        stop.clone(),
-        Arc::new({
-            let wake = wake.clone();
-            move || wake.wake()
-        }),
+        controls.clone(),
+        live_input::session_input_factory(
+            input_link.clone(),
+            stop.clone(),
+            Arc::new({
+                let wake = wake.clone();
+                move || wake.wake()
+            }),
+        ),
     );
-    let capture_status: SessionInputState = input_capture.status();
     shell.set_input_capture(Box::new(input_capture));
+    // The viewed PC's saved default is handed to the network here, before
+    // `net::run` below starts. The replay has no saved PC, so it has no default.
+    let viewed = RemotePc {
+        id: "dev-replay".into(),
+        name: "Local replay".into(),
+        kind: PcKind::Desktop,
+        online: true,
+        ..Default::default()
+    };
+    let mut backend = SessionBackend::new(
+        Arc::new({
+            let stats = stats.clone();
+            move || app_state(&stats)
+        }),
+        controls.clone(),
+        input_control.clone(),
+        &viewed,
+        stop.clone(),
+    );
     let diagnostics = Arc::new(Mutex::new(Diagnostics::default()));
     let metadata: Arc<Mutex<BTreeMap<i64, FrameMeta>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let presentation_metrics = metrics::PresentationMetrics::default();
@@ -490,14 +518,6 @@ fn run_windowed(options: DevOptions) -> Result<()> {
                 })?,
         );
     }
-    let mut backend = SessionBackend {
-        poll: Arc::new({
-            let stats = stats.clone();
-            move || app_state(&stats)
-        }),
-        stop: stop.clone(),
-        notifier: None,
-    };
     backend.set_notifier(Arc::new({
         let wake = wake.clone();
         move || wake.wake()
@@ -551,7 +571,8 @@ fn run_windowed(options: DevOptions) -> Result<()> {
     );
     document["pacing"] = pacing.snapshot();
     document["input"] = serde_json::to_value(input_link.snapshot())?;
-    document["capture_state"] = serde_json::to_value(capture_status.snapshot())?;
+    document["capture_state"] =
+        serde_json::to_value(input_control.status().map(|status| status.snapshot()))?;
     document["audio"] = serde_json::to_value(audio_control.stats())?;
     let mut stats_summary = presentation_metrics.summary(
         &last_window,

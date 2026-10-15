@@ -53,6 +53,8 @@ pub struct DevOptions {
     pub count_only: bool,
     /// Synthetic input through InputLink; headless sessions only.
     pub input_script: Option<InputScript>,
+    /// Exercise live monitor/mode controls with decoded readiness and synthetic input.
+    pub session_script: bool,
     #[cfg(feature = "dev-login")]
     pub login: Option<super::dev_login::DevLogin>,
     pub stats_out_path: Option<PathBuf>,
@@ -82,6 +84,7 @@ impl DevOptions {
         let mut headless = false;
         let mut count_only = false;
         let mut input_script = None;
+        let mut session_script = false;
         #[cfg(feature = "dev-login")]
         let mut relay = None;
         #[cfg(feature = "dev-login")]
@@ -178,6 +181,7 @@ impl DevOptions {
                     ))
                 }
                 "--dev-headless" => headless = true,
+                "--dev-session-script" => session_script = true,
                 "--dev-count-only" => count_only = true,
                 "--dev-input-script" => {
                     input_script = Some(
@@ -287,6 +291,14 @@ impl DevOptions {
         if count_only && !headless {
             bail!("--dev-count-only requires --dev-headless");
         }
+        if session_script
+            && (!headless
+                || count_only
+                || input_script.is_some()
+                || mode != crate::input::Mode::Work)
+        {
+            bail!("--dev-session-script requires decoded --dev-headless in Work and supplies its own synthetic input");
+        }
         if count_only && input_script.is_some() {
             bail!(
                 "--dev-input-script needs Decoded readiness and cannot run with --dev-count-only"
@@ -339,6 +351,7 @@ impl DevOptions {
             headless,
             count_only,
             input_script,
+            session_script,
             #[cfg(feature = "dev-login")]
             login,
             stats_out_path,
@@ -382,6 +395,7 @@ fn is_dev_flag(value: &str) -> bool {
             | "--dev-headless"
             | "--dev-count-only"
             | "--dev-input-script"
+            | "--dev-session-script"
             | "--transport"
             | "--ice-timeout-ms"
     ) {
@@ -589,6 +603,7 @@ mod tests {
             headless: _,
             count_only: _,
             input_script: _,
+            session_script: _,
             stats_out_path: _,
         } = options;
     }
@@ -779,6 +794,35 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(game.input_script, Some(InputScript::Game));
+    }
+
+    #[test]
+    fn live_controls_script_requires_decoded_loopback_headless() {
+        let options = parse(&[
+            "--dev-wss",
+            "ws://127.0.0.1:19764",
+            "--dev-headless",
+            "--dev-session-script",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(options.session_script);
+        for extra in [
+            vec![],
+            vec!["--dev-headless", "--dev-count-only"],
+            vec!["--dev-headless", "--dev-input-script", "work"],
+        ] {
+            let mut args = vec!["--dev-wss", "ws://127.0.0.1", "--dev-session-script"];
+            args.extend(extra);
+            assert!(parse(&args).is_err());
+        }
+        assert!(parse(&[
+            "--dev-wss",
+            "wss://example.com",
+            "--dev-headless",
+            "--dev-session-script",
+        ])
+        .is_err());
     }
 
     #[test]

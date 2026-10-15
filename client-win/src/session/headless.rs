@@ -267,10 +267,12 @@ struct Measure {
     receipt_to_decode_ms: VecDeque<f64>,
     codec: Option<Codec>,
     resolution: Option<(u32, u32)>,
+    generation: Option<u32>,
 }
 
 impl Measure {
     fn note_decoded(&mut self, meta: FrameMeta, decoded_at: Instant) {
+        self.generation = Some(meta.generation);
         self.decoded += 1;
         push_capped(&mut self.decoded_at, decoded_at);
         let ms = decoded_at
@@ -424,6 +426,7 @@ pub(super) fn run(options: DevOptions) -> Result<()> {
     let decode_free = device.is_none();
     config.video_watchdog = !decode_free;
     config.headless_decoded_ready = !decode_free;
+    let controls = config.controls.clone();
 
     let stop = Arc::new(AtomicBool::new(false));
     let diagnostics = Arc::new(Mutex::new(Diagnostics::default()));
@@ -502,7 +505,11 @@ pub(super) fn run(options: DevOptions) -> Result<()> {
         None => Some(event_rx),
     };
 
-    let mut driver = options.input_script.map(InputDriver::new);
+    let mut driver = options
+        .input_script
+        .or(options.session_script.then_some(InputScript::Work))
+        .map(InputDriver::new);
+    let mut exercise = options.session_script.then(ControlExercise::default);
     let mut received_at: VecDeque<Instant> = VecDeque::new();
     let mut last_received: Option<Instant> = None;
     let duration = options.exit_after.unwrap_or(DEFAULT_DURATION);
@@ -528,6 +535,17 @@ pub(super) fn run(options: DevOptions) -> Result<()> {
             }
             last_received = Some(at);
             push_capped(&mut received_at, at);
+        }
+        if let (Some(exercise), Some(driver)) = (&mut exercise, &mut driver) {
+            let measured = lock(&measure);
+            exercise.tick(
+                &controls,
+                &input,
+                driver,
+                &measured,
+                lock(&diagnostics).resets.len(),
+                transport.snapshot().attempts,
+            );
         }
         if let Some(driver) = driver.as_mut() {
             driver.tick(&input, Instant::now());
@@ -568,7 +586,7 @@ pub(super) fn run(options: DevOptions) -> Result<()> {
         decode_errors: measured.decode_errors,
         input_sent: driver.as_ref().map(|driver| driver.sent),
     };
-    let pass = passes(outcome, &facts);
+    let pass = passes(outcome, &facts) && exercise.as_ref().is_none_or(|run| run.phase == 4);
     let mut document = json!({
         "pass": pass,
         "headless": true,
@@ -642,6 +660,26 @@ pub(super) fn run(options: DevOptions) -> Result<()> {
     rtc["audio_counters"] = document["audio"].clone();
     rtc["input_round_trip_ms"] = json!({"p50":input_snapshot.rtt_p50_ms,"p95":input_snapshot.rtt_p95_ms,"samples":input_snapshot.rtt_samples});
     document["webrtc"] = rtc;
+    if let Some(exercise) = &exercise {
+        document["session_controls"] = json!({
+            "complete": exercise.phase == 4,
+            "phase": exercise.phase,
+            "gate_reopened": exercise.gate_reopened,
+            "gate_closes_before": exercise.gate_closes_before,
+            "gate_closes_at_reopen": exercise.gate_closes_at_reopen,
+            "gate_closes_after": input_snapshot.gate_closes,
+            "monitor": exercise.target,
+            "generation_before": exercise.generation_before,
+            "generation_after": measured.generation,
+            "modes": exercise.modes,
+            "game_input_sent": exercise.game_input_sent,
+            "work_input_sent": driver.as_ref().map(|d| d.sent.saturating_sub(exercise.input_at_mode)),
+            "error": controls.snapshot().error.map(|e| e.reason),
+            "selected": controls.snapshot().selected,
+            "pending": controls.snapshot().pending,
+            "mode_revision": controls.snapshot().mode_revision,
+        });
+    }
     drop(measured);
     write_dev_report(&options, &document)?;
     if let Some(index) = typed {
@@ -659,6 +697,108 @@ pub(super) fn run(options: DevOptions) -> Result<()> {
     }
     Ok(())
 }
+
+/// A bounded synthetic qualification sequence. Net readiness is decode proof;
+/// no windows, hooks or OS input participate in any stage.
+#[derive(Default)]
+struct ControlExercise {
+    phase: u8,
+    target: Option<String>,
+    generation_before: Option<u32>,
+    decoded_before: u64,
+    resets_before: usize,
+    attempts_before: u64,
+    gate_reopened: bool,
+    gate_closes_before: u64,
+    gate_closes_at_reopen: u64,
+    mode_revision: u64,
+    mode_at: Option<Instant>,
+    input_at_mode: u64,
+    game_input_sent: u64,
+    modes: Vec<&'static str>,
+}
+
+impl ControlExercise {
+    fn tick(
+        &mut self,
+        controls: &net::SessionControls,
+        input: &InputLink,
+        driver: &mut InputDriver,
+        measured: &Measure,
+        resets: usize,
+        attempts: u64,
+    ) {
+        use crate::model::StreamMode;
+        let view = controls.snapshot();
+        let input_view = input.snapshot();
+        let ready = input_view.ready;
+        match self.phase {
+            0 if ready && measured.decoded > 0 => {
+                let Some(target) = view.monitors.iter().find(|m| !m.selected) else {
+                    return;
+                };
+                if controls.pick_monitor(&target.selector) != net::PickOutcome::Queued {
+                    return;
+                }
+                self.target = Some(target.selector.clone());
+                self.generation_before = measured.generation;
+                self.decoded_before = measured.decoded;
+                self.resets_before = resets;
+                self.attempts_before = attempts;
+                self.gate_closes_before = input_view.gate_closes;
+                self.phase = 1;
+            }
+            1 if ready
+                && view.pending.is_none()
+                && view.error.is_none()
+                && view.selected == self.target
+                && measured.generation != self.generation_before
+                && measured.decoded > self.decoded_before
+                && resets > self.resets_before
+                && input_view.gate_closes > self.gate_closes_before
+                && attempts == self.attempts_before =>
+            {
+                self.gate_reopened = true;
+                self.gate_closes_at_reopen = input_view.gate_closes;
+                controls.set_mode(StreamMode::Game);
+                self.mode_revision = view.mode_revision + 1;
+                self.mode_at = Some(Instant::now());
+                self.input_at_mode = driver.sent;
+                driver.steps = GAME_STEPS;
+                driver.next = 0;
+                self.phase = 2;
+            }
+            2 | 3
+                if ready
+                    && view.mode_revision >= self.mode_revision
+                    && self
+                        .mode_at
+                        .is_some_and(|at| at.elapsed() >= Duration::from_millis(600))
+                    && driver.sent >= self.input_at_mode + 4 =>
+            {
+                if self.phase == 2 && view.mode == StreamMode::Game {
+                    self.modes.push("game");
+                    self.game_input_sent = driver.sent - self.input_at_mode;
+                    controls.set_mode(StreamMode::Work);
+                    self.mode_revision = view.mode_revision + 1;
+                    self.mode_at = Some(Instant::now());
+                    self.input_at_mode = driver.sent;
+                    driver.steps = WORK_STEPS;
+                    driver.next = 0;
+                    self.phase = 3;
+                } else if self.phase == 3 && view.mode == StreamMode::Work {
+                    self.modes.push("work");
+                    self.phase = 4;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "step6_e2e.rs"]
+mod step6_e2e;
 
 #[cfg(test)]
 mod tests {

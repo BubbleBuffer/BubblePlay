@@ -117,6 +117,7 @@ fn base_state() -> AppState {
                 allowed: "View and input".into(),
                 vouch_request: None,
                 problem: None,
+                default_monitor: None,
             },
             RemotePc {
                 id: LIVING_ID.into(),
@@ -129,6 +130,7 @@ fn base_state() -> AppState {
                 allowed: "View and input".into(),
                 vouch_request: None,
                 problem: None,
+                default_monitor: None,
             },
             RemotePc {
                 id: OFFICE_ID.into(),
@@ -141,6 +143,7 @@ fn base_state() -> AppState {
                 allowed: "View and input".into(),
                 vouch_request: None,
                 problem: None,
+                default_monitor: None,
             },
         ],
         host: Some(host_base()),
@@ -265,6 +268,7 @@ fn den_pc() -> RemotePc {
         allowed: "View and input".into(),
         vouch_request: None,
         problem: None,
+        default_monitor: None,
     }
 }
 
@@ -306,6 +310,7 @@ fn session_base() -> Session {
         rtt_ms: 12,
         monitors: vec![
             Monitor {
+                selector: "mock-display-1".into(),
                 name: "Display 1".into(),
                 width: 2560,
                 height: 1440,
@@ -316,6 +321,7 @@ fn session_base() -> Session {
             },
             // Desktop positions are approximate, read off the picker map.
             Monitor {
+                selector: "mock-display-2".into(),
                 name: "Display 2".into(),
                 width: 1920,
                 height: 1080,
@@ -325,6 +331,7 @@ fn session_base() -> Session {
                 primary: false,
             },
             Monitor {
+                selector: "mock-display-3".into(),
                 name: "Display 3".into(),
                 width: 1080,
                 height: 1920,
@@ -335,8 +342,12 @@ fn session_base() -> Session {
             },
         ],
         monitor: 0,
+        monitor_pending: false,
+        monitor_error: None,
         quality: Quality::Auto,
+        quality_controls_available: true,
         audio: true,
+        audio_controls_available: true,
         captured: false,
         link: Link::Live,
         notice: None,

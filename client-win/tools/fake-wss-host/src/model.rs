@@ -202,6 +202,8 @@ pub enum Injection {
     SeqGap,
     GenerationChange,
     SocketDrop,
+    /// A live monitor switch (`--monitors`): a generation bump and a keyframe.
+    MonitorSwitch,
 }
 
 impl Injection {
@@ -210,6 +212,7 @@ impl Injection {
             Injection::SeqGap => "seq-gap",
             Injection::GenerationChange => "generation-change",
             Injection::SocketDrop => "socket-drop",
+            Injection::MonitorSwitch => "monitor-switch",
         }
     }
 }
@@ -279,6 +282,22 @@ pub struct Counters {
     pub rejected_control: u64,
     pub stale_epoch_control: u64,
     pub outbound_overflow: u64,
+    /// `monitor-list` messages sent: at hello, after each switch, and on refresh.
+    pub monitor_list_sent: u64,
+    /// Accepted `monitors` refresh actions.
+    pub monitor_refreshes: u64,
+    /// Accepted `monitor` actions, whether the switch succeeded or not.
+    pub monitor_switches: u64,
+    /// Switches answered with `monitor-error`; the previous display is kept.
+    pub monitor_switch_failures: u64,
+    /// Selector of the display in use, once a list has been served.
+    pub monitor_selected: Option<String>,
+    /// In-flight WSS frames a switch dropped; they belong to the old picture.
+    pub frames_dropped_on_switch: u64,
+    /// The stream mode in use, as the browser names it. Starts at `work`.
+    pub stream_mode: Option<String>,
+    /// Accepted `mode` actions that changed the stream mode.
+    pub stream_mode_changes: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -356,7 +375,10 @@ impl Model {
             fired: BTreeMap::new(),
             keyframe_due: None,
             recoveries: Vec::new(),
-            counters: Counters::default(),
+            counters: Counters {
+                stream_mode: Some("work".into()),
+                ..Counters::default()
+            },
         }
     }
 
@@ -449,6 +471,33 @@ impl Model {
         // Stop production while preserving frames already sent on the separate
         // media socket. Their ACKs may arrive after this signaling control.
         // Actual detach/epoch replacement accounts for any unreceived tail.
+    }
+
+    /// A live monitor switch. The frames in flight belong to the old display,
+    /// so they are dropped; the generation moves on and the next frame is a
+    /// keyframe. Returns the new generation, which the caller advertises.
+    pub fn switch_monitor(&mut self, now: Instant) -> u32 {
+        self.counters.monitor_switches += 1;
+        self.counters.frames_dropped_on_switch += self.flow.clear() as u64;
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.need_key = true;
+        self.keyframe_due = None;
+        self.open_recovery(Injection::MonitorSwitch, now);
+        self.generation
+    }
+
+    /// A `mode` action. Returns false when the mode is already in use (no
+    /// change, no keyframe). A change forces a keyframe, as the host's encoder does.
+    pub fn set_stream_mode(&mut self, mode: &str) -> bool {
+        if self.counters.stream_mode.as_deref() == Some(mode) {
+            return false;
+        }
+        self.counters.stream_mode = Some(mode.to_owned());
+        self.counters.stream_mode_changes += 1;
+        if self.streaming {
+            self.need_key = true;
+        }
+        true
     }
 
     /// The receiver's media socket is up. Its decoder chain is new, so the

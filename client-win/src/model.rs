@@ -109,6 +109,11 @@ pub struct RemotePc {
     /// The last known trouble with this PC, shown on its row and in its
     /// detail panel. None when the last connect worked (or none was tried).
     pub problem: Option<PcProblem>,
+    /// The monitor this PC opens on, saved when a monitor is picked in a
+    /// session (the browser's default monitor). Holds the monitor's selector
+    /// from the host's monitor list; None means the host's default.
+    #[serde(default)]
+    pub default_monitor: Option<String>,
 }
 
 /// Trouble with a saved PC that Your PCs shows before anyone clicks Connect.
@@ -363,8 +368,21 @@ pub struct Session {
     pub rtt_ms: u32,
     pub monitors: Vec<Monitor>,
     pub monitor: usize,
+    /// A monitor pick is waiting for the host to switch.
+    #[serde(default)]
+    pub monitor_pending: bool,
+    /// The last monitor pick the host refused or failed, as shown to the user.
+    #[serde(default)]
+    pub monitor_error: Option<String>,
     pub quality: Quality,
+    /// Whether the quality picker can change anything here (the live client
+    /// cannot yet send a quality change to the host).
+    #[serde(default)]
+    pub quality_controls_available: bool,
     pub audio: bool,
+    /// Whether the audio toggle can change anything here.
+    #[serde(default)]
+    pub audio_controls_available: bool,
     /// Input capture (driven by the input module later).
     pub captured: bool,
     pub link: Link,
@@ -374,6 +392,9 @@ pub struct Session {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Monitor {
+    /// The host's id for this monitor, sent back when it is picked.
+    #[serde(default)]
+    pub selector: String,
     pub name: String,
     pub width: u32,
     pub height: u32,

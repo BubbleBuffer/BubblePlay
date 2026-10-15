@@ -9,6 +9,7 @@ pub mod cursor;
 pub mod evidence;
 pub mod input_record;
 pub mod model;
+pub mod monitors;
 pub mod protocol;
 pub mod report;
 pub mod rtc;

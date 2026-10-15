@@ -96,6 +96,7 @@ async fn main() -> ExitCode {
         input_record: args.input_record,
         audio: args.audio,
         rtc: args.rtc,
+        monitors: args.monitors.clone(),
     };
     if let Some(knobs) = args.rtc {
         eprintln!(

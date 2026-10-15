@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use common::{send_json, signal_hello, Ws};
 use fake_wss_host::model::Source;
+use fake_wss_host::monitors::Knobs as Monitors;
 use fake_wss_host::rtc::Knobs;
 use fake_wss_host::stream::Codec;
 use futures_util::StreamExt;
@@ -93,6 +94,8 @@ struct Seen {
     admitted: Option<Value>,
     /// When the DTLS close_notify reached this offerer as `Event::Closed`.
     closed_at: Option<Instant>,
+    /// Every `desktop-state`, `monitor-list` and `monitor-error` message, in order.
+    signals: Vec<Value>,
 }
 
 /// The offerer. It owns the sans-IO `Rtc` and drives it from one loop that
@@ -263,6 +266,9 @@ impl Browser {
                         self.rtc.add_remote_candidate(candidate);
                     }
                 }
+            }
+            Some("desktop-state" | "monitor-list" | "monitor-error") => {
+                self.seen.signals.push(value.clone());
             }
             Some("first-frame") if value["phase"] == "ready" => self.seen.ready = true,
             Some("first-frame") if value["phase"] == "admitted" => {
@@ -598,4 +604,107 @@ async fn without_webrtc_the_offer_and_ice_are_counted_and_ws_answers() {
     assert_eq!(unhandled.get("offer"), Some(&1));
     assert_eq!(unhandled.get("ice"), Some(&1));
     assert!(snapshot.rtc.is_empty());
+}
+
+/// A monitor switch on a live RTC session keeps the peer and channels, and the
+/// next keyframe is admitted under the new generation with its own timestamp.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_monitor_switch_admits_the_new_keyframe_on_the_same_peer() {
+    let harness = common::spawn_monitored(
+        sources(),
+        Duration::from_secs(9),
+        Duration::ZERO,
+        Monitors::scripted(),
+        Some(Knobs::default()),
+    )
+    .await;
+    let (mut ws, epoch) = signal_hello(harness.addr).await;
+    let mut browser = Browser::offer(&mut ws).await;
+    send_json(&mut ws, request_first_frame("ff-1")).await;
+    browser
+        .drive(&mut ws, Instant::now() + Duration::from_secs(5), |seen| {
+            seen.connected && seen.admitted.is_some()
+        })
+        .await;
+    let first = browser.seen.admitted.clone().expect("first admission");
+    assert_eq!(first["requestId"], "ff-1", "{first}");
+    let first_ts = first["rtpTimestamp"].as_u64().expect("rtpTimestamp");
+
+    send_json(
+        &mut ws,
+        json!({"type": "media-control", "action": "monitor", "protocol": 4, "epoch": epoch,
+               "monitor": r"\\.\DISPLAY2", "reason": "user-monitor"}),
+    )
+    .await;
+    browser
+        .drive(&mut ws, Instant::now() + Duration::from_secs(3), |seen| {
+            seen.signals.iter().any(|m| m["reason"] == "monitor-switched")
+                && seen.signals.iter().filter(|m| m["type"] == "monitor-list").count() == 2
+        })
+        .await;
+
+    let signals = browser.seen.signals.clone();
+    let states: Vec<(&str, &str)> = signals
+        .iter()
+        .filter(|m| m["type"] == "desktop-state")
+        .map(|m| {
+            (
+                m["state"].as_str().unwrap_or_default(),
+                m["reason"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        states,
+        vec![("unavailable", "monitor-switch"), ("active", "monitor-switched")],
+        "{signals:?}"
+    );
+    let switched = signals
+        .iter()
+        .find(|m| m["type"] == "desktop-state" && m["state"] == "active")
+        .expect("desktop-state active");
+    let new_generation =
+        u32::try_from(switched["generation"].as_u64().expect("generation")).expect("u32");
+    assert_ne!(
+        Some(u64::from(new_generation)),
+        first["generation"].as_u64(),
+        "the switch moves to a new generation"
+    );
+    let list = signals
+        .iter()
+        .rfind(|m| m["type"] == "monitor-list")
+        .expect("monitor-list after the switch");
+    assert_eq!(list["monitors"][1]["selected"], true, "{list}");
+
+    // The browser asks again for a first frame; the switch's keyframe answers it.
+    send_json(&mut ws, request_first_frame("ff-2")).await;
+    browser
+        .drive(&mut ws, Instant::now() + Duration::from_secs(4), |seen| {
+            seen.admitted.as_ref().is_some_and(|a| a["requestId"] == "ff-2")
+        })
+        .await;
+    let second = browser.seen.admitted.clone().expect("second admission");
+    assert_eq!(second["requestId"], "ff-2", "{second}");
+    assert_eq!(second["transport"], "webrtc", "{second}");
+    assert_eq!(second["generation"].as_u64(), Some(u64::from(new_generation)), "{second}");
+    assert_ne!(
+        second["rtpTimestamp"].as_u64(),
+        Some(first_ts),
+        "the new keyframe carries its own timestamp"
+    );
+    assert!(!browser.seen.ready, "the RTC lane never sends WSS ready");
+    assert_ws_alive(&mut ws).await;
+
+    let snapshot = harness.finish().await;
+    assert_eq!(snapshot.rtc.len(), 1, "one peer across the switch");
+    assert_eq!(snapshot.counters.monitor_switches, 1);
+    let report = &snapshot.rtc[0];
+    assert_eq!(report.reseeks, 1, "the switch is the only reseek");
+    assert!(report.admissions >= 2, "one admission per keyframe asked for");
+    assert_eq!(report.admitted_generation, Some(new_generation));
+    assert_eq!(
+        report.admitted_rtp_timestamp.map(u64::from),
+        second["rtpTimestamp"].as_u64(),
+        "the last admission names the post-switch keyframe"
+    );
 }

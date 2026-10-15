@@ -27,6 +27,7 @@ use crate::input_record::{Received, Recorder};
 use crate::model::{
     Action, Counters, Emitted, Injections, Model, ModelConfig, Recovery, Source, StartOutcome,
 };
+use crate::monitors;
 use crate::protocol::{self, ClientMessage};
 use crate::rtc;
 use crate::signal::{self, MediaControl, Signal};
@@ -58,6 +59,8 @@ pub struct ServerConfig {
     pub audio: Option<Script>,
     /// The WebRTC answerer, when `--webrtc` is given.
     pub rtc: Option<rtc::Knobs>,
+    /// The monitor list and its scripted failures, when `--monitors` is given.
+    pub monitors: monitors::Knobs,
 }
 
 /// Everything the report needs, taken once the hub has finished.
@@ -196,6 +199,12 @@ struct Hub {
     rtc_media_stopped: bool,
     /// The keyframe the current RTC session admitted, if one has left.
     rtc_idr: Option<RtcIdr>,
+    /// The generation the current RTC session admits under. Keyframes that
+    /// notify under another one were written before a monitor switch.
+    rtc_generation: u32,
+    /// The monitor surface (`--monitors`) and the index of the display in use.
+    monitors: monitors::Knobs,
+    selected: usize,
 }
 
 impl Hub {
@@ -441,6 +450,7 @@ impl Hub {
         };
         let id = self.rtc_next_id;
         self.rtc_next_id += 1;
+        self.rtc_generation = rtc::session_generation(id);
         let (commands, command_rx) = mpsc::channel(rtc::COMMAND_DEPTH);
         let session = rtc::Session {
             sources,
@@ -538,6 +548,10 @@ impl Hub {
                 rtp_timestamp,
                 codec,
             } => {
+                // Written before a monitor switch: the picture it proves is gone.
+                if generation != self.rtc_generation {
+                    return;
+                }
                 self.rtc_idr = Some(RtcIdr {
                     session: id,
                     generation,
@@ -643,6 +657,7 @@ impl Hub {
             conn.hello = true;
         }
         self.send(id, Outbound::Text(protocol::hello_ok_signal(&epoch)));
+        self.send_monitor_list(id);
         if self.audio.is_some() {
             self.send(id, Outbound::Text(protocol::host_capabilities_audio()));
         }
@@ -710,6 +725,20 @@ impl Hub {
                 let reason = control.reason.as_deref().unwrap_or("unspecified");
                 self.model.keyframe_request(reason, now);
             }
+            "monitor" if self.monitors.enabled => {
+                match monitors::bounded_selector(control.monitor.as_deref()) {
+                    Some(selector) => self.on_monitor_switch(id, selector, now),
+                    None => self.count_unhandled("monitor"),
+                }
+            }
+            "monitors" if self.monitors.enabled && control.protocol == Some(MEDIA_PROTOCOL) => {
+                self.model.counters.monitor_refreshes += 1;
+                self.send_monitor_list(id);
+            }
+            "mode" => match control.stream_mode.as_deref() {
+                Some(mode @ ("work" | "game")) => self.on_stream_mode(mode),
+                _ => self.count_unhandled("mode"),
+            },
             other => {
                 *self
                     .model
@@ -718,6 +747,85 @@ impl Hub {
                     .entry(other.to_owned())
                     .or_insert(0) += 1
             }
+        }
+    }
+
+    /// The `monitor-list` for the selection in use. Sent only with `--monitors`.
+    fn send_monitor_list(&mut self, id: u64) {
+        if !self.monitors.enabled {
+            return;
+        }
+        self.model.counters.monitor_list_sent += 1;
+        self.model.counters.monitor_selected = self
+            .monitors
+            .monitors
+            .get(self.selected)
+            .map(|monitor| monitor.selector.clone());
+        let text = monitors::monitor_list_message(&self.monitors.monitors, self.selected);
+        self.send(id, Outbound::Text(text));
+    }
+
+    /// A `monitor` action, in the host's order: `desktop-state` unavailable,
+    /// a generation bump with a keyframe, then the outcome, then `monitor-list`.
+    /// A failed switch keeps the previous display, as the host does. The RTC
+    /// session keeps its peer and admits the new keyframe under the new generation.
+    fn on_monitor_switch(&mut self, id: u64, selector: &str, now: Instant) {
+        // `Model::switch_monitor` counts the accepted switch.
+        let before = self.model.generation();
+        self.send(
+            id,
+            Outbound::Text(monitors::desktop_state_message(
+                "unavailable",
+                before,
+                "monitor-switch",
+            )),
+        );
+        let generation = self.model.switch_monitor(now);
+        self.first_frame = None;
+        self.rtc_idr = None;
+        self.rtc_generation = generation;
+        if let Some(session) = self.rtc_session.as_ref() {
+            let _ = session.commands.try_send(rtc::Command::Reseek {
+                generation: Some(generation),
+            });
+        }
+        let known = self.monitors.position(selector).is_some();
+        match self.monitors.position(selector) {
+            Some(index) if !self.monitors.fails(selector) => self.selected = index,
+            _ => {
+                let reason = if known {
+                    monitors::SCRIPTED_ERROR_REASON
+                } else {
+                    monitors::NOT_FOUND_REASON
+                };
+                self.model.counters.monitor_switch_failures += 1;
+                self.send(
+                    id,
+                    Outbound::Text(monitors::monitor_error_message(selector, reason)),
+                );
+            }
+        }
+        self.send(
+            id,
+            Outbound::Text(monitors::desktop_state_message(
+                "active",
+                generation,
+                "monitor-switched",
+            )),
+        );
+        self.send_monitor_list(id);
+    }
+
+    /// A `mode` action with a known mode. A real change forces a keyframe on
+    /// the WSS model and on the RTC session; the same mode is a no-op.
+    fn on_stream_mode(&mut self, mode: &str) {
+        if !self.model.set_stream_mode(mode) {
+            return;
+        }
+        if let Some(session) = self.rtc_session.as_ref() {
+            let _ = session
+                .commands
+                .try_send(rtc::Command::Reseek { generation: None });
         }
     }
 
@@ -1112,6 +1220,9 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
         rtc_drop_at,
         rtc_media_stopped: false,
         rtc_idr: None,
+        rtc_generation: 0,
+        monitors: config.monitors.clone(),
+        selected: 0,
     };
     let mut hub_task = tokio::spawn(run_hub(hub, events_rx, notices_rx));
     let slots = Arc::new(Semaphore::new(config.max_connections));

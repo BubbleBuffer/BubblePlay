@@ -25,12 +25,14 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
 use super::config::{Codec, NetConfig, RelayEndpoint};
+use super::controls::{stream_mode_wire, SessionControls};
 use super::error::NetError;
 use super::events::{DecoderFeedback, NetEvent, ResetEvent, VideoFrame};
 use super::gate::{next_backoff, GateVerdict, KeyframeThrottle, ReceiveGate};
 use super::protocol::{
     ack_message, first_frame_keyframe, first_frame_presented, first_frame_request, hello_message,
-    is_audio_packet, keyframe_message, new_request_id, parse_frame, parse_relay_control,
+    is_audio_packet, keyframe_message, mode_control_message, monitor_control_message,
+    new_request_id, parse_frame, parse_monitor_error, parse_monitor_list, parse_relay_control,
     ping_message, sanitize_reason, start_message, valid_epoch, validate_host_control, RelayControl,
     V4_HEADER_BYTES,
 };
@@ -120,6 +122,8 @@ pub(crate) fn run_with_timing(
         .enable_all()
         .build()
         .map_err(|error| NetError::Socket(error.to_string()))?;
+    // The configured start mode seeds the live controls, unless a mode was already set on them.
+    config.controls.seed_mode(config.stream_mode.as_deref());
     let mut session = Session::new(config, events, feedback, stop, stats, timing);
     runtime.block_on(session.run_loop(endpoint))
 }
@@ -341,6 +345,8 @@ impl Session {
     async fn run_loop(&mut self, endpoint: RelayEndpoint) -> Result<(), NetError> {
         loop {
             let attempt = self.attempt(&endpoint).await;
+            // Pending monitor picks and queued mode targets end with the socket they were sent on.
+            self.config.controls.epoch_restart();
             // Clear audio before backoff, including failures on either socket.
             if let Some(audio) = &self.config.audio {
                 audio.reset_epoch(self.local_epoch);
@@ -425,6 +431,11 @@ impl Session {
                 "hello-ok without a valid mediaEpoch".into(),
             ))
         })?;
+        self.config.controls.epoch_registered(&wire);
+        // A live mode the user chose (also before connect) is the start mode on reconnect.
+        if let Some(mode) = self.config.controls.configured_mode() {
+            self.config.stream_mode = Some(stream_mode_wire(mode).to_owned());
+        }
         if let Some(mode) = &self.config.stream_mode {
             signal.send(json!({"type":"media-control","action":"mode","protocol":4,"epoch":wire,"streamMode":mode,"reason":"signaling-start"}).to_string()).await?;
         }
@@ -875,10 +886,27 @@ impl Session {
                         Some("peer-left") => {
                             return Err(Halt::from(NetError::Socket("host left session".into())))
                         }
+                        // Handled before input, so a session without native input still regates.
+                        Some("desktop-state")
+                            if text.len() <= 16384
+                                && matches!(
+                                    value["state"].as_str(),
+                                    Some("active" | "unavailable")
+                                ) =>
+                        {
+                            self.desktop_state(link, &value);
+                            return Ok(());
+                        }
+                        Some("monitor-list" | "monitor-error") => {
+                            if !monitor_message(&self.config.controls, &link.epoch.wire, &value) {
+                                count(&self.stats.rejected_controls);
+                            }
+                            return Ok(());
+                        }
                         _ => {}
                     }
                 }
-                if self.input_control(link, &text) {
+                if self.input_control(&text) {
                     return Ok(());
                 }
                 match parse_relay_control(&text) {
@@ -900,7 +928,7 @@ impl Session {
         }
         Ok(())
     }
-    fn input_control(&mut self, link: &mut Link, text: &str) -> bool {
+    fn input_control(&mut self, text: &str) -> bool {
         if self.config.input.is_none() || text.len() > 16384 {
             return false;
         }
@@ -916,34 +944,83 @@ impl Session {
                     .capabilities(value["protocol"] == 1 && value["scancode"] == true);
                 true
             }
-            Some("desktop-state")
-                if matches!(value["state"].as_str(), Some("active" | "unavailable")) =>
-            {
-                link.epoch.desktop_available = value["state"] == "active";
-                if let Some(input) = value["input"].as_str() {
-                    if matches!(input, "enabled" | "suspended" | "read-only") {
-                        link.epoch.desktop_enabled = input == "enabled";
-                    }
-                }
-                if link
-                    .epoch
-                    .regate_desktop(value["generation"].as_u64(), self.timing.first_frame)
-                {
-                    self.reset_gate("desktop-state");
-                    if let Some(peer) = &mut link.rtc {
-                        peer.startup.ready = false;
-                        peer.startup.request_sent(Instant::now());
-                        // A new desktop generation requires the host's RTP
-                        // admission boundary; buffered old desktop media must
-                        // never reopen native input on the new desktop.
-                        link.epoch.rtc_require_admission = link.epoch.desktop_generation.is_some();
-                        link.epoch.rtc_admitted_timestamp = None;
-                    }
-                }
-                true
-            }
             _ => false,
         }
+    }
+
+    /// `desktop-state` regates the first frame whether or not native input is configured.
+    /// A switch to `unavailable` and back reopens the RTP admission gate on the same peer.
+    fn desktop_state(&mut self, link: &mut Link, value: &Value) {
+        link.epoch.desktop_available = value["state"] == "active";
+        if let Some(input) = value["input"].as_str() {
+            if matches!(input, "enabled" | "suspended" | "read-only") {
+                link.epoch.desktop_enabled = input == "enabled";
+            }
+        }
+        if link
+            .epoch
+            .regate_desktop(value["generation"].as_u64(), self.timing.first_frame)
+        {
+            // Close the producer gate now: unavailable and active can arrive
+            // before the next tick, and a fast decode must not preserve input
+            // queued for the old desktop through that transition.
+            if let Some(input) = &self.config.input {
+                // A monitor switch keeps held input (browser inputTransitionHold);
+                // the transport gate still closes now. Other changes release.
+                if is_monitor_transition(value) {
+                    input.hold_for_monitor();
+                } else {
+                    input.set_ready(false);
+                }
+            }
+            self.reset_gate("desktop-state");
+            if let Some(peer) = &mut link.rtc {
+                peer.startup.ready = false;
+                peer.startup.request_sent(Instant::now());
+                // A new desktop generation requires the host's RTP
+                // admission boundary; buffered old desktop media must
+                // never reopen native input on the new desktop.
+                link.epoch.rtc_require_admission = link.epoch.desktop_generation.is_some();
+                link.epoch.rtc_admitted_timestamp = None;
+            }
+        }
+    }
+
+    /// Write the user's queued mode and monitor commands on the `/ws` socket.
+    /// Commands were already taken out of the shared state, so no lock is held here.
+    async fn drain_controls(&mut self, link: &mut Link) -> Result<(), Halt> {
+        let outbound = self.config.controls.take_outbound(&link.epoch.wire);
+        if let Some(mode) = outbound.mode {
+            // As `releaseInput` before `sendStreamMode("user-mode")`: held keys and buttons go first.
+            if let Some(input) = self.config.input.clone() {
+                input.release(self.local_epoch);
+                // Flush the release barrier before the signaling mode command,
+                // as the browser does on its input lane. When gated, next()
+                // retains the barrier for the next admission.
+                if let Some(release) = input.next() {
+                    if self.send_input_packet(link, release.clone()).await? {
+                        input.sent(true);
+                    } else {
+                        input.retry_front(release);
+                    }
+                }
+            }
+            let wire = stream_mode_wire(mode);
+            link.signal
+                .send(mode_control_message(&link.epoch.wire, wire))
+                .await?;
+            // Reconnects start in the mode the user last chose.
+            self.config.stream_mode = Some(wire.to_owned());
+            self.config
+                .controls
+                .mark_mode_written(outbound.mode_request);
+        }
+        if let Some(selector) = outbound.pick {
+            link.signal
+                .send(monitor_control_message(&link.epoch.wire, &selector))
+                .await?;
+        }
+        Ok(())
     }
 
     async fn drain_input(&mut self, link: &mut Link) -> Result<(), Halt> {
@@ -956,6 +1033,12 @@ impl Session {
             && link.epoch.input_generation.is_some()
             && link.epoch.input_generation == self.gate_generation
             && (link.media.is_some() || link.rtc.as_ref().is_some_and(Peer::lanes_ready));
+        // Monitor carry (browser inputTransitionHold): the gate stays closed and held
+        // input is kept until the new frame reopens it. Losing the host or the
+        // desktop input still releases through set_ready below.
+        if !ready && input.monitor_hold() && link.epoch.host_present && link.epoch.desktop_enabled {
+            return Ok(());
+        }
         let was_ready = input.snapshot().ready;
         input.set_ready(ready);
         if was_ready && !ready {
@@ -1336,6 +1419,7 @@ impl Session {
             link.signal.send(request).await?;
             self.pending_keyframe = Some("desktop-state".into());
         }
+        self.drain_controls(link).await?;
         self.drain_feedback(link).await?;
         self.drain_input(link).await?;
         self.flush_reset()?;
@@ -1702,6 +1786,191 @@ fn rtc_first_frame_keyframe(codec: Codec) -> String {
     json!({"type":"media-control","action":"keyframe","protocol":4,"epoch":null,
         "reason":"first-frame-timeout","codec":codec.wire_name()})
     .to_string()
+}
+
+/// Apply `monitor-list` or `monitor-error` from the `/ws` socket of `wire`.
+/// Returns false only for a malformed `monitor-list`. An explicit `epoch` that is
+/// not `wire` (including a non-string one) is ignored and still counts as handled,
+/// so a stale error never clears the pending pick. A message with no `epoch`
+/// belongs to the current socket.
+fn monitor_message(controls: &SessionControls, wire: &str, value: &Value) -> bool {
+    if value
+        .get("epoch")
+        .is_some_and(|epoch| epoch.as_str() != Some(wire))
+    {
+        return true;
+    }
+    match value["type"].as_str() {
+        Some("monitor-list") => match parse_monitor_list(value) {
+            Some(monitors) => {
+                controls.apply_monitor_list(monitors, wire);
+                true
+            }
+            None => false,
+        },
+        Some("monitor-error") => {
+            controls.apply_monitor_error(parse_monitor_error(value), wire);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A monitor switch carries held input through the closed gate (browser
+/// `desktopTransitionPlan`). Other desktop changes release, as before.
+fn is_monitor_transition(value: &Value) -> bool {
+    matches!(
+        value["reason"].as_str(),
+        Some("monitor-switch" | "monitor-switched")
+    )
+}
+
+#[cfg(test)]
+mod monitor_message_tests {
+    use super::*;
+    use crate::net::controls::PickOutcome;
+
+    const EPOCH: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210";
+
+    fn entry(selector: &str, selected: bool) -> Value {
+        json!({ "selector": selector, "name": selector, "selected": selected })
+    }
+
+    /// Registered on EPOCH with DISPLAY1 selected and DISPLAY2 available.
+    fn connected() -> SessionControls {
+        let controls = SessionControls::new();
+        controls.epoch_registered(EPOCH);
+        let list = json!({ "type": "monitor-list", "monitors": [entry("DISPLAY1", true), entry("DISPLAY2", false)] });
+        assert!(monitor_message(&controls, EPOCH, &list));
+        controls
+    }
+
+    #[test]
+    fn stale_epoch_error_does_not_clear_a_queued_pick() {
+        let controls = connected();
+        assert_eq!(controls.pick_monitor("DISPLAY2"), PickOutcome::Queued);
+        let stale = json!({ "type": "monitor-error", "epoch": OTHER, "selector": "DISPLAY2", "reason": "busy" });
+        assert!(
+            monitor_message(&controls, EPOCH, &stale),
+            "a stale epoch counts as handled"
+        );
+        let snapshot = controls.snapshot();
+        assert_eq!(snapshot.pending.as_deref(), Some("DISPLAY2"));
+        assert_eq!(snapshot.error, None);
+        assert_eq!(
+            controls.take_outbound(EPOCH).pick.as_deref(),
+            Some("DISPLAY2")
+        );
+    }
+
+    #[test]
+    fn stale_epoch_error_does_not_clear_a_written_pick() {
+        let controls = connected();
+        assert_eq!(controls.pick_monitor("DISPLAY2"), PickOutcome::Queued);
+        assert_eq!(
+            controls.take_outbound(EPOCH).pick.as_deref(),
+            Some("DISPLAY2")
+        );
+        let stale = json!({ "type": "monitor-error", "epoch": OTHER, "reason": "busy" });
+        assert!(monitor_message(&controls, EPOCH, &stale));
+        assert_eq!(
+            controls.snapshot().pending.as_deref(),
+            Some("DISPLAY2"),
+            "still waiting for the host"
+        );
+        let current = json!({ "type": "monitor-error", "epoch": EPOCH, "selector": "DISPLAY2", "reason": "busy" });
+        assert!(monitor_message(&controls, EPOCH, &current));
+        let snapshot = controls.snapshot();
+        assert_eq!(
+            snapshot.pending, None,
+            "the matching error answers the pick"
+        );
+        assert_eq!(
+            snapshot.error.map(|error| error.reason).as_deref(),
+            Some("busy")
+        );
+    }
+
+    #[test]
+    fn stale_epoch_list_is_not_applied_and_keeps_the_pending_pick() {
+        let controls = connected();
+        assert_eq!(controls.pick_monitor("DISPLAY2"), PickOutcome::Queued);
+        let stale = json!({ "type": "monitor-list", "epoch": OTHER, "monitors": [entry("DISPLAY1", false), entry("DISPLAY2", true)] });
+        assert!(monitor_message(&controls, EPOCH, &stale));
+        let snapshot = controls.snapshot();
+        assert_eq!(
+            snapshot.selected.as_deref(),
+            Some("DISPLAY1"),
+            "the stale selection is ignored"
+        );
+        assert_eq!(snapshot.pending.as_deref(), Some("DISPLAY2"));
+    }
+
+    #[test]
+    fn non_string_epoch_is_treated_as_stale() {
+        let controls = connected();
+        assert_eq!(controls.pick_monitor("DISPLAY2"), PickOutcome::Queued);
+        let odd = json!({ "type": "monitor-error", "epoch": 7, "reason": "busy" });
+        assert!(monitor_message(&controls, EPOCH, &odd));
+        assert_eq!(controls.snapshot().pending.as_deref(), Some("DISPLAY2"));
+    }
+
+    #[test]
+    fn matching_epoch_list_applies_and_clears_the_pending_pick() {
+        let controls = connected();
+        assert_eq!(controls.pick_monitor("DISPLAY2"), PickOutcome::Queued);
+        let current = json!({ "type": "monitor-list", "epoch": EPOCH, "monitors": [entry("DISPLAY1", false), entry("DISPLAY2", true)] });
+        assert!(monitor_message(&controls, EPOCH, &current));
+        let snapshot = controls.snapshot();
+        assert_eq!(snapshot.selected.as_deref(), Some("DISPLAY2"));
+        assert_eq!(snapshot.pending, None);
+    }
+
+    #[test]
+    fn messages_without_an_epoch_belong_to_the_current_socket() {
+        let controls = connected();
+        assert_eq!(controls.pick_monitor("DISPLAY2"), PickOutcome::Queued);
+        let error = json!({ "type": "monitor-error", "selector": "DISPLAY2", "reason": "busy" });
+        assert!(monitor_message(&controls, EPOCH, &error));
+        assert_eq!(controls.snapshot().pending, None);
+        assert_eq!(
+            controls
+                .snapshot()
+                .error
+                .map(|error| error.reason)
+                .as_deref(),
+            Some("busy")
+        );
+    }
+
+    #[test]
+    fn malformed_list_is_refused_and_changes_nothing() {
+        let controls = connected();
+        assert_eq!(controls.pick_monitor("DISPLAY2"), PickOutcome::Queued);
+        let malformed = json!({ "type": "monitor-list", "monitors": "DISPLAY2" });
+        assert!(
+            !monitor_message(&controls, EPOCH, &malformed),
+            "the caller counts it as rejected"
+        );
+        let snapshot = controls.snapshot();
+        assert_eq!(snapshot.pending.as_deref(), Some("DISPLAY2"));
+        assert_eq!(snapshot.selected.as_deref(), Some("DISPLAY1"));
+    }
+
+    #[test]
+    fn only_monitor_switch_reasons_carry_held_input() {
+        assert!(is_monitor_transition(
+            &json!({ "reason": "monitor-switch" })
+        ));
+        assert!(is_monitor_transition(
+            &json!({ "reason": "monitor-switched" })
+        ));
+        assert!(!is_monitor_transition(
+            &json!({ "reason": "desktop-switched" })
+        ));
+        assert!(!is_monitor_transition(&json!({ "state": "unavailable" })));
+    }
 }
 
 #[cfg(test)]

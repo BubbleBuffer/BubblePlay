@@ -1,5 +1,6 @@
 //! Session configuration and relay endpoint rules.
 
+use super::controls::SessionControls;
 use super::cookies::CookieJar;
 use super::error::NetError;
 
@@ -62,7 +63,10 @@ pub struct NetConfig {
     pub cookies: CookieJar,
     /// Optional native input mailbox, scoped to each /ws epoch.
     pub input: Option<super::InputLink>,
+    /// Start mode sent in `signaling-start`. Kept in step with live mode changes from `controls`.
     pub stream_mode: Option<String>,
+    /// Live monitor and mode controls. Clone it into the UI; the net thread reads and writes the same state.
+    pub controls: SessionControls,
     /// Independent bounded audio lane; absent means this receiver cannot play Opus.
     pub audio: Option<crate::audio::AudioHandle>,
     /// Disabled only by the decode-free audio development harness.
@@ -82,6 +86,7 @@ impl NetConfig {
             cookies,
             input: None,
             stream_mode: None,
+            controls: SessionControls::new(),
             audio: None,
             video_watchdog: true,
             transport: TransportChoice::Wss,

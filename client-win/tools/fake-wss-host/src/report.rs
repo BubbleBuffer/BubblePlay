@@ -347,6 +347,7 @@ fn video_checks(meta: &RunMeta, snap: &Snapshot) -> Vec<Check> {
                 Injection::SeqGap => "seq-gap-recovered",
                 Injection::GenerationChange => "generation-change-recovered",
                 Injection::SocketDrop => "socket-drop-recovered",
+                Injection::MonitorSwitch => "monitor-switch-recovered",
             },
             recovered,
             format!(
@@ -466,6 +467,18 @@ pub fn build(meta: &RunMeta, snap: &Snapshot) -> Value {
             "seq_gaps": c.seq_gaps_injected,
             "generation_changes": c.generation_changes_injected,
             "socket_drops": c.socket_drops,
+        },
+        "monitor": {
+            "list_sent": c.monitor_list_sent,
+            "refreshes": c.monitor_refreshes,
+            "switches": c.monitor_switches,
+            "switch_failures": c.monitor_switch_failures,
+            "selected": c.monitor_selected,
+            "frames_dropped_on_switch": c.frames_dropped_on_switch,
+        },
+        "stream_mode": {
+            "current": c.stream_mode,
+            "changes": c.stream_mode_changes,
         },
         "recoveries": recoveries,
         "audio": audio_json(meta, snap),

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use fake_wss_host::audio::Script;
 use fake_wss_host::model::{Injections, Source};
+use fake_wss_host::monitors::Knobs as MonitorKnobs;
 use fake_wss_host::protocol::{decode_frame, is_valid_epoch, ReceiveGate};
 use fake_wss_host::rtc::Knobs;
 use fake_wss_host::server::{self, ServerConfig, Snapshot};
@@ -175,6 +176,52 @@ async fn spawn_with(
     audio: Option<Script>,
     rtc: Option<Knobs>,
 ) -> Harness {
+    spawn_full(
+        sources,
+        injections,
+        exit_after,
+        drain,
+        input_record,
+        audio,
+        rtc,
+        MonitorKnobs::default(),
+    )
+    .await
+}
+
+/// A run with the monitor surface as `monitors` describes (off by default),
+/// and optionally the WebRTC answerer. Recordings are synthetic.
+pub async fn spawn_monitored(
+    sources: Vec<Arc<dyn Source>>,
+    exit_after: Duration,
+    drain: Duration,
+    monitors: MonitorKnobs,
+    rtc: Option<Knobs>,
+) -> Harness {
+    spawn_full(
+        sources,
+        no_injections(),
+        exit_after,
+        drain,
+        None,
+        None,
+        rtc,
+        monitors,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_full(
+    sources: Vec<Arc<dyn Source>>,
+    injections: Injections,
+    exit_after: Duration,
+    drain: Duration,
+    input_record: Option<PathBuf>,
+    audio: Option<Script>,
+    rtc: Option<Knobs>,
+    monitors: MonitorKnobs,
+) -> Harness {
     let listener = server::bind("127.0.0.1:0".parse().unwrap())
         .await
         .expect("bind loopback");
@@ -190,6 +237,7 @@ async fn spawn_with(
         input_record,
         audio,
         rtc,
+        monitors,
     };
     Harness {
         addr,

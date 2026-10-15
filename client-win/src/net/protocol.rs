@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::{json, Map, Value};
 
 use super::config::Codec;
+use super::controls::{
+    utf16_prefix, within_utf16, MonitorEntry, MonitorError, MAX_ERROR_CHARS, MAX_MONITORS,
+    MAX_SELECTOR_CHARS,
+};
 
 /// `"BPV4"` big-endian.
 pub const V4_MAGIC: u32 = 0x4250_5634;
@@ -28,6 +32,9 @@ pub const START_STREAM_MODE: &str = "work";
 pub const START_REASON: &str = "client-start";
 /// Reason for the one media-control keyframe sent on a first-frame timeout.
 pub const FIRST_FRAME_TIMEOUT_REASON: &str = "first-frame-timeout";
+/// Reasons for the user's monitor pick and display-mode change, as in `receiver.js`.
+pub const USER_MONITOR_REASON: &str = "user-monitor";
+pub const USER_MODE_REASON: &str = "user-mode";
 
 /// The decoded 28-byte BPV4 header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +212,75 @@ pub fn parse_relay_control(text: &str) -> Option<RelayControl> {
     }
 }
 
+/// Parse a `monitor-list` as `handleMonitorList` does. A non-array or more than
+/// 16 entries refuses the whole message. Within a list, an entry is dropped when
+/// its selector is missing, not a string, or over 128 UTF-16 units. Empty
+/// selectors are kept, as the browser keeps them; the pick path refuses them.
+/// `follow` is not read here.
+pub fn parse_monitor_list(value: &Value) -> Option<Vec<MonitorEntry>> {
+    let monitors = value.get("monitors")?.as_array()?;
+    if monitors.len() > MAX_MONITORS {
+        return None;
+    }
+    Some(monitors.iter().filter_map(parse_monitor_entry).collect())
+}
+
+fn parse_monitor_entry(value: &Value) -> Option<MonitorEntry> {
+    let object = value.as_object()?;
+    let selector = object.get("selector")?.as_str()?;
+    if !within_utf16(selector, MAX_SELECTOR_CHARS) {
+        return None;
+    }
+    Some(MonitorEntry {
+        selector: selector.to_owned(),
+        name: object
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(selector)
+            .to_owned(),
+        width: wire_u32(object.get("width")),
+        height: wire_u32(object.get("height")),
+        origin_x: wire_i32(object.get("origin_x")),
+        origin_y: wire_i32(object.get("origin_y")),
+        selected: object
+            .get("selected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn wire_u32(value: Option<&Value>) -> u32 {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+fn wire_i32(value: Option<&Value>) -> i32 {
+    value
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+/// Parse a `monitor-error` as `handleMonitorError` does. The reason is capped at
+/// 180 UTF-16 units; a missing, empty or non-string reason reads as "unknown error".
+pub fn parse_monitor_error(value: &Value) -> MonitorError {
+    let reason = value
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| utf16_prefix(reason, MAX_ERROR_CHARS))
+        .unwrap_or_else(|| "unknown error".to_owned());
+    MonitorError {
+        selector: value
+            .get("selector")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        reason,
+    }
+}
+
 /// `^[a-f0-9]{32}$`: the wire epoch from `hello-ok`.
 pub fn valid_epoch(value: &str) -> bool {
     value.len() == 32
@@ -373,6 +449,32 @@ pub fn keyframe_message(reason: &str) -> String {
 
 pub fn ping_message() -> String {
     json!({ "type": "ping" }).to_string()
+}
+
+/// The user's monitor pick, as `requestMonitor` sends it.
+pub fn monitor_control_message(epoch: &str, selector: &str) -> String {
+    json!({
+        "type": "media-control",
+        "action": "monitor",
+        "protocol": V4_VERSION,
+        "epoch": epoch,
+        "monitor": selector,
+        "reason": USER_MONITOR_REASON,
+    })
+    .to_string()
+}
+
+/// A live display-mode change, as `sendStreamMode` sends it. `stream_mode` is `"work"` or `"game"`.
+pub fn mode_control_message(epoch: &str, stream_mode: &str) -> String {
+    json!({
+        "type": "media-control",
+        "action": "mode",
+        "protocol": V4_VERSION,
+        "epoch": epoch,
+        "streamMode": stream_mode,
+        "reason": USER_MODE_REASON,
+    })
+    .to_string()
 }
 
 // ---- Fixture-shaped helpers for tests -------------------------------------------
@@ -838,5 +940,125 @@ mod tests {
         assert_eq!(keyframe["codec"], "h264");
         let hello: Value = serde_json::from_str(&hello_message("media-client")).unwrap();
         assert_eq!(hello, json!({ "type": "hello", "role": "media-client" }));
+    }
+
+    fn entry(selector: &str, selected: bool) -> Value {
+        json!({ "selector": selector, "name": selector, "width": 1920, "height": 1080,
+                "origin_x": 0, "origin_y": 0, "selected": selected })
+    }
+
+    #[test]
+    fn monitor_list_parses_the_host_shape_and_ignores_follow() {
+        let message = json!({
+            "type": "monitor-list",
+            "monitors": [
+                { "selector": "DISPLAY1", "name": "Main", "width": 2560, "height": 1440,
+                  "origin_x": -1920, "origin_y": 0, "selected": true },
+                { "selector": "DISPLAY2", "name": "Side", "width": 1920, "height": 1080,
+                  "origin_x": 0, "origin_y": 0, "selected": false },
+            ],
+            "follow": true,
+        });
+        let monitors = parse_monitor_list(&message).expect("valid list");
+        assert_eq!(monitors.len(), 2);
+        assert_eq!(monitors[0].selector, "DISPLAY1");
+        assert_eq!(monitors[0].name, "Main");
+        assert_eq!((monitors[0].width, monitors[0].height), (2560, 1440));
+        assert_eq!((monitors[0].origin_x, monitors[0].origin_y), (-1920, 0));
+        assert!(monitors[0].selected);
+        assert!(!monitors[1].selected);
+    }
+
+    #[test]
+    fn monitor_list_refuses_a_non_array_and_more_than_sixteen_entries() {
+        assert!(parse_monitor_list(&json!({ "type": "monitor-list" })).is_none());
+        assert!(parse_monitor_list(&json!({ "monitors": "DISPLAY1" })).is_none());
+        let sixteen: Vec<Value> = (0..16).map(|i| entry(&format!("D{i}"), i == 0)).collect();
+        assert_eq!(
+            parse_monitor_list(&json!({ "monitors": sixteen })).map(|list| list.len()),
+            Some(16)
+        );
+        let seventeen: Vec<Value> = (0..17).map(|i| entry(&format!("D{i}"), i == 0)).collect();
+        assert!(parse_monitor_list(&json!({ "monitors": seventeen })).is_none());
+    }
+
+    #[test]
+    fn monitor_list_drops_only_the_malformed_entries() {
+        let long = "x".repeat(MAX_SELECTOR_CHARS + 1);
+        // 64 astral characters are 128 UTF-16 units, the browser's limit; one more is over it.
+        let astral = "\u{1F600}".repeat(64);
+        let message = json!({ "monitors": [
+            entry("DISPLAY1", true),
+            Value::Null,
+            json!({ "name": "no selector", "selected": true }),
+            json!({ "selector": 7, "selected": true }),
+            json!({ "selector": "", "selected": true }),
+            json!({ "selector": long, "selected": true }),
+            json!({ "selector": format!("{astral}x"), "selected": false }),
+            json!({ "selector": astral, "selected": false }),
+            entry("DISPLAY2", false),
+        ]});
+        let monitors = parse_monitor_list(&message).expect("valid list");
+        let selectors: Vec<&str> = monitors.iter().map(|m| m.selector.as_str()).collect();
+        assert_eq!(selectors, ["DISPLAY1", "", astral.as_str(), "DISPLAY2"]);
+    }
+
+    #[test]
+    fn monitor_list_fields_use_strict_types_and_fall_back() {
+        let message = json!({ "monitors": [{
+            "selector": "DISPLAY1",
+            "name": 5,
+            "width": "1920",
+            "height": -3,
+            "origin_x": "left",
+            "selected": "true",
+        }]});
+        let monitor = &parse_monitor_list(&message).expect("valid list")[0];
+        assert_eq!(
+            monitor.name, "DISPLAY1",
+            "a non-string name falls back to the selector"
+        );
+        assert_eq!((monitor.width, monitor.height), (0, 0));
+        assert_eq!(monitor.origin_x, 0);
+        assert!(!monitor.selected, "only a boolean true selects");
+    }
+
+    #[test]
+    fn monitor_error_keeps_the_selector_and_caps_the_reason() {
+        let error = parse_monitor_error(&json!({
+            "type": "monitor-error",
+            "selector": "DISPLAY2",
+            "reason": "x".repeat(MAX_ERROR_CHARS + 20),
+        }));
+        assert_eq!(error.selector.as_deref(), Some("DISPLAY2"));
+        assert_eq!(error.reason.chars().count(), MAX_ERROR_CHARS);
+
+        let bare = parse_monitor_error(&json!({ "type": "monitor-error", "reason": "" }));
+        assert_eq!(bare.selector, None);
+        assert_eq!(bare.reason, "unknown error");
+        let typed = parse_monitor_error(&json!({ "reason": 4 }));
+        assert_eq!(typed.reason, "unknown error");
+    }
+
+    #[test]
+    fn monitor_and_mode_controls_match_the_browser_shape() {
+        let epoch = "0123456789abcdef0123456789abcdef";
+        let pick: Value =
+            serde_json::from_str(&monitor_control_message(epoch, "DISPLAY2")).unwrap();
+        assert_eq!(
+            pick,
+            json!({
+                "type": "media-control", "action": "monitor", "protocol": 4,
+                "epoch": epoch, "monitor": "DISPLAY2", "reason": "user-monitor",
+            })
+        );
+        let mode: Value = serde_json::from_str(&mode_control_message(epoch, "game")).unwrap();
+        assert_eq!(
+            mode,
+            json!({
+                "type": "media-control", "action": "mode", "protocol": 4,
+                "epoch": epoch, "streamMode": "game", "reason": "user-mode",
+            })
+        );
     }
 }
