@@ -21,7 +21,6 @@ import de.bubblebuffer.bubbleplay.keys.DeviceKeyException
 import de.bubblebuffer.bubbleplay.keys.DeviceKeyStore
 import de.bubblebuffer.bubbleplay.keys.KeyFile
 import de.bubblebuffer.bubbleplay.keys.KeyFileCodec
-import java.io.File
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
@@ -469,18 +468,10 @@ class DeviceKeyActivity : Activity() {
             .show()
     }
 
-    /**
-     * Deletes the key file. The store has no remove call, so this deletes the same file names it
-     * uses (the file and AtomicFile's backup) directly from app-private storage.
-     */
+    /** Deletes the stored key and its backup through the store, which owns the file names. */
     private fun removeKey() {
         worker.execute {
-            val result = runCatching {
-                val stuck = listOf(STORE_FILE, "$STORE_FILE.bak")
-                    .map { File(filesDir, it) }
-                    .filter { it.exists() && !it.delete() }
-                if (stuck.isNotEmpty()) throw IOException("could not delete the key file")
-            }
+            val result = runCatching { store.remove() }
             runOnUiThread {
                 if (isDestroyed) return@runOnUiThread
                 result.onSuccess {
@@ -544,8 +535,6 @@ class DeviceKeyActivity : Activity() {
         private const val REQUEST_EXPORT = 1
         private const val REQUEST_IMPORT = 2
         private const val MIME_KEY = "application/json"
-        /** The store's file name (keys/DeviceKeyStore). Kept in step with it: Remove deletes this file. */
-        private const val STORE_FILE = "device-key.bpkey"
         private const val MAX_FILE_BYTES = 64 * 1024
 
         fun intent(context: Context, start: String? = null): Intent =
