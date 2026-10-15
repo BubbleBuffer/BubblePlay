@@ -972,7 +972,11 @@ test("socket upgrades from another origin are refused before authentication", as
   const env = {
     ...WORKER_SECRETS,
     STREAM_LAB_LOCAL_BYPASS: "1",
-    GATE: { idFromName: () => "gate", get: () => ({ fetch: async () => { gateChecks += 1; return new Response(null, { status: 204 }); } }) },
+    // The default /ws asks the GATE which PC to use; this mock registers none.
+    GATE: { idFromName: () => "gate", get: () => ({ fetch: async (request) => {
+      if (new URL(request.url).pathname === "/__pc/resolve") return Response.json({ pc: null });
+      gateChecks += 1; return new Response(null, { status: 204 });
+    } }) },
     ROOM: { idFromName: name => name, get: () => ({ fetch: async () => { rooms += 1; return roomResponse; } }) },
     MEDIA_ROOM: { idFromName: name => name, get: () => ({ fetch: async () => { rooms += 1; return roomResponse; } }) },
   };
