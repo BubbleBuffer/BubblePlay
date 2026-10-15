@@ -11,7 +11,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -981,6 +981,285 @@ fn write_pretty(value: &Json, depth: usize, out: &mut String) {
             out.push('}');
         }
         other => write_canonical(other, out),
+    }
+}
+
+/// Environment variable that carries the PC key from the tray to the host: the plain key file
+/// JSON. The tray sets it on the child command only; the host removes it before anything else.
+pub const HANDOFF_ENV: &str = "BUBBLEPLAY_DEVICE_KEY";
+
+const RELAY_CONTEXT: &str = "bubbleplay-relay-v1";
+const HOST_ROLE: &str = "host";
+
+/// Takes the handoff variable out of this process's environment. Call it first in `main`, so no
+/// child process can inherit it. The value is returned even when it is later found invalid.
+pub fn take_handoff_env() -> Option<Zeroizing<String>> {
+    let value = std::env::var_os(HANDOFF_ENV);
+    std::env::remove_var(HANDOFF_ENV);
+    value
+        .and_then(|value| value.into_string().ok())
+        .map(Zeroizing::new)
+}
+
+/// An unlocked PC key. Holds only the signing key (zeroized on drop); `Debug` shows the ID alone.
+pub struct DeviceIdentity {
+    id: DeviceId,
+    signing: SigningKey,
+}
+
+impl DeviceIdentity {
+    /// Unlocks a plain key file (no passphrase), as the tray hands it over. A passphrase-protected
+    /// file is refused: nothing at the host can supply the passphrase.
+    pub fn from_plain_key_json(text: &str) -> Result<Self, DeviceKeyError> {
+        let file = KeyFile::parse(text)?;
+        if file.is_protected() {
+            return Err(DeviceKeyError::PassphraseRequired);
+        }
+        let signing = file.unlock(None)?;
+        Ok(Self {
+            id: file.id(),
+            signing,
+        })
+    }
+
+    pub fn id(&self) -> DeviceId {
+        self.id
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        self.signing.verifying_key().to_bytes()
+    }
+
+    /// The raw public key as unpadded base64url, the form the relay expects in `hello`.
+    pub fn public_b64(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.public_key())
+    }
+
+    /// Signs the relay proof for the host role at `origin` and the relay's `nonce`.
+    pub fn sign_relay_proof(&self, origin: &str, nonce: &[u8; 32]) -> [u8; 64] {
+        let hash = relay_proof_hash(
+            HOST_ROLE,
+            origin,
+            nonce,
+            &self.id.to_string(),
+            &self.public_key(),
+        );
+        self.signing.sign(&hash).to_bytes()
+    }
+}
+
+impl fmt::Debug for DeviceIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceIdentity")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Unlocks the handed-over key when there is one. `Ok(None)` means no key was handed over.
+pub fn identity_from_handoff(
+    handoff: Option<&str>,
+) -> Result<Option<DeviceIdentity>, DeviceKeyError> {
+    handoff.map(DeviceIdentity::from_plain_key_json).transpose()
+}
+
+/// The relay-proof encoding (`docs/architecture/device-keys.md`, "Encodings for implementers"):
+/// each field as uint32 big-endian length then bytes, in this order: the context label, the role,
+/// the relay origin, the raw nonce, the canonical ID and the raw public key.
+pub fn relay_proof_encoding(
+    role: &str,
+    origin: &str,
+    nonce: &[u8; 32],
+    id: &str,
+    public: &[u8; 32],
+) -> Vec<u8> {
+    let fields: [&[u8]; 6] = [
+        RELAY_CONTEXT.as_bytes(),
+        role.as_bytes(),
+        origin.as_bytes(),
+        nonce.as_slice(),
+        id.as_bytes(),
+        public.as_slice(),
+    ];
+    let mut out = Vec::new();
+    for field in fields {
+        out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        out.extend_from_slice(field);
+    }
+    out
+}
+
+/// SHA-256 of the relay-proof encoding. Ed25519 signs these 32 bytes directly.
+pub fn relay_proof_hash(
+    role: &str,
+    origin: &str,
+    nonce: &[u8; 32],
+    id: &str,
+    public: &[u8; 32],
+) -> [u8; 32] {
+    Sha256::digest(relay_proof_encoding(role, origin, nonce, id, public)).into()
+}
+
+/// The origin the relay signs for a worker URL: `https://host[:port]` for `wss`/`https`,
+/// `http://host[:port]` for `ws`/`http`, host lowercased and a default port dropped, matching the
+/// relay's canonical origin. `None` for URLs without a usable scheme, host or with userinfo.
+pub fn relay_origin(worker_url: &str) -> Option<String> {
+    let uri: tungstenite::http::Uri = worker_url.parse().ok()?;
+    let (scheme, default_port) = match uri.scheme_str()? {
+        "wss" | "https" => ("https", 443),
+        "ws" | "http" => ("http", 80),
+        _ => return None,
+    };
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority.host().to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    Some(match authority.port_u16() {
+        Some(port) if port != default_port => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    })
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    use serde_json::Value;
+
+    const FIXTURE: &str = include_str!("../../fixtures/device-keys-contract.json");
+
+    fn fixture() -> Value {
+        serde_json::from_str(FIXTURE).expect("fixture parses")
+    }
+
+    fn vector(name: &str) -> Value {
+        fixture()["relayProof"]["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|vector| vector["name"] == name)
+            .unwrap()
+            .clone()
+    }
+
+    fn b64(value: &str) -> Vec<u8> {
+        URL_SAFE_NO_PAD.decode(value).unwrap()
+    }
+
+    fn nonce_of(vector: &Value) -> [u8; 32] {
+        b64(vector["nonce"].as_str().unwrap()).try_into().unwrap()
+    }
+
+    fn pc_identity() -> DeviceIdentity {
+        let file = fixture()["keyFiles"]["plain"]["file"].to_string();
+        DeviceIdentity::from_plain_key_json(&file).unwrap()
+    }
+
+    #[test]
+    fn host_vector_encoding_hash_and_signature_match_the_fixture() {
+        let host = vector("host");
+        let nonce = nonce_of(&host);
+        let origin = host["origin"].as_str().unwrap();
+        let id = host["id"].as_str().unwrap();
+        let public: [u8; 32] = b64(host["public"].as_str().unwrap()).try_into().unwrap();
+        let encoding = relay_proof_encoding("host", origin, &nonce, id, &public);
+        assert_eq!(hex(&encoding), host["encodingHex"].as_str().unwrap());
+        let hash = relay_proof_hash("host", origin, &nonce, id, &public);
+        assert_eq!(hex(&hash), host["sha256Hex"].as_str().unwrap());
+
+        let identity = pc_identity();
+        assert_eq!(identity.id().to_string(), id);
+        assert_eq!(identity.public_b64(), host["public"].as_str().unwrap());
+        let signature = identity.sign_relay_proof(origin, &nonce);
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(signature),
+            host["signature"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn wrong_origin_vector_is_a_different_hash_and_fails_verification() {
+        let wrong = vector("wrong-origin");
+        let nonce = nonce_of(&wrong);
+        let id = wrong["id"].as_str().unwrap();
+        let public: [u8; 32] = b64(wrong["public"].as_str().unwrap()).try_into().unwrap();
+        let hash = relay_proof_hash(
+            "host",
+            wrong["origin"].as_str().unwrap(),
+            &nonce,
+            id,
+            &public,
+        );
+        assert_eq!(hex(&hash), wrong["sha256Hex"].as_str().unwrap());
+        let signature =
+            ed25519_dalek::Signature::from_slice(&b64(wrong["signature"].as_str().unwrap()))
+                .unwrap();
+        let key = VerifyingKey::from_bytes(&public).unwrap();
+        assert!(key.verify_strict(&hash, &signature).is_err());
+    }
+
+    #[test]
+    fn relay_origin_matches_the_relay_canonical_form() {
+        assert_eq!(
+            relay_origin("wss://Play.Example/host-ws").as_deref(),
+            Some("https://play.example")
+        );
+        assert_eq!(
+            relay_origin("wss://play.example:443/host-ws?pc=x").as_deref(),
+            Some("https://play.example")
+        );
+        assert_eq!(
+            relay_origin("wss://play.example:8443/lab-host-ws?run=a").as_deref(),
+            Some("https://play.example:8443")
+        );
+        assert_eq!(
+            relay_origin("ws://127.0.0.1:8787/host-ws").as_deref(),
+            Some("http://127.0.0.1:8787")
+        );
+        assert_eq!(
+            relay_origin("ws://localhost:80/host-ws").as_deref(),
+            Some("http://localhost")
+        );
+        assert_eq!(
+            relay_origin("wss://[::1]:8443/host-ws").as_deref(),
+            Some("https://[::1]:8443")
+        );
+        assert_eq!(relay_origin("wss://user@play.example/host-ws"), None);
+        assert_eq!(relay_origin("ftp://play.example/host-ws"), None);
+        assert_eq!(relay_origin("/host-ws"), None);
+    }
+
+    #[test]
+    fn handoff_env_is_removed_on_read_even_when_the_value_is_invalid() {
+        std::env::set_var(HANDOFF_ENV, "{not a key");
+        let value = take_handoff_env();
+        assert_eq!(value.as_deref().map(String::as_str), Some("{not a key"));
+        assert!(std::env::var_os(HANDOFF_ENV).is_none());
+        assert!(take_handoff_env().is_none());
+    }
+
+    #[test]
+    fn handoff_identity_accepts_plain_and_refuses_protected_or_tampered_files() {
+        let plain = fixture()["keyFiles"]["plain"]["file"].to_string();
+        let identity = identity_from_handoff(Some(&plain)).unwrap().unwrap();
+        assert_eq!(identity.id().to_string(), "77VH-7M56-8GJK-Y12J");
+        assert!(identity_from_handoff(None).unwrap().is_none());
+        let protected = fixture()["keyFiles"]["passphrase"]["file"].to_string();
+        assert!(matches!(
+            identity_from_handoff(Some(&protected)),
+            Err(DeviceKeyError::PassphraseRequired)
+        ));
+        let tampered = plain.replace("PUAXw", "PUAXx");
+        assert!(identity_from_handoff(Some(&tampered)).is_err());
+        let debug = format!("{identity:?}");
+        assert!(debug.contains("77VH-7M56-8GJK-Y12J") && !debug.contains("4ccd"));
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
 

@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::HANDLE;
 
+use zeroize::Zeroizing;
+
+use super::device_key_file;
 use super::logic::{
     build_host_args, Backoff, HostState, SharedLog, StoredHostConfig, TraySettings,
 };
@@ -141,6 +144,25 @@ fn tray_settings_path(host_config: &Path) -> PathBuf {
     host_config.with_file_name("tray.json")
 }
 
+/// The PC device key for this host start. An unusable key logs a safe line and returns `None`,
+/// so the host starts without a device ID. The key file is never replaced.
+fn device_key_handoff(config: &SupervisorConfig) -> Option<Zeroizing<String>> {
+    let path = device_key_file::path_beside(&config.host_config);
+    match device_key_file::handoff(
+        &path,
+        &device_key_file::default_label(),
+        &device_key_file::now_rfc3339(),
+    ) {
+        Ok(key) => Some(key),
+        Err(_) => {
+            config
+                .host_log
+                .append(b"PC device key unavailable; starting without a device ID\n");
+            None
+        }
+    }
+}
+
 fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
     if !config.host_exe.is_file() {
         anyhow::bail!("host executable missing: {}", config.host_exe.display());
@@ -148,6 +170,7 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
     let (stored, secrets) = load(config)?;
     // Read at every spawn, so a changed setting applies on the next host start.
     let settings = TraySettings::load(&tray_settings_path(&config.host_config));
+    let device_key = device_key_handoff(config);
     let mut command = Command::new(&config.host_exe);
     command
         .args(build_host_args(&stored, settings.audio, settings.cpu_mode))
@@ -158,6 +181,8 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
         .env_remove("BUBBLEPLAY_HOST_GATE_TOKEN")
         .env_remove("BUBBLEPLAY_ADMIN_AGENT_PIPE")
         .env_remove("BUBBLEPLAY_ADMIN_AGENT_ALLOW_DEV")
+        // Never inherited: only the child command below may carry the device key.
+        .env_remove(device_key_file::HANDOFF_ENV)
         .envs(config.extra_env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -168,6 +193,9 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
     }
     if let Some(gate) = &secrets.host_gate_token {
         command.env("BUBBLEPLAY_HOST_GATE_TOKEN", gate);
+    }
+    if let Some(key) = &device_key {
+        command.env(device_key_file::HANDOFF_ENV, key.as_str());
     }
     let mut child = command.spawn().context("starting bubbleplay-host.exe")?;
     if let Err(error) = job.assign(HANDLE(child.as_raw_handle())) {
