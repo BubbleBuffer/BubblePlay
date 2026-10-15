@@ -39,7 +39,7 @@ use crate::file_transfer::{
     RateLimiter, RequestPayload, ResultPayload, SendWindow, TransferError,
 };
 use crate::native_file_drop::{DropBatch, NativeDropRequest};
-use crate::wss_media::{host_socket_request, HostSocket};
+use crate::wss_media::{data_hello, host_socket_request_routed, HostSocket, RelayRoute};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const INBOUND_SILENCE_LIMIT: Duration = Duration::from_secs(40);
@@ -199,6 +199,17 @@ pub struct FileService {
 
 impl FileService {
     pub fn spawn(worker_url: &str, bearer: &str, config: FileServiceConfig) -> Result<Self> {
+        Self::spawn_routed(worker_url, bearer, config, RelayRoute::Legacy)
+    }
+
+    /// [`FileService::spawn`] for the room `route` names. The route, including any ticket, lives in
+    /// the socket thread and goes away when the service is dropped.
+    pub fn spawn_routed(
+        worker_url: &str,
+        bearer: &str,
+        config: FileServiceConfig,
+        route: RelayRoute,
+    ) -> Result<Self> {
         let shared = Arc::new(Mutex::new(Shared {
             epoch: None,
             rate_cap_bps: 0,
@@ -217,7 +228,7 @@ impl FileService {
             threads.push(
                 thread::Builder::new()
                     .name("bubbleplay-file-socket".into())
-                    .spawn(move || socket_loop(&url, &bearer, &config, &shared, &stop))
+                    .spawn(move || socket_loop(&url, &bearer, &route, &config, &shared, &stop))
                     .context("spawn file socket thread")?,
             );
         }
@@ -464,10 +475,15 @@ fn poll_spool(shared: &Mutex<Shared>, dir: &Path) {
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
-fn connect_file_socket(worker_url: &str, bearer: &str, epoch: &str) -> Result<Socket> {
-    let request = host_socket_request(worker_url, bearer, epoch, HostSocket::File)?;
+fn connect_file_socket(
+    worker_url: &str,
+    bearer: &str,
+    epoch: &str,
+    route: &RelayRoute,
+) -> Result<Socket> {
+    let request = host_socket_request_routed(worker_url, bearer, epoch, HostSocket::File, route)?;
     let (mut ws, _) = tungstenite::connect(request).context("connect file socket")?;
-    ws.send(Message::text(r#"{"type":"hello","role":"file-host"}"#))
+    ws.send(Message::text(data_hello("file-host", route)))
         .context("send file hello")?;
     ws.flush().context("flush file hello")?;
     let tcp: &TcpStream = match ws.get_mut() {
@@ -483,6 +499,7 @@ fn connect_file_socket(worker_url: &str, bearer: &str, epoch: &str) -> Result<So
 fn socket_loop(
     worker_url: &str,
     bearer: &str,
+    route: &RelayRoute,
     config: &FileServiceConfig,
     shared: &Mutex<Shared>,
     stop: &AtomicBool,
@@ -493,7 +510,7 @@ fn socket_loop(
             sleep_unless_stopped(stop, Duration::from_millis(200));
             continue;
         };
-        let mut ws = match connect_file_socket(worker_url, bearer, &epoch) {
+        let mut ws = match connect_file_socket(worker_url, bearer, &epoch, route) {
             Ok(ws) => ws,
             Err(error) => {
                 warn!(error = %format!("{error:#}"), ?delay, "file socket connect failed");

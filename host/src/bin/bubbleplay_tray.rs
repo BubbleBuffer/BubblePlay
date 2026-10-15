@@ -15,6 +15,8 @@
 //!                                offer (Explorer "Send to > BubblePlay")
 #![windows_subsystem = "windows"]
 
+#[path = "../tray/device_key_file.rs"]
+mod device_key_file;
 #[path = "../tray/logic.rs"]
 mod logic;
 #[path = "../tray/platform.rs"]
