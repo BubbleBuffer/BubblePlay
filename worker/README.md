@@ -95,6 +95,36 @@ registration secret and separate endpoint credential:
 bubbleplay-host.exe --mode serve --worker ws://localhost:8787/host-ws --token <TOKEN> --host-gate-token <HOST_GATE_TOKEN>
 ```
 
+## Hosts registered by device ID
+
+An ID'd host connects to `/host-ws?pc=<id>` (or `/lab-host-ws` with the
+same selector) with the `HOST_GATE_TOKEN` bearer and sends `hello` with
+matching `id` and `public`. The relay issues a fresh `register-challenge`;
+the host answers with `register-proof`, signing the fixture's relay-proof
+hash for role `host` and the relay's public origin. First registration needs
+`TOKEN`; a remembered key can reconnect without it. A supplied wrong token
+is always refused. IDs accept lowercase, hyphens and Crockford aliases, and
+are returned in canonical form. Hosts without `pc` and `id` retain legacy
+authentication and the legacy room. Browser approval and both cookies remain
+required as before.
+
+Viewers select `/ws?pc=<id>` or default to the most recently registered online
+PC, then the online legacy host, then the most recently registered listed PC
+(or legacy when none is listed). Signaling `hello-ok` includes a `ticket`
+and, for ID rooms, `pc`. Media/file URLs carry `pc` beside `epoch`; their
+`hello` can carry the ticket. A host may use its ticket instead of the bearer
+on those sockets. Viewers still need cookies; any supplied ticket must match
+their room and epoch. Tickets expire when the issuing socket closes or after
+12 hours, and must never go in URLs or logs.
+
+With the existing `GATE_ADMIN_TOKEN` bearer, `GET /__gate/manage/pcs` lists
+`id`, `public`, `firstSeen`, `lastSeen` (milliseconds), and `online`.
+`DELETE /__gate/manage/pcs/<id>` forgets the PC and closes its host sockets;
+its next registration needs `TOKEN` again. Online status is read from live
+Room socket attachments on listing/default resolution, so Room or GATE
+eviction cannot leave a stale online flag. No new Durable Object class or
+migration is needed.
+
 ## TURN is opt-in
 
 The browser only receives TURN credentials (and the TURN hostname) when the

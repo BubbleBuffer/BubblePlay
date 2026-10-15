@@ -26,6 +26,7 @@ export { benchStatusRejectionReason } from "./protocol-validation.js";
 //
 import { createTurnIceServers } from "./turn.js";
 import { ApprovalGate, authorized } from "./gate.js";
+import { canonicalDeviceId, deriveDeviceId, randomTicket, hashTicket, constantTimeEqual, verifyRelayProof } from "./device-keys.js";
 import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
 import {
   V4_HEADER_BYTES,
@@ -42,7 +43,7 @@ export { ApprovalGate };
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/__approval/") ||
+    if (url.pathname.startsWith("/__approval/") || url.pathname.startsWith("/__pc/") ||
         ["/__auth/socket", "/__auth/socket-register", "/__auth/socket-unregister", "/__auth/recheck"].includes(url.pathname)) return badRoute();
     if (url.pathname === "/lab-compat" && ["GET", "HEAD"].includes(request.method)) {
       const body = request.method === "HEAD" ? null : JSON.stringify({
@@ -79,7 +80,10 @@ export default {
       }
     }
     if (isHostSocketPath(url.pathname)) {
-      if (!localLabBypass && !(await authorized(request, env.HOST_GATE_TOKEN))) {
+      // Signaling always needs the phase-1 endpoint bearer. Media/file may
+      // instead authenticate with a signaling ticket in their first frame.
+      if ((!isMediaSocketPath(url.pathname) && !isFileSocketPath(url.pathname) || request.headers.has("Authorization")) &&
+          !localLabBypass && !(await authorized(request, env.HOST_GATE_TOKEN))) {
         return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });
       }
       if (!validSocketRoute(url)) return badRoute();
@@ -97,6 +101,17 @@ export default {
         });
         if ((await gate.fetch(check)).status !== 204) {
           return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });
+        }
+      }
+      if (url.pathname === "/ws" && !url.searchParams.has("pc")) {
+        const resolved = await gate.fetch(new Request("https://gate.internal/__pc/resolve"));
+        if (resolved.status !== 200) return badRoute();
+        const { pc } = await resolved.json();
+        if (pc !== null) {
+          if (!canonicalDeviceId(pc)) return badRoute();
+          url.searchParams.set("pc", canonicalDeviceId(pc));
+          // Clone the original request, including its Upgrade header.
+          request = new Request(url, request);
         }
       }
       return handleWebSocket(request, env);
@@ -118,11 +133,12 @@ function socketRoom(url) {
   // own room names, so no new Durable Object class or migration is needed.
   const epoch = url.searchParams.get("epoch");
   const run = url.searchParams.get("run");
+  const pc = canonicalDeviceId(url.searchParams.get("pc"));
   // One media Durable Object per browser epoch carries the single v4 socket
   // pair (media down, ACK/keyframe up).
   const roomName = file
     ? (lab ? `lab-file-v1:${run}:${epoch}` : `file-v1:${epoch}`)
-    : lab
+    : pc && !media ? `pc-v1:${pc}` : lab
       ? (media ? `lab-media-v4:${run}:${epoch}` : `lab-signal-v1:${run}`)
       : (media ? `media-v4:${epoch}` : "room-v3");
   return { roomName, namespace: media || file ? "MEDIA_ROOM" : "ROOM" };
@@ -201,6 +217,8 @@ function configurationError(names) {
   });
 }
 function validSocketRoute(url) {
+  if (url.searchParams.has("pc") &&
+      (url.searchParams.getAll("pc").length !== 1 || !canonicalDeviceId(url.searchParams.get("pc")))) return false;
   if (isLabSocketPath(url.pathname) && !validLabRun(url)) return false;
   if (!isMediaSocketPath(url.pathname) && !isFileSocketPath(url.pathname)) return true;
   return /^[a-f0-9]{32}$/.test(url.searchParams.get("epoch") || "");
@@ -222,6 +240,7 @@ export class Room {
     this.peerCache = new Map();
     this.sessionChecks = new Map();
     this.pendingOperation = Promise.resolve();
+    this.messageOperation = Promise.resolve();
     if (env.GATE && state.blockConcurrencyWhile && state.getWebSockets().some(socket => {
       const att = socket.deserializeAttachment() || {};
       return socket.readyState === 1 && !att.replaced && (att.role || att.expectedRole)?.endsWith("client");
@@ -241,6 +260,7 @@ export class Room {
     // fields are not authoritative peer state. Attachments and storage are.
     const url = new URL(request.url);
     if (url.origin === "https://room.internal") {
+      if (url.pathname.startsWith("/__pc/")) return this.pcFetch(request, url);
       if (url.pathname.startsWith("/__approval/")) return this.approvalFetch(request, url);
       if (url.pathname === "/__auth/recheck" && request.method === "POST") {
         await this.checkBrowserSockets();
@@ -248,6 +268,7 @@ export class Room {
       }
       return badRoute();
     }
+    if (!validSocketRoute(url)) return badRoute();
     const media = isMediaSocketPath(url.pathname);
     const file = isFileSocketPath(url.pathname);
     const lab = isLabSocketPath(url.pathname);
@@ -273,6 +294,8 @@ export class Room {
     const [client, server] = Object.values(pair);
     console.log("[room] socket accepted");
     server.serializeAttachment({ role: null, expectedRole, sessionIdentity, ...location,
+      pc: canonicalDeviceId(url.searchParams.get("pc")), origin: url.origin,
+      bearerOk: isHostSocketPath(url.pathname) && (localLab || await authorized(request, this.env.HOST_GATE_TOKEN)),
       epoch: url.searchParams.get("epoch") || null,
       run: lab ? url.searchParams.get("run") : null,
       localLab });
@@ -283,9 +306,24 @@ export class Room {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketMessage(ws, message) {
-    const att = ws.deserializeAttachment() || {};
-    if (att.replaced) return;
+  webSocketMessage(ws, message) {
+    // Hello/proof crypto and DO calls yield. Preserve wire order and single
+    // peer ownership while those awaits run, including concurrent hellos.
+    const operation = this.messageOperation.then(() => this.onWebSocketMessage(ws, message)).catch(error => {
+      const att = ws.deserializeAttachment() || {};
+      if (!att.role && (att.pc || att.expectedRole?.startsWith("media-") || att.expectedRole?.startsWith("file-"))) {
+        this.closePeer(ws, 1008, "");
+        return;
+      }
+      throw error;
+    });
+    this.messageOperation = operation.catch(() => {});
+    return operation;
+  }
+
+  async onWebSocketMessage(ws, message) {
+    let att = ws.deserializeAttachment() || {};
+    if (att.replaced || ws.readyState !== 1) return;
     if (!(await this.checkBrowserSocket(ws, att))) return;
     if (att.role === "media-host" || att.role === "media-client") {
       this.relayMediaV4(ws, att, message);
@@ -341,6 +379,32 @@ export class Room {
       return; // keepalive acknowledgement is never relayed
     }
 
+    let registeredByKey = false;
+    if (!att.role && att.registration) {
+      const registration = att.registration;
+      // Consume the nonce before crypto/DO awaits: a second proof cannot race
+      // the first proof, and a wake cannot resurrect a consumed challenge.
+      att = { ...att, registration: null };
+      ws.serializeAttachment(att);
+      if (msg.type !== "register-proof" || registration.expiresAt <= Date.now() ||
+          (registration.tokenSupplied && (typeof this.env.TOKEN !== "string" ||
+            !constantTimeEqual(registration.tokenHash, await hashTicket(this.env.TOKEN)))) ||
+          !(await verifyRelayProof({ ...registration, origin: att.origin, signature: msg.signature }))) {
+        this.closePeer(ws, 1008, "");
+        return;
+      }
+      const registered = await this.gateFetch("/__pc/register", { method: "POST", body: JSON.stringify({
+        id: att.pc, public: registration.public,
+        ...(registration.tokenSupplied ? { token: this.env.TOKEN } : {}),
+      }) });
+      if (registered.status !== 204 || ws.readyState !== 1 || ws.deserializeAttachment()?.replaced) {
+        this.closePeer(ws, 1008, "");
+        return;
+      }
+      registeredByKey = true;
+      msg = { type: "hello", role: "host" };
+    }
+
     // First message must be hello; assigns the socket a role.
     if (!att.role) {
       if (msg.type !== "hello") return;
@@ -348,13 +412,40 @@ export class Room {
       const role = msg.role;
       if (!["host", "client", "media-host", "media-client", "file-host", "file-client", "version-probe"].includes(role) ||
           role !== att.expectedRole) {
-        this.reject(ws, "bad role");
+        if (att.expectedRole === "host" && att.pc) this.closePeer(ws, 1008, "");
+        else this.reject(ws, "bad role");
         return;
       }
-      // Media-host already passed the separate HTTP bearer gate before this
-      // request reached the room. Do not require or duplicate the relay token
-      // inside the media socket hello.
-      const tokenOk = role === "client" || role === "media-client" || role === "media-host" ||
+      if (role === "host" && !registeredByKey && (att.pc || Object.hasOwn(msg, "id"))) {
+        const id = canonicalDeviceId(msg.id);
+        if (!att.pc || id !== att.pc || await deriveDeviceId(msg.public) !== id) {
+          this.closePeer(ws, 1008, "");
+          return;
+        }
+        const lookup = await this.gateFetch("/__pc/lookup", { method: "POST", body: JSON.stringify({
+          id, public: msg.public, ...(Object.hasOwn(msg, "token") ? { token: msg.token } : {}),
+        }) });
+        if (lookup.status !== 204 || ws.readyState !== 1 || ws.deserializeAttachment()?.replaced) {
+          this.closePeer(ws, 1008, "");
+          return;
+        }
+        const nonce = randomTicket();
+        const tokenHash = Object.hasOwn(msg, "token") ? await hashTicket(msg.token) : null;
+        if (ws.readyState !== 1 || ws.deserializeAttachment()?.replaced) return;
+        ws.serializeAttachment({ ...att, registration: {
+          nonce, id, public: msg.public, tokenHash, tokenSupplied: Object.hasOwn(msg, "token"), expiresAt: Date.now() + 60_000,
+        } });
+        ws.send(JSON.stringify({ type: "register-challenge", nonce }));
+        return;
+      }
+      const auxiliary = role.startsWith("media-") || role.startsWith("file-");
+      if (auxiliary && !(await this.authenticateAuxiliary(att, msg))) {
+        this.closePeer(ws, 1008, "");
+        return;
+      }
+      // Auxiliary peers authenticate against the signaling Room above; they
+      // never need to duplicate the registration secret in their hello.
+      const tokenOk = registeredByKey || role === "client" || role === "media-client" || role === "media-host" ||
         role === "file-client" || role === "file-host" ||
         (role === "host" && att.localLab === true && this.env.STREAM_LAB_LOCAL_BYPASS === "1") ||
         (typeof configuredToken === "string" && configuredToken.length > 0 && msg.token === configuredToken);
@@ -381,6 +472,7 @@ export class Room {
         // epoch so capabilities, topology, and input bind together.
         if (role === "host") {
           const client = this.findPeer("client");
+          await this.retireHostSockets();
           try { client?.send(JSON.stringify({ type: "peer-left" })); } catch { /* client already gone */ }
         }
         this.reject(existing, `${role} replaced`);
@@ -389,23 +481,29 @@ export class Room {
       // now-dead session — delivering them to a future host would poison it
       // (the host accepts a stale offer, its DTLS times out, session dies).
       if (role === "client") {
+        if (existingAttachment.mediaEpoch) await this.retireEpoch(existingAttachment);
         await this.withPending(() => this.state.storage.delete("pendingToHost"));
       }
       const mediaEpoch = role === "client" ? randomEpoch() : null;
       const registeredAtMs = Date.now();
+      const ticket = role === "host" || role === "client" ? randomTicket() : null;
+      const ticketBinding = ticket ? { ticketHash: await hashTicket(ticket), ticketExpiresAt: Date.now() + TICKET_TTL_MS } : {};
+      if (ws.readyState !== 1 || ws.deserializeAttachment()?.replaced) return;
       ws.serializeAttachment(role === "client"
-        ? { ...att, role, mediaEpoch, registeredAtMs }
-        : { ...att, role, registeredAtMs });
+        ? { ...att, role, mediaEpoch, registeredAtMs, ...ticketBinding }
+        : { ...att, role, registeredAtMs, ...ticketBinding });
       this.rememberPeer(role, ws);
-      // Hosts keep the original wire shape. Clients receive only short-lived
-      // TURN REST credentials, minted after authentication and never stored.
+      // Only the digest lives in the hibernation attachment; the ticket is
+      // delivered once, on the authenticated signaling connection.
       const hello = role === "client"
         ? { type: "hello-ok", iceServers: await createTurnIceServers(this.env, { turn: msg.turn === true }), mediaEpoch,
             ...(workerVersionId ? { workerVersionId } : {}) }
         : { type: "hello-ok",
             ...(role === "media-client" ? { registeredAtMs } : {}),
             ...(workerVersionId ? { workerVersionId } : {}) };
+      if (ticket) Object.assign(hello, { ticket, ...(att.pc ? { pc: att.pc } : {}) });
       ws.send(JSON.stringify(hello));
+      if (role === "host") await this.reportPresence(att.pc);
       if (role === "media-host" || role === "media-client") {
         // v4 peers learn about each other from the relay: the host needs a
         // fresh keyframe for every new receiver and must not encode for an
@@ -611,6 +709,9 @@ export class Room {
   async webSocketClose(ws, _code, _reason, _wasClean) {
     const att = ws.deserializeAttachment() || {};
     const role = att.role;
+    // A closing socket is never authoritative, even when the runtime still
+    // returns it from getWebSockets() during this callback.
+    ws.serializeAttachment({ ...att, replaced: true });
     this.forgetPeer(ws);
     if (att.sessionIdentity) {
       this.sessionChecks.delete(`${att.sessionIdentity.gateHash}:${att.sessionIdentity.authHash}`);
@@ -624,12 +725,17 @@ export class Room {
     }
     console.log(`[room] socket closed role=${role || "unassigned"} run=${att.run || "-"} target=${att.registeredAtMs ?? "-"} replaced=${!!att.replaced}`);
     if (!role) return;
+    if (att.replaced && !att.closedByRelay) return; // replaced sockets get no farewell
     // When the client dies, its buffered offer/ICE is worthless — clear it so
     // a later host never receives a stale offer from a dead peer.
     if (role === "client") {
+      await this.retireEpoch(att);
       await this.withPending(() => this.state.storage.delete("pendingToHost"));
     }
-    if (att.replaced && !att.closedByRelay) return; // replaced sockets get no farewell
+    if (role === "host") {
+      await this.retireHostSockets();
+      await this.reportPresence(att.pc);
+    }
     // Media socket churn is isolated from the signaling session. Losing the
     // media socket must not tell the host/browser that the application peer left.
     if (role === "media-host" || role === "media-client") {
@@ -722,6 +828,123 @@ export class Room {
   gateFetch(path, init = {}) {
     const gate = this.env.GATE.get(this.env.GATE.idFromName("global-v1"));
     return gate.fetch(new Request(`https://gate.internal${path}`, init));
+  }
+
+  signalRoom(pc, run) {
+    return this.env.ROOM.get(this.env.ROOM.idFromName(pc ? `pc-v1:${pc}` : run ? `lab-signal-v1:${run}` : "room-v3"));
+  }
+
+  async authenticateAuxiliary(att, msg) {
+    const host = att.expectedRole.endsWith("host");
+    const carriesTicket = Object.hasOwn(msg, "ticket");
+    // Direct protocol tests have no namespace. Every deployed media/file
+    // socket has one, and performs one validation call to its signaling Room.
+    if (!this.env.ROOM) return !carriesTicket && att.bearerOk !== false;
+    try {
+      const response = await this.signalRoom(att.pc, att.run).fetch(new Request("https://room.internal/__pc/validate", {
+        method: "POST", body: JSON.stringify({ pc: att.pc || null, epoch: att.epoch,
+          ...(att.run ? { run: att.run } : {}),
+          role: host ? "host" : "viewer", requireTicket: host && !att.bearerOk,
+          ...(carriesTicket ? { ticket: msg.ticket } : {}) }),
+      }));
+      return response.status === 204;
+    } catch { return false; }
+  }
+
+  async pcFetch(request, url) {
+    if (url.pathname === "/__pc/online" && request.method === "GET") {
+      return Response.json({ online: !!this.findPeer("host") });
+    }
+    if (request.method !== "POST") return badRoute();
+    if (url.pathname === "/__pc/delete") {
+      const viewer = this.findPeer("client");
+      for (const socket of this.state.getWebSockets()) {
+        const att = socket.deserializeAttachment() || {};
+        if ((att.role || att.expectedRole) === "host") this.closePeer(socket, 1008, "");
+      }
+      await this.retireHostSockets();
+      if (viewer) {
+        this.sendPeer(viewer, JSON.stringify({ type: "peer-left" }));
+      }
+      return new Response(null, { status: 204 });
+    }
+    let body;
+    try { body = await request.json(); } catch { return badRoute(); }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return badRoute();
+    if (url.pathname === "/__pc/retire") {
+      for (const socket of this.state.getWebSockets()) {
+        const att = socket.deserializeAttachment() || {};
+        if ((att.pc || null) !== body.pc || att.epoch !== body.epoch) continue;
+        if (body.hostOnly && !(att.role || att.expectedRole)?.endsWith("host")) continue;
+        this.closePeer(socket, 1001, "");
+      }
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname !== "/__pc/validate" || !["host", "viewer"].includes(body.role) ||
+        !(body.pc === null || canonicalDeviceId(body.pc) === body.pc)) return badRoute();
+    if (!/^[a-f0-9]{32}$/.test(body.epoch || "")) return badRoute();
+    const viewer = this.findPeer("client");
+    const carriesTicket = Object.hasOwn(body, "ticket");
+    if (!carriesTicket) {
+      if (body.requireTicket) return badRoute();
+      // Preserve phase-1 bearer/cookie admission for peers without tickets.
+      if (body.role === "host") await this.rememberHostEpoch(body);
+      return new Response(null, { status: 204 });
+    }
+    const viewerAtt = viewer?.deserializeAttachment() || {};
+    if (body.role === "viewer" && (!viewer || viewerAtt.mediaEpoch !== body.epoch || (viewerAtt.pc || null) !== body.pc)) return badRoute();
+    if (typeof body.ticket !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(body.ticket)) return badRoute();
+    const digest = await hashTicket(body.ticket);
+    const issuingSocket = body.role === "host" ? this.findPeer("host") : viewer;
+    const issuing = issuingSocket?.deserializeAttachment() || {};
+    if (!issuingSocket || (issuing.pc || null) !== body.pc || !Number.isFinite(issuing.ticketExpiresAt) || issuing.ticketExpiresAt <= Date.now() ||
+        typeof issuing.ticketHash !== "string" || !constantTimeEqual(digest, issuing.ticketHash)) return badRoute();
+    // Recheck after the hashing await: a socket may have closed/replaced while
+    // crypto was running, and its ticket must stop working immediately.
+    if (body.role === "host") await this.rememberHostEpoch(body);
+    if (this.findPeer(body.role === "host" ? "host" : "client") !== issuingSocket ||
+        body.role === "viewer" && this.findPeer("client") !== viewer) return badRoute();
+    return new Response(null, { status: 204 });
+  }
+
+  async retireEpoch(att, hostOnly = false) {
+    if (!att?.mediaEpoch || !this.env.MEDIA_ROOM) return;
+    const operations = ["media", "file"].map(kind => {
+      const name = att.run ? `lab-${kind}-${kind === "media" ? "v4" : "v1"}:${att.run}:${att.mediaEpoch}`
+        : `${kind}-${kind === "media" ? "v4" : "v1"}:${att.mediaEpoch}`;
+      return this.env.MEDIA_ROOM.get(this.env.MEDIA_ROOM.idFromName(name)).fetch(new Request("https://room.internal/__pc/retire", {
+        method: "POST", body: JSON.stringify({ pc: att.pc || null, epoch: att.mediaEpoch, hostOnly }),
+      }));
+    });
+    const responses = await Promise.all(operations);
+    if (responses.some(response => response.status !== 204)) throw new Error("auxiliary cleanup failed");
+    if (!hostOnly) await this.withPending(async () => {
+      const epochs = await this.state.storage.get("hostAuxiliaryEpochs") || [];
+      await this.state.storage.put("hostAuxiliaryEpochs", epochs.filter(epoch => epoch.mediaEpoch !== att.mediaEpoch || epoch.run !== (att.run || null)));
+    });
+  }
+
+  rememberHostEpoch(body) {
+    return this.withPending(async () => {
+      const epochs = await this.state.storage.get("hostAuxiliaryEpochs") || [];
+      if (epochs.some(epoch => epoch.mediaEpoch === body.epoch && epoch.run === (body.run || null))) return;
+      epochs.push({ pc: body.pc, mediaEpoch: body.epoch, run: body.run || null });
+      await this.state.storage.put("hostAuxiliaryEpochs", epochs);
+    });
+  }
+
+  async retireHostSockets() {
+    await this.withPending(async () => {
+      const epochs = await this.state.storage.get("hostAuxiliaryEpochs") || [];
+      await Promise.all(epochs.map(epoch => this.retireEpoch(epoch, true)));
+      await this.state.storage.delete("hostAuxiliaryEpochs");
+    });
+  }
+
+  async reportPresence(pc) {
+    if (!this.env.GATE) return;
+    await this.gateFetch("/__pc/presence", { method: "POST", body: JSON.stringify({ pc: pc || null, id: pc || null,
+      online: !!this.findPeer("host") }) });
   }
 
   async approvalFetch(request, url) {
@@ -895,6 +1118,7 @@ const SIGNAL_MAX_BYTES = 512 * 1024;
 const PENDING_MAX_BYTES = 512 * 1024;
 const SESSION_CACHE_MS = 3_000;
 const SESSION_CHECK_MS = 5_000;
+const TICKET_TTL_MS = 12 * 60 * 60 * 1000;
 
 function validSocketIdentity(identity) {
   return identity && /^[a-f0-9]{64}$/.test(identity.gateHash) && /^[a-f0-9]{64}$/.test(identity.authHash);

@@ -78,7 +78,10 @@ test("host relay token and preauthenticated client role remain separate", async 
 
   const hostHello = JSON.parse(host.messages[0]);
   const clientHello = JSON.parse(client.messages[0]);
-  assert.deepEqual(hostHello, { type: "hello-ok" });
+  // The host's hello-ok carries its session ticket; the shape is pinned, the value is not.
+  assert.deepEqual(Object.keys(hostHello).sort(), ["ticket", "type"]);
+  assert.match(hostHello.ticket, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(hostHello.type, "hello-ok");
   assert.equal(clientHello.type, "hello-ok");
   assert.equal(clientHello.iceServers.length, 2);
   const observable = JSON.stringify({ messages: [...host.messages, ...client.messages], stored: [...storage.values.values()] });
@@ -122,7 +125,9 @@ test("a loopback Stream Lab socket can authenticate its host without a productio
 
   await room.webSocketMessage(host, JSON.stringify({ type: "hello", role: "host" }));
 
-  assert.deepEqual(JSON.parse(host.messages[0]), { type: "hello-ok" });
+  const helloOk = JSON.parse(host.messages[0]);
+  assert.deepEqual(Object.keys(helloOk).sort(), ["ticket", "type"]);
+  assert.match(helloOk.ticket, /^[A-Za-z0-9_-]{43}$/);
   assert.equal(host.closed.length, 0);
 });
 
