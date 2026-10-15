@@ -80,6 +80,7 @@ pub struct TransportStats {
     pub(crate) stale_feedback: AtomicU64,
     last_error: Mutex<Option<String>>,
     window: Mutex<Window>,
+    pub(crate) webrtc: Mutex<super::webrtc::stats::WebRtcStats>,
 }
 
 /// A point-in-time copy of [`TransportStats`].
@@ -123,6 +124,24 @@ pub struct TransportSnapshot {
 }
 
 impl TransportStats {
+    pub fn transport_name(&self) -> &'static str {
+        if self
+            .webrtc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .selected_transport
+            .as_deref()
+            == Some("webrtc")
+        {
+            "WebRTC"
+        } else {
+            "WSS v4"
+        }
+    }
+    pub fn webrtc_snapshot(&self) -> serde_json::Value {
+        serde_json::to_value(&*self.webrtc.lock().unwrap_or_else(|e| e.into_inner()))
+            .expect("WebRTC stats serialize")
+    }
     pub fn new() -> Self {
         Self::default()
     }

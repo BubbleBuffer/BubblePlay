@@ -12,6 +12,7 @@ use anyhow::Result;
 use fake_wss_host::audio::Script;
 use fake_wss_host::model::{Injections, Source};
 use fake_wss_host::protocol::{decode_frame, is_valid_epoch, ReceiveGate};
+use fake_wss_host::rtc::Knobs;
 use fake_wss_host::server::{self, ServerConfig, Snapshot};
 use fake_wss_host::stream::Codec;
 use futures_util::{SinkExt, StreamExt};
@@ -101,7 +102,7 @@ pub async fn spawn_many(
     exit_after: Duration,
     drain: Duration,
 ) -> Harness {
-    spawn_with(sources, injections, exit_after, drain, None, None).await
+    spawn_with(sources, injections, exit_after, drain, None, None, None).await
 }
 
 /// A run with the audio lane on. `sources` may be empty: an audio-only run.
@@ -118,6 +119,7 @@ pub async fn spawn_audio(
         drain,
         None,
         Some(script),
+        None,
     )
     .await
 }
@@ -136,6 +138,26 @@ pub async fn spawn_recording(
         drain,
         Some(record.to_path_buf()),
         None,
+        None,
+    )
+    .await
+}
+
+/// A run with the WebRTC answerer on. The browser's offer arrives on `/ws`;
+/// no media socket is used.
+pub async fn spawn_webrtc(
+    sources: Vec<Arc<dyn Source>>,
+    exit_after: Duration,
+    knobs: Knobs,
+) -> Harness {
+    spawn_with(
+        sources,
+        no_injections(),
+        exit_after,
+        Duration::ZERO,
+        None,
+        None,
+        Some(knobs),
     )
     .await
 }
@@ -151,6 +173,7 @@ async fn spawn_with(
     drain: Duration,
     input_record: Option<PathBuf>,
     audio: Option<Script>,
+    rtc: Option<Knobs>,
 ) -> Harness {
     let listener = server::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -166,6 +189,7 @@ async fn spawn_with(
         max_connections: 8,
         input_record,
         audio,
+        rtc,
     };
     Harness {
         addr,
@@ -184,9 +208,11 @@ pub async fn open(
     addr: SocketAddr,
     path: &str,
 ) -> std::result::Result<Ws, tokio_tungstenite::tungstenite::Error> {
-    connect_async(format!("ws://{addr}{path}"))
-        .await
-        .map(|(ws, _)| ws)
+    let (ws, _) = connect_async(format!("ws://{addr}{path}")).await?;
+    if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
+        tcp.set_nodelay(true)?;
+    }
+    Ok(ws)
 }
 
 pub async fn send_json(ws: &mut Ws, value: Value) {

@@ -251,6 +251,32 @@ pub fn host_capabilities_audio() -> String {
 }
 
 /// First-frame handshake notices from the host (`admitted`, `ready`, `failed`).
+/// The WebRTC admission, sent once the keyframe's first RTP packet has left.
+/// `rtpTimestamp` is that packet's header timestamp, which the browser checks
+/// presented frames against.
+pub fn first_frame_admitted_rtc(
+    request_id: &str,
+    generation: u32,
+    rtp_timestamp: u32,
+    codec: &str,
+    epoch: Option<&str>,
+) -> String {
+    let mut message = json!({
+        "type": "first-frame",
+        "protocol": 1,
+        "phase": "admitted",
+        "requestId": request_id,
+        "transport": "webrtc",
+        "generation": generation,
+        "rtpTimestamp": rtp_timestamp,
+        "codec": codec,
+    });
+    if let Some(epoch) = epoch {
+        message["epoch"] = json!(epoch);
+    }
+    message.to_string()
+}
+
 pub fn first_frame(
     phase: &str,
     request_id: &str,

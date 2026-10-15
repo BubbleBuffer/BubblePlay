@@ -93,9 +93,12 @@ impl Held {
     }
 }
 
-/// One binary message as the hub received it.
+/// One binary message as the hub received it. `channel` names the lane it
+/// arrived on: `ws` for `/ws` binary, `input-control` or `input-motion` for the
+/// WebRTC data channels.
 pub struct Received<'a> {
     pub epoch: Option<&'a str>,
+    pub channel: &'a str,
     pub received_ms: f64,
     pub unix_ms: u128,
     pub bytes: &'a [u8],
@@ -132,6 +135,7 @@ impl Recorder {
         let mut line = json!({
             "index": self.written,
             "epoch": received.epoch,
+            "channel": received.channel,
             "received_ms": received.received_ms,
             "received_unix_ms": received.unix_ms,
             "len": received.bytes.len(),
@@ -171,6 +175,20 @@ impl Recorder {
         let before = self.held.to_json();
         self.held = Held::default();
         let line = json!({"event":"disconnect","epoch":epoch,"reason":reason,"received_ms":received_ms,"held_before":before,"held_after":self.held.to_json()});
+        writeln!(self.out, "{line}")?;
+        self.out.flush()
+    }
+
+    /// WebRTC lifecycle evidence (ICE state, data channel open, RTC drop): one
+    /// line that is never a packet and never changes the held state.
+    pub fn lifecycle(
+        &mut self,
+        epoch: Option<&str>,
+        event: &str,
+        channel: Option<&str>,
+        received_ms: f64,
+    ) -> io::Result<()> {
+        let line = json!({"event":event,"epoch":epoch,"channel":channel,"received_ms":received_ms});
         writeln!(self.out, "{line}")?;
         self.out.flush()
     }
@@ -442,5 +460,37 @@ mod tests {
         held.apply(classify(&[13, 0, 29, 0, 0, 0]).effect);
         held.apply(classify(&[6]).effect);
         assert_eq!(held, Held::default());
+    }
+
+    #[test]
+    fn every_line_names_its_channel_and_lifecycle_lines_are_not_packets() {
+        let path =
+            std::env::temp_dir().join(format!("fake-wss-host-record-{}.jsonl", std::process::id()));
+        let mut recorder = Recorder::create(&path).expect("create record");
+        recorder
+            .record(Received {
+                epoch: Some("0123456789abcdef0123456789abcdef"),
+                channel: "input-control",
+                received_ms: 1.0,
+                unix_ms: 2,
+                bytes: &[8, 1, 0, 0, 0, 0, 0],
+            })
+            .expect("record packet");
+        recorder
+            .lifecycle(None, "ice-connected", Some("input-control"), 3.0)
+            .expect("record lifecycle");
+        drop(recorder);
+        let text = std::fs::read_to_string(&path).expect("read record");
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json line"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["channel"], "input-control");
+        assert_eq!(lines[0]["kind"], "absolute-v2");
+        assert_eq!(lines[1]["event"], "ice-connected");
+        assert_eq!(lines[1]["channel"], "input-control");
+        assert!(lines[1].get("type").is_none(), "lifecycle is not a packet");
     }
 }

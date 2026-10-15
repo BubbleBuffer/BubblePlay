@@ -68,6 +68,23 @@ impl std::fmt::Debug for InputLink {
     }
 }
 impl InputLink {
+    /// Restore an unsent reliable packet without admitting newer events ahead
+    /// of it. The network thread calls this when SCTP applies backpressure.
+    pub(crate) fn retry_front(&self, packet: Vec<u8>) {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if packet == [6] {
+            state.needs_release = true;
+            return;
+        }
+        if state.view.ready && state.bytes + packet.len() <= MAX_BYTES {
+            state.bytes += packet.len();
+            state.queue.push_front(packet);
+        } else {
+            state.queue.clear();
+            state.bytes = 0;
+            state.needs_release = true;
+        }
+    }
     pub fn ready_signal(&self) -> Arc<AtomicBool> {
         self.ready_signal.clone()
     }
@@ -188,6 +205,8 @@ impl InputLink {
             return;
         };
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = u16::from_le_bytes([*lo, *hi]);
+        state.absolute_sent.retain(|(seq, _)| *seq != sequence);
         while state
             .absolute_sent
             .front()
@@ -201,6 +220,16 @@ impl InputLink {
         state
             .absolute_sent
             .push_back((u16::from_le_bytes([*lo, *hi]), at));
+    }
+    pub(crate) fn absolute_unsent(&self, packet: &[u8]) {
+        if let [8, lo, hi, _, _, _, _] = packet {
+            let seq = u16::from_le_bytes([*lo, *hi]);
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .absolute_sent
+                .retain(|(s, _)| *s != seq);
+        }
     }
     pub(crate) fn receive(&self, data: &[u8]) -> bool {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());

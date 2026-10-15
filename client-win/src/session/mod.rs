@@ -5,6 +5,7 @@ mod audio_dev;
 mod decode;
 #[cfg(feature = "dev-login")]
 mod dev_login;
+mod headless;
 pub(crate) mod input_dev;
 mod metrics;
 mod options;
@@ -145,15 +146,36 @@ impl Drop for Running {
 pub fn run_dev(options: DevOptions) -> Result<()> {
     let result = if options.audio_only || options.audio_render_test || options.decoder_probe {
         audio_dev::run(&options)
+    } else if options.headless {
+        headless::run(options.clone())
     } else {
         run_windowed(options.clone())
     };
     finish_dev(&options, result)
 }
 
+/// Development login happens once, before any window, network or device work.
+/// Reconnects reuse this jar and never repeat the single-use TOTP POST.
+#[cfg(feature = "dev-login")]
+fn session_cookies(options: &DevOptions) -> Result<CookieJar> {
+    match &options.login {
+        Some(login) => Ok(dev_login::login(login)?),
+        None => Ok(CookieJar::new()),
+    }
+}
+
+#[cfg(not(feature = "dev-login"))]
+fn session_cookies(_options: &DevOptions) -> Result<CookieJar> {
+    Ok(CookieJar::new())
+}
+
 fn finish_dev(options: &DevOptions, result: Result<()>) -> Result<()> {
     if let Err(error) = &result {
-        if let Some(capability) = error.downcast_ref::<crate::media::NoHardwareVideoDecoder>() {
+        // Headless sessions have already written their full report with error_kind.
+        if let Some(capability) = error
+            .downcast_ref::<crate::media::NoHardwareVideoDecoder>()
+            .filter(|_| !options.headless)
+        {
             let failure = serde_json::json!({
                 "pass": false, "error_kind": "no_hardware_video_decoder",
                 "errors": [capability.to_string()], "headless": options.decoder_probe,
@@ -191,16 +213,7 @@ fn run_windowed(options: DevOptions) -> Result<()> {
     if options.input_only {
         return input_dev::run(options);
     }
-    // Authentication happens once before any window or reconnect worker starts.
-    // Reconnects reuse this jar and never repeat the single-use TOTP POST.
-    #[cfg(feature = "dev-login")]
-    let cookies = if let Some(login) = &options.login {
-        dev_login::login(login)?
-    } else {
-        CookieJar::new()
-    };
-    #[cfg(not(feature = "dev-login"))]
-    let cookies = CookieJar::new();
+    let cookies = session_cookies(&options)?;
     let started = Instant::now();
     let pacing = pacing::Pacing::new(started);
     pacing.mark("runtime_start");
@@ -221,6 +234,9 @@ fn run_windowed(options: DevOptions) -> Result<()> {
     let hevc_available = probe_available(Codec::Hevc, &device)?;
     pacing.mark("hevc_probe_end");
     let codec = match options.codec {
+        CodecChoice::Auto if options.transport != net::TransportChoice::Wss && hevc_available => {
+            Codec::Hevc
+        }
         CodecChoice::Auto | CodecChoice::H264 if h264_available => Codec::H264,
         CodecChoice::Hevc if hevc_available => Codec::Hevc,
         CodecChoice::Auto | CodecChoice::H264 => {
@@ -255,6 +271,10 @@ fn run_windowed(options: DevOptions) -> Result<()> {
         },
         cookies,
     );
+    config.transport = options.transport;
+    config.ice_checking_timeout = options
+        .ice_timeout
+        .unwrap_or(net::AUTO_ICE_CHECKING_TIMEOUT);
     let wake = shell.wake_handle();
     let media_stats = MediaStats::new();
     let transport = Arc::new(TransportStats::new());
@@ -539,6 +559,21 @@ fn run_windowed(options: DevOptions) -> Result<()> {
         &diagnostics.lock().unwrap().errors,
     );
     stats_summary["audio"] = serde_json::to_value(audio_control.stats())?;
+    let mut rtc = stats.transport.webrtc_snapshot();
+    rtc["measurement_scope"] = serde_json::json!("whole session, including WSS after fallback");
+    for name in [
+        "received_fps",
+        "decoded_fps",
+        "presented_fps",
+        "frame_interval_ms",
+        "receive_to_presented_ms",
+        "input_round_trip_ms",
+    ] {
+        rtc[name] = stats_summary[name].clone();
+    }
+    rtc["audio_counters"] = stats_summary["audio"].clone();
+    stats_summary["webrtc"] = rtc.clone();
+    document["webrtc"] = rtc;
     document["session_summary"] = stats_summary.clone();
     document["arrival_times_last_second_ms"] = serde_json::json!(summary.arrival_times_ms);
     document["arrival_window_end_ms"] = serde_json::json!(summary.end_ms);
@@ -605,7 +640,7 @@ fn app_state(stats: &SessionStats) -> AppState {
                 fps: sample.presented_fps as f32,
                 decode_ms: sample.recv_to_decode_p50_ms.unwrap_or(0.0) as f32,
                 dropped: sample.totals.dropped as u32,
-                transport: "WSS v4".into(),
+                transport: stats.transport.transport_name().into(),
                 codec: sample.codec.map_or("", Codec::name).into(),
                 ..Default::default()
             },

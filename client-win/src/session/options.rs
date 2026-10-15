@@ -2,12 +2,24 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{bail, Context, Result};
 
+use crate::net::TransportChoice;
+
+/// Upper bound for `--ice-timeout-ms`: a development override, never a wait for the UI.
+pub const MAX_ICE_TIMEOUT_MS: u64 = 60_000;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CodecChoice {
     #[default]
     Auto,
     H264,
     Hevc,
+}
+
+/// Built-in synthetic input scripts. Each covers the packet types of one mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputScript {
+    Work,
+    Game,
 }
 
 /// Development-only connection controls. The regular UI/demo path keeps its
@@ -31,6 +43,16 @@ pub struct DevOptions {
     pub audio_render_test: bool,
     /// Window-free hardware decoder capability probe.
     pub decoder_probe: bool,
+    /// Transport for `--dev-wss`/`--dev-relay`; the legacy input and audio harnesses default to WSS.
+    pub transport: TransportChoice,
+    /// Development override of the Auto ICE checking deadline (1 to 60000 ms).
+    pub ice_timeout: Option<Duration>,
+    /// Window-free transport session with real decode; no shell or presentation.
+    pub headless: bool,
+    /// Explicit decode-free counters inside a headless session.
+    pub count_only: bool,
+    /// Synthetic input through InputLink; headless sessions only.
+    pub input_script: Option<InputScript>,
     #[cfg(feature = "dev-login")]
     pub login: Option<super::dev_login::DevLogin>,
     pub stats_out_path: Option<PathBuf>,
@@ -55,6 +77,11 @@ impl DevOptions {
         let mut audio_muted = false;
         let mut audio_render_test = false;
         let mut decoder_probe = false;
+        let mut transport = None;
+        let mut ice_timeout = None;
+        let mut headless = false;
+        let mut count_only = false;
+        let mut input_script = None;
         #[cfg(feature = "dev-login")]
         let mut relay = None;
         #[cfg(feature = "dev-login")]
@@ -150,6 +177,46 @@ impl DevOptions {
                         iter.next().context("--capture requires a PNG file path")?,
                     ))
                 }
+                "--dev-headless" => headless = true,
+                "--dev-count-only" => count_only = true,
+                "--dev-input-script" => {
+                    input_script = Some(
+                        match iter
+                            .next()
+                            .context("--dev-input-script requires work or game")?
+                            .as_str()
+                        {
+                            "work" => InputScript::Work,
+                            "game" => InputScript::Game,
+                            value => bail!("unsupported input script: {value}"),
+                        },
+                    )
+                }
+                "--transport" => {
+                    transport = Some(
+                        match iter
+                            .next()
+                            .context("--transport requires auto, webrtc or wss")?
+                            .as_str()
+                        {
+                            "auto" => TransportChoice::Auto,
+                            "webrtc" => TransportChoice::WebRtc,
+                            "wss" => TransportChoice::Wss,
+                            value => bail!("unsupported transport: {value}"),
+                        },
+                    )
+                }
+                "--ice-timeout-ms" => {
+                    let millis: u64 = iter
+                        .next()
+                        .context("--ice-timeout-ms requires milliseconds")?
+                        .parse()
+                        .context("invalid --ice-timeout-ms")?;
+                    if !(1..=MAX_ICE_TIMEOUT_MS).contains(&millis) {
+                        bail!("--ice-timeout-ms must be from 1 to {MAX_ICE_TIMEOUT_MS}");
+                    }
+                    ice_timeout = Some(Duration::from_millis(millis));
+                }
                 "--ui-demo" | "--shots" => {
                     bail!("--dev-wss cannot be combined with UI demo options")
                 }
@@ -189,10 +256,16 @@ impl DevOptions {
             }
             None
         };
-        if [input_only, audio_only, audio_render_test, decoder_probe]
-            .into_iter()
-            .filter(|v| *v)
-            .count()
+        if [
+            input_only,
+            audio_only,
+            audio_render_test,
+            decoder_probe,
+            headless,
+        ]
+        .into_iter()
+        .filter(|v| *v)
+        .count()
             > 1
         {
             bail!("development harness modes are mutually exclusive");
@@ -200,10 +273,38 @@ impl DevOptions {
         if audio_wasapi && !audio_only {
             bail!("--dev-audio-wasapi requires --dev-audio-only");
         }
-        if (audio_only || audio_render_test || decoder_probe) && capture_path.is_some() {
+        if (audio_only || audio_render_test || decoder_probe || headless) && capture_path.is_some()
+        {
             bail!("headless modes cannot capture a window");
         }
-        let url = if audio_render_test || decoder_probe {
+        let local_probe = audio_render_test || decoder_probe;
+        if local_probe && (transport.is_some() || ice_timeout.is_some()) {
+            bail!("local device probes take no --transport or --ice-timeout-ms");
+        }
+        if input_only && transport.is_some_and(|t| t != TransportChoice::Wss) {
+            bail!("--dev-input-only is WSS-only");
+        }
+        if count_only && !headless {
+            bail!("--dev-count-only requires --dev-headless");
+        }
+        if count_only && input_script.is_some() {
+            bail!(
+                "--dev-input-script needs Decoded readiness and cannot run with --dev-count-only"
+            );
+        }
+        if let Some(script) = input_script {
+            if !headless {
+                bail!("--dev-input-script requires --dev-headless");
+            }
+            let (name, required) = match script {
+                InputScript::Work => ("work", crate::input::Mode::Work),
+                InputScript::Game => ("game", crate::input::Mode::Game),
+            };
+            if mode != required {
+                bail!("--dev-input-script {name} requires --mode {name}");
+            }
+        }
+        let url = if local_probe {
             if url.is_some() {
                 bail!("local device probes do not accept a host URL");
             }
@@ -211,6 +312,14 @@ impl DevOptions {
         } else {
             url.context("missing --dev-wss URL")?
         };
+        if headless {
+            require_loopback_websocket(&url)?;
+        }
+        let transport = transport.unwrap_or(if input_only || audio_only {
+            TransportChoice::Wss
+        } else {
+            TransportChoice::Auto
+        });
         Ok(Some(Self {
             url,
             codec,
@@ -225,6 +334,11 @@ impl DevOptions {
             audio_muted,
             audio_render_test,
             decoder_probe,
+            transport,
+            ice_timeout,
+            headless,
+            count_only,
+            input_script,
             #[cfg(feature = "dev-login")]
             login,
             stats_out_path,
@@ -232,10 +346,44 @@ impl DevOptions {
     }
 }
 
+/// Headless sessions connect only to loopback, checked before any network,
+/// credential or device work starts.
+pub(super) fn require_loopback_websocket(value: &str) -> Result<()> {
+    let url = url::Url::parse(value).context("invalid --dev-wss URL")?;
+    if !matches!(url.scheme(), "ws" | "wss") {
+        bail!("headless sessions require a ws:// or wss:// URL");
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("headless URLs take no credentials, query or fragment");
+    }
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if !loopback {
+        bail!("headless sessions require a loopback host: 127.0.0.1, ::1 or localhost");
+    }
+    Ok(())
+}
+
 fn is_dev_flag(value: &str) -> bool {
     if matches!(
         value,
-        "--dev-wss" | "--dev-audio-only" | "--dev-audio-render-test" | "--dev-decoder-probe"
+        "--dev-wss"
+            | "--dev-audio-only"
+            | "--dev-audio-render-test"
+            | "--dev-decoder-probe"
+            | "--dev-headless"
+            | "--dev-count-only"
+            | "--dev-input-script"
+            | "--transport"
+            | "--ice-timeout-ms"
     ) {
         return true;
     }
@@ -436,7 +584,227 @@ mod tests {
             audio_muted: _,
             audio_render_test: _,
             decoder_probe: _,
+            transport: _,
+            ice_timeout: _,
+            headless: _,
+            count_only: _,
+            input_script: _,
             stats_out_path: _,
         } = options;
+    }
+
+    #[test]
+    fn transport_and_ice_knobs_are_explicit_bounded_and_harness_scoped() {
+        let normal = parse(&["--dev-wss", "ws://127.0.0.1:19764"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(normal.transport, TransportChoice::Auto);
+        assert_eq!(normal.ice_timeout, None);
+        for (value, expected) in [
+            ("auto", TransportChoice::Auto),
+            ("webrtc", TransportChoice::WebRtc),
+            ("wss", TransportChoice::Wss),
+        ] {
+            let options = parse(&["--dev-wss", "ws://127.0.0.1", "--transport", value])
+                .unwrap()
+                .unwrap();
+            assert_eq!(options.transport, expected);
+        }
+        // Legacy harnesses stay on WSS unless the caller asks otherwise.
+        let audio = parse(&["--dev-audio-only", "--dev-wss", "ws://127.0.0.1"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(audio.transport, TransportChoice::Wss);
+        let audio_webrtc = parse(&[
+            "--dev-audio-only",
+            "--dev-wss",
+            "ws://127.0.0.1",
+            "--transport",
+            "webrtc",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(audio_webrtc.transport, TransportChoice::WebRtc);
+        for (value, millis) in [("1", 1), ("60000", 60_000), ("+250", 250)] {
+            let options = parse(&["--dev-wss", "ws://127.0.0.1", "--ice-timeout-ms", value])
+                .unwrap()
+                .unwrap();
+            assert_eq!(options.ice_timeout, Some(Duration::from_millis(millis)));
+        }
+        for value in ["0", "60001", "-1", "1.5", "bad", ""] {
+            assert!(
+                parse(&["--dev-wss", "ws://127.0.0.1", "--ice-timeout-ms", value]).is_err(),
+                "{value}"
+            );
+        }
+        for args in [
+            vec!["--dev-wss", "ws://127.0.0.1", "--transport", "tcp"],
+            vec!["--dev-wss", "ws://127.0.0.1", "--transport"],
+            vec!["--dev-wss", "ws://127.0.0.1", "--ice-timeout-ms"],
+            // Without a host URL, these knobs would silently configure nothing.
+            vec!["--transport", "wss"],
+            vec!["--ice-timeout-ms", "5"],
+            vec!["--dev-decoder-probe", "--transport", "wss"],
+            vec!["--dev-audio-render-test", "--ice-timeout-ms", "5"],
+            vec![
+                "--dev-wss",
+                "ws://127.0.0.1",
+                "--dev-input-only",
+                "--transport",
+                "webrtc",
+            ],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn headless_is_loopback_only_and_refuses_window_and_harness_mixing() {
+        let ok = parse(&[
+            "--dev-headless",
+            "--dev-wss",
+            "ws://127.0.0.1:19764",
+            "--stats-out",
+            "headless.json",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(ok.headless && !ok.count_only);
+        assert_eq!(ok.input_script, None);
+        assert_eq!(ok.transport, TransportChoice::Auto);
+        for url in [
+            "ws://[::1]:19764",
+            "ws://localhost:19764",
+            "wss://localhost:443",
+        ] {
+            assert!(
+                parse(&["--dev-headless", "--dev-wss", url]).is_ok(),
+                "{url}"
+            );
+        }
+        for url in [
+            "wss://example.com",
+            "ws://192.168.1.2:19764",
+            "ws://127.0.0.2:19764",
+            "http://127.0.0.1:19764",
+            "ws://user@127.0.0.1:19764",
+            "ws://127.0.0.1:19764/?x=1",
+        ] {
+            assert!(
+                parse(&["--dev-headless", "--dev-wss", url]).is_err(),
+                "{url}"
+            );
+        }
+        assert!(parse(&["--dev-headless"]).is_err());
+        for args in [
+            vec![
+                "--dev-headless",
+                "--dev-wss",
+                "ws://127.0.0.1",
+                "--capture",
+                "x.png",
+            ],
+            vec![
+                "--dev-headless",
+                "--dev-wss",
+                "ws://127.0.0.1",
+                "--dev-audio-only",
+            ],
+            vec![
+                "--dev-headless",
+                "--dev-wss",
+                "ws://127.0.0.1",
+                "--dev-input-only",
+            ],
+            vec!["--dev-headless", "--dev-decoder-probe"],
+            vec!["--dev-headless", "--dev-audio-render-test"],
+            // Count-only is decode-free and must be asked for explicitly.
+            vec!["--dev-count-only", "--dev-wss", "ws://127.0.0.1"],
+            // Synthetic input is headless-only and must match the mode.
+            vec!["--dev-input-script", "work", "--dev-wss", "ws://127.0.0.1"],
+            vec![
+                "--dev-headless",
+                "--dev-wss",
+                "ws://127.0.0.1",
+                "--dev-input-script",
+                "game",
+            ],
+            vec![
+                "--dev-headless",
+                "--dev-wss",
+                "ws://127.0.0.1",
+                "--dev-input-script",
+                "fire",
+            ],
+            // Input needs Decoded readiness, which a count-only run never reaches.
+            vec![
+                "--dev-headless",
+                "--dev-count-only",
+                "--dev-wss",
+                "ws://127.0.0.1",
+                "--dev-input-script",
+                "work",
+            ],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        let count = parse(&[
+            "--dev-headless",
+            "--dev-count-only",
+            "--dev-wss",
+            "ws://127.0.0.1",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(count.count_only);
+        let work = parse(&[
+            "--dev-headless",
+            "--dev-wss",
+            "ws://127.0.0.1",
+            "--dev-input-script",
+            "work",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(work.input_script, Some(InputScript::Work));
+        let game = parse(&[
+            "--dev-headless",
+            "--dev-wss",
+            "ws://127.0.0.1",
+            "--mode",
+            "game",
+            "--dev-input-script",
+            "game",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(game.input_script, Some(InputScript::Game));
+    }
+
+    #[test]
+    #[cfg(feature = "dev-login")]
+    fn headless_accepts_loopback_dev_relay_and_refuses_remote_origins() {
+        let options = parse(&[
+            "--dev-headless",
+            "--dev-relay",
+            "http://127.0.0.1:8788",
+            "--password-file",
+            "fake-password",
+            "--totp-provision",
+            "fake-provision",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(options.headless && options.login.is_some());
+        assert!(parse(&[
+            "--dev-headless",
+            "--dev-relay",
+            "https://relay.example",
+            "--password-file",
+            "p",
+            "--totp-provision",
+            "t",
+        ])
+        .is_err());
     }
 }

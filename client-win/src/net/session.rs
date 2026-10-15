@@ -35,6 +35,11 @@ use super::protocol::{
     V4_HEADER_BYTES,
 };
 use super::stats::{count, NetState, TransportStats};
+use super::{
+    webrtc::{auto::Action, Peer},
+    TransportChoice,
+};
+use str0m::{Event as RtcEvent, IceConnectionState};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Socket, Message>;
@@ -149,6 +154,7 @@ enum Wake {
     Signal(Option<Result<Message, tungstenite::Error>>),
     Tick,
     Input,
+    Udp(Vec<u8>, std::net::SocketAddr),
 }
 
 /// Per-socket send and receive times, for heartbeats and dead detection.
@@ -201,6 +207,9 @@ struct Epoch {
     desktop_available: bool,
     desktop_enabled: bool,
     desktop_generation: Option<u64>,
+    rtc_generation: u32,
+    rtc_require_admission: bool,
+    rtc_admitted_timestamp: Option<u32>,
 }
 
 impl Epoch {
@@ -228,7 +237,8 @@ impl Epoch {
 
 struct Link {
     signal: Lane,
-    media: Lane,
+    media: Option<Lane>,
+    rtc: Option<Peer>,
     epoch: Epoch,
 }
 
@@ -253,6 +263,8 @@ struct Session {
     pending_reset: Option<String>,
     /// A keyframe request not yet sent (throttled).
     pending_keyframe: Option<String>,
+    remembered_rtc_failure: bool,
+    rtp_ingress: super::webrtc::ingress::Ingress,
 }
 
 impl Session {
@@ -282,6 +294,8 @@ impl Session {
             decoded_seq: None,
             pending_reset: None,
             pending_keyframe: None,
+            remembered_rtc_failure: false,
+            rtp_ingress: super::webrtc::ingress::Ingress::new(Instant::now()),
         }
     }
 
@@ -360,6 +374,7 @@ impl Session {
 
     /// Start a new `/ws` epoch. Frames from older epochs are stale from here on.
     fn begin_epoch(&mut self) {
+        self.rtp_ingress = super::webrtc::ingress::Ingress::new(Instant::now());
         self.local_epoch += 1;
         if let Some(audio) = &self.config.audio {
             audio.reset_epoch(self.local_epoch);
@@ -385,145 +400,260 @@ impl Session {
     /// One full attempt: `/ws` hello, start and first-frame request, `/media-ws`
     /// hello, then the stream loop. Always ends with `Err`.
     async fn attempt(&mut self, endpoint: &RelayEndpoint) -> Result<(), Halt> {
-        let handshake_started = Instant::now();
         self.begin_epoch();
-        let cookie = self.config.cookies.cookie_header();
-        let codec = self.config.codec;
-
-        let signal_socket = self
-            .handshake(open_socket(endpoint, cookie.clone(), "/ws", None))
+        let socket = self
+            .handshake(open_socket(
+                endpoint,
+                self.config.cookies.cookie_header(),
+                "/ws",
+                None,
+            ))
             .await?;
-        let (signal_tx, mut signal_rx) = signal_socket.split();
-        let mut signal = Lane::new(signal_tx);
+        let route_ip = match socket.get_ref() {
+            MaybeTlsStream::Plain(tcp) => tcp.local_addr().ok().map(|addr| addr.ip()),
+            MaybeTlsStream::Rustls(tls) => tls.get_ref().0.local_addr().ok().map(|addr| addr.ip()),
+            _ => None,
+        };
+        let (tx, mut signal_rx) = socket.split();
+        let mut signal = Lane::new(tx);
         signal.send(hello_message("client")).await?;
-        let media_epoch = self
+        let (epoch, ice_servers) = self
             .handshake(await_hello_ok(&mut signal_rx, &self.stats, "signal"))
             .await?;
-        let wire = match media_epoch {
-            Some(epoch) if valid_epoch(&epoch) => epoch,
-            _ => {
-                return Err(Halt::from(NetError::Protocol(
-                    "hello-ok without a valid mediaEpoch".to_owned(),
-                )))
-            }
-        };
-
-        eprintln!(
-            "BP_TIMING signal_ready: {:.3}ms",
-            handshake_started.elapsed().as_secs_f64() * 1000.0
-        );
-        let request_id = new_request_id();
-        self.stats.set_state(NetState::MediaHandshake);
-
-        let query = format!("epoch={wire}");
-        let media_socket = self
-            .handshake(open_socket(endpoint, cookie, "/media-ws", Some(&query)))
-            .await?;
-        let (media_tx, mut media_rx) = media_socket.split();
-        let mut media = Lane::new(media_tx);
-        media.send(hello_message("media-client")).await?;
-        let host_present = self
-            .handshake(await_media_ready(&mut media_rx, &self.stats))
-            .await?;
-
-        eprintln!(
-            "BP_TIMING media_ready_total: {:.3}ms",
-            handshake_started.elapsed().as_secs_f64() * 1000.0
-        );
-        // Media must be registered before the host is asked to start. The
-        // relay can otherwise discard start or frames on an unpaired socket.
-        let mut start = start_message(&wire, codec);
-        if self.config.stream_mode.is_some() || self.config.audio.is_some() {
-            let mut value: Value = serde_json::from_str(&start).expect("locally encoded start");
-            if let Some(mode) = &self.config.stream_mode {
-                value["streamMode"] = json!(mode);
-            }
-            if self.config.audio.is_some() {
-                value["audio"] = json!(1);
-            }
-            start = value.to_string();
+        let wire = epoch.filter(|epoch| valid_epoch(epoch)).ok_or_else(|| {
+            Halt::from(NetError::Protocol(
+                "hello-ok without a valid mediaEpoch".into(),
+            ))
+        })?;
+        if let Some(mode) = &self.config.stream_mode {
+            signal.send(json!({"type":"media-control","action":"mode","protocol":4,"epoch":wire,"streamMode":mode,"reason":"signaling-start"}).to_string()).await?;
         }
-        signal.send(start).await?;
-        signal.send(first_frame_request(&request_id, &wire)).await?;
-        let first_frame_deadline = Instant::now() + self.timing.first_frame;
-
-        count(&self.stats.established);
-        self.backoff = Duration::ZERO;
-        self.ever_opened = true;
-        self.stats.set_state(NetState::Starting);
-
+        let request_id = new_request_id();
+        let rtc_selected = self.config.transport != TransportChoice::Wss
+            && !(self.config.transport == TransportChoice::Auto && self.remembered_rtc_failure);
         let mut link = Link {
             signal,
-            media,
+            media: None,
+            rtc: None,
             epoch: Epoch {
                 wire,
                 request_id,
-                codec,
-                host_present,
+                codec: self.config.codec,
+                host_present: true,
                 presented: false,
-                first_frame_deadline: self.config.video_watchdog.then_some(first_frame_deadline),
+                first_frame_deadline: None,
                 first_frame_retried: false,
                 first_frame_pending: false,
                 input_generation: None,
                 desktop_available: true,
                 desktop_enabled: true,
                 desktop_generation: None,
+                rtc_generation: 1,
+                rtc_require_admission: false,
+                rtc_admitted_timestamp: None,
             },
         };
-        self.serve(&mut link, signal_rx, media_rx).await
+        let mut media_rx = None;
+        if rtc_selected {
+            let loopback = url::Url::parse(endpoint.origin())
+                .is_ok_and(|u| matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")));
+            let mut peer = Peer::new(
+                self.config.transport,
+                self.config.ice_checking_timeout,
+                self.config.codec == Codec::Hevc,
+                &ice_servers,
+                loopback,
+                route_ip,
+            )
+            .await?;
+            link.signal
+                .send(json!({"type":"offer","sdp":peer.offer}).to_string())
+                .await?;
+            peer.offer_sent(Instant::now());
+            link.rtc = Some(peer);
+            link.signal
+                .send(rtc_first_frame_request(&link.epoch.request_id))
+                .await?;
+            let mut stats = self.stats.webrtc.lock().unwrap();
+            stats.enabled = true;
+            stats.ice_checking_timeout_ms =
+                Some(self.config.ice_checking_timeout.as_millis() as u64);
+            stats.selected_transport = Some("webrtc".into());
+            stats.state(self.local_epoch, "new", Instant::now(), self.started);
+        } else {
+            self.start_wss(endpoint, &mut link, &mut media_rx).await?;
+        }
+        count(&self.stats.established);
+        self.backoff = Duration::ZERO;
+        self.ever_opened = true;
+        self.stats.set_state(NetState::Starting);
+        self.serve(endpoint, &mut link, signal_rx, media_rx).await
+    }
+
+    async fn start_wss(
+        &mut self,
+        endpoint: &RelayEndpoint,
+        link: &mut Link,
+        media_rx: &mut Option<Source>,
+    ) -> Result<(), Halt> {
+        self.stats.set_state(NetState::MediaHandshake);
+        let query = format!("epoch={}", link.epoch.wire);
+        let socket = self
+            .handshake(open_socket(
+                endpoint,
+                self.config.cookies.cookie_header(),
+                "/media-ws",
+                Some(&query),
+            ))
+            .await?;
+        let (tx, mut rx) = socket.split();
+        let mut media = Lane::new(tx);
+        media.send(hello_message("media-client")).await?;
+        link.epoch.host_present = self
+            .handshake(await_media_ready(&mut rx, &self.stats))
+            .await?;
+        let mut value: Value =
+            serde_json::from_str(&start_message(&link.epoch.wire, link.epoch.codec))
+                .expect("locally encoded start");
+        if let Some(mode) = &self.config.stream_mode {
+            value["streamMode"] = json!(mode);
+        }
+        if self.config.audio.is_some() {
+            value["audio"] = json!(1);
+        }
+        link.signal.send(value.to_string()).await?;
+        link.epoch.request_id = new_request_id();
+        link.epoch.presented = false;
+        link.epoch.input_generation = None;
+        link.epoch.first_frame_retried = false;
+        link.signal
+            .send(first_frame_request(
+                &link.epoch.request_id,
+                &link.epoch.wire,
+            ))
+            .await?;
+        link.epoch.first_frame_deadline = self
+            .config
+            .video_watchdog
+            .then(|| Instant::now() + self.timing.first_frame);
+        link.media = Some(media);
+        *media_rx = Some(rx);
+        self.stats.set_state(NetState::Starting);
+        self.stats.webrtc.lock().unwrap().selected_transport = Some("wss".into());
+        Ok(())
+    }
+
+    async fn fallback_wss(
+        &mut self,
+        endpoint: &RelayEndpoint,
+        link: &mut Link,
+        media_rx: &mut Option<Source>,
+        reason: &str,
+    ) -> Result<(), Halt> {
+        if link.media.is_some() {
+            return Ok(());
+        }
+        let Some(peer) = link.rtc.as_mut() else {
+            return Ok(());
+        };
+        peer.startup.select_wss();
+        self.stats.webrtc.lock().unwrap().fallback(
+            reason,
+            Instant::now(),
+            self.started,
+            peer.offer_at,
+        );
+        self.remembered_rtc_failure = true;
+        if let Some(input) = self.config.input.clone() {
+            input.set_ready(false);
+        }
+        if let Some(audio) = &self.config.audio {
+            audio.reset_epoch(self.local_epoch);
+        }
+        self.reset_gate("webrtc-fallback");
+        // Keep the RTC peer as lifecycle/control anchor, as receiver.js:1472-1491.
+        self.start_wss(endpoint, link, media_rx).await
     }
 
     async fn serve(
         &mut self,
+        endpoint: &RelayEndpoint,
         link: &mut Link,
         mut signal_rx: Source,
-        mut media_rx: Source,
+        mut media_rx: Option<Source>,
     ) -> Result<(), Halt> {
-        let result = async {
+        let mut udp_buffer = vec![0; 65536];
+        let result=async {
             loop {
-                if self.stop_requested() {
-                    return Err(Halt::Stop);
-                }
-                let wake = tokio::select! {
-                    item = media_rx.next() => Wake::Media(item),
-                    item = signal_rx.next() => Wake::Signal(item),
-                    _ = sleep(self.timing.tick) => Wake::Tick,
-                    _ = async {
-                        if let Some(input) = &self.config.input { input.notify.notified().await; }
-                        else { std::future::pending::<()>().await; }
-                    } => Wake::Input,
+                if self.stop_requested(){return Err(Halt::Stop);}
+                // A terminal peer must stop receiving UDP even while its
+                // bookkeeping survives WSS takeover. In particular, Windows
+                // UDP connection-reset errors from the old endpoint must not
+                // tear down the surviving WebSocket session.
+                let udp=link.rtc.as_ref().filter(|p|p.rtc.is_alive()).map(|p|p.socket.clone());
+                let wait=link.rtc.as_ref().filter(|p|p.rtc.is_alive()).map_or(self.timing.tick,|p|p.wait(Instant::now()).min(self.timing.tick));
+                let wake=tokio::select! {
+                    item=async {match media_rx.as_mut(){Some(rx)=>rx.next().await,None=>std::future::pending().await}}=>Wake::Media(item),
+                    item=signal_rx.next()=>Wake::Signal(item),
+                    received=async {if let Some(socket)=udp {let (length,source)=socket.recv_from(&mut udp_buffer).await.map_err(|e|NetError::Socket(e.to_string()))?;Ok::<_,NetError>((udp_buffer[..length].to_vec(),source))}else{std::future::pending().await}}=>{
+                        let (bytes,source)=received?;Wake::Udp(bytes,source)
+                    },
+                    _=sleep(wait)=>Wake::Tick,
+                    _=async {if let Some(input)=&self.config.input {input.notify.notified().await;} else {std::future::pending::<()>().await;}}=>Wake::Input,
                 };
                 match wake {
-                    Wake::Media(item) => {
-                        let inbound = classify(item, "media")?;
-                        link.media.last_seen = Instant::now();
-                        self.on_media(link, inbound).await?;
+                    Wake::Media(item)=> {let inbound=classify(item,"media")?;if let Some(media)=&mut link.media {media.last_seen=Instant::now();}self.on_media(link,inbound).await?;},
+                    Wake::Signal(item)=> {let inbound=classify(item,"signal")?;link.signal.last_seen=Instant::now();self.on_signal(link,inbound)?;},
+                    Wake::Udp(bytes,source)=> {if let Some(peer)=&mut link.rtc {if !peer.datagram(&bytes,source)? {self.stats.webrtc.lock().unwrap().rejected_datagrams+=1;}}},
+                    Wake::Tick|Wake::Input=>{},
+                }
+                if let Some(peer)=&mut link.rtc {
+                    let events=peer.pump().await?;
+                    for event in events {
+                        if let Some(reason)=self.on_rtc_event(link,event).await? {self.fallback_wss(endpoint,link,&mut media_rx,reason).await?;}
                     }
-                    Wake::Signal(item) => {
-                        let inbound = classify(item, "signal")?;
-                        link.signal.last_seen = Instant::now();
-                        self.on_signal(link, inbound)?;
+                }
+                if let Some(peer)=&mut link.rtc {
+                    for candidate in std::mem::take(&mut peer.trickle) {link.signal.send(json!({"type":"ice","candidate":candidate}).to_string()).await?;}
+                    let mut stats=self.stats.webrtc.lock().unwrap();stats.stun_requests=peer.stun_requests;stats.srflx_candidates=peer.srflx_count;
+                }
+                if link.media.is_none() {
+                    let actions=link.rtc.as_mut().map(|p|p.startup.tick(Instant::now())).unwrap_or_default();
+                    for action in actions {
+                        match action {
+                            Action::Fallback(reason)=>self.fallback_wss(endpoint,link,&mut media_rx,reason).await?,
+                            Action::RetryFirstFrame=> {
+                                self.stats.webrtc.lock().unwrap().first_frame_retries+=1;
+                                link.signal.send(rtc_first_frame_request(&link.epoch.request_id)).await?;
+                                link.signal.send(rtc_first_frame_keyframe(link.epoch.codec)).await?;
+                                if let Some(peer)=&mut link.rtc {let _=peer.keyframe();}
+                            },
+                            Action::FirstFrameFailed=>self.stats.webrtc.lock().unwrap().first_frame_failures+=1,
+                        }
                     }
-                    Wake::Tick | Wake::Input => {}
                 }
                 self.tick(link).await?;
             }
-        }
-        .await;
-        // A media drop leaves /ws writable; release there before reconnect.
-        // If /ws itself died, delivery cannot be proved. The next epoch starts
-        // with release-all, and the host releases when its peer disconnects.
-        if let Some(input) = &self.config.input {
+        }.await;
+        if let Some(input) = self.config.input.clone() {
             input.set_ready(false);
-            if timeout(SHUTDOWN_CLOSE, link.signal.send_binary(vec![6]))
+            if self
+                .send_input_packet(link, vec![6])
                 .await
-                .is_ok_and(|result| result.is_ok())
+                .is_ok_and(|sent| sent)
             {
                 input.sent(true);
             }
         }
         if matches!(result, Err(Halt::Stop)) {
-            self.shutdown(link, &mut signal_rx, &mut media_rx).await;
+            if let Some(rx) = media_rx.as_mut() {
+                self.shutdown(link, &mut signal_rx, rx).await;
+            } else {
+                close_lane(&mut link.signal, &mut signal_rx).await;
+            }
+        }
+        if let Some(peer) = &mut link.rtc {
+            peer.rtc.disconnect();
         }
         result
     }
@@ -572,7 +702,7 @@ impl Session {
         // Send normal close frames, then read the peer's close replies. Both
         // lanes close concurrently, adding at most SHUTDOWN_CLOSE to exit.
         tokio::join!(
-            close_lane(&mut link.media, media_rx),
+            close_lane(link.media.as_mut().expect("WSS media lane"), media_rx),
             close_lane(&mut link.signal, signal_rx),
         );
     }
@@ -645,6 +775,8 @@ impl Session {
         // ACK before the gate: every valid frame is acknowledged, dropped or not.
         let recv_ts_ms = self.started.elapsed().as_secs_f64() * 1000.0;
         link.media
+            .as_mut()
+            .expect("WSS media lane")
             .send(ack_message(
                 header.generation,
                 header.seq,
@@ -704,6 +836,48 @@ impl Session {
                 if let Some(message) = relay_error(&text) {
                     return Err(Halt::from(NetError::RelayError(message)));
                 }
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    match value["type"].as_str() {
+                        Some("answer") => {
+                            if let (Some(peer), Some(sdp)) = (&mut link.rtc, value["sdp"].as_str())
+                            {
+                                peer.answer(sdp)?;
+                            }
+                            return Ok(());
+                        }
+                        Some("ice") => {
+                            if let (Some(peer), Some(candidate)) =
+                                (&mut link.rtc, value["candidate"].as_str())
+                            {
+                                if peer.candidate(candidate).is_err() {
+                                    self.stats.webrtc.lock().unwrap().malformed_candidates += 1;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Some("first-frame") if value["requestId"] == link.epoch.request_id => {
+                            if value["phase"] == "admitted" {
+                                if let Some(peer) = &mut link.rtc {
+                                    peer.startup.progress(Instant::now());
+                                }
+                                link.epoch.rtc_admitted_timestamp = value["rtpTimestamp"]
+                                    .as_u64()
+                                    .and_then(|v| u32::try_from(v).ok());
+                                if let Some(generation) = value["generation"]
+                                    .as_u64()
+                                    .and_then(|v| u32::try_from(v).ok())
+                                {
+                                    link.epoch.rtc_generation = generation;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Some("peer-left") => {
+                            return Err(Halt::from(NetError::Socket("host left session".into())))
+                        }
+                        _ => {}
+                    }
+                }
                 if self.input_control(link, &text) {
                     return Ok(());
                 }
@@ -756,6 +930,15 @@ impl Session {
                     .regate_desktop(value["generation"].as_u64(), self.timing.first_frame)
                 {
                     self.reset_gate("desktop-state");
+                    if let Some(peer) = &mut link.rtc {
+                        peer.startup.ready = false;
+                        peer.startup.request_sent(Instant::now());
+                        // A new desktop generation requires the host's RTP
+                        // admission boundary; buffered old desktop media must
+                        // never reopen native input on the new desktop.
+                        link.epoch.rtc_require_admission = link.epoch.desktop_generation.is_some();
+                        link.epoch.rtc_admitted_timestamp = None;
+                    }
                 }
                 true
             }
@@ -771,11 +954,12 @@ impl Session {
             && link.epoch.desktop_available
             && link.epoch.desktop_enabled
             && link.epoch.input_generation.is_some()
-            && link.epoch.input_generation == self.gate_generation;
+            && link.epoch.input_generation == self.gate_generation
+            && (link.media.is_some() || link.rtc.as_ref().is_some_and(Peer::lanes_ready));
         let was_ready = input.snapshot().ready;
         input.set_ready(ready);
         if was_ready && !ready {
-            link.signal.send_binary(vec![6]).await?;
+            self.send_input_packet(link, vec![6]).await?;
             input.sent(true);
         }
         if ready {
@@ -789,11 +973,333 @@ impl Session {
                 if absolute {
                     input.absolute_sent(&packet, sent_at);
                 }
-                link.signal.send_binary(packet).await?;
-                input.sent(release);
+                if self.send_input_packet(link, packet.clone()).await? {
+                    input.sent(release);
+                } else {
+                    if absolute {
+                        input.absolute_unsent(&packet);
+                    }
+                    input.retry_front(packet);
+                    break;
+                }
             }
         }
         Ok(())
+    }
+
+    async fn send_input_packet(&mut self, link: &mut Link, packet: Vec<u8>) -> Result<bool, Halt> {
+        let framed = super::webrtc::channels::frame_outbound(&packet)
+            .map_err(|e| Halt::from(NetError::Protocol(e.to_string())))?;
+        let motion = framed.lane == super::webrtc::channels::Lane::Motion;
+        if let Some(peer) = &mut link.rtc {
+            if peer.send_input(framed.bytes, motion)? {
+                let mut stats = self.stats.webrtc.lock().unwrap();
+                if motion {
+                    stats.input_motion_sent += 1;
+                } else {
+                    stats.input_control_sent += 1;
+                }
+                return Ok(true);
+            }
+        }
+        if link.media.is_some() {
+            link.signal.send_binary(packet).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn on_rtc_event(
+        &mut self,
+        link: &mut Link,
+        event: RtcEvent,
+    ) -> Result<Option<&'static str>, Halt> {
+        let now = Instant::now();
+        match event {
+            RtcEvent::IceConnectionStateChange(state) => {
+                let name = match state {
+                    IceConnectionState::New => "new",
+                    IceConnectionState::Checking => "checking",
+                    IceConnectionState::Connected => "connected",
+                    IceConnectionState::Completed => "completed",
+                    IceConnectionState::Disconnected => "disconnected",
+                };
+                self.stats
+                    .webrtc
+                    .lock()
+                    .unwrap()
+                    .state(self.local_epoch, name, now, self.started);
+                if let Some(peer) = &mut link.rtc {
+                    peer.startup.ice_connected = matches!(
+                        state,
+                        IceConnectionState::Connected | IceConnectionState::Completed
+                    );
+                    peer.startup.progress(now);
+                    if state == IceConnectionState::Disconnected {
+                        peer.control = None;
+                        peer.motion = None;
+                        if let Some(Action::Fallback(reason)) = peer.startup.terminal() {
+                            peer.rtc.disconnect();
+                            return Ok(Some(reason));
+                        }
+                        if link.media.is_none() {
+                            return Err(Halt::from(NetError::Socket("RTC disconnected".into())));
+                        }
+                        peer.rtc.disconnect();
+                    }
+                }
+            }
+            RtcEvent::Connected => {
+                if let Some(peer) = &mut link.rtc {
+                    peer.startup.peer_connected = true;
+                    peer.startup.ice_connected = true;
+                    if peer.startup.connected(now) {
+                        link.epoch.request_id = new_request_id();
+                        link.signal
+                            .send(rtc_first_frame_request(&link.epoch.request_id))
+                            .await?;
+                    }
+                }
+            }
+            RtcEvent::ChannelOpen(id, label) => {
+                if let Some(peer) = &mut link.rtc {
+                    match super::webrtc::channels::lane_for_label(&label) {
+                        Some(super::webrtc::channels::Lane::Control) => peer.control = Some(id),
+                        Some(super::webrtc::channels::Lane::Motion) => peer.motion = Some(id),
+                        _ => {}
+                    }
+                    peer.startup.progress(now);
+                }
+            }
+            RtcEvent::ChannelClose(id) => {
+                if let Some(peer) = &mut link.rtc {
+                    if peer.control == Some(id) {
+                        peer.control = None;
+                    }
+                    if peer.motion == Some(id) {
+                        peer.motion = None;
+                    }
+                    if link.media.is_some() {
+                        peer.rtc.disconnect();
+                    } else {
+                        return Err(Halt::from(NetError::Socket("RTC input lane closed".into())));
+                    }
+                }
+            }
+            RtcEvent::ChannelData(data) => {
+                let label = link.rtc.as_ref().and_then(|p| {
+                    if p.control == Some(data.id) {
+                        Some(super::webrtc::channels::Lane::Control.label())
+                    } else if p.motion == Some(data.id) {
+                        Some(super::webrtc::channels::Lane::Motion.label())
+                    } else {
+                        None
+                    }
+                });
+                if label.is_some_and(|label| {
+                    super::webrtc::channels::accept_inbound(label, data.binary).is_some()
+                }) {
+                    if let Some(input) = &self.config.input {
+                        let _ = input.receive(&data.data);
+                    }
+                }
+            }
+            RtcEvent::PeerStats(stats) => {
+                if let Some(peer) = &mut link.rtc {
+                    peer.startup.stats_available = true;
+                    let mut output = self.stats.webrtc.lock().unwrap();
+                    output.rtt_ms = stats.rtt.map(|t| t.as_secs_f64() * 1000.0);
+                    if let Some(pair) = stats.selected_candidate_pair {
+                        output.selected_candidate_pair_type =
+                            Some(peer.pair_type(pair.local.addr, pair.remote.addr));
+                        output.rtt_ms = pair
+                            .current_round_trip_time
+                            .map(|t| t.as_secs_f64() * 1000.0)
+                            .or(output.rtt_ms);
+                    }
+                }
+            }
+            RtcEvent::MediaIngressStats(stats) => {
+                if let Some(peer) = &mut link.rtc {
+                    let mut output = self.stats.webrtc.lock().unwrap();
+                    let target = if stats.mid == peer.video_mid {
+                        &mut output.video
+                    } else if stats.mid == peer.audio_mid {
+                        &mut output.audio
+                    } else {
+                        return Ok(None);
+                    };
+                    target.nacks = target.nacks.max(stats.nacks);
+                    target.plis = target.plis.max(stats.plis);
+                    target.firs = target.firs.max(stats.firs);
+                    target.loss_fraction = stats.loss;
+                }
+            }
+            RtcEvent::RtpPacket(packet) => self.on_rtp(link, packet)?,
+            RtcEvent::Closed => {
+                if let Some(peer) = &mut link.rtc {
+                    peer.control = None;
+                    peer.motion = None;
+                    if let Some(Action::Fallback(reason)) = peer.startup.terminal() {
+                        peer.rtc.disconnect();
+                        return Ok(Some(reason));
+                    }
+                    if link.media.is_none() {
+                        return Err(Halt::from(NetError::Socket("RTC closed".into())));
+                    }
+                    peer.rtc.disconnect();
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn on_rtp(&mut self, link: &mut Link, packet: str0m::rtp::RtpPacket) -> Result<(), Halt> {
+        let Some(peer) = &mut link.rtc else {
+            return Ok(());
+        };
+        if peer.audio_pt == Some(packet.header.payload_type) {
+            {
+                let mut stats = self.stats.webrtc.lock().unwrap();
+                stats.audio.packets += 1;
+                stats.audio.bytes += packet.payload.len() as u64;
+                self.rtp_ingress.audio_tracker.packet(
+                    *packet.seq_no,
+                    packet.header.timestamp,
+                    48000.0,
+                    packet.timestamp,
+                    &mut stats.audio,
+                );
+            }
+            if link.media.is_none() {
+                if let Some(audio) = &self.config.audio {
+                    audio.push_rtp(
+                        self.local_epoch,
+                        *packet.seq_no,
+                        packet
+                            .time
+                            .rebase(str0m::media::Frequency::FORTY_EIGHT_KHZ)
+                            .numer(),
+                        &packet.payload,
+                        packet.timestamp,
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let Some(codec) = peer.video_codecs.get(&packet.header.payload_type).copied() else {
+            return Ok(());
+        };
+        {
+            let mut stats = self.stats.webrtc.lock().unwrap();
+            stats.video.packets += 1;
+            stats.video.bytes += packet.payload.len() as u64;
+            self.rtp_ingress.video_tracker.packet(
+                *packet.seq_no,
+                packet.header.timestamp,
+                90000.0,
+                packet.timestamp,
+                &mut stats.video,
+            );
+        }
+        peer.startup.video_packets += 1;
+        peer.startup.video_bytes += packet.payload.len() as u64;
+        if link.media.is_some() {
+            return Ok(());
+        }
+        link.epoch.codec = codec;
+        let (units, changed, dropped) = self.rtp_ingress.push(codec, &packet);
+        if changed {
+            self.reset_gate("rtp-stream-change");
+        }
+        if dropped > 0 {
+            self.stats.webrtc.lock().unwrap().depacketization_drops += dropped;
+            self.reset_gate("rtp-loss");
+            self.pending_keyframe = Some("rtp-loss".into());
+        }
+        for unit in units {
+            self.admit_rtc_unit(link, codec, unit)?;
+        }
+        Ok(())
+    }
+
+    fn admit_rtc_unit(
+        &mut self,
+        link: &mut Link,
+        codec: Codec,
+        unit: super::webrtc::ingress::Unit,
+    ) -> Result<(), Halt> {
+        self.stats.record_received(unit.received_at);
+        if link.epoch.rtc_require_admission
+            && !link
+                .epoch
+                .rtc_admitted_timestamp
+                .is_some_and(|admitted| (unit.au.rtp_timestamp.wrapping_sub(admitted) as i32) >= 0)
+        {
+            self.stats.record_gate_drop();
+            self.pending_keyframe = Some("rtc-admission".into());
+            return Ok(());
+        }
+        let Some(geometry) = unit.au.geometry else {
+            self.stats.record_gate_drop();
+            self.pending_keyframe = Some("rtp-no-sps".into());
+            return Ok(());
+        };
+        let (Ok(width), Ok(height)) = (
+            u16::try_from(geometry.display_width),
+            u16::try_from(geometry.display_height),
+        ) else {
+            return Ok(());
+        };
+        let header = super::protocol::FrameHeader {
+            codec,
+            key: unit.au.keyframe,
+            refine: false,
+            generation: link.epoch.rtc_generation,
+            seq: unit.seq,
+            capture_ts_us: u64::from(unit.au.rtp_timestamp) * 1_000_000 / 90_000,
+            width,
+            height,
+        };
+        match self.gate.accept(&header) {
+            GateVerdict::Decode => {
+                self.gate_generation = Some(header.generation);
+                if header.key {
+                    self.pending_keyframe = None;
+                }
+                if let Some(input) = &self.config.input {
+                    input.dimensions(u32::from(width), u32::from(height));
+                }
+                self.stats.set_state(NetState::Streaming);
+                self.offer_frame(VideoFrame {
+                    local_epoch: self.local_epoch,
+                    codec,
+                    key: header.key,
+                    refine: false,
+                    generation: header.generation,
+                    seq: header.seq,
+                    capture_ts_us: header.capture_ts_us,
+                    width,
+                    height,
+                    data: unit.au.annex_b,
+                    received_at: unit.received_at,
+                })
+            }
+            GateVerdict::Drop {
+                invalidated,
+                request,
+            } => {
+                self.stats.record_gate_drop();
+                if invalidated {
+                    self.gate_generation = None;
+                    self.decoded_seq = None;
+                    self.pending_reset = Some(request.clone());
+                }
+                self.pending_keyframe = Some(request);
+                Ok(())
+            }
+        }
     }
 
     /// Per-tick work: feedback, pending reset and keyframe, heartbeats, dead
@@ -802,13 +1308,32 @@ impl Session {
         if self.stop_requested() {
             return Err(Halt::Stop);
         }
+        // A bounded packet reorder window must also release an idle, incomplete
+        // access unit. Live frames normally resolve gaps on the next timestamp;
+        // this only expires assembly when RTP itself has gone quiet.
+        if link.media.is_none()
+            && self
+                .rtp_ingress
+                .last_video
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(100))
+        {
+            let (units, dropped) = self.rtp_ingress.flush();
+            if dropped > 0 {
+                self.stats.webrtc.lock().unwrap().depacketization_drops += dropped;
+                self.reset_gate("rtp-stalled-assembly");
+                self.pending_keyframe = Some("rtp-stalled-assembly".into());
+            }
+            for unit in units {
+                self.admit_rtc_unit(link, link.epoch.codec, unit)?;
+            }
+        }
         if std::mem::take(&mut link.epoch.first_frame_pending) {
-            link.signal
-                .send(first_frame_request(
-                    &link.epoch.request_id,
-                    &link.epoch.wire,
-                ))
-                .await?;
+            let request = if link.media.is_some() {
+                first_frame_request(&link.epoch.request_id, &link.epoch.wire)
+            } else {
+                rtc_first_frame_request(&link.epoch.request_id)
+            };
+            link.signal.send(request).await?;
             self.pending_keyframe = Some("desktop-state".into());
         }
         self.drain_feedback(link).await?;
@@ -820,16 +1345,22 @@ impl Session {
         if now.duration_since(link.signal.last_seen) >= self.timing.dead {
             return Err(Halt::from(NetError::Stalled("signal")));
         }
-        if now.duration_since(link.media.last_seen) >= self.timing.dead {
+        if link
+            .media
+            .as_ref()
+            .is_some_and(|m| now.duration_since(m.last_seen) >= self.timing.dead)
+        {
             return Err(Halt::from(NetError::Stalled("media")));
         }
         if now.duration_since(link.signal.last_sent) >= self.timing.heartbeat {
             link.signal.send(ping_message()).await?;
             count(&self.stats.heartbeats_sent);
         }
-        if now.duration_since(link.media.last_sent) >= self.timing.heartbeat {
-            link.media.send(ping_message()).await?;
-            count(&self.stats.heartbeats_sent);
+        if let Some(media) = &mut link.media {
+            if now.duration_since(media.last_sent) >= self.timing.heartbeat {
+                media.send(ping_message()).await?;
+                count(&self.stats.heartbeats_sent);
+            }
         }
         self.check_first_frame(link).await
     }
@@ -865,12 +1396,31 @@ impl Session {
                 count(&self.stats.decoded);
                 self.stats.last_decoded_seq.store(u64::from(seq), Relaxed);
                 self.decoded_seq = Some(seq);
+                if let Some(peer) = &mut link.rtc {
+                    if link.media.is_none() {
+                        peer.startup.decoded();
+                        self.remembered_rtc_failure = false;
+                    }
+                }
+                if self.config.headless_decoded_ready {
+                    link.epoch.input_generation = Some(generation);
+                    link.epoch.first_frame_deadline = None;
+                    if let Some(peer) = &mut link.rtc {
+                        peer.startup.presented();
+                    }
+                }
             }
             DecoderFeedback::Presented { generation, .. } => {
                 if self.gate_generation != Some(generation) {
                     return Ok(());
                 }
                 link.epoch.input_generation = Some(generation);
+                if link.media.is_none() {
+                    if let Some(peer) = &mut link.rtc {
+                        peer.startup.presented();
+                        self.remembered_rtc_failure = false;
+                    }
+                }
                 link.epoch.first_frame_deadline = None;
                 if !link.epoch.presented {
                     link.epoch.presented = true;
@@ -898,7 +1448,14 @@ impl Session {
             return Ok(());
         }
         if let Some(reason) = self.pending_keyframe.take() {
-            link.media.send(keyframe_message(&reason)).await?;
+            if let Some(media) = &mut link.media {
+                media.send(keyframe_message(&reason)).await?;
+            } else {
+                link.signal.send(json!({"type":"media-control","action":"keyframe","protocol":4,"epoch":link.epoch.wire,"reason":reason,"codec":link.epoch.codec.wire_name()}).to_string()).await?;
+                if let Some(peer) = &mut link.rtc {
+                    let _ = peer.keyframe();
+                }
+            }
             self.stats.record_keyframe();
         }
         Ok(())
@@ -907,6 +1464,9 @@ impl Session {
     /// The first-frame watchdog: one resend of the request and a
     /// `first-frame-timeout` keyframe, then a reconnect.
     async fn check_first_frame(&mut self, link: &mut Link) -> Result<(), Halt> {
+        if link.media.is_none() {
+            return Ok(());
+        }
         let Some(deadline) = link.epoch.first_frame_deadline else {
             return Ok(());
         };
@@ -1075,7 +1635,7 @@ async fn await_hello_ok(
     source: &mut Source,
     stats: &TransportStats,
     label: &str,
-) -> Result<Option<String>, NetError> {
+) -> Result<(Option<String>, Value), NetError> {
     loop {
         match classify(source.next().await, label)? {
             Inbound::Text(text) => {
@@ -1083,7 +1643,14 @@ async fn await_hello_ok(
                     return Err(NetError::RelayError(message));
                 }
                 match parse_relay_control(&text) {
-                    Some(RelayControl::HelloOk { media_epoch }) => return Ok(media_epoch),
+                    Some(RelayControl::HelloOk { media_epoch }) => {
+                        return Ok((
+                            media_epoch,
+                            serde_json::from_str::<Value>(&text).unwrap_or(Value::Null)
+                                ["iceServers"]
+                                .clone(),
+                        ))
+                    }
                     _ => count(&stats.rejected_controls),
                 }
             }
@@ -1127,9 +1694,31 @@ fn relay_error(text: &str) -> Option<String> {
     )
 }
 
+fn rtc_first_frame_request(request_id: &str) -> String {
+    json!({"type":"first-frame","protocol":1,"phase":"request","requestId":request_id,"transport":"webrtc"}).to_string()
+}
+fn rtc_first_frame_keyframe(codec: Codec) -> String {
+    // receiver.js:342 uses firstFrameHandshake.epoch, which is null for RTC.
+    json!({"type":"media-control","action":"keyframe","protocol":4,"epoch":null,
+        "reason":"first-frame-timeout","codec":codec.wire_name()})
+    .to_string()
+}
+
 #[cfg(test)]
 mod input_readiness_tests {
     use super::*;
+    #[test]
+    fn rtc_first_frame_messages_match_browser_epoch_and_retry_reason() {
+        let request: Value =
+            serde_json::from_str(&rtc_first_frame_request("test-request")).unwrap();
+        assert_eq!(request["transport"], "webrtc");
+        assert!(request.get("epoch").is_none());
+        let retry: Value = serde_json::from_str(&rtc_first_frame_keyframe(Codec::H264)).unwrap();
+        assert!(retry["epoch"].is_null());
+        assert_eq!(retry["reason"], "first-frame-timeout");
+        assert_eq!(retry["protocol"], 4);
+        assert_eq!(retry["codec"], "h264");
+    }
     #[test]
     fn desktop_state_reuses_inflight_but_never_completed_or_unavailable_presentation() {
         let mut epoch = Epoch {
@@ -1145,6 +1734,9 @@ mod input_readiness_tests {
             desktop_available: true,
             desktop_enabled: true,
             desktop_generation: Some(7),
+            rtc_generation: 1,
+            rtc_require_admission: false,
+            rtc_admitted_timestamp: None,
         };
         assert!(!epoch.regate_desktop(Some(7), Duration::from_secs(10)));
         assert_eq!(epoch.request_id, "original");

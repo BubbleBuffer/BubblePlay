@@ -25,6 +25,7 @@ fn meta(injections: Injections) -> RunMeta {
         bind: String::new(),
         injections,
         audio: None,
+        rtc: None,
     }
 }
 

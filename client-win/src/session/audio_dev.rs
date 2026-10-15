@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_json::json;
 
 use super::{options::CodecChoice, DevOptions};
@@ -40,38 +40,9 @@ fn require_device_opt_in() -> Result<()> {
 }
 
 fn decoder_probe(options: &DevOptions) -> Result<()> {
-    use windows::Win32::Graphics::{
-        Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
-        Direct3D11::{
-            D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            D3D11_SDK_VERSION,
-        },
-    };
     let _runtime = crate::media::MediaRuntime::new()?;
-    let mut device = None;
-    // The same hardware-first selection as the shell, with no window creation.
-    for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
-        let result = unsafe {
-            D3D11CreateDevice(
-                None,
-                driver,
-                Default::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            )
-        };
-        if result.is_ok() {
-            break;
-        }
-        if driver == D3D_DRIVER_TYPE_WARP {
-            result.context("create headless D3D11 device")?;
-        }
-    }
-    let device = device.context("D3D11CreateDevice returned no device")?;
+    // The same hardware-first device as the headless session, with no window creation.
+    let device = super::headless::create_device()?;
     let request = match options.codec {
         CodecChoice::Auto => crate::media::CodecRequest::Auto,
         CodecChoice::H264 => crate::media::CodecRequest::Explicit(crate::media::Codec::H264),
@@ -122,6 +93,10 @@ fn receive(options: &DevOptions) -> Result<()> {
     let mut config = net::NetConfig::new(endpoint, net::Codec::H264, net::CookieJar::new());
     config.audio = Some(control.clone());
     config.video_watchdog = false;
+    config.transport = options.transport;
+    config.ice_checking_timeout = options
+        .ice_timeout
+        .unwrap_or(net::AUTO_ICE_CHECKING_TIMEOUT);
     let transport = Arc::new(net::TransportStats::new());
     let stop = Arc::new(AtomicBool::new(false));
     let (events_tx, events) = mpsc::sync_channel(8);
@@ -157,8 +132,10 @@ fn receive(options: &DevOptions) -> Result<()> {
     let document = json!({
         "pass":pass,"headless":true,"sink":if options.audio_wasapi {"wasapi"} else {"fake"},
         "duration_s":started.elapsed().as_secs_f64(),"audio":audio,
-        "transport":{"attempts":net.attempts,"established":net.established,"local_epoch":net.local_epoch,
-            "video_received":net.frames_received,"video_acks":net.acks_sent,"keyframe_requests":net.keyframe_requests},
+        "transport":{"requested":format!("{:?}", options.transport),
+            "attempts":net.attempts,"established":net.established,"local_epoch":net.local_epoch,
+            "video_received":net.frames_received,"video_acks":net.acks_sent,"keyframe_requests":net.keyframe_requests,
+            "webrtc":transport.webrtc_snapshot()},
         "errors":result.as_ref().err().map(|e| e.to_string()),
     });
     super::write_dev_report(options, &document)?;

@@ -28,6 +28,7 @@ use crate::model::{
     Action, Counters, Emitted, Injections, Model, ModelConfig, Recovery, Source, StartOutcome,
 };
 use crate::protocol::{self, ClientMessage};
+use crate::rtc;
 use crate::signal::{self, MediaControl, Signal};
 
 const EVENT_DEPTH: usize = 1024;
@@ -55,6 +56,8 @@ pub struct ServerConfig {
     pub input_record: Option<PathBuf>,
     /// The audio lane's script, when `--audio` is given.
     pub audio: Option<Script>,
+    /// The WebRTC answerer, when `--webrtc` is given.
+    pub rtc: Option<rtc::Knobs>,
 }
 
 /// Everything the report needs, taken once the hub has finished.
@@ -68,6 +71,8 @@ pub struct Snapshot {
     pub hard_stop: bool,
     /// `None` when the run has no audio lane.
     pub audio: Option<AudioCounters>,
+    /// One report per RTC session, in the order they ended. Empty without `--webrtc`.
+    pub rtc: Vec<rtc::Report>,
 }
 
 pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
@@ -119,7 +124,17 @@ struct Conn {
 
 struct FirstFrame {
     request_id: String,
-    ready_sent: bool,
+    /// The answer (admitted, or ready on WSS) has been sent for this request.
+    answered: bool,
+}
+
+/// The keyframe the RTC session admitted: its first RTP packet has left.
+#[derive(Debug, Clone, Copy)]
+struct RtcIdr {
+    session: u64,
+    generation: u32,
+    rtp_timestamp: u32,
+    codec: &'static str,
 }
 
 /// Progress through `cursor::SCRIPT`, armed by an accepted `start`.
@@ -127,6 +142,19 @@ struct FirstFrame {
 struct CursorScript {
     armed: Instant,
     next: usize,
+}
+
+/// What a new RTC session is built from.
+struct RtcSettings {
+    knobs: rtc::Knobs,
+    sources: Vec<Arc<dyn Source>>,
+    fps: u32,
+}
+
+/// The one RTC session `/ws` currently owns. Its pump is joined by the hub.
+struct RtcSession {
+    id: u64,
+    commands: mpsc::Sender<rtc::Command>,
 }
 
 struct Hub {
@@ -154,6 +182,20 @@ struct Hub {
     /// A protocol-4 start with `audio:1` opted this media epoch in. It stays
     /// set across media reattaches and is cleared with the epoch.
     audio_wanted: bool,
+    /// The RTC answerer, when the run has one.
+    rtc: Option<RtcSettings>,
+    rtc_session: Option<RtcSession>,
+    rtc_next_id: u64,
+    rtc_tasks: JoinSet<rtc::Report>,
+    rtc_notices: rtc::Notices,
+    rtc_reports: Vec<rtc::Report>,
+    /// Ends the current RTC session once, this far into the run.
+    rtc_drop_at: Option<Duration>,
+    /// A WSS `start` took over: the RTC session stops its media but stays up.
+    /// Cleared by the next offer.
+    rtc_media_stopped: bool,
+    /// The keyframe the current RTC session admitted, if one has left.
+    rtc_idr: Option<RtcIdr>,
 }
 
 impl Hub {
@@ -184,8 +226,9 @@ impl Hub {
         self.model.counters.rejected_control += 1;
     }
 
-    /// Record one binary message from `/ws`, with the epoch current at receipt.
-    fn record_input(&mut self, bytes: &[u8], now: Instant) {
+    /// Record one binary message, with the epoch current at receipt. `channel`
+    /// is `ws` for `/ws` and the data channel's label for RTC.
+    fn record_input(&mut self, bytes: &[u8], channel: &str, now: Instant) {
         if self.recorder.is_none() {
             return;
         }
@@ -195,6 +238,7 @@ impl Hub {
             .map_or(0, |since| since.as_millis());
         let received = Received {
             epoch: self.epoch.as_deref(),
+            channel,
             received_ms,
             unix_ms,
             bytes,
@@ -205,6 +249,18 @@ impl Hub {
         if let Err(error) = recorder.record(received) {
             self.recorder = None;
             self.record_error = Some(format!("cannot record input: {error}"));
+        }
+    }
+
+    /// A channel opening or the RTC session ending, as a non-packet line.
+    fn record_lifecycle(&mut self, event: &str, channel: Option<&str>, now: Instant) {
+        let received_ms = self.elapsed(now).as_secs_f64() * 1000.0;
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        if let Err(error) = recorder.lifecycle(self.epoch.as_deref(), event, channel, received_ms) {
+            self.recorder = None;
+            self.record_error = Some(format!("cannot record lifecycle: {error}"));
         }
     }
     fn input_disconnected(&mut self, reason: &str, now: Instant) {
@@ -269,9 +325,16 @@ impl Hub {
         lane.produce(now);
         let conns = &self.conns;
         lane.deliver(|bytes| {
-            conns
-                .get(&media)
-                .is_some_and(|conn| conn.out.try_send(Outbound::Binary(bytes)).is_ok())
+            let Some(conn) = conns.get(&media) else {
+                return audio::Delivery::Gone;
+            };
+            match conn.out.try_send(Outbound::Binary(bytes)) {
+                Ok(()) => audio::Delivery::Sent,
+                // The writer task has exited: the peer closed its socket, and
+                // the hub has not processed that close yet.
+                Err(mpsc::error::TrySendError::Closed(_)) => audio::Delivery::Gone,
+                Err(mpsc::error::TrySendError::Full(_)) => audio::Delivery::Refused,
+            }
         });
     }
 
@@ -309,7 +372,7 @@ impl Hub {
                         if !crate::input_record::classify(&bytes).valid {
                             self.reject();
                         }
-                        self.record_input(&bytes, now);
+                        self.record_input(&bytes, "ws", now);
                     } else {
                         self.reject();
                     }
@@ -334,6 +397,7 @@ impl Hub {
         }
         if self.signal == Some(id) {
             self.input_disconnected("signal-closed", Instant::now());
+            self.end_rtc("signal-closed");
             self.detach_media("signal-closed");
             self.audio_wanted = false;
             self.signal = None;
@@ -341,6 +405,181 @@ impl Hub {
             self.first_frame = None;
             self.cursor = None;
             self.set_epoch(None);
+        }
+    }
+
+    /// Ends the RTC session, if any. The pump reports `reason` as its end and
+    /// its socket closes; the browser sees the session go.
+    fn end_rtc(&mut self, reason: &'static str) {
+        if let Some(session) = self.rtc_session.take() {
+            let _ = session.commands.try_send(rtc::Command::End(reason));
+        }
+    }
+
+    fn count_unhandled(&mut self, kind: &str) {
+        *self
+            .model
+            .counters
+            .unhandled_control
+            .entry(kind.to_owned())
+            .or_insert(0) += 1;
+    }
+
+    /// A browser offer starts a new RTC session. Without `--webrtc` it is only
+    /// counted, as any other unknown control is.
+    fn on_offer(&mut self, sdp: String) {
+        if self.rtc.is_none() {
+            return self.count_unhandled("offer");
+        }
+        self.end_rtc("superseded");
+        let Some((knobs, fps, sources)) = self
+            .rtc
+            .as_ref()
+            .map(|settings| (settings.knobs, settings.fps, settings.sources.clone()))
+        else {
+            return;
+        };
+        let id = self.rtc_next_id;
+        self.rtc_next_id += 1;
+        let (commands, command_rx) = mpsc::channel(rtc::COMMAND_DEPTH);
+        let session = rtc::Session {
+            sources,
+            fps,
+            knobs,
+            offer: sdp,
+        };
+        let notices = self.rtc_notices.clone();
+        self.rtc_tasks
+            .spawn(async move { rtc::run(session, id, command_rx, notices).await });
+        self.rtc_session = Some(RtcSession { id, commands });
+        self.rtc_media_stopped = false;
+        self.rtc_idr = None;
+    }
+
+    /// WSS took over: the RTC session stops writing media and stays connected,
+    /// as the browser keeps its peer and data channels alive.
+    fn stop_rtc_media(&mut self) {
+        self.rtc_media_stopped = true;
+        if let Some(session) = self.rtc_session.as_ref() {
+            let _ = session.commands.try_send(rtc::Command::StopMedia);
+        }
+    }
+
+    /// Whether the first-frame answer belongs to WebRTC: an RTC run whose media
+    /// has not been taken over by WSS. Such an answer waits for the keyframe.
+    fn rtc_lane(&self) -> bool {
+        self.rtc.is_some() && !self.rtc_media_stopped
+    }
+
+    /// Answers the pending WebRTC first-frame request with the admitted keyframe,
+    /// once. It is sent only when the keyframe's first RTP packet has left, so a
+    /// request that arrives earlier waits, and a retry after the admission
+    /// joins that same keyframe.
+    fn first_frame_admitted_rtc(&mut self, id: u64) {
+        let Some(idr) = self.rtc_idr else { return };
+        let current = self.rtc_session.as_ref().map(|session| session.id);
+        if current != Some(idr.session) {
+            return;
+        }
+        let Some(ff) = self.first_frame.as_mut() else {
+            return;
+        };
+        if ff.answered {
+            return;
+        }
+        ff.answered = true;
+        let msg = protocol::first_frame_admitted_rtc(
+            &ff.request_id,
+            idr.generation,
+            idr.rtp_timestamp,
+            idr.codec,
+            self.epoch.as_deref(),
+        );
+        self.send(id, Outbound::Text(msg));
+    }
+
+    /// A browser candidate goes to the current session. Trickle that arrives
+    /// with no session to take it is dropped, as a stale candidate would be.
+    fn on_ice(&mut self, candidate: String) {
+        if self.rtc.is_none() {
+            return self.count_unhandled("ice");
+        }
+        if let Some(session) = self.rtc_session.as_ref() {
+            let _ = session.commands.try_send(rtc::Command::Remote(candidate));
+        }
+    }
+
+    /// Acts on one notice from a pump. Notices from a session that is no
+    /// longer current are dropped.
+    fn handle_rtc(&mut self, id: u64, notice: rtc::Notice, now: Instant) {
+        if !self
+            .rtc_session
+            .as_ref()
+            .is_some_and(|session| session.id == id)
+        {
+            return;
+        }
+        let Some(signal) = self.signal else { return };
+        match notice {
+            rtc::Notice::Answer(sdp) => {
+                let text = serde_json::json!({"type": "answer", "sdp": sdp}).to_string();
+                self.send(signal, Outbound::Text(text));
+            }
+            rtc::Notice::Candidate(candidate) => {
+                let text = serde_json::json!({"type": "ice", "candidate": candidate}).to_string();
+                self.send(signal, Outbound::Text(text));
+            }
+            rtc::Notice::ChannelOpen(label) => {
+                self.record_lifecycle("channel-open", Some(label.as_str()), now)
+            }
+            rtc::Notice::Input { channel, bytes } => self.record_input(&bytes, &channel, now),
+            rtc::Notice::FirstKeyframe {
+                generation,
+                rtp_timestamp,
+                codec,
+            } => {
+                self.rtc_idr = Some(RtcIdr {
+                    session: id,
+                    generation,
+                    rtp_timestamp,
+                    codec,
+                });
+                self.first_frame_admitted_rtc(signal);
+            }
+            rtc::Notice::Ended(_) => self.rtc_session = None,
+            rtc::Notice::Connected | rtc::Notice::Disconnected => {}
+        }
+    }
+
+    /// One pump task finished; its report is kept in the order it ended.
+    fn rtc_joined(&mut self, joined: Result<rtc::Report, tokio::task::JoinError>) {
+        let report = match joined {
+            Ok(report) => report,
+            Err(_) => rtc::Report::failed("failed:task"),
+        };
+        self.rtc_reports.push(report);
+    }
+
+    /// Ends every RTC session and joins its pump, with the same grace as the
+    /// connections. A pump that outlives the grace is aborted.
+    async fn close_rtc(&mut self, notices: &mut mpsc::Receiver<(u64, rtc::Notice)>) {
+        self.rtc_session = None;
+        let grace = tokio::time::sleep(CLOSE_GRACE);
+        tokio::pin!(grace);
+        while !self.rtc_tasks.is_empty() {
+            tokio::select! {
+                joined = self.rtc_tasks.join_next() => {
+                    if let Some(joined) = joined {
+                        self.rtc_joined(joined);
+                    }
+                }
+                Some(_) = notices.recv() => {}
+                _ = &mut grace => break,
+            }
+        }
+        self.rtc_tasks.abort_all();
+        while let Some(joined) = self.rtc_tasks.join_next().await {
+            self.rtc_joined(joined);
         }
     }
 
@@ -356,6 +595,8 @@ impl Hub {
             Signal::Ping => {
                 self.send(id, Outbound::Text(protocol::pong()));
             }
+            Signal::Offer { sdp } => self.on_offer(sdp),
+            Signal::Ice { candidate } => self.on_ice(candidate),
             Signal::MediaControl(control) => self.on_media_control(id, control, now),
             Signal::FirstFrame { phase, request_id } => {
                 self.on_first_frame(id, &phase, &request_id)
@@ -382,6 +623,7 @@ impl Hub {
         if self.epoch.is_some() {
             self.input_disconnected("epoch-rotated", now);
         }
+        self.end_rtc("epoch-rotated");
         self.detach_media("epoch-rotated");
         self.audio_wanted = false;
         if let Some(old) = self.signal.take() {
@@ -413,7 +655,10 @@ impl Hub {
         if control.protocol.is_some_and(|p| p != MEDIA_PROTOCOL) {
             return self.reject();
         }
-        if control.protocol == Some(MEDIA_PROTOCOL) && control.epoch.is_none() {
+        if control.protocol == Some(MEDIA_PROTOCOL)
+            && control.epoch.is_none()
+            && !(control.action == "keyframe" && self.rtc_session.is_some() && self.media.is_none())
+        {
             return self.reject();
         }
         if let Some(epoch) = &control.epoch {
@@ -421,6 +666,10 @@ impl Hub {
                 self.model.counters.stale_epoch_control += 1;
                 return;
             }
+        }
+        if control.action == "start" {
+            // The browser picked WSS: RTC stops its media, but the session lives on.
+            self.stop_rtc_media();
         }
         if control.action == "start"
             && control.protocol == Some(MEDIA_PROTOCOL)
@@ -478,19 +727,24 @@ impl Hub {
                 self.model.counters.first_frame_requests += 1;
                 self.first_frame = Some(FirstFrame {
                     request_id: request_id.to_owned(),
-                    ready_sent: false,
+                    answered: false,
                 });
-                let msg = if self.start_refused {
-                    protocol::first_frame("failed", request_id, None, Some("codec-mismatch"))
+                if self.start_refused {
+                    let msg =
+                        protocol::first_frame("failed", request_id, None, Some("codec-mismatch"));
+                    self.send(id, Outbound::Text(msg));
+                } else if self.rtc_lane() {
+                    // WebRTC admits only once the keyframe's RTP is on the wire.
+                    self.first_frame_admitted_rtc(id);
                 } else {
-                    protocol::first_frame(
+                    let msg = protocol::first_frame(
                         "admitted",
                         request_id,
                         Some(self.model.generation()),
                         None,
-                    )
-                };
-                self.send(id, Outbound::Text(msg));
+                    );
+                    self.send(id, Outbound::Text(msg));
+                }
             }
             "presented" => {
                 if self
@@ -561,6 +815,7 @@ impl Hub {
     /// the client has to say hello again to get a new one.
     fn drop_sockets(&mut self) {
         self.input_disconnected("socket-drop", Instant::now());
+        self.end_rtc("socket-drop");
         if let Some(signal) = self.signal.take() {
             self.close_conn(signal, "socket-drop");
         }
@@ -588,9 +843,14 @@ impl Hub {
         if !key {
             return;
         }
+        self.first_frame_ready(generation);
+    }
+
+    /// Answers the pending WSS first-frame request once, on the first keyframe.
+    fn first_frame_ready(&mut self, generation: u32) {
         let ready = match &mut self.first_frame {
-            Some(ff) if !ff.ready_sent => {
-                ff.ready_sent = true;
+            Some(ff) if !ff.answered => {
+                ff.answered = true;
                 Some(ff.request_id.clone())
             }
             _ => None,
@@ -608,6 +868,10 @@ impl Hub {
             self.draining = true;
             self.model.set_draining();
         }
+        if self.rtc_drop_at.is_some_and(|at| elapsed >= at) {
+            self.rtc_drop_at = None;
+            self.end_rtc("rtc-dropped");
+        }
         self.send_cursor_script(now);
         let in_flight = self.model.in_flight();
         if elapsed >= self.exit_after && (in_flight == 0 || elapsed >= self.exit_after + HARD_TAIL)
@@ -622,7 +886,7 @@ impl Hub {
         false
     }
 
-    fn finish(mut self, now: Instant) -> Snapshot {
+    fn finish(mut self, now: Instant, rtc: Vec<rtc::Report>) -> Snapshot {
         self.input_disconnected("run-complete", now);
         // Stopping counts whatever is still queued or held as discarded, so the
         // audio accounting identity holds at exit. It also counts as a stop.
@@ -642,14 +906,22 @@ impl Hub {
             in_flight_at_exit,
             elapsed_ms,
             audio,
+            rtc,
         }
     }
 }
 
 /// Returns the snapshot and the first input-recording error, if any.
-async fn run_hub(mut hub: Hub, mut events: mpsc::Receiver<Event>) -> (Snapshot, Option<String>) {
+async fn run_hub(
+    mut hub: Hub,
+    mut events: mpsc::Receiver<Event>,
+    mut notices: mpsc::Receiver<(u64, rtc::Notice)>,
+) -> (Snapshot, Option<String>) {
     let mut ticker = tokio::time::interval(hub.model.frame_period());
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Windows timer wakes can be several milliseconds late. Preserve the
+    // recording's 60 Hz cadence instead of silently skipping those frames;
+    // the model's four-frame/150 ms in-flight limits bound catch-up work.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     let mut audio_ticker = tokio::time::interval(audio::FRAME_PERIOD);
     audio_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -664,10 +936,16 @@ async fn run_hub(mut hub: Hub, mut events: mpsc::Receiver<Event>) -> (Snapshot, 
                 }
             }
             _ = audio_ticker.tick(), if hub.audio.is_some() => hub.audio_tick(Instant::now()),
+            Some((id, notice)) = notices.recv() => hub.handle_rtc(id, notice, Instant::now()),
+            Some(joined) = hub.rtc_tasks.join_next(), if !hub.rtc_tasks.is_empty() => {
+                hub.rtc_joined(joined);
+            }
         }
     }
+    hub.close_rtc(&mut notices).await;
     let record_error = hub.record_error.take();
-    (hub.finish(Instant::now()), record_error)
+    let reports = std::mem::take(&mut hub.rtc_reports);
+    (hub.finish(Instant::now(), reports), record_error)
 }
 
 fn query_value(query: &str, key: &str) -> Option<String> {
@@ -792,6 +1070,13 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
         .map(|script| AudioLane::new(script, run_start))
         .transpose()
         .context("cannot start the audio encoder")?;
+    let rtc_drop_at = config.rtc.and_then(|knobs| knobs.drop_at);
+    let rtc = config.rtc.map(|knobs| RtcSettings {
+        knobs,
+        sources: config.sources.clone(),
+        fps: config.fps,
+    });
+    let (notices_tx, notices_rx) = mpsc::channel(rtc::NOTICE_DEPTH);
     let model = Model::new(ModelConfig {
         sources: config.sources,
         fps: config.fps,
@@ -818,8 +1103,17 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
         record_error: None,
         audio,
         audio_wanted: false,
+        rtc,
+        rtc_session: None,
+        rtc_next_id: 0,
+        rtc_tasks: JoinSet::new(),
+        rtc_notices: notices_tx,
+        rtc_reports: Vec::new(),
+        rtc_drop_at,
+        rtc_media_stopped: false,
+        rtc_idr: None,
     };
-    let mut hub_task = tokio::spawn(run_hub(hub, events_rx));
+    let mut hub_task = tokio::spawn(run_hub(hub, events_rx, notices_rx));
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let mut conns: JoinSet<()> = JoinSet::new();
     let mut next_id = 0u64;

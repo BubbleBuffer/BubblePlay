@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::audio::Script;
 use crate::model::Injections;
+use crate::rtc::Knobs;
 use crate::stream::Codec;
 
 pub const DEFAULT_STREAMS_DIR: &str = "F:/build/spike-streams";
@@ -31,9 +32,17 @@ usage: fake-wss-host [--stream h264|hevc] [options]
                             with audio:1 on start; with no recordings, audio only
   --audio-loss-every N      drop every Nth audio packet on the wire (N >= 2; needs --audio)
   --audio-reorder-every N   send every Nth audio packet after the next one (N >= 2; needs --audio)
+  --webrtc                  answer the browser's offer on /ws with a WebRTC session over
+                            loopback UDP: video (HEVC if offered and recorded, else H.264),
+                            a 440 Hz Opus tone, and the input-control and input-motion channels
+  --block-ice               with --webrtc: answer, but send and receive no UDP
+  --stall-first-frame       with --webrtc: channels and audio run, and no video RTP is sent
+  --rtc-drop-at SECONDS     with --webrtc: end the RTC session once at this time; /ws and
+                            WSS keep running
 
 Injections must fire at least one second before the drain window ends. Video
-injections need recordings; with none they do not fire.
+injections need recordings; with none they do not fire. The RTC drop time is
+held to the same limit.
 The JSON report goes to stdout. Listen address and progress go to stderr.
 Exit codes: 0 every check passed, 1 a check failed, 2 usage or startup error.";
 
@@ -51,6 +60,8 @@ pub struct Args {
     pub input_record: Option<PathBuf>,
     /// The audio lane, when `--audio` is given.
     pub audio: Option<Script>,
+    /// The WebRTC answerer, when `--webrtc` is given.
+    pub rtc: Option<Knobs>,
 }
 
 /// `Ok(None)` for `--help`.
@@ -66,6 +77,10 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
     let mut audio_on = false;
     let mut audio_loss_every = None;
     let mut audio_reorder_every = None;
+    let mut webrtc_on = false;
+    let mut block_ice = false;
+    let mut stall_first_frame = false;
+    let mut rtc_drop_at = None;
 
     let mut iter = raw.iter();
     while let Some(flag) = iter.next() {
@@ -113,12 +128,19 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
             "--audio-reorder-every" => {
                 audio_reorder_every = Some(every("--audio-reorder-every", &value()?)?)
             }
+            "--webrtc" => webrtc_on = true,
+            "--block-ice" => block_ice = true,
+            "--stall-first-frame" => stall_first_frame = true,
+            "--rtc-drop-at" => rtc_drop_at = Some(seconds("--rtc-drop-at", &value()?)?),
             other => return Err(format!("unknown option {other}")),
         }
     }
 
     if !audio_on && (audio_loss_every.is_some() || audio_reorder_every.is_some()) {
         return Err("--audio-loss-every and --audio-reorder-every need --audio".into());
+    }
+    if !webrtc_on && (block_ice || stall_first_frame || rtc_drop_at.is_some()) {
+        return Err("--block-ice, --stall-first-frame and --rtc-drop-at need --webrtc".into());
     }
     let audio = if audio_on {
         Some(Script::new(audio_loss_every, audio_reorder_every)?)
@@ -142,6 +164,7 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
         ("--seq-gap-at", injections.seq_gap_at),
         ("--generation-at", injections.generation_at),
         ("--socket-drop-at", injections.socket_drop_at),
+        ("--rtc-drop-at", rtc_drop_at),
     ] {
         let Some(at) = at else { continue };
         if !latest.is_some_and(|latest| at <= latest) {
@@ -152,6 +175,11 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
             ));
         }
     }
+    let rtc = webrtc_on.then_some(Knobs {
+        block_ice,
+        stall_first_frame,
+        drop_at: rtc_drop_at,
+    });
     Ok(Some(Args {
         constraint,
         streams_dir,
@@ -162,6 +190,7 @@ pub fn parse(raw: &[String]) -> Result<Option<Args>, String> {
         stats,
         input_record,
         audio,
+        rtc,
     }))
 }
 
@@ -365,5 +394,44 @@ mod tests {
             args(&["--audio", "--audio-loss-every", "1000001"]).is_err(),
             "above the bound"
         );
+    }
+
+    #[test]
+    fn webrtc_is_off_unless_asked_for() {
+        assert!(ok(&[]).rtc.is_none());
+        let knobs = ok(&["--webrtc"]).rtc.expect("webrtc on");
+        assert_eq!(knobs, Knobs::default());
+    }
+
+    #[test]
+    fn rtc_knobs_map_to_their_flags() {
+        let knobs = ok(&[
+            "--webrtc",
+            "--block-ice",
+            "--stall-first-frame",
+            "--rtc-drop-at",
+            "2.5",
+        ])
+        .rtc
+        .expect("webrtc on");
+        assert!(knobs.block_ice);
+        assert!(knobs.stall_first_frame);
+        assert_eq!(knobs.drop_at, Some(Duration::from_millis(2500)));
+    }
+
+    #[test]
+    fn rtc_knobs_need_webrtc() {
+        assert!(args(&["--block-ice"]).is_err());
+        assert!(args(&["--stall-first-frame"]).is_err());
+        assert!(args(&["--rtc-drop-at", "1"]).is_err());
+        assert!(args(&["--webrtc", "--rtc-drop-at"]).is_err(), "no value");
+        assert!(args(&["--webrtc", "--rtc-drop-at", "nan"]).is_err());
+    }
+
+    #[test]
+    fn rtc_drop_obeys_the_same_window_as_the_injections() {
+        // 3 s run, 1 s drain: the drop must be at or before 1.0 s.
+        assert!(args(&["--webrtc", "--exit-after", "3", "--rtc-drop-at", "1.0"]).is_ok());
+        assert!(args(&["--webrtc", "--exit-after", "3", "--rtc-drop-at", "2.5"]).is_err());
     }
 }

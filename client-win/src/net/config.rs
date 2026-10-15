@@ -3,6 +3,21 @@
 use super::cookies::CookieJar;
 use super::error::NetError;
 
+/// Development and session transport choice. Auto remembers an RTC failure
+/// within this session, matching the browser's tab-scoped fallback memory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransportChoice {
+    Auto,
+    WebRtc,
+    #[default]
+    Wss,
+}
+
+/// Deliberate native deviation: receiver.js keeps waiting while ICE checks.
+/// Auto rescues a stuck checking peer ten seconds after transmitting its offer.
+/// The dev CLI can override this through `--ice-timeout-ms`.
+pub const AUTO_ICE_CHECKING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Video codec for `media-control start` and the BPV4 codec byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -52,6 +67,11 @@ pub struct NetConfig {
     pub audio: Option<crate::audio::AudioHandle>,
     /// Disabled only by the decode-free audio development harness.
     pub video_watchdog: bool,
+    pub transport: TransportChoice,
+    pub ice_checking_timeout: std::time::Duration,
+    /// Headless qualification may authorize synthetic input after MF decode;
+    /// it never reports a presentation or sends a false presentation proof.
+    pub headless_decoded_ready: bool,
 }
 
 impl NetConfig {
@@ -64,6 +84,9 @@ impl NetConfig {
             stream_mode: None,
             audio: None,
             video_watchdog: true,
+            transport: TransportChoice::Wss,
+            ice_checking_timeout: AUTO_ICE_CHECKING_TIMEOUT,
+            headless_decoded_ready: false,
         }
     }
 }

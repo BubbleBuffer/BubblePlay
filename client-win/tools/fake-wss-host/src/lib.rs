@@ -11,6 +11,7 @@ pub mod input_record;
 pub mod model;
 pub mod protocol;
 pub mod report;
+pub mod rtc;
 pub mod server;
 pub mod signal;
 pub mod stream;

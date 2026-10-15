@@ -28,8 +28,8 @@ pub enum OutputMode {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AudioStats {
     pub received: u64,
-    /// Last admitted BPA1 capture timestamp in the host's clock domain.
-    /// Diagnostic only; it is not comparable with the local render clock.
+    /// BPA1 host capture time, or extended 48 kHz RTP time converted to us.
+    /// Diagnostic only; neither is comparable with the local render clock.
     pub last_capture_ts_us: Option<u64>,
     pub rejected: u64,
     pub decoded: u64,
@@ -54,6 +54,9 @@ pub struct AudioStats {
     pub device_open: bool,
     pub last_device_error: Option<String>,
     pub schedule_resets: u64,
+    /// Explicit transport flushes (epoch start/end or RTP-to-WSS handoff),
+    /// separate from jitter catch-up and device scheduling rebases.
+    pub transport_resets: u64,
     pub rendered_frames: u64,
     /// Cumulative post-volume PCM measurements, before the device mixer.
     pub output_rms: f64,
@@ -86,6 +89,7 @@ struct State {
     rejected: u64,
     ingress_dropped: u64,
     stats: AudioStats,
+    rtp_clock: Option<(u64, u64)>,
 }
 struct Shared {
     state: Mutex<State>,
@@ -110,6 +114,49 @@ impl AudioHandle {
     /// Full ingress drops oldest packets and marks the new front discontinuous.
     pub fn push(&self, epoch: u64, bytes: &[u8], received_at: Instant) -> bool {
         let packet = parse_packet(bytes);
+        self.push_packet(epoch, packet, received_at)
+    }
+
+    /// RTP Opus uses the same bounded decoder/jitter ingress as BPA1. str0m
+    /// supplies extended RTP sequence/time so both survive wire wrap. The
+    /// negotiated host sends 480 stereo samples per packet at 48 kHz.
+    pub fn push_rtp(
+        &self,
+        epoch: u64,
+        sequence: u64,
+        timestamp: u64,
+        payload: &[u8],
+        received_at: Instant,
+    ) -> bool {
+        let discontinuity = {
+            let mut state = lock(&self.shared.state);
+            if epoch != state.epoch || state.stop || !state.alive {
+                return false;
+            }
+            let discontinuity = state.rtp_clock.is_some_and(|(seq, time)| {
+                sequence > seq
+                    && timestamp != time.saturating_add((sequence - seq).saturating_mul(480))
+            });
+            if state.rtp_clock.is_none_or(|(seq, _)| sequence > seq)
+                && !payload.is_empty()
+                && payload.len() <= wire::MAX_PAYLOAD_BYTES
+            {
+                state.rtp_clock = Some((sequence, timestamp));
+            }
+            discontinuity
+        };
+        let packet = (!payload.is_empty() && payload.len() <= wire::MAX_PAYLOAD_BYTES).then(|| {
+            wire::Packet {
+                seq: sequence as u32,
+                capture_ts_us: (u128::from(timestamp) * 1_000_000 / 48_000) as u64,
+                discontinuity,
+                payload: payload.to_vec(),
+            }
+        });
+        self.push_packet(epoch, packet, received_at)
+    }
+
+    fn push_packet(&self, epoch: u64, packet: Option<wire::Packet>, received_at: Instant) -> bool {
         let mut state = lock(&self.shared.state);
         if epoch != state.epoch || state.stop || !state.alive {
             return false;
@@ -142,6 +189,7 @@ impl AudioHandle {
     pub fn reset_epoch(&self, epoch: u64) {
         let mut state = lock(&self.shared.state);
         state.epoch = epoch;
+        state.rtp_clock = None;
         state.ingress_dropped += state.queue.len() as u64;
         state.queue.clear();
         state.reset += 1;
@@ -174,6 +222,7 @@ impl AudioHandle {
         stats.rejected = state.rejected;
         stats.dropped += state.ingress_dropped;
         stats.epoch = state.epoch;
+        stats.transport_resets = state.reset;
         stats.muted = state.muted;
         stats.volume = state.volume;
         stats
@@ -205,6 +254,7 @@ impl AudioPlayer {
                 rejected: 0,
                 ingress_dropped: 0,
                 stats: AudioStats::default(),
+                rtp_clock: None,
             }),
         });
         let handle = AudioHandle {

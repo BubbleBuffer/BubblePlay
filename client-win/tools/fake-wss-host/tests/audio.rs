@@ -35,6 +35,7 @@ fn meta(script: Script) -> RunMeta {
         bind: String::new(),
         injections: Injections::default(),
         audio: Some(script),
+        rtc: None,
     }
 }
 

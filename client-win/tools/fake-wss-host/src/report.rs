@@ -5,7 +5,11 @@ use serde_json::{json, Value};
 
 use crate::audio::{AudioCounters, Script};
 use crate::model::{Injection, Injections, Recovery};
+use crate::rtc;
 use crate::server::Snapshot;
+
+/// The two input lanes the browser opens, in the order it creates them.
+const INPUT_LANES: [&str; 2] = ["input-control", "input-motion"];
 
 /// One recording the run offered to the browser.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +32,8 @@ pub struct RunMeta {
     pub injections: Injections,
     /// The audio lane's script, when `--audio` is given.
     pub audio: Option<Script>,
+    /// The `--webrtc` knobs, when the RTC answerer ran.
+    pub rtc: Option<rtc::Knobs>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,23 +47,159 @@ fn check(name: &'static str, pass: bool, detail: String) -> Check {
     Check { name, pass, detail }
 }
 
+/// The checks for the lanes this run used. A run without `--webrtc` is judged
+/// on WSS alone, as before. With it, the RTC session is judged on its own, and
+/// the WSS checks apply only when WSS carried media (a `start` was accepted,
+/// frames went out, or audio was opted in).
+pub fn checks(meta: &RunMeta, snap: &Snapshot) -> Vec<Check> {
+    let Some(knobs) = meta.rtc else {
+        return wss_checks(meta, snap);
+    };
+    let mut out = rtc_checks(meta, knobs, &snap.rtc);
+    if wss_used(snap) {
+        out.extend(wss_checks(meta, snap));
+    } else {
+        out.push(rejects_check(snap));
+    }
+    out
+}
+
+/// Whether the WSS lane carried anything: a start, a frame, or an audio opt-in.
+fn wss_used(snap: &Snapshot) -> bool {
+    snap.counters.starts >= 1
+        || snap.counters.frames_sent > 0
+        || snap.audio.as_ref().is_some_and(|a| a.opt_in_starts > 0)
+}
+
 /// Video checks for a run with recordings, audio checks when `--audio` is on.
 /// An audio-only run has no video to judge, so only the rejects check applies.
-pub fn checks(meta: &RunMeta, snap: &Snapshot) -> Vec<Check> {
+fn wss_checks(meta: &RunMeta, snap: &Snapshot) -> Vec<Check> {
     let mut out = if meta.streams.is_empty() {
-        vec![check(
-            "no-unhandled-media-rejects",
-            snap.counters.rejected_control == 0,
-            format!(
-                "{} rejected control messages",
-                snap.counters.rejected_control
-            ),
-        )]
+        vec![rejects_check(snap)]
     } else {
         video_checks(meta, snap)
     };
     if let (Some(script), Some(audio)) = (meta.audio, snap.audio.as_ref()) {
         out.extend(audio_checks(script, audio));
+    }
+    out
+}
+
+fn rejects_check(snap: &Snapshot) -> Check {
+    check(
+        "no-unhandled-media-rejects",
+        snap.counters.rejected_control == 0,
+        format!(
+            "{} rejected control messages",
+            snap.counters.rejected_control
+        ),
+    )
+}
+
+/// The RTC session's checks, with each knob's effect judged as requested. A
+/// blocked run must stay silent; a stalled run must send audio but no video; a
+/// dropped run must end once with the DTLS close_notify sent.
+fn rtc_checks(meta: &RunMeta, knobs: rtc::Knobs, sessions: &[rtc::Report]) -> Vec<Check> {
+    let connected = sessions.iter().filter(|s| s.connected_ms.is_some()).count();
+    let ended: Vec<&str> = sessions.iter().map(|s| s.ended.as_str()).collect();
+    let mut out = vec![
+        check(
+            "rtc-session-offered",
+            !sessions.is_empty(),
+            format!("{} sessions, ended {ended:?}", sessions.len()),
+        ),
+        check(
+            "rtc-no-failed-session",
+            sessions
+                .iter()
+                .all(|s| !s.ended.starts_with("failed:") && s.error.is_none()),
+            format!("ended {ended:?}"),
+        ),
+    ];
+    let audio_sent: u64 = sessions.iter().map(|s| s.audio_rtp_packets).sum();
+    if knobs.block_ice {
+        let blocked: u64 = sessions.iter().map(|s| s.blocked_datagrams).sum();
+        let silent = sessions.iter().all(|s| {
+            s.connected_ms.is_none() && s.video_rtp_packets == 0 && s.audio_rtp_packets == 0
+        });
+        out.push(check(
+            "rtc-blocked-as-requested",
+            !sessions.is_empty() && silent && blocked > 0,
+            format!("{blocked} datagrams blocked, {connected} connected"),
+        ));
+    } else {
+        out.push(check(
+            "rtc-connected",
+            connected >= 1,
+            format!("{connected} of {} sessions connected", sessions.len()),
+        ));
+        let lanes_open = sessions.iter().any(|s| {
+            INPUT_LANES
+                .iter()
+                .all(|lane| s.channels.iter().any(|open| open == lane))
+        });
+        out.push(check(
+            "rtc-input-lanes-open",
+            lanes_open,
+            format!(
+                "lanes opened: {:?}",
+                sessions.iter().map(|s| &s.channels).collect::<Vec<_>>()
+            ),
+        ));
+        let echoes: u64 = sessions.iter().map(|s| s.echoes).sum();
+        let requests: u64 = sessions.iter().map(|s| s.echo_requests).sum();
+        out.push(check(
+            "rtc-cursor-echoed",
+            echoes == requests && sessions.iter().all(|s| s.echo_refused == 0),
+            format!(
+                "{echoes} cursor echoes for {requests} requests, {} refused",
+                sessions.iter().map(|s| s.echo_refused).sum::<u64>()
+            ),
+        ));
+        if knobs.stall_first_frame {
+            let held: u64 = sessions.iter().map(|s| s.video_frames_suppressed).sum();
+            let video_sent: u64 = sessions.iter().map(|s| s.video_rtp_packets).sum();
+            out.push(check(
+                "rtc-stalled-as-requested",
+                connected >= 1 && video_sent == 0 && held > 0 && audio_sent > 0,
+                format!(
+                    "{held} frames held back, {video_sent} video and {audio_sent} audio packets"
+                ),
+            ));
+        } else {
+            if !meta.streams.is_empty() {
+                let admitted: Vec<Option<u32>> =
+                    sessions.iter().map(|s| s.admitted_rtp_timestamp).collect();
+                let video = sessions.iter().any(|s| {
+                    s.video_rtp_packets > 0
+                        && s.admitted_rtp_timestamp.is_some()
+                        && s.video_codec
+                            .as_deref()
+                            .is_some_and(|codec| meta.streams.iter().any(|st| st.codec == codec))
+                });
+                out.push(check(
+                    "rtc-video-admitted-on-rtp",
+                    video,
+                    format!("admitted at RTP timestamps {admitted:?}"),
+                ));
+            }
+            out.push(check(
+                "rtc-audio-sent",
+                audio_sent > 0,
+                format!("{audio_sent} audio RTP packets"),
+            ));
+        }
+    }
+    if knobs.drop_at.is_some() {
+        let dropped = sessions
+            .iter()
+            .filter(|s| s.ended == "rtc-dropped" && s.close_notify_sent)
+            .count();
+        out.push(check(
+            "rtc-dropped-with-close-notify",
+            dropped == 1,
+            format!("{dropped} sessions dropped with a close_notify sent"),
+        ));
     }
     out
 }
@@ -388,6 +530,7 @@ mod tests {
             bind: "127.0.0.1:0".into(),
             injections,
             audio: None,
+            rtc: None,
         }
     }
 
@@ -409,6 +552,7 @@ mod tests {
             elapsed_ms: 2000.0,
             hard_stop: false,
             audio: None,
+            rtc: Vec::new(),
         }
     }
 
@@ -577,5 +721,151 @@ mod tests {
         let report = build(&meta(Injections::default()), &snap);
         assert_eq!(report["stream"]["negotiated_codec"], json!("hevc"));
         assert_eq!(report["stream"]["width"], json!(1920));
+    }
+
+    fn rtc_meta(knobs: rtc::Knobs) -> RunMeta {
+        RunMeta {
+            rtc: Some(knobs),
+            ..meta(Injections::default())
+        }
+    }
+
+    /// A connected session that sent video and audio and echoed the cursor.
+    fn rtc_session() -> rtc::Report {
+        rtc::Report {
+            ended: "run-complete".into(),
+            video_codec: Some("h264".into()),
+            video_pt: Some(96),
+            audio_pt: Some(111),
+            connected_ms: Some(120.0),
+            first_keyframe_ms: Some(180.0),
+            admitted_rtp_timestamp: Some(90_000),
+            channels: INPUT_LANES.iter().map(|lane| lane.to_string()).collect(),
+            video_frames: 60,
+            video_rtp_packets: 600,
+            audio_frames: 300,
+            audio_rtp_packets: 300,
+            echoes: 2,
+            echo_requests: 2,
+            ..rtc::Report::default()
+        }
+    }
+
+    /// An RTC run with no WSS traffic: the counters a pure `--webrtc` run has.
+    fn rtc_snapshot(sessions: Vec<rtc::Report>) -> Snapshot {
+        let mut snap = healthy();
+        snap.counters = Counters::default();
+        snap.rtc = sessions;
+        snap
+    }
+
+    #[test]
+    fn a_pure_rtc_run_is_judged_on_rtc_not_wss() {
+        let list = checks(
+            &rtc_meta(rtc::Knobs::default()),
+            &rtc_snapshot(vec![rtc_session()]),
+        );
+        assert!(list.iter().all(|c| c.pass), "{list:#?}");
+        assert!(list.iter().any(|c| c.name == "rtc-video-admitted-on-rtp"));
+        assert!(!list
+            .iter()
+            .any(|c| c.name == "frames-sent" || c.name == "acks-received"));
+    }
+
+    #[test]
+    fn a_pure_rtc_run_with_no_session_fails() {
+        let list = checks(&rtc_meta(rtc::Knobs::default()), &rtc_snapshot(Vec::new()));
+        assert!(failed("rtc-session-offered", &list));
+    }
+
+    #[test]
+    fn wss_checks_join_in_only_when_wss_carried_media() {
+        let mut snap = rtc_snapshot(vec![rtc_session()]);
+        snap.counters.starts = 1;
+        snap.counters.frames_sent = 0;
+        let list = checks(&rtc_meta(rtc::Knobs::default()), &snap);
+        assert!(
+            failed("frames-sent", &list),
+            "a WSS start with no frames fails"
+        );
+        snap.counters = Counters {
+            frames_sent: 100,
+            frames_retired_by_ack: 100,
+            acks_received: 100,
+            starts: 1,
+            negotiated_codec: Some("h264".into()),
+            ..Counters::default()
+        };
+        snap.in_flight_at_exit = 0;
+        let list = checks(&rtc_meta(rtc::Knobs::default()), &snap);
+        assert!(list.iter().all(|c| c.pass), "{list:#?}");
+    }
+
+    #[test]
+    fn a_blocked_run_must_stay_silent() {
+        let knobs = rtc::Knobs {
+            block_ice: true,
+            ..rtc::Knobs::default()
+        };
+        let blocked = rtc::Report {
+            ended: "run-complete".into(),
+            blocked_datagrams: 40,
+            ..rtc::Report::default()
+        };
+        let list = checks(&rtc_meta(knobs), &rtc_snapshot(vec![blocked.clone()]));
+        assert!(list.iter().all(|c| c.pass), "{list:#?}");
+        let connected = rtc::Report {
+            connected_ms: Some(50.0),
+            ..blocked
+        };
+        let list = checks(&rtc_meta(knobs), &rtc_snapshot(vec![connected]));
+        assert!(failed("rtc-blocked-as-requested", &list));
+    }
+
+    #[test]
+    fn a_stalled_run_sends_audio_and_no_video() {
+        let knobs = rtc::Knobs {
+            stall_first_frame: true,
+            ..rtc::Knobs::default()
+        };
+        let stalled = rtc::Report {
+            ended: "run-complete".into(),
+            connected_ms: Some(120.0),
+            channels: INPUT_LANES.iter().map(|lane| lane.to_string()).collect(),
+            video_frames_suppressed: 90,
+            audio_rtp_packets: 300,
+            echoes: 1,
+            echo_requests: 1,
+            ..rtc::Report::default()
+        };
+        let list = checks(&rtc_meta(knobs), &rtc_snapshot(vec![stalled.clone()]));
+        assert!(list.iter().all(|c| c.pass), "{list:#?}");
+        let leaked = rtc::Report {
+            video_rtp_packets: 5,
+            ..stalled
+        };
+        let list = checks(&rtc_meta(knobs), &rtc_snapshot(vec![leaked]));
+        assert!(failed("rtc-stalled-as-requested", &list));
+    }
+
+    #[test]
+    fn a_drop_must_send_the_close_notify() {
+        let knobs = rtc::Knobs {
+            drop_at: Some(Duration::from_secs(1)),
+            ..rtc::Knobs::default()
+        };
+        let dropped = rtc::Report {
+            ended: "rtc-dropped".into(),
+            close_notify_sent: true,
+            ..rtc_session()
+        };
+        let list = checks(&rtc_meta(knobs), &rtc_snapshot(vec![dropped.clone()]));
+        assert!(list.iter().all(|c| c.pass), "{list:#?}");
+        let silent = rtc::Report {
+            close_notify_sent: false,
+            ..dropped
+        };
+        let list = checks(&rtc_meta(knobs), &rtc_snapshot(vec![silent]));
+        assert!(failed("rtc-dropped-with-close-notify", &list));
     }
 }

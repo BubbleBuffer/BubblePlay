@@ -250,6 +250,16 @@ pub struct AudioCounters {
     pub resyncs: u64,
 }
 
+/// What became of one packet handed to the media socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    Sent,
+    /// The socket is full or refused the write: back-pressure, `send_failed`.
+    Refused,
+    /// The media socket is already gone, so nothing more can go out: `discarded`.
+    Gone,
+}
+
 /// The audio lane for one run. It produces 10 ms packets while active and
 /// hands them out in order; the hub decides when a lane is active.
 pub struct AudioLane {
@@ -390,10 +400,11 @@ impl AudioLane {
         self.ready.push_back(packet);
     }
 
-    /// Hands every queued packet to `send`, in order. `send` returns false
-    /// when the socket refused the packet.
-    pub fn deliver(&mut self, mut send: impl FnMut(Vec<u8>) -> bool) {
-        for packet in std::mem::take(&mut self.ready) {
+    /// Hands every queued packet to `send`, in order. `send` says what became
+    /// of the packet; see [`Delivery`].
+    pub fn deliver(&mut self, mut send: impl FnMut(Vec<u8>) -> Delivery) {
+        let mut queue = std::mem::take(&mut self.ready).into_iter();
+        while let Some(packet) = queue.next() {
             let discontinuity = packet.discontinuity;
             let bytes = match encode_packet(&packet) {
                 Ok(bytes) => bytes,
@@ -404,15 +415,25 @@ impl AudioLane {
                 }
             };
             let len = bytes.len() as u64;
-            if send(bytes) {
-                self.counters.packets_sent += 1;
-                self.counters.bytes_sent += len;
-                if discontinuity {
-                    self.counters.discontinuities_sent += 1;
+            match send(bytes) {
+                Delivery::Sent => {
+                    self.counters.packets_sent += 1;
+                    self.counters.bytes_sent += len;
+                    if discontinuity {
+                        self.counters.discontinuities_sent += 1;
+                    }
                 }
-            } else {
-                self.counters.send_failed += 1;
-                self.gap = true;
+                Delivery::Refused => {
+                    self.counters.send_failed += 1;
+                    self.gap = true;
+                }
+                // The peer has already gone; nothing after this can be sent.
+                // The hub detaches the media, and these were never delivered.
+                Delivery::Gone => {
+                    self.counters.discarded += 1 + queue.len() as u64;
+                    self.gap = true;
+                    return;
+                }
             }
         }
     }
@@ -446,7 +467,7 @@ mod tests {
         lane.deliver(|bytes| {
             let p = decode_packet(&bytes).expect("own packet decodes");
             out.push((p.seq, p.discontinuity));
-            true
+            Delivery::Sent
         });
         out
     }
@@ -652,7 +673,7 @@ mod tests {
         assert_eq!(delivered(&mut lane), vec![(0, true)]);
         // Packet 3 (seq 2) is refused by the socket: a host-side gap.
         lane.produce(t0 + Duration::from_millis(25));
-        lane.deliver(|_| false);
+        lane.deliver(|_| Delivery::Refused);
         assert_eq!(lane.counters().send_failed, 1);
         // Packet 4 (seq 3) is lost on the wire; packet 5 (seq 4) carries the flag.
         lane.produce(t0 + Duration::from_millis(45));
@@ -745,9 +766,42 @@ mod tests {
         let (mut lane, t0) = lane(Script::default());
         lane.start(t0);
         lane.produce(t0 + Duration::from_millis(15));
-        lane.deliver(|_| false);
+        lane.deliver(|_| Delivery::Refused);
         assert_eq!(lane.counters().send_failed, 2);
         lane.produce(t0 + Duration::from_millis(25));
         assert_eq!(delivered(&mut lane), vec![(2, true)]);
+    }
+
+    #[test]
+    fn packets_into_a_socket_the_peer_has_closed_are_discarded_not_refused() {
+        let (mut lane, t0) = lane(Script::default());
+        lane.start(t0);
+        lane.produce(t0 + Duration::from_millis(25));
+        let before = lane.counters().packets_encoded;
+        assert_eq!(before, 3);
+        let mut attempts = 0;
+        lane.deliver(|_| {
+            attempts += 1;
+            Delivery::Gone
+        });
+        // The first refusal ends the delivery: the rest of the queue is not tried.
+        assert_eq!(attempts, 1);
+        let counters = lane.counters();
+        assert_eq!(
+            counters.send_failed, 0,
+            "the peer left; the socket did not refuse"
+        );
+        assert_eq!(
+            counters.discarded, 3,
+            "every queued packet is accounted for"
+        );
+        assert_eq!(
+            counters.packets_encoded,
+            counters.packets_sent
+                + counters.lost_by_script
+                + counters.queue_dropped
+                + counters.send_failed
+                + counters.discarded
+        );
     }
 }

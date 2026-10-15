@@ -68,6 +68,7 @@ fn run_meta(
         bind,
         injections,
         audio: None,
+        rtc: None,
     }
 }
 

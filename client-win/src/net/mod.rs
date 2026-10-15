@@ -1,5 +1,5 @@
-//! Windows client WSS v4 receive path (step 1): relay login, `/ws` signaling,
-//! `/media-ws` BPV4 frames, the receive gate and whole-session reconnects.
+//! Windows client transports: `/ws` signaling and input, str0m WebRTC over
+//! owned UDP, WSS v4 media and auto fallback, epoch gates and reconnects.
 //!
 //! The entry point is [`run`], called on an owned worker thread. The API is
 //! documented in `F:/build/win-client-step1/net-api.md`.
@@ -15,6 +15,7 @@ mod login;
 mod protocol;
 mod session;
 mod stats;
+pub(crate) mod webrtc;
 
 #[cfg(test)]
 mod fake_relay;
@@ -23,7 +24,7 @@ mod integration_contract_tests;
 #[cfg(test)]
 mod session_tests;
 
-pub use config::{Codec, NetConfig};
+pub use config::{Codec, NetConfig, TransportChoice, AUTO_ICE_CHECKING_TIMEOUT};
 pub use cookies::CookieJar;
 #[cfg(any(test, feature = "dev-login"))]
 pub use cookies::{GATE_COOKIE, SESSION_COOKIE};

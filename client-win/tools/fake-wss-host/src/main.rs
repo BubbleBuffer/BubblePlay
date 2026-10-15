@@ -14,6 +14,7 @@ use fake_wss_host::cli::{self, Args, USAGE};
 use fake_wss_host::evidence;
 use fake_wss_host::model::Source;
 use fake_wss_host::report::{self, RunMeta, StreamInfo};
+use fake_wss_host::rtc;
 use fake_wss_host::server::{self, ServerConfig};
 use fake_wss_host::stream::{Codec, Stream};
 
@@ -94,7 +95,16 @@ async fn main() -> ExitCode {
         max_connections: 8,
         input_record: args.input_record,
         audio: args.audio,
+        rtc: args.rtc,
     };
+    if let Some(knobs) = args.rtc {
+        eprintln!(
+            "fake-wss-host: webrtc answerer on: block-ice {}, stall-first-frame {}, rtc-drop-at {:?}",
+            knobs.block_ice,
+            knobs.stall_first_frame,
+            knobs.drop_at.map(|at| at.as_secs_f64())
+        );
+    }
     let snapshot = match server::serve(listener, config).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -113,8 +123,12 @@ async fn main() -> ExitCode {
         bind,
         injections: args.injections,
         audio: args.audio,
+        rtc: args.rtc,
     };
-    let document = report::build(&meta, &snapshot);
+    let mut document = report::build(&meta, &snapshot);
+    if let Some(knobs) = args.rtc {
+        document["webrtc"] = rtc::summary(&snapshot.rtc, knobs);
+    }
     let text = match serde_json::to_string_pretty(&document) {
         Ok(text) => text,
         Err(error) => return usage_error(&format!("cannot encode the report: {error}")),

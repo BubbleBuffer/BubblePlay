@@ -1,6 +1,72 @@
 use super::wire::{Packet, FRAME_SAMPLES, SAMPLE_RATE};
 use super::*;
 
+fn rtp_ingress() -> AudioHandle {
+    AudioHandle {
+        shared: Arc::new(Shared {
+            origin: Instant::now(),
+            wake: Condvar::new(),
+            state: Mutex::new(State {
+                queue: VecDeque::new(),
+                epoch: 7,
+                reset: 0,
+                reset_done: 0,
+                stop: false,
+                alive: true,
+                volume: 1.0,
+                muted: false,
+                received: 0,
+                rejected: 0,
+                ingress_dropped: 0,
+                stats: AudioStats::default(),
+                rtp_clock: None,
+            }),
+        }),
+    }
+}
+
+#[test]
+fn rtp_handoff_preserves_extended_sequence_time_loss_and_reorder() {
+    let handle = rtp_ingress();
+    let now = Instant::now();
+    let time = u64::from(u32::MAX) + 1;
+    assert!(handle.push_rtp(7, 65535, time, &[1], now));
+    assert!(handle.push_rtp(7, 65537, time + 960, &[2], now));
+    assert!(handle.push_rtp(7, 65536, time + 480, &[3], now));
+    let state = lock(&handle.shared.state);
+    let packets: Vec<_> = state.queue.iter().map(|p| &p.packet).collect();
+    assert_eq!(
+        packets.iter().map(|p| p.seq).collect::<Vec<_>>(),
+        vec![65535, 65537, 65536]
+    );
+    assert_eq!(
+        packets[1].capture_ts_us,
+        ((u128::from(time + 960) * 1_000_000) / 48000) as u64
+    );
+    assert!(packets.iter().all(|p| !p.discontinuity));
+    assert_eq!(packets[2].payload, vec![3]);
+}
+
+#[test]
+fn rtp_clock_gap_rebases_but_invalid_or_stale_ingress_does_not_change_clock() {
+    let handle = rtp_ingress();
+    let now = Instant::now();
+    assert!(!handle.push_rtp(6, 1, 0, &[1], now));
+    assert!(!handle.push_rtp(7, 1, 0, &[], now));
+    assert_eq!(lock(&handle.shared.state).rtp_clock, None);
+    assert!(handle.push_rtp(7, 1, 0, &[1], now));
+    assert!(handle.push_rtp(7, 2, 4800, &[2], now));
+    assert!(
+        lock(&handle.shared.state)
+            .queue
+            .back()
+            .unwrap()
+            .packet
+            .discontinuity
+    );
+    assert_eq!(lock(&handle.shared.state).rejected, 1);
+}
+
 fn unhex(value: &str) -> Vec<u8> {
     value
         .as_bytes()

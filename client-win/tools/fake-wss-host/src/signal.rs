@@ -21,6 +21,16 @@ pub enum Signal {
         phase: String,
         request_id: String,
     },
+    /// The browser's WebRTC offer (`{type:"offer", sdp}`), answered by the
+    /// RTC answerer when `--webrtc` is on and refused otherwise.
+    Offer {
+        sdp: String,
+    },
+    /// A browser ICE candidate (`{type:"ice", candidate}`), the `candidate:`
+    /// string with no `a=` prefix.
+    Ice {
+        candidate: String,
+    },
     /// Any other type. The fake does not act on it; it is only counted.
     Other(String),
 }
@@ -130,6 +140,18 @@ pub fn parse_signal(text: &str) -> Result<Signal, &'static str> {
                 request_id: request_id.to_owned(),
             })
         }
+        "offer" => match value.get("sdp").and_then(Value::as_str) {
+            Some(sdp) => Ok(Signal::Offer {
+                sdp: sdp.to_owned(),
+            }),
+            None => Ok(Signal::Other("offer".into())),
+        },
+        "ice" => match value.get("candidate").and_then(Value::as_str) {
+            Some(candidate) => Ok(Signal::Ice {
+                candidate: candidate.to_owned(),
+            }),
+            None => Ok(Signal::Other("ice".into())),
+        },
         other if token_ok(other) => Ok(Signal::Other(other.to_owned())),
         _ => Err("type is not a token"),
     }
@@ -236,6 +258,33 @@ mod tests {
             "x".repeat(SIGNAL_MAX_BYTES)
         ))
         .is_err());
+    }
+
+    #[test]
+    fn offer_and_ice_carry_their_strings() {
+        assert_eq!(
+            parse_signal(r#"{"type":"offer","sdp":"v=0\r\n"}"#),
+            Ok(Signal::Offer {
+                sdp: "v=0\r\n".into()
+            })
+        );
+        assert_eq!(
+            parse_signal(
+                r#"{"type":"ice","candidate":"candidate:1 1 udp 2 127.0.0.1 9 typ host"}"#
+            ),
+            Ok(Signal::Ice {
+                candidate: "candidate:1 1 udp 2 127.0.0.1 9 typ host".into()
+            })
+        );
+        // A missing string is counted as an unknown type, not acted on.
+        assert_eq!(
+            parse_signal(r#"{"type":"offer"}"#),
+            Ok(Signal::Other("offer".into()))
+        );
+        assert_eq!(
+            parse_signal(r#"{"type":"ice","candidate":3}"#),
+            Ok(Signal::Other("ice".into()))
+        );
     }
 
     #[test]
