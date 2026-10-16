@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 // The original 16 s host expired while the 11 s client loop was still running:
 // process startup and final cleanup extend beyond that loop's clock. Bound the
 // whole child lifetime, so slow setup fails explicitly instead of hanging.
-const HOST_BIND_BUDGET_S: u64 = 20;
+const HOST_BIND_BUDGET_S: u64 = 60; // fake-host startup loads recordings; seen at 9-20+ s under load
 const CLIENT_SETUP_BUDGET_S: u64 = 40; // cold process/device/MF startup
 const ESTABLISH_BUDGET_S: u64 = 20; // WSS/ICE establishment inside the client clock
 const EXERCISE_S: u64 = 11; // monitor switch and Game/Work round trip after establishment
