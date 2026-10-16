@@ -264,6 +264,7 @@ Deleted in phase 2:
 - **Host:** the browser approval dialog (`host/src/browser_approval.rs`) and `browserApproval` capability, `HOST_GATE_TOKEN` handling in setup, tray and signaling.
 - **Android:** `LoginActivity` WebView login, cookie storage and replay, "Forget browser".
 - **Docs and fixtures:** [browser approval](browser-approval.md) rewritten as the site gate (ntfy only); the host-approval messages in `fixtures/browser-approval-contract.json` removed; setup guides rewritten for key pairing.
+- **Ticketless media and file sockets:** require a ticket on `/media-ws` and `/file-ws` for ID'd PCs, in both relays. In phase 1 a pc-less socket without a ticket is still accepted when its epoch matches the resolved room, because old viewers send no ticket and the upgrade stays behind today's login.
 
 Kept: the ntfy site gate with the `__Host-gate` cookie and `/__gate/decision`, `TOKEN` as the first-registration ticket, the admin token for operator management, the per-prefix rate limiting (now also on pairing requests and handshakes), TURN credential issuance.
 
