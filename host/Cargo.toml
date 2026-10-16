@@ -51,6 +51,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
+    "Win32_UI_Controls_Dialogs",
 ] }
 windows-service = "0.8.1"
 windows-core = "0.62.2"
@@ -63,6 +64,14 @@ base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opus = "0.4.0"
+# Device key files (host/src/device_key.rs). Exact pins: the key file format is a
+# compatibility contract, so these do not float within a caret range.
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core", "zeroize"] }
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+aes-gcm = { version = "=0.10.3", features = ["zeroize"] }
+sha2 = "=0.10.9"
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+zeroize = { version = "=1.9.0", features = ["alloc"] }
 
 [profile.release]
 lto = "thin"

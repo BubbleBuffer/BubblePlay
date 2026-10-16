@@ -15,6 +15,10 @@
 //!                                offer (Explorer "Send to > BubblePlay")
 #![windows_subsystem = "windows"]
 
+#[path = "../tray/device_key_file.rs"]
+mod device_key_file;
+#[path = "../tray/key_ui.rs"]
+mod key_ui;
 #[path = "../tray/logic.rs"]
 mod logic;
 #[path = "../tray/platform.rs"]
@@ -81,6 +85,8 @@ const WM_QUIT_REQUEST: u32 = WM_APP + 2;
 /// Posted when the elevated agent update finished; WPARAM = exit code.
 const WM_AGENT_UPDATED: u32 = WM_APP + 3;
 const WM_ADMIN_CHANGED: u32 = WM_APP + 4;
+/// Posted when a PC key export/import window flow ends; WPARAM = 1 when the key was replaced.
+const WM_KEY_UI_DONE: u32 = WM_APP + 5;
 const TIMER_ID: usize = 1;
 
 const CMD_STATUS: usize = 1;
@@ -95,6 +101,8 @@ const CMD_AGENT_UPDATE: usize = 9;
 const CMD_SECURE_HELPER_UPDATE: usize = 10;
 const CMD_AUDIO: usize = 11;
 const CMD_CPU_MODE: usize = 12;
+const CMD_EXPORT_KEY: usize = 13;
+const CMD_IMPORT_KEY: usize = 14;
 
 /// Time the secure helper gets to answer after its task was started.
 const AGENT_START_GRACE: Duration = Duration::from_secs(15);
@@ -308,6 +316,8 @@ struct App {
     exits: Vec<u64>,
     host_hash: Option<String>,
     host_error: Option<String>,
+    /// An export or import window flow is running on its own thread.
+    key_ui_running: bool,
 }
 
 impl App {
@@ -1187,6 +1197,40 @@ impl App {
         self.start_user();
     }
 
+    /// Runs an owner key action on its own thread. The menu is greyed while it runs.
+    fn start_key_flow(&mut self, flow: key_ui::Flow) {
+        if self.key_ui_running {
+            return;
+        }
+        let key_path = device_key_file::path_beside(&self.data.join("host.json"));
+        let hwnd = self.hwnd.0 as isize;
+        let started = key_ui::start(flow, key_path, move |replaced| {
+            // SAFETY: posting to our own window; a failed post only loses the notification.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    WM_KEY_UI_DONE,
+                    WPARAM(usize::from(replaced)),
+                    LPARAM(0),
+                )
+            };
+        });
+        match started {
+            Ok(()) => self.key_ui_running = true,
+            Err(error) => tracing::warn!(%error, "could not start the PC key window"),
+        }
+    }
+
+    /// A key flow ended. A replaced key restarts the host so it loads the new identity.
+    fn key_flow_done(&mut self, replaced: bool) {
+        self.key_ui_running = false;
+        if replaced {
+            tracing::info!("PC key replaced from the tray; restarting host");
+            self.restart_host();
+        }
+        self.tick();
+    }
+
     /// The host reads the setting when it spawns, so applying it restarts the
     /// host. That ends a connected viewer's session.
     fn toggle_audio(&mut self) {
@@ -1235,6 +1279,8 @@ impl App {
             }
             CMD_AUDIO => self.toggle_audio(),
             CMD_CPU_MODE => self.toggle_cpu_mode(),
+            CMD_EXPORT_KEY => self.start_key_flow(key_ui::Flow::Export),
+            CMD_IMPORT_KEY => self.start_key_flow(key_ui::Flow::Import),
             CMD_RESTART => self.restart_host(),
             CMD_ROLLBACK => self.roll_back("requested from tray menu", false),
             CMD_LOGS => open_folder(&logs_dir(&self.data)),
@@ -1276,6 +1322,7 @@ fn show_menu(hwnd: HWND) {
         build,
         error,
         can_roll_back,
+        key_busy,
     )) = with_app(|app| {
         app.refresh_admin_mode();
         app.check_agent(true);
@@ -1308,6 +1355,7 @@ fn show_menu(hwnd: HWND) {
             app.build_line(),
             app.host_error.clone(),
             app.can_roll_back(),
+            app.key_ui_running,
         )
     })
     else {
@@ -1380,6 +1428,13 @@ fn show_menu(hwnd: HWND) {
             CMD_CPU_MODE,
             "CPU mode",
         );
+        let key_flags = if key_busy {
+            MF_STRING | MF_GRAYED
+        } else {
+            MF_STRING
+        };
+        item(key_flags, CMD_EXPORT_KEY, "Export PC key...");
+        item(key_flags, CMD_IMPORT_KEY, "Import PC key...");
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING, CMD_RESTART, "Restart host");
         if can_roll_back {
@@ -1437,6 +1492,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_AGENT_UPDATED => {
             with_app(|app| app.agent_updated(wparam.0 as u32));
+            LRESULT(0)
+        }
+        WM_KEY_UI_DONE => {
+            let replaced = wparam.0 != 0;
+            with_app(|app| app.key_flow_done(replaced));
             LRESULT(0)
         }
         WM_QUIT_REQUEST => {
@@ -1561,6 +1621,7 @@ fn run_tray() -> Result<i32> {
         exits: Vec::new(),
         host_hash: None,
         host_error: None,
+        key_ui_running: false,
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     with_app(|app| {

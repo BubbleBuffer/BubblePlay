@@ -157,6 +157,14 @@ type authRate struct {
 	Failures    int   `json:"failures"`
 	LockedUntil int64 `json:"lockedUntil"`
 }
+
+// pcRecord is one host PC registered with this relay. Its map key is the
+// canonical device ID; FirstSeen and LastSeen are Unix milliseconds, like sessions.
+type pcRecord struct {
+	Public    string `json:"public"`
+	FirstSeen int64  `json:"firstSeen"`
+	LastSeen  int64  `json:"lastSeen"`
+}
 type authState struct {
 	Version                int                    `json:"version"`
 	ConfiguredPasswordHash string                 `json:"configuredPasswordHash"`
@@ -167,7 +175,29 @@ type authState struct {
 	Gates                  map[string]authSession `json:"gates"`
 	Sessions               map[string]authSession `json:"sessions"`
 	Rates                  map[string]authRate    `json:"rates"`
+	PCs                    map[string]pcRecord    `json:"pcs"`
 }
+
+// validDurablePCs accepts a PC table only when every key is the canonical device
+// ID of its own unpadded base64url 32-byte public key. A nil table is empty, so
+// version 1 files written before PCs existed still load.
+func validDurablePCs(pcs map[string]pcRecord) bool {
+	if len(pcs) > maxAuthRecords {
+		return false
+	}
+	for id, record := range pcs {
+		canonical, ok := canonicalDeviceID(id)
+		if !ok || canonical != id || record.FirstSeen <= 0 || record.LastSeen < record.FirstSeen {
+			return false
+		}
+		public, err := base64.RawURLEncoding.DecodeString(record.Public)
+		if err != nil || len(public) != 32 || base64.RawURLEncoding.EncodeToString(public) != record.Public || deviceID(public) != id {
+			return false
+		}
+	}
+	return true
+}
+
 type pendingApproval struct {
 	id, prefix, approveHash, denyHash, navigation string
 	expires                                       time.Time
@@ -226,7 +256,7 @@ func NewAuth(cfg Config) (*Auth, error) {
 		return nil, err
 	}
 	a := &Auth{cfg: cfg, password: password, secret: secret, healthy: true, pending: make(map[string]*pendingApproval), capabilities: make(map[string]*pendingApproval), cooldown: make(map[string]time.Time), loginSlots: make(chan struct{}, 2), client: &http.Client{Timeout: 10 * time.Second}, now: time.Now, approvalTTL: time.Duration(ttl) * time.Second}
-	a.state = authState{Version: 1, ConfiguredPasswordHash: cfg.PasswordHash, PasswordHash: cfg.PasswordHash, FactorTag: tokenHash(cfg.AdminToken + "\x00" + cfg.HostGateToken + "\x00" + string(secret)), TOTPTag: tokenHash(string(secret)), LastTOTPCounter: -1, Gates: make(map[string]authSession), Sessions: make(map[string]authSession), Rates: make(map[string]authRate)}
+	a.state = authState{Version: 1, ConfiguredPasswordHash: cfg.PasswordHash, PasswordHash: cfg.PasswordHash, FactorTag: tokenHash(cfg.AdminToken + "\x00" + cfg.HostGateToken + "\x00" + string(secret)), TOTPTag: tokenHash(string(secret)), LastTOTPCounter: -1, Gates: make(map[string]authSession), Sessions: make(map[string]authSession), Rates: make(map[string]authRate), PCs: make(map[string]pcRecord)}
 	if cfg.ApprovalMethods != nil {
 		// Preserve the legacy factor identity until methods are explicitly configured.
 		a.state.FactorTag = tokenHash(a.state.FactorTag + "\x00" + strings.Join(cfg.approvalNotifiers(), ",") + "\x00" + strconv.FormatBool(cfg.methodEnabled("totp")))
@@ -240,7 +270,7 @@ func NewAuth(cfg Config) (*Auth, error) {
 		var extra any
 		end := decoder.Decode(&extra)
 		_ = file.Close()
-		if err != nil || end != io.EOF || stored.Version != 1 || stored.Gates == nil || stored.Sessions == nil || stored.Rates == nil || len(stored.Gates) > maxAuthRecords || len(stored.Sessions) > maxAuthRecords || len(stored.Rates) > maxAuthRecords {
+		if err != nil || end != io.EOF || stored.Version != 1 || stored.Gates == nil || stored.Sessions == nil || stored.Rates == nil || len(stored.Gates) > maxAuthRecords || len(stored.Sessions) > maxAuthRecords || len(stored.Rates) > maxAuthRecords || !validDurablePCs(stored.PCs) {
 			return nil, errors.New("invalid durable authentication state")
 		}
 		if stored.ConfiguredPasswordHash == cfg.PasswordHash {
@@ -257,6 +287,10 @@ func NewAuth(cfg Config) (*Auth, error) {
 			a.state.Gates = stored.Gates
 			a.state.Sessions = stored.Sessions
 			a.state.Rates = stored.Rates
+		}
+		// PCs are registrations, not session state: they survive password and factor changes.
+		if stored.PCs != nil {
+			a.state.PCs = stored.PCs
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, err

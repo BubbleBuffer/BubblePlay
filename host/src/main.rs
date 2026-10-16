@@ -178,6 +178,8 @@ fn wss_v4_refine_bitrate(current_bps: u32) -> u32 {
 struct Args {
     mode: String, // "spike" | "serve"
     worker: Option<String>,
+    /// The unlocked PC key from the tray. `None` runs the legacy registration.
+    device_identity: Option<bubbleplay_host::device_key::DeviceIdentity>,
     token: Option<String>,
     host_gate_token: Option<String>,
     duration_secs: u32,
@@ -213,6 +215,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
     let mut args = Args {
         mode: "serve".to_string(),
         worker: None,
+        device_identity: None,
         token: std::env::var("BUBBLEPLAY_TOKEN").ok(),
         host_gate_token: std::env::var("BUBBLEPLAY_HOST_GATE_TOKEN").ok(),
         duration_secs: 10,
@@ -603,6 +606,8 @@ fn native_drop_view_rejection(
 }
 
 fn main() -> Result<()> {
+    // Read and remove the tray's key handoff before anything else can spawn a child process.
+    let device_key_handoff = bubbleplay_host::device_key::take_handoff_env();
     tracing_subscriber::fmt()
         .with_writer(|| std::io::LineWriter::new(std::io::stderr()))
         .with_ansi(false)
@@ -612,7 +617,26 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let args = parse_args()?;
+    let mut args = parse_args()?;
+    // Privileged and admin serving keep the legacy registration.
+    args.device_identity = if args.privileged_agent {
+        None
+    } else {
+        let handoff = device_key_handoff.as_deref().map(String::as_str);
+        match bubbleplay_host::device_key::identity_from_handoff(handoff) {
+            Ok(identity) => {
+                if identity.is_none() {
+                    info!("no PC device key supplied; starting without a device ID");
+                }
+                identity
+            }
+            Err(_) => {
+                warn!("PC device key is unusable; starting without a device ID");
+                None
+            }
+        }
+    };
+    drop(device_key_handoff);
     if args.mode == "serve" && !args.privileged_agent {
         bubbleplay_host::input::recover_headless_cursor_support();
     }
@@ -1002,14 +1026,27 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mapped_addr = stun::discover_mapped_address(&socket, STUN_SERVER).ok();
     let mut signaling = session_call!(
         Signaling,
-        Signaling::connect(&worker, &token, args.host_gate_token.as_deref())
+        Signaling::connect_with_identity(
+            &worker,
+            &token,
+            args.host_gate_token.as_deref(),
+            args.device_identity.as_ref(),
+        )
     )?;
+    // Room and data-socket ticket for this signaling connection; the file and media sessions below
+    // take copies and drop them when this run ends.
+    let relay_route = signaling.relay_route();
     // File transfer runs only in the user-level host (Downloads, clipboard
     // and Send To belong to the interactive user) and needs the host bearer
     // for `/host-file-ws`.
     let file_service = match args.host_gate_token.as_deref() {
         Some(bearer) if !args.privileged_agent => {
-            match FileService::spawn(&worker, bearer, FileServiceConfig::from_env()) {
+            match FileService::spawn_routed(
+                &worker,
+                bearer,
+                FileServiceConfig::from_env(),
+                relay_route.clone(),
+            ) {
                 Ok(service) => Some(service),
                 Err(error) => {
                     warn!(error = %format!("{error:#}"), "file transfer unavailable");
@@ -3325,12 +3362,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 args.max_bitrate_bps,
                                 stream_mode,
                             );
-                            WssMediaEgress::connect(
+                            WssMediaEgress::connect_routed(
                                 &worker,
                                 bearer,
                                 epoch,
                                 u64::from(preset.target_bps),
                                 u64::from(preset.target_bps),
+                                &relay_route,
                             )
                         } else {
                             Err(anyhow::anyhow!("unsupported WSS media protocol"))

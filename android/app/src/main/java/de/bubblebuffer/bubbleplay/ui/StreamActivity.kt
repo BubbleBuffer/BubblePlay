@@ -62,6 +62,7 @@ import de.bubblebuffer.bubbleplay.input.WheelAccumulator
 import de.bubblebuffer.bubbleplay.net.SecureDesktop
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.Session
+import de.bubblebuffer.bubbleplay.net.ViewerGrant
 import de.bubblebuffer.bubbleplay.protocol.CursorState
 import de.bubblebuffer.bubbleplay.protocol.CursorKind
 import de.bubblebuffer.bubbleplay.protocol.InputPackets
@@ -108,6 +109,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private var files: FileTransfers? = null
     private var fileCapability: Boolean? = null
     @Volatile private var fileEpoch: String? = null
+    @Volatile private var viewerGrant = ViewerGrant.NONE
     // Host sound (BPA1): capability from host-capabilities; the Sound row shows only when it is present.
     private var soundCapability = false
     private var currentOffer: FileWire.Offer? = null
@@ -196,7 +198,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         buildViews()
         KeepAlive.owner = this
         clipboardManager.addPrimaryClipChangedListener(clipboardChanged)
-        files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, { if (config.isLab) null else Prefs.cookieHeader(config) }, fileListener)
+        files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, { if (config.isLab) null else Prefs.cookieHeader(config) }, fileListener, { viewerGrant })
         enterImmersive() // also sets up edge-to-edge and the cutout mode
         if (!immersive) exitImmersive()
         startSession()
@@ -419,6 +421,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         input?.releaseAll()
         metaSync.reset()
         session?.stop()
+        viewerGrant = ViewerGrant.NONE
         if (KeepAlive.active) SessionService.stop(this)
         session = null
         input = null
@@ -1385,6 +1388,10 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override fun onSoundCapability(enabled: Boolean) {
         soundCapability = enabled
         quickBar.render()
+    }
+
+    override fun onViewerGrant(grant: ViewerGrant) {
+        viewerGrant = grant
     }
 
     override fun onFileEpoch(epoch: String?) {

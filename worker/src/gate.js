@@ -7,6 +7,7 @@ import {
 import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
 import { approvalMethods } from "./approval-methods.js";
 import { validApprovalMessage } from "./protocol-validation.js";
+import { canonicalDeviceId, constantTimeEqual, deriveDeviceId } from "./device-keys.js";
 
 const COOKIE_NAME = "__Host-gate";
 const SESSION_PREFIX = "session:";
@@ -65,6 +66,9 @@ export class ApprovalGate {
   async fetch(request) {
     const url = new URL(request.url);
     const forceApproval = isInitialNavigation(request) && url.searchParams.get("approval") === "request";
+    // Registry paths answer before the approval-method check, so a bad approval
+    // config cannot break PC registration, and they never reach the hold flow.
+    if (url.pathname.startsWith("/__pc/")) return this.pcRoute(request, url);
     let methods;
     try { methods = approvalMethods(this.env); } catch { return empty(503); }
     if (url.pathname === "/__auth/methods") {
@@ -165,20 +169,40 @@ export class ApprovalGate {
     return held;
   }
 
-  hostRoom() {
-    return this.env.ROOM?.get(this.env.ROOM.idFromName("room-v3"));
+  hostRoom(name = LEGACY_ROOM) {
+    return this.env.ROOM?.get(this.env.ROOM.idFromName(name));
   }
 
-  async hostOnline() {
+  // One capable host receives each approval: the legacy room first (current
+  // behaviour), then registered PCs newest lastSeen first. Each Room is asked
+  // live and the search stops at the first host that is online.
+  async selectApprovalHost() {
+    if (!this.env.ROOM) return null;
+    if (await this.hostCapable(LEGACY_ROOM)) return LEGACY_ROOM;
+    for (const pc of (await this.listPcs()).sort(newestFirst)) {
+      if (await this.hostCapable(pcRoomName(pc.id))) return pcRoomName(pc.id);
+    }
+    return null;
+  }
+
+  async hostCapable(name) {
     try {
-      const response = await this.hostRoom()?.fetch(new Request("https://room.internal/__approval/status"));
+      const response = await this.hostRoom(name)?.fetch(new Request("https://room.internal/__approval/status"));
       return response?.ok === true && (await response.json()).hostOnline === true;
     } catch { return false; }
   }
 
+  async hostOnline() {
+    return (await this.selectApprovalHost()) !== null;
+  }
+
   async publishHost(pending) {
-    const room = this.hostRoom();
+    const name = await this.selectApprovalHost();
+    const room = name ? this.hostRoom(name) : null;
     if (!room) throw new Error("host is offline");
+    // Pin the Room that receives the request. Cancellation uses this name, even
+    // if the default host or the PC list changes before the request ends.
+    pending.hostRoomName = name;
     pending.hostNotified = true;
     const response = await room.fetch(new Request("https://room.internal/__approval/request", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -191,9 +215,9 @@ export class ApprovalGate {
   }
 
   cancelHost(pending) {
-    if (!pending.hostNotified) return;
+    if (!pending.hostNotified || !pending.hostRoomName) return;
     try {
-      const operation = this.hostRoom()?.fetch(new Request("https://room.internal/__approval/cancel", {
+      const operation = this.hostRoom(pending.hostRoomName)?.fetch(new Request("https://room.internal/__approval/cancel", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ type: "approval-cancel", id: pending.id }),
       }));
@@ -648,8 +672,145 @@ export class ApprovalGate {
       if (found) await this.notifySocketRooms();
       return empty(204);
     }
+    const pcMatch = url.pathname.match(/^\/__gate\/manage\/pcs(?:\/([^/]+))?$/);
+    if (pcMatch) return this.managePcs(request, pcMatch[1]);
     return hidden();
   }
+
+  // Registry and routing for the device-key PCs. Only the gate.internal host
+  // (the Worker's own fetch) may reach it; anything from the public internet
+  // gets the same 404 as an unknown path, without entering the approval hold.
+  async pcRoute(request, url) {
+    if (!internalOrigin(request.url)) return hidden();
+    if (request.method === "GET" && url.pathname === "/__pc/resolve") return json({ pc: await this.resolvePc() });
+    if (request.method !== "POST" || !["/__pc/lookup", "/__pc/register", "/__pc/presence"].includes(url.pathname)) return hidden();
+    let body;
+    try { body = await request.json(); } catch { return hidden(); }
+    if (url.pathname === "/__pc/presence") {
+      // Presence is a no-op on purpose. Online state is read live from the
+      // PC's Room socket attachment, so storing it would only add a stale copy
+      // that can outlive the socket. Rooms still send it to show activity.
+      return validPresence(body) ? empty(204) : hidden();
+    }
+    const entry = await parsePcBody(body);
+    if (!entry) return hidden();
+    if (url.pathname === "/__pc/lookup") {
+      return (await this.pcAdmits(entry, await this.state.storage.get(pcKey(entry.id)))) ? empty(204) : hidden();
+    }
+    // Register decides again under the PC's lock, not from the lookup result.
+    // A delete that ran while the proof was in flight must refuse this call.
+    return this.withLock(pcLockKey(entry.id), async () => {
+      const record = await this.state.storage.get(pcKey(entry.id));
+      if (!(await this.pcAdmits(entry, record))) return hidden();
+      const now = Date.now();
+      await this.state.storage.put(pcKey(entry.id), {
+        public: entry.public, firstSeen: record?.firstSeen ?? now, lastSeen: now,
+      });
+      return empty(204);
+    });
+  }
+
+  // Known PCs need the same public key. A token key that is present (even
+  // null, false or 0) must be the correct string, known or unknown. With no
+  // token key, only a known PC is admitted.
+  async pcAdmits(entry, record) {
+    if (record && record.public !== entry.public) return false;
+    if (entry.tokenPresent) return this.tokenMatches(entry.token);
+    return !!record;
+  }
+
+  async tokenMatches(token) {
+    const configured = this.env.TOKEN;
+    if (typeof token !== "string" || typeof configured !== "string" || !configured) return false;
+    return constantTimeEqual(await hashToken(token), await hashToken(configured));
+  }
+
+  async listPcs() {
+    const stored = await this.state.storage.list({ prefix: PC_PREFIX });
+    return [...stored].map(([key, record]) => ({
+      id: key.slice(PC_PREFIX.length), public: record.public, firstSeen: record.firstSeen, lastSeen: record.lastSeen,
+    }));
+  }
+
+  // Asks the PC's own Room whether a host socket is attached. Fails closed:
+  // any error or odd answer counts as offline. Nothing is cached.
+  async roomOnline(name) {
+    try {
+      const room = this.env.ROOM?.get(this.env.ROOM.idFromName(name));
+      const response = await room?.fetch(new Request("https://room.internal/__pc/online"));
+      return response?.ok === true && (await response.json()).online === true;
+    } catch { return false; }
+  }
+
+  // Resolve order: newest online PC by lastSeen, then the legacy room if its
+  // host is online, then the newest listed PC, then legacy (null). "Sole listed"
+  // is the newest listed case with one entry. The legacy room is asked only
+  // when no registered PC is online.
+  async resolvePc() {
+    const listed = await this.listPcs();
+    const states = await Promise.all(listed.map(async (pc) => ({ ...pc, online: await this.roomOnline(`pc-v1:${pc.id}`) })));
+    const [onlineNewest] = states.filter((pc) => pc.online).sort(newestFirst);
+    if (onlineNewest) return onlineNewest.id;
+    if (await this.roomOnline("room-v3")) return null;
+    const [newest] = states.sort(newestFirst);
+    return newest?.id ?? null;
+  }
+
+  async managePcs(request, rawId) {
+    if (rawId === undefined) {
+      if (request.method !== "GET") return hidden();
+      const listed = (await this.listPcs()).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      const rows = await Promise.all(listed.map(async (pc) => ({ ...pc, online: await this.roomOnline(`pc-v1:${pc.id}`) })));
+      return json(rows);
+    }
+    const id = canonicalDeviceId(rawId);
+    if (request.method !== "DELETE" || !id) return hidden();
+    // The registry row goes first, so a register waiting on this lock is
+    // refused. The Room is told next; a failure returns 503 and a retry repeats both steps.
+    return this.withLock(pcLockKey(id), async () => {
+      await this.state.storage.delete(pcKey(id));
+      return (await this.roomDelete(id)) ? empty(204) : empty(503);
+    });
+  }
+
+  async roomDelete(id) {
+    try {
+      const room = this.env.ROOM?.get(this.env.ROOM.idFromName(`pc-v1:${id}`));
+      const response = await room?.fetch(new Request("https://room.internal/__pc/delete", { method: "POST" }));
+      return response?.ok === true;
+    } catch { return false; }
+  }
+}
+
+const PC_PREFIX = "pc:";
+const LEGACY_ROOM = "room-v3";
+const INTERNAL_ORIGIN = "https://gate.internal";
+function pcKey(id) { return `${PC_PREFIX}${id}`; }
+function pcLockKey(id) { return `pc-lock:${id}`; }
+function pcRoomName(id) { return `pc-v1:${id}`; }
+
+// Newest lastSeen first; equal times break by ID so the order is deterministic.
+function newestFirst(a, b) { return (b.lastSeen - a.lastSeen) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0); }
+
+// Exact origin, not hostname: http, a port or userinfo all fail. The URL parser
+// drops a default :443, so that spelling still matches.
+function internalOrigin(value) {
+  const url = new URL(value);
+  return url.origin === INTERNAL_ORIGIN && url.protocol === "https:" && url.port === "" && !url.username && !url.password;
+}
+
+// Shape check for the body of lookup and register. The ID must be the canonical
+// form of the ID derived from the public key. Anything else returns null.
+async function parsePcBody(body) {
+  if (body === null || typeof body !== "object" || typeof body.public !== "string") return null;
+  const id = canonicalDeviceId(body.id);
+  if (!id || (await deriveDeviceId(body.public)) !== id) return null;
+  return { id, public: body.public, token: body.token, tokenPresent: Object.hasOwn(body, "token") };
+}
+
+function validPresence(body) {
+  if (body === null || typeof body !== "object" || typeof body.online !== "boolean") return false;
+  return body.id === null || (typeof body.id === "string" && canonicalDeviceId(body.id) === body.id);
 }
 
 export async function authorized(request, configuredToken) {

@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.widget.Button
@@ -17,6 +18,7 @@ import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import de.bubblebuffer.bubbleplay.R
+import de.bubblebuffer.bubbleplay.keys.DeviceKeyStore
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.Session
 
@@ -28,6 +30,7 @@ class MainActivity : Activity(), SettingsView.Host {
     private lateinit var codec: RadioGroup
     private lateinit var message: TextView
     private lateinit var frame: FrameLayout
+    private lateinit var keyCard: LinearLayout
     private var settingsView: SettingsView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -48,6 +51,8 @@ class MainActivity : Activity(), SettingsView.Host {
             setTextColor(0xFFB8C0CC.toInt())
             setPadding(0, dp(4), 0, dp(16))
         })
+        keyCard = deviceKeyCard()
+        column.addView(keyCard)
         column.addView(label(R.string.server_label))
         server = EditText(this).apply {
             setText(prefs.server)
@@ -90,6 +95,10 @@ class MainActivity : Activity(), SettingsView.Host {
         column.addView(Button(this).apply {
             setText(R.string.settings_open)
             setOnClickListener { openSettings() }
+        })
+        column.addView(Button(this).apply {
+            setText(R.string.dk_open)
+            setOnClickListener { startActivity(DeviceKeyActivity.intent(this@MainActivity)) }
         })
         column.addView(Button(this).apply {
             setText(R.string.forget_browser)
@@ -171,6 +180,46 @@ class MainActivity : Activity(), SettingsView.Host {
         val next = if (config.isLab || (signedIn && !forceLogin)) StreamActivity::class.java else LoginActivity::class.java
         startActivity(PendingShares.attach(Intent(this, next).putExtra(LoginActivity.EXTRA_FORCE, forceLogin), PendingShares.read(intent)))
         PendingShares.consume(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshKeyOffer()
+    }
+
+    /** The device-key offer: a small card, shown only when [DeviceKeyLogic.offerVisible] says so. Never blocks Connect. */
+    private fun deviceKeyCard(): LinearLayout {
+        val views = KeyViews(this)
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(views.dp(16), views.dp(14), views.dp(16), views.dp(14))
+            background = views.panel()
+            visibility = View.GONE
+            addView(views.body(R.string.dk_offer_text))
+            addView(views.button(R.string.dk_offer_create, KeyViews.Style.PRIMARY) {
+                startActivity(DeviceKeyActivity.intent(this@MainActivity, DeviceKeyActivity.START_CREATE))
+            })
+            addView(views.button(R.string.dk_offer_import, KeyViews.Style.SECONDARY) {
+                startActivity(DeviceKeyActivity.intent(this@MainActivity, DeviceKeyActivity.START_IMPORT))
+            })
+            addView(views.button(R.string.dk_offer_later, KeyViews.Style.SECONDARY) {
+                prefs.deviceKeyOfferDismissed = true
+                visibility = View.GONE
+            })
+        }
+    }
+
+    /** Reads the stored key off the UI thread, then shows or hides the offer. */
+    private fun refreshKeyOffer() {
+        val store = DeviceKeyStore(this)
+        Thread {
+            val stored = DeviceKeyLogic.read(store)
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                val show = DeviceKeyLogic.offerVisible(stored, prefs.deviceKeyOfferDismissed)
+                keyCard.visibility = if (show) View.VISIBLE else View.GONE
+            }
+        }.start()
     }
 
     override fun onNewIntent(intent: Intent) {

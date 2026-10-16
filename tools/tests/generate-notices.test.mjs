@@ -81,3 +81,46 @@ test("personal build paths inside notice source fail closed", () => {
     assert.equal(fs.existsSync(f.output), false);
   } finally { removeFixture(f.dir); }
 });
+
+const nonCargoHeading = "## Additional non-Cargo components";
+const repoRoot = new URL("../../", import.meta.url);
+const repoBytes = file => fs.readFileSync(new URL(file, repoRoot));
+const expectedBody = bytes => bytes.toString("utf8").replaceAll("\r\n", "\n").replaceAll("\r", "\n").replace(/\n?$/, "\n");
+const cargoSectionSha256 = "ff61e1d6f65131279cc25c70059de6b89eca4b907ad4f6915e5b97832bc35b8a"; // pre-change generator output for this fixture
+
+test("previous Cargo inventory, ParsecVDD section and retained texts stay byte-identical before the appended section", () => {
+  const f = fixture();
+  try {
+    const result = f.run(); assert.equal(result.status, 0, result.stderr);
+    const content = fs.readFileSync(f.output, "utf8");
+    const at = content.indexOf(nonCargoHeading);
+    assert.notEqual(at, -1, "non-Cargo section is appended");
+    assert.equal(content.indexOf(nonCargoHeading, at + 1), -1, "exactly one non-Cargo section");
+    assert.equal(hash(content.slice(0, at)), cargoSectionSha256);
+  } finally { removeFixture(f.dir); }
+});
+
+test("non-Cargo list entries carry exact provenance and append repository texts with new ids", () => {
+  const f = fixture();
+  try {
+    const result = f.run(); assert.equal(result.status, 0, result.stderr);
+    const content = fs.readFileSync(f.output, "utf8");
+    const at = content.indexOf(nonCargoHeading);
+    const appended = content.slice(at), lines = appended.split("\n");
+    const cargoIds = [...content.slice(0, at).matchAll(/^### License text (\d+)$/gm)].map(match => Number(match[1]));
+    const top = Math.max(...cargoIds), wasmId = top + 1, bcId = top + 2;
+    assert.ok(lines.includes("| Component | Version | Licence | Source | Repository licence file | Retained text |"));
+    assert.ok(lines.includes(`| hash-wasm | 4.12.0 | MIT | https://registry.npmjs.org/hash-wasm/-/hash-wasm-4.12.0.tgz | worker/public/vendor/hash-wasm/LICENSE | [license text ${wasmId}](#license-text-${wasmId}) |`));
+    assert.ok(lines.includes(`| bcprov-jdk18on | 1.86 | MIT | https://raw.githubusercontent.com/bcgit/bc-java/r1rv86/LICENSE.html | android/licenses/bouncycastle-LICENSE.txt | [license text ${bcId}](#license-text-${bcId}) |`));
+    for (const [id, name, version, source, file] of [
+      [wasmId, "hash-wasm", "4.12.0", "https://registry.npmjs.org/hash-wasm/-/hash-wasm-4.12.0.tgz", "worker/public/vendor/hash-wasm/LICENSE"],
+      [bcId, "bcprov-jdk18on", "1.86", "https://raw.githubusercontent.com/bcgit/bc-java/r1rv86/LICENSE.html", "android/licenses/bouncycastle-LICENSE.txt"],
+    ]) {
+      const bytes = repoBytes(file);
+      const block = `<a id="license-text-${id}"></a>\n\n### License text ${id}\n\nOriginal file SHA-256: \`${hash(bytes)}\`.\n\nSources:\n\n`
+        + `- ${name}@${version} source: ${source}\n- ${name}@${version} repository licence file: ${file}\n\n`
+        + `\`\`\`text\n${expectedBody(bytes)}\`\`\`\n\n`;
+      assert.ok(appended.includes(block), `exact repository text for ${file}`);
+    }
+  } finally { removeFixture(f.dir); }
+});

@@ -12,6 +12,8 @@ import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.util.Log
 import android.webkit.MimeTypeMap
+import de.bubblebuffer.bubbleplay.net.ServerConfig
+import de.bubblebuffer.bubbleplay.net.ViewerGrant
 import de.bubblebuffer.bubbleplay.protocol.FileWire
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
@@ -42,6 +44,8 @@ class FileTransfers(
     private val urlProvider: () -> HttpUrl?,
     private val cookieProvider: () -> String?,
     private val listener: Listener,
+    /** The viewer grant of the current signaling session: its PC goes in the URL, its ticket in the hello. */
+    private val grantProvider: () -> ViewerGrant = { ViewerGrant.NONE },
 ) {
     enum class Direction { UP, DOWN }
 
@@ -280,7 +284,8 @@ class FileTransfers(
     }
 
     private fun openSocket() {
-        val url = urlProvider()
+        val grant = grantProvider()
+        val url = urlProvider()?.let { ServerConfig.withPc(it, grant.pc) }
         if (url == null) { failQueued(ERR_UNAVAILABLE); return }
         val gen = ++wsGen
         nextTid = 1
@@ -288,9 +293,11 @@ class FileTransfers(
         Log.i(TAG, "opening file socket")
         ws = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = on(gen) {
+                // The grant changed while this socket connected: its ticket is stale, so reconnect with the current one.
+                if (grantProvider() !== grant) { socketLost("grant changed", auth = false, counts = false); return@on }
                 wsOpen = true
                 failures = 0
-                webSocket.send(HELLO)
+                webSocket.send(grant.hello("file-client"))
                 handler.removeCallbacks(ping)
                 handler.postDelayed(ping, PING_MS)
                 handler.removeCallbacks(peerTimeout)
@@ -668,7 +675,6 @@ class FileTransfers(
         private const val MAX_OPEN_FAILURES = 3
         private const val PING_MS = 15_000L
         private const val PEER_WAIT_MS = 10_000L
-        private const val HELLO = "{\"type\":\"hello\",\"role\":\"file-client\"}"
         private const val PING = "{\"type\":\"ping\"}"
 
         const val ERR_CANCELLED = "cancelled"
