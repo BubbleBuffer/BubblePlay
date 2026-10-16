@@ -189,7 +189,8 @@ test("file routes are gated like the media routes and paired per epoch in the Me
   const env = {
     ...RELAY_SECRETS,
     APPROVAL_METHODS: "host",
-    GATE: { idFromName: () => "gate", get: () => ({ fetch: async () => new Response(null, { status: gateStatus }) }) },
+    GATE: { idFromName: () => "gate", get: () => ({ fetch: async (request) => (new URL(request.url).pathname === "/__pc/resolve"
+      ? Response.json({ pc: null }) : new Response(null, { status: gateStatus })) }) },
     ROOM: { idFromName: name => name, get: () => ({ fetch: async () => new Response("signal") }) },
     MEDIA_ROOM: { idFromName: name => { selected.push(name); return name; }, get: () => ({ fetch: async () => fileResponse }) },
   };

@@ -103,22 +103,39 @@ export default {
           return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });
         }
       }
-      if (url.pathname === "/ws" && !url.searchParams.has("pc")) {
-        const resolved = await gate.fetch(new Request("https://gate.internal/__pc/resolve"));
-        if (resolved.status !== 200) return badRoute();
-        const { pc } = await resolved.json();
-        if (pc !== null) {
-          if (!canonicalDeviceId(pc)) return badRoute();
-          url.searchParams.set("pc", canonicalDeviceId(pc));
-          // Clone the original request, including its Upgrade header.
-          request = new Request(url, request);
-        }
-      }
-      return handleWebSocket(request, env);
+      const routed = await routeBrowserSocket(request, url, gate);
+      if (!routed) return badRoute();
+      return handleWebSocket(routed, env);
     }
     return gate.fetch(request);
   },
 };
+
+// Viewer /ws, /media-ws and /file-ws share default-PC resolution. Auxiliary
+// sockets must match the resolved signaling room's active viewer epoch.
+// Lab twins keep their run's signaling room instead of resolving a production
+// PC. Mark every pc-less viewer so auxiliary hellos check that binding too.
+const DEFAULT_PC_PATHS = new Set(["/ws", "/media-ws", "/file-ws"]);
+// Set by the Worker on pc-less browser sockets only; any client copy is removed.
+const DEFAULT_PC_HEADER = "X-Relay-Default-Pc";
+async function routeBrowserSocket(request, url, gate) {
+  const pcLess = !url.searchParams.has("pc");
+  if (pcLess && DEFAULT_PC_PATHS.has(url.pathname)) {
+    const resolved = await gate.fetch(new Request("https://gate.internal/__pc/resolve"));
+    if (resolved.status !== 200) return null;
+    const { pc } = await resolved.json();
+    if (pc !== null) {
+      if (!canonicalDeviceId(pc)) return null;
+      url.searchParams.set("pc", canonicalDeviceId(pc));
+    }
+  }
+  if (!pcLess && !request.headers.has(DEFAULT_PC_HEADER)) return request;
+  // Clone the original request, including its Upgrade header.
+  const routed = new Request(url, request);
+  routed.headers.delete(DEFAULT_PC_HEADER);
+  if (pcLess) routed.headers.set(DEFAULT_PC_HEADER, "1");
+  return routed;
+}
 
 function socketRoom(url) {
   // Room name bump = fresh Durable Object state. The previous "room" instance
@@ -298,6 +315,8 @@ export class Room {
       bearerOk: isHostSocketPath(url.pathname) && (localLab || await authorized(request, this.env.HOST_GATE_TOKEN)),
       epoch: url.searchParams.get("epoch") || null,
       run: lab ? url.searchParams.get("run") : null,
+      // The original viewer URL omitted pc; auxiliary hellos check its epoch.
+      defaultPc: expectedRole.endsWith("client") && request.headers.get(DEFAULT_PC_HEADER) === "1",
       localLab });
 
     // acceptWebSocket() both accepts the server side and registers it for
@@ -845,6 +864,7 @@ export class Room {
         method: "POST", body: JSON.stringify({ pc: att.pc || null, epoch: att.epoch,
           ...(att.run ? { run: att.run } : {}),
           role: host ? "host" : "viewer", requireTicket: host && !att.bearerOk,
+          ...(att.defaultPc === true && !host ? { defaultPc: true } : {}),
           ...(carriesTicket ? { ticket: msg.ticket } : {}) }),
       }));
       return response.status === 204;
@@ -885,6 +905,12 @@ export class Room {
     if (!/^[a-f0-9]{32}$/.test(body.epoch || "")) return badRoute();
     const viewer = this.findPeer("client");
     const carriesTicket = Object.hasOwn(body, "ticket");
+    // Without a ticket, a pc-less viewer must use the active signaling epoch
+    // in its resolved room (or lab run). Explicit-pc admission is unchanged.
+    if (!carriesTicket && body.role === "viewer" && body.defaultPc === true) {
+      const viewerAtt = viewer?.deserializeAttachment() || {};
+      if (!viewer || viewerAtt.mediaEpoch !== body.epoch || (viewerAtt.pc || null) !== body.pc) return badRoute();
+    }
     if (!carriesTicket) {
       if (body.requireTicket) return badRoute();
       // Preserve phase-1 bearer/cookie admission for peers without tickets.

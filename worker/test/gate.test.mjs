@@ -1075,7 +1075,9 @@ test("media websocket routing uses an isolated Durable Object namespace", async 
   const mediaResponse = new Response("media", { status: 200 });
   const env = {
     ...WORKER_SECRETS,
-    GATE: { idFromName: () => "gate", get: () => ({ fetch: async () => new Response(null, { status: 204 }) }) },
+    // The pc-less media socket asks the GATE which PC to use; this mock registers none.
+    GATE: { idFromName: () => "gate", get: () => ({ fetch: async (request) => (new URL(request.url).pathname === "/__pc/resolve"
+      ? Response.json({ pc: null }) : new Response(null, { status: 204 })) }) },
     ROOM: { idFromName: (name) => { selected.push(`signal:${name}`); return name; }, get: () => ({ fetch: async () => new Response("signal") }) },
     MEDIA_ROOM: { idFromName: (name) => { selected.push(`media:${name}`); return name; }, get: () => ({ fetch: async () => mediaResponse }) },
   };

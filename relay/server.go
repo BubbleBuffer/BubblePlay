@@ -362,10 +362,12 @@ func (s *Relay) upgrade(w http.ResponseWriter, r *http.Request, kind, role strin
 	}
 	epoch := query.Get("epoch")
 	s.mu.Lock()
-	if role == "client" && !query.Has("pc") {
+	if !host && !query.Has("pc") {
 		pc = s.defaultPCLocked()
 	}
 	rm := s.findRoomLocked(pc)
+	// Old viewers send the signaling epoch but no PC or ticket. Checking it
+	// against the resolved room refuses a default that changed since /ws.
 	if s.stopped || len(s.all)+s.pendingUpgrades >= s.cfg.MaxConnections || (kind != "signal" && (!epochPattern.MatchString(epoch) || rm == nil || epoch != rm.currentEpoch)) {
 		s.mu.Unlock()
 		http.NotFound(w, r)

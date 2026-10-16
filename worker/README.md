@@ -110,7 +110,13 @@ required as before.
 
 Viewers select `/ws?pc=<id>` or default to the most recently registered online
 PC, then the online legacy host, then the most recently registered listed PC
-(or legacy when none is listed). Signaling `hello-ok` includes a `ticket`
+(or legacy when none is listed). One shared resolver applies this rule to
+pc-less viewer `/ws`, `/media-ws` and `/file-ws`. Old Android viewers send
+only the signaling epoch on media/file URLs, without `pc` or tickets. The
+resolved signaling room must still own that active viewer epoch; a changed
+default is refused rather than cross-connected. Lab twins use the same
+binding check within their run. Explicit `pc` and ticket behavior is unchanged.
+Signaling `hello-ok` includes a `ticket`
 and, for ID rooms, `pc`. Media/file URLs carry `pc` beside `epoch`; their
 `hello` can carry the ticket. A host may use its ticket instead of the bearer
 on those sockets. Viewers still need cookies; any supplied ticket must match

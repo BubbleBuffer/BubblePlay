@@ -47,6 +47,7 @@ func peerOpen(p *peer) bool {
 	}
 }
 
+// Shared default for viewer signaling, media and file upgrades without pc.
 // All room/peer decisions hold Relay.mu before consulting durable auth state.
 func (s *Relay) defaultPCLocked() string {
 	s.auth.mu.Lock()

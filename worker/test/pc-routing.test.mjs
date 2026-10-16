@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { STREAM_LAB_COMPATIBILITY } from "../public/media.js";
+import { ackMessageV4, parseFrameV4 } from "../public/media-v4.js";
+import { decodeFilePacket, encodeData, encodeRequest } from "../public/file-transfer.js";
 import {
   contract, PC, VIEWER, ALIAS_PC, RELAY_ORIGIN, freshNonce, tamper, signRelayProof, verifyWithFixtureKey, relayProofEncoding, unb64url,
 } from "./helpers/dk-contract.mjs";
@@ -46,6 +49,20 @@ async function validate(env, pcId, body) {
   }));
   return response.status;
 }
+
+// The same v4 packet fixture the media tests validate against.
+const V4_FIXTURE = JSON.parse(readFileSync(new URL("../../fixtures/wss-v4-contract.json", import.meta.url), "utf8"));
+
+// Native Android handshake: the session Cookie, no Origin, no pc, no ticket.
+const native = (env, path, cookie) => connect(env, path, { headers: { Cookie: cookie }, origin: null });
+const hostBearer = env => ({ Authorization: `Bearer ${env.HOST_GATE_TOKEN}` });
+// Binary frames enter the Room the way the Worker delivers them (send() only JSON-encodes text).
+async function sendRaw(env, socket, raw) {
+  const { roomName, namespace } = socket.attachment;
+  return env[namespace].instance(roomName).webSocketMessage(socket, raw);
+}
+const hasFrame = (socket, bytes) => socket.messages.some(raw => Buffer.from(raw).equals(Buffer.from(bytes)));
+const lastValidate = env => env.testLog.filter(entry => entry.binding === "ROOM" && entry.path === "/__pc/validate").at(-1);
 
 async function onlineHost(env, identity = PC, extra = {}) {
   const host = await registerHost(env, { identity, token: env.TOKEN, ...extra });
@@ -467,6 +484,306 @@ test("the lab twin /lab-host-ws requires a pc for an ID hello, like /host-ws", a
   assertHostRefused(await registerHost(env, { path: labPath, pc: null, params: labParams, token: env.TOKEN }), "lab ID hello, no pc");
   const lab = await registerHost(env, { path: labPath, params: labParams, token: env.TOKEN });
   assert.equal(lab.reply?.pc, PC.id, "lab ID hello with pc");
+});
+
+// The old Android client: /ws hello {role:"client"}, then /media-ws and /file-ws by
+// mediaEpoch with no pc and no ticket. All three must reach the ID host's PC.
+test("an old viewer with no pc reaches the ID host on /ws, /media-ws and /file-ws", async () => {
+  const env = relayEnv();
+  await onlineHost(env, PC);
+  const cookie = await browserCookie(env);
+  const viewer = await viewerConnect(env, "/ws", cookie);
+  assert.equal(viewer.socket.attachment.roomName, `pc-v1:${PC.id}`);
+  const hello = await viewerHello(env, viewer.socket);
+  assert.equal(hello.pc, PC.id);
+
+  const media = await viewerConnect(env, `/media-ws?epoch=${hello.mediaEpoch}`, cookie);
+  assert.equal(media.status, 101);
+  assert.equal(media.socket.attachment.pc, PC.id, "media binds to the PC /ws resolved");
+  assert.equal(media.socket.attachment.roomName, `media-v4:${hello.mediaEpoch}`, "media room is still epoch-keyed");
+  await send(env, media.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(media.socket, "hello-ok").length, 1, "no ticket, bound by the viewer's epoch");
+
+  const file = await viewerConnect(env, `/file-ws?epoch=${hello.mediaEpoch}`, cookie);
+  assert.equal(file.status, 101);
+  assert.equal(file.socket.attachment.pc, PC.id, "file binds to the PC /ws resolved");
+  assert.equal(file.socket.attachment.roomName, `file-v1:${hello.mediaEpoch}`);
+  await send(env, file.socket, { type: "hello", role: "file-client" });
+  assert.equal(framesOfType(file.socket, "hello-ok").length, 1, "file: no ticket, bound by epoch");
+
+  const validations = env.testLog.filter(entry => entry.binding === "ROOM" && entry.path === "/__pc/validate");
+  assert.equal(validations.length, 2, "one validate per auxiliary hello");
+  assert.ok(validations.every(entry => entry.name === `pc-v1:${PC.id}` && entry.body.defaultPc === true));
+
+  // The epoch check is the same one the ticket path uses: the wrong epoch and the wrong PC are refused.
+  assert.equal(await validate(env, PC.id, { role: "viewer", epoch: hello.mediaEpoch, defaultPc: true, requireTicket: false }), 204);
+  assert.equal(await validate(env, PC.id, { role: "viewer", epoch: E_B, defaultPc: true, requireTicket: false }), 404, "wrong epoch");
+  assert.equal(await validate(env, ALIAS_PC.id, { role: "viewer", epoch: hello.mediaEpoch, defaultPc: true, requireTicket: false }), 404, "wrong PC");
+
+  // Leaving retires the defaulted auxiliary sockets, because they carry the PC too.
+  await close(env, viewer.socket, 1000);
+  assert.ok(media.socket.closed.length > 0, "media retired with its signaling viewer");
+  assert.ok(file.socket.closed.length > 0, "file retired with its signaling viewer");
+});
+
+test("a pc-less media or file upgrade that resolves a PC the viewer is not on is refused at hello", async () => {
+  const env = relayEnv();
+  const hostA = await onlineHost(env, PC);
+  const cookie = await browserCookie(env);
+  const viewer = await viewerConnect(env, "/ws", cookie);
+  const hello = await viewerHello(env, viewer.socket);
+  // Upgrades made while PC A is the default bind to A, and the viewer is on A.
+  const media = await viewerConnect(env, `/media-ws?epoch=${hello.mediaEpoch}`, cookie);
+  const file = await viewerConnect(env, `/file-ws?epoch=${hello.mediaEpoch}`, cookie);
+  assert.equal(media.socket.attachment.pc, PC.id);
+  assert.equal(file.socket.attachment.pc, PC.id);
+
+  // The default moves to B. The viewer's signaling socket is still on A.
+  await close(env, hostA.socket, 1000);
+  await onlineHost(env, ALIAS_PC);
+  // A new upgrade resolves B, which the viewer is not on. Upgrade succeeds; hello is refused.
+  const moved = await viewerConnect(env, `/media-ws?epoch=${hello.mediaEpoch}`, cookie);
+  assert.equal(moved.status, 101, "the upgrade itself resolves");
+  assert.equal(moved.socket.attachment.pc, ALIAS_PC.id);
+  await send(env, moved.socket, { type: "hello", role: "media-client" });
+  assertSocketRefused(moved.socket, "media upgrade for B, viewer on A");
+  const movedFile = await viewerConnect(env, `/file-ws?epoch=${hello.mediaEpoch}`, cookie);
+  assert.equal(movedFile.socket.attachment.pc, ALIAS_PC.id);
+  await send(env, movedFile.socket, { type: "hello", role: "file-client" });
+  assertSocketRefused(movedFile.socket, "file upgrade for B, viewer on A");
+
+  // The upgrade made under A still belongs to the viewer on A, so its hello is accepted.
+  await send(env, media.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(media.socket, "hello-ok").length, 1, "A-bound media, viewer on A");
+  await send(env, file.socket, { type: "hello", role: "file-client" });
+  assert.equal(framesOfType(file.socket, "hello-ok").length, 1, "A-bound file, viewer on A");
+
+  // Positive control: the same viewer re-hellos on /ws under B, gets a new epoch, and its defaulted media works.
+  const viewerB = await viewerConnect(env, "/ws", cookie);
+  const helloB = await viewerHello(env, viewerB.socket);
+  assert.equal(helloB.pc, ALIAS_PC.id);
+  const mediaB = await viewerConnect(env, `/media-ws?epoch=${helloB.mediaEpoch}`, cookie);
+  assert.equal(mediaB.socket.attachment.pc, ALIAS_PC.id);
+  await send(env, mediaB.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(mediaB.socket, "hello-ok").length, 1, "re-hello on B: media accepted");
+});
+
+test("the lab viewer's pc-less media stays on its run's signaling room and never resolves the default PC", async () => {
+  const env = relayEnv();
+  await onlineHost(env, PC);
+  const cookie = await browserCookie(env);
+  const labQuery = `run=${RUN}&compat=${COMPAT}`;
+  const lab = await viewerConnect(env, `/lab-ws?${labQuery}`, cookie);
+  assert.equal(lab.socket.attachment.roomName, `lab-signal-v1:${RUN}`);
+  const labHello = await viewerHello(env, lab.socket);
+  assert.equal(labHello.pc, undefined, "lab signaling names no PC");
+
+  const media = await viewerConnect(env, `/lab-media-ws?${labQuery}&epoch=${labHello.mediaEpoch}`, cookie);
+  assert.equal(media.status, 101);
+  assert.equal(media.socket.attachment.pc, null, "no default PC on the lab twin");
+  assert.equal(media.socket.attachment.defaultPc, true, "pc-less lab media is marked for the epoch check");
+  await send(env, media.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(media.socket, "hello-ok").length, 1);
+  const validations = env.testLog.filter(entry => entry.binding === "ROOM" && entry.path === "/__pc/validate");
+  assert.equal(validations.at(-1).name, `lab-signal-v1:${RUN}`, "validated against the run's signaling room");
+  assert.equal(validations.at(-1).body.defaultPc, true);
+});
+
+test("explicit-pc media without a ticket keeps its old admission: the viewer's epoch is not checked", async () => {
+  const env = relayEnv();
+  await onlineHost(env, PC);
+  await onlineHost(env, ALIAS_PC);
+  const cookie = await browserCookie(env);
+  const viewer = await viewerConnect(env, `/ws?pc=${PC.id}`, cookie);
+  await viewerHello(env, viewer.socket);
+  // Unchanged from before the default-PC routing: an explicit pc and a stale epoch are admitted without a ticket.
+  const explicit = await viewerConnect(env, `/media-ws?pc=${ALIAS_PC.id}&epoch=${E_B}`, cookie);
+  await send(env, explicit.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(explicit.socket, "hello-ok").length, 1, "explicit pc, no ticket, epoch not checked");
+  const validations = env.testLog.filter(entry => entry.binding === "ROOM" && entry.path === "/__pc/validate");
+  assert.equal("defaultPc" in validations.at(-1).body, false, "explicit pc is not marked as defaulted");
+});
+
+test("native Android viewer with no pc joins the ID host: offer, media frame, ACK and file packets all reach it", async () => {
+  const env = relayEnv();
+  const host = await onlineHost(env, PC);
+  const cookie = await browserCookie(env);
+
+  // Signaling: the old client's hello, then its offer reaches the ID host's signaling socket.
+  const viewer = await native(env, "/ws", cookie);
+  assert.equal(viewer.status, 101);
+  const hello = await viewerHello(env, viewer.socket);
+  assert.equal(hello.pc, PC.id);
+  const epoch = hello.mediaEpoch;
+  await send(env, viewer.socket, JSON.stringify({ type: "offer", sdp: "v=0 native-android" }));
+  assert.deepEqual(framesOfType(host.socket, "offer").map(frame => frame.sdp), ["v=0 native-android"]);
+
+  // Media: the host joins the same epoch; the viewer's pc-less media is admitted and bound to the PC.
+  const mediaHost = await connect(env, `/host-media-ws?pc=${PC.id}&epoch=${epoch}`, { headers: hostBearer(env), origin: null });
+  await send(env, mediaHost.socket, { type: "hello", role: "media-host" });
+  assert.equal(framesOfType(mediaHost.socket, "hello-ok").length, 1, "host media joins the epoch");
+  const media = await native(env, `/media-ws?epoch=${epoch}`, cookie);
+  assert.equal(media.status, 101);
+  assert.equal(media.socket.attachment.pc, PC.id);
+  await send(env, media.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(media.socket, "hello-ok").length, 1, "viewer media admitted without a ticket");
+
+  // A fixture packet is validated before it is sent, and reaches the viewer byte for byte.
+  const fixture = V4_FIXTURE.packets.find(packet => packet.accepted);
+  const packet = Buffer.from(fixture.hex, "hex");
+  assert.ok(parseFrameV4(packet), "fixture packet parses");
+  await sendRaw(env, mediaHost.socket, packet);
+  assert.ok(hasFrame(media.socket, packet), "frame reached the viewer");
+
+  // The viewer's ACK reaches the ID host's media socket.
+  await send(env, media.socket, ackMessageV4({ generation: fixture.generation, seq: fixture.seq, recvTsMs: 12.5, decodedSeq: fixture.seq }));
+  assert.deepEqual(framesOfType(mediaHost.socket, "ack").map(frame => [frame.generation, frame.seq]), [[fixture.generation, fixture.seq]]);
+
+  // File: the host joins the epoch; the client's REQUEST and the host's DATA each reach the other side.
+  const fileHost = await connect(env, `/host-file-ws?pc=${PC.id}&epoch=${epoch}`, { headers: hostBearer(env), origin: null });
+  await send(env, fileHost.socket, { type: "hello", role: "file-host" });
+  assert.equal(framesOfType(fileHost.socket, "hello-ok").length, 1, "host file joins the epoch");
+  const file = await native(env, `/file-ws?epoch=${epoch}`, cookie);
+  assert.equal(file.status, 101);
+  assert.equal(file.socket.attachment.pc, PC.id);
+  await send(env, file.socket, { type: "hello", role: "file-client" });
+  assert.equal(framesOfType(file.socket, "hello-ok").length, 1, "viewer file admitted without a ticket");
+  const request = encodeRequest(7, 7, 7);
+  const data = encodeData(7, 0, new Uint8Array([1, 2, 3, 4]));
+  assert.equal(decodeFilePacket(request).ok, true);
+  assert.equal(decodeFilePacket(data).ok, true);
+  await sendRaw(env, file.socket, request);
+  assert.ok(hasFrame(fileHost.socket, request), "request reached the file host");
+  await sendRaw(env, fileHost.socket, data);
+  assert.ok(hasFrame(file.socket, data), "data reached the file client");
+});
+
+test("with PC A still online and B registered later, a pc-less media or file socket carrying A's epoch is refused", async () => {
+  const env = relayEnv();
+  await onlineHost(env, PC);
+  const cookie = await browserCookie(env);
+  const viewerA = await native(env, "/ws", cookie);
+  const helloA = await viewerHello(env, viewerA.socket);
+  assert.equal(helloA.pc, PC.id);
+
+  // B registers at a later time, so it is the newest online PC and the default. A stays online.
+  await atOffset(60_000, () => onlineHost(env, ALIAS_PC));
+  const viewerB = await native(env, "/ws", cookie);
+  assert.equal(viewerB.socket.attachment.roomName, `pc-v1:${ALIAS_PC.id}`);
+  const helloB = await viewerHello(env, viewerB.socket);
+  assert.equal(helloB.pc, ALIAS_PC.id);
+  assert.notEqual(helloB.mediaEpoch, helloA.mediaEpoch);
+
+  // A's epoch, pc-less: both sockets bind to B, where the viewer has another epoch. Both are refused.
+  const mediaA = await native(env, `/media-ws?epoch=${helloA.mediaEpoch}`, cookie);
+  assert.equal(mediaA.socket.attachment.pc, ALIAS_PC.id);
+  await send(env, mediaA.socket, { type: "hello", role: "media-client" });
+  assertSocketRefused(mediaA.socket, "media with A's epoch under B");
+  assert.equal(lastValidate(env).name, `pc-v1:${ALIAS_PC.id}`, "checked against B's signaling room");
+  const fileA = await native(env, `/file-ws?epoch=${helloA.mediaEpoch}`, cookie);
+  assert.equal(fileA.socket.attachment.pc, ALIAS_PC.id);
+  await send(env, fileA.socket, { type: "hello", role: "file-client" });
+  assertSocketRefused(fileA.socket, "file with A's epoch under B");
+
+  // Positive control: B's own epoch is accepted on both sockets.
+  const mediaB = await native(env, `/media-ws?epoch=${helloB.mediaEpoch}`, cookie);
+  await send(env, mediaB.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(mediaB.socket, "hello-ok").length, 1, "media with B's epoch");
+  const fileB = await native(env, `/file-ws?epoch=${helloB.mediaEpoch}`, cookie);
+  await send(env, fileB.socket, { type: "hello", role: "file-client" });
+  assert.equal(framesOfType(fileB.socket, "hello-ok").length, 1, "file with B's epoch");
+  assert.equal(viewerA.socket.closed.length, 0, "A's signaling viewer is untouched");
+});
+
+test("a viewer's signaling replacement between an upgrade and its hello refuses the replaced epoch", async () => {
+  const env = relayEnv();
+  await onlineHost(env, PC);
+  const cookie = await browserCookie(env);
+  const first = await native(env, "/ws", cookie);
+  const helloOld = await viewerHello(env, first.socket);
+  // An upgrade made under the old epoch, before the replacement.
+  const early = await native(env, `/media-ws?epoch=${helloOld.mediaEpoch}`, cookie);
+  // A replacement signaling socket on the same PC takes a new epoch and retires the old epoch's auxiliary sockets.
+  const second = await native(env, "/ws", cookie);
+  const helloNew = await viewerHello(env, second.socket);
+  assert.notEqual(helloNew.mediaEpoch, helloOld.mediaEpoch);
+  assert.ok(early.socket.closed.length > 0, "the upgrade made under the old epoch is retired with it");
+
+  // An upgrade that still carries the old epoch lands after the replacement: its hello is refused by the binding.
+  const late = await native(env, `/media-ws?epoch=${helloOld.mediaEpoch}`, cookie);
+  assert.equal(late.status, 101);
+  await send(env, late.socket, { type: "hello", role: "media-client" });
+  assertSocketRefused(late.socket, "old epoch after the replacement");
+  assert.equal(await validate(env, PC.id, { role: "viewer", epoch: helloOld.mediaEpoch, defaultPc: true, requireTicket: false }), 404);
+  assert.equal(await validate(env, PC.id, { role: "viewer", epoch: helloNew.mediaEpoch, defaultPc: true, requireTicket: false }), 204);
+
+  const fresh = await native(env, `/media-ws?epoch=${helloNew.mediaEpoch}`, cookie);
+  await send(env, fresh.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(fresh.socket, "hello-ok").length, 1, "the new epoch is admitted");
+});
+
+test("a caller's X-Relay-Default-Pc header cannot skip the pc-less epoch check, and cannot mark an explicit pc", async () => {
+  const env = relayEnv();
+  await onlineHost(env, PC);
+  const cookie = await browserCookie(env);
+  const viewer = await native(env, "/ws", cookie);
+  const hello = await viewerHello(env, viewer.socket);
+
+  // Pc-less, stale epoch, caller says "0": the Worker sets its own marker, so the stale epoch is refused.
+  const spoofed = await connect(env, `/media-ws?epoch=${E_B}`, { headers: { Cookie: cookie, "X-Relay-Default-Pc": "0" }, origin: null });
+  assert.equal(spoofed.socket.attachment.defaultPc, true, "marker set by the Worker");
+  await send(env, spoofed.socket, { type: "hello", role: "media-client" });
+  assertSocketRefused(spoofed.socket, "spoofed header, stale epoch");
+
+  // Explicit pc, caller says "1": the header is stripped, so the socket is not marked and admission is unchanged.
+  const explicit = await connect(env, `/media-ws?pc=${PC.id}&epoch=${E_B}`, { headers: { Cookie: cookie, "X-Relay-Default-Pc": "1" }, origin: null });
+  assert.equal(explicit.socket.attachment.defaultPc, false);
+  await send(env, explicit.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(explicit.socket, "hello-ok").length, 1, "explicit pc, no ticket: unchanged");
+
+  // The real epoch, pc-less, with the header set by the caller: still admitted.
+  const real = await connect(env, `/media-ws?epoch=${hello.mediaEpoch}`, { headers: { Cookie: cookie, "X-Relay-Default-Pc": "1" }, origin: null });
+  await send(env, real.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(real.socket, "hello-ok").length, 1, "real epoch, pc-less");
+});
+
+test("pc-less lab media and file are bound to their own run's epoch, never a production PC, and a spoofed header does not bypass it", async () => {
+  const env = relayEnv();
+  await onlineHost(env, PC); // A production PC is online; the lab must not use it.
+  const cookie = await browserCookie(env);
+  const RUN_B = "123e4567-e89b-42d3-a456-426614174001";
+  const labQuery = `run=${RUN}&compat=${COMPAT}`;
+
+  const lab = await native(env, `/lab-ws?${labQuery}`, cookie);
+  assert.equal(lab.socket.attachment.roomName, `lab-signal-v1:${RUN}`);
+  const hello = await viewerHello(env, lab.socket);
+  assert.equal(hello.pc, undefined, "lab signaling names no PC");
+
+  // Valid: media and file with the run's own epoch, no pc and no ticket.
+  const media = await native(env, `/lab-media-ws?${labQuery}&epoch=${hello.mediaEpoch}`, cookie);
+  assert.equal(media.socket.attachment.pc, null, "no production PC");
+  await send(env, media.socket, { type: "hello", role: "media-client" });
+  assert.equal(framesOfType(media.socket, "hello-ok").length, 1, "valid lab media");
+  assert.equal(lastValidate(env).name, `lab-signal-v1:${RUN}`, "validated in the run's signaling room");
+  const file = await native(env, `/lab-file-ws?${labQuery}&epoch=${hello.mediaEpoch}`, cookie);
+  await send(env, file.socket, { type: "hello", role: "file-client" });
+  assert.equal(framesOfType(file.socket, "hello-ok").length, 1, "valid lab file");
+
+  // Wrong run: the epoch belongs to RUN, so RUN_B's room has no such viewer.
+  const wrongRun = await native(env, `/lab-media-ws?run=${RUN_B}&compat=${COMPAT}&epoch=${hello.mediaEpoch}`, cookie);
+  await send(env, wrongRun.socket, { type: "hello", role: "media-client" });
+  assertSocketRefused(wrongRun.socket, "epoch from another run");
+  assert.equal(lastValidate(env).name, `lab-signal-v1:${RUN_B}`);
+
+  // Stale epoch on the right run.
+  const stale = await native(env, `/lab-file-ws?${labQuery}&epoch=${E_B}`, cookie);
+  await send(env, stale.socket, { type: "hello", role: "file-client" });
+  assertSocketRefused(stale.socket, "stale epoch on the right run");
+
+  // Spoofed header on a pc-less lab socket with a stale epoch: still refused.
+  const spoofed = await connect(env, `/lab-media-ws?${labQuery}&epoch=${E_B}`, { headers: { Cookie: cookie, "X-Relay-Default-Pc": "0" }, origin: null });
+  await send(env, spoofed.socket, { type: "hello", role: "media-client" });
+  assertSocketRefused(spoofed.socket, "spoofed header on a lab twin");
 });
 
 test("a host ticket stops admitting host media once its issuing host signaling socket closes", async () => {
