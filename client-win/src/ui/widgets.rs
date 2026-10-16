@@ -699,7 +699,7 @@ fn top_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> Response {
 }
 
 /// Colour with the disabled opacity applied when `enabled` is false.
-fn dim(enabled: bool, c: Color32) -> Color32 {
+pub fn dim(enabled: bool, c: Color32) -> Color32 {
     if enabled {
         c
     } else {

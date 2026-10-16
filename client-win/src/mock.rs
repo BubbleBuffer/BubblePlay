@@ -41,7 +41,7 @@ const REQUEST_NUMBER: u32 = 482_913;
 /// The scene labels, in order. `DemoDriver::len` is `LABELS.len()`.
 /// 0..=22 keep the numbering of the snapshots before step 4 (7 was the
 /// temporary password step); step 4 scenes follow from 23.
-const LABELS: [&str; 47] = [
+const LABELS: [&str; 50] = [
     "Your PCs",
     "Vouch request",
     "This PC",
@@ -89,6 +89,9 @@ const LABELS: [&str; 47] = [
     "Connect: no video decoder",
     "Connect: PC key changed",
     "Approval: withdrawn",
+    "Session: display switching",
+    "Session: display switch failed",
+    "Session: live controls",
 ];
 
 /// Session sparkline points from session.html (34 px high viewBox, 25
@@ -570,7 +573,7 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
             View::Home(studio_sel())
         }
         _ => {
-            // Session scenes (14..=22): the view underneath is never shown.
+            // Session scenes (14..=22, 47..=49): the view underneath is never shown.
             let sess = s.session.insert(session_base());
             let view = View::Home(studio_sel());
             match index {
@@ -593,6 +596,19 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
                 }
                 22 => {
                     sess.notice = Some(SessionNotice::SecureDesktop);
+                    ui.strip = StripView::Toolbar;
+                }
+                47 => {
+                    sess.monitor_pending = true;
+                    ui.strip = StripView::MonitorPicker;
+                }
+                48 => {
+                    sess.monitor_error = Some("The display is not available".into());
+                    ui.strip = StripView::MonitorPicker;
+                }
+                49 => {
+                    sess.quality_controls_available = false;
+                    sess.audio_controls_available = false;
                     ui.strip = StripView::Toolbar;
                 }
                 _ => unreachable!("scene index is reduced modulo LABELS.len()"),
@@ -811,7 +827,7 @@ mod tests {
     #[test]
     fn scenes_apply_without_panic_and_labels_are_unique() {
         let (_backend, mut demo) = new();
-        assert_eq!(demo.len(), 47);
+        assert_eq!(demo.len(), 50);
         let mut seen = HashSet::new();
         assert_eq!(demo.len(), LABELS.len());
         for (i, expected) in LABELS.iter().enumerate() {
@@ -819,7 +835,7 @@ mod tests {
             assert_eq!(label, *expected);
             assert!(seen.insert(label.clone()), "duplicate scene label: {label}");
         }
-        assert_eq!(seen.len(), 47);
+        assert_eq!(seen.len(), 50);
     }
 
     #[test]

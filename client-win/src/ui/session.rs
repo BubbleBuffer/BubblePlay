@@ -18,7 +18,7 @@ use egui::{
 use super::contract;
 use super::icons::Icons;
 use super::theme;
-use super::widgets::{self, BtnKind, BtnSize};
+use super::widgets::{self, dim, BtnKind, BtnSize, NoticeKind};
 use super::{Cx, StripView, Toast, UiState};
 use crate::model::{Action, AppState, Link, Quality, Session, SessionNotice, StreamMode};
 
@@ -159,7 +159,8 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, state: &AppState, sess: &Session, 
     let Picks { mut acts, drag, no_drag, mut strip, toggle_stats, dismiss, .. } = o;
     if picker {
         if let Some(n) = num {
-            if n < sess.monitors.len() {
+            // While a switch is pending the number keys do nothing; Esc still closes.
+            if n < sess.monitors.len() && !sess.monitor_pending {
                 acts.push(Action::SetMonitor(n));
                 strip = Some(StripView::Toolbar);
             }
@@ -275,6 +276,12 @@ struct Btn<'a> {
 /// Mockup `.tb-btn`: 32 px, fitted corners, muted text that lifts on hover.
 /// Icon-only buttons are 34 px wide.
 fn tb_btn(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str) -> Response {
+    tb_btn_enabled(ui, icons, b, tip, true)
+}
+
+/// [`tb_btn`], or when `enabled` is false drawn dimmed with no hover lift and
+/// never clicked. Same size and place either way; the tooltip still shows.
+fn tb_btn_enabled(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str, enabled: bool) -> Response {
     let font = theme::bold(12.5);
     let label_w = match b.label {
         Some(t) => ui.painter().layout_no_wrap(t.to_owned(), font.clone(), theme::INK).size().x,
@@ -290,8 +297,9 @@ fn tb_btn(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str) -> Response {
     let icon_only = b.label.is_none() && b.chev.is_none();
     let w = if icon_only { 34.0 } else { 20.0 + icon_w + label_w + chev_w + gaps };
 
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, BTN_H), Sense::click());
-    let hot = resp.hovered();
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, BTN_H), sense);
+    let hot = enabled && resp.hovered();
     let (bg, fg) = if b.open {
         (theme::INK, theme::SIGNAL_INK)
     } else if b.leave && hot {
@@ -301,6 +309,7 @@ fn tb_btn(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str) -> Response {
     } else {
         (Color32::TRANSPARENT, theme::INK_MUTED)
     };
+    let fg = dim(enabled, fg);
 
     let p = ui.painter().clone();
     if bg != Color32::TRANSPARENT {
@@ -507,7 +516,7 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
                     };
                     let q = keep(
                         o,
-                        tb_btn(
+                        tb_btn_enabled(
                             ui,
                             cx.icons,
                             Btn {
@@ -517,24 +526,32 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
                                 open: false,
                                 leave: false,
                             },
-                            "Picture quality: click to change",
+                            if sess.quality_controls_available {
+                                "Picture quality: click to change"
+                            } else {
+                                "Quality: not available yet"
+                            },
+                            sess.quality_controls_available,
                         ),
                     );
                     if q.clicked() {
                         o.acts.push(Action::SetQuality(qnext));
                     }
-                    let (audio_icon, audio_tip) = if sess.audio {
+                    let (audio_icon, audio_tip) = if !sess.audio_controls_available {
+                        (if sess.audio { "volume-2" } else { "volume-x" }, "Audio: not available yet")
+                    } else if sess.audio {
                         ("volume-2", "Audio on")
                     } else {
                         ("volume-x", "Audio off")
                     };
                     let a = keep(
                         o,
-                        tb_btn(
+                        tb_btn_enabled(
                             ui,
                             cx.icons,
                             Btn { icon: Some(audio_icon), label: None, chev: None, open: false, leave: false },
                             audio_tip,
+                            sess.audio_controls_available,
                         ),
                     );
                     if a.clicked() {
@@ -674,6 +691,17 @@ fn picker_panel(ctx: &egui::Context, cx: &Cx, sess: &Session, screen: Rect, disp
                     monitor_map(ui, sess, o);
                     ui.add_space(10.0);
                     monitor_rows(ui, cx, sess, o);
+                    if sess.monitor_pending {
+                        ui.add_space(10.0);
+                        widgets::notice(ui, cx, NoticeKind::Neutral, "loader-circle", |ui| {
+                            label(ui, "Switching display…", theme::body(13.0), theme::INK_MUTED);
+                        });
+                    } else if let Some(err) = &sess.monitor_error {
+                        ui.add_space(10.0);
+                        widgets::notice(ui, cx, NoticeKind::Error, "circle-alert", |ui| {
+                            label(ui, &format!("Couldn't switch display: {err}"), theme::body(13.0), theme::INK_MUTED);
+                        });
+                    }
                 });
         });
 }
@@ -695,16 +723,19 @@ fn monitor_map(ui: &mut Ui, sess: &Session, o: &mut Picks) {
     let ox = area.left() + (PICKER_INNER_W - bw * s) / 2.0;
     let oy = area.top() + (MAP_H - bh * s) / 2.0;
 
+    // While a switch is pending the map is drawn dimmed and takes no clicks or hover.
+    let live = !sess.monitor_pending;
     for (i, m) in sess.monitors.iter().enumerate() {
         let r = Rect::from_min_size(
             pos2(ox + (m.x as f32 - minx) * s, oy + (m.y as f32 - miny) * s),
             vec2(m.width as f32 * s, m.height as f32 * s),
         );
-        let resp = ui.interact(r, ui.id().with(("mon", i)), Sense::click());
+        let resp = ui.interact(r, ui.id().with(("mon", i)), if live { Sense::click() } else { Sense::hover() });
+        let hot = live && resp.hovered();
         let cur = i == sess.monitor;
         let edge = if cur {
             theme::SIGNAL
-        } else if resp.hovered() {
+        } else if hot {
             theme::INK_FAINT
         } else {
             theme::THREAD_STRONG
@@ -715,12 +746,18 @@ fn monitor_map(ui: &mut Ui, sess: &Session, o: &mut Picks) {
             theme::SURFACE_RAISED
         };
         let p = ui.painter();
-        p.rect_filled(r, CornerRadius::same(4), fill);
-        p.rect_stroke(r, CornerRadius::same(4), Stroke::new(1.5, edge), StrokeKind::Inside);
+        p.rect_filled(r, CornerRadius::same(4), dim(live, fill));
+        p.rect_stroke(r, CornerRadius::same(4), Stroke::new(1.5, dim(live, edge)), StrokeKind::Inside);
         let ink = if cur { theme::INK } else { theme::INK_MUTED };
-        p.text(r.center(), Align2::CENTER_CENTER, (i + 1).to_string(), theme::display(20.0), ink);
+        p.text(r.center(), Align2::CENTER_CENTER, (i + 1).to_string(), theme::display(20.0), dim(live, ink));
         if cur {
-            p.text(pos2(r.center().x, r.bottom() - 5.0), Align2::CENTER_BOTTOM, "Showing", theme::bold(10.0), theme::SIGNAL);
+            p.text(
+                pos2(r.center().x, r.bottom() - 5.0),
+                Align2::CENTER_BOTTOM,
+                "Showing",
+                theme::bold(10.0),
+                dim(live, theme::SIGNAL),
+            );
         }
         if resp.clicked() {
             o.acts.push(Action::SetMonitor(i));
@@ -731,36 +768,39 @@ fn monitor_map(ui: &mut Ui, sess: &Session, o: &mut Picks) {
 
 /// One row per display: check (current) or number key, name, mode in mono.
 fn monitor_rows(ui: &mut Ui, cx: &Cx, sess: &Session, o: &mut Picks) {
+    // While a switch is pending the rows are drawn dimmed and take no clicks or hover.
+    let live = !sess.monitor_pending;
     for (i, m) in sess.monitors.iter().enumerate() {
         let (rect, _) = ui.allocate_exact_size(vec2(PICKER_INNER_W, 40.0), Sense::hover());
-        let resp = ui.interact(rect, ui.id().with(("mrow", i)), Sense::click());
+        let resp = ui.interact(rect, ui.id().with(("mrow", i)), if live { Sense::click() } else { Sense::hover() });
+        let hot = live && resp.hovered();
         let cur = i == sess.monitor;
         let p = ui.painter();
         if cur {
-            p.rect_filled(rect, theme::R_FIELD, theme::SURFACE_MUTED);
-        } else if resp.hovered() {
+            p.rect_filled(rect, theme::R_FIELD, dim(live, theme::SURFACE_MUTED));
+        } else if hot {
             p.rect_filled(rect, theme::R_FIELD, theme::SURFACE_RAISED);
         }
         let cy = rect.center().y;
         let mut x = rect.left() + 10.0;
         if cur {
-            cx.icons.paint(p, Rect::from_center_size(pos2(x + 8.0, cy), vec2(16.0, 16.0)), "check", theme::SIGNAL);
+            cx.icons.paint(p, Rect::from_center_size(pos2(x + 8.0, cy), vec2(16.0, 16.0)), "check", dim(live, theme::SIGNAL));
         } else {
             let key = Rect::from_min_size(pos2(x, cy - 9.0), vec2(18.0, 18.0));
-            p.rect_filled(key, CornerRadius::same(4), theme::SURFACE_RAISED);
-            p.text(key.center(), Align2::CENTER_CENTER, (i + 1).to_string(), theme::mono(10.5), theme::INK_MUTED);
+            p.rect_filled(key, CornerRadius::same(4), dim(live, theme::SURFACE_RAISED));
+            p.text(key.center(), Align2::CENTER_CENTER, (i + 1).to_string(), theme::mono(10.5), dim(live, theme::INK_MUTED));
         }
         x += 32.0;
-        let name = p.text(pos2(x, cy), Align2::LEFT_CENTER, format!("Display {}", i + 1), theme::bold(13.0), theme::INK);
+        let name = p.text(pos2(x, cy), Align2::LEFT_CENTER, format!("Display {}", i + 1), theme::bold(13.0), dim(live, theme::INK));
         if m.primary {
-            p.text(pos2(name.right(), cy), Align2::LEFT_CENTER, " · main", theme::body(13.0), theme::INK_MUTED);
+            p.text(pos2(name.right(), cy), Align2::LEFT_CENTER, " · main", theme::body(13.0), dim(live, theme::INK_MUTED));
         }
         p.text(
             pos2(rect.right() - 10.0, cy),
             Align2::RIGHT_CENTER,
             format!("{} x {} · {} Hz", m.width, m.height, m.refresh_hz),
             theme::mono(11.0),
-            theme::INK_FAINT,
+            dim(live, theme::INK_FAINT),
         );
         if resp.clicked() {
             o.acts.push(Action::SetMonitor(i));
