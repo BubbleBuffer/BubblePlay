@@ -104,6 +104,16 @@ The `.gitignore` also excludes `*.jks`, `*.keystore` and `keystore.properties`.
 
 Each build's `versionCode` is the build time in minutes since the Unix epoch, so every new build outranks the installed one and update stores (F-Droid repos, Obtainium) offer it. `versionName` is `0.1.0-<that number>`. Pass `-PversionCode=<n>` to set it explicitly.
 
+## Phone APK pipeline
+
+`.github/workflows/android-apk.yml` runs after every green `Checks` push run on `master`, and on manual dispatch (`gh workflow run android-apk.yml --ref master`). A newer run cancels an older one.
+
+1. The self-hosted `build01` runner builds the release APK with `assembleRelease`. It has no keystore, so the APK is unsigned.
+2. The job streams the APK over SSH to `linux01` with a dedicated key that may only run `apk-publish bubbleplay`.
+3. `linux01` checks the package id, zipaligns, signs with the release key (a copy of the folder above), verifies the signature and publishes the APK to the owner's private F-Droid repository. The repository refuses a versionCode that is not higher than the last one, and a signer that differs from the published builds.
+
+There is no GitHub secret and no GitHub artifact. A failed publish fails the job.
+
 ## Install
 
 ```powershell

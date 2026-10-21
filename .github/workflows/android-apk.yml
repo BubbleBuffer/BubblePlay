@@ -1,0 +1,58 @@
+# Phone APK on the home server, same path as Notes: build01 builds the unsigned
+# release APK and streams it over vmbr1 to linux01, which aligns, release-signs
+# with the BubblePlay key and publishes it to the private F-Droid repo. Neither
+# the PC keystore nor a GitHub artifact or secret is involved.
+name: android-apk
+
+on:
+  workflow_dispatch:
+  # Every master push that passes Checks goes to the phone. Rapid merges
+  # collapse: a newer run cancels the older one (concurrency below).
+  workflow_run:
+    workflows: [Checks]
+    types: [completed]
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    # workflow_run fires in this repository's context even when the triggering
+    # run came from a fork, so require a successful Checks push run on this
+    # repository's own master before anything reaches build01 and the phone.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'master' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: [self-hosted, build01]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # The commit Checks passed on, not whatever master is by now.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Build unsigned release APK
+        working-directory: android
+        # No keystore.properties on build01, so assembleRelease leaves the APK
+        # unsigned; versionCode defaults to epoch minutes (app/build.gradle.kts).
+        # android/gradlew is committed without the executable bit, so run it via bash.
+        run: bash ./gradlew --no-daemon assembleRelease
+      - name: Sign and publish on linux01
+        working-directory: android
+        run: |
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -i /home/builder/.ssh/linux01-apk-bubbleplay dev@100.65.1.104 'apk-publish bubbleplay' \
+            < app/build/outputs/apk/release/app-release-unsigned.apk
