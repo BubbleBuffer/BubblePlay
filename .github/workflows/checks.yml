@@ -165,7 +165,7 @@ jobs:
         run: npm install --no-save --no-audit --no-fund wrangler@4.148.0
       - name: bp-relay-worker tests (wrangler dev, local workerd)
         working-directory: relay-rs/worker
-        run: node --test tests/
+        run: node --test 'tests/*.test.mjs'
       - name: Container build
         run: docker build -f relay-rs/Dockerfile -t bubbleplay-relay-rs:check .
 
