@@ -340,6 +340,24 @@ impl KeyFile {
     }
 }
 
+#[doc(hidden)]
+impl KeyFile {
+    /// The authenticated metadata (AAD) this file is sealed with, or None for a plain file.
+    /// Exposed only so the contract tests can compare it with the shared fixture.
+    pub fn aad_for_contract(&self) -> Option<Vec<u8>> {
+        match &self.protection {
+            Protection::Plain { .. } => None,
+            Protection::Protected { salt, .. } => Some(aad_bytes(
+                &self.id_text,
+                &self.label,
+                &self.created,
+                &self.public,
+                salt,
+            )),
+        }
+    }
+}
+
 impl fmt::Debug for KeyFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyFile")
