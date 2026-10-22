@@ -98,7 +98,10 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt --target wasm32-unknown-unknown --no-self-update
-          rustup default 1.97.1
+          # Pin the toolchain for this job only. Jobs from other repos share RUSTUP_HOME on build01
+          # and can change the global default mid-run, so `rustup default` is not enough.
+          echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
+          export RUSTUP_TOOLCHAIN=1.97.1
           # Runners on build01 share RUSTUP_HOME, so rustup can report the wasm32 target
           # installed while its rlibs are missing. Check the sysroot and reinstall if so.
           sysroot="$(rustc +1.97.1 --print sysroot)"
