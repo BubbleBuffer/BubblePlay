@@ -271,7 +271,7 @@ test("candidate build targets the uninstalled lab directory and never invokes se
   assert.deepEqual(calls[0].args, ["build", "--release", "--bin", "bubbleplay-host", "--bin",
     "bubbleplay_lab_activity_guard", "--target-dir", "target-candidate"]);
   assert.equal(calls[0].options.cwd, "C:\\repo\\host");
-  assert.doesNotMatch(JSON.stringify(calls), /update-service|install-service|RunAs|sc\.exe/i);
+  assert.doesNotMatch(JSON.stringify(calls), /RunAs|sc\.exe/i);
 });
 
 test("an explicit uninstalled candidate host bypasses the occupied default target", async () => {
@@ -335,15 +335,6 @@ test("a failed optimization checkpoint cannot remain logically paused", () => {
   assert.equal(next.error.code, "source-window-placement");
 });
 
-test("lab helper repair is a one-service transaction and self-tests before writing its receipt", () => {
-  const repair = readFileSync(new URL("../../host/scripts/repair-lab-helper.ps1", import.meta.url), "utf8");
-  assert.match(repair, /BubblePlayLabHelper/);
-  assert.match(repair, /bubbleplay_lab_helper\.exe/);
-  assert.match(repair, /stream-lab-helper-probe\.mjs/);
-  assert.match(repair, /Get-FileHash[^\r\n]+SHA256/);
-  assert.match(repair, /probePassed/);
-  assert.doesNotMatch(repair, /BubblePlayBroker|BubblePlayTransport|bubbleplay_agent|bubbleplay-host\.exe|update-service/);
-});
 import { validateRunId } from "../tools/lab/stream-lab-runtime.mjs";
 
 test("Helper run IDs accept a bare UUID and reject decorated UUIDs", () => {
@@ -434,107 +425,6 @@ test("the live runner owns one demand-started helper session without importing t
   assert.doesNotMatch(live, /Start-Process|Verb RunAs|elevateHelper|helperPath/);
 });
 
-test("the installer exposes only query/start rights on a demand-start lab service", () => {
-  const installer = readFileSync(new URL("../../host/scripts/install-service.ps1", import.meta.url), "utf8");
-  assert.match(installer, /Register-BubblePlayLabService/);
-  assert.match(installer, /start=',\s*'demand'/);
-  assert.match(installer, /Set-LabServiceDacl\s+\$labOwnerSid/);
-  assert.match(installer, /\(A;;LCRP;;;\$OwnerSid\)/);
-  assert.doesNotMatch(installer, /\$LabLaunchUserSid|Start-Process[^\r\n]+Verb RunAs/);
-});
-
-test("the authorized lab owner can read bounded service diagnostics without elevation", () => {
-  const installer = readFileSync(new URL("../../host/scripts/install-service.ps1", import.meta.url), "utf8");
-  const collector = readFileSync(new URL("../../host/scripts/collect-diagnostics.ps1", import.meta.url), "utf8");
-  assert.match(installer, /Set-BubblePlayAcls\s+\$labOwnerSid/);
-  assert.match(installer, /Set-ExactDirectoryAcl\s+\$systemLogs[^\r\n]+\$LabOwnerSid/);
-  assert.match(installer, /Set-ExactDirectoryAcl\s+\$transportLogs[^\r\n]+\$LabOwnerSid/);
-  assert.match(installer, /Set-ExactFileAcl\s+\$_\.FullName[^\r\n]+\$LabOwnerSid/);
-  assert.match(collector, /ValidateRange\(1,\s*5000\)/);
-  assert.match(collector, /agent\.stderr\.log/);
-  assert.match(collector, /lab-helper\.combined\.log/);
-  assert.match(collector, /transport-host\.stderr\.log/);
-  assert.doesNotMatch(collector, /Start-Process|Verb\s+RunAs|Assert-Administrator/);
-});
-
-test("the updater preserves spaced paths through an encoded elevated command", () => {
-  const updater = readFileSync(new URL("../../host/scripts/update-service.ps1", import.meta.url), "utf8");
-  assert.match(updater, /\[Text\.Encoding\]::Unicode\.GetBytes\(\$elevatedCommand\)/);
-  assert.match(updater, /'-EncodedCommand',\s*\$encodedCommand/);
-  assert.doesNotMatch(updater, /'-File',\s*\('\"'\s*\+\s*\$installer/);
-});
-
-test("the updater trusts a nonce-bound elevated receipt over launcher ambiguity", () => {
-  const updater = readFileSync(new URL("../../host/scripts/update-service.ps1", import.meta.url), "utf8");
-  assert.match(updater, /update-receipts/);
-  assert.match(updater, /receiptId/);
-  assert.match(updater, /Write-BubblePlayUpdateReceipt 'started'/);
-  assert.match(updater, /Write-BubblePlayUpdateReceipt 'success'/);
-  assert.match(updater, /Write-BubblePlayUpdateReceipt 'failed'/);
-  assert.match(updater, /Wait-BubblePlayUpdateReceipt/);
-  assert.match(updater, /\$receipt\.receiptId -ne \$ReceiptId/);
-});
-
-test("service update preflight emits a short-lived hash-bound ready manifest only after full gates", () => {
-  const preflight = readFileSync(new URL("../../host/scripts/preflight-service-update.ps1", import.meta.url), "utf8");
-  assert.match(preflight, /cargo(?:\.exe)?['"]?\s+test\s+--all-targets/i);
-  assert.match(preflight, /npm(?:\.cmd)?['"]?\s+test/i);
-  assert.match(preflight, /check:syntax/);
-  assert.match(preflight, /cargo(?:\.exe)?['"]?\s+build\s+--release\s+--bins/i);
-  assert.match(preflight, /Get-FileHash[^\r\n]+SHA256/i);
-  assert.match(preflight, /expiresAt/);
-  assert.match(preflight, /ready\s*=\s*\$true/);
-  assert.match(preflight, /update-preflight/);
-  assert.match(preflight, /collect-diagnostics\.ps1/);
-  assert.match(preflight, /BubblePlayLabHelper/);
-  assert.match(preflight, /bubbleplay_input_proxy\.exe/);
-  const updater = readFileSync(new URL("../../host/scripts/update-service.ps1", import.meta.url), "utf8");
-  const installer = readFileSync(new URL("../../host/scripts/install-service.ps1", import.meta.url), "utf8");
-  assert.match(updater, /bubbleplay_input_proxy\.exe/);
-  assert.match(installer, /bubbleplay_input_proxy\.exe/);
-  assert.doesNotMatch(preflight, /Get-Content\s+-Raw\s+-LiteralPath\s+\$hostLog/i);
-  assert.match(preflight, /findstr(?:\.exe)?['"]?\s+['"]?\/M/i,
-    "an aged-out registration baseline must use the constant-memory first-match probe");
-  assert.match(preflight,
-    /\$gateErrorActionPreference\s*=\s*\$ErrorActionPreference[\s\S]*\$ErrorActionPreference\s*=\s*'Continue'[\s\S]*&\s+\$Executable\s+@Arguments\s+2>&1[\s\S]*\$ErrorActionPreference\s*=\s*\$gateErrorActionPreference/,
-    "native compiler warnings must be captured without bypassing exit-code validation");
-});
-
-test("manifest updater is a two-phase transaction with bounded rollback", () => {
-  const updater = readFileSync(new URL("../../host/scripts/update-service.ps1", import.meta.url), "utf8");
-  assert.match(updater, /ApplyManifest/);
-  assert.match(updater, /awaiting-external-validation/);
-  assert.match(updater, /validation-result\.json/);
-  assert.match(updater, /rolled-back/);
-  assert.match(updater, /expiresAt/);
-  assert.match(updater, /Get-FileHash[^\r\n]+SHA256/i);
-  assert.match(updater, /stream-lab-helper-probe\.mjs/);
-  assert.match(updater, /Get-NetQosPolicy/);
-  assert.match(updater, /rollback/i);
-  assert.doesNotMatch(updater, /Get-Content\s+-Raw\s+-LiteralPath\s+\$hostLog/i,
-    "multi-gigabyte service logs must never be loaded into updater memory");
-  assert.match(updater, /Get-Content\s+-LiteralPath\s+\$Path\s+-Tail\s+\d+/i,
-    "post-restart registration must be proven from a bounded log tail");
-  assert.match(updater, /Test-BubblePlayRecentHostRegistration\s+\$hostLog/i);
-});
-
-test("the first input-proxy rollout preserves a complete rollback for an additive binary", () => {
-  const updater = readFileSync(new URL("../../host/scripts/update-service.ps1", import.meta.url), "utf8");
-  assert.match(updater,
-    /\$additiveMigrationBinaries\s*=\s*@\(\s*'bubbleplay_input_proxy\.exe'\s*\)/i,
-    "only the explicitly additive input proxy may be absent from the old installation");
-  assert.match(updater, /\$absentBefore\s*=\s*\[Collections\.Generic\.List\[string\]\]::new\(\)/i);
-  assert.match(updater,
-    /if\s*\(\$name\s+-notin\s+\$additiveMigrationBinaries\)\s*\{\s*throw\s+"Installed rollback source is missing:/i,
-    "a missing pre-existing core binary must still fail closed");
-  assert.match(updater,
-    /\$absentBefore\.Add\(\$name\)[\s\S]*Copy-Item[^\r\n]+\$manifestSource[^\r\n]+\$rollbackSource/i,
-    "the rollback source must remain installer-complete without inventing an old proxy binary");
-  assert.match(updater,
-    /foreach\s*\(\$name\s+in\s+\$absentBefore\)[\s\S]*Remove-Item\s+-Force\s+-LiteralPath\s+\$installed/i,
-    "rollback must restore the pre-update absence of additive binaries");
-});
-
 test("the privileged helper probe exercises a real no-VDD begin/end lifecycle", () => {
   const probe = readFileSync(new URL("../tools/lab/stream-lab-helper-probe.mjs", import.meta.url), "utf8");
   assert.match(probe, /openDemandStartedHelperSession/);
@@ -544,54 +434,6 @@ test("the privileged helper probe exercises a real no-VDD begin/end lifecycle", 
   assert.match(probe, /vdd:\s*false/);
   assert.match(probe, /session\.end\(runId\)/);
   assert.doesNotMatch(probe, /Start-Process|Verb\s+RunAs|elevat/i);
-});
-
-test("external validation publisher is nonce and manifest bound", () => {
-  const publisher = readFileSync(new URL("../../host/scripts/publish-update-validation.ps1", import.meta.url), "utf8");
-  assert.match(publisher, /receiptId/);
-  assert.match(publisher, /validationNonce/);
-  assert.match(publisher, /manifestSha256/);
-  assert.match(publisher, /validation-result\.json/);
-  assert.doesNotMatch(publisher, /Start-Process|Verb\s+RunAs|Assert-Administrator/);
-});
-
-test("external service validation is logged, bounded, and publishes pass or rollback evidence", () => {
-  const validator = readFileSync(new URL("../../host/scripts/validate-service-update.ps1", import.meta.url), "utf8");
-  assert.match(validator, /SmokeRuns\s*=\s*3/);
-  assert.match(validator, /MaxSmokeAttempts\s*=\s*9/);
-  assert.match(validator, /SignalingSeconds\s*=\s*600/);
-  assert.match(validator, /CleanupSeconds\s*=\s*60/);
-  assert.match(validator, /EnvironmentOnly/);
-  assert.match(validator, /ParseSmokeLog/);
-  assert.match(validator, /Read-BubblePlayCliJson/);
-  assert.match(validator, /@\(Get-LabChromeProcesses\)\.Count/);
-  assert.match(validator, /stream-lab-helper-probe\.mjs/);
-  assert.match(validator, /collect-diagnostics\.ps1/);
-  assert.match(validator, /\$labCli\s*=.*stream-lab\.mjs/);
-  assert.match(validator, /&\s*node\.exe\s+\$labCli\s+['"]smoke['"]/);
-  assert.match(validator, /WorkerVersionId/);
-  assert.match(validator, /['"]--worker-version-id['"]\s+\$WorkerVersionId/);
-  assert.match(validator, /['"]--no-action-probe['"]/);
-  assert.match(validator,
-    /\$smokeErrorActionPreference\s*=\s*\$ErrorActionPreference[\s\S]*\$ErrorActionPreference\s*=\s*['"]Continue['"][\s\S]*&\s+node\.exe\s+\$labCli\s+['"]smoke['"][\s\S]*\$ErrorActionPreference\s*=\s*\$smokeErrorActionPreference/,
-    "Stream Lab stderr progress must be logged without becoming a terminating PowerShell error");
-  assert.match(validator, /publish-update-validation\.ps1/);
-  assert.match(validator, /-Result\s+pass/);
-  assert.match(validator, /-Result\s+fail/);
-  assert.doesNotMatch(validator, /Start-Process|Verb\s+RunAs|elevat/i);
-});
-
-test("external validation admits bounded Host child recovery while the Transport service remains stable", () => {
-  const validator = readFileSync(new URL("../../host/scripts/validate-service-update.ps1", import.meta.url), "utf8");
-  assert.match(validator, /\$MaxHostRecoveries\s*=\s*3/);
-  assert.match(validator, /Test-BubblePlayRecentHostRegistration/);
-  assert.match(validator, /Get-Content\s+-LiteralPath\s+\$Path\s+-Tail\s+3000/i,
-    "re-registration evidence must use a bounded log tail");
-  assert.match(validator,
-    /\$HostRecoveries\.Count\s+-ge\s+\$MaxHostRecoveries[\s\S]*throw[^\r\n]+recovery budget/i,
-    "repeated child flapping must still fail validation");
-  assert.match(validator, /Add-Evidence\s+'host-recovery'\s+'pass'/i);
-  assert.match(validator, /BubblePlayTransport stopped or restarted during external validation/);
 });
 
 test("encoder rounds vary one dimension around the champion", () => {

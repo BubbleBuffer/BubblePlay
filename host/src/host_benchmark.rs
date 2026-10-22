@@ -1,13 +1,12 @@
 //! Binary-owned benchmark boundary; preserves existing streaming policy.
 use super::{
-    benchmark, wss_gop_interval, BenchEncodeStages, BenchHybridActivity, BenchRoiActivity,
-    BenchStageTiming, BenchmarkHybridMode, BenchmarkRoiMode, BenchmarkStreamMode,
-    BenchmarkTransport, DamageCoverageAudit, DeferredReadbackActivity, Duration,
-    EncodeStageTimings, FeedbackBudgetPolicy, FeedbackPlan, FeedbackPlanReason,
-    FeedbackWireDecision, HybridTileOperation, HybridWireBudget, QuiescentTilePlan,
-    QuiescentTilePlanner, QuiescentValidationStatus, ReconstructionFeedbackSubmission,
-    RoiMapReason, RoiMapTelemetry, StreamMode, TemporalDiffResult, TemporalMaskDecision,
-    VideoCodec, IDR_INTERVAL,
+    benchmark, BenchEncodeStages, BenchHybridActivity, BenchRoiActivity, BenchStageTiming,
+    BenchmarkHybridMode, BenchmarkRoiMode, BenchmarkStreamMode, BenchmarkTransport,
+    DamageCoverageAudit, DeferredReadbackActivity, Duration, EncodeStageTimings,
+    FeedbackBudgetPolicy, FeedbackPlan, FeedbackPlanReason, FeedbackWireDecision,
+    HybridTileOperation, HybridWireBudget, QuiescentTilePlan, QuiescentTilePlanner,
+    QuiescentValidationStatus, ReconstructionFeedbackSubmission, RoiMapReason, RoiMapTelemetry,
+    StreamMode, TemporalDiffResult, TemporalMaskDecision, VideoCodec,
 };
 
 pub(super) fn benchmark_mode_matches(
@@ -35,22 +34,6 @@ pub(super) fn benchmark_owned_encoder_bitrate(
                 && benchmark_mode_matches(profile.stream_mode, stream_mode)
         })
         .map_or(requested_bitrate_bps, |profile| profile.bitrate_bps)
-}
-
-pub(super) fn effective_idr_interval(
-    stream_mode: StreamMode,
-    wss_active: bool,
-    benchmark_gop_seconds: Option<u8>,
-) -> Duration {
-    benchmark_gop_seconds
-        .map(|seconds| Duration::from_secs(u64::from(seconds)))
-        .unwrap_or_else(|| {
-            if wss_active {
-                wss_gop_interval(stream_mode)
-            } else {
-                IDR_INTERVAL
-            }
-        })
 }
 
 pub(super) fn advance_benchmark_profile_revision(

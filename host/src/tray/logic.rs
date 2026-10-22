@@ -721,7 +721,6 @@ mod tests {
                 .map(OsString::from)
                 .to_vec()
         );
-        assert!(!args.iter().any(|a| a == "--privileged-agent"));
         assert!(!args
             .iter()
             .any(|a| a == "--token" || a == "--host-gate-token"));

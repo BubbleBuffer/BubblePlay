@@ -15,7 +15,7 @@ import {
 test("recovery inventory separates reviewable source from generated and runtime evidence", () => {
   assert.equal(classifyWorkspacePath("host/src/input.rs"), "source");
   assert.equal(classifyWorkspacePath("worker/test/input.test.mjs"), "test");
-  assert.equal(classifyWorkspacePath("host/scripts/update-service.ps1"), "deployment");
+  assert.equal(classifyWorkspacePath("host/scripts/setup-tray.ps1"), "deployment");
   assert.equal(classifyWorkspacePath("worker/wrangler.toml"), "configuration");
   assert.equal(classifyWorkspacePath("target-stage1/debug/cache.bin"), "generated");
   assert.equal(classifyWorkspacePath("host/target-privileged/release/bubbleplay-host.exe"), "generated");

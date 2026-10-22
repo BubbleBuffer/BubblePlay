@@ -389,7 +389,6 @@ pub fn restore_headless_cursor_after_exit(pid: u32) {
 }
 
 /// Local tray-host startup recovery, including when no viewer is connected.
-/// Privileged Agent callers must not invoke this per-user settings operation.
 pub fn recover_headless_cursor_support() {
     match CursorSupportLock::acquire() {
         Ok(_lock) => recover_cursor_marker(None),
@@ -1467,7 +1466,7 @@ pub struct InputSink {
 }
 
 /// Clipboard state exists only where the sink runs as the interactive user
-/// (input proxy, unprivileged local host). Elsewhere clipboard packets are
+/// (the local host). Elsewhere clipboard packets are
 /// ignored.
 #[derive(Debug, Default)]
 struct ClipboardSync {
@@ -2164,8 +2163,7 @@ mod tests {
 
     #[test]
     fn carried_release_waits_for_available_capture_and_presented_frame() {
-        // Capture availability may return before presentation acknowledgement,
-        // on either local capture or the privileged Agent path.
+        // Capture availability may return before presentation acknowledgement.
         for (available, ready) in [(false, false), (false, true), (true, false)] {
             let mut carry = super::CarriedInput::default();
             carry.observe_forwarded(&[4, 1]);

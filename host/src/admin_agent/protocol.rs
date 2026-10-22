@@ -7,9 +7,9 @@
 //! changes therefore never need an agent change; only a new kind of Windows
 //! input primitive would.
 //!
-//! Framing follows the input-proxy layout (magic, then a length-prefixed
-//! payload) but is a separate, smaller format: the proxy forwards whole
-//! browser packets, which would tie the agent to the host's input format.
+//! Framing is magic, then a length-prefixed payload. It deliberately does not
+//! carry whole browser packets, which would tie the agent to the host's input
+//! format.
 //!
 //! Frozen across every protocol version, so any agent can tell any client
 //! which versions it speaks:

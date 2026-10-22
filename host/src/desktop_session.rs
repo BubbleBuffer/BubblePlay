@@ -1,6 +1,5 @@
-//! Interactive desktop detection and transition policy for the privileged agent.
+//! Interactive desktop detection and desktop transition policy.
 //!
-//! The LocalSystem broker launches the agent into the active console session.
 //! A fresh media/input worker binds to whichever desktop currently receives
 //! input; no USER or D3D resources survive a Default/Winlogon transition.
 
