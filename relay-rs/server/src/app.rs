@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::ws::{CloseFrame, Message, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -85,7 +86,18 @@ async fn dispatch(
         state.gate().handle(&mut OsRandom, &req)
     };
     match verdict {
-        Verdict::Refuse => StatusCode::NOT_FOUND.into_response(),
+        Verdict::Refuse => {
+            // The gate refuses a browser socket that names the public origin without a valid
+            // cookie. That one is accepted and closed 1008 instead of 404. The origin is compared
+            // exactly, as the gate does, so a foreign origin and the gate's own paths still get 404.
+            let browser_socket = websocket
+                && header_str(&parts.headers, "origin") == Some(state.public_origin.as_str())
+                && route_for_path(path).is_some();
+            if browser_socket {
+                return refused_socket(&state, &mut parts).await;
+            }
+            StatusCode::NOT_FOUND.into_response()
+        }
         Verdict::Wait(response, effects) | Verdict::Handled(response, effects) => {
             state.run_gate_effects(effects).await;
             gate_response(response)
@@ -116,6 +128,23 @@ async fn dispatch(
             serve_asset(&state.assets_dir, &parts.method, path, parts.uri.query()).await
         }
     }
+}
+
+/// Accepts a refused browser socket and closes it 1008 with an empty reason. A failed upgrade
+/// reaches the browser as a bare 1006, and the browser reconnects in a loop. A 1008 tells it to
+/// stop, and the page reloads into the wait page.
+async fn refused_socket(state: &AppState, parts: &mut Parts) -> Response {
+    let upgrade = match WebSocketUpgrade::from_request_parts(parts, state).await {
+        Ok(upgrade) => upgrade,
+        Err(rejection) => return rejection.into_response(),
+    };
+    upgrade.on_upgrade(|mut socket| async move {
+        let frame = CloseFrame {
+            code: 1008,
+            reason: String::new().into(),
+        };
+        let _ = socket.send(Message::Close(Some(frame))).await;
+    })
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

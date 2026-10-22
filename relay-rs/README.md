@@ -90,6 +90,13 @@ lab build.
 2. Run `bp-relay import-go-auth <auth.json> --config <relay.json>`. Only the `pcs` table is read. Passwords, TOTP secrets, sessions, rate counters and approvals are ignored on purpose. An entry is skipped and listed when its key is not the canonical device ID, its public key is malformed, its ID does not match its public key, or its `firstSeen` is not a positive time.
 3. PCs registered on the Cloudflare Worker relay are not in the Go auth file, and they cannot be imported. Each of them re-registers once with `TOKEN` at cutover.
 
+## Known limits (M1)
+
+- `last_seen` is derived, not stored: the PC table keeps `registered_ms` only, and on load `last_seen` is set equal to `registered_ms`. The admin listing shows a PC's last contact as its registration time until it connects again after a restart.
+- Queued frames drain before a close: a socket's frames already in its queue are sent before its close frame, including the 1008 and 1001 closes. The drain shares `CLOSE_TIMEOUT` (2 s). A socket being removed or replaced can therefore receive frames queued just before the close.
+- A failed-upgrade connection is reaped by `tick`: the core accepts an upgrade before the WebSocket handshake finishes. If the handshake fails, the connection stays until its hello deadline (10 s), and `tick` then closes and forgets it.
+- Admin DELETE of an unknown PC returns 404 (`NotFound`) and persists nothing. Deleting a registered PC persists first and returns 204.
+
 ## M3 notes (Cloudflare build)
 
 These three caveats came from the workers-rs spike.

@@ -118,6 +118,9 @@ pub struct Shared {
     pub assets_dir: PathBuf,
     /// The host of the public origin, for the Host check on `/healthz`.
     pub public_host: String,
+    /// The canonical public origin. A browser socket that names it without a valid cookie is
+    /// accepted and closed 1008 (see `app::refused_socket`).
+    pub public_origin: String,
     /// The listen address's host literal, for the Host check on `/healthz` (the Docker probe).
     pub listen_host: String,
     /// Proxies whose `X-Forwarded-For` is believed.
@@ -177,6 +180,7 @@ impl Shared {
         Ok(Shared {
             admin_token: cfg.admin_token.expose().to_string(),
             assets_dir: cfg.assets_dir.clone(),
+            public_origin: cfg.public_origin.clone(),
             public_host,
             listen_host,
             trusted_proxies: cfg.trusted_proxy_cidrs.clone(),
