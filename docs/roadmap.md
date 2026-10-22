@@ -2,7 +2,7 @@
 
 Work beyond the [release blockers](release-status.md#before-publication), from a gap review on 2026-10-12. Each entry has a status: proposed, approved YYYY-MM-DD, in progress, done YYYY-MM-DD, deferred or dropped. Done entries link to the page that now describes the feature.
 
-Current focus: audio, Android parity and the device ID and key proposal in parallel; then Wake-on-LAN and unattended access, which build on device keys.
+Current focus: device keys phase 2 with a Rust relay that replaces both relays (in progress on `lane/rust-relay`); then Wake-on-LAN and unattended access, which build on device keys.
 
 ## Testing and CI
 
@@ -55,7 +55,7 @@ Decisions:
 - The off switch is the tray's **Stream PC sound** item; mute in the viewer is local and starts unmuted each session.
 
 ### Device IDs and keys
-Status: approved 2026-10-13 with decisions; implementation not started.
+Status: approved 2026-10-13 with decisions; in progress (phases 0 and 1 built, phase 2 in progress with the Rust relay).
 Each device (PC host, browser, phone, Wake-on-LAN helper, pre-login logon host) has an Ed25519 key in a portable key file (export, import, optional passphrase) and an ID derived from its public key. The relay routes by ID; the endpoints authenticate each other's keys, like SSH `authorized_keys`. The trusted-device list lives on the PC and is managed in the tray. Device keys are the only way to connect: the application password and its login are deleted without a migration period. Remote pairing is off by default and approved at the PC or by a voucher from an already-paired device; a device can vouch for its own new key to rotate its ID. ntfy approval stays as a gate in front of the browser site. Phase 2 unblocks Wake-on-LAN, phase 3 unattended access. Design and decisions: [device-keys.md](architecture/device-keys.md).
 
 ### Wake-on-LAN
