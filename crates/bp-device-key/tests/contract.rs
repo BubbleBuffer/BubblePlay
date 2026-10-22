@@ -13,6 +13,7 @@ use bp_device_key::{
     relay_origin, relay_proof_encoding, relay_proof_hash, verify_relay_proof, DeviceId,
     DeviceIdentity, DeviceKeyError, Role,
 };
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::Value;
 
 fn fixture() -> Value {
@@ -214,6 +215,28 @@ fn contract_relay_origin_canonicalises_the_handshake_origin() {
     assert_eq!(relay_origin("wss://user@example.test/host-ws"), None);
     assert_eq!(relay_origin("ftp://example.test/host-ws"), None);
     assert_eq!(relay_origin("/host-ws"), None);
+}
+
+#[test]
+fn contract_auth_bind_pc_signs_the_dtls_binding() {
+    let fixture = fixture();
+    let handshake = &fixture["handshake"];
+    let message = &handshake["messages"]["authBindPc"];
+    assert_eq!(field(message, "type"), "auth-bind");
+    let dtls_pc = &handshake["dtls"]["pc"];
+    assert_eq!(field(message, "signature"), field(dtls_pc, "signature"));
+    // The PC's DTLS binding: Ed25519 over the signed bytes, under the PC public key.
+    let public: [u8; 32] = b64(field(&handshake["pc"], "public"))
+        .try_into()
+        .expect("32-byte public key");
+    let verifying = VerifyingKey::from_bytes(&public).expect("PC public key");
+    let signature: [u8; 64] = b64(field(message, "signature"))
+        .try_into()
+        .expect("64-byte signature");
+    let signed = unhex(field(dtls_pc, "signedBytesHex"));
+    verifying
+        .verify_strict(&signed, &Signature::from_bytes(&signature))
+        .expect("PC auth-bind signature verifies");
 }
 
 #[cfg(feature = "keyfile")]
