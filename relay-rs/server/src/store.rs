@@ -166,13 +166,13 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), StoreError> 
         source,
     };
     fs::create_dir_all(dir).map_err(|source| io_error(source, dir))?;
-    if let Ok(meta) = fs::symlink_metadata(&target) {
-        if !meta.is_file() {
-            return Err(io_error(
-                io::Error::other("state file must be a regular file"),
-                &target,
-            ));
-        }
+    if let Ok(meta) = fs::symlink_metadata(&target)
+        && !meta.is_file()
+    {
+        return Err(io_error(
+            io::Error::other("state file must be a regular file"),
+            &target,
+        ));
     }
     let suffix = random_suffix().map_err(|source| io_error(source, dir))?;
     let temp = dir.join(format!(".{name}.tmp-{suffix}"));
