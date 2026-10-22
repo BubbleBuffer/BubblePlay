@@ -167,7 +167,10 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   Missing installations or incompatible versions offer "Admin agent needs
   update (one admin prompt)", which reruns `setup-tray.ps1 -AgentOnly`
   elevated. Runtime launch failures do not suppress subsequent bounded
-  retries while Admin mode and viewer demand remain active.
+  retries while Admin mode and viewer demand remain active. A hello with no
+  reply within 10 s is retried once on a new connection; if it still gets no
+  reply, the tray status reads "admin agent not responding" and it keeps
+  retrying instead of offering the update prompt.
 - Secure desktop: `setup-tray.ps1 -IncludeAgent` / `-AgentOnly` installs the
   admin agent and SYSTEM secure helper together in the same elevated child.
   The tray starts `\BubblePlay\SecureDesktop` for every viewer session,

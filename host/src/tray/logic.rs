@@ -369,11 +369,77 @@ pub enum AgentStatus {
     /// The agent is missing, speaks another protocol, or does not start: the
     /// host injects at user level until the (one-UAC) agent update ran.
     NeedsUpdate { reason: String },
+    /// The agent is running but did not answer the hello in time. It may be
+    /// slow or stalled, not out of date, so the update prompt is not offered;
+    /// the tray keeps retrying.
+    NotResponding { reason: String },
 }
 
 impl AgentStatus {
     pub fn needs_update(&self) -> bool {
         matches!(self, AgentStatus::NeedsUpdate { .. })
+    }
+}
+
+/// Status after a failed probe of a running agent. Only a missed hello
+/// deadline is "not responding"; every other failure keeps the update prompt.
+pub fn running_probe_status(timed_out: bool, reason: String) -> AgentStatus {
+    if timed_out {
+        AgentStatus::NotResponding { reason }
+    } else {
+        AgentStatus::NeedsUpdate { reason }
+    }
+}
+
+/// Minimum time between probes that are not forced.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// A probe still unreported after this long is treated as lost (its thread
+/// died) and a new one may start. A live probe ends well before this.
+pub const PROBE_LOST_AFTER: Duration = Duration::from_secs(60);
+
+/// Single-flight and throttle state for the agent probe. The probe runs on a
+/// background thread, so the tray asks this gate before starting one.
+#[derive(Debug, Default)]
+pub struct ProbeGate {
+    next_ticket: u64,
+    in_flight: Option<(u64, Instant)>,
+    last_started: Option<Instant>,
+}
+
+impl ProbeGate {
+    /// Starts a probe and returns its ticket, unless one is in flight or the
+    /// throttle holds it back. A forced probe skips the throttle, never the
+    /// in-flight check.
+    pub fn try_start(&mut self, now: Instant, force: bool) -> Option<u64> {
+        if let Some((_, started)) = self.in_flight {
+            if now.saturating_duration_since(started) < PROBE_LOST_AFTER {
+                return None;
+            }
+        }
+        if !force
+            && self
+                .last_started
+                .is_some_and(|at| now.saturating_duration_since(at) < PROBE_INTERVAL)
+        {
+            return None;
+        }
+        self.next_ticket += 1;
+        self.in_flight = Some((self.next_ticket, now));
+        self.last_started = Some(now);
+        Some(self.next_ticket)
+    }
+
+    /// Records that the probe with `ticket` reported. A lost probe that
+    /// reports late does not clear a newer probe in flight.
+    pub fn finish(&mut self, ticket: u64) {
+        if self.in_flight.is_some_and(|(current, _)| current == ticket) {
+            self.in_flight = None;
+        }
+    }
+
+    /// The agent was started or stopped: the next probe may run at once.
+    pub fn reset_throttle(&mut self) {
+        self.last_started = None;
     }
 }
 
@@ -388,6 +454,7 @@ pub fn status_line(state: &HostState, agent: &AgentStatus) -> String {
         AgentStatus::Starting => "user input, admin agent starting",
         AgentStatus::Ready => "admin input",
         AgentStatus::NeedsUpdate { .. } => "user input, admin agent needs update",
+        AgentStatus::NotResponding { .. } => "user input, admin agent not responding",
     };
     format!("BubblePlay: {} ({input})", state.label())
 }
@@ -400,6 +467,7 @@ pub fn admin_mode_line(agent: &AgentStatus) -> Option<&'static str> {
         AgentStatus::Starting => Some("Admin mode: starting (viewer connected)"),
         AgentStatus::Ready => Some("Admin mode: active"),
         AgentStatus::NeedsUpdate { .. } => Some("Admin mode: agent needs update"),
+        AgentStatus::NotResponding { .. } => Some("Admin mode: agent not responding"),
     }
 }
 
@@ -935,6 +1003,71 @@ mod tests {
             AGENT_UPDATE_LABEL,
             "Admin agent needs update (one admin prompt)"
         );
+    }
+
+    #[test]
+    fn missed_hello_deadline_shows_not_responding_not_an_update() {
+        let silent = running_probe_status(true, "the admin agent is not responding".into());
+        assert_eq!(
+            silent,
+            AgentStatus::NotResponding {
+                reason: "the admin agent is not responding".into()
+            }
+        );
+        assert!(!silent.needs_update());
+        assert_eq!(
+            admin_mode_line(&silent),
+            Some("Admin mode: agent not responding")
+        );
+        assert_eq!(
+            status_line(&HostState::Running { pid: 1 }, &silent),
+            "BubblePlay: Running (user input, admin agent not responding)"
+        );
+        // A version or protocol problem, or any other failure, still asks for the update.
+        let stale = running_probe_status(false, "speaks protocol 1-1".into());
+        assert_eq!(
+            stale,
+            AgentStatus::NeedsUpdate {
+                reason: "speaks protocol 1-1".into()
+            }
+        );
+        assert!(stale.needs_update());
+    }
+
+    #[test]
+    fn probe_in_flight_means_no_second_probe() {
+        let t0 = Instant::now();
+        let mut gate = ProbeGate::default();
+        let first = gate.try_start(t0, true).expect("first probe starts");
+        // Neither a forced probe nor a due one starts while the first is out.
+        assert_eq!(gate.try_start(t0, true), None);
+        assert_eq!(gate.try_start(t0 + Duration::from_secs(10), false), None);
+        gate.finish(first);
+        // After it reported, the throttle still applies to unforced probes.
+        assert_eq!(gate.try_start(t0 + Duration::from_secs(1), false), None);
+        assert!(gate.try_start(t0 + Duration::from_secs(1), true).is_some());
+        // A reset (agent started or stopped) lets an unforced probe run at once.
+        let mut fresh = ProbeGate::default();
+        let ticket = fresh.try_start(t0, true).expect("probe starts");
+        fresh.finish(ticket);
+        fresh.reset_throttle();
+        assert!(fresh.try_start(t0, false).is_some());
+    }
+
+    #[test]
+    fn lost_probe_is_replaced_and_its_late_report_is_ignored() {
+        let t0 = Instant::now();
+        let mut gate = ProbeGate::default();
+        let lost = gate.try_start(t0, true).expect("probe starts");
+        let later = t0 + PROBE_LOST_AFTER + Duration::from_secs(1);
+        let fresh = gate
+            .try_start(later, false)
+            .expect("a lost probe must not block forever");
+        // The lost probe reports late: the newer one is still in flight.
+        gate.finish(lost);
+        assert_eq!(gate.try_start(later, true), None);
+        gate.finish(fresh);
+        assert!(gate.try_start(later, true).is_some());
     }
 
     #[test]
