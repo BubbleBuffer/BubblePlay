@@ -11,6 +11,7 @@
 //! Every validator returns `Invalid::Drop` (ignore the message, keep the
 //! socket) or `Invalid::Close` (close the socket), as Go does for that case.
 
+pub mod gate;
 pub mod limits;
 pub mod protocol;
 pub mod relay;
