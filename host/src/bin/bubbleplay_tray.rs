@@ -62,10 +62,10 @@ use bubbleplay_host::secure_helper::protocol::{
     PROTOCOL_MAX as SECURE_PROTOCOL_MAX, PROTOCOL_MIN as SECURE_PROTOCOL_MIN,
 };
 use logic::{
-    admin_menu_enabled, admin_mode_line, run_key_command, secure_helper_should_launch,
-    start_secure_helper_for_viewer, status_line, unix_ms_now, AgentStatus, HostState,
-    SecureHelperStatus, SharedLog, TraySettings, ViewerGate, AGENT_UPDATE_LABEL,
-    SECURE_HELPER_UPDATE_LABEL,
+    admin_menu_enabled, admin_mode_line, run_key_command, running_probe_status,
+    secure_helper_should_launch, start_secure_helper_for_viewer, status_line, unix_ms_now,
+    AgentStatus, HostState, SecureHelperStatus, SharedLog, TraySettings, ViewerGate,
+    AGENT_UPDATE_LABEL, SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
     acquire_single_instance, create_manual_event, data_dir, end_agent_task, ensure_agent_task,
@@ -731,30 +731,43 @@ impl App {
                 self.set_agent(AgentStatus::NeedsUpdate { reason });
             }
             ProbeResult::Unavailable(error) => {
-                let retry = self
-                    .agent_retry
-                    .should_start(Instant::now(), needed, running);
-                if !retry && !running {
-                    return;
-                }
-                let result = if self.test_mode || (self.agent_started.is_none() && !running) {
-                    String::new()
-                } else {
-                    platform::agent_task_result()
-                };
-                let reason = format!("the admin agent does not answer ({error}){result}");
-                self.report_agent_failure(&reason);
-                // Keep transient startup failure in diagnostics without a new balloon.
-                if self.agent != AgentStatus::Starting {
-                    tracing::warn!(%reason, "admin agent probe failed");
-                }
-                if retry {
-                    tracing::warn!(%reason, "admin agent needed; scheduling start");
-                    self.start_agent();
-                } else if running {
-                    self.set_agent(AgentStatus::NeedsUpdate { reason });
-                }
+                self.agent_probe_failed(error, false, needed, running);
             }
+            ProbeResult::NotResponding(error) => {
+                self.agent_probe_failed(error, true, needed, running);
+            }
+        }
+    }
+
+    /// A probe failed without a version answer. A missed hello deadline is
+    /// reported as "not responding", never as an out-of-date agent.
+    fn agent_probe_failed(&mut self, error: String, timed_out: bool, needed: bool, running: bool) {
+        let retry = self
+            .agent_retry
+            .should_start(Instant::now(), needed, running);
+        if !retry && !running {
+            return;
+        }
+        let result = if self.test_mode || (self.agent_started.is_none() && !running) {
+            String::new()
+        } else {
+            platform::agent_task_result()
+        };
+        let reason = if timed_out {
+            format!("the admin agent is not responding ({error}){result}")
+        } else {
+            format!("the admin agent does not answer ({error}){result}")
+        };
+        self.report_agent_failure(&reason);
+        // Keep transient startup failure in diagnostics without a new balloon.
+        if self.agent != AgentStatus::Starting {
+            tracing::warn!(%reason, "admin agent probe failed");
+        }
+        if retry {
+            tracing::warn!(%reason, "admin agent needed; scheduling start");
+            self.start_agent();
+        } else if running {
+            self.set_agent(running_probe_status(timed_out, reason));
         }
     }
 

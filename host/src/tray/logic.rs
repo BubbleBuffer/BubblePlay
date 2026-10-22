@@ -369,11 +369,25 @@ pub enum AgentStatus {
     /// The agent is missing, speaks another protocol, or does not start: the
     /// host injects at user level until the (one-UAC) agent update ran.
     NeedsUpdate { reason: String },
+    /// The agent is running but did not answer the hello in time. It may be
+    /// slow or stalled, not out of date, so the update prompt is not offered;
+    /// the tray keeps retrying.
+    NotResponding { reason: String },
 }
 
 impl AgentStatus {
     pub fn needs_update(&self) -> bool {
         matches!(self, AgentStatus::NeedsUpdate { .. })
+    }
+}
+
+/// Status after a failed probe of a running agent. Only a missed hello
+/// deadline is "not responding"; every other failure keeps the update prompt.
+pub fn running_probe_status(timed_out: bool, reason: String) -> AgentStatus {
+    if timed_out {
+        AgentStatus::NotResponding { reason }
+    } else {
+        AgentStatus::NeedsUpdate { reason }
     }
 }
 
@@ -388,6 +402,7 @@ pub fn status_line(state: &HostState, agent: &AgentStatus) -> String {
         AgentStatus::Starting => "user input, admin agent starting",
         AgentStatus::Ready => "admin input",
         AgentStatus::NeedsUpdate { .. } => "user input, admin agent needs update",
+        AgentStatus::NotResponding { .. } => "user input, admin agent not responding",
     };
     format!("BubblePlay: {} ({input})", state.label())
 }
@@ -400,6 +415,7 @@ pub fn admin_mode_line(agent: &AgentStatus) -> Option<&'static str> {
         AgentStatus::Starting => Some("Admin mode: starting (viewer connected)"),
         AgentStatus::Ready => Some("Admin mode: active"),
         AgentStatus::NeedsUpdate { .. } => Some("Admin mode: agent needs update"),
+        AgentStatus::NotResponding { .. } => Some("Admin mode: agent not responding"),
     }
 }
 
@@ -935,6 +951,35 @@ mod tests {
             AGENT_UPDATE_LABEL,
             "Admin agent needs update (one admin prompt)"
         );
+    }
+
+    #[test]
+    fn missed_hello_deadline_shows_not_responding_not_an_update() {
+        let silent = running_probe_status(true, "the admin agent is not responding".into());
+        assert_eq!(
+            silent,
+            AgentStatus::NotResponding {
+                reason: "the admin agent is not responding".into()
+            }
+        );
+        assert!(!silent.needs_update());
+        assert_eq!(
+            admin_mode_line(&silent),
+            Some("Admin mode: agent not responding")
+        );
+        assert_eq!(
+            status_line(&HostState::Running { pid: 1 }, &silent),
+            "BubblePlay: Running (user input, admin agent not responding)"
+        );
+        // A version or protocol problem, or any other failure, still asks for the update.
+        let stale = running_probe_status(false, "speaks protocol 1-1".into());
+        assert_eq!(
+            stale,
+            AgentStatus::NeedsUpdate {
+                reason: "speaks protocol 1-1".into()
+            }
+        );
+        assert!(stale.needs_update());
     }
 
     #[test]

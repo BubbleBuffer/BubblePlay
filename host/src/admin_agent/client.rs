@@ -34,7 +34,9 @@ pub const AGENT_EXE: &str = "bubbleplay_admin_agent.exe";
 pub const VIEWER_STARTED_MARKER: &str = "viewer session started";
 /// Host log line when that viewer session ends (peer left, error or exit).
 pub const VIEWER_ENDED_MARKER: &str = "viewer session ended";
-const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Client steps slower than this are logged, so a stall shows which side is slow.
+const SLOW_STEP: Duration = Duration::from_millis(500);
 const INJECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// Error code reported for a batch the agent refused under its rate limit.
 pub const ERROR_AGENT_RATE_LIMITED: i32 = 0x2000_0001;
@@ -60,6 +62,8 @@ pub enum LinkError {
     Incompatible { agent_min: u16, agent_max: u16 },
     /// I/O or protocol failure.
     Failed(String),
+    /// The agent did not answer the hello before its deadline (slow or stalled).
+    TimedOut(String),
 }
 
 impl std::fmt::Display for LinkError {
@@ -75,6 +79,7 @@ impl std::fmt::Display for LinkError {
                 "admin agent speaks protocol {agent_min}..{agent_max}, host needs {PROTOCOL_MIN}..{PROTOCOL_MAX}"
             ),
             LinkError::Failed(why) => write!(f, "admin agent failed: {why}"),
+            LinkError::TimedOut(why) => write!(f, "admin agent not responding: {why}"),
         }
     }
 }
@@ -82,7 +87,9 @@ impl std::fmt::Display for LinkError {
 /// Delay before the next connection attempt after a failure.
 pub fn retry_delay(error: &LinkError) -> Duration {
     match error {
-        LinkError::Unavailable(_) | LinkError::Failed(_) => Duration::from_secs(2),
+        LinkError::Unavailable(_) | LinkError::Failed(_) | LinkError::TimedOut(_) => {
+            Duration::from_secs(2)
+        }
         // Neither heals without an agent update; the tray reports these.
         LinkError::Untrusted(_) | LinkError::Incompatible { .. } => Duration::from_secs(60),
     }
@@ -197,15 +204,23 @@ fn send_message(
     pipe.write_all_until(&frame, deadline)
 }
 impl Connection {
-    /// Connect, verify the server and perform the versioned hello.
+    /// Connect, verify the server and perform the versioned hello. A hello
+    /// that misses its deadline is retried once on a fresh connection.
     pub fn open(pipe: &str, allow_dev: bool, role: Role) -> Result<Self, LinkError> {
+        retry_once_on_timeout(|| Self::open_once(pipe, allow_dev, role))
+    }
+
+    fn open_once(pipe: &str, allow_dev: bool, role: Role) -> Result<Self, LinkError> {
+        let started = Instant::now();
         let mut pipe = open_pipe(pipe)?;
         verify_server(
             pipe.file()
                 .map_err(|error| LinkError::Failed(error.to_string()))?,
             allow_dev,
         )?;
+        log_slow_step("connect and verify_server", started);
         let deadline = Instant::now() + HELLO_TIMEOUT;
+        let written = Instant::now();
         send_message(
             &mut pipe,
             &ClientMessage::Hello {
@@ -215,8 +230,12 @@ impl Connection {
             },
             deadline,
         )
-        .map_err(|error| LinkError::Failed(format!("hello: {error}")))?;
-        match read_reply(&mut pipe, deadline) {
+        .map_err(|error| hello_failure("hello", error))?;
+        log_slow_step("hello write", written);
+        let replied = Instant::now();
+        let reply = read_reply(&mut pipe, deadline);
+        log_slow_step("hello reply", replied);
+        match reply {
             Ok(AgentMessage::Welcome {
                 version,
                 agent_pid,
@@ -241,7 +260,7 @@ impl Connection {
             Ok(other) => Err(LinkError::Failed(format!(
                 "unexpected hello reply {other:?}"
             ))),
-            Err(error) => Err(LinkError::Failed(format!("hello reply: {error}"))),
+            Err(error) => Err(hello_failure("hello reply", error)),
         }
     }
 
@@ -262,7 +281,12 @@ impl Connection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
     Ready(Handshake),
-    Incompatible { agent_min: u16, agent_max: u16 },
+    Incompatible {
+        agent_min: u16,
+        agent_max: u16,
+    },
+    /// The agent did not answer in time; it is not known to be out of date.
+    NotResponding(String),
     Unavailable(String),
 }
 
@@ -276,7 +300,43 @@ pub fn probe(pipe: &str, allow_dev: bool) -> ProbeResult {
             agent_min,
             agent_max,
         },
+        Err(LinkError::TimedOut(why)) => ProbeResult::NotResponding(why),
         Err(error) => ProbeResult::Unavailable(error.to_string()),
+    }
+}
+
+/// A missed hello deadline means a slow or stalled agent; any other I/O
+/// error is a failure.
+fn hello_failure(step: &str, error: io::Error) -> LinkError {
+    if error.kind() == io::ErrorKind::TimedOut {
+        LinkError::TimedOut(format!("{step}: {error}"))
+    } else {
+        LinkError::Failed(format!("{step}: {error}"))
+    }
+}
+
+/// Runs the attempt again once if the agent did not answer in time. Every
+/// other failure is final, so an untrusted or incompatible agent is not retried.
+fn retry_once_on_timeout<T>(
+    mut attempt: impl FnMut() -> Result<T, LinkError>,
+) -> Result<T, LinkError> {
+    match attempt() {
+        Err(LinkError::TimedOut(why)) => {
+            tracing::info!(%why, "admin agent did not answer in time; retrying once");
+            attempt()
+        }
+        other => other,
+    }
+}
+
+fn log_slow_step(step: &'static str, started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_STEP {
+        tracing::warn!(
+            step,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "admin agent client step slow"
+        );
     }
 }
 
@@ -685,6 +745,57 @@ mod tests {
             retry_delay(&LinkError::Untrusted(String::new())),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn timed_out_hello_is_retried_once_then_reported() {
+        let mut calls = 0;
+        let result: Result<u8, LinkError> = retry_once_on_timeout(|| {
+            calls += 1;
+            Err(LinkError::TimedOut("hello reply".into()))
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(result, Err(LinkError::TimedOut("hello reply".into())));
+    }
+
+    #[test]
+    fn timed_out_hello_that_recovers_on_retry_succeeds() {
+        let mut calls = 0;
+        let result: Result<u8, LinkError> = retry_once_on_timeout(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(LinkError::TimedOut("slow".into()))
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(result, Ok(7));
+    }
+
+    #[test]
+    fn other_hello_failures_are_not_retried() {
+        let mut calls = 0;
+        let result: Result<u8, LinkError> = retry_once_on_timeout(|| {
+            calls += 1;
+            Err(LinkError::Untrusted("not the agent".into()))
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result, Err(LinkError::Untrusted("not the agent".into())));
+    }
+
+    #[test]
+    fn missed_hello_deadline_is_a_timeout_not_a_failure() {
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "named pipe operation timed out");
+        assert!(matches!(
+            hello_failure("hello reply", timed_out),
+            LinkError::TimedOut(_)
+        ));
+        let broken = io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed");
+        assert!(matches!(
+            hello_failure("hello reply", broken),
+            LinkError::Failed(_)
+        ));
     }
 
     #[test]

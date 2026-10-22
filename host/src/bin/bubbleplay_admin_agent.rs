@@ -70,9 +70,26 @@ use session::{Injector, Outcome, Session};
 
 /// Pipe instances: one listening plus up to three clients (host, probe, spare).
 const MAX_INSTANCES: u32 = 4;
-const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longer than the host's 10 s hello deadline, so the host, not this watchdog,
+/// reports a slow hello.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hello steps slower than this (measured from the client's connect) are logged.
+const SLOW_HELLO_STEP: Duration = Duration::from_millis(500);
 const TRAY_MISSING_LIMIT: u32 = 3;
 const RATE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Logs a hello step that finished late, so a stall shows which side is slow.
+fn log_slow_hello(stage: &'static str, client_pid: u32, connected: Instant) {
+    let elapsed = connected.elapsed();
+    if elapsed >= SLOW_HELLO_STEP {
+        tracing::warn!(
+            client_pid,
+            stage,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "admin agent hello slow"
+        );
+    }
+}
 
 struct Handle(HANDLE);
 
@@ -482,6 +499,8 @@ impl Agent {
         let mut writer: &File = &file;
         let mut last_rate_log: Option<Instant> = None;
         let mut rate_limited_seen = 0u64;
+        let connected = Instant::now();
+        let mut first_reply = true;
         let reason = loop {
             let (kind, payload) = match read_frame(&mut reader) {
                 Ok(frame) => frame,
@@ -490,6 +509,9 @@ impl Agent {
                 }
                 Err(error) => break format!("read: {error}"),
             };
+            if !greeted.load(Ordering::SeqCst) {
+                log_slow_hello("hello received", client_pid, connected);
+            }
             let outcome = {
                 let mut session = lock(&session);
                 let outcome = session.on_frame(kind, &payload, Instant::now());
@@ -513,6 +535,10 @@ impl Agent {
                 Outcome::Reply(message) => {
                     if let Err(error) = write_agent(&mut writer, &message) {
                         break format!("write: {error}");
+                    }
+                    if first_reply {
+                        first_reply = false;
+                        log_slow_hello("hello reply sent", client_pid, connected);
                     }
                 }
                 Outcome::ReplyAndClose(message) => {
