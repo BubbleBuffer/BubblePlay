@@ -32,7 +32,7 @@ impl Relay {
             self.close(id, 1008, "invalid packet", out);
             return;
         }
-        self.touch(id, now_ms);
+        self.record_activity(id, now_ms, out);
         match conn.role.kind() {
             Kind::Signal => self.signal_text(id, &conn, text, now_ms, out),
             Kind::Media => self.media_text(id, &conn, text, out),
@@ -55,7 +55,7 @@ impl Relay {
             self.close(id, 1008, "invalid packet", out);
             return;
         }
-        self.touch(id, now_ms);
+        self.record_activity(id, now_ms, out);
         let side = conn.role.side();
         match conn.role.kind() {
             // Go drops an invalid signal or media frame and keeps the socket.
@@ -133,13 +133,19 @@ impl Relay {
                     .and_then(|bytes| bytes.try_into().ok());
                 if let Some(admit) = admit {
                     self.pair_open(&conn.pc, admit, now_ms);
+                    self.persist(id, out);
                 }
             }
-            SignalKind::PairClose => self.pair_close(&conn.pc),
+            SignalKind::PairClose => {
+                if self.pair_close(&conn.pc) {
+                    self.persist(id, out);
+                }
+            }
             kind => {
                 if conn.role == Role::Host && kind.cached_for_viewers() {
                     let room = self.rooms.entry(conn.pc.clone()).or_default();
                     room.cached.insert(kind.as_str(), text.to_owned());
+                    self.persist(id, out);
                 }
                 if !self.pairing_allows(conn, kind) {
                     return;

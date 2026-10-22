@@ -49,16 +49,26 @@ impl Relay {
         );
     }
 
-    /// Closes the PC's pairing window, if one is open.
-    pub(super) fn pair_close(&mut self, pc: &str) {
-        self.pair_windows.remove(pc);
+    /// Closes the PC's pairing window, if one is open. True when one was.
+    pub(super) fn pair_close(&mut self, pc: &str) -> bool {
+        self.pair_windows.remove(pc).is_some()
     }
 
-    /// Drops expired windows and expired failure counts. Called from `tick`.
-    pub(super) fn expire_pairing(&mut self, now_ms: u64) {
+    /// Drops expired windows and expired failure counts. Called from `tick`. A
+    /// host whose window expires gets a snapshot without it. Failure counts are
+    /// in memory only and get no snapshot.
+    pub(super) fn expire_pairing(&mut self, now_ms: u64, out: &mut Vec<Action>) {
         let fail_window = self.config.timings.pair_fail_window_ms;
-        self.pair_windows
-            .retain(|_, window| now_ms < window.expires_ms);
+        let expired: Vec<String> = self
+            .pair_windows
+            .iter()
+            .filter(|(_, window)| now_ms >= window.expires_ms)
+            .map(|(pc, _)| pc.clone())
+            .collect();
+        for pc in &expired {
+            self.pair_windows.remove(pc);
+            self.persist_host(pc, out);
+        }
         self.pair_failures
             .retain(|_, failures| now_ms < failures.start_ms + fail_window);
     }
@@ -106,6 +116,7 @@ impl Relay {
             .is_some_and(|window| util::ct_eq(&pair, &window.admit));
         if matched {
             self.pair_windows.remove(&pc);
+            self.persist_host(&pc, out);
             self.viewer_admit(id, device, turn, true, now_ms, rng, out);
             return;
         }
@@ -120,11 +131,17 @@ impl Relay {
                 window.failures += 1;
                 window.failures
             });
-        if failures.is_some_and(|count| count >= PAIR_PC_FAILURES) {
+        let dropped = failures.is_some_and(|count| count >= PAIR_PC_FAILURES);
+        if dropped {
             self.pair_windows.remove(&pc);
-            if let Some(host) = self.peers.get(&key_for(Role::Host, "", &pc)).copied() {
-                self.send_text(host, json!({"type": "pair-closed"}).to_string(), out);
-            }
+        }
+        if failures.is_some() {
+            // The PC-wide count must survive a hibernation, so the host's
+            // snapshot records it before anything else is sent.
+            self.persist_host(&pc, out);
+        }
+        if dropped && let Some(host) = self.peers.get(&key_for(Role::Host, "", &pc)).copied() {
+            self.send_text(host, json!({"type": "pair-closed"}).to_string(), out);
         }
         self.hello_refused(id, out);
     }

@@ -194,6 +194,11 @@ pub(crate) struct Conn {
     pub device: String,
     /// True while the viewer is in pairing mode (admitted by a pairing window).
     pub pairing: bool,
+    /// The last activity seen on a live socket, in Unix ms (touch or note_activity).
+    pub activity_ms: u64,
+    /// The activity value the last emitted snapshot recorded. A new snapshot is
+    /// emitted once `activity_ms` has moved a step past it.
+    pub saved_activity_ms: u64,
 }
 
 /// A buffered viewer message, kept for the next host.
