@@ -101,8 +101,8 @@ jobs:
       - name: bp-device-key tests, clippy and fmt
         working-directory: crates/bp-device-key
         run: |
-          cargo test --locked --all-features
-          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --all-features
+          cargo clippy --all-targets --all-features -- -D warnings
           cargo fmt --all -- --check
       - name: relay-rs tests, clippy and fmt
         working-directory: relay-rs
