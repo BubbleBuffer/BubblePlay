@@ -42,4 +42,5 @@ url = "2"
 
 [dev-dependencies]
 tempfile = "3"
+tokio-tungstenite = "0.26"
 tower = { version = "0.5", features = ["util"] }
