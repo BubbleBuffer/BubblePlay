@@ -11,8 +11,12 @@
 //! Every validator returns `Invalid::Drop` (ignore the message, keep the
 //! socket) or `Invalid::Close` (close the socket), as Go does for that case.
 
+pub mod gate;
 pub mod limits;
 pub mod protocol;
+pub mod rng;
+
+pub use rng::RelayRng;
 
 pub use limits::{
     FILE_HEADER_BYTES, FILE_LIMIT, HELLO_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT,
