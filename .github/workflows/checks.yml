@@ -99,6 +99,15 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt --target wasm32-unknown-unknown --no-self-update
           rustup default 1.97.1
+          # Runners on build01 share RUSTUP_HOME, so rustup can report the wasm32 target
+          # installed while its rlibs are missing. Check the sysroot and reinstall if so.
+          sysroot="$(rustc +1.97.1 --print sysroot)"
+          if ! ls "$sysroot"/lib/rustlib/wasm32-unknown-unknown/lib/libcore-*.rlib >/dev/null 2>&1; then
+            echo "wasm32 rust-std missing from $sysroot; reinstalling"
+            rustup component remove rust-std --target wasm32-unknown-unknown --toolchain 1.97.1 || true
+            rustup target add wasm32-unknown-unknown --toolchain 1.97.1
+            ls "$sysroot"/lib/rustlib/wasm32-unknown-unknown/lib/libcore-*.rlib
+          fi
           rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
