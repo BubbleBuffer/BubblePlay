@@ -179,7 +179,7 @@ Kept from today, independent of device keys: a browser must pass ntfy approval b
 
 - **Hosts register by ID.** On `/host-ws` the host sends its ID and public key and signs a relay nonce. The relay checks the ID against the key hash and the signature, and issues a short-lived ticket for that connection's media and file sockets.
 - **Who may register:** the operator's registration secret (`TOKEN`) stays as the ticket for a PC's first registration; the relay then remembers the PC ID and key, and later registrations need only the signature. The operator lists and removes PC IDs with the admin token. `HOST_GATE_TOKEN` is replaced by the signature and the ticket, and deleted.
-- **Viewers connect to a PC ID.** `hello` carries `target: <pc id>`, the viewer's ID and a signature over a relay nonce; the relay answers with a ticket for that epoch's media and file sockets. The session cookie is gone; browsers also need the site gate cookie.
+- **Viewers connect to a PC ID.** The PC ID is in the URL (`/ws?pc=<id>`). `hello` carries the viewer's ID and public key. The relay answers with a nonce, and the viewer signs it, the same way hosts register. The relay then answers with a ticket for that epoch's media and file sockets. The session cookie is gone; browsers also need the site gate cookie. For the wire format, see [Phase 2 relay protocol](#phase-2-relay-protocol).
 - **Admission without accounts:** each PC publishes the list of viewer IDs it trusts (IDs only) and whether remote pairing is on. The relay admits a viewer to a PC's room only if its ID is listed, or for an open pairing window or a remote pairing request. Strangers never reach the host's parser beyond the pairing messages, and the PC still checks every key itself.
 - **What the relay stores:** per PC: ID, public key, last seen, the published viewer-ID list, the remote-pairing flag, a hash of an open pairing code. Separately, the site gate's ntfy settings and hashed gate sessions, as today. No names, permissions, passwords, or second-factor secrets for pairing or pre-login. Go keeps it in `auth.json`, Cloudflare in the `GATE` Durable Object storage. Rooms are per PC ID: Go keys peers as `signal:host:<id>` and `signal:client:<id>`; Cloudflare names the `ROOM` object after the PC ID instead of `room-v3`.
 - **What the relay learns:** which device IDs talk to which PC and when, and their IP prefixes, as it sees today.
@@ -340,7 +340,7 @@ Verified: repeated generation is byte-identical and matches the staged fixture; 
 - **Signatures:** H = SHA-256(transcript). PC signs `bubbleplay-auth-host-v1` || H; viewer signs `bubbleplay-auth-viewer-v1` || H || raw 64-byte PC signature. Ed25519 signs these bytes directly; contexts are raw UTF-8 without length prefixes.
 - **Control:** X25519 shared secret → HKDF-SHA-256, salt H, 32-byte outputs, UTF-8 info `bubbleplay-ctl-v1 viewer-to-pc` / `bubbleplay-ctl-v1 pc-to-viewer`. Per-direction AES-256-GCM nonce: four zero bytes || uint64 big-endian sequence starting at 0. AAD: raw UTF-8 `type`; ciphertext || 16-byte tag. `plaintextUtf8` fixes sample JSON serialization; capability strings are illustrative.
 - **DTLS:** each side signs raw UTF-8 `bubbleplay-dtls-v1` || H || local fingerprint || newline || remote fingerprint. Fingerprints are UTF-8 SDP `a=fingerprint` **values**, including algorithm/spaces/colons, excluding `a=fingerprint:`. Each signer uses its own local/remote order.
-- **Signaling:** `auth-hello` `{type, id, public, nonce, ephemeral, caps}` (string-array `caps`); `auth-host` `{type, id, public, nonce, ephemeral, signature}`; `auth-finish`/`auth-bind` `{type, signature}`. `type` is the hyphenated message name, IDs canonical, binary fields unpadded base64url. The fixture's `auth-bind` is viewer-sent.
+- **Signaling:** `auth-hello` `{type, id, public, nonce, ephemeral, caps}` (string-array `caps`); `auth-host` `{type, id, public, nonce, ephemeral, signature}`; `auth-finish`/`auth-bind` `{type, signature}`. `type` is the hyphenated message name, IDs canonical, binary fields unpadded base64url. Both sides send `auth-bind`, each signing its own local/remote order (decided 2026-10-22, D9). The fixture's `messages.authBind` is the viewer's, and `messages.authBindPc` is the PC's.
 
 ### Browser research (docs and web only)
 
@@ -368,3 +368,77 @@ Recommend **hash-wasm's Argon2 bundle** for explicit Worker support, simple load
 7. **Key screens in phase 1 are optional:** a first-open offer with **Not now** plus a settings entry in the browser and Android. Unlock on open becomes mandatory at the phase 2 cutover, so today's login is untouched.
 
 Android state, 2026-10-15 (lane `dk-androidui`, not yet on master): `ui/DeviceKeyActivity` (create, import, export with keep, re-seal or drop passphrase, change passphrase, remove), `ui/PassphraseDialog` and `ui/KeyViews`, and an offer card on the start screen (`ui/MainActivity`, flag `deviceKeyOfferDismissed` in `Prefs`). Export and passphrase work run on a worker thread and close the unlocked seed on every path. Remove calls `DeviceKeyStore.remove()`, which deletes the store's file (`device-key.bpkey` and its `.bak`) under the same lock as load and save; the UI names no file. Not run on a device; the JVM tests cover the offer, file name and error mapping only.
+
+## Phase 2 relay protocol
+
+Decided 2026-10-22 for the Rust relay (`relay-rs/`, lane rust-relay, M2). Constants live in `relay-rs/core/src/limits.rs`. Every failure before admission closes the socket with 1008 and an empty reason, with nothing else sent first. Every message before admission is at most 16 KiB.
+
+**Viewer hello on `/ws?pc=<id>`** (the same exchange as host registration):
+
+1. The viewer sends `{"type":"hello","role":"viewer","id","public","turn"?,"pair"?}`. Unknown keys are refused. `id` is canonical and must match `public`; `pair` is 32 bytes. Until the cutover the relay also accepts the old role `client`.
+2. The relay answers `{"type":"register-challenge","nonce"}`. The nonce is 32 random bytes for this socket only. It is valid for one answer and 30 s.
+3. The viewer answers `{"type":"register-proof","signature"}`, a relay proof with role `viewer` and the relay's configured public origin, checked with strict Ed25519 verification.
+4. The relay checks admission (below). Only then does it send `hello-ok`, replay the cached capabilities and rotate the epoch. Until admission the socket receives nothing but the challenge, and it neither takes the viewer slot nor causes peer events.
+
+Media and file sockets keep the phase 1 ticket hello. A browser socket (one with `Origin`) also needs the gate cookie. A socket without `Origin` is native and is judged by the signed hello alone.
+
+**Admission list:**
+
+- The host sends `{"type":"admit","viewers":[<id>...],"remotePairing":<bool>}` on its authenticated `/host-ws` after `hello-ok` and on every change.
+- Each message fully replaces the list. It holds at most 256 canonical IDs with no duplicates. The relay consumes it and never forwards it. An invalid `admit` is dropped.
+- The relay persists the list and the flag with the PC record. The operator's `GET /__gate/manage/pcs` shows only the count. `remotePairing` is stored but unused until remote pairing (phase 3).
+- A viewer is admitted when its ID is listed. A list that was never published is empty.
+- A connected viewer that drops off the list is closed 1008.
+
+**Pairing window (pairing at the PC):**
+
+- The host sends `{"type":"pair-open","admit":<b64url SHA-256("bubbleplay-pair-admit-v1" || canonical PC ID || code)>}`. It also sends `{"type":"pair-close"}`. The relay consumes both.
+- There is one window per PC. It is kept in memory only, ends 300 s after `pair-open`, and is replaced by a newer `pair-open`. It is removed by `pair-close` or by the host's signalling socket closing.
+- An unlisted viewer adds `pair` (the same hash, computed from the code it scanned or typed) to its hello. After a valid proof, the relay compares the value in constant time.
+  - On a match, the window is consumed and the socket is admitted in **pairing mode**: `hello-ok` carries `"pairing":true` and no ticket.
+  - Failures are limited to 5 per client prefix per 300 s. After 20 failures against a PC, its window is dropped and the host gets `{"type":"pair-closed"}`. This cap against brute force lets a stranger who knows the PC ID end a pairing window early. The tray then says so, and the user opens a new one.
+- Pairing mode takes the normal viewer slot.
+  - It forwards only `auth-hello`, `auth-finish`, `auth-bind` and `pair-proof` from the viewer.
+  - It forwards only `auth-host`, `auth-bind`, `pair-proof`, `pair-done` and `pair-denied` from the host.
+  - Everything else is dropped in both directions, including binary frames.
+  - A later `admit` does not close it. The viewer reconnects normally once it is listed.
+- Remote pairing (B) is phase 3.
+
+**Forwarded phase 2 types.** Each has exact keys, a direction and a size cap. None is buffered while the host is away. Anything with the wrong direction, shape or size is dropped.
+
+| Type | Direction | Cap | Fields |
+| --- | --- | --- | --- |
+| `auth-hello` | viewer to PC | 2 KiB | `id`, `public`, `nonce`, `ephemeral`; `caps`: at most 32 strings of 1-64 chars `[a-z0-9-]` |
+| `auth-host` | PC to viewer | 2 KiB | `id`, `public`, `nonce`, `ephemeral`, `signature` |
+| `auth-finish` | viewer to PC | 1 KiB | `signature` |
+| `auth-bind` | both | 1 KiB | `signature` |
+| `pair-proof` | both | 1 KiB | `mac` (32 bytes) |
+| `pair-done`, `pair-denied` | PC to viewer | 1 KiB | none |
+| `ctl` | both | 512 KiB signal cap | `kind` `[a-z0-9-]{1,32}`, `seq` an integer 0 to 2^53-1, `data` base64url of at most `CTL_DATA_MAX` (263,168) chars |
+
+`CTL_DATA_MAX` is the base64url length of the largest clipboard chunk the relay allows today (`CLIPBOARD_RAW_MAX`, 196,864 bytes) plus the 16-byte AEAD tag, rounded up to the next KiB. The relay does no cryptography on these types and does not track `seq`.
+
+Binary signalling frames are forwarded from the viewer to the PC only.
+
+**Cutover commit** (lands with the host and client lanes, not before):
+
+- The relay accepts only the roles `viewer`, `media-viewer` and `file-viewer`. `client`, `media-client` and `file-client` are refused.
+- Input, clipboard and other control travel only inside `ctl`. The plaintext signalling types for them are removed from the allowlist. So are plaintext binary input frames from the viewer, which in WSS mode travel as `ctl` with `kind` `input` and `data` = AEAD(the binary frame). The list of types comes from the host's routes when the commit is made.
+
+**Proposed for the host and client lanes** (the lane's proposals, not settled; the relay forwards these as opaque bounded messages):
+
+- *Pairing exchange (3b):*
+  - The code is 10 Crockford base32 characters from the PC's CSPRNG, normalised like IDs.
+  - Pairing reuses `auth-hello`, `auth-host` and `auth-finish`, with `pair-v1` in `caps`.
+  - Each side sends `pair-proof` with `mac` = HMAC-SHA256(HKDF(code, "bubbleplay-pair-v1"), "viewer" or "pc" || H), where H is the transcript hash.
+  - The comparison number is the first 4 bytes of SHA-256("bubbleplay-pair-sas-v1" || H), as big-endian u32 mod 10^6, zero-padded to 6 digits.
+  - The PC ends with `pair-done` or `pair-denied`.
+- *Control channel (6):*
+  - The envelope is `{"type":"ctl","kind":<inner type>,"seq","data":<ciphertext || tag>}`. AAD is `kind`, and after decryption `plaintext.type` must equal `kind`.
+  - The receiver accepts only `seq` equal to the expected value. Any gap, repeat or authentication failure ends the session.
+  - Each handshake brings new keys and starts again at `seq` 0.
+- *Caps (8):*
+  - Unknown caps are ignored, and a missing cap means the feature is off.
+  - Every cap needed at cutover (`control-aead-v1`, and `dtls-bind-v1` in WebRTC mode) is mandatory. A relay that strips caps can only cause a refusal, not a downgrade.
+  - Caps are not in the transcript (above), so the endpoints may repeat them inside `ctl` after the handshake.
+- *PC key rotation:* there is no relay change. The new ID registers with `TOKEN`, and the operator removes the old record. The `rotate` statement reaches viewers inside `ctl`.
