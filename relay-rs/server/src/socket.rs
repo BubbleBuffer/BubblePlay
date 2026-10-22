@@ -2,6 +2,7 @@
 //! the relay, and one writer task, which drains the socket's queue. A close from the core stops
 //! both: the writer sends the close frame, the reader stops reading.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -30,10 +31,15 @@ pub fn route_for_path(path: &str) -> Option<Route> {
     }
 }
 
-/// Accepts an upgrade the gate allowed. A refusal by the core is HTTP 404, and the socket is never
-/// upgraded.
-pub fn accept(state: Arc<Shared>, upgrade: WebSocketUpgrade, req: UpgradeRequest) -> Response {
-    let result = state.relay().upgrade(req, now_ms());
+/// Accepts an upgrade the gate allowed. `client` is the peer address the core keys its pairing
+/// limits by. A refusal by the core is HTTP 404, and the socket is never upgraded.
+pub fn accept(
+    state: Arc<Shared>,
+    upgrade: WebSocketUpgrade,
+    req: UpgradeRequest,
+    client: IpAddr,
+) -> Response {
+    let result = state.relay().upgrade(req, client, now_ms());
     let id = match result {
         Ok(id) => id,
         Err(Reject) => return StatusCode::NOT_FOUND.into_response(),

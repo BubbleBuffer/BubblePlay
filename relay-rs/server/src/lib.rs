@@ -7,8 +7,6 @@ pub mod config;
 pub mod health;
 pub mod import;
 pub mod init;
-#[cfg(feature = "lab")]
-pub mod lab;
 pub mod net;
 pub mod runtime;
 pub mod server;

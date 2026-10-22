@@ -129,12 +129,6 @@ jobs:
       - name: bp-relay-core builds for wasm32
         working-directory: relay-rs
         run: cargo check --locked -p bp-relay-core --target wasm32-unknown-unknown
-      - name: bp-relay-server with the lab feature
-        if: hashFiles('relay-rs/server/Cargo.toml') != ''
-        working-directory: relay-rs
-        run: |
-          cargo test --locked -p bp-relay-server --features lab
-          cargo clippy --locked -p bp-relay-server --all-targets --features lab -- -D warnings
       - name: Container build
         run: docker build -f relay-rs/Dockerfile -t bubbleplay-relay-rs:check .
 

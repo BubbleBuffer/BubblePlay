@@ -36,7 +36,7 @@ logs or in `Debug` output.
 
 Both files live in `state_dir`.
 
-- `pcs.json` holds the registered host PCs: `{"version":1,"pcs":[{"id":"XXXX-XXXX-XXXX-XXXX","public":"<base64url 32 bytes>","registered_ms":0}]}`. Each ID must be the hash of its own public key.
+- `pcs.json` holds the registered host PCs: `{"version":1,"pcs":[{"id":"XXXX-XXXX-XXXX-XXXX","public":"<base64url 32 bytes>","registered_ms":0,"admitted":["XXXX-XXXX-XXXX-XXXX"],"remotePairing":false}]}`. Each ID must be the hash of its own public key. `admitted` lists the viewer IDs the host admitted (at most 256, canonical and unique) and defaults to empty. `remotePairing` defaults to `false`.
 - `gate.json` holds the gate cookies: `{"version":1,"cookies":[{"hash":"<base64url SHA-256 of the cookie value>","expires_ms":0}]}`. The cookie itself is never stored, only its hash. The gate's tick drops expired cookies and rewrites the file.
 
 Writes are atomic. The new content goes to a temp file in the same directory, which is fsynced
@@ -73,16 +73,27 @@ The build context is the repository root. `relay-rs/Dockerfile.dockerignore` hol
 rules: BuildKit reads a Dockerfile-specific ignore file that sits next to the Dockerfile, so it
 applies to this build with the repo-root context. Keep it next to the Dockerfile.
 
-## The `lab` feature
+## Viewer admission (M2)
 
-`lab` is a cargo feature. It is off by default, so a normal build has no lab code in it. The
-feature compiles the loopback guard and turns on its check in `serve`.
+A viewer's `/ws` hello is signed. The client sends `{"type":"hello","role":"viewer","id","public","turn","pair"?}`.
+The relay answers `register-challenge` with a nonce. The viewer replies `register-proof` with a
+signature over that nonce and the public origin, made with the viewer's device key.
 
-    cargo build --release --features lab
+- An ID in the PC's `admitted` list is admitted. The relay sends `hello-ok` with a media ticket.
+- Otherwise, while the host has an open pairing window, a viewer that sends the window's 32-byte `pair` value is admitted in pairing mode. Its `hello-ok` carries `pairing: true` and no media ticket. A pairing viewer may send only `auth-hello`, `auth-finish`, `auth-bind` and `pair-proof`, and the host may send it only `auth-host`, `auth-bind`, `pair-proof`, `pair-done` and `pair-denied`. Everything else is dropped in that direction.
+- A pairing window opens with the host's `pair-open` and lasts 300 s. It closes on `pair-close`, when the host disconnects, or after 20 failed attempts against that PC. Five failures from one client prefix in 300 s refuse that prefix. The host gets `pair-closed` when a window closes on failures.
+- Anything else is closed 1008 with an empty reason.
+- A browser viewer (one that sends an `Origin`) also needs a valid gate cookie. Without one it is closed 1008 with an empty reason.
+- Origin-less sockets are native clients. They are upgraded and judged by the signed hello alone.
 
-With `lab` on, `serve` refuses to start unless every listen address is loopback: `127.0.0.0/8`
-or `::1`. When it starts, it logs a loud warning. The shell has no lab routes yet. Never expose a
-lab build.
+The host's `admit` message sets the admitted list. It has `viewers` (at most 256 canonical IDs, no
+duplicates) and `remotePairing` (a boolean). The relay stores `remotePairing` with the PC and
+reports it back, but admission does not read it. A viewer that drops off the admitted list is
+closed 1008 with an empty reason. A pairing viewer is not affected by that check.
+
+The host's `admit`, `pair-open` and `pair-close` are consumed by the relay and never forwarded.
+`pair-done` and `pair-denied` reach a pairing viewer from the host. `ctl` is forwarded between the
+host and a live viewer in both directions.
 
 ## Migrating from the Go relay
 
@@ -90,8 +101,10 @@ lab build.
 2. Run `bp-relay import-go-auth <auth.json> --config <relay.json>`. Only the `pcs` table is read. Passwords, TOTP secrets, sessions, rate counters and approvals are ignored on purpose. An entry is skipped and listed when its key is not the canonical device ID, its public key is malformed, its ID does not match its public key, or its `firstSeen` is not a positive time.
 3. PCs registered on the Cloudflare Worker relay are not in the Go auth file, and they cannot be imported. Each of them re-registers once with `TOKEN` at cutover.
 
-## Known limits (M1)
+## Known limits (M2)
 
+- Pairing windows and pair-failure counters live in memory. A restart closes every window, and the host must send `pair-open` again.
+- The admin listing at `/__gate/manage/pcs` reports the count of admitted viewers per PC (`admitted`), never the IDs.
 - `last_seen` is derived, not stored: the PC table keeps `registered_ms` only, and on load `last_seen` is set equal to `registered_ms`. The admin listing shows a PC's last contact as its registration time until it connects again after a restart.
 - Queued frames drain before a close: a socket's frames already in its queue are sent before its close frame, including the 1008 and 1001 closes. The drain shares `CLOSE_TIMEOUT` (2 s). A socket being removed or replaced can therefore receive frames queued just before the close.
 - A failed-upgrade connection is reaped by `tick`: the core accepts an upgrade before the WebSocket handshake finishes. If the handshake fails, the connection stays until its hello deadline (10 s), and `tick` then closes and forgets it.

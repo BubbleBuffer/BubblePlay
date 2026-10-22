@@ -62,6 +62,8 @@ fn import_keeps_only_valid_pcs_and_reports_the_rest() {
             id: id_for(1),
             public: public_b64(1),
             registered_ms: 1_700_000_000_001,
+            admitted: Vec::new(),
+            remote_pairing: false,
         }]
     );
 }
@@ -93,6 +95,8 @@ fn import_merges_into_existing_pcs_without_dropping_them() {
             id: id_for(7),
             public: public_b64(7),
             registered_ms: 77,
+            admitted: Vec::new(),
+            remote_pairing: false,
         }],
     };
     store::save_pcs(dir.path(), &existing).unwrap();

@@ -123,5 +123,7 @@ fn convert(key: &str, pc: &GoPc) -> Result<PcRecord, String> {
         id: key.to_string(),
         public: pc.public.clone(),
         registered_ms,
+        admitted: Vec::new(),
+        remote_pairing: false,
     })
 }

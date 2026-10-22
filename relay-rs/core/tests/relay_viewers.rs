@@ -225,6 +225,10 @@ fn host_capabilities_are_cached_and_replayed_to_a_later_viewer() {
 fn viewer_messages_wait_for_the_host_and_flush_after_registration() {
     let mut h = Harness::new();
     let a = identity(1);
+    // A viewer is admitted only through its PC's stored list, so the host
+    // registers once and goes away before the viewer joins.
+    let (first, _) = h.register_host(&a, Some(TOKEN));
+    h.close(first.id);
     let viewer = h.open_viewer(&identity(1).id().to_string());
     let offer = r#"{"type":"offer","sdp":"v=0"}"#;
     assert!(
@@ -242,6 +246,8 @@ fn viewer_messages_wait_for_the_host_and_flush_after_registration() {
 fn pending_buffer_keeps_the_newest_sixty_four_in_order() {
     let mut h = Harness::new();
     let a = identity(1);
+    let (first, _) = h.register_host(&a, Some(TOKEN));
+    h.close(first.id);
     let viewer = h.open_viewer(&a.id().to_string());
     for i in 0..(PENDING_LIMIT + 6) {
         let ice = json!({"type": "ice", "candidate": format!("c{i}")});
@@ -288,6 +294,8 @@ fn pending_messages_and_capabilities_stay_in_their_own_room() {
     let mut h = Harness::new();
     let a = identity(1);
     let b = identity(2);
+    let (first_a, _) = h.register_host(&a, Some(TOKEN));
+    h.close(first_a.id);
     let va = h.open_viewer(&a.id().to_string());
     let offer = r#"{"type":"offer","sdp":"v=0"}"#;
     h.raw(va.id, offer);

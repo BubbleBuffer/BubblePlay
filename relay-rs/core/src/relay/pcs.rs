@@ -1,6 +1,6 @@
 //! The PC table: the remembered host identities.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Go's maxAuthRecords: an unknown PC is refused once the table holds this many.
 pub const MAX_PCS: usize = 4096;
@@ -14,6 +14,11 @@ pub struct PcRecord {
     pub first_seen: u64,
     /// Unix milliseconds of the most recent registration.
     pub last_seen: u64,
+    /// Canonical IDs of the viewers the host has admitted. Each admit message
+    /// replaces the whole set.
+    pub admitted: BTreeSet<String>,
+    /// The host's remotePairing flag. Stored in M2 and not used yet.
+    pub remote_pairing: bool,
 }
 
 /// The PC table, keyed by canonical device id. The adapter loads it at start

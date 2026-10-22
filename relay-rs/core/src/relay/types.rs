@@ -51,8 +51,9 @@ pub struct UpgradeRequest {
     pub pc: Option<String>,
     /// The raw `epoch` query value (data sockets only).
     pub epoch: Option<String>,
-    /// True when the adapter authorised a browser viewer (gate cookie, and in M1
-    /// the lab stand-in). Required by `Ws`, `MediaWs` and `FileWs`.
+    /// True when the site gate passed for this viewer upgrade: no Origin header,
+    /// or an Origin with a valid gate cookie. Required by `Ws`, `MediaWs` and
+    /// `FileWs`. It does not admit the viewer; that takes the device-key proof.
     pub viewer_authorized: bool,
 }
 
@@ -82,6 +83,8 @@ pub struct PcListing {
     pub last_seen: u64,
     /// True when the PC's host signalling socket is open.
     pub online: bool,
+    /// How many viewer IDs the PC's host has admitted. The IDs are never listed.
+    pub admitted: usize,
 }
 
 /// Protocol timings. Defaults are the settled values.
@@ -95,6 +98,10 @@ pub struct Timings {
     pub idle_ms: u64,
     /// Lifetime of a signalling ticket (12 h).
     pub ticket_ttl_ms: u64,
+    /// Lifetime of a pairing window, from its pair-open (300 s).
+    pub pair_window_ms: u64,
+    /// The window over which pairing failures are counted per client prefix (300 s).
+    pub pair_fail_window_ms: u64,
 }
 
 impl Default for Timings {
@@ -104,6 +111,8 @@ impl Default for Timings {
             challenge_ms: 30_000,
             idle_ms: 90_000,
             ticket_ttl_ms: 12 * 60 * 60 * 1000,
+            pair_window_ms: 300_000,
+            pair_fail_window_ms: 300_000,
         }
     }
 }

@@ -19,10 +19,14 @@
 //!
 //! Nothing here panics or touches the world outside its arguments.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bp_device_key::DeviceId;
 use serde_json::{Map, Value};
 
 use crate::limits::{
-    FILE_HEADER_BYTES, FILE_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT,
+    ADMIT_MAX, ADMIT_VIEWERS_MAX, AUTH_MAX, CLIPBOARD_RAW_MAX, CTL_DATA_MAX, CTL_SEQ_MAX,
+    FILE_HEADER_BYTES, FILE_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT, PAIR_MAX,
     SIGNAL_BINARY_MAX, SIGNAL_LIMIT,
 };
 
@@ -230,6 +234,28 @@ pub enum SignalKind {
     MonitorList,
     MonitorError,
     BenchStatus,
+    /// Host to relay: the viewer IDs allowed to join. Consumed, never forwarded.
+    Admit,
+    /// Host to relay: opens a pairing window. Consumed, never forwarded.
+    PairOpen,
+    /// Host to relay: closes the pairing window. Consumed, never forwarded.
+    PairClose,
+    /// Viewer to host: the phase-2 handshake's first message.
+    AuthHello,
+    /// Host to viewer: the host's half of the phase-2 handshake.
+    AuthHost,
+    /// Viewer to host: the viewer's signature.
+    AuthFinish,
+    /// Either side: the binding signature.
+    AuthBind,
+    /// Either side: the pairing MAC.
+    PairProof,
+    /// Host to viewer: pairing succeeded.
+    PairDone,
+    /// Host to viewer: pairing was refused.
+    PairDenied,
+    /// Either side: a control message with an opaque, base64url payload.
+    Ctl,
 }
 
 impl SignalKind {
@@ -261,6 +287,17 @@ impl SignalKind {
             SignalKind::MonitorList => "monitor-list",
             SignalKind::MonitorError => "monitor-error",
             SignalKind::BenchStatus => "bench-status",
+            SignalKind::Admit => "admit",
+            SignalKind::PairOpen => "pair-open",
+            SignalKind::PairClose => "pair-close",
+            SignalKind::AuthHello => "auth-hello",
+            SignalKind::AuthHost => "auth-host",
+            SignalKind::AuthFinish => "auth-finish",
+            SignalKind::AuthBind => "auth-bind",
+            SignalKind::PairProof => "pair-proof",
+            SignalKind::PairDone => "pair-done",
+            SignalKind::PairDenied => "pair-denied",
+            SignalKind::Ctl => "ctl",
         }
     }
 
@@ -276,6 +313,9 @@ impl SignalKind {
                 | SignalKind::Bye
                 | SignalKind::HostCapabilities
                 | SignalKind::InputCapabilities
+                | SignalKind::Admit
+                | SignalKind::PairOpen
+                | SignalKind::PairClose
         )
     }
 
@@ -799,7 +839,146 @@ fn valid_signal_message(
         "bench-status" => {
             (host && length <= 16384 && protocol(m, 1.0)).then_some(SignalKind::BenchStatus)
         }
+        // Phase 2 and pairing. Exact keys, a direction and a size cap for each.
+        "admit" => (host && valid_admit(m, length)).then_some(SignalKind::Admit),
+        "pair-open" => (host && exact(m, &["type", "admit"]) && b64url_is(m, "admit", 32))
+            .then_some(SignalKind::PairOpen),
+        "pair-close" => (host && exact(m, &["type"])).then_some(SignalKind::PairClose),
+        "auth-hello" => {
+            (viewer && length <= AUTH_MAX && valid_auth_hello(m)).then_some(SignalKind::AuthHello)
+        }
+        "auth-host" => {
+            (host && length <= AUTH_MAX && valid_auth_host(m)).then_some(SignalKind::AuthHost)
+        }
+        "auth-finish" => (viewer
+            && length <= PAIR_MAX
+            && exact(m, &["type", "signature"])
+            && b64url_is(m, "signature", 64))
+        .then_some(SignalKind::AuthFinish),
+        "auth-bind" => ((host || viewer)
+            && length <= PAIR_MAX
+            && exact(m, &["type", "signature"])
+            && b64url_is(m, "signature", 64))
+        .then_some(SignalKind::AuthBind),
+        "pair-proof" => ((host || viewer)
+            && length <= PAIR_MAX
+            && exact(m, &["type", "mac"])
+            && b64url_is(m, "mac", 32))
+        .then_some(SignalKind::PairProof),
+        "pair-done" => {
+            (host && length <= PAIR_MAX && exact(m, &["type"])).then_some(SignalKind::PairDone)
+        }
+        "pair-denied" => {
+            (host && length <= PAIR_MAX && exact(m, &["type"])).then_some(SignalKind::PairDenied)
+        }
+        "ctl" => ((host || viewer) && valid_ctl(m)).then_some(SignalKind::Ctl),
         _ => None,
+    }
+}
+
+/// True when `text` is a canonical device ID: it parses, and it prints back to
+/// the same characters (hyphenated, upper case).
+fn canonical_id(text: &str) -> bool {
+    DeviceId::parse(text).is_ok_and(|id| id.to_string() == text)
+}
+
+/// The string at `key`, or None when it is missing or not a string.
+fn str_of<'a>(m: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    m.get(key).and_then(Value::as_str)
+}
+
+/// True when `key` is a canonical unpadded base64url string of exactly `len`
+/// bytes (the same rule the relay applies to every key and signature).
+fn b64url_is(m: &Map<String, Value>, key: &str, len: usize) -> bool {
+    let Some(text) = str_of(m, key) else {
+        return false;
+    };
+    match URL_SAFE_NO_PAD.decode(text) {
+        Ok(bytes) => bytes.len() == len && URL_SAFE_NO_PAD.encode(&bytes) == text,
+        Err(_) => false,
+    }
+}
+
+/// Go-style admit: exact keys, a boolean remotePairing, and at most
+/// ADMIT_VIEWERS_MAX distinct canonical viewer IDs in a message of at most
+/// ADMIT_MAX bytes.
+fn valid_admit(m: &Map<String, Value>, length: usize) -> bool {
+    if length > ADMIT_MAX || !exact(m, &["type", "viewers", "remotePairing"]) {
+        return false;
+    }
+    if !is_boolean(m, "remotePairing") {
+        return false;
+    }
+    let Some(viewers) = m.get("viewers").and_then(Value::as_array) else {
+        return false;
+    };
+    if viewers.len() > ADMIT_VIEWERS_MAX {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    viewers.iter().all(|value| {
+        value
+            .as_str()
+            .is_some_and(|id| canonical_id(id) && seen.insert(id))
+    })
+}
+
+/// auth-hello: the viewer's canonical ID, its public key, a nonce and an
+/// ephemeral key (32 bytes each), and caps: at most 32 names of 1 to 64 characters
+/// from [a-z0-9-].
+fn valid_auth_hello(m: &Map<String, Value>) -> bool {
+    if !exact(m, &["type", "id", "public", "nonce", "ephemeral", "caps"]) {
+        return false;
+    }
+    if !str_of(m, "id").is_some_and(canonical_id) {
+        return false;
+    }
+    if !(b64url_is(m, "public", 32) && b64url_is(m, "nonce", 32) && b64url_is(m, "ephemeral", 32)) {
+        return false;
+    }
+    let Some(caps) = m.get("caps").and_then(Value::as_array) else {
+        return false;
+    };
+    caps.len() <= 32
+        && caps.iter().all(|cap| {
+            cap.as_str()
+                .is_some_and(|name| (1..=64).contains(&name.len()) && is_cap_name(name))
+        })
+}
+
+/// auth-host: the same fields as auth-hello with a 64-byte signature in place of caps.
+fn valid_auth_host(m: &Map<String, Value>) -> bool {
+    exact(
+        m,
+        &["type", "id", "public", "nonce", "ephemeral", "signature"],
+    ) && str_of(m, "id").is_some_and(canonical_id)
+        && b64url_is(m, "public", 32)
+        && b64url_is(m, "nonce", 32)
+        && b64url_is(m, "ephemeral", 32)
+        && b64url_is(m, "signature", 64)
+}
+
+/// A capability name: lower-case letters, digits and hyphens.
+fn is_cap_name(name: &str) -> bool {
+    name.bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// ctl: exact keys; kind is 1 to 32 characters from [a-z0-9-]; seq is an integer
+/// from 0 to 2^53 - 1; data is unpadded base64url of at most CTL_DATA_MAX
+/// characters. The relay does not track seq.
+fn valid_ctl(m: &Map<String, Value>) -> bool {
+    if !exact(m, &["type", "kind", "seq", "data"]) {
+        return false;
+    }
+    let kind_ok =
+        str_of(m, "kind").is_some_and(|kind| (1..=32).contains(&kind.len()) && is_cap_name(kind));
+    if !kind_ok || !integer(m, "seq", 0.0, CTL_SEQ_MAX) {
+        return false;
+    }
+    match str_of(m, "data") {
+        Some(data) => data.len() <= CTL_DATA_MAX && URL_SAFE_NO_PAD.decode(data).is_ok(),
+        None => false,
     }
 }
 
@@ -915,7 +1094,7 @@ fn valid_clipboard(m: &Map<String, Value>, image: bool, host: bool, length: usiz
     let count = number(m, "count").unwrap_or_default();
     let max_count = if image { 342.0 } else { 64.0 };
     if !host
-        || length > 32 * 1024 * 6 + 256
+        || length > CLIPBOARD_RAW_MAX
         || !protocol(m, 1.0)
         || !uint32_value(m, "id")
         || !integer(m, "count", 1.0, max_count)

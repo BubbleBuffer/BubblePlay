@@ -455,6 +455,8 @@ pub fn load_pcs_table(state_dir: &Path) -> Result<PcTable, ServeError> {
                 public,
                 first_seen: record.registered_ms,
                 last_seen: record.registered_ms,
+                admitted: record.admitted.into_iter().collect(),
+                remote_pairing: record.remote_pairing,
             },
         );
     }
@@ -471,6 +473,8 @@ fn pcs_file(table: &PcTable) -> PcsFile {
                 id: id.clone(),
                 public: URL_SAFE_NO_PAD.encode(record.public),
                 registered_ms: record.first_seen,
+                admitted: record.admitted.iter().cloned().collect(),
+                remote_pairing: record.remote_pairing,
             })
             .collect(),
     }
