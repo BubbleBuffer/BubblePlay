@@ -323,6 +323,7 @@ fn gate_decision_without_authorization_answers_204() {
         origin: None,
         cookie: None,
         authorization: None,
+        sec_fetch_dest: None,
         body: b"approve",
         client_ip: ip(DECIDER),
         now_ms: T0 + 2_000,
@@ -410,7 +411,7 @@ fn gate_forget_clears_the_cookie_and_its_record() {
 }
 
 #[test]
-fn gate_public_origin_trailing_slash_is_normalised() {
+fn gate_public_origin_trailing_slash_is_stripped() {
     let config = GateConfig {
         public_origin: format!("{ORIGIN}/"),
         ..config(true)
