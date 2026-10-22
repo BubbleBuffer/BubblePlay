@@ -14,8 +14,13 @@
 pub mod gate;
 pub mod limits;
 pub mod protocol;
+pub mod relay;
 pub mod rng;
 
+pub use relay::{
+    Action, AdminError, ConnId, CoreConfig, MAX_PCS, PcListing, PcRecord, PcTable, Reject, Relay,
+    Route, Timings, TurnConfig, UpgradeRequest,
+};
 pub use rng::RelayRng;
 
 pub use limits::{
