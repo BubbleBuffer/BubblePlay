@@ -12,10 +12,10 @@ import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
-import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
+import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
-  rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes,
+  orderRtpCodecPreferences, rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes,
 } from "/transport.js";
 import {
   desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,
@@ -746,6 +746,10 @@ setInterval(() => {
 // ---- signaling --------------------------------------------------------------
 const proto = location.protocol === "https:" ? "wss:" : "ws:";
 let ws = null;
+// Relay credentials belong only to the current signaling session. Never expose
+// the ticket through URLs, diagnostics, settings or debug snapshots.
+let signalingPc = null;
+let signalingTicket = null;
 let signalingGeneration = 0;
 let reconnectTimer = null;
 let terminalSignalingFailure = false;
@@ -932,6 +936,8 @@ function reconnectSignaling(reason) {
       latestInputStatus = null;
       inputStatusReason = null;
       signalingRegistered = false;
+      signalingPc = null;
+      signalingTicket = null;
       recordSignalingError("socket-close", `WebSocket closed (${event.code})`, { code: event.code, reason: event.reason || "" });
       debugTrace("signaling-close", { generation, code: event.code, reason: event.reason || "" });
       hud.classList.add("bad");
@@ -951,9 +957,11 @@ function reconnectSignaling(reason) {
 
 function signalingSocketUrl() {
   const path = labRun ? "/lab-ws" : "/ws";
-  const query = labRun
+  let query = labRun
     ? `?run=${encodeURIComponent(labRun)}&compat=${encodeURIComponent(labCompatibilityId)}`
     : "";
+  const targetPc = (params.get("pc") || "").trim();
+  if (targetPc) query += `${query ? "&" : "?"}pc=${encodeURIComponent(targetPc)}`;
   return `${proto}//${location.host}${path}${query}`;
 }
 
@@ -986,6 +994,8 @@ function recycleSignaling(reason) {
   const socket = ws;
   ws = null;
   signalingRegistered = false;
+  signalingPc = null;
+  signalingTicket = null;
   signalingGeneration++;
   try { socket?.close(1000, reason); } catch {}
   reconnectSignaling(reason);
@@ -1002,6 +1012,8 @@ async function handleSignal(socket, generation, ev) {
   if (["answer", "ice", "quality", "bench-status", "media-view", "desktop-state", "input-status", "host-capabilities", "first-frame", "monitor-list", "monitor-error"].includes(msg.type)) recordHostEvidence(msg.type);
   switch (msg.type) {
     case "hello-ok":
+      signalingPc = typeof msg.pc === "string" && msg.pc ? msg.pc : null;
+      signalingTicket = typeof msg.ticket === "string" && msg.ticket ? msg.ticket : null;
       signalingRegistered = true;
       signalingRegisteredAtMs = Date.now();
       sendClientLog("info", "signaling-registered");
@@ -1142,9 +1154,18 @@ async function handleSignal(socket, generation, ev) {
   }
 }
 
+// The host's trickled candidates are bare SDP strings with no mid. Bind each
+// to the first m-line of the remote description (the host bundles everything
+// there); index 0 is the fallback. Without a mid or index the browser throws.
+function remoteIceInit(ice, remoteSdp) {
+  const section = (remoteSdp || "").split(/^m=/m)[1] || "";
+  const mid = /^a=mid:(\S+)/m.exec(section)?.[1];
+  return mid ? { candidate: ice, sdpMid: mid, sdpMLineIndex: 0 } : { candidate: ice, sdpMLineIndex: 0 };
+}
+
 async function addRemoteIce(candidate, generation, ice) {
   try {
-    await candidate.addIceCandidate({ candidate: ice });
+    await candidate.addIceCandidate(remoteIceInit(ice, candidate.remoteDescription?.sdp));
   } catch (e) {
     if (isCurrentPeer(generation, candidate)) console.warn("addIceCandidate", e);
   }
@@ -1295,7 +1316,8 @@ function openWssV4Socket() {
   const current = () => usingWssMedia && wssV4.socket === socket;
   socket.onopen = () => {
     if (!current()) return;
-    socket.send(JSON.stringify({ type: "hello", role: "media-client" }));
+    if (signalingTicket) socket.send(JSON.stringify({ type: "hello", role: "media-client", ticket: signalingTicket }));
+    else socket.send(JSON.stringify({ type: "hello", role: "media-client" }));
     wssV4.lastSendAt = wssV4.lastInboundAt = performance.now();
   };
   socket.onmessage = (event) => {
@@ -1448,6 +1470,7 @@ function startWssV4() {
 function mediaSocketUrl() {
   const path = labRun ? "/lab-media-ws" : "/media-ws";
   const query = new URLSearchParams({ epoch: mediaEpoch });
+  if (signalingPc) query.set("pc", signalingPc);
   if (labRun) {
     query.set("run", labRun);
     query.set("compat", labCompatibilityId);
@@ -1818,15 +1841,23 @@ function noteWssFailure(reason) {
 }
 
 function decodeWssFrame(frame) {
-  if (frame.codec !== (codecSession.codec === "hevc" ? CODEC.HEVC : CODEC.H264)) return;
   if (typeof VideoDecoder === "undefined") { noteWssFailure("webcodecs-unsupported"); return; }
+  const detectedCodec = detectAnnexBCodec(frame.data, { key: frame.key });
+  const headerCodec = frame.codec === CODEC.HEVC ? "hevc" : "h264";
+  if (!frame.key && (detectedCodec || headerCodec) !== codecSession.codec) return;
   const prepared = prepareHybridWssFrame(frame, {
-    active: activeWssHybridMode(),
+    active: activeWssHybridMode() && detectedCodec !== "h264",
     cache: activeWssHybridCache(),
   });
   if (!prepared) {
     noteWssFailure("hybrid-frame-invalid");
     return;
+  }
+  const bitstreamCodec = detectedCodec || detectAnnexBCodec(prepared.data, { key: frame.key });
+  const codec = bitstreamCodec || headerCodec;
+  if (codec !== codecSession.codec) {
+    if (!frame.key || !bitstreamCodec) return;
+    followDecoderCodec(codec);
   }
   if (prepared.activity && (prepared.activity.upserts || prepared.activity.invalidations ||
       prepared.activity.clears || prepared.activity.pngBytes)) {
@@ -1942,13 +1973,15 @@ async function startPeer(generation = peerGeneration) {
     try { transceiver.receiver.jitterBufferTarget = 0; } catch { /* older implementation */ }
   }
 
-  // Prefer HEVC for a fresh page. H.264 is only selected after the one local
-  // capability/decode fallback; no selection is persisted between sessions.
+  // Prefer HEVC for a fresh page, with H.264 after it so an H.264-only host can
+  // still answer. The preference and capability/decode fallback are page-local;
+  // no selection is persisted between sessions.
   try {
     const caps = RTCRtpReceiver.getCapabilities("video");
-    const wanted = rtpCodecMimeTypes(codecSession.codec);
-    const codec = caps && caps.codecs.filter((c) => wanted.includes(c.mimeType.toLowerCase()));
-    if (codec && codec.length) {
+    const codec = orderRtpCodecPreferences(caps?.codecs, codecSession.codec);
+    const primary = rtpCodecMimeTypes(codecSession.codec);
+    const primaryAvailable = codec.some((c) => primary.includes(c.mimeType.toLowerCase()));
+    if (codec.length && primaryAvailable) {
       transceiver.setCodecPreferences(codec);
     } else if (codecSession.codec === "hevc" && codecSession.fallbackToH264()) {
       offerSent = false;
@@ -2905,6 +2938,26 @@ document.addEventListener("visibilitychange", () => {
   if (useWebCodecs && document.visibilityState === "visible") latencyGuard.reset("visibility-resume");
 });
 
+function followDecoderCodec(codec) {
+  const previousCodec = codecSession.codec;
+  if (!codecSession.followBitstreamCodec(codec)) return;
+  clearWssKeyframeWatchdog();
+  wssDecoderEpoch++;
+  try { decoder?.close(); } catch {}
+  decoder = null;
+  // Keep the admitted keyframe's generation and ordering gate. A full resync
+  // would request another keyframe and discard the one that proves the codec.
+  while (latencyGuard.decodeFrames > 0) latencyGuard.releaseDecode();
+  resetRenderPacing();
+  wssDecodeSequenceByTimestamp.clear();
+  wssFrameMeta = new WeakMap();
+  wssPresentedFrameTraces.clear();
+  clearWssHybridCaches();
+  wssNoOutputFailures = 0;
+  if (wssRecoveryState === "awaiting-keyframe-output") wssRecoveryState = "awaiting-keyframe";
+  sendClientLog("info", "decoder-keyframe-codec-change", { previousCodec, codec });
+}
+
 function feedDecoder(chunk, generation) {
   // An encoded frame is the concrete RTP/media arrival signal. Do not cancel
   // auto fallback merely because a track object was announced.
@@ -2930,9 +2983,16 @@ function feedDecoder(chunk, generation) {
     }
   }
 
+  const bitstreamCodec = usingWssMedia ? null : detectAnnexBCodec(data, { key: isKey });
+  const codecName = bitstreamCodec || chunk.codec || codecSession.codec;
+  if (codecName !== codecSession.codec) {
+    if (!isKey || !bitstreamCodec) { hudState.dropped++; return; }
+    followDecoderCodec(codecName);
+  }
+
   if (!decoder) {
     // WSS HEVC is Annex-B and has no decoder description/config record.
-    const codec = chunk.codec === "hevc" ? activeWssHevcCodec() : (avcCodecFromSps(data) || "avc1.64002A");
+    const codec = codecName === "hevc" ? activeWssHevcCodec() : (avcCodecFromSps(data) || "avc1.64002A");
     resetRenderPacing();
     const decoderEpoch = ++wssDecoderEpoch;
     decoder = new VideoDecoder({
@@ -2974,7 +3034,12 @@ function feedDecoder(chunk, generation) {
         }
         latencyGuard.releaseDecode(); onDecodedFrame(frame);
       },
-      error: (e) => { sendClientLog("error", "decoder-error", { message: String(e?.message || e) }); hudState.dec = `err:${e.message}`; if (usingWssMedia) noteWssFailure("decode-error"); else dropAndResync("decoder-error"); },
+      error: (e) => {
+        if (decoderEpoch !== wssDecoderEpoch) return;
+        sendClientLog("error", "decoder-error", { message: String(e?.message || e) });
+        hudState.dec = `err:${e.message}`;
+        if (usingWssMedia) noteWssFailure("decode-error"); else dropAndResync("decoder-error");
+      },
     });
     try {
       decoder.configure({
@@ -2990,6 +3055,7 @@ function feedDecoder(chunk, generation) {
     } catch (e) {
       sendClientLog("error", "decoder-config-error", { message: String(e?.message || e), codec });
       hudState.dec = `cfg:${e.message}`;
+      try { decoder.close(); } catch {}
       decoder = null;
       if (usingWssMedia) noteWssFailure("configure-unsupported");
       return;
@@ -3285,7 +3351,7 @@ document.addEventListener("paste", e => {
 }, true);
 // ---- file transfer (hook 5/5) ----------------------------------------------
 // Protocol and state: file-transfer.js / file-client.js; rendering: file-ui.js.
-const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl });
+const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl, socketTicket: () => signalingTicket });
 let nativeFileDropAvailable = false;
 let nativeFileDropPreviewAvailable = false;
 const fileDragPreview = createFileDragPreviewController({
@@ -3305,6 +3371,7 @@ const fileUi = installFileTransferUi({
 function fileSocketUrl() {
   if (!mediaEpoch) return null;
   const query = new URLSearchParams({ epoch: mediaEpoch });
+  if (signalingPc) query.set("pc", signalingPc);
   if (labRun) {
     query.set("run", labRun);
     query.set("compat", labCompatibilityId);

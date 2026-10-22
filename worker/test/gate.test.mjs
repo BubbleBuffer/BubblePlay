@@ -972,7 +972,11 @@ test("socket upgrades from another origin are refused before authentication", as
   const env = {
     ...WORKER_SECRETS,
     STREAM_LAB_LOCAL_BYPASS: "1",
-    GATE: { idFromName: () => "gate", get: () => ({ fetch: async () => { gateChecks += 1; return new Response(null, { status: 204 }); } }) },
+    // The default /ws asks the GATE which PC to use; this mock registers none.
+    GATE: { idFromName: () => "gate", get: () => ({ fetch: async (request) => {
+      if (new URL(request.url).pathname === "/__pc/resolve") return Response.json({ pc: null });
+      gateChecks += 1; return new Response(null, { status: 204 });
+    } }) },
     ROOM: { idFromName: name => name, get: () => ({ fetch: async () => { rooms += 1; return roomResponse; } }) },
     MEDIA_ROOM: { idFromName: name => name, get: () => ({ fetch: async () => { rooms += 1; return roomResponse; } }) },
   };
@@ -1071,7 +1075,9 @@ test("media websocket routing uses an isolated Durable Object namespace", async 
   const mediaResponse = new Response("media", { status: 200 });
   const env = {
     ...WORKER_SECRETS,
-    GATE: { idFromName: () => "gate", get: () => ({ fetch: async () => new Response(null, { status: 204 }) }) },
+    // The pc-less media socket asks the GATE which PC to use; this mock registers none.
+    GATE: { idFromName: () => "gate", get: () => ({ fetch: async (request) => (new URL(request.url).pathname === "/__pc/resolve"
+      ? Response.json({ pc: null }) : new Response(null, { status: 204 })) }) },
     ROOM: { idFromName: (name) => { selected.push(`signal:${name}`); return name; }, get: () => ({ fetch: async () => new Response("signal") }) },
     MEDIA_ROOM: { idFromName: (name) => { selected.push(`media:${name}`); return name; }, get: () => ({ fetch: async () => mediaResponse }) },
   };

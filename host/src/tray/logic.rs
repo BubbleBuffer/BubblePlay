@@ -225,6 +225,8 @@ pub struct TraySettings {
     pub start_at_login: bool,
     /// Send PC sound to the viewer. Missing from older files means on.
     pub audio: bool,
+    /// Encode on the CPU instead of the graphics card. Missing means off.
+    pub cpu_mode: bool,
 }
 
 impl Default for TraySettings {
@@ -232,6 +234,7 @@ impl Default for TraySettings {
         Self {
             start_at_login: true,
             audio: true,
+            cpu_mode: false,
         }
     }
 }
@@ -288,9 +291,10 @@ impl StoredHostConfig {
 }
 
 /// Command-line arguments for `bubbleplay-host.exe`. Secrets never appear
-/// here; they travel as environment variables. `audio` comes from
-/// `TraySettings`; `--no-audio` is passed only when it is off.
-pub fn build_host_args(config: &StoredHostConfig, audio: bool) -> Vec<OsString> {
+/// here; they travel as environment variables. `audio` and `cpu_mode` come
+/// from `TraySettings`; `--no-audio` is passed only when audio is off and
+/// `--cpu-mode` only when CPU mode is on.
+pub fn build_host_args(config: &StoredHostConfig, audio: bool, cpu_mode: bool) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("--mode"),
         OsString::from("serve"),
@@ -303,6 +307,9 @@ pub fn build_host_args(config: &StoredHostConfig, audio: bool) -> Vec<OsString> 
     }
     if !audio {
         args.push(OsString::from("--no-audio"));
+    }
+    if cpu_mode {
+        args.push(OsString::from("--cpu-mode"));
     }
     args
 }
@@ -640,7 +647,7 @@ mod tests {
             assert!(!settings.start_at_login);
             assert_eq!(
                 serde_json::to_value(settings).unwrap(),
-                serde_json::json!({"startAtLogin":false,"audio":true})
+                serde_json::json!({"startAtLogin":false,"audio":true,"cpuMode":false})
             );
         }
     }
@@ -654,6 +661,7 @@ mod tests {
         let settings = TraySettings {
             start_at_login: false,
             audio: true,
+            cpu_mode: false,
         };
         settings.save(&path).unwrap();
         assert_eq!(TraySettings::load(&path), settings);
@@ -665,6 +673,7 @@ mod tests {
             TraySettings {
                 start_at_login: true,
                 audio: true,
+                cpu_mode: false,
             }
         );
         fs::write(
@@ -689,17 +698,49 @@ mod tests {
             TraySettings {
                 start_at_login: false,
                 audio: true,
+                cpu_mode: false,
             }
         );
         // Explicit off survives a save and load.
         let off = TraySettings {
             start_at_login: true,
             audio: false,
+            cpu_mode: false,
         };
         off.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"audio\": false"));
         assert_eq!(TraySettings::load(&path), off);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cpu_mode_setting_defaults_off_and_roundtrips_explicitly() {
+        let dir = temp_dir("cpu-mode-setting");
+        let path = dir.join("tray.json");
+        // Missing field in an existing file: CPU mode stays off.
+        fs::write(&path, b"{\"startAtLogin\": false, \"audio\": true}").unwrap();
+        assert_eq!(
+            TraySettings::load(&path),
+            TraySettings {
+                start_at_login: false,
+                audio: true,
+                cpu_mode: false,
+            }
+        );
+        // Explicit on survives a save and load, and other fields are kept.
+        let on = TraySettings {
+            start_at_login: true,
+            audio: true,
+            cpu_mode: true,
+        };
+        on.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"cpuMode\": true"));
+        assert_eq!(TraySettings::load(&path), on);
+        // Unreadable file: CPU mode falls back to off.
+        fs::write(&path, b"not json").unwrap();
+        assert!(!TraySettings::load(&path).cpu_mode);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -714,7 +755,7 @@ mod tests {
 
     #[test]
     fn host_args_never_include_secrets() {
-        let args = build_host_args(&config(), true);
+        let args = build_host_args(&config(), true, false);
         assert_eq!(
             args,
             ["--mode", "serve", "--worker", "wss://play.example/host-ws"]
@@ -727,20 +768,20 @@ mod tests {
         assert!(!args.iter().any(|a| a.to_string_lossy().contains("01AB")));
         let mut with_monitor = config();
         with_monitor.monitor = Some("primary".into());
-        let args = build_host_args(&with_monitor, true);
+        let args = build_host_args(&with_monitor, true, false);
         assert_eq!(
             &args[4..],
             &[OsString::from("--monitor"), OsString::from("primary")]
         );
         with_monitor.monitor = Some(String::new());
-        assert_eq!(build_host_args(&with_monitor, true).len(), 4);
+        assert_eq!(build_host_args(&with_monitor, true, false).len(), 4);
     }
 
     #[test]
     fn host_args_pass_no_audio_only_when_audio_is_off() {
-        let on = build_host_args(&config(), true);
+        let on = build_host_args(&config(), true, false);
         assert!(!on.iter().any(|a| a == "--no-audio"));
-        let off = build_host_args(&config(), false);
+        let off = build_host_args(&config(), false, false);
         assert_eq!(
             off,
             [
@@ -757,11 +798,42 @@ mod tests {
         let mut with_monitor = config();
         with_monitor.monitor = Some("primary".into());
         assert_eq!(
-            &build_host_args(&with_monitor, false)[4..],
+            &build_host_args(&with_monitor, false, false)[4..],
             &[
                 OsString::from("--monitor"),
                 OsString::from("primary"),
                 OsString::from("--no-audio"),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_args_pass_cpu_mode_only_when_cpu_mode_is_on() {
+        let off = build_host_args(&config(), true, false);
+        assert!(!off.iter().any(|a| a == "--cpu-mode"));
+        let on = build_host_args(&config(), true, true);
+        assert_eq!(
+            on,
+            [
+                "--mode",
+                "serve",
+                "--worker",
+                "wss://play.example/host-ws",
+                "--cpu-mode",
+            ]
+            .map(OsString::from)
+            .to_vec()
+        );
+        // With a monitor and audio off, --cpu-mode comes last.
+        let mut with_monitor = config();
+        with_monitor.monitor = Some("primary".into());
+        assert_eq!(
+            &build_host_args(&with_monitor, false, true)[4..],
+            &[
+                OsString::from("--monitor"),
+                OsString::from("primary"),
+                OsString::from("--no-audio"),
+                OsString::from("--cpu-mode"),
             ]
         );
     }

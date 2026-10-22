@@ -39,7 +39,7 @@ use crate::file_transfer::{
     RateLimiter, RequestPayload, ResultPayload, SendWindow, TransferError,
 };
 use crate::native_file_drop::{DropBatch, NativeDropRequest};
-use crate::wss_media::{host_socket_request, HostSocket};
+use crate::wss_media::{data_hello, host_socket_request_routed, HostSocket, RelayRoute};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const INBOUND_SILENCE_LIMIT: Duration = Duration::from_secs(40);
@@ -199,6 +199,17 @@ pub struct FileService {
 
 impl FileService {
     pub fn spawn(worker_url: &str, bearer: &str, config: FileServiceConfig) -> Result<Self> {
+        Self::spawn_routed(worker_url, bearer, config, RelayRoute::Legacy)
+    }
+
+    /// [`FileService::spawn`] for the room `route` names. The route, including any ticket, lives in
+    /// the socket thread and goes away when the service is dropped.
+    pub fn spawn_routed(
+        worker_url: &str,
+        bearer: &str,
+        config: FileServiceConfig,
+        route: RelayRoute,
+    ) -> Result<Self> {
         let shared = Arc::new(Mutex::new(Shared {
             epoch: None,
             rate_cap_bps: 0,
@@ -217,7 +228,7 @@ impl FileService {
             threads.push(
                 thread::Builder::new()
                     .name("bubbleplay-file-socket".into())
-                    .spawn(move || socket_loop(&url, &bearer, &config, &shared, &stop))
+                    .spawn(move || socket_loop(&url, &bearer, &route, &config, &shared, &stop))
                     .context("spawn file socket thread")?,
             );
         }
@@ -464,10 +475,15 @@ fn poll_spool(shared: &Mutex<Shared>, dir: &Path) {
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
-fn connect_file_socket(worker_url: &str, bearer: &str, epoch: &str) -> Result<Socket> {
-    let request = host_socket_request(worker_url, bearer, epoch, HostSocket::File)?;
+fn connect_file_socket(
+    worker_url: &str,
+    bearer: &str,
+    epoch: &str,
+    route: &RelayRoute,
+) -> Result<Socket> {
+    let request = host_socket_request_routed(worker_url, bearer, epoch, HostSocket::File, route)?;
     let (mut ws, _) = tungstenite::connect(request).context("connect file socket")?;
-    ws.send(Message::text(r#"{"type":"hello","role":"file-host"}"#))
+    ws.send(Message::text(data_hello("file-host", route)))
         .context("send file hello")?;
     ws.flush().context("flush file hello")?;
     let tcp: &TcpStream = match ws.get_mut() {
@@ -483,6 +499,7 @@ fn connect_file_socket(worker_url: &str, bearer: &str, epoch: &str) -> Result<So
 fn socket_loop(
     worker_url: &str,
     bearer: &str,
+    route: &RelayRoute,
     config: &FileServiceConfig,
     shared: &Mutex<Shared>,
     stop: &AtomicBool,
@@ -493,7 +510,7 @@ fn socket_loop(
             sleep_unless_stopped(stop, Duration::from_millis(200));
             continue;
         };
-        let mut ws = match connect_file_socket(worker_url, bearer, &epoch) {
+        let mut ws = match connect_file_socket(worker_url, bearer, &epoch, route) {
             Ok(ws) => ws,
             Err(error) => {
                 warn!(error = %format!("{error:#}"), ?delay, "file socket connect failed");
@@ -1255,6 +1272,14 @@ impl Session {
     /// The last file of a batch is done: put the saved files on the
     /// clipboard, and ask for a paste when the batch was a paste.
     fn finish_batch(&mut self, shared: &Mutex<Shared>) {
+        self.finish_batch_with(shared, crate::clipboard::set_files);
+    }
+
+    fn finish_batch_with(
+        &mut self,
+        shared: &Mutex<Shared>,
+        set_files: impl FnOnce(&[PathBuf]) -> Result<u32>,
+    ) {
         let batch = std::mem::take(&mut self.batch);
         if batch.saved.is_empty() {
             return;
@@ -1266,15 +1291,19 @@ impl Session {
             );
             return;
         }
-        let mut state = lock(shared);
-        match crate::clipboard::set_files(&batch.saved) {
+        let epoch = lock(shared).epoch.clone();
+        // EmptyClipboard may message a hung owner. Never hold the mutex the
+        // input/session thread uses for take_outbox, epochs and rate updates.
+        match set_files(&batch.saved) {
             Ok(seq) => {
+                let mut state = lock(shared);
                 state.own_clipboard_seq = Some(seq);
                 info!(
                     files = batch.saved.len(),
                     "uploaded files placed on the clipboard"
                 );
-                if batch.purpose == Some(Purpose::Paste) {
+                if batch.purpose == Some(Purpose::Paste) && epoch.is_some() && state.epoch == epoch
+                {
                     state.outbox.pastes += 1;
                 }
             }
@@ -1661,6 +1690,31 @@ fn mime_for(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploaded_clipboard_write_does_not_hold_the_input_owners_mutex() {
+        let (mut session, _server, _client, shared, dir) = native_test_session();
+        session.config.clipboard = true;
+        session.batch.saved = vec![dir.join("synthetic.txt")];
+        session.batch.purpose = Some(Purpose::Paste);
+        session.finish_batch_with(&shared, |_| {
+            // The native call can block arbitrarily. Foreground/window work
+            // must not prevent the input owner from reading or changing state.
+            let mut state = shared
+                .try_lock()
+                .expect("clipboard write held session mutex");
+            state.epoch = Some("replacement-viewer".into());
+            Ok(42)
+        });
+        let state = lock(&shared);
+        assert_eq!(state.own_clipboard_seq, Some(42));
+        assert_eq!(
+            state.outbox.pastes, 0,
+            "old viewer must not paste into a new session"
+        );
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

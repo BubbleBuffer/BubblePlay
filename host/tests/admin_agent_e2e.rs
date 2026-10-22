@@ -117,6 +117,7 @@ fn open_raw(pipe: &str) -> std::fs::File {
 }
 
 #[test]
+#[ignore = "injects real mouse input; run only in the authorized test VM"]
 fn dev_agent_receives_host_input_over_the_pipe() {
     if trust::is_process_elevated() {
         eprintln!("skipped: the dev agent refuses to run elevated (run tests unelevated)");

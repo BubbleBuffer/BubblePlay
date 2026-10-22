@@ -20,6 +20,7 @@ use crate::activity::Activity;
 use crate::audio::AudioFrame;
 use crate::rtc::{RtcAction, RtcSession};
 use crate::stun;
+use crate::video_encoder::EncoderCapabilities;
 
 pub const AU_QUEUE_BOUND: usize = 1;
 /// Five 10 ms frames: at most 50 ms of PC audio waits behind a stalled pump.
@@ -168,6 +169,8 @@ pub struct AccessUnit {
 
 pub enum TransportCommand {
     Offer(String),
+    /// The producer has selected the actual local encoder before negotiation.
+    OfferWithCapabilities(String, EncoderCapabilities),
     RemoteCandidate(String),
     CursorStateReliable([u8; 8]),
     /// End the current peer while retaining the transport socket and thread.
@@ -179,6 +182,8 @@ pub enum TransportCommand {
 
 pub enum TransportEvent {
     Answer(String),
+    /// A new local ICE candidate discovered after the SDP answer was sent.
+    LocalCandidate(String),
     OfferRejected,
     Action(RtcAction),
     AccessUnitWritten {
@@ -615,8 +620,9 @@ fn fresh_epoch(
     host_addr: Option<SocketAddr>,
     mapped: Option<SocketAddr>,
     bitrate: u32,
+    capabilities: EncoderCapabilities,
 ) -> Result<RtcSession> {
-    let mut rtc = RtcSession::new(Instant::now(), bitrate);
+    let mut rtc = RtcSession::new_with_capabilities(Instant::now(), bitrate, capabilities);
     let Some(host_addr) = host_addr else {
         return Ok(rtc);
     };
@@ -683,7 +689,8 @@ fn transport_loop(
         .context("make media socket nonblocking")?;
     let mut offer_active = false;
     let mut mapping_refresh: Option<MappingRefresh> = None;
-    let mut rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+    let mut encoder_capabilities = EncoderCapabilities::NVENC;
+    let mut rtc = fresh_epoch(&socket, host_addr, mapped, bitrate, encoder_capabilities)?;
     let mut timeout = schedule_timeout(
         drain_outputs(&mut rtc, &socket, Some(&events), None)?,
         Instant::now(),
@@ -707,7 +714,21 @@ fn transport_loop(
         let mut mutated = false;
         match command_rx.try_recv() {
             Ok(_) if stop_takes_priority(stop.load(Ordering::Acquire)) => break,
-            Ok(TransportCommand::Offer(sdp)) => {
+            Ok(
+                command @ (TransportCommand::Offer(_)
+                | TransportCommand::OfferWithCapabilities(_, _)),
+            ) => {
+                let sdp = match command {
+                    TransportCommand::Offer(sdp) => {
+                        encoder_capabilities = EncoderCapabilities::NVENC;
+                        sdp
+                    }
+                    TransportCommand::OfferWithCapabilities(sdp, capabilities) => {
+                        encoder_capabilities = capabilities;
+                        sdp
+                    }
+                    _ => unreachable!(),
+                };
                 if let Some(refresh) = &mut mapping_refresh {
                     refresh.next_request = Instant::now();
                 }
@@ -715,7 +736,7 @@ fn transport_loop(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clear();
-                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate, encoder_capabilities)?;
                 cursor_kind_latest
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -759,7 +780,7 @@ fn transport_loop(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clear();
-                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate, encoder_capabilities)?;
                 emit(&events, TransportEvent::PeerReset);
                 mutated = true;
             }
@@ -788,7 +809,7 @@ fn transport_loop(
             DeadEpochAction::Continue => {}
             DeadEpochAction::RenewIdle => {
                 info!("renewing expired idle RTC epoch");
-                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate)?;
+                rtc = fresh_epoch(&socket, host_addr, mapped, bitrate, encoder_capabilities)?;
                 timeout = schedule_timeout(
                     drain_outputs(&mut rtc, &socket, Some(&events), Some(&mut counters))?,
                     Instant::now(),
@@ -936,8 +957,28 @@ fn transport_loop(
                         .and_then(|refresh| refresh.response(&buffer[..n], source))
                     {
                         if mapped != Some(address) {
-                            info!(%address, "refreshed STUN mapping for next RTC offer");
+                            info!(%address, offer_active, "refreshed STUN mapping");
                             mapped = Some(address);
+                            if let Some(base) = host_addr.filter(|_| offer_active) {
+                                let candidate = rtc.add_srflx_candidate(address, base)?;
+                                // Discovery can finish after the answer. Update
+                                // this epoch too, draining its mutation before
+                                // another input, and trickle to its current peer.
+                                timeout = schedule_timeout(
+                                    drain_outputs(
+                                        &mut rtc,
+                                        &socket,
+                                        Some(&events),
+                                        Some(&mut counters),
+                                    )?,
+                                    Instant::now(),
+                                    offer_active,
+                                );
+                                emit(
+                                    &events,
+                                    TransportEvent::LocalCandidate(candidate.to_sdp_string()),
+                                );
+                            }
                         }
                         continue;
                     }
@@ -1139,6 +1180,341 @@ mod tests {
     }
 
     #[test]
+    fn stun_mapping_discovered_after_answer_is_trickled_to_active_peer() {
+        use super::{TransportCommand, TransportPump};
+        use std::net::UdpSocket;
+        use str0m::media::{Direction, MediaKind};
+
+        struct ShutdownPump(Option<TransportPump>);
+
+        impl Drop for ShutdownPump {
+            fn drop(&mut self) {
+                if let Some(pump) = self.0.take() {
+                    pump.shutdown();
+                }
+            }
+        }
+
+        let activity = crate::activity::Activity::new().unwrap();
+        let host_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_addr = host_socket.local_addr().unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let pump_guard = ShutdownPump(Some(TransportPump::spawn(
+            host_socket,
+            Some(host_addr),
+            None,
+            2_000_000,
+        )));
+        let pump = pump_guard.0.as_ref().unwrap();
+        pump.set_activity(activity.clone());
+        let mut viewer = str0m::Rtc::builder()
+            .enable_h265(true)
+            .build(Instant::now());
+        let mut change = viewer.sdp_api();
+        change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        let (offer, _) = change.apply().unwrap();
+        assert!(pump.command(TransportCommand::Offer(offer.to_sdp_string())));
+        // The pump initializes fresh DTLS epochs on its own thread. Leave
+        // room for cold crypto initialization and a busy build machine; the
+        // candidate-specific deadline starts only after the STUN exchange.
+        let answer_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match pump.try_event() {
+                Some(TransportEvent::Answer(answer)) => {
+                    assert!(answer.contains(" typ host"));
+                    assert!(!answer.contains(" typ srflx"));
+                    break;
+                }
+                Some(TransportEvent::OfferRejected | TransportEvent::Stopped) => {
+                    panic!("pump stopped or rejected recvonly offer");
+                }
+                Some(_) => {}
+                None => {
+                    assert!(Instant::now() < answer_deadline, "SDP answer timed out");
+                    activity
+                        .wait(
+                            answer_deadline.saturating_duration_since(Instant::now()),
+                            &[],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+
+        // Start discovery only after the answer: the mapped address cannot
+        // have been baked into SDP and must reach this peer through trickle.
+        assert!(pump.command(TransportCommand::StunServer(server.local_addr().unwrap())));
+        let mut request = [0u8; 20];
+        let (size, source) = server.recv_from(&mut request).unwrap();
+        assert_eq!(size, request.len());
+        assert_eq!(source, host_addr, "STUN must use the RTC media socket");
+        assert_eq!(&request[..2], &0x0001u16.to_be_bytes());
+        let mapped_addr = "203.0.113.9:4444".parse::<std::net::SocketAddr>().unwrap();
+        let mut response = [0u8; 32];
+        response[..20].copy_from_slice(&request);
+        response[..2].copy_from_slice(&0x0101u16.to_be_bytes());
+        response[2..4].copy_from_slice(&12u16.to_be_bytes());
+        response[20..22].copy_from_slice(&0x0020u16.to_be_bytes());
+        response[22..24].copy_from_slice(&8u16.to_be_bytes());
+        response[25] = 1;
+        response[26..28].copy_from_slice(&(mapped_addr.port() ^ 0x2112).to_be_bytes());
+        for (index, byte) in [203u8, 0, 113, 9].into_iter().enumerate() {
+            response[28 + index] = byte ^ request[4 + index];
+        }
+        server.send_to(&response, source).unwrap();
+
+        let candidate_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match pump.try_event() {
+                Some(TransportEvent::LocalCandidate(candidate)) => {
+                    assert!(candidate.contains(" typ srflx"), "{candidate}");
+                    assert!(candidate.contains(" 203.0.113.9 4444 "), "{candidate}");
+                    let candidate = str0m::Candidate::from_sdp_string(&candidate)
+                        .expect("trickled candidate is valid SDP");
+                    assert_eq!(candidate.addr(), mapped_addr);
+                    break;
+                }
+                Some(
+                    TransportEvent::Stopped | TransportEvent::Action(crate::rtc::RtcAction::Closed),
+                ) => {
+                    panic!("pump stopped before trickling mapped candidate");
+                }
+                Some(_) => {}
+                None => {
+                    assert!(
+                        Instant::now() < candidate_deadline,
+                        "STUN mapping discovered after the answer was not trickled to the active peer"
+                    );
+                    activity
+                        .wait(
+                            candidate_deadline.saturating_duration_since(Instant::now()),
+                            &[],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_hevc_idr_reaches_recvonly_peer_without_signaled_remote_candidates() {
+        use super::{AccessUnit, TransportCommand, TransportPump};
+        use crate::encode::VideoCodec;
+        use crate::rtc::RtcAction;
+        use crate::video_encoder::EncoderCapabilities;
+        use std::io::ErrorKind;
+        use std::net::UdpSocket;
+        use str0m::format::Codec;
+        use str0m::media::{Direction, MediaKind};
+        use str0m::net::{Protocol, Receive};
+        use str0m::{Candidate, Event, Input, Output, Rtc};
+
+        // A transport fixture, not a decoder fixture: IDR_N_LP (NAL type 20),
+        // layer 0, temporal_id_plus1 1, followed by a synthetic slice payload.
+        // str0m must packetize, encrypt, receive and depacketize these bytes.
+        const IDR: &[u8] = &[0, 0, 0, 1, 0x28, 0x01, 0x80, 0x55, 0xaa, 0x80];
+        const AU_ID: u64 = 17;
+
+        struct ShutdownPump(Option<TransportPump>);
+
+        impl Drop for ShutdownPump {
+            fn drop(&mut self) {
+                if let Some(pump) = self.0.take() {
+                    pump.shutdown();
+                }
+            }
+        }
+
+        fn drain_viewer(
+            viewer: &mut Rtc,
+            socket: &UdpSocket,
+            connected: &mut bool,
+            media: &mut Option<str0m::media::MediaData>,
+        ) -> Instant {
+            loop {
+                match viewer.poll_output().expect("poll recvonly viewer") {
+                    Output::Transmit(packet) => {
+                        socket
+                            .send_to(&packet.contents, packet.destination)
+                            .expect("send viewer ICE/DTLS/RTCP");
+                    }
+                    Output::Event(Event::Connected) => *connected = true,
+                    Output::Event(Event::MediaData(data)) => {
+                        assert!(
+                            media.replace(data).is_none(),
+                            "unexpected second access unit"
+                        );
+                    }
+                    Output::Event(Event::Closed) => panic!("viewer closed before receiving IDR"),
+                    Output::Event(_) => {}
+                    Output::Timeout(deadline) => return deadline,
+                }
+            }
+        }
+
+        let host_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_addr = host_socket.local_addr().unwrap();
+        let viewer_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        viewer_socket.set_nonblocking(true).unwrap();
+        let viewer_addr = viewer_socket.local_addr().unwrap();
+        let pump_guard = ShutdownPump(Some(TransportPump::spawn(
+            host_socket,
+            Some(host_addr),
+            None,
+            2_000_000,
+        )));
+        let pump = pump_guard.0.as_ref().unwrap();
+        let mut viewer = Rtc::builder().enable_h265(true).build(Instant::now());
+        let mut viewer_connected = false;
+        let mut received_media = None;
+        viewer.add_local_candidate(Candidate::host(viewer_addr, "udp").unwrap());
+        drain_viewer(
+            &mut viewer,
+            &viewer_socket,
+            &mut viewer_connected,
+            &mut received_media,
+        );
+        let mut change = viewer.sdp_api();
+        let video_mid = change.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        let (offer, pending) = change.apply().unwrap();
+        // Browsers can expose only an mDNS host candidate that the host cannot
+        // resolve. Keep the viewer's local candidate internally but signal none
+        // of its addresses: the viewer initiates checks using the answer's
+        // host candidate and the pump must learn its peer-reflexive address.
+        let offer = offer.to_sdp_string();
+        assert!(offer.lines().any(|line| line.starts_with("a=candidate:")));
+        let offer = offer
+            .lines()
+            .filter(|line| !line.starts_with("a=candidate:"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            + "\r\n";
+        assert!(!offer.contains("a=candidate:"));
+        assert!(offer.contains("a=recvonly"));
+        assert!(offer.contains("H265/90000"));
+        assert!(pump.command(TransportCommand::OfferWithCapabilities(
+            offer,
+            EncoderCapabilities::NVENC,
+        )));
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut pending = Some(pending);
+        let mut host_connected = false;
+        let mut hevc_selected = false;
+        let mut submitted = false;
+        let mut written_timestamp = None;
+        let mut packets_to_viewer = 0;
+        let mut buffer = [0u8; 65_536];
+        loop {
+            let mut viewer_timeout = drain_viewer(
+                &mut viewer,
+                &viewer_socket,
+                &mut viewer_connected,
+                &mut received_media,
+            );
+            while let Some(event) = pump.try_event() {
+                match event {
+                    TransportEvent::Answer(answer) => {
+                        assert!(answer.contains("H265/90000"));
+                        assert!(answer.contains("a=sendonly"));
+                        assert!(answer.contains("a=candidate:"));
+                        viewer
+                            .sdp_api()
+                            .accept_answer(
+                                pending.take().expect("one SDP answer"),
+                                str0m::change::SdpAnswer::from_sdp_string(&answer).unwrap(),
+                            )
+                            .expect("accept pump answer");
+                        viewer_timeout = drain_viewer(
+                            &mut viewer,
+                            &viewer_socket,
+                            &mut viewer_connected,
+                            &mut received_media,
+                        );
+                    }
+                    TransportEvent::Action(RtcAction::IceConnected) => host_connected = true,
+                    TransportEvent::Action(RtcAction::VideoCodecSelected(codec)) => {
+                        assert_eq!(codec, VideoCodec::Hevc);
+                        hevc_selected = true;
+                    }
+                    TransportEvent::AccessUnitWritten {
+                        id,
+                        is_idr,
+                        rtp_timestamp,
+                    } => {
+                        assert_eq!(id, AU_ID);
+                        assert!(is_idr);
+                        written_timestamp = Some(rtp_timestamp);
+                    }
+                    TransportEvent::AccessUnitNotAdmitted { id, .. } => {
+                        panic!("negotiated first HEVC IDR {id} was not admitted");
+                    }
+                    TransportEvent::OfferRejected => panic!("recvonly HEVC offer rejected"),
+                    TransportEvent::Stopped | TransportEvent::Action(RtcAction::Closed) => {
+                        panic!("transport stopped before first HEVC IDR");
+                    }
+                    _ => {}
+                }
+            }
+            if host_connected && viewer_connected && hevc_selected && !submitted {
+                let reservation = pump.reserve_access_unit().expect("first AU slot available");
+                assert!(reservation.submit(AccessUnit {
+                    id: AU_ID,
+                    data: IDR.to_vec(),
+                    produced_at: Instant::now(),
+                    is_idr: true,
+                }));
+                submitted = true;
+            }
+            if written_timestamp.is_some() && received_media.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first HEVC IDR timed out: answer={}, host_connected={host_connected}, \
+                 viewer_connected={viewer_connected}, hevc_selected={hevc_selected}, \
+                 submitted={submitted}, written={written_timestamp:?}, packets_to_viewer={packets_to_viewer}",
+                pending.is_none(),
+            );
+            match viewer_socket.recv_from(&mut buffer) {
+                Ok((size, source)) => {
+                    assert_eq!(source, host_addr);
+                    packets_to_viewer += 1;
+                    let input = Input::Receive(
+                        Instant::now(),
+                        Receive {
+                            proto: Protocol::Udp,
+                            source,
+                            destination: viewer_addr,
+                            contents: buffer[..size].try_into().unwrap(),
+                        },
+                    );
+                    assert!(viewer.accepts(&input), "viewer rejected pump packet");
+                    viewer.handle_input(input).expect("receive pump packet");
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    let now = Instant::now();
+                    if now >= viewer_timeout {
+                        viewer.handle_input(Input::Timeout(now)).unwrap();
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(error) => panic!("receive viewer datagram: {error}"),
+            }
+        }
+        let media = received_media.unwrap();
+        assert_eq!(media.mid, video_mid);
+        assert_eq!(media.params.spec().codec, Codec::H265);
+        assert!(media.is_keyframe(), "receiver did not recognize HEVC IDR");
+        assert_eq!(&*media.data, IDR);
+        assert_eq!(media.time.numer() as u32, written_timestamp.unwrap());
+    }
+
+    #[test]
     fn resetting_a_peer_keeps_the_pump_alive_and_wakes_the_producer() {
         let activity = crate::activity::Activity::new().unwrap();
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1199,7 +1575,14 @@ mod tests {
     #[test]
     fn rtc_epoch_without_a_host_address_starts_without_candidates() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        assert!(super::fresh_epoch(&socket, None, None, 2_000_000).is_ok());
+        assert!(super::fresh_epoch(
+            &socket,
+            None,
+            None,
+            2_000_000,
+            crate::video_encoder::EncoderCapabilities::NVENC
+        )
+        .is_ok());
     }
 
     #[test]

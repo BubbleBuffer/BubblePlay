@@ -2,6 +2,7 @@ package de.bubblebuffer.bubbleplay.net
 
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import org.json.JSONObject
 
 /**
  * Where the relay lives. Production uses the gate-cookie protected /ws and
@@ -19,18 +20,46 @@ data class ServerConfig(
         if (isLab) { addQueryParameter("run", labRun); addQueryParameter("compat", labCompat) }
     }.build()
 
-    fun mediaUrl(epoch: String): HttpUrl = base.newBuilder().encodedPath(if (isLab) "/lab-media-ws" else "/media-ws").query(null).apply {
+    /** [pc] (device keys phase 1) follows the epoch when the relay named one; absent, the URL is unchanged. */
+    fun mediaUrl(epoch: String, pc: String? = null): HttpUrl = base.newBuilder().encodedPath(if (isLab) "/lab-media-ws" else "/media-ws").query(null).apply {
         addQueryParameter("epoch", epoch)
+        pc?.let { addQueryParameter("pc", it) }
         if (isLab) { addQueryParameter("run", labRun); addQueryParameter("compat", labCompat) }
     }.build()
 
     /** File transfer v1 socket for the signaling epoch (the relay pairs it with the host's). */
-    fun fileUrl(epoch: String): HttpUrl = base.newBuilder().encodedPath(if (isLab) "/lab-file-ws" else "/file-ws").query(null).apply {
+    fun fileUrl(epoch: String, pc: String? = null): HttpUrl = base.newBuilder().encodedPath(if (isLab) "/lab-file-ws" else "/file-ws").query(null).apply {
         addQueryParameter("epoch", epoch)
+        pc?.let { addQueryParameter("pc", it) }
         if (isLab) { addQueryParameter("run", labRun); addQueryParameter("compat", labCompat) }
     }.build()
 
     companion object {
+        /**
+         * The signaling hello, unchanged from before device keys: /ws stays the same in phase 1.
+         */
+        fun signalingHello(): JSONObject = JSONObject().put("type", "hello").put("role", "client")
+
+        /**
+         * Sets the PC of a file URL built by [fileUrl]: any existing `pc` is replaced, and the new one
+         * goes right after `epoch` (appended when there is no epoch). Other parameters, lab run and
+         * compat included, keep their order. Values are decoded and re-encoded, which is exact for the
+         * relay's values.
+         */
+        fun withPc(url: HttpUrl, pc: String?): HttpUrl {
+            if (pc == null) return url
+            val builder = url.newBuilder().query(null)
+            var placed = false
+            for (i in 0 until url.querySize) {
+                val name = url.queryParameterName(i)
+                if (name == "pc") continue
+                builder.addQueryParameter(name, url.queryParameterValue(i))
+                if (name == "epoch") { builder.addQueryParameter("pc", pc); placed = true }
+            }
+            if (!placed) builder.addQueryParameter("pc", pc)
+            return builder.build()
+        }
+
         // A fresh install must use the operator's relay; saved addresses stay in Prefs.
         const val DEFAULT_SERVER = ""
         const val GATE_COOKIE = "__Host-gate"

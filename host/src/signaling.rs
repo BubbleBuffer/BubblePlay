@@ -25,6 +25,12 @@ use tungstenite::http::{header::AUTHORIZATION, HeaderName, HeaderValue, Request}
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{client_tls_with_config, Error as WsError, Message, WebSocket};
 
+use crate::device_key::{relay_origin, DeviceId, DeviceIdentity};
+use crate::wss_media::{RelayRoute, RelayTicket};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use serde_json::json;
+
 const SIGNALING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKER_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(15);
@@ -1192,6 +1198,9 @@ impl PendingCursorState {
 
 pub struct Signaling {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
+    /// The room this host serves and the ticket its data sockets present. Lives as long as this
+    /// signaling connection.
+    route: RelayRoute,
     pending_cursor_state: PendingCursorState,
     registered: bool,
     peer_seen: bool,
@@ -1305,33 +1314,58 @@ fn input_routing_status_message(
 }
 
 impl Signaling {
-    /// Connect to the worker (wss://...), upgrade to WS, register as host.
+    /// Connect to the worker (wss://...), upgrade to WS, register as host. Legacy registration:
+    /// the shared room and no device ID.
     pub fn connect(url: &str, token: &str, host_gate_token: Option<&str>) -> Result<Self> {
+        Self::connect_with_identity(url, token, host_gate_token, None)
+    }
+
+    /// Connect and register. With `identity`, the host registers by device ID: it connects to
+    /// `pc=<id>`, answers the relay's challenge with a relay proof, and keeps the ticket for its
+    /// data sockets. Without one, the legacy registration runs unchanged.
+    pub fn connect_with_identity(
+        url: &str,
+        token: &str,
+        host_gate_token: Option<&str>,
+        identity: Option<&DeviceIdentity>,
+    ) -> Result<Self> {
+        let Some(identity) = identity else {
+            return Self::connect_legacy(url, token, host_gate_token);
+        };
+        info!(url, "connecting to signaling worker by device ID");
+        let origin = relay_origin(url).context("worker URL has no usable relay origin")?;
+        let id = identity.id().to_string();
+        let request = signaling_request(&keyed_signaling_url(url, &id)?, host_gate_token)?;
+        let (mut ws, _) = connect_with_timeout(request)?;
+        ws.send(Message::text(host_hello(token, Some(identity))?))
+            .context("send hello")?;
+        let (worker_version_id, route) = complete_keyed_registration(&mut ws, identity, &origin)?;
+        Self::finish(ws, url, token, host_gate_token, worker_version_id, route)
+    }
+
+    fn connect_legacy(url: &str, token: &str, host_gate_token: Option<&str>) -> Result<Self> {
         info!(url, "connecting to signaling worker");
         let request = signaling_request(url, host_gate_token)?;
         let (mut ws, response) = connect_with_timeout(request)?;
         debug!(status = %response.status(), "ws handshake done");
 
         // Send hello, then wait (blocking, one-time) for hello-ok.
-        let hello = SignalMsg::Hello {
-            token: token.to_string(),
-            role: "host".to_string(),
-        };
-        ws.send(Message::text(serde_json::to_string(&hello)?))
+        ws.send(Message::text(host_hello(token, None)?))
             .context("send hello")?;
+        let (worker_version_id, route) = complete_registration(&mut ws, None)?;
 
-        let worker_version_id = loop {
-            let msg = ws.read().context("read hello-ack")?;
-            let Message::Text(text) = msg else { continue };
-            let parsed: SignalMsg =
-                serde_json::from_str(&text).with_context(|| format!("bad hello ack: {text}"))?;
-            match parsed {
-                SignalMsg::HelloOk { worker_version_id } => break worker_version_id,
-                SignalMsg::Error { message } => bail!("worker rejected hello: {message}"),
-                other => bail!("unexpected message while registering: {other:?}"),
-            }
-        };
+        Self::finish(ws, url, token, host_gate_token, worker_version_id, route)
+    }
 
+    /// Starts the version monitor and switches the registered socket to the run loop's mode.
+    fn finish(
+        mut ws: WebSocket<MaybeTlsStream<TcpStream>>,
+        url: &str,
+        token: &str,
+        host_gate_token: Option<&str>,
+        worker_version_id: Option<String>,
+        route: RelayRoute,
+    ) -> Result<Self> {
         let version_monitor =
             WorkerVersionMonitor::spawn(url, token, host_gate_token, worker_version_id.clone())?;
 
@@ -1340,6 +1374,7 @@ impl Signaling {
         info!("signaling registered as host");
         Ok(Self {
             ws,
+            route,
             pending_cursor_state: PendingCursorState::default(),
             registered: true,
             peer_seen: false,
@@ -1351,6 +1386,11 @@ impl Signaling {
             browser_approval: Default::default(),
             audio_enabled: false,
         })
+    }
+
+    /// The room and data-socket ticket for this connection. Clone it into media and file sessions.
+    pub fn relay_route(&self) -> RelayRoute {
+        self.route.clone()
     }
 
     /// Advertise file transfer in later host-capabilities messages.
@@ -2432,6 +2472,12 @@ fn worker_version_probe_url(url: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     if uri.scheme_str() != Some("wss") {
+        // A cleartext relay is allowed only on loopback (a local test relay);
+        // it has no Worker to probe, so it runs without a version monitor.
+        if uri.scheme_str() == Some("ws") && crate::relay_url::require_secure_relay_url(url).is_ok()
+        {
+            return Ok(None);
+        }
         bail!("Worker version probe requires a wss signaling URL");
     }
     let authority = uri
@@ -2472,6 +2518,123 @@ fn probe_worker_version(
             },
             Message::Close(_) => bail!("Worker version probe closed before hello-ok"),
             _ => {}
+        }
+    }
+}
+
+/// Keyed signaling URL: `pc=<id>` appended to the worker URL's query. Lab twins keep their
+/// `run` and `compat` fields.
+fn keyed_signaling_url(url: &str, id: &str) -> Result<String> {
+    let uri: tungstenite::http::Uri = url.parse().context("invalid worker URL")?;
+    if uri
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .any(|field| field.split('=').next() == Some("pc"))
+    {
+        bail!("worker URL already names a PC");
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    Ok(format!("{url}{separator}pc={id}"))
+}
+
+fn host_hello(token: &str, identity: Option<&DeviceIdentity>) -> Result<String> {
+    match identity {
+        Some(identity) => Ok(json!({
+            "type": "hello", "role": "host", "token": token,
+            "id": identity.id().to_string(), "public": identity.public_b64(),
+        })
+        .to_string()),
+        None => Ok(serde_json::to_string(&SignalMsg::Hello {
+            token: token.to_owned(),
+            role: "host".to_owned(),
+        })?),
+    }
+}
+
+/// The relay's messages during a keyed registration. Parsing never echoes the text, so a malformed
+/// ticket or challenge cannot leak into an error.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum RegistrationReply {
+    RegisterChallenge {
+        nonce: String,
+    },
+    HelloOk {
+        #[serde(default, rename = "workerVersionId")]
+        worker_version_id: Option<String>,
+        #[serde(default)]
+        ticket: Option<RelayTicket>,
+        #[serde(default)]
+        pc: Option<String>,
+    },
+    Error {},
+}
+
+fn parse_registration_reply(text: &str) -> Result<RegistrationReply> {
+    serde_json::from_str(text)
+        .map_err(|_| anyhow::anyhow!("relay sent an unexpected registration message"))
+}
+
+/// The `register-proof` signature for a challenge. The nonce must be the canonical 32-byte value.
+fn registration_proof(identity: &DeviceIdentity, origin: &str, nonce: &str) -> Result<String> {
+    let nonce: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(nonce)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .filter(|bytes| URL_SAFE_NO_PAD.encode(bytes) == nonce)
+        .ok_or_else(|| anyhow::anyhow!("relay sent a malformed registration challenge"))?;
+    Ok(URL_SAFE_NO_PAD.encode(identity.sign_relay_proof(origin, &nonce)))
+}
+
+/// Runs the registration after the keyed hello: answers one `register-challenge` with a
+/// `register-proof`, then reads `hello-ok`. Older relays can accept without a challenge or ticket.
+fn complete_keyed_registration(
+    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    identity: &DeviceIdentity,
+    origin: &str,
+) -> Result<(Option<String>, RelayRoute)> {
+    complete_registration(ws, Some((identity, origin)))
+}
+
+fn complete_registration(
+    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    identity: Option<(&DeviceIdentity, &str)>,
+) -> Result<(Option<String>, RelayRoute)> {
+    let mut challenged = false;
+    loop {
+        let Message::Text(text) = ws.read().context("read registration reply")? else {
+            continue;
+        };
+        match parse_registration_reply(&text)? {
+            RegistrationReply::RegisterChallenge { nonce } if !challenged => {
+                let (identity, origin) = identity.context("relay challenged an ID-less host")?;
+                challenged = true;
+                let signature = registration_proof(identity, origin, &nonce)?;
+                let proof = json!({"type": "register-proof", "signature": signature});
+                ws.send(Message::text(proof.to_string()))
+                    .context("send register-proof")?;
+            }
+            RegistrationReply::RegisterChallenge { .. } => {
+                bail!("relay sent a second registration challenge")
+            }
+            RegistrationReply::HelloOk {
+                worker_version_id,
+                ticket,
+                pc,
+            } => {
+                let expected_pc = identity.map(|(identity, _)| identity.id());
+                if let Some(pc) = pc {
+                    let pc = DeviceId::parse(&pc)
+                        .map_err(|_| anyhow::anyhow!("relay registered an invalid PC ID"))?;
+                    if Some(pc) != expected_pc {
+                        bail!("relay registered a different PC ID");
+                    }
+                }
+                let route = RelayRoute::from_registration(expected_pc, ticket);
+                return Ok((worker_version_id, route));
+            }
+            RegistrationReply::Error {} => bail!("worker rejected host registration"),
         }
     }
 }
@@ -2554,8 +2717,8 @@ mod tests {
         bench_status_wire, keepalive_expired, signaling_request,
         signaling_request_with_worker_version, worker_version_changed, worker_version_probe_url,
         BenchEncodeStages, BenchHybridActivity, BenchRoiActivity, BenchStageTiming,
-        BenchStatusEffective, BenchStatusEncoder, SignalMsg, BENCH_STATUS_MAX_BYTES,
-        KEEPALIVE_TIMEOUT, V2_REDUNDANT_BENCH_FIELDS,
+        BenchStatusEffective, BenchStatusEncoder, SignalMsg, WorkerVersionMonitor,
+        BENCH_STATUS_MAX_BYTES, KEEPALIVE_TIMEOUT, V2_REDUNDANT_BENCH_FIELDS,
     };
     use std::time::{Duration, Instant};
 
@@ -2649,6 +2812,47 @@ mod tests {
             None
         );
         assert!(worker_version_probe_url("https://play.example/host-ws").is_err());
+    }
+
+    #[test]
+    fn cleartext_loopback_relay_runs_without_a_worker_version_monitor() {
+        for url in [
+            "ws://127.0.0.1:8788/host-ws",
+            "ws://127.5.6.7:8788/host-ws",
+            "ws://[::1]:8788/host-ws",
+            "ws://localhost:8788/host-ws",
+        ] {
+            assert_eq!(worker_version_probe_url(url).unwrap(), None, "{url}");
+            assert!(
+                WorkerVersionMonitor::spawn(url, "token", None, None)
+                    .unwrap()
+                    .is_none(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_non_loopback_relay_still_refuses_a_worker_version_monitor() {
+        for url in [
+            "ws://192.168.1.20:8788/host-ws",
+            "ws://play.example/host-ws",
+            "ws://localhost.evil.com/host-ws",
+        ] {
+            let error = worker_version_probe_url(url).unwrap_err().to_string();
+            assert!(error.contains("requires a wss signaling URL"), "{error}");
+            assert!(
+                WorkerVersionMonitor::spawn(url, "token", None, None).is_err(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn wss_relay_gets_a_worker_version_monitor() {
+        let monitor =
+            WorkerVersionMonitor::spawn("wss://play.example/host-ws", "token", None, None).unwrap();
+        assert!(monitor.is_some());
     }
 
     #[test]
@@ -4134,5 +4338,292 @@ mod tests {
             fixture["minSwitchIntervalMs"],
             crate::follow_window::MIN_SWITCH_INTERVAL.as_millis() as u64
         );
+    }
+}
+
+#[cfg(test)]
+mod keyed_registration_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    const FIXTURE: &str = include_str!("../../fixtures/device-keys-contract.json");
+    const ORIGIN: &str = "https://example.test";
+    const NONCE: &str = "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8";
+    const TICKET: &str = "4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6-_z9_v8";
+
+    fn fixture() -> serde_json::Value {
+        serde_json::from_str(FIXTURE).unwrap()
+    }
+
+    fn fixture_identity() -> DeviceIdentity {
+        DeviceIdentity::from_plain_key_json(&fixture()["keyFiles"]["plain"]["file"].to_string())
+            .unwrap()
+    }
+
+    /// Runs a scripted relay on loopback and returns the port. Each scripted message is sent in
+    /// order; after a `register-challenge` the relay reads the host's next message. The relay
+    /// hands those client messages back when it ends.
+    struct ScriptRelay(Option<std::thread::JoinHandle<Vec<String>>>);
+
+    impl ScriptRelay {
+        fn join(mut self) -> std::thread::Result<Vec<String>> {
+            self.0.take().unwrap().join()
+        }
+    }
+
+    impl Drop for ScriptRelay {
+        fn drop(&mut self) {
+            if let Some(thread) = self.0.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn scripted_relay(script: Vec<String>) -> (u16, ScriptRelay) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("scripted relay accept failed: {error}"),
+                }
+            };
+            // The listener polls accept with a deadline; the WebSocket script uses blocking I/O.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let mut received = Vec::new();
+            for message in script {
+                let challenged = message.contains("register-challenge");
+                ws.send(Message::text(message)).unwrap();
+                if challenged {
+                    if let Ok(Message::Text(text)) = ws.read() {
+                        received.push(text.to_string());
+                    }
+                }
+            }
+            received
+        });
+        (port, ScriptRelay(Some(handle)))
+    }
+
+    fn client(port: u16) -> WebSocket<MaybeTlsStream<TcpStream>> {
+        let mut ws = tungstenite::connect(format!("ws://127.0.0.1:{port}/ws"))
+            .unwrap()
+            .0;
+        if let MaybeTlsStream::Plain(stream) = ws.get_mut() {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+        }
+        ws
+    }
+
+    fn challenge() -> String {
+        json!({"type": "register-challenge", "nonce": NONCE}).to_string()
+    }
+
+    #[test]
+    fn keyed_registration_proves_the_fixture_signature_and_takes_the_ticket() {
+        let identity = fixture_identity();
+        let (port, relay) = scripted_relay(vec![
+            challenge(),
+            json!({"type": "hello-ok", "workerVersionId": "v1", "ticket": TICKET, "pc": identity.id().to_string()}).to_string(),
+        ]);
+        let mut ws = client(port);
+        let (version, route) =
+            complete_keyed_registration(&mut ws, &identity, ORIGIN).expect("keyed registration");
+        assert_eq!(version.as_deref(), Some("v1"));
+        let RelayRoute::Keyed { pc, ticket } = route else {
+            panic!("expected a keyed route");
+        };
+        assert_eq!(pc, identity.id().to_string());
+        assert_eq!(format!("{:?}", ticket.unwrap()), "RelayTicket(<redacted>)");
+        let received = relay.join().unwrap();
+        let proof: serde_json::Value = serde_json::from_str(&received[0]).unwrap();
+        assert_eq!(proof["type"], "register-proof");
+        assert_eq!(
+            proof["signature"],
+            fixture()["relayProof"]["messages"]["registerProof"]["signature"]
+        );
+    }
+
+    #[test]
+    fn a_relay_that_accepts_without_a_challenge_keeps_the_key_id() {
+        let identity = fixture_identity();
+        let (port, relay) = scripted_relay(vec![json!({"type": "hello-ok"}).to_string()]);
+        let mut ws = client(port);
+        let (version, route) =
+            complete_keyed_registration(&mut ws, &identity, ORIGIN).expect("legacy relay");
+        assert_eq!(version, None);
+        assert!(
+            matches!(route, RelayRoute::Keyed { pc, ticket: None } if pc == identity.id().to_string())
+        );
+        relay.join().unwrap();
+    }
+
+    #[test]
+    fn a_challenged_registration_without_a_ticket_is_accepted() {
+        let identity = fixture_identity();
+        let (port, _relay) =
+            scripted_relay(vec![challenge(), json!({"type": "hello-ok"}).to_string()]);
+        let mut ws = client(port);
+        let (_, route) = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap();
+        assert!(
+            matches!(route, RelayRoute::Keyed { pc, ticket: None } if pc == identity.id().to_string())
+        );
+    }
+
+    #[test]
+    fn a_hello_ok_for_another_pc_is_refused() {
+        let identity = fixture_identity();
+        let (port, _relay) = scripted_relay(vec![
+            challenge(),
+            json!({"type": "hello-ok", "ticket": TICKET, "pc": "AAAA-AAAA-AAAA-AAAA"}).to_string(),
+        ]);
+        let mut ws = client(port);
+        let error = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap_err();
+        assert_eq!(error.to_string(), "relay registered a different PC ID");
+    }
+
+    #[test]
+    fn a_second_challenge_is_refused() {
+        let identity = fixture_identity();
+        let (port, _relay) = scripted_relay(vec![challenge(), challenge()]);
+        let mut ws = client(port);
+        let error = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "relay sent a second registration challenge"
+        );
+    }
+
+    #[test]
+    fn malformed_ticket_errors_never_echo_the_ticket_text() {
+        let secret = "SECRET-TICKET-TEXT-not-base64url!";
+        let identity = fixture_identity();
+        let text = json!({"type": "hello-ok", "ticket": secret}).to_string();
+        let (port, _relay) = scripted_relay(vec![challenge(), text]);
+        let mut ws = client(port);
+        let error = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "relay sent an unexpected registration message"
+        );
+        assert!(!format!("{error:?}").contains("SECRET"), "{error:?}");
+    }
+
+    #[test]
+    fn malformed_challenge_nonce_is_refused_without_echo() {
+        let identity = fixture_identity();
+        let error = registration_proof(&identity, ORIGIN, "not+canonical/nonce")
+            .expect_err("bad nonce must fail");
+        assert_eq!(
+            error.to_string(),
+            "relay sent a malformed registration challenge"
+        );
+    }
+
+    #[test]
+    fn registration_proof_matches_the_fixture_for_the_fixture_origin() {
+        let identity = fixture_identity();
+        let signature = registration_proof(&identity, ORIGIN, NONCE).unwrap();
+        assert_eq!(
+            signature,
+            fixture()["relayProof"]["messages"]["registerProof"]["signature"]
+        );
+    }
+
+    #[test]
+    fn host_hello_with_and_without_a_key_matches_the_contract() {
+        let identity = fixture_identity();
+        let keyed: serde_json::Value = serde_json::from_str(
+            &host_hello("test-only-registration-token", Some(&identity)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(keyed, fixture()["relayProof"]["messages"]["hello"]);
+        let legacy: serde_json::Value =
+            serde_json::from_str(&host_hello("legacy-token", None).unwrap()).unwrap();
+        assert_eq!(
+            legacy,
+            json!({"type":"hello", "role":"host", "token":"legacy-token"})
+        );
+    }
+
+    #[test]
+    fn legacy_registration_retains_an_optional_ticket() {
+        for ticket in [None, Some(TICKET)] {
+            let (port, _relay) =
+                scripted_relay(vec![json!({"type":"hello-ok", "ticket":ticket}).to_string()]);
+            let mut ws = client(port);
+            let (_, route) = complete_registration(&mut ws, None).unwrap();
+            assert_eq!(
+                matches!(route, RelayRoute::LegacyTicket(_)),
+                ticket.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn no_challenge_ack_retains_a_ticket_and_validates_pc() {
+        let identity = fixture_identity();
+        let alias = identity.id().to_string().to_lowercase().replace('-', "");
+        let (port, _relay) = scripted_relay(vec![
+            json!({"type":"hello-ok", "ticket":TICKET, "pc":alias}).to_string(),
+        ]);
+        let mut ws = client(port);
+        let (_, route) = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap();
+        assert!(
+            matches!(route, RelayRoute::Keyed { pc, ticket:Some(_) } if pc == identity.id().to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_registration_errors_never_echo_reply_content() {
+        let (port, _relay) = scripted_relay(vec![
+            r#"{"type":"hello-ok","ticket":"SECRET-TICKET",bad}"#.to_owned(),
+        ]);
+        let mut ws = client(port);
+        let error = complete_registration(&mut ws, None).unwrap_err();
+        assert!(!format!("{error:?}").contains("SECRET-TICKET"));
+    }
+
+    #[test]
+    fn worker_error_is_refused_with_a_fixed_message() {
+        let identity = fixture_identity();
+        let (port, _relay) = scripted_relay(vec![json!({"type": "error"}).to_string()]);
+        let mut ws = client(port);
+        let error = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap_err();
+        assert_eq!(error.to_string(), "worker rejected host registration");
+    }
+
+    #[test]
+    fn keyed_url_adds_the_pc_and_keeps_lab_fields() {
+        assert_eq!(
+            keyed_signaling_url("wss://worker.example/host-ws", "ABCD-EFGH-JKMN-PQRS").unwrap(),
+            "wss://worker.example/host-ws?pc=ABCD-EFGH-JKMN-PQRS"
+        );
+        let lab = "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v4-bench2-hevc-tiles-bpip4-v16";
+        let keyed = keyed_signaling_url(lab, "ABCD-EFGH-JKMN-PQRS").unwrap();
+        assert!(keyed.ends_with("&pc=ABCD-EFGH-JKMN-PQRS"), "{keyed}");
+        assert!(keyed.contains("?run=123e4567"), "{keyed}");
+        assert!(keyed_signaling_url("wss://worker.example/host-ws?pc=X", "ABCD").is_err());
     }
 }

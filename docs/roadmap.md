@@ -27,9 +27,18 @@ Status: done 2026-10-12. Android now follows the browser's carry rule: held keys
 Status: approved 2026-10-12 for all four: follow active window (including edge-hold drags), game mode, background survival and keyboard lock.
 Built on lane/android-parity (2026-10-13), not yet merged: follow active window in the switch-screen popover, Work/Game pointer modes (Game uses Android pointer capture), keyboard capture (Esc and Win combinations; Android keeps Win alone, Alt+Tab and Print Screen), and a `dataSync` foreground service that keeps the session and transfers alive in the background with a Disconnect notification, falling back to the 30 s background stop. Still browser-only: desktop file drops with preview.
 
+### Compose UI and Game controls
+Status: planned; starts after the encoders and Windows-client lanes are further along.
+Decided 2026-10-14: the Android UI (today plain Views built in code, no layouts) moves to Jetpack Compose step by step, through ComposeView interop. The SurfaceView video path and the networking stay as they are. The session overlays and the new Game controls come first. Ruled out: a WebView UI (the touch routing and the JS bridge sit in the game-input path), egui on Android (weak IME), Flutter (rewrite). Game controls: an on-screen gamepad and virtual keys with editable layouts, a key bar (Esc, Tab, Win, F-keys, modifiers), real key down/up from hardware keyboards and gamepads, and touch controls hidden while a physical controller is in use. Shares design tokens with the browser and Windows clients. Claude designs it with mockups for the owner first; no Codex for UI.
+
 ### Typing over laggy connections
 Status: proposed; investigate first.
 Idea from 2026-10-12: on a slow link, typed keys could be buffered and sent in chunks instead of one packet per key. Control packets are already queued in order, so first measure what goes wrong today: lost keys, reordering, or only delay. Then decide between batching key packets and sending text chunks. Applies to Android first, the browser if the same issue shows.
+Idea from 2026-10-13: while keys are buffered or in flight on a slow link, show a small, unobtrusive bar at the bottom edge ("Sending 12 keys…") so the user sees the input was taken and is on its way. It hides when the queue drains and never covers the stream's centre.
+
+### Key events in Game mode
+Status: proposed; investigate first.
+Idea from 2026-10-13: Game mode is underdeveloped. It should send physical key down and up events (scancodes, held state, no auto-repeat from the client) instead of text input, as games expect. Text-style input stays for Work mode. First check what each client sends today (browser, Android, the Windows client). Open points: keyboard layout (scancodes follow the host's layout, so text typed into a game's chat box comes out in the host layout), keys held when focus or the connection is lost (release them all), and Android, whose soft keyboard only gives text.
 
 ## Features
 
@@ -58,8 +67,13 @@ Status: approved 2026-10-13 (option B). Waits for device IDs and keys, then an N
 The host starts at Windows sign-in, so a signed-in user is required. Lock-screen and UAC capture are helper-based and pending live acceptance. A service-based host that works before sign-in is a larger change with its own security review. Design and decisions: [unattended-access.md](architecture/unattended-access.md).
 
 ### More encoders and host platforms
-Status: deferred.
-Only NVIDIA NVENC on Windows x64 is supported. AMD, Intel and software encoding, and macOS or Linux hosts, are not planned for the first alpha.
+Status: done 2026-10-14 for Windows (merged from lane/encoders).
+Encoding is pluggable:
+- NVENC first.
+- Then a Media Foundation hardware encoder, which is experimental and untested on AMD and Intel.
+- Then the Windows software H.264 encoder ("CPU mode"), which can also be forced from the tray.
+
+On a GPU-less test VM, CPU mode streams at the VM's capture rate (about 22 fps) with 25 ms mean latency, using 3-6% host CPU. Streaming the UAC secure desktop in CPU mode is not working yet; the cause is under investigation. See [encoders.md](architecture/encoders.md). macOS and Linux hosts are not planned for the first alpha.
 
 ## Documentation
 

@@ -77,7 +77,7 @@ Approve option B, built in this order; each step is separately reviewable:
 Required controls for step 2:
 
 - Opt-in: off by default. Turned on in the tray through UAC; off in one click via a SYSTEM task; greyed out while a viewer is connected (same pattern as Admin mode). With it off, the service does not start the logon host at all.
-- Separate approval: the logon host registers as pre-login; the relay requires a fresh approval (ntfy or authenticator code) per pre-login session and never accepts a remembered browser approval for it. The viewer sees "PC is at the sign-in screen".
+- Separate approval: the logon host registers as pre-login; the relay requires a fresh ntfy approval, sent by the PC itself, per pre-login session and never accepts a remembered browser approval for it. The viewer sees "PC is at the sign-in screen".
 - Audit and notification: Windows Application event log entries for pre-login session start and end, approval method and viewer address; after the next local sign-in the tray shows "Someone connected before sign-in at HH:MM". Optional ntfy message on start.
 - Credential handling: BubblePlay never stores, captures, logs or auto-types Windows passwords or PINs. Logs keep counts only, as today. The machine relay credential is separate from the user's DPAPI-protected credential and can be revoked on its own.
 - Narrow pre-login mode: no file transfer, no clipboard, no admin agent, no process launch, no monitor follow; input only to the Winlogon desktop; the session ends when a user signs in.
@@ -89,7 +89,7 @@ Required controls for step 2:
 2. Should the logon host use the same relay room and host credential as the user host (simpler for the viewer), or a separate pre-login identity (cleaner revocation and approval rules)?
 3. Is input on the sign-in screen required for the first step, or is view only (to confirm the PC is up after a reboot) useful on its own?
 4. Should the pre-login opt-in require Admin mode to be on as well, or stay independent?
-5. Which approval is acceptable for pre-login sessions: ntfy only, authenticator only, or either? Cloudflare relays currently use browser approval plus password.
+5. Decided: pre-login sessions use a fresh ntfy approval sent by the PC itself, no authenticator codes (decision 5).
 6. Is the switch-user screen in scope, given that fast user switching then hands the console between two hosts?
 7. If NVENC does not work from session 0, accept a lower-quality software encoder for pre-login, or run the logon host in the console session?
 

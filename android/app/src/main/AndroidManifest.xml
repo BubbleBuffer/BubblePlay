@@ -44,6 +44,14 @@
             android:theme="@style/Theme.BubblePlay.Stream"
             android:windowSoftInputMode="adjustNothing|stateAlwaysHidden" />
 
+        <!-- Device key: create, import, export, change passphrase, remove. Configuration changes are
+             handled in place so a half-typed passphrase survives rotation (as LoginActivity). -->
+        <activity
+            android:name=".ui.DeviceKeyActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize" />
+
         <!-- Keeps an open session and its file transfers alive in the background. -->
         <service
             android:name=".ui.SessionService"

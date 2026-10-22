@@ -65,7 +65,7 @@ One text file per key, extension `.bpkey`, UTF-8 JSON:
 | --- | --- | --- | --- |
 | Browser | The `.bpkey` file as created or imported, in IndexedDB for the relay origin. | Asks for the passphrase when the page opens, if the key has one. | **Export key** downloads the file; **Import key** reads one. |
 | Android | `files/device-key.bpkey` in app-private storage, additionally wrapped with a Keystore AES key so a copied file is useless off the phone. Backup stays off. | Asks for the passphrase when the app opens, if the key has one. | Export and import through the system file picker; export unwraps the Keystore layer and writes the portable file. |
-| PC user host | `%LOCALAPPDATA%\BubblePlay\device-key.bpkey`, CurrentUser DPAPI-wrapped, no passphrase, because the host starts unattended at sign-in. | None. | Tray **Export key** asks for an optional export passphrase; **Import key** keeps a PC's ID across a reinstall. |
+| PC user host | `%LOCALAPPDATA%\BubblePlay\device-key.bpkey`, CurrentUser DPAPI-wrapped, no passphrase, because the host starts unattended at sign-in. | None. | Tray menu **Export PC key...** asks for an optional export passphrase; **Import PC key...** keeps a PC's ID across a reinstall. |
 | Pre-login logon host | `ProgramData\BubblePlay\prelogin\device-key.bpkey`, LocalMachine DPAPI, ACL SYSTEM and `NT SERVICE\BubblePlayLogon`. | None. | Not exported; it is created by the elevated pre-login opt-in. Its own ID, as decided in [unattended access](unattended-access.md#decisions). |
 | Wake-on-LAN helper | Key file in its state volume, mode 600, no passphrase. | None. | Plain file. |
 
@@ -217,7 +217,7 @@ Each trusted key has permissions, set at pairing and editable in the tray. The h
 | Clipboard | on | New check in the clipboard control path. |
 | Files | on | Replaces "host gate token present" (`host/src/main.rs` 950-963). |
 | Elevated input | off | Admin mode stays the machine switch in HKLM, set through UAC. Elevated input needs Admin mode **and** this permission. The host enforces the device part, so the residual same-user risk in [security and privacy](../security-and-privacy.md) is unchanged. |
-| Before sign-in | off | The logon host admits only keys with this permission, plus a fresh second factor per session: ntfy approval sent by the logon host, or an authenticator code checked by the logon host and sent inside the authenticated control channel. |
+| Before sign-in | off | The logon host admits only keys with this permission, plus a fresh ntfy approval per session, sent by the logon host itself. |
 | Wake | on | The Wake-on-LAN helper accepts wake requests only from keys the PC marked so. |
 
 **Lists for the logon host and the helper.** The owner edits only in the user host's tray. Giving a key "Before sign-in" writes its ID and public key to `ProgramData\BubblePlay\prelogin\trusted.json` through the same UAC step that turns on pre-login (ACL: SYSTEM, the service SID, Administrators), so a same-user process cannot add pre-login devices. The Wake-on-LAN helper is paired with the PC like a viewer (pairing at the PC); while awake, the PC sends it, end to end, its MAC address and the IDs and keys of devices with "Wake". The helper checks a viewer's signed wake request against that list.
@@ -250,6 +250,8 @@ This PC   Office-PC   ID 7HQ2-K9MX-4RTD-P0ZB   Relay play.example.com (online)
 - Last seen comes from the host's own records, not the relay.
 - Native window, like the existing approval dialog, following the BubblePlay product profile.
 
+**Current state of PC key backup (2026-10-15):** the tray menu has **Export PC key...** and **Import PC key...**, built in `host/src/tray/key_ui.rs`. Export asks for an optional passphrase, typed twice, then saves `<PC ID>.bpkey`. Import reads a `.bpkey`, asks for its passphrase when it is protected, asks to confirm the ID change, replaces the PC key and restarts the host. Both run on their own thread, so the tray stays responsive. Not yet checked on screen.
+
 ## Cutover and removal
 
 No migration period: device keys are the only way to connect. Relay, host and clients are updated together; an old client or host stops working against a new relay. There is no public release yet, so only the owner's own setups are affected.
@@ -262,6 +264,7 @@ Deleted in phase 2:
 - **Host:** the browser approval dialog (`host/src/browser_approval.rs`) and `browserApproval` capability, `HOST_GATE_TOKEN` handling in setup, tray and signaling.
 - **Android:** `LoginActivity` WebView login, cookie storage and replay, "Forget browser".
 - **Docs and fixtures:** [browser approval](browser-approval.md) rewritten as the site gate (ntfy only); the host-approval messages in `fixtures/browser-approval-contract.json` removed; setup guides rewritten for key pairing.
+- **Ticketless media and file sockets:** require a ticket on `/media-ws` and `/file-ws` for ID'd PCs, in both relays. In phase 1 a pc-less socket without a ticket is still accepted when its epoch matches the resolved room, because old viewers send no ticket and the upgrade stays behind today's login.
 
 Kept: the ntfy site gate with the `__Host-gate` cookie and `/__gate/decision`, `TOKEN` as the first-registration ticket, the admin token for operator management, the per-prefix rate limiting (now also on pairing requests and handshakes), TURN credential issuance.
 
@@ -319,3 +322,49 @@ Sizes: S under a week, M one to three weeks, L three to six weeks, each with tes
    4. Revoking a device asks whether to revoke the devices it vouched for; no silent cascade.
    5. ID rotation: a device vouches for its own new key; the PC moves permissions and history to the new ID and revokes the old one atomically. Real security value after a suspected exposure, small privacy value, no help against a leaked key (the attacker can rotate too; revoke at the PC instead). Phase 3, with remote pairing; tray and app UI not detailed here.
    6. Pairing-request spam now reaches paired devices too, so requests show as tray or in-app prompts with rate limits per PC and per source. Remote pairing stays off by default.
+
+## Phase 0 results
+
+2026-10-15: [the fixture](../../fixtures/device-keys-contract.json) contains three Ed25519 ID derivations (including lowercase/O/I/L/unhyphenated parsing), plain and protected `.bpkey` files, wrong-passphrase and tampered-AAD failures, a full handshake, control ciphertexts for sequences 0/1 in each direction, both DTLS bindings and four signaling examples. Private inputs are public, fixed and **test-only**. Fields ending in `Hex` are hexadecimal; other binary fields use unpadded base64url. `aadUtf8` and `plaintextUtf8` fix exact UTF-8 bytes. The decimal epoch vector exceeds JavaScript's safe integer range.
+
+[Generate](../../tools/device-keys/gen-contract.mjs) on linux01 with Node 24: `crypto.argon2Sync` is required; output is UTF-8 JSON, two-space indentation, final LF. Independent [Node](../../tools/tests/device-keys-contract.test.mjs) and [Go](../../relay/devicekeys_contract_test.go) checks recompute from inputs. Node 22 skips only three Argon2 cases; Go always checks them with the existing `golang.org/x/crypto/argon2` dependency. Go runs only on linux01: `cd relay && go test ./... -run DeviceKeys -v`.
+
+Verified: repeated generation is byte-identical and matches the staged fixture; Node 24 passes 10 checks, Node 22 passes 7 with the required 3 skips. On 2026-10-15, `cd relay && go test ./... -run DeviceKeys -v` passes all four checks on linux01 with Go 1.27.1, including relay proofs; `go vet ./...` also passes. No Go ran on the PC.
+
+### Encodings for implementers
+
+- **IDs/key files:** SHA-256(raw 32-byte Ed25519 public), first 10 bytes, most-significant-bit-first Crockford base32, uppercase `XXXX-XXXX-XXXX-XXXX`. Ignore input hyphens/case; O→0, I/L→1. Seed: 32 bytes. Plain: `kdf`/`aead` null, `private` = seed. Protected: Argon2id v19, UTF-8 passphrase, m=65536 KiB, t=3, p=1, salt 16 bytes, output 32 bytes; AES-256-GCM nonce 12 bytes, `private` = ciphertext || 16-byte tag.
+- **Key-file AAD:** UTF-8 [RFC 8785 JCS](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON after removing `private` and nested `aead.nonce`; keep `aead.alg`, all other metadata and null `aead`. No trailing newline. The fixture records the AAD string/hex and exercises quotes and non-ASCII UTF-8.
+- **Transcript:** each field is uint32 big-endian byte length || bytes, ordered: `bubbleplay-auth-v1`, relay origin, decimal epoch string, canonical viewer ID, viewer public, canonical PC ID, PC public, viewer nonce, PC nonce, viewer ephemeral X25519 public, PC ephemeral X25519 public. Strings are UTF-8; public keys/nonces are raw 32 bytes. Preserve epoch bytes without numeric coercion.
+- **Relay proof:** each field is uint32 big-endian byte length || bytes, ordered: UTF-8 `bubbleplay-relay-v1`, UTF-8 role (`host` or `viewer`), UTF-8 relay origin (the same origin form as the transcript), raw 32-byte nonce, UTF-8 canonical device ID, raw 32-byte Ed25519 public key. H = SHA-256(encoding); Ed25519 signs the 32 bytes of H directly. The label inside the encoding is the domain separator; no extra context prefix.
+- **Signatures:** H = SHA-256(transcript). PC signs `bubbleplay-auth-host-v1` || H; viewer signs `bubbleplay-auth-viewer-v1` || H || raw 64-byte PC signature. Ed25519 signs these bytes directly; contexts are raw UTF-8 without length prefixes.
+- **Control:** X25519 shared secret → HKDF-SHA-256, salt H, 32-byte outputs, UTF-8 info `bubbleplay-ctl-v1 viewer-to-pc` / `bubbleplay-ctl-v1 pc-to-viewer`. Per-direction AES-256-GCM nonce: four zero bytes || uint64 big-endian sequence starting at 0. AAD: raw UTF-8 `type`; ciphertext || 16-byte tag. `plaintextUtf8` fixes sample JSON serialization; capability strings are illustrative.
+- **DTLS:** each side signs raw UTF-8 `bubbleplay-dtls-v1` || H || local fingerprint || newline || remote fingerprint. Fingerprints are UTF-8 SDP `a=fingerprint` **values**, including algorithm/spaces/colons, excluding `a=fingerprint:`. Each signer uses its own local/remote order.
+- **Signaling:** `auth-hello` `{type, id, public, nonce, ephemeral, caps}` (string-array `caps`); `auth-host` `{type, id, public, nonce, ephemeral, signature}`; `auth-finish`/`auth-bind` `{type, signature}`. `type` is the hyphenated message name, IDs canonical, binary fields unpadded base64url. The fixture's `auth-bind` is viewer-sent.
+
+### Browser research (docs and web only)
+
+No numeric minimum appears in `docs/` or `worker/`: [release status](../release-status.md) targets desktop Chromium; [worker guide](../../worker/README.md) says Chrome. Workers `compatibility_date` is a server setting. [MDN compatibility data](https://github.com/mdn/browser-compat-data/blob/main/api/SubtleCrypto.json): Ed25519 generate/import/sign/verify starts at Chrome 137; X25519 generate/import/deriveBits at 133. Therefore 137+ covers both, but availability at BubblePlay's minimum remains unresolved. No support floor or curve choice was changed; no browser runtime test ran.
+
+Two browser Argon2id WASM candidates were compared:
+
+| Candidate | Size and license | Maintenance | 64 MiB in a Web Worker |
+| --- | --- | --- | --- |
+| **hash-wasm 4.12.0** | Upstream [README](https://github.com/Daninet/hash-wasm) reports approximately **11 kB gzipped** for the combined Argon2d/i/id bundle with embedded WASM; not the entire package. [MIT](https://github.com/Daninet/hash-wasm/blob/v4.12.0/LICENSE). | Latest npm release 2024-11-19, corroborated by its [changelog](https://github.com/Daninet/hash-wasm/blob/v4.12.0/CHANGELOG.md); no newer npm release as checked today. | Worker support is documented. [API/source](https://github.com/Daninet/hash-wasm/blob/v4.12.0/lib/argon2.ts) accepts `memorySize: 65536` in KiB and allocates that memory plus overhead. Support at these parameters is inferred from source, not device-tested. |
+| **argon2-browser 1.18.0** | [README](https://github.com/antelle/argon2-browser) reports approximately **14 kB JS + 25 kB WASM**, file sizes rather than gzip figures, excluding additional wrapper/bundling overhead. MIT. | Latest [npm release](https://registry.npmjs.org/argon2-browser) 2021-06-05; no newer npm release as checked today. Its README's SIMD/browser guidance is dated. | [Loader/source](https://github.com/antelle/argon2-browser/blob/master/lib/argon2.js) uses `self`, fetch/dynamic import and a memory allocator that permits `mem: 65536` (about 80 MiB initial WASM memory including overhead). Worker feasibility is inferred from source; asset paths and the exact build still need testing. |
+
+Recommend **hash-wasm's Argon2 bundle** for explicit Worker support, simple loading and its newer release; its release gap remains a maintenance consideration. Its documented download is ~11 kB gzip (not directly comparable to raw file sizes). Parameters: `argon2id`, `memorySize: 65536`, `iterations: 3`, `parallelism: 1`, `hashLength: 32`, `outputType: "binary"`. Memory availability, worker startup and latency remain unverified. Nothing was vendored/added; dependency selection and the browser floor remain for the main session.
+
+## Phase 1 decisions
+
+2026-10-15, main session defaults (the owner may override):
+
+1. **Viewer target:** `/ws?pc=<id>`. Without `pc`, one shared resolver serves viewer `/ws`, `/media-ws` and `/file-ws`: the most recently registered online PC with an ID; else the legacy room if an ID-less host is online; else the only listed PC; else the most recently registered listed PC; else the legacy room. Viewer signaling `hello-ok` names the resolved `pc`. A pc-less media/file socket must carry the epoch issued by signaling, and that epoch must still belong to the resolved PC's active viewer; if the default changed to another PC, refuse rather than cross-connect. Explicit `pc` and ticket routing retain their phase 1 behavior. The browser takes `?pc=` from the page URL; master Android sends neither `pc` nor tickets.
+2. **ID-less hosts** keep working in the legacy room (`signal:host` / `room-v3`) until the phase 2 cutover.
+3. **Host registration:** `hello` adds `id` and `public`; the relay answers `register-challenge {nonce}`; the host answers `register-proof {signature}` (encoding under "Relay proof" above). An unknown ID needs `TOKEN`; a known ID needs only the signature. The `HOST_GATE_TOKEN` bearer stays required in phase 1.
+4. **Tickets:** 32 random bytes in every `hello-ok`, bound to PC ID, side and (viewers) epoch; valid while the issuing signaling socket is open, at most 12 h. Media and file URLs add `pc=`; the socket `hello` carries the ticket, never the URL. Compared in constant time and never logged. Host media and file sockets accept the bearer or a ticket in phase 1.
+5. **Operator PC list:** Go `auth.json` gains an optional `pcs` map ({public, firstSeen, lastSeen}, `version` stays 1); Cloudflare stores `pc:<id>` in `GATE`. Admin routes `GET /__gate/manage/pcs` and `DELETE /__gate/manage/pcs/<id>`. The Room object for a PC is named `pc-v1:<id>`.
+6. **PC key at rest:** the tray creates `%LOCALAPPDATA%\BubblePlay\device-key.bpkey` as a raw CurrentUser DPAPI blob of the plain key file and passes the key to the host in an environment variable, as with `TOKEN`; the host removes the variable from its own environment after reading it. Export and import use native dialogs.
+7. **Key screens in phase 1 are optional:** a first-open offer with **Not now** plus a settings entry in the browser and Android. Unlock on open becomes mandatory at the phase 2 cutover, so today's login is untouched.
+
+Android state, 2026-10-15 (lane `dk-androidui`, not yet on master): `ui/DeviceKeyActivity` (create, import, export with keep, re-seal or drop passphrase, change passphrase, remove), `ui/PassphraseDialog` and `ui/KeyViews`, and an offer card on the start screen (`ui/MainActivity`, flag `deviceKeyOfferDismissed` in `Prefs`). Export and passphrase work run on a worker thread and close the unlocked seed on every path. Remove calls `DeviceKeyStore.remove()`, which deletes the store's file (`device-key.bpkey` and its `.bak`) under the same lock as load and save; the UI names no file. Not run on a device; the JVM tests cover the offer, file name and error mapping only.

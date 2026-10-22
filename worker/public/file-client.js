@@ -4,7 +4,7 @@
 // Intent: docs/architecture/file-transfer.md; wire: fixtures/file-transfer-contract.json.
 //
 // API (FileTransferClient extends EventTarget, fires "change"):
-//   new FileTransferClient({ socketUrl })   socketUrl() -> ws(s) URL or null
+//   new FileTransferClient({ socketUrl, socketTicket })   callbacks -> URL / optional session ticket
 //   client.transfers                        snapshot rows (see snapshot())
 //   client.offer                            { offerId, items, source } | null
 //   client.setOffer(fileOfferMessage)       signaling `file-offer` (items [] withdraws)
@@ -66,9 +66,10 @@ export function describeFileError(code) {
 }
 
 export class FileTransferClient extends EventTarget {
-  constructor({ socketUrl, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() } = {}) {
+  constructor({ socketUrl, socketTicket = () => null, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() } = {}) {
     super();
     this.socketUrl = socketUrl;
+    this.socketTicket = socketTicket;
     this.WebSocketImpl = WebSocketImpl;
     this.now = now;
     this.rows = [];
@@ -257,7 +258,11 @@ export class FileTransferClient extends EventTarget {
     this.ws = ws;
     this.socketState = "opening";
     this.nextTransferId = 1;
-    ws.onopen = () => { if (this.ws === ws) ws.send(JSON.stringify({ type: "hello", role: "file-client" })); };
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
+      const ticket = this.socketTicket();
+      ws.send(JSON.stringify({ type: "hello", role: "file-client", ...(ticket ? { ticket } : {}) }));
+    };
     ws.onmessage = event => { if (this.ws === ws) this.onMessage(event.data); };
     ws.onclose = () => { if (this.ws === ws) this.onSocketClosed(); };
     ws.onerror = () => {};

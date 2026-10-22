@@ -2,7 +2,9 @@ name: Checks
 
 on:
   push:
+    branches: [master, "lane/**"]
   pull_request:
+    branches: [master, "lane/**"]
   workflow_dispatch:
 
 permissions:
@@ -10,7 +12,9 @@ permissions:
 
 jobs:
   browser:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, build01]
+    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       matrix:
         node: [22, 24]
@@ -50,7 +54,9 @@ jobs:
           ./worker/tools/test-set-app-password.ps1
 
   relay:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, build01]
+    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     defaults:
       run:
         working-directory: relay
@@ -124,8 +130,10 @@ jobs:
         run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
 
   android:
-    name: Android unit tests and lint (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: Android unit tests and lint (build01)
+    runs-on: [self-hosted, build01]
+    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

@@ -67,6 +67,30 @@ checks.
    - Turning it off is one click with no prompt: the tray runs a SYSTEM task that can only clear the value.
 4. Without the helper, behaviour is (1) only.
 
+## Hung foreground windows and input
+
+Rule: **the input path never blocks on another window**, including clipboard
+owners. Previously `InputSink` read clipboard formats and replaced clipboard
+text inline with input dispatch. Windows can message the owner for delayed
+rendering or `EmptyClipboard`; a hung owner stalled input before either local
+or elevated injection. File uploads also held the input owner's file-service
+mutex across clipboard replacement. See Microsoft's [clipboard documentation](https://learn.microsoft.com/en-us/windows/win32/dataxchg/clipboard-operations).
+
+`clipboard_worker.rs` now runs reads/writes through bounded queues, and uploads
+release the shared mutex before clipboard calls. Input submission, completion
+reads and clipboard-worker teardown never wait for native clipboard work.
+Live workers are capped, and session/desktop epochs discard stale queued work
+and results. An already running Windows clipboard call cannot be cancelled.
+Paste requires a successful write, the original foreground identity and an
+age under two seconds; new presses, scrolling, release-all, geometry or session/
+desktop changes cancel it. Modifier releases from Ctrl+V remain usable. The
+admin-agent and secure-helper protocols and security checks are unchanged.
+
+Regressions use a temporarily unpumped message-only window and controlled
+backends, without real input, focus changes or access to the user's clipboard.
+The owner's exact application, Windows wait/close dialog and live Alt+Tab still
+need VM qualification.
+
 ## Milestone A validation and owner test
 
 - `cargo test` in `host/`: passed (all binaries, library and integration tests; two existing library tests ignored).

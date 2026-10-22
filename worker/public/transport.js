@@ -5,6 +5,22 @@ export function rtpCodecMimeTypes(codec) {
   return codec === "hevc" ? ["video/h265", "video/hevc"] : codec === "h264" ? ["video/h264"] : [];
 }
 
+// HEVC is followed by H.264 so an H.264-only host can still answer a
+// HEVC-preferring viewer. H.264 never pulls in HEVC.
+const RTP_PREFERENCE_FAMILIES = Object.freeze({ hevc: ["hevc", "h264"], h264: ["h264"] });
+
+/** Orders receiver capabilities by family, ignoring getCapabilities order. Capabilities keep their relative order within a family. */
+export function orderRtpCodecPreferences(capabilities, codec) {
+  const ordered = [];
+  for (const family of RTP_PREFERENCE_FAMILIES[codec] ?? []) {
+    const mimeTypes = rtpCodecMimeTypes(family);
+    for (const capability of capabilities ?? []) {
+      if (mimeTypes.includes(String(capability?.mimeType ?? "").toLowerCase())) ordered.push(capability);
+    }
+  }
+  return ordered;
+}
+
 /** Query-only selection; it deliberately never reads or writes persistent storage. */
 export function parseTransport(params) {
   if (params.get("wsl") === "1" || params.get("transport") === "wsl") return TRANSPORT.WSS;
@@ -58,6 +74,11 @@ export function createCodecSession({ transport = "webrtc", decoderPath = "native
   return {
     get codec() { return codec; },
     get h264FallbackUsed() { return h264FallbackUsed; },
+    followBitstreamCodec(nextCodec) {
+      if (!["hevc", "h264"].includes(nextCodec) || nextCodec === codec) return false;
+      codec = nextCodec;
+      return true;
+    },
     fallbackToH264() {
       if (h264FallbackUsed) return false;
       h264FallbackUsed = true;
