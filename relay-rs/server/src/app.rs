@@ -225,10 +225,12 @@ async fn admin(state: &Shared, method: &Method, path: &str, headers: &HeaderMap)
             Err(AdminError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         };
     }
-    if let Some(id) = path.strip_prefix("/__gate/manage/pcs/") {
-        if *method == Method::DELETE && !id.is_empty() && !id.contains('/') {
-            return delete_pc(state, id).await;
-        }
+    if let Some(id) = path.strip_prefix("/__gate/manage/pcs/")
+        && *method == Method::DELETE
+        && !id.is_empty()
+        && !id.contains('/')
+    {
+        return delete_pc(state, id).await;
     }
     StatusCode::NOT_FOUND.into_response()
 }
