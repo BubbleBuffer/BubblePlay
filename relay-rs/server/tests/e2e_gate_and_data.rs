@@ -138,7 +138,7 @@ async fn e2e_ws_with_cookie_gets_hello_ok_with_epoch() {
 }
 
 #[tokio::test]
-async fn e2e_ws_wrong_origin_or_missing_cookie_is_404() {
+async fn e2e_ws_wrong_origin_is_404() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let cookie = browser_cookie(&server, &env).await;
@@ -153,7 +153,26 @@ async fn e2e_ws_wrong_origin_or_missing_cookie_is_404() {
         .await,
         404
     );
-    assert_eq!(refused(server.addr, &path, Some(ORIGIN), None).await, 404);
+}
+
+#[tokio::test]
+async fn e2e_ws_origin_without_valid_cookie_is_accepted_then_closed_1008_empty() {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let cookie = browser_cookie(&server, &env).await;
+    let path = format!("/ws?pc={}", pc_id(&identity(11)));
+    // No cookie at all, then a cookie the gate does not hold (an expired one is refused the same
+    // way). The upgrade succeeds so the browser sees a 1008, not a 1006 it would retry.
+    for presented in [None, Some("__Host-gate=not-a-cookie")] {
+        let mut ws = connect(server.addr, &path, Some(ORIGIN), presented)
+            .await
+            .expect("the upgrade is accepted");
+        assert_eq!(expect_close(&mut ws).await, (1008, String::new()));
+    }
+    // The same path with the approved cookie still answers hello-ok.
+    let (_ws, ok) =
+        viewer_hello(&server, &pc_id(&identity(11)), Some(cookie.as_str()), false).await;
+    assert_eq!(ok["mediaEpoch"].as_str().map(str::len), Some(32));
 }
 
 #[tokio::test]
