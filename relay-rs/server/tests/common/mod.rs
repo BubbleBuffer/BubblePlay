@@ -183,6 +183,7 @@ pub fn b64(bytes: &[u8]) -> String {
 }
 
 /// Opens a WebSocket. A refused upgrade comes back as Err with the HTTP status inside.
+#[allow(clippy::result_large_err)] // the tests read the refusal status from tungstenite's error
 pub async fn connect(
     addr: SocketAddr,
     path: &str,
