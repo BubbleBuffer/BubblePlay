@@ -144,10 +144,14 @@ async fn m2_unlisted_native_viewer_is_closed_1008_with_empty_reason() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let host = identity(1);
-    let (_host_ws, _) = register_host(&server, &host, Some(TOKEN)).await;
+    let (mut host_ws, _) = register_host(&server, &host, Some(TOKEN)).await;
     let mut viewer = native_viewer(&server, &pc_id(&host)).await;
     prove_viewer(&mut viewer, &identity(203), None).await;
     assert_eq!(expect_close(&mut viewer).await, (1008, String::new()));
+    // The refusal never reaches the host, which stays connected and answers a ping.
+    expect_quiet(&mut host_ws, Duration::from_millis(500)).await;
+    send_json(&mut host_ws, json!({"type": "ping"})).await;
+    next_json_of(&mut host_ws, "pong").await;
 }
 
 #[tokio::test]
