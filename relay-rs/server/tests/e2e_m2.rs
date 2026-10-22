@@ -226,6 +226,9 @@ async fn m2_pairing_over_real_sockets_forwards_auth_and_drops_offers() {
         json!({ "type": "pair-open", "admit": b64(&admit) }),
     )
     .await;
+    // The pong comes after pair-open is applied, so the window is open before the viewer knocks.
+    send_json(&mut host_ws, json!({ "type": "ping" })).await;
+    next_json_of(&mut host_ws, "pong").await;
 
     let stranger = identity(203);
     let mut viewer = native_viewer(&server, &pc).await;

@@ -125,6 +125,7 @@ async fn e2e_ws_with_cookie_gets_hello_ok_with_epoch() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let cookie = browser_cookie(&server, &env).await;
+    let (_host, _) = register_host(&server, &identity(10), Some(TOKEN)).await;
     let pc = pc_id(&identity(10));
     let (_ws, ok) = viewer_hello(&server, &pc, Some(cookie.as_str()), false).await;
     let epoch = ok["mediaEpoch"].as_str().unwrap();
@@ -160,6 +161,7 @@ async fn e2e_ws_origin_without_valid_cookie_is_accepted_then_closed_1008_empty()
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let cookie = browser_cookie(&server, &env).await;
+    let (_host, _) = register_host(&server, &identity(11), Some(TOKEN)).await;
     let path = format!("/ws?pc={}", pc_id(&identity(11)));
     // No cookie at all, then a cookie the gate does not hold (an expired one is refused the same
     // way). The upgrade succeeds so the browser sees a 1008, not a 1006 it would retry.
@@ -185,6 +187,7 @@ async fn e2e_ws_with_turn_adds_credentialed_ice_server() {
     };
     let server = Server::start(&env, Some(turn)).await;
     let cookie = browser_cookie(&server, &env).await;
+    let (_host, _) = register_host(&server, &identity(12), Some(TOKEN)).await;
     let pc = pc_id(&identity(12));
     let (_on, on) = viewer_hello(&server, &pc, Some(cookie.as_str()), true).await;
     let servers = on["iceServers"].as_array().unwrap();

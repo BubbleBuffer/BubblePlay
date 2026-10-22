@@ -328,6 +328,10 @@ pub async fn register_host(
         }),
     )
     .await;
+    // The relay handles this socket's frames in order. The pong means the admit has been applied,
+    // so a viewer that connects next is not refused by a race.
+    send_json(&mut ws, json!({ "type": "ping" })).await;
+    next_json_of(&mut ws, "pong").await;
     (ws, ok)
 }
 
