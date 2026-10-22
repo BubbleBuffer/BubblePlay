@@ -1,6 +1,6 @@
 [package]
 name = "bp-relay-core"
-description = "Sans-IO protocol validation and wire size limits for the BubblePlay relay"
+description = "Sans-IO protocol validation, wire size limits and routing state machine for the BubblePlay relay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,4 +11,9 @@ name = "bp_relay_core"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+bp-device-key = { path = "../../crates/bp-device-key" }
+hmac = { version = "0.12", default-features = false }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }

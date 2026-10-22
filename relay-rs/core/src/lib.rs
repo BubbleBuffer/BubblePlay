@@ -13,6 +13,14 @@
 
 pub mod limits;
 pub mod protocol;
+pub mod relay;
+pub mod rng;
+
+pub use relay::{
+    Action, AdminError, ConnId, CoreConfig, MAX_PCS, PcListing, PcRecord, PcTable, Reject, Relay,
+    Route, Timings, TurnConfig, UpgradeRequest,
+};
+pub use rng::RelayRng;
 
 pub use limits::{
     FILE_HEADER_BYTES, FILE_LIMIT, HELLO_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT,
