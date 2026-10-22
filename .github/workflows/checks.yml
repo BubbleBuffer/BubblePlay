@@ -116,6 +116,7 @@ jobs:
         with:
           workspaces: |
             relay-rs -> target
+            relay-rs/worker -> target
             crates/bp-device-key -> target
       # The browser job is skipped on lane/rust-relay*, so check the shared fixture's JS contract test here.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -138,6 +139,33 @@ jobs:
       - name: bp-relay-core builds for wasm32
         working-directory: relay-rs
         run: cargo check --locked -p bp-relay-core --target wasm32-unknown-unknown
+      # worker-build 0.8.7 is the line that matches workers-rs (worker =0.8.7 in relay-rs/worker/Cargo.toml).
+      # Published 2026-09-25, so it is at least two weeks old on 2026-10-23. Reinstalled only when
+      # the installed version differs, so a warm runner skips the compile.
+      - name: Install worker-build (pinned)
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          WORKER_BUILD_VERSION=0.8.7
+          if [ "$(worker-build --version 2>/dev/null | awk '{print $NF}' || true)" != "$WORKER_BUILD_VERSION" ]; then
+            cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+          fi
+          worker-build --version
+      - name: bp-relay-worker clippy (wasm32) and fmt
+        working-directory: relay-rs/worker
+        run: |
+          cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+          cargo fmt --check
+      - name: bp-relay-worker builds (worker-build --release)
+        working-directory: relay-rs/worker
+        run: worker-build --release
+      # wrangler 4.148.0 was published 2026-10-06: the newest release at least two weeks old on
+      # 2026-10-23 (4.149.0 is 13.9 days old). The crate has no lockfile for wrangler, so the exact pin is the guarantee.
+      - name: Install wrangler (pinned)
+        working-directory: relay-rs/worker
+        run: npm install --no-save --no-audit --no-fund wrangler@4.148.0
+      - name: bp-relay-worker tests (wrangler dev, local workerd)
+        working-directory: relay-rs/worker
+        run: node --test 'tests/*.test.mjs'
       - name: Container build
         run: docker build -f relay-rs/Dockerfile -t bubbleplay-relay-rs:check .
 

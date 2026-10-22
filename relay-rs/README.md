@@ -117,3 +117,7 @@ These three caveats came from the workers-rs spike.
 - Use the stock release profile. A size-optimised profile (opt-level `s`, `lto`, `codegen-units = 1`, `strip`) breaks wasm-bindgen with "externref table required for catch wrappers".
 - Override `websocket_close` and `websocket_error`. The workers-rs 0.8.7 defaults are `unimplemented!()` and panic.
 - Repeat the p99 latency measurement on deployed Cloudflare. Local workerd showed a Rust p99 of about 1.2 s at 64 KiB, against 87 ms for JS.
+
+## Cloudflare build (M3)
+
+`relay-rs/worker` (`bp-relay-worker`) is the Cloudflare Workers adapter. relay-rs excludes it from its workspace, and it has its own committed `Cargo.lock`. The `relay-rs` job in `.github/workflows/checks.yml` builds it with `worker-build --release`, checks it with clippy for wasm32 and `cargo fmt --check`, and runs `node --test tests/` against a local workerd started by `wrangler dev --local`. Nothing is deployed: the crate has no account, route or secret. The Durable Object is still a stub that refuses text frames with 1008, and the relay logic is still to come.
