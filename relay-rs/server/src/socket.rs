@@ -67,6 +67,29 @@ async fn closing(stop: &mut watch::Receiver<Option<Close>>) -> Option<Close> {
     }
 }
 
+/// Sends the frames still in the queue, then the close frame. The core queues a reply (hello-ok,
+/// a forwarded frame) and then a close in the same action batch, but the close arrives on a
+/// separate watch channel and can be seen first, so a plain close would drop that reply. The
+/// drain shares CLOSE_TIMEOUT and stops at the first failed write, so a stalled peer still
+/// closes promptly. Only frames that were queued before the close are sent.
+async fn flush_then_close(
+    sink: &mut SplitSink<WebSocket, Message>,
+    queue: &mut mpsc::Receiver<Out>,
+    queued_bytes: &AtomicUsize,
+    close: Close,
+) {
+    let deadline = tokio::time::Instant::now() + CLOSE_TIMEOUT;
+    while let Ok(out) = queue.try_recv() {
+        let len = out.len();
+        let sent = tokio::time::timeout_at(deadline, sink.send(into_message(out))).await;
+        queued_bytes.fetch_sub(len, Ordering::SeqCst);
+        if !matches!(sent, Ok(Ok(()))) {
+            break;
+        }
+    }
+    send_close(sink, close).await;
+}
+
 async fn send_close(sink: &mut SplitSink<WebSocket, Message>, close: Close) {
     let frame = CloseFrame {
         code: close.code,
@@ -93,7 +116,7 @@ async fn write_loop(
             biased;
             close = closing(&mut stop) => {
                 if let Some(close) = close {
-                    send_close(&mut sink, close).await;
+                    flush_then_close(&mut sink, &mut queue, &queued_bytes, close).await;
                 }
                 return;
             }
@@ -109,7 +132,7 @@ async fn write_loop(
             close = closing(&mut stop) => {
                 queued_bytes.fetch_sub(len, Ordering::SeqCst);
                 if let Some(close) = close {
-                    send_close(&mut sink, close).await;
+                    flush_then_close(&mut sink, &mut queue, &queued_bytes, close).await;
                 }
                 return;
             }

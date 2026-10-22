@@ -214,13 +214,16 @@ impl Relay {
 
     /// Forgets a PC. Persists the table first (the first action), then closes
     /// its host sockets 1008 "peer removed" and sends peer-left to its viewer.
-    /// An id that is not a device id is `AdminError::NotFound`.
+    /// An id that is not a device id, or a valid id with no registered PC, is
+    /// `AdminError::NotFound` and nothing is persisted.
     pub fn delete_pc(&mut self, id: &str) -> Result<Vec<Action>, AdminError> {
         if !self.healthy {
             return Err(AdminError::Unavailable);
         }
         let pc = util::canonical_pc(id).ok_or(AdminError::NotFound)?;
-        self.pcs.records.remove(&pc);
+        if self.pcs.records.remove(&pc).is_none() {
+            return Err(AdminError::NotFound);
+        }
         let mut out = vec![Action::PersistPcs(self.pcs.clone())];
         let hosts: Vec<ConnId> = self
             .conns

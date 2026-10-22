@@ -108,9 +108,12 @@ async fn e2e_approval_grants_cookie_and_asset_access() {
     assert_eq!(with_cookie.status(), 200);
     assert_eq!(with_cookie.text().await.unwrap(), "home");
 
-    // A non-navigation request without the cookie gets the plain 403, not the wait page.
+    // A non-navigation request without the cookie gets the plain 403, not the wait page. The
+    // gate treats a request with no Sec-Fetch-Dest as a navigation, so this one states that it is
+    // a subresource fetch.
     let bare = client
         .get(format!("{}/", base(server.addr)))
+        .header("Sec-Fetch-Dest", "empty")
         .send()
         .await
         .unwrap();
