@@ -111,7 +111,10 @@ async fn dispatch(
                     return StatusCode::NOT_FOUND.into_response();
                 };
                 let (pc, epoch) = query_values(parts.uri.query());
-                let viewer_authorized = cfg!(feature = "lab")
+                // A viewer socket with no Origin (a native client) is authorized by the
+                // signed hello and the admitted list. A browser socket must also carry a
+                // valid gate cookie (M2 section 1).
+                let viewer_authorized = header_str(&parts.headers, "origin").is_none()
                     || state.cookie_valid(header_str(&parts.headers, "cookie"), now_ms());
                 let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
                     Ok(upgrade) => upgrade,
@@ -123,7 +126,7 @@ async fn dispatch(
                     epoch,
                     viewer_authorized,
                 };
-                return accept(state, upgrade, req);
+                return accept(state, upgrade, req, client);
             }
             serve_asset(&state.assets_dir, &parts.method, path, parts.uri.query()).await
         }
@@ -245,6 +248,7 @@ async fn admin(state: &Shared, method: &Method, path: &str, headers: &HeaderMap)
                             "first_seen": row.first_seen,
                             "last_seen": row.last_seen,
                             "online": row.online,
+                            "admitted": row.admitted,
                         })
                     })
                     .collect();

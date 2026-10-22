@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bp_device_key::DeviceId;
+use bp_relay_core::limits::ADMIT_VIEWERS_MAX;
 use serde::{Deserialize, Serialize};
 
 pub const PCS_FILE: &str = "pcs.json";
@@ -28,6 +29,13 @@ pub struct PcRecord {
     pub id: String,
     pub public: String,
     pub registered_ms: u64,
+    /// The viewer IDs the host admits: canonical, unique, at most ADMIT_VIEWERS_MAX. Absent in
+    /// files written before M2, which load as an empty list.
+    #[serde(default)]
+    pub admitted: Vec<String>,
+    /// The host's remote-pairing flag, from its last `admit`.
+    #[serde(default, rename = "remotePairing")]
+    pub remote_pairing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +107,22 @@ pub fn validate_pcs(file: &PcsFile) -> Result<(), String> {
         }
         if !seen.insert(record.id.clone()) {
             return Err(format!("pc {}: listed twice", record.id));
+        }
+        if record.admitted.len() > ADMIT_VIEWERS_MAX {
+            return Err(format!(
+                "pc {}: more than {ADMIT_VIEWERS_MAX} admitted viewers",
+                record.id
+            ));
+        }
+        let mut admitted = HashSet::new();
+        for viewer in &record.admitted {
+            let canonical = DeviceId::parse(viewer).is_ok_and(|v| v.to_string() == *viewer);
+            if !canonical || !admitted.insert(viewer) {
+                return Err(format!(
+                    "pc {}: admitted viewer {viewer} is not a unique canonical ID",
+                    record.id
+                ));
+            }
         }
     }
     Ok(())
@@ -229,6 +253,8 @@ mod tests {
             id: DeviceId::from_public_key(&public).to_string(),
             public: URL_SAFE_NO_PAD.encode(public),
             registered_ms: 1_700_000_000_000 + u64::from(seed),
+            admitted: vec![DeviceId::from_public_key(&[seed.wrapping_add(1); 32]).to_string()],
+            remote_pairing: seed.is_multiple_of(2),
         }
     }
 

@@ -10,16 +10,20 @@
 
 mod forward;
 mod hello;
+mod pairing;
 mod pcs;
 mod state;
 mod types;
 mod util;
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 use crate::RelayRng;
+use crate::gate::Prefix;
 use crate::limits::HELLO_LIMIT;
 use crate::protocol::validate_epoch;
+use pairing::{PairFailures, PairWindow};
 use state::{Conn, Kind, Phase, Role, Room, key_for, read_limit};
 
 pub use pcs::{MAX_PCS, PcRecord, PcTable};
@@ -38,6 +42,10 @@ pub struct Relay {
     peers: BTreeMap<state::PeerKey, ConnId>,
     /// Per-PC state while a socket for the PC is open (Go's rooms).
     rooms: BTreeMap<String, Room>,
+    /// The open pairing window for each PC, in memory only (M2 section 3).
+    pair_windows: BTreeMap<String, PairWindow>,
+    /// Failed pairing attempts per client prefix (M2 section 3).
+    pair_failures: BTreeMap<Prefix, PairFailures>,
     next_id: u64,
 }
 
@@ -51,6 +59,8 @@ impl Relay {
             conns: BTreeMap::new(),
             peers: BTreeMap::new(),
             rooms: BTreeMap::new(),
+            pair_windows: BTreeMap::new(),
+            pair_failures: BTreeMap::new(),
             next_id: 1,
         }
     }
@@ -73,8 +83,14 @@ impl Relay {
     }
 
     /// Accepts an upgrade. Origin and the gate cookie were checked by the
-    /// adapter. Refusals are `Reject` (HTTP 404), including the connection cap.
-    pub fn upgrade(&mut self, req: UpgradeRequest, now_ms: u64) -> Result<ConnId, Reject> {
+    /// adapter. `client` is the peer address; its prefix keys the pairing rate
+    /// limits. Refusals are `Reject` (HTTP 404), including the connection cap.
+    pub fn upgrade(
+        &mut self,
+        req: UpgradeRequest,
+        client: IpAddr,
+        now_ms: u64,
+    ) -> Result<ConnId, Reject> {
         let role = req.route.role();
         let kind = role.kind();
         if req.route.needs_viewer() && !req.viewer_authorized {
@@ -110,6 +126,9 @@ impl Relay {
                 deadline_ms: now_ms + self.config.timings.hello_ms,
                 closing: false,
                 ticket: None,
+                prefix: Prefix::of(client),
+                device: String::new(),
+                pairing: false,
             },
         );
         Ok(id)
@@ -140,6 +159,7 @@ impl Relay {
         match conn.phase {
             Phase::Hello => self.on_hello(id, text, now_ms, rng, &mut out),
             Phase::Proof { .. } => self.on_proof(id, text, now_ms, rng, &mut out),
+            Phase::ViewerProof { .. } => self.on_viewer_proof(id, text, now_ms, rng, &mut out),
             Phase::Live => self.on_live_text(id, text, now_ms, &mut out),
         }
         out
@@ -174,20 +194,29 @@ impl Relay {
 
     /// Fires the timeouts due at `now_ms`. A hello not received in time, or a
     /// socket idle past the idle timeout, closes 1001 "peer disconnected". A
-    /// register-proof not received in time closes 1008 "invalid hello".
+    /// host's register-proof not received in time closes 1008 "invalid hello";
+    /// a viewer's register-proof closes 1008 with an empty reason. Expired
+    /// pairing windows and failure counts are dropped.
     pub fn tick(&mut self, now_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
-        let due: Vec<(ConnId, bool)> = self
+        self.expire_pairing(now_ms);
+        let due: Vec<(ConnId, Option<&'static str>)> = self
             .conns
             .iter()
             .filter(|(_, c)| !c.closing && now_ms >= c.deadline_ms)
-            .map(|(id, c)| (*id, matches!(c.phase, Phase::Proof { .. })))
+            .map(|(id, c)| {
+                let challenge = match c.phase {
+                    Phase::Proof { .. } => Some("invalid hello"),
+                    Phase::ViewerProof { .. } => Some(""),
+                    _ => None,
+                };
+                (*id, challenge)
+            })
             .collect();
         for (id, challenge) in due {
-            if challenge {
-                self.close(id, 1008, "invalid hello", &mut out);
-            } else {
-                self.close(id, 1001, "peer disconnected", &mut out);
+            match challenge {
+                Some(reason) => self.close(id, 1008, reason, &mut out),
+                None => self.close(id, 1001, "peer disconnected", &mut out),
             }
         }
         out
@@ -208,6 +237,7 @@ impl Relay {
                 first_seen: record.first_seen,
                 last_seen: record.last_seen,
                 online: self.host_online(id),
+                admitted: record.admitted.len(),
             })
             .collect())
     }
@@ -328,6 +358,10 @@ impl Relay {
             }
             if let (Role::Host, Some(room)) = (conn.role, self.rooms.get_mut(&conn.pc)) {
                 room.cached.clear();
+            }
+            if conn.role == Role::Host {
+                // The host's signalling socket closing removes its pairing window.
+                self.pair_windows.remove(&conn.pc);
             }
             self.notify_peer_left(&conn, kind, out);
         }

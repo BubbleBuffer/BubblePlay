@@ -16,8 +16,6 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Lab routes for local testing only. Off by default. When on, serve refuses any non-loopback listen address.
-lab = []
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }

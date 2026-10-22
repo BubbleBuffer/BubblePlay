@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use bp_device_key::DeviceId;
 
 use super::types::Route;
+use crate::gate::Prefix;
 use crate::protocol::Side;
 
 /// The three socket families.
@@ -159,6 +160,15 @@ pub(crate) enum Phase {
         public: [u8; 32],
         token_valid: bool,
     },
+    /// Viewer signalling: the challenge is out and the signed register-proof is
+    /// awaited. `turn` and `pair` are the hello's fields, kept for admission.
+    ViewerProof {
+        nonce: [u8; 32],
+        id: DeviceId,
+        public: [u8; 32],
+        turn: bool,
+        pair: Option<[u8; 32]>,
+    },
     /// Hello done: the socket forwards messages.
     Live,
 }
@@ -178,6 +188,12 @@ pub(crate) struct Conn {
     /// Set once a Close action was issued. A closing socket is no longer open.
     pub closing: bool,
     pub ticket: Option<Ticket>,
+    /// The client's address prefix, the key for pairing rate limits.
+    pub prefix: Prefix,
+    /// The admitted viewer's canonical ID. Empty until a viewer proof passes.
+    pub device: String,
+    /// True while the viewer is in pairing mode (admitted by a pairing window).
+    pub pairing: bool,
 }
 
 /// A buffered viewer message, kept for the next host.

@@ -125,6 +125,7 @@ async fn e2e_ws_with_cookie_gets_hello_ok_with_epoch() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let cookie = browser_cookie(&server, &env).await;
+    let (_host, _) = register_host(&server, &identity(10), Some(TOKEN)).await;
     let pc = pc_id(&identity(10));
     let (_ws, ok) = viewer_hello(&server, &pc, Some(cookie.as_str()), false).await;
     let epoch = ok["mediaEpoch"].as_str().unwrap();
@@ -160,6 +161,7 @@ async fn e2e_ws_origin_without_valid_cookie_is_accepted_then_closed_1008_empty()
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let cookie = browser_cookie(&server, &env).await;
+    let (_host, _) = register_host(&server, &identity(11), Some(TOKEN)).await;
     let path = format!("/ws?pc={}", pc_id(&identity(11)));
     // No cookie at all, then a cookie the gate does not hold (an expired one is refused the same
     // way). The upgrade succeeds so the browser sees a 1008, not a 1006 it would retry.
@@ -185,6 +187,7 @@ async fn e2e_ws_with_turn_adds_credentialed_ice_server() {
     };
     let server = Server::start(&env, Some(turn)).await;
     let cookie = browser_cookie(&server, &env).await;
+    let (_host, _) = register_host(&server, &identity(12), Some(TOKEN)).await;
     let pc = pc_id(&identity(12));
     let (_on, on) = viewer_hello(&server, &pc, Some(cookie.as_str()), true).await;
     let servers = on["iceServers"].as_array().unwrap();
@@ -423,28 +426,17 @@ async fn e2e_healthz_loopback_200_bad_host_404_head_empty() {
     assert_eq!(bad_host.status(), 404);
 }
 
-#[cfg(feature = "lab")]
+// M2 section 1: a socket with no Origin needs no gate cookie. The upgrade is accepted, and the
+// signed hello decides admission. A bare hello (no ID, no key) is refused 1008 with an empty
+// reason. The admitted and unlisted cases are in e2e_m2.rs.
 #[tokio::test]
-async fn e2e_lab_native_viewer_without_origin_is_accepted() {
+async fn e2e_native_viewer_without_origin_upgrades_and_bare_hello_is_1008() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let pc = pc_id(&identity(40));
     let mut ws = connect(server.addr, &format!("/ws?pc={pc}"), None, None)
         .await
-        .unwrap();
+        .expect("the upgrade is accepted without a cookie");
     send_json(&mut ws, json!({ "type": "hello", "role": "viewer" })).await;
-    let ok = next_json_of(&mut ws, "hello-ok").await;
-    assert!(ok["mediaEpoch"].is_string());
-}
-
-#[cfg(not(feature = "lab"))]
-#[tokio::test]
-async fn e2e_native_viewer_without_cookie_is_404() {
-    let env = Env::new().await;
-    let server = Server::start(&env, None).await;
-    let pc = pc_id(&identity(40));
-    assert_eq!(
-        refused(server.addr, &format!("/ws?pc={pc}"), None, None).await,
-        404
-    );
+    assert_eq!(expect_close(&mut ws).await, (1008, String::new()));
 }

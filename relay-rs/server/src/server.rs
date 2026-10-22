@@ -12,17 +12,8 @@ use crate::runtime::{Shared, spawn_ticker};
 
 pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Runs the relay with `cfg` until a shutdown signal arrives. With the `lab` feature, refuses to
-/// start unless every listen address is loopback.
+/// Runs the relay with `cfg` until a shutdown signal arrives.
 pub async fn serve(cfg: &Config) -> Result<(), ServeError> {
-    #[cfg(feature = "lab")]
-    {
-        crate::lab::require_loopback(&[cfg.listen]).map_err(ServeError::from)?;
-        tracing::warn!(
-            listen = %cfg.listen,
-            "LAB BUILD: the listener is loopback-only. Local testing only."
-        );
-    }
     let listener = TcpListener::bind(cfg.listen).await?;
     run(cfg, listener).await
 }

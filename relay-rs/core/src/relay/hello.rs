@@ -1,6 +1,8 @@
 //! The first message on every socket: hello, host registration, tickets and
 //! data-socket attachment (Go's Relay.hello, routing.go, server.go:473-612).
 
+use std::collections::BTreeSet;
+
 use bp_device_key::{DeviceId, Role as KeyRole, verify_relay_proof};
 use hmac::{Hmac, Mac};
 use serde_json::{Map, Value, json};
@@ -100,9 +102,81 @@ impl Relay {
         self.register_host(id, &conn.pc, public, now_ms, rng, out);
     }
 
-    /// Refuses a hello for a signalling socket, or any structural failure.
+    /// The viewer's register-proof (M2 section 1). A valid proof admits the
+    /// viewer through the PC's admission list, or through a pairing window when
+    /// the hello carried `pair`. Any other answer closes 1008 with an empty reason.
+    pub(super) fn on_viewer_proof(
+        &mut self,
+        id: ConnId,
+        text: &str,
+        now_ms: u64,
+        rng: &mut dyn RelayRng,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(conn) = self.open_conn(id) else {
+            return;
+        };
+        let Phase::ViewerProof {
+            nonce,
+            id: claimed,
+            public,
+            turn,
+            pair,
+        } = conn.phase.clone()
+        else {
+            return;
+        };
+        let Some(m) = util::parse_object(text) else {
+            self.hello_refused(id, out);
+            return;
+        };
+        if m.keys().any(|key| key != "type" && key != "signature")
+            || util::text_of(&m, "type") != "register-proof"
+        {
+            self.hello_refused(id, out);
+            return;
+        }
+        let Some(signature) = util::decode_b64url(util::text_of(&m, "signature"), 64) else {
+            self.hello_refused(id, out);
+            return;
+        };
+        let origin = self.config.public_origin.clone();
+        let device = claimed.to_string();
+        let proof_ok = verify_relay_proof(
+            KeyRole::Viewer,
+            &origin,
+            &nonce,
+            &device,
+            &public,
+            &signature,
+        )
+        .is_ok();
+        if !proof_ok {
+            self.hello_refused(id, out);
+            return;
+        }
+        let admitted = self
+            .pcs
+            .records
+            .get(&conn.pc)
+            .is_some_and(|record| record.admitted.contains(&device));
+        if admitted {
+            self.viewer_admit(id, device, turn, false, now_ms, rng, out);
+        } else if let Some(pair) = pair {
+            self.pair_attempt(id, device, pair, turn, now_ms, rng, out);
+        } else {
+            self.hello_refused(id, out);
+        }
+    }
+
+    /// Refuses a hello, a proof or any pre-auth failure. A viewer's refusal has
+    /// an empty reason (M2 section 1); a host keeps Go's "invalid hello".
     pub(super) fn hello_refused(&mut self, id: ConnId, out: &mut Vec<Action>) {
-        self.close(id, 1008, "invalid hello", out);
+        let reason = match self.conns.get(&id).map(|c| c.role) {
+            Some(Role::Viewer) => "",
+            _ => "invalid hello",
+        };
+        self.close(id, 1008, reason, out);
     }
 
     /// Refuses a data-socket hello whose ticket or epoch does not check out.
@@ -214,15 +288,27 @@ impl Relay {
         rng: &mut dyn RelayRng,
         out: &mut Vec<Action>,
     ) {
-        let first_seen = self.pcs.records.get(pc).map_or(now_ms, |r| r.first_seen);
+        // Re-registration keeps the admission list and the remote-pairing flag.
+        let (first_seen, admitted, remote_pairing) = match self.pcs.records.get(pc) {
+            Some(record) => (
+                record.first_seen,
+                record.admitted.clone(),
+                record.remote_pairing,
+            ),
+            None => (now_ms, BTreeSet::new(), false),
+        };
         self.pcs.records.insert(
             pc.to_owned(),
             PcRecord {
                 public,
                 first_seen,
                 last_seen: now_ms,
+                admitted,
+                remote_pairing,
             },
         );
+        // A pairing window belongs to the host session that opened it.
+        self.pair_windows.remove(pc);
         // The adapter must make this durable before it sends the hello-ok below.
         // If the write fails it calls set_store_healthy(false) and closes.
         out.push(Action::PersistPcs(self.pcs.clone()));
@@ -250,9 +336,9 @@ impl Relay {
         }
     }
 
-    /// The viewer's signalling hello: rotates the epoch, drops the old viewer's
-    /// stale data sockets, replays the cached host capabilities (Go
-    /// server.go:553-600).
+    /// The viewer's signalling hello (M2 section 1). It checks the signed
+    /// identity and sends the register-challenge. Nothing else is sent, and the
+    /// viewer is not admitted, until the register-proof passes.
     fn viewer_hello(
         &mut self,
         id: ConnId,
@@ -261,10 +347,48 @@ impl Relay {
         rng: &mut dyn RelayRng,
         out: &mut Vec<Action>,
     ) {
+        let Some(hello) = parse_viewer_hello(m) else {
+            self.hello_refused(id, out);
+            return;
+        };
+        let nonce: [u8; 32] = util::random(rng);
+        let deadline = now_ms + self.config.timings.challenge_ms;
+        if let Some(conn) = self.conns.get_mut(&id) {
+            conn.phase = Phase::ViewerProof {
+                nonce,
+                id: hello.id,
+                public: hello.public,
+                turn: hello.turn,
+                pair: hello.pair,
+            };
+            conn.deadline_ms = deadline;
+        }
+        self.send_text(
+            id,
+            json!({"type": "register-challenge", "nonce": util::b64url(&nonce)}).to_string(),
+            out,
+        );
+    }
+
+    /// Admits a viewer that has passed its proof and its admission check. It
+    /// rotates the epoch, drops the old viewer's stale data sockets and sends
+    /// hello-ok, then replays the cached host capabilities (Go
+    /// server.go:553-600). A pairing-mode viewer gets `pairing: true` and no
+    /// ticket, and no replay.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn viewer_admit(
+        &mut self,
+        id: ConnId,
+        device: String,
+        turn: bool,
+        pairing: bool,
+        now_ms: u64,
+        rng: &mut dyn RelayRng,
+        out: &mut Vec<Action>,
+    ) {
         let Some(pc) = self.conns.get(&id).map(|c| c.pc.clone()) else {
             return;
         };
-        let turn = util::bool_of(m, "turn");
         let key = key_for(Role::Viewer, "", &pc);
         if let Some(old) = self.peers.get(&key).copied().filter(|old| *old != id) {
             self.evict(old, 1008, "peer replaced", out);
@@ -287,23 +411,33 @@ impl Relay {
 
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.epoch = epoch.clone();
+            conn.device = device;
+            conn.pairing = pairing;
         }
         self.peers.insert(key, id);
         self.make_live(id, now_ms);
-        let ticket = self.issue_ticket(id, now_ms, rng);
+        let ticket = if pairing {
+            None
+        } else {
+            Some(self.issue_ticket(id, now_ms, rng))
+        };
         let ice = self.ice_servers(turn, now_ms, rng);
-        self.send_text(
-            id,
-            json!({
-                "type": "hello-ok",
-                "ticket": ticket,
-                "pc": pc,
-                "mediaEpoch": epoch,
-                "iceServers": ice,
-            })
-            .to_string(),
-            out,
-        );
+        let mut hello = json!({
+            "type": "hello-ok",
+            "pc": pc,
+            "mediaEpoch": epoch,
+            "iceServers": ice,
+        });
+        if let Some(ticket) = ticket {
+            hello["ticket"] = json!(ticket);
+        }
+        if pairing {
+            hello["pairing"] = json!(true);
+        }
+        self.send_text(id, hello.to_string(), out);
+        if pairing {
+            return;
+        }
         let cached: Vec<String> = self
             .rooms
             .get(&pc)
@@ -443,6 +577,53 @@ impl Relay {
         }));
         Value::Array(servers)
     }
+}
+
+/// The fields of a viewer hello that are checked before the proof.
+struct ViewerHello {
+    id: DeviceId,
+    public: [u8; 32],
+    turn: bool,
+    pair: Option<[u8; 32]>,
+}
+
+/// Parses a viewer hello (M2 section 1). Unknown keys are refused. The `id`
+/// must be canonical and must match `public`, which is 32 base64url bytes.
+/// `turn` is a boolean when present. `pair` is 32 base64url bytes when present.
+fn parse_viewer_hello(m: &Map<String, Value>) -> Option<ViewerHello> {
+    const KEYS: [&str; 6] = ["type", "role", "id", "public", "turn", "pair"];
+    if m.keys().any(|key| !KEYS.contains(&key.as_str())) {
+        return None;
+    }
+    let text = util::text_of(m, "id");
+    let id = DeviceId::parse(text).ok()?;
+    if id.to_string() != text {
+        return None;
+    }
+    let public = key32(util::decode_b64url(util::text_of(m, "public"), 32)?)?;
+    if DeviceId::from_public_key(&public) != id {
+        return None;
+    }
+    let turn = match m.get("turn") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return None,
+    };
+    let pair = match m.get("pair") {
+        None => None,
+        Some(Value::String(text)) => Some(key32(util::decode_b64url(text, 32)?)?),
+        Some(_) => return None,
+    };
+    Some(ViewerHello {
+        id,
+        public,
+        turn,
+        pair,
+    })
+}
+
+fn key32(bytes: Vec<u8>) -> Option<[u8; 32]> {
+    bytes.try_into().ok()
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {

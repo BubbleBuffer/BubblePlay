@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bp_device_key::{DeviceIdentity, Role as KeyRole};
@@ -15,6 +17,12 @@ use serde_json::{Value, json};
 pub const ORIGIN: &str = "https://relay.example.test";
 pub const TOKEN: &str = "relay-token-for-tests-0001";
 pub const START_MS: u64 = 1_000_000;
+
+/// The seed of the viewer identity every test host admits by default.
+pub const VIEWER_SEED: u8 = 200;
+
+/// The client address a harness upgrade comes from unless a test changes it.
+pub const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
 
 /// Deterministic RNG (splitmix64). Every run with the same seed yields the same bytes.
 pub struct TestRng(u64);
@@ -47,6 +55,8 @@ pub struct Harness {
     pub relay: Relay,
     pub rng: TestRng,
     pub now: u64,
+    /// The peer address for every upgrade. Its prefix keys the pairing limits.
+    pub client: IpAddr,
 }
 
 /// A registered host: its signalling socket, PC id and ticket.
@@ -78,11 +88,12 @@ impl Harness {
             relay: Relay::new(config, PcTable::new()),
             rng: TestRng::new(7),
             now: START_MS,
+            client: CLIENT,
         }
     }
 
     pub fn try_upgrade(&mut self, req: UpgradeRequest) -> Result<ConnId, Reject> {
-        self.relay.upgrade(req, self.now)
+        self.relay.upgrade(req, self.client, self.now)
     }
 
     pub fn upgrade(&mut self, req: UpgradeRequest) -> ConnId {
@@ -151,6 +162,14 @@ impl Harness {
         let nonce = challenge_nonce(&actions, id).expect("register-challenge sent");
         let actions = self.text(id, &proof_msg(identity, ORIGIN, &nonce));
         let ok = hello_ok(&actions, id);
+        // Every test host admits the default viewer identity, as a real host
+        // publishes its list. The admit's own actions are not part of the result.
+        let admit = json!({
+            "type": "admit",
+            "viewers": [viewer_identity().id().to_string()],
+            "remotePairing": false,
+        });
+        self.text(id, &admit);
         let host = Host {
             id,
             pc: identity.id().to_string(),
@@ -159,18 +178,37 @@ impl Harness {
         (host, actions)
     }
 
-    /// Opens a viewer signalling socket on `pc` and sends its hello.
-    pub fn viewer_hello(&mut self, pc: &str, turn: bool) -> (Viewer, Vec<Action>) {
+    /// Runs the signed viewer hello for `identity` on `pc`: the hello, the
+    /// register-challenge, then the register-proof. Returns the socket and the
+    /// actions from the proof (hello-ok, or a refusal). `pair` is the pairing
+    /// value sent in the hello, if any.
+    pub fn viewer_join(
+        &mut self,
+        identity: &DeviceIdentity,
+        pc: &str,
+        turn: bool,
+        pair: Option<&[u8; 32]>,
+    ) -> (ConnId, Vec<Action>) {
         let id = self.upgrade(UpgradeRequest {
             route: Route::Ws,
             pc: Some(pc.to_owned()),
             epoch: None,
             viewer_authorized: true,
         });
-        let actions = self.text(
-            id,
-            &json!({"type": "hello", "role": "viewer", "turn": turn}),
-        );
+        let mut hello = viewer_hello_msg(identity, turn);
+        if let Some(pair) = pair {
+            hello["pair"] = json!(b64(pair));
+        }
+        let actions = self.text(id, &hello);
+        let nonce = challenge_nonce(&actions, id).expect("register-challenge sent");
+        let actions = self.text(id, &viewer_proof_msg(identity, ORIGIN, &nonce));
+        (id, actions)
+    }
+
+    /// Opens a viewer signalling socket on `pc` with the default viewer identity,
+    /// which the test host admits. Returns the viewer and the proof's actions.
+    pub fn viewer_hello(&mut self, pc: &str, turn: bool) -> (Viewer, Vec<Action>) {
+        let (id, actions) = self.viewer_join(&viewer_identity(), pc, turn, None);
         let ok = hello_ok(&actions, id);
         let viewer = Viewer {
             id,
@@ -237,6 +275,28 @@ pub fn b64(bytes: &[u8]) -> String {
 pub fn proof_msg(identity: &DeviceIdentity, origin: &str, nonce: &[u8; 32]) -> Value {
     let signature = identity.sign_relay_proof(KeyRole::Host, origin, nonce);
     json!({"type": "register-proof", "signature": b64(&signature)})
+}
+
+/// The register-proof a viewer sends for `nonce`, signed for `origin`.
+pub fn viewer_proof_msg(identity: &DeviceIdentity, origin: &str, nonce: &[u8; 32]) -> Value {
+    let signature = identity.sign_relay_proof(KeyRole::Viewer, origin, nonce);
+    json!({"type": "register-proof", "signature": b64(&signature)})
+}
+
+/// The signed viewer hello for `identity`, without the optional `pair`.
+pub fn viewer_hello_msg(identity: &DeviceIdentity, turn: bool) -> Value {
+    json!({
+        "type": "hello",
+        "role": "viewer",
+        "id": identity.id().to_string(),
+        "public": b64(&identity.public_key()),
+        "turn": turn,
+    })
+}
+
+/// The viewer identity every test host admits.
+pub fn viewer_identity() -> DeviceIdentity {
+    identity(VIEWER_SEED)
 }
 
 /// Every text frame sent to `id`, as exact strings.

@@ -318,10 +318,66 @@ pub async fn register_host(
     )
     .await;
     let ok = next_json_of(&mut ws, "hello-ok").await;
+    // Every test host admits the fixed viewer identity, as a real host publishes its list.
+    send_json(
+        &mut ws,
+        json!({
+            "type": "admit",
+            "viewers": [viewer_identity().id().to_string()],
+            "remotePairing": false,
+        }),
+    )
+    .await;
+    // The relay handles this socket's frames in order. The pong means the admit has been applied,
+    // so a viewer that connects next is not refused by a race.
+    send_json(&mut ws, json!({ "type": "ping" })).await;
+    next_json_of(&mut ws, "pong").await;
     (ws, ok)
 }
 
-/// A viewer's signalling socket on /ws, with the Origin and gate cookie a browser sends.
+/// The viewer identity the e2e helpers sign with. Test hosts admit it.
+pub const VIEWER_SEED: u8 = 200;
+
+pub fn viewer_identity() -> DeviceIdentity {
+    identity(VIEWER_SEED)
+}
+
+/// Sends the signed viewer hello for `who` (with an optional pairing value), answers the
+/// register-challenge, and returns the hello-ok or refusal the relay sends next.
+pub async fn viewer_join_signed(
+    ws: &mut Ws,
+    who: &DeviceIdentity,
+    turn: bool,
+    pair: Option<&[u8; 32]>,
+) -> Value {
+    let mut hello = json!({
+        "type": "hello",
+        "role": "viewer",
+        "id": who.id().to_string(),
+        "public": b64(&who.public_key()),
+        "turn": turn,
+    });
+    if let Some(pair) = pair {
+        hello["pair"] = json!(b64(pair));
+    }
+    send_json(ws, hello).await;
+    let challenge = next_json_of(ws, "register-challenge").await;
+    let nonce: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(challenge["nonce"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signature = who.sign_relay_proof(Role::Viewer, ORIGIN, &nonce);
+    send_json(
+        ws,
+        json!({ "type": "register-proof", "signature": b64(&signature) }),
+    )
+    .await;
+    next_json_of(ws, "hello-ok").await
+}
+
+/// A viewer's signalling socket on /ws, with the Origin and gate cookie a browser sends. It
+/// signs the hello with the fixed viewer identity, which the host admits.
 pub async fn viewer_hello(
     server: &Server,
     pc: &str,
@@ -331,12 +387,7 @@ pub async fn viewer_hello(
     let mut ws = connect(server.addr, &format!("/ws?pc={pc}"), Some(ORIGIN), cookie)
         .await
         .unwrap();
-    send_json(
-        &mut ws,
-        json!({ "type": "hello", "role": "viewer", "turn": turn }),
-    )
-    .await;
-    let ok = next_json_of(&mut ws, "hello-ok").await;
+    let ok = viewer_join_signed(&mut ws, &viewer_identity(), turn, None).await;
     (ws, ok)
 }
 
