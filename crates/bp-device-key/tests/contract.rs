@@ -289,6 +289,24 @@ mod key_files {
     }
 
     #[test]
+    fn contract_keyfile_aad_matches_fixture_bytes() {
+        let fixture = fixture();
+        let vector = &fixture["keyFiles"]["passphrase"];
+        let key_file = KeyFile::parse(&vector["file"].to_string()).expect("protected file parses");
+        let aad = key_file
+            .aad_for_contract()
+            .expect("protected file has an AAD");
+        assert_eq!(
+            String::from_utf8(aad.clone()).expect("utf8"),
+            field(vector, "aadUtf8")
+        );
+        assert_eq!(hex(&aad), field(vector, "aadHex"));
+        let plain = KeyFile::parse(&fixture["keyFiles"]["plain"]["file"].to_string())
+            .expect("plain file parses");
+        assert!(plain.aad_for_contract().is_none());
+    }
+
+    #[test]
     fn contract_keyfile_failures_are_authentication_failures() {
         let fixture = fixture();
         let failures = fixture["keyFiles"]["failures"]
