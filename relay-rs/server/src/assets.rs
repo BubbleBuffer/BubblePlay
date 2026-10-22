@@ -13,16 +13,8 @@
 use std::path::Path;
 
 use axum::body::Body;
-use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-
-use crate::app::AppState;
-
-/// Gate hook for the site gate. Returns `true` (allow) until the gate is wired in.
-pub fn asset_gate(_headers: &HeaderMap) -> bool {
-    true
-}
 
 /// `path.Clean("/" + input)` for a rooted path: drops empty and `.` segments, applies `..`
 /// lexically, and never climbs above the root.
@@ -74,16 +66,17 @@ fn content_type(path: &Path) -> String {
     }
 }
 
-/// Fallback handler for every path that is not `/healthz`.
-pub async fn serve_asset(State(state): State<AppState>, request: Request) -> Response {
-    let method = request.method().clone();
-    if method != Method::GET && method != Method::HEAD {
+/// Serves `raw_path` (undecoded) from `root`. Called after the gate has allowed the request.
+pub async fn serve_asset(
+    root: &Path,
+    method: &Method,
+    raw_path: &str,
+    query: Option<&str>,
+) -> Response {
+    if *method != Method::GET && *method != Method::HEAD {
         return not_found();
     }
-    if !asset_gate(request.headers()) {
-        return not_found();
-    }
-    let Some(decoded) = decode_path(request.uri().path()) else {
+    let Some(decoded) = decode_path(raw_path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let cleaned = clean_path(&decoded);
@@ -96,11 +89,10 @@ pub async fn serve_asset(State(state): State<AppState>, request: Request) -> Res
         return not_found();
     }
 
-    let assets_root: &Path = &state.assets_dir;
-    let Ok(root) = tokio::fs::canonicalize(assets_root).await else {
+    let Ok(root) = tokio::fs::canonicalize(root).await else {
         return not_found();
     };
-    let Ok(resolved) = tokio::fs::canonicalize(assets_root.join(&cleaned[1..])).await else {
+    let Ok(resolved) = tokio::fs::canonicalize(root.join(&cleaned[1..])).await else {
         return not_found();
     };
     if !resolved.starts_with(&root) {
@@ -114,10 +106,10 @@ pub async fn serve_asset(State(state): State<AppState>, request: Request) -> Res
     }
 
     if decoded.ends_with("/index.html") {
-        return redirect_to_dot_slash(request.uri().query());
+        return redirect_to_dot_slash(query);
     }
 
-    let body = if method == Method::HEAD {
+    let body = if *method == Method::HEAD {
         Vec::new()
     } else {
         match tokio::fs::read(&resolved).await {

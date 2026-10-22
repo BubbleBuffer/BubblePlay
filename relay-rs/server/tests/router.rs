@@ -6,13 +6,20 @@ use std::path::{Path, PathBuf};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
+use std::sync::Arc;
+
 use axum::extract::ConnectInfo;
 use axum::http::{Request, Response, StatusCode};
-use bp_relay_server::app::{AppState, router};
-use bp_relay_server::assets::asset_gate;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bp_relay_server::app::router;
+use bp_relay_server::config::{Config, Secret};
+use bp_relay_server::runtime::{Shared, cookie_hash};
 use tower::ServiceExt;
 
 const ADMIN: &str = "adm-test-token";
+/// The gate cookie every test request carries. Its hash is pre-seeded in gate.json.
+const COOKIE: &str = "__Host-gate=testcookie";
 
 struct Site {
     _root: tempfile::TempDir,
@@ -40,14 +47,38 @@ fn site() -> Site {
     }
 }
 
+/// The router over `assets`, with state files in a sibling `state/` directory and a gate cookie
+/// that every request carries.
 fn app(assets: &Path) -> Router {
-    router(AppState::new(ADMIN, assets))
+    let state_dir = assets.parent().unwrap().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let cookie = URL_SAFE_NO_PAD.encode(cookie_hash("testcookie"));
+    fs::write(
+        state_dir.join("gate.json"),
+        format!(r#"{{"version":1,"cookies":[{{"hash":"{cookie}","expires_ms":4102444800000}}]}}"#),
+    )
+    .unwrap();
+    let cfg = Config {
+        public_origin: "https://relay.test".to_string(),
+        listen: "127.0.0.1:8080".parse().unwrap(),
+        assets_dir: assets.to_path_buf(),
+        state_dir,
+        token: Secret::new("tok-test"),
+        admin_token: Secret::new(ADMIN),
+        max_connections: 32,
+        turn: None,
+        ntfy: None,
+        approval_ttl_s: 90,
+        trusted_proxy_cidrs: Vec::new(),
+    };
+    router(Arc::new(Shared::new(&cfg).unwrap()))
 }
 
 fn request(method: &str, uri: &str, peer: &str) -> Request<Body> {
     let mut request = Request::builder()
         .method(method)
         .uri(uri)
+        .header("cookie", COOKIE)
         .body(Body::empty())
         .unwrap();
     let peer: SocketAddr = peer.parse().unwrap();
@@ -327,9 +358,4 @@ async fn assets_symlink_escaping_the_root_is_404() {
         get(&site, "/escape.txt").await.status(),
         StatusCode::NOT_FOUND
     );
-}
-
-#[test]
-fn asset_gate_allows_everything_for_now() {
-    assert!(asset_gate(&axum::http::HeaderMap::new()));
 }

@@ -4,8 +4,11 @@ The Rust relay is the native server for BubblePlay's host and client connections
 `relay-rs/server` (package `bp-relay-server`, binary `bp-relay`), is its shell: config loading,
 the state files, the subcommands, the static asset handler and `/healthz`.
 
-The relay and gate state machines are not wired in yet. Until they are, `serve` answers
-`/healthz` and serves static assets, and every other path gets a 404.
+`serve` runs the relay state machine (`bp-relay-core`) and the site gate behind one axum router.
+Every HTTP path and every WebSocket upgrade passes the gate first. The signalling, media and file
+WebSocket routes (`/host-ws`, `/ws`, `/host-version-ws`, `/host-media-ws`, `/media-ws`,
+`/host-file-ws`, `/file-ws`) go to the relay. `/healthz` and the `/__gate/manage/` admin API are
+handled by the server itself. Static assets come from `assets_dir`.
 
 ## Configuration: relay.json
 
@@ -24,7 +27,7 @@ are an error. Every validation error names the field it is about.
 | `approval_ttl_s` | `90` | Must be 30 to 120 seconds. |
 | `trusted_proxy_cidrs` | `[]` | CIDR ranges of reverse proxies. `X-Forwarded-For` is read only when the direct peer is in one of them. |
 | `turn` | none | Optional. `host`, `secret` (at least 32 bytes) and `ttl_s` (default `21600`, 300 to 86400). |
-| `ntfy` | none | Optional. `url`, `topic` and `token`. |
+| `ntfy` | none | Optional. `url` (http or https), `topic` and `token`. Without it the gate has no approval path and a browser gets 503. Approval messages carry the approve and deny bearers in their action headers, never the poll token. Publishes use rustls with the bundled webpki roots and a 10 s timeout. |
 
 Environment values win over the file. An empty value is an error. Secrets never appear in
 logs or in `Debug` output.
@@ -34,7 +37,7 @@ logs or in `Debug` output.
 Both files live in `state_dir`.
 
 - `pcs.json` holds the registered host PCs: `{"version":1,"pcs":[{"id":"XXXX-XXXX-XXXX-XXXX","public":"<base64url 32 bytes>","registered_ms":0}]}`. Each ID must be the hash of its own public key.
-- `gate.json` holds one opaque JSON value. The site gate defines its contents later.
+- `gate.json` holds the gate cookies: `{"version":1,"cookies":[{"hash":"<base64url SHA-256 of the cookie value>","expires_ms":0}]}`. The cookie itself is never stored, only its hash. The gate's tick drops expired cookies and rewrites the file.
 
 Writes are atomic. The new content goes to a temp file in the same directory, which is fsynced
 and renamed over the old file. On unix the directory is fsynced too. Files are mode 0600 on unix.

@@ -20,22 +20,27 @@ default = []
 lab = []
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+bp-relay-core = { path = "../core" }
+futures-util = "0.3"
 base64 = "0.22"
 bp-device-key = { path = "../../crates/bp-device-key" }
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
 ipnet = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+sha2 = "0.10"
 mime_guess = "2"
 percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2.6"
-tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
 [dev-dependencies]
 tempfile = "3"
+tokio-tungstenite = "0.26"
 tower = { version = "0.5", features = ["util"] }

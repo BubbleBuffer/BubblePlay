@@ -222,6 +222,24 @@ fn delete_rejects_a_non_device_id() {
 }
 
 #[test]
+fn delete_of_an_unregistered_or_deleted_pc_is_not_found() {
+    let mut h = Harness::new();
+    let a = identity(1);
+    let never = identity(2);
+    assert!(matches!(
+        h.relay.delete_pc(&never.id().to_string()),
+        Err(AdminError::NotFound)
+    ));
+    h.register_host(&a, Some(TOKEN));
+    h.relay.delete_pc(&a.id().to_string()).expect("deleted");
+    assert!(matches!(
+        h.relay.delete_pc(&a.id().to_string()),
+        Err(AdminError::NotFound)
+    ));
+    assert_eq!(h.relay.list_pcs().expect("listing").len(), 0);
+}
+
+#[test]
 fn deleted_pc_needs_the_token_again() {
     let mut h = Harness::new();
     let a = identity(1);

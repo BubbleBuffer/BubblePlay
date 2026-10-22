@@ -126,6 +126,8 @@ jobs:
         run: |
           cargo test --locked -p bp-relay-server --features lab
           cargo clippy --locked -p bp-relay-server --all-targets --features lab -- -D warnings
+      - name: Container build
+        run: docker build -f relay-rs/Dockerfile -t bubbleplay-relay-rs:check .
 
   host:
     name: Host checks (windows-latest)
