@@ -312,6 +312,9 @@ impl Gate {
             .public_origin
             .strip_suffix('/')
             .unwrap_or(&config.public_origin);
+        if stripped.is_empty() {
+            return Err(ConfigError::EmptyPublicOrigin);
+        }
         if !is_canonical_origin(stripped) {
             return Err(ConfigError::NonCanonicalPublicOrigin);
         }
