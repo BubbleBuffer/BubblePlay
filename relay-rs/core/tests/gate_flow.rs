@@ -323,6 +323,7 @@ fn gate_decision_without_authorization_answers_204() {
         origin: None,
         cookie: None,
         authorization: None,
+        sec_fetch_dest: None,
         body: b"approve",
         client_ip: ip(DECIDER),
         now_ms: T0 + 2_000,
@@ -410,20 +411,14 @@ fn gate_forget_clears_the_cookie_and_its_record() {
 }
 
 #[test]
-fn gate_public_origin_trailing_slash_is_normalised() {
+fn gate_public_origin_with_trailing_slash_is_rejected() {
     let config = GateConfig {
         public_origin: format!("{ORIGIN}/"),
         ..config(true)
     };
-    let mut gate = Gate::new(config, GateSnapshot::default(), T0).expect("valid config");
-    let mut rng = TestRng::new(121);
-    let mut request = req("GET", "/", CLIENT, T0);
-    request.origin = Some(ORIGIN);
-    let (_, effects) = wait_parts(gate.handle(&mut rng, &request));
-    let json = ntfy_json(&effects[0]);
     assert_eq!(
-        json["actions"][0]["url"],
-        "https://relay.example/__gate/decision"
+        Gate::new(config, GateSnapshot::default(), T0).err(),
+        Some(ConfigError::NonCanonicalPublicOrigin)
     );
 }
 

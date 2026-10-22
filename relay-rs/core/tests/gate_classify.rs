@@ -123,20 +123,26 @@ fn gate_unknown_cookie_waits() {
 }
 
 #[test]
-fn gate_post_without_cookie_is_refused() {
+fn gate_post_without_cookie_is_403_and_opens_nothing() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(12);
     let request = req("POST", "/pair", CLIENT, T0);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    let (page, effects) = wait_parts(gate.handle(&mut rng, &request));
+    assert_eq!(page.status, 403);
+    assert!(effects.is_empty());
+    assert!(gate.snapshot().records.is_empty());
+    assert_eq!(gate.pending_ids(T0).len(), 0);
 }
 
 #[test]
-fn gate_head_without_cookie_waits_with_empty_body() {
+fn gate_head_without_cookie_waits_with_empty_body_and_opens_nothing() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(13);
     let (page, effects) = wait_parts(gate.handle(&mut rng, &req("HEAD", "/", CLIENT, T0)));
+    assert_eq!(page.status, 200);
     assert!(page.body.is_empty());
-    assert_eq!(effects.len(), 1);
+    assert!(effects.is_empty());
+    assert_eq!(gate.pending_ids(T0).len(), 0);
 }
 
 #[test]

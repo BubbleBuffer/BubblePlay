@@ -1,10 +1,13 @@
 //! The ntfy site gate, as a sans-IO state machine.
 //!
-//! The gate sits in front of every browser-facing path of the relay. A request
-//! from a browser (one with an `Origin` header) needs a valid `__Host-gate`
-//! cookie. Without one, a GET or HEAD is held on a minimal wait page while a
-//! pending approval is published to ntfy with Approve and Deny actions. The
-//! page polls `POST /__gate/poll` until the decision lands, then reloads.
+//! The gate sits in front of every browser-facing HTTP path and every WebSocket
+//! upgrade that carries an `Origin`. Every gated HTTP path needs a valid
+//! `__Host-gate` cookie. Without one, only a top-level navigation (a GET with
+//! `Sec-Fetch-Dest: document`, or with no `Sec-Fetch-Dest`) is held on a
+//! minimal wait page while a pending approval is published to ntfy with Approve
+//! and Deny actions. The page polls `POST /__gate/poll` until the decision
+//! lands, then reloads. Any other gated request without a cookie gets a plain
+//! 403 and opens nothing; HEAD gets the wait-page headers and opens nothing.
 //!
 //! Nothing here touches sockets, clocks or randomness. The adapter passes
 //! `now_ms` with every call, supplies randomness through [`RelayRng`], sends
@@ -43,6 +46,10 @@ pub const COOLDOWN_MS: u64 = 15_000;
 /// not processed.
 pub const DECISION_LIMIT: u32 = 60;
 pub const DECISION_WINDOW_MS: u64 = 60_000;
+/// Upper bound on each per-prefix map (decision rates, cooldowns) and on the
+/// pending list. A new prefix arriving at a full map is answered 429 after
+/// expired entries are pruned.
+pub const MAX_TRACKED_PREFIXES: usize = 4096;
 /// How long an approved or denied pending entry waits to be polled.
 const RESOLVED_KEEP_MS: u64 = 300_000;
 const DECISION_PATH: &str = "/__gate/decision";
@@ -52,7 +59,7 @@ const GATE_PREFIX: &str = "/__gate/";
 const MANAGE_PREFIX: &str = "/__gate/manage/";
 
 /// The ntfy topic the approval messages go to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NtfyConfig {
     /// The publish URL, used exactly as configured.
     pub url: String,
@@ -61,11 +68,22 @@ pub struct NtfyConfig {
     pub token: Option<String>,
 }
 
+impl fmt::Debug for NtfyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NtfyConfig")
+            .field("url", &self.url)
+            .field("topic", &self.topic)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GateConfig {
-    /// Exact origin of the relay, for example `https://relay.example`. A
-    /// trailing slash is removed. Browser requests must send exactly this
-    /// `Origin`, and the decision links point at it.
+    /// Exact origin of the relay, for example `https://relay.example`: scheme,
+    /// host and an optional non-default port, all lowercase, no path, query or
+    /// fragment. Browser requests must send exactly this `Origin`, and the
+    /// decision links point at it.
     pub public_origin: String,
     pub approval_ttl_secs: u64,
     pub ntfy: Option<NtfyConfig>,
@@ -74,6 +92,8 @@ pub struct GateConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     EmptyPublicOrigin,
+    /// `public_origin` is not a canonical bare origin.
+    NonCanonicalPublicOrigin,
     ApprovalTtlOutOfRange(u64),
 }
 
@@ -91,7 +111,7 @@ pub struct GateSnapshot {
 }
 
 /// Work the adapter must do after a call returns.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum GateEffect {
     /// POST `body` to `url` with `headers`. The body is JSON.
     NtfyPublish {
@@ -103,6 +123,36 @@ pub enum GateEffect {
     PersistGate(GateSnapshot),
 }
 
+/// The ntfy body carries the approve and deny bearers, and the headers carry
+/// the ntfy token, so neither is printed.
+impl fmt::Debug for GateEffect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GateEffect::NtfyPublish { url, headers, body } => {
+                let headers: Vec<(&str, &str)> = headers
+                    .iter()
+                    .map(|(name, value)| {
+                        let value = if name.eq_ignore_ascii_case("authorization") {
+                            "<redacted>"
+                        } else {
+                            value.as_str()
+                        };
+                        (name.as_str(), value)
+                    })
+                    .collect();
+                f.debug_struct("NtfyPublish")
+                    .field("url", url)
+                    .field("headers", &headers)
+                    .field("body", &format_args!("<redacted {} bytes>", body.len()))
+                    .finish()
+            }
+            GateEffect::PersistGate(snapshot) => {
+                f.debug_tuple("PersistGate").field(snapshot).finish()
+            }
+        }
+    }
+}
+
 /// A response the adapter writes as is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
@@ -112,7 +162,7 @@ pub struct Response {
 }
 
 /// One HTTP or WebSocket-upgrade request, as the adapter sees it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Request<'a> {
     pub method: &'a str,
     pub path: &'a str,
@@ -123,10 +173,31 @@ pub struct Request<'a> {
     pub cookie: Option<&'a str>,
     /// The raw `Authorization` header.
     pub authorization: Option<&'a str>,
+    /// The raw `Sec-Fetch-Dest` header. Only `document` (or no header at all)
+    /// on a GET is a top-level navigation that may open an approval.
+    pub sec_fetch_dest: Option<&'a str>,
     pub body: &'a [u8],
     /// The client address, already resolved by the adapter.
     pub client_ip: IpAddr,
     pub now_ms: u64,
+}
+
+/// Cookies and bearers are redacted, and the body is shown by length only.
+impl fmt::Debug for Request<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("websocket", &self.websocket)
+            .field("origin", &self.origin)
+            .field("cookie", &self.cookie.map(|_| "<redacted>"))
+            .field("authorization", &self.authorization.map(|_| "<redacted>"))
+            .field("sec_fetch_dest", &self.sec_fetch_dest)
+            .field("body", &format_args!("<{} bytes>", self.body.len()))
+            .field("client_ip", &self.client_ip)
+            .field("now_ms", &self.now_ms)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,11 +207,21 @@ pub enum Verdict {
     /// Answer 404 for HTTP. Refuse a WebSocket upgrade (the adapter closes
     /// with 1008 and an empty reason, or returns 404).
     Refuse,
-    /// Answer the wait page, or a page about limits or configuration. Any
-    /// effects (the ntfy publish) must still run.
+    /// Answer this response. It is the wait page, a limit or configuration
+    /// page, or a plain 403 for a gated request that cannot open an approval.
+    /// Any effects (the ntfy publish) must still run.
     Wait(Response, Vec<GateEffect>),
     /// A gate endpoint answered. Run the effects.
     Handled(Response, Vec<GateEffect>),
+}
+
+/// Outcome of counting one decision request against its prefix.
+enum Counted {
+    Ok,
+    /// Over the per-prefix limit: 204, not processed.
+    Limited,
+    /// A new prefix at a full map: 429.
+    Full,
 }
 
 /// The client prefix an approval is keyed by: IPv4 /24 or IPv6 /56. An
@@ -222,21 +303,19 @@ impl Gate {
         if !(MIN_APPROVAL_TTL_SECS..=MAX_APPROVAL_TTL_SECS).contains(&config.approval_ttl_secs) {
             return Err(ConfigError::ApprovalTtlOutOfRange(config.approval_ttl_secs));
         }
-        let public_origin = config.public_origin.trim_end_matches('/').to_string();
-        if public_origin.is_empty() {
+        if config.public_origin.is_empty() {
             return Err(ConfigError::EmptyPublicOrigin);
         }
-        let ttl_ms = config.approval_ttl_secs * 1000;
+        if !is_canonical_origin(&config.public_origin) {
+            return Err(ConfigError::NonCanonicalPublicOrigin);
+        }
+        let ttl_ms = config.approval_ttl_secs.saturating_mul(1000);
         let cookies: BTreeMap<[u8; 32], u64> = persisted
             .records
             .into_iter()
             .filter(|record| record.expires_ms > now_ms)
             .map(|record| (record.hash, record.expires_ms))
             .collect();
-        let config = GateConfig {
-            public_origin,
-            ..config
-        };
         Ok(Gate {
             config,
             ttl_ms,
@@ -314,10 +393,26 @@ impl Gate {
         if cookie_ok {
             return Verdict::Allow;
         }
-        if req.method == "GET" || req.method == "HEAD" {
+        // Without a cookie, only a top-level navigation may open an approval.
+        // HEAD gets the wait-page headers and never creates a pending. Anything
+        // else is a plain 403.
+        if req.method == "HEAD" {
+            return Verdict::Wait(self.head_page(rng), Vec::new());
+        }
+        if req.method == "GET" && is_navigation(req.sec_fetch_dest) {
             self.start_wait(rng, req)
         } else {
-            Verdict::Refuse
+            Verdict::Wait(forbidden(), Vec::new())
+        }
+    }
+
+    /// The headers of the wait page with an empty body and no pending. The
+    /// status is 503 when approval is not configured.
+    fn head_page(&self, rng: &mut dyn RelayRng) -> Response {
+        if self.config.ntfy.is_some() {
+            page(rng, 200, Notice::Waiting(String::new()), true)
+        } else {
+            page(rng, 503, Notice::NotConfigured, true)
         }
     }
 
@@ -347,8 +442,10 @@ impl Gate {
 
     fn decide(&mut self, req: &Request<'_>) -> Verdict {
         let prefix = Prefix::of(req.client_ip);
-        if !self.count_decision(prefix, req.now_ms) {
-            return Verdict::Handled(no_content(), Vec::new());
+        match self.count_decision(prefix, req.now_ms) {
+            Counted::Ok => {}
+            Counted::Limited => return Verdict::Handled(no_content(), Vec::new()),
+            Counted::Full => return Verdict::Handled(too_many_requests(), Vec::new()),
         }
         let bearer = req
             .authorization
@@ -414,8 +511,10 @@ impl Gate {
                     State::Approved => {
                         self.pending.remove(index);
                         let value = random_token(rng);
-                        self.cookies
-                            .insert(sha256(&value), req.now_ms + COOKIE_LIFETIME_MS);
+                        self.cookies.insert(
+                            sha256(&value),
+                            req.now_ms.saturating_add(COOKIE_LIFETIME_MS),
+                        );
                         headers.push(("Set-Cookie".into(), set_cookie(&value)));
                         effects.push(GateEffect::PersistGate(self.snapshot()));
                         "approved"
@@ -460,10 +559,10 @@ impl Gate {
         )
     }
 
+    /// Open a pending approval for a top-level navigation and publish it.
     fn start_wait(&mut self, rng: &mut dyn RelayRng, req: &Request<'_>) -> Verdict {
-        let head = req.method == "HEAD";
         let Some(ntfy) = self.config.ntfy.clone() else {
-            let page = page(rng, 503, Notice::NotConfigured, head);
+            let page = page(rng, 503, Notice::NotConfigured, false);
             return Verdict::Wait(page, Vec::new());
         };
         let prefix = Prefix::of(req.client_ip);
@@ -480,8 +579,13 @@ impl Gate {
             .cooldowns
             .get(&prefix)
             .is_some_and(|until| *until > req.now_ms);
-        if waiting >= MAX_PENDING || busy || cooling {
-            let page = page(rng, 429, Notice::TryLater, head);
+        // A new prefix needs room in the cooldown map and the pending list.
+        // Expired cooldowns and resolved entries were pruned by `sweep`.
+        let cooldowns_full =
+            !self.cooldowns.contains_key(&prefix) && self.cooldowns.len() >= MAX_TRACKED_PREFIXES;
+        let pending_full = self.pending.len() >= MAX_TRACKED_PREFIXES;
+        if waiting >= MAX_PENDING || busy || cooling || cooldowns_full || pending_full {
+            let page = page(rng, 429, Notice::TryLater, false);
             return Verdict::Wait(page, Vec::new());
         }
         let id = random_string(rng, 16);
@@ -494,28 +598,49 @@ impl Gate {
             poll_hash: sha256(&poll),
             approve_hash: Some(sha256(&approve)),
             deny_hash: Some(sha256(&deny)),
-            expires_ms: req.now_ms + self.ttl_ms,
+            expires_ms: req.now_ms.saturating_add(self.ttl_ms),
             decided_ms: req.now_ms,
             state: State::Waiting,
         });
         let effect = ntfy_publish(&ntfy, &self.config.public_origin, prefix, &approve, &deny);
-        let page = page(rng, 200, Notice::Waiting(poll), head);
+        let page = page(rng, 200, Notice::Waiting(poll), false);
         Verdict::Wait(page, vec![effect])
     }
 
-    /// Count one decision request. Returns false when the prefix is over the
-    /// limit.
-    fn count_decision(&mut self, prefix: Prefix, now_ms: u64) -> bool {
+    /// Count one decision request against its prefix. Expired windows were
+    /// pruned by `sweep`, so a full map holds only live prefixes.
+    fn count_decision(&mut self, prefix: Prefix, now_ms: u64) -> Counted {
+        if !self.decision_rates.contains_key(&prefix)
+            && self.decision_rates.len() >= MAX_TRACKED_PREFIXES
+        {
+            return Counted::Full;
+        }
         let entry = self.decision_rates.entry(prefix).or_insert((now_ms, 0));
         if now_ms.saturating_sub(entry.0) >= DECISION_WINDOW_MS {
             *entry = (now_ms, 0);
         }
-        entry.1 += 1;
-        entry.1 <= DECISION_LIMIT
+        entry.1 = entry.1.saturating_add(1);
+        if entry.1 <= DECISION_LIMIT {
+            Counted::Ok
+        } else {
+            Counted::Limited
+        }
     }
 
     fn set_cooldown(&mut self, prefix: Prefix, from_ms: u64) {
-        let until = from_ms + COOLDOWN_MS;
+        let until = from_ms.saturating_add(COOLDOWN_MS);
+        if !self.cooldowns.contains_key(&prefix)
+            && self.cooldowns.len() >= MAX_TRACKED_PREFIXES
+            && let Some(soonest) = self
+                .cooldowns
+                .iter()
+                .min_by_key(|(_, ends)| **ends)
+                .map(|(prefix, _)| *prefix)
+        {
+            // Only reachable when the map filled after this prefix's pending
+            // was admitted. Drop the cooldown that ends soonest to hold the cap.
+            self.cooldowns.remove(&soonest);
+        }
         let entry = self.cooldowns.entry(prefix).or_insert(0);
         *entry = (*entry).max(until);
     }
@@ -697,6 +822,98 @@ fn no_content() -> Response {
         status: 204,
         headers: common_headers(),
         body: Vec::new(),
+    }
+}
+
+/// A plain 403 for a gated request that cannot open an approval.
+fn forbidden() -> Response {
+    plain(403, "Forbidden")
+}
+
+/// A plain 429 for a gate endpoint that is over its capacity.
+fn too_many_requests() -> Response {
+    plain(429, "Too many requests.")
+}
+
+fn plain(status: u16, text: &str) -> Response {
+    let mut headers = common_headers();
+    headers.push(("Content-Type".into(), "text/plain; charset=utf-8".into()));
+    Response {
+        status,
+        headers,
+        body: text.as_bytes().to_vec(),
+    }
+}
+
+/// `Sec-Fetch-Dest` is `document` for a top-level navigation. A request with no
+/// such header is treated as one, for clients that do not send it.
+fn is_navigation(dest: Option<&str>) -> bool {
+    dest.is_none_or(|value| value.trim().eq_ignore_ascii_case("document"))
+}
+
+/// True for `scheme://host[:port]` with a lowercase `http` or `https` scheme, a
+/// lowercase host, and a port only when it is not the scheme's default. No
+/// userinfo, path, query or fragment.
+fn is_canonical_origin(origin: &str) -> bool {
+    if origin != origin.to_ascii_lowercase() || origin.bytes().any(|b| b.is_ascii_whitespace()) {
+        return false;
+    }
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    let default_port = match scheme {
+        "http" => "80",
+        "https" => "443",
+        _ => return false,
+    };
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
+        return false;
+    }
+    let port = if let Some(rest) = authority.strip_prefix('[') {
+        // An IPv6 literal in brackets, then an optional port.
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let literal = &rest[..end];
+        let literal_ok = !literal.is_empty()
+            && literal
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
+        if !literal_ok {
+            return false;
+        }
+        match &rest[end + 1..] {
+            "" => None,
+            after => match after.strip_prefix(':') {
+                Some(port) => Some(port),
+                None => return false,
+            },
+        }
+    } else {
+        let (host, port) = match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        };
+        let host_ok = !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+        if !host_ok {
+            return false;
+        }
+        port
+    };
+    match port {
+        None => true,
+        Some(port) => {
+            // Digits only, no leading zero (so no "0" either), and not the
+            // scheme's default port, which the canonical form omits.
+            !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && !port.starts_with('0')
+                && port != default_port
+                && port.parse::<u16>().is_ok()
+        }
     }
 }
 
