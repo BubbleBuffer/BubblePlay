@@ -1,0 +1,32 @@
+[package]
+name = "bp-device-key"
+version = "0.1.0"
+edition = "2021"
+description = "BubblePlay device-key primitives: device IDs, relay proofs and the encrypted key file"
+license = "AGPL-3.0-or-later"
+
+# Standalone crate: never look for a parent workspace.
+[workspace]
+
+[features]
+default = []
+# Key generation from OS randomness. Pulls getrandom.
+keygen = ["dep:rand_core", "rand_core/getrandom"]
+# The passphrase-encrypted key file format. Pulls argon2 and aes-gcm.
+keyfile = ["dep:argon2", "dep:aes-gcm"]
+
+[dependencies]
+base64 = "0.22"
+# Exact pins: the device ID, the relay proof and the key file format are compatibility
+# contracts shared with the Go relay and the browser, so these do not float in a caret range.
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "std", "zeroize"] }
+sha2 = "=0.10.9"
+url = "2"
+zeroize = { version = "=1.9.0", features = ["alloc"] }
+rand_core = { version = "=0.6.4", default-features = false, optional = true }
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"], optional = true }
+aes-gcm = { version = "=0.10.3", features = ["zeroize"], optional = true }
+
+[dev-dependencies]
+base64 = "0.22"
+serde_json = "1"
