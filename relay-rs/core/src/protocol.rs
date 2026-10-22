@@ -1,0 +1,1259 @@
+//! Message validators, ported from relay/protocol.go.
+//!
+//! The Go relay decodes every text message into a map[string]json.RawMessage
+//! and inspects individual keys through small helpers (str, boolean, number,
+//! integer, boundedString, object, only, exact, ...). This module keeps that
+//! structure so the two implementations can be compared line by line.
+//!
+//! Two Go details are load bearing and are reproduced on purpose:
+//!
+//! * JSON numbers are float64. 1.0, 1e3 and -0 are integers, 1.5 is not, -0
+//!   satisfies "value >= 0", and bound checks see the same rounding
+//!   encoding/json applies, so the 2^53 limits behave identically.
+//! * Lengths are byte lengths, not character counts: of the whole message, of
+//!   a string field, and of a binary frame.
+//! * Numbers are kept as their literal text (serde_json's arbitrary_precision)
+//!   and converted to f64 only when a validator reads them, as Go does. A
+//!   literal beyond float64 range is "not a number" in the field that reads it
+//!   and does not make the whole document invalid.
+//!
+//! Nothing here panics or touches the world outside its arguments.
+
+use serde_json::{Map, Value};
+
+use crate::limits::{
+    FILE_HEADER_BYTES, FILE_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT,
+    SIGNAL_BINARY_MAX, SIGNAL_LIMIT,
+};
+
+/// A message the relay refuses. Go does one of two things with it, and the
+/// adapter must do the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Invalid {
+    /// Go ignores the message and keeps the socket open (validSignalMessage
+    /// false, a media-host text, a media frame outside 28..=MEDIA_LIMIT, ...).
+    Drop,
+    /// Go closes the socket ("invalid packet" / read limit): text that is not a
+    /// JSON object, a file-socket text that is not ping, a binary frame that
+    /// breaks the file packet rules, or any frame over the socket's read limit.
+    /// For a file packet Go also closes the other end of the file pair.
+    Close,
+}
+
+impl Invalid {
+    /// True when the adapter must close the socket.
+    pub fn closes_socket(self) -> bool {
+        self == Invalid::Close
+    }
+}
+
+impl core::fmt::Display for Invalid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Invalid::Drop => f.write_str("invalid relay message (dropped)"),
+            Invalid::Close => f.write_str("invalid relay message (socket closed)"),
+        }
+    }
+}
+
+impl std::error::Error for Invalid {}
+
+/// The end of a socket a message came from. Go calls the viewer "client".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Side {
+    /// The PC: /host-ws, /host-media-ws, /host-file-ws.
+    Host,
+    /// The browser: /ws, /media-ws, /file-ws (Go's "client").
+    Viewer,
+}
+
+impl Side {
+    /// Go's "host := role == \"host\"" and "client := role == \"client\"".
+    fn flags(self) -> (bool, bool) {
+        match self {
+            Side::Host => (true, false),
+            Side::Viewer => (false, true),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Go's map helpers
+// ---------------------------------------------------------------------------
+
+/// Go's str helper: the value if it is a JSON string, otherwise the empty
+/// string.
+fn text<'a>(m: &'a Map<String, Value>, key: &str) -> &'a str {
+    m.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Go's boolean helper: the value if it is a JSON bool, otherwise false.
+fn boolean(m: &Map<String, Value>, key: &str) -> bool {
+    matches!(m.get(key), Some(Value::Bool(true)))
+}
+
+/// Go's isBoolean helper: true only for a JSON true or false.
+fn is_boolean(m: &Map<String, Value>, key: &str) -> bool {
+    matches!(m.get(key), Some(Value::Bool(_)))
+}
+
+/// Go's has helper.
+fn has(m: &Map<String, Value>, key: &str) -> bool {
+    m.contains_key(key)
+}
+
+/// Go's number helper: a finite JSON number. Missing keys, null, non-numbers
+/// and numbers that do not fit a float64 (which Go's encoding/json rejects)
+/// all yield None.
+fn number(m: &Map<String, Value>, key: &str) -> Option<f64> {
+    m.get(key)?.as_f64().filter(|value| value.is_finite())
+}
+
+/// Go's integer helper: a finite number in min..=max with no fractional part.
+///
+/// trunc mirrors Go's "value == math.Trunc(value)".
+fn integer(m: &Map<String, Value>, key: &str, min: f64, max: f64) -> bool {
+    match number(m, key) {
+        Some(value) => value >= min && value <= max && value.trunc() == value,
+        None => false,
+    }
+}
+
+/// Go's uint32Value helper: integer in 0..=4294967295.
+fn uint32_value(m: &Map<String, Value>, key: &str) -> bool {
+    integer(m, key, 0.0, 4_294_967_295.0)
+}
+
+/// Go's object helper: the value if it is a JSON object. null, arrays and
+/// scalars are None, just as Go's decoder leaves the map nil.
+fn object<'a>(m: &'a Map<String, Value>, key: &str) -> Option<&'a Map<String, Value>> {
+    m.get(key)?.as_object()
+}
+
+/// Go's only helper: every key of the object is in keys.
+fn only(m: &Map<String, Value>, keys: &[&str]) -> bool {
+    m.keys().all(|key| keys.contains(&key.as_str()))
+}
+
+/// Go's exact helper: the object has exactly these keys.
+fn exact(m: &Map<String, Value>, keys: &[&str]) -> bool {
+    m.len() == keys.len() && only(m, keys)
+}
+
+/// Go's boundedString helper: a JSON string whose byte length is min..=max.
+///
+/// Go also checks utf8.ValidString; a &str is always valid UTF-8, so that
+/// check is implicit here.
+fn bounded_string(m: &Map<String, Value>, key: &str, min: usize, max: usize) -> bool {
+    match m.get(key).and_then(Value::as_str) {
+        Some(value) => value.len() >= min && value.len() <= max,
+        None => false,
+    }
+}
+
+/// Go's protocol helper: the protocol field equals version.
+fn protocol(m: &Map<String, Value>, version: f64) -> bool {
+    integer(m, "protocol", version, version)
+}
+
+// ---------------------------------------------------------------------------
+// Go's regular expressions
+// ---------------------------------------------------------------------------
+
+/// Go's epochPattern ("^[a-f0-9]{32}$", relay/server.go): the media epoch the
+/// relay hands to a viewer and compares against.
+pub fn validate_epoch(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
+/// Go's "^[A-Za-z0-9_.:-]{1,64}$" (media-control keyframe reason).
+fn is_keyframe_reason(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+}
+
+/// Go's "^[A-Za-z0-9+/]*={0,2}$" (clipboard image payload).
+fn is_base64_payload(value: &str) -> bool {
+    let (data, padding) = match value.find('=') {
+        Some(index) => value.split_at(index),
+        None => (value, ""),
+    };
+    padding.len() <= 2
+        && padding.bytes().all(|b| b == b'=')
+        && data
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
+}
+
+/// Go's "^[A-Za-z0-9_-]{8,64}$" (first-frame requestId).
+fn is_request_id(value: &str) -> bool {
+    (8..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+// ---------------------------------------------------------------------------
+// Message types
+// ---------------------------------------------------------------------------
+
+/// The type of a validated signaling message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SignalKind {
+    Ping,
+    Bye,
+    Offer,
+    Answer,
+    Ice,
+    Diag,
+    ClientLog,
+    Qos,
+    Quality,
+    HostCapabilities,
+    DesktopState,
+    SecureAction,
+    SecureActionResult,
+    InputStatus,
+    InputCapabilities,
+    Clipboard,
+    ClipboardImage,
+    FileOffer,
+    FileDragPreview,
+    MediaControl,
+    FirstFrame,
+    MediaView,
+    MonitorList,
+    MonitorError,
+    BenchStatus,
+}
+
+impl SignalKind {
+    /// The wire name of the message type.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignalKind::Ping => "ping",
+            SignalKind::Bye => "bye",
+            SignalKind::Offer => "offer",
+            SignalKind::Answer => "answer",
+            SignalKind::Ice => "ice",
+            SignalKind::Diag => "diag",
+            SignalKind::ClientLog => "client-log",
+            SignalKind::Qos => "qos",
+            SignalKind::Quality => "quality",
+            SignalKind::HostCapabilities => "host-capabilities",
+            SignalKind::DesktopState => "desktop-state",
+            SignalKind::SecureAction => "secure-action",
+            SignalKind::SecureActionResult => "secure-action-result",
+            SignalKind::InputStatus => "input-status",
+            SignalKind::InputCapabilities => "input-capabilities",
+            SignalKind::Clipboard => "clipboard",
+            SignalKind::ClipboardImage => "clipboard-image",
+            SignalKind::FileOffer => "file-offer",
+            SignalKind::FileDragPreview => "file-drag-preview",
+            SignalKind::MediaControl => "media-control",
+            SignalKind::FirstFrame => "first-frame",
+            SignalKind::MediaView => "media-view",
+            SignalKind::MonitorList => "monitor-list",
+            SignalKind::MonitorError => "monitor-error",
+            SignalKind::BenchStatus => "bench-status",
+        }
+    }
+
+    /// True for the types the router handles itself instead of only forwarding.
+    ///
+    /// Go's forward answers ping with pong, turns bye into a close, and keeps
+    /// the last host-capabilities / input-capabilities for viewers that join
+    /// later (those two are forwarded as well).
+    pub fn consumed_by_relay(self) -> bool {
+        matches!(
+            self,
+            SignalKind::Ping
+                | SignalKind::Bye
+                | SignalKind::HostCapabilities
+                | SignalKind::InputCapabilities
+        )
+    }
+
+    /// True for the host messages the relay caches per room and replays to a
+    /// viewer that joins later.
+    pub fn cached_for_viewers(self) -> bool {
+        matches!(
+            self,
+            SignalKind::HostCapabilities | SignalKind::InputCapabilities
+        )
+    }
+}
+
+/// A validated signaling message: its type plus the parsed JSON.
+///
+/// The adapter forwards raw() verbatim (Go never re-encodes forwarded
+/// messages) and reads the parsed fields for its own decisions.
+#[derive(Clone, Debug)]
+pub struct SignalMessage<'a> {
+    raw: &'a str,
+    value: Value,
+    kind: SignalKind,
+}
+
+impl<'a> SignalMessage<'a> {
+    /// The message type.
+    pub fn kind(&self) -> SignalKind {
+        self.kind
+    }
+
+    /// The message exactly as it arrived; forward these bytes unchanged.
+    pub fn raw(&self) -> &'a str {
+        self.raw
+    }
+
+    /// The parsed JSON object.
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// A string field of the message, or the empty string (Go's str helper).
+    pub fn field(&self, key: &str) -> &str {
+        self.value
+            .as_object()
+            .map(|m| text(m, key))
+            .unwrap_or_default()
+    }
+
+    /// The action of a media-control or file-drag-preview message.
+    pub fn action(&self) -> &str {
+        self.field("action")
+    }
+
+    /// The phase of a first-frame message.
+    pub fn phase(&self) -> &str {
+        self.field("phase")
+    }
+
+    /// browserApproval, which the relay caches per host connection. Only a
+    /// host-capabilities message can set it.
+    pub fn browser_approval(&self) -> bool {
+        self.kind == SignalKind::HostCapabilities
+            && self
+                .value
+                .as_object()
+                .is_some_and(|m| boolean(m, "browserApproval"))
+    }
+
+    /// Go's bufferable helper: keep this viewer message while no host is
+    /// connected.
+    pub fn bufferable(&self) -> bool {
+        match self.kind {
+            SignalKind::Offer | SignalKind::Ice => true,
+            SignalKind::FirstFrame => self.phase() == "request",
+            SignalKind::MediaControl => matches!(self.action(), "start" | "monitors" | "follow"),
+            _ => false,
+        }
+    }
+
+    /// See SignalKind::consumed_by_relay.
+    pub fn consumed_by_relay(&self) -> bool {
+        self.kind.consumed_by_relay()
+    }
+
+    /// See SignalKind::cached_for_viewers.
+    pub fn cached_for_viewers(&self) -> bool {
+        self.kind.cached_for_viewers()
+    }
+}
+
+/// A validated media-socket text message.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MediaControl {
+    /// ping: answered with pong, never relayed. Go matches ping before the
+    /// media-socket role check, so either side may send it.
+    Ping,
+    /// ack: recvTsMs is a finite number that may be fractional
+    /// (server_test.go requires a 12.3 ack to survive).
+    Ack {
+        /// Capture generation being acknowledged.
+        generation: u32,
+        /// Frame sequence number being acknowledged.
+        seq: u32,
+        /// Viewer receive time in milliseconds; fractional values are kept.
+        recv_ts_ms: f64,
+        /// Highest decoded sequence, when the viewer reported one.
+        decoded_seq: Option<u32>,
+    },
+    /// keyframe: the viewer asks the host for a fresh key frame.
+    Keyframe {
+        /// Reason token, already matched against Go's pattern.
+        reason: String,
+    },
+}
+
+/// A validated file packet (BPF1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilePacket<'a> {
+    /// Packet type.
+    pub kind: FileKind,
+    /// Bytes after the 16-byte header.
+    pub payload: &'a [u8],
+}
+
+/// File packet types (Go's validFilePacket).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FileKind {
+    /// 1: file metadata.
+    Offer,
+    /// 2: transfer accepted.
+    Accept,
+    /// 3: file bytes.
+    Data,
+    /// 4: received byte total.
+    Ack,
+    /// 5: transfer finished, SHA-256 of the file.
+    Done,
+    /// 6: transfer cancelled.
+    Cancel,
+    /// 7: receiver result.
+    Result,
+    /// 8: viewer asks the host for a file.
+    Request,
+}
+
+impl FileKind {
+    /// The header byte for this type.
+    pub fn code(self) -> u8 {
+        match self {
+            FileKind::Offer => 1,
+            FileKind::Accept => 2,
+            FileKind::Data => 3,
+            FileKind::Ack => 4,
+            FileKind::Done => 5,
+            FileKind::Cancel => 6,
+            FileKind::Result => 7,
+            FileKind::Request => 8,
+        }
+    }
+
+    /// The type for a header byte, None outside 1..=8.
+    pub fn from_code(code: u8) -> Option<FileKind> {
+        Some(match code {
+            1 => FileKind::Offer,
+            2 => FileKind::Accept,
+            3 => FileKind::Data,
+            4 => FileKind::Ack,
+            5 => FileKind::Done,
+            6 => FileKind::Cancel,
+            7 => FileKind::Result,
+            8 => FileKind::Request,
+            _ => return None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+/// Validate a text message on a signaling socket.
+///
+/// Returns the message type and the parsed body so the router can act on it.
+/// The epoch is the socket's current media epoch (Go's p.epoch), which
+/// media-control, file-drag-preview and the first-frame request phase are
+/// checked against.
+///
+/// A message longer than SIGNAL_LIMIT is rejected: that is the socket's read
+/// limit, so such a message never reaches the Go validator either.
+pub fn validate_signal_text<'a>(
+    side: Side,
+    raw: &'a str,
+    epoch: &str,
+) -> Result<SignalMessage<'a>, Invalid> {
+    validate_signal_text_for_role(Some(side), raw, epoch)
+}
+
+/// Validate a text message on a signaling socket, given Go's role string.
+///
+/// Pass Some(side) for a signaling peer (host or client) and None for any
+/// other socket role (media-host, file-client, version-probe, ...), where Go's
+/// host and client flags are both false.
+pub fn validate_signal_text_for_role<'a>(
+    side: Option<Side>,
+    raw: &'a str,
+    epoch: &str,
+) -> Result<SignalMessage<'a>, Invalid> {
+    if raw.len() > SIGNAL_LIMIT {
+        return Err(Invalid::Close);
+    }
+    let value = decode_object(raw)?;
+    let message = value.as_object().ok_or(Invalid::Close)?;
+    // Go's forward answers ping before consulting the validators, and ping is
+    // not one of the types validSignalMessage accepts.
+    if text(message, "type") == "ping" {
+        return Ok(SignalMessage {
+            raw,
+            value,
+            kind: SignalKind::Ping,
+        });
+    }
+    let (host, viewer) = match side {
+        Some(side) => side.flags(),
+        None => (false, false),
+    };
+    let kind =
+        valid_signal_message(message, host, viewer, epoch, raw.len()).ok_or(Invalid::Drop)?;
+    Ok(SignalMessage { raw, value, kind })
+}
+
+/// Validate a text message on a media socket: ping, or a media-control message
+/// from the viewer.
+///
+/// The epoch is accepted for symmetry with validate_signal_text but is not
+/// used: Go validates media-socket text with validMediaControl, which has no
+/// epoch rule. Epoch matching belongs to signaling media-control messages.
+pub fn validate_media_text(side: Side, raw: &str, _epoch: &str) -> Result<MediaControl, Invalid> {
+    if raw.len() > MEDIA_LIMIT {
+        return Err(Invalid::Close);
+    }
+    let value = decode_object(raw)?;
+    let message = value.as_object().ok_or(Invalid::Close)?;
+    // Go answers ping before the media branch, so either side may send it.
+    if text(message, "type") == "ping" {
+        return Ok(MediaControl::Ping);
+    }
+    // Go drops text from a media host:
+    // "if p.role != \"media-client\" || !validMediaControl(m, len(data))".
+    if side != Side::Viewer || !valid_media_control(message, raw.len()) {
+        return Err(Invalid::Drop);
+    }
+    match text(message, "type") {
+        "ack" => Ok(MediaControl::Ack {
+            generation: number(message, "generation").unwrap_or_default() as u32,
+            seq: number(message, "seq").unwrap_or_default() as u32,
+            recv_ts_ms: number(message, "recvTsMs").unwrap_or_default(),
+            decoded_seq: has(message, "decodedSeq")
+                .then_some(number(message, "decodedSeq").unwrap_or_default() as u32),
+        }),
+        _ => Ok(MediaControl::Keyframe {
+            reason: text(message, "reason").to_owned(),
+        }),
+    }
+}
+
+/// Validate a binary frame on a media socket. Only the host sends frames, and
+/// only frames longer than the 28-byte header are relayed.
+///
+/// The frame contents (the BPV4 and BPA1 headers, codec, flags) are the
+/// viewer's business: see fixtures/wss-v4-contract.json and
+/// fixtures/audio-contract.json.
+pub fn validate_media_binary(side: Side, bytes: &[u8]) -> Result<(), Invalid> {
+    if bytes.len() > MEDIA_LIMIT {
+        return Err(Invalid::Close);
+    }
+    if side != Side::Host || bytes.len() <= MEDIA_HEADER_BYTES {
+        return Err(Invalid::Drop);
+    }
+    Ok(())
+}
+
+/// Validate a binary frame on a signaling socket: 1..=16384 bytes. A frame
+/// over the socket's 512 KiB read limit closes it; any other size outside the
+/// range is dropped.
+pub fn validate_signal_binary(bytes: &[u8]) -> Result<(), Invalid> {
+    if bytes.len() > SIGNAL_LIMIT {
+        return Err(Invalid::Close);
+    }
+    if bytes.is_empty() || bytes.len() > SIGNAL_BINARY_MAX {
+        return Err(Invalid::Drop);
+    }
+    Ok(())
+}
+
+/// What a file socket does with a text message that is a ping: Go answers it
+/// with pong and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileText {
+    /// ping: answer with pong, never relayed.
+    Ping,
+}
+
+/// Validate a text message on a file socket. Go's forward answers ping and
+/// closes the socket on any other text (or on text that is not JSON).
+pub fn validate_file_text(raw: &str) -> Result<FileText, Invalid> {
+    if raw.len() > FILE_LIMIT {
+        return Err(Invalid::Close);
+    }
+    // Go closes on null too: the file branch returns false for any text that
+    // is not a ping, and a null message is not one.
+    match decode_object(raw) {
+        Ok(value) => match value.as_object() {
+            Some(message) if text(message, "type") == "ping" => Ok(FileText::Ping),
+            _ => Err(Invalid::Close),
+        },
+        Err(_) => Err(Invalid::Close),
+    }
+}
+
+/// Decode a text message the way Go's json.Unmarshal into a map does. A JSON
+/// object is returned; null decodes to a nil map, which every validator drops;
+/// anything else (not JSON, or an array, string or number) is a decode error
+/// that closes the socket.
+fn decode_object(raw: &str) -> Result<Value, Invalid> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value @ Value::Object(_)) => Ok(value),
+        Ok(Value::Null) => Err(Invalid::Drop),
+        _ => Err(Invalid::Close),
+    }
+}
+
+/// Validate a binary frame on a file socket (Go's validFilePacket).
+///
+/// The side is the socket that sent the packet: REQUEST is only accepted from
+/// the viewer.
+pub fn validate_file_binary(side: Side, bytes: &[u8]) -> Result<FilePacket<'_>, Invalid> {
+    // Every failure here closes the file socket (Go: validFilePacket false).
+    if bytes.len() < FILE_HEADER_BYTES || bytes.len() > FILE_LIMIT {
+        return Err(Invalid::Close);
+    }
+    if &bytes[..4] != b"BPF1" || bytes[5] != 0 || bytes[6] != 0 || bytes[7] != 0 {
+        return Err(Invalid::Close);
+    }
+    let kind = FileKind::from_code(bytes[4]).ok_or(Invalid::Close)?;
+    let control_seq = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    if kind != FileKind::Data && control_seq != 0 {
+        return Err(Invalid::Close);
+    }
+    let payload = &bytes[FILE_HEADER_BYTES..];
+    let packet = FilePacket { kind, payload };
+    let valid = match kind {
+        FileKind::Accept => payload.is_empty(),
+        FileKind::Data => !payload.is_empty(),
+        FileKind::Ack => {
+            payload.len() == 8
+                && u64::from_le_bytes(payload.try_into().unwrap_or_default())
+                    <= 9_007_199_254_740_991
+        }
+        FileKind::Done => payload.len() == 32,
+        FileKind::Offer => payload_check(payload, valid_file_meta),
+        FileKind::Cancel => payload_check(payload, |m| bounded_string(m, "reason", 0, 256)),
+        FileKind::Result => payload_check(payload, |m| {
+            is_boolean(m, "ok")
+                && (!has(m, "error")
+                    || matches!(m.get("error"), Some(Value::Null))
+                    || bounded_string(m, "error", 0, 256))
+        }),
+        FileKind::Request => payload_check(payload, |m| {
+            side == Side::Viewer && uint32_value(m, "offerId") && uint32_value(m, "id")
+        }),
+    };
+    if valid {
+        Ok(packet)
+    } else {
+        Err(Invalid::Close)
+    }
+}
+
+/// Check a control packet payload: 1..=4096 UTF-8 bytes holding a JSON
+/// object (Go requires a non-nil map).
+fn payload_check<F>(payload: &[u8], check: F) -> bool
+where
+    F: FnOnce(&Map<String, Value>) -> bool,
+{
+    if payload.is_empty() || payload.len() > 4096 {
+        return false;
+    }
+    let Ok(body) = std::str::from_utf8(payload) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    match value.as_object() {
+        Some(message) => check(message),
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// validSignalMessage
+// ---------------------------------------------------------------------------
+
+/// Go's validSignalMessage: Some(kind) when the relay accepts the message from
+/// this side, None when it must be dropped.
+fn valid_signal_message(
+    m: &Map<String, Value>,
+    host: bool,
+    viewer: bool,
+    epoch: &str,
+    length: usize,
+) -> Option<SignalKind> {
+    if length > SIGNAL_LIMIT {
+        return None;
+    }
+    match text(m, "type") {
+        "bye" => (m.len() == 1).then_some(SignalKind::Bye),
+        "offer" => (viewer && length <= 256 * 1024 && bounded_string(m, "sdp", 1, 256 * 1024))
+            .then_some(SignalKind::Offer),
+        "answer" => (host && length <= 256 * 1024 && bounded_string(m, "sdp", 1, 256 * 1024))
+            .then_some(SignalKind::Answer),
+        "ice" => {
+            (length <= 16384 && (viewer || host) && has(m, "candidate")).then_some(SignalKind::Ice)
+        }
+        "diag" => (viewer && length <= 16384).then_some(SignalKind::Diag),
+        "client-log" => (viewer
+            && length <= 2048
+            && has(m, "seq")
+            && has(m, "atMs")
+            && bounded_string(m, "level", 1, 32)
+            && bounded_string(m, "event", 1, 128)
+            && object(m, "detail").is_some())
+        .then_some(SignalKind::ClientLog),
+        "qos" => (viewer && length <= 2048).then_some(SignalKind::Qos),
+        "quality" => (host && length <= 1024).then_some(SignalKind::Quality),
+        "host-capabilities" => {
+            // The approval-only form ({type, browserApproval} exactly) went
+            // away with browser approval; only the full form is accepted.
+            if !host
+                || length > 512
+                || !is_boolean(m, "serviceMode")
+                || !is_boolean(m, "coldBoot")
+                || !is_boolean(m, "secureDesktop")
+                || !is_boolean(m, "secureText")
+            {
+                return None;
+            }
+            if has(m, "browserApproval") && !is_boolean(m, "browserApproval") {
+                return None;
+            }
+            if has(m, "fileTransfer") && !integer(m, "fileTransfer", 0.0, 255.0) {
+                return None;
+            }
+            if has(m, "fileDrop")
+                && (!integer(m, "fileDrop", 1.0, 1.0) || !integer(m, "fileTransfer", 1.0, 1.0))
+            {
+                return None;
+            }
+            if has(m, "fileDropPreview")
+                && (!integer(m, "fileDropPreview", 1.0, 1.0)
+                    || !integer(m, "fileDrop", 1.0, 1.0)
+                    || boolean(m, "serviceMode"))
+            {
+                return None;
+            }
+            (!has(m, "followWindow") || integer(m, "followWindow", 0.0, 255.0))
+                .then_some(SignalKind::HostCapabilities)
+        }
+        "desktop-state" => {
+            (host && length <= 512 && valid_desktop_state(m)).then_some(SignalKind::DesktopState)
+        }
+        "secure-action" => (viewer
+            && length <= 512
+            && exact(m, &["type", "action"])
+            && text(m, "action") == "deny")
+            .then_some(SignalKind::SecureAction),
+        "secure-action-result" => (host
+            && length <= 512
+            && exact(m, &["type", "action", "ok", "reason"])
+            && text(m, "action") == "deny"
+            && is_boolean(m, "ok")
+            && bounded_string(m, "reason", 0, 96))
+        .then_some(SignalKind::SecureActionResult),
+        "input-status" => {
+            (host && valid_input_status(m, length)).then_some(SignalKind::InputStatus)
+        }
+        "input-capabilities" => (host
+            && length <= 256
+            && exact(
+                m,
+                &[
+                    "type",
+                    "protocol",
+                    "scancode",
+                    "clipboard",
+                    "clipboardMaxBytes",
+                ],
+            )
+            && protocol(m, 1.0)
+            && is_boolean(m, "scancode")
+            && is_boolean(m, "clipboard")
+            && integer(m, "clipboardMaxBytes", 0.0, 1024.0 * 1024.0))
+        .then_some(SignalKind::InputCapabilities),
+        "clipboard" => valid_clipboard(m, false, host, length).then_some(SignalKind::Clipboard),
+        "clipboard-image" => {
+            valid_clipboard(m, true, host, length).then_some(SignalKind::ClipboardImage)
+        }
+        "file-offer" => (host && valid_file_offer(m)).then_some(SignalKind::FileOffer),
+        "file-drag-preview" => {
+            valid_file_drag_preview(m, viewer, epoch, length).then_some(SignalKind::FileDragPreview)
+        }
+        "media-control" => {
+            valid_signal_media_control(m, viewer, epoch, length).then_some(SignalKind::MediaControl)
+        }
+        "first-frame" => {
+            valid_first_frame(m, host, viewer, epoch, length).then_some(SignalKind::FirstFrame)
+        }
+        "media-view" => (host && length <= 64 * 1024).then_some(SignalKind::MediaView),
+        "monitor-list" => (host && length <= 64 * 1024).then_some(SignalKind::MonitorList),
+        "monitor-error" => (host && length <= 64 * 1024).then_some(SignalKind::MonitorError),
+        "bench-status" => {
+            (host && length <= 16384 && protocol(m, 1.0)).then_some(SignalKind::BenchStatus)
+        }
+        _ => None,
+    }
+}
+
+/// Go's validMediaControl: media-control text on a media socket.
+fn valid_media_control(m: &Map<String, Value>, length: usize) -> bool {
+    if length > MEDIA_CONTROL_MAX {
+        return false;
+    }
+    match text(m, "type") {
+        "ack" => {
+            only(m, &["type", "generation", "seq", "recvTsMs", "decodedSeq"])
+                && uint32_value(m, "generation")
+                && uint32_value(m, "seq")
+                && number(m, "recvTsMs").is_some_and(|stamp| stamp >= 0.0)
+                && (!has(m, "decodedSeq") || uint32_value(m, "decodedSeq"))
+        }
+        "keyframe" => exact(m, &["type", "reason"]) && is_keyframe_reason(text(m, "reason")),
+        _ => false,
+    }
+}
+
+/// Go's media-control arm of validSignalMessage (the same shape on a signaling
+/// socket, plus the epoch rule).
+fn valid_signal_media_control(
+    m: &Map<String, Value>,
+    viewer: bool,
+    epoch: &str,
+    length: usize,
+) -> bool {
+    if !viewer || length > 2048 {
+        return false;
+    }
+    if protocol(m, 4.0) && text(m, "epoch") != epoch {
+        return false;
+    }
+    match text(m, "action") {
+        "monitors" => protocol(m, 4.0) && text(m, "epoch") == epoch,
+        "monitor" => bounded_string(m, "monitor", 1, 128),
+        "follow" => protocol(m, 4.0) && text(m, "epoch") == epoch && is_boolean(m, "follow"),
+        "start" | "stop" | "viewport" | "profile" | "keyframe" | "mode" | "quality" => true,
+        _ => false,
+    }
+}
+
+/// Go's first-frame arm.
+fn valid_first_frame(
+    m: &Map<String, Value>,
+    host: bool,
+    viewer: bool,
+    epoch: &str,
+    length: usize,
+) -> bool {
+    if length > 1024 || !protocol(m, 1.0) || !is_request_id(text(m, "requestId")) {
+        return false;
+    }
+    match text(m, "phase") {
+        "request" => {
+            viewer
+                && matches!(text(m, "transport"), "webrtc" | "wss")
+                && (!has(m, "epoch") || text(m, "epoch") == epoch)
+        }
+        "presented" => viewer && uint32_value(m, "generation"),
+        "admitted" | "ready" => host && uint32_value(m, "generation"),
+        "failed" => host && uint32_value(m, "generation") && bounded_string(m, "reason", 1, 96),
+        _ => false,
+    }
+}
+
+/// Go's file-drag-preview arm.
+fn valid_file_drag_preview(
+    m: &Map<String, Value>,
+    viewer: bool,
+    epoch: &str,
+    length: usize,
+) -> bool {
+    if !viewer
+        || length > 8192
+        || !protocol(m, 1.0)
+        || text(m, "epoch") != epoch
+        || !integer(m, "dragId", 1.0, 4_294_967_295.0)
+        || !only(
+            m,
+            &[
+                "type", "protocol", "epoch", "dragId", "action", "drop", "types",
+            ],
+        )
+    {
+        return false;
+    }
+    if text(m, "action") == "cancel" {
+        return !has(m, "drop") && !has(m, "types");
+    }
+    if text(m, "action") != "update" || !object(m, "drop").is_some_and(valid_drop) {
+        return false;
+    }
+    let Some(types) = m.get("types").and_then(Value::as_array) else {
+        return false;
+    };
+    if types.is_empty() || types.len() > 64 {
+        return false;
+    }
+    // Go decodes the array into []string, and a JSON null element decodes to
+    // "" without an error, so it passes the checks below.
+    types.iter().all(|value| match value {
+        Value::Null => true,
+        Value::String(value) => value.len() <= 96 && value.bytes().all(|b| (33..=126).contains(&b)),
+        _ => false,
+    })
+}
+
+/// Go's clipboard and clipboard-image arm.
+fn valid_clipboard(m: &Map<String, Value>, image: bool, host: bool, length: usize) -> bool {
+    let count = number(m, "count").unwrap_or_default();
+    let max_count = if image { 342.0 } else { 64.0 };
+    if !host
+        || length > 32 * 1024 * 6 + 256
+        || !protocol(m, 1.0)
+        || !uint32_value(m, "id")
+        || !integer(m, "count", 1.0, max_count)
+        || !integer(m, "index", 0.0, count - 1.0)
+        || !bounded_string(m, "text", 0, 32 * 1024)
+    {
+        return false;
+    }
+    if image {
+        exact(
+            m,
+            &[
+                "count", "id", "index", "mimeType", "protocol", "text", "type",
+            ],
+        ) && text(m, "mimeType") == "image/png"
+            && is_base64_payload(text(m, "text"))
+    } else {
+        exact(m, &["count", "id", "index", "protocol", "text", "type"])
+    }
+}
+
+/// Go's input-status arm.
+fn valid_input_status(m: &Map<String, Value>, length: usize) -> bool {
+    if length > 1024 || !protocol(m, 1.0) || !uint32_value(m, "generation") {
+        return false;
+    }
+    // A JSON null reason is allowed and means "no reason".
+    if has(m, "reason")
+        && !matches!(m.get("reason"), Some(Value::Null))
+        && !matches!(text(m, "reason"), "admin-required" | "admin-unavailable")
+    {
+        return false;
+    }
+    if has(m, "route") && !matches!(text(m, "route"), "local" | "admin" | "secure") {
+        return false;
+    }
+    for key in [
+        "receivedPackets",
+        "acceptedPackets",
+        "failedPackets",
+        "droppedPackets",
+        "releasedInputs",
+        "requestedEvents",
+        "appliedEvents",
+    ] {
+        if !integer(m, key, 0.0, 9_007_199_254_740_991.0) {
+            return false;
+        }
+    }
+    let received = number(m, "receivedPackets").unwrap_or_default();
+    for key in ["acceptedPackets", "failedPackets", "droppedPackets"] {
+        if number(m, key).unwrap_or_default() > received {
+            return false;
+        }
+    }
+    let applied = number(m, "appliedEvents").unwrap_or_default();
+    let requested = number(m, "requestedEvents").unwrap_or_default();
+    if applied > requested {
+        return false;
+    }
+    if has(m, "lastErrorCode") && !integer(m, "lastErrorCode", -2_147_483_648.0, 2_147_483_647.0) {
+        return false;
+    }
+    if has(m, "lastSequence") && !integer(m, "lastSequence", 0.0, 65535.0) {
+        return false;
+    }
+    true
+}
+
+/// Go's secure-desktop state message (desktop-state).
+fn valid_desktop_state(m: &Map<String, Value>) -> bool {
+    if !only(
+        m,
+        &[
+            "type",
+            "state",
+            "desktop",
+            "input",
+            "generation",
+            "reason",
+            "secureKind",
+            "secureCapabilities",
+        ],
+    ) || !matches!(text(m, "state"), "active" | "unavailable")
+        || !uint32_value(m, "generation")
+        || !bounded_string(m, "reason", 0, 96)
+    {
+        return false;
+    }
+    if has(m, "desktop") && !matches!(text(m, "desktop"), "default" | "secure" | "none") {
+        return false;
+    }
+    if has(m, "input") && !matches!(text(m, "input"), "enabled" | "suspended" | "read-only") {
+        return false;
+    }
+    if has(m, "secureKind")
+        && (text(m, "desktop") != "secure"
+            || !matches!(text(m, "secureKind"), "uac" | "lock" | "other"))
+    {
+        return false;
+    }
+    if has(m, "secureCapabilities") {
+        // Go: only on a secure desktop; the list must decode (null is a nil
+        // slice and rejected; [] is accepted).
+        if text(m, "desktop") != "secure" {
+            return false;
+        }
+        let Some(values) = m.get("secureCapabilities").and_then(Value::as_array) else {
+            return false;
+        };
+        if values.len() > 3 {
+            return false;
+        }
+        let mut seen = [false; 3];
+        for value in values {
+            let Some(capability) = value.as_str() else {
+                return false;
+            };
+            let index = match capability {
+                "view" => 0,
+                "deny" => 1,
+                "input" => 2,
+                _ => return false,
+            };
+            if seen[index] {
+                return false;
+            }
+            seen[index] = true;
+        }
+    }
+    true
+}
+
+/// Go's validDrop: the pointer a drag was released at.
+fn valid_drop(m: &Map<String, Value>) -> bool {
+    exact(m, &["x", "y", "generation", "viewportRevision"])
+        && integer(m, "x", 0.0, 65535.0)
+        && integer(m, "y", 0.0, 65535.0)
+        && integer(m, "generation", 1.0, 4_294_967_295.0)
+        && uint32_value(m, "viewportRevision")
+}
+
+/// Go's validFileMeta: the metadata payload of an OFFER packet.
+fn valid_file_meta(m: &Map<String, Value>) -> bool {
+    if !bounded_string(m, "name", 1, 1024)
+        || !integer(m, "size", 0.0, 2.0 * 1024.0 * 1024.0 * 1024.0)
+        || !bounded_string(m, "mime", 0, 255)
+        || !integer(m, "mtimeMs", 0.0, 9_007_199_254_740_991.0)
+        || !uint32_value(m, "batchId")
+        || !integer(m, "batchCount", 1.0, 64.0)
+    {
+        return false;
+    }
+    let count = number(m, "batchCount").unwrap_or_default();
+    if !integer(m, "batchIndex", 0.0, count - 1.0) {
+        return false;
+    }
+    match text(m, "purpose") {
+        "save" | "paste" => !has(m, "drop"),
+        "drop" => object(m, "drop").is_some_and(valid_drop),
+        _ => false,
+    }
+}
+
+/// Go's validFileOffer: the signaling file-offer message.
+fn valid_file_offer(m: &Map<String, Value>) -> bool {
+    if !protocol(m, 1.0)
+        || !uint32_value(m, "offerId")
+        || !matches!(text(m, "source"), "clipboard" | "sendto")
+    {
+        return false;
+    }
+    let items: Vec<&Map<String, Value>> = match m.get("items") {
+        None => return false,
+        // Go decodes a JSON null into an empty slice without an error; a
+        // missing key is an error. Both are handled the way Go does.
+        Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => {
+            let mut items = Vec::with_capacity(values.len());
+            for value in values {
+                match value.as_object() {
+                    Some(item) => items.push(item),
+                    None => return false,
+                }
+            }
+            items
+        }
+        Some(_) => return false,
+    };
+    if items.len() > 64 {
+        return false;
+    }
+    items.iter().all(|item| {
+        uint32_value(item, "id")
+            && bounded_string(item, "name", 1, 1024)
+            && integer(item, "size", 0.0, 2.0 * 1024.0 * 1024.0 * 1024.0)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object_of(raw: &str) -> Map<String, Value> {
+        match serde_json::from_str::<Value>(raw).expect("json") {
+            Value::Object(map) => map,
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    fn field<'a>(map: &'a Map<String, Value>, key: &str) -> &'a Value {
+        map.get(key).expect("field")
+    }
+
+    // Port of the wrong-JSON-type loop in relay/server_test.go
+    // (TestBrowserGeneratedProtocolFixtures).
+    #[test]
+    fn wrong_json_types_fail_typed_helpers() {
+        for (raw, expect_integer, expect_boolean, expect_string) in [
+            ("null", false, false, false),
+            ("\"0\"", false, false, true),
+            ("false", false, true, false),
+            ("[]", false, false, false),
+            ("{}", false, false, false),
+            ("0", true, false, false),
+        ] {
+            let value = serde_json::from_str::<Value>(raw).expect("json");
+            let mut map = Map::new();
+            map.insert("value".into(), value);
+            assert_eq!(integer(&map, "value", 0.0, 100.0), expect_integer, "{raw}");
+            assert_eq!(is_boolean(&map, "value"), expect_boolean, "{raw}");
+            assert_eq!(bounded_string(&map, "value", 0, 10), expect_string, "{raw}");
+        }
+        let map = object_of("{\"value\": null}");
+        assert!(!integer(&map, "value", 0.0, 100.0));
+        assert!(!is_boolean(&map, "value"));
+        assert!(!bounded_string(&map, "value", 0, 100));
+    }
+
+    // Go decodes JSON numbers into float64, so all of these behave like Go.
+    #[test]
+    fn numbers_follow_go_float64_semantics() {
+        let map = object_of(
+            r#"{"whole":1.0,"exponent":1e3,"negativeZero":-0,"fraction":1.5,
+               "uint32":4294967295,"tooBig":4294967296,"negative":-1,
+               "biggest":9007199254740991,"rounded":9007199254740993,
+               "huge":123456789012345678901234567890}"#,
+        );
+        assert!(integer(&map, "whole", 1.0, 1.0));
+        assert_eq!(number(&map, "exponent"), Some(1000.0));
+        assert!(integer(&map, "negativeZero", 0.0, 4.0));
+        assert!(!integer(&map, "fraction", 0.0, 10.0));
+        assert!(uint32_value(&map, "uint32"));
+        assert!(!uint32_value(&map, "tooBig"));
+        assert!(!uint32_value(&map, "negative"));
+        assert!(integer(&map, "biggest", 0.0, 9_007_199_254_740_991.0));
+        // 2^53+1 rounds to 2^53, which is above the limit, as in Go.
+        assert_eq!(number(&map, "rounded"), Some(9_007_199_254_740_992.0));
+        assert!(!integer(&map, "rounded", 0.0, 9_007_199_254_740_991.0));
+        assert!(integer(&map, "huge", 0.0, 1e30));
+        // Go's ParseFloat fails on overflow (the field reads as absent) and
+        // silently underflows to 0. The document itself stays valid, because
+        // only a validator that reads the field decodes it.
+        let extreme = object_of(r#"{"outOfRange":1e400,"underflow":1e-400,"negOverflow":-1e400}"#);
+        assert_eq!(number(&extreme, "outOfRange"), None);
+        assert_eq!(number(&extreme, "negOverflow"), None);
+        assert!(!integer(&extreme, "outOfRange", 0.0, 1e308));
+        assert_eq!(number(&extreme, "underflow"), Some(0.0));
+        assert!(integer(&extreme, "underflow", 0.0, 0.0));
+    }
+
+    #[test]
+    fn exact_and_only_compare_the_key_set() {
+        let map = object_of(r#"{"type":"bye","action":"deny"}"#);
+        assert!(only(&map, &["type", "action"]));
+        assert!(!only(&map, &["type"]));
+        assert!(exact(&map, &["type", "action"]));
+        assert!(!exact(&map, &["type"]));
+        assert!(!exact(&map, &["type", "action", "extra"]));
+    }
+
+    #[test]
+    fn bounded_string_counts_bytes() {
+        let mut map = Map::new();
+        map.insert("value".into(), Value::String("e".repeat(96)));
+        assert!(bounded_string(&map, "value", 0, 96));
+        map.insert("value".into(), Value::String("\u{e9}".repeat(48)));
+        assert_eq!(text(&map, "value").len(), 96);
+        assert!(bounded_string(&map, "value", 0, 96));
+        map.insert("value".into(), Value::String("\u{e9}".repeat(49)));
+        assert!(!bounded_string(&map, "value", 0, 96));
+        assert!(!bounded_string(&map, "missing", 0, 100));
+    }
+
+    #[test]
+    fn keyframe_reason_matches_go_pattern() {
+        assert!(is_keyframe_reason("decoder:lost"));
+        assert!(is_keyframe_reason(&"a".repeat(64)));
+        assert!(!is_keyframe_reason(&"a".repeat(65)));
+        assert!(!is_keyframe_reason(""));
+        assert!(!is_keyframe_reason("bad reason!"));
+        assert!(!is_keyframe_reason("\u{e9}"));
+    }
+
+    #[test]
+    fn clipboard_payload_matches_go_pattern() {
+        assert!(is_base64_payload(""));
+        assert!(is_base64_payload("AQID"));
+        assert!(is_base64_payload("AQ=="));
+        assert!(is_base64_payload("=="));
+        assert!(!is_base64_payload("A==="));
+        assert!(!is_base64_payload("AQ=ID"));
+        assert!(!is_base64_payload("AQ-ID"));
+        assert!(!is_base64_payload("AQ ID"));
+    }
+
+    #[test]
+    fn request_id_and_epoch_match_go_patterns() {
+        assert!(is_request_id("fixture_1"));
+        assert!(is_request_id(&"a".repeat(64)));
+        assert!(!is_request_id(&"a".repeat(65)));
+        assert!(!is_request_id("short7c"));
+        assert!(!is_request_id("has space"));
+        assert!(validate_epoch("0123456789abcdef0123456789abcdef"));
+        assert!(!validate_epoch("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(!validate_epoch("0123456789abcdef0123456789abcdeg"));
+        assert!(!validate_epoch(""));
+        assert!(!validate_epoch("0123456789abcdef0123456789abcdef0"));
+    }
+
+    #[test]
+    fn text_helper_returns_empty_for_non_strings() {
+        let map = object_of(r#"{"s":"x","n":1,"b":true,"z":null}"#);
+        assert_eq!(text(&map, "s"), "x");
+        assert_eq!(text(&map, "n"), "");
+        assert_eq!(text(&map, "b"), "");
+        assert_eq!(text(&map, "z"), "");
+        assert_eq!(text(&map, "missing"), "");
+        assert_eq!(field(&map, "n"), &Value::from(1));
+    }
+}
