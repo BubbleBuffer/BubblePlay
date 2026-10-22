@@ -10,11 +10,17 @@ on:
 permissions:
   contents: read
 
+# A newer push to a lane branch cancels its older run, so superseded runs don't hold build01 runners.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/lane/') }}
+
 jobs:
   browser:
     runs-on: [self-hosted, build01]
     # build01 is a persistent self-hosted host: never run code from fork PRs on it.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Rust relay lane pushes only need the relay-rs job; the full suite runs on PRs to master.
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay')
     strategy:
       matrix:
         node: [22, 24]
@@ -56,7 +62,8 @@ jobs:
   relay:
     runs-on: [self-hosted, build01]
     # build01 is a persistent self-hosted host: never run code from fork PRs on it.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Rust relay lane pushes only need the relay-rs job; the full suite runs on PRs to master.
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay')
     defaults:
       run:
         working-directory: relay
@@ -179,7 +186,8 @@ jobs:
     name: Android unit tests and lint (build01)
     runs-on: [self-hosted, build01]
     # build01 is a persistent self-hosted host: never run code from fork PRs on it.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Rust relay lane pushes only need the relay-rs job; the full suite runs on PRs to master.
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay')
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
