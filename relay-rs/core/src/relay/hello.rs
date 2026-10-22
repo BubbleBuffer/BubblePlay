@@ -270,6 +270,7 @@ impl Relay {
             };
             conn.deadline_ms = deadline;
         }
+        self.persist(id, out);
         self.send_text(
             id,
             json!({"type": "register-challenge", "nonce": util::b64url(&nonce)}).to_string(),
@@ -326,6 +327,7 @@ impl Relay {
         let pending = std::mem::take(&mut room.pending);
         self.make_live(id, now_ms);
         let ticket = self.issue_ticket(id, now_ms, rng);
+        self.persist(id, out);
         self.send_text(
             id,
             json!({"type": "hello-ok", "ticket": ticket, "pc": pc}).to_string(),
@@ -363,6 +365,7 @@ impl Relay {
             };
             conn.deadline_ms = deadline;
         }
+        self.persist(id, out);
         self.send_text(
             id,
             json!({"type": "register-challenge", "nonce": util::b64url(&nonce)}).to_string(),
@@ -421,6 +424,7 @@ impl Relay {
         } else {
             Some(self.issue_ticket(id, now_ms, rng))
         };
+        self.persist(id, out);
         let ice = self.ice_servers(turn, now_ms, rng);
         let mut hello = json!({
             "type": "hello-ok",
@@ -486,6 +490,7 @@ impl Relay {
         }
         self.peers.insert(key, id);
         self.make_live(id, now_ms);
+        self.persist(id, out);
 
         let mut hello = json!({"type": "hello-ok"});
         if conn.role == Role::MediaViewer {

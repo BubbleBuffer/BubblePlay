@@ -264,6 +264,7 @@ impl Shared {
                         return Err(StoreFailed);
                     }
                 }
+                Action::Snapshot(_, _) => {}
                 Action::SendText(id, text) => self.deliver(id, Out::Text(text), &mut queue),
                 Action::SendBinary(id, bytes) => self.deliver(id, Out::Binary(bytes), &mut queue),
                 Action::Close(id, code, reason) => {
@@ -285,6 +286,7 @@ impl Shared {
                 Action::PersistPcs(_) => {
                     tracing::warn!("skipped a PersistPcs on a close path");
                 }
+                Action::Snapshot(_, _) => {}
                 Action::SendText(id, text) => self.deliver(id, Out::Text(text), &mut queue),
                 Action::SendBinary(id, bytes) => self.deliver(id, Out::Binary(bytes), &mut queue),
                 Action::Close(id, code, reason) => {

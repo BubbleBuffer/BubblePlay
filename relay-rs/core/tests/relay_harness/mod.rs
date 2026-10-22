@@ -25,6 +25,7 @@ pub const VIEWER_SEED: u8 = 200;
 pub const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
 
 /// Deterministic RNG (splitmix64). Every run with the same seed yields the same bytes.
+#[derive(Clone)]
 pub struct TestRng(u64);
 
 impl TestRng {
