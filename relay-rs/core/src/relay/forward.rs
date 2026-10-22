@@ -134,10 +134,9 @@ impl Relay {
                 self.send_text(id, json!({"type": "pong"}).to_string(), out);
             }
             Ok(_) => {
-                if conn.role == Role::MediaViewer {
-                    if let Some(other) = self.other_of(conn) {
-                        self.send_text(other, text.to_owned(), out);
-                    }
+                let viewer_only = conn.role == Role::MediaViewer;
+                if let Some(other) = self.other_of(conn).filter(|_| viewer_only) {
+                    self.send_text(other, text.to_owned(), out);
                 }
             }
             Err(Invalid::Drop) => {}

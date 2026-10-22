@@ -33,7 +33,7 @@ impl Relay {
             return;
         };
         let role_text = util::text_of(&m, "role");
-        let known_role = conn.role.hello_roles().iter().any(|r| *r == role_text);
+        let known_role = conn.role.hello_roles().contains(&role_text);
         if util::text_of(&m, "type") != "hello" || !known_role {
             self.hello_refused(id, out);
             return;

@@ -278,11 +278,9 @@ impl Relay {
 
     /// Marks a socket closing and queues the Close action. Idempotent.
     fn close(&mut self, id: ConnId, code: u16, reason: &str, out: &mut Vec<Action>) {
-        if let Some(conn) = self.conns.get_mut(&id) {
-            if !conn.closing {
-                conn.closing = true;
-                out.push(Action::Close(id, code, reason.to_owned()));
-            }
+        if let Some(conn) = self.conns.get_mut(&id).filter(|c| !c.closing) {
+            conn.closing = true;
+            out.push(Action::Close(id, code, reason.to_owned()));
         }
     }
 
@@ -325,10 +323,8 @@ impl Relay {
             if conn.role == Role::Viewer {
                 self.forget_viewer_state(&conn, out);
             }
-            if conn.role == Role::Host {
-                if let Some(room) = self.rooms.get_mut(&conn.pc) {
-                    room.cached.clear();
-                }
+            if let (Role::Host, Some(room)) = (conn.role, self.rooms.get_mut(&conn.pc)) {
+                room.cached.clear();
             }
             self.notify_peer_left(&conn, kind, out);
         }
