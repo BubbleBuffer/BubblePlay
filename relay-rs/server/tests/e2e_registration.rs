@@ -200,13 +200,7 @@ async fn e2e_admin_list_and_delete_closes_host() {
         404
     );
 
-    let rows: Value = admin_get(&server, ADMIN)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let rows: Value = read_json(admin_get(&server, ADMIN).send().await.unwrap()).await;
     let row = rows
         .as_array()
         .unwrap()
@@ -227,13 +221,7 @@ async fn e2e_admin_list_and_delete_closes_host() {
         (1008, "peer removed".to_string())
     );
 
-    let after: Value = admin_get(&server, ADMIN)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let after: Value = read_json(admin_get(&server, ADMIN).send().await.unwrap()).await;
     assert!(
         after
             .as_array()
@@ -264,13 +252,7 @@ async fn e2e_restart_keeps_pcs_and_gate_cookie() {
     };
 
     let second = Server::start(&env, None).await;
-    let rows: Value = admin_get(&second, ADMIN)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let rows: Value = read_json(admin_get(&second, ADMIN).send().await.unwrap()).await;
     let row = rows
         .as_array()
         .unwrap()

@@ -156,6 +156,12 @@ pub fn base(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
 
+/// A JSON body. reqwest is built without its json feature, so the body is parsed here.
+pub async fn read_json(response: reqwest::Response) -> Value {
+    let text = response.text().await.unwrap();
+    serde_json::from_str(&text).expect("body is JSON")
+}
+
 pub fn http() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -415,7 +421,7 @@ pub async fn browser_cookie(server: &Server, env: &Env) -> String {
         .next()
         .unwrap()
         .to_string();
-    let state: Value = poll_reply.json().await.unwrap();
+    let state: Value = read_json(poll_reply).await;
     assert_eq!(state["state"], "approved");
     cookie
 }

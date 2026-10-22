@@ -141,7 +141,13 @@ async fn e2e_ws_wrong_origin_or_missing_cookie_is_404() {
     let cookie = browser_cookie(&server, &env).await;
     let path = format!("/ws?pc={}", pc_id(&identity(11)));
     assert_eq!(
-        refused(server.addr, &path, Some("https://evil.test"), Some(cookie.as_str())).await,
+        refused(
+            server.addr,
+            &path,
+            Some("https://evil.test"),
+            Some(cookie.as_str())
+        )
+        .await,
         404
     );
     assert_eq!(refused(server.addr, &path, Some(ORIGIN), None).await, 404);
