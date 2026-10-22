@@ -1,9 +1,14 @@
 //! `serve`: binds the listen address and runs the axum app until SIGTERM or Ctrl-C.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use crate::app::{AppState, router};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+
+use crate::app::router;
 use crate::config::Config;
+use crate::runtime::{Shared, spawn_ticker};
 
 pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -18,20 +23,36 @@ pub async fn serve(cfg: &Config) -> Result<(), ServeError> {
             "LAB BUILD: the listener is loopback-only. Local testing only."
         );
     }
-    let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
+    let listener = TcpListener::bind(cfg.listen).await?;
+    run(cfg, listener).await
+}
+
+/// Runs the relay on an already bound listener until a shutdown signal. Tests use this with a
+/// listener on 127.0.0.1:0.
+pub async fn run(cfg: &Config, listener: TcpListener) -> Result<(), ServeError> {
     tracing::info!(
         listen = %listener.local_addr()?,
         public_origin = %cfg.public_origin,
         max_connections = cfg.max_connections,
         "relay listening"
     );
-    let state = AppState::new(cfg.admin_token.expose(), &cfg.assets_dir);
-    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+    let shared = Arc::new(Shared::new(cfg)?);
+    let _ticker = AbortOnDrop(spawn_ticker(shared.clone()));
+    let app = router(shared).into_make_service_with_connect_info::<SocketAddr>();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     tracing::info!("relay stopped");
     Ok(())
+}
+
+/// Aborts its task when dropped, so the ticker never outlives the server.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 async fn shutdown_signal() {
