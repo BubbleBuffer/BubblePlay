@@ -58,6 +58,7 @@ dependencies = [
  "base64",
  "bp-device-key",
  "hmac",
+ "serde",
  "serde_json",
  "sha1",
  "sha2",
