@@ -1,0 +1,11 @@
+# Build-context rules for relay-rs/Dockerfile (the context is the repository root).
+.git
+**/target
+android
+client-win
+host
+relay
+docs
+branding
+worker/*
+!worker/public
