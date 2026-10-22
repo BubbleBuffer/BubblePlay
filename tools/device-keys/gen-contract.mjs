@@ -195,6 +195,7 @@ const fixture = {
       authHost: { type: "auth-host", id: pc.id, public: pc.public, nonce: pc.nonce, ephemeral: pc.ephemeral, signature: b64(pcSignature) },
       authFinish: { type: "auth-finish", signature: b64(viewerSignature) },
       authBind: { type: "auth-bind", signature: dtls.viewer.signature },
+      authBindPc: { type: "auth-bind", signature: dtls.pc.signature },
     },
   },
   relayProof: {
