@@ -738,7 +738,7 @@ fn m2_auth_hello_rejects_bad_shapes_and_oversize() {
     dropped(Side::Viewer, &extra);
 
     let mut too_many = auth_hello_msg(201);
-    too_many["caps"] = json!(["input"; 33]);
+    too_many["caps"] = serde_json::Value::from(vec!["input"; 33]);
     dropped(Side::Viewer, &too_many);
 
     let mut long_name = auth_hello_msg(201);
