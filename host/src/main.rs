@@ -20,7 +20,6 @@ mod viewer_display;
 use viewer_display::{DisplayWakePolicy, ViewerDisplayHold};
 
 use bubbleplay_host::activity::Activity;
-use bubbleplay_host::agent_client;
 use bubbleplay_host::benchmark;
 use bubbleplay_host::capture;
 use bubbleplay_host::encode;
@@ -32,8 +31,6 @@ use bubbleplay_host::frame_damage;
 use bubbleplay_host::hevc_tiles;
 use bubbleplay_host::hybrid;
 use bubbleplay_host::input;
-use bubbleplay_host::privileged_ipc;
-use bubbleplay_host::privileged_pipe;
 use bubbleplay_host::quality;
 use bubbleplay_host::reconstruction_feedback;
 use bubbleplay_host::rtc;
@@ -64,7 +61,6 @@ use tracing::{error, info, warn};
 use windows::core::Interface;
 use windows::Win32::Foundation::{POINT, RECT};
 
-use agent_client::AgentClient;
 use benchmark::{
     BenchmarkAqMode, BenchmarkHybridCacheMode, BenchmarkHybridMode, BenchmarkMultipass,
     BenchmarkPreset, BenchmarkResourceMode, BenchmarkRoiMode, BenchmarkStreamMode,
@@ -90,12 +86,6 @@ use hybrid::{
     MAX_HYBRID_SIDECAR_BYTES,
 };
 use input::{CursorKindTracker, CursorTracker, DesktopRegion, InputPacketCoalescer, InputSink};
-use privileged_ipc::{
-    Codec as AgentCodec, CropRect as AgentCrop, EncoderAqMode as AgentAqMode,
-    EncoderMultipass as AgentMultipass, EncoderPreset as AgentPreset, EncoderTuning as AgentTuning,
-    Message as AgentMessage, StreamMode as AgentStreamMode,
-};
-use privileged_pipe::RetryPolicy;
 use quality::{Controller, Decision, Profile, Qos, StreamMode};
 use reconstruction_feedback::{
     is_exact_previous_feedback, ReconstructionFeedbackAnalyzer, ReconstructionFeedbackSubmission,
@@ -135,7 +125,6 @@ const MAX_BITRATE_BPS: u32 = 40_000_000;
 const IDR_INTERVAL: Duration = Duration::from_secs(2);
 const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_secs(2);
 const STATIC_REPLAY_DELAY: Duration = Duration::from_millis(250);
-const WSS_GOP_INTERVAL: Duration = Duration::from_secs(1);
 const WSS_HIGH_BITRATE_BPS: u32 = 6_000_000;
 const WSS_BALANCED_BITRATE_BPS: u32 = 3_000_000;
 const WSS_SAVER_BITRATE_BPS: u32 = 1_500_000;
@@ -145,14 +134,6 @@ const SIGNALING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// bitrate (NVENC grows the one-frame VBV with it), so a keyframe is not
 /// starved into a blocky whole-frame dip.
 const WSS_V4_REFINE_BITRATE_FACTOR: u32 = 4;
-
-fn wss_gop_interval(mode: StreamMode) -> Duration {
-    if mode == StreamMode::Work {
-        IDR_INTERVAL
-    } else {
-        WSS_GOP_INTERVAL
-    }
-}
 
 /// v4 has no periodic keyframe: only start, a new peer / reconnect, a
 /// transition and an explicit receiver request produce one.
@@ -191,7 +172,6 @@ struct Args {
     out: String,
     monitor: Option<String>,
     vdd: bool,
-    privileged_agent: bool,
     audio: bool,
     benchmark_profile: Option<PathBuf>,
     cpu_mode: bool,
@@ -227,7 +207,6 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
         out: "test.h264".to_string(),
         monitor: None,
         vdd: false,
-        privileged_agent: false,
         audio: true,
         benchmark_profile: None,
         cpu_mode: false,
@@ -254,7 +233,6 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
             "--out" => args.out = it.next().context("--out value")?,
             "--monitor" => args.monitor = Some(it.next().context("--monitor value")?),
             "--vdd" => args.vdd = true,
-            "--privileged-agent" => args.privileged_agent = true,
             "--no-audio" => args.audio = false,
             "--benchmark-profile" => {
                 args.benchmark_profile = Some(PathBuf::from(
@@ -265,7 +243,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
             // Diagnostic override for the encoder backend; not in --help.
             "--encoder" => args.encoder = it.next().context("--encoder value")?.parse()?,
             "-h" | "--help" => {
-                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--host-gate-token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--privileged-agent] [--no-audio] [--benchmark-profile absolute-path] [--cpu-mode]");
+                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--host-gate-token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--no-audio] [--benchmark-profile absolute-path] [--cpu-mode]");
                 std::process::exit(0);
             }
             other => bail!("unknown argument: {other}"),
@@ -307,13 +285,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
     Ok(args)
 }
 
-fn local_recovery_probe_due(
-    privileged: bool,
-    available: bool,
-    now: Instant,
-    deadline: Instant,
-) -> bool {
-    !privileged && !available && now >= deadline
+fn local_recovery_probe_due(available: bool, now: Instant, deadline: Instant) -> bool {
+    !available && now >= deadline
 }
 
 fn refresh_input_geometry(
@@ -329,18 +302,17 @@ fn refresh_input_geometry(
 /// A failed switch still advances the generation and closes presentation.
 /// Reannounce the retained source so the viewer can present a fresh frame and
 /// complete the same readiness handshake as a successful switch.
-fn retained_capture_after_failed_switch(state: PrivilegedDesktopState) -> bool {
+fn retained_capture_after_failed_switch(state: DesktopState) -> bool {
     state.available && state.desktop == "default"
 }
 
 fn foreground_sample_live(
     viewer_attached: bool,
-    privileged: bool,
     available: bool,
     desktop: &str,
     transport_live: bool,
 ) -> bool {
-    viewer_attached && !privileged && available && desktop == "default" && transport_live
+    viewer_attached && available && desktop == "default" && transport_live
 }
 
 fn announce_capture_state(
@@ -359,7 +331,7 @@ fn announce_capture_state(
         );
         return;
     }
-    if !capture.is_privileged() && !state.available {
+    if !state.available {
         if let Some(kind) = bubbleplay_host::desktop_session::secure_desktop_kind() {
             signaling.send_secure_desktop_state(kind, &[], generation);
             return;
@@ -540,11 +512,9 @@ fn reconcile_carried_input(
     capture_available: bool,
     remote_input_ready: bool,
     input_sink: &mut InputSink,
-    capture: &mut CaptureSource,
 ) {
     if carried_input.take_resume_release(capture_available, remote_input_ready) {
         input_sink.release_all();
-        capture.release_input();
     }
 }
 
@@ -618,26 +588,21 @@ fn main() -> Result<()> {
         .init();
 
     let mut args = parse_args()?;
-    // Privileged and admin serving keep the legacy registration.
-    args.device_identity = if args.privileged_agent {
-        None
-    } else {
-        let handoff = device_key_handoff.as_deref().map(String::as_str);
-        match bubbleplay_host::device_key::identity_from_handoff(handoff) {
-            Ok(identity) => {
-                if identity.is_none() {
-                    info!("no PC device key supplied; starting without a device ID");
-                }
-                identity
+    let handoff = device_key_handoff.as_deref().map(String::as_str);
+    args.device_identity = match bubbleplay_host::device_key::identity_from_handoff(handoff) {
+        Ok(identity) => {
+            if identity.is_none() {
+                info!("no PC device key supplied; starting without a device ID");
             }
-            Err(_) => {
-                warn!("PC device key is unusable; starting without a device ID");
-                None
-            }
+            identity
+        }
+        Err(_) => {
+            warn!("PC device key is unusable; starting without a device ID");
+            None
         }
     };
     drop(device_key_handoff);
-    if args.mode == "serve" && !args.privileged_agent {
+    if args.mode == "serve" {
         bubbleplay_host::input::recover_headless_cursor_support();
     }
     info!(
@@ -653,8 +618,6 @@ fn main() -> Result<()> {
 
 /// The display the client asked for, retained for the lifetime of the serve
 /// loop so a session restart (peer left, ICE loss) reopens the same monitor.
-/// The privileged Agent keeps its own selection; the host never records one
-/// for it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct CaptureSelection {
     selector: Option<String>,
@@ -680,17 +643,14 @@ impl CaptureSelection {
         self.runtime
     }
 
-    /// Record a live switch. `None` (privileged source) leaves the selection
-    /// untouched so privileged behavior is preserved.
-    fn remember(&mut self, selector: Option<String>) -> bool {
-        match selector.filter(|value| !value.is_empty()) {
-            Some(selector) => {
-                self.selector = Some(selector);
-                self.runtime = true;
-                true
-            }
-            None => false,
+    /// Record a live switch. An empty selector leaves the selection untouched.
+    fn remember(&mut self, selector: String) -> bool {
+        if selector.is_empty() {
+            return false;
         }
+        self.selector = Some(selector);
+        self.runtime = true;
+        true
     }
 }
 
@@ -708,16 +668,12 @@ fn remembered_monitor_attempt_exhausted(attempts: u32) -> bool {
 fn run_serve_forever(args: &Args) -> Result<()> {
     // The inline VDD keepalive outlives a single session: dropping it between
     // sessions would unplug a remembered virtual display.
-    let _vdd = if args.privileged_agent {
-        None
-    } else {
-        start_vdd_keepalive(args)?
-    };
+    let _vdd = start_vdd_keepalive(args)?;
     let mut selection = CaptureSelection::from_launch(args.monitor.as_deref());
     let mut backoff = Duration::from_secs(1);
     let mut unavailable_attempts = 0u32;
     loop {
-        if !args.privileged_agent && selection.is_runtime() {
+        if selection.is_runtime() {
             if let Some(selector) = selection.selector() {
                 if let Err(error) = pick_monitor(Some(selector)) {
                     unavailable_attempts += 1;
@@ -746,11 +702,6 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                 std::thread::sleep(backoff);
             }
             Err(e) => {
-                if !should_retry_serve_error(args.privileged_agent) {
-                    return Err(e).context(
-                        "privileged serve session failed; returning to the external service supervisor",
-                    );
-                }
                 // Worker deploys reset the Durable Object, killing our WS
                 // and briefly 500ing new connections. That's transient —
                 // retry with backoff instead of taking the host down.
@@ -764,10 +715,6 @@ fn run_serve_forever(args: &Args) -> Result<()> {
             }
         }
     }
-}
-
-fn should_retry_serve_error(privileged_agent: bool) -> bool {
-    !privileged_agent
 }
 
 /// M1 spike: capture + encode to a local file, measure latency.
@@ -994,11 +941,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             .is_ok_and(|value| value == "1");
     let mut capture = session_call!(Capture, CaptureSource::open(args, selection.selector()))?;
     let mut encoder_discovery = EncoderDiscoveryCache::default();
-    let mut discovered_adapter = if let Some(selector) = capture.monitor_selector() {
+    let mut discovered_adapter = {
+        let selector = capture.monitor_selector();
         let adapter = capture::monitor_adapter(Some(&selector))?;
         Some(encoder_adapter(&adapter.cast()?)?)
-    } else {
-        None
     };
     let mut discovered_backend = match discovered_adapter {
         Some(adapter) => encoder_discovery.resolve(adapter, args.encoder_preference())?,
@@ -1040,7 +986,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     // and Send To belong to the interactive user) and needs the host bearer
     // for `/host-file-ws`.
     let file_service = match args.host_gate_token.as_deref() {
-        Some(bearer) if !args.privileged_agent => {
+        Some(bearer) => {
             match FileService::spawn_routed(
                 &worker,
                 bearer,
@@ -1057,20 +1003,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         _ => None,
     };
     signaling.set_file_transfer(file_service.is_some());
-    signaling.set_file_drop(file_service.is_some() && !capture.is_privileged());
+    signaling.set_file_drop(file_service.is_some());
     // Follow active window needs the interactive user's foreground window,
     // so only the local (tray) capture path advertises it.
-    signaling.set_follow_window_supported(!capture.is_privileged());
+    signaling.set_follow_window_supported(true);
     signaling.set_audio_enabled(args.audio);
     let mut next_file_rate_update = Instant::now();
     let mut file_drag_preview = FileDragPreviewState::default();
     let mut pending_native_drop: Option<PendingNativeDrop> = None;
-    signaling.send_host_capabilities(
-        args.privileged_agent,
-        args.privileged_agent,
-        args.privileged_agent,
-        false,
-    );
+    signaling.send_host_capabilities(false, false, false, false);
     let pinned = match args.quality.as_str() {
         "480p24" => Some(Profile::Mobile),
         "540p30" => Some(Profile::Low),
@@ -1133,17 +1074,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut cpu_damage = CpuDamage::default();
     let mut cpu_requested_mode: Option<VideoMode> = None;
     let mut cpu_applied_mode: Option<VideoMode> = None;
-    // Only an unprivileged local host runs as the interactive user; the
-    // service path syncs clipboard inside the input proxy instead.
     // Admin mode: the tray points the user-level host at the elevated input
     // agent; without it (or if it is unavailable) input stays user-level.
-    let admin_agent = if capture.is_privileged() {
-        None
-    } else {
-        bubbleplay_host::admin_agent::client::AdminAgentLink::from_env()
-    };
+    let admin_agent = bubbleplay_host::admin_agent::client::AdminAgentLink::from_env();
     let mut input_sink = InputSink::new()
-        .with_clipboard(!capture.is_privileged())
+        .with_clipboard(true)
         .with_admin_agent(admin_agent)
         .with_secure_helper(capture.secure_helper());
     input_sink.set_absolute_region(capture.region());
@@ -1251,14 +1186,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut wss_delta_count = 0u64;
     let mut wss_max_access_unit_bytes = 0usize;
     let mut next_au_id = 1u64;
-    let mut capture_available = !args.privileged_agent;
+    let mut capture_available = true;
     let mut next_local_recovery_probe = Instant::now();
-    // The privileged path stays fail-closed across desktop/monitor/source
-    // transitions until the browser acknowledges presentation of a frame from
-    // the newly announced media generation.
-    let mut remote_input_ready = !args.privileged_agent;
+    let mut remote_input_ready = true;
     let mut carried_input = input::CarriedInput::default();
-    let mut last_privileged_desktop_state: Option<PrivilegedDesktopState> = None;
     let mut last_secure_announcement: Option<(bool, &'static str, Vec<&'static str>)> = None;
     let mut last_secure_helper_ready = false;
     let mut next_secure_state_poll = Instant::now();
@@ -1318,7 +1249,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 carried_input.begin_switch($carry_input);
                 if !$carry_input {
                     session_call!(Input, input_sink.release_all());
-                    capture.release_input();
                 }
                 remote_input_ready = false;
                 latest_cursor_kind = None;
@@ -1337,30 +1267,24 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 next_admission = Instant::now();
                 next_idr = Instant::now();
                 match capture.switch_monitor(selector) {
-                    Ok(completed) => {
-                        // Local capture completes synchronously. The
-                        // privileged Agent returns false and must prove
-                        // the newly selected monitor with
-                        // CaptureHealth::Active before input/media are
-                        // advertised ready.
-                        capture_available = completed;
-                        if completed {
-                            // The client owns the display choice for
-                            // the lifetime of the host process: a
-                            // later session reopens the same monitor.
-                            selection.remember(capture.monitor_selector());
-                            refresh_input_geometry(
-                                &mut input_sink,
-                                &mut cursor_tracker,
-                                capture.region(),
-                                Instant::now(),
-                            );
-                            signaling.send_desktop_state(
-                                "active",
-                                media_generation,
-                                "monitor-switched",
-                            );
-                        }
+                    Ok(()) => {
+                        // Local capture completes synchronously.
+                        capture_available = true;
+                        // The client owns the display choice for
+                        // the lifetime of the host process: a
+                        // later session reopens the same monitor.
+                        selection.remember(capture.monitor_selector());
+                        refresh_input_geometry(
+                            &mut input_sink,
+                            &mut cursor_tracker,
+                            capture.region(),
+                            Instant::now(),
+                        );
+                        signaling.send_desktop_state(
+                            "active",
+                            media_generation,
+                            "monitor-switched",
+                        );
                         if let Ok(monitors) = capture.monitors() {
                             signaling.send_monitor_list(monitors);
                         }
@@ -1403,16 +1327,19 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     }
     macro_rules! park_viewer {
         ($reason:expr) => {{
+            remote_input_ready = false;
+            park_viewer!(@keep_input $reason);
+        }};
+        // For a caller that re-arms remote input itself right afterwards.
+        (@keep_input $reason:expr) => {{
             file_drag_preview.cancel();
             if let Some(pending) = pending_native_drop.take() {
                 pending.request.reject("viewer-disconnected");
             }
             session_call!(Input, input_sink.release_all());
-            capture.release_input();
             capture.set_capture_demand(false)?;
             capture.end_viewer_session();
             carried_input.reset();
-            remote_input_ready = false;
             viewer_attached = false;
             if let Some(egress) = &wss_media {
                 egress.set_audio_enabled(false);
@@ -1472,6 +1399,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     }
     macro_rules! begin_viewer_input {
         () => {{
+            begin_viewer_input!(@keep_input);
+            remote_input_ready = capture_available;
+        }};
+        // For a caller that re-arms remote input itself right afterwards.
+        (@keep_input) => {{
             session_call!(Input, input_sink.reset_viewer_session());
             input_coalescer = InputPacketCoalescer::default();
             signaling.reset_viewer_cursor_state();
@@ -1479,13 +1411,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             cursor_tracker = CursorTracker::for_region(capture.region(), Instant::now());
             cursor_kind_tracker.reset();
             latest_cursor_kind = None;
-            capture.begin_viewer_session();
-            // A replaced Agent lease requires a fresh media identity and its
-            // existing verified-frame/presentation gate before accepting input.
+            // A new viewer starts a fresh media identity.
             media_generation = media_generation.wrapping_add(1).max(1);
             media_sequence = 0;
-            last_privileged_desktop_state = None;
-            remote_input_ready = !args.privileged_agent && capture_available;
             info!("viewer input sequence space reset");
         }};
     }
@@ -1510,12 +1438,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             || profiles.staged().is_some()
             || encoder.as_ref().is_some_and(VideoEncoder::idr_pending);
         let recovery_due = viewer_attached
-            && local_recovery_probe_due(
-                capture.is_privileged(),
-                capture_available,
-                wait_now,
-                next_local_recovery_probe,
-            );
+            && local_recovery_probe_due(capture_available, wait_now, next_local_recovery_probe);
         capture.set_capture_demand(capture_demand || recovery_due)?;
         if capture_demand || recovery_due {
             capture.request_event_frame_at(if urgent_capture || recovery_due {
@@ -1525,7 +1448,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             })?;
         }
         if let Ok(wake) = &cursor_wake {
-            wake.set_active(capture_demand && !capture.is_privileged());
+            wake.set_active(capture_demand);
         }
         if !first_iteration {
             let mut deadlines = vec![next_ping, next_benchmark_refresh, next_input_log];
@@ -1543,7 +1466,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 deadlines.push(next_benchmark_status);
             }
             if capture_demand {
-                if !capture.is_privileged() && capture.desktop_state().desktop != "secure" {
+                if capture.desktop_state().desktop != "secure" {
                     deadlines.push(next_cursor_poll);
                     if cursor_wake
                         .as_ref()
@@ -1551,9 +1474,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     {
                         deadlines.push(next_cursor_event_sample);
                     }
-                }
-                if capture.is_privileged() && next_admission > wait_now {
-                    deadlines.push(next_admission);
                 }
                 if wss_media.is_some() {
                     deadlines.push(next_wss_stats);
@@ -1566,7 +1486,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
                 if foreground_sample_live(
                     viewer_attached,
-                    capture.is_privileged(),
                     capture_available,
                     capture.desktop_state().desktop,
                     ice_connected || wss_peer_live,
@@ -1616,19 +1535,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                     (None, None) => {}
                 }
-                if !args.privileged_agent {
-                    // The local candidate owns its NVENC session. Any effective
-                    // lease change must recreate that session so bench-status
-                    // cannot claim options that the encoder never applied.
-                    encoder = None;
-                    scaler = None;
-                    latest_idr = None;
-                    pending_transition_idr = None;
-                    pending_wss_idr = None;
-                    pending_viewport_idr = None;
-                    next_admission = Instant::now();
-                    next_idr = Instant::now();
-                }
+                // The local candidate owns its NVENC session. Any effective
+                // lease change must recreate that session so bench-status
+                // cannot claim options that the encoder never applied.
+                encoder = None;
+                scaler = None;
+                latest_idr = None;
+                pending_transition_idr = None;
+                pending_wss_idr = None;
+                pending_viewport_idr = None;
+                next_admission = Instant::now();
+                next_idr = Instant::now();
                 benchmark_profile = next_profile;
                 benchmark_roi_activity = benchmark_profile
                     .as_ref()
@@ -1818,7 +1735,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 benchmark_status_now + benchmark_status_retry_delay(status_sent);
         }
         session_stage!(SecureHelper);
-        capture.tick(loop_now)?;
         capture.tick_secure(
             viewer_attached && (ice_connected || wss_peer_live),
             loop_now,
@@ -1827,9 +1743,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         let secure_helper_ready = capture.secure_helper_ready();
         if secure_helper_ready != last_secure_helper_ready {
             signaling.send_host_capabilities(
-                args.privileged_agent,
-                args.privileged_agent,
-                args.privileged_agent || secure_helper_ready,
+                false,
+                false,
+                secure_helper_ready,
                 secure_helper_ready,
             );
             last_secure_helper_ready = secure_helper_ready;
@@ -1847,194 +1763,67 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 signaling.send_secure_action_result(result.ok, &result.reason);
             }
         }
-        while let Some(event) = capture.try_privileged_event()? {
-            match event {
-                PrivilegedEvent::Desktop {
-                    available,
-                    desktop,
-                    input,
-                    generation: agent_generation,
-                    reason,
-                } => {
-                    let announced = PrivilegedDesktopState {
-                        available,
-                        desktop,
-                        input,
-                        agent_generation,
-                    };
-                    if !record_privileged_desktop_state(
-                        &mut last_privileged_desktop_state,
-                        announced,
-                    ) {
-                        continue;
-                    }
-                    last_privileged_desktop_state = Some(announced);
-                    remote_input_ready = false;
-                    capture_available = available;
-                    media_generation = media_generation.wrapping_add(1).max(1);
-                    if !available {
-                        pending_first_frame = None;
-                        latest_idr = None;
-                        pending_transition_idr = None;
-                        pending_wss_idr = None;
-                        pending_viewport_idr = None;
-                    } else {
-                        next_admission = Instant::now();
-                        next_idr = Instant::now();
-                    }
-                    signaling.send_desktop_state_kind(
-                        if available { "active" } else { "unavailable" },
-                        Some(desktop),
-                        Some(input),
-                        media_generation,
-                        reason,
-                    );
-                    info!(
-                        agent_generation,
-                        media_generation, desktop, input, "privileged desktop state"
-                    );
-                }
-                PrivilegedEvent::Cursor(encoded) => {
-                    // Pipe feedback from the previous producer may already be
-                    // queued when its lease is replaced. Do not import its ACK
-                    // into the fresh viewer's watermark behind the frame gate.
-                    if !remote_input_ready {
-                        continue;
-                    }
-                    signaling.send_cursor_state(encoded, false);
-                    if ice_connected {
-                        pump.publish_cursor_state(encoded);
-                    }
-                }
-                PrivilegedEvent::CursorKind(encoded) => {
-                    latest_cursor_kind = Some(encoded);
-                    signaling.send_binary(&encoded);
-                    pump.publish_cursor_kind(encoded);
-                }
-                PrivilegedEvent::InputStatus(stats) => {
-                    // Agent input handling emits an ordered Cursor + InputStats
-                    // pair for every reliable button/cursor-sync response.
-                    // Preserve that response distinctly before this barrier.
-                    signaling.flush_cursor_state_reliable();
-                    signaling.send_input_status(
-                        stats.session_generation,
-                        stats.received_packets,
-                        stats.accepted_packets,
-                        stats.failed_packets,
-                        stats.dropped_packets,
-                        stats.released_inputs,
-                        stats.requested_events,
-                        stats.applied_events,
-                        stats.last_error_code,
-                        stats.last_sequence,
-                    );
-                }
-                PrivilegedEvent::Clipboard {
-                    id,
-                    index,
-                    count,
-                    text,
-                    png,
-                } => signaling.send_clipboard_content_chunk(id, index, count, &text, png),
-                PrivilegedEvent::Monitors(monitors) => signaling.send_monitor_list(monitors),
-                PrivilegedEvent::MonitorSwitch {
-                    accepted,
-                    monitor,
-                    error_code,
-                } => {
-                    if accepted {
-                        media_generation = media_generation.wrapping_add(1).max(1);
-                        let state = capture.desktop_state();
-                        signaling.send_desktop_state_kind(
-                            if state.available {
-                                "active"
-                            } else {
-                                "unavailable"
-                            },
-                            Some(state.desktop),
-                            Some(state.input),
-                            media_generation,
-                            "monitor-switched",
-                        );
-                        if let Ok(monitors) = capture.monitors() {
-                            signaling.send_monitor_list(monitors);
-                        }
-                    } else {
-                        signaling.send_monitor_error(
-                            &monitor,
-                            &format!("privileged Agent error {error_code}"),
-                        );
-                    }
-                }
-            }
-        }
-        if let CaptureSource::Local(source) = &mut capture {
-            if let Some(state) = source.take_availability_transition() {
-                match state {
-                    CaptureAvailability::Unavailable => {
-                        capture_available = false;
-                        next_local_recovery_probe = Instant::now();
-                        // Keep startup alive through local capture recovery;
-                        // its own watchdog retains a bounded deadline.
-                        carried_input.reset();
-                        session_call!(Input, input_sink.release_all());
-                        latest_idr = None;
-                        pending_transition_idr = None;
-                        pending_wss_idr = None;
-                        pending_viewport_idr = None;
-                        encoder = None;
-                        scaler = None;
-                        if let Some(secure) =
-                            source.secure_state.as_ref().filter(|state| state.secure)
-                        {
-                            signaling.send_secure_desktop_state(secure.kind, &[], media_generation);
-                        } else if let Some(kind) =
-                            bubbleplay_host::desktop_session::secure_desktop_kind()
-                        {
-                            signaling.send_secure_desktop_state(kind, &[], media_generation);
-                        } else if !source
-                            .unavailable_announcement_deferred(viewer_attached, Instant::now())
-                        {
-                            signaling.send_desktop_state(
-                                "unavailable",
-                                media_generation,
-                                "capture-unavailable",
-                            );
-                        }
-                        warn!(
-                            generation = media_generation,
-                            reason = %source.unavailable_reason(),
-                            "desktop capture unavailable; input suspended"
-                        );
-                    }
-                    CaptureAvailability::Active => {
-                        capture_available = true;
-                        media_generation = media_generation.wrapping_add(1).max(1);
-                        if let Some(pending) = pending_first_frame.as_mut() {
-                            pending.rebind_after_recovery(media_generation);
-                        }
-                        if display_wake.recovered() {
-                            info!("desktop capture recovered after display wake");
-                        }
-                        media_sequence = 0;
-                        latest_idr = None;
-                        pending_transition_idr = None;
-                        pending_wss_idr = None;
-                        pending_viewport_idr = None;
-                        encoder = None;
-                        scaler = None;
-                        next_admission = Instant::now();
-                        next_idr = Instant::now();
+        let CaptureSource::Local(source) = &mut capture;
+        if let Some(state) = source.take_availability_transition() {
+            match state {
+                CaptureAvailability::Unavailable => {
+                    capture_available = false;
+                    next_local_recovery_probe = Instant::now();
+                    // Keep startup alive through local capture recovery;
+                    // its own watchdog retains a bounded deadline.
+                    carried_input.reset();
+                    session_call!(Input, input_sink.release_all());
+                    latest_idr = None;
+                    pending_transition_idr = None;
+                    pending_wss_idr = None;
+                    pending_viewport_idr = None;
+                    encoder = None;
+                    scaler = None;
+                    if let Some(secure) = source.secure_state.as_ref().filter(|state| state.secure)
+                    {
+                        signaling.send_secure_desktop_state(secure.kind, &[], media_generation);
+                    } else if let Some(kind) =
+                        bubbleplay_host::desktop_session::secure_desktop_kind()
+                    {
+                        signaling.send_secure_desktop_state(kind, &[], media_generation);
+                    } else if !source
+                        .unavailable_announcement_deferred(viewer_attached, Instant::now())
+                    {
                         signaling.send_desktop_state(
-                            "active",
+                            "unavailable",
                             media_generation,
-                            "capture-recovered",
-                        );
-                        info!(
-                            generation = media_generation,
-                            "desktop capture recovered; waiting for fresh IDR"
+                            "capture-unavailable",
                         );
                     }
+                    warn!(
+                        generation = media_generation,
+                        reason = %source.unavailable_reason(),
+                        "desktop capture unavailable; input suspended"
+                    );
+                }
+                CaptureAvailability::Active => {
+                    capture_available = true;
+                    media_generation = media_generation.wrapping_add(1).max(1);
+                    if let Some(pending) = pending_first_frame.as_mut() {
+                        pending.rebind_after_recovery(media_generation);
+                    }
+                    if display_wake.recovered() {
+                        info!("desktop capture recovered after display wake");
+                    }
+                    media_sequence = 0;
+                    latest_idr = None;
+                    pending_transition_idr = None;
+                    pending_wss_idr = None;
+                    pending_viewport_idr = None;
+                    encoder = None;
+                    scaler = None;
+                    next_admission = Instant::now();
+                    next_idr = Instant::now();
+                    signaling.send_desktop_state("active", media_generation, "capture-recovered");
+                    info!(
+                        generation = media_generation,
+                        "desktop capture recovered; waiting for fresh IDR"
+                    );
                 }
             }
         }
@@ -2042,7 +1831,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             let active = capture.desktop_state().available;
             (active, state.kind, if active { state.caps } else { vec![] })
         });
-        if secure_announcement.is_none() && !capture.is_privileged() && !capture_available {
+        if secure_announcement.is_none() && !capture_available {
             if loop_now >= next_secure_state_poll {
                 secure_announcement = bubbleplay_host::desktop_session::secure_desktop_kind()
                     .map(|kind| (false, kind, vec![]));
@@ -2206,7 +1995,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         capture_available,
                         remote_input_ready,
                         &mut input_sink,
-                        &mut capture,
                     );
                     if !capture_available || !remote_input_ready || !capture.secure_input_allowed()
                     {
@@ -2235,9 +2023,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     input_coalescer.observe(&data);
                     carried_input.observe_forwarded(&data);
                     invalidate_pending_drop_input(&mut pending_native_drop, &data);
-                    if capture.send_input(&data)? {
-                        continue;
-                    }
                     let outcome = session_call!(Input, input_sink.handle_counted(&data));
                     if outcome.sync_requested && capture.desktop_state().desktop != "secure" {
                         if let Some(kind) = cursor_kind_tracker.sample(true, Instant::now()) {
@@ -2349,13 +2134,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         let cursor_changed = cursor_now >= next_cursor_event_sample
             && cursor_wake.as_ref().is_ok_and(|wake| wake.take_changed());
         cursor_kind_tracker.set_active(
-            !capture.is_privileged()
-                && capture_available
+            capture_available
                 && capture.desktop_state().desktop != "secure"
                 && (ice_connected || wss_media.is_some()),
         );
         if viewer_attached
-            && !capture.is_privileged()
             && capture.desktop_state().desktop != "secure"
             && (cursor_changed || cursor_now >= next_cursor_poll)
         {
@@ -2393,7 +2176,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         let foreground_sample_now = Instant::now();
         let foreground_live = foreground_sample_live(
             viewer_attached,
-            capture.is_privileged(),
             capture_available,
             capture.desktop_state().desktop,
             ice_connected || wss_peer_live,
@@ -2422,13 +2204,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 let monitors = edge_monitors.as_deref().unwrap_or_default();
                 let rects: Vec<follow_window::Rect> =
                     monitors.iter().map(follow_window::Rect::of).collect();
-                let current = capture
-                    .monitor_selector()
-                    .and_then(|current| {
-                        monitors
-                            .iter()
-                            .find(|m| m.selector.eq_ignore_ascii_case(&current))
-                    })
+                let current_selector = capture.monitor_selector();
+                let current = monitors
+                    .iter()
+                    .find(|m| m.selector.eq_ignore_ascii_case(&current_selector))
                     .map(follow_window::Rect::of);
                 let carry = current.and_then(|from| {
                     let to =
@@ -2452,10 +2231,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     switch_capture_monitor!(&selector, true);
                     // Same relative position on the new monitor while the
                     // button is still held, so the dragged window comes along.
-                    if capture
-                        .monitor_selector()
-                        .is_some_and(|streamed| streamed.eq_ignore_ascii_case(&selector))
-                    {
+                    if capture.monitor_selector().eq_ignore_ascii_case(&selector) {
                         let (x, y) = follow_window::carry_cursor(cursor, from, to);
                         if !follow_window::set_cursor(x, y) {
                             warn!("follow active window: edge hold could not move the cursor");
@@ -2476,9 +2252,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     match capture.monitors() {
                         Ok(monitors) => match follow_window::selector_for(&monitors, &target) {
                             Some(selector)
-                                if !capture.monitor_selector().is_some_and(|current| {
-                                    current.eq_ignore_ascii_case(&selector)
-                                }) =>
+                                if !capture.monitor_selector().eq_ignore_ascii_case(&selector) =>
                             {
                                 follow.switched(now);
                                 info!(
@@ -2505,7 +2279,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             file_drag_preview.tick(
                 NativeDropView {
                     ready: file_service.is_some()
-                        && !capture.is_privileged()
                         && bubbleplay_host::clipboard::input_desktop_is_default()
                         && remote_input_ready
                         && capture_available
@@ -2543,7 +2316,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 signaling.send_text(text);
             }
             let desktop = (!outbox.drops.is_empty() || pending_native_drop.is_some())
-                && !capture.is_privileged()
                 && bubbleplay_host::clipboard::input_desktop_is_default();
             let view = NativeDropView {
                 ready: remote_input_ready
@@ -2728,28 +2500,23 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     // An offer that starts a new peer (including a client's
                     // fallback restart after a desktop transition) keeps
                     // input off until that peer's first-frame handshake
-                    // presents, in the user host as in the privileged Agent.
+                    // presents.
                     let starts_peer = !rtc_peer.ended()
                         && should_forward_offer(ice_connected, offer_accepted, offer_in_flight);
                     // A repeated offer never turns input back on by itself.
-                    remote_input_ready = remote_input_ready
-                        && input_ready_on_offer(
-                            args.privileged_agent,
-                            capture_available,
-                            starts_peer,
-                        );
+                    remote_input_ready =
+                        remote_input_ready && input_ready_on_offer(capture_available, starts_peer);
                     if let Some(kind) = latest_cursor_kind {
                         signaling.send_binary(&kind);
                         pump.publish_cursor_kind(kind);
                     }
-                    if args.privileged_agent || starts_peer {
+                    if starts_peer {
                         carried_input.reset();
-                        capture.release_input();
                     }
                     signaling.send_host_capabilities(
-                        args.privileged_agent,
-                        args.privileged_agent,
-                        args.privileged_agent || capture.secure_helper_ready(),
+                        false,
+                        false,
+                        capture.secure_helper_ready(),
                         capture.secure_helper_ready(),
                     );
                     if let Ok(monitors) = capture.monitors() {
@@ -2764,31 +2531,22 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     if rtc_peer.ended() {
                         warn!("ignoring an RTC offer after the RTC peer ended under WSS");
                     } else if should_forward_offer(ice_connected, offer_accepted, offer_in_flight) {
-                        if capture.is_privileged() {
-                            // The privileged encoder remains directly NVENC-owned.
-                            if !pump.command(TransportCommand::Offer(sdp)) {
-                                break 'session;
-                            }
-                        } else {
-                            let selector = capture
-                                .monitor_selector()
-                                .context("local capture selector")?;
-                            let adapter = capture::monitor_adapter(Some(&selector))?;
-                            let adapter = encoder_adapter(&adapter.cast()?)?;
-                            if discovered_adapter != Some(adapter) {
-                                discovered_backend = encoder_discovery
-                                    .resolve(adapter, args.encoder_preference())?;
-                                discovered_adapter = Some(adapter);
-                                discovery_reason = encoder_discovery
-                                    .reason(adapter)
-                                    .unwrap_or_default()
-                                    .to_owned();
-                            }
-                            // Answer at master's offer site, without waiting for
-                            // a DDA frame or changing NVENC's prewarm codec.
-                            if !pump.command(startup_offer_command(sdp, discovered_backend)) {
-                                break 'session;
-                            }
+                        let selector = capture.monitor_selector();
+                        let adapter = capture::monitor_adapter(Some(&selector))?;
+                        let adapter = encoder_adapter(&adapter.cast()?)?;
+                        if discovered_adapter != Some(adapter) {
+                            discovered_backend =
+                                encoder_discovery.resolve(adapter, args.encoder_preference())?;
+                            discovered_adapter = Some(adapter);
+                            discovery_reason = encoder_discovery
+                                .reason(adapter)
+                                .unwrap_or_default()
+                                .to_owned();
+                        }
+                        // Answer at master's offer site, without waiting for
+                        // a DDA frame or changing NVENC's prewarm codec.
+                        if !pump.command(startup_offer_command(sdp, discovered_backend)) {
+                            break 'session;
                         }
                         offer_in_flight = true;
                     }
@@ -2960,11 +2718,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 epoch.as_deref(),
                                 codec.as_deref(),
                             );
-                            let state = capture.desktop_state();
-                            remote_input_ready = privileged_input_ready_after_presentation(
-                                args.privileged_agent,
+                            remote_input_ready = input_ready_after_presentation(
                                 capture_available,
-                                state,
                                 generation,
                                 media_generation,
                             );
@@ -2973,7 +2728,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 capture_available,
                                 remote_input_ready,
                                 &mut input_sink,
-                                &mut capture,
                             );
                             completed_first_frame =
                                 Some((request_id, generation, transport, epoch));
@@ -3083,7 +2837,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             capture_available,
                             remote_input_ready,
                             &mut input_sink,
-                            &mut capture,
                         );
                         if !capture_available
                             || !remote_input_ready
@@ -3113,9 +2866,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                         carried_input.observe_forwarded(&data);
                         invalidate_pending_drop_input(&mut pending_native_drop, &data);
-                        if capture.send_input(&data)? {
-                            continue;
-                        }
                         let outcome = session_call!(Input, input_sink.handle_counted(&data));
                         if outcome.sync_requested && capture.desktop_state().desktop != "secure" {
                             if let Some(kind) = cursor_kind_tracker.sample(true, Instant::now()) {
@@ -3192,10 +2942,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             warn!("follow control missing boolean follow");
                             continue;
                         };
-                        if capture.is_privileged() {
-                            warn!("follow control ignored: not advertised by this host");
-                            continue;
-                        }
                         let changed = follow_state.is_some() != enabled;
                         if enabled {
                             follow_state.get_or_insert_with(FollowWindow::default);
@@ -3290,17 +3036,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 // Replacement can arrive without PeerLeft.
                                 // Fence queued/late input on the old RTC peer
                                 // before clearing the producer's stale barrier.
-                                park_viewer!("wss-epoch-replaced");
+                                park_viewer!(@keep_input "wss-epoch-replaced");
                             }
                             if !viewer_attached {
-                                begin_viewer_input!();
+                                begin_viewer_input!(@keep_input);
                             }
                         }
                         viewer_attached = true;
                         display_hold.set_attached(true);
-                        if !args.privileged_agent {
-                            remote_input_ready = capture_available;
-                        }
+                        remote_input_ready = capture_available;
                         if let Some(requested_epoch) =
                             epoch.as_deref().filter(|value| valid_media_epoch(value))
                         {
@@ -3379,11 +3123,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 wss_audio_requested = audio && protocol == Some(4);
                                 egress.set_audio_enabled(args.audio && wss_audio_requested);
                                 wss_audio_sink = Some(egress.audio_sink());
-                                if args.privileged_agent {
-                                    remote_input_ready = false;
-                                    carried_input.reset();
-                                    capture.release_input();
-                                }
                                 info!(codec = active_codec.name(), "WSS media egress connected");
                                 wss_media = Some(egress);
                                 active_wss_epoch = Some(epoch.to_owned());
@@ -3399,9 +3138,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                     "wss-session-start",
                                 );
                                 signaling.send_host_capabilities(
-                                    args.privileged_agent,
-                                    args.privileged_agent,
-                                    args.privileged_agent || capture.secure_helper_ready(),
+                                    false,
+                                    false,
+                                    capture.secure_helper_ready(),
                                     capture.secure_helper_ready(),
                                 );
                                 // WSS-only clients do not necessarily complete
@@ -3701,16 +3440,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         signaling.flush_cursor_state();
-        if !capture.is_privileged() {
-            let viewer_live =
-                capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
-            // Apply queued RTC and WSS actions before a clipboard completion:
-            // a newer press or disconnect must cancel a delayed paste first.
-            if viewer_live {
-                session_call!(Input, input_sink.finish_clipboard());
-            }
-            local_clipboard.poll(viewer_live, Instant::now(), &mut input_sink, &mut signaling);
+        let viewer_live =
+            capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
+        // Apply queued RTC and WSS actions before a clipboard completion:
+        // a newer press or disconnect must cancel a delayed paste first.
+        if viewer_live {
+            session_call!(Input, input_sink.finish_clipboard());
         }
+        local_clipboard.poll(viewer_live, Instant::now(), &mut input_sink, &mut signaling);
         let audio_wanted =
             args.audio && viewer_attached && (wss_audio_requested || rtc_audio_requested);
         if audio_wanted && audio_capture.is_none() && Instant::now() >= next_audio_start {
@@ -3737,7 +3474,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             };
             capture.set_sink(sink);
         }
-        if viewer_attached && !capture.is_privileged() {
+        if viewer_attached {
             let changed = input_sink.take_status_change();
             if let Some(status) = changed {
                 last_routing_status = Some(status);
@@ -3790,7 +3527,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         let now = Instant::now();
-        let recovering = !capture.is_privileged() && !capture.desktop_state().available;
+        let recovering = !capture.desktop_state().available;
         let wake_default = viewer_attached
             && recovering
             && capture.secure_state().is_none()
@@ -3960,16 +3697,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         let negotiation_active = viewer_attached && (offer_in_flight || offer_accepted);
         let prewarm_needed = negotiation_active && !ice_connected && latest_idr.is_none();
         let local_recovery_probe = viewer_attached
-            && local_recovery_probe_due(
-                capture.is_privileged(),
-                capture_available,
-                now,
-                next_local_recovery_probe,
-            );
+            && local_recovery_probe_due(capture_available, now, next_local_recovery_probe);
         if local_recovery_probe
             || capture_admission_ready(
                 capture_available,
-                capture.is_privileged() && !capture_available,
                 negotiation_active,
                 ice_connected,
                 wss_ready,
@@ -3988,303 +3719,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         BenchmarkTransport::Webrtc => wss_media.is_none() && ice_connected,
                     }
             });
-            if let CaptureSource::Privileged(source) = &mut capture {
-                let old_mode = profiles.active;
-                let mode = profiles.staged.map(|(mode, _)| mode).unwrap_or(old_mode);
-                let benchmark_profile = active_benchmark_profile;
-                let transition = profiles.staged().is_some();
-                if now < next_admission {
-                    continue 'session;
-                }
-                let mut force_idr = periodic_idr_due(now, next_idr, wss_media.is_some())
-                    || latest_idr.is_none()
-                    || transition;
-                let mut wss_reservation = None;
-                if let Some(egress) = wss_media.as_ref() {
-                    let base_meta = WssAccessUnitMeta {
-                        codec: wss_codec(active_codec),
-                        generation: media_generation,
-                        sequence: media_sequence.wrapping_add(1),
-                        timestamp90k: (media_clock_start.elapsed().as_secs_f64() * 90_000.0) as u32,
-                        key: force_idr,
-                    };
-                    match egress.reserve(base_meta) {
-                        Ok(reservation) => wss_reservation = Some(reservation),
-                        Err(WssReserveOutcome::RequireKeyframe) if !force_idr => {
-                            force_idr = true;
-                            match egress.reserve(WssAccessUnitMeta {
-                                key: true,
-                                ..base_meta
-                            }) {
-                                Ok(reservation) => wss_reservation = Some(reservation),
-                                Err(WssReserveOutcome::Stopped) => break 'session,
-                                Err(_) => {
-                                    wss_preencode_skips = wss_preencode_skips.saturating_add(1);
-                                    benchmark_skips = benchmark_skips.saturating_add(1);
-                                    wss_preencode_skips_total =
-                                        wss_preencode_skips_total.saturating_add(1);
-                                    continue 'session;
-                                }
-                            }
-                        }
-                        Err(WssReserveOutcome::Stopped) => break 'session,
-                        Err(_) => {
-                            wss_preencode_skips = wss_preencode_skips.saturating_add(1);
-                            benchmark_skips = benchmark_skips.saturating_add(1);
-                            wss_preencode_skips_total = wss_preencode_skips_total.saturating_add(1);
-                            continue 'session;
-                        }
-                    }
-                }
-                let permit_id = next_au_id;
-                next_au_id = next_au_id.wrapping_add(1).max(1);
-                let crop = viewport_crop.map(|crop| AgentCrop::Pixels {
-                    x: crop.x,
-                    y: crop.y,
-                    width: crop.width,
-                    height: crop.height,
-                });
-                session_stage!(Encode);
-                let result = source.encode_agent(AgentMessage::EncodePermit {
-                    permit_id,
-                    session_generation: media_generation,
-                    config_revision: 1,
-                    stream_mode: if stream_mode == StreamMode::Work {
-                        AgentStreamMode::Work
-                    } else {
-                        AgentStreamMode::Gaming
-                    },
-                    width: benchmark_profile
-                        .map_or(mode.width, |profile| u32::from(profile.width))
-                        .min(u16::MAX as u32) as u16,
-                    height: benchmark_profile
-                        .map_or(mode.height, |profile| u32::from(profile.height))
-                        .min(u16::MAX as u32) as u16,
-                    fps: benchmark_profile
-                        .map_or(mode.fps, |profile| u32::from(profile.fps))
-                        .min(u16::MAX as u32) as u16,
-                    bitrate_bps: benchmark_profile
-                        .map_or_else(|| quality.target(), |profile| profile.bitrate_bps),
-                    codec: if active_codec == VideoCodec::Hevc {
-                        AgentCodec::Hevc
-                    } else {
-                        AgentCodec::H264
-                    },
-                    preset: benchmark_profile.map_or_else(
-                        || {
-                            if args.preset == "p1" {
-                                AgentPreset::P1
-                            } else {
-                                AgentPreset::P3
-                            }
-                        },
-                        |profile| match profile.encoder.preset {
-                            BenchmarkPreset::P1 => AgentPreset::P1,
-                            BenchmarkPreset::P2 => AgentPreset::P2,
-                            BenchmarkPreset::P3 => AgentPreset::P3,
-                            BenchmarkPreset::P4 => AgentPreset::P4,
-                            BenchmarkPreset::P5 => AgentPreset::P5,
-                            BenchmarkPreset::P6 => AgentPreset::P6,
-                            BenchmarkPreset::P7 => AgentPreset::P7,
-                        },
-                    ),
-                    tuning: benchmark_profile.map_or(AgentTuning::UltraLowLatency, |profile| {
-                        match profile.encoder.tuning {
-                            BenchmarkTuning::UltraLowLatency => AgentTuning::UltraLowLatency,
-                            BenchmarkTuning::LowLatency => AgentTuning::LowLatency,
-                        }
-                    }),
-                    multipass: benchmark_profile.map_or(AgentMultipass::Disabled, |profile| {
-                        match profile.encoder.multipass {
-                            BenchmarkMultipass::Disabled => AgentMultipass::Disabled,
-                            BenchmarkMultipass::Quarter => AgentMultipass::Quarter,
-                            BenchmarkMultipass::Full => AgentMultipass::Full,
-                        }
-                    }),
-                    aq_mode: benchmark_profile.map_or(
-                        AgentAqMode::Spatial,
-                        |profile| match profile.effective_aq_mode() {
-                            BenchmarkAqMode::None => AgentAqMode::None,
-                            BenchmarkAqMode::Spatial => AgentAqMode::Spatial,
-                            BenchmarkAqMode::Temporal => AgentAqMode::Temporal,
-                        },
-                    ),
-                    aq_strength: benchmark_profile.map_or(8, |profile| profile.encoder.aq_strength),
-                    vbv_frames: benchmark_profile.map_or(1, |profile| profile.encoder.vbv_frames),
-                    lookahead_depth: benchmark_profile
-                        .map_or(0, |profile| profile.encoder.lookahead_depth),
-                    weighted_prediction: benchmark_profile
-                        .is_some_and(|profile| profile.encoder.weighted_prediction),
-                    gop_seconds: benchmark_profile.map_or_else(
-                        || {
-                            if stream_mode == StreamMode::Game {
-                                1
-                            } else {
-                                2
-                            }
-                        },
-                        |profile| profile.gop_seconds,
-                    ),
-                    crop,
-                    force_idr,
-                    allow_idle_snapshot: true,
-                });
-                let access = match result {
-                    Ok(AgentMessage::EncodedAccessUnit(access)) => access,
-                    Ok(AgentMessage::NoFrame { .. }) => {
-                        next_admission = now + privileged_no_frame_retry_delay(capture_available);
-                        continue 'session;
-                    }
-                    Ok(other) => {
-                        warn!(kind = ?other.kind(), "unexpected privileged Agent media result");
-                        continue 'session;
-                    }
-                    Err(error) => {
-                        let failed_at = Instant::now();
-                        let retry = source.note_encode_failure(failed_at, &error);
-                        capture_available = false;
-                        // Keep signaling and WSS/WebRTC control alive while
-                        // the privileged process boundary reconnects. The
-                        // queued disconnect transition announces Unavailable
-                        // exactly once. The Agent must publish
-                        // CaptureHealth::Active before another frame is
-                        // admitted. Both the retry cadence and the report are
-                        // bounded: an unconditional warn plus an immediate
-                        // retry against the reconnecting client spins here and
-                        // floods stderr until the service log-budget guard
-                        // stops the transport.
-                        next_admission = failed_at + retry;
-                        continue 'session;
-                    }
-                };
-                source.width = access.width as u32;
-                source.height = access.height as u32;
-                if benchmark_profile.is_some() {
-                    benchmark_encoded_bytes =
-                        benchmark_encoded_bytes.saturating_add(access.data.len() as u64);
-                    benchmark_encode_count = benchmark_encode_count.saturating_add(1);
-                    benchmark_encode_us_total =
-                        benchmark_encode_us_total.saturating_add(u64::from(access.encode_us));
-                    benchmark_encode_us_max = benchmark_encode_us_max.max(access.encode_us);
-                    if access.keyframe {
-                        benchmark_idr_count = benchmark_idr_count.saturating_add(1);
-                    } else {
-                        benchmark_delta_count = benchmark_delta_count.saturating_add(1);
-                    }
-                }
-                next_admission = now + Duration::from_secs_f64(1.0 / (access.fps as f64).max(1.0));
-                if force_idr {
-                    next_idr = now
-                        + effective_idr_interval(
-                            stream_mode,
-                            wss_media.is_some(),
-                            benchmark_profile.map(|profile| profile.gop_seconds),
-                        );
-                }
-                if access.keyframe {
-                    latest_idr = Some(CachedIdr {
-                        data: access.data.clone(),
-                        mode,
-                        requires_default: false,
-                        generation: media_generation,
-                    });
-                }
-                let id = permit_id;
-                if let Some(mut reservation) = wss_reservation {
-                    media_sequence = media_sequence.wrapping_add(1);
-                    let meta = WssAccessUnitMeta {
-                        codec: wss_codec(active_codec),
-                        generation: media_generation,
-                        sequence: media_sequence,
-                        timestamp90k: access.timestamp_90khz as u32,
-                        key: access.keyframe,
-                    };
-                    reservation.set_meta(meta);
-                    let encoded_len = access.data.len();
-                    if matches!(
-                        reservation.submit(access.data.clone()),
-                        WssSubmitOutcome::Queued
-                    ) {
-                        if benchmark_profile.is_some() {
-                            benchmark_wss_payload_bytes = benchmark_wss_payload_bytes
-                                .saturating_add(
-                                    wss_media
-                                        .as_ref()
-                                        .map_or(0, |egress| egress.wire_payload_bytes(encoded_len)),
-                                );
-                        }
-                        if access.keyframe {
-                            startup_idr_admitted = Some((media_generation, "wss"));
-                            wss_idr_count = wss_idr_count.saturating_add(1);
-                            if let Some(pending) = pending_first_frame.as_mut() {
-                                if pending.admit_wss_access_unit(media_generation, true) {
-                                    signaling.send_first_frame(
-                                        "admitted",
-                                        &pending.request_id,
-                                        pending.generation,
-                                        Some("wss"),
-                                        pending.epoch.as_deref(),
-                                        Some(active_codec.name()),
-                                    );
-                                }
-                            }
-                            let transition_reason = profiles
-                                .staged
-                                .filter(|(staged, _)| *staged == mode)
-                                .map(|(_, reason)| reason);
-                            if let Some(reason) = transition_reason {
-                                pending_wss_idr = Some(PendingWssIdr {
-                                    generation: media_generation,
-                                    sequence: media_sequence,
-                                    mode,
-                                    reason,
-                                });
-                            }
-                            if let Some(crop) = viewport_crop {
-                                pending_viewport_idr = Some(PendingViewportIdr {
-                                    generation: media_generation,
-                                    sequence: media_sequence,
-                                    crop,
-                                });
-                            }
-                        } else {
-                            wss_delta_count = wss_delta_count.saturating_add(1);
-                        }
-                        wss_max_access_unit_bytes = wss_max_access_unit_bytes.max(encoded_len);
-                    } else {
-                        wss_submission_failures = wss_submission_failures.saturating_add(1);
-                        next_idr = now;
-                    }
-                }
-                if ice_connected && wss_media.is_none() {
-                    if let Some(reservation) = rtc_reservation {
-                        if reservation.submit(AccessUnit {
-                            id,
-                            data: access.data,
-                            produced_at: Instant::now(),
-                            is_idr: access.keyframe,
-                        }) && access.keyframe
-                        {
-                            startup_idr_submitted = Some((media_generation, "webrtc", id));
-                            if let Some(pending) = pending_first_frame.as_mut().filter(|pending| {
-                                pending.transport == "webrtc"
-                                    && pending.generation == media_generation
-                                    && !pending.admitted
-                            }) {
-                                pending.rtc_idr_id.get_or_insert(id);
-                            }
-                            if transition {
-                                pending_transition_idr = Some(PendingSubmittedIdr {
-                                    id,
-                                    mode,
-                                    reason: "transition",
-                                });
-                            }
-                        }
-                    }
-                }
-                continue 'session;
-            }
             let desired_encoder_benchmark_profile_revision =
                 active_benchmark_profile.map(|_| benchmark_profile_revision);
             if encoder_benchmark_contract_changed(
@@ -4384,7 +3818,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 if local_recovery_probe
                     && !capture_admission_ready(
                         true,
-                        false,
                         negotiation_active,
                         ice_connected,
                         wss_media.is_some(),
@@ -6867,7 +6300,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         pending.request.reject("drop-not-ready");
     }
     session_call!(Input, input_sink.release_all());
-    capture.release_input();
     signaling.send_bye();
     drop(audio_capture);
     if let Some(egress) = wss_media {
@@ -7352,29 +6784,27 @@ mod tests {
 
     use super::{
         active_encoder_dimensions, advance_benchmark_profile_revision, advance_frame_deadline,
-        agent_reconnect_delay, benchmark_encoder_options, benchmark_mode_matches,
-        benchmark_owned_encoder_bitrate, benchmark_status_retry_delay, cached_replay_transition,
-        capture_admission_ready, coalesce_quiescent_cache_round_trips, commit_matching_transition,
-        effective_idr_interval, encoder_benchmark_contract_changed, encoder_mode_for_capture,
-        fallback_mode, frame_admission_due, full_profile_uses_native_texture,
-        idle_snapshot_completion_order, input_ready_on_offer, lab_quality_keyframe_request,
-        privileged_input_ready_after_presentation, privileged_no_frame_retry_delay,
+        benchmark_encoder_options, benchmark_mode_matches, benchmark_owned_encoder_bitrate,
+        benchmark_status_retry_delay, cached_replay_transition, capture_admission_ready,
+        coalesce_quiescent_cache_round_trips, commit_matching_transition,
+        encoder_benchmark_contract_changed, encoder_mode_for_capture, fallback_mode,
+        frame_admission_due, full_profile_uses_native_texture, idle_snapshot_completion_order,
+        input_ready_after_presentation, input_ready_on_offer, lab_quality_keyframe_request,
         producer_wait_duration, quiescent_damage_rects, quiescent_immediate_damage_rects,
         quiescent_transition_followup_needed, quiescent_transition_upsert_allowed,
         quiescent_validation_requests, record_benchmark_encode_stages,
         record_benchmark_feedback_plan, record_benchmark_feedback_submission,
         record_benchmark_hybrid_validation, record_benchmark_roi_activity,
-        record_benchmark_temporal_activity, record_privileged_desktop_state,
-        recover_quiescent_after_unsubmitted_frame, rejected_transition_requires_recovery,
-        remembered_monitor_attempt_exhausted, same_viewport_geometry, session_capture_selector,
-        should_forward_offer, should_replace_wss_media_session,
-        should_reset_lab_encoder_for_keyframe, should_snapshot_idle_desktop,
-        take_matching_transition, temporal_readback_policy, valid_lab_quality_request_id,
-        valid_monitor_refresh_control, viewport_from_q16, CachedIdr, CachedIdrReplay,
-        CaptureSelection, FirstFrameRecovery, IdleSnapshotCompletionOrder, PendingFirstFrame,
-        PendingSubmittedIdr, PrivilegedDesktopState, ProfileTransition, ReconnectLogGate,
-        TemporalReadbackPolicy, VideoMode, ViewportCrop, AGENT_RECONNECT_LOG_INTERVAL,
-        REMEMBERED_MONITOR_MAX_ATTEMPTS, STATIC_REPLAY_DELAY,
+        record_benchmark_temporal_activity, recover_quiescent_after_unsubmitted_frame,
+        rejected_transition_requires_recovery, remembered_monitor_attempt_exhausted,
+        same_viewport_geometry, session_capture_selector, should_forward_offer,
+        should_replace_wss_media_session, should_reset_lab_encoder_for_keyframe,
+        should_snapshot_idle_desktop, take_matching_transition, temporal_readback_policy,
+        valid_lab_quality_request_id, valid_monitor_refresh_control, viewport_from_q16, CachedIdr,
+        CachedIdrReplay, CaptureSelection, DesktopState, FirstFrameRecovery,
+        IdleSnapshotCompletionOrder, PendingFirstFrame, PendingSubmittedIdr, ProfileTransition,
+        TemporalReadbackPolicy, VideoMode, ViewportCrop, REMEMBERED_MONITOR_MAX_ATTEMPTS,
+        STATIC_REPLAY_DELAY,
     };
     use crate::encode::{
         AqMode, EncodeStageTimings, Multipass, Preset, RateControlMode, ResourceMode, RoiMapReason,
@@ -7398,20 +6828,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn privileged_agent_reconnect_backoff_is_bounded_and_resets() {
-        assert_eq!(agent_reconnect_delay(0), Duration::from_millis(250));
-        assert_eq!(agent_reconnect_delay(1), Duration::from_millis(500));
-        assert_eq!(agent_reconnect_delay(2), Duration::from_secs(1));
-        assert_eq!(agent_reconnect_delay(3), Duration::from_secs(2));
-        assert_eq!(agent_reconnect_delay(30), Duration::from_secs(2));
-    }
-
-    #[test]
     fn remembered_capture_selection_survives_a_session_restart() {
         let mut selection = CaptureSelection::from_launch(None);
         assert_eq!(selection.selector(), None);
         assert!(!selection.is_runtime());
-        assert!(selection.remember(Some("\\\\.\\DISPLAY5".into())));
+        assert!(selection.remember("\\\\.\\DISPLAY5".into()));
         assert_eq!(selection.selector(), Some("\\\\.\\DISPLAY5"));
         assert!(selection.is_runtime());
         // A restarted session reopens the remembered display, not the launch
@@ -7432,7 +6853,7 @@ mod tests {
         // The launch selector keeps the original unbounded serve retry; only a
         // runtime selection is bounded before the host refuses to substitute.
         assert!(!selection.is_runtime());
-        assert!(selection.remember(Some("\\\\.\\DISPLAY5".into())));
+        assert!(selection.remember("\\\\.\\DISPLAY5".into()));
         assert!(selection.is_runtime());
         assert_eq!(
             session_capture_selector(selection.selector(), Some("primary")),
@@ -7441,14 +6862,9 @@ mod tests {
     }
 
     #[test]
-    fn privileged_source_never_records_a_local_monitor_selection() {
+    fn an_empty_selector_is_never_remembered() {
         let mut selection = CaptureSelection::from_launch(None);
-        // CaptureSource::monitor_selector() returns None for the privileged
-        // source, so the remembered selection is left untouched.
-        assert!(!selection.remember(None));
-        assert_eq!(selection.selector(), None);
-        assert!(!selection.is_runtime());
-        assert!(!selection.remember(Some(String::new())));
+        assert!(!selection.remember(String::new()));
         assert_eq!(selection.selector(), None);
         assert!(!selection.is_runtime());
     }
@@ -7468,22 +6884,6 @@ mod tests {
             session_capture_selector(Some("\\\\.\\DISPLAY5"), Some("primary")),
             Some("\\\\.\\DISPLAY5")
         );
-    }
-
-    #[test]
-    fn privileged_service_mode_errors_exit_for_external_supervision() {
-        assert!(!super::should_retry_serve_error(true));
-        assert!(super::should_retry_serve_error(false));
-    }
-
-    #[test]
-    fn privileged_agent_reconnect_logs_are_rate_limited_with_a_suppressed_count() {
-        let start = Instant::now();
-        let mut gate = ReconnectLogGate::default();
-        assert_eq!(gate.admit(start), Some(0));
-        assert_eq!(gate.admit(start + Duration::from_secs(1)), None);
-        assert_eq!(gate.admit(start + Duration::from_secs(2)), None);
-        assert_eq!(gate.admit(start + AGENT_RECONNECT_LOG_INTERVAL), Some(2));
     }
 
     #[test]
@@ -8230,107 +7630,25 @@ mod tests {
     }
 
     #[test]
-    fn active_benchmark_gop_overrides_production_idr_cadence() {
-        assert_eq!(
-            effective_idr_interval(StreamMode::Work, true, Some(4)),
-            Duration::from_secs(4)
-        );
-        assert_eq!(
-            effective_idr_interval(StreamMode::Game, false, Some(1)),
-            Duration::from_secs(1)
-        );
-    }
-
-    #[test]
-    fn production_idr_cadence_is_unchanged_without_a_matching_benchmark() {
-        assert_eq!(
-            effective_idr_interval(StreamMode::Work, true, None),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            effective_idr_interval(StreamMode::Game, true, None),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            effective_idr_interval(StreamMode::Game, false, None),
-            Duration::from_secs(2)
-        );
-    }
-
-    #[test]
-    fn repeated_privileged_desktop_state_does_not_churn_media_generation() {
-        let state = PrivilegedDesktopState {
-            available: true,
-            desktop: "secure",
-            input: "enabled",
-            agent_generation: 7,
-        };
-        let mut last = None;
-        assert!(record_privileged_desktop_state(&mut last, state));
-        assert!(!record_privileged_desktop_state(&mut last, state));
-        assert!(record_privileged_desktop_state(
-            &mut last,
-            PrivilegedDesktopState {
-                input: "suspended",
-                ..state
-            }
-        ));
-    }
-
-    #[test]
-    fn privileged_input_requires_presented_current_generation() {
-        let state = PrivilegedDesktopState {
-            available: true,
-            desktop: "secure",
-            input: "enabled",
-            agent_generation: 2,
-        };
-        assert!(!privileged_input_ready_after_presentation(
-            true, true, state, 8, 9
-        ));
-        assert!(!privileged_input_ready_after_presentation(
-            true, false, state, 9, 9
-        ));
-        assert!(privileged_input_ready_after_presentation(
-            true, true, state, 9, 9
-        ));
-    }
-
-    #[test]
     fn failed_switch_restores_retained_active_source_in_the_new_generation() {
-        let state = PrivilegedDesktopState {
+        let state = DesktopState {
             available: true,
             desktop: "default",
             input: "enabled",
-            agent_generation: 2,
         };
         assert!(super::retained_capture_after_failed_switch(state));
         // The retained source is active, but the old-generation frame cannot
-        // reopen privileged input; presentation of the fresh frame does.
-        assert!(!privileged_input_ready_after_presentation(
-            true, true, state, 8, 9
-        ));
-        assert!(!privileged_input_ready_after_presentation(
-            false, true, state, 8, 9
-        ));
-        assert!(privileged_input_ready_after_presentation(
-            true, true, state, 9, 9
-        ));
-        assert!(privileged_input_ready_after_presentation(
-            false, true, state, 9, 9
-        ));
-        assert!(!super::retained_capture_after_failed_switch(
-            PrivilegedDesktopState {
-                available: false,
-                ..state
-            }
-        ));
-        assert!(!super::retained_capture_after_failed_switch(
-            PrivilegedDesktopState {
-                desktop: "secure",
-                ..state
-            }
-        ));
+        // reopen input; presentation of the fresh frame does.
+        assert!(!input_ready_after_presentation(true, 8, 9));
+        assert!(input_ready_after_presentation(true, 9, 9));
+        assert!(!super::retained_capture_after_failed_switch(DesktopState {
+            available: false,
+            ..state
+        }));
+        assert!(!super::retained_capture_after_failed_switch(DesktopState {
+            desktop: "secure",
+            ..state
+        }));
     }
 
     #[test]
@@ -8346,24 +7664,11 @@ mod tests {
 
     #[test]
     fn foreground_sampling_parks_with_retained_wss_and_excludes_secure_sources() {
-        assert!(super::foreground_sample_live(
-            true, false, true, "default", true
-        ));
-        assert!(!super::foreground_sample_live(
-            false, false, true, "default", true
-        ));
-        assert!(!super::foreground_sample_live(
-            true, true, true, "default", true
-        ));
-        assert!(!super::foreground_sample_live(
-            true, false, false, "default", true
-        ));
-        assert!(!super::foreground_sample_live(
-            true, false, true, "secure", true
-        ));
-        assert!(!super::foreground_sample_live(
-            true, false, true, "default", false
-        ));
+        assert!(super::foreground_sample_live(true, true, "default", true));
+        assert!(!super::foreground_sample_live(false, true, "default", true));
+        assert!(!super::foreground_sample_live(true, false, "default", true));
+        assert!(!super::foreground_sample_live(true, true, "secure", true));
+        assert!(!super::foreground_sample_live(true, true, "default", false));
     }
 
     #[test]
@@ -8736,14 +8041,14 @@ mod tests {
     #[test]
     fn signaling_without_a_client_does_not_admit_capture_or_encode() {
         assert!(!capture_admission_ready(
-            true, false, false, false, false, false, false
+            true, false, false, false, false, false
         ));
     }
 
     #[test]
-    fn unavailable_capture_without_a_privileged_probe_does_not_admit_wss_encode() {
+    fn unavailable_capture_does_not_admit_wss_encode() {
         assert!(!capture_admission_ready(
-            false, false, true, true, true, false, false
+            false, true, true, true, false, false
         ));
     }
 
@@ -8751,41 +8056,13 @@ mod tests {
     fn unavailable_local_capture_probes_without_media_admission_every_500ms() {
         let now = Instant::now();
         assert!(!capture_admission_ready(
-            false, false, true, true, false, false, false
+            false, true, true, false, false, false
         ));
-        assert!(super::local_recovery_probe_due(false, false, now, now));
+        assert!(super::local_recovery_probe_due(false, now, now));
         let deadline = now + super::capture::CAPTURE_RECOVERY_INTERVAL;
-        assert!(!super::local_recovery_probe_due(
-            false, false, now, deadline
-        ));
-        assert!(super::local_recovery_probe_due(
-            false, false, deadline, deadline
-        ));
-        assert!(!super::local_recovery_probe_due(
-            false, true, deadline, deadline
-        ));
-        assert!(!super::local_recovery_probe_due(
-            true, false, deadline, deadline
-        ));
-    }
-
-    #[test]
-    fn unverified_privileged_capture_admits_a_bootstrap_probe_for_active_wss() {
-        assert!(capture_admission_ready(
-            false, true, true, true, true, false, false
-        ));
-    }
-
-    #[test]
-    fn unverified_privileged_capture_probe_retries_are_bounded() {
-        assert_eq!(
-            privileged_no_frame_retry_delay(false),
-            Duration::from_millis(250)
-        );
-        assert_eq!(
-            privileged_no_frame_retry_delay(true),
-            Duration::from_millis(1)
-        );
+        assert!(!super::local_recovery_probe_due(false, now, deadline));
+        assert!(super::local_recovery_probe_due(false, deadline, deadline));
+        assert!(!super::local_recovery_probe_due(true, deadline, deadline));
     }
 
     #[test]
@@ -8844,23 +8121,23 @@ mod tests {
     #[test]
     fn negotiation_prewarms_only_while_a_first_idr_is_needed() {
         assert!(capture_admission_ready(
-            true, false, true, false, false, false, true
+            true, true, false, false, false, true
         ));
         assert!(!capture_admission_ready(
-            true, false, true, false, false, false, false
+            true, true, false, false, false, false
         ));
     }
 
     #[test]
     fn active_wss_does_not_require_a_dormant_rtc_reservation() {
         assert!(capture_admission_ready(
-            true, false, true, true, true, false, false
+            true, true, true, true, false, false
         ));
         assert!(!capture_admission_ready(
-            true, false, true, true, false, false, false
+            true, true, true, false, false, false
         ));
         assert!(capture_admission_ready(
-            true, false, true, true, false, true, false
+            true, true, true, false, true, false
         ));
     }
 
@@ -8942,27 +8219,14 @@ mod tests {
 
     #[test]
     fn new_peer_offer_keeps_host_input_off_until_presentation() {
-        // User host: a forwarded offer starts a peer and waits for "presented".
-        assert!(!input_ready_on_offer(false, true, true));
-        // An offer the host ignores keeps the previous user-host rule.
-        assert!(input_ready_on_offer(false, true, false));
-        assert!(!input_ready_on_offer(false, false, false));
-        // The privileged Agent always waits.
-        assert!(!input_ready_on_offer(true, true, false));
-        assert!(!input_ready_on_offer(true, true, true));
-        // Presentation of the current generation then enables user-host input.
-        let state = PrivilegedDesktopState {
-            available: true,
-            desktop: "default",
-            input: "enabled",
-            agent_generation: 1,
-        };
-        assert!(privileged_input_ready_after_presentation(
-            false, true, state, 4, 4
-        ));
-        assert!(!privileged_input_ready_after_presentation(
-            false, true, state, 3, 4
-        ));
+        // A forwarded offer starts a peer and waits for "presented".
+        assert!(!input_ready_on_offer(true, true));
+        // An offer the host ignores keeps the previous rule.
+        assert!(input_ready_on_offer(true, false));
+        assert!(!input_ready_on_offer(false, false));
+        // Presentation of the current generation then enables input.
+        assert!(input_ready_after_presentation(true, 4, 4));
+        assert!(!input_ready_after_presentation(true, 3, 4));
     }
 
     #[test]

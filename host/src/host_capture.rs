@@ -1,7 +1,6 @@
 //! Binary-owned capture boundary; preserves existing streaming policy.
 use super::{
-    capture, info, input, pick_monitor, privileged_ipc, warn, AgentClient, AgentMessage, Args,
-    Capture, Context, DesktopRegion, Duration, Instant, Result, RetryPolicy,
+    capture, pick_monitor, warn, Args, Capture, Context, DesktopRegion, Duration, Instant, Result,
 };
 use bubbleplay_host::secure_helper::client::{SecureHelperLink, SecureState};
 use std::sync::{Arc, Mutex};
@@ -96,10 +95,8 @@ impl JoinRecoveryWindow {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 pub(super) enum CaptureSource {
     Local(LocalCaptureSource),
-    Privileged(PrivilegedSource),
 }
 
 pub(super) struct LocalCaptureSource {
@@ -436,264 +433,19 @@ impl LocalCaptureSource {
     }
 }
 
-pub(super) struct PrivilegedSource {
-    pub(super) client: Option<AgentClient>,
-    pub(super) next_agent_connect: Instant,
-    pub(super) agent_reconnect_step: usize,
-    pub(super) disconnect_event_pending: bool,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) monitors: Vec<capture::MonitorInfo>,
-    pub(super) selected_monitor: Option<u32>,
-    pub(super) desktop_available: bool,
-    pub(super) desktop: &'static str,
-    pub(super) input_state: &'static str,
-    pub(super) generation: u32,
-    pub(super) reconnect_log: ReconnectLogGate,
-    event_activity: Option<bubbleplay_host::activity::Activity>,
-}
-
-pub(super) const AGENT_RECONNECT_LOG_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Floor for the producer's retry after a failed privileged permit. The
-/// reconnect backoff supplies the real cadence; this only guarantees that a
-/// failure can never be retried in the same instant it was observed.
-pub(super) const MIN_AGENT_ENCODE_RETRY_DELAY: Duration = Duration::from_millis(50);
-
-#[derive(Debug, Default)]
-pub(super) struct ReconnectLogGate {
-    pub(super) last_emitted: Option<Instant>,
-    pub(super) suppressed: u64,
-}
-
-impl ReconnectLogGate {
-    pub(super) fn admit(&mut self, now: Instant) -> Option<u64> {
-        if self
-            .last_emitted
-            .is_some_and(|last| now.saturating_duration_since(last) < AGENT_RECONNECT_LOG_INTERVAL)
-        {
-            self.suppressed = self.suppressed.saturating_add(1);
-            return None;
-        }
-        self.last_emitted = Some(now);
-        Some(std::mem::take(&mut self.suppressed))
-    }
-}
-
-pub(super) fn agent_reconnect_delay(step: usize) -> Duration {
-    pub(super) const DELAYS: [Duration; 4] = [
-        Duration::from_millis(250),
-        Duration::from_millis(500),
-        Duration::from_secs(1),
-        Duration::from_secs(2),
-    ];
-    DELAYS[step.min(DELAYS.len() - 1)]
-}
-
-impl PrivilegedSource {
-    pub(super) fn new(now: Instant) -> Self {
-        Self {
-            client: None,
-            next_agent_connect: now,
-            agent_reconnect_step: 0,
-            disconnect_event_pending: false,
-            width: 1920,
-            height: 1080,
-            monitors: Vec::new(),
-            selected_monitor: None,
-            desktop_available: false,
-            desktop: "none",
-            input_state: "suspended",
-            generation: 0,
-            reconnect_log: ReconnectLogGate::default(),
-            event_activity: None,
-        }
-    }
-
-    pub(super) fn connect_startup(now: Instant) -> Result<Self> {
-        let mut client = AgentClient::connect().context("connect initial privileged Agent")?;
-        client
-            .send(&AgentMessage::ListMonitors)
-            .context("request initial privileged monitor topology")?;
-        let mut source = Self::new(now);
-        source.client = Some(client);
-        info!("initial privileged Agent connection established");
-        Ok(source)
-    }
-
-    pub(super) fn mark_agent_unavailable(&mut self, now: Instant, error: &anyhow::Error) {
-        let was_connected = self.client.take().is_some();
-        self.desktop_available = false;
-        self.input_state = "suspended";
-        if was_connected {
-            self.disconnect_event_pending = true;
-        }
-        let delay = agent_reconnect_delay(self.agent_reconnect_step);
-        self.agent_reconnect_step = self.agent_reconnect_step.saturating_add(1);
-        self.next_agent_connect = now + delay;
-        if let Some(suppressed) = self.reconnect_log.admit(now) {
-            warn!(
-                ?error,
-                retry_ms = delay.as_millis(),
-                suppressed,
-                "privileged Agent unavailable; preserving network session"
-            );
-        }
-    }
-
-    pub(super) fn connect_agent_if_due(&mut self, now: Instant) {
-        if self.client.is_some() || now < self.next_agent_connect {
-            return;
-        }
-        let policy = RetryPolicy::new(Duration::ZERO, Duration::from_millis(1))
-            .expect("valid one-shot Agent retry policy");
-        match AgentClient::connect_with_retry(policy) {
-            Ok(mut client) => {
-                if let Some(activity) = self.event_activity.as_ref() {
-                    client.set_activity(activity.clone());
-                }
-                // Refresh topology after every process-boundary recovery. The
-                // browser may have issued its request while the Agent was down.
-                if let Err(error) = client.send(&AgentMessage::ListMonitors) {
-                    self.client = Some(client);
-                    self.mark_agent_unavailable(now, &error);
-                    return;
-                }
-                self.client = Some(client);
-                self.agent_reconnect_step = 0;
-                self.next_agent_connect = now;
-                info!("privileged Agent connected");
-            }
-            Err(error) => self.mark_agent_unavailable(now, &error),
-        }
-    }
-
-    pub(super) fn tick_agent(&mut self, now: Instant) {
-        self.connect_agent_if_due(now);
-        let result = self.client.as_mut().map(|client| client.tick(now));
-        if let Some(Err(error)) = result {
-            self.mark_agent_unavailable(now, &error);
-        }
-    }
-
-    pub(super) fn try_agent_message(&mut self, now: Instant) -> Option<AgentMessage> {
-        let result = self.client.as_ref()?.try_event();
-        match result {
-            Ok(message) => message,
-            Err(error) => {
-                self.mark_agent_unavailable(now, &error);
-                None
-            }
-        }
-    }
-
-    pub(super) fn send_agent(&mut self, message: &AgentMessage) -> Result<()> {
-        let result = self
-            .client
-            .as_mut()
-            .context("privileged Agent is reconnecting")?
-            .send(message);
-        if let Err(error) = &result {
-            self.mark_agent_unavailable(Instant::now(), error);
-        }
-        result
-    }
-
-    pub(super) fn encode_agent(&mut self, permit: AgentMessage) -> Result<AgentMessage> {
-        let result = self
-            .client
-            .as_mut()
-            .context("privileged Agent is reconnecting")?
-            .encode(permit);
-        if let Err(error) = &result {
-            self.mark_agent_unavailable(Instant::now(), error);
-        }
-        result
-    }
-
-    /// Bounded wait before the next privileged encode attempt. The reconnect
-    /// backoff already owns this cadence; the producer must respect it instead
-    /// of re-issuing a permit against a client that is being reconnected.
-    pub(super) fn agent_retry_delay(&self, now: Instant) -> Duration {
-        self.next_agent_connect
-            .saturating_duration_since(now)
-            .max(MIN_AGENT_ENCODE_RETRY_DELAY)
-    }
-
-    /// Producer-side companion to `mark_agent_unavailable`: returns the bounded
-    /// retry delay and reports the failure at most once per reconnect window.
-    /// The failure is normally already reported by `mark_agent_unavailable`;
-    /// this gate exists so the producer's retry loop cannot emit an unbounded
-    /// warning per iteration (that flood trips the service log-budget guard).
-    pub(super) fn note_encode_failure(&mut self, now: Instant, error: &anyhow::Error) -> Duration {
-        let delay = self.agent_retry_delay(now);
-        if let Some(suppressed) = self.reconnect_log.admit(now) {
-            warn!(
-                ?error,
-                retry_ms = delay.as_millis(),
-                suppressed,
-                "privileged Agent encode failed; preserving network session"
-            );
-        }
-        delay
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PrivilegedDesktopState {
+pub(super) struct DesktopState {
     pub(super) available: bool,
     pub(super) desktop: &'static str,
     pub(super) input: &'static str,
-    pub(super) agent_generation: u32,
 }
 
-pub(super) fn record_privileged_desktop_state(
-    last: &mut Option<PrivilegedDesktopState>,
-    next: PrivilegedDesktopState,
-) -> bool {
-    if *last == Some(next) {
-        return false;
-    }
-    *last = Some(next);
-    true
-}
-
-pub(super) fn privileged_input_ready_after_presentation(
-    privileged: bool,
+pub(super) fn input_ready_after_presentation(
     capture_available: bool,
-    state: PrivilegedDesktopState,
     presented_generation: u32,
     current_generation: u32,
 ) -> bool {
-    presented_generation == current_generation
-        && capture_available
-        && (!privileged || (state.available && state.input == "enabled"))
-}
-
-pub(super) enum PrivilegedEvent {
-    Desktop {
-        available: bool,
-        desktop: &'static str,
-        input: &'static str,
-        generation: u32,
-        reason: &'static str,
-    },
-    Cursor([u8; 8]),
-    CursorKind([u8; 2]),
-    InputStatus(privileged_ipc::InputStatistics),
-    Monitors(Vec<capture::MonitorInfo>),
-    MonitorSwitch {
-        accepted: bool,
-        monitor: String,
-        error_code: i32,
-    },
-    Clipboard {
-        id: u32,
-        index: u16,
-        count: u16,
-        text: String,
-        png: bool,
-    },
+    presented_generation == current_generation && capture_available
 }
 
 /// The display a session must capture: the runtime selection when one exists,
@@ -711,105 +463,67 @@ impl CaptureSource {
     /// sessions. It wins over the launch selector; when it no longer resolves,
     /// opening fails instead of silently capturing a different display.
     pub(super) fn open(args: &Args, selector_override: Option<&str>) -> Result<Self> {
-        if args.privileged_agent {
-            // Cold service startup must prove the privileged boundary before
-            // the host advertises signaling readiness. Runtime disconnects
-            // after this point still use the bounded in-session reconnect path.
-            // The privileged Agent owns its monitor selection; the host keeps
-            // no local override for it.
-            Ok(Self::Privileged(PrivilegedSource::connect_startup(
-                Instant::now(),
-            )?))
-        } else {
-            Ok(Self::Local(LocalCaptureSource::open(
-                session_capture_selector(selector_override, args.monitor.as_deref()),
-            )?))
-        }
+        Ok(Self::Local(LocalCaptureSource::open(
+            session_capture_selector(selector_override, args.monitor.as_deref()),
+        )?))
     }
 
-    /// Canonical selector for the live local capture. `None` for the
-    /// privileged source: its selection lives in the Agent and the host must
-    /// not substitute a local display choice for it.
-    pub(super) fn monitor_selector(&self) -> Option<String> {
+    /// Canonical selector for the live local capture.
+    pub(super) fn monitor_selector(&self) -> String {
         match self {
-            Self::Local(source) => Some(source.selector.clone()),
-            Self::Privileged(_) => None,
+            Self::Local(source) => source.selector.clone(),
         }
     }
 
     pub(super) fn width(&self) -> u32 {
         match self {
             Self::Local(source) => source.width,
-            Self::Privileged(source) => source.width,
         }
     }
 
     pub(super) fn height(&self) -> u32 {
         match self {
             Self::Local(source) => source.height,
-            Self::Privileged(source) => source.height,
         }
     }
 
     pub(super) fn region(&self) -> DesktopRegion {
         match self {
             Self::Local(source) => source.region,
-            Self::Privileged(source) => DesktopRegion::new(0, 0, source.width, source.height),
         }
     }
 
     pub(super) fn monitors(&mut self) -> Result<Vec<capture::MonitorInfo>> {
         match self {
             Self::Local(source) => source.monitors(),
-            Self::Privileged(source) => {
-                source.send_agent(&AgentMessage::ListMonitors)?;
-                Ok(source.monitors.clone())
-            }
         }
     }
 
-    pub(super) fn switch_monitor(&mut self, selector: &str) -> Result<bool> {
+    pub(super) fn switch_monitor(&mut self, selector: &str) -> Result<()> {
         if !self.desktop_state().available || self.desktop_state().desktop == "secure" {
             anyhow::bail!("capture unavailable; monitor selection is suspended until recovery");
         }
         match self {
-            Self::Local(source) => {
-                source.switch_monitor(selector)?;
-                Ok(true)
-            }
-            Self::Privileged(source) => {
-                let monitor_id = selector
-                    .strip_prefix("agent:")
-                    .unwrap_or(selector)
-                    .parse::<u32>()
-                    .context("privileged monitor selector must be agent:<id>")?;
-                source.send_agent(&AgentMessage::SelectMonitor { monitor_id })?;
-                Ok(false)
-            }
+            Self::Local(source) => source.switch_monitor(selector),
         }
     }
 
     pub(super) fn request_idle_snapshot(&mut self) {
-        if let Self::Local(source) = self {
-            source.request_idle_snapshot();
-        }
-        // Privileged permits carry allow_idle_snapshot and force_idr, so the
-        // next one is already a complete static-desktop wake request.
+        let Self::Local(source) = self;
+        source.request_idle_snapshot();
     }
 
     pub(super) fn request_idle_followup_snapshot(&mut self, delay: Duration) {
-        if let Self::Local(source) = self {
-            if let Some(capture) = source.capture.as_mut() {
-                capture.request_idle_followup_snapshot(delay);
-            }
+        let Self::Local(source) = self;
+        if let Some(capture) = source.capture.as_mut() {
+            capture.request_idle_followup_snapshot(delay);
         }
     }
 
     pub(super) fn cancel_idle_followup_snapshot(&mut self) {
-        if let Self::Local(source) = self {
-            if let Some(capture) = source.capture.as_mut() {
-                capture.cancel_idle_followup_snapshot();
-            }
+        let Self::Local(source) = self;
+        if let Some(capture) = source.capture.as_mut() {
+            capture.cancel_idle_followup_snapshot();
         }
     }
 
@@ -819,61 +533,34 @@ impl CaptureSource {
     ) -> Result<Option<(capture::CapturedFrame<'_>, bool, bool)>> {
         match self {
             Self::Local(source) => source.acquire(timeout),
-            Self::Privileged(_) => Ok(None),
         }
     }
 
     pub(super) fn set_event_activity(&mut self, activity: bubbleplay_host::activity::Activity) {
-        match self {
-            Self::Local(source) => {
-                source.event_activity = Some(activity.clone());
-                if let Some(capture) = source.capture.as_mut() {
-                    capture.enable_event_capture(activity);
-                }
-            }
-            Self::Privileged(source) => {
-                source.event_activity = Some(activity.clone());
-                if let Some(client) = source.client.as_ref() {
-                    client.set_activity(activity);
-                }
-            }
+        let Self::Local(source) = self;
+        source.event_activity = Some(activity.clone());
+        if let Some(capture) = source.capture.as_mut() {
+            capture.enable_event_capture(activity);
         }
     }
 
     pub(super) fn set_capture_demand(&mut self, enabled: bool) -> Result<()> {
-        if let Self::Local(source) = self {
-            source.capture_demand = enabled;
-            if let Some(capture) = source.capture.as_mut() {
-                capture.set_capture_demand(enabled);
-            }
+        let Self::Local(source) = self;
+        source.capture_demand = enabled;
+        if let Some(capture) = source.capture.as_mut() {
+            capture.set_capture_demand(enabled);
         }
         Ok(())
     }
 
     pub(super) fn end_viewer_session(&mut self) {
-        if let Self::Local(source) = self {
-            source.join_recovery = JoinRecoveryWindow::default();
-        }
-    }
-
-    /// Rotate the existing Agent lease only for a new viewer input producer.
-    /// A warm proxy must forget the previous producer's pointer/wheel sequences.
-    pub(super) fn begin_viewer_session(&mut self) {
-        if let Self::Privileged(source) = self {
-            source.input_state = "suspended";
-            if let Some(client) = source.client.as_mut() {
-                if let Err(error) = client.begin_viewer_session() {
-                    source.mark_agent_unavailable(Instant::now(), &error);
-                }
-            }
-        }
+        let Self::Local(source) = self;
+        source.join_recovery = JoinRecoveryWindow::default();
     }
 
     pub(super) fn defer_recoverable_join_state(&mut self, now: Instant) -> bool {
         let state = self.desktop_state();
-        let Self::Local(source) = self else {
-            return false;
-        };
+        let Self::Local(source) = self;
         let secure = source
             .secure_state
             .as_ref()
@@ -886,19 +573,18 @@ impl CaptureSource {
     }
 
     pub(super) fn maintain_parked(&mut self, viewer_attached: bool, now: Instant) -> Result<()> {
-        if let Self::Local(source) = self {
-            if !viewer_attached
-                && !source
-                    .secure_state
-                    .as_ref()
-                    .is_some_and(|state| state.secure)
-            {
-                if let Some(capture) = source.capture.as_mut() {
-                    capture.maintain_parked(now)?;
-                    source.width = capture.width();
-                    source.height = capture.height();
-                    source.region = capture.region();
-                }
+        let Self::Local(source) = self;
+        if !viewer_attached
+            && !source
+                .secure_state
+                .as_ref()
+                .is_some_and(|state| state.secure)
+        {
+            if let Some(capture) = source.capture.as_mut() {
+                capture.maintain_parked(now)?;
+                source.width = capture.width();
+                source.height = capture.height();
+                source.region = capture.region();
             }
         }
         Ok(())
@@ -922,23 +608,20 @@ impl CaptureSource {
     }
 
     pub(super) fn request_event_frame_at(&mut self, not_before: Instant) -> Result<()> {
-        if let Self::Local(source) = self {
-            if source.capture_demand
-                && !source
-                    .secure_state
-                    .as_ref()
-                    .is_some_and(|state| state.secure)
-            {
-                source.ensure_capture()?.request_frame_at(not_before)?;
-            }
+        let Self::Local(source) = self;
+        if source.capture_demand
+            && !source
+                .secure_state
+                .as_ref()
+                .is_some_and(|state| state.secure)
+        {
+            source.ensure_capture()?.request_frame_at(not_before)?;
         }
         Ok(())
     }
 
     pub(super) fn next_event_deadline(&mut self, snapshot_eligible: bool) -> Option<Instant> {
-        let Self::Local(source) = self else {
-            return None;
-        };
+        let Self::Local(source) = self;
         if !source.capture_demand {
             return None;
         }
@@ -1000,220 +683,28 @@ impl CaptureSource {
     }
 
     pub(super) fn acknowledge_idle_snapshot_idr(&mut self) {
-        if let Self::Local(source) = self {
-            if let Some(capture) = source.capture.as_mut() {
-                capture.acknowledge_idle_snapshot_idr();
-            }
+        let Self::Local(source) = self;
+        if let Some(capture) = source.capture.as_mut() {
+            capture.acknowledge_idle_snapshot_idr();
         }
     }
 
     pub(super) fn local_capture_stats(&self) -> Option<(u64, u64)> {
         match self {
             Self::Local(source) => source.capture.as_ref().map(Capture::stats),
-            Self::Privileged(_) => None,
         }
     }
 
     pub(super) fn tick_secure(&mut self, viewer: bool, now: Instant) {
-        if let Self::Local(source) = self {
-            source.tick_secure(viewer, now);
-        }
+        let Self::Local(source) = self;
+        source.tick_secure(viewer, now);
     }
 
-    pub(super) fn tick(&mut self, now: Instant) -> Result<()> {
-        if let Self::Privileged(source) = self {
-            source.tick_agent(now);
-        }
-        Ok(())
-    }
-
-    pub(super) fn try_privileged_event(&mut self) -> Result<Option<PrivilegedEvent>> {
-        let Self::Privileged(source) = self else {
-            return Ok(None);
-        };
-        if source.disconnect_event_pending {
-            source.disconnect_event_pending = false;
-            return Ok(Some(PrivilegedEvent::Desktop {
-                available: false,
-                desktop: source.desktop,
-                input: "suspended",
-                generation: source.generation,
-                reason: "agent-disconnected",
-            }));
-        }
-        let Some(message) = source.try_agent_message(Instant::now()) else {
-            return Ok(None);
-        };
-        Ok(match message {
-            AgentMessage::DesktopTransition {
-                desktop,
-                generation,
-                input_enabled,
-                reason,
-            } => {
-                let desktop = match desktop {
-                    privileged_ipc::Desktop::Default => "default",
-                    privileged_ipc::Desktop::Winlogon => "secure",
-                    privileged_ipc::Desktop::Unknown => "none",
-                };
-                let input = if input_enabled {
-                    "enabled"
-                } else {
-                    "suspended"
-                };
-                if source.generation != generation || desktop == "none" {
-                    // A freshly-bound desktop is not safe to expose until the
-                    // Agent proves capture with a frame from this generation.
-                    source.desktop_available = false;
-                }
-                source.desktop = desktop;
-                source.input_state = input;
-                source.generation = generation;
-                let available = source.desktop_available && desktop != "none";
-                let reason = match reason {
-                    privileged_ipc::DesktopTransitionReason::Startup => "agent-startup",
-                    privileged_ipc::DesktopTransitionReason::DesktopSwitched => "desktop-switched",
-                    privileged_ipc::DesktopTransitionReason::SessionChanged => "session-changed",
-                    privileged_ipc::DesktopTransitionReason::AgentRestarted => "agent-restarted",
-                };
-                Some(PrivilegedEvent::Desktop {
-                    available,
-                    desktop,
-                    input: if available { input } else { "suspended" },
-                    generation,
-                    reason,
-                })
-            }
-            AgentMessage::CaptureHealth { state, .. } => {
-                let available = state == privileged_ipc::CaptureState::Active;
-                source.desktop_available = available;
-                Some(PrivilegedEvent::Desktop {
-                    available,
-                    // Preserve which desktop is being recovered. In
-                    // particular, reconnecting during Winlogon must retain the
-                    // secure-desktop policy even while no new frame exists.
-                    desktop: source.desktop,
-                    input: if available {
-                        source.input_state
-                    } else {
-                        "suspended"
-                    },
-                    generation: source.generation,
-                    reason: if available {
-                        "capture-recovered"
-                    } else {
-                        "capture-unavailable"
-                    },
-                })
-            }
-            AgentMessage::CursorKind(kind) => Some(PrivilegedEvent::CursorKind(kind.encode())),
-            AgentMessage::Cursor(cursor) => Some(PrivilegedEvent::Cursor(
-                input::CursorState {
-                    acknowledged_sequence: cursor.acknowledged_sequence,
-                    x: cursor.x,
-                    y: cursor.y,
-                    in_bounds: cursor.in_bounds,
-                    visible: cursor.visible,
-                }
-                .encode(),
-            )),
-            AgentMessage::MonitorList(monitors) => {
-                source.monitors = monitors
-                    .into_iter()
-                    .map(|monitor| capture::MonitorInfo {
-                        selector: format!("agent:{}", monitor.id),
-                        name: monitor.name,
-                        width: monitor.width as u32,
-                        height: monitor.height as u32,
-                        origin_x: 0,
-                        origin_y: 0,
-                        selected: source.selected_monitor == Some(monitor.id)
-                            || monitor.primary && source.selected_monitor.is_none(),
-                    })
-                    .collect();
-                Some(PrivilegedEvent::Monitors(source.monitors.clone()))
-            }
-            AgentMessage::MonitorSwitchResult(result) => {
-                if result.accepted {
-                    source.selected_monitor = Some(result.monitor_id);
-                    source.width = result.width as u32;
-                    source.height = result.height as u32;
-                    for monitor in &mut source.monitors {
-                        monitor.selected =
-                            monitor.selector == format!("agent:{}", result.monitor_id);
-                    }
-                }
-                Some(PrivilegedEvent::MonitorSwitch {
-                    accepted: result.accepted,
-                    monitor: format!("agent:{}", result.monitor_id),
-                    error_code: result.error_code,
-                })
-            }
-            AgentMessage::InputStats(stats) => Some(PrivilegedEvent::InputStatus(stats)),
-            AgentMessage::ClipboardText {
-                id,
-                index,
-                count,
-                text,
-            } => Some(PrivilegedEvent::Clipboard {
-                id,
-                index,
-                count,
-                text,
-                png: false,
-            }),
-            AgentMessage::ClipboardPng {
-                id,
-                index,
-                count,
-                text,
-            } => Some(PrivilegedEvent::Clipboard {
-                id,
-                index,
-                count,
-                text,
-                png: true,
-            }),
-            AgentMessage::Capabilities(_) | AgentMessage::ConfigAck { .. } => None,
-            AgentMessage::RecoverableError(error) => {
-                warn!(
-                    operation = ?error.operation,
-                    error_code = error.error_code,
-                    session_generation = error.session_generation,
-                    config_revision = error.config_revision,
-                    permit_id = ?error.permit_id,
-                    "privileged Agent reported a recoverable error"
-                );
-                None
-            }
-            AgentMessage::FatalError(error) => {
-                warn!(
-                    operation = ?error.operation,
-                    error_code = error.error_code,
-                    session_generation = error.session_generation,
-                    config_revision = error.config_revision,
-                    permit_id = ?error.permit_id,
-                    "privileged Agent reported a fatal error"
-                );
-                source.desktop_available = false;
-                source.input_state = "suspended";
-                Some(PrivilegedEvent::Desktop {
-                    available: false,
-                    desktop: source.desktop,
-                    input: "suspended",
-                    generation: source.generation,
-                    reason: "agent-fatal-error",
-                })
-            }
-            _ => None,
-        })
-    }
-
-    pub(super) fn desktop_state(&self) -> PrivilegedDesktopState {
+    pub(super) fn desktop_state(&self) -> DesktopState {
         match self {
             Self::Local(source) => {
                 if let Some(state) = source.secure_state.as_ref().filter(|state| state.secure) {
-                    return PrivilegedDesktopState {
+                    return DesktopState {
                         available: source.secure_streaming && state.available,
                         desktop: "secure",
                         input: if source.secure_streaming
@@ -1226,37 +717,24 @@ impl CaptureSource {
                         } else {
                             "suspended"
                         },
-                        agent_generation: 0,
                     };
                 }
                 let available = !source.normal_recovery_pending
                     && source.capture.as_ref().is_none_or(|capture| {
                         capture.availability() == capture::CaptureAvailability::Active
                     });
-                PrivilegedDesktopState {
+                DesktopState {
                     available,
                     desktop: if available { "default" } else { "none" },
                     input: if available { "enabled" } else { "suspended" },
-                    agent_generation: 0,
                 }
             }
-            Self::Privileged(source) => PrivilegedDesktopState {
-                available: source.desktop_available,
-                desktop: source.desktop,
-                input: if source.desktop_available {
-                    source.input_state
-                } else {
-                    "suspended"
-                },
-                agent_generation: source.generation,
-            },
         }
     }
 
     pub(super) fn secure_helper(&self) -> Option<SharedSecureHelper> {
         match self {
             Self::Local(source) => Some(source.secure_helper.clone()),
-            _ => None,
         }
     }
 
@@ -1268,7 +746,6 @@ impl CaptureSource {
     pub(super) fn secure_state(&self) -> Option<SecureState> {
         match self {
             Self::Local(source) => source.secure_state.clone().filter(|state| state.secure),
-            _ => None,
         }
     }
 
@@ -1276,50 +753,11 @@ impl CaptureSource {
         self.secure_state()
             .is_none_or(|state| self.desktop_state().available && state.caps.contains(&"input"))
     }
-
-    pub(super) fn send_input(&mut self, data: &[u8]) -> Result<bool> {
-        match self {
-            Self::Local(_) => Ok(false),
-            Self::Privileged(source)
-                if source.desktop_available && source.input_state == "enabled" =>
-            {
-                // An Agent failure must suspend input, not tear down the
-                // authenticated browser/signaling session.
-                let _ = source.send_agent(&AgentMessage::Input(data.to_vec()));
-                Ok(true)
-            }
-            Self::Privileged(_) => Ok(true),
-        }
-    }
-
-    pub(super) fn is_privileged(&self) -> bool {
-        matches!(self, Self::Privileged(_))
-    }
-
-    pub(super) fn release_input(&mut self) {
-        if let Self::Privileged(source) = self {
-            let _ = source.send_agent(&AgentMessage::ReleaseAll);
-        }
-    }
 }
 
 #[cfg(test)]
-mod agent_encode_recovery_tests {
+mod tests {
     use super::*;
-
-    #[test]
-    fn privileged_capture_keeps_activity_before_a_client_reconnects() {
-        let mut capture = CaptureSource::Privileged(PrivilegedSource::new(Instant::now()));
-        capture.set_event_activity(bubbleplay_host::activity::Activity::new().unwrap());
-        let CaptureSource::Privileged(source) = capture else {
-            panic!("privileged source changed")
-        };
-        assert!(source.client.is_none());
-        assert!(
-            source.event_activity.is_some(),
-            "reconnected clients need the same producer notifier"
-        );
-    }
 
     #[test]
     fn snapshot_deadlines_wake_when_due_once_and_rearm_for_changed_work() {
@@ -1447,17 +885,20 @@ mod agent_encode_recovery_tests {
         let mut capture = CaptureSource::Local(source);
         assert!(!capture.desktop_state().available);
         assert!(!capture.secure_input_allowed());
-        if let CaptureSource::Local(source) = &mut capture {
+        {
+            let CaptureSource::Local(source) = &mut capture;
             source.secure_streaming = true;
         }
         assert!(capture.desktop_state().available);
         assert!(capture.secure_input_allowed());
-        if let CaptureSource::Local(source) = &mut capture {
+        {
+            let CaptureSource::Local(source) = &mut capture;
             source.secure_state.as_mut().unwrap().caps = vec!["view", "deny"];
         }
         assert!(!capture.secure_input_allowed());
         assert!(capture.switch_monitor("DISPLAY1").is_err());
-        if let CaptureSource::Local(source) = &mut capture {
+        {
+            let CaptureSource::Local(source) = &mut capture;
             source.secure_state = None;
         }
         assert!(!capture.desktop_state().available);
@@ -1467,7 +908,8 @@ mod agent_encode_recovery_tests {
         capture.set_capture_demand(false).unwrap();
         capture.request_event_frame_at(Instant::now()).unwrap();
         assert!(capture.next_event_deadline(true).is_none());
-        if let CaptureSource::Local(source) = &capture {
+        {
+            let CaptureSource::Local(source) = &capture;
             assert!(source.capture.is_none());
         }
     }
@@ -1522,7 +964,8 @@ mod agent_encode_recovery_tests {
             assert!(!capture.desktop_state().available);
             assert!(!capture.secure_input_allowed());
             assert_eq!(capture.secure_state().unwrap().caps, Vec::<&str>::new());
-            if let CaptureSource::Local(source) = &mut capture {
+            {
+                let CaptureSource::Local(source) = &mut capture;
                 source.observe_desktop(None, true, "other");
             }
             assert!(
@@ -1530,58 +973,5 @@ mod agent_encode_recovery_tests {
                 "Default alone is not a recovered DDA frame"
             );
         }
-    }
-
-    fn timed_out() -> anyhow::Error {
-        anyhow::anyhow!("Agent encode permit timed out")
-    }
-
-    #[test]
-    fn encode_failure_retry_respects_the_reconnect_backoff() {
-        let now = Instant::now();
-        let mut source = PrivilegedSource::new(now);
-        // Even without a recorded failure the floor forbids a same-instant
-        // retry, so the producer loop can never spin at full speed.
-        assert_eq!(source.agent_retry_delay(now), MIN_AGENT_ENCODE_RETRY_DELAY);
-        source.mark_agent_unavailable(now, &timed_out());
-        let delay = source.agent_retry_delay(now);
-        assert_eq!(delay, agent_reconnect_delay(0));
-        assert!(delay >= MIN_AGENT_ENCODE_RETRY_DELAY);
-        // The deadline is absolute: once it passes, one retry is allowed.
-        assert_eq!(
-            source.agent_retry_delay(now + delay),
-            MIN_AGENT_ENCODE_RETRY_DELAY
-        );
-    }
-
-    #[test]
-    fn repeated_encode_failures_do_not_report_per_iteration() {
-        let now = Instant::now();
-        let mut source = PrivilegedSource::new(now);
-        let error = timed_out();
-        // The first failure of a window is reported by mark_agent_unavailable.
-        source.mark_agent_unavailable(now, &error);
-        assert!(source.reconnect_log.last_emitted.is_some());
-        let suppressed_before = source.reconnect_log.suppressed;
-        // A producer that retried as fast as it could (the production flood)
-        // must accumulate suppressions instead of stderr lines.
-        for step in 0..5_000u64 {
-            let at = now + Duration::from_micros(step);
-            let delay = source.note_encode_failure(at, &error);
-            assert!(delay >= MIN_AGENT_ENCODE_RETRY_DELAY);
-        }
-        assert!(source.reconnect_log.suppressed > suppressed_before);
-        // Still inside the same window: nothing further is emitted.
-        assert_eq!(
-            source
-                .reconnect_log
-                .admit(now + AGENT_RECONNECT_LOG_INTERVAL - Duration::from_millis(1)),
-            None
-        );
-        // A later window reports again and carries the suppressed count.
-        assert!(source
-            .reconnect_log
-            .admit(now + AGENT_RECONNECT_LOG_INTERVAL)
-            .is_some());
     }
 }

@@ -178,7 +178,7 @@ The `BP_CPU_*` variables are read when the converter and encoder are built. The 
 - **NVIDIA MFT is tested on one GPU.** The test GPU is a GTX 1660 SUPER.
 - **Gradual intra refresh is not used.** The inbox software MFT accepts `CODECAPI_AVEncVideoGradualIntraRefresh` (SetValue returns `S_OK` and the value reads back), but it ignores the value. With values 0, 30 and 60 the streams are byte-identical, and there are no intra slices outside IDRs (`probe_mf --intra-refresh`, PC and VM 105). The host does not use it.
 - **Privileged and cropped paths keep the old preparation.** They get no fused scaling and no adaptation.
-- **The old SYSTEM-agent path (`privileged_backend.rs`) is NVENC-only.** It is a development path. Its IPC carries no encoder preference, so it does not follow CPU mode. The shipped secure helper hands BGRA frames to the normal host, which uses the selected encoder.
+- **The old SYSTEM-agent path (`privileged_backend.rs`) was removed in October 2026.** The shipped secure helper hands BGRA frames to the normal host, which uses the selected encoder.
 - **Quality/speed above 0 is not qualified.** At 100, the HD matrix error is about 87 code values. The cause is unresolved.
 - **NVENC performance is not benchmarked in this lane.** NVENC's encode and config code is unchanged.
 - **CPU mode is tested on a VM only.** The live host runs above were on VM 105, started with `--cpu-mode`. The tray toggle, a GPU-less physical PC and the protected desktop have not been tested live.

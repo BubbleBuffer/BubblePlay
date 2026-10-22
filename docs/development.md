@@ -6,7 +6,7 @@ Run development commands below from the repository root. For the public product 
 
 | Path | What to change here |
 | --- | --- |
-| [`host/`](../host) | Rust Windows capture/encoding, input, clipboard, files, tray and optional admin-input helper |
+| [`host/`](../host) | Rust Windows capture/encoding, input, clipboard, files, tray and optional admin-input helper; the retired LocalSystem service path was removed |
 | [`relay/`](../relay/README.md) | Go relay/authentication and Docker definitions |
 | [`worker/src/`](../worker/src) | Cloudflare relay, authentication and protocol validation |
 | [`worker/public/`](../worker/public) | Browser receiver shared by Go and Cloudflare; no frontend bundler |
@@ -68,9 +68,9 @@ RTC control while it is open and signaling otherwise to avoid duplicate updates
 arriving out of order. Older clients ignore the new packet; older hosts keep the
 client's default arrow.
 
-For the optional privileged capture backend, the host and transport Agent must
-both use privileged IPC version 5. Upgrade those components together; this is
-separate from the tray's admin input agent protocol.
+The optional privileged capture backend (LocalSystem broker, transport and
+Agent, privileged IPC) was removed in October 2026; the tray's admin input
+agent protocol is unaffected.
 
 ## Development checks
 

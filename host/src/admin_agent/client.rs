@@ -17,7 +17,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_PIPE_BUSY, HANDLE};
 use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
 
-use crate::bounded_pipe::BoundedPipe;
+use crate::deadline_pipe::BoundedPipe;
 
 use super::protocol::{
     read_frame, write_client, AgentMessage, ClientMessage, Record, RefuseCode, Role,

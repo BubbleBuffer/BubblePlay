@@ -62,25 +62,16 @@ pub(super) fn should_snapshot_idle_desktop(media_ready: bool, latest_idr_missing
 
 pub(super) fn capture_admission_ready(
     capture_available: bool,
-    privileged_probe_allowed: bool,
     negotiation_active: bool,
     ice_connected: bool,
     wss_active: bool,
     rtc_reserved: bool,
     prewarm_needed: bool,
 ) -> bool {
-    (capture_available || privileged_probe_allowed)
+    capture_available
         && (wss_active
             || (ice_connected && rtc_reserved)
             || (negotiation_active && !ice_connected && prewarm_needed))
-}
-
-pub(super) fn privileged_no_frame_retry_delay(capture_available: bool) -> Duration {
-    if capture_available {
-        Duration::from_millis(1)
-    } else {
-        Duration::from_millis(250)
-    }
 }
 
 pub(super) fn encoder_benchmark_contract_changed(
@@ -223,7 +214,7 @@ pub(super) struct CachedIdr {
     pub(super) data: Vec<u8>,
     pub(super) mode: VideoMode,
     /// Local Default pixels need fresh authorization before cached replay.
-    /// Secure helper and privileged Agent frames retain their own policy.
+    /// Secure helper frames retain their own policy.
     pub(super) requires_default: bool,
     /// Media generation the IDR was encoded in. A cached IDR is never replayed
     /// or reused for admission in another generation: on WebRTC its fresh RTP
@@ -329,16 +320,11 @@ pub(super) fn rejected_transition_requires_recovery(
     pending.as_ref().is_some_and(|candidate| candidate.id == id)
 }
 
-/// Host input readiness when a WebRTC offer arrives. The privileged Agent
-/// always waits for presentation; the user host waits too when the offer
-/// starts a new peer, since its helper can stream the secure desktop. An offer
-/// that is not forwarded keeps the user host's previous rule.
-pub(super) fn input_ready_on_offer(
-    privileged: bool,
-    capture_available: bool,
-    starts_peer: bool,
-) -> bool {
-    !privileged && !starts_peer && capture_available
+/// Host input readiness when a WebRTC offer arrives. The host waits for
+/// presentation when the offer starts a new peer, since its helper can stream
+/// the secure desktop. An offer that is not forwarded keeps the previous rule.
+pub(super) fn input_ready_on_offer(capture_available: bool, starts_peer: bool) -> bool {
+    !starts_peer && capture_available
 }
 
 pub(super) fn should_forward_offer(

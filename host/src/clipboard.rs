@@ -1,9 +1,9 @@
 //! Text and image clipboard access for the interactive user session.
 //!
-//! Only the input proxy (interactive user token, default desktop) and the
-//! unprivileged local host use this module. Every access re-checks that the
-//! current input desktop is the default desktop, so clipboard contents are never
-//! read or written while Winlogon/UAC (the secure desktop) is active.
+//! Only the local host, running as the interactive user, uses this module.
+//! Every access re-checks that the current input desktop is the default
+//! desktop, so clipboard contents are never read or written while Winlogon/UAC
+//! (the secure desktop) is active.
 //!
 //! Wire formats (see `fixtures/input-contract.json`):
 //! - browser -> host: binary input packet type 12, chunked UTF-8 (see

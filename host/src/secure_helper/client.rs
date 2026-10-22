@@ -9,7 +9,7 @@ use super::{
 use crate::{
     activity::Activity,
     admin_agent::protocol::{ClientMessage, Record},
-    bounded_pipe::BoundedPipe,
+    deadline_pipe::BoundedPipe,
     input::DesktopRegion,
 };
 use std::{

@@ -20,7 +20,7 @@ What the existing pieces already provide:
 
 - `bubbleplay_secure_helper.exe` (SYSTEM, console session, no network listener) captures Winlogon with GDI, composites the cursor, hands BGRA frames to the host over shared memory, and applies pointer, keyboard and Unicode input under policy. Its pipe `\\.\pipe\BubblePlay.SecureHelper.s<session>` allows SYSTEM and the console user SID only (`secure_helper/trust.rs` 259-261). Its input policy is Admin mode, which is bound to the console user's SID (`HKLM\SOFTWARE\BubblePlay` `AdminMode`/`AdminModeSid`, `host/src/admin_mode.rs`). Before sign-in there is no console user, so today it has no client and no policy.
 - The user host already encodes helper frames with its own encoder and runs the secure-desktop state/banner protocol ([secure-desktop-contract.json](../../fixtures/secure-desktop-contract.json)).
-- The retired service path (`install-service.ps1`: `BubblePlayBroker` as LocalSystem, `BubblePlayTransport` as LocalService with its own service SID; `host/src/service_runtime.rs`) already follows the active console session and launches a process into it. It is excluded from the release and was never validated on Winlogon. Its LocalService transport split is a useful precedent.
+- The retired service path (`install-service.ps1`: `BubblePlayBroker` as LocalSystem, `BubblePlayTransport` as LocalService with its own service SID; `host/src/service_runtime.rs`) followed the active console session and launched a process into it. It was removed from the repo in October 2026 (see git history), never shipped and was never validated on Winlogon. Its LocalService transport split is a useful precedent.
 - No BubblePlay process accepts inbound network connections; all relay traffic is outbound.
 
 ## Options
@@ -45,7 +45,7 @@ A small SYSTEM service `BubblePlayLogon` with no network code supervises session
 
 When a user signs in, the service stops the logon host; the viewer is disconnected, the user's tray starts from the Run key as today, and the viewer reconnects to the user host.
 
-- Changes: new service binary (session following can be lifted from `service_runtime.rs`); host pre-login mode with file transfer, clipboard, monitor follow and the admin agent compiled out or refused; helper trust check extended to accept the logon host's service SID from session 0 when the console has no user; a machine-scoped host credential; relay support for a pre-login flag and fresh approval (Go and Cloudflare, plus a fixture); tray/setup UI for the opt-in.
+- Changes: new service binary (session following can be recovered from the removed `service_runtime.rs` in git history); host pre-login mode with file transfer, clipboard, monitor follow and the admin agent compiled out or refused; helper trust check extended to accept the logon host's service SID from session 0 when the console has no user; a machine-scoped host credential; relay support for a pre-login flag and fresh approval (Go and Cloudflare, plus a fixture); tray/setup UI for the opt-in.
 - New attack surface: an always-on SYSTEM service (local only, no network); a network-connected process that runs before anyone is signed in, parsing relay signaling and WebRTC/WSS, but as a service account without SYSTEM rights; input on the sign-in screen, which means the viewer types a Windows password or PIN that passes through the relay as key events (a WSS relay sees them above TLS). A compromised logon host can still drive the helper within the pre-login policy, that is, type on the sign-in screen.
 - Admin mode / secure desktop: Admin mode keeps governing the signed-in user's lock screen and UAC. Pre-login gets its own machine-wide value (`HKLM\SOFTWARE\BubblePlay\PreLogin`), set only through UAC, cleared by a SYSTEM task like `AdminModeOff`. The helper reads it per request, as it reads Admin mode.
 - Install/update/removal: the existing elevated child installs the service, its account and ACLs, and `ProgramData\BubblePlay\prelogin` credentials (ACL: SYSTEM and the service SID). Update stops the service before replacing Program Files binaries and is covered by rollback. Uninstall removes the service, the value and the credentials. `package-release.ps1` requires the new binary.
@@ -56,7 +56,7 @@ When a user signs in, the service stops the logon host; the viewer is disconnect
 
 A SYSTEM service always runs the host as SYSTEM in the active console session, covering pre-login, lock, UAC and the user desktop with one process; the tray becomes UI only.
 
-- Changes: replaces the current privilege model; effectively revives the retired broker/agent path.
+- Changes: replaces the current privilege model; effectively revives the broker/agent path that was removed in October 2026.
 - New attack surface: the whole host (signaling, WebRTC, file transfer, clipboard, input) is network-connected SYSTEM code, before and after sign-in. Remote input as SYSTEM on the user's desktop bypasses UAC by design.
 - Admin mode / secure desktop: Admin mode loses its meaning unless re-enforced inside the SYSTEM host; the user/helper separation built in Milestones A and B goes away.
 - Install/update/removal: per-machine install only; per-user setup and update scripts are replaced.

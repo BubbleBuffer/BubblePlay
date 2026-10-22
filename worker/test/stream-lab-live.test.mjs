@@ -774,7 +774,7 @@ test("host publishes benchmark status before candidate encoding can skip the pro
   assert.ok(status >= 0, "benchmark status scheduler must remain in the session loop");
   assert.ok(encode >= 0, "local NVENC encode must remain in the session loop");
   assert.ok(status < encode, "benchmark status must not be starved by an encode-error continue");
-  const scheduler = session.slice(status, session.indexOf("capture.tick(loop_now)", status));
+  const scheduler = session.slice(status, session.indexOf("capture.tick_secure(", status));
   assert.equal(scheduler.includes("wss_media.is_some()"), false,
     "profile activation telemetry must not wait for the transport event");
 });
@@ -1994,7 +1994,6 @@ test("candidate host launch reuses the broker-owned VDD and reads only its scrat
     BUBBLEPLAY_LAB_IDR_TELEMETRY: "1",
     BUBBLEPLAY_LAB_RESET_ENCODER_ON_DIAGNOSTIC_KEYFRAME: "1",
   });
-  assert.equal(launch.args.includes("--privileged-agent"), false);
   assert.equal(launch.args.includes("--vdd"), false);
 
   const steadyStateLaunch = buildCandidateHostLaunch(
