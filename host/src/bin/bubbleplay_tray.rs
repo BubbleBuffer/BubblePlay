@@ -64,7 +64,7 @@ use bubbleplay_host::secure_helper::protocol::{
 use logic::{
     admin_menu_enabled, admin_mode_line, run_key_command, running_probe_status,
     secure_helper_should_launch, start_secure_helper_for_viewer, status_line, unix_ms_now,
-    AgentStatus, HostState, SecureHelperStatus, SharedLog, TraySettings, ViewerGate,
+    AgentStatus, HostState, ProbeGate, SecureHelperStatus, SharedLog, TraySettings, ViewerGate,
     AGENT_UPDATE_LABEL, SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
@@ -296,7 +296,11 @@ struct App {
     /// When the agent task was started or an existing agent was adopted.
     agent_started: Option<Instant>,
     agent_retry: StartRetry,
-    last_probe: Option<Instant>,
+    /// Single-flight and throttle for the probe thread; results come back on
+    /// `probe_rx` and are applied by `drain_probes` on the timer.
+    probe_gate: ProbeGate,
+    probe_tx: std::sync::mpsc::Sender<(u64, ProbeResult)>,
+    probe_rx: std::sync::mpsc::Receiver<(u64, ProbeResult)>,
     /// Test mode only: the unelevated `--dev` agent the tray spawned.
     agent_child: Option<std::process::Child>,
     agent_update_running: bool,
@@ -616,7 +620,7 @@ impl App {
                     "admin agent start attempt accepted"
                 );
                 self.agent_started = Some(Instant::now());
-                self.last_probe = None;
+                self.probe_gate.reset_throttle();
                 self.set_agent(AgentStatus::Starting);
             }
             Err(reason) => {
@@ -651,7 +655,7 @@ impl App {
             end_agent_task();
         }
         self.agent_started = None;
-        self.last_probe = None;
+        self.probe_gate.reset_throttle();
     }
 
     fn stop_agent(&mut self) {
@@ -698,17 +702,41 @@ impl App {
         if !needed || self.agent_update_running {
             return;
         }
-        let now = Instant::now();
-        let running = self.agent_running();
-        let due = force_probe
-            || self
-                .last_probe
-                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(5));
-        if !due {
+        let Some(ticket) = self.probe_gate.try_start(Instant::now(), force_probe) else {
+            return;
+        };
+        // The pipe probe can wait seconds on a stalled agent, so it runs off
+        // the UI thread. The status stays as last known until the result lands.
+        let pipe = self.agent_pipe.clone();
+        let test_mode = self.test_mode;
+        let tx = self.probe_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("agent-probe".into())
+            .spawn(move || {
+                let _ = tx.send((ticket, probe(&pipe, test_mode)));
+            });
+        if spawned.is_err() {
+            self.probe_gate.finish(ticket);
+        }
+    }
+
+    /// Applies the probe results that arrived since the last timer tick.
+    fn drain_probes(&mut self) {
+        while let Ok((ticket, result)) = self.probe_rx.try_recv() {
+            self.probe_gate.finish(ticket);
+            self.apply_probe(result);
+        }
+    }
+
+    /// Applies one probe result while Admin mode still needs the agent.
+    fn apply_probe(&mut self, result: ProbeResult) {
+        let needed = self.admin_on && active_from_env();
+        if !needed || self.agent_update_running {
             return;
         }
-        self.last_probe = Some(now);
-        match probe(&self.agent_pipe, self.test_mode) {
+        let now = Instant::now();
+        let running = self.agent_running();
+        match result {
             ProbeResult::Ready(handshake) => {
                 if self.agent != AgentStatus::Ready {
                     tracing::warn!(
@@ -1186,6 +1214,7 @@ impl App {
 
     fn tick(&mut self) {
         self.refresh_admin_mode();
+        self.drain_probes();
         self.watch_update();
         self.gate_agent();
         self.check_agent(false);
@@ -1338,6 +1367,8 @@ fn show_menu(hwnd: HWND) {
         key_busy,
     )) = with_app(|app| {
         app.refresh_admin_mode();
+        app.drain_probes();
+        // Starts a probe if none is in flight; the menu shows the last known status.
         app.check_agent(true);
         app.check_secure_helper(true);
         let agent_update = if app.agent_update_running {
@@ -1595,6 +1626,7 @@ fn run_tray() -> Result<i32> {
     let settings_path = data.join("tray.json");
     let settings = TraySettings::load(&settings_path);
     let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel();
     let app = App {
         hwnd,
         data: data.clone(),
@@ -1618,7 +1650,9 @@ fn run_tray() -> Result<i32> {
         viewers: ViewerGate::default(),
         agent_started: None,
         agent_retry: StartRetry::default(),
-        last_probe: None,
+        probe_gate: ProbeGate::default(),
+        probe_tx,
+        probe_rx,
         agent_child: None,
         agent_update_running: false,
         announce_ready: false,
