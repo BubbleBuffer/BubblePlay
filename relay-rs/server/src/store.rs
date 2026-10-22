@@ -254,7 +254,7 @@ mod tests {
             public: URL_SAFE_NO_PAD.encode(public),
             registered_ms: 1_700_000_000_000 + u64::from(seed),
             admitted: vec![DeviceId::from_public_key(&[seed.wrapping_add(1); 32]).to_string()],
-            remote_pairing: seed % 2 == 0,
+            remote_pairing: seed.is_multiple_of(2),
         }
     }
 

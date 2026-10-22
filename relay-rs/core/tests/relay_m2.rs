@@ -581,7 +581,7 @@ fn m2_twenty_failures_for_one_window_send_pair_closed_to_the_host() {
         assert!(refused(&actions, id));
         let told_host = sent_types(&actions, host.id)
             .iter()
-            .any(|t| t == "pair-closed");
+            .any(|t| t.as_str() == "pair-closed");
         assert_eq!(
             told_host,
             i == 19,
@@ -603,7 +603,7 @@ fn m2_full_prefix_map_refuses_new_prefixes_and_keeps_tracked_ones() {
     // 4096 distinct prefixes, one failure each. The window is reopened every
     // 19 attempts so the twentieth failure never drops it.
     for i in 0..4096u16 {
-        if i % 19 == 0 {
+        if i.is_multiple_of(19) {
             send_pair_open(&mut h, host.id, &PAIR_VALUE);
         }
         h.client = IpAddr::V4(Ipv4Addr::new(10, (i >> 8) as u8, (i & 0xff) as u8, 1));
@@ -699,7 +699,11 @@ fn m2_pairing_viewer_offer_is_not_buffered_for_the_next_host() {
     let actions = h.text(p, &json!({"type": "offer", "sdp": "v=0"}));
     assert!(actions.is_empty());
     let (new_host, actions) = reregister(&mut h, &identity(1));
-    assert!(!sent_types(&actions, new_host).iter().any(|t| t == "offer"));
+    assert!(
+        !sent_types(&actions, new_host)
+            .iter()
+            .any(|t| t.as_str() == "offer")
+    );
 }
 
 #[test]
@@ -712,7 +716,11 @@ fn m2_listed_viewer_offer_is_buffered_while_the_host_is_away() {
     h.close(host.id);
     h.text(v.id, &json!({"type": "offer", "sdp": "v=0"}));
     let (new_host, actions) = reregister(&mut h, &identity(1));
-    assert!(sent_types(&actions, new_host).iter().any(|t| t == "offer"));
+    assert!(
+        sent_types(&actions, new_host)
+            .iter()
+            .any(|t| t.as_str() == "offer")
+    );
 }
 
 // ------------------------------------------------------------- allowlist
@@ -730,7 +738,7 @@ fn m2_auth_hello_rejects_bad_shapes_and_oversize() {
     dropped(Side::Viewer, &extra);
 
     let mut too_many = auth_hello_msg(201);
-    too_many["caps"] = json!(vec!["input"; 33]);
+    too_many["caps"] = json!(["input"; 33]);
     dropped(Side::Viewer, &too_many);
 
     let mut long_name = auth_hello_msg(201);
