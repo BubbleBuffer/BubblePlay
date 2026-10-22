@@ -24,8 +24,8 @@ Not yet run live: the 10-minute soak and stabilization list in [development.md](
 Status: done 2026-10-12. Android now follows the browser's carry rule: held keys and buttons survive a monitor switch, and release-all is sent on resume only if something held was let go during the gate. Desktop-source changes and dead transports still release. See [follow-active-window.md](architecture/follow-active-window.md#monitor-transitions-in-the-browser).
 
 ### Feature parity with the browser
-Status: approved 2026-10-12 for all four: follow active window (including edge-hold drags), game mode, background survival and keyboard lock.
-Built on lane/android-parity (2026-10-13), not yet merged: follow active window in the switch-screen popover, Work/Game pointer modes (Game uses Android pointer capture), keyboard capture (Esc and Win combinations; Android keeps Win alone, Alt+Tab and Print Screen), and a `dataSync` foreground service that keeps the session and transfers alive in the background with a Disconnect notification, falling back to the 30 s background stop. Still browser-only: desktop file drops with preview.
+Status: done 2026-10-13 for all four: follow active window (including edge-hold drags), game mode, background survival and keyboard lock.
+Built on lane/android-parity and merged on 2026-10-13: follow active window in the switch-screen popover, Work/Game pointer modes (Game uses Android pointer capture), keyboard capture (Esc and Win combinations; Android keeps Win alone, Alt+Tab and Print Screen), and a `dataSync` foreground service that keeps the session and transfers alive in the background with a Disconnect notification, falling back to the 30 s background stop. Still browser-only: desktop file drops with preview.
 
 ### Compose UI and Game controls
 Status: planned; starts after the encoders and Windows-client lanes are further along.
