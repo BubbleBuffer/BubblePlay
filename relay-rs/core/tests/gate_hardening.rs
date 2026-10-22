@@ -221,6 +221,9 @@ fn gate_accepts_canonical_bare_origins() {
         "https://[2001:db8::1]",
         "https://[2001:db8::1]:8443",
         "https://a-b.example.com",
+        // One trailing slash is canonicalised away.
+        "https://relay.example/",
+        "https://relay.example:8443/",
     ] {
         assert!(
             origin_error(origin).is_none(),
@@ -233,8 +236,9 @@ fn gate_accepts_canonical_bare_origins() {
 fn gate_rejects_non_canonical_public_origins() {
     for origin in [
         "https://Relay.example",
-        "https://relay.example/",
+        "https://relay.example//",
         "https://relay.example/path",
+        "https://relay.example/path/",
         "https://relay.example?q=1",
         "https://relay.example#frag",
         "https://relay.example:443",
@@ -243,7 +247,6 @@ fn gate_rejects_non_canonical_public_origins() {
         "https://relay.example:0",
         "https://relay.example:",
         "https://relay.example:99999",
-        "https://relay.example:8443/",
         "https://user@relay.example",
         "https://relay example",
         "relay.example",

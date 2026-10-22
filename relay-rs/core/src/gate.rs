@@ -306,9 +306,20 @@ impl Gate {
         if config.public_origin.is_empty() {
             return Err(ConfigError::EmptyPublicOrigin);
         }
-        if !is_canonical_origin(&config.public_origin) {
+        // One trailing slash is canonicalised away; anything else must already be
+        // a canonical bare origin.
+        let stripped = config
+            .public_origin
+            .strip_suffix('/')
+            .unwrap_or(&config.public_origin);
+        if !is_canonical_origin(stripped) {
             return Err(ConfigError::NonCanonicalPublicOrigin);
         }
+        let public_origin = stripped.to_string();
+        let config = GateConfig {
+            public_origin,
+            ..config
+        };
         let ttl_ms = config.approval_ttl_secs.saturating_mul(1000);
         let cookies: BTreeMap<[u8; 32], u64> = persisted
             .records

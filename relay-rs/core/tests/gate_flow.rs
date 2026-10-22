@@ -411,14 +411,20 @@ fn gate_forget_clears_the_cookie_and_its_record() {
 }
 
 #[test]
-fn gate_public_origin_with_trailing_slash_is_rejected() {
+fn gate_public_origin_trailing_slash_is_stripped() {
     let config = GateConfig {
         public_origin: format!("{ORIGIN}/"),
         ..config(true)
     };
+    let mut gate = Gate::new(config, GateSnapshot::default(), T0).expect("valid config");
+    let mut rng = TestRng::new(121);
+    let mut request = req("GET", "/", CLIENT, T0);
+    request.origin = Some(ORIGIN);
+    let (_, effects) = wait_parts(gate.handle(&mut rng, &request));
+    let json = ntfy_json(&effects[0]);
     assert_eq!(
-        Gate::new(config, GateSnapshot::default(), T0).err(),
-        Some(ConfigError::NonCanonicalPublicOrigin)
+        json["actions"][0]["url"],
+        "https://relay.example/__gate/decision"
     );
 }
 
