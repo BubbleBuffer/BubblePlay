@@ -107,7 +107,7 @@ host and a live viewer in both directions.
 - The admin listing at `/__gate/manage/pcs` reports the count of admitted viewers per PC (`admitted`), never the IDs.
 - `last_seen` is derived, not stored: the PC table keeps `registered_ms` only, and on load `last_seen` is set equal to `registered_ms`. The admin listing shows a PC's last contact as its registration time until it connects again after a restart.
 - Queued frames drain before a close: a socket's frames already in its queue are sent before its close frame, including the 1008 and 1001 closes. The drain shares `CLOSE_TIMEOUT` (2 s). A socket being removed or replaced can therefore receive frames queued just before the close.
-- A failed-upgrade connection is reaped by `tick`: the core accepts an upgrade before the WebSocket handshake finishes. If the handshake fails, the connection stays until its hello deadline (10 s), and `tick` then closes and forgets it.
+- A failed-upgrade connection is reaped by `tick`: the core accepts an upgrade before the WebSocket handshake finishes. If the handshake fails, the connection stays until its hello deadline (10 s), and `tick` then closes it 1008 with an empty reason and forgets it. A socket still in its hello or viewer proof at its deadline is closed the same way, and a host that misses its proof deadline is closed 1008 "invalid hello".
 - Admin DELETE of an unknown PC returns 404 (`NotFound`) and persists nothing. Deleting a registered PC persists first and returns 204.
 
 ## M3 notes (Cloudflare build)

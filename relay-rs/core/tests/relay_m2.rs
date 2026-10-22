@@ -47,6 +47,56 @@ fn refused(actions: &[Action], id: ConnId) -> bool {
     closed(actions, id) == Some((1008, String::new()))
 }
 
+/// The socket an action is sent to, if it has one. `PersistPcs` has none.
+fn target(action: &Action) -> Option<ConnId> {
+    match action {
+        Action::SendText(to, _) | Action::SendBinary(to, _) | Action::Close(to, _, _) => Some(*to),
+        Action::PersistPcs(_) => None,
+    }
+}
+
+/// One frame a refused socket can receive, in the form the contract checks.
+#[derive(Debug, PartialEq)]
+enum Frame {
+    Challenge,
+    Close(u16, String),
+    Other(String),
+}
+
+fn is_type(text: &str, kind: &str) -> bool {
+    serde_json::from_str::<Value>(text).is_ok_and(|v| v["type"] == kind)
+}
+
+/// Checks the refusal contract for `id`, a socket refused after `batches` of
+/// relay actions (its hello, then its proof, and so on). Its own frames must
+/// be exactly `[register-challenge, close 1008 ""]`, or only the close when the
+/// refusal came before the challenge (`challenged` is false). No action may
+/// target `host`, the PC's host socket.
+fn assert_refusal_contract(batches: &[Vec<Action>], id: ConnId, host: ConnId, challenged: bool) {
+    let frames: Vec<Frame> = batches
+        .iter()
+        .flatten()
+        .filter(|action| target(action) == Some(id))
+        .map(|action| match action {
+            Action::SendText(_, text) if is_type(text, "register-challenge") => Frame::Challenge,
+            Action::Close(_, code, reason) => Frame::Close(*code, reason.clone()),
+            other => Frame::Other(format!("{other:?}")),
+        })
+        .collect();
+    let mut expected = Vec::new();
+    if challenged {
+        expected.push(Frame::Challenge);
+    }
+    expected.push(Frame::Close(1008, String::new()));
+    assert_eq!(frames, expected, "frames sent to the refused socket");
+    let to_host = batches
+        .iter()
+        .flatten()
+        .filter(|action| target(action) == Some(host))
+        .count();
+    assert_eq!(to_host, 0, "no action may target the host socket");
+}
+
 fn listed_admitted(h: &Harness, pc: &str) -> usize {
     h.relay
         .list_pcs()
@@ -96,18 +146,40 @@ fn reregister(h: &mut Harness, who: &DeviceIdentity) -> (ConnId, Vec<Action>) {
     (id, actions)
 }
 
+/// Runs the viewer handshake for `who` on `pc`: the signed hello (with `pair`
+/// when given), then the proof for the challenge. Returns the socket and the
+/// batch of actions from each step.
+fn viewer_handshake(
+    h: &mut Harness,
+    who: &DeviceIdentity,
+    pc: &str,
+    pair: Option<&[u8; 32]>,
+) -> (ConnId, Vec<Vec<Action>>) {
+    let id = h.upgrade(req(Route::Ws, Some(pc), None, true));
+    let mut hello = viewer_hello_msg(who, false);
+    if let Some(pair) = pair {
+        hello["pair"] = json!(b64(pair));
+    }
+    let hello_actions = h.text(id, &hello);
+    let nonce = challenge_nonce(&hello_actions, id).expect("register-challenge sent");
+    let proof_actions = h.text(id, &viewer_proof_msg(who, ORIGIN, &nonce));
+    (id, vec![hello_actions, proof_actions])
+}
+
 /// A valid viewer hello is sent, then `proof` is answered. The socket must be
-/// refused with 1008 and an empty reason.
+/// refused under the refusal contract, after the challenge.
 fn proof_is_refused(proof: impl FnOnce(&[u8; 32]) -> Value) {
     let mut h = Harness::new();
     let host = host_up(&mut h);
-    let hello = viewer_hello_msg(&viewer_identity(), false);
-    let (id, nonce) = viewer_start(&mut h, &host.pc, &hello);
-    let actions = h.text(id, &proof(&nonce));
-    assert!(refused(&actions, id));
+    let id = h.upgrade(req(Route::Ws, Some(&host.pc), None, true));
+    let hello_actions = h.text(id, &viewer_hello_msg(&viewer_identity(), false));
+    let nonce = challenge_nonce(&hello_actions, id).expect("register-challenge sent");
+    let proof_actions = h.text(id, &proof(&nonce));
+    assert_refusal_contract(&[hello_actions, proof_actions], id, host.id, true);
 }
 
-/// A viewer hello changed by `tweak` must be refused before any challenge.
+/// A viewer hello changed by `tweak` must be refused before any challenge,
+/// under the refusal contract.
 fn hello_is_refused(tweak: impl FnOnce(&mut Value)) {
     let mut h = Harness::new();
     let host = host_up(&mut h);
@@ -119,7 +191,7 @@ fn hello_is_refused(tweak: impl FnOnce(&mut Value)) {
         challenge_nonce(&actions, id).is_none(),
         "a bad hello gets no challenge"
     );
-    assert!(refused(&actions, id));
+    assert_refusal_contract(&[actions], id, host.id, false);
 }
 
 fn auth_hello_msg(seed: u8) -> Value {
@@ -257,8 +329,8 @@ fn m2_hello_with_the_host_role_is_refused() {
 fn m2_unlisted_viewer_is_refused_with_empty_reason() {
     let mut h = Harness::new();
     let host = host_up(&mut h);
-    let (id, actions) = h.viewer_join(&stranger(), &host.pc, false, None);
-    assert!(refused(&actions, id));
+    let (id, batches) = viewer_handshake(&mut h, &stranger(), &host.pc, None);
+    assert_refusal_contract(&batches, id, host.id, true);
 }
 
 #[test]
@@ -286,6 +358,91 @@ fn m2_proof_at_29_seconds_is_accepted() {
     h.advance(29_000);
     let actions = h.text(id, &viewer_proof_msg(&viewer_identity(), ORIGIN, &nonce));
     assert!(hello_ok(&actions, id).get("ticket").is_some());
+}
+
+// ------------------------------------------- pre-admission and idle timeouts
+
+#[test]
+fn m2_socket_that_never_sends_hello_is_closed_1008_with_empty_reason() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let id = h.upgrade(req(Route::Ws, Some(&host.pc), None, true));
+    let out = h.advance(10_000);
+    assert_eq!(out, vec![Action::Close(id, 1008, String::new())]);
+}
+
+#[test]
+fn m2_hello_without_a_challenge_answer_is_closed_1008_with_empty_reason() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let id = h.upgrade(req(Route::Ws, Some(&host.pc), None, true));
+    let hello_actions = h.text(id, &viewer_hello_msg(&viewer_identity(), false));
+    assert!(challenge_nonce(&hello_actions, id).is_some());
+    let timeout_actions = h.advance(30_000);
+    assert_eq!(
+        timeout_actions,
+        vec![Action::Close(id, 1008, String::new())]
+    );
+    assert_refusal_contract(&[hello_actions, timeout_actions], id, host.id, true);
+}
+
+#[test]
+fn m2_host_challenge_timeout_keeps_the_invalid_hello_reason() {
+    let mut h = Harness::new();
+    let (id, actions) = h.host_hello(&identity(1), Some(TOKEN));
+    assert!(challenge_nonce(&actions, id).is_some());
+    let out = h.advance(30_000);
+    assert_eq!(
+        out,
+        vec![Action::Close(id, 1008, "invalid hello".to_owned())]
+    );
+}
+
+#[test]
+fn m2_idle_open_viewer_is_closed_1001_peer_disconnected() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let (viewer, _) = h.viewer_hello(&host.pc, false);
+    // The host pings at 60 s so only the viewer goes idle at 90 s.
+    pass_time(&mut h, host.id, 60_000);
+    let out = h.advance(30_000);
+    assert_eq!(
+        closes(&out, viewer.id),
+        vec![(1001, "peer disconnected".to_owned())]
+    );
+    assert!(closes(&out, host.id).is_empty());
+}
+
+#[test]
+fn m2_refused_viewers_leave_the_admitted_viewer_and_the_room_epoch_alone() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let pc = host.pc.clone();
+    let (viewer, _) = h.viewer_hello(&pc, false);
+    let mut seen = Vec::new();
+
+    // An unlisted viewer, with no pairing window open.
+    let (unlisted, batches) = viewer_handshake(&mut h, &stranger(), &pc, None);
+    assert_refusal_contract(&batches, unlisted, host.id, true);
+    seen.extend(batches.into_iter().flatten());
+    h.close(unlisted);
+
+    // A wrong-pair viewer, with a pairing window open.
+    send_pair_open(&mut h, host.id, &PAIR_VALUE);
+    let (wrong, batches) = viewer_handshake(&mut h, &identity(202), &pc, Some(&WRONG_VALUE));
+    assert_refusal_contract(&batches, wrong, host.id, true);
+    seen.extend(batches.into_iter().flatten());
+    h.close(wrong);
+
+    // The admitted viewer received nothing, is still connected, and the room
+    // epoch is the one it was given: a media upgrade with it is still accepted.
+    assert!(seen.iter().all(|action| target(action) != Some(viewer.id)));
+    let pong = h.text(viewer.id, &json!({"type": "ping"}));
+    assert_eq!(sent_types(&pong, viewer.id), vec!["pong".to_owned()]);
+    assert!(
+        h.try_upgrade(req(Route::MediaWs, Some(&pc), Some(&viewer.epoch), true))
+            .is_ok()
+    );
 }
 
 // ------------------------------------------------------------- host admit
@@ -473,8 +630,8 @@ fn m2_pair_window_admits_one_viewer_only() {
     send_pair_open(&mut h, host.id, &PAIR_VALUE);
     let (first, actions) = h.viewer_join(&stranger(), &host.pc, false, Some(&PAIR_VALUE));
     hello_ok(&actions, first);
-    let (second, actions) = h.viewer_join(&identity(202), &host.pc, false, Some(&PAIR_VALUE));
-    assert!(refused(&actions, second));
+    let (second, batches) = viewer_handshake(&mut h, &identity(202), &host.pc, Some(&PAIR_VALUE));
+    assert_refusal_contract(&batches, second, host.id, true);
 }
 
 #[test]
@@ -482,8 +639,8 @@ fn m2_wrong_pair_value_is_refused() {
     let mut h = Harness::new();
     let host = host_up(&mut h);
     send_pair_open(&mut h, host.id, &PAIR_VALUE);
-    let (id, actions) = h.viewer_join(&stranger(), &host.pc, false, Some(&WRONG_VALUE));
-    assert!(refused(&actions, id));
+    let (id, batches) = viewer_handshake(&mut h, &stranger(), &host.pc, Some(&WRONG_VALUE));
+    assert_refusal_contract(&batches, id, host.id, true);
 }
 
 #[test]
@@ -502,8 +659,8 @@ fn m2_pair_window_expires_after_300_seconds() {
     let host = host_up(&mut h);
     send_pair_open(&mut h, host.id, &PAIR_VALUE);
     pass_time(&mut h, host.id, 300_000);
-    let (id, actions) = h.viewer_join(&stranger(), &host.pc, false, Some(&PAIR_VALUE));
-    assert!(refused(&actions, id));
+    let (id, batches) = viewer_handshake(&mut h, &stranger(), &host.pc, Some(&PAIR_VALUE));
+    assert_refusal_contract(&batches, id, host.id, true);
 }
 
 #[test]
@@ -513,8 +670,8 @@ fn m2_pair_close_removes_the_window() {
     send_pair_open(&mut h, host.id, &PAIR_VALUE);
     let actions = h.text(host.id, &json!({"type": "pair-close"}));
     assert!(actions.is_empty());
-    let (id, actions) = h.viewer_join(&stranger(), &host.pc, false, Some(&PAIR_VALUE));
-    assert!(refused(&actions, id));
+    let (id, batches) = viewer_handshake(&mut h, &stranger(), &host.pc, Some(&PAIR_VALUE));
+    assert_refusal_contract(&batches, id, host.id, true);
 }
 
 #[test]
@@ -524,9 +681,9 @@ fn m2_host_disconnect_drops_the_window() {
     let pc = host.pc.clone();
     send_pair_open(&mut h, host.id, &PAIR_VALUE);
     h.close(host.id);
-    reregister(&mut h, &identity(1));
-    let (id, actions) = h.viewer_join(&stranger(), &pc, false, Some(&PAIR_VALUE));
-    assert!(refused(&actions, id));
+    let (new_host, _) = reregister(&mut h, &identity(1));
+    let (id, batches) = viewer_handshake(&mut h, &stranger(), &pc, Some(&PAIR_VALUE));
+    assert_refusal_contract(&batches, id, new_host, true);
 }
 
 #[test]
@@ -536,12 +693,12 @@ fn m2_five_wrong_tries_block_the_prefix_even_with_the_right_value() {
     let pc = host.pc.clone();
     send_pair_open(&mut h, host.id, &PAIR_VALUE);
     for _ in 0..5 {
-        let (id, actions) = h.viewer_join(&stranger(), &pc, false, Some(&WRONG_VALUE));
-        assert!(refused(&actions, id));
+        let (id, batches) = viewer_handshake(&mut h, &stranger(), &pc, Some(&WRONG_VALUE));
+        assert_refusal_contract(&batches, id, host.id, true);
         h.close(id);
     }
-    let (id, actions) = h.viewer_join(&stranger(), &pc, false, Some(&PAIR_VALUE));
-    assert!(refused(&actions, id));
+    let (id, batches) = viewer_handshake(&mut h, &stranger(), &pc, Some(&PAIR_VALUE));
+    assert_refusal_contract(&batches, id, host.id, true);
     h.close(id);
     // The window itself is still open for another prefix.
     h.client = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
@@ -607,13 +764,13 @@ fn m2_full_prefix_map_refuses_new_prefixes_and_keeps_tracked_ones() {
             send_pair_open(&mut h, host.id, &PAIR_VALUE);
         }
         h.client = IpAddr::V4(Ipv4Addr::new(10, (i >> 8) as u8, (i & 0xff) as u8, 1));
-        let (id, actions) = h.viewer_join(&stranger(), &pc, false, Some(&WRONG_VALUE));
-        assert!(refused(&actions, id));
+        let (id, batches) = viewer_handshake(&mut h, &stranger(), &pc, Some(&WRONG_VALUE));
+        assert_refusal_contract(&batches, id, host.id, true);
         h.close(id);
     }
     h.client = IpAddr::V4(Ipv4Addr::new(10, 200, 0, 1));
-    let (id, actions) = h.viewer_join(&stranger(), &pc, false, Some(&PAIR_VALUE));
-    assert!(refused(&actions, id));
+    let (id, batches) = viewer_handshake(&mut h, &stranger(), &pc, Some(&PAIR_VALUE));
+    assert_refusal_contract(&batches, id, host.id, true);
     h.close(id);
     // 10.0.0.x is already tracked (one failure), so it still reaches the window.
     h.client = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));

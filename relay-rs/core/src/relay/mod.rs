@@ -206,6 +206,7 @@ impl Relay {
             .filter(|(_, c)| !c.closing && now_ms >= c.deadline_ms)
             .map(|(id, c)| {
                 let challenge = match c.phase {
+                    Phase::Hello => Some(""),
                     Phase::Proof { .. } => Some("invalid hello"),
                     Phase::ViewerProof { .. } => Some(""),
                     _ => None,

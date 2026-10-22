@@ -283,6 +283,14 @@ pub async fn expect_close(ws: &mut Ws) -> (u16, String) {
     }
 }
 
+/// Asserts that nothing arrives on `ws` for `quiet`. A frame, or the socket ending,
+/// fails the test.
+pub async fn expect_quiet(ws: &mut Ws, quiet: Duration) {
+    if let Ok(next) = timeout(quiet, ws.next()).await {
+        panic!("expected silence, got {next:?}");
+    }
+}
+
 /// A host's signalling socket: hello, register-challenge, register-proof, hello-ok. The
 /// `signer` identity both proves the key and names the PC. Returns the socket and hello-ok
 /// (its `ticket` and `pc`).
