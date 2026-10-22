@@ -1,0 +1,21 @@
+[package]
+name = "bp-relay-worker"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "Cloudflare Workers adapter for the BubblePlay relay: stub Durable Object (M3-A scaffold)"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Stock release profile on purpose: a size-optimised profile breaks wasm-bindgen.
+[dependencies]
+bp-relay-core = { path = "../core" }
+console_error_panic_hook = "0.1.7"
+worker = "=0.8.7"
+
+# Own workspace root. relay-rs excludes this directory, so `cargo ... --workspace`
+# there never compiles this crate for the native target.
+[workspace]
+resolver = "3"
