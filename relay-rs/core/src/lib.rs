@@ -18,15 +18,16 @@ pub mod relay;
 pub mod rng;
 
 pub use relay::{
-    Action, AdminError, ConnId, CoreConfig, MAX_PCS, PcListing, PcRecord, PcTable, Reject, Relay,
-    Route, Timings, TurnConfig, UpgradeRequest,
+    Action, AdminError, CachedCapabilities, ConnId, ConnPhase, ConnSnapshot, CoreConfig, MAX_PCS,
+    PcListing, PcRecord, PcTable, Reject, Relay, Route, SnapshotPairWindow, SnapshotTicket,
+    Timings, TurnConfig, UpgradeRequest,
 };
 pub use rng::RelayRng;
 
 pub use limits::{
-    FILE_HEADER_BYTES, FILE_LIMIT, HELLO_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT,
-    PENDING_LIMIT, QUEUE_BYTE_LIMIT, QUEUE_FRAMES, SIGNAL_BINARY_MAX, SIGNAL_BINARY_MIN,
-    SIGNAL_LIMIT,
+    ATTACHMENT_MAX, FILE_HEADER_BYTES, FILE_LIMIT, HELLO_LIMIT, MEDIA_CONTROL_MAX,
+    MEDIA_HEADER_BYTES, MEDIA_LIMIT, PENDING_LIMIT, QUEUE_BYTE_LIMIT, QUEUE_FRAMES,
+    SIGNAL_BINARY_MAX, SIGNAL_BINARY_MIN, SIGNAL_LIMIT,
 };
 pub use protocol::{
     FileKind, FilePacket, FileText, Invalid, MediaControl, Side, SignalKind, SignalMessage,

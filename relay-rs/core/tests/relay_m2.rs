@@ -51,7 +51,7 @@ fn refused(actions: &[Action], id: ConnId) -> bool {
 fn target(action: &Action) -> Option<ConnId> {
     match action {
         Action::SendText(to, _) | Action::SendBinary(to, _) | Action::Close(to, _, _) => Some(*to),
-        Action::PersistPcs(_) => None,
+        Action::PersistPcs(_) | Action::Snapshot(_, _) => None,
     }
 }
 
@@ -599,7 +599,10 @@ fn m2_pair_open_is_consumed_and_forwards_nothing() {
     let mut h = Harness::new();
     let host = host_up(&mut h);
     let actions = send_pair_open(&mut h, host.id, &PAIR_VALUE);
-    assert!(actions.is_empty());
+    assert!(
+        actions.iter().all(|a| matches!(a, Action::Snapshot(..))),
+        "{actions:?}"
+    );
 }
 
 #[test]
@@ -669,7 +672,10 @@ fn m2_pair_close_removes_the_window() {
     let host = host_up(&mut h);
     send_pair_open(&mut h, host.id, &PAIR_VALUE);
     let actions = h.text(host.id, &json!({"type": "pair-close"}));
-    assert!(actions.is_empty());
+    assert!(
+        actions.iter().all(|a| matches!(a, Action::Snapshot(..))),
+        "{actions:?}"
+    );
     let (id, batches) = viewer_handshake(&mut h, &stranger(), &host.pc, Some(&PAIR_VALUE));
     assert_refusal_contract(&batches, id, host.id, true);
 }

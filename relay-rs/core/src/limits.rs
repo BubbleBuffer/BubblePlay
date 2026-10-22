@@ -85,3 +85,7 @@ pub const PAIR_PREFIX_FAILURES: u32 = 5;
 
 /// Pairing failures against one open window before the window is dropped.
 pub const PAIR_PC_FAILURES: u32 = 20;
+
+/// The most bytes a Durable Object socket attachment may hold (the platform's
+/// limit on serialized `serializeAttachment` data). Snapshots must fit.
+pub const ATTACHMENT_MAX: usize = 2048;

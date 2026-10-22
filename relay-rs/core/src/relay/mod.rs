@@ -12,6 +12,7 @@ mod forward;
 mod hello;
 mod pairing;
 mod pcs;
+mod snapshot;
 mod state;
 mod types;
 mod util;
@@ -28,8 +29,8 @@ use state::{Conn, Kind, Phase, Role, Room, key_for, read_limit};
 
 pub use pcs::{MAX_PCS, PcRecord, PcTable};
 pub use types::{
-    Action, AdminError, ConnId, CoreConfig, PcListing, Reject, Route, Timings, TurnConfig,
-    UpgradeRequest,
+    Action, AdminError, CachedCapabilities, ConnId, ConnPhase, ConnSnapshot, CoreConfig, PcListing,
+    Reject, Route, SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig, UpgradeRequest,
 };
 
 /// The routing state for one relay.
@@ -129,6 +130,8 @@ impl Relay {
                 prefix: Prefix::of(client),
                 device: String::new(),
                 pairing: false,
+                activity_ms: now_ms,
+                saved_activity_ms: now_ms,
             },
         );
         Ok(id)
@@ -196,10 +199,12 @@ impl Relay {
     /// socket idle past the idle timeout, closes 1001 "peer disconnected". A
     /// host's register-proof not received in time closes 1008 "invalid hello";
     /// a viewer's register-proof closes 1008 with an empty reason. Expired
-    /// pairing windows and failure counts are dropped.
+    /// pairing windows and tickets are dropped (with a snapshot for the host or
+    /// the socket), and expired failure counts are dropped.
     pub fn tick(&mut self, now_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
-        self.expire_pairing(now_ms);
+        self.expire_pairing(now_ms, &mut out);
+        self.expire_tickets(now_ms, &mut out);
         let due: Vec<(ConnId, Option<&'static str>)> = self
             .conns
             .iter()
@@ -293,20 +298,14 @@ impl Relay {
         self.rooms.get(pc)?.current_epoch.as_deref()
     }
 
-    /// Moves a socket to the live phase and refreshes its idle deadline.
+    /// Moves a socket to the live phase, records its activity and refreshes its
+    /// idle deadline. The caller emits the snapshot.
     fn make_live(&mut self, id: ConnId, now_ms: u64) {
         let idle = self.config.timings.idle_ms;
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.phase = Phase::Live;
             conn.deadline_ms = now_ms + idle;
-        }
-    }
-
-    /// Refreshes the idle deadline after a processed message.
-    fn touch(&mut self, id: ConnId, now_ms: u64) {
-        let idle = self.config.timings.idle_ms;
-        if let Some(conn) = self.conns.get_mut(&id) {
-            conn.deadline_ms = now_ms + idle;
+            conn.activity_ms = now_ms;
         }
     }
 

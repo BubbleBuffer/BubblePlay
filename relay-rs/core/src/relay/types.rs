@@ -1,9 +1,11 @@
 //! The types the adapter sees: configuration, requests, actions and errors.
 
+use serde::{Deserialize, Serialize};
+
 use super::pcs::PcTable;
 
 /// Identifies one upgraded socket. Ids are never reused within a Relay.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ConnId(pub u64);
 
 /// What the adapter must do with a socket. Actions in one returned Vec run in
@@ -20,10 +22,14 @@ pub enum Action {
     Close(ConnId, u16, String),
     /// Write the whole PC table to durable storage.
     PersistPcs(PcTable),
+    /// Replace the socket's attachment with this snapshot. Emitted after each
+    /// change the snapshot records and before the sends that depend on it. An
+    /// adapter without hibernation ignores it. See `ConnSnapshot`.
+    Snapshot(ConnId, ConnSnapshot),
 }
 
 /// The seven WebSocket routes. The adapter maps the request path to one of these.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Route {
     /// /host-ws?pc=ID: the PC's signalling socket.
     HostWs,
@@ -152,6 +158,134 @@ impl CoreConfig {
             max_connections: 32,
             turn: None,
             timings: Timings::default(),
+        }
+    }
+}
+
+/// The handshake phase a snapshot records. Pre-auth sockets are closed on
+/// rehydrate, so only `Live` survives; the others are kept to say what was closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnPhase {
+    /// Waiting for the first hello.
+    Hello,
+    /// Host registration: the challenge is out and the register-proof is awaited.
+    HostProof,
+    /// Viewer signalling: the challenge is out and the register-proof is awaited.
+    ViewerProof,
+    /// Hello done: the socket forwards messages.
+    Live,
+}
+
+/// A signalling ticket as a snapshot holds it: only the SHA-256 of its text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotTicket {
+    /// SHA-256 of the ticket text. Base64url in the serialized form.
+    #[serde(with = "b64::fixed")]
+    pub hash: [u8; 32],
+    /// Unix ms at which the ticket expires.
+    pub expires_ms: u64,
+}
+
+/// A host's open pairing window as a snapshot holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPairWindow {
+    /// The value a viewer must present. Base64url in the serialized form.
+    #[serde(with = "b64::fixed")]
+    pub admit: [u8; 32],
+    /// Unix ms at which the window expires.
+    pub expires_ms: u64,
+    /// Failed attempts against the window so far (below 20 while it is open).
+    pub failures: u32,
+}
+
+/// The host's cached `host-capabilities` or `input-capabilities` text, which
+/// is replayed to viewers that join later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedCapabilities {
+    /// `host-capabilities` or `input-capabilities`.
+    pub kind: String,
+    /// The raw message text. Base64url in the serialized form, so JSON
+    /// escaping of quotes cannot push the attachment past `ATTACHMENT_MAX`.
+    #[serde(with = "b64::any")]
+    pub raw: Vec<u8>,
+}
+
+/// What a socket needs to come back after the Durable Object hibernates. The
+/// adapter stores one per socket in its attachment (serialized as JSON) and
+/// passes them all to `Relay::rehydrate`. Pending viewer messages, the
+/// per-prefix pairing counts and challenge nonces are not part of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnSnapshot {
+    /// The socket's id, so the adapter can match it to the live socket.
+    pub id: ConnId,
+    /// The route the socket came in on.
+    pub route: Route,
+    /// The canonical PC id. Empty only for a version probe.
+    pub pc: String,
+    /// The socket's epoch: set for data sockets and admitted viewers, else empty.
+    pub epoch: String,
+    /// Where the socket is in its handshake.
+    pub phase: ConnPhase,
+    /// The admitted viewer's device id. Empty for hosts and pre-auth sockets.
+    pub device: String,
+    /// True while the viewer is in pairing mode.
+    pub pairing: bool,
+    /// The last activity recorded, in Unix ms. It can lag the real last
+    /// activity by less than the step (idle / 4).
+    pub activity_ms: u64,
+    /// The signalling ticket, if one is held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<SnapshotTicket>,
+    /// The host's cached capabilities for viewers. Host sockets only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cached: Vec<CachedCapabilities>,
+    /// The host's open pairing window. Host sockets only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_window: Option<SnapshotPairWindow>,
+}
+
+/// Serde helpers: byte values as unpadded base64url strings.
+mod b64 {
+    /// Any byte container, and the reader for it.
+    pub mod any {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<T: AsRef<[u8]>, S: Serializer>(
+            bytes: &T,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(&URL_SAFE_NO_PAD.encode(bytes.as_ref()))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<u8>, D::Error> {
+            let text = String::deserialize(deserializer)?;
+            URL_SAFE_NO_PAD
+                .decode(text)
+                .map_err(<D::Error as serde::de::Error>::custom)
+        }
+    }
+
+    /// Exactly 32 bytes.
+    pub mod fixed {
+        pub fn serialize<S: serde::Serializer>(
+            bytes: &[u8; 32],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            super::any::serialize(bytes, serializer)
+        }
+
+        pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<[u8; 32], D::Error> {
+            let bytes = super::any::deserialize(deserializer)?;
+            let array: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| <D::Error as serde::de::Error>::custom("expected 32 bytes"))?;
+            Ok(array)
         }
     }
 }

@@ -367,6 +367,24 @@ impl Gate {
         }
     }
 
+    /// The earliest time at which `tick` has work: an approval's expiry, the end
+    /// of a resolved approval's keep time, a cookie's expiry, a cooldown's end or
+    /// a decision window's end. None when nothing is tracked. `tick` at this
+    /// time (and not before) does what the sweep would.
+    pub fn next_deadline(&self) -> Option<u64> {
+        let pending = self.pending.iter().map(|pending| match pending.state {
+            State::Waiting => pending.expires_ms,
+            State::Approved | State::Denied => pending.decided_ms.saturating_add(RESOLVED_KEEP_MS),
+        });
+        let cookies = self.cookies.values().copied();
+        let cooldowns = self.cooldowns.values().copied();
+        let rates = self
+            .decision_rates
+            .values()
+            .map(|(start, _)| start.saturating_add(DECISION_WINDOW_MS));
+        pending.chain(cookies).chain(cooldowns).chain(rates).min()
+    }
+
     /// The ids of the approvals still waiting for a decision.
     pub fn pending_ids(&mut self, now_ms: u64) -> Vec<String> {
         self.sweep(now_ms);
