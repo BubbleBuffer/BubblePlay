@@ -74,6 +74,46 @@ jobs:
         working-directory: .
         run: docker build -f relay/Dockerfile -t bubbleplay-relay:check .
 
+  relay-rs:
+    runs-on: [self-hosted, build01]
+    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt --target wasm32-unknown-unknown --no-self-update
+          rustup default 1.97.1
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            relay-rs -> target
+            crates/bp-device-key -> target
+      - name: bp-device-key tests, clippy and fmt
+        working-directory: crates/bp-device-key
+        run: |
+          cargo test --locked --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo fmt --all -- --check
+      - name: relay-rs tests, clippy and fmt
+        working-directory: relay-rs
+        run: |
+          cargo test --locked --workspace --no-fail-fast
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo fmt --all -- --check
+      - name: bp-relay-core builds for wasm32
+        working-directory: relay-rs
+        run: cargo check --locked -p bp-relay-core --target wasm32-unknown-unknown
+
   host:
     name: Host checks (windows-latest)
     runs-on: windows-latest
