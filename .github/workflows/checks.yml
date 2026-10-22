@@ -96,6 +96,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: host -> target
+          # Keep the runner's shared ~/.cargo/bin: cache-bin deletes rustup on build01.
+          cache-bin: "false"
       - name: Fetch locked crates
         run: cargo fetch --locked --manifest-path host/Cargo.toml
       - name: Create NVENC and NVDEC import libraries
