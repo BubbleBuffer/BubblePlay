@@ -212,13 +212,15 @@ test('m3 an Origin without a valid gate cookie is accepted then closed 1008 with
   assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: '' });
 });
 
-// Client IP: the relay reads CF-Connecting-IP only. This probe shows whether local workerd adds
-// one itself: with no header the upgrade must be refused, which it would not be if it did.
+// Client IP: the relay reads CF-Connecting-IP only and refuses a request without one with 404 (the
+// production edge always sends it). CI run 39878845827 showed that local workerd fills the header
+// in when the client sends none, so the missing-IP 404 cannot be reached under wrangler dev.
 
-test('m3 CF-Connecting-IP probe: a missing client IP is refused 404 and a supplied one is accepted', { timeout: CASE_TIMEOUT_MS }, async () => {
+test('m3 CF-Connecting-IP probe: local workerd fills in a missing client IP and a supplied one is accepted', { timeout: CASE_TIMEOUT_MS }, async () => {
   const pc = identity(45).id;
   const missing = await openSocket(relay.port, `/ws?pc=${pc}`, { ip: null });
-  assert.equal(missing.status, 404);
+  assert.equal(missing.status, 101);
+  missing.socket.close();
   const present = await openSocket(relay.port, `/ws?pc=${pc}`, { ip: CLIENT_IP });
   assert.equal(present.status, 101);
   present.socket.close();
