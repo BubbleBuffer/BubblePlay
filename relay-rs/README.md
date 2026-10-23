@@ -118,6 +118,9 @@ These three caveats came from the workers-rs spike.
 - Override `websocket_close` and `websocket_error`. The workers-rs 0.8.7 defaults are `unimplemented!()` and panic.
 - Repeat the p99 latency measurement on deployed Cloudflare. Local workerd showed a Rust p99 of about 1.2 s at 64 KiB, against 87 ms for JS.
 
+- One Durable Object (`relay-v1`) runs the whole core, gate included. It is one location and one CPU budget, roughly 1000 messages per second at 1 KiB, so a few heavy media sessions over WSS could saturate it. If that happens, split rooms into a Durable Object per PC. That split is not built.
+- Hibernation: each socket's state is a `ConnSnapshot` in its attachment (2048 B limit). On wake the DO calls `Relay::rehydrate` and arms an alarm at `next_deadline()` instead of ticking. A wake loses the pending viewer buffer, per-prefix pairing failure counts, and the gate's pending approvals, cooldowns and decision counts. The gate fails closed. Sockets awaiting a hello or proof are closed 1008. The PC-wide pairing failure count survives.
+
 ## Cloudflare build (M3)
 
 `relay-rs/worker` (`bp-relay-worker`) is the Cloudflare Workers adapter. relay-rs excludes it from its workspace, and it has its own committed `Cargo.lock`. The `relay-rs` job in `.github/workflows/checks.yml` builds it with `worker-build --release`, checks it with clippy for wasm32 and `cargo fmt --check`, and runs `node --test tests/` against a local workerd started by `wrangler dev --local`. Nothing is deployed: the crate has no account, route or secret. The Durable Object is still a stub that refuses text frames with 1008, and the relay logic is still to come.
