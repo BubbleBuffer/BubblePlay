@@ -7,10 +7,12 @@ use bp_relay_core::relay::{CoreConfig, TurnConfig};
 use worker::url::Host;
 use worker::{Env, Url};
 
-/// What the Durable Object needs: the relay's config and the gate's config.
+/// What the Durable Object needs: the relay's config, the gate's config and the admin bearer.
 pub struct Settings {
     pub core: CoreConfig,
     pub gate: GateConfig,
+    /// The admin bearer. Checked against each admin and healthz request, never printed.
+    pub admin_token: String,
 }
 
 const DEFAULT_MAX_CONNECTIONS: usize = 32;
@@ -22,8 +24,7 @@ const TURN_TTL_RANGE: std::ops::RangeInclusive<u64> = 300..=86_400;
 pub fn load(env: &Env) -> Result<Settings, String> {
     let public_origin = canonical_public_origin(&required_var(env, "PUBLIC_ORIGIN")?)?;
     let token = required_secret(env, "RELAY_TOKEN")?;
-    // ADMIN_TOKEN is checked like the native one and never stored: M3-C2 reads it.
-    required_secret(env, "ADMIN_TOKEN")?;
+    let admin_token = required_secret(env, "ADMIN_TOKEN")?;
 
     let max_connections = match optional_var(env, "MAX_CONNECTIONS") {
         None => DEFAULT_MAX_CONNECTIONS,
@@ -65,7 +66,11 @@ pub fn load(env: &Env) -> Result<Settings, String> {
         approval_ttl_secs,
         ntfy,
     };
-    Ok(Settings { core, gate })
+    Ok(Settings {
+        core,
+        gate,
+        admin_token,
+    })
 }
 
 /// The canonical origin from the device-key helper. Plain http is allowed only for loopback

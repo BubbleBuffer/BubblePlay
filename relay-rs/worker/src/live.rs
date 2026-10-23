@@ -19,6 +19,10 @@ pub struct Live {
     /// The canonical public origin, for the browser-socket check.
     pub origin: String,
     pub pcs_healthy: bool,
+    /// The admin bearer, for the admin API and healthz.
+    pub admin_token: String,
+    /// The public origin's host, lowercase, without a port. The healthz Host check uses it.
+    pub public_host: String,
     /// The alarm time last set, if known. The outer None means unknown, so the next call sets
     /// it. Some(None) means no alarm is set.
     pub armed: Option<Option<u64>>,
