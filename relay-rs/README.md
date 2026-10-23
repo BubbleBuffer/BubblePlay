@@ -124,3 +124,40 @@ These three caveats came from the workers-rs spike.
 ## Cloudflare build (M3)
 
 `relay-rs/worker` (`bp-relay-worker`) is the Cloudflare Workers adapter. relay-rs excludes it from its workspace, and it has its own committed `Cargo.lock`. The `relay-rs` job in `.github/workflows/checks.yml` builds it with `worker-build --release`, checks it with clippy for wasm32 and `cargo fmt --check`, and runs `node --test tests/` against a local workerd started by `wrangler dev --local`. Nothing is deployed: the crate has no account, route or secret. The Durable Object is still a stub that refuses text frames with 1008, and the relay logic is still to come.
+
+## Measuring p99 on deployed Cloudflare
+
+Status: **not yet run.** Nothing below has been run against a deployed relay. The only measurements so far are the local-workerd numbers from the M0 spike.
+
+The bench measures the ctl channel, viewer to host and back, with one message in flight at a time, at 1 KiB, 16 KiB and 64 KiB. The M0 spike measured one-way media frames under a 30 Mbit/s load. The two sets of numbers measure different things, so compare them with care.
+
+M0 baseline, local workerd, 64 KiB: Rust p99 about 1175 ms, JS p99 87 ms (M0 spike verdict, 2026-10-22).
+
+1. Copy the template and fill in the placeholders. Keep the copy out of git, because it holds your account's values:
+   ```
+   cd relay-rs/worker
+   cp wrangler.deploy.toml.example wrangler.deploy.toml
+   ```
+2. Set the secrets. Each command prompts for its value. Generate fresh values for this run:
+   ```
+   npx wrangler@4.148.0 secret put RELAY_TOKEN -c wrangler.deploy.toml
+   npx wrangler@4.148.0 secret put ADMIN_TOKEN -c wrangler.deploy.toml
+   ```
+   Add `TURN_SECRET` (32 bytes or more) and `NTFY_TOKEN` only if you set those vars.
+3. Build and deploy:
+   ```
+   worker-build --release
+   npx wrangler@4.148.0 deploy -c wrangler.deploy.toml
+   ```
+   Note the URL that deploy prints. The bench needs it.
+4. Run the bench from a machine with Node 24. Pass the registration token in `BENCH_TOKEN`, not on the command line. In PowerShell, set it with `$env:BENCH_TOKEN = '...'`.
+   ```
+   BENCH_TOKEN=<RELAY_TOKEN value> node relay-rs/worker/scripts/bench-p99.mjs \
+     --url https://<deployed URL> --origin https://relay.example.com --count 1000 > bench-deployed.json
+   ```
+   `--origin` must equal `PUBLIC_ORIGIN`, because the relay proof is bound to it. Without `--origin`, the origin of `--url` is used. Each run registers one throwaway PC, which stays in the relay's state until teardown. The output is JSON with p50, p95, p99 and max per size.
+5. Compare with M0. Read the p50, p95 and p99 for each size from `bench-deployed.json` and set them beside the M0 numbers above. A large gap needs an explanation before anyone acts on it.
+6. Tear down when you are done. Confirm the prompt:
+   ```
+   npx wrangler@4.148.0 delete -c wrangler.deploy.toml
+   ```
