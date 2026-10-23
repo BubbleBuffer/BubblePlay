@@ -68,8 +68,12 @@ dependencies = [
 name = "bp-relay-worker"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "bp-device-key",
  "bp-relay-core",
  "console_error_panic_hook",
+ "serde",
+ "serde_json",
  "worker",
 ]
 

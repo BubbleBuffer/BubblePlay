@@ -4,15 +4,19 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 publish = false
-description = "Cloudflare Workers adapter for the BubblePlay relay: stub Durable Object (M3-A scaffold)"
+description = "Cloudflare Workers adapter for the BubblePlay relay: Durable Object driving the relay core over hibernating WebSockets (M3-C1)"
 
 [lib]
 crate-type = ["cdylib"]
 
 # Stock release profile on purpose: a size-optimised profile breaks wasm-bindgen.
 [dependencies]
+base64 = "0.22"
+bp-device-key = { path = "../../crates/bp-device-key" }
 bp-relay-core = { path = "../core" }
 console_error_panic_hook = "0.1.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 worker = "=0.8.7"
 
 # Own workspace root. relay-rs excludes this directory, so `cargo ... --workspace`
