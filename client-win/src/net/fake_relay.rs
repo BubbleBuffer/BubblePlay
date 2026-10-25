@@ -213,6 +213,7 @@ async fn handle(stream: TcpStream, state: Arc<State>, log: Sender<Logged>) {
     let plan: Arc<Mutex<Option<(String, Scenario)>>> = Arc::new(Mutex::new(None));
     let slot = plan.clone();
     let callback_log = log.clone();
+    let origin = state.origin.clone();
     // Tungstenite fixes this callback's error type to its HTTP response.
     #[allow(clippy::result_large_err)]
     let accepted = accept_hdr_async(stream, move |request: &Request, response: Response| {
@@ -243,7 +244,6 @@ async fn handle(stream: TcpStream, state: Arc<State>, log: Sender<Logged>) {
     })
     .await;
     let Ok(ws) = accepted else { return };
-    let origin = state.origin.clone();
     let Some((path, scenario)) = plan.lock().unwrap().take() else {
         return;
     };
