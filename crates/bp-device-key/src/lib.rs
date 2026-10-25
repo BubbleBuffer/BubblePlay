@@ -10,6 +10,9 @@
 //!   verification, and the relay-origin canonicaliser.
 //! - `keygen`: key generation (pulls `getrandom`).
 //! - `keyfile`: the encrypted key file format (pulls `argon2` and `aes-gcm`).
+//! - `phase2`: the [`phase2`] module: handshake transcript and signatures, X25519 + HKDF
+//!   control keys, the sequenced AES-256-GCM `ctl` envelope, pairing codes, MACs and the
+//!   comparison number (pulls `x25519-dalek`, `hkdf`, `hmac` and `aes-gcm`).
 //!
 //! The host still has its own copy of this module in `host/src/device_key.rs`; a follow-up moves
 //! it onto this crate.
@@ -23,6 +26,9 @@ mod proof;
 
 #[cfg(feature = "keyfile")]
 mod keyfile;
+
+#[cfg(feature = "phase2")]
+pub mod phase2;
 
 pub use ids::DeviceId;
 pub use proof::{
@@ -65,6 +71,26 @@ pub enum DeviceKeyError {
     /// signature that was made over them.
     InvalidSignature,
     Internal(&'static str),
+    /// Phase 2: a handshake signature (auth-host, auth-finish or auth-bind) did not verify.
+    InvalidHandshakeSignature,
+    /// Phase 2: X25519 produced the all-zero shared secret (low-order peer key).
+    WeakSharedSecret,
+    /// Phase 2: a ctl kind outside `[a-z0-9-]{1,32}`.
+    InvalidCtlKind,
+    /// Phase 2: a ctl sequence number other than the expected next one (gap or repeat).
+    CtlSequence,
+    /// Phase 2: the ctl sequence would pass 2^53 - 1.
+    CtlSequenceExhausted,
+    /// Phase 2: a ctl AEAD tag did not verify.
+    CtlAuthenticationFailed,
+    /// Phase 2: an earlier failure ended this ctl channel.
+    CtlChannelClosed,
+    /// Phase 2: a pairing code that is not 10 Crockford base32 characters.
+    InvalidPairingCode,
+    /// Phase 2: a pairing MAC did not match.
+    PairingMacMismatch,
+    /// Phase 2: a DTLS fingerprint that is not `sha-256` plus 32 uppercase hex pairs.
+    InvalidFingerprint,
 }
 
 impl fmt::Display for DeviceKeyError {
@@ -117,6 +143,25 @@ impl fmt::Display for DeviceKeyError {
             Self::Entropy => write!(f, "operating system randomness is unavailable"),
             Self::InvalidSignature => write!(f, "relay proof signature did not verify"),
             Self::Internal(what) => write!(f, "internal cryptography failure: {what}"),
+            Self::InvalidHandshakeSignature => write!(f, "handshake signature did not verify"),
+            Self::WeakSharedSecret => write!(f, "X25519 shared secret is all zero"),
+            Self::InvalidCtlKind => write!(f, "control message kind must match [a-z0-9-]{{1,32}}"),
+            Self::CtlSequence => write!(f, "control message sequence number out of order"),
+            Self::CtlSequenceExhausted => {
+                write!(f, "control message sequence number limit reached")
+            }
+            Self::CtlAuthenticationFailed => {
+                write!(f, "control message did not authenticate")
+            }
+            Self::CtlChannelClosed => write!(f, "control channel ended after an earlier failure"),
+            Self::InvalidPairingCode => {
+                write!(f, "pairing code must be 10 Crockford base32 characters")
+            }
+            Self::PairingMacMismatch => write!(f, "pairing proof did not match"),
+            Self::InvalidFingerprint => write!(
+                f,
+                "DTLS fingerprint must be sha-256 followed by 32 uppercase hex pairs"
+            ),
         }
     }
 }
