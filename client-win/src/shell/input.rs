@@ -135,7 +135,13 @@ fn push_text(inp: &mut InputState, text: String) {
 /// Handles one window message for the input. Returns the LRESULT when the
 /// message is fully handled, None to let DefWindowProc run. Sets `frame_due`
 /// when events were queued.
-pub(super) fn message(st: &mut State, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+pub(super) fn message(
+    st: &mut State,
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> Option<LRESULT> {
     if st.captured && is_pointer_or_key(msg) {
         // The capture did not consume it; it goes to DefWindowProc, not egui.
         return None;
@@ -160,9 +166,12 @@ pub(super) fn message(st: &mut State, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             inp.events.push(egui::Event::PointerGone);
             Some(LRESULT(0))
         }
-        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP
-        | WM_XBUTTONDOWN | WM_XBUTTONUP => {
-            let down = matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+        | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let down = matches!(
+                msg,
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+            );
             let button = match msg {
                 WM_LBUTTONDOWN | WM_LBUTTONUP => egui::PointerButton::Primary,
                 WM_RBUTTONDOWN | WM_RBUTTONUP => egui::PointerButton::Secondary,

@@ -14,7 +14,9 @@
 use std::path::PathBuf;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
+};
 
 mod d3d;
 mod input;
@@ -100,7 +102,13 @@ pub enum WindowCommand {
 ///   `crate::input`, never on the UI/render thread, so it can't be stalled by
 ///   a slow frame.
 pub trait InputCapture {
-    fn on_message(&mut self, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT>;
+    fn on_message(
+        &mut self,
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<LRESULT>;
     fn captured(&self) -> bool;
     fn on_frame(&mut self, hwnd: HWND, video_px: Option<Rect>);
 }
@@ -123,7 +131,9 @@ pub struct Shell {
 
 impl Shell {
     pub fn new(config: ShellConfig) -> anyhow::Result<Self> {
-        Ok(Self { inner: window::Window::new(config)? })
+        Ok(Self {
+            inner: window::Window::new(config)?,
+        })
     }
 
     pub fn wake_handle(&self) -> WakeHandle {

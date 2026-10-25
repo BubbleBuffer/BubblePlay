@@ -123,7 +123,10 @@ fn describe(hwnd: HWND) -> String {
     let mut title = [0u16; 128];
     let (class_len, title_len) = unsafe {
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        (GetClassNameW(hwnd, &mut class), GetWindowTextW(hwnd, &mut title))
+        (
+            GetClassNameW(hwnd, &mut class),
+            GetWindowTextW(hwnd, &mut title),
+        )
     };
     format!(
         "{hwnd:?} pid {pid} class {:?} title {:?}",
