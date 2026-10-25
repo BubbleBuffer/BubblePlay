@@ -1036,6 +1036,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     // Room and data-socket ticket for this signaling connection; the file and media sessions below
     // take copies and drop them when this run ends.
     let relay_route = signaling.relay_route();
+    // The route's ticket expires 12 h after this hello-ok while the socket can
+    // stay open; an idle session re-registers before then.
+    let relay_registered_at = Instant::now();
     // File transfer runs only in the user-level host (Downloads, clipboard
     // and Send To belong to the interactive user) and needs the host bearer
     // for `/host-file-ws`.
@@ -1266,6 +1269,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut pending_wss_idr: Option<PendingWssIdr> = None;
     let mut pending_lab_quality_keyframe: Option<String> = None;
     let mut pending_first_frame: Option<PendingFirstFrame> = None;
+    let mut capture_watchdog = CaptureStallWatchdog::default();
     // (generation, RTP timestamp) of the startup IDR last admitted on WebRTC.
     let mut startup_idr_rtp: Option<(u32, u32)> = None;
     let mut completed_first_frame: Option<(String, u32, String, Option<String>)> = None;
@@ -1414,9 +1418,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             carried_input.reset();
             remote_input_ready = false;
             viewer_attached = false;
-            if let Some(egress) = &wss_media {
-                egress.set_audio_enabled(false);
+            // The viewer's media epoch ends with it. A kept egress would keep
+            // reconnecting to a retired epoch that the relay refuses.
+            if let Some(egress) = wss_media.take() {
+                egress.retire_epoch();
+                egress.shutdown();
             }
+            active_wss_epoch = None;
             audio_capture = None;
             rtc_audio_requested = false;
             wss_audio_requested = false;
@@ -3291,6 +3299,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 // Fence queued/late input on the old RTC peer
                                 // before clearing the producer's stale barrier.
                                 park_viewer!("wss-epoch-replaced");
+                                // Parking stopped the old egress, so the
+                                // replacement below does not run; keep its
+                                // immediate IDR for the new epoch.
+                                next_idr = Instant::now();
                             }
                             if !viewer_attached {
                                 begin_viewer_input!();
@@ -3819,7 +3831,18 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     Some(active_codec.name()),
                     reason,
                 );
-                warn!(generation = pending.generation, transport = %pending.transport, reason, "first-frame handshake failed");
+                // Name the capture-demand inputs that are false (empty: demand
+                // was true), so a failure without demand says why.
+                let wss_stats = wss_media.as_ref().map(WssMediaEgress::stats);
+                let demand_false_inputs = capture_demand_gaps(
+                    viewer_attached,
+                    offer_in_flight,
+                    offer_accepted,
+                    ice_connected,
+                    wss_stats.is_some_and(|stats| stats.connected),
+                    wss_stats.is_some_and(|stats| stats.peer_present),
+                );
+                warn!(generation = pending.generation, transport = %pending.transport, reason, demand_false_inputs, "first-frame handshake failed");
             }
         }
         let wss_ready = viewer_attached
@@ -3832,6 +3855,57 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             .as_ref()
             .map(WssMediaEgress::take_events)
             .unwrap_or_default();
+        if let Some(end) = &wss_v4_events.link_end {
+            match wss_link_end_action(end) {
+                WssLinkEndAction::Reregister => {
+                    warn!(
+                        ?end,
+                        epoch = active_wss_epoch.as_deref(),
+                        "relay keeps refusing WSS media for this signaling registration; ending the session to re-register for a fresh ticket"
+                    );
+                    break 'session;
+                }
+                WssLinkEndAction::AwaitNextStart => {
+                    info!(
+                        ?end,
+                        epoch = active_wss_epoch.as_deref(),
+                        "WSS media epoch retired by relay; awaiting the next media start"
+                    );
+                }
+            }
+        }
+        if relay_ticket_refresh_due(
+            relay_registered_at,
+            relay_route.has_ticket(),
+            viewer_attached,
+            now,
+        ) {
+            info!(
+                registered_for_secs = now.saturating_duration_since(relay_registered_at).as_secs(),
+                "idle signaling registration nears its relay ticket expiry; re-registering"
+            );
+            break 'session;
+        }
+        if let Some(reason) = capture_watchdog.poll(
+            capture_demand,
+            capture_available,
+            pending_first_frame.is_some(),
+            latest_idr.is_none(),
+            now,
+        ) {
+            if capture.recreate_stalled_duplication(now) {
+                warn!(
+                    reason,
+                    stall_ms = CAPTURE_STALL_LIMIT.as_millis() as u64,
+                    "capture watchdog: no captured frame while one is needed; re-creating the duplication"
+                );
+                latest_idr = None;
+                if let Some(enc) = encoder.as_mut() {
+                    enc.force_idr();
+                }
+                next_idr = now;
+            }
+        }
         if let Some(reason) = wss_v4_events
             .keyframe
             .as_deref()
@@ -4316,6 +4390,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 None => None,
             };
             if let Some((mut frame, is_new, recovered)) = captured {
+                if is_new {
+                    capture_watchdog.frame_captured();
+                }
                 if recovered {
                     if let Some(region) = frame.desktop_region() {
                         refresh_input_geometry(

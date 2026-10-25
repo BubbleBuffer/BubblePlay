@@ -688,6 +688,215 @@ pub(super) fn encoder_mode_for_capture(
     native
 }
 
+/// Relay tickets from the signaling `hello-ok` expire 12 h after issue (worker
+/// `TICKET_TTL_MS`, relay-rs `ticket_ttl_ms`), although the signaling socket
+/// can stay open for days. The relay then refuses every media and file socket
+/// that presents the ticket. Re-register an idle host before that.
+pub(super) const RELAY_TICKET_REFRESH_AGE: Duration = Duration::from_secs(11 * 60 * 60);
+
+/// An idle host's signaling registration is old enough that its ticket must be
+/// renewed by re-registering. A routed-ticketless (legacy) host never expires.
+pub(super) fn relay_ticket_refresh_due(
+    registered_at: Instant,
+    has_ticket: bool,
+    viewer_attached: bool,
+    now: Instant,
+) -> bool {
+    has_ticket
+        && !viewer_attached
+        && now.saturating_duration_since(registered_at) >= RELAY_TICKET_REFRESH_AGE
+}
+
+/// What the session does when a WSS v4 link stopped on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WssLinkEndAction {
+    /// The relay keeps refusing this signaling session's ticket or route: end
+    /// the session so the next one registers and gets a fresh ticket.
+    Reregister,
+    /// The relay retired the epoch; the viewer's next media start replaces it.
+    AwaitNextStart,
+}
+
+pub(super) fn wss_link_end_action(end: &bubbleplay_host::wss_v4::V4LinkEnd) -> WssLinkEndAction {
+    match end {
+        bubbleplay_host::wss_v4::V4LinkEnd::Refused { .. } => WssLinkEndAction::Reregister,
+        bubbleplay_host::wss_v4::V4LinkEnd::Retired { .. } => WssLinkEndAction::AwaitNextStart,
+    }
+}
+
+/// The capture demand inputs that are false, for a first-frame failure log.
+pub(super) fn capture_demand_gaps(
+    viewer_attached: bool,
+    offer_in_flight: bool,
+    offer_accepted: bool,
+    ice_connected: bool,
+    wss_connected: bool,
+    wss_peer_present: bool,
+) -> String {
+    let mut gaps = Vec::new();
+    if !viewer_attached {
+        gaps.push("viewer_attached");
+    }
+    let wss_peer_live = wss_connected && wss_peer_present;
+    if !(offer_in_flight || offer_accepted || ice_connected || wss_peer_live) {
+        gaps.push("offer_in_flight");
+        gaps.push("offer_accepted");
+        gaps.push("ice_connected");
+        gaps.push(if wss_connected {
+            "wss_peer_present"
+        } else {
+            "wss_connected"
+        });
+    }
+    gaps.join(",")
+}
+
+/// No new captured frame for this long while one is needed re-creates the
+/// duplication.
+pub(super) const CAPTURE_STALL_LIMIT: Duration = Duration::from_secs(5);
+
+/// Capture watchdog. A frame is needed while a viewer waits for its first
+/// frame, or while a live viewer has no IDR to decode from. A static desktop
+/// with an IDR delivered needs no frames and never arms it.
+#[derive(Debug, Default)]
+pub(super) struct CaptureStallWatchdog {
+    waiting_since: Option<Instant>,
+}
+
+impl CaptureStallWatchdog {
+    /// A new desktop frame (or idle snapshot) arrived.
+    pub(super) fn frame_captured(&mut self) {
+        self.waiting_since = None;
+    }
+
+    /// Returns the reason once per `CAPTURE_STALL_LIMIT` without a frame while
+    /// capture is demanded, available and a frame is needed.
+    pub(super) fn poll(
+        &mut self,
+        demand: bool,
+        capture_available: bool,
+        first_frame_pending: bool,
+        idr_missing: bool,
+        now: Instant,
+    ) -> Option<&'static str> {
+        if !(demand && capture_available && (first_frame_pending || idr_missing)) {
+            self.waiting_since = None;
+            return None;
+        }
+        let since = *self.waiting_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < CAPTURE_STALL_LIMIT {
+            return None;
+        }
+        // One occurrence per stall window; the next fires a full window later.
+        self.waiting_since = Some(now);
+        Some(if first_frame_pending {
+            "first-frame-pending"
+        } else {
+            "no-captured-frame"
+        })
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+    use bubbleplay_host::wss_v4::V4LinkEnd;
+
+    #[test]
+    fn idle_hosts_reregister_before_the_relay_ticket_expires() {
+        let registered = Instant::now();
+        let at = |hours| registered + Duration::from_secs(hours * 60 * 60);
+        assert!(!relay_ticket_refresh_due(registered, true, false, at(10)));
+        assert!(relay_ticket_refresh_due(registered, true, false, at(11)));
+        // The 2026-10-25 host held one registration for 58 h.
+        assert!(relay_ticket_refresh_due(registered, true, false, at(58)));
+        // A watching viewer is not cut off; a ticketless route never expires.
+        assert!(!relay_ticket_refresh_due(registered, true, true, at(58)));
+        assert!(!relay_ticket_refresh_due(registered, false, false, at(58)));
+        assert!(RELAY_TICKET_REFRESH_AGE < Duration::from_secs(12 * 60 * 60));
+    }
+
+    #[test]
+    fn a_refused_media_link_reregisters_and_a_retired_one_waits() {
+        let refused = V4LinkEnd::Refused {
+            code: 1008,
+            reason: String::new(),
+            refusals: 5,
+        };
+        let retired = V4LinkEnd::Retired {
+            code: 1001,
+            reason: "stale epoch".into(),
+        };
+        assert_eq!(wss_link_end_action(&refused), WssLinkEndAction::Reregister);
+        assert_eq!(
+            wss_link_end_action(&retired),
+            WssLinkEndAction::AwaitNextStart
+        );
+    }
+
+    #[test]
+    fn demand_gaps_name_the_false_inputs() {
+        // The 2026-10-25 log: a WSS viewer whose media socket the relay refused.
+        assert_eq!(
+            capture_demand_gaps(true, false, false, false, false, false),
+            "offer_in_flight,offer_accepted,ice_connected,wss_connected"
+        );
+        assert_eq!(
+            capture_demand_gaps(true, false, false, false, true, false),
+            "offer_in_flight,offer_accepted,ice_connected,wss_peer_present"
+        );
+        assert_eq!(
+            capture_demand_gaps(false, false, false, false, true, true),
+            "viewer_attached"
+        );
+        assert_eq!(
+            capture_demand_gaps(true, false, false, true, false, false),
+            ""
+        );
+    }
+
+    #[test]
+    fn capture_watchdog_fires_once_per_stall_only_while_a_frame_is_needed() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut watchdog = CaptureStallWatchdog::default();
+        assert_eq!(watchdog.poll(true, true, true, false, at(0)), None);
+        assert_eq!(watchdog.poll(true, true, true, false, at(4_999)), None);
+        assert_eq!(
+            watchdog.poll(true, true, true, false, at(5_000)),
+            Some("first-frame-pending")
+        );
+        // Once per occurrence: the next fires a full window later.
+        assert_eq!(watchdog.poll(true, true, true, false, at(5_001)), None);
+        assert_eq!(
+            watchdog.poll(true, true, false, true, at(10_000)),
+            Some("no-captured-frame")
+        );
+        // A captured frame restarts the window.
+        watchdog.frame_captured();
+        assert_eq!(watchdog.poll(true, true, false, true, at(12_000)), None);
+        assert_eq!(watchdog.poll(true, true, false, true, at(16_999)), None);
+        assert!(watchdog.poll(true, true, false, true, at(17_000)).is_some());
+        // Never without demand, during an existing recovery, or on a static
+        // desktop whose IDR was delivered.
+        for (demand, available, first, missing) in [
+            (false, true, true, true),
+            (true, false, true, true),
+            (true, true, false, false),
+        ] {
+            let mut watchdog = CaptureStallWatchdog::default();
+            assert_eq!(
+                watchdog.poll(demand, available, first, missing, at(0)),
+                None
+            );
+            assert_eq!(
+                watchdog.poll(demand, available, first, missing, at(60_000)),
+                None
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod contract_tests {
     use super::*;

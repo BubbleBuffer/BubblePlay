@@ -116,6 +116,19 @@ impl RelayRoute {
             Self::Keyed { pc, .. } => Some(pc),
         }
     }
+
+    /// The route carries a relay ticket, which expires (12 h) independently of
+    /// the signaling socket that received it.
+    pub fn has_ticket(&self) -> bool {
+        matches!(
+            self,
+            Self::LegacyTicket(_)
+                | Self::Keyed {
+                    ticket: Some(_),
+                    ..
+                }
+        )
+    }
 }
 
 /// The first frame a host data socket sends. Legacy hosts send exactly the bytes they always did.
@@ -244,7 +257,9 @@ impl WssMediaEgress {
     }
 
     /// Connect the media socket for `epoch` in the room `route` names. The route, including any
-    /// ticket, is kept for every reconnect the link makes.
+    /// ticket, is kept for every reconnect the link makes, so it must be the signaling connection's
+    /// current route when the link starts. A relay that keeps refusing it ends the link with
+    /// [`V4LinkEnd::Refused`](crate::wss_v4::V4LinkEnd) instead of looping.
     pub fn connect_routed(
         worker_url: &str,
         bearer: &str,
@@ -258,10 +273,12 @@ impl WssMediaEgress {
         }
         // Validate the route before the link thread starts retrying it.
         media_request(worker_url, bearer, epoch, route)?;
-        let (url, bearer, epoch) = (worker_url.to_owned(), bearer.to_owned(), epoch.to_owned());
+        let (url, bearer, epoch_label) =
+            (worker_url.to_owned(), bearer.to_owned(), epoch.to_owned());
         let route = route.clone();
-        let link = V4Link::spawn(
-            Box::new(move || connect_media_socket(&url, &bearer, &epoch, &route)),
+        let link = V4Link::spawn_for_epoch(
+            Box::new(move || connect_media_socket(&url, &bearer, &epoch_label, &route)),
+            epoch,
             bitrate_bps,
             max_bitrate_bps,
         )?;
@@ -319,6 +336,11 @@ impl WssMediaEgress {
 
     pub fn wire_payload_bytes(&self, access_unit_bytes: usize) -> u64 {
         (V4_HEADER_BYTES + access_unit_bytes) as u64
+    }
+
+    /// The host moved off this egress's epoch; see [`V4Link::retire_epoch`].
+    pub fn retire_epoch(&self) {
+        self.link.retire_epoch();
     }
 
     pub fn shutdown(self) {
@@ -663,6 +685,21 @@ mod tests {
             "{uri}"
         );
         assert!(uri.ends_with("&compat=wss-v4-bench2-hevc-tiles-bpip4-v16"));
+    }
+
+    #[test]
+    fn only_ticketed_routes_report_an_expiring_ticket() {
+        assert!(keyed_route().has_ticket());
+        assert!(
+            RelayRoute::LegacyTicket(RelayTicket::try_from(TICKET.to_owned()).unwrap())
+                .has_ticket()
+        );
+        assert!(!RelayRoute::Legacy.has_ticket());
+        assert!(!RelayRoute::Keyed {
+            pc: "AAAA-AAAA-AAAA-AAAA".into(),
+            ticket: None
+        }
+        .has_ticket());
     }
 
     #[test]
