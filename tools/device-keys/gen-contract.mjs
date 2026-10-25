@@ -171,6 +171,88 @@ const relayWrongOrigin = { ...relayHost, name: "wrong-origin", origin: "https://
 const wrongOriginEncoding = relayProofEncoding(relayWrongOrigin);
 relayWrongOrigin.encodingHex = wrongOriginEncoding.toString("hex");
 relayWrongOrigin.sha256Hex = sha256(wrongOriginEncoding).toString("hex");
+// ---- Phase 2 (decisions 2026-10-25, items 2, 4, 5, 6, 8). Reuses the phase 0 handshake transcript hash H.
+const hmac = (key, ...parts) => { const m = crypto.createHmac("sha256", key); for (const p of parts) m.update(p); return m.digest(); };
+const normaliseCode = input => input.toUpperCase().replace(/[-\s]/g, "").replaceAll("O", "0").replace(/[IL]/g, "1");
+// TEST ONLY: a fixed pairing code; real codes come from the PC's CSPRNG.
+const pairCode = "70Q1K9MXR1";
+const pairCodeInput = "7oq-ik9 mxrl";
+if (normaliseCode(pairCodeInput) !== pairCode || !/^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{10}$/.test(pairCode)) throw new Error("pair code vector");
+const pairCodeDisplay = `${pairCode.slice(0, 5)}-${pairCode.slice(5)}`;
+const admitBytes = Buffer.concat([utf8("bubbleplay-pair-admit-v1"), utf8(pc.id), utf8(pairCode)]);
+const admitHash = sha256(admitBytes);
+const pairKey = Buffer.from(crypto.hkdfSync("sha256", utf8(pairCode), Buffer.alloc(0), utf8("bubbleplay-pair-v1"), 32));
+const viewerMac = hmac(pairKey, utf8("viewer"), transcriptHash);
+const pcMac = hmac(pairKey, utf8("pc"), transcriptHash);
+const wrongCode = "70Q1K9MXR2";
+const wrongPairKey = Buffer.from(crypto.hkdfSync("sha256", utf8(wrongCode), Buffer.alloc(0), utf8("bubbleplay-pair-v1"), 32));
+const sasBytes = Buffer.concat([utf8("bubbleplay-pair-sas-v1"), transcriptHash]);
+const sasHash = sha256(sasBytes);
+const sasU32 = sasHash.readUInt32BE(0);
+const sasNumber = String(sasU32 % 1000000).padStart(6, "0");
+const sasDisplay = `${sasNumber.slice(0, 3)} ${sasNumber.slice(3)}`;
+
+// ctl envelopes: one direction each way, seq 0 and 1, JSON and binary (binary only viewer-to-pc, the WSS input frame).
+const inputFrame = Buffer.from([13, 2, 75, 0, 37, 0]); // fixtures/input-contract.json packet "arrow-left-down"
+const ctlPlain = [
+  { direction: "viewer-to-pc", seq: 0, kind: "input", encoding: "binary", plaintext: inputFrame },
+  { direction: "viewer-to-pc", seq: 1, kind: "file-cancel", encoding: "json", plaintext: utf8(JSON.stringify({ type: "file-cancel", id: "t1" })) },
+  { direction: "pc-to-viewer", seq: 0, kind: "clipboard", encoding: "json", plaintext: utf8(JSON.stringify({ type: "clipboard", protocol: 1, text: "hello" })) },
+  { direction: "pc-to-viewer", seq: 1, kind: "cursor", encoding: "json", plaintext: utf8(JSON.stringify({ type: "cursor", shape: "text" })) },
+];
+const ctl = ctlPlain.map(v => {
+  const nonce = Buffer.alloc(12);
+  nonce.writeBigUInt64BE(BigInt(v.seq), 4);
+  const key = hex(v.direction === "viewer-to-pc" ? controlKeys.viewerToPcHex : controlKeys.pcToViewerHex);
+  const data = b64(encrypt(key, nonce, utf8(v.kind), v.plaintext));
+  return { direction: v.direction, seq: v.seq, kind: v.kind, encoding: v.encoding,
+    plaintextHex: v.plaintext.toString("hex"), ...(v.encoding === "json" ? { plaintextUtf8: v.plaintext.toString("utf8") } : {}),
+    nonceHex: nonce.toString("hex"), aadUtf8: v.kind, message: { type: "ctl", kind: v.kind, seq: v.seq, data } };
+});
+const ctlFirst = ctl[0];
+const ctlFailures = [
+  { name: "replayed-seq", direction: "viewer-to-pc", expectedSeq: 1, message: ctlFirst.message, expected: "end-session" },
+  { name: "skipped-seq", direction: "viewer-to-pc", expectedSeq: 0, message: ctl[1].message, expected: "end-session" },
+  { name: "wrong-kind-aad", direction: "viewer-to-pc", expectedSeq: 0, message: { ...ctlFirst.message, kind: "clipboard" }, expected: "end-session" },
+  { name: "wrong-direction-key", direction: "pc-to-viewer", expectedSeq: 0, message: ctlFirst.message, expected: "end-session" },
+];
+
+// auth-bind (item 8, amended 2026-10-25): the phase 0 encoding wins, so phase 2 reuses handshake.dtls
+// ("bubbleplay-dtls-v1" || H || local fp || "\n" || remote fp) and handshake.messages.authBind / authBindPc.
+
+const phase2 = {
+  notes: "Phase 2 vectors (decisions 2026-10-25). H is handshake.transcriptHashHex; control keys are handshake.controlKeys; auth-bind uses the phase 0 handshake.dtls encoding unchanged. Where phase 0 defines an encoding it wins. TEST ONLY.",
+  pairing: {
+    code: pairCode, codeDisplay: pairCodeDisplay,
+    normalise: [{ input: pairCodeInput, canonical: pairCode }, { input: pairCodeDisplay, canonical: pairCode }],
+    pcId: pc.id,
+    admitBytesHex: admitBytes.toString("hex"), admit: b64(admitHash),
+    pairKeyHex: pairKey.toString("hex"),
+    viewerMac: b64(viewerMac), pcMac: b64(pcMac),
+    wrongCode, wrongCodeViewerMac: b64(hmac(wrongPairKey, utf8("viewer"), transcriptHash)),
+    sasBytesHex: sasBytes.toString("hex"), sasU32, sasNumber, sasDisplay,
+    qr: {
+      android: `bubbleplay://pair?relay=${encodeURIComponent(relayOrigin)}&pc=${pc.id}&code=${pairCode}`,
+      browser: `${relayOrigin}/pair#pc=${pc.id}&code=${pairCode}`,
+    },
+    messages: {
+      pairOpen: { type: "pair-open", admit: b64(admitHash) },
+      pairClose: { type: "pair-close" },
+      pairClosed: { type: "pair-closed" },
+      viewerHello: { type: "hello", role: "viewer", id: viewer.id, public: viewer.public, pair: b64(admitHash) },
+      authHello: { type: "auth-hello", id: viewer.id, public: viewer.public, nonce: viewer.nonce, ephemeral: viewer.ephemeral, caps: ["control-aead-v1", "dtls-bind-v1", "pair-v1"] },
+      pairProofViewer: { type: "pair-proof", mac: b64(viewerMac) },
+      pairProofPc: { type: "pair-proof", mac: b64(pcMac) },
+      pairDone: { type: "pair-done" },
+      pairDenied: { type: "pair-denied" },
+    },
+  },
+  admit: { type: "admit", viewers: [viewer.id], remotePairing: false },
+  ctl: { messages: ctl, failures: ctlFailures },
+  bind: { encoding: "phase0", vectors: "handshake.dtls", messages: "handshake.messages.authBind, handshake.messages.authBindPc" },
+  caps: { mandatory: ["control-aead-v1"], mandatoryWebRtc: ["control-aead-v1", "dtls-bind-v1"], pairing: "pair-v1" },
+};
+
 const fixture = {
   version: 1,
   notes: "See docs/architecture/device-keys.md, Phase 0 results. TEST ONLY: all private keys, passphrases, salts and nonces are public deterministic vectors; never use them in production. Binary JSON fields use unpadded base64url unless named Hex; plaintextUtf8 and aadUtf8 are exact UTF-8 strings.",
@@ -208,6 +290,7 @@ const fixture = {
       helloOk: { type: "hello-ok", ticket: b64(hex("e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")) },
     },
   },
+  phase2,
 };
 writeFileSync(new URL("../../fixtures/device-keys-contract.json", import.meta.url), JSON.stringify(fixture, null, 2) + "\n", "utf8");
 console.log("Wrote fixtures/device-keys-contract.json");
