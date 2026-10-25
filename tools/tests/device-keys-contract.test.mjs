@@ -448,7 +448,7 @@ test("phase 2 ctl envelopes: seq 0 and 1 each direction, JSON and binary input",
   }
   // The binary input frame is the input-contract "arrow-left-down" packet.
   const inputContract = JSON.parse(readFileSync(new URL("../../fixtures/input-contract.json", import.meta.url), "utf8"));
-  const packet = JSON.stringify(Object.values(inputContract).find(x => x && Array.isArray(x.packets))?.packets.find(p => p.name === "arrow-left-down")?.bytes);
+  const packet = JSON.stringify(inputContract.packets.find(p => p.name === "arrow-left-down").bytes);
   assert.equal(packet, JSON.stringify([...fromHex(msgs[0].plaintextHex)]));
 });
 
