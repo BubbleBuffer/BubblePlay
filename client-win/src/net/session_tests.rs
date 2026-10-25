@@ -10,11 +10,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::config::{Codec, NetConfig};
-use super::cookies::CookieJar;
+use super::config::{Codec, NetConfig, ViewerAuth};
 use super::error::NetError;
 use super::events::{DecoderFeedback, NetEvent, ResetEvent, VideoFrame};
-use super::fake_relay::{FakeRelay, Logged, Scenario, Step};
+use super::fake_relay::{FakeRelay, Logged, Scenario, Step, FAKE_TICKET};
 use super::protocol::{encode_frame, FrameHeader, V4_HEADER_BYTES};
 use super::session::{run_with_timing, Timing};
 use super::stats::{NetState, TransportStats};
@@ -38,12 +37,7 @@ fn timing() -> Timing {
     }
 }
 
-fn cookies() -> CookieJar {
-    CookieJar::from_set_cookie([
-        "__Host-gate=gate-1; Path=/; Secure",
-        "__Host-bp-session=sess-1; Path=/; Secure",
-    ])
-}
+const PC: &str = "77VH-7M56-8GJK-Y12J";
 
 fn frame(key: bool, generation: u32, seq: u32, payload: &[u8]) -> Vec<u8> {
     encode_frame(
@@ -104,7 +98,7 @@ fn start_audio(
     audio: Option<crate::audio::AudioHandle>,
 ) -> Harness {
     let relay = FakeRelay::start(scenarios);
-    let mut config = NetConfig::new(relay.origin.clone(), Codec::H264, cookies());
+    let mut config = NetConfig::new(relay.origin.clone(), Codec::H264, ViewerAuth::fixture());
     config.audio = audio;
     let (event_tx, events) = mpsc::sync_channel(capacity);
     let (feedback, feedback_rx) = mpsc::channel();
@@ -394,7 +388,7 @@ fn of_type<'a>(messages: &'a [Value], kind: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-/// The query, origin and cookie of the first upgrade on `path`.
+/// The query and the `Origin` and `Cookie` headers of the first upgrade on `path`.
 fn first_connect(seen: &[Logged], path: &str) -> (String, Option<String>, Option<String>) {
     seen.iter()
         .find_map(|item| match item {
@@ -438,31 +432,32 @@ fn handshake_start_and_first_frame_then_stream() {
     );
     wait_for(|| h.stats.state() == NetState::Streaming);
 
-    let origin = h.relay.origin.clone();
     let seen = drain_log(&h.relay.log, QUIET);
 
+    // No Origin header and no cookies on either socket.
     let (query, signal_origin, signal_cookie) = first_connect(&seen, "/ws");
-    assert_eq!(query, "");
-    assert_eq!(signal_origin.as_deref(), Some(origin.as_str()));
-    let cookie = signal_cookie.expect("/ws cookie");
-    assert!(
-        cookie.contains("__Host-gate=gate-1") && cookie.contains("__Host-bp-session=sess-1"),
-        "{cookie}"
-    );
+    assert_eq!(query, format!("pc={PC}"));
+    assert_eq!((signal_origin, signal_cookie), (None, None));
     let (query, media_origin, media_cookie) = first_connect(&seen, "/media-ws");
-    assert_eq!(query, format!("epoch={EPOCH_A}"));
-    assert_eq!(media_origin.as_deref(), Some(origin.as_str()));
-    assert_eq!(
-        media_cookie,
-        Some(cookie),
-        "both sockets send the same cookies"
-    );
+    assert_eq!(query, format!("pc={PC}&epoch={EPOCH_A}"));
+    assert_eq!((media_origin, media_cookie), (None, None));
 
     let signal = texts(&seen, "/ws");
-    assert_eq!(signal.len(), 3, "{signal:?}");
-    assert_eq!(signal[0], json!({ "type": "hello", "role": "client" }));
+    assert_eq!(signal.len(), 4, "{signal:?}");
+    let viewer = ViewerAuth::fixture();
     assert_eq!(
-        signal[1],
+        signal[0],
+        json!({
+            "type": "hello",
+            "role": "viewer",
+            "id": viewer.identity().id().to_string(),
+            "public": viewer.identity().public_b64(),
+        })
+    );
+    // The fake relay closes 1008 on a proof that does not verify; reaching video proves it did.
+    assert_eq!(signal[1]["type"], "register-proof");
+    assert_eq!(
+        signal[2],
         json!({
             "type": "media-control",
             "action": "start",
@@ -475,16 +470,19 @@ fn handshake_start_and_first_frame_then_stream() {
         }),
         "start copies the browser values and carries no audio key"
     );
-    assert_eq!(signal[2]["type"], "first-frame");
-    assert_eq!(signal[2]["phase"], "request");
-    assert_eq!(signal[2]["protocol"], 1);
-    assert_eq!(signal[2]["transport"], "wss");
-    assert_eq!(signal[2]["epoch"], EPOCH_A);
-    let request_id = signal[2]["requestId"].as_str().expect("requestId");
+    assert_eq!(signal[3]["type"], "first-frame");
+    assert_eq!(signal[3]["phase"], "request");
+    assert_eq!(signal[3]["protocol"], 1);
+    assert_eq!(signal[3]["transport"], "wss");
+    assert_eq!(signal[3]["epoch"], EPOCH_A);
+    let request_id = signal[3]["requestId"].as_str().expect("requestId");
     assert!((8..=64).contains(&request_id.len()));
 
     let media = texts(&seen, "/media-ws");
-    assert_eq!(media[0], json!({ "type": "hello", "role": "media-client" }));
+    assert_eq!(
+        media[0],
+        json!({ "type": "hello", "role": "media-viewer", "ticket": FAKE_TICKET })
+    );
     assert_eq!(media.len(), 2, "the hello, then one ACK: {media:?}");
     assert_eq!(media[1]["type"], "ack");
     assert_eq!(
@@ -819,7 +817,10 @@ fn dead_media_socket_reconnects_with_a_new_ws_epoch() {
         .collect();
     assert_eq!(
         media_queries,
-        vec![format!("epoch={EPOCH_A}"), format!("epoch={EPOCH_B}")]
+        vec![
+            format!("pc={PC}&epoch={EPOCH_A}"),
+            format!("pc={PC}&epoch={EPOCH_B}")
+        ]
     );
     let snapshot = h.stats.snapshot();
     assert_eq!(
@@ -996,6 +997,18 @@ fn an_auth_refusal_is_fatal_and_is_not_retried() {
 }
 
 #[test]
+fn a_viewer_the_relay_does_not_admit_is_fatal_and_is_not_retried() {
+    let refused = Scenario {
+        refuse_viewer: true,
+        ..Scenario::new(EPOCH_A)
+    };
+    let mut h = start(vec![refused], timing(), 8);
+    assert_eq!(h.join(), Err(NetError::NotAdmitted));
+    assert_eq!(h.stats.snapshot().attempts, 1);
+    assert_eq!(h.stats.state(), NetState::Stopped);
+}
+
+#[test]
 fn a_relay_error_on_signaling_is_fatal() {
     let failing = Scenario {
         signal_error: Some("room full".to_owned()),
@@ -1033,7 +1046,7 @@ fn plaintext_and_malformed_relays_are_refused_before_any_socket() {
         let (event_tx, _events) = mpsc::sync_channel(1);
         let (_feedback, feedback_rx) = mpsc::channel();
         let stats = Arc::new(TransportStats::new());
-        let config = NetConfig::new(relay, Codec::H264, CookieJar::new());
+        let config = NetConfig::new(relay, Codec::H264, ViewerAuth::fixture());
         let result = run_with_timing(
             config,
             event_tx,
@@ -1078,7 +1091,7 @@ fn shutdown_relay_case(keep_sending: bool) {
     let address = listener.local_addr().unwrap();
     let origin = format!("http://{address}");
     listener.set_nonblocking(true).unwrap();
-    let config = NetConfig::new(origin, Codec::H264, cookies());
+    let config = NetConfig::new(origin, Codec::H264, ViewerAuth::fixture());
     let (event_tx, events) = mpsc::sync_channel(8);
     let (feedback, feedback_rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1104,7 +1117,19 @@ fn shutdown_relay_case(keep_sending: bool) {
             ));
             signal
                 .send(Message::Text(
-                    json!({"type":"hello-ok", "mediaEpoch": EPOCH_A})
+                    json!({"type":"register-challenge", "nonce": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                signal.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            signal
+                .send(Message::Text(
+                    json!({"type":"hello-ok", "mediaEpoch": EPOCH_A, "ticket": FAKE_TICKET})
                         .to_string()
                         .into(),
                 ))

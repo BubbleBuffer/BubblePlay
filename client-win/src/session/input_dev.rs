@@ -4,7 +4,7 @@
 use super::DevOptions;
 use crate::{
     input::{CaptureStatus, SessionInput},
-    net::{self, CookieJar, DecoderFeedback, NetConfig, NetEvent, TransportStats},
+    net::{self, DecoderFeedback, NetConfig, NetEvent, TransportStats},
     shell::{InputCapture, Rect},
 };
 use anyhow::{bail, Context, Result};
@@ -194,7 +194,11 @@ pub fn run(options: DevOptions) -> Result<()> {
     let capture = SessionInput::new(options.mode, input.clone(), stop.clone(), wake.clone());
     let status: CaptureStatus = capture.status();
     window.state.capture = Some(capture);
-    let mut config = NetConfig::new(options.url.clone(), net::Codec::H264, CookieJar::new());
+    let mut config = NetConfig::new(
+        options.url.clone(),
+        net::Codec::H264,
+        super::viewer_auth(&options)?,
+    );
     config.input = Some(input.clone());
     config.stream_mode = Some(options.mode.stream_mode().into());
     let stats = Arc::new(TransportStats::new());

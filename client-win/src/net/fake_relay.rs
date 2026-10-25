@@ -1,5 +1,10 @@
 //! A synthetic relay for session tests. It serves `/ws` and `/media-ws` on
 //! 127.0.0.1 from a script and logs every handshake and text message it gets.
+//!
+//! `/ws` runs the phase 2 viewer admission: hello, `register-challenge` with
+//! [`FAKE_NONCE`], `register-proof` (checked with `verify_relay_proof` against the
+//! relay's origin; a bad proof closes 1008), then `hello-ok` with [`FAKE_TICKET`].
+//! `/media-ws` answers any hello; the tests assert its ticket.
 
 use std::future::pending;
 use std::net::TcpListener as StdListener;
@@ -8,6 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use bp_device_key::{verify_relay_proof, Role};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
@@ -16,10 +24,17 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::WebSocketStream;
 
 type ServerSocket = WebSocketStream<TcpStream>;
+
+/// The `register-challenge` nonce the fake relay sends.
+pub(crate) const FAKE_NONCE: [u8; 32] = [0x5a; 32];
+/// The media ticket in the fake relay's `/ws` hello-ok (32 bytes of base64url).
+pub(crate) const FAKE_TICKET: &str = "4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6-_z9_v8";
 
 /// What one accepted connection does. Connections use scenarios in order; the
 /// last one repeats.
@@ -33,6 +48,8 @@ pub(crate) struct Scenario {
     pub refuse: Option<u16>,
     /// Stop answering on `/ws` after hello-ok, keeping the socket open.
     pub signal_silent: bool,
+    /// Refuse the viewer after its proof (close 1008, as for a key not admitted).
+    pub refuse_viewer: bool,
     /// Value of `present` in the `media-peer` sent after the media hello-ok.
     pub host_present: bool,
     /// Sent on `/media-ws`, in order, after the media hello-ok and `media-peer`.
@@ -94,6 +111,7 @@ impl FakeRelay {
         listener.set_nonblocking(true).expect("nonblocking");
         let (log_tx, log_rx) = mpsc::channel();
         let state = Arc::new(State {
+            origin: origin.clone(),
             scenarios,
             ws_count: Mutex::new(0),
             last_ws: Mutex::new(Scenario::default()),
@@ -166,6 +184,7 @@ impl Drop for FakeRelay {
 }
 
 struct State {
+    origin: String,
     scenarios: Vec<Scenario>,
     ws_count: Mutex<usize>,
     last_ws: Mutex<Scenario>,
@@ -224,11 +243,12 @@ async fn handle(stream: TcpStream, state: Arc<State>, log: Sender<Logged>) {
     })
     .await;
     let Ok(ws) = accepted else { return };
+    let origin = state.origin.clone();
     let Some((path, scenario)) = plan.lock().unwrap().take() else {
         return;
     };
     match path.as_str() {
-        "/ws" => serve_signal(ws, scenario, log).await,
+        "/ws" => serve_signal(ws, scenario, &origin, log).await,
         "/media-ws" => serve_media(ws, scenario, log).await,
         _ => {}
     }
@@ -266,18 +286,66 @@ fn message_type(text: &str) -> Option<String> {
     value.get("type")?.as_str().map(str::to_owned)
 }
 
-async fn serve_signal(mut ws: ServerSocket, scenario: Scenario, log: Sender<Logged>) {
+/// Whether `proof` answers [`FAKE_NONCE`] for the key in `hello` at `origin`.
+fn proof_verifies(hello: &str, proof: &str, origin: &str) -> bool {
+    let (Ok(hello), Ok(proof)) = (
+        serde_json::from_str::<Value>(hello),
+        serde_json::from_str::<Value>(proof),
+    ) else {
+        return false;
+    };
+    let decode = |value: &Value| URL_SAFE_NO_PAD.decode(value.as_str()?).ok();
+    let (Some(id), Some(public), Some(signature)) = (
+        hello["id"].as_str(),
+        decode(&hello["public"]),
+        decode(&proof["signature"]),
+    ) else {
+        return false;
+    };
+    hello["role"] == "viewer"
+        && proof["type"] == "register-proof"
+        && verify_relay_proof(Role::Viewer, origin, &FAKE_NONCE, id, &public, &signature).is_ok()
+}
+
+async fn close_policy(ws: &mut ServerSocket) {
+    let _ = ws
+        .send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: "".into(),
+        })))
+        .await;
+}
+
+async fn serve_signal(mut ws: ServerSocket, scenario: Scenario, origin: &str, log: Sender<Logged>) {
     let path = "/ws";
-    if read_text(&mut ws, path, &log).await.is_none() {
+    let Some(hello) = read_text(&mut ws, path, &log).await else {
         return;
-    }
+    };
     if let Some(message) = &scenario.signal_error {
         send_json(&mut ws, json!({ "type": "error", "message": message })).await;
         return;
     }
     send_json(
         &mut ws,
-        json!({ "type": "hello-ok", "mediaEpoch": scenario.epoch }),
+        json!({ "type": "register-challenge", "nonce": URL_SAFE_NO_PAD.encode(FAKE_NONCE) }),
+    )
+    .await;
+    let Some(proof) = read_text(&mut ws, path, &log).await else {
+        return;
+    };
+    if scenario.refuse_viewer || !proof_verifies(&hello, &proof, origin) {
+        close_policy(&mut ws).await;
+        return;
+    }
+    send_json(
+        &mut ws,
+        json!({
+            "type": "hello-ok",
+            "pc": "77VH-7M56-8GJK-Y12J",
+            "mediaEpoch": scenario.epoch,
+            "iceServers": [],
+            "ticket": FAKE_TICKET,
+        }),
     )
     .await;
     if scenario.signal_silent {

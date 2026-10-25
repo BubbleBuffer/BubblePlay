@@ -3,8 +3,6 @@
 mod app;
 mod audio_dev;
 mod decode;
-#[cfg(feature = "dev-login")]
-mod dev_login;
 mod headless;
 pub(crate) mod input_dev;
 mod live_input;
@@ -31,7 +29,7 @@ use std::{
 use crate::{
     media::{Codec, MediaRuntime, MediaStats, StatsSnapshot, VideoRenderer},
     model::{AppState, Backend, Link, Monitor, PcKind, Quality, RemotePc, Session, Stats},
-    net::{self, CookieJar, DecoderFeedback, NetConfig, NetState, TransportStats},
+    net::{self, DecoderFeedback, NetConfig, NetState, TransportStats, ViewerAuth},
     shell::{Shell, ShellConfig},
 };
 use anyhow::{bail, Context, Result};
@@ -155,19 +153,11 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
     finish_dev(&options, result)
 }
 
-/// Development login happens once, before any window, network or device work.
-/// Reconnects reuse this jar and never repeat the single-use TOTP POST.
-#[cfg(feature = "dev-login")]
-fn session_cookies(options: &DevOptions) -> Result<CookieJar> {
-    match &options.login {
-        Some(login) => Ok(dev_login::login(login)?),
-        None => Ok(CookieJar::new()),
-    }
-}
-
-#[cfg(not(feature = "dev-login"))]
-fn session_cookies(_options: &DevOptions) -> Result<CookieJar> {
-    Ok(CookieJar::new())
+/// The viewer key is opened (and its passphrase asked) once, before any window, network
+/// or device work. A key that cannot be unlocked means no connection.
+fn viewer_auth(options: &DevOptions) -> Result<ViewerAuth> {
+    let identity = crate::store::key::open_identity(options.key.as_deref())?;
+    Ok(ViewerAuth::new(identity, options.pc))
 }
 
 fn finish_dev(options: &DevOptions, result: Result<()>) -> Result<()> {
@@ -214,7 +204,7 @@ fn run_windowed(options: DevOptions) -> Result<()> {
     if options.input_only {
         return input_dev::run(options);
     }
-    let cookies = session_cookies(&options)?;
+    let viewer = viewer_auth(&options)?;
     let started = Instant::now();
     let pacing = pacing::Pacing::new(started);
     pacing.mark("runtime_start");
@@ -270,7 +260,7 @@ fn run_windowed(options: DevOptions) -> Result<()> {
             Codec::H264 => net::Codec::H264,
             Codec::Hevc => net::Codec::Hevc,
         },
-        cookies,
+        viewer,
     );
     config.transport = options.transport;
     config.ice_checking_timeout = options

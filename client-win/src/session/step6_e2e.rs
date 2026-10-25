@@ -131,9 +131,8 @@ fn run(transport: &str) {
     let client_status = client.wait(Duration::from_secs(CLIENT_DEADLINE_S));
     let client_wall_s = client_started.elapsed().as_secs_f64();
     let host_alive_at_client_exit = host.0.try_wait().unwrap().is_none();
-    let host_status = host.wait(
-        Duration::from_secs(HOST_DEADLINE_S).saturating_sub(host_started.elapsed()),
-    );
+    let host_status =
+        host.wait(Duration::from_secs(HOST_DEADLINE_S).saturating_sub(host_started.elapsed()));
     let timing = json!({
         "budgets_s": {
             "host_bind": HOST_BIND_BUDGET_S,

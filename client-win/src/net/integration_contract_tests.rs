@@ -1,4 +1,4 @@
-//! Local socket contracts for media registration, feedback, receipt timing and login.
+//! Local socket contracts for viewer admission, media registration, feedback and receipt timing.
 //! Every listener, connection task and client thread belongs to a test guard.
 
 use std::net::TcpListener as StdListener;
@@ -8,9 +8,11 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use bp_device_key::{verify_relay_proof, Role};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc as async_mpsc;
 use tokio::task::JoinSet;
@@ -21,11 +23,13 @@ use tokio_tungstenite::{accept_hdr_async, WebSocketStream};
 use super::protocol::{encode_frame, FrameHeader};
 use super::session::{run_with_timing, Timing};
 use super::{
-    login_with_cookies, Codec, CookieJar, DecoderFeedback, LoginRequest, NetConfig, NetError,
-    NetEvent, TransportStats, VideoFrame, GATE_COOKIE, SESSION_COOKIE,
+    Codec, DecoderFeedback, NetConfig, NetError, NetEvent, TransportStats, VideoFrame, ViewerAuth,
 };
 
 const EPOCH: &str = "0123456789abcdef0123456789abcdef";
+const PC: &str = "77VH-7M56-8GJK-Y12J";
+const NONCE: [u8; 32] = [0x33; 32];
+const TICKET: &str = "4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6-_z9_v8";
 const WAIT: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(5);
 type Socket = WebSocketStream<TcpStream>;
@@ -35,10 +39,11 @@ enum Seen {
     Text(&'static str, Value),
     Ready(&'static str),
     RejectedStart,
-    Login(String),
 }
 
 struct RelayState {
+    /// The relay's own origin: what a viewer proof must be bound to.
+    origin: String,
     stop: AtomicBool,
     release_second: AtomicBool,
     hello_sent: AtomicBool,
@@ -64,6 +69,7 @@ impl OwnedRelay {
         let (log_tx, log) = mpsc::channel();
         let (send, media_rx) = async_mpsc::unbounded_channel();
         let state = Arc::new(RelayState {
+            origin: origin.clone(),
             stop: AtomicBool::new(false),
             release_second: AtomicBool::new(false),
             hello_sent: AtomicBool::new(false),
@@ -146,23 +152,21 @@ async fn serve_connection(
     state: Arc<RelayState>,
     media_rx: Arc<tokio::sync::Mutex<Option<async_mpsc::UnboundedReceiver<Vec<u8>>>>>,
 ) {
-    let mut prefix = [0u8; 4];
-    if stream.peek(&mut prefix).await.unwrap_or(0) == 4 && &prefix == b"POST" {
-        serve_login(stream, &state).await;
-        return;
-    }
     let path_slot = Arc::new(std::sync::Mutex::new(String::new()));
     let capture = path_slot.clone();
     // Tungstenite fixes this callback's error type to its HTTP response.
     #[allow(clippy::result_large_err)]
     let ws = accept_hdr_async(stream, move |request: &Request, response: Response| {
         *capture.lock().unwrap() = request.uri().path().to_owned();
-        if request.uri().path() == "/media-ws" {
-            assert_eq!(
-                request.uri().query(),
-                Some(format!("epoch={EPOCH}").as_str())
-            );
-        }
+        // No Origin header and no cookies on any socket.
+        assert!(request.headers().get("origin").is_none());
+        assert!(request.headers().get("cookie").is_none());
+        let query = if request.uri().path() == "/media-ws" {
+            format!("pc={PC}&epoch={EPOCH}")
+        } else {
+            format!("pc={PC}")
+        };
+        assert_eq!(request.uri().query(), Some(query.as_str()));
         Ok(response)
     })
     .await;
@@ -182,8 +186,46 @@ async fn serve_socket(
         let Some(hello) = socket_json(&mut ws, "/ws", &state).await else {
             return;
         };
-        assert_eq!(hello, json!({"type":"hello", "role":"client"}));
-        socket_send(&mut ws, json!({"type":"hello-ok", "mediaEpoch":EPOCH})).await;
+        let viewer = ViewerAuth::fixture();
+        assert_eq!(
+            hello,
+            json!({
+                "type": "hello",
+                "role": "viewer",
+                "id": viewer.identity().id().to_string(),
+                "public": viewer.identity().public_b64(),
+            })
+        );
+        socket_send(
+            &mut ws,
+            json!({"type":"register-challenge", "nonce": URL_SAFE_NO_PAD.encode(NONCE)}),
+        )
+        .await;
+        let Some(proof) = socket_json(&mut ws, "/ws", &state).await else {
+            return;
+        };
+        assert_eq!(proof.as_object().unwrap().len(), 2, "{proof}");
+        assert_eq!(proof["type"], "register-proof");
+        let signature = URL_SAFE_NO_PAD
+            .decode(proof["signature"].as_str().unwrap())
+            .unwrap();
+        let public = URL_SAFE_NO_PAD
+            .decode(hello["public"].as_str().unwrap())
+            .unwrap();
+        verify_relay_proof(
+            Role::Viewer,
+            &state.origin,
+            &NONCE,
+            hello["id"].as_str().unwrap(),
+            &public,
+            &signature,
+        )
+        .expect("the proof is bound to this relay's origin and nonce");
+        socket_send(
+            &mut ws,
+            json!({"type":"hello-ok", "pc": PC, "mediaEpoch":EPOCH, "iceServers": [], "ticket": TICKET}),
+        )
+        .await;
         while let Some(message) = socket_json(&mut ws, "/ws", &state).await {
             if message["type"] == "media-control" && message["action"] == "start" {
                 if !state.hello_sent.load(SeqCst) || !state.peer_sent.load(SeqCst) {
@@ -205,7 +247,10 @@ async fn serve_socket(
         let Some(hello) = socket_json(&mut ws, "/media-ws", &state).await else {
             return;
         };
-        assert_eq!(hello, json!({"type":"hello", "role":"media-client"}));
+        assert_eq!(
+            hello,
+            json!({"type":"hello", "role":"media-viewer", "ticket": TICKET})
+        );
         let first = if state.peer_first {
             "media-peer"
         } else {
@@ -279,34 +324,6 @@ async fn ready(ws: &mut Socket, kind: &'static str, state: &RelayState) {
     let _ = state.log.send(Seen::Ready(kind));
 }
 
-async fn serve_login(mut stream: TcpStream, state: &RelayState) {
-    let mut bytes = Vec::new();
-    let mut buffer = [0; 1024];
-    loop {
-        let read = stream.read(&mut buffer).await.unwrap();
-        assert!(read > 0, "HTTP request ended early");
-        bytes.extend_from_slice(&buffer[..read]);
-        assert!(bytes.len() < 16384, "bounded synthetic login request");
-        let text = String::from_utf8_lossy(&bytes);
-        if let Some(end) = text.find("\r\n\r\n") {
-            let length: usize = text[..end]
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse().unwrap())
-                })
-                .unwrap();
-            if bytes.len() >= end + 4 + length {
-                break;
-            }
-        }
-    }
-    let request = String::from_utf8(bytes).unwrap();
-    let _ = state.log.send(Seen::Login(request));
-    stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\nSet-Cookie: __Host-gate=rotated-gate; Path=/; Secure\r\nSet-Cookie: __Host-bp-session=rotated-session; Path=/; Secure\r\n\r\n").await.unwrap();
-}
-
 struct Client {
     relay: OwnedRelay,
     events: Receiver<NetEvent>,
@@ -324,7 +341,7 @@ impl Client {
         let config = NetConfig::new(
             relay.origin.replacen("http://", "ws://", 1),
             Codec::H264,
-            CookieJar::new(),
+            ViewerAuth::fixture(),
         );
         let (event_tx, events) = mpsc::sync_channel(capacity);
         let (feedback, feedback_rx) = mpsc::channel();
@@ -727,64 +744,15 @@ fn receipt_drop_overflow_and_keyframe_windows_count_socket_events_then_expire() 
 }
 
 #[test]
-fn password_login_reuses_existing_gate_and_returns_rotated_credentials() {
-    let relay = OwnedRelay::new(false);
-    let existing = CookieJar::from_set_cookie(["__Host-gate=existing-approval; Path=/; Secure"]);
-    let request = LoginRequest {
-        password: "synthetic-password",
-        totp: None,
-        remember: true,
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let rotated = runtime
-        .block_on(login_with_cookies(&relay.origin, &request, &existing))
-        .unwrap();
-    let Seen::Login(raw) = relay.log.recv_timeout(WAIT).unwrap() else {
-        panic!("expected login HTTP request");
-    };
-    let (headers, body) = raw.split_once("\r\n\r\n").unwrap();
-    assert!(headers.starts_with("POST /__auth/login HTTP/1.1"));
-    assert!(headers
-        .lines()
-        .any(|line| line.eq_ignore_ascii_case("cookie: __Host-gate=existing-approval")));
-    assert!(headers
-        .lines()
-        .any(|line| line.eq_ignore_ascii_case(&format!("origin: {}", relay.origin))));
-    assert_eq!(
-        serde_json::from_str::<Value>(body).unwrap(),
-        json!({"password":"synthetic-password","remember":true})
-    );
-    assert_eq!(rotated.get(GATE_COOKIE), Some("rotated-gate"));
-    assert_eq!(rotated.get(SESSION_COOKIE), Some("rotated-session"));
-    assert_eq!(existing.get(GATE_COOKIE), Some("existing-approval"));
-}
-
-#[test]
-fn credential_debug_redacts_password_totp_and_retained_cookie_values() {
-    let request = LoginRequest {
-        password: "synthetic-password-marker",
-        totp: Some("849271"),
-        remember: true,
-    };
-    let cookies = CookieJar::from_set_cookie([
-        "__Host-gate=synthetic-gate-marker",
-        "__Host-bp-session=synthetic-session-marker",
-    ]);
+fn config_debug_names_the_viewer_but_never_its_key() {
     let printed = format!(
-        "{request:?} {:?}",
-        NetConfig::new("http://127.0.0.1:1234", Codec::H264, cookies)
+        "{:?}",
+        NetConfig::new("http://127.0.0.1:1234", Codec::H264, ViewerAuth::fixture())
     );
-    for secret in [
-        request.password,
-        request.totp.unwrap(),
-        "synthetic-gate-marker",
-        "synthetic-session-marker",
-    ] {
-        assert!(!printed.contains(secret), "credential escaped via Debug");
+    assert!(printed.contains("47Z3-3QX1-AJH6-2RKB"), "{printed}");
+    assert!(printed.contains(PC), "{printed}");
+    // The fixture seed starts 9d 61 b1 9d.
+    for secret in ["9d61b1", "157, 97, 177", "[157, 97"] {
+        assert!(!printed.contains(secret), "key material escaped via Debug");
     }
-    assert!(printed.contains("remember: true"));
-    assert!(printed.contains("has_totp: true"));
 }

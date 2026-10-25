@@ -1,8 +1,61 @@
 //! Session configuration and relay endpoint rules.
 
+use std::sync::Arc;
+
+use bp_device_key::{DeviceId, DeviceIdentity};
+
 use super::controls::SessionControls;
-use super::cookies::CookieJar;
 use super::error::NetError;
+
+/// Who connects and to which PC: the unlocked viewer key that signs the relay proof, and the
+/// PC ID that goes into `/ws?pc=` and `/media-ws?pc=`.
+#[derive(Clone)]
+pub struct ViewerAuth {
+    identity: Arc<DeviceIdentity>,
+    pc: Option<DeviceId>,
+}
+
+impl ViewerAuth {
+    /// `pc` is `None` only for the loopback fake host, which serves a single PC.
+    pub fn new(identity: DeviceIdentity, pc: Option<DeviceId>) -> Self {
+        Self {
+            identity: Arc::new(identity),
+            pc,
+        }
+    }
+
+    pub fn identity(&self) -> &DeviceIdentity {
+        &self.identity
+    }
+
+    pub fn pc(&self) -> Option<DeviceId> {
+        self.pc
+    }
+
+    /// The fixture viewer key (fixtures/device-keys-contract.json `ids[0]`) for PC
+    /// `77VH-7M56-8GJK-Y12J`. Test only.
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        Self::new(
+            DeviceIdentity::from_seed(&seed),
+            Some(DeviceId::parse("77VH-7M56-8GJK-Y12J").expect("fixture PC ID")),
+        )
+    }
+}
+
+impl std::fmt::Debug for ViewerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ViewerAuth")
+            .field("viewer", &self.identity.id())
+            .field("pc", &self.pc)
+            .finish()
+    }
+}
 
 /// Development and session transport choice. Auto remembers an RTC failure
 /// within this session, matching the browser's tab-scoped fallback memory.
@@ -59,8 +112,8 @@ pub struct NetConfig {
     /// Relay origin, for example `https://relay.example` or `http://127.0.0.1:8787`.
     pub relay: String,
     pub codec: Codec,
-    /// Session cookies from [`crate::net::login`] (or a retained jar).
-    pub cookies: CookieJar,
+    /// The viewer key and PC for the signed `/ws` hello.
+    pub viewer: ViewerAuth,
     /// Optional native input mailbox, scoped to each /ws epoch.
     pub input: Option<super::InputLink>,
     /// Start mode sent in `signaling-start`. Kept in step with live mode changes from `controls`.
@@ -79,11 +132,11 @@ pub struct NetConfig {
 }
 
 impl NetConfig {
-    pub fn new(relay: impl Into<String>, codec: Codec, cookies: CookieJar) -> Self {
+    pub fn new(relay: impl Into<String>, codec: Codec, viewer: ViewerAuth) -> Self {
         Self {
             relay: relay.into(),
             codec,
-            cookies,
+            viewer,
             input: None,
             stream_mode: None,
             controls: SessionControls::new(),
@@ -96,7 +149,8 @@ impl NetConfig {
     }
 }
 
-/// A parsed relay origin. Only `https`, or `http` to the IP literal `127.0.0.1`.
+/// A parsed relay origin. Only `https`, or `http` to a loopback host (`127.0.0.1`, `::1`,
+/// `localhost`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayEndpoint {
     origin: String,
@@ -133,11 +187,12 @@ impl RelayEndpoint {
         {
             return Err(NetError::InvalidRelayUrl(input.to_owned()));
         }
-        let plaintext_allowed = url.host_str() == Some("127.0.0.1");
-        #[cfg(feature = "dev-login")]
-        let plaintext_allowed = plaintext_allowed
-            || matches!(url.host(), Some(url::Host::Domain("localhost")))
-            || matches!(url.host(),Some(url::Host::Ipv6(ip)) if ip==std::net::Ipv6Addr::LOCALHOST);
+        let plaintext_allowed = match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+            Some(url::Host::Domain(host)) => host == "localhost",
+            None => false,
+        };
         if !secure && !plaintext_allowed {
             return Err(NetError::PlaintextRefused(input.to_owned()));
         }
@@ -148,7 +203,8 @@ impl RelayEndpoint {
         })
     }
 
-    /// The `Origin` header and login origin: scheme, host and non-default port.
+    /// Scheme, host and non-default port. The relay proof signs this form (no `Origin`
+    /// header is ever sent: a native socket is judged by its signed hello alone).
     pub fn origin(&self) -> &str {
         &self.origin
     }
@@ -158,17 +214,6 @@ impl RelayEndpoint {
         self.secure
     }
 
-    /// Loopback endpoints, including TLS, never use a system proxy.
-    #[cfg(any(test, feature = "dev-login"))]
-    pub fn is_loopback(&self) -> bool {
-        url::Url::parse(&self.origin).is_ok_and(|url| match url.host() {
-            Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
-            Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
-            Some(url::Host::Domain(host)) => host == "localhost",
-            _ => false,
-        })
-    }
-
     /// A WebSocket URL on this relay, for example `wss://relay.example/ws`.
     pub fn ws_url(&self, path: &str, query: Option<&str>) -> String {
         let scheme = if self.secure { "wss" } else { "ws" };
@@ -176,12 +221,6 @@ impl RelayEndpoint {
             Some(query) => format!("{scheme}://{}{path}?{query}", self.authority),
             None => format!("{scheme}://{}{path}", self.authority),
         }
-    }
-
-    /// The HTTP URL for a path on this relay.
-    #[cfg(any(test, feature = "dev-login"))]
-    pub fn http_url(&self, path: &str) -> String {
-        format!("{}{path}", self.origin)
     }
 }
 
@@ -205,7 +244,6 @@ mod tests {
             endpoint.ws_url("/media-ws", Some("epoch=0123456789abcdef0123456789abcdef")),
             "ws://127.0.0.1:8787/media-ws?epoch=0123456789abcdef0123456789abcdef"
         );
-        assert!(endpoint.is_loopback());
     }
 
     #[test]
@@ -225,16 +263,8 @@ mod tests {
                 "{url} must be refused as plaintext"
             );
         }
-        #[cfg(not(feature = "dev-login"))]
         for url in ["http://localhost:8787", "http://[::1]:8787"] {
-            assert!(matches!(
-                RelayEndpoint::parse(url),
-                Err(NetError::PlaintextRefused(_))
-            ));
-        }
-        #[cfg(feature = "dev-login")]
-        for url in ["http://localhost:8787", "http://[::1]:8787"] {
-            assert!(RelayEndpoint::parse(url).is_ok());
+            assert!(RelayEndpoint::parse(url).is_ok(), "{url} is loopback");
         }
     }
 

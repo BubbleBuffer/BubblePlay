@@ -19,8 +19,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{COOKIE, ORIGIN};
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
@@ -30,11 +29,11 @@ use super::error::NetError;
 use super::events::{DecoderFeedback, NetEvent, ResetEvent, VideoFrame};
 use super::gate::{next_backoff, GateVerdict, KeyframeThrottle, ReceiveGate};
 use super::protocol::{
-    ack_message, first_frame_keyframe, first_frame_presented, first_frame_request, hello_message,
-    is_audio_packet, keyframe_message, mode_control_message, monitor_control_message,
-    new_request_id, parse_frame, parse_monitor_error, parse_monitor_list, parse_relay_control,
-    ping_message, sanitize_reason, start_message, valid_epoch, validate_host_control, RelayControl,
-    V4_HEADER_BYTES,
+    ack_message, first_frame_keyframe, first_frame_presented, first_frame_request, is_audio_packet,
+    keyframe_message, media_hello, mode_control_message, monitor_control_message, new_request_id,
+    parse_frame, parse_monitor_error, parse_monitor_list, parse_register_challenge,
+    parse_relay_control, ping_message, register_proof, sanitize_reason, start_message, valid_epoch,
+    validate_host_control, viewer_hello, RelayControl, V4_HEADER_BYTES,
 };
 use super::stats::{count, NetState, TransportStats};
 use super::{
@@ -200,6 +199,8 @@ impl Lane {
 /// `host-joined` tracking. Replaced on every reconnect.
 struct Epoch {
     wire: String,
+    /// The `/media-ws` ticket from this epoch's `hello-ok`.
+    ticket: String,
     request_id: String,
     codec: Codec,
     host_present: bool,
@@ -403,17 +404,18 @@ impl Session {
         self.stats.set_state(NetState::Signaling);
     }
 
-    /// One full attempt: `/ws` hello, start and first-frame request, `/media-ws`
-    /// hello, then the stream loop. Always ends with `Err`.
+    /// The `pc=<id>` query of both sockets, when a PC is chosen.
+    fn pc_query(&self) -> Option<String> {
+        self.config.viewer.pc().map(|pc| format!("pc={pc}"))
+    }
+
+    /// One full attempt: signed `/ws` hello and proof, start and first-frame request,
+    /// `/media-ws` ticket hello, then the stream loop. Always ends with `Err`.
     async fn attempt(&mut self, endpoint: &RelayEndpoint) -> Result<(), Halt> {
         self.begin_epoch();
+        let query = self.pc_query();
         let socket = self
-            .handshake(open_socket(
-                endpoint,
-                self.config.cookies.cookie_header(),
-                "/ws",
-                None,
-            ))
+            .handshake(open_socket(endpoint, "/ws", query.as_deref()))
             .await?;
         let route_ip = match socket.get_ref() {
             MaybeTlsStream::Plain(tcp) => tcp.local_addr().ok().map(|addr| addr.ip()),
@@ -422,14 +424,27 @@ impl Session {
         };
         let (tx, mut signal_rx) = socket.split();
         let mut signal = Lane::new(tx);
-        signal.send(hello_message("client")).await?;
-        let (epoch, ice_servers) = self
-            .handshake(await_hello_ok(&mut signal_rx, &self.stats, "signal"))
+        // A cheap clone (the key sits behind an Arc): `handshake` borrows `self` mutably.
+        let viewer = self.config.viewer.clone();
+        signal.send(viewer_hello(viewer.identity())).await?;
+        let nonce = self
+            .handshake(await_register_challenge(&mut signal_rx, &self.stats))
+            .await?;
+        let proof_origin = bp_device_key::relay_origin(endpoint.origin())
+            .unwrap_or_else(|| endpoint.origin().to_owned());
+        signal
+            .send(register_proof(viewer.identity(), &proof_origin, &nonce))
+            .await?;
+        let (epoch, ticket, ice_servers) = self
+            .handshake(await_hello_ok(&mut signal_rx, &self.stats))
             .await?;
         let wire = epoch.filter(|epoch| valid_epoch(epoch)).ok_or_else(|| {
             Halt::from(NetError::Protocol(
                 "hello-ok without a valid mediaEpoch".into(),
             ))
+        })?;
+        let ticket = ticket.ok_or_else(|| {
+            Halt::from(NetError::Protocol("hello-ok without a media ticket".into()))
         })?;
         self.config.controls.epoch_registered(&wire);
         // A live mode the user chose (also before connect) is the start mode on reconnect.
@@ -448,6 +463,7 @@ impl Session {
             rtc: None,
             epoch: Epoch {
                 wire,
+                ticket,
                 request_id,
                 codec: self.config.codec,
                 host_present: true,
@@ -508,18 +524,16 @@ impl Session {
         media_rx: &mut Option<Source>,
     ) -> Result<(), Halt> {
         self.stats.set_state(NetState::MediaHandshake);
-        let query = format!("epoch={}", link.epoch.wire);
+        let query = match self.pc_query() {
+            Some(pc) => format!("{pc}&epoch={}", link.epoch.wire),
+            None => format!("epoch={}", link.epoch.wire),
+        };
         let socket = self
-            .handshake(open_socket(
-                endpoint,
-                self.config.cookies.cookie_header(),
-                "/media-ws",
-                Some(&query),
-            ))
+            .handshake(open_socket(endpoint, "/media-ws", Some(&query)))
             .await?;
         let (tx, mut rx) = socket.split();
         let mut media = Lane::new(tx);
-        media.send(hello_message("media-client")).await?;
+        media.send(media_hello(&link.epoch.ticket)).await?;
         link.epoch.host_present = self
             .handshake(await_media_ready(&mut rx, &self.stats))
             .await?;
@@ -1647,23 +1661,18 @@ async fn close_lane(lane: &mut Lane, source: &mut Source) {
     .await;
 }
 
-/// Open one WebSocket with `Origin` and the cookie header.
+/// Open one WebSocket. No `Origin` header and no cookies: the relay admits a native
+/// viewer by its signed hello alone.
 async fn open_socket(
     endpoint: &RelayEndpoint,
-    cookie: Option<String>,
     path: &str,
     query: Option<&str>,
 ) -> Result<Socket, NetError> {
     let url = endpoint.ws_url(path, query);
-    let mut request = url
+    let request = url
         .as_str()
         .into_client_request()
         .map_err(|error| NetError::Handshake(error.to_string()))?;
-    let headers = request.headers_mut();
-    headers.insert(ORIGIN, header_value(endpoint.origin())?);
-    if let Some(cookie) = cookie {
-        headers.insert(COOKIE, header_value(&cookie)?);
-    }
     // Keep media access units and small ACK/control messages from waiting for
     // TCP's delayed-ACK/Nagle interaction before the decoder can see them.
     match connect_async_with_config(request, None, true).await {
@@ -1677,10 +1686,6 @@ async fn open_socket(
         }
         Err(error) => Err(NetError::Handshake(error.to_string())),
     }
-}
-
-fn header_value(value: &str) -> Result<HeaderValue, NetError> {
-    HeaderValue::from_str(value).map_err(|error| NetError::Handshake(error.to_string()))
 }
 
 /// Both media controls must arrive before start; controls can arrive in either
@@ -1714,22 +1719,60 @@ async fn await_media_ready(source: &mut Source, stats: &TransportStats) -> Resul
     }
 }
 
-/// Read until the relay's `hello-ok`. Returns its `mediaEpoch`, if it has one.
+/// Read until the relay's `register-challenge` and return its nonce. A 1008 close here
+/// means the hello was refused.
+async fn await_register_challenge(
+    source: &mut Source,
+    stats: &TransportStats,
+) -> Result<[u8; 32], NetError> {
+    loop {
+        match admission(source.next().await)? {
+            Inbound::Text(text) => {
+                if let Some(message) = relay_error(&text) {
+                    return Err(NetError::RelayError(message));
+                }
+                match parse_register_challenge(&text) {
+                    Some(nonce) => return Ok(nonce),
+                    None => count(&stats.rejected_controls),
+                }
+            }
+            Inbound::Binary(_) => count(&stats.rejected_controls),
+            Inbound::Other => {}
+        }
+    }
+}
+
+/// [`classify`] for the signalling socket before `hello-ok`: the relay refuses a viewer
+/// (unknown key, not admitted to the PC, bad proof) by closing with 1008, which is fatal.
+fn admission(item: Option<Result<Message, tungstenite::Error>>) -> Result<Inbound, NetError> {
+    if let Some(Ok(Message::Close(Some(frame)))) = &item {
+        if frame.code == CloseCode::Policy {
+            return Err(NetError::NotAdmitted);
+        }
+    }
+    classify(item, "signal")
+}
+
+/// Read until the relay's `hello-ok`. Returns its `mediaEpoch` and `ticket`, if present,
+/// and its `iceServers`.
 async fn await_hello_ok(
     source: &mut Source,
     stats: &TransportStats,
-    label: &str,
-) -> Result<(Option<String>, Value), NetError> {
+) -> Result<(Option<String>, Option<String>, Value), NetError> {
     loop {
-        match classify(source.next().await, label)? {
+        match admission(source.next().await)? {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(NetError::RelayError(message));
                 }
                 match parse_relay_control(&text) {
-                    Some(RelayControl::HelloOk { media_epoch }) => {
+                    Some(RelayControl::HelloOk {
+                        media_epoch,
+                        ticket,
+                    }) => {
                         return Ok((
                             media_epoch,
+                            ticket,
                             serde_json::from_str::<Value>(&text).unwrap_or(Value::Null)
                                 ["iceServers"]
                                 .clone(),
@@ -1992,6 +2035,7 @@ mod input_readiness_tests {
     fn desktop_state_reuses_inflight_but_never_completed_or_unavailable_presentation() {
         let mut epoch = Epoch {
             wire: "epoch".into(),
+            ticket: "ticket".into(),
             request_id: "original".into(),
             codec: Codec::H264,
             host_present: true,
