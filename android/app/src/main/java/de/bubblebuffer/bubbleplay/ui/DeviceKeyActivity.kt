@@ -21,6 +21,7 @@ import de.bubblebuffer.bubbleplay.keys.DeviceKeyException
 import de.bubblebuffer.bubbleplay.keys.DeviceKeyStore
 import de.bubblebuffer.bubbleplay.keys.KeyFile
 import de.bubblebuffer.bubbleplay.keys.KeyFileCodec
+import de.bubblebuffer.bubbleplay.keys.UnlockedKey
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
@@ -30,15 +31,19 @@ import java.util.concurrent.Executors
 /**
  * This phone's device key: create, import, export, change the passphrase, or remove it.
  *
- * Phase 1: the key is optional and nothing here blocks connecting. Disk, Keystore and Argon2id
- * work runs on [worker]; passphrases are asked in [PassphraseDialog]. An unlocked key is closed as
- * soon as its one step is done.
+ * The app is locked without an unlocked key, so the start screen opens this activity in
+ * [START_UNLOCK] mode to ask for the passphrase only. Disk, Keystore and Argon2id work runs on
+ * [worker]; passphrases are asked in [PassphraseDialog]. A key unlocked for the app is handed to
+ * [UnlockedKey]; any other unlocked key is closed as soon as its one step is done.
  */
 class DeviceKeyActivity : Activity() {
     private lateinit var store: DeviceKeyStore
     private lateinit var views: KeyViews
     private lateinit var column: LinearLayout
     private val worker = Executors.newSingleThreadExecutor()
+
+    /** True when opened only to unlock: no setup screens, and the result tells the caller it worked. */
+    private var unlockOnly = false
 
     /** Null until the first read finishes. */
     private var stored: StoredKey? = null
@@ -70,7 +75,12 @@ class DeviceKeyActivity : Activity() {
         })
         column.addView(views.body(R.string.dk_loading))
         val start = intent.getStringExtra(EXTRA_START)
+        unlockOnly = start == START_UNLOCK
         reload {
+            if (unlockOnly) {
+                startUnlock(auto = savedInstanceState == null)
+                return@reload
+            }
             render()
             // A new activity from the start screen acts at once; a restored one does not repeat it.
             if (savedInstanceState == null) {
@@ -79,6 +89,46 @@ class DeviceKeyActivity : Activity() {
                     start == START_CREATE && stored is StoredKey.Missing -> showCreate()
                 }
             }
+        }
+    }
+
+    /**
+     * The unlock-only screen: asks for the stored key's passphrase, then finishes with RESULT_OK.
+     * [auto] asks at once (the first time the screen opens); otherwise the Unlock button asks.
+     * Without a stored key there is nothing to unlock, so the normal screens show instead.
+     */
+    private fun startUnlock(auto: Boolean) {
+        if (UnlockedKey.get() != null) {
+            setResult(RESULT_OK)
+            finish()
+            return
+        }
+        val key = stored as? StoredKey.Present
+        if (key == null) {
+            render()
+            return
+        }
+        screen {
+            column.addView(views.body(R.string.dk_unlock_intro))
+            statusLine()
+            column.addView(views.button(R.string.dk_unlock_action, KeyViews.Style.PRIMARY) { unlockForApp(key.file) })
+            column.addView(views.button(R.string.dk_cancel, KeyViews.Style.SECONDARY) { finish() })
+        }
+        if (auto) unlockForApp(key.file)
+    }
+
+    /** Unlocks the stored key for this app run. Cancelling the passphrase closes the screen unchanged. */
+    private fun unlockForApp(file: KeyFile) {
+        unlockCurrent(
+            file,
+            R.string.dk_unlock_title,
+            R.string.dk_unlock_message,
+            R.string.dk_unlock_action,
+            onCancel = { finish() },
+        ) { key ->
+            UnlockedKey.set(key)
+            setResult(RESULT_OK)
+            finish()
         }
     }
 
@@ -203,10 +253,15 @@ class DeviceKeyActivity : Activity() {
         worker.execute {
             val result = runCatching {
                 val created = KeyFileCodec.create(label, pass.ifEmpty { null })
-                created.key.close()
-                val text = KeyFileCodec.serialize(created.file)
-                store.savePortable(text)
-                StoredKey.Present(text, created.file)
+                try {
+                    val text = KeyFileCodec.serialize(created.file)
+                    store.savePortable(text)
+                    UnlockedKey.set(created.key)
+                    StoredKey.Present(text, created.file)
+                } catch (e: Throwable) {
+                    created.key.close()
+                    throw e
+                }
             }
             runOnUiThread {
                 if (isDestroyed) return@runOnUiThread
@@ -342,8 +397,7 @@ class DeviceKeyActivity : Activity() {
     private fun continueImport(file: KeyFile, text: String) {
         unlockCurrent(file, R.string.dk_import_title, R.string.dk_import_message, R.string.dk_import_action) { key ->
             // Unlocking proves the passphrase and the key match before anything is replaced.
-            key.close()
-            writeStored(text, R.string.dk_imported)
+            writeStored(text, R.string.dk_imported, unlocked = key)
         }
     }
 
@@ -403,6 +457,7 @@ class DeviceKeyActivity : Activity() {
         title: Int,
         message: Int,
         action: Int,
+        onCancel: () -> Unit = {},
         onUnlocked: (DeviceKey) -> Unit,
     ) {
         if (!file.isProtected) {
@@ -439,16 +494,21 @@ class DeviceKeyActivity : Activity() {
                     }
                 }
             },
-            onCancel = {},
+            onCancel = onCancel,
         ).show()
     }
 
     // ---- store changes ----------------------------------------------------------------------------
 
-    /** Saves [text] as this phone's key, then shows the result with [done] as its notice. */
-    private fun writeStored(text: String, done: Int) {
+    /**
+     * Saves [text] as this phone's key, then shows the result with [done] as its notice. An
+     * [unlocked] key (already proven by its passphrase) becomes the app's unlocked key once saved,
+     * and is closed if the save fails.
+     */
+    private fun writeStored(text: String, done: Int, unlocked: DeviceKey? = null) {
         worker.execute {
             val result = runCatching { store.savePortable(text) }
+            if (result.isSuccess) unlocked?.let { UnlockedKey.set(it) } else unlocked?.close()
             runOnUiThread {
                 if (isDestroyed) return@runOnUiThread
                 result.onSuccess {
@@ -475,6 +535,7 @@ class DeviceKeyActivity : Activity() {
             runOnUiThread {
                 if (isDestroyed) return@runOnUiThread
                 result.onSuccess {
+                    UnlockedKey.clear()
                     notice = R.string.dk_removed
                     reload()
                 }.onFailure { showError(R.string.dk_err_io) }
@@ -527,10 +588,14 @@ class DeviceKeyActivity : Activity() {
     }
 
     companion object {
-        /** Start-screen entry points: create goes straight to the form, import to the picker. */
+        /**
+         * Start-screen entry points: create goes straight to the form, import to the picker, and
+         * unlock asks for the passphrase only (RESULT_OK once the app holds the key).
+         */
         const val EXTRA_START = "deviceKeyStart"
         const val START_CREATE = "create"
         const val START_IMPORT = "import"
+        const val START_UNLOCK = "unlock"
 
         private const val REQUEST_EXPORT = 1
         private const val REQUEST_IMPORT = 2

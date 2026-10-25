@@ -30,6 +30,6 @@ interface PcStore {
     fun remove(id: String)
 
     companion object {
-        fun from(context: Context): PcStore = throw NotImplementedError("PcStore: implemented by the UI run")
+        fun from(context: Context): PcStore = PcListStore.preferences(context)
     }
 }

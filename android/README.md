@@ -5,13 +5,13 @@ It uses the same WSS v4 media path and input contract as the browser receiver (`
 
 Start with the [public documentation](../docs/README.md) for host/relay setup and [architecture](../docs/architecture/README.md) for the shared contracts. Android's packaged/device acceptance is separate from the Windows/browser alpha. Interoperability with the new Go relay has not been demonstrated.
 
-On a fresh install, enter your own relay address before connecting. Existing saved addresses are retained; the app has no built-in personal relay destination.
+On a fresh install, create or import a device key, then pair each PC with its relay address and PC ID. The app has no built-in relay destination.
 
 ## How it works
 
-- **Sign-in:** a WebView opens `<server>/`, which is the unchanged Worker gate (ntfy approval, then the password page).
-  - When the page navigates back to `/` with both `__Host-gate` and `__Host-bp-session` cookies set, the app intercepts that navigation. The browser receiver never loads.
-  - The app then passes the cookies to the native session.
+- **Device key and PC list:** the app opens to the PC list only with an unlocked device key. Without a key it shows setup (create or import); a locked key shows an unlock step (`ui/DeviceKeyActivity.kt`, `START_UNLOCK`).
+  - **Pairing:** Pair a PC takes the relay address, the PC ID, the code shown on the PC and an optional name (`ui/PairActivity.kt`). A `bubbleplay://pair` link only fills the form; it never submits. Each paired PC is kept on the phone with its name and relay.
+  - Tap a PC to connect through its saved relay.
 - **Signaling:** an OkHttp WebSocket to `/ws` carries hello, media-control, the first-frame handshake, desktop state, clipboard, monitors and binary input.
 - **Media:** an OkHttp WebSocket to `/media-ws?epoch=…` using v4 framing.
   - The app sends a per-frame ACK (with `decodedSeq`), sends keyframe requests (limited to one per 250 ms), and sends a 15 s `ping` heartbeat.
@@ -36,7 +36,7 @@ On a fresh install, enter your own relay address before connecting. Existing sav
   - A status line shows state, codec and size. Tap it to reconnect after an error. Full screen and touch mode can also be switched from the bar for the current session only.
   - Foreground windows that need Admin mode show “This window needs Admin mode — turn it on at the PC” in that status line. An unavailable Admin mode helper shows “Admin mode helper isn’t responding”. The warning clears when the host clears its reason, and controls stay enabled. Optional `input-status` reason and route fields are validated; older receipt-only messages preserve the current warning.
   - **Background:** with **Stay connected in the background** on (default), a foreground service (`ui/SessionService.kt`, type `dataSync`) starts with the session and stops with it. While it runs, the session, file transfers and reconnects continue when the app leaves the foreground, and an ongoing low-priority notification ("Connected to <host>") returns to the stream on tap and has a Disconnect action. Android 13+ asks for the notification permission at the first session start. The service only starts while the app is in the foreground. When Android refuses it, ends it (Android 15+: 6 h of `dataSync` per 24 h), or the setting is off, the session is stopped 30 s after the app leaves the foreground (see "Known limits").
-  - **Resume:** when the app pauses, it copies the current video frame (`PixelCopy`). On return that frame stays on screen, dimmed, with a "Reconnecting…" label, until the first live frame is presented; it then fades out over 150 ms. If the copy failed, the screen is black until the stream returns. The frame is kept across the 30 s background stop and dropped on Disconnect or Sign out.
+  - **Resume:** when the app pauses, it copies the current video frame (`PixelCopy`). On return that frame stays on screen, dimmed, with a "Reconnecting…" label, until the first live frame is presented; it then fades out over 150 ms. If the copy failed, the screen is black until the stream returns. The frame is kept across the 30 s background stop and dropped on Disconnect.
   - **Reconnect in the background:** without the background service, lost signaling or media sockets are not reconnected while the app is in the background. On return (`onStart`) the backoff resets and any held or waiting retry runs at once.
   - **Surface watchdog:** the 2 s steps (forced keyframe, media restart, give up) count only while signaling is up, and restart from the next `hello-ok`, so a slow host reconnect does not end in "Stream recovery stopped".
   - logcat (`BubblePlayStream`) logs `foreground to first live frame N ms` on each return.
@@ -54,7 +54,7 @@ Code layout (`app/src/main/java/de/bubblebuffer/bubbleplay/`):
 
 See the shared [session UI](../docs/architecture/session-ui.md). One view (`ui/SettingsView.kt`), opened from More in the bar and from the connection screen. From the bar it opens over the stream inside `StreamActivity`, so the stream stays in the foreground; Disconnect stays a separate item in More. Values persist in `Prefs` (SharedPreferences, schema version 2) and apply live:
 
-- **Connection:** server address (saved here applies to the next connection), Sign out (expires the `__Host-gate` and `__Host-bp-session` cookies for that server, ends the session, returns to the connection screen), stay connected in the background (default on; turning it off in a session stops the service now).
+- **Connection:** stay connected in the background (default on; turning it off in a session stops the service now). The relay belongs to each PC and is set when it is paired.
 - **Touch:** default touch mode, trackpad pointer speed (levels 1 to 9; 5 is the old fixed gain 1.6, each step 25 %), tap to click (trackpad one-finger tap; when off, long-press clicks and a two-finger tap still right-clicks).
 - **Mouse and keyboard:** pointer mode for a hardware mouse (Work or Game, default Work; a change in a session switches the host's stream mode now), capture keyboard shortcuts (default on).
 - **Display:** start in full screen, keep screen on, default monitor (requested once when a session starts, if the host lists it and is not already showing it; choosing one in a session switches to it now).
@@ -68,7 +68,7 @@ See [file-transfer behavior](../docs/architecture/file-transfer.md) and the [sha
 
 - **Socket:** a second OkHttp WebSocket, `/file-ws?epoch=<mediaEpoch>` (lab: `/lab-file-ws` with `run` and `compat`), with the same gate cookie as `/ws`. It opens on demand, sends `hello`, waits for `file-peer` present (10 s), pings every 15 s and closes after 60 s idle. One transfer runs per direction; the rest queue.
 - **Upload:**
-  - Share sheet: "BubblePlay" accepts `SEND`/`SEND_MULTIPLE` of any type, purpose `save`. Without a session it opens the app (connect or sign in first), then uploads. At most 64 files go; the rest are reported.
+  - Share sheet: "BubblePlay" accepts `SEND`/`SEND_MULTIPLE` of any type, purpose `save`. Without a session it opens the PC list; the files wait there until you pick a PC, then they upload. At most 64 files go; the rest are reported.
   - The Attach icon in the quick bar opens the system picker (multiple).
   - Shortcuts → Paste: a content URI on the phone clipboard is uploaded with purpose `paste` instead of pasting text.
   - Files are read through `ContentResolver`; no storage permission. A source without a known size is copied to the app cache first.
@@ -123,6 +123,8 @@ adb install -r app\build\outputs\apk\release\app-release.apk
 Alternatively, copy the APK to the phone and open it after allowing installs from that source.
 
 ## Testing against the local Stream Lab relay (not production)
+
+> **Stale (2026-10-25):** this section predates the PC list. The Server field and Lab run setting it describes are no longer in the UI, so these steps do not work as written. They need a rewrite around pairing before use.
 
 1. Install dependencies with `npm --prefix worker ci` from the repository root, then start `node worker/tools/lab/stream-lab-direct-relay.mjs --port 8787`.
 2. Start a candidate host against that relay. `<compat>` is `compatibility.id` from `http://127.0.0.1:8787/lab-compat`, and `<uuid>` is any new UUID:

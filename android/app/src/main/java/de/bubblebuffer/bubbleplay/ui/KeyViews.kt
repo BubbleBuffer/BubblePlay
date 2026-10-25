@@ -1,6 +1,7 @@
 package de.bubblebuffer.bubbleplay.ui
 
 import android.content.Context
+import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
@@ -59,6 +60,16 @@ internal class KeyViews(private val context: Context) {
     }
 
     fun body(text: Int): TextView = body(context.getString(text))
+
+    /** Text in the monospace face, for IDs and keys: people compare and copy them character by character. */
+    fun mono(text: CharSequence, sizeSp: Float = 16f) = TextView(context).apply {
+        this.text = text
+        typeface = Typeface.MONOSPACE
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
+        setTextColor(KeyPalette.MILK)
+        setPadding(0, dp(4), 0, dp(4))
+        setTextIsSelectable(true)
+    }
 
     fun fieldLabel(text: Int) = TextView(context).apply {
         setText(text)

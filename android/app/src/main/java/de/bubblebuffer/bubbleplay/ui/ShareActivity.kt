@@ -9,13 +9,12 @@ import android.os.Bundle
 import android.widget.Toast
 import de.bubblebuffer.bubbleplay.R
 import de.bubblebuffer.bubbleplay.files.ShareParse
-import de.bubblebuffer.bubbleplay.net.ServerConfig
 
 /**
- * Share-sheet target ("BubblePlay" for any MIME type). No UI: it hands the
- * shared URIs to the stream screen, which uploads them (purpose "save") once
- * the host is connected. Not connected yet: the stream screen starts the
- * session (or sign-in goes first) and the shares travel along.
+ * Share-sheet target ("BubblePlay" for any MIME type). No UI: it hands the shared URIs to the PC
+ * list ([MainActivity]), which keeps them until the user picks a PC; the stream screen then uploads
+ * them (purpose "save") once connected. The device key gate and pairing happen there, so a share
+ * never skips them.
  *
  * Read access to the URIs was granted to this activity; every hop forwards it
  * with FLAG_GRANT_READ_URI_PERMISSION + ClipData ([PendingShares]).
@@ -29,16 +28,8 @@ class ShareActivity : Activity() {
             finish(); return
         }
         if (result.dropped > 0) Toast.makeText(this, resources.getQuantityString(R.plurals.file_too_many, result.dropped, result.dropped), Toast.LENGTH_LONG).show()
-        val prefs = Prefs(this)
-        val config = prefs.serverConfig()
-        val signedIn = config != null && (config.isLab || ServerConfig.hasSessionCookies(Prefs.cookieHeader(config)))
-        val next = when {
-            config == null -> MainActivity::class.java
-            signedIn -> StreamActivity::class.java
-            else -> LoginActivity::class.java
-        }
-        // Into BubblePlay's own task: an open stream screen gets onNewIntent.
-        val forward = Intent(this, next).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        // Into BubblePlay's own task: an open PC list gets onNewIntent.
+        val forward = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         startActivity(PendingShares.attach(forward, result.items))
         finish()
     }
