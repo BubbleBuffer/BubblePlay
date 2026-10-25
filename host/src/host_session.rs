@@ -805,7 +805,7 @@ mod stall_tests {
     #[test]
     fn idle_hosts_reregister_before_the_relay_ticket_expires() {
         let registered = Instant::now();
-        let at = |hours| registered + Duration::from_secs(hours * 60 * 60);
+        let at = |hours: u64| registered + Duration::from_secs(hours * 60 * 60);
         assert!(!relay_ticket_refresh_due(registered, true, false, at(10)));
         assert!(relay_ticket_refresh_due(registered, true, false, at(11)));
         // The 2026-10-25 host held one registration for 58 h.
