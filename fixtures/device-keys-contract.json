@@ -302,5 +302,222 @@
         "ticket": "4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6-_z9_v8"
       }
     }
+  },
+  "phase2": {
+    "notes": "Phase 2 vectors (decisions 2026-10-25). H is handshake.transcriptHashHex; control keys are handshake.controlKeys; auth-bind uses the phase 0 handshake.dtls encoding unchanged. Where phase 0 defines an encoding it wins. TEST ONLY.",
+    "pairing": {
+      "code": "70Q1K9MXR1",
+      "codeDisplay": "70Q1K-9MXR1",
+      "normalise": [
+        {
+          "input": "7oq-ik9 mxrl",
+          "canonical": "70Q1K9MXR1"
+        },
+        {
+          "input": "70Q1K-9MXR1",
+          "canonical": "70Q1K9MXR1"
+        }
+      ],
+      "pcId": "77VH-7M56-8GJK-Y12J",
+      "admitBytesHex": "627562626c65706c61792d706169722d61646d69742d7631373756482d374d35362d38474a4b2d5931324a373051314b394d585231",
+      "admit": "SFml4GBVWYlks8t0GZAPfxB_lveeU4fkBlAkoCa2L6E",
+      "pairKeyHex": "adc46c68ff321dff8df4efb11d8d2fdeea70f03418041bd1bb4227e76be88a5d",
+      "viewerMac": "G-iVm095wO8brxV7Er8Kk4DpQln03e-LtNqNZ7_p5FI",
+      "pcMac": "oLatJWOG53W-rTA0O2n5ci85CIG4uDKGE3OD_udxnT0",
+      "wrongCode": "70Q1K9MXR2",
+      "wrongCodeViewerMac": "-IwedMWOxY3RSB_eU0LwQS10FVr2wxemf4AX4pR7Lzw",
+      "sasBytesHex": "627562626c65706c61792d706169722d7361732d7631b57d64e60130ff4a0f16564bb5cc20e6ff0f6feccafaa5c84eeaa736706f056d",
+      "sasU32": 271830687,
+      "sasNumber": "830687",
+      "sasDisplay": "830 687",
+      "qr": {
+        "android": "bubbleplay://pair?relay=https%3A%2F%2Fexample.test&pc=77VH-7M56-8GJK-Y12J&code=70Q1K9MXR1",
+        "browser": "https://example.test/pair#pc=77VH-7M56-8GJK-Y12J&code=70Q1K9MXR1"
+      },
+      "messages": {
+        "pairOpen": {
+          "type": "pair-open",
+          "admit": "SFml4GBVWYlks8t0GZAPfxB_lveeU4fkBlAkoCa2L6E"
+        },
+        "pairClose": {
+          "type": "pair-close"
+        },
+        "pairClosed": {
+          "type": "pair-closed"
+        },
+        "viewerHello": {
+          "type": "hello",
+          "role": "viewer",
+          "id": "47Z3-3QX1-AJH6-2RKB",
+          "public": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+          "pair": "SFml4GBVWYlks8t0GZAPfxB_lveeU4fkBlAkoCa2L6E"
+        },
+        "authHello": {
+          "type": "auth-hello",
+          "id": "47Z3-3QX1-AJH6-2RKB",
+          "public": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+          "nonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+          "ephemeral": "eaYx7t4b-cmPEgMs3q3Q56B5OY_HhriMyEbsia-FpRo",
+          "caps": [
+            "control-aead-v1",
+            "dtls-bind-v1",
+            "pair-v1"
+          ]
+        },
+        "pairProofViewer": {
+          "type": "pair-proof",
+          "mac": "G-iVm095wO8brxV7Er8Kk4DpQln03e-LtNqNZ7_p5FI"
+        },
+        "pairProofPc": {
+          "type": "pair-proof",
+          "mac": "oLatJWOG53W-rTA0O2n5ci85CIG4uDKGE3OD_udxnT0"
+        },
+        "pairDone": {
+          "type": "pair-done"
+        },
+        "pairDenied": {
+          "type": "pair-denied"
+        }
+      }
+    },
+    "admit": {
+      "type": "admit",
+      "viewers": [
+        "47Z3-3QX1-AJH6-2RKB"
+      ],
+      "remotePairing": false
+    },
+    "ctl": {
+      "messages": [
+        {
+          "direction": "viewer-to-pc",
+          "seq": 0,
+          "kind": "input",
+          "encoding": "binary",
+          "plaintextHex": "0d024b002500",
+          "nonceHex": "000000000000000000000000",
+          "aadUtf8": "input",
+          "message": {
+            "type": "ctl",
+            "kind": "input",
+            "seq": 0,
+            "data": "g-MM7_Nrukb9JSvvLFD8OSTZBtjBMg"
+          }
+        },
+        {
+          "direction": "viewer-to-pc",
+          "seq": 1,
+          "kind": "file-cancel",
+          "encoding": "json",
+          "plaintextHex": "7b2274797065223a2266696c652d63616e63656c222c226964223a227431227d",
+          "plaintextUtf8": "{\"type\":\"file-cancel\",\"id\":\"t1\"}",
+          "nonceHex": "000000000000000000000001",
+          "aadUtf8": "file-cancel",
+          "message": {
+            "type": "ctl",
+            "kind": "file-cancel",
+            "seq": 1,
+            "data": "L0G2inDfbZUxKjpY9UTMzMEg8YrkntRfy2sE4fbELDQZQimYrd7Kn7YoLLauTm2M"
+          }
+        },
+        {
+          "direction": "pc-to-viewer",
+          "seq": 0,
+          "kind": "clipboard",
+          "encoding": "json",
+          "plaintextHex": "7b2274797065223a22636c6970626f617264222c2270726f746f636f6c223a312c2274657874223a2268656c6c6f227d",
+          "plaintextUtf8": "{\"type\":\"clipboard\",\"protocol\":1,\"text\":\"hello\"}",
+          "nonceHex": "000000000000000000000000",
+          "aadUtf8": "clipboard",
+          "message": {
+            "type": "ctl",
+            "kind": "clipboard",
+            "seq": 0,
+            "data": "NJUIqSfWnPP7qt_KfQDBGGov087nXk9_wOrkE8o9rXtIsmGaQJ9U0j9iIKs1RUcxC_cS5PhWgTJCyIUt9svJMg"
+          }
+        },
+        {
+          "direction": "pc-to-viewer",
+          "seq": 1,
+          "kind": "cursor",
+          "encoding": "json",
+          "plaintextHex": "7b2274797065223a22637572736f72222c227368617065223a2274657874227d",
+          "plaintextUtf8": "{\"type\":\"cursor\",\"shape\":\"text\"}",
+          "nonceHex": "000000000000000000000001",
+          "aadUtf8": "cursor",
+          "message": {
+            "type": "ctl",
+            "kind": "cursor",
+            "seq": 1,
+            "data": "GKvvqTHnB0if2NhC04-bip30mTysdsTeO1SWQGBcjfforVCQgy1qp0ayNevPbFFb"
+          }
+        }
+      ],
+      "failures": [
+        {
+          "name": "replayed-seq",
+          "direction": "viewer-to-pc",
+          "expectedSeq": 1,
+          "message": {
+            "type": "ctl",
+            "kind": "input",
+            "seq": 0,
+            "data": "g-MM7_Nrukb9JSvvLFD8OSTZBtjBMg"
+          },
+          "expected": "end-session"
+        },
+        {
+          "name": "skipped-seq",
+          "direction": "viewer-to-pc",
+          "expectedSeq": 0,
+          "message": {
+            "type": "ctl",
+            "kind": "file-cancel",
+            "seq": 1,
+            "data": "L0G2inDfbZUxKjpY9UTMzMEg8YrkntRfy2sE4fbELDQZQimYrd7Kn7YoLLauTm2M"
+          },
+          "expected": "end-session"
+        },
+        {
+          "name": "wrong-kind-aad",
+          "direction": "viewer-to-pc",
+          "expectedSeq": 0,
+          "message": {
+            "type": "ctl",
+            "kind": "clipboard",
+            "seq": 0,
+            "data": "g-MM7_Nrukb9JSvvLFD8OSTZBtjBMg"
+          },
+          "expected": "end-session"
+        },
+        {
+          "name": "wrong-direction-key",
+          "direction": "pc-to-viewer",
+          "expectedSeq": 0,
+          "message": {
+            "type": "ctl",
+            "kind": "input",
+            "seq": 0,
+            "data": "g-MM7_Nrukb9JSvvLFD8OSTZBtjBMg"
+          },
+          "expected": "end-session"
+        }
+      ]
+    },
+    "bind": {
+      "encoding": "phase0",
+      "vectors": "handshake.dtls",
+      "messages": "handshake.messages.authBind, handshake.messages.authBindPc"
+    },
+    "caps": {
+      "mandatory": [
+        "control-aead-v1"
+      ],
+      "mandatoryWebRtc": [
+        "control-aead-v1",
+        "dtls-bind-v1"
+      ],
+      "pairing": "pair-v1"
+    }
   }
 }

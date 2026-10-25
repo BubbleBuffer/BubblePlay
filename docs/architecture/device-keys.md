@@ -331,6 +331,8 @@ Sizes: S under a week, M one to three weeks, L three to six weeks, each with tes
 
 Verified: repeated generation is byte-identical and matches the staged fixture; Node 24 passes 10 checks, Node 22 passes 7 with the required 3 skips. On 2026-10-15, `cd relay && go test ./... -run DeviceKeys -v` passes all four checks on linux01 with Go 1.27.1, including relay proofs; `go vet ./...` also passes. No Go ran on the PC.
 
+2026-10-25: the fixture gained a `phase2` section (phase 0 content unchanged): pairing code and its normalisation, the relay admit hash (`"bubbleplay-pair-admit-v1"` || canonical PC ID || normalised code, no length prefixes), pair key (HKDF-SHA256, code ASCII as IKM, empty salt, info `bubbleplay-pair-v1`), both `pair-proof` MACs plus a wrong-code MAC, the comparison number, the QR and link forms, `pair-open`/`pair-close`/`pair-closed`/`pair-done`/`pair-denied`, an `admit` list, mandatory caps, and `ctl` envelopes for sequences 0/1 in each direction (the viewer's sequence 0 is a binary input frame, the rest JSON) with replay, skip, wrong-kind and wrong-direction failures. `auth-bind` keeps the phase 0 `handshake.dtls` encoding below. Where phase 0 defines an encoding, it wins.
+
 ### Encodings for implementers
 
 - **IDs/key files:** SHA-256(raw 32-byte Ed25519 public), first 10 bytes, most-significant-bit-first Crockford base32, uppercase `XXXX-XXXX-XXXX-XXXX`. Ignore input hyphens/case; O→0, I/L→1. Seed: 32 bytes. Plain: `kdf`/`aead` null, `private` = seed. Protected: Argon2id v19, UTF-8 passphrase, m=65536 KiB, t=3, p=1, salt 16 bytes, output 32 bytes; AES-256-GCM nonce 12 bytes, `private` = ciphertext || 16-byte tag.
