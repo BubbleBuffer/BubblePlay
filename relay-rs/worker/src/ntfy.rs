@@ -24,7 +24,7 @@ async fn post(url: &str, headers: &[(String, String)], body: Vec<u8>) -> Result<
     let controller = AbortController::default();
     let signal = controller.signal();
     let deadline = Deadline::start(controller)?;
-    let mut header_map = Headers::new();
+    let header_map = Headers::new();
     for (name, value) in headers {
         header_map.set(name, value)?;
     }
