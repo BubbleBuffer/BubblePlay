@@ -235,34 +235,19 @@ test("first-frame startup uses one bounded retry and clears on native or decoded
   assert.match(client, /lastDecodedDimensions/);
 });
 
-test("login uses the BubblePlay responsive shell while preserving remembered auth", () => {
-  const login = readFileSync(new URL("../public/login.html", import.meta.url), "utf8");
-  assert.match(login, /class="brand"/);
-  assert.match(login, /Welcome back/);
-  assert.match(login, /security-note/);
-  assert.match(login, /autocomplete="current-password"/);
-  assert.match(login, /Remember this browser for 30 days/);
-  assert.match(login, /fetch\("\/__auth\/login"/);
-});
-
 test("BubbleBuffer edge instrument replaces purple glass and exposes adaptive session controls", () => {
   const client = readClientSource();
-  const login = readFileSync(new URL("../public/login.html", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../public/bubbleplay.css", import.meta.url), "utf8");
 
   assert.match(client, /href="\/bubbleplay\.css"/);
-  assert.match(login, /href="\/bubbleplay\.css"/);
   assert.match(client, /class="session-page/);
-  assert.match(login, /class="auth-page"/);
-  assert.match(login, /class="signal-cut"/);
   assert.match(client, /id="context-hint"/);
-  assert.match(client, /id="logout-session"/);
+  assert.match(client, /id="switch-pc"/);
+  assert.match(client, /id="lock-key"/);
   assert.match(client, /id="forget-browser"/);
   assert.match(client, /function syncShellMode\(\)/);
   assert.match(client, /classList\.toggle\("mode-game"/);
   assert.match(client, /classList\.add\("has-presented-frame"\)/);
-  assert.match(client, /endBrowserSession\("\/__auth\/logout", false\)/);
-  assert.match(client, /endBrowserSession\("\/__auth\/forget-browser", true\)/);
   assert.match(styles, /--bright-apricot:\s*#F0A064/i);
   assert.match(styles, /@font-face[\s\S]*atkinson-hyperlegible-next\.woff2/);
   // Touch layout docks the bar at the bottom with 48px targets (session-ui.md, Web touch).
@@ -271,7 +256,6 @@ test("BubbleBuffer edge instrument replaces purple glass and exposes adaptive se
   assert.doesNotMatch(styles, /chrome-idle/);
   assert.doesNotMatch(client, /chrome-idle/);
   assert.doesNotMatch(styles, /#7c3aed|#9b6cff|backdrop-filter|linear-gradient|radial-gradient/i);
-  assert.doesNotMatch(login, /#7c3aed|#9b6cff|backdrop-filter|linear-gradient|radial-gradient/i);
 });
 
 test("client starts a new signaling and peer epoch after relay loss or peer departure", () => {
@@ -283,22 +267,14 @@ test("client starts a new signaling and peer epoch after relay loss or peer depa
   assert.match(client, /pendingRemoteIce/);
 });
 
-test("browser signaling uses the remembered server session and never stores an application secret", () => {
+test("browser signaling sends the signed viewer hello and never stores an application secret", () => {
   const client = readClientSource();
-  const login = readFileSync(new URL("../public/login.html", import.meta.url), "utf8");
   assert.match(client, /const labRun = parseLabRun\(params\)/);
   assert.match(client, /labRun \? "\/lab-ws" : "\/ws"/);
   assert.match(client, /labRun \? "\/lab-media-ws" : "\/media-ws"/);
-  assert.match(client, /sendSignal\(\{ type: "hello", role: "client", \.\.\.\(wantsTurn\(params\) \? \{ turn: true \} : \{\}\) \}\)/);
+  assert.match(client, /sendRelay\(viewerHello\(\{ identity: sessionIdentity, turn: wantsTurn\(params\) \}\)\)/);
   assert.doesNotMatch(client, /bp_token|BubblePlay token|hello", token/);
-  assert.match(login, /autocomplete="current-password"/);
-  assert.match(login, /Remember this browser for 30 days/);
-  assert.match(login, /fetch\("\/__auth\/login"/);
-  assert.match(login, /next\.searchParams\.delete\("approval"\)/);
-  assert.match(login, /location\.replace\(`\$\{next\.pathname\}\$\{next\.search\}`\)/);
-  const inlineScript = login.match(/<script>([\s\S]*?)<\/script>/)?.[1];
-  assert.ok(inlineScript);
-  assert.doesNotThrow(() => new Function(inlineScript));
+  assert.doesNotMatch(client, /localStorage[^\n]*(privateKey|sessionIdentity)/);
 });
 
 test("WSS fallback negotiates the v4 media socket and keeps the control surface", () => {
@@ -312,7 +288,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /streamMode: streamModeValue\(\)/);
   assert.match(client, /<option value="auto">Auto<\/option>/);
   assert.match(client, /function mediaSocketUrl\(\)/);
-  assert.match(client, /role: "media-client"/);
+  assert.match(client, /role: "media-viewer"/);
   assert.match(client, /hev1\.1\.6\.L120\.B0/);
   assert.match(client, /media-control/);
   assert.match(client, /fullFrameDiagnostic/);

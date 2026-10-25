@@ -22,9 +22,14 @@ test("local receiver overrides include the entrypoint and its module dependencie
     assert.equal(response.method, "Fetch.fulfillRequest", path);
     const body = Buffer.from(response.params.body, "base64").toString();
     assert.equal(body, readFileSync(new URL(`../public${path}`, import.meta.url), "utf8"));
-    pending.push(...[...body.matchAll(/from\s+["'](\/[^"']+\.js)["']/g)].map(match => match[1]));
+    pending.push(...[...body.matchAll(/(?:from\s+|import\()["']((?:\.{1,2})?\/[^"']+\.js)["']/g)]
+      .map(match => new URL(match[1], `https://lab.example${path}`).pathname)
+      // The lab overrides top-level public/*.js; vendored files (the KDF worker's argon2) are unchanged builds.
+      .filter(dependency => !dependency.startsWith("/vendor/")));
   }
+  assert.ok(visited.has("/dk-app.js"));
   assert.ok(visited.has("/receiver.js"));
+  assert.ok(visited.has("/dk-relay.js"));
   assert.ok(visited.has("/media-v4.js"));
   await paused({ requestId: "external", resourceType: "Script", request: { url: "https://other.example/receiver.js" } });
   assert.equal(calls.at(-1).method, "Fetch.continueRequest");

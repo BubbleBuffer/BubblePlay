@@ -83,13 +83,13 @@ test("first-frame is requested directly after successful offer signaling", async
   const context = vm.createContext({ generation: 3,
     candidate: { createOffer: async () => ({ sdp: "offer-sdp" }), setLocalDescription: async () => events.push("local-description") },
     isCurrentPeer: () => true, rtcOfferSignaled: false,
-    sendSignal: message => { events.push(message.type); return true; },
+    sendControl: message => { events.push(message.type); return true; },
     startFirstFrameHandshake: reason => events.push(`first-frame:${reason}`),
   });
   await vm.runInContext(`(async () => { ${block} })()`, context);
   assert.deepEqual(events, ["local-description", "offer", "first-frame:offer-sent"]);
   assert.equal(context.rtcOfferSignaled, true);
-  events.length = 0; context.sendSignal = () => false; context.rtcOfferSignaled = false;
+  events.length = 0; context.sendControl = () => false; context.rtcOfferSignaled = false;
   await vm.runInContext(`(async () => { ${block} })()`, context);
   assert.deepEqual(events, ["local-description"]);
   assert.equal(context.rtcOfferSignaled, false);
@@ -109,7 +109,7 @@ test("slow ICE renews an exhausted offer-time handshake; normal ICE retains its 
     clearFirstFrameWatchdog() { if (state.timer !== null) timers.delete(state.timer); state.timer = null; },
     firstFrameRequestId: () => `request-${++nextRequest}`,
     sendFirstFrameRequest: () => sent.push(state.requestId),
-    renderDesktopState() {}, sendClientLog() {}, sendSignal() {}, recoverWssStartup() {},
+    renderDesktopState() {}, sendClientLog() {}, sendControl() {}, recoverWssStartup() {},
     WSS_PROTOCOL: 4, codecSession: { codec: "hevc" },
     setTimeout: (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
     candidate, generation: 0, isCurrentPeer: () => true, hudState: {}, connected: false,

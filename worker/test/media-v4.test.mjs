@@ -222,7 +222,7 @@ test("receiver wires v4: media-socket keyframes, in-order decode, reconnect back
   assert.match(source, /latencyGuard\.admitDecode\(usingWssMedia \? Infinity : decodeHardLimit\)/);
   assert.match(source, /shouldPresentDecodedV4\(/);
   assert.match(source, /Connected · WSS \(static\)/);
-  assert.match(source, /sendSignal\(\{ type: "ping" \}\);\s*\}, V4_HEARTBEAT_MS\);/);
+  assert.match(source, /if \(signalingRegistered\) sendRelay\(\{ type: "ping" \}\);\s*\}, V4_HEARTBEAT_MS\);/);
   // v4 has no deadline expiry timer.
   assert.match(source, /\/\/ v4 decodes every frame in order: there is no deadline expiry\.\s*startWssV4\(\);/);
 });
@@ -246,6 +246,6 @@ test("receiver input stays on the signaling socket and the media socket carries 
   for (const arg of calls) assert.match(arg, /^(ackMessageV4|keyframeMessageV4|'\{"type":"ping"\}')/);
   // Shared media sender, plus the media hello with or without a signaling ticket.
   assert.equal([...source.matchAll(/(?<!ws)\bsocket\.send\(/g)].length, 3);
-  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-client", ticket: signalingTicket \}\)\)/);
-  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-client" \}\)\)/);
+  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-viewer", ticket: signalingTicket \}\)\)/);
+  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-viewer" \}\)\)/);
 });

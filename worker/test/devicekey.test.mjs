@@ -625,50 +625,75 @@ test("createDeviceKeyApi returns the full API and needs a function KDF", () => {
 });
 
 // A deliberately small asynchronous fake: requests succeed before transaction
-// commit, and an injected commit failure aborts without persisting a write.
+// commit, writes apply only when the last request settles, and an injected
+// commit failure aborts without persisting a write.
 import { createDeviceKeyStore } from "../public/devicekey-store.js";
 import { Worker as ThreadWorker } from "node:worker_threads";
 import { deriveKeyInWorker } from "../public/devicekey-kdf-worker.js";
 
-function memoryIDB() {
-  const records = new Map();
-  const state = { records, opens: 0, closes: 0, upgrades: 0, commits: 0, abortNext: false, blockedNext: false };
-  let exists = false;
+function memoryIDB({ existing = [] } = {}) {
+  const stores = new Map([["keys", new Map()], ["pcs", new Map()]]);
+  const records = stores.get("keys");
+  const state = { records, pcs: stores.get("pcs"), opens: 0, closes: 0, upgrades: 0, commits: 0, abortNext: false, blockedNext: false };
+  const created = new Set(existing);
   const db = () => ({
-    objectStoreNames: { contains: name => exists && name === "keys" },
-    createObjectStore(name) { assert.equal(name, "keys"); exists = true; state.upgrades++; },
+    objectStoreNames: { contains: name => created.has(name) },
+    createObjectStore(name, options) {
+      assert.ok(stores.has(name), name);
+      assert.ok(!created.has(name), `${name} created twice`);
+      assert.deepEqual(options, name === "pcs" ? { keyPath: "id" } : undefined);
+      created.add(name);
+      state.upgrades++;
+    },
     close() { state.closes++; },
     transaction(name, mode) {
-      assert.equal(name, "keys");
+      assert.ok(created.has(name), name);
       assert.ok(mode === "readonly" || mode === "readwrite");
+      const data = stores.get(name);
+      const writes = [];
+      let pending = 0;
+      let finished = false;
       const transaction = { error: null };
-      const run = (kind, key, value) => {
-        assert.equal(key, "device");
+      // Commits once no request is pending; writes apply only at commit.
+      const settle = () => queueMicrotask(() => {
+        if (pending || finished) return;
+        finished = true;
+        if (state.abortNext) {
+          state.abortNext = false;
+          transaction.error = new Error("simulated quota failure at commit");
+          transaction.onabort?.();
+          return;
+        }
+        for (const write of writes) write();
+        state.commits++;
+        transaction.oncomplete?.();
+      });
+      const run = (resultOf, write) => {
         const request = { result: undefined, error: null };
+        pending++;
         queueMicrotask(() => {
-          request.result = kind === "get" ? records.get(key) : kind === "put" ? key : undefined;
+          request.result = resultOf();
+          if (write) writes.push(write);
           request.onsuccess?.();
-          queueMicrotask(() => {
-            if (state.abortNext) {
-              state.abortNext = false;
-              transaction.error = new Error("simulated quota failure at commit");
-              transaction.onabort?.();
-            } else {
-              if (kind === "put") records.set(key, value);
-              if (kind === "delete") records.delete(key);
-              state.commits++;
-              transaction.oncomplete?.();
-            }
-          });
+          pending--;
+          settle();
         });
         return request;
       };
-      transaction.objectStore = name => {
-        assert.equal(name, "keys");
+      transaction.objectStore = storeName => {
+        assert.equal(storeName, name);
+        const writable = () => assert.equal(mode, "readwrite");
         return {
-          get: key => run("get", key),
-          put: (value, key) => { assert.equal(mode, "readwrite"); return run("put", key, value); },
-          delete: key => { assert.equal(mode, "readwrite"); return run("delete", key); },
+          get: key => run(() => structuredClone(data.get(key))),
+          getAll: () => run(() => [...data.values()].map(value => structuredClone(value))),
+          put: (value, key) => {
+            writable();
+            if (name === "pcs") { assert.equal(key, undefined); key = value.id; }
+            else assert.equal(key, "device");
+            const copy = structuredClone(value);
+            return run(() => key, () => data.set(key, copy));
+          },
+          delete: key => { writable(); return run(() => undefined, () => data.delete(key)); },
         };
       };
       return transaction;
@@ -678,12 +703,12 @@ function memoryIDB() {
     state,
     open(name, version) {
       assert.equal(name, "bubbleplay-device");
-      assert.equal(version, 1);
+      assert.equal(version, 2);
       state.opens++;
       const request = { result: db() };
       queueMicrotask(() => {
         if (state.blockedNext) { state.blockedNext = false; request.onblocked?.(); }
-        if (!exists) request.onupgradeneeded?.();
+        if (!created.has("keys") || !created.has("pcs")) request.onupgradeneeded?.();
         request.onsuccess?.();
       });
       return request;
@@ -699,7 +724,7 @@ test("IndexedDB stores the original JSON text in exactly one device record and c
   await store.save(original);
   assert.equal(await createDeviceKeyStore({ indexedDB }).load(), original);
   assert.deepEqual([...indexedDB.state.records], [["device", original]]);
-  assert.equal(indexedDB.state.upgrades, 1);
+  assert.equal(indexedDB.state.upgrades, 2, "a fresh database gets keys and pcs");
   await store.clear();
   await store.clear();
   assert.equal(await store.load(), null);
@@ -736,6 +761,58 @@ test("IndexedDB handles unavailable storage, blocked opens and non-text records"
   indexedDB.state.records.set("device", new Uint8Array(32));
   await assert.rejects(store.load(), /not JSON text/);
   assert.equal(indexedDB.state.opens, indexedDB.state.closes);
+});
+
+test("version 2 adds the pcs store without touching an existing version-1 key record", async () => {
+  const indexedDB = memoryIDB({ existing: ["keys"] });
+  indexedDB.state.records.set("device", "stored JSON text");
+  const store = createDeviceKeyStore({ indexedDB });
+  assert.equal(await store.load(), "stored JSON text");
+  assert.equal(indexedDB.state.upgrades, 1, "only pcs is created");
+  assert.deepEqual(await store.listPcs(), []);
+  assert.equal(indexedDB.state.opens, indexedDB.state.closes);
+});
+
+test("pcs store keeps canonical records and supports rename, touch and remove", async () => {
+  const indexedDB = memoryIDB();
+  const store = createDeviceKeyStore({ indexedDB });
+  const pc = fixture.ids.find(item => item.name === "pc");
+  const alias = pc.id.toLowerCase().replace(/-/g, "").replace(/0/g, "o").replace(/1/g, "l");
+  const saved = await store.putPc({ id: alias, name: "  Office PC  ", public: pc.public, paired: 1_000 });
+  assert.deepEqual(saved, { id: pc.id, name: "Office PC", public: pc.public, paired: 1_000, lastUsed: null });
+  assert.deepEqual([...indexedDB.state.pcs.keys()], [pc.id]);
+  assert.deepEqual(await store.getPc(alias), saved);
+  assert.equal(await store.getPc("not an id"), null);
+  assert.deepEqual(await store.listPcs(), [saved]);
+
+  assert.deepEqual(await store.renamePc(pc.id, "x".repeat(100)), { ...saved, name: "x".repeat(80) });
+  assert.equal((await store.renamePc(pc.id, "   ")).name, pc.id, "an empty name falls back to the ID");
+  assert.equal((await store.touchPc(pc.id, 5_000)).lastUsed, 5_000);
+  assert.equal((await store.getPc(pc.id)).lastUsed, 5_000);
+  const other = fixture.ids.find(item => item.id !== pc.id);
+  assert.equal(await store.touchPc(other.id, 6_000), null, "touching an unknown PC writes nothing");
+  assert.equal(indexedDB.state.pcs.size, 1);
+
+  await store.removePc(alias);
+  assert.deepEqual(await store.listPcs(), []);
+  assert.equal(indexedDB.state.opens, indexedDB.state.closes);
+});
+
+test("pcs store refuses malformed records and keeps the key record separate", async () => {
+  const indexedDB = memoryIDB();
+  const store = createDeviceKeyStore({ indexedDB });
+  const pc = fixture.ids.find(item => item.name === "pc");
+  const good = { id: pc.id, name: "PC", public: pc.public, paired: 1 };
+  for (const bad of [{ ...good, id: "nope" }, { ...good, public: "short" }, { ...good, paired: -1 },
+    { ...good, paired: 1.5 }, { ...good, lastUsed: "yesterday" }]) {
+    await assert.rejects(store.putPc(bad));
+  }
+  assert.equal(indexedDB.state.pcs.size, 0);
+  await store.save("key JSON text");
+  await store.putPc(good);
+  await store.clear();
+  assert.equal(await store.load(), null);
+  assert.equal((await store.listPcs()).length, 1, "removing the key leaves the PC list");
 });
 
 // Node has WebCrypto but no browser Worker global. Adapt worker_threads only at

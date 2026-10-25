@@ -1,0 +1,269 @@
+/* Device-key gate screens (dk-gate.js). Colours and type come from the tokens in bubbleplay.css:
+   duvet field behind one fitted panel, bright apricot only on the screen's one primary action,
+   focus ring in focus blue, Fragment Mono only for IDs, codes and the comparison number. */
+
+#dk-gate {
+  position: fixed;
+  z-index: 40;
+  inset: 0;
+  display: grid;
+  place-items: start center;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: max(24px, env(safe-area-inset-top)) 24px max(24px, env(safe-area-inset-bottom));
+  color: var(--milk-cloth);
+  background: var(--duvet);
+}
+
+#dk-gate[hidden] { display: none; }
+
+#dk-gate .dk-gate-panel {
+  box-sizing: border-box;
+  width: min(440px, 100%);
+  min-width: 0;
+  padding: 24px;
+  text-align: left;
+  background: var(--duvet-ink);
+  border: 1px solid var(--thread-strong);
+  border-radius: 12px 18px 10px 16px;
+}
+
+#dk-gate .dk-gate-panel:focus { outline: none; }
+
+#dk-gate .dk-gate-refusal { border-left: 3px solid var(--paw-pink); }
+
+#dk-gate .dk-gate-title {
+  margin: 0;
+  font-family: "Bricolage Grotesque", "Segoe UI", sans-serif;
+  font-size: 28px;
+  font-weight: 620;
+  font-stretch: 88%;
+  line-height: 1.1;
+  letter-spacing: -0.025em;
+  overflow-wrap: anywhere;
+}
+
+#dk-gate .dk-gate-title:focus { outline: none; }
+#dk-gate .dk-gate-heading-2 { margin: 0 0 10px; font-size: 17px; font-weight: 680; }
+
+#dk-gate .dk-gate-subtitle { margin: 6px 0 0; color: var(--muted-cream); font-size: 13px; }
+#dk-gate .dk-gate-copy { margin: 12px 0 0; color: var(--milk-cloth); line-height: 1.5; overflow-wrap: anywhere; }
+#dk-gate .dk-gate-help { margin: 0; color: var(--muted-cream); font-size: 13px; line-height: 1.45; }
+
+#dk-gate .dk-gate-mono {
+  font-family: "Fragment Mono", Consolas, monospace;
+  letter-spacing: 0.04em;
+  overflow-wrap: anywhere;
+}
+
+#dk-gate .dk-gate-number {
+  margin: 18px 0 4px;
+  font-family: "Fragment Mono", Consolas, monospace;
+  font-size: clamp(44px, 15vw, 68px);
+  font-weight: 400;
+  line-height: 1.1;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+/* Fields ------------------------------------------------------------------- */
+
+#dk-gate .dk-gate-form { margin: 0; }
+#dk-gate .dk-gate-field { display: grid; gap: 6px; margin-top: 16px; }
+#dk-gate .dk-gate-label { color: var(--milk-cloth); font-size: 14px; font-weight: 720; }
+
+#dk-gate .dk-gate-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 46px;
+  padding: 10px 12px;
+  color: var(--milk-cloth);
+  background: var(--dark-surface);
+  border: 1px solid var(--thread-strong);
+  border-radius: 6px 10px 6px 8px;
+  font: inherit;
+  font-size: 15px;
+}
+
+#dk-gate .dk-gate-input::placeholder { color: var(--dark-thread-strong); opacity: 1; }
+
+/* Buttons ------------------------------------------------------------------ */
+
+#dk-gate .dk-gate-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+#dk-gate .dk-gate-actions:empty { display: none; }
+
+#dk-gate .dk-gate-btn {
+  min-height: 46px;
+  padding: 10px 16px;
+  color: var(--milk-cloth);
+  background: var(--dark-surface);
+  border: 1px solid var(--thread-strong);
+  border-radius: 7px 11px 6px 9px;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+#dk-gate .dk-gate-btn:hover { background: var(--dark-muted); }
+#dk-gate .dk-gate-btn:active { transform: translateY(1px); }
+#dk-gate .dk-gate-btn:disabled { color: var(--dark-thread-strong); background: var(--duvet); cursor: not-allowed; }
+#dk-gate .dk-gate-btn[hidden] { display: none; }
+
+#dk-gate .dk-gate-primary {
+  color: var(--duvet-ink);
+  background: var(--bright-apricot);
+  border-color: var(--bright-apricot);
+  font-weight: 720;
+}
+
+#dk-gate .dk-gate-primary:hover { background: var(--calico-apricot); border-color: var(--calico-apricot); }
+#dk-gate .dk-gate-primary:disabled { color: var(--dark-thread-strong); background: var(--duvet); border-color: var(--thread); }
+
+/* Destructive and link-like actions: secondary styling, kept apart from the main action. */
+#dk-gate .dk-gate-quiet,
+#dk-gate .dk-gate-danger {
+  min-height: 40px;
+  padding: 6px 10px;
+  color: var(--muted-cream);
+  background: transparent;
+  border-color: transparent;
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+#dk-gate .dk-gate-quiet:hover { color: var(--milk-cloth); background: transparent; }
+#dk-gate .dk-gate-danger { color: var(--danger); }
+#dk-gate .dk-gate-danger:hover { color: var(--milk-cloth); background: color-mix(in srgb, var(--danger) 18%, transparent); }
+
+/* Seams and apart zones ---------------------------------------------------- */
+
+#dk-gate .dk-gate-seam { height: 1px; margin: 22px 0 18px; background: var(--thread); }
+#dk-gate .dk-gate-apart { margin-top: 4px; }
+#dk-gate .dk-gate-apart .dk-gate-quiet { margin-top: 2px; }
+
+#dk-gate .dk-gate-confirm {
+  margin-top: 10px;
+  padding: 12px 14px 14px;
+  background: var(--dark-surface);
+  border: 1px solid var(--thread-strong);
+  border-radius: 8px 12px 7px 10px;
+}
+
+#dk-gate .dk-gate-confirm .dk-gate-copy { margin: 0; font-size: 14px; }
+#dk-gate .dk-gate-confirm .dk-gate-actions { margin-top: 12px; }
+
+/* Status and errors --------------------------------------------------------- */
+
+#dk-gate .dk-gate-error { min-height: 0; margin: 12px 0 0; color: var(--danger); font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
+#dk-gate .dk-gate-status { min-height: 0; margin: 12px 0 0; color: var(--muted-cream); font-size: 13px; }
+#dk-gate .dk-gate-status:empty { margin: 0; }
+
+/* Progress hint while the PC answers. Still under reduced motion. */
+
+#dk-gate .dk-gate-progress {
+  height: 4px;
+  margin-top: 18px;
+  overflow: hidden;
+  background: var(--dark-muted);
+  border-radius: 2px;
+}
+
+#dk-gate .dk-gate-progress-bar {
+  width: 40%;
+  height: 100%;
+  background: var(--bright-apricot);
+  border-radius: 2px;
+  animation: dk-gate-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes dk-gate-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(260%); }
+}
+
+/* PC list ------------------------------------------------------------------ */
+
+#dk-gate .dk-gate-pcs { display: grid; gap: 8px; margin: 18px 0 0; padding: 0; list-style: none; }
+
+#dk-gate .dk-gate-pc {
+  min-width: 0;
+  background: var(--dark-surface);
+  border: 1px solid var(--thread);
+  border-radius: 8px 12px 7px 10px;
+}
+
+#dk-gate .dk-gate-pc-main {
+  box-sizing: border-box;
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  min-height: 46px;
+  padding: 12px 14px 6px;
+  color: var(--milk-cloth);
+  background: transparent;
+  border: 0;
+  border-radius: 8px 12px 0 0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+#dk-gate .dk-gate-pc-main:hover { background: var(--dark-muted); }
+#dk-gate .dk-gate-pc-main:disabled { cursor: not-allowed; color: var(--dark-thread-strong); }
+#dk-gate .dk-gate-pc-name { font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
+#dk-gate .dk-gate-pc-id { color: var(--muted-cream); font-size: 12px; overflow-wrap: anywhere; }
+#dk-gate .dk-gate-pc-used { color: var(--muted-cream); font-size: 12px; }
+
+#dk-gate .dk-gate-pc-tools {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 2px;
+  padding: 0 8px 4px;
+}
+
+#dk-gate .dk-gate-pc-tools .dk-gate-btn { min-height: 40px; }
+#dk-gate .dk-gate-inline { padding: 0 14px 12px; }
+#dk-gate .dk-gate-inline .dk-gate-actions { margin-top: 12px; }
+#dk-gate .dk-gate-pc .dk-gate-confirm { margin: 0 10px 10px; }
+#dk-gate .dk-gate-pair { margin: 0; }
+
+/* Footer -------------------------------------------------------------------- */
+
+#dk-gate .dk-gate-footer { display: grid; gap: 4px; }
+#dk-gate .dk-gate-foot { margin: 0; color: var(--muted-cream); font-size: 13px; overflow-wrap: anywhere; }
+#dk-gate .dk-gate-footer .dk-gate-actions { margin-top: 10px; }
+
+/* Focus and motion ---------------------------------------------------------- */
+
+#dk-gate :where(button, input):focus-visible {
+  outline: 2px solid var(--focus-blue);
+  outline-offset: 3px;
+}
+
+@media (max-width: 700px) {
+  #dk-gate { padding: 16px; }
+  #dk-gate .dk-gate-panel { padding: 24px 20px; }
+  #dk-gate .dk-gate-btn { flex: 1 1 auto; }
+}
+
+@media (pointer: coarse) {
+  #dk-gate .dk-gate-btn,
+  #dk-gate .dk-gate-input { min-height: 46px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #dk-gate *,
+  #dk-gate *::before,
+  #dk-gate *::after { transition: none !important; animation: none !important; }
+  #dk-gate .dk-gate-progress-bar { width: 40%; transform: translateX(60%); }
+}

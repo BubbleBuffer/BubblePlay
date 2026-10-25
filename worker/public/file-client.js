@@ -261,7 +261,7 @@ export class FileTransferClient extends EventTarget {
     ws.onopen = () => {
       if (this.ws !== ws) return;
       const ticket = this.socketTicket();
-      ws.send(JSON.stringify({ type: "hello", role: "file-client", ...(ticket ? { ticket } : {}) }));
+      ws.send(JSON.stringify({ type: "hello", role: "file-viewer", ...(ticket ? { ticket } : {}) }));
     };
     ws.onmessage = event => { if (this.ws === ws) this.onMessage(event.data); };
     ws.onclose = () => { if (this.ws === ws) this.onSocketClosed(); };

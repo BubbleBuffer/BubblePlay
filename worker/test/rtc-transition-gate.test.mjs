@@ -111,7 +111,7 @@ function receiverHarness({ path = "native", reason = "desktop-source-transition"
     input: { resumeAfterTransition() {} }, onInputReady() {}, showContextHint() {}, renderDesktopState() {}, debugTrace() {},
     clearFirstFrameWatchdog() {}, recoverWssStartup() {}, sendClientLog() {}, forgetRtcFailure() {}, rtcFailureStorage() {},
     rtcStartupFallback: { progress() {}, stop() {}, requestSent() {} }, document: { body: { classList: { add() {} } } },
-    resyncPipeline: (why, gate) => resyncs.push({ why, gate }), sendSignal: (message) => signals.push(message),
+    resyncPipeline: (why, gate) => resyncs.push({ why, gate }), sendControl: (message) => signals.push(message),
     recycleSignaling() {}, restartPeer() {},
     restartPeerInNewEpoch: (_fns, why) => restarts.push(why),
     ws: { readyState: 1 }, WebSocket: { OPEN: 1 }, rtcOfferSignaled: true, mediaEpoch: null, desktopAvailable: true,

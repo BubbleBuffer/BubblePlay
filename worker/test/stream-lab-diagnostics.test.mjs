@@ -47,7 +47,7 @@ test("WSS recovery watches for a keyframe and never suppresses an identified lab
     client.indexOf("function clearWssKeyframeWatchdog", client.indexOf("function requestWssKeyframe(reason")));
   assert.match(request, /if \(!requestId && requestWssKeyframe\.lastAt/);
   assert.match(request, /return false/);
-  assert.match(request, /sendSignal\([\s\S]*?requestId[\s\S]*?return true/);
+  assert.match(request, /sendControl\([\s\S]*?requestId[\s\S]*?return true/);
   const recovery = client.slice(client.indexOf("function beginWssRecovery(reason"),
     client.indexOf("function scheduleWssAck", client.indexOf("function beginWssRecovery(reason")));
   assert.match(recovery, /function beginWssRecovery\(reason, requestId = null\)/);
