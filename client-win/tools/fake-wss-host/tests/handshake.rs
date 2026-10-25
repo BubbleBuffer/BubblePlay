@@ -4,12 +4,16 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use bp_device_key::Role;
 use common::*;
 use fake_wss_host::model::Injections;
 use fake_wss_host::protocol::decode_frame;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 const WAIT: Duration = Duration::from_secs(2);
@@ -53,21 +57,21 @@ async fn media_socket_must_match_the_current_epoch() {
         Duration::from_millis(100),
     )
     .await;
-    let (mut signal, epoch_a) = signal_hello(harness.addr).await;
+    let (mut signal, epoch_a, ticket_a) = signal_hello_ticket(harness.addr).await;
 
     // A well-formed but wrong epoch is refused at the upgrade.
-    match media_open(harness.addr, &"0".repeat(32)).await {
+    match media_open(harness.addr, &"0".repeat(32), &ticket_a).await {
         Err(WsError::Http(response)) => assert_eq!(response.status(), 409),
         other => panic!("expected HTTP 409 for a wrong epoch, got {other:?}"),
     }
     // A malformed epoch is refused too.
     assert!(matches!(
-        media_open(harness.addr, "NOT-HEX").await,
+        media_open(harness.addr, "NOT-HEX", &ticket_a).await,
         Err(WsError::Http(_))
     ));
 
     // The current epoch is accepted: both readiness controls are on media.
-    let mut media = media_open(harness.addr, &epoch_a)
+    let mut media = media_open(harness.addr, &epoch_a, &ticket_a)
         .await
         .expect("upgrade with current epoch");
     let reply = next_json(&mut media, WAIT).await.expect("media hello-ok");
@@ -83,19 +87,19 @@ async fn media_socket_must_match_the_current_epoch() {
     assert_eq!(peer["present"], true);
 
     // A new /ws hello rotates the epoch and closes the stale media socket.
-    let (_signal_b, epoch_b) = signal_hello(harness.addr).await;
+    let (_signal_b, epoch_b, ticket_b) = signal_hello_ticket(harness.addr).await;
     assert_ne!(epoch_a, epoch_b);
     assert!(
         next_json(&mut media, WAIT).await.is_none(),
         "stale media socket is closed"
     );
-    match media_open(harness.addr, &epoch_a).await {
+    match media_open(harness.addr, &epoch_a, &ticket_a).await {
         Err(WsError::Http(response)) => {
             assert_eq!(response.status(), 409, "old epoch is stale now")
         }
         other => panic!("expected HTTP 409 for a stale epoch, got {other:?}"),
     }
-    let mut fresh = media_open(harness.addr, &epoch_b)
+    let mut fresh = media_open(harness.addr, &epoch_b, &ticket_b)
         .await
         .expect("upgrade with the new epoch");
     assert_eq!(
@@ -110,6 +114,90 @@ async fn media_socket_must_match_the_current_epoch() {
         snap.counters.stale_epoch_control
     );
     assert_eq!(snap.counters.media_attaches, 2);
+}
+
+#[tokio::test]
+async fn a_bad_relay_proof_closes_1008_and_admits_nothing() {
+    let harness = spawn(
+        synthetic(60, 30),
+        no_injections(),
+        Duration::from_millis(600),
+        Duration::from_millis(100),
+    )
+    .await;
+    let identity = viewer_identity();
+    let mut ws = open(harness.addr, "/ws").await.expect("open /ws");
+    send_json(
+        &mut ws,
+        json!({
+            "type": "hello",
+            "role": "viewer",
+            "id": identity.id().to_string(),
+            "public": identity.public_b64(),
+        }),
+    )
+    .await;
+    let challenge = next_json(&mut ws, WAIT).await.expect("register-challenge");
+    assert_eq!(challenge["type"], "register-challenge", "{challenge}");
+    let nonce: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(challenge["nonce"].as_str().expect("nonce"))
+        .expect("nonce is base64url")
+        .try_into()
+        .expect("nonce is 32 bytes");
+    // Signed for an origin this relay does not serve: the proof must not verify.
+    let signature = identity.sign_relay_proof(Role::Viewer, "https://relay.example", &nonce);
+    send_json(
+        &mut ws,
+        json!({"type": "register-proof", "signature": URL_SAFE_NO_PAD.encode(signature)}),
+    )
+    .await;
+    match ws.next().await {
+        Some(Ok(Message::Close(Some(frame)))) => assert_eq!(frame.code, CloseCode::Policy),
+        other => panic!("expected a 1008 close, got {other:?}"),
+    }
+
+    let snap = harness.finish().await;
+    assert!(snap.epochs.is_empty(), "no epoch was issued");
+}
+
+#[tokio::test]
+async fn a_media_ticket_from_an_earlier_signalling_socket_is_refused() {
+    let harness = spawn(
+        synthetic(60, 30),
+        no_injections(),
+        Duration::from_millis(900),
+        Duration::from_millis(100),
+    )
+    .await;
+    let (_first, epoch_a, ticket_a) = signal_hello_ticket(harness.addr).await;
+    let (_second, epoch_b, ticket_b) = signal_hello_ticket(harness.addr).await;
+    assert_ne!(epoch_a, epoch_b);
+
+    // The ticket of the rotated-out signalling socket is refused, and so is an invented one.
+    let mut stale = media_open(harness.addr, &epoch_b, &ticket_a)
+        .await
+        .expect("upgrade");
+    assert!(
+        next_json(&mut stale, WAIT).await.is_none(),
+        "a stale ticket closes the media socket"
+    );
+    let mut invented = media_open(harness.addr, &epoch_b, "AAAA")
+        .await
+        .expect("upgrade");
+    assert!(
+        next_json(&mut invented, WAIT).await.is_none(),
+        "an invented ticket closes the media socket"
+    );
+    let mut fresh = media_open(harness.addr, &epoch_b, &ticket_b)
+        .await
+        .expect("upgrade");
+    assert_eq!(
+        next_json(&mut fresh, WAIT).await.expect("hello-ok")["type"],
+        "hello-ok"
+    );
+
+    let snap = harness.finish().await;
+    assert_eq!(snap.counters.media_attaches, 1, "only the good ticket attaches");
 }
 
 #[tokio::test]

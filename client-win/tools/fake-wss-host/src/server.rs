@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use bp_device_key::{relay_origin, verify_relay_proof, Role};
 use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -94,7 +96,7 @@ enum Kind {
 enum Outbound {
     Text(String),
     Binary(Vec<u8>),
-    Close(&'static str),
+    Close(CloseCode, &'static str),
 }
 
 #[derive(Debug)]
@@ -123,6 +125,15 @@ struct Conn {
     kind: Kind,
     out: mpsc::Sender<Outbound>,
     hello: bool,
+    /// A viewer hello that got its challenge and waits for `register-proof`.
+    pending: Option<Pending>,
+}
+
+/// What a `register-proof` must answer, from the viewer's hello and the challenge.
+struct Pending {
+    id: String,
+    public: String,
+    nonce: [u8; 32],
 }
 
 struct FirstFrame {
@@ -167,6 +178,10 @@ struct Hub {
     drain: Duration,
     mirror: EpochMirror,
     epoch: Option<String>,
+    /// The media ticket issued by the admitted `/ws` hello. Cleared with the epoch.
+    ticket: Option<String>,
+    /// The relay origin the viewers sign for: `relay_origin` of this server's `ws://` URL.
+    origin: String,
     epochs: Vec<String>,
     conns: HashMap<u64, Conn>,
     signal: Option<u64>,
@@ -221,13 +236,25 @@ impl Hub {
     /// Remove the connection and ask its task to close the socket. Dropping
     /// the sender also ends the task if the close frame cannot be queued.
     fn close_conn(&mut self, id: u64, reason: &'static str) {
+        self.close_with(id, CloseCode::Normal, reason);
+    }
+
+    /// As `close_conn`, with close code 1008 (Policy): a failed admission.
+    fn close_policy(&mut self, id: u64, reason: &'static str) {
+        self.close_with(id, CloseCode::Policy, reason);
+    }
+
+    fn close_with(&mut self, id: u64, code: CloseCode, reason: &'static str) {
         if let Some(conn) = self.conns.remove(&id) {
-            let _ = conn.out.try_send(Outbound::Close(reason));
+            let _ = conn.out.try_send(Outbound::Close(code, reason));
         }
     }
 
     fn set_epoch(&mut self, value: Option<String>) {
         *self.mirror.lock().unwrap_or_else(|e| e.into_inner()) = value.clone();
+        if value.is_none() {
+            self.ticket = None;
+        }
         self.epoch = value;
     }
 
@@ -367,6 +394,7 @@ impl Hub {
                         kind,
                         out,
                         hello: false,
+                        pending: None,
                     },
                 );
             }
@@ -598,13 +626,16 @@ impl Hub {
     }
 
     fn on_signal_text(&mut self, id: u64, text: &str, now: Instant) {
+        if self.conns.get(&id).is_some_and(|c| c.pending.is_some()) {
+            return self.on_register_proof(id, text, now);
+        }
         let hello = self.conns.get(&id).is_some_and(|c| c.hello);
         let message = match signal::parse_signal(text) {
             Ok(message) => message,
             Err(_) => return self.reject(),
         };
         match message {
-            Signal::Hello { role } => self.on_signal_hello(id, &role, now),
+            Signal::Hello { role, body } => self.on_signal_hello(id, &role, &body),
             _ if !hello => self.reject(),
             Signal::Ping => {
                 self.send(id, Outbound::Text(protocol::pong()));
@@ -615,6 +646,8 @@ impl Hub {
             Signal::FirstFrame { phase, request_id } => {
                 self.on_first_frame(id, &phase, &request_id)
             }
+            // B2: answer auth-hello with auth-host (bp_device_key::phase2), then route endpoint messages through ctl.
+            Signal::Other(kind) if kind.starts_with("auth-") => {}
             Signal::Other(kind) => {
                 *self
                     .model
@@ -626,14 +659,63 @@ impl Hub {
         }
     }
 
-    /// A client hello on `/ws` rotates the epoch: the previous media socket
-    /// is closed, the previous signalling socket is superseded, and the model
-    /// starts a new generation that begins at a keyframe.
-    fn on_signal_hello(&mut self, id: u64, role: &str, now: Instant) {
+    /// The first `/ws` hello. Only a viewer with the right keys gets a
+    /// challenge; nothing is admitted, and no epoch rotates, until its proof
+    /// verifies (see `on_register_proof`).
+    fn on_signal_hello(&mut self, id: u64, role: &str, body: &Value) {
         let already = self.conns.get(&id).is_some_and(|c| c.hello);
-        if role != "client" || already {
+        if already {
             return self.reject();
         }
+        let hello = match (role, signal::parse_viewer_hello(body)) {
+            ("viewer", Ok(hello)) => hello,
+            _ => return self.close_policy(id, "bad-hello"),
+        };
+        let nonce = protocol::random32();
+        if let Some(conn) = self.conns.get_mut(&id) {
+            conn.pending = Some(Pending {
+                id: hello.id,
+                public: hello.public,
+                nonce,
+            });
+        }
+        self.send(id, Outbound::Text(protocol::register_challenge(&nonce)));
+    }
+
+    /// The answer to the challenge. Any other message, or a proof that does not
+    /// verify for this viewer, origin and nonce, closes with 1008 and admits nothing.
+    fn on_register_proof(&mut self, id: u64, text: &str, now: Instant) {
+        let pending = self.conns.get_mut(&id).and_then(|c| c.pending.take());
+        let Some(pending) = pending else { return };
+        if !self.proof_verifies(&pending, text) {
+            return self.close_policy(id, "bad-proof");
+        }
+        self.admit(id, now);
+    }
+
+    fn proof_verifies(&self, pending: &Pending, text: &str) -> bool {
+        let Some(signature) = protocol::register_proof_signature(text) else {
+            return false;
+        };
+        let Some(public) = protocol::b64url_decode(&pending.public) else {
+            return false;
+        };
+        verify_relay_proof(
+            Role::Viewer,
+            &self.origin,
+            &pending.nonce,
+            &pending.id,
+            &public,
+            &signature,
+        )
+        .is_ok()
+    }
+
+    /// An admitted viewer rotates the epoch: the previous media socket is
+    /// closed, the previous signalling socket is superseded, and the model
+    /// starts a new generation that begins at a keyframe. The media ticket is
+    /// issued here, for this signalling socket only.
+    fn admit(&mut self, id: u64, now: Instant) {
         if self.epoch.is_some() {
             self.input_disconnected("epoch-rotated", now);
         }
@@ -648,6 +730,8 @@ impl Hub {
         self.model.begin_epoch(now);
         let epoch = protocol::new_epoch(self.model.counters.epochs_issued);
         self.set_epoch(Some(epoch.clone()));
+        let ticket = protocol::b64url_encode(&protocol::random32());
+        self.ticket = Some(ticket.clone());
         self.epochs.push(epoch.clone());
         self.signal = Some(id);
         self.first_frame = None;
@@ -656,7 +740,7 @@ impl Hub {
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.hello = true;
         }
-        self.send(id, Outbound::Text(protocol::hello_ok_signal(&epoch)));
+        self.send(id, Outbound::Text(protocol::hello_ok_signal(&epoch, &ticket)));
         self.send_monitor_list(id);
         if self.audio.is_some() {
             self.send(id, Outbound::Text(protocol::host_capabilities_audio()));
@@ -873,7 +957,7 @@ impl Hub {
         let hello = self.conns.get(&id).is_some_and(|c| c.hello);
         if !hello {
             return match signal::parse_signal(text) {
-                Ok(Signal::Hello { role }) => self.on_media_hello(id, &role, now),
+                Ok(Signal::Hello { role, body }) => self.on_media_hello(id, &role, &body, now),
                 _ => self.reject(),
             };
         }
@@ -898,8 +982,15 @@ impl Hub {
         }
     }
 
-    fn on_media_hello(&mut self, id: u64, role: &str, now: Instant) {
-        if role != "media-client" || self.epoch.is_none() {
+    /// The media hello: role `media-viewer` and the ticket of the current
+    /// signalling socket. Anything else is closed as before.
+    fn on_media_hello(&mut self, id: u64, role: &str, body: &Value, now: Instant) {
+        let ticket = body.get("ticket").and_then(Value::as_str);
+        let admitted = role == "media-viewer"
+            && self.epoch.is_some()
+            && ticket.is_some()
+            && ticket == self.ticket.as_deref();
+        if !admitted {
             self.reject();
             self.close_conn(id, "bad-media-hello");
             return;
@@ -1148,8 +1239,8 @@ async fn connection(
                         break;
                     }
                 }
-                Some(Outbound::Close(reason)) => {
-                    let frame = CloseFrame { code: CloseCode::Normal, reason: reason.into() };
+                Some(Outbound::Close(code, reason)) => {
+                    let frame = CloseFrame { code, reason: reason.into() };
                     let _ = sink.send(Message::Close(Some(frame))).await;
                     break;
                 }
@@ -1162,6 +1253,13 @@ async fn connection(
 
 /// Serve until `exit_after`, then drain, close every socket and return.
 pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapshot> {
+    // The origin a viewer signs for is the one of the `ws://` URL this server
+    // is reachable at, as the client computes it (`relay_origin`).
+    let bound = listener
+        .local_addr()
+        .context("the listener has no local address")?;
+    let origin =
+        relay_origin(&format!("ws://{bound}")).context("no relay origin for the listener")?;
     let mirror: EpochMirror = Arc::new(Mutex::new(None));
     let (events_tx, events_rx) = mpsc::channel(EVENT_DEPTH);
     let recorder = config
@@ -1199,6 +1297,8 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
         drain: config.drain,
         mirror: mirror.clone(),
         epoch: None,
+        ticket: None,
+        origin,
         epochs: Vec::new(),
         conns: HashMap::new(),
         signal: None,

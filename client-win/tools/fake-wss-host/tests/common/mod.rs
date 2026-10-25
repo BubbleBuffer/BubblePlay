@@ -9,6 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use bp_device_key::{relay_origin, DeviceIdentity, Role};
 use fake_wss_host::audio::Script;
 use fake_wss_host::model::{Injections, Source};
 use fake_wss_host::monitors::Knobs as MonitorKnobs;
@@ -311,26 +314,79 @@ pub async fn next_json(ws: &mut Ws, wait: Duration) -> Option<Value> {
     }
 }
 
-/// `/ws` hello as the browser sends it; returns the socket and its epoch.
-pub async fn signal_hello(addr: SocketAddr) -> (Ws, String) {
+/// The viewer identity the handshake tests admit: the seed
+/// `9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60`.
+pub const VIEWER_SEED: [u8; 32] = [
+    0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+    0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
+];
+
+pub fn viewer_identity() -> DeviceIdentity {
+    DeviceIdentity::from_seed(&VIEWER_SEED)
+}
+
+/// `/ws` hello as a viewer: the signed hello, the challenge, the proof, then
+/// hello-ok. Returns the socket, its epoch and the media ticket.
+pub async fn signal_hello_ticket(addr: SocketAddr) -> (Ws, String, String) {
+    let identity = viewer_identity();
     let mut ws = open(addr, "/ws").await.expect("open /ws");
-    send_json(&mut ws, json!({"type": "hello", "role": "client"})).await;
+    send_json(
+        &mut ws,
+        json!({
+            "type": "hello",
+            "role": "viewer",
+            "id": identity.id().to_string(),
+            "public": identity.public_b64(),
+        }),
+    )
+    .await;
+    let challenge = next_json(&mut ws, Duration::from_secs(2))
+        .await
+        .expect("register-challenge");
+    assert_eq!(challenge["type"], "register-challenge", "{challenge}");
+    let nonce: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(challenge["nonce"].as_str().expect("nonce"))
+        .expect("nonce is base64url")
+        .try_into()
+        .expect("nonce is 32 bytes");
+    // The origin the client signs for: the relay's ws:// URL, canonicalised.
+    let origin = relay_origin(&format!("ws://{addr}")).expect("loopback origin");
+    let signature = identity.sign_relay_proof(Role::Viewer, &origin, &nonce);
+    send_json(
+        &mut ws,
+        json!({"type": "register-proof", "signature": URL_SAFE_NO_PAD.encode(signature)}),
+    )
+    .await;
     let reply = next_json(&mut ws, Duration::from_secs(2))
         .await
         .expect("hello-ok");
     assert_eq!(reply["type"], "hello-ok", "{reply}");
     let epoch = reply["mediaEpoch"].as_str().expect("mediaEpoch").to_owned();
     assert!(is_valid_epoch(&epoch), "bad epoch {epoch}");
+    let ticket = reply["ticket"].as_str().expect("ticket").to_owned();
+    let ticket_bytes = URL_SAFE_NO_PAD.decode(&ticket).expect("ticket is base64url");
+    assert_eq!(ticket_bytes.len(), 32, "ticket is 32 bytes");
+    (ws, epoch, ticket)
+}
+
+/// `signal_hello_ticket` without the ticket.
+pub async fn signal_hello(addr: SocketAddr) -> (Ws, String) {
+    let (ws, epoch, _ticket) = signal_hello_ticket(addr).await;
     (ws, epoch)
 }
 
-/// `/media-ws?epoch=` hello; the caller reads the reply.
+/// `/media-ws?epoch=` hello with the ticket; the caller reads the reply.
 pub async fn media_open(
     addr: SocketAddr,
     epoch: &str,
+    ticket: &str,
 ) -> std::result::Result<Ws, tokio_tungstenite::tungstenite::Error> {
     let mut ws = open(addr, &format!("/media-ws?epoch={epoch}")).await?;
-    send_json(&mut ws, json!({"type": "hello", "role": "media-client"})).await;
+    send_json(
+        &mut ws,
+        json!({"type": "hello", "role": "media-viewer", "ticket": ticket}),
+    )
+    .await;
     Ok(ws)
 }
 
@@ -351,8 +407,8 @@ pub fn start_with_audio(epoch: &str, codec: &str) -> Value {
 
 /// Start the fake streaming on a fresh session with media attached.
 pub async fn streaming_session(addr: SocketAddr, codec: &str) -> (Ws, Ws, String) {
-    let (mut signal, epoch) = signal_hello(addr).await;
-    let mut media = media_open(addr, &epoch).await.expect("media upgrade");
+    let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
+    let mut media = media_open(addr, &epoch, &ticket).await.expect("media upgrade");
     let reply = next_json(&mut media, Duration::from_secs(2))
         .await
         .expect("media hello-ok");

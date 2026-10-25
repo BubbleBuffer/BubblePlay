@@ -21,8 +21,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
+bp-device-key = { path = "../../../crates/bp-device-key" }
 futures-util = { version = "0.3", features = ["sink"] }
 opus = "0.4.0"
+# OS randomness for the register nonce and the media ticket. Pinned like
+# bp-device-key's own copy, so the two resolve to one rand_core.
+rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
 serde_json = "1"
 str0m = { version = "0.21.0", default-features = false, features = ["aws-lc-rs"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }

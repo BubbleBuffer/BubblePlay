@@ -2,6 +2,8 @@
 //! relay applies to them for protocol 4 (`relay/protocol.go`
 //! `validSignalMessage`). Media-socket control lives in `protocol.rs`.
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde_json::Value;
 
 use crate::protocol::{is_valid_epoch, V4_MAX_CONTROL_BYTES};
@@ -10,10 +12,26 @@ use crate::protocol::{is_valid_epoch, V4_MAX_CONTROL_BYTES};
 /// they get their own cap. Oversize frames are refused, not truncated.
 pub const SIGNAL_MAX_BYTES: usize = 16 * 1024;
 
+/// The keys a viewer's `/ws` hello may carry. Any other key closes the socket.
+const VIEWER_HELLO_KEYS: [&str; 5] = ["type", "role", "id", "public", "pair"];
+
+/// A viewer's `/ws` hello after its keys and types were checked. The proof
+/// itself is checked later, against the challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewerHello {
+    /// The device ID as sent (the proof check requires the canonical form).
+    pub id: String,
+    /// The raw Ed25519 public key as sent, unpadded base64url.
+    pub public: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signal {
+    /// A `hello`. `role` is read here; `body` is the whole message, so the
+    /// caller can check the keys its socket allows.
     Hello {
         role: String,
+        body: Value,
     },
     Ping,
     MediaControl(MediaControl),
@@ -84,6 +102,7 @@ pub fn parse_signal(text: &str) -> Result<Signal, &'static str> {
                 .ok_or("hello has no role")?;
             Ok(Signal::Hello {
                 role: role.to_owned(),
+                body: value.clone(),
             })
         }
         "ping" => Ok(Signal::Ping),
@@ -163,6 +182,39 @@ pub fn parse_signal(text: &str) -> Result<Signal, &'static str> {
     }
 }
 
+/// Checks a viewer's `/ws` hello body: only the allowed keys, `id` and `public`
+/// as strings, and `pair`, if present, as 32 bytes of base64url.
+pub fn parse_viewer_hello(body: &Value) -> Result<ViewerHello, &'static str> {
+    let object = body.as_object().ok_or("hello is not an object")?;
+    if object
+        .keys()
+        .any(|key| !VIEWER_HELLO_KEYS.contains(&key.as_str()))
+    {
+        return Err("hello has an unknown key");
+    }
+    let id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("hello has no id")?;
+    let public = body
+        .get("public")
+        .and_then(Value::as_str)
+        .ok_or("hello has no public key")?;
+    if let Some(pair) = object.get("pair") {
+        let bytes = pair
+            .as_str()
+            .and_then(|text| URL_SAFE_NO_PAD.decode(text).ok())
+            .ok_or("pair is not base64url")?;
+        if bytes.len() != 32 {
+            return Err("pair is not 32 bytes");
+        }
+    }
+    Ok(ViewerHello {
+        id: id.to_owned(),
+        public: public.to_owned(),
+    })
+}
+
 /// The media socket's text control has a tighter cap (`V4_MAX_CONTROL_BYTES`).
 pub fn media_text_fits(text: &str) -> bool {
     text.len() <= V4_MAX_CONTROL_BYTES
@@ -176,19 +228,48 @@ mod tests {
 
     #[test]
     fn hello_roles_are_read_for_both_sockets() {
+        let viewer = r#"{"type":"hello","role":"viewer","id":"x","public":"y"}"#;
         assert_eq!(
-            parse_signal(r#"{"type":"hello","role":"client","turn":true}"#),
+            parse_signal(viewer),
             Ok(Signal::Hello {
-                role: "client".into()
+                role: "viewer".into(),
+                body: serde_json::from_str(viewer).unwrap(),
             })
         );
-        assert_eq!(
-            parse_signal(r#"{"type":"hello","role":"media-client"}"#),
-            Ok(Signal::Hello {
-                role: "media-client".into()
-            })
-        );
+        let media = r#"{"type":"hello","role":"media-viewer","ticket":"t"}"#;
+        match parse_signal(media) {
+            Ok(Signal::Hello { role, body }) => {
+                assert_eq!(role, "media-viewer");
+                assert_eq!(body["ticket"], "t");
+            }
+            other => panic!("expected a hello, got {other:?}"),
+        }
         assert!(parse_signal(r#"{"type":"hello"}"#).is_err());
+    }
+
+    #[test]
+    fn viewer_hello_takes_only_its_keys() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use serde_json::json;
+
+        let plain = json!({"type": "hello", "role": "viewer", "id": "a", "public": "b"});
+        assert_eq!(
+            parse_viewer_hello(&plain),
+            Ok(ViewerHello {
+                id: "a".into(),
+                public: "b".into()
+            })
+        );
+        let pair = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let with_pair = json!({"type": "hello", "role": "viewer", "id": "a", "public": "b", "pair": pair});
+        assert!(parse_viewer_hello(&with_pair).is_ok());
+        let short_pair = json!({"type": "hello", "role": "viewer", "id": "a", "public": "b", "pair": "AAAA"});
+        assert!(parse_viewer_hello(&short_pair).is_err());
+        let extra = json!({"type": "hello", "role": "viewer", "id": "a", "public": "b", "turn": true});
+        assert!(parse_viewer_hello(&extra).is_err());
+        let no_public = json!({"type": "hello", "role": "viewer", "id": "a"});
+        assert!(parse_viewer_hello(&no_public).is_err());
     }
 
     #[test]

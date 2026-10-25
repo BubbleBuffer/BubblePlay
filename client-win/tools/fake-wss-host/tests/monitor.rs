@@ -272,9 +272,11 @@ async fn a_switch_moves_the_wss_stream_to_a_new_generation_that_starts_at_an_idr
         None,
     )
     .await;
-    let (mut signal, epoch) = signal_hello(harness.addr).await;
+    let (mut signal, epoch, ticket) = signal_hello_ticket(harness.addr).await;
     let _hello_list = expect_json(&mut signal).await;
-    let mut media = media_open(harness.addr, &epoch).await.expect("media upgrade");
+    let mut media = media_open(harness.addr, &epoch, &ticket)
+        .await
+        .expect("media upgrade");
     let reply = expect_json(&mut media).await;
     assert_eq!(reply["type"], "hello-ok", "{reply}");
     let peer = expect_json(&mut media).await;
