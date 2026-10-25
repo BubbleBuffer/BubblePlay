@@ -29,13 +29,41 @@ Run these commands from `client-win/`, after building both crates through the sh
 
 Use `--mode game` for Game; omit the flag for Work. Starting Game engages the hook and pointer capture: run desktop qualification only on VM 101, never on the owner's working PC. The fake host records decoded valid/refused packets, held state and disconnect lifecycle in JSON lines, and sends a finite scripted cursor sequence. Its `--seq-gap-at 5 --generation-at 10 --socket-drop-at 15` offsets start at host launch. The normal session now requests audio with `audio:1` (step 3); the input-only fixture keeps its decode-free path. Automatic codec selection uses H.264 for forced WSS and tries HEVC before H.264 for RTC when the decoder supports it; explicit HEVC remains available on `--dev-wss` with an installed hardware decoder.
 
-The optional `dev-login` feature is off by default. Without it, the development relay flags, provision parsing and TOTP module are absent. Build an explicitly enabled development executable with `cargo build --release --features dev-login` (under the same lock), then run:
+### Device key and PC list (phase 2, stage A, 2026-10-25)
+
+The password, TOTP and cookie login is gone: `--password-file`, `--totp-provision`, the `dev-login` feature, `net/login.rs` and `net/cookies.rs` were deleted, and no socket sends an `Origin` header or cookies. The relay admits the viewer by its device key ([device keys](device-keys.md), "Phase 2 relay protocol"). Only the dev CLI path (`--dev-relay`, `--dev-wss`, `net/` and `session/`) uses the key; the egui screens still run against the mock backend.
+
+- **Key at rest:** `%LOCALAPPDATA%\BubblePlay\viewer\device-key.bpkey`, the portable `.bpkey` JSON (`crates/bp-device-key` `KeyFile`) wrapped in a CurrentUser DPAPI blob (`src/store/key.rs`, `src/store/dpapi.rs`). A key with a passphrase asks for it on the console, without echo, when a session opens it. A key that cannot be unlocked means no connection.
+- **`--key <file.bpkey>`** reads a plain (not DPAPI-wrapped) key file instead, for development.
+- **PC list:** `%LOCALAPPDATA%\BubblePlay\viewer\pcs.json`, a JSON array of `{name, id, public, relay}` (`public` is the pinned PC key, base64url, empty until paired). `PcStore::add` is the API stage B pairing (`--pair`) will call.
+- **Subcommands** (the executable is a GUI program, so pipe it, for example `... | Out-Host`, to keep the shell from reading the console at the same time):
 
 ```powershell
-.\target\release\bubbleplay-client.exe --dev-relay http://127.0.0.1:8788 --password-file C:\path\password.txt --totp-provision C:\path\provision.txt --codec auto --mode work --exit-after 30 --stats-out F:\build\relay-stats.json
+.\target\debug\bubbleplay-client.exe key create [--label L] [--passphrase-prompt]
+.\target\debug\bubbleplay-client.exe key import C:\path\viewer.bpkey
+.\target\debug\bubbleplay-client.exe key export C:\path\viewer.bpkey   # plain portable file; never overwrites
+.\target\debug\bubbleplay-client.exe key show                            # prints the viewer ID
+.\target\debug\bubbleplay-client.exe pcs list
+.\target\debug\bubbleplay-client.exe pcs remove <id>
 ```
 
-The origin must use http/https and host 127.0.0.1, ::1 or localhost; refusal precedes file reads and network access. The helper reads only the provision's Authenticator secret/enrollment URI, computes RFC 6238 SHA1/6-digit/30-second TOTP, makes one login POST with `remember:false` and exact Origin, requires 204, and reuses both cookies on `/ws` and `/media-ws`, including Secure cookies over loopback HTTP. Redirects and automatic POST retries are disabled. Logs expose status and cookie names; password, provision contents, TOTP material and cookie values are not persisted. Real-relay login is reserved for the user's coming live test.
+- **Relay session:** `--dev-relay <origin> --pc <id>`. The origin is `https://host[:port]`, or `http://` for a loopback relay only. `--pc` is required here and optional on `--dev-wss`. The PC need not be in `pcs.json`.
+
+```powershell
+.\target\release\bubbleplay-client.exe --dev-relay https://relay.example --pc 77VH-7M56-8GJK-Y12J --codec auto --mode work --exit-after 30 --stats-out F:\build\relay-stats.json
+```
+
+On the wire: `/ws?pc=<id>`, then `{"type":"hello","role":"viewer","id","public"}`. The relay answers `register-challenge {nonce}`, and the client replies `{"type":"register-proof","signature"}`, signed with `sign_relay_proof(Role::Viewer, origin, nonce)` where the origin is `relay_origin` of the relay URL. `hello-ok` carries `mediaEpoch`, `iceServers` and a `ticket`. The media socket is `/media-ws?pc=<id>&epoch=<epoch>`, with hello `{"type":"hello","role":"media-viewer","ticket"}`. A 1008 close before `hello-ok` is fatal (`NetError::NotAdmitted`) and is not retried. A `hello-ok` without a ticket is a protocol error, because pairing mode is stage B. The handshake (`auth-hello`), pairing, ctl AEAD and the DTLS bind are stage B. Input and clipboard sends are unchanged.
+
+Known gap: `tools/fake-wss-host` still expects the old `client` / `media-client` hellos and sends no challenge or ticket, so `--dev-wss` against it fails until it is updated. It is a separate crate and is not built in CI.
+
+### CI
+
+The `client-win` job in `.github/workflows/checks.yml` runs on windows-latest with the pinned 1.97.1 toolchain:
+
+- `cargo test --locked` for the crate, which includes the `tests/ui_layout.rs` snapshots;
+- all-target Clippy with `-D warnings`;
+- `rustfmt --check` from `src/main.rs`. The frozen mock UI (`src/ui`, `src/mock.rs`, `src/model.rs`) is `#[rustfmt::skip]` in `main.rs`, and `tests/ui_layout.rs` is not covered.
 
 `--stats-out` contains received/decoded/presented rates over the final one-second window, frame intervals p50/p95/p99, receipt-to-new-frame-blit p50/p95, requests/drops/errors, codec/resolution, and Work absolute-input RTT when a matching cursor ACK exists. Presentation timing uses CPU successful video-processor blit callbacks, not scanout. Video quantiles retain the most recent 8192 samples. Input RTT runs from type-8 socket send start to receipt of an ACK_VALID type-128 with the same sequence and epoch; it includes host cursor publication and return transport, excludes UI queueing/display, and remains null without matching echoes. Input quantiles retain the most recent 512 matching echoes in the current epoch; the sample counter is cumulative within that epoch.
 
@@ -114,15 +142,15 @@ Constraint: no host, relay or protocol changes. The client speaks exactly what t
 
 Learned from `worker/public/`, `relay/`, `worker/src/` and `host/src/` (research notes 2026-10-13; line references are in those files, not repeated here).
 
-- **Login.** `POST /__auth/login` with JSON `{password, totp?, remember}` and `Origin` equal to the relay's public URL. The relay sets two cookies, `__Host-gate` and `__Host-bp-session`, which go on every socket upgrade. The Go relay accepts password plus TOTP; the Cloudflare relay needs an approved site-gate cookie first (ntfy or [host approval](browser-approval.md)), so the client needs a "waiting for approval" screen. There is no pairing today; [device keys](device-keys.md) is designed but not built.
-- **Signaling.** `wss://<relay>/ws`, first message `{"type":"hello","role":"client"}`. The reply `hello-ok` carries `iceServers` and a fresh `mediaEpoch`; every media socket and `media-control` message must carry that epoch. Reconnect is a new hello and a new epoch.
+- **Admission (phase 2, replaces the 2026-10-13 password and cookie login).** A signed viewer hello on `/ws?pc=<id>`, then a register-challenge and register-proof. See "Device key and PC list" above and [device keys](device-keys.md).
+- **Signaling.** `wss://<relay>/ws?pc=<id>`. The reply `hello-ok` carries `iceServers`, a fresh `mediaEpoch` and the media `ticket`. Every media socket and `media-control` message must carry that epoch. Reconnect is a new hello and a new epoch.
 - **Two media transports, both already served by the host:**
   - **WebRTC** (browser default in auto mode): the client offers recvonly HEVC + H.264 video and Opus audio, and opens two data channels, `input-control` (ordered, reliable) and `input-motion` (unordered, no retransmits). The host is str0m 0.21, prefers HEVC, gathers host and server-reflexive candidates only (no TURN client on the host side).
-  - **WSS v4**: `/media-ws?epoch=E`. One Annex-B access unit per binary message behind a 28-byte `BPV4` header; the client ACKs every frame and asks for keyframes on gaps. Audio rides the same socket as BPA1 packets (one 10 ms Opus frame each) when `start` carries `audio:1`. Input goes as binary on `/ws`. Traffic passes through the relay.
+  - **WSS v4**: `/media-ws?pc=<id>&epoch=E`, hello `media-viewer` with the ticket. One Annex-B access unit per binary message behind a 28-byte `BPV4` header; the client ACKs every frame and asks for keyframes on gaps. Audio rides the same socket as BPA1 packets (one 10 ms Opus frame each) when `start` carries `audio:1`. Input goes as binary on `/ws`. Traffic passes through the relay.
 - **Input.** Little-endian binary packets from `fixtures/input-contract.json`: set-1 scan codes with an E0 flag (type 13), relative motion with wheel (7), absolute position (8), buttons-at (9), release-all (6), with one wrapping u16 sequence per epoch. Cursor state and cursor kind come back as packets 128 and 129.
 - **Monitor switch.** `media-control` `monitor`. The browser's in-place switch needs `requestVideoFrameCallback` RTP timestamps; a native client can match the admitted `rtpTimestamp` itself on WebRTC, or restart in a new epoch as the browser's fallback does.
 
-Nothing in the protocol depends on a browser. Cookies, the Origin header and the ntfy wait are plain HTTP.
+Nothing in the protocol depends on a browser.
 
 ## Stacks compared
 
@@ -192,7 +220,7 @@ All dated 2026-10-13.
 - **Transports.** v1 ships both. WSS v4 is built first, then WebRTC with auto fallback, matching the browser.
 - **Relays.** The Go relay comes first. Cloudflare, with the approval wait screen, is required before v1 is called done.
 - **Packaging.** For v1 the client is a separate portable exe. Installer integration is decided later.
-- **Local storage.** Saved devices and the remembered session cookie live in `%APPDATA%\BubblePlay\client\`. The cookies are protected with DPAPI.
+- **Local storage** (superseded 2026-10-25 by phase 2 device keys). The viewer key and the PC list live in `%LOCALAPPDATA%\BubblePlay\viewer\`, with the key wrapped by DPAPI. There are no cookies.
 - **Codecs.** H.264 is first-class, because hosts with Media Foundation encoders produce only H.264 and the host will follow codec changes on keyframes. The client must work on a PC without the HEVC extension, by checking at startup which decoders are installed.
 - **Decode route: Media Foundation** (2026-10-14, from the spike in [`client-win/spikes/decode-latency`](../../client-win/spikes/decode-latency/README.md)). Median submit-to-presented is within 0.3 ms of FFmpeg d3d11va for both codecs on the GTX 1660 Super (H.264 about 4.5 ms, HEVC about 3.3 ms, present-on-decode). MF H.264 has much tighter tails (p99 about 11 ms against 54 ms). Both backends show HEVC stalls of 100-500 ms. The machine was under heavy memory and build load during the runs, so the tails are not reliable; a quiet-machine rerun is still owed. The MF HEVC MFT here has no ICodecAPI; low latency is set through the `MF_LOW_LATENCY` attribute instead. FFmpeg stays out of the client.
 - **Step 6 scope** (2026-10-15, main session). Rule for every case: copy what the browser does today, with no new protocol messages. Monitor switch uses `media-control` `monitor` on signaling with one pending switch, as `monitor-selection.js` does. On WebRTC the client keeps the peer and switches in place, admitting frames by the host's `rtpTimestamp`; a new epoch is used only if that cannot map onto str0m, with the reason recorded here. Work/Game changes live with `media-control` `mode`, as the browser does. Quality and audio controls come later: on the live path they are disabled, not hidden, so the approved layout stays. The Follow row stays out. The saved default monitor per PC is applied once per session.
