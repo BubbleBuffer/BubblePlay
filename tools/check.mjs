@@ -21,7 +21,7 @@ function files(directory) {
 }
 if (["full", "client", "syntax"].includes(profile)) {
   let checked = 0;
-  for (const directory of ["worker/src", "worker/public", "worker/tools", "worker/test", "tools"]) {
+  for (const directory of ["worker/public", "worker/tools", "worker/test", "tools"]) {
     for (const file of files(join(root, directory))) {
       if (/\.(?:js|mjs)$/.test(file)) {
         run(process.execPath, ["--check", file]);

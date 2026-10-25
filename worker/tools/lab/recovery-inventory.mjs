@@ -12,7 +12,7 @@ export const DEFAULT_FULL_HASH_LIMIT_BYTES = 1024 * 1024;
 export const DEFAULT_SAMPLE_BYTES = 64 * 1024;
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 
-const SOURCE_PREFIXES = ["host/src/", "worker/src/", "worker/public/"];
+const SOURCE_PREFIXES = ["host/src/", "worker/public/"];
 const GENERATED_PREFIXES = [
   "target/", "target-stage1/", "host/target-", "host/sdk-stub/",
   "node_modules/", "worker/node_modules/", "worker/.wrangler/", "worker/.wrangler-dry-run/",

@@ -23,7 +23,6 @@
     "check": "node ../tools/check.mjs client"
   },
   "devDependencies": {
-    "wrangler": "4.147.0",
     "ws": "^8.21.3"
   }
 }

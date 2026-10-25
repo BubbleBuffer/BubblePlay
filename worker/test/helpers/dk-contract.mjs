@@ -1,6 +1,6 @@
 // Device-key fixtures for the phase-1 routing tests. Everything here is a public,
 // deterministic TEST vector from fixtures/device-keys-contract.json; never use these
-// seeds for a real device. The signer is written independently from src/device-keys.js
+// seeds for a real device. The signer is written independently from the relay's own verifier (the old src/device-keys.js)
 // (WebCrypto Ed25519 over the encoding in docs/architecture/device-keys.md), so the
 // relay's verifier is checked against a second implementation, not against itself.
 import { readFileSync } from "node:fs";

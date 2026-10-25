@@ -112,9 +112,9 @@ Constraint: no host, relay or protocol changes. The client speaks exactly what t
 
 ## What the client must speak
 
-Learned from `worker/public/`, `relay/`, `worker/src/` and `host/src/` (research notes 2026-10-13; line references are in those files, not repeated here).
+Learned from `worker/public/`, `relay/` and `worker/src/` (both relays deleted at CUT-1) and `host/src/` (research notes 2026-10-13; line references are in those files, not repeated here).
 
-- **Login.** `POST /__auth/login` with JSON `{password, totp?, remember}` and `Origin` equal to the relay's public URL. The relay sets two cookies, `__Host-gate` and `__Host-bp-session`, which go on every socket upgrade. The Go relay accepts password plus TOTP; the Cloudflare relay needs an approved site-gate cookie first (ntfy or [host approval](browser-approval.md)), so the client needs a "waiting for approval" screen. There is no pairing today; [device keys](device-keys.md) is designed but not built.
+- **Login.** The old relays had `POST /__auth/login` (password, plus TOTP on Go); both were deleted at CUT-1. The Rust relay has no password login: a browser is approved through ntfy and needs a valid gate cookie, so the client needs a "waiting for approval" screen. There is no pairing today; [device keys](device-keys.md) is designed but not built.
 - **Signaling.** `wss://<relay>/ws`, first message `{"type":"hello","role":"client"}`. The reply `hello-ok` carries `iceServers` and a fresh `mediaEpoch`; every media socket and `media-control` message must carry that epoch. Reconnect is a new hello and a new epoch.
 - **Two media transports, both already served by the host:**
   - **WebRTC** (browser default in auto mode): the client offers recvonly HEVC + H.264 video and Opus audio, and opens two data channels, `input-control` (ordered, reliable) and `input-motion` (unordered, no retransmits). The host is str0m 0.21, prefers HEVC, gathers host and server-reflexive candidates only (no TURN client on the host side).
@@ -190,7 +190,7 @@ Proposed spike (throwaway, about half a day): Media Foundation H.264 and HEVC de
 All dated 2026-10-13.
 
 - **Transports.** v1 ships both. WSS v4 is built first, then WebRTC with auto fallback, matching the browser.
-- **Relays.** The Go relay comes first. Cloudflare, with the approval wait screen, is required before v1 is called done.
+- **Relays.** The Go and Cloudflare relays were deleted at CUT-1. The [Rust relay](../../relay-rs/README.md), with the approval wait screen, is required before v1 is called done.
 - **Packaging.** For v1 the client is a separate portable exe. Installer integration is decided later.
 - **Local storage.** Saved devices and the remembered session cookie live in `%APPDATA%\BubblePlay\client\`. The cookies are protected with DPAPI.
 - **Codecs.** H.264 is first-class, because hosts with Media Foundation encoders produce only H.264 and the host will follow codec changes on keyframes. The client must work on a PC without the HEVC extension, by checking at startup which decoders are installed.

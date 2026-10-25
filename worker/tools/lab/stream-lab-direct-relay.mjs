@@ -121,7 +121,7 @@ function parseSocketRoute(rawUrl) {
   };
 }
 
-// File transfer v1 (mirrors relayFile in worker/src): one file-host and one
+// File transfer v1 (mirrors relayFile in the deleted worker/src): one file-host and one
 // file-client per epoch; binary packets are validated and relayed both ways,
 // a malformed one closes both sides, and a leaving side closes the other.
 function attachFileSocket(socket, route, rooms, emit) {
@@ -231,7 +231,7 @@ function attachSignalingSocket(socket, route, rooms, emit) {
 
 // Protocol v4: one socket per side. Host binary frames go to the client;
 // client ACK/keyframe text goes to the host; heartbeats are answered here
-// and each side is told whether its peer is present (mirrors worker/src).
+// and each side is told whether its peer is present (mirrors the deleted worker/src).
 function attachMediaSocket(socket, route, rooms, emit, shaper) {
   const room = getRoom(rooms, route.key, () => ({ "media-host": null, "media-client": null }));
   let role = null;
