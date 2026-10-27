@@ -35,7 +35,7 @@ PUBLIC_ORIGIN = "https://relay.example.com"
 # Optional TURN settings. TURN_TTL_S is 300 to 86400 seconds.
 TURN_HOST = "turn.example.com"
 TURN_TTL_S = "21600"
-# Optional ntfy approval pushes. The Worker's ntfy path lands in M3-C2.
+# Optional ntfy approval pushes.
 NTFY_URL = "https://ntfy.example.com"
 NTFY_TOPIC = "replace-with-your-topic"
 # Approval window in seconds, 30 to 120.
@@ -43,7 +43,9 @@ APPROVAL_TTL_S = "90"
 # At least 1.
 MAX_CONNECTIONS = "32"
 
-# Static files from the JS Worker's public directory. Relative to this file. Off until M3-C2 serves them.
-# [assets]
-# directory = "../../worker/public"
-# run_worker_first = true
+# Static files from the JS Worker's public directory, the same block as wrangler.toml. Relative to this file.
+[assets]
+directory = "../../worker/public"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "none"

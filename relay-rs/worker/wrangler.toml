@@ -4,6 +4,14 @@ name = "bp-relay-worker"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-07-15"
 
+# The JS Worker's public directory, served through the ASSETS binding. The Worker runs first, so
+# the gate decides before any file goes out. Read-only here: the JS Worker's files are not changed.
+[assets]
+directory = "../../worker/public"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "none"
+
 [durable_objects]
 bindings = [{ name = "RELAY", class_name = "Relay" }]
 
