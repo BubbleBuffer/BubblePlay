@@ -165,7 +165,9 @@ jobs:
         run: npm install --no-save --no-audit --no-fund wrangler@4.148.0
       - name: bp-relay-worker tests (wrangler dev, local workerd)
         working-directory: relay-rs/worker
-        run: node --test 'tests/*.test.mjs'
+        # One test file at a time: each file starts its own wrangler dev, and when two start at once
+        # one workerd fails to bind ("bind(): Address already in use").
+        run: node --test --test-concurrency=1 'tests/*.test.mjs'
       - name: Container build
         run: docker build -f relay-rs/Dockerfile -t bubbleplay-relay-rs:check .
 

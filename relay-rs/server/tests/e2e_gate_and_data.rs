@@ -440,3 +440,172 @@ async fn e2e_native_viewer_without_origin_upgrades_and_bare_hello_is_1008() {
     send_json(&mut ws, json!({ "type": "hello", "role": "viewer" })).await;
     assert_eq!(expect_close(&mut ws).await, (1008, String::new()));
 }
+
+/// `/pair` is the browser page too. Without a cookie, a top-level GET gets the gate's wait page.
+#[tokio::test]
+async fn e2e_pair_without_cookie_gets_wait_page() {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let page = http()
+        .get(format!("{}/pair", base(server.addr)))
+        .header("Accept", "text/html")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    assert!(page.text().await.unwrap().contains("Waiting for approval"));
+}
+
+/// With the gate cookie, GET and HEAD `/pair` serve the page as `/` does, and `/pair/x` stays 404.
+#[tokio::test]
+async fn e2e_pair_with_cookie_serves_the_page_and_nothing_below_it() {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let cookie = browser_cookie(&server, &env).await;
+    let client = http();
+    let pair = client
+        .get(format!("{}/pair", base(server.addr)))
+        .header("Cookie", cookie.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pair.status(), 200);
+    assert_eq!(
+        pair.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(pair.text().await.unwrap(), "home");
+
+    let head = client
+        .head(format!("{}/pair", base(server.addr)))
+        .header("Cookie", cookie.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    assert!(head.bytes().await.unwrap().is_empty());
+
+    let below = client
+        .get(format!("{}/pair/x", base(server.addr)))
+        .header("Cookie", cookie.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(below.status(), 404);
+}
+
+/// A media round trip with the viewer's hello role string as given, old name or new.
+async fn media_round_trip(viewer_role: &str, seed: u8) {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let s = session(&server, &env, seed).await;
+    let (mut host_media, _) = data_socket(
+        &server,
+        "/host-media-ws",
+        &s.pc,
+        &s.epoch,
+        "media-host",
+        &s.host_ticket,
+        None,
+    )
+    .await;
+    let (mut viewer_media, _) = data_socket(
+        &server,
+        "/media-ws",
+        &s.pc,
+        &s.epoch,
+        viewer_role,
+        &s.viewer_ticket,
+        Some(s.cookie.as_str()),
+    )
+    .await;
+
+    send_binary(&mut host_media, vec![9u8; 64]).await;
+    assert_eq!(next_binary(&mut viewer_media).await, vec![9u8; 64]);
+    send_json(
+        &mut viewer_media,
+        json!({ "type": "keyframe", "reason": viewer_role }),
+    )
+    .await;
+    let keyframe = next_json_of(&mut host_media, "keyframe").await;
+    assert_eq!(keyframe["reason"], viewer_role);
+}
+
+/// The media viewer's new name takes `/media-ws` the same way its old name does.
+#[tokio::test]
+async fn e2e_media_viewer_role_names_both_forward() {
+    media_round_trip("media-client", 30).await;
+    media_round_trip("media-viewer", 31).await;
+}
+
+/// A file round trip with the viewer's hello role string as given, old name or new.
+async fn file_round_trip(viewer_role: &str, seed: u8) {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let s = session(&server, &env, seed).await;
+    let (mut file_host, _) = data_socket(
+        &server,
+        "/host-file-ws",
+        &s.pc,
+        &s.epoch,
+        "file-host",
+        &s.host_ticket,
+        None,
+    )
+    .await;
+    let (mut file_client, _) = data_socket(
+        &server,
+        "/file-ws",
+        &s.pc,
+        &s.epoch,
+        viewer_role,
+        &s.viewer_ticket,
+        Some(s.cookie.as_str()),
+    )
+    .await;
+
+    let packet = file_packet(b"hello");
+    send_binary(&mut file_host, packet.clone()).await;
+    assert_eq!(next_binary(&mut file_client).await, packet);
+    send_binary(&mut file_client, packet.clone()).await;
+    assert_eq!(next_binary(&mut file_host).await, packet);
+    send_json(&mut file_client, json!({ "type": "ping" })).await;
+    assert_eq!(next_json_of(&mut file_client, "pong").await["type"], "pong");
+}
+
+/// The file viewer's new name takes `/file-ws` the same way its old name does.
+#[tokio::test]
+async fn e2e_file_viewer_role_names_both_forward() {
+    file_round_trip("file-client", 32).await;
+    file_round_trip("file-viewer", 33).await;
+}
+
+/// The signalling viewer takes `/ws` under its new name `viewer` and its old name `client`.
+#[tokio::test]
+async fn e2e_signal_viewer_role_names_both_take_ws() {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let cookie = browser_cookie(&server, &env).await;
+    let mut hosts = Vec::new();
+    for (seed, role) in [(34u8, "client"), (35u8, "viewer")] {
+        let host = identity(seed);
+        let (host_ws, _) = register_host(&server, &host, Some(TOKEN)).await;
+        hosts.push(host_ws);
+        let mut ws = connect(
+            server.addr,
+            &format!("/ws?pc={}", pc_id(&host)),
+            Some(ORIGIN),
+            Some(cookie.as_str()),
+        )
+        .await
+        .unwrap();
+        let ok = viewer_join_as(&mut ws, role, &viewer_identity(), false, None).await;
+        assert!(ok["mediaEpoch"].is_string(), "{role} takes /ws");
+    }
+}
