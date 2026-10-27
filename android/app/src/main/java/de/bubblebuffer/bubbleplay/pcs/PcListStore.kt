@@ -35,6 +35,11 @@ class PcListStore(private val backing: Backing) : PcStore {
     }
 
     @Synchronized
+    override fun touch(id: String, lastSeen: Long, problem: String?) {
+        save(list().map { if (it.id == id) it.copy(lastSeen = lastSeen, problem = problem) else it })
+    }
+
+    @Synchronized
     override fun remove(id: String) {
         save(list().filterNot { it.id == id })
     }

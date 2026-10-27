@@ -5,7 +5,8 @@ import org.json.JSONException
 import org.json.JSONObject
 
 /**
- * The PC list as JSON: `{"version":1,"pcs":[{"id":…,"publicKey":…,"relay":…,"name":…,"paired":…}]}`.
+ * Version 1 PC list JSON, with optional lastSeen and problem connection metadata. Older lists
+ * without these fields decode with the [PcEntry] defaults.
  * Pure Kotlin over org.json, so the round trip runs in JVM tests. Decoding never throws: text of any
  * other shape gives an empty list, and one malformed entry is skipped without losing the others.
  */
@@ -22,7 +23,9 @@ object PcListCodec {
                     .put("publicKey", entry.publicKey)
                     .put("relay", entry.relay)
                     .put("name", entry.name)
-                    .put("paired", entry.paired),
+                    .put("paired", entry.paired)
+                    .put("lastSeen", entry.lastSeen)
+                    .put("problem", entry.problem ?: JSONObject.NULL),
             )
         }
         return JSONObject().put("version", VERSION).put(KEY_PCS, array).toString()
@@ -46,6 +49,10 @@ object PcListCodec {
         val publicKey = json.optString("publicKey")
         val relay = json.optString("relay")
         if (id.isEmpty() || publicKey.isEmpty() || relay.isEmpty()) return null
-        return PcEntry(id, publicKey, relay, json.optString("name"), json.optLong("paired"))
+        return PcEntry(
+            id, publicKey, relay, json.optString("name"), json.optLong("paired"),
+            lastSeen = json.optLong("lastSeen", 0L),
+            problem = json.opt("problem") as? String,
+        )
     }
 }

@@ -55,6 +55,26 @@ class PcListStoreTest {
     }
 
     @Test
+    fun touchPersistsOnlyTheNamedPcsMetadataAndSuccessClearsTheProblem() {
+        val backing = MemoryBacking()
+        val store = PcListStore(backing)
+        store.put(desk)
+        store.put(den)
+        store.touch(desk.id, 123L, "Key revoked")
+        assertEquals(listOf(desk.copy(lastSeen = 123L, problem = "Key revoked"), den), PcListStore(backing).list())
+        store.touch(desk.id, 456L, null)
+        assertEquals(listOf(desk.copy(lastSeen = 456L), den), PcListStore(backing).list())
+    }
+
+    @Test
+    fun touchDoesNotCreateAnUnknownPc() {
+        val store = PcListStore(MemoryBacking())
+        store.put(desk)
+        store.touch(den.id, 123L, "Offline")
+        assertEquals(listOf(desk), store.list())
+    }
+
+    @Test
     fun badStoredTextIsAnEmptyListAndCanBeWrittenOver() {
         val backing = MemoryBacking("{broken")
         val store = PcListStore(backing)

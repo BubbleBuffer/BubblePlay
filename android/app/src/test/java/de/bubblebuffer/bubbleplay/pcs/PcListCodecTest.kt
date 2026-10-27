@@ -9,7 +9,28 @@ class PcListCodecTest {
 
     @Test
     fun roundTripKeepsEveryField() {
-        assertEquals(listOf(desk, unnamed), PcListCodec.decode(PcListCodec.encode(listOf(desk, unnamed))))
+        val entries = listOf(desk.copy(lastSeen = 1_700_000_200_000L, problem = "PC said \"revoked\"\nRetry later"), unnamed)
+        assertEquals(entries, PcListCodec.decode(PcListCodec.encode(entries)))
+    }
+
+    @Test
+    fun oldVersionOneListDefaultsConnectionMetadata() {
+        val text = """{"version":1,"pcs":[{"id":"X","publicKey":"B","relay":"https://r","name":"n","paired":2}]}"""
+        assertEquals(listOf(PcEntry("X", "B", "https://r", "n", 2L)), PcListCodec.decode(text))
+    }
+
+    @Test
+    fun nullOrMalformedOptionalMetadataDoesNotLosePairedPc() {
+        val text = """
+            {"version":1,"pcs":[
+              {"id":"X","publicKey":"B","relay":"https://r","name":"n","paired":2,"lastSeen":null,"problem":null},
+              {"id":"Y","publicKey":"C","relay":"https://r","name":"m","paired":3,"lastSeen":"bad","problem":{"message":"bad"}}
+            ]}
+        """.trimIndent()
+        assertEquals(
+            listOf(PcEntry("X", "B", "https://r", "n", 2L), PcEntry("Y", "C", "https://r", "m", 3L)),
+            PcListCodec.decode(text),
+        )
     }
 
     @Test
