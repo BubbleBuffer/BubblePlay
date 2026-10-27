@@ -213,6 +213,14 @@ test('m3 admitted viewer gets hello-ok with a media epoch and a ticket', { timeo
   assert.ok(typeof ok.ticket === 'string' && ok.ticket.length > 0);
 });
 
+test('m3 admitted viewer is announced to the host as peer-joined with its media epoch', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const host = identity(90);
+  const { socket: hostSocket } = await registerHost(relay.port, host);
+  const { ok } = await viewerJoin(relay.port, host.id);
+  const joined = await hostSocket.nextJson('peer-joined', 10_000);
+  assert.deepEqual(joined, { type: 'peer-joined', mediaEpoch: ok.mediaEpoch, pairing: false });
+});
+
 // Browser origin: a browser Origin needs a valid gate cookie. Without one the gate refuses: a wrong
 // origin is 404, and the public origin is accepted then closed 1008.
 
@@ -266,6 +274,9 @@ test('m3 pairing viewer auth messages are forwarded to the host and its offers a
   const ok = await viewer.nextJson('hello-ok', 10_000);
   assert.equal(ok.pairing, true);
   assert.equal(ok.ticket, undefined);
+  // The host hears of the admission first, so its peer-joined comes before the auth-hello.
+  const joined = await hostSocket.nextJson('peer-joined', 10_000);
+  assert.equal(joined.pairing, true);
 
   viewer.sendJson({ type: 'offer', sdp: 'v=0' });
   viewer.sendJson(authHello(stranger));
