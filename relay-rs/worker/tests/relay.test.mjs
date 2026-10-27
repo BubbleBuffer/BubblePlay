@@ -633,6 +633,37 @@ test('m3 static traversal, dotfile and backslash paths are 404, and POST is 404'
   assert.equal(post.status, 404);
 });
 
+// /pair is the browser page too (native: e2e_pair_* in e2e_gate_and_data.rs). The pairing code
+// rides in the fragment, which the page reads itself, so the Worker only maps the path.
+
+test('m3 GET /pair without a cookie opens the gate wait page', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const page = await httpRequest(relay.port, {
+    path: '/pair',
+    ip: freshClientIp(),
+    headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
+  });
+  assert.equal(page.status, 200);
+  assert.match(page.body.toString('utf8'), /Waiting for approval/);
+});
+
+test('m3 GET and HEAD /pair with a cookie serve index.html, as / does', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  const root = await httpRequest(relay.port, { path: '/', headers: { Cookie: cookie } });
+  const pair = await httpRequest(relay.port, { path: '/pair', headers: { Cookie: cookie } });
+  assert.equal(pair.status, 200);
+  assert.match(pair.headers['content-type'] ?? '', /text\/html/);
+  assert.deepEqual(pair.body, root.body);
+  const head = await httpRequest(relay.port, { method: 'HEAD', path: '/pair', headers: { Cookie: cookie } });
+  assert.equal(head.status, 200);
+  assert.equal(head.body.length, 0);
+});
+
+test('m3 /pair/x with a cookie is still 404, as before /pair was served', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  const below = await httpRequest(relay.port, { path: '/pair/x', headers: { Cookie: cookie } });
+  assert.equal(below.status, 404);
+});
+
 // TURN (e2e_ws_with_turn_adds_credentialed_ice_server): a TURN instance, so the TURN config is set.
 
 test('m3 a WebSocket hello with turn gets a credentialed TURN ICE server', { timeout: RESTART_TIMEOUT_MS }, async () => {

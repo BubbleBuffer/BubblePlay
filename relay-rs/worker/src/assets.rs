@@ -6,6 +6,7 @@
 //! - a malformed percent escape is 400;
 //! - a backslash, a dot segment or a dotfile is 404 before anything is fetched. Native cleans
 //!   `..` lexically and serves the result; this does not, which is a known difference;
+//! - `/pair` is served as `/`, the browser page, as native does;
 //! - `/index.html`, when the file exists, is a 301 to `./` (keeping the query), as native does;
 //! - `Cache-Control: no-store` on every served file.
 
@@ -36,6 +37,14 @@ pub fn plan(method: &str, raw_path: &str) -> Plan {
         .collect();
     if segments.iter().any(|segment| segment.starts_with('.')) {
         return Plan::Status(404);
+    }
+    // `/pair` is the same page as `/`: the browser reads the pairing code from the fragment. The
+    // binding serves that page at `/`, so `/pair` fetches `/`, as native maps it to index.html.
+    if segments == ["pair"] {
+        return Plan::Fetch {
+            path: "/".to_owned(),
+            index: false,
+        };
     }
     let index = decoded.ends_with("/index.html");
     let path = if segments.is_empty() {
