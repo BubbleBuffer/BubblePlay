@@ -15,14 +15,14 @@ class InputLinkTest {
     private val epochB = "b".repeat(32)
 
     @Test
-    fun inputIsSuppressedUntilHelloAndFirstFrame() {
+    fun inputIsSuppressedUntilAuthenticationAndFirstFrame() {
         val link = InputLink<Sock>()
         val s = Sock("s1")
         val gen = link.connecting(s)
         assertNull(link.inputSocket()) // socket open, no hello yet
         assertFalse(link.presented(gen)) // a frame before hello does not open input
         assertNull(link.inputSocket())
-        assertTrue(link.helloOk(gen, epochA))
+        assertTrue(link.authenticated(gen, epochA))
         assertNull(link.inputSocket()) // hello done, first frame not presented yet
         assertTrue(link.presented(gen))
         assertSame(s, link.inputSocket())
@@ -34,7 +34,7 @@ class InputLinkTest {
     fun mediaUpSignalingDownAsksForReconnectAndDropsInput() {
         val link = InputLink<Sock>()
         val gen = link.connecting(Sock("s1"))
-        link.helloOk(gen, epochA); link.presented(gen)
+        link.authenticated(gen, epochA); link.presented(gen)
         link.mediaUp = true
         assertFalse(link.inputReconnecting)
         assertTrue(link.lost(gen)) // current socket lost: caller releases input and reconnects
@@ -49,15 +49,15 @@ class InputLinkTest {
     fun staleSocketIsIgnored() {
         val link = InputLink<Sock>()
         val old = link.connecting(Sock("old"))
-        link.helloOk(old, epochA); link.presented(old)
+        link.authenticated(old, epochA); link.presented(old)
         val fresh = Sock("fresh")
         val gen = link.connecting(fresh) // reconnect replaced the socket
         assertNull(link.inputSocket()) // never falls back to the old socket
         assertFalse(link.isCurrent(old))
-        assertFalse(link.helloOk(old, epochA)) // late hello-ok from the old socket
+        assertFalse(link.authenticated(old, epochA)) // late hello-ok from the old socket
         assertFalse(link.lost(old)) // late close from the old socket does not kill the new one
         assertTrue(link.isCurrent(gen))
-        assertTrue(link.helloOk(gen, epochB))
+        assertTrue(link.authenticated(gen, epochB))
         assertTrue(link.presented(gen))
         assertSame(fresh, link.inputSocket())
         assertEquals(epochB, link.currentEpoch)
@@ -67,12 +67,12 @@ class InputLinkTest {
     fun resetForgetsTheSocketAndItsCallbacks() {
         val link = InputLink<Sock>()
         val gen = link.connecting(Sock("s"))
-        link.helloOk(gen, epochA); link.presented(gen)
+        link.authenticated(gen, epochA); link.presented(gen)
         link.reset() // peer-left / stop
         assertNull(link.inputSocket())
         assertFalse(link.signalingUp)
         assertFalse(link.lost(gen))
-        assertFalse(link.helloOk(gen, epochA))
+        assertFalse(link.authenticated(gen, epochA))
     }
 
     @Test

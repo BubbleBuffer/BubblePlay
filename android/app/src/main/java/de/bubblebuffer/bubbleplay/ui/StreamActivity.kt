@@ -63,6 +63,9 @@ import de.bubblebuffer.bubbleplay.net.SecureDesktop
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.Session
 import de.bubblebuffer.bubbleplay.net.ViewerGrant
+import de.bubblebuffer.bubbleplay.keys.UnlockedKey
+import de.bubblebuffer.bubbleplay.pcs.PcEntry
+import de.bubblebuffer.bubbleplay.pcs.PcStore
 import de.bubblebuffer.bubbleplay.protocol.CursorState
 import de.bubblebuffer.bubbleplay.protocol.CursorKind
 import de.bubblebuffer.bubbleplay.protocol.InputPackets
@@ -78,6 +81,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
     private lateinit var config: ServerConfig
+    private lateinit var pc: PcEntry
     private var session: Session? = null
     private var input: RemoteInput? = null
     private var surface: android.view.Surface? = null
@@ -189,7 +193,10 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
         remoteClipboard.automatic = prefs.autoCopyRemoteClipboard
-        config = prefs.serverConfig() ?: run { finish(); return }
+        pc = intent.getStringExtra(EXTRA_PC_ID)?.let { PcStore.from(this).get(it) } ?: run { finish(); return }
+        val relay = ServerConfig.parseServer(pc.relay) ?: run { finish(); return }
+        if (UnlockedKey.get() == null) { finish(); return }
+        config = ServerConfig(relay, pc.id)
         gestures.mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
         gestures.tapToClick = prefs.tapToClick
         pointerGain = PointerSpeed.gain(prefs.pointerSpeed)
@@ -198,7 +205,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         buildViews()
         KeepAlive.owner = this
         clipboardManager.addPrimaryClipChangedListener(clipboardChanged)
-        files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, { if (config.isLab) null else Prefs.cookieHeader(config) }, fileListener, { viewerGrant })
+        files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, fileListener, { viewerGrant })
         enterImmersive() // also sets up edge-to-edge and the cutout mode
         if (!immersive) exitImmersive()
         startSession()
@@ -359,7 +366,12 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     // ---- session lifecycle -----------------------------------------------------
     private fun startSession() {
         if (session != null) return
-        val s = Session(config, { Prefs.cookieHeader(config) }, Session.chooseCodec(prefs.codec), this)
+        val label = (android.provider.Settings.Global.getString(contentResolver, "device_name")
+            ?.takeIf { it.isNotBlank() } ?: Build.MODEL.orEmpty())
+            .filterNot { Character.isISOControl(it) }.take(64)
+        val s = Session(config, pc, UnlockedKey.require(), label, Session.chooseCodec(prefs.codec), this) { lastSeen, problem ->
+            PcStore.from(this).touch(pc.id, lastSeen, problem)
+        }
         session = s
         input = RemoteInput(s, cursorReconciler::noteSent, ::scheduleMotionFlush)
         surface?.let { s.decoder.setSurface(it) }
@@ -576,7 +588,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     // ---- Session.Listener (main thread) --------------------------------------------
     override fun onStatus(status: Session.Status) {
         lastStatus = status
-        this.status.text = status.text
+        val resource = status.problem?.let { resources.getIdentifier(it, "string", packageName) } ?: 0
+        this.status.text = if (resource == 0) status.text
+            else if (status.detail != null) getString(resource, status.detail) else getString(resource)
         this.status.setTextColor(
             if (status.inputWarning) STATUS_PENDING else when (status.state) {
                 Session.State.CONNECTED, Session.State.STATIC -> 0xFFB8F5C8.toInt()
@@ -594,14 +608,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             Log.i(TAG, "foreground to first live frame ${SystemClock.elapsedRealtime() - foregroundAt} ms (frozen frame shown=$wasFrozen)")
             foregroundAt = 0L
         }
-    }
-
-    override fun onAuthRequired() {
-        stopSession()
-        // Shares that have not gone out yet come back to the PC list.
-        val waiting = pendingUploads.filter { it.second == FileWire.PURPOSE_SAVE }.flatMap { it.first }
-        startActivity(PendingShares.attach(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP), waiting))
-        finish()
     }
 
     override fun onCursor(state: CursorState) {
@@ -1423,7 +1429,6 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     private fun fileError(error: String): String = when (error) {
         FileTransfers.ERR_CONNECTION -> getString(R.string.file_err_connection)
-        FileTransfers.ERR_AUTH -> getString(R.string.file_err_auth)
         FileTransfers.ERR_UNAVAILABLE -> getString(R.string.file_err_unavailable)
         FileTransfers.ERR_TOO_LARGE -> getString(R.string.file_err_too_large)
         FileTransfers.ERR_UNREADABLE -> getString(R.string.file_err_unreadable)

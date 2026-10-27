@@ -11,7 +11,7 @@ class MediaRecoveryTest {
         var socketPresent = false
 
         fun hello() {
-            assertTrue(link.helloOk(signalId, "a".repeat(32)))
+            assertTrue(link.authenticated(signalId, "a".repeat(32)))
             // Session's hello teardown is unconditional, even after mediaDown cleared the socket.
             leg.invalidate()
             socketPresent = false

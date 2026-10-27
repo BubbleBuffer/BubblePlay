@@ -87,13 +87,13 @@ class CtlChannelTest {
 
     @Test
     fun plaintextTypeMustEqualKind() {
-        val forged = envelope(p2v, 0, "cursor", """{"type":"clipboard","text":"x"}""".toByteArray())
+        val forged = envelope(p2v, 0, "clipboard", """{"type":"caps","text":"x"}""".toByteArray())
         assertFails(CtlException.Reason.TYPE_MISMATCH, forged)
-        assertFails(CtlException.Reason.TYPE_MISMATCH, envelope(p2v, 0, "cursor", "not json".toByteArray()))
-        assertFails(CtlException.Reason.TYPE_MISMATCH, envelope(p2v, 0, "cursor", byteArrayOf(0x7b, 0xff.toByte(), 0x7d)))
+        assertFails(CtlException.Reason.TYPE_MISMATCH, envelope(p2v, 0, "clipboard", "not json".toByteArray()))
+        assertFails(CtlException.Reason.TYPE_MISMATCH, envelope(p2v, 0, "clipboard", byteArrayOf(0x7b, 0xff.toByte(), 0x7d)))
         // The sender refuses such plaintexts without closing.
         val sender = keys().viewerChannel()
-        assertThrows<IllegalArgumentException> { sender.seal("cursor", """{"type":"clipboard"}""".toByteArray()) }
+        assertThrows<IllegalArgumentException> { sender.seal("clipboard", """{"type":"caps"}""".toByteArray()) }
         assertThrows<IllegalArgumentException> { sender.seal("Bad_Kind", """{"type":"Bad_Kind"}""".toByteArray()) }
         assertJsonEquals(vectors[0].getJSONObject("message"), sender.seal("input", hex(vectors[0].getString("plaintextHex"))))
     }
@@ -132,6 +132,22 @@ class CtlChannelTest {
         val opened = viewer.open(pc.seal(CtlChannel.KIND_CAPS, caps.toByteArray()))
         assertEquals("caps", opened.kind)
         assertArrayEquals(caps.toByteArray(), opened.plaintext)
+    }
+
+    @Test
+    fun binaryCursorSkipsTheJsonTypeCheckAndStillChecksSequenceAndTag() {
+        val pc = keys().pcChannel()
+        val viewer = keys().viewerChannel()
+        val bytes = byteArrayOf(0x80.toByte(), 0xff.toByte(), 0, 12, 0, 13, 0, 0)
+        val envelope = pc.seal(CtlChannel.KIND_CURSOR, bytes)
+        val opened = viewer.open(envelope)
+        assertEquals(CtlChannel.KIND_CURSOR, opened.kind)
+        assertArrayEquals(bytes, opened.plaintext)
+        assertEquals(CtlException.Reason.OUT_OF_ORDER, assertThrows<CtlException> { viewer.open(envelope) }.reason)
+
+        val changedKind = JSONObject(envelope).put("kind", "input").toString()
+        assertEquals(CtlException.Reason.AUTH_FAILED,
+            assertThrows<CtlException> { keys().viewerChannel().open(changedKind) }.reason)
     }
 
     private fun assertFails(reason: CtlException.Reason, envelope: String) {

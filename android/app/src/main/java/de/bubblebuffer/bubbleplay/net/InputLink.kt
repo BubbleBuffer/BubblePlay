@@ -5,7 +5,7 @@ package de.bubblebuffer.bubbleplay.net
  * it is unit-testable; [Session] drives it from its own thread, while
  * [inputSocket] is read from any thread.
  *
- * Input goes out only on the socket that is current, has completed hello for
+ * Input goes out only on the socket that is current, has authenticated for
  * this signaling epoch, and has presented a first frame for that epoch (the
  * host gates input on the first-frame handshake). Every reconnect starts a new
  * generation, so callbacks and references from an older socket are ignored.
@@ -13,7 +13,7 @@ package de.bubblebuffer.bubbleplay.net
 class InputLink<S : Any> {
     private var generation = 0
     private var socket: S? = null
-    private var helloDone = false
+    private var authenticated = false
     private var ready = false
     private var epoch: String? = null
 
@@ -26,25 +26,25 @@ class InputLink<S : Any> {
     fun connecting(socket: S): Int {
         generation++
         this.socket = socket
-        helloDone = false; ready = false; epoch = null
+        authenticated = false; ready = false; epoch = null
         return generation
     }
 
     @Synchronized
     fun isCurrent(gen: Int): Boolean = gen == generation && socket != null
 
-    /** hello-ok on [gen]; false (ignored) for a stale socket. Input stays off until [presented]. */
+    /** Authentication completed on [gen]; false (ignored) for a stale socket. Input stays off until [presented]. */
     @Synchronized
-    fun helloOk(gen: Int, mediaEpoch: String?): Boolean {
+    fun authenticated(gen: Int, mediaEpoch: String?): Boolean {
         if (!isCurrent(gen)) return false
-        helloDone = true; ready = false; epoch = mediaEpoch
+        authenticated = true; ready = false; epoch = mediaEpoch
         return true
     }
 
     /** The first frame for this epoch was presented: input may flow. */
     @Synchronized
     fun presented(gen: Int = generation): Boolean {
-        if (!isCurrent(gen) || !helloDone) return false
+        if (!isCurrent(gen) || !authenticated) return false
         ready = true
         return true
     }
@@ -60,23 +60,23 @@ class InputLink<S : Any> {
     @Synchronized
     fun lost(gen: Int): Boolean {
         if (!isCurrent(gen)) return false
-        socket = null; helloDone = false; ready = false; epoch = null
+        socket = null; authenticated = false; ready = false; epoch = null
         return true
     }
 
     /** Deliberate teardown (stop, peer-left): forget the socket; callbacks from it become stale. */
     @Synchronized
-    fun reset() { generation++; socket = null; helloDone = false; ready = false; epoch = null }
+    fun reset() { generation++; socket = null; authenticated = false; ready = false; epoch = null }
 
     /** The socket input may be written to right now, or null. */
     @Synchronized
-    fun inputSocket(): S? = if (helloDone && ready) socket else null
+    fun inputSocket(): S? = if (authenticated && ready) socket else null
 
     @get:Synchronized
-    val signalingUp: Boolean get() = socket != null && helloDone
+    val signalingUp: Boolean get() = socket != null && authenticated
 
     @get:Synchronized
-    val currentEpoch: String? get() = if (helloDone) epoch else null
+    val currentEpoch: String? get() = if (authenticated) epoch else null
 
     /** Video still flows but input has no usable signaling socket. */
     @get:Synchronized

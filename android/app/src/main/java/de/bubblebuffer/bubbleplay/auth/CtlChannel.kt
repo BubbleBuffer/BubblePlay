@@ -43,9 +43,9 @@ class ControlKeys(viewerToPc: ByteArray, pcToViewer: ByteArray) {
     }
 }
 
-/** A decrypted ctl message. For kind "input" [plaintext] is the raw binary frame; otherwise UTF-8 JSON. */
+/** A decrypted ctl message. For binary kinds "input" and "cursor" [plaintext] is the raw binary frame; otherwise UTF-8 JSON. */
 class CtlMessage(val kind: String, val plaintext: ByteArray) {
-    /** The JSON text (not meaningful for kind "input"). */
+    /** The JSON text (not meaningful for binary kinds). */
     fun text(): String = String(plaintext, Charsets.UTF_8)
 }
 
@@ -95,14 +95,14 @@ class CtlChannel(sendKey: ByteArray, receiveKey: ByteArray) {
 
     /**
      * Seals [plaintext] as kind [kind] and returns the envelope JSON
-     * `{"type":"ctl","kind","seq","data"}`. For kinds other than "input", [plaintext] must be a UTF-8
+     * `{"type":"ctl","kind","seq","data"}`. For kinds other than "input" and "cursor", [plaintext] must be a UTF-8
      * JSON object whose type equals [kind] (IllegalArgumentException otherwise; the channel stays open).
      */
     @Synchronized
     fun seal(kind: String, plaintext: ByteArray): String {
         failed?.let { throw CtlException(CtlException.Reason.CLOSED, "control channel closed: ${it.reason}") }
         require(KIND.matches(kind)) { "bad ctl kind" }
-        if (kind != KIND_INPUT) require(jsonTypeOf(plaintext) == kind) { "plaintext type must equal kind" }
+        if (kind != KIND_INPUT && kind != KIND_CURSOR) require(jsonTypeOf(plaintext) == kind) { "plaintext type must equal kind" }
         if (sendSeq > MAX_SEQ) fail(CtlException.Reason.EXHAUSTED, "send sequence exhausted")
         val data = AuthCrypto.b64(crypt(Cipher.ENCRYPT_MODE, sendKey, sendSeq, kind, plaintext))
         require(data.length <= DATA_MAX) { "ctl message too large" }
@@ -138,7 +138,7 @@ class CtlChannel(sendKey: ByteArray, receiveKey: ByteArray) {
         } catch (e: AEADBadTagException) {
             fail(CtlException.Reason.AUTH_FAILED, "ctl tag did not verify")
         }
-        if (kind != KIND_INPUT && jsonTypeOf(plaintext) != kind) {
+        if (kind != KIND_INPUT && kind != KIND_CURSOR && jsonTypeOf(plaintext) != kind) {
             plaintext.fill(0)
             fail(CtlException.Reason.TYPE_MISMATCH, "plaintext type does not equal kind")
         }
@@ -192,6 +192,7 @@ class CtlChannel(sendKey: ByteArray, receiveKey: ByteArray) {
     companion object {
         const val CAP = "control-aead-v1"
         const val KIND_INPUT = "input"
+        const val KIND_CURSOR = "cursor"
         /** The PC's first ctl message carries its caps under this kind (decisions item 16). */
         const val KIND_CAPS = "caps"
         /** Longest accepted `data` in characters (relay `CTL_DATA_MAX`). */

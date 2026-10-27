@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="session_relay_refused">The relay refused this device. It may have been removed on the PC; pair again at the PC.</string>
+    <string name="session_device_removed">The PC removed this device. Pair again at the PC to reconnect.</string>
+    <string name="session_pc_key_changed">This PC\'s key changed. BubblePlay won\'t connect until you pair with it again.</string>
+    <string name="session_auth_timeout">This PC does not support device keys or is not reachable.</string>
+    <string name="session_control_failed">The encrypted control channel failed a check, so the session ended.</string>
+    <string name="session_cap_refused">The PC refused this viewer: %1$s</string>
+    <string name="session_auth_failed">The PC\'s device-key authentication failed. Pair again at the PC to reconnect.</string>
+    <string name="session_relay_error">The relay refused the connection: %1$s</string>
+</resources>
