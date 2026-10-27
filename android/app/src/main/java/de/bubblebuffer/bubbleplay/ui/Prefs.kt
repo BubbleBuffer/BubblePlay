@@ -110,11 +110,6 @@ class Prefs(private val store: PrefStore) {
         get() = store.getBoolean(KEY_AUTO_COPY_REMOTE_CLIPBOARD) ?: true
         set(value) = store.edit { putBoolean(KEY_AUTO_COPY_REMOTE_CLIPBOARD, value) }
 
-    /** The start-screen device-key offer was dismissed with **Not now**; it stays hidden after that. */
-    var deviceKeyOfferDismissed: Boolean
-        get() = store.getBoolean(KEY_DEVICE_KEY_OFFER_DISMISSED) ?: false
-        set(value) = store.edit { putBoolean(KEY_DEVICE_KEY_OFFER_DISMISSED, value) }
-
     /** The host monitor selector requested when a session starts; blank = the host's choice. */
     val defaultMonitor: String get() = store.getString(KEY_DEFAULT_MONITOR) ?: ""
 
@@ -171,7 +166,6 @@ class Prefs(private val store: PrefStore) {
         const val KEY_AUTO_COPY_REMOTE_CLIPBOARD = "autoCopyRemoteClipboard"
         const val KEY_DEFAULT_MONITOR = "defaultMonitor"
         const val KEY_DEFAULT_MONITOR_NAME = "defaultMonitorName"
-        const val KEY_DEVICE_KEY_OFFER_DISMISSED = "deviceKeyOfferDismissed"
 
         fun normalizeCodec(value: String): String = when (value.trim().lowercase().replace(".", "").replace("-", "")) {
             "hevc", "h265" -> CODEC_HEVC
@@ -180,24 +174,5 @@ class Prefs(private val store: PrefStore) {
         }
 
         fun cookieHeader(config: ServerConfig): String? = CookieManager.getInstance().getCookie(config.base.toString())
-
-        /**
-         * Sign out of this server: expires the gate and session cookies the
-         * relay set (both are `__Host-` cookies: Path=/, Secure, no Domain), so
-         * the next connection goes through sign-in again.
-         */
-        fun signOut(config: ServerConfig, done: () -> Unit) {
-            val cookies = CookieManager.getInstance()
-            val url = config.base.toString()
-            val names = listOf(ServerConfig.GATE_COOKIE, ServerConfig.AUTH_COOKIE)
-            var left = names.size
-            for (name in names) {
-                cookies.setCookie(url, "$name=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; Secure") {
-                    if (--left == 0) { cookies.flush(); done() }
-                }
-            }
-        }
-
-        fun signedIn(config: ServerConfig): Boolean = !config.isLab && ServerConfig.hasSessionCookies(cookieHeader(config))
     }
 }

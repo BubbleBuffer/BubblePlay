@@ -20,9 +20,11 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.BubblePlay">
 
+        <!-- Launcher: the PC list, behind the device key. Shares arrive by onNewIntent. -->
         <activity
             android:name=".ui.MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -30,11 +32,21 @@
             </intent-filter>
         </activity>
 
+        <!-- Pair a PC. Also opened by a bubbleplay://pair link (for example scanned with the camera app),
+             which only fills the form. -->
         <activity
-            android:name=".ui.LoginActivity"
-            android:exported="false"
+            android:name=".ui.PairActivity"
+            android:exported="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
-            android:windowSoftInputMode="adjustResize" />
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="bubbleplay" android:host="pair" />
+            </intent-filter>
+        </activity>
 
         <activity
             android:name=".ui.StreamActivity"
@@ -44,8 +56,8 @@
             android:theme="@style/Theme.BubblePlay.Stream"
             android:windowSoftInputMode="adjustNothing|stateAlwaysHidden" />
 
-        <!-- Device key: create, import, export, change passphrase, remove. Configuration changes are
-             handled in place so a half-typed passphrase survives rotation (as LoginActivity). -->
+        <!-- Device key: create, import, export, change passphrase, remove, and unlock. Configuration changes
+             are handled in place so a half-typed passphrase survives rotation. -->
         <activity
             android:name=".ui.DeviceKeyActivity"
             android:exported="false"

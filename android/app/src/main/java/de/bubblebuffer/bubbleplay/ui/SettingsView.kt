@@ -2,7 +2,6 @@ package de.bubblebuffer.bubbleplay.ui
 
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ActivityNotFoundException
 import android.content.ClipboardManager
@@ -19,15 +18,10 @@ import android.os.Build
 import android.os.Handler
 import android.net.Uri
 import android.os.Looper
-import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
-import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
@@ -72,19 +66,14 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         fun diagnostics(): Session.Diagnostics?
         fun probeRoundTrip()
         fun onSettingChanged(setting: Setting)
-        fun signOut()
         fun closeSettings()
     }
 
-    enum class Setting { SERVER, TOUCH_MODE, POINTER_SPEED, TAP_TO_CLICK, POINTER_MODE, KEYBOARD_LOCK, BACKGROUND, FULLSCREEN, KEEP_SCREEN_ON, DEFAULT_MONITOR, CODEC, AUTO_COPY_REMOTE_CLIPBOARD }
+    enum class Setting { TOUCH_MODE, POINTER_SPEED, TAP_TO_CLICK, POINTER_MODE, KEYBOARD_LOCK, BACKGROUND, FULLSCREEN, KEEP_SCREEN_ON, DEFAULT_MONITOR, CODEC, AUTO_COPY_REMOTE_CLIPBOARD }
 
     private val density = resources.displayMetrics.density
     private val timers = Handler(Looper.getMainLooper())
     private val column = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-    private lateinit var serverField: EditText
-    private lateinit var serverNote: TextView
-    private lateinit var signOutRow: View
-    private lateinit var signOutDetail: TextView
     private lateinit var monitorList: LinearLayout
     private val diagValues = LinkedHashMap<Int, TextView>()
     private var probes = 0
@@ -142,46 +131,10 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
     /** The host's monitor list changed. */
     fun monitorsChanged() = renderMonitors()
 
-    /** Sign-in state or the saved server changed outside the view. */
-    fun connectionChanged() {
-        serverField.setText(prefs.server)
-        renderSignOut()
-        if (isAttachedToWindow) loadSourceLink()
-    }
-
     // ---- sections ----------------------------------------------------------------------------
 
     private fun build() {
         section(R.string.settings_connection)
-        column.addView(fieldLabel(R.string.settings_server))
-        val serverRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        serverField = EditText(activity).apply {
-            setText(prefs.server)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            imeOptions = EditorInfo.IME_ACTION_DONE
-            setSingleLine()
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            typeface = Typeface.MONOSPACE
-            setTextColor(MILK)
-            setHintTextColor(THREAD_STRONG)
-            background = fieldBackground()
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            contentDescription = activity.getString(R.string.settings_server)
-            setOnEditorActionListener { _, action, event ->
-                if (action == EditorInfo.IME_ACTION_DONE || event?.keyCode == KeyEvent.KEYCODE_ENTER) { saveServer(); true } else false
-            }
-        }
-        serverRow.addView(serverField, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        serverRow.addView(button(R.string.settings_save, primary = false) { saveServer() },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)).apply { marginStart = dp(8) })
-        column.addView(serverRow)
-        serverNote = note("")
-        serverNote.visibility = View.GONE
-        column.addView(serverNote)
-        signOutDetail = detailText("")
-        signOutRow = actionRow(R.string.settings_sign_out, signOutDetail, DANGER) { confirmSignOut() }
-        column.addView(signOutRow)
-        renderSignOut()
         column.addView(switchRow(R.string.settings_stay_connected, R.string.settings_stay_connected_detail, prefs.stayConnected) {
             prefs.stayConnected = it; host.onSettingChanged(Setting.BACKGROUND)
         })
@@ -291,56 +244,6 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
 
     // ---- connection --------------------------------------------------------------------------
 
-    private fun saveServer() {
-        val base = ServerConfig.parseServer(serverField.text.toString())
-        if (base == null) {
-            showServerNote(activity.getString(R.string.settings_server_invalid), DANGER)
-            return
-        }
-        val changed = base.toString() != ServerConfig.parseServer(prefs.server)?.toString()
-        prefs.server = base.toString()
-        loadSourceLink()
-        serverField.setText(base.toString())
-        hideKeyboard()
-        showServerNote(activity.getString(when {
-            !changed -> R.string.settings_server_unchanged
-            host.inSession -> R.string.settings_server_saved_next
-            else -> R.string.settings_server_saved
-        }), CREAM)
-        if (changed) host.onSettingChanged(Setting.SERVER)
-        renderSignOut()
-    }
-
-    private fun showServerNote(text: String, color: Int) {
-        serverNote.text = text
-        serverNote.setTextColor(color)
-        serverNote.visibility = View.VISIBLE
-        serverNote.announceForAccessibility(text)
-    }
-
-    private fun renderSignOut() {
-        val config = host.settingsConfig
-        val (enabled, detail) = when {
-            config == null -> false to activity.getString(R.string.settings_sign_out_no_server)
-            config.isLab -> false to activity.getString(R.string.settings_sign_out_lab)
-            Prefs.signedIn(config) -> true to activity.getString(R.string.settings_signed_in, config.base.host)
-            else -> false to activity.getString(R.string.settings_signed_out, config.base.host)
-        }
-        signOutDetail.text = detail
-        signOutRow.isEnabled = enabled
-        signOutRow.alpha = if (enabled) 1f else 0.55f
-    }
-
-    private fun confirmSignOut() {
-        val config = host.settingsConfig ?: return
-        AlertDialog.Builder(activity)
-            .setTitle(activity.getString(R.string.settings_sign_out_title, config.base.host))
-            .setMessage(if (host.inSession) R.string.settings_sign_out_message_session else R.string.settings_sign_out_message)
-            .setPositiveButton(R.string.settings_sign_out) { _, _ -> host.signOut() }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
     // ---- display -----------------------------------------------------------------------------
 
     private fun renderMonitors() {
@@ -439,8 +342,6 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         setTextColor(CREAM)
     }
 
-    private fun note(text: String) = detailText(text).apply { setPadding(0, dp(6), 0, dp(2)) }
-
     private fun button(label: Int, primary: Boolean, onClick: () -> Unit) = TextView(activity).apply {
         setText(label)
         gravity = Gravity.CENTER
@@ -455,24 +356,6 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         isClickable = true
         isFocusable = true
         setOnClickListener { onClick() }
-    }
-
-    /** A full-width row: title + detail line; tapping it acts. */
-    private fun actionRow(title: Int, detail: TextView, titleColor: Int, onClick: () -> Unit) = LinearLayout(activity).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER_VERTICAL
-        minimumHeight = dp(56)
-        setPadding(dp(4), dp(8), dp(4), dp(8))
-        background = pressable()
-        isClickable = true
-        isFocusable = true
-        setOnClickListener { onClick() }
-        addView(TextView(activity).apply {
-            setText(title)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setTextColor(titleColor)
-        })
-        addView(detail)
     }
 
     private fun choiceRow(title: String, detail: String?, checked: Boolean, onClick: () -> Unit) = LinearLayout(activity).apply {
@@ -615,11 +498,6 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         return line
     }
 
-    private fun hideKeyboard() {
-        serverField.clearFocus()
-        (activity.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(serverField.windowToken, 0)
-    }
-
     // ---- drawing -----------------------------------------------------------------------------
 
     private fun dp(value: Int) = (value * density).roundToInt()
@@ -640,15 +518,6 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         setColor(fill)
     }
 
-    private fun fieldBackground(): Drawable = StateListDrawable().apply {
-        addState(intArrayOf(android.R.attr.state_focused), GradientDrawable().apply {
-            cornerRadii = radii(7f, 11f, 6f, 9f); setColor(SURFACE); setStroke(dp(2), MILK)
-        })
-        addState(intArrayOf(), GradientDrawable().apply {
-            cornerRadii = radii(7f, 11f, 6f, 9f); setColor(SURFACE); setStroke(dp(1), THREAD)
-        })
-    }
-
     private fun pressable(): Drawable = StateListDrawable().apply {
         addState(intArrayOf(android.R.attr.state_pressed), shape(SURFACE_MUTED))
         addState(intArrayOf(android.R.attr.state_focused), shape(SURFACE))
@@ -664,7 +533,6 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         const val THREAD_STRONG = 0xFF999DA6.toInt()
         const val MILK = 0xFFF3EFE7.toInt()
         const val CREAM = 0xFFC6BAAC.toInt()
-        const val DANGER = 0xFFE5B1AA.toInt()
 
         const val MAX_WIDTH_DP = 560
         const val REFRESH_MS = 1_000L

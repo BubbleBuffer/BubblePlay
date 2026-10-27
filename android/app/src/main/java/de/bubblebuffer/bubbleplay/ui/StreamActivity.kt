@@ -598,9 +598,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onAuthRequired() {
         stopSession()
-        // Shares that have not gone out yet come back after sign-in.
+        // Shares that have not gone out yet come back to the PC list.
         val waiting = pendingUploads.filter { it.second == FileWire.PURPOSE_SAVE }.flatMap { it.first }
-        startActivity(PendingShares.attach(Intent(this, LoginActivity::class.java).putExtra(LoginActivity.EXTRA_FORCE, true), waiting))
+        startActivity(PendingShares.attach(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP), waiting))
         finish()
     }
 
@@ -1304,24 +1304,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
                 startSession()
                 transferDock.showNotice(getString(R.string.settings_codec_reconnecting))
             }
-            SettingsView.Setting.SERVER -> {} // the next connection uses it
             SettingsView.Setting.AUTO_COPY_REMOTE_CLIPBOARD -> {
                 remoteClipboard.automatic = prefs.autoCopyRemoteClipboard
                 observeLocalClipboard()
                 applyRemoteClipboard()
             }
-        }
-    }
-
-    override fun signOut() {
-        closeSettings()
-        clearFrozen()
-        stopSession()
-        Prefs.signOut(config) {
-            startActivity(Intent(this, MainActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                .putExtra(MainActivity.EXTRA_SIGNED_OUT, true))
-            finish()
         }
     }
 
@@ -1491,6 +1478,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     companion object {
+        /** The paired PC to connect to, as its canonical ID (set by the PC list). */
+        const val EXTRA_PC_ID = "pc"
         private const val TAG = "BubblePlayStream"
         private const val STATUS_PENDING = 0xFFFFE08A.toInt()
         /** About 35 % black over the frozen frame. */
