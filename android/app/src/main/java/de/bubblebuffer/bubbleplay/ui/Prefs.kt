@@ -2,7 +2,6 @@ package de.bubblebuffer.bubbleplay.ui
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.webkit.CookieManager
 import de.bubblebuffer.bubbleplay.input.PointerSpeed
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 
@@ -48,15 +47,6 @@ class Prefs(private val store: PrefStore) {
     constructor(context: Context) : this(SharedPrefStore(context.getSharedPreferences("bubbleplay", Context.MODE_PRIVATE)))
 
     init { migrate() }
-
-    var server: String
-        get() = store.getString(KEY_SERVER)?.takeIf { it.isNotBlank() } ?: ServerConfig.DEFAULT_SERVER
-        set(value) = store.edit { putString(KEY_SERVER, value) }
-
-    /** Stream Lab run id (UUID) for the local direct relay; blank for production. */
-    var labRun: String
-        get() = store.getString(KEY_LAB_RUN) ?: ""
-        set(value) = store.edit { putString(KEY_LAB_RUN, value) }
 
     /** [CODEC_AUTO], [CODEC_HEVC] or [CODEC_H264]. */
     var codec: String
@@ -121,11 +111,8 @@ class Prefs(private val store: PrefStore) {
         else { putString(KEY_DEFAULT_MONITOR, selector); putString(KEY_DEFAULT_MONITOR_NAME, name) }
     }
 
-    fun serverConfig(): ServerConfig? {
-        val base = ServerConfig.parseServer(server) ?: return null
-        val run = labRun.trim()
-        return if (ServerConfig.validLabRun(run)) ServerConfig(base, run.lowercase()) else ServerConfig(base)
-    }
+    // The PC list has no active relay until a PC is selected.
+    fun serverConfig(): ServerConfig? = null
 
     /**
      * Version 1 (unversioned) stored only server, labRun, codec and the last
@@ -151,8 +138,6 @@ class Prefs(private val store: PrefStore) {
         private val CODECS = setOf(CODEC_AUTO, CODEC_HEVC, CODEC_H264)
 
         const val KEY_VERSION = "prefsVersion"
-        const val KEY_SERVER = "server"
-        const val KEY_LAB_RUN = "labRun"
         const val KEY_CODEC = "codec"
         const val KEY_DIRECT_TOUCH = "directTouch"
         const val KEY_POINTER_SPEED = "pointerSpeed"
@@ -173,6 +158,5 @@ class Prefs(private val store: PrefStore) {
             else -> CODEC_AUTO
         }
 
-        fun cookieHeader(config: ServerConfig): String? = CookieManager.getInstance().getCookie(config.base.toString())
     }
 }

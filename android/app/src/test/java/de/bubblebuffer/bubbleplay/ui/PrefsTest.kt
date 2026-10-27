@@ -1,7 +1,6 @@
 package de.bubblebuffer.bubbleplay.ui
 
 import de.bubblebuffer.bubbleplay.input.PointerSpeed
-import de.bubblebuffer.bubbleplay.net.ServerConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -30,8 +29,6 @@ class PrefsTest {
     fun defaultsOnAFreshInstall() {
         val store = MapStore()
         val prefs = Prefs(store)
-        assertEquals("", prefs.server)
-        assertEquals("", prefs.labRun)
         assertEquals(Prefs.CODEC_AUTO, prefs.codec)
         assertFalse(prefs.directTouch)
         assertEquals(PointerSpeed.DEFAULT, prefs.pointerSpeed)
@@ -50,13 +47,10 @@ class PrefsTest {
     @Test
     fun migratesVersionOneKeepingTheConnectionAndTouchMode() {
         val store = MapStore(hashMapOf(
-            Prefs.KEY_SERVER to "https://relay.example.dev/",
-            Prefs.KEY_LAB_RUN to "",
             Prefs.KEY_CODEC to "H.265",
             Prefs.KEY_DIRECT_TOUCH to true,
         ))
         val prefs = Prefs(store)
-        assertEquals("https://relay.example.dev/", prefs.server)
         assertEquals(Prefs.CODEC_HEVC, store.map[Prefs.KEY_CODEC])
         assertTrue("the last used touch mode becomes the default", prefs.directTouch)
         assertEquals(PointerSpeed.DEFAULT, prefs.pointerSpeed)
@@ -80,14 +74,12 @@ class PrefsTest {
     fun malformedValuesReadAsDefaults() {
         val store = MapStore(hashMapOf(
             Prefs.KEY_VERSION to Prefs.VERSION,
-            Prefs.KEY_SERVER to "  ",
             Prefs.KEY_CODEC to "av1",
             Prefs.KEY_POINTER_SPEED to 42,
             Prefs.KEY_TAP_TO_CLICK to "yes", // wrong type
             Prefs.KEY_KEEP_SCREEN_ON to 0,
         ))
         val prefs = Prefs(store)
-        assertEquals(ServerConfig.DEFAULT_SERVER, prefs.server)
         assertEquals(Prefs.CODEC_AUTO, prefs.codec)
         assertEquals(PointerSpeed.MAX, prefs.pointerSpeed)
         assertTrue(prefs.tapToClick)

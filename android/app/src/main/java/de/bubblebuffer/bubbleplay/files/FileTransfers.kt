@@ -12,7 +12,6 @@ import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.util.Log
 import android.webkit.MimeTypeMap
-import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.ViewerGrant
 import de.bubblebuffer.bubbleplay.protocol.FileWire
 import okhttp3.HttpUrl
@@ -32,8 +31,7 @@ import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
 
 /**
- * File transfer v1 client: one on-demand `/file-ws` socket (same cookie as
- * `/ws`), one upload and one download at a time (others queue), 1 MiB send
+ * File transfer v1 client: one on-demand `/file-ws` socket (ticket from the current signaling session), one upload and one download at a time (others queue), 1 MiB send
  * window, ACK pacing, SHA-256 checks, closes after 60 s idle. A socket drop
  * fails the active transfers (no resume in v1); queued ones go out on a new
  * socket. All state lives on one background thread; [Listener] callbacks
@@ -42,7 +40,6 @@ import java.util.concurrent.TimeUnit
 class FileTransfers(
     context: Context,
     private val urlProvider: () -> HttpUrl?,
-    private val cookieProvider: () -> String?,
     private val listener: Listener,
     /** The viewer grant of the current signaling session: its PC goes in the URL, its ticket in the hello. */
     private val grantProvider: () -> ViewerGrant = { ViewerGrant.NONE },
@@ -191,7 +188,7 @@ class FileTransfers(
      * goes out on a socket for the new epoch.
      */
     fun epochChanged() = handler.post {
-        if (ws != null) socketLost("epoch changed", auth = false, counts = false)
+        if (ws != null) socketLost("epoch changed", counts = false)
     }
 
     /** Stops the active transfer in [direction] and everything queued behind it. */
@@ -285,19 +282,19 @@ class FileTransfers(
 
     private fun openSocket() {
         val grant = grantProvider()
-        val url = urlProvider()?.let { ServerConfig.withPc(it, grant.pc) }
+        val url = urlProvider()?.takeIf { grant !== ViewerGrant.NONE }
         if (url == null) { failQueued(ERR_UNAVAILABLE); return }
         val gen = ++wsGen
         nextTid = 1
-        val request = Request.Builder().url(url).apply { cookieProvider()?.let { header("Cookie", it) } }.build()
+        val request = Request.Builder().url(url).build()
         Log.i(TAG, "opening file socket")
         ws = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = on(gen) {
                 // The grant changed while this socket connected: its ticket is stale, so reconnect with the current one.
-                if (grantProvider() !== grant) { socketLost("grant changed", auth = false, counts = false); return@on }
+                if (grantProvider() !== grant) { socketLost("grant changed", counts = false); return@on }
                 wsOpen = true
                 failures = 0
-                webSocket.send(grant.hello("file-client"))
+                webSocket.send(grant.hello("file-viewer"))
                 handler.removeCallbacks(ping)
                 handler.postDelayed(ping, PING_MS)
                 handler.removeCallbacks(peerTimeout)
@@ -311,10 +308,10 @@ class FileTransfers(
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
             }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = on(gen) { socketLost("closed $code", auth = false) }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = on(gen) { socketLost("closed $code") }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = on(gen) {
                 val code = response?.code ?: 0
-                socketLost("failure ${t.javaClass.simpleName} $code", auth = code == 401 || code == 403)
+                socketLost("failure ${t.javaClass.simpleName} $code")
             }
         })
     }
@@ -349,7 +346,7 @@ class FileTransfers(
         try { socket.close(1000, why.take(64)) } catch (_: Exception) {}
     }
 
-    private fun socketLost(why: String, auth: Boolean, counts: Boolean = true) {
+    private fun socketLost(why: String, counts: Boolean = true) {
         Log.w(TAG, "file socket lost: $why")
         val wasOpen = wsOpen
         val socket = ws
@@ -365,7 +362,6 @@ class FileTransfers(
         down?.let { finishDown(it, ok = false, error = ERR_CONNECTION) }
         if (!wasOpen && counts) failures++
         when {
-            auth -> failQueued(ERR_AUTH)
             failures >= MAX_OPEN_FAILURES -> failQueued(ERR_CONNECTION)
             ups.isNotEmpty() || downs.isNotEmpty() -> handler.postDelayed(reconnect, RECONNECT_MS * failures.coerceAtLeast(1))
         }
@@ -641,7 +637,7 @@ class FileTransfers(
     private fun send(socket: WebSocket, bytes: ByteArray): Boolean {
         if (socket.send(bytes.toByteString())) return true
         // OkHttp refuses once the socket is closing or its queue is full.
-        socketLost("send refused", auth = false)
+        socketLost("send refused")
         return false
     }
 
@@ -679,7 +675,6 @@ class FileTransfers(
 
         const val ERR_CANCELLED = "cancelled"
         const val ERR_CONNECTION = "connection"
-        const val ERR_AUTH = "auth"
         const val ERR_UNAVAILABLE = "unavailable"
         const val ERR_TOO_LARGE = "too-large"
         const val ERR_UNREADABLE = "unreadable"
