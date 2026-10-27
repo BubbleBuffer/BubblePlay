@@ -51,7 +51,7 @@ enum class PairingFailure {
     Timeout,
 }
 
-/** Callbacks run on the main thread. Exactly one of onPaired, onDenied, onFailed ends an attempt. */
+/** Callbacks run on the main thread. One terminal callback ends an attempt, unless cancelled. */
 interface PairingListener {
     fun onStage(stage: PairingStage)
     /** The comparison number, display form "482 913". */
@@ -276,7 +276,8 @@ class PairingClient(
                 AuthFailure.PAIR_MAC_MISMATCH -> PairingFailure.ProofMismatch
                 AuthFailure.ID_MISMATCH, AuthFailure.WRONG_PC, AuthFailure.PC_KEY_CHANGED,
                 AuthFailure.BAD_SIGNATURE, AuthFailure.KEY_AGREEMENT -> PairingFailure.PcKeyInvalid
-                AuthFailure.MALFORMED, AuthFailure.UNEXPECTED_MESSAGE -> PairingFailure.ConnectionLost
+                AuthFailure.MALFORMED -> if (state == State.AuthHost) PairingFailure.PcKeyInvalid else PairingFailure.ConnectionLost
+                AuthFailure.UNEXPECTED_MESSAGE -> PairingFailure.ConnectionLost
             })
             is AuthEvent.Authenticated -> fail(PairingFailure.ConnectionLost)
         }
