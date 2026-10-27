@@ -98,7 +98,7 @@ Pairing adds a viewer's public key to a PC's trusted list, with a name and permi
 1. Owner clicks **Pair device** in the tray. For 5 minutes the tray shows the PC's ID, a one-time pairing code, and a QR code with `bubbleplay://pair?relay=<url>&pc=<id>&code=<code>` (the browser uses `https://<relay>/pair#pc=<id>&code=<code>`; the fragment never reaches the relay). The code is 10 Crockford base32 characters from the PC's CSPRNG, shown as `XXXXX-XXXXX`, for example `70Q1K-9MXR1`.
    - Normalisation, for any typed code or a code taken from a link: uppercase, O becomes 0, I and L become 1, dashes and spaces are dropped. `7oq-ik9 mxrl` normalises to `70Q1K9MXR1`.
    - The PC registers the admit hash with the relay in `pair-open`: `b64url(SHA-256("bubbleplay-pair-admit-v1" || canonical PC ID || normalised code))` ([relay protocol](#phase-2-relay-protocol)).
-2. The viewer, key unlocked, opens the pairing link or types the PC ID and code. Android has no in-app QR scanner; the camera app opens `bubbleplay://pair`. The viewer sends the same admit hash as `pair` in its relay `hello` and connects as an unpaired device asking for that PC.
+2. The viewer, key unlocked, opens the pairing link or types the PC ID and code. Android has no in-app QR scanner; the camera app opens `bubbleplay://pair`. The browser opens `https://<relay>/pair#pc=<id>&code=<code>` from the QR (any phone or desktop camera, or the link), or the user types the PC ID and code into the browser's pair form; the handshake and comparison number are the same (decision 14). The viewer sends the same admit hash as `pair` in its relay `hello` and connects as an unpaired device asking for that PC.
 3. The viewer and the PC run the handshake over the signaling socket with `pair-v1` in `caps`: `auth-hello`, `auth-host`, `auth-finish`. H is the transcript hash. Both sides derive the pair key K = HKDF-SHA256(ikm = normalised code as ASCII, salt empty, info `bubbleplay-pair-v1`, 32 bytes).
 4. The viewer sends `pair-proof` with `mac` = HMAC-SHA256(K, `"viewer"` || H). The PC verifies it in constant time. A wrong MAC ends the attempt with no number shown.
 5. The PC sends its own `pair-proof` with `mac` = HMAC-SHA256(K, `"pc"` || H). The viewer verifies it in constant time.
@@ -250,7 +250,7 @@ This PC   Office-PC   ID 7HQ2-K9MX-4RTD-P0ZB   Relay play.example.com (online)
 ```
 
 - Each row is one key. A key seen from more than one client kind or network in the last 30 days expands to its recent connections, so a shared key file is visible.
-- **Edit** opens name and permission checkboxes; "Elevated input" and "Before sign-in" are greyed with a note while their machine switch is off, and changing "Before sign-in" asks for UAC.
+- **Edit** (after phase 2; phase 2 has no rename, the name always comes from the device's `caps`) opens name and permission checkboxes; "Elevated input" and "Before sign-in" are greyed with a note while their machine switch is off, and changing "Before sign-in" asks for UAC.
 - **Revoke** asks once, removes the key, ends its session and syncs the relay list. If the device vouched for others, the same dialog asks whether to revoke them too.
 - **Pair device** shows the code, the QR and the confirmation from pairing at the PC, inside this window.
 - **Allow remote pairing** works without ntfy; ntfy only adds the heads-up. Pending requests appear at the top of the window with the comparison number and **Allow** / **Deny**.
