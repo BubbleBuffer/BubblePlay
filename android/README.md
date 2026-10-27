@@ -12,8 +12,8 @@ On a fresh install, create or import a device key, then pair each PC with its re
 - **Device key and PC list:** the app opens to the PC list only with an unlocked device key. Without a key it shows setup (create or import); a locked key shows an unlock step (`ui/DeviceKeyActivity.kt`, `START_UNLOCK`).
   - **Pairing:** Pair a PC takes the relay address, the PC ID, the code shown on the PC and an optional name (`ui/PairActivity.kt`). A `bubbleplay://pair` link only fills the form; it never submits. Each paired PC is kept on the phone with its name and relay.
   - Tap a PC to connect through its saved relay.
-- **Signaling:** an OkHttp WebSocket to `/ws` carries hello, media-control, the first-frame handshake, desktop state, clipboard, monitors and binary input.
-- **Media:** an OkHttp WebSocket to `/media-ws?epoch=…` using v4 framing.
+- **Signaling:** `/ws?pc=<id>` uses a signed viewer hello and relay challenge, then authenticates the PC against its pinned public key. All endpoint control messages, including input, use the encrypted ctl channel. A relay refusal (1008) or changed PC key stops automatic reconnect; tap the status line to retry or pair again.
+- **Media:** `/media-ws?epoch=…&pc=…` uses the current signaling ticket and v4 framing; it starts after authentication.
   - The app sends a per-frame ACK (with `decodedSeq`), sends keyframe requests (limited to one per 250 ms), and sends a 15 s `ping` heartbeat.
   - Reconnect backoff runs from 250 ms up to 5 s, and the app forces a keyframe after each reconnect.
 - **Decode:** MediaCodec renders to a SurfaceView.
@@ -50,6 +50,8 @@ Code layout (`app/src/main/java/de/bubblebuffer/bubbleplay/`):
 - `files/`: file transfer v1 (flow control, names, the transfer engine, MediaStore downloads).
 - `ui/`: the activities, the IME target view and the cursor overlay.
 
+Pair a new PC using its relay address, PC ID and pairing code. The PC and viewer display a comparison number; allow the request on the PC to save its public key in the PC list.
+
 ### Settings
 
 See the shared [session UI](../docs/architecture/session-ui.md). One view (`ui/SettingsView.kt`), opened from More in the bar and from the connection screen. From the bar it opens over the stream inside `StreamActivity`, so the stream stays in the foreground; Disconnect stays a separate item in More. Values persist in `Prefs` (SharedPreferences, schema version 2) and apply live:
@@ -59,14 +61,14 @@ See the shared [session UI](../docs/architecture/session-ui.md). One view (`ui/S
 - **Mouse and keyboard:** pointer mode for a hardware mouse (Work or Game, default Work; a change in a session switches the host's stream mode now), capture keyboard shortcuts (default on).
 - **Display:** start in full screen, keep screen on, default monitor (requested once when a session starts, if the host lists it and is not already showing it; choosing one in a session switches to it now).
 - **Video:** codec (Auto, HEVC, H.264). A change reconnects the stream with a short notice; transfers in flight end with the old session.
-- **Diagnostics:** decoder, resolution and codec, presented frames/s and media bitrate (1 s windows), relay round trip (signaling ping to pong; the view sends an extra ping every 5 s while open). Copy report puts these plus app, device and settings (server host only, no cookies) on the clipboard.
+- **Diagnostics:** decoder, resolution and codec, presented frames/s and media bitrate (1 s windows), relay round trip (signaling ping to pong; the view sends an extra ping every 5 s while open). Copy report puts these plus app, device and settings (relay host only) on the clipboard.
 - **About:** app version.
 
 ### File transfer (v1)
 
 See [file-transfer behavior](../docs/architecture/file-transfer.md) and the [shared fixture](../fixtures/file-transfer-contract.json). All of it is hidden unless the host's `host-capabilities` carries `fileTransfer` >= 1.
 
-- **Socket:** a second OkHttp WebSocket, `/file-ws?epoch=<mediaEpoch>` (lab: `/lab-file-ws` with `run` and `compat`), with the same gate cookie as `/ws`. It opens on demand, sends `hello`, waits for `file-peer` present (10 s), pings every 15 s and closes after 60 s idle. One transfer runs per direction; the rest queue.
+- **Socket:** a second OkHttp WebSocket, `/file-ws?epoch=<mediaEpoch>&pc=<id>`, using the current signaling ticket. It opens on demand, sends `hello`, waits for `file-peer` present (10 s), pings every 15 s and closes after 60 s idle. One transfer runs per direction; the rest queue.
 - **Upload:**
   - Share sheet: "BubblePlay" accepts `SEND`/`SEND_MULTIPLE` of any type, purpose `save`. Without a session it opens the PC list; the files wait there until you pick a PC, then they upload. At most 64 files go; the rest are reported.
   - The Attach icon in the quick bar opens the system picker (multiple).
@@ -131,7 +133,7 @@ Alternatively, copy the APK to the phone and open it after allowing installs fro
    `host\target\release\bubbleplay-host.exe --mode serve --worker "ws://127.0.0.1:8787/lab-host-ws?run=<uuid>&compat=<compat>"`
 3. In the app, set **Server** to `http://10.0.2.2:8787/` (emulator) and **Lab run** to the same UUID, then tap Connect.
    - For a USB phone, run `adb reverse tcp:8787 tcp:8787` and use `http://127.0.0.1:8787/`.
-   - Lab mode skips the sign-in gate.
+
 
 Cleartext HTTP is allowed only for `10.0.2.2`, `127.0.0.1` and `localhost`. See `res/xml/network_security_config.xml`.
 
