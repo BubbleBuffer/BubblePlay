@@ -1,0 +1,150 @@
+{
+  "epoch": "0123456789abcdef0123456789abcdef",
+  "mediaHex": "42505634040101000000000100000000000000000000007b00000000010203",
+  "ack": {
+    "type": "ack",
+    "generation": 1,
+    "seq": 0,
+    "recvTsMs": 12.3,
+    "decodedSeq": 0
+  },
+  "keyframe": {
+    "type": "keyframe",
+    "reason": "decoder:lost"
+  },
+  "files": [
+    "425046310100000001000000000000007b226e616d65223a2273796e7468657469632e747874222c2273697a65223a332c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2264726f70222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a312c2264726f70223a7b2278223a33323736372c2279223a32303030302c2267656e65726174696f6e223a312c2276696577706f72745265766973696f6e223a307d7d",
+    "42504631030000000100000000000000010203",
+    "425046310500000001000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "425046310800000002000000000000007b226f666665724964223a312c226964223a307d",
+    "425046310600000001000000000000007b22726561736f6e223a2263616e63656c6c6564227d"
+  ],
+  "signals": [
+    {
+      "role": "client",
+      "message": {
+        "type": "client-log",
+        "seq": 1,
+        "atMs": 1,
+        "level": "info",
+        "event": "test",
+        "detail": {}
+      }
+    },
+    {
+      "role": "client",
+      "message": {
+        "type": "qos",
+        "sessionId": "synthetic",
+        "seq": 1,
+        "atMs": 1,
+        "rx": {},
+        "presentation": {}
+      }
+    },
+    {
+      "role": "client",
+      "message": {
+        "type": "media-control",
+        "action": "start",
+        "protocol": 4,
+        "epoch": "0123456789abcdef0123456789abcdef",
+        "codec": "h264"
+      }
+    },
+    {
+      "role": "client",
+      "message": {
+        "type": "media-control",
+        "action": "mode",
+        "protocol": 4,
+        "epoch": "0123456789abcdef0123456789abcdef",
+        "streamMode": "gaming"
+      }
+    },
+    {
+      "role": "client",
+      "message": {
+        "type": "media-control",
+        "action": "quality",
+        "protocol": 4,
+        "epoch": "0123456789abcdef0123456789abcdef"
+      }
+    },
+    {
+      "role": "client",
+      "message": {
+        "type": "first-frame",
+        "protocol": 1,
+        "requestId": "fixture_1",
+        "phase": "request",
+        "transport": "wss",
+        "epoch": "0123456789abcdef0123456789abcdef"
+      }
+    },
+    {
+      "role": "host",
+      "message": {
+        "type": "media-view",
+        "protocol": 4,
+        "generation": 1,
+        "desktopWidth": 1920,
+        "desktopHeight": 1080,
+        "sourceX": 0,
+        "sourceY": 0,
+        "sourceWidth": 1920,
+        "sourceHeight": 1080
+      }
+    },
+    {
+      "role": "host",
+      "message": {
+        "type": "monitor-list",
+        "protocol": 4,
+        "monitors": [],
+        "current": "primary"
+      }
+    },
+    {
+      "role": "host",
+      "message": {
+        "type": "input-capabilities",
+        "protocol": 1,
+        "scancode": true,
+        "clipboard": true,
+        "clipboardMaxBytes": 1048576
+      }
+    },
+    {
+      "role": "host",
+      "message": {
+        "type": "clipboard-image",
+        "protocol": 1,
+        "id": 1,
+        "index": 0,
+        "count": 342,
+        "mimeType": "image/png",
+        "text": "AQID"
+      }
+    },
+    {
+      "role": "client",
+      "message": {
+        "type": "file-drag-preview",
+        "protocol": 1,
+        "epoch": "0123456789abcdef0123456789abcdef",
+        "dragId": 1,
+        "action": "update",
+        "drop": {
+          "x": 32767,
+          "y": 20000,
+          "generation": 1,
+          "viewportRevision": 0
+        },
+        "types": [
+          "text/plain"
+        ]
+      }
+    }
+  ]
+}

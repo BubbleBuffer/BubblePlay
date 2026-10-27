@@ -1,6 +1,6 @@
-//! relay/testdata/worker-contract.json: the shapes the browser and the host
-//! really produce (port of TestBrowserGeneratedProtocolFixtures in
-//! relay/server_test.go).
+//! tests/data/worker-contract.json: the shapes the browser and the host
+//! really produce (port of TestBrowserGeneratedProtocolFixtures in the
+//! Go relay's server_test.go, deleted at CUT-1).
 
 mod common;
 
