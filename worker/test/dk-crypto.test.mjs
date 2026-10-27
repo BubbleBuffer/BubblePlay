@@ -138,6 +138,25 @@ test("transcript refuses a numeric epoch, non-canonical IDs and wrong lengths", 
   await assert.rejects(dk.transcript({ ...fields, viewerNonce: viewerNonce.subarray(1) }), TypeError);
 });
 
+test("transcript encodes a 32-lowercase-hex epoch as its exact bytes with length prefix 32", async () => {
+  const mediaEpoch = "00abcdef0123456789abcdef01234567";
+  const { bytes } = await dk.transcript({
+    relayOrigin, epoch: mediaEpoch, viewerId, viewerPublic, pcId, pcPublic,
+    viewerNonce, pcNonce, viewerEphemeral, pcEphemeral,
+  });
+  const offset = 4 + utf8("bubbleplay-auth-v1").length + 4 + utf8(relayOrigin).length;
+  assert.deepEqual(bytes.subarray(offset, offset + 4), new Uint8Array([0, 0, 0, 32]));
+  assert.deepEqual(bytes.subarray(offset + 4, offset + 36), utf8(mediaEpoch));
+});
+
+test("transcript rejects empty, non-ASCII, nonprintable and oversized epochs", async () => {
+  const fields = { relayOrigin, epoch, viewerId, viewerPublic, pcId, pcPublic, viewerNonce, pcNonce, viewerEphemeral, pcEphemeral };
+  for (const invalid of ["", "caf\u00e9", "abc\n", "\x7f", "a".repeat(65)]) {
+    await assert.rejects(dk.transcript({ ...fields, epoch: invalid }), TypeError);
+  }
+  await dk.transcript({ ...fields, epoch: "a".repeat(64) });
+});
+
 test("pairAdmitHash, pairKey and the pair MACs match the pairing vectors", async () => {
   assert.equal(await dk.pairAdmitHash(pcId, pair.code), pair.admit);
   assert.equal(await dk.pairAdmitHash("77vh7m568gjky12j", pair.codeDisplay), pair.admit);

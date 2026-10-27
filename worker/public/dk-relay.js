@@ -3,8 +3,9 @@
 // Spec: docs/architecture/device-keys.md, "Phase 2 relay protocol" and
 // "Encodings for implementers" (Relay proof). No DOM; safe to import in Node.
 
+import { normalizePairCode, pairAdmitHash as cryptoPairAdmitHash } from "./dk-crypto.js";
+
 const encoder = new TextEncoder();
-const CROCKFORD = /^[0-9A-HJKMNP-TV-Z]+$/;
 export const PAIR_CODE_LENGTH = 10;
 
 export function b64urlEncode(bytes) {
@@ -86,18 +87,12 @@ export function viewerHello({ identity, turn = false, pair = null }) {
 
 /** Pairing code: uppercase, O->0, I/L->1, dashes and spaces dropped; 10 Crockford characters. */
 export function normalizePairingCode(input) {
-  const normalized = String(input ?? "").replace(/[\s-]/g, "").toUpperCase().replace(/O/g, "0").replace(/[IL]/g, "1");
-  if (normalized.length !== PAIR_CODE_LENGTH || !CROCKFORD.test(normalized)) return null;
-  return normalized;
+  try { return normalizePairCode(input); } catch { return null; }
 }
 
 /** b64url(SHA-256("bubbleplay-pair-admit-v1" || canonical PC ID || normalised code)). */
 export async function pairAdmitHash(pcId, code) {
-  const parts = ["bubbleplay-pair-admit-v1", pcId, code].map(text => encoder.encode(text));
-  const bytes = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
-  let offset = 0;
-  for (const part of parts) { bytes.set(part, offset); offset += part.length; }
-  return b64urlEncode(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+  return cryptoPairAdmitHash(pcId, code);
 }
 
 /** The page URL that shows the PC list: the current URL without pc, path "/", no fragment. */
@@ -118,20 +113,23 @@ export function signalingUrl(href, pcId) {
 
 /**
  * Opens /ws in pairing mode: hello with `pair`, register-proof, then hello-ok with pairing:true.
- * The end-to-end pairing handshake (auth-hello, pair-proof, ...) is added by a later run in
- * onPairingAdmitted; this run stops there. Any close before hello-ok is reported by onRefused
- * (code 1008 = not admitted) or onClosed.
+ * After admission, onMessage receives pairing messages in socket order. Callback failures close
+ * the socket and report onError. There are no session/media/control hooks on this socket.
  */
 export function openPairingSocket({
   identity, pc, pair, href, origin = relayOrigin(href), WebSocketImpl = globalThis.WebSocket,
-  onPairingAdmitted, onRefused, onClosed,
+  onPairingAdmitted, onMessage, onRefused, onClosed, onError,
 }) {
   const socket = new WebSocketImpl(signalingUrl(href, pc));
   let admitted = false;
   let challenged = false;
-  const send = message => { try { socket.send(JSON.stringify(message)); } catch {} };
+  let closed = false;
+  let transportClosed = false;
+  let queue = Promise.resolve();
+  const send = message => { if (!closed && !transportClosed) socket.send(JSON.stringify(message)); };
   socket.onopen = () => send(viewerHello({ identity, pair }));
-  socket.onmessage = async event => {
+  async function receive(event) {
+    if (closed) return;
     if (typeof event.data !== "string") return;
     let message;
     try { message = JSON.parse(event.data); } catch { return; }
@@ -143,13 +141,30 @@ export function openPairingSocket({
     } else if (message.type === "hello-ok" && !admitted) {
       if (message.pairing !== true) { socket.close(); return; }
       admitted = true;
-      // TODO(dk2 handshake run): run the pairing handshake on this socket.
-      onPairingAdmitted?.({ socket, message });
+      await onPairingAdmitted?.({ socket, message });
+    } else if (admitted) {
+      await onMessage?.(message);
     }
+  }
+  socket.onmessage = event => {
+    queue = queue.then(() => receive(event)).catch(error => {
+      closed = true;
+      socket.close();
+      onError?.(error);
+    });
+    return queue;
   };
   socket.onclose = event => {
-    if (!admitted && event.code === 1008) onRefused?.(event);
-    else onClosed?.(event, { admitted });
+    // A close event may arrive while WebCrypto is still checking earlier message events.
+    // Drain those messages first: pair-done/denied received before close must win over close.
+    transportClosed = true;
+    queue = queue.then(() => {
+      closed = true;
+      if (!admitted && event.code === 1008) onRefused?.(event);
+      else onClosed?.(event, { admitted });
+    });
+    return queue;
   };
+  socket.onerror = event => onError?.(event);
   return socket;
 }

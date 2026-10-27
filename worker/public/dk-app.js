@@ -10,6 +10,8 @@ import { canonicalId, unlockKeyFile } from "./devicekey.js";
 import { createDeviceKeyStore } from "./devicekey-store.js";
 import { deviceKeyErrorMessage, passphraseValue, summarizeKeyFile } from "./devicekey-ui.js";
 import { normalizePairingCode, openPairingSocket, pairAdmitHash, pcListUrl, relayOrigin } from "./dk-relay.js";
+import { b64u, pairKey, pairMac, verifyPairMac, comparisonNumber } from "./dk-crypto.js";
+import { beginViewerHandshake } from "./dk-handshake.js";
 
 export const FORGET_ENDPOINT = "/__gate/forget";
 
@@ -48,10 +50,20 @@ export function createApp({
   fetch = globalThis.fetch?.bind(globalThis),
   reload = () => location.reload(),
   openPairing = openPairingSocket,
+  beginHandshake = beginViewerHandshake,
+  setTimer = globalThis.setTimeout,
+  clearTimer = globalThis.clearTimeout,
+  now = Date.now,
 }) {
   let identity = null;
   let session = null;
   let pendingLink = null;
+  let pairingAttempt = null;
+
+  function stopPairing() {
+    pairingAttempt?.stop();
+    pairingAttempt = null;
+  }
 
   function wrongPassphrase() {
     const error = new Error("Wrong passphrase.");
@@ -92,6 +104,7 @@ export function createApp({
 
   /** Loads and unlocks the key, then routes. Re-entered after create, import or remove. */
   async function boot() {
+    stopPairing();
     identity = null;
     const text = await store.load();
     if (text === null || text === undefined) return showSetup(false);
@@ -144,6 +157,7 @@ export function createApp({
   }
 
   async function showList() {
+    stopPairing();
     const pcs = sortPcs(await store.listPcs());
     gate.showPcList({
       deviceId: identity.id,
@@ -158,6 +172,7 @@ export function createApp({
   }
 
   async function connect(id) {
+    stopPairing();
     const record = await store.getPc(id);
     if (!record) return showList();
     const url = new URL(location.href);
@@ -166,30 +181,136 @@ export function createApp({
     history.replaceState(null, "", `${url.pathname}${url.search}`);
     gate.showBusy(`Connecting to ${record.name}…`);
     session = await loadSession();
-    session.startSession({ identity, pc: record.id, gate });
+    await session.startSession({ identity, pc: record.id, pinnedPublic: record.public, gate });
   }
 
-  /**
-   * Pairing seam. This run: validate, compute the admit hash, open /ws in pairing mode and stop
-   * at hello-ok pairing:true. The handshake, comparison number and putPc come in a later run.
-   */
+  /** Pair at the PC: prove the code and PC identity before showing a comparison number. */
   async function startPairing(input) {
     const { pc, code } = normalizePairingInput(input);
-    const pair = await pairAdmitHash(pc, code);
+    stopPairing();
     let socket = null;
-    let cancelled = false;
-    const failed = () => { if (!cancelled) gate.showPairing({ state: "failed", pcId: pc, onBack: showList }); };
-    gate.showPairing({ state: "connecting", pcId: pc, onCancel: () => { cancelled = true; socket?.close(); showList(); } });
-    socket = openPairing({
-      identity, pc, pair, href: location.href, origin: relayOrigin(location.href),
-      onPairingAdmitted: () => {
-        // TODO(dk2 handshake run): auth-hello / auth-host / auth-finish with pair-v1, pair-proof
-        // both ways, gate.showPairing({ state: "compare", number }), pair-done -> store.putPc.
-      },
-      onRefused: failed,
-      onClosed: failed,
-    });
-    return { pc, code, pair };
+    let ended = false;
+    let timer = null;
+    let stage = "admission";
+    let handshake = null;
+    let verified = null;
+    let key = null;
+    let queue = Promise.resolve();
+    const attempt = { stop() {
+      ended = true;
+      clearTimer(timer);
+      key = null;
+      socket?.close();
+    } };
+    pairingAttempt = attempt;
+    const active = () => !ended && pairingAttempt === attempt;
+    const fail = (message, state = "failed") => {
+      if (!active()) return;
+      attempt.stop();
+      gate.showPairing({ state, pcId: pc, message, onBack: showList });
+    };
+    const closedMessage = "The PC closed the pairing window. Open Pair device on the PC again.";
+    const notReachable = () => {
+      if (!active()) return;
+      attempt.stop();
+      gate.showRefusal({ title: "PC not reachable", body: "This PC does not support device keys or is not reachable.",
+        actionLabel: "Back to PCs", onAction: async () => {
+          const url = new URL(pcListUrl(location.href));
+          history.replaceState(null, "", `${url.pathname}${url.search}`);
+          await showList();
+        } });
+    };
+    const deadline = (milliseconds, onTimeout = notReachable) => {
+      clearTimer(timer);
+      timer = setTimer(onTimeout, milliseconds);
+      timer?.unref?.();
+    };
+    const cancel = async () => { attempt.stop(); await showList(); };
+    const send = message => {
+      if (active()) socket.send(JSON.stringify(message));
+    };
+    // Even injected socket adapters must preserve the asynchronous handshake's message order.
+    const inOrder = task => {
+      queue = queue.then(async () => { if (active()) await task(); }).catch(error => {
+        fail(error?.reason === "pc-key-changed"
+          ? "This PC answered with a different key. Remove it from the PC list and pair again."
+          : "The PC's pairing exchange could not be verified. Open a new pairing code on the PC and try again.");
+      });
+      return queue;
+    };
+    gate.showPairing({ state: "connecting", pcId: pc, onCancel: cancel });
+    deadline(10000);
+    try {
+      const pair = await pairAdmitHash(pc, code);
+      key = await pairKey(code);
+      if (!active()) { key = null; return; }
+      socket = openPairing({
+        identity, pc, pair, href: location.href, origin: relayOrigin(location.href),
+        onPairingAdmitted: ({ socket: admittedSocket, message }) => inOrder(async () => {
+          socket = admittedSocket;
+          if (stage !== "admission" || message.pc !== pc || message.pairing !== true || message.ticket !== undefined ||
+              typeof message.mediaEpoch !== "string" || !/^[\x20-\x7e]{1,64}$/.test(message.mediaEpoch))
+            throw new Error("Invalid pairing admission");
+          stage = "auth-host";
+          deadline(10000);
+          handshake = await beginHandshake({
+            identity, pcId: pc, pinnedPublic: null,
+            relayOrigin: relayOrigin(location.href), epoch: message.mediaEpoch, pairing: true, send,
+          });
+        }),
+        onMessage: message => inOrder(async () => {
+          if (stage === "done") return;
+          if (message.type === "auth-host" && stage === "auth-host") {
+            clearTimer(timer);
+            verified = await handshake.handleAuthHost(message);
+            if (!active()) return;
+            const mac = await pairMac(key, "viewer", verified.H);
+            if (!active()) return;
+            stage = "pc-proof";
+            send({ type: "pair-proof", mac });
+            deadline(10000);
+          } else if (message.type === "pair-proof" && stage === "pc-proof") {
+            if (Object.keys(message).sort().join(",") !== "mac,type" ||
+                !await verifyPairMac(key, "pc", verified.H, message.mac)) {
+              fail("The pairing code did not match.");
+              return;
+            }
+            const number = await comparisonNumber(verified.H);
+            if (!active()) return;
+            key = null;
+            stage = "approval";
+            deadline(300000, () => fail(closedMessage));
+            gate.showPairing({ state: "compare", pcId: pc, number, onCancel: cancel });
+          } else if (message.type === "pair-done" && stage === "approval" && Object.keys(message).length === 1) {
+            const publicText = b64u.encode(verified.pcPublic);
+            stage = "done";
+            clearTimer(timer);
+            let saved = false;
+            gate.showPairing({ state: "done", pcId: pc, onSave: async name => {
+              if (!active() || saved) return;
+              saved = true;
+              try { await store.putPc({ id: pc, public: publicText, name, paired: now(), lastUsed: null }); }
+              catch (error) { saved = false; throw error; }
+              if (!active()) return;
+              attempt.stop();
+              await connect(pc);
+            } });
+          } else if (message.type === "pair-denied" && Object.keys(message).length === 1) {
+            fail(undefined, "denied");
+          } else if (["auth-host", "auth-finish", "auth-bind", "pair-proof", "pair-done", "ctl"].includes(message.type)) {
+            throw new Error("Unexpected pairing message");
+          } else if (["pair-closed", "peer-left", "error"].includes(message.type)) {
+            fail(closedMessage);
+          }
+        }),
+        onRefused: () => fail("The relay did not accept this code. Check the PC ID and code, or open a new code on the PC."),
+        onClosed: () => { if (stage !== "done") fail(closedMessage); },
+        onError: () => { if (stage !== "done") fail("The pairing connection failed. Check the connection and try again."); },
+      });
+      return { pc, code, pair };
+    } catch (error) {
+      fail(error.message);
+    }
   }
 
   async function forgetBrowser() {
@@ -198,16 +319,19 @@ export function createApp({
     try { response = await fetch(FORGET_ENDPOINT, { method: "POST", credentials: "same-origin" }); }
     catch { throw problem; }
     if (!response.ok) throw problem;
+    stopPairing();
     session?.endSession?.();
     reload();
   }
 
   function switchPc() {
+    stopPairing();
     session?.endSession?.();
     location.assign(pcListUrl(location.href));
   }
 
   function lock() {
+    stopPairing();
     session?.endSession?.();
     reload();
   }

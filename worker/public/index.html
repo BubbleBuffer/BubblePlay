@@ -215,9 +215,6 @@
     : crypto.randomUUID();
   const state = {
     attemptId,
-    runId: uuid.test(search.get("labRun") || "") ? search.get("labRun").toLowerCase() : null,
-    compatibilityId: search.get("labCompat") || null,
-    receiverBuild: null,
     seq: 0,
   };
   const normalizeDetail = detail => Object.fromEntries(Object.entries(detail || {}).slice(0, 16).map(([key, value]) => {
@@ -229,9 +226,6 @@
     const payload = {
       schemaVersion: 1,
       attemptId: state.attemptId,
-      runId: state.runId,
-      compatibilityId: state.compatibilityId,
-      receiverBuild: state.receiverBuild,
       seq: ++state.seq,
       atMs: Date.now(),
       stage,
@@ -247,11 +241,6 @@
   };
   window.__bubbleplayDebugTrace = {
     attemptId: state.attemptId,
-    configure({ runId, compatibilityId, receiverBuild }) {
-      if (runId === null || uuid.test(runId || "")) state.runId = runId?.toLowerCase() ?? null;
-      state.compatibilityId = compatibilityId || null;
-      state.receiverBuild = receiverBuild || null;
-    },
     trace,
   };
   addEventListener("error", event => trace("window-error", {
@@ -264,7 +253,6 @@
     pathname: location.pathname,
     transport: search.get("transport") || "auto",
     decoderPath: search.get("decoderPath") || "native",
-    hasLabRun: state.runId !== null,
   });
 })();
 </script>

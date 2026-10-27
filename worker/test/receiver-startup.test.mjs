@@ -43,7 +43,7 @@ function probeHarness() {
   };
 }
 
-test("startup constructs signaling immediately; socket reconnect retains its 250ms delay", () => {
+test("startup constructs signaling immediately; socket reconnect retains its 250ms delay", async () => {
   const sockets = [];
   const timers = [];
   class Socket {
@@ -53,10 +53,10 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
   const context = vm.createContext({ WebSocket: Socket, URL,
     inputStatusReason: "admin-required", latestInputStatus: { failedPackets: 2 },
     terminalSignalingFailure: false, reconnectTimer: null, ws: null,
-    signalingGeneration: 0, signalingRegistered: false,
-    hudState: {}, hud: { classList: { add() {} } }, labRun: null,
+    signalingGeneration: 0, signalingRegistered: false, authenticatedSession: null,
+    hudState: {}, hud: { classList: { add() {} } },
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, recordSignalingError() {},
-    shouldReconnectAfterClose: () => true, restartPeer() {}, handleSignal() {},
+    shouldReconnectAfterClose: () => true, restartPeer() {}, cleanupPeer() {}, handleSignal() {},
     setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
   });
   const fn = source.slice(source.indexOf("function reconnectSignaling("), source.indexOf("\nfunction signalingSocketUrl("));
@@ -68,6 +68,8 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
   context.inputStatusReason = "admin-unavailable";
   sockets[0].readyState = 3;
   sockets[0].onclose({ code: 1006 });
+  await Promise.resolve();
+  await Promise.resolve();
   assert.equal(context.inputStatusReason, null);
   assert.equal(sockets.length, 1);
   assert.equal(timers[0].delay, 250);
@@ -110,6 +112,7 @@ test("slow ICE renews an exhausted offer-time handshake; normal ICE retains its 
     firstFrameRequestId: () => `request-${++nextRequest}`,
     sendFirstFrameRequest: () => sent.push(state.requestId),
     renderDesktopState() {}, sendClientLog() {}, sendControl() {}, recoverWssStartup() {},
+    recoverRtcInPlaceTransition() {}, consumeRtcTransitionRestart: () => false,
     WSS_PROTOCOL: 4, codecSession: { codec: "hevc" },
     setTimeout: (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
     candidate, generation: 0, isCurrentPeer: () => true, hudState: {}, connected: false,
@@ -259,7 +262,7 @@ test("terminal RTC failure falls back in auto mode; explicit RTC and transient d
       endRtcPeerOnly: () => events.push("end-peer"),
       switchToWss: () => { events.push("fallback"); context.wssSelected = true; },
       ws: { readyState: 1, close: () => events.push("recycle") }, WebSocket: { OPEN: 1 },
-      hudState: {}, hud: { classList: { add() {} } }, restartPeer() {}, startFirstFrameHandshake() {},
+      hudState: {}, hud: { classList: { add() {} } }, restartPeer() {}, startFirstFrameHandshake() {}, maybeBindRtcPeer() {},
     });
     vm.runInContext(fn + `\nhandleRtcPeerConnectionState(0, {}, "${state}");`, context);
     assert.deepEqual(events, expected === "none" ? [] : [expected]);

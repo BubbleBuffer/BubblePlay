@@ -188,7 +188,7 @@ export async function transcript({ relayOrigin, epoch, viewerId, viewerPublic, p
   if (typeof relayOrigin !== "string" || !/^https?:\/\/[\x21-\x7e]+$/.test(relayOrigin)) {
     throw new TypeError("relayOrigin must be an http or https origin");
   }
-  if (typeof epoch !== "string" || !/^[0-9]+$/.test(epoch)) throw new TypeError("epoch must be a decimal string");
+  if (typeof epoch !== "string" || !/^[\x20-\x7e]{1,64}$/.test(epoch)) throw new TypeError("epoch must be 1-64 printable ASCII characters");
   if (!isCanonicalId(viewerId) || !isCanonicalId(pcId)) throw new TypeError("IDs must be canonical");
   const bytes = lengthPrefixed([
     utf8("bubbleplay-auth-v1"), utf8(relayOrigin), utf8(epoch), utf8(viewerId),

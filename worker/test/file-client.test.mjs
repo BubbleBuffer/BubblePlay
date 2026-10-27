@@ -6,6 +6,22 @@ import {
 } from "../public/file-transfer.js";
 import { describeFileError, FileTransferClient } from "../public/file-client.js";
 
+test("file socket closes without sending a hello when no ticket is available", () => {
+  const sent = [];
+  let closed = 0;
+  class Socket {
+    send(data) { sent.push(data); }
+    close() { closed++; }
+  }
+  const client = new FileTransferClient({ socketUrl: () => "wss://x/file-ws", WebSocketImpl: Socket });
+  client.openSocket();
+  client.ws.onopen();
+  assert.deepEqual(sent, []);
+  assert.equal(closed, 1);
+  assert.equal(client.socketState, "closed");
+  client.reset();
+});
+
 test("incremental SHA-256 matches node:crypto across block boundaries", () => {
   for (const size of [0, 1, 55, 56, 63, 64, 65, 119, 120, 1000, 200_003]) {
     const bytes = randomBytes(size);
@@ -108,7 +124,7 @@ class FakeHost {
 
 test("native drop announces all files and streams the batch before awaiting app acceptance", async () => {
   const host = new FakeHost({ deferDropResult: true });
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const point = { x: 54321, y: 12345, generation: 7, viewportRevision: 3 };
   const ids = client.upload([new File([randomBytes(80_000)], "a.bin"), new File([], "empty.txt"), new File(["last"], "b.txt")], "drop", point);
   point.x = 0;
@@ -134,7 +150,7 @@ test("native drop announces all files and streams the batch before awaiting app 
 
 test("invalid native drop coordinates and aggregate size fail before opening a socket", () => {
   const host = new FakeHost();
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const file = new File(["a"], "a.txt");
   for (const point of [undefined, { x: -1, y: 0 }, { x: 65536, y: 0 }, { x: 1.1, y: 0 }]) {
     const [id] = client.upload([file], "drop", point);
@@ -147,7 +163,7 @@ test("invalid native drop coordinates and aggregate size fail before opening a s
 
 test("a native drop becomes done only on the host's final accepted result", async () => {
   const host = new FakeHost({ deferDropResult: true });
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const ids = client.upload([new File(["accepted"], "a.txt")], "drop", { x: 32, y: 64, generation: 7, viewportRevision: 0 });
   await new Promise(resolve => {
     const check = () => {
@@ -166,7 +182,7 @@ test("a native drop becomes done only on the host's final accepted result", asyn
 
 test("cancelling one native drop file cancels its complete batch", async () => {
   const host = new FakeHost({ deferDropResult: true });
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const ids = client.upload([new File(["a"], "a"), new File(["b"], "b")], "drop", { x: 0, y: 65535, generation: 7, viewportRevision: 0 });
   client.cancel(ids[0]);
   const rows = await settled(client, ids);
@@ -195,7 +211,7 @@ function memorySink() {
 
 test("uploads a batch through the window and the PC verifies each hash", async () => {
   const host = new FakeHost();
-  const client = new FileTransferClient({ socketUrl: () => "wss://example.test/file-ws?epoch=x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://example.test/file-ws?epoch=x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const big = randomBytes(3 * 1024 * 1024 + 17);
   const ids = client.upload([new File([big], "big.bin"), new File([new Uint8Array([7])], "one.txt", { type: "text/plain" })], "paste");
   const rows = await settled(client, ids);
@@ -214,7 +230,7 @@ test("uploads a batch through the window and the PC verifies each hash", async (
 
 test("files over 2 GiB are refused before anything is sent", async () => {
   const host = new FakeHost();
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const [id] = client.upload([{ name: "huge.iso", size: 2 * 1024 * 1024 * 1024 + 1, type: "", lastModified: 0, slice() { throw new Error("read"); } }]);
   const [row] = await settled(client, [id]);
   assert.equal(row.state, "failed");
@@ -225,7 +241,7 @@ test("files over 2 GiB are refused before anything is sent", async () => {
 test("downloads an offered file, verifies it and closes the sink", async () => {
   const bytes = randomBytes(2 * 1024 * 1024 + 3);
   const host = new FakeHost({ files: { 4: { name: "report.pdf", bytes } } });
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   assert.ok(client.setOffer({ type: "file-offer", protocol: 1, offerId: 9, items: [{ id: 4, name: "report.pdf", size: bytes.length }], source: "sendto" }));
   const sink = memorySink();
   const ids = client.download(client.offer.items, async () => sink);
@@ -254,7 +270,7 @@ function activeDownload(client) {
 test("a download exceeding the outstanding window fails without queuing more disk writes", { timeout: 3000 }, async () => {
   const bytes = randomBytes(FT_WINDOW_BYTES + 1);
   const host = new FakeHost({ files: { 1: { name: "slow.bin", bytes } }, manualDownload: true });
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const sink = memorySink();
   let release;
   sink.write = data => new Promise(resolve => { sink.parts.push(Buffer.from(data)); release = resolve; });
@@ -289,7 +305,7 @@ test("a download exceeding the outstanding window fails without queuing more dis
 test("written and ACKed bytes reopen the download window for a compliant sender", { timeout: 3000 }, async () => {
   const bytes = randomBytes(FT_WINDOW_BYTES + FT_MAX_DATA_BYTES);
   const host = new FakeHost({ files: { 1: { name: "slow.bin", bytes } }, manualDownload: true });
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const sink = memorySink();
   let release;
   const firstWrite = new Promise(resolve => { release = resolve; });
@@ -325,7 +341,7 @@ test("written and ACKed bytes reopen the download window for a compliant sender"
 
 test("a captured download offer cannot be replaced or withdrawn before download starts", () => {
   const host = new FakeHost();
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const original = { type: "file-offer", protocol: 1, offerId: 1, items: [{ id: 1, name: "a", size: 1 }], source: "clipboard" };
   client.setOffer(original);
   const captured = client.offer;
@@ -345,7 +361,7 @@ test("a captured download offer cannot be replaced or withdrawn before download 
 test("a damaged download is rejected and its partial output discarded", async () => {
   const bytes = randomBytes(200_000);
   const host = new FakeHost({ files: { 1: { name: "a.bin", bytes } }, corrupt: true });
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   client.setOffer({ type: "file-offer", protocol: 1, offerId: 1, items: [{ id: 1, name: "a.bin", size: bytes.length }], source: "clipboard" });
   const sink = memorySink();
   const [row] = await settled(client, client.download(client.offer.items, async () => sink));
@@ -358,7 +374,7 @@ test("a damaged download is rejected and its partial output discarded", async ()
 
 test("a withdrawn file is reported, and a user cancel sends CANCEL", async () => {
   const host = new FakeHost();
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   client.setOffer({ type: "file-offer", protocol: 1, offerId: 2, items: [{ id: 5, name: "gone.txt", size: 3 }], source: "clipboard" });
   const sink = memorySink();
   const [gone] = await settled(client, client.download(client.offer.items, async () => sink));
@@ -388,7 +404,7 @@ test("offers replace each other and an empty offer withdraws", () => {
 
 test("no PC on the file socket fails the transfer with a clear reason", async () => {
   const host = new FakeHost({ peerPresent: false });
-  const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: host.WebSocket });
+  const client = new FileTransferClient({ socketUrl: () => "wss://x", socketTicket: () => "test-ticket", WebSocketImpl: host.WebSocket });
   const [id] = client.upload([new File([new Uint8Array([1])], "a")]);
   // The socket ends while still waiting for the PC (as after the 10 s peer wait).
   setTimeout(() => host.sockets[0].close(), 30);

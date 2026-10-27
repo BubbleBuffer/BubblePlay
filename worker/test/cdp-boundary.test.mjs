@@ -3,25 +3,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-test("live collector attaches to a page target and collects rendered and barcode latency", () => {
-  const source = readFileSync(new URL("../tools/lab/latency-live.mjs", import.meta.url), "utf8");
-  assert.match(source, /webSocketDebuggerUrl/);
-  assert.match(source, /json\/list/);
-  assert.match(source, /__bubbleplayDiagnostics/);
-  assert.match(source, /750/);
-  assert.match(source, /glassToGlassSamples/);
-  assert.match(source, /timestamp-pattern\.html/);
-  assert.doesNotMatch(source, /glassToGlass: \{ status: "unavailable"/);
-});
-
-test("receiver diagnostics identify both index and media asset capabilities", () => {
+test("receiver diagnostics expose current host capabilities, capture and clock", () => {
   const client = readClientSource();
-  const media = readFileSync(new URL("../public/media.js", import.meta.url), "utf8");
-  assert.match(media, /export const STREAM_LAB_ASSET_BUILD = "wss-v4-bench2-hevc-tiles-bpip4-v16"/);
-  assert.match(client, /STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD/);
-  assert.match(client, /const INDEX_ASSET_BUILD = STREAM_LAB_COMPATIBILITY\.receiverBuild/);
-  assert.match(client, /compatibility:\s*STREAM_LAB_COMPATIBILITY/);
-  assert.match(client, /assetBuild:\s*\{\s*index:\s*INDEX_ASSET_BUILD,\s*media:\s*MEDIA_ASSET_BUILD\s*\}/);
   assert.match(client, /hostCapabilities:\s*\{\s*\.\.\.hostCapabilities,\s*current:\s*hostCapabilitiesGeneration === signalingGeneration/);
   assert.match(client, /captureFrame\(\)\s*\{[\s\S]*?toDataURL\("image\/png"\)/);
   assert.match(client, /clock:\s*\{\s*performanceMs:\s*snapshotAtMs,\s*epochMs:\s*snapshotAtEpochMs\s*\}/);
@@ -155,7 +138,6 @@ test("native video is the default path and WebCodecs is opt-in", () => {
 
 test("native video keeps an explicit input overlay and diagnostics count presented frames", () => {
   const client = readClientSource();
-  const collector = readFileSync(new URL("../tools/lab/latency-live.mjs", import.meta.url), "utf8");
   assert.match(client, /#stage\.native-video-input #screen/);
   assert.match(client, /stage\.classList\.add\("native-video-input"\)/);
   assert.match(client, /z-index:1;pointer-events:none/);
@@ -165,8 +147,6 @@ test("native video keeps an explicit input overlay and diagnostics count present
   assert.match(client, /canvas \{\s*width: 100%; height: 100%;\s*object-fit: contain;/);
   assert.match(client, /framesDrawn = nativePresentation\.framesPresented/);
   assert.match(client, /renderedTimestamp: lastRenderedTimestamp \?\? \(nativeFramesPresented > 0 \? nativeFramesPresented : null\)/);
-  assert.match(collector, /function hasRenderedFrame\(snapshot\)/);
-  assert.doesNotMatch(collector, /ready && ready\.ice === "connected" && Number\.isFinite\(ready\.renderedTimestamp\)/);
 });
 
 test("responsive product shell keeps normal controls compact and diagnostics advanced-only", () => {
@@ -262,16 +242,16 @@ test("client starts a new signaling and peer epoch after relay loss or peer depa
   const client = readClientSource();
   assert.match(client, /function reconnectSignaling\(reason\)/);
   assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
-  assert.match(client, /socket\.onclose = \(event\) => \{[\s\S]*reconnectSignaling\("ws-closed"\)/);
+  const reconnect = client.match(/function reconnectSignaling\(reason\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(reconnect);
+  assert.match(reconnect, /socket\.onclose = event => \{[\s\S]*receiveQueue = receiveQueue\.then\(\(\) => handleClose\(event\)\);/);
+  assert.match(reconnect, /const handleClose = event => \{[\s\S]*authenticatedSession\?\.close\(\);[\s\S]*cleanupPeer\(\);[\s\S]*restartPeer\("ws-closed", false\);\s*reconnectSignaling\("ws-closed"\);/);
   assert.match(client, /const generation = \+\+peerGeneration/);
   assert.match(client, /pendingRemoteIce/);
 });
 
 test("browser signaling sends the signed viewer hello and never stores an application secret", () => {
   const client = readClientSource();
-  assert.match(client, /const labRun = parseLabRun\(params\)/);
-  assert.match(client, /labRun \? "\/lab-ws" : "\/ws"/);
-  assert.match(client, /labRun \? "\/lab-media-ws" : "\/media-ws"/);
   assert.match(client, /sendRelay\(viewerHello\(\{ identity: sessionIdentity, turn: wantsTurn\(params\) \}\)\)/);
   assert.doesNotMatch(client, /bp_token|BubblePlay token|hello", token/);
   assert.doesNotMatch(client, /localStorage[^\n]*(privateKey|sessionIdentity)/);
@@ -319,7 +299,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false/);
   assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)[\s\S]*desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
   assert.doesNotMatch(client, /sharpZoomEnabled\s*&&\s*pointerMode\s*===\s*"desktop"/);
-  assert.match(client, /function requestWssMediaStart\(\) \{\s*if \(usingWssMedia\) return;\s*if \(!mediaEpoch\)[\s\S]*ensureMainCanvas\(\);/);
+  assert.match(client, /function requestWssMediaStart\(\) \{\s*if \(usingWssMedia\) return;\s*if \(!authenticatedSession\?\.controlReady \|\| !signalingTicket\) return;\s*if \(!mediaEpoch\)[\s\S]*ensureMainCanvas\(\);/);
   assert.match(client, /function requestWssMediaStart\(\)[\s\S]*stage\.classList\.remove\("native-video-input"\)/);
   assert.match(client, /function recoverNetworkRoute\(reason\)/);
   assert.match(client, /addEventListener\("online", \(\) => recoverNetworkRoute\("online"\)\)/);
@@ -336,9 +316,6 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /frameTraceHistory/);
   assert.match(client, /wssPresentedSequence\s*=\s*metadata\.sequence\s*>>>\s*0/);
   assert.doesNotMatch(client, /wssPresentedSequence\s*=\s*Math\.max\(/);
-  assert.match(client, /armPresentedIdentityHistory\(frameCount = 16\)/);
-  assert.match(client, /wssPresentedIdentityFramesRemaining > 0\s*\?\s*readTimestampPattern\(presentedCanvas, presentedContext\)/);
-  assert.match(client, /wssPresentedIdentityFramesRemaining--/);
   assert.match(client, /decodeQueuedAtMs/);
   assert.match(client, /decodedAtMs/);
   assert.match(client, /presentedAtMs/);
@@ -363,8 +340,9 @@ test("client applies validated ephemeral ICE configuration and keeps route diagn
   const client = readClientSource();
   assert.match(client, /from "\/turn\.js"/);
   assert.match(client, /currentIceServers = validateIceServers\(msg\.iceServers\);/);
-  assert.match(client, /mediaEpoch = \/\^\[a-f0-9\]\{32\}\$\/\.test\(msg\.mediaEpoch/);
-  assert.match(client, /if \(wssSelected\) requestWssMediaStart\(\);\s*else startPeer\(peerGeneration\);/);
+  assert.ok(client.includes('mediaEpoch = typeof msg.mediaEpoch === "string" && /^[\\x20-\\x7e]{1,64}$/.test(msg.mediaEpoch) ? msg.mediaEpoch : null;'),
+    "the admitted epoch must be a bounded printable ASCII string, preserved without numeric conversion");
+  assert.match(client, /onAuthenticated: \(\) => \{\s*if \(!current\(\)\) return;[\s\S]*?if \(wssSelected\) requestWssMediaStart\(\);\s*else startPeer\(peerGeneration\);/);
   assert.match(client, /iceServers: currentIceServers,\s*iceTransportPolicy,/);
   assert.match(client, /hudState\.route = deriveCandidateRoute\(latestRtcProfile\);/);
   assert.match(client, /hudState\.route = "…";/);
@@ -465,7 +443,8 @@ test("mobile desktop pointer uses absolute targets and authoritative host reconc
 
 test("desktop input suspension is enforced at the final browser transport boundary", () => {
   const client = readClientSource();
-  assert.match(client, /function sendInput\(data, channel\) \{\s*if \(desktopInputState !== "enabled"\) return false;/);
+  assert.match(client, /function sendInput\(data, channel\) \{\s*if \(!authenticatedSession\?\.mediaReady\) return false;\s*if \(desktopInputState !== "enabled"\) return false;/);
+  assert.match(client, /function inputControlState\(\) \{\s*if \(!authenticatedSession\?\.mediaReady\) return "down";\s*if \(desktopInputState !== "enabled" \|\| !desktopAvailable\) return "down";/);
   assert.match(client, /if \(desktopInputState !== "enabled"\) releaseInput\(false\);/);
 });
 

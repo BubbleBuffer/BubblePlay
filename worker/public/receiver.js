@@ -10,7 +10,7 @@ import {
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
-import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport, STREAM_LAB_ASSET_BUILD as MEDIA_ASSET_BUILD, STREAM_LAB_COMPATIBILITY } from "/media.js";
+import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
 import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
@@ -28,6 +28,8 @@ import { SoundController, WssAudioPlayer, isAudioPacket, probeOpusDecode, soundB
 import { FileTransferClient } from "/file-client.js";
 import { touchPc } from "/devicekey-store.js";
 import { pcListUrl, registerProof, relayOrigin, viewerHello } from "/dk-relay.js";
+import { b64u } from "/dk-crypto.js";
+import { createViewerSession } from "/dk-session.js";
 import { createFileDragPreviewController, filesFromPaste, installFileTransferUi, mapFileDropPoint } from "/file-ui.js";
 
 const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
@@ -98,12 +100,6 @@ function releaseWebRtcVideoSink() {
 }
 
 const params = new URLSearchParams(location.search);
-function parseLabRun(searchParams) {
-  const value = searchParams.get("labRun") || "";
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : null;
-}
-const labRun = parseLabRun(params);
-const labCompatibilityId = labRun ? STREAM_LAB_COMPATIBILITY.id : null;
 // Media-control messages carry the WSS protocol version (v4 is the only one).
 const WSS_PROTOCOL = V4_VERSION;
 // Opus decode is probed once. The WSS start opts in to BPA1 audio only when it can decode.
@@ -122,17 +118,9 @@ let qualityPreset = parseQualityPreset(params, qualityStorageView(settings));
 const codecSession = createCodecSession({ transport: requestedTransport, decoderPath: useWebCodecs ? "webcodecs" : "native" }); // page-local
 const diagnosticsEnabled = params.get("diag") === "1";
 const profilingEnabled = params.get("profile") === "1" || diagnosticsEnabled;
-const INDEX_ASSET_BUILD = STREAM_LAB_COMPATIBILITY.receiverBuild;
-window.__bubbleplayDebugTrace?.configure({
-  runId: labRun,
-  compatibilityId: labCompatibilityId,
-  receiverBuild: INDEX_ASSET_BUILD,
-});
 debugTrace("module-ready", {
-  mediaBuild: MEDIA_ASSET_BUILD,
   transport: requestedTransport,
   decoderPath: useWebCodecs ? "webcodecs" : "native",
-  hasLabRun: labRun !== null,
 });
 const fullFrameDiagnostic = params.get("fullFrame") === "1";
 const iceTransportPolicy = parseIceTransportPolicy(params);
@@ -143,7 +131,6 @@ let latestRtcProfile = null;
 let latestRtcProfileGeneration = null;
 let hostQuality = null;
 let latestBenchStatus = null;
-let latestBenchStatusRejection = null;
 const sharpZoomEnabled = !fullFrameDiagnostic && params.get("sharpZoom") !== "0";
 const desktopState = document.getElementById("desktop-state");
 const desktopStateTitle = document.getElementById("desktop-state-title");
@@ -181,7 +168,6 @@ let fileDropPresentedViewportRevision = null;
 // rtpGate: on WebRTC, how presentation of the admitted generation is proven
 // (rtcAdmissionGate in monitor-selection.js); null keeps the legacy rule.
 const firstFrameHandshake = { requestId: null, reason: "", transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, rtpGate: null, failureReason: "", timer: null };
-const labQualityKeyframeAcks = new Map();
 let viewportRevision = 0;
 let viewportTimer = null;
 let viewportLast = null;
@@ -471,19 +457,6 @@ function markFirstFramePresented(presentedGeneration = null, presentedViewportRe
   return true;
 }
 function handleFirstFrameMessage(message) {
-  if (message?.protocol === 1 && message.phase === "quality-keyframe-admitted") {
-    if (typeof message.requestId === "string" && Number.isInteger(message.generation) &&
-        Number.isInteger(message.sequence)) {
-      labQualityKeyframeAcks.set(message.requestId, {
-        requestId: message.requestId,
-        generation: message.generation,
-        sequence: message.sequence,
-      });
-      while (labQualityKeyframeAcks.size > 8)
-        labQualityKeyframeAcks.delete(labQualityKeyframeAcks.keys().next().value);
-    }
-    return;
-  }
   if (!message || message.protocol !== 1 || message.requestId !== firstFrameHandshake.requestId) return;
   if (message.phase === "admitted") {
     const firstAdmission = !firstFrameHandshake.admitted;
@@ -757,8 +730,11 @@ let signalingTicket = null;
 // Set once by startSession (dk-app.js). The private key is a non-extractable CryptoKey.
 let sessionIdentity = null;
 let sessionPc = null;
+let sessionPinnedPublic = null;
 let sessionGate = null;
 let sessionTouched = false;
+let authenticatedSession = null;
+let pendingRtcTracks = [];
 let signalingGeneration = 0;
 let reconnectTimer = null;
 let terminalSignalingFailure = false;
@@ -781,18 +757,20 @@ const input = new InputController({
 // congested and discarded only when it is gated or dead; the controller then
 // sends release-all before the next event.
 function inputControlState() {
+  if (!authenticatedSession?.mediaReady) return "down";
   if (desktopInputState !== "enabled" || !desktopAvailable) return "down";
   if (desktopAwaitingFrame) return inputTransitionHold && (dc?.readyState === "open" || (usingWssMedia && ws?.readyState === WebSocket.OPEN)) ? "gated" : "down";
-  if (dc?.readyState === "open") return dc.bufferedAmount > 262_144 ? "busy" : "open";
   if (usingWssMedia && ws?.readyState === WebSocket.OPEN) return ws.bufferedAmount > 16_384 ? "busy" : "open";
+  if (authenticatedSession.rtcReady && dc?.readyState === "open") return dc.bufferedAmount > 262_144 ? "busy" : "open";
   return "down";
 }
 function sendInput(data, channel) {
+  if (!authenticatedSession?.mediaReady) return false;
   if (desktopInputState !== "enabled") return false;
   if (!desktopAvailable || desktopAwaitingFrame) return false;
-  if (channel?.readyState === "open") try { channel.send(data); return true; } catch {}
+  if (!usingWssMedia && authenticatedSession.rtcReady && channel?.readyState === "open") try { channel.send(data); return true; } catch {}
   // The WSS media fallback deliberately keeps input/cursor on /ws.
-  if (usingWssMedia && signalingRegistered && ws?.readyState === WebSocket.OPEN && ws.bufferedAmount <= 16_384) try { ws.send(data); return true; } catch {}
+  if (usingWssMedia && signalingRegistered && ws?.readyState === WebSocket.OPEN && ws.bufferedAmount <= 16_384) return authenticatedSession.sendInput(data);
   return false;
 }
 let motionFrame = null;
@@ -854,7 +832,6 @@ let wssDecodeSequenceByTimestamp = new Map();
 let wssFrameMeta = new WeakMap();
 let wssLatestFrameTrace = null;
 let wssPresentedFrameTraces = new Map();
-let wssPresentedIdentityFramesRemaining = 0;
 let wssTimestampFallbackLogged = false;
 const hybridTileCache = new HybridTileCache();
 const hevcTileCache = new HevcTileCache();
@@ -878,12 +855,10 @@ function sendRelay(message) {
   return true;
 }
 
-// The one path for every viewer->PC JSON message on /ws (the control-channel seam: the
-// handshake run encrypts here). Nothing is sent before the relay admits this socket.
+// Every endpoint JSON message on /ws is encrypted; relay messages use sendRelay instead.
 function sendControl(message) {
   if (!signalingRegistered || ws?.readyState !== WebSocket.OPEN) return false;
-  ws.send(JSON.stringify(message));
-  return true;
+  return authenticatedSession?.sendControl(message) || false;
 }
 
 function recordHostEvidence(type) {
@@ -931,24 +906,26 @@ function reconnectSignaling(reason) {
     reconnectTimer = null;
     latestInputStatus = null;
     inputStatusReason = null;
+    authenticatedSession?.close();
+    authenticatedSession = null;
     const generation = ++signalingGeneration;
     const socketUrl = signalingSocketUrl();
     debugTrace("signaling-construct", {
       path: new URL(socketUrl).pathname,
       generation,
       reason,
-      hasLabRun: labRun !== null,
     });
     const socket = new WebSocket(socketUrl);
     socket.binaryType = "arraybuffer";
     ws = socket;
+    let receiveQueue = Promise.resolve();
     socket.onopen = () => {
       if (ws !== socket || generation !== signalingGeneration) return;
       hudState.ws = "open";
       debugTrace("signaling-open", { generation });
       sendRelay(viewerHello({ identity: sessionIdentity, turn: wantsTurn(params) }));
     };
-    socket.onclose = (event) => {
+    const handleClose = event => {
       if (ws !== socket || generation !== signalingGeneration) return;
       const admitted = signalingRegistered;
       hudState.ws = "closed";
@@ -957,6 +934,9 @@ function reconnectSignaling(reason) {
       signalingRegistered = false;
       signalingPc = null;
       signalingTicket = null;
+      authenticatedSession?.close();
+      authenticatedSession = null;
+      cleanupPeer();
       recordSignalingError("socket-close", `WebSocket closed (${event.code})`, { code: event.code, reason: event.reason || "" });
       debugTrace("signaling-close", { generation, code: event.code, reason: event.reason || "" });
       hud.classList.add("bad");
@@ -975,20 +955,25 @@ function reconnectSignaling(reason) {
       reconnectSignaling("ws-closed");
     };
     socket.onerror = () => { if (ws === socket) { hudState.ws = "error"; recordSignalingError("socket-error", "WebSocket signaling error"); debugTrace("signaling-error", { generation }); } };
-    socket.onmessage = (ev) => handleSignal(socket, generation, ev);
+    // WebCrypto yields between messages. Preserve wire order across hello-ok,
+    // auth-host and ctl rather than letting WebSocket callbacks race each other.
+    socket.onmessage = ev => {
+      receiveQueue = receiveQueue.then(() => handleSignal(socket, generation, ev)).catch(() => {
+        if (ws === socket && generation === signalingGeneration) endAuthenticatedSession({ title: "Session ended", body: "A control message failed its integrity check, so the session was closed." });
+      });
+    };
+    socket.onclose = event => {
+      // A final encrypted refusal precedes close on the wire, but decryption
+      // may still be running. Let that refusal decide whether to reconnect.
+      receiveQueue = receiveQueue.then(() => handleClose(event));
+    };
   };
   if (reason === "startup") connect();
   else reconnectTimer = setTimeout(connect, 250);
 }
 
 function signalingSocketUrl() {
-  const path = labRun ? "/lab-ws" : "/ws";
-  let query = labRun
-    ? `?run=${encodeURIComponent(labRun)}&compat=${encodeURIComponent(labCompatibilityId)}`
-    : "";
-  const targetPc = sessionPc || "";
-  if (targetPc) query += `${query ? "&" : "?"}pc=${encodeURIComponent(targetPc)}`;
-  return `${proto}//${location.host}${path}${query}`;
+  return `${proto}//${location.host}/ws?pc=${encodeURIComponent(sessionPc)}`;
 }
 
 function recycleSignaling(reason) {
@@ -1022,6 +1007,8 @@ function recycleSignaling(reason) {
   signalingRegistered = false;
   signalingPc = null;
   signalingTicket = null;
+  authenticatedSession?.close();
+  authenticatedSession = null;
   signalingGeneration++;
   try { socket?.close(1000, reason); } catch {}
   reconnectSignaling(reason);
@@ -1029,13 +1016,11 @@ function recycleSignaling(reason) {
 
 async function handleSignal(socket, generation, ev) {
   if (ws !== socket || generation !== signalingGeneration) return;
-  if (ev.data instanceof ArrayBuffer || ArrayBuffer.isView(ev.data)) {
-    handleCursorState(ev.data, "signaling");
-    return;
-  }
+  // The relay never forwards plaintext endpoint frames after cutover.
+  if (typeof ev.data !== "string") { console.info("BubblePlay ignored a plaintext endpoint frame."); return; }
   let msg;
   try { msg = JSON.parse(ev.data); } catch { return; }
-  if (["answer", "ice", "quality", "bench-status", "media-view", "desktop-state", "input-status", "host-capabilities", "first-frame", "monitor-list", "monitor-error"].includes(msg.type)) recordHostEvidence(msg.type);
+  if (!msg || typeof msg !== "object") return;
   switch (msg.type) {
     case "register-challenge": {
       if (signalingRegistered || !sessionIdentity) return;
@@ -1044,25 +1029,67 @@ async function handleSignal(socket, generation, ev) {
       sendRelay(proof);
       break;
     }
-    case "hello-ok":
+    case "hello-ok": {
+      if (signalingRegistered) return;
       signalingPc = typeof msg.pc === "string" && msg.pc ? msg.pc : null;
       signalingTicket = typeof msg.ticket === "string" && msg.ticket ? msg.ticket : null;
+      if (signalingPc !== sessionPc || !signalingTicket) return endAuthenticatedSession({ title: "PC not reachable", body: "This PC does not support device keys or is not reachable." });
       signalingRegistered = true;
       signalingRegisteredAtMs = Date.now();
-      sendClientLog("info", "signaling-registered");
       debugTrace("signaling-hello-ok", { generation, hasMediaEpoch: typeof msg.mediaEpoch === "string" });
       hudState.ws = "ok";
-      sessionGate?.hide();
-      if (!sessionTouched && sessionPc) { sessionTouched = true; touchPc(sessionPc).catch(() => {}); }
       currentIceServers = validateIceServers(msg.iceServers);
-      mediaEpoch = /^[a-f0-9]{32}$/.test(msg.mediaEpoch || "") ? msg.mediaEpoch : null;
+      mediaEpoch = typeof msg.mediaEpoch === "string" && /^[\x20-\x7e]{1,64}$/.test(msg.mediaEpoch) ? msg.mediaEpoch : null;
       renderAbout({ relay: typeof msg.workerVersionId === "string" ? msg.workerVersionId.slice(0, 96) : null });
       // File transfer hook (2/5): file sockets pair on the epoch.
       noteFileEpoch(mediaEpoch);
-      sendStreamMode("signaling-start");
-      if (wssSelected) requestWssMediaStart();
-      else startPeer(peerGeneration);
+      const current = () => ws === socket && generation === signalingGeneration;
+      const session = createViewerSession({ identity: sessionIdentity, pcId: sessionPc, pinnedPublic: sessionPinnedPublic,
+        relayOrigin: relayOrigin(location.href), epoch: msg.mediaEpoch, transport: wssSelected ? "wss" : "webrtc",
+        send: message => current() && sendRelay(message),
+        onAuthenticated: () => {
+          if (!current()) return;
+          sendClientLog("info", "signaling-authenticated");
+          sendStreamMode("signaling-start");
+          if (wssSelected) requestWssMediaStart();
+          else startPeer(peerGeneration);
+        },
+        onMessage: message => { if (current()) return handleEndpointSignal(socket, generation, message); },
+        onBinary: (kind, bytes) => { if (current() && kind === "cursor") handleCursorState(bytes, "signaling"); },
+        onMediaReady: () => { if (current()) openAuthenticatedMedia(); },
+        onFailure: refusal => { if (current()) endAuthenticatedSession(refusal); },
+      });
+      authenticatedSession = session;
+      await session.start();
       break;
+    }
+    case "auth-host":
+    case "auth-bind":
+    case "ctl":
+      await authenticatedSession?.receive(msg);
+      break;
+    case "peer-left":
+      recycleSignaling("peer-left");
+      restartPeer("peer-left", false);
+      break;
+    case "error":
+      recordSignalingError("relay-error", msg.message, msg);
+      endAuthenticatedSession({ title: "Session ended", body: typeof msg.message === "string" ? msg.message.slice(0, 200) : "The relay ended this session." });
+      break;
+    case "ping":
+    case "pong":
+    case "peer-joined":
+    case "pair-closed":
+      break;
+    default:
+      console.info("BubblePlay ignored a plaintext endpoint message.");
+  }
+}
+
+async function handleEndpointSignal(socket, generation, msg) {
+  if (ws !== socket || generation !== signalingGeneration || !authenticatedSession?.controlReady) return;
+  if (["answer", "ice", "quality", "bench-status", "media-view", "desktop-state", "input-status", "host-capabilities", "first-frame", "monitor-list", "monitor-error"].includes(msg.type)) recordHostEvidence(msg.type);
+  switch (msg.type) {
     case "answer": {
       const candidate = pc;
       const peer = peerGeneration;
@@ -1071,6 +1098,7 @@ async function handleSignal(socket, generation, ev) {
         await candidate.setRemoteDescription({ type: "answer", sdp: msg.sdp });
         if (!isCurrentPeer(peer, candidate)) return;
         remoteDescriptionSet = true;
+        maybeBindRtcPeer(candidate, peer);
         rtcStartupFallback?.progress();
         hudState.ice = "answer";
         const queued = pendingRemoteIce;
@@ -1087,24 +1115,13 @@ async function handleSignal(socket, generation, ev) {
         else addRemoteIce(pc, peerGeneration, msg.candidate);
       }
       break;
-    case "peer-left":
-      recycleSignaling("peer-left");
-      restartPeer("peer-left", false);
-      break;
     case "quality": {
       const quality = parseHostQuality(msg);
       if (quality) hostQuality = quality;
       break;
     }
     case "bench-status":
-      latestBenchStatusRejection = null;
       applyBenchStatus(msg);
-      break;
-    case "bench-status-rejected":
-      if (labRun && msg.protocol === 1 && typeof msg.reason === "string") {
-        latestBenchStatusRejection = { reason: msg.reason, atMs: Date.now() };
-        recordHostEvidence("bench-status-rejected");
-      }
       break;
     case "media-view":
       handleMediaView(msg);
@@ -1180,11 +1197,12 @@ async function handleSignal(socket, generation, ev) {
       handleMonitorError(msg);
       break;
     case "error":
-      recordSignalingError("relay-error", msg.message, msg);
+      recordSignalingError("endpoint-error", msg.message, msg);
       sendClientLog("error", "signaling-error", { message: msg.message });
       terminalSignalingFailure = true;
       hudState.ws = `err:${msg.message}`;
       hud.classList.add("bad");
+      endAuthenticatedSession({ title: "Session ended", body: typeof msg.message === "string" ? msg.message.slice(0, 200) : "The PC ended this session." });
       break;
   }
 }
@@ -1212,6 +1230,57 @@ setInterval(() => {
 }, V4_HEARTBEAT_MS);
 
 // ---- WebRTC ----------------------------------------------------------------
+function endAuthenticatedSession(refusal) {
+  terminalSignalingFailure = true;
+  authenticatedSession?.close();
+  authenticatedSession = null;
+  clearTimeout(reconnectTimer); reconnectTimer = null;
+  const socket = ws;
+  ws = null;
+  signalingGeneration++;
+  signalingRegistered = false;
+  signalingPc = signalingTicket = null;
+  clearFirstFrameWatchdog();
+  cleanupPeer();
+  noteFileEpoch(null);
+  setFileTransferAvailable(false);
+  hudState.ws = "error";
+  hud.classList.add("bad");
+  try { socket?.close(1000, "session-ended"); } catch {}
+  sessionGate?.showRefusal({ ...refusal, actionLabel: "Back to PCs", onAction: () => location.assign(pcListUrl(location.href)) });
+}
+
+function updateAuthenticatedInputReady() {
+  const wasReady = inputReady;
+  inputReady = !!authenticatedSession?.mediaReady && (usingWssMedia || (authenticatedSession.rtcReady && dc?.readyState === "open" && motionDc?.readyState === "open"));
+  hudState.control = usingWssMedia ? (inputReady ? "open" : "closed") : dc?.readyState || "closed";
+  hudState.motion = usingWssMedia ? (inputReady ? "open" : "closed") : motionDc?.readyState || "closed";
+  hudState.dc = inputReady ? "open" : "closed";
+  if (!wasReady && inputReady) onInputReady();
+}
+
+function openAuthenticatedMedia() {
+  if (!authenticatedSession?.mediaReady) return;
+  sessionGate?.hide();
+  if (!sessionTouched && sessionPc) { sessionTouched = true; touchPc(sessionPc).catch(() => {}); }
+  if (!wssSelected && !usingWssMedia) {
+    const tracks = pendingRtcTracks;
+    pendingRtcTracks = [];
+    for (const { event, generation } of tracks) {
+      if (!isCurrentPeer(generation) || event.track.readyState === "ended") continue;
+      event.track.enabled = true;
+      onTrack(event, generation);
+    }
+  }
+  updateAuthenticatedInputReady();
+}
+
+function maybeBindRtcPeer(candidate = pc, generation = peerGeneration) {
+  if (!candidate || !isCurrentPeer(generation, candidate) || usingWssMedia || wssSelected ||
+      candidate.connectionState !== "connected" || !candidate.localDescription?.sdp || !candidate.remoteDescription?.sdp) return;
+  void authenticatedSession?.bindPeer({ localSdp: candidate.localDescription.sdp, remoteSdp: candidate.remoteDescription.sdp });
+}
+
 function restartPeer(reason, reconnect = true) {
   const generation = ++peerGeneration;
   invalidatePendingMonitorRequest(reason);
@@ -1242,15 +1311,18 @@ function restartPeer(reason, reconnect = true) {
 }
 
 function cleanupPeer() {
+  for (const { event } of pendingRtcTracks) event.track.stop();
+  pendingRtcTracks = [];
   fileDragPreview.cancel();
   nativeFileDropPreviewAvailable = false;
   fileDropPresentedGeneration = null;
   fileDropPresentedViewportRevision = null;
+  closingPeer = true;
+  releaseInput();
   if (usingWssMedia) stopWssMedia();
   soundController.detachSink("rtc");
   clearWssTimers();
-  closingPeer = true;
-  releaseInput();
+  authenticatedSession?.resetPeer();
   resetKeyboardDraft();
   resetTouchCursor();
   cursorAppearance.reset();
@@ -1301,7 +1373,6 @@ function stopWssMedia() {
   debugFirstMediaPacket = false;
   debugFirstDecoderConfigured = false; debugFirstDecoderOutput = false;
   wssPresentedFrameTraces.clear();
-  wssPresentedIdentityFramesRemaining = 0;
   wssLatestFrameTrace = null; wssTimestampFallbackLogged = false;
   clearWssHybridCaches();
   requestWssKeyframe.lastAt = 0;
@@ -1342,17 +1413,17 @@ function scheduleWssV4Reconnect(reason) {
 }
 
 function openWssV4Socket() {
-  if (!usingWssMedia || !mediaEpoch) return;
+  if (!usingWssMedia || !mediaEpoch || !signalingTicket || !authenticatedSession?.mediaReady) return;
+  const ticket = signalingTicket;
   const socket = new WebSocket(mediaSocketUrl());
   socket.binaryType = "arraybuffer";
   wssV4.socket = socket;
   wssV4.socketOpen = false;
   wssV4.hostPresent = false;
-  const current = () => usingWssMedia && wssV4.socket === socket;
+  const current = () => usingWssMedia && wssV4.socket === socket && signalingTicket === ticket && authenticatedSession?.mediaReady;
   socket.onopen = () => {
     if (!current()) return;
-    if (signalingTicket) socket.send(JSON.stringify({ type: "hello", role: "media-viewer", ticket: signalingTicket }));
-    else socket.send(JSON.stringify({ type: "hello", role: "media-viewer" }));
+    socket.send(JSON.stringify({ type: "hello", role: "media-viewer", ticket }));
     wssV4.lastSendAt = wssV4.lastInboundAt = performance.now();
   };
   socket.onmessage = (event) => {
@@ -1503,14 +1574,9 @@ function startWssV4() {
 }
 
 function mediaSocketUrl() {
-  const path = labRun ? "/lab-media-ws" : "/media-ws";
   const query = new URLSearchParams({ epoch: mediaEpoch });
-  if (signalingPc) query.set("pc", signalingPc);
-  if (labRun) {
-    query.set("run", labRun);
-    query.set("compat", labCompatibilityId);
-  }
-  return `${proto}//${location.host}${path}?${query}`;
+  query.set("pc", signalingPc);
+  return `${proto}//${location.host}/media-ws?${query}`;
 }
 
 function recordWssPacketRejection(reason) {
@@ -1526,6 +1592,7 @@ function recordWssPacketRejection(reason) {
 
 function requestWssMediaStart() {
   if (usingWssMedia) return;
+  if (!authenticatedSession?.controlReady || !signalingTicket) return;
   if (!mediaEpoch) { hudState.ice = "wss session unavailable"; return; }
   // Automatic fallback keeps the peer and data channels alive, but the
   // WebRTC transform worker may still own the visible canvas. Release only
@@ -1544,12 +1611,14 @@ function requestWssMediaStart() {
   desktopAvailable = true;
   desktopAwaitingFrame = true;
   renderDesktopState();
+  authenticatedSession.useWss();
+  openAuthenticatedMedia();
   // In auto mode keep the peer object alive as a control/lifecycle anchor.
   // Closing it here makes the host interpret the transport fallback as the
   // browser leaving. The host stops admitting RTP once WSS is selected.
   hudState.ice = "wss"; hudState.route = "wss"; hudState.dec = `${codecSession.codec} wss`;
   sendClientLog("info", "wss-start", { epoch: mediaEpoch, protocol: WSS_PROTOCOL, rememberedRtcFailure: startOnRememberedWss });
-  inputReady = connected = true; onInputReady();
+  connected = true; updateAuthenticatedInputReady();
   wssStartedHost = false;
   // v4 decodes every frame in order: there is no deadline expiry.
   startWssV4();
@@ -1733,7 +1802,10 @@ function beginWssRecovery(reason, requestId = null) {
 function handleRtcPeerConnectionState(generation, candidate, state) {
   if (!isCurrentPeer(generation, candidate)) return;
   rtcStartupFallback?.progress();
-  if (state === "connected" && !usingWssMedia) startFirstFrameHandshake("peer-connected");
+  if (state === "connected" && !usingWssMedia) {
+    maybeBindRtcPeer(candidate, generation);
+    startFirstFrameHandshake("peer-connected");
+  }
   const action = rtcPeerEndAction({ usingWssMedia, connectionState: state });
   if (action === "end-peer") endRtcPeerOnly(`rtc-${state}`);
   else if (action === "recycle") {
@@ -1947,6 +2019,7 @@ function decodeWssFrame(frame) {
 
 async function startPeer(generation = peerGeneration) {
   if (requestedTransport === TRANSPORT.WSS || usingWssMedia) return;
+  if (!authenticatedSession?.controlReady) return;
   if (offerSent || generation !== peerGeneration || ws?.readyState !== WebSocket.OPEN) return;
   offerSent = true;
   lastIceCandidateError = null;
@@ -2035,7 +2108,7 @@ async function startPeer(generation = peerGeneration) {
   motionDc = motionChannel;
   channel.binaryType = "arraybuffer";
   motionChannel.binaryType = "arraybuffer";
-  const updateInputReady = () => { const wasReady=inputReady; inputReady = dc?.readyState === "open" && motionDc?.readyState === "open"; hudState.control = dc?.readyState || "closed"; hudState.motion = motionDc?.readyState || "closed"; hudState.dc = inputReady ? "open" : "closed"; if (!wasReady && inputReady) onInputReady(); };
+  const updateInputReady = () => updateAuthenticatedInputReady();
   const laneClosed = () => {
     if (!isCurrentPeer(generation, candidate) || closingPeer) return;
     if (wssSelected || rtcPeerEndAction({ usingWssMedia, laneClosed: true }) === "end-peer") return endRtcPeerOnly("input-lane-closed");
@@ -2046,8 +2119,8 @@ async function startPeer(generation = peerGeneration) {
   motionChannel.onopen = () => { if (isCurrentPeer(generation, candidate)) { rtcStartupFallback?.progress(); updateInputReady(); } };
   motionChannel.onclose = laneClosed;
   channel.onerror = (e) => { if (isCurrentPeer(generation, candidate)) hudState.dc = `err:${e.message || ""}`; };
-  channel.onmessage = (event) => { if (isCurrentPeer(generation, candidate)) handleCursorState(event.data); };
-  motionChannel.onmessage = (event) => { if (isCurrentPeer(generation, candidate)) handleCursorState(event.data); };
+  channel.onmessage = (event) => { if (isCurrentPeer(generation, candidate) && !usingWssMedia && authenticatedSession?.mediaReady) handleCursorState(event.data); };
+  motionChannel.onmessage = (event) => { if (isCurrentPeer(generation, candidate) && !usingWssMedia && authenticatedSession?.mediaReady) handleCursorState(event.data); };
 
   candidate.onicecandidate = (ev) => {
     if (isCurrentPeer(generation, candidate) && ev.candidate) {
@@ -2083,7 +2156,16 @@ async function startPeer(generation = peerGeneration) {
       startFirstFrameHandshake("ice-connected");
     }
   };
-  candidate.ontrack = (ev) => { if (isCurrentPeer(generation, candidate)) onTrack(ev, generation); };
+  candidate.ontrack = ev => {
+    if (!isCurrentPeer(generation, candidate) || usingWssMedia || wssSelected) { ev.track.stop(); return; }
+    if (authenticatedSession?.mediaReady) onTrack(ev, generation);
+    else {
+      ev.track.enabled = false;
+      // There is one receive transceiver each for video and audio.
+      if (pendingRtcTracks.length >= 2) { ev.track.stop(); return; }
+      pendingRtcTracks.push({ event: ev, generation });
+    }
+  };
   candidate.onconnectionstatechange = () => handleRtcPeerConnectionState(generation, candidate, candidate.connectionState);
 
   try {
@@ -2102,15 +2184,19 @@ async function startPeer(generation = peerGeneration) {
 
 /**
  * Starts the session for one PC after dk-app.js unlocked the key. identity: { id,
- * publicRaw: Uint8Array, privateKey: non-extractable CryptoKey }. The gate hides on hello-ok.
+ * publicRaw: Uint8Array, privateKey: non-extractable CryptoKey }. pinnedPublic is the
+ * stored base64url PC key. The gate hides only after endpoint authentication/binding.
  */
-export function startSession({ identity, pc, gate = null }) {
+export function startSession({ identity, pc, pinnedPublic, gate = null }) {
   if (sessionIdentity) throw new Error("A session is already running on this page.");
-  if (!identity?.id || !(identity.publicRaw instanceof Uint8Array) || !identity.privateKey || !pc) {
+  if (!identity?.id || !(identity.publicRaw instanceof Uint8Array) || !identity.privateKey || typeof pc !== "string" || !pc) {
     throw new TypeError("startSession needs an unlocked identity and a PC ID.");
   }
+  const pin = b64u.decode(pinnedPublic);
+  if (pin.length !== 32) throw new TypeError("startSession needs the PC's pinned public key.");
   sessionIdentity = identity;
   sessionPc = pc;
+  sessionPinnedPublic = pin;
   sessionGate = gate;
   terminalSignalingFailure = false;
   reconnectSignaling("startup");
@@ -2121,9 +2207,16 @@ export function endSession() {
   releaseInput();
   if (document.pointerLockElement) document.exitPointerLock?.();
   terminalSignalingFailure = true;
+  authenticatedSession?.close(); authenticatedSession = null;
   clearTimeout(reconnectTimer); reconnectTimer = null;
   cleanupPeer();
-  try { ws?.close(1000, "session-ended"); } catch {}
+  noteFileEpoch(null);
+  const socket = ws;
+  ws = null;
+  signalingRegistered = false;
+  signalingPc = signalingTicket = null;
+  signalingGeneration++;
+  try { socket?.close(1000, "session-ended"); } catch {}
 }
 
 function showNotAdmitted() {
@@ -2215,52 +2308,18 @@ if (diagnosticsEnabled) {
       if (typeof selector !== "string" || !monitorList.some(monitor => monitor.selector === selector)) return false;
       return requestMonitor(selector);
     },
-    injectDecoderFault(requestReason = "diagnostic-injected-fault", qualityRequestId = null) {
-      const reason = requestReason === "stream-lab-quality-capture"
-        ? requestReason : "diagnostic-injected-fault";
-      if (reason === "stream-lab-quality-capture" &&
-          (typeof qualityRequestId !== "string" || !/^quality-[0-9a-f-]{36}$/.test(qualityRequestId)))
-        return false;
+    injectDecoderFault() {
+      const reason = "diagnostic-injected-fault";
       if (usingWssMedia) {
         wssLastRecoveryAt = -Infinity;
-        // An identified lab request must reach the host even when another
-        // recovery is already awaiting a keyframe; the host acknowledgement
-        // binds scoring to the exact reset IDR admitted to WSS.
-        return beginWssRecovery(reason, qualityRequestId);
+        return beginWssRecovery(reason);
       }
       if (!encodedWorker) return false;
       encodedWorker.postMessage({ type: "resync", reason });
       return true;
     },
-    qualityKeyframeAck(requestId) {
-      return labQualityKeyframeAcks.get(requestId) ?? null;
-    },
-    armPresentedIdentityHistory(frameCount = 16) {
-      frameCount = Number(frameCount);
-      if (!labRun || !Number.isInteger(frameCount) || frameCount < 1 || frameCount > 64)
-        return false;
-      wssPresentedIdentityFramesRemaining = Math.max(
-        wssPresentedIdentityFramesRemaining,
-        frameCount,
-      );
-      return true;
-    },
-    // Lab-only: fail the RTC peer as the browser reports it, to prove that a
-    // WSS session outlives its RTC lifecycle anchor.
-    simulateRtcPeerFailure() {
-      if (!labRun || !pc) return false;
-      handleRtcPeerConnectionState(peerGeneration, pc, "failed");
-      return true;
-    },
     rtcPeerState() {
       return pc ? pc.connectionState : null;
-    },
-    // Lab-only: drop the v4 media socket to exercise backoff reconnect.
-    dropWssV4Socket() {
-      if (!labRun || !usingWssMedia || !wssV4.socket) return false;
-      sendClientLog("warn", "wss-v4-diagnostic-drop", {});
-      try { wssV4.socket.close(4000, "diagnostic-drop"); } catch { return false; }
-      return true;
     },
     setFixedZoom(zoom) {
       const value = Number(zoom);
@@ -2341,8 +2400,6 @@ if (diagnosticsEnabled) {
         (nativePresentation?.lastFrameAtMs === null || nativePresentation?.lastFrameAtMs === undefined ? null : performance.now() - nativePresentation.lastFrameAtMs);
       return {
         diagnosticAttemptId,
-        assetBuild: { index: INDEX_ASSET_BUILD, media: MEDIA_ASSET_BUILD },
-        compatibility: STREAM_LAB_COMPATIBILITY,
         clock: { performanceMs: snapshotAtMs, epochMs: snapshotAtEpochMs },
         ...hudState,
         generation: latencyGuard.generation,
@@ -2389,7 +2446,6 @@ if (diagnosticsEnabled) {
           hostEvidence: { ...signalingHostEvidence },
           lastError: lastSignalingError ? { ...lastSignalingError } : null,
           lastRecycle: lastSignalingRecycle ? { ...lastSignalingRecycle } : null,
-          benchStatusRejection: latestBenchStatusRejection ? { ...latestBenchStatusRejection } : null,
           monitorRevision: monitorListRevision,
           monitorSwitchPending,
           lastMonitorRequest: lastMonitorRequest ? { ...lastMonitorRequest } : null,
@@ -3217,10 +3273,6 @@ function drawFrame(frame, due = performance.now()) {
     if (metadata?.frameTrace) {
       metadata.frameTrace.hybridTilesDrawn = hybridTilesDrawn;
       metadata.frameTrace.presentedAtMs = renderedAt;
-      metadata.frameTrace.presentedIdentity = wssPresentedIdentityFramesRemaining > 0
-        ? readTimestampPattern(presentedCanvas, presentedContext) : null;
-      if (wssPresentedIdentityFramesRemaining > 0)
-        wssPresentedIdentityFramesRemaining--;
       wssLatestFrameTrace = { ...metadata.frameTrace };
       wssPresentedFrameTraces.set(metadata.frameTrace.sequence >>> 0, { ...metadata.frameTrace });
       while (wssPresentedFrameTraces.size > 64)
@@ -3437,14 +3489,10 @@ const fileUi = installFileTransferUi({
   onError: error => sendClientLog("warn", "file-download-target", { message: String(error?.message || error) }),
 });
 function fileSocketUrl() {
-  if (!mediaEpoch) return null;
+  if (!mediaEpoch || !signalingPc || !signalingTicket || !authenticatedSession?.mediaReady) return null;
   const query = new URLSearchParams({ epoch: mediaEpoch });
-  if (signalingPc) query.set("pc", signalingPc);
-  if (labRun) {
-    query.set("run", labRun);
-    query.set("compat", labCompatibilityId);
-  }
-  return `${proto}//${location.host}${labRun ? "/lab-file-ws" : "/file-ws"}?${query}`;
+  query.set("pc", signalingPc);
+  return `${proto}//${location.host}/file-ws?${query}`;
 }
 let fileEpoch = null;
 function noteFileEpoch(epoch) {
@@ -3456,8 +3504,6 @@ function setFileTransferAvailable(available) {
   if (!available && fileUi.enabled) fileClient.reset("disconnected");
   fileUi.setEnabled(available);
 }
-// Lab and diagnostics handle (stream-lab-file-transfer.mjs drives transfers through it).
-window.__bubbleplayFiles = { client: fileClient, capability: () => fileUi.enabled, available: () => fileTransferAvailable(), dropCapability: () => nativeFileDropAvailable, dropPreviewCapability: () => nativeFileDropPreviewAvailable };
 function resolveNativeFileDrop(event) {
   // Keep the existing save route on touch devices, outside the remote surface,
   // and when connected to hosts implementing only the original file protocol.
@@ -4267,7 +4313,7 @@ function renderAbout(update = {}) {
   Object.assign(aboutState, update);
   document.getElementById("about-relay").textContent = aboutState.relay || "Not reported";
   document.getElementById("about-host").textContent = "Not reported by this host";
-  document.getElementById("about-receiver").textContent = `${clientBuild} · ${INDEX_ASSET_BUILD}`;
+  document.getElementById("about-receiver").textContent = clientBuild;
 }
 
 let diagnosticsVisible = diagnosticsEnabled;

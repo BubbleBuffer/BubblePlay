@@ -4,8 +4,6 @@ import { readFileSync } from "node:fs";
 import * as mediaModule from "../public/media.js";
 import {
   CODEC,
-  STREAM_LAB_ASSET_BUILD,
-  STREAM_LAB_COMPATIBILITY,
   createSignalingRecycleDiagnostic,
   decodeHybridFrameV1,
   drawBaseThenHybrid,
@@ -85,30 +83,6 @@ test("presentation telemetry distinguishes synchronous WSS draws from RAF loss",
     rafCoalesced: 0,
     rafLateDrops: 0,
   });
-});
-
-test("Stream Lab compatibility identifies the exact WSS v4 and benchmark contract", () => {
-  assert.equal(STREAM_LAB_ASSET_BUILD, "wss-v4-bench2-hevc-tiles-bpip4-v16");
-  assert.deepEqual(STREAM_LAB_COMPATIBILITY, {
-    schemaVersion: 1,
-    id: "wss-v4-bench2-hevc-tiles-bpip4-v16",
-    receiverBuild: "wss-v4-bench2-hevc-tiles-bpip4-v16",
-    mediaProtocol: 4,
-    benchStatusProtocol: 2,
-    privilegedIpc: { version: 4 },
-    roiModes: ["off", "damage", "text-edge", "feedback", "feedback-headroom"],
-    hybridModes: ["off", "png-static-roi", "png-quiescent-detail", "hevc-quiescent-tiles"],
-    hybridCacheModes: ["dda-gated", "suppress-reactivate"],
-    requiredTelemetry: ["reconstructionFeedback:v1", "reconstructionFeedbackHeadroom:v1", "hybridActivity:png-quiescent-detail", "hevcQuiescentTiles:v1", "hybridDeferredReadback:v1",
-      "ddaDamageAudit:v1", "hybridCacheSuppression:v1", "hybridCachePolicy:v1",
-      "signalingRecycle:v1", "networkRouteProbe:v2", "wssImmediatePresentation:v1"],
-  });
-});
-
-test("the candidate host media socket advertises the same immutable compatibility generation", () => {
-  const host = readFileSync(new URL("../../host/src/wss_media.rs", import.meta.url), "utf8");
-  const advertised = host.match(/const STREAM_LAB_COMPATIBILITY_ID:\s*&str\s*=\s*"([^"]+)"/)?.[1];
-  assert.equal(advertised, STREAM_LAB_COMPATIBILITY.id);
 });
 
 test("signaling recycle diagnostics retain only bounded WSS state and the initiating reason", () => {

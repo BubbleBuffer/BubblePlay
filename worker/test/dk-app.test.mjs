@@ -139,6 +139,7 @@ test("?pc= naming a stored PC connects directly with the unlocked identity", asy
   assert.equal(h.gate.last("showPcList"), undefined);
   assert.equal(h.sessions.length, 1);
   assert.equal(h.sessions[0].pc, PC_ID);
+  assert.equal(h.sessions[0].pinnedPublic, PUBLIC);
   assert.equal(h.sessions[0].gate, h.gate);
   assert.deepEqual(h.sessions[0].identity, { id: VIEWER_ID, publicRaw: IDENTITY_KEY.publicKey, privateKey: IDENTITY_KEY.privateKey });
   assert.match(h.location.href, /transport=wss/);
@@ -202,6 +203,8 @@ test("pairing refusal shows the failed screen; cancel returns to the list", asyn
   await h.gate.last("showPcList").onPair({ pc: PC_ID, code: "7K3QDM9X2P" });
   h.pairings[0].onRefused({ code: 1008 });
   assert.equal(h.gate.last("showPairing").state, "failed");
+  assert.equal(h.gate.last("showPairing").message,
+    "The relay did not accept this code. Check the PC ID and code, or open a new code on the PC.");
   await h.gate.last("showPcList").onPair({ pc: PC_ID, code: "7K3QDM9X2P" });
   h.gate.last("showPairing").onCancel();
   await flush();

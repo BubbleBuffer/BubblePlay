@@ -86,12 +86,13 @@ function fakeSocketClass() {
   } };
 }
 
-test("pairing socket: hello with pair, register-proof, stops at hello-ok pairing:true", async () => {
+test("pairing socket: signed hello admits pairing and routes subsequent messages in order", async () => {
   const identity = await fixtureIdentity(VIEWER_VECTOR.public);
   const { sockets, Socket } = fakeSocketClass();
   const events = [];
   openPairingSocket({ identity, pc: "77VH-7M56-8GJK-Y12J", pair: "PAIR", href: "https://example.test/pair",
     WebSocketImpl: Socket, onPairingAdmitted: ({ message }) => events.push(["admitted", message.pairing]),
+    onMessage: message => events.push(["message", message.type]),
     onRefused: () => events.push(["refused"]), onClosed: () => events.push(["closed"]) });
   const socket = sockets[0];
   assert.equal(socket.url, "wss://example.test/ws?pc=77VH-7M56-8GJK-Y12J");
@@ -102,6 +103,32 @@ test("pairing socket: hello with pair, register-proof, stops at hello-ok pairing
   await socket.onmessage({ data: JSON.stringify({ type: "hello-ok", pc: "77VH-7M56-8GJK-Y12J", pairing: true }) });
   assert.deepEqual(events, [["admitted", true]]);
   assert.equal(socket.sent.length, 2);
+  await socket.onmessage({ data: JSON.stringify({ type: "pair-proof", mac: "m" }) });
+  await socket.onmessage({ data: JSON.stringify({ type: "pair-done" }) });
+  assert.deepEqual(events, [["admitted", true], ["message", "pair-proof"], ["message", "pair-done"]]);
+});
+
+test("pairing socket serializes asynchronous admission and closes on callback errors", async () => {
+  const identity = await fixtureIdentity(VIEWER_VECTOR.public);
+  const { sockets, Socket } = fakeSocketClass();
+  const events = [];
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  openPairingSocket({ identity, pc: "77VH-7M56-8GJK-Y12J", pair: "PAIR", href: "https://example.test/pair",
+    WebSocketImpl: Socket,
+    onPairingAdmitted: async () => { events.push("begin"); await pending; events.push("ready"); },
+    onMessage: message => { events.push(message.type); throw new Error("bad proof"); },
+    onError: error => events.push(error.message) });
+  const socket = sockets[0];
+  const admission = socket.onmessage({ data: JSON.stringify({ type: "hello-ok", pairing: true }) });
+  const proof = socket.onmessage({ data: JSON.stringify({ type: "pair-proof", mac: "m" }) });
+  await Promise.resolve();
+  assert.deepEqual(events, ["begin"]);
+  release();
+  await admission;
+  await proof;
+  assert.deepEqual(events, ["begin", "ready", "pair-proof", "bad proof"]);
+  assert.equal(socket.closed, true);
 });
 
 test("pairing socket: 1008 before hello-ok is a refusal; hello-ok without pairing closes", async () => {

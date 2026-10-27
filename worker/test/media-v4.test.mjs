@@ -204,15 +204,6 @@ test("v4 reconnect backoff, presentation skipping and status labels", () => {
   assert.equal(wssV4StatusLabel({ socketOpen: true, framesPresented: 5, lastFrameAtMs: 4_900, nowMs: 5_000 }), "connected");
 });
 
-test("lab receiver URLs carry no WSS protocol or lane selection", async () => {
-  const { buildReceiverUrl } = await import("../tools/lab/stream-lab-live.mjs");
-  const run = "123e4567-e89b-42d3-a456-426614174000";
-  const url = buildReceiverUrl("http://127.0.0.1:8787/", "wss", { labRun: run });
-  assert.equal(url.searchParams.get("transport"), "wss");
-  assert.equal(url.searchParams.get("labRun"), run);
-  for (const legacy of ["wssProtocol", "wssLanes", "wssParity"]) assert.equal(url.searchParams.get(legacy), null);
-});
-
 test("receiver wires v4: media-socket keyframes, in-order decode, reconnect backoff, static status", () => {
   const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   assert.match(source, /from "\/media-v4\.js";/);
