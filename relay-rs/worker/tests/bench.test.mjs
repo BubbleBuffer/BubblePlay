@@ -1,5 +1,5 @@
-// Tests for scripts/bench-p99.mjs. The usage test runs now. The local workerd run needs the M3-C1
-// relay (registration and admission, tests/m3-support.mjs), so it is skipped until that merges.
+// Tests for scripts/bench-p99.mjs. The usage test checks the flags. The local workerd run starts the
+// relay from tests/m3-support.mjs and runs the bench against it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -10,8 +10,6 @@ import { fileURLToPath } from 'node:url';
 
 const scriptPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'bench-p99.mjs');
 const RUN_TIMEOUT_MS = 180_000;
-const NEEDS_M3_C1 =
-  'needs the M3-C1 relay (registration and admission in tests/m3-support.mjs), not on lane/rust-relay yet; unskip after that merge';
 
 function runBench(args, env) {
   return new Promise((resolve, reject) => {
@@ -47,14 +45,14 @@ test('m3 bench script refuses to run without a relay URL and token', async () =>
   assert.match(stderr, /--url \(or BENCH_URL\) is required/);
 });
 
-test('m3 bench script runs against local workerd', { skip: NEEDS_M3_C1, timeout: RUN_TIMEOUT_MS + 60_000 }, async () => {
-  const { startRelay, ORIGIN, TOKEN } = await import('./m3-support.mjs');
+test('m3 bench script runs against local workerd', { timeout: RUN_TIMEOUT_MS + 60_000 }, async () => {
+  const { startRelay, TOKEN } = await import('./m3-support.mjs');
   const persistDir = mkdtempSync(path.join(tmpdir(), 'bp-m3-bench-'));
   let relay = null;
   try {
     relay = await startRelay({ persistDir });
     const { code, stdout, stderr } = await runBench(
-      ['--url', relay.base, '--origin', ORIGIN, '--count', '5', '--sizes', '1024,65536'],
+      ['--url', relay.base, '--origin', relay.origin, '--count', '5', '--sizes', '1024,65536'],
       { ...process.env, BENCH_TOKEN: TOKEN },
     );
     assert.equal(code, 0, stderr.slice(-4000));
@@ -72,7 +70,7 @@ test('m3 bench script runs against local workerd', { skip: NEEDS_M3_C1, timeout:
     ]);
     assert.equal(report.channel, 'ctl');
     assert.equal(report.count, 5);
-    assert.equal(report.origin, ORIGIN);
+    assert.equal(report.origin, relay.origin);
     assert.equal(report.sizes.length, 2);
     for (const [index, expected] of [1024, 65536].entries()) {
       const size = report.sizes[index];
