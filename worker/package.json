@@ -6,23 +6,6 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "check:syntax": "node ../tools/check.mjs syntax",
-    "recovery:inventory": "node tools/lab/recovery-inventory.mjs ..",
-    "latency:live": "node tools/lab/latency-live.mjs",
-    "latency:bench": "node tools/lab/latency-live.mjs --glass-to-glass",
-    "lab:preflight": "node tools/lab/stream-lab.mjs preflight",
-    "lab:manual": "node tools/lab/stream-lab.mjs manual",
-    "lab:baseline": "node tools/lab/stream-lab.mjs baseline",
-    "lab:smoke": "node tools/lab/stream-lab.mjs smoke",
-    "lab:sweep": "node tools/lab/stream-lab.mjs sweep",
-    "lab:campaign": "node tools/lab/stream-lab.mjs campaign",
-    "lab:optimize": "node tools/lab/stream-lab.mjs optimize",
-    "lab:compare": "node tools/lab/stream-lab.mjs compare",
-    "lab:cleanup": "node tools/lab/stream-lab.mjs cleanup",
-    "lab:diagnostics": "powershell -NoProfile -ExecutionPolicy Bypass -File ../host/scripts/collect-diagnostics.ps1",
-    "lab:direct-relay": "node tools/lab/stream-lab-direct-relay.mjs",
     "check": "node ../tools/check.mjs client"
-  },
-  "devDependencies": {
-    "ws": "^8.21.3"
   }
 }

@@ -23,7 +23,7 @@ The temporary native cache is private and carries Mark-of-the-Web. Destination a
 
 The setup/update scripts create Send To > BubblePlay. The tray stages requests under `%LOCALAPPDATA%\BubblePlay\sendto`; the host rejects old requests and skips folders. `BUBBLEPLAY_DOWNLOADS_DIR` and `BUBBLEPLAY_SENDTO_DIR` override those local locations. `BUBBLEPLAY_FILE_CLIPBOARD=0` disables clipboard file reading/placement and paste for isolated tests.
 
-Rust, JavaScript and Kotlin exercise the shared fixture. Isolated Windows acceptance uses `node worker/tools/lab/stream-lab-file-transfer.mjs` and `node worker/tools/lab/stream-lab-native-file-drop.mjs` from the repository root. Source checks and prior Chrome/Explorer evidence do not prove a fresh installation or native interoperability through the Go relay; see [release status](../release-status.md).
+Rust, JavaScript and Kotlin exercise the shared fixture. The isolated Windows lab checks for this (`stream-lab-file-transfer`, `stream-lab-native-file-drop`) were removed at CUT-1 with the JavaScript Worker relay. Source checks and prior Chrome/Explorer evidence do not prove a fresh installation or native interoperability through the Go relay; see [release status](../release-status.md).
 
 ## Wire contract (v1)
 

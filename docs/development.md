@@ -12,7 +12,7 @@ Run development commands below from the repository root. For the public product 
 | [`android/`](../android/README.md) | Native Kotlin receiver, gestures, codec and APK build |
 | [`fixtures/`](../fixtures) | Shared packet and feature contracts; update affected language implementations together |
 | [`tools/`](../tools/README.md) | Repository checks, release packaging and dependency notices |
-| [`worker/tools/`](../worker/tools/README.md) | Isolated stream-lab tooling |
+| [`worker/`](../worker/README.md) | Browser receiver (`worker/public/`) and its tests; the stream lab was removed at CUT-1 |
 | [`branding/`](../branding) | Editable branding source |
 | [`docs/`](README.md) | Current public guides, architecture and release status |
 
@@ -38,7 +38,7 @@ node --test tools/tests/*.test.mjs
 
 `tools/generate-notices.mjs` reads an existing locked Windows Cargo metadata snapshot and cached dependency licenses offline. It retains full license/notice texts and fails if provenance/texts are missing. The exact upstream exceptions live in `tools/third-party/notice-overrides.json`.
 
-Windows desktop streaming uses the Rust capture/encode host, the relay and a Chromium receiver. See [relay setup](../relay-rs/README.md); the stream lab uses the local lab paths in [worker/tools/lab](../worker/tools/lab/).
+Windows desktop streaming uses the Rust capture/encode host, the relay and a Chromium receiver. See [relay setup](../relay-rs/README.md). The stream lab was removed at CUT-1 with the JavaScript Worker relay it drove.
 
 ## Cursor translation
 
@@ -230,10 +230,8 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   Files icon gets a dot and its popover shows "N files from PC · Download".
   Only offered files can be read.
 - Bytes use a separate `/file-ws` socket, with host downloads rate-capped below video. Contract
-  and behavior: [file transfer](architecture/file-transfer.md); lab check:
-  `node worker/tools/lab/stream-lab-file-transfer.mjs`.
-  Native desktop acceptance: `node worker/tools/lab/stream-lab-native-file-drop.mjs`
-  (synthetic files and local destinations).
+  and behavior: [file transfer](architecture/file-transfer.md). The isolated lab checks
+  (`stream-lab-file-transfer`, `stream-lab-native-file-drop`) were removed at CUT-1.
 
 ## Runtime boundaries
 
