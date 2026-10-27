@@ -111,6 +111,12 @@ impl DeviceIdentity {
         self.signing.verifying_key().to_bytes()
     }
 
+    /// Ed25519 over `message` itself (phase 2 signs its context-prefixed bytes directly).
+    #[cfg(feature = "phase2")]
+    pub(crate) fn sign_bytes(&self, message: &[u8]) -> [u8; 64] {
+        self.signing.sign(message).to_bytes()
+    }
+
     /// The raw public key as unpadded base64url, the form the relay expects in `hello`.
     pub fn public_b64(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.public_key())
