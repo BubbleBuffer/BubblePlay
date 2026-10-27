@@ -220,6 +220,30 @@ const ctlFailures = [
 // auth-bind (item 8, amended 2026-10-25): the phase 0 encoding wins, so phase 2 reuses handshake.dtls
 // ("bubbleplay-dtls-v1" || H || local fp || "\n" || remote fp) and handshake.messages.authBind / authBindPc.
 
+// Decision 22 (2026-10-27): the relay epoch is an opaque ASCII string; relay-rs uses 32 lowercase hex.
+// Same peers, nonces and ephemeral keys as the phase 0 handshake, only the epoch differs.
+const hexEpoch = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+const hexTranscript = lengthPrefixed([
+  utf8("bubbleplay-auth-v1"), utf8(relayOrigin), utf8(hexEpoch),
+  utf8(viewer.id), Buffer.from(viewer.public, "base64url"), utf8(pc.id), Buffer.from(pc.public, "base64url"),
+  Buffer.from(viewer.nonce, "base64url"), Buffer.from(pc.nonce, "base64url"),
+  Buffer.from(viewer.ephemeral, "base64url"), Buffer.from(pc.ephemeral, "base64url"),
+]);
+const hexHash = sha256(hexTranscript);
+const hexPcSignature = crypto.sign(null, Buffer.concat([utf8("bubbleplay-auth-host-v1"), hexHash]), privateKey(hex(pc.seedHex), "ed25519"));
+const hexViewerSignature = crypto.sign(null, Buffer.concat([utf8("bubbleplay-auth-viewer-v1"), hexHash, hexPcSignature]), privateKey(hex(viewer.seedHex), "ed25519"));
+const hexEpochHandshake = {
+  sessionEpoch: hexEpoch,
+  transcriptHex: hexTranscript.toString("hex"), transcriptHashHex: hexHash.toString("hex"),
+  pcSignature: b64(hexPcSignature), viewerSignature: b64(hexViewerSignature),
+  controlKeys: {
+    viewerToPcHex: Buffer.from(crypto.hkdfSync("sha256", sharedSecret, hexHash, utf8("bubbleplay-ctl-v1 viewer-to-pc"), 32)).toString("hex"),
+    pcToViewerHex: Buffer.from(crypto.hkdfSync("sha256", sharedSecret, hexHash, utf8("bubbleplay-ctl-v1 pc-to-viewer"), 32)).toString("hex"),
+  },
+  sasNumber: String(sha256(Buffer.concat([utf8("bubbleplay-pair-sas-v1"), hexHash])).readUInt32BE(0) % 1000000).padStart(6, "0"),
+  peerJoined: { type: "peer-joined", mediaEpoch: hexEpoch, pairing: false },
+};
+
 const phase2 = {
   notes: "Phase 2 vectors (decisions 2026-10-25). H is handshake.transcriptHashHex; control keys are handshake.controlKeys; auth-bind uses the phase 0 handshake.dtls encoding unchanged. Where phase 0 defines an encoding it wins. TEST ONLY.",
   pairing: {
@@ -251,6 +275,7 @@ const phase2 = {
   ctl: { messages: ctl, failures: ctlFailures },
   bind: { encoding: "phase0", vectors: "handshake.dtls", messages: "handshake.messages.authBind, handshake.messages.authBindPc" },
   caps: { mandatory: ["control-aead-v1"], mandatoryWebRtc: ["control-aead-v1", "dtls-bind-v1"], pairing: "pair-v1" },
+  hexEpochHandshake,
 };
 
 const fixture = {
