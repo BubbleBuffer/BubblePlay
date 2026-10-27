@@ -67,7 +67,7 @@ class RelayProofTest {
         viewerKey().use { key ->
             assertJsonEquals(expected, ViewerHello.hello(key, expected.getString("pair")))
             val plain = JSONObject(ViewerHello.hello(key))
-            assertEquals(setOf("type", "role", "id", "public"), plain.keySet())
+            assertEquals(setOf("type", "role", "id", "public"), jsonKeys(plain))
             assertEquals("viewer", plain.getString("role"))
         }
     }

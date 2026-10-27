@@ -69,7 +69,19 @@ internal fun authHostWith(change: JSONObject.() -> Unit): String =
 
 internal fun assertJsonEquals(expected: JSONObject, actual: String) {
     val parsed = JSONObject(actual)
-    assertTrue("expected $expected\nactual   $parsed", expected.similar(parsed))
+    assertTrue("expected $expected\nactual   $parsed", jsonSame(expected, parsed))
+}
+
+/** Structural JSON equality (Android's org.json stub has no similar()/keySet() at compile time). */
+internal fun jsonKeys(o: JSONObject): Set<String> = o.keys().asSequence().toSet()
+
+internal fun jsonSame(a: Any?, b: Any?): Boolean = when {
+    a is JSONObject && b is JSONObject ->
+        jsonKeys(a) == jsonKeys(b) && jsonKeys(a).all { jsonSame(a.get(it), b.get(it)) }
+    a is org.json.JSONArray && b is org.json.JSONArray ->
+        a.length() == b.length() && (0 until a.length()).all { jsonSame(a.get(it), b.get(it)) }
+    a is Number && b is Number -> a.toString() == b.toString() || a.toDouble() == b.toDouble()
+    else -> a == b
 }
 
 internal inline fun <reified T : Throwable> assertThrows(block: () -> Unit): T {
