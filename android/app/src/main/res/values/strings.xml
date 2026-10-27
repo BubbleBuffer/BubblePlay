@@ -293,7 +293,6 @@
     <string name="pcs_remove_title">Remove this PC?</string>
     <string name="pcs_remove_message">Remove %1$s? This phone forgets the PC and its key. To use it again, pair at the PC.</string>
     <string name="pcs_remove_action">Remove</string>
-    <string name="dk_unlock_intro">Unlock this phone\'s device key to see your PCs.</string>
     <string name="pair_title">Pair a PC</string>
     <string name="pair_intro">Type the PC ID and pairing code shown on the PC, then press Pair. Or open a bubbleplay link from the PC, which fills these fields for you.</string>
     <string name="pair_relay">Relay address</string>
@@ -318,6 +317,10 @@
     <string name="pair_connecting">Connecting to the relay…</string>
     <string name="pair_proving">Checking the code with the PC…</string>
     <string name="pair_waiting">Check that the PC shows the same number, then choose Allow on the PC.</string>
+    <string name="pair_from_link">From a scanned code</string>
+    <string name="pair_number_label">Comparison number</string>
+    <string name="pair_confirm_pc">Confirm on the PC.</string>
+    <string name="pair_earlier">Earlier stage: %1$s</string>
     <string name="pair_cancelled">Pairing cancelled. Nothing was saved.</string>
     <string name="pair_paired">Paired with %1$s.</string>
     <string name="pair_denied">The PC declined. Nothing was saved.</string>

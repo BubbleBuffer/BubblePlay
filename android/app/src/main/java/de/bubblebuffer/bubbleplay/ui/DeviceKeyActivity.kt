@@ -69,6 +69,7 @@ class DeviceKeyActivity : Activity() {
             setPadding(views.dp(20), views.dp(20), views.dp(20), views.dp(20))
         }
         setContentView(ScrollView(this).apply {
+            isFillViewport = true
             setBackgroundColor(KeyPalette.CANVAS)
             fitsSystemWindows = true
             addView(column)
@@ -108,10 +109,11 @@ class DeviceKeyActivity : Activity() {
             render()
             return
         }
-        screen {
-            column.addView(views.body(R.string.dk_unlock_intro))
+        screen(R.string.main_unlock_title) {
+            column.addView(views.body(R.string.main_unlock_body))
             statusLine()
-            column.addView(views.button(R.string.dk_unlock_action, KeyViews.Style.PRIMARY) { unlockForApp(key.file) })
+            column.addView(views.spacer())
+            column.addView(views.button(R.string.main_unlock_action, KeyViews.Style.PRIMARY) { unlockForApp(key.file) })
             column.addView(views.button(R.string.dk_cancel, KeyViews.Style.SECONDARY) { finish() })
         }
         if (auto) unlockForApp(key.file)
@@ -140,10 +142,10 @@ class DeviceKeyActivity : Activity() {
     // ---- screens --------------------------------------------------------------------------------
 
     /** Starts a screen with its title; [build] adds the rest. */
-    private fun screen(build: () -> Unit) {
+    private fun screen(title: Int = R.string.dk_title, build: () -> Unit) {
         column.removeAllViews()
         status = null
-        column.addView(views.title(R.string.dk_title))
+        column.addView(views.title(title))
         build()
     }
 

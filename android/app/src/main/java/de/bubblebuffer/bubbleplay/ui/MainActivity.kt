@@ -2,6 +2,7 @@ package de.bubblebuffer.bubbleplay.ui
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -55,7 +56,10 @@ class MainActivity : Activity(), SettingsView.Host {
             setBackgroundColor(KeyPalette.CANVAS)
             fitsSystemWindows = true // API 35 draws edge-to-edge; keep the list and settings clear of the bars.
         }
-        frame.addView(ScrollView(this).apply { addView(column) })
+        frame.addView(ScrollView(this).apply {
+            isFillViewport = true
+            addView(column)
+        })
         setContentView(frame)
     }
 
@@ -112,6 +116,7 @@ class MainActivity : Activity(), SettingsView.Host {
     private fun showUnlock() {
         column.addView(views.title(R.string.main_unlock_title))
         column.addView(views.body(R.string.main_unlock_body))
+        column.addView(views.spacer())
         column.addView(views.button(R.string.main_unlock_action, KeyViews.Style.PRIMARY) { openUnlock() })
         if (!unlockPrompted) {
             unlockPrompted = true
@@ -122,17 +127,32 @@ class MainActivity : Activity(), SettingsView.Host {
     /** This phone's ID, the PCs it has paired, and the actions that lead on from them. */
     private fun showPcs(deviceId: String) {
         column.addView(views.title(R.string.pcs_title))
-        column.addView(views.fieldLabel(R.string.pcs_this_device))
-        column.addView(views.mono(deviceId))
-        column.addView(views.button(R.string.dk_open, KeyViews.Style.SECONDARY) { openKeys(null) })
-        column.addView(views.button(R.string.settings_open, KeyViews.Style.SECONDARY) { openSettings() })
+        column.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+            setPadding(0, 0, 0, views.dp(16))
+            addView(TextView(this@MainActivity).apply {
+                setText(R.string.pcs_this_device)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(KeyPalette.CREAM)
+                setPadding(0, 0, views.dp(8), 0)
+            })
+            addView(views.mono(deviceId, 14f).apply { setPadding(0, 0, 0, 0) })
+        })
 
         val list = pcs.list()
         if (list.isEmpty()) {
-            column.addView(views.body(R.string.pcs_empty).apply { setPadding(0, views.dp(16), 0, 0) })
+            column.addView(views.body(R.string.pcs_empty).apply { setPadding(0, views.dp(8), 0, 0) })
         } else {
-            list.forEach { column.addView(pcRow(it)) }
+            column.addView(views.rule())
+            list.forEach {
+                column.addView(pcRow(it))
+                column.addView(views.rule())
+            }
         }
+        column.addView(views.spacer())
+        column.addView(views.button(R.string.dk_open, KeyViews.Style.SECONDARY) { openKeys(null) })
+        column.addView(views.button(R.string.settings_open, KeyViews.Style.SECONDARY) { openSettings() })
         column.addView(views.button(R.string.pcs_pair, KeyViews.Style.PRIMARY) {
             startActivity(Intent(this, PairActivity::class.java))
         })
@@ -151,14 +171,15 @@ class MainActivity : Activity(), SettingsView.Host {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(views.dp(14), views.dp(10), views.dp(4), views.dp(10))
-            background = views.panel()
+            minimumHeight = views.dp(66)
+            setPadding(0, views.dp(10), 0, views.dp(10))
+            background = views.rowBackground()
             isClickable = true
             isFocusable = true
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = views.dp(10) }
+            )
             setOnClickListener { connect(pc) }
             setOnLongClickListener {
                 actions(pc)
@@ -174,16 +195,21 @@ class MainActivity : Activity(), SettingsView.Host {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
             setTextColor(KeyPalette.MILK)
         })
-        text.addView(views.mono(pc.id, 13f))
+        text.addView(views.mono(pc.id, 13f).apply {
+            setTextColor(KeyPalette.CREAM)
+            setPadding(0, views.dp(2), 0, 0)
+        })
         text.addView(TextView(this).apply {
             this.text = Uri.parse(pc.relay).host ?: pc.relay
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTextColor(KeyPalette.THREAD_STRONG)
+            setTextColor(KeyPalette.CREAM)
+            setPadding(0, views.dp(1), 0, 0)
         })
         row.addView(text)
         row.addView(ImageButton(this).apply {
             setImageResource(R.drawable.ic_bar_more)
-            setBackgroundColor(0)
+            imageTintList = android.content.res.ColorStateList.valueOf(KeyPalette.CREAM)
+            background = views.rowBackground()
             contentDescription = getString(R.string.pcs_actions)
             setOnClickListener { actions(pc) }
             layoutParams = LinearLayout.LayoutParams(views.dp(48), views.dp(48))
@@ -203,24 +229,59 @@ class MainActivity : Activity(), SettingsView.Host {
         PendingShares.consume(intent)
     }
 
+    /** The PC's actions as a bottom sheet: its name and ID on top, Remove set apart, Cancel last. */
     private fun actions(pc: PcEntry) {
-        AlertDialog.Builder(this)
-            .setTitle(PairForm.displayName(pc))
-            .setItems(
-                arrayOf(
-                    getString(R.string.pcs_rename),
-                    getString(R.string.pcs_details),
-                    getString(R.string.pcs_remove),
-                ),
-            ) { _, which ->
-                when (which) {
-                    0 -> rename(pc)
-                    1 -> details(pc)
-                    else -> confirmRemove(pc)
+        val sheet = Dialog(this)
+        sheet.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = views.sheetBackground()
+            setPadding(views.dp(20), views.dp(16), views.dp(20), views.dp(20))
+        }
+        body.addView(TextView(this).apply {
+            text = PairForm.displayName(pc)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(KeyPalette.MILK)
+            isAccessibilityHeading = true
+        })
+        body.addView(views.mono(pc.id, 13f).apply {
+            setTextColor(KeyPalette.CREAM)
+            setPadding(0, views.dp(2), 0, views.dp(8))
+        })
+        fun item(label: Int, color: Int, gap: Boolean, act: () -> Unit) {
+            body.addView(views.rule(if (gap) KeyPalette.THREAD_STRONG else KeyPalette.THREAD).apply {
+                (layoutParams as LinearLayout.LayoutParams).topMargin = if (gap) views.dp(14) else 0
+            })
+            body.addView(TextView(this).apply {
+                setText(label)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+                setTextColor(color)
+                gravity = Gravity.CENTER_VERTICAL
+                minHeight = views.dp(52)
+                background = views.rowBackground()
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    sheet.dismiss()
+                    act()
                 }
-            }
-            .setNegativeButton(R.string.dk_cancel, null)
-            .show()
+            })
+        }
+        item(R.string.pcs_rename, KeyPalette.MILK, false) { rename(pc) }
+        item(R.string.pcs_details, KeyPalette.MILK, false) { details(pc) }
+        item(R.string.pcs_remove, KeyPalette.DANGER, true) { confirmRemove(pc) }
+        body.addView(views.button(R.string.dk_cancel, KeyViews.Style.SECONDARY) { sheet.dismiss() }.apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = views.dp(12)
+        })
+        sheet.setContentView(body)
+        sheet.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0))
+            setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            setGravity(Gravity.BOTTOM)
+            setDimAmount(0.72f)
+        }
+        sheet.show()
     }
 
     private fun rename(pc: PcEntry) {
@@ -262,17 +323,47 @@ class MainActivity : Activity(), SettingsView.Host {
             .show()
     }
 
+    /** Cancel and Remove side by side; Remove is the one in danger colour and the message names the PC. */
     private fun confirmRemove(pc: PcEntry) {
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(R.string.pcs_remove_title)
-            .setMessage(getString(R.string.pcs_remove_message, PairForm.displayName(pc)))
-            .setPositiveButton(R.string.pcs_remove_action) { _, _ ->
-                pcs.remove(pc.id)
-                refresh()
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = views.panel()
+            setPadding(views.dp(20), views.dp(20), views.dp(20), views.dp(20))
+        }
+        body.addView(TextView(this).apply {
+            setText(R.string.pcs_remove_title)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(KeyPalette.MILK)
+            setPadding(0, 0, 0, views.dp(8))
+            isAccessibilityHeading = true
+        })
+        body.addView(views.body(getString(R.string.pcs_remove_message, PairForm.displayName(pc))))
+        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun half(label: Int, style: KeyViews.Style, start: Int, act: () -> Unit) = views.button(label, style) {
+            dialog.dismiss()
+            act()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                topMargin = views.dp(14)
+                marginStart = start
             }
-            .setNegativeButton(R.string.dk_cancel, null)
-            .show()
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(KeyPalette.DANGER)
+        }
+        buttons.addView(half(R.string.dk_cancel, KeyViews.Style.SECONDARY, 0) {})
+        buttons.addView(half(R.string.pcs_remove_action, KeyViews.Style.DANGER, views.dp(10)) {
+            pcs.remove(pc.id)
+            refresh()
+        })
+        body.addView(buttons)
+        dialog.setContentView(body)
+        dialog.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0))
+            setLayout(resources.displayMetrics.widthPixels - views.dp(40), ViewGroup.LayoutParams.WRAP_CONTENT)
+            setDimAmount(0.72f)
+        }
+        dialog.show()
     }
 
     // ---- settings view -------------------------------------------------------------------------

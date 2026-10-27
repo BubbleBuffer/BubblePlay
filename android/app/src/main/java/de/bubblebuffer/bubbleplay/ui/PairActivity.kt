@@ -5,7 +5,11 @@ import android.content.Intent
 import android.graphics.Typeface
 import android.os.Bundle
 import android.text.InputType
+import android.util.TypedValue
 import android.view.View
+import android.view.ViewGroup
+import android.content.res.ColorStateList
+import android.widget.ProgressBar
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -44,7 +48,13 @@ class PairActivity : Activity() {
     private lateinit var pairButton: TextView
     private lateinit var progress: LinearLayout
     private lateinit var stageLine: TextView
+    private lateinit var numberLabel: TextView
     private lateinit var numberLine: TextView
+    private lateinit var confirmLine: TextView
+    private lateinit var instructionLine: TextView
+    private lateinit var progressBar: ProgressBar
+    private lateinit var earlierLine: TextView
+    private lateinit var scannedNote: TextView
     private lateinit var paired: LinearLayout
     private lateinit var pairedLine: TextView
     private val worker = Executors.newSingleThreadExecutor()
@@ -61,19 +71,32 @@ class PairActivity : Activity() {
     /** The unlock prompt opens by itself once per activity, so cancelling it does not loop. */
     private var unlockPrompted = false
 
+    /** The stage line now showing, so the next stage can name it as the earlier one. */
+    private var shownStage: Int = 0
+
     private val listener = object : PairingListener {
         override fun onStage(stage: PairingStage) {
-            stageLine.setText(
+            val waiting = stage == PairingStage.WaitingForPc
+            showStage(
                 when (stage) {
                     PairingStage.Connecting -> R.string.pair_connecting
                     PairingStage.Proving -> R.string.pair_proving
                     PairingStage.WaitingForPc -> R.string.pair_waiting
                 },
             )
+            // Waiting for the PC is the comparison screen: number, instruction, confirm line, no progress bar.
+            val gone = if (waiting) View.GONE else View.VISIBLE
+            stageLine.visibility = gone
+            progressBar.visibility = gone
+            if (waiting) earlierLine.visibility = View.GONE
+            instructionLine.visibility = if (waiting) View.VISIBLE else View.GONE
+            confirmLine.visibility = if (waiting) View.VISIBLE else View.GONE
         }
 
         override fun onNumber(display: String) {
             numberLine.text = display
+            numberLine.contentDescription = display
+            numberLabel.visibility = View.VISIBLE
             numberLine.visibility = View.VISIBLE
         }
 
@@ -100,10 +123,9 @@ class PairActivity : Activity() {
         pcs = PcStore.from(this)
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(views.dp(20), views.dp(20), views.dp(20), views.dp(20))
+            setPadding(views.dp(20), views.dp(16), views.dp(20), views.dp(20))
         }
         column.addView(views.title(R.string.pair_title))
-        column.addView(views.body(R.string.pair_intro))
 
         keyCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -117,7 +139,12 @@ class PairActivity : Activity() {
         keyCard.addView(keyAction)
         column.addView(keyCard)
 
-        form = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        form = tallColumn()
+        form.addView(views.muted(R.string.pair_intro).apply { setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f) })
+        status = views.status()
+        form.addView(status)
+        scannedNote = views.note(R.string.pair_from_link).apply { visibility = View.GONE }
+        form.addView(scannedNote)
         relayField = views.field(R.string.pair_relay_hint).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         }
@@ -132,35 +159,63 @@ class PairActivity : Activity() {
         form.addView(codeField)
         form.addView(views.fieldLabel(R.string.pair_name))
         form.addView(nameField)
-        status = views.status()
-        status.visibility = View.GONE
-        form.addView(status)
+        form.addView(views.spacer())
         pairButton = views.button(R.string.pair_action, KeyViews.Style.PRIMARY) { pair() }
         form.addView(pairButton)
         column.addView(form)
 
-        progress = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        progress = tallColumn().apply { visibility = View.GONE }
+        stageLine = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextColor(KeyPalette.MILK)
+            setPadding(0, views.dp(18), 0, views.dp(8))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            isIndeterminate = true
+            indeterminateTintList = ColorStateList.valueOf(KeyPalette.CREAM)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, views.dp(4))
+        }
+        earlierLine = views.body("").apply {
+            setTextColor(KeyPalette.CREAM)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setPadding(0, views.dp(8), 0, views.dp(8))
             visibility = View.GONE
         }
-        stageLine = views.body("").apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
-        numberLine = views.mono("", 36f).apply { visibility = View.GONE }
+        numberLabel = views.fieldLabel(R.string.pair_number_label).apply { visibility = View.GONE }
+        numberLine = views.mono("", 52f).apply {
+            setPadding(0, views.dp(6), 0, views.dp(18))
+            letterSpacing = 0.06f
+            visibility = View.GONE
+        }
+        instructionLine = views.body(R.string.pair_waiting).apply { visibility = View.GONE }
+        confirmLine = views.muted(R.string.pair_confirm_pc).apply { visibility = View.GONE }
         progress.addView(stageLine)
+        progress.addView(progressBar)
+        progress.addView(earlierLine)
+        progress.addView(numberLabel)
         progress.addView(numberLine)
+        progress.addView(instructionLine)
+        progress.addView(confirmLine)
+        progress.addView(views.spacer())
         progress.addView(views.button(R.string.pair_cancel, KeyViews.Style.SECONDARY) { cancelPairing() })
         column.addView(progress)
 
-        paired = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
+        paired = tallColumn().apply { visibility = View.GONE }
+        pairedLine = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            setTextColor(KeyPalette.CONSTRUCTIVE)
+            setPadding(0, views.dp(8), 0, views.dp(8))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
-        pairedLine = views.body("").apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
         paired.addView(pairedLine)
+        paired.addView(views.spacer())
         paired.addView(views.button(R.string.pair_connect, KeyViews.Style.PRIMARY) { connectPaired() })
         paired.addView(views.button(R.string.pair_done, KeyViews.Style.SECONDARY) { finish() })
         column.addView(paired)
 
         setContentView(ScrollView(this).apply {
+            isFillViewport = true
             setBackgroundColor(KeyPalette.CANVAS)
             fitsSystemWindows = true
             addView(column)
@@ -238,6 +293,7 @@ class PairActivity : Activity() {
             status.visibility = View.VISIBLE
             return
         }
+        scannedNote.visibility = View.VISIBLE
         relayField.setText(link.relay)
         pcIdField.setText(link.pcId)
         codeField.setText(PairingCode.display(link.code))
@@ -287,8 +343,15 @@ class PairActivity : Activity() {
         form.visibility = View.GONE
         paired.visibility = View.GONE
         progress.visibility = View.VISIBLE
+        numberLabel.visibility = View.GONE
         numberLine.visibility = View.GONE
-        stageLine.setText(R.string.pair_connecting)
+        confirmLine.visibility = View.GONE
+        instructionLine.visibility = View.GONE
+        stageLine.visibility = View.VISIBLE
+        progressBar.visibility = View.VISIBLE
+        earlierLine.visibility = View.GONE
+        shownStage = 0
+        showStage(R.string.pair_connecting)
     }
 
     private fun showPaired(pc: PcEntry) {
@@ -311,6 +374,22 @@ class PairActivity : Activity() {
         PairingFailure.PcKeyInvalid -> R.string.pair_fail_key
         PairingFailure.ConnectionLost -> R.string.pair_fail_lost
         PairingFailure.Timeout -> R.string.pair_fail_timeout
+    }
+
+    /** A state container that grows to the screen, so its last buttons sit at the bottom. */
+    private fun tallColumn() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+    }
+
+    /** Shows [stage] as the current line and the one it replaces as the earlier stage. */
+    private fun showStage(stage: Int) {
+        if (shownStage != 0 && shownStage != stage) {
+            earlierLine.text = getString(R.string.pair_earlier, getString(shownStage))
+            earlierLine.visibility = View.VISIBLE
+        }
+        shownStage = stage
+        stageLine.setText(stage)
     }
 
     private fun monoField(hint: Int): EditText = views.field(hint).apply {

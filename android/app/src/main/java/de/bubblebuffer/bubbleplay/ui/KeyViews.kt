@@ -46,20 +46,61 @@ internal class KeyViews(private val context: Context) {
 
     fun title(text: Int) = TextView(context).apply {
         setText(text)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 28f)
+        setTypeface(typeface, Typeface.BOLD)
+        setLineSpacing(0f, 1.1f)
         setTextColor(KeyPalette.MILK)
-        setPadding(0, dp(8), 0, dp(8))
+        setPadding(0, dp(4), 0, dp(8))
         isAccessibilityHeading = true
     }
 
     fun body(text: CharSequence) = TextView(context).apply {
         this.text = text
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-        setTextColor(KeyPalette.CREAM)
-        setPadding(0, dp(4), 0, dp(4))
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+        setLineSpacing(0f, 1.1f)
+        setTextColor(KeyPalette.MILK)
+        setPadding(0, dp(4), 0, dp(8))
     }
 
     fun body(text: Int): TextView = body(context.getString(text))
+
+    /** Secondary copy: the same body, in the quieter cream. */
+    fun muted(text: Int): TextView = body(text).apply { setTextColor(KeyPalette.CREAM) }
+
+    /** A short context line with a thread bar on its left, e.g. "From a scanned code". */
+    fun note(text: Int) = TextView(context).apply {
+        setText(text)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        setTextColor(KeyPalette.CREAM)
+        setPadding(dp(13), dp(2), 0, dp(2))
+        background = leftBar(KeyPalette.THREAD_STRONG)
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(10) }
+    }
+
+    /** An expanding spacer: pushes the views after it to the bottom of a tall column. */
+    fun spacer() = View(context).apply {
+        layoutParams = LinearLayout.LayoutParams(0, 0, 1f).apply {
+            width = ViewGroup.LayoutParams.MATCH_PARENT
+        }
+    }
+
+    /** A rule across the list, between rows. */
+    fun rule(color: Int = KeyPalette.THREAD) = View(context).apply {
+        setBackgroundColor(color)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+    }
+
+    /** A 3dp bar down the left edge, the seam that marks a note or an error. */
+    private fun leftBar(color: Int): Drawable {
+        val bar = GradientDrawable().apply { setColor(color) }
+        return android.graphics.drawable.LayerDrawable(arrayOf(bar)).apply {
+            setLayerSize(0, dp(3), ViewGroup.LayoutParams.MATCH_PARENT)
+            setLayerGravity(0, Gravity.START)
+        }
+    }
 
     /** Text in the monospace face, for IDs and keys: people compare and copy them character by character. */
     fun mono(text: CharSequence, sizeSp: Float = 16f) = TextView(context).apply {
@@ -74,21 +115,28 @@ internal class KeyViews(private val context: Context) {
     fun fieldLabel(text: Int) = TextView(context).apply {
         setText(text)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-        setTextColor(KeyPalette.MILK)
-        setPadding(0, dp(12), 0, dp(2))
+        setTextColor(KeyPalette.CREAM)
+        setPadding(0, dp(14), 0, dp(4))
     }
 
     /** A status line, hidden until [tell] sets it. Live region so screen readers hear the result. */
     fun status() = TextView(context).apply {
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-        setPadding(0, dp(8), 0, dp(4))
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        setLineSpacing(0f, 1.1f)
+        setPadding(dp(13), dp(2), 0, dp(2))
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(8); bottomMargin = dp(6) }
         visibility = View.GONE
         accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
     }
 
     fun tell(view: TextView, text: Int, error: Boolean) {
         view.setText(text)
-        view.setTextColor(if (error) KeyPalette.DANGER else KeyPalette.CONSTRUCTIVE)
+        val color = if (error) KeyPalette.DANGER else KeyPalette.CONSTRUCTIVE
+        view.setTextColor(color)
+        view.background = leftBar(color)
         view.visibility = View.VISIBLE
     }
 
@@ -117,7 +165,8 @@ internal class KeyViews(private val context: Context) {
     fun button(text: Int, style: Style, onClick: () -> Unit): TextView = TextView(context).apply {
         setText(text)
         gravity = Gravity.CENTER
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+        setTypeface(typeface, Typeface.BOLD)
         setTextColor(
             when (style) {
                 Style.PRIMARY -> KeyPalette.INK
@@ -137,15 +186,34 @@ internal class KeyViews(private val context: Context) {
         setOnClickListener { onClick() }
     }
 
+    /** A list row or sheet item: flat, with a pressed field and a focus outline. */
+    fun rowBackground(): Drawable = StateListDrawable().apply {
+        addState(intArrayOf(android.R.attr.state_pressed), GradientDrawable().apply { setColor(KeyPalette.SURFACE_MUTED) })
+        addState(
+            intArrayOf(android.R.attr.state_focused),
+            GradientDrawable().apply {
+                setColor(0)
+                setStroke(dp(2), KeyPalette.FOCUS)
+            },
+        )
+        addState(intArrayOf(), GradientDrawable().apply { setColor(0) })
+    }
+
+    /** A bottom sheet: surface fill, a strong thread along its top edge. */
+    fun sheetBackground(): Drawable = GradientDrawable().apply {
+        setColor(KeyPalette.SURFACE)
+        setStroke(dp(1), KeyPalette.THREAD_STRONG)
+    }
+
     /** A bounded panel for the start-screen offer. */
     fun panel(): Drawable = GradientDrawable().apply {
-        cornerRadii = radii(12f, 18f, 10f, 16f)
+        cornerRadii = radii(6f, 10f, 6f, 8f)
         setColor(KeyPalette.SURFACE)
         setStroke(dp(1), KeyPalette.THREAD)
     }
 
     private fun buttonBackground(style: Style): Drawable {
-        val fill = if (style == Style.PRIMARY) KeyPalette.APRICOT else KeyPalette.SURFACE
+        val fill = if (style == Style.PRIMARY) KeyPalette.APRICOT else KeyPalette.DUVET
         val pressed = if (style == Style.PRIMARY) KeyPalette.CREAM else KeyPalette.SURFACE_MUTED
         val stroke = when (style) {
             Style.PRIMARY -> KeyPalette.APRICOT
@@ -164,7 +232,7 @@ internal class KeyViews(private val context: Context) {
             intArrayOf(android.R.attr.state_focused),
             GradientDrawable().apply {
                 cornerRadii = radii(6f, 10f, 6f, 8f)
-                setColor(KeyPalette.SURFACE)
+                setColor(KeyPalette.DUVET)
                 setStroke(dp(2), KeyPalette.FOCUS)
             },
         )
@@ -172,7 +240,7 @@ internal class KeyViews(private val context: Context) {
             intArrayOf(),
             GradientDrawable().apply {
                 cornerRadii = radii(6f, 10f, 6f, 8f)
-                setColor(KeyPalette.SURFACE)
+                setColor(KeyPalette.DUVET)
                 setStroke(dp(1), KeyPalette.THREAD)
             },
         )
