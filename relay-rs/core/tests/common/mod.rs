@@ -35,7 +35,7 @@ pub fn compact(value: &Value) -> String {
 pub fn side_for(role: &str) -> Option<Side> {
     match role {
         "host" => Some(Side::Host),
-        "client" => Some(Side::Viewer),
+        "client" | "viewer" => Some(Side::Viewer),
         _ => None,
     }
 }

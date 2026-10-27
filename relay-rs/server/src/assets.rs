@@ -1,7 +1,7 @@
 //! Static assets from `assets_dir`. This follows the Go relay's `serveAsset`:
 //!
 //! - only GET and HEAD; anything else is a 404;
-//! - the path is cleaned (`path.Clean` rules) and `/` maps to `/index.html`;
+//! - the path is cleaned (`path.Clean` rules) and `/` maps to `/index.html`, and so does `/pair`;
 //! - a backslash in the cleaned path is a 404;
 //! - the file must resolve (symlinks followed) to a regular file inside the assets directory;
 //! - a request ending in `/index.html` redirects to `./`, as `http.ServeFile` does;
@@ -80,7 +80,8 @@ pub async fn serve_asset(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let cleaned = clean_path(&decoded);
-    let cleaned = if cleaned == "/" {
+    // `/pair` is the same page. The browser reads the pairing code from the fragment itself.
+    let cleaned = if cleaned == "/" || cleaned == "/pair" {
         "/index.html".to_string()
     } else {
         cleaned
