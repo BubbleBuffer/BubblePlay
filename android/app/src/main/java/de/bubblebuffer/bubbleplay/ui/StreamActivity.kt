@@ -371,6 +371,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             .filterNot { Character.isISOControl(it) }.take(64)
         val s = Session(config, pc, UnlockedKey.require(), label, Session.chooseCodec(prefs.codec), this) { lastSeen, problem ->
             PcStore.from(this).touch(pc.id, lastSeen, problem)
+            pc = pc.copy(lastSeen = lastSeen, problem = problem)
         }
         session = s
         input = RemoteInput(s, cursorReconciler::noteSent, ::scheduleMotionFlush)
