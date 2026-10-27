@@ -240,7 +240,7 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   session/profile policies, and lab telemetry from the host event loop.
 - The browser page keeps the early diagnostic bootstrap; `receiver.js` starts
   the session and uses the separately testable media ACK scheduler.
-- The relay applies `protocol-validation.js` at its existing message boundaries.
+- The Rust relay validates signal, file and media packets at its message boundaries (`relay-rs/core/src/protocol.rs`).
 - The lab lifecycle module owns lease renewal, checkpoints, and termination;
   the measurement module owns alignment, cohort readiness, and ranking policy.
   The live runner retains browser/process orchestration and measurement I/O.
