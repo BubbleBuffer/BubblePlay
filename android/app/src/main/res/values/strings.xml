@@ -274,7 +274,7 @@
     <string name="main_unlock_action">Unlock</string>
     <string name="pcs_title">PCs</string>
     <string name="pcs_this_device">This device</string>
-    <string name="pcs_empty">No PCs yet. On the PC, open BubblePlay in the tray, choose Devices &gt; Pair device, then scan the QR code with this phone's camera, or tap Pair a PC and type the PC ID and code.</string>
+    <string name="pcs_empty">No PCs yet. On the PC, open BubblePlay in the tray, choose Devices &gt; Pair device, then scan the QR code with this phone\'s camera, or tap Pair a PC and type the PC ID and code.</string>
     <string name="pcs_pair">Pair a PC</string>
     <string name="pcs_actions">PC actions</string>
     <string name="pcs_rename">Rename</string>
@@ -293,7 +293,7 @@
     <string name="pcs_remove_title">Remove this PC?</string>
     <string name="pcs_remove_message">Remove %1$s? This phone forgets the PC and its key. To use it again, pair at the PC.</string>
     <string name="pcs_remove_action">Remove</string>
-    <string name="dk_unlock_intro">Unlock this phone's device key to see your PCs.</string>
+    <string name="dk_unlock_intro">Unlock this phone\'s device key to see your PCs.</string>
     <string name="pair_title">Pair a PC</string>
     <string name="pair_intro">Type the PC ID and pairing code shown on the PC, then press Pair. Or open a bubbleplay link from the PC, which fills these fields for you.</string>
     <string name="pair_relay">Relay address</string>
@@ -313,7 +313,7 @@
     <string name="pair_err_pcid">The PC ID has 16 characters: letters and digits, without I, L, O or U.</string>
     <string name="pair_err_code">The pairing code has 10 characters. Copy it from the PC.</string>
     <string name="pair_bad_link">That link is not a valid pairing link. Type the details instead.</string>
-    <string name="pair_needs_key">Pairing needs this phone's device key. Create or import one first.</string>
+    <string name="pair_needs_key">Pairing needs this phone\'s device key. Create or import one first.</string>
     <string name="pair_needs_unlock">Pairing needs your device key. Unlock it to continue.</string>
     <string name="pair_connecting">Connecting to the relay…</string>
     <string name="pair_proving">Checking the code with the PC…</string>
@@ -322,8 +322,8 @@
     <string name="pair_paired">Paired with %1$s.</string>
     <string name="pair_denied">The PC declined. Nothing was saved.</string>
     <string name="pair_fail_refused">The relay refused the pairing. The code may be wrong or expired, or pairing is closed on the PC. Open Pair device on the PC for a new code.</string>
-    <string name="pair_fail_proof">The PC's proof did not match this code. Nothing was saved. Check the code and try again.</string>
-    <string name="pair_fail_key">The PC's key check failed. Nothing was saved.</string>
+    <string name="pair_fail_proof">The PC\'s proof did not match this code. Nothing was saved. Check the code and try again.</string>
+    <string name="pair_fail_key">The PC\'s key check failed. Nothing was saved.</string>
     <string name="pair_fail_lost">The connection dropped during pairing. Nothing was saved. Try again.</string>
     <string name="pair_fail_timeout">No answer from the PC. Make sure Pair device is still open on the PC, then try again.</string>
 </resources>
