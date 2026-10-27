@@ -12,12 +12,16 @@ mod object;
 mod rng;
 mod routes;
 mod store;
+mod stubs;
 
 use std::cell::RefCell;
 
 use worker::*;
 
 use crate::live::Live;
+
+// Inert classes for the in-place deploy on the JS relay's script. Nothing routes to them.
+pub use stubs::{AgentRoom, ApprovalGate, MediaRoom, Room};
 
 const RELAY_NAME: &str = "relay-v1";
 
