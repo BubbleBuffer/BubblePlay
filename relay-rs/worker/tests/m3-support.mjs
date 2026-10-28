@@ -5,6 +5,7 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +13,13 @@ import { fileURLToPath } from 'node:url';
 const crateRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const wranglerBin = path.join(crateRoot, 'node_modules', '.bin', 'wrangler');
 
-export const ORIGIN = 'https://relay.test';
+// The relay's PUBLIC_ORIGIN is the loopback origin of the instance under test. Each instance
+// binds its own relay proofs and Origin checks to it; http is allowed for loopback only.
+export const originFor = (port) => `http://127.0.0.1:${port}`;
+export const NTFY_TOPIC = 'm3-approvals';
+export const NTFY_TOKEN = 'm3-ntfy-token-local';
+export const TURN_HOST = 'turn.test';
+export const TURN_SECRET = 'm3-turn-secret-local-padding-to-32-bytes';
 export const TOKEN = 'm3-token-local';
 export const ADMIN = 'm3-admin-local';
 export const CLIENT_IP = '203.0.113.7';
@@ -74,12 +81,13 @@ function lengthPrefixed(fields) {
   return Buffer.concat(parts);
 }
 
-// The relay proof: Ed25519 over the SHA-256 of the length-prefixed fields, for the test origin.
-export function relayProof(who, role, nonce) {
+// The relay proof: Ed25519 over the SHA-256 of the length-prefixed fields, bound to the relay's
+// PUBLIC_ORIGIN.
+export function relayProof(who, role, nonce, origin) {
   const encoding = lengthPrefixed([
     RELAY_CONTEXT,
     Buffer.from(role, 'utf8'),
-    Buffer.from(ORIGIN, 'utf8'),
+    Buffer.from(origin, 'utf8'),
     nonce,
     Buffer.from(who.id, 'utf8'),
     who.publicKey,
@@ -317,26 +325,37 @@ export async function openOk(port, target, options) {
   return socket;
 }
 
-// Sends the signed hello and answers the register-challenge. Does not wait for hello-ok.
-export async function proveViewer(socket, who, pair) {
+// Sends the signed hello and answers the register-challenge. Does not wait for hello-ok. `origin`
+// is the relay's PUBLIC_ORIGIN, which the proof is bound to.
+export async function proveViewer(socket, who, { origin, pair, turn = false } = {}) {
   const hello = {
     type: 'hello',
     role: 'viewer',
     id: who.id,
     public: who.publicB64,
-    turn: false,
+    turn,
   };
   if (pair !== undefined) hello.pair = b64(pair);
   socket.sendJson(hello);
   const challenge = await socket.nextJson('register-challenge', 10_000);
   const nonce = Buffer.from(challenge.nonce, 'base64url');
-  socket.sendJson({ type: 'register-proof', signature: relayProof(who, 'viewer', nonce) });
+  socket.sendJson({ type: 'register-proof', signature: relayProof(who, 'viewer', nonce, origin) });
 }
 
 // A native viewer on /ws (no Origin, so no gate cookie): signed hello, then its hello-ok.
-export async function viewerJoin(port, pc, who = viewerIdentity()) {
+export async function viewerJoin(port, pc, who = viewerIdentity(), { turn = false } = {}) {
   const socket = await openOk(port, `/ws?pc=${pc}`);
-  await proveViewer(socket, who);
+  await proveViewer(socket, who, { origin: originFor(port), turn });
+  const ok = await socket.nextJson('hello-ok', 10_000);
+  return { socket, ok };
+}
+
+// A browser viewer: its WebSocket names the public origin and carries the gate cookie. Once the
+// gate lets it through it is admitted the same way a native viewer is.
+export async function browserJoin(port, pc, cookie, { who = viewerIdentity(), turn = false } = {}) {
+  const origin = originFor(port);
+  const socket = await openOk(port, `/ws?pc=${pc}`, { origin, cookie });
+  await proveViewer(socket, who, { origin, turn });
   const ok = await socket.nextJson('hello-ok', 10_000);
   return { socket, ok };
 }
@@ -351,7 +370,7 @@ export async function registerHost(port, who, { token = TOKEN, admit = true } = 
   socket.sendJson(hello);
   const challenge = await socket.nextJson('register-challenge', 10_000);
   const nonce = Buffer.from(challenge.nonce, 'base64url');
-  socket.sendJson({ type: 'register-proof', signature: relayProof(who, 'host', nonce) });
+  socket.sendJson({ type: 'register-proof', signature: relayProof(who, 'host', nonce, originFor(port)) });
   const ok = await socket.nextJson('hello-ok', 10_000);
   if (admit) {
     socket.sendJson({
@@ -409,10 +428,135 @@ async function stopChild(child) {
   if (child.exitCode === null && child.signalCode === null) signalGroup(child.pid, 'SIGKILL');
 }
 
+// A plain HTTP request to the instance. fetch cannot set Host or add a second header, and the tests
+// need both, so this uses node:http. `ip` sets CF-Connecting-IP (null sends none).
+export function httpRequest(
+  port,
+  { method = 'GET', path: target = '/', headers = {}, ip = CLIENT_IP, body } = {},
+) {
+  return new Promise((resolve, reject) => {
+    const sent = { ...headers };
+    if (ip) sent['CF-Connecting-IP'] = ip;
+    const req = http.request({ host: '127.0.0.1', port, method, path: target, headers: sent }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('error', reject);
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+    req.setTimeout(15_000, () => req.destroy(new Error(`no response for ${method} ${target}`)));
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+// The wait page carries the poll token in its script as `var token = "...";`.
+export function pollTokenOf(html) {
+  const marker = 'var token = "';
+  const start = html.indexOf(marker);
+  if (start < 0) throw new Error('the wait page has no poll token');
+  const from = start + marker.length;
+  return html.slice(from, html.indexOf('"', from));
+}
+
+// A fake ntfy server. Each publish is recorded in order as { method, headers, body }, with the JSON
+// body parsed. `waitFor(after, match)` returns the first publish at or after index `after` that
+// matches, so a case can ignore publishes made by earlier cases.
+export async function startNtfy() {
+  const publishes = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      let body = null;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch {
+        body = null;
+      }
+      publishes.push({ method: req.method, headers: req.headers, body });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = server.address();
+  return {
+    url: `http://127.0.0.1:${port}/`,
+    count: () => publishes.length,
+    async waitFor(after, match, timeoutMs = 10_000) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const hit = publishes.slice(after).find(match);
+        if (hit) return hit;
+        if (Date.now() > deadline) throw new Error(`no matching ntfy publish in ${timeoutMs} ms`);
+        await sleep(50);
+      }
+    },
+    stop() {
+      return new Promise((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      });
+    },
+  };
+}
+
+// Each approval asks from its own client prefix. The gate cools a /24 down for 15 s after each
+// decision, and every case shares one relay, so a case cannot reuse another's prefix.
+let approvalCount = 0;
+export function freshClientIp() {
+  approvalCount += 1;
+  if (approvalCount > 250) throw new Error('out of fresh client prefixes');
+  return `198.18.${approvalCount}.20`;
+}
+
+// The browser approval, as the wait page drives it: a top-level navigation opens the wait page, ntfy
+// carries the approve bearer, the decision posts it, and the poll returns the gate cookie. Returns
+// the cookie pair as a browser sends it back.
+export async function approveBrowser(relay, ntfy, ip = freshClientIp()) {
+  const before = ntfy.count();
+  const page = await httpRequest(relay.port, {
+    path: '/',
+    ip,
+    headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
+  });
+  if (page.status !== 200) throw new Error(`wait page answered ${page.status}`);
+  const pending = pollTokenOf(page.body.toString('utf8'));
+  const prefix = `${ip.split('.').slice(0, 3).join('.')}.0/24`;
+  const expected = `Browser navigation awaiting approval from client prefix ${prefix}`;
+  const publish = await ntfy.waitFor(before, (p) => p.body?.message === expected);
+  const approve = publish.body.actions[0].headers.Authorization.replace(/^Bearer /, '');
+  const decision = await httpRequest(relay.port, {
+    method: 'POST',
+    path: '/__gate/decision',
+    ip,
+    headers: { Authorization: `Bearer ${approve}` },
+    body: 'approve',
+  });
+  if (decision.status !== 204) throw new Error(`decision answered ${decision.status}`);
+  const reply = await httpRequest(relay.port, {
+    method: 'POST',
+    path: '/__gate/poll',
+    ip,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pending }),
+  });
+  const state = JSON.parse(reply.body.toString('utf8'));
+  if (state.state !== 'approved') throw new Error(`poll answered ${state.state}`);
+  const cookie = (reply.headers['set-cookie'] ?? []).find((value) => value.startsWith('__Host-gate='));
+  if (!cookie) throw new Error('the approved poll set no gate cookie');
+  return cookie.split(';')[0];
+}
+
 // Starts `wrangler dev --local` on a free port with the throwaway config as --var values and the
-// given --persist-to directory. Resolves when the Worker answers. A config rejection (500) fails
-// the start, so the cause shows up in the log instead of in a test.
-export async function startRelay({ persistDir, maxConnections = 256 }) {
+// given --persist-to directory. Resolves when the Worker answers /healthz with the admin bearer. A
+// config rejection (500) fails the start, so the cause shows up in the log instead of in a test.
+// `ntfy` (from startNtfy) turns approvals on, and `turn` adds the TURN ICE server.
+export async function startRelay({ persistDir, maxConnections = 256, ntfy = null, turn = false }) {
   if (!existsSync(path.join(crateRoot, 'build', 'worker', 'shim.mjs'))) {
     throw new Error('build/worker/shim.mjs is missing: run worker-build --release first');
   }
@@ -421,6 +565,15 @@ export async function startRelay({ persistDir, maxConnections = 256 }) {
   }
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
+  const origin = originFor(port);
+  const vars = [
+    ['PUBLIC_ORIGIN', origin],
+    ['RELAY_TOKEN', TOKEN],
+    ['ADMIN_TOKEN', ADMIN],
+    ['MAX_CONNECTIONS', String(maxConnections)],
+  ];
+  if (ntfy) vars.push(['NTFY_URL', ntfy.url], ['NTFY_TOPIC', NTFY_TOPIC], ['NTFY_TOKEN', NTFY_TOKEN]);
+  if (turn) vars.push(['TURN_HOST', TURN_HOST], ['TURN_SECRET', TURN_SECRET]);
   let output = '';
   const child = spawn(
     wranglerBin,
@@ -434,14 +587,7 @@ export async function startRelay({ persistDir, maxConnections = 256 }) {
       '--persist-to',
       persistDir,
       '--show-interactive-dev-session=false',
-      '--var',
-      `PUBLIC_ORIGIN:${ORIGIN}`,
-      '--var',
-      `RELAY_TOKEN:${TOKEN}`,
-      '--var',
-      `ADMIN_TOKEN:${ADMIN}`,
-      '--var',
-      `MAX_CONNECTIONS:${maxConnections}`,
+      ...vars.flatMap(([name, value]) => ['--var', `${name}:${value}`]),
     ],
     {
       cwd: crateRoot,
@@ -469,12 +615,16 @@ export async function startRelay({ persistDir, maxConnections = 256 }) {
         throw new Error(`wrangler not ready in ${READY_TIMEOUT_MS} ms (${lastErr})\n${output.slice(-4000)}`);
       }
       try {
-        const res = await fetch(`${base}/`, { signal: AbortSignal.timeout(2000) });
-        await res.arrayBuffer();
+        const res = await httpRequest(port, {
+          path: '/healthz',
+          headers: { Authorization: `Bearer ${ADMIN}` },
+          ip: null,
+        });
         if (res.status === 500) {
           throw new Error(`relay configuration rejected (500)\n${output.slice(-4000)}`);
         }
-        break;
+        if (res.status === 200) break;
+        lastErr = `healthz answered ${res.status}`;
       } catch (err) {
         if (String(err).includes('configuration rejected')) throw err;
         lastErr = String(err);
@@ -485,5 +635,5 @@ export async function startRelay({ persistDir, maxConnections = 256 }) {
     await stop();
     throw err;
   }
-  return { port, base, stop, log: () => output };
+  return { port, base, origin, stop, log: () => output };
 }

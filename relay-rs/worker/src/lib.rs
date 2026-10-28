@@ -1,11 +1,13 @@
-// M3-C1: Cloudflare Workers adapter for the relay core.
+// Cloudflare Workers adapter for the relay core (M3-C1 WebSockets, M3-C2 HTTP).
 // Every request is routed to one Relay object (idFromName "relay-v1"). The object
-// runs the core relay and the site gate for the seven WebSocket routes, with the
-// hibernation API. Every other request gets an empty 404. The HTTP routes (gate
-// pages, admin, healthz, static assets) come in M3-C2 and go in the router that
-// `on_fetch` will hand non-WebSocket requests to.
+// runs the core relay and the site gate, serves the gate's pages, the admin API,
+// healthz and the static assets (Workers Static Assets, through the ASSETS binding),
+// and accepts the seven WebSocket routes with the hibernation API.
+mod assets;
 mod config;
+mod http;
 mod live;
+mod ntfy;
 mod object;
 mod rng;
 mod routes;

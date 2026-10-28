@@ -377,7 +377,8 @@ impl Relay {
     /// rotates the epoch, drops the old viewer's stale data sockets and sends
     /// hello-ok, then replays the cached host capabilities (Go
     /// server.go:553-600). A pairing-mode viewer gets `pairing: true` and no
-    /// ticket, and no replay.
+    /// ticket, and no replay. A host that is connected is told first, with
+    /// `peer-joined` carrying the same epoch and the pairing flag.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn viewer_admit(
         &mut self,
@@ -425,6 +426,15 @@ impl Relay {
             Some(self.issue_ticket(id, now_ms, rng))
         };
         self.persist(id, out);
+        // The host hears of the admission first, with the epoch the viewer is
+        // about to hold. Its peer-joined is queued before the viewer's hello-ok.
+        if let Some(host) = self.peers.get(&key_for(Role::Host, "", &pc)).copied() {
+            self.send_text(
+                host,
+                json!({"type": "peer-joined", "mediaEpoch": epoch, "pairing": pairing}).to_string(),
+                out,
+            );
+        }
         let ice = self.ice_servers(turn, now_ms, rng);
         let mut hello = json!({
             "type": "hello-ok",
