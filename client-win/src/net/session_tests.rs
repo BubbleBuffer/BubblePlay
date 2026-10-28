@@ -1380,7 +1380,7 @@ fn no_auth_host_in_time_is_fatal_with_the_device_keys_message() {
 #[test]
 fn a_relay_close_after_the_handshake_reconnects_with_a_fresh_handshake() {
     let closing = Scenario {
-        close_after_caps: Some(1001),
+        close_in_session: Some(1001),
         ..Scenario::new(EPOCH_A)
     };
     let h = start(
@@ -1407,7 +1407,7 @@ fn a_relay_close_after_the_handshake_reconnects_with_a_fresh_handshake() {
 #[test]
 fn a_policy_close_after_the_handshake_is_fatal_and_not_retried() {
     let revoked = Scenario {
-        close_after_caps: Some(1008),
+        close_in_session: Some(1008),
         ..Scenario::new(EPOCH_A)
     };
     let mut h = start(

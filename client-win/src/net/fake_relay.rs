@@ -67,8 +67,9 @@ pub(crate) struct Scenario {
     /// A pairing hello (with `pair`) gets a pairing-mode `hello-ok`; then the PC sends its
     /// `pair-proof` for this code, followed by `pair-done` (true) or `pair-denied` (false).
     pub pair: Option<(String, bool)>,
-    /// Close `/ws` with this code right after the PC's first `ctl` message.
-    pub close_after_caps: Option<u16>,
+    /// Close `/ws` with this code once the viewer sent its first-frame request (it is
+    /// then in its session loop).
+    pub close_in_session: Option<u16>,
     /// The PC skips one `ctl` sequence number before its first message (a seq gap).
     pub pc_ctl_gap: bool,
 }
@@ -505,10 +506,21 @@ async fn serve_signal(mut ws: ServerSocket, scenario: Scenario, origin: &str, lo
             }),
         };
         if let (true, Some(session)) = (scenario.pc_ctl_gap, &mut pc) {
-            let _skipped = session.ctl.seal_text("{}").expect("seal");
+            let _skipped = session
+                .ctl
+                .seal_text(r#"{"type":"caps","caps":[]}"#)
+                .expect("seal");
         }
         send_ctl(&mut ws, &mut pc, first).await;
-        if let Some(code) = scenario.close_after_caps {
+        if let Some(code) = scenario.close_in_session {
+            // Once the viewer is in its session loop (its first-frame request).
+            loop {
+                match read_signal(&mut ws, &mut pc, &log).await {
+                    None => return,
+                    Some(text) if message_type(&text).as_deref() == Some("first-frame") => break,
+                    Some(_) => {}
+                }
+            }
             let _ = ws
                 .send(Message::Close(Some(CloseFrame {
                     code: CloseCode::from(code),

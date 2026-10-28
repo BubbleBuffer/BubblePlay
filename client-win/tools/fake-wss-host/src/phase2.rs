@@ -617,7 +617,10 @@ mod tests {
     fn the_sdp_fingerprint_is_the_sha_256_line() {
         let sdp = "v=0\r\na=setup:passive\r\na=fingerprint:sha-1 00:11\r\na=fingerprint:sha-256 AB:CD\r\na=fingerprint:x\r\n";
         assert_eq!(sdp_fingerprint(sdp).as_deref(), Some("sha-256 AB:CD"));
-        assert_eq!(sdp_fingerprint("v=0\r\na=fingerprint:sha-1 00:11\r\n"), None);
+        assert_eq!(
+            sdp_fingerprint("v=0\r\na=fingerprint:sha-1 00:11\r\n"),
+            None
+        );
         assert_eq!(sdp_fingerprint("v=0\r\n"), None);
     }
 }
