@@ -1512,6 +1512,8 @@ impl Signaling {
             match msg {
                 Message::Text(text) => {
                     // Only relay-generated control messages bypass the authenticated channel.
+                    // These types can only come from the relay: relay-rs forwards only the
+                    // decision-15 allowlist from viewer to host (CUT-2, 9f56c26).
                     let kind = serde_json::from_str::<serde_json::Value>(&text)
                         .ok()
                         .and_then(|v| v.get("type").and_then(|v| v.as_str()).map(str::to_owned));
