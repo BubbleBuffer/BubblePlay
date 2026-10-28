@@ -721,7 +721,7 @@ impl Model {
             Ctl::ColName => "Name".to_owned(),
             Ctl::ColId => "ID".to_owned(),
             Ctl::ColSeen => "Last seen".to_owned(),
-            Ctl::Empty => "No paired devices yet.\r\nPair a device to use this PC from it.".to_owned(),
+            Ctl::Empty => "\r\n\r\n\r\n\r\n\r\nNo paired devices yet.\r\nPair a device to use this PC from it.".to_owned(),
             Ctl::Title => (if self.page == Page::Request {
                 "Pair this device?"
             } else {
@@ -966,7 +966,7 @@ fn spec(ctl: Ctl) -> (&'static str, u32) {
         ),
         Ctl::Number => ("STATIC", label | SS_CENTER_ | SS_CENTERIMAGE_ | WS_BORDER.0),
         Ctl::Qr => ("STATIC", SS_OWNERDRAW_),
-        Ctl::Empty => ("STATIC", label | SS_CENTER_ | SS_CENTERIMAGE_),
+        Ctl::Empty => ("STATIC", label | SS_CENTER_),
         Ctl::ColName | Ctl::ColId | Ctl::ColSeen => ("STATIC", label | SS_ENDELLIPSIS_),
         Ctl::PairButton | Ctl::Cancel | Ctl::Close | Ctl::NewCode | Ctl::Allow | Ctl::Deny => {
             ("BUTTON", BS_PUSHBUTTON_ | WS_TABSTOP.0)
@@ -1120,6 +1120,8 @@ struct Ui {
     scroll: Cell<i32>,
     last_minute: Cell<i64>,
     qr_cache: RefCell<Option<QrMatrix>>,
+    /// Test harness: keep the windows far off every monitor and never activate them.
+    offscreen: Cell<bool>,
 }
 
 fn window_thread(shared: Arc<Shared>) {
@@ -1127,31 +1129,7 @@ fn window_thread(shared: Arc<Shared>) {
     // the message loop and is reached from the window procedures only through user data.
     unsafe {
         let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let model = Model::new(&shared.info);
-        let ui = Ui {
-            shared: Arc::clone(&shared),
-            model: RefCell::new(model),
-            hwnd: Cell::new(HWND::default()),
-            rows_hwnd: Cell::new(HWND::default()),
-            confirm: Cell::new(HWND::default()),
-            dpi: Cell::new(96),
-            high_contrast: Cell::new(false),
-            fonts: RefCell::new(Fonts {
-                handles: HashMap::new(),
-            }),
-            brushes: RefCell::new(HashMap::new()),
-            applied_text: RefCell::default(),
-            applied_look: RefCell::default(),
-            applied_shown: RefCell::default(),
-            applied_enabled: RefCell::default(),
-            applied_page: Cell::new(None),
-            applied_default: Cell::new(None),
-            rows_built: Cell::new(u64::MAX),
-            row_children: RefCell::default(),
-            scroll: Cell::new(0),
-            last_minute: Cell::new(now_unix() / 60),
-            qr_cache: RefCell::new(None),
-        };
+        let ui = Ui::new(Arc::clone(&shared));
         let created = ui.create();
         {
             let mut inner = shared.lock();
@@ -1223,6 +1201,35 @@ fn register_class(
 }
 
 impl Ui {
+    fn new(shared: Arc<Shared>) -> Self {
+        let model = Model::new(&shared.info);
+        Self {
+            shared,
+            model: RefCell::new(model),
+            hwnd: Cell::new(HWND::default()),
+            rows_hwnd: Cell::new(HWND::default()),
+            confirm: Cell::new(HWND::default()),
+            dpi: Cell::new(96),
+            high_contrast: Cell::new(false),
+            fonts: RefCell::new(Fonts {
+                handles: HashMap::new(),
+            }),
+            brushes: RefCell::new(HashMap::new()),
+            applied_text: RefCell::default(),
+            applied_look: RefCell::default(),
+            applied_shown: RefCell::default(),
+            applied_enabled: RefCell::default(),
+            applied_page: Cell::new(None),
+            applied_default: Cell::new(None),
+            rows_built: Cell::new(u64::MAX),
+            row_children: RefCell::default(),
+            scroll: Cell::new(0),
+            last_minute: Cell::new(now_unix() / 60),
+            qr_cache: RefCell::new(None),
+            offscreen: Cell::new(false),
+        }
+    }
+
     fn px(&self, value: i32) -> i32 {
         (i64::from(value) * i64::from(self.dpi.get()) / 96) as i32
     }
@@ -1236,8 +1243,13 @@ impl Ui {
             return None;
         }
         let title = wide("BubblePlay \u{2014} Devices");
+        let extra = if self.offscreen.get() {
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        } else {
+            WINDOW_EX_STYLE(0)
+        };
         let hwnd = CreateWindowExW(
-            MAIN_EX_STYLE,
+            MAIN_EX_STYLE | extra,
             w!("BubblePlayDevices"),
             PCWSTR(title.as_ptr()),
             MAIN_STYLE,
@@ -1429,13 +1441,19 @@ impl Ui {
             AdjustWindowRectExForDpi(&mut rect, MAIN_STYLE, false, MAIN_EX_STYLE, self.dpi.get());
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
-        let left = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
-        let top = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
+        let (left, top) = if self.offscreen.get() {
+            (-30_000, -30_000)
+        } else {
+            (
+                ((GetSystemMetrics(SM_CXSCREEN) - width) / 2).max(0),
+                ((GetSystemMetrics(SM_CYSCREEN) - height) / 2).max(0),
+            )
+        };
         let _ = SetWindowPos(
             hwnd,
             None,
-            left.max(0),
-            top.max(0),
+            left,
+            top,
             width,
             height,
             SWP_NOZORDER | SWP_NOACTIVATE,
@@ -2033,7 +2051,12 @@ impl Ui {
         let top = owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2;
         let title = wide("Revoke device");
         let Ok(window) = CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
+            WS_EX_DLGMODALFRAME
+                | if self.offscreen.get() {
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+                } else {
+                    WINDOW_EX_STYLE(0)
+                },
             w!("BubblePlayDeviceRevoke"),
             PCWSTR(title.as_ptr()),
             style,
@@ -2097,7 +2120,14 @@ impl Ui {
         }
         self.confirm.set(window);
         let _ = EnableWindow(owner, false);
-        let _ = ShowWindow(window, SW_SHOW);
+        let _ = ShowWindow(
+            window,
+            if self.offscreen.get() {
+                SW_SHOWNOACTIVATE
+            } else {
+                SW_SHOW
+            },
+        );
         if let Ok(cancel) = GetDlgItem(Some(window), RV_CANCEL) {
             let _ = SetFocus(Some(cancel));
         }
@@ -2766,6 +2796,212 @@ mod tests {
                 assert!(x >= 0 && y >= 0 && width > 0 && height > 0, "{ctl:?}");
                 assert!(x + width <= CLIENT_W && y + height <= CLIENT_H, "{ctl:?}");
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Screenshot harness: `devices_window_screenshots`, run through win-check with
+    // `-- --ignored` and BP_SCREENSHOT_DIR set. The windows are created far outside every
+    // monitor with tool-window and no-activate styles, are never activated, and are captured
+    // with PrintWindow into memory bitmaps.
+    // -----------------------------------------------------------------------------------------
+
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DIB_RGB_COLORS,
+    };
+
+    fn rfc3339_ago(secs: i64) -> String {
+        let total = now_unix() - secs;
+        let days = total.div_euclid(86_400);
+        let rest = total.rem_euclid(86_400);
+        // Hinnant's civil_from_days.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            rest / 3600,
+            rest % 3600 / 60,
+            rest % 60
+        )
+    }
+
+    /// Writes a 32-bit BMP of `window` by asking it to paint itself into a memory bitmap.
+    unsafe fn capture(window: HWND, path: &std::path::Path) {
+        let mut rect = RECT::default();
+        GetWindowRect(window, &mut rect).expect("window rect");
+        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(Some(screen));
+        let header = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let info = BITMAPINFO {
+            bmiHeader: header,
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+            .expect("dib section");
+        let old = SelectObject(dc, HGDIOBJ(bitmap.0));
+        // An off-screen window has an empty visible region and never paints itself, so ask it
+        // to print into the bitmap: client, non-client, background and children.
+        let _ = SendMessageW(
+            window,
+            WM_PRINT,
+            Some(WPARAM(dc.0 as usize)),
+            Some(LPARAM(0x2 | 0x4 | 0x8 | 0x10)),
+        );
+        let size = (width * height * 4) as usize;
+        let pixels = std::slice::from_raw_parts(bits as *const u8, size).to_vec();
+        SelectObject(dc, old);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(dc);
+        ReleaseDC(None, screen);
+        let mut file = Vec::with_capacity(54 + size);
+        file.extend_from_slice(b"BM");
+        file.extend_from_slice(&((54 + size) as u32).to_le_bytes());
+        file.extend_from_slice(&[0; 4]);
+        file.extend_from_slice(&54u32.to_le_bytes());
+        file.extend_from_slice(&40u32.to_le_bytes());
+        file.extend_from_slice(&width.to_le_bytes());
+        file.extend_from_slice(&height.to_le_bytes()); // positive: rows are written bottom-up
+        file.extend_from_slice(&1u16.to_le_bytes());
+        file.extend_from_slice(&32u16.to_le_bytes());
+        file.extend_from_slice(&[0; 24]);
+        for row in pixels.chunks(width as usize * 4).rev() {
+            file.extend_from_slice(row);
+        }
+        std::fs::write(path, file).expect("write bmp");
+    }
+
+    unsafe fn settle() {
+        let mut msg = MSG::default();
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    #[test]
+    #[ignore = "renders off-screen; run through win-check with BP_SCREENSHOT_DIR"]
+    fn devices_window_screenshots() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("BP_SCREENSHOT_DIR").expect("BP_SCREENSHOT_DIR is set"),
+        );
+        std::fs::create_dir_all(&dir).expect("screenshot dir");
+        let (commands, _unused) = std::sync::mpsc::channel();
+        let shared = Arc::new(Shared {
+            info: info(true),
+            commands,
+            inner: Mutex::new(Inner {
+                slot: Slot::Closed,
+                queue: VecDeque::new(),
+            }),
+        });
+        let uri = fixture_uri();
+        let rows = || {
+            vec![
+                row("B7QK-2M9X-H4PD-R8TN", "Pixel 8", None, true),
+                row(
+                    "3FWD-8NCH-QX2J-V6LA",
+                    "Work laptop",
+                    Some(&rfc3339_ago(26 * 3600)),
+                    false,
+                ),
+                row(
+                    "M2ZT-5PRE-9KGY-C4HW",
+                    "",
+                    Some(&rfc3339_ago(34 * 86_400)),
+                    false,
+                ),
+            ]
+        };
+        let waiting = || DevicesEvent::PairWaiting {
+            code_display: "70Q1K-9MXR1".into(),
+            qr_uri: uri.clone(),
+            pc_id: "7HQ2-K9MX-4RTD-P0ZB".into(),
+            expires_at: SystemTime::now() + Duration::from_secs(272),
+        };
+        let request = |name: &str| DevicesEvent::PairRequest {
+            id: "B7QK-2M9X-H4PD-R8TN".into(),
+            name: name.into(),
+            sas_display: "482 913".into(),
+        };
+        // SAFETY: the whole harness runs on this one thread, which owns every window it makes.
+        unsafe {
+            let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let ui = Ui::new(Arc::clone(&shared));
+            ui.offscreen.set(true);
+            let window = ui.create().expect("window");
+            let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+            let shot = |ui: &Ui, name: &str, events: Vec<DevicesEvent>| {
+                for event in events {
+                    ui.model.borrow_mut().apply(event);
+                }
+                ui.sync();
+                settle();
+                capture(ui.hwnd.get(), &dir.join(format!("{name}.bmp")));
+            };
+            shot(&ui, "01-list-online", vec![DevicesEvent::List(rows())]);
+            ui.model.borrow_mut().set_relay_online(false);
+            shot(&ui, "02-list-offline", vec![]);
+            ui.model.borrow_mut().set_relay_online(true);
+            shot(&ui, "03-list-empty", vec![DevicesEvent::List(vec![])]);
+            shot(&ui, "04-revoke-list", vec![DevicesEvent::List(rows())]);
+            ui.ask_revoke(0);
+            settle();
+            capture(ui.confirm.get(), &dir.join("04b-revoke-dialog.bmp"));
+            ui.close_confirm();
+            settle();
+            shot(&ui, "05-pair-waiting", vec![waiting()]);
+            shot(&ui, "06-pair-expired", vec![DevicesEvent::PairExpired]);
+            shot(
+                &ui,
+                "07-pair-stopped",
+                vec![waiting(), DevicesEvent::PairStopped],
+            );
+            shot(&ui, "08-pair-request", vec![waiting(), request("Pixel 8")]);
+            shot(
+                &ui,
+                "09-pair-done",
+                vec![DevicesEvent::PairDone {
+                    id: "B7QK-2M9X-H4PD-R8TN".into(),
+                    name: "Pixel 8".into(),
+                }],
+            );
+            shot(
+                &ui,
+                "10-pair-denied",
+                vec![waiting(), request("Pixel 8"), DevicesEvent::PairDenied],
+            );
+            shot(
+                &ui,
+                "11-save-error",
+                vec![DevicesEvent::SaveError("disk full".into())],
+            );
+            shot(&ui, "12-pair-request-unnamed", vec![waiting(), request("")]);
+            shot(
+                &ui,
+                "13-pair-failed",
+                vec![waiting(), DevicesEvent::PairFailed],
+            );
+            let _ = DestroyWindow(window);
+            settle();
+            ui.release_resources();
         }
     }
 }
