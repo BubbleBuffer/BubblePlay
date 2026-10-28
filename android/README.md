@@ -9,11 +9,12 @@ On a fresh install, create or import a device key, then pair each PC with its re
 
 ## How it works
 
-- **Device key and PC list:** the app opens to the PC list only with an unlocked device key. Without a key it shows setup (create or import); a locked key shows an unlock step (`ui/DeviceKeyActivity.kt`, `START_UNLOCK`).
+- **Device key and PC list:** the app opens to the PC list only with an unlocked device key. Without a key it shows setup (create or import); a locked key shows an unlock step (`ui/DeviceKeyActivity.kt`, `START_UNLOCK`). Each PC row shows its name, ID, relay host and a status line: "Not connected yet", or "Last seen …" plus the last problem (in the danger colour) if the last session ended with one. The list never shows "online".
   - **Pairing:** Pair a PC takes the relay address, the PC ID, the code shown on the PC and an optional name (`ui/PairActivity.kt`). A `bubbleplay://pair` link only fills the form; it never submits. Each paired PC is kept on the phone with its name and relay.
   - Tap a PC to connect through its saved relay.
 - **Signaling:** `/ws?pc=<id>` uses a signed viewer hello and relay challenge, then authenticates the PC against its pinned public key. All endpoint control messages, including input, use the encrypted ctl channel. A relay refusal (1008) or changed PC key stops automatic reconnect; tap the status line to retry or pair again.
 - **Media:** `/media-ws?epoch=…&pc=…` uses the current signaling ticket and v4 framing; it starts after authentication.
+- **DTLS bind:** WSS media only; no DTLS bind (decision 23 n/a).
   - The app sends a per-frame ACK (with `decodedSeq`), sends keyframe requests (limited to one per 250 ms), and sends a 15 s `ping` heartbeat.
   - Reconnect backoff runs from 250 ms up to 5 s, and the app forces a keyframe after each reconnect.
 - **Decode:** MediaCodec renders to a SurfaceView.
@@ -124,16 +125,9 @@ adb install -r app\build\outputs\apk\release\app-release.apk
 
 Alternatively, copy the APK to the phone and open it after allowing installs from that source.
 
-## Testing against the local Stream Lab relay (not production)
+## Testing against a local relay
 
-> **Stale (2026-10-25):** this section predates the PC list. The Server field and Lab run setting it describes are no longer in the UI, so these steps do not work as written. They need a rewrite around pairing before use.
-
-1. Install dependencies with `npm --prefix worker ci` from the repository root, then start `node worker/tools/lab/stream-lab-direct-relay.mjs --port 8787`.
-2. Start a candidate host against that relay. `<compat>` is `compatibility.id` from `http://127.0.0.1:8787/lab-compat`, and `<uuid>` is any new UUID:
-   `host\target\release\bubbleplay-host.exe --mode serve --worker "ws://127.0.0.1:8787/lab-host-ws?run=<uuid>&compat=<compat>"`
-3. In the app, set **Server** to `http://10.0.2.2:8787/` (emulator) and **Lab run** to the same UUID, then tap Connect.
-   - For a USB phone, run `adb reverse tcp:8787 tcp:8787` and use `http://127.0.0.1:8787/`.
-
+The old Stream Lab steps (Server field, Lab run) were removed with the PC list. Pair the app with a host on a local `bp-relay` (`relay-rs/README.md`) through the normal pairing flow; the automated version of this is the end-to-end tests below.
 
 Cleartext HTTP is allowed only for `10.0.2.2`, `127.0.0.1` and `localhost`. See `res/xml/network_security_config.xml`.
 
