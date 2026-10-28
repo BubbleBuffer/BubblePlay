@@ -345,7 +345,9 @@ async fn pairing_pins_the_pc_and_a_normal_connect_works_after() {
         .collect();
     assert_eq!(pinned, vec![(pc_id.to_string(), pc_public)]);
 
-    // The PC admits the newly paired viewer; a normal connect trusts the stored key.
+    // The pairing connection ends; the PC admits the newly paired viewer and a normal
+    // connect trusts the stored key.
+    next_of(&mut host, "peer-left").await;
     let viewer_id = viewer_identity(13).id().to_string();
     admit(&mut host, &[viewer_id]).await;
     let auth = viewer_auth_in(&args(&[]), viewer_identity(13), &store).expect("viewer auth");
