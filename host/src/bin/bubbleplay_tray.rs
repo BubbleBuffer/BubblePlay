@@ -103,6 +103,7 @@ const CMD_AUDIO: usize = 11;
 const CMD_CPU_MODE: usize = 12;
 const CMD_EXPORT_KEY: usize = 13;
 const CMD_IMPORT_KEY: usize = 14;
+const CMD_DEVICES: usize = 15;
 
 /// Time the secure helper gets to answer after its task was started.
 const AGENT_START_GRACE: Duration = Duration::from_secs(15);
@@ -1197,6 +1198,22 @@ impl App {
         self.start_user();
     }
 
+    /// Asks the host child that is running now to open its Devices window.
+    /// A replaced or exited child never receives the request.
+    fn open_devices(&self) {
+        let Some(user) = &self.user else {
+            return;
+        };
+        if let Err(error) = user.request_open_devices() {
+            tracing::warn!(?error, "devices window request not delivered");
+            self.balloon(
+                "BubblePlay",
+                "The host is not running, so Devices can't open.",
+                NIIF_WARNING,
+            );
+        }
+    }
+
     /// Runs an owner key action on its own thread. The menu is greyed while it runs.
     fn start_key_flow(&mut self, flow: key_ui::Flow) {
         if self.key_ui_running {
@@ -1281,6 +1298,7 @@ impl App {
             CMD_CPU_MODE => self.toggle_cpu_mode(),
             CMD_EXPORT_KEY => self.start_key_flow(key_ui::Flow::Export),
             CMD_IMPORT_KEY => self.start_key_flow(key_ui::Flow::Import),
+            CMD_DEVICES => self.open_devices(),
             CMD_RESTART => self.restart_host(),
             CMD_ROLLBACK => self.roll_back("requested from tray menu", false),
             CMD_LOGS => open_folder(&logs_dir(&self.data)),
@@ -1323,6 +1341,7 @@ fn show_menu(hwnd: HWND) {
         error,
         can_roll_back,
         key_busy,
+        devices_enabled,
     )) = with_app(|app| {
         app.refresh_admin_mode();
         app.check_agent(true);
@@ -1356,6 +1375,7 @@ fn show_menu(hwnd: HWND) {
             app.host_error.clone(),
             app.can_roll_back(),
             app.key_ui_running,
+            matches!(app.state(), HostState::Running { .. }),
         )
     })
     else {
@@ -1435,6 +1455,12 @@ fn show_menu(hwnd: HWND) {
         };
         item(key_flags, CMD_EXPORT_KEY, "Export PC key...");
         item(key_flags, CMD_IMPORT_KEY, "Import PC key...");
+        let devices_flags = if devices_enabled {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
+        item(devices_flags, CMD_DEVICES, "Devices…");
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING, CMD_RESTART, "Restart host");
         if can_roll_back {

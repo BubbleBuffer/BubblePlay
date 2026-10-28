@@ -16,6 +16,7 @@ mod clipboard_worker;
 pub mod content_class;
 pub mod desktop_session;
 pub mod device_key;
+pub mod devices_ui_api;
 pub mod dk_session;
 pub mod dpapi;
 pub mod encode;
