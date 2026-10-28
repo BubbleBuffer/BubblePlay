@@ -6,14 +6,9 @@
 
 #![windows_subsystem = "windows"]
 
-// The mock UI (model, mock, ui) is frozen prototype code that predates the formatting check;
-// CI runs `rustfmt --check` on everything else.
-#[rustfmt::skip]
 mod model;
-#[rustfmt::skip]
 mod mock;
 mod shell;
-#[rustfmt::skip]
 mod ui;
 mod audio;
 mod input;
