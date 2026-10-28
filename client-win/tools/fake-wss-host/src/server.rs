@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use bp_device_key::phase2::EphemeralSecret;
+use bp_device_key::phase2::{sdp_sha256_fingerprint, EphemeralSecret};
 use bp_device_key::{relay_origin, verify_relay_proof, Role};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -519,7 +519,7 @@ impl Hub {
         if self.rtc.is_none() {
             return self.count_unhandled("offer");
         }
-        self.offer_fingerprint = phase2::sdp_fingerprint(&sdp);
+        self.offer_fingerprint = sdp_sha256_fingerprint(&sdp).ok();
         self.answer_fingerprint = None;
         if self.offer_fingerprint.is_none() {
             // Decision 23: an offer without a sha-256 fingerprint cannot be bound.
@@ -617,7 +617,7 @@ impl Hub {
         let Some(signal) = self.signal else { return };
         match notice {
             rtc::Notice::Answer(sdp) => {
-                self.answer_fingerprint = phase2::sdp_fingerprint(&sdp);
+                self.answer_fingerprint = sdp_sha256_fingerprint(&sdp).ok();
                 let text = serde_json::json!({"type": "answer", "sdp": sdp}).to_string();
                 self.send(signal, Outbound::Text(text));
                 self.send_pc_bind(signal);

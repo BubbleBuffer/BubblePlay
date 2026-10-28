@@ -72,8 +72,9 @@ pub enum Phase2Error {
     PcRefused { code: String, message: String },
     /// A signature, MAC, key agreement or `ctl` message failed in `bp_device_key::phase2`.
     Crypto(String),
-    /// An SDP without a `sha-256` `a=fingerprint` line: the DTLS bind is impossible
-    /// (decision 23; the PC answers such an offer with `dtls-bind-required`).
+    /// An SDP without one valid `sha-256` `a=fingerprint` (decision 23, checked by
+    /// `bp_device_key::phase2::sdp_sha256_fingerprint`): the DTLS bind is impossible and the
+    /// PC answers such an offer with `dtls-bind-required`.
     NoSha256Fingerprint(&'static str),
 }
 
@@ -122,7 +123,7 @@ impl fmt::Display for Phase2Error {
             Phase2Error::Crypto(message) => write!(f, "device-key check failed: {message}"),
             Phase2Error::NoSha256Fingerprint(which) => write!(
                 f,
-                "the {which} has no sha-256 DTLS fingerprint, so the WebRTC connection cannot be bound to device keys (dtls-bind-required)"
+                "the {which} has no valid sha-256 DTLS fingerprint, so the WebRTC connection cannot be bound to device keys (dtls-bind-required)"
             ),
         }
     }
@@ -586,7 +587,7 @@ impl Binder {
 
     /// Our offer's fingerprint, from the offer SDP text exactly as sent.
     pub fn local_sdp(&mut self, sdp: &str) -> Result<(), Phase2Error> {
-        self.local = Some(sdp_fingerprint(sdp).ok_or(Phase2Error::NoSha256Fingerprint("offer"))?);
+        self.local = Some(sdp_fingerprint(sdp, "offer")?);
         Ok(())
     }
 
@@ -600,7 +601,7 @@ impl Binder {
         if self.remote.is_some() {
             return Ok(None);
         }
-        self.remote = Some(sdp_fingerprint(sdp).ok_or(Phase2Error::NoSha256Fingerprint("answer"))?);
+        self.remote = Some(sdp_fingerprint(sdp, "answer")?);
         let (Some(local), Some(remote)) = (&self.local, &self.remote) else {
             return Ok(None);
         };
@@ -640,22 +641,11 @@ impl Binder {
     }
 }
 
-/// The DTLS fingerprint to bind (decision 23): the value of the SDP's `a=fingerprint:` line
-/// whose algorithm is `sha-256` (any case; other algorithms are skipped), normalised to
-/// `sha-256 AB:CD:...`. `None` when the SDP lists no sha-256 fingerprint. Always read from
-/// the SDP text that was sent or received, never rebuilt from the WebRTC stack.
-pub fn sdp_fingerprint(sdp: &str) -> Option<String> {
-    let value = sdp
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("a=fingerprint:"))
-        .map(str::trim)
-        .find(|value| {
-            value
-                .split_whitespace()
-                .next()
-                .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case("sha-256"))
-        })?;
-    Some(value.to_owned()) // D23: crate normaliser (bp_device_key::phase2) replaces this pass-through
+/// The DTLS fingerprint to bind (decision 23), read from the SDP text that was sent or
+/// received (never rebuilt from the WebRTC stack) and normalised by the crate.
+fn sdp_fingerprint(sdp: &str, which: &'static str) -> Result<String, Phase2Error> {
+    p2::sdp_sha256_fingerprint(sdp)
+        .map_err(|_| Phase2Error::NoSha256Fingerprint(which))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1273,28 +1263,27 @@ mod tests {
     }
 
     #[test]
-    fn the_sdp_fingerprint_is_the_sha_256_line_and_refused_without_one() {
-        let several = "v=0\r\na=fingerprint:sha-1 AA:BB\r\n\
-                       a=fingerprint:SHA-256 AB:CD\r\na=fingerprint:sha-512 EE\r\n";
-        // Case-insensitive here: the crate normaliser settles the case.
-        assert_eq!(
-            sdp_fingerprint(several).map(|value| value.to_ascii_lowercase()),
-            Some("sha-256 ab:cd".to_owned())
-        );
-        let sha1_only = "v=0\r\na=fingerprint:sha-1 AA:BB\r\n";
-        assert_eq!(sdp_fingerprint(sha1_only), None);
-        assert_eq!(sdp_fingerprint("v=0\r\n"), None);
+    fn the_binder_refuses_an_sdp_without_a_valid_sha_256_fingerprint() {
         let mut binder = Binder::new([0; 32], [0; 32]);
-        assert!(matches!(
-            binder.local_sdp(sha1_only),
-            Err(Phase2Error::NoSha256Fingerprint("offer"))
-        ));
+        for sdp in [
+            "v=0\r\n",
+            "v=0\r\na=fingerprint:sha-1 AA:BB\r\n",
+            "v=0\r\na=fingerprint:sha-256 AB:CD\r\n",
+        ] {
+            assert!(matches!(
+                binder.local_sdp(sdp),
+                Err(Phase2Error::NoSha256Fingerprint("offer"))
+            ));
+            assert!(matches!(
+                binder.remote_sdp(viewer().identity(), sdp),
+                Err(Phase2Error::NoSha256Fingerprint("answer"))
+            ));
+        }
     }
 
     /// Decision 23: lowercase hex and an uppercase algorithm normalise to the fixture's form,
     /// so the viewer's `auth-bind` is the fixture's byte for byte.
     #[test]
-    #[ignore = "waits for bp_device_key::phase2 normaliser"]
     fn lowercase_fingerprints_produce_the_fixture_bind() {
         let viewer = viewer();
         let (shake, _) = fixed_start(pinned(), &[CAP_CONTROL_AEAD, CAP_DTLS_BIND]);
