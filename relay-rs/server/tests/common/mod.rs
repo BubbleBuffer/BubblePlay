@@ -358,9 +358,21 @@ pub async fn viewer_join_signed(
     turn: bool,
     pair: Option<&[u8; 32]>,
 ) -> Value {
+    viewer_join_as(ws, "viewer", who, turn, pair).await
+}
+
+/// `viewer_join_signed` with `role` as the hello's role string: the viewer's new name, or the old
+/// one it replaces. The proof is the same for both.
+pub async fn viewer_join_as(
+    ws: &mut Ws,
+    role: &str,
+    who: &DeviceIdentity,
+    turn: bool,
+    pair: Option<&[u8; 32]>,
+) -> Value {
     let mut hello = json!({
         "type": "hello",
-        "role": "viewer",
+        "role": role,
         "id": who.id().to_string(),
         "public": b64(&who.public_key()),
         "turn": turn,
@@ -410,7 +422,7 @@ pub async fn data_socket(
     ticket: &str,
     viewer_cookie: Option<&str>,
 ) -> (Ws, Value) {
-    let viewer_side = role.ends_with("client");
+    let viewer_side = role.ends_with("client") || role.ends_with("viewer");
     let (origin, cookie) = if viewer_side {
         (Some(ORIGIN), viewer_cookie)
     } else {

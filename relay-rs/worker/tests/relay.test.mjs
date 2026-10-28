@@ -1,47 +1,62 @@
 // Local workerd tests for the relay Durable Object. Each run starts `wrangler dev --local` from
 // the crate root (after `worker-build --release`) on a free loopback port, with throwaway config
-// values, and stops every process it started. The two M3-A cases keep their names. The `m3 `
-// cases port the native e2e behaviours from relay-rs/server/tests.
+// values, and stops every process it started. Every case name carries the `m3 ` prefix; the GET /
+// case is replaced by the gate's wait page (M3-C2). The `m3 ` cases port the native e2e behaviours
+// from relay-rs/server/tests.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
+  ADMIN,
   CASE_TIMEOUT_MS,
   CLIENT_IP,
-  ORIGIN,
+  NTFY_TOKEN,
+  NTFY_TOPIC,
   RESTART_TIMEOUT_MS,
   SYNC_PING,
   TOKEN,
+  approveBrowser,
   b64,
+  browserJoin,
   dataSocket,
+  freshClientIp,
+  httpRequest,
   identity,
   openOk,
   openSocket,
+  pollTokenOf,
   proveViewer,
   registerHost,
+  startNtfy,
   startRelay,
+  viewerIdentity,
   viewerJoin,
 } from './m3-support.mjs';
 
 let relay = null;
+let ntfy = null;
 let persistDir = '';
 
 before(async () => {
   persistDir = mkdtempSync(path.join(tmpdir(), 'bp-relay-m3-'));
-  relay = await startRelay({ persistDir });
+  ntfy = await startNtfy();
+  relay = await startRelay({ persistDir, ntfy });
 });
 
 after(async () => {
   if (relay) await relay.stop();
+  if (ntfy) await ntfy.stop();
   relay = null;
+  ntfy = null;
   if (persistDir) rmSync(persistDir, { recursive: true, force: true });
 });
 
-// Restarts run on their own instance and persist directory, so the shared one is untouched.
-async function withRelay(dir, fn) {
-  const instance = await startRelay({ persistDir: dir });
+// Restarts and the TURN case run on their own instance and persist directory, so the shared one is
+// untouched. `options` goes to startRelay (ntfy, turn).
+async function withRelay(dir, fn, options = {}) {
+  const instance = await startRelay({ persistDir: dir, ...options });
   try {
     return await fn(instance);
   } finally {
@@ -82,14 +97,19 @@ function authHost(host) {
 
 // M3-A cases (names kept from the stub).
 
-test('GET / returns 404 with an empty body', { timeout: CASE_TIMEOUT_MS }, async () => {
-  const res = await fetch(`${relay.base}/`);
-  assert.equal(res.status, 404);
-  assert.equal(await res.text(), '');
+// M3-C2 replaces the M3-A 404: with the gate wired, a top-level navigation without a cookie opens
+// the wait page.
+test('m3 GET / without a cookie opens the gate wait page instead of a 404', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const page = await httpRequest(relay.port, {
+    path: '/',
+    headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document' },
+  });
+  assert.equal(page.status, 200);
+  assert.match(page.body.toString('utf8'), /Waiting for approval/);
 });
 
 test(
-  'a text hello sent to /ws closes the socket with 1008 and an empty reason',
+  'm3 a text hello sent to /ws closes the socket with 1008 and an empty reason',
   { timeout: CASE_TIMEOUT_MS },
   async () => {
     const socket = await openOk(relay.port, `/ws?pc=${identity(70).id}`);
@@ -177,7 +197,7 @@ test('m3 unlisted viewer is closed 1008 with an empty reason and the host stays 
   const host = identity(42);
   const { socket: hostSocket } = await registerHost(relay.port, host);
   const viewer = await openOk(relay.port, `/ws?pc=${host.id}`);
-  await proveViewer(viewer, identity(203));
+  await proveViewer(viewer, identity(203), { origin: relay.origin });
   assert.deepEqual(await viewer.expectClose(10_000), { code: 1008, reason: '' });
   await hostSocket.quiet(500);
   hostSocket.sendRawText(SYNC_PING);
@@ -193,8 +213,16 @@ test('m3 admitted viewer gets hello-ok with a media epoch and a ticket', { timeo
   assert.ok(typeof ok.ticket === 'string' && ok.ticket.length > 0);
 });
 
-// Browser origin: a browser Origin needs a valid gate cookie, which arrives in M3-C2. Until then
-// the gate verdict is the only check on these routes.
+test('m3 admitted viewer is announced to the host as peer-joined with its media epoch', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const host = identity(90);
+  const { socket: hostSocket } = await registerHost(relay.port, host);
+  const { ok } = await viewerJoin(relay.port, host.id);
+  const joined = await hostSocket.nextJson('peer-joined', 10_000);
+  assert.deepEqual(joined, { type: 'peer-joined', mediaEpoch: ok.mediaEpoch, pairing: false });
+});
+
+// Browser origin: a browser Origin needs a valid gate cookie. Without one the gate refuses: a wrong
+// origin is 404, and the public origin is accepted then closed 1008.
 
 test('m3 a wrong Origin on /ws is refused with 404', { timeout: CASE_TIMEOUT_MS }, async () => {
   const { status, socket } = await openSocket(relay.port, `/ws?pc=${identity(11).id}`, {
@@ -205,11 +233,15 @@ test('m3 a wrong Origin on /ws is refused with 404', { timeout: CASE_TIMEOUT_MS 
 });
 
 test('m3 an Origin without a valid gate cookie is accepted then closed 1008 with an empty reason', { timeout: CASE_TIMEOUT_MS }, async () => {
-  const { status, socket } = await openSocket(relay.port, `/ws?pc=${identity(44).id}`, {
-    origin: ORIGIN,
-  });
-  assert.equal(status, 101);
-  assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: '' });
+  // No cookie, then a cookie the gate does not hold. The upgrade succeeds so the browser sees a 1008.
+  for (const cookie of [undefined, '__Host-gate=not-a-cookie']) {
+    const { status, socket } = await openSocket(relay.port, `/ws?pc=${identity(44).id}`, {
+      origin: relay.origin,
+      cookie,
+    });
+    assert.equal(status, 101);
+    assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: '' });
+  }
 });
 
 // Client IP: the relay reads CF-Connecting-IP only and refuses a request without one with 404 (the
@@ -238,10 +270,13 @@ test('m3 pairing viewer auth messages are forwarded to the host and its offers a
 
   const stranger = identity(203);
   const viewer = await openOk(relay.port, `/ws?pc=${host.id}`);
-  await proveViewer(viewer, stranger, admit);
+  await proveViewer(viewer, stranger, { origin: relay.origin, pair: admit });
   const ok = await viewer.nextJson('hello-ok', 10_000);
   assert.equal(ok.pairing, true);
   assert.equal(ok.ticket, undefined);
+  // The host hears of the admission first, so its peer-joined comes before the auth-hello.
+  const joined = await hostSocket.nextJson('peer-joined', 10_000);
+  assert.equal(joined.pairing, true);
 
   viewer.sendJson({ type: 'offer', sdp: 'v=0' });
   viewer.sendJson(authHello(stranger));
@@ -410,4 +445,285 @@ test('m3 the exact text {"type":"ping"} is answered with the exact text {"type":
   const { socket } = await registerHost(relay.port, host);
   socket.sendRawText('{"type":"ping"}');
   assert.equal(await socket.nextText(10_000), '{"type":"pong"}');
+});
+
+// M3-C2 HTTP surfaces. Native: e2e_gate_and_data.rs, e2e_m2.rs and e2e_registration.rs; the static
+// and healthz rules come from relay-rs/server/src/assets.rs and app.rs.
+
+test('m3 a viewer without a cookie gets the wait page, and ntfy names only the client prefix', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const ip = freshClientIp();
+  const prefix = `${ip.split('.').slice(0, 3).join('.')}.0/24`;
+  const before = ntfy.count();
+  const page = await httpRequest(relay.port, {
+    path: '/',
+    ip,
+    headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
+  });
+  assert.equal(page.status, 200);
+  const html = page.body.toString('utf8');
+  assert.match(html, /Waiting for approval/);
+  const pending = pollTokenOf(html);
+
+  const publish = await ntfy.waitFor(
+    before,
+    (p) => p.body?.message === `Browser navigation awaiting approval from client prefix ${prefix}`,
+  );
+  assert.equal(publish.headers.authorization, `Bearer ${NTFY_TOKEN}`);
+  assert.equal(publish.body.topic, NTFY_TOPIC);
+  assert.equal(publish.body.actions[0].label, 'Approve');
+  assert.equal(publish.body.actions[1].label, 'Deny');
+  const sent = JSON.stringify(publish.body);
+  assert.ok(!sent.includes(ip), 'ntfy names the prefix, not the client address');
+  assert.ok(!sent.includes(pending), 'ntfy never carries the poll token');
+});
+
+test('m3 approval grants the gate cookie, and the page is served with it', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  assert.match(cookie, /^__Host-gate=/);
+  const page = await httpRequest(relay.port, { path: '/', headers: { Cookie: cookie } });
+  assert.equal(page.status, 200);
+  assert.match(page.body.toString('utf8'), /^<!doctype html>/i);
+
+  const bare = await httpRequest(relay.port, { path: '/', headers: { 'Sec-Fetch-Dest': 'empty' } });
+  assert.equal(bare.status, 403, 'a subresource without the cookie gets 403, not the wait page');
+});
+
+test('m3 a WebSocket with the gate cookie gets hello-ok with a media epoch', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const host = identity(80);
+  await registerHost(relay.port, host);
+  const cookie = await approveBrowser(relay, ntfy);
+  const { ok } = await browserJoin(relay.port, host.id, cookie);
+  assert.equal(ok.type, 'hello-ok');
+  assert.equal(ok.mediaEpoch.length, 32, 'the epoch is 16 bytes in hex');
+  assert.ok(typeof ok.ticket === 'string' && ok.ticket.length > 0);
+  assert.equal(ok.iceServers.length, 1, 'STUN only without TURN');
+});
+
+test('m3 a browser viewer with a gate cookie is admitted, and its media ticket opens a media socket', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const host = identity(85);
+  await registerHost(relay.port, host);
+  const cookie = await approveBrowser(relay, ntfy);
+  const { ok } = await browserJoin(relay.port, host.id, cookie);
+  const media = await openOk(relay.port, `/media-ws?pc=${host.id}&epoch=${ok.mediaEpoch}`);
+  media.sendJson({ type: 'hello', role: 'media-client', ticket: ok.ticket });
+  assert.equal((await media.nextJson('hello-ok', 10_000)).type, 'hello-ok');
+  media.close();
+});
+
+test('m3 POST /__gate/forget needs an Origin, and then drops the gate cookie', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  const bare = await httpRequest(relay.port, { method: 'POST', path: '/__gate/forget', headers: { Cookie: cookie } });
+  assert.equal(bare.status, 404, 'forget without an Origin is refused');
+
+  const forget = await httpRequest(relay.port, {
+    method: 'POST',
+    path: '/__gate/forget',
+    headers: { Cookie: cookie, Origin: relay.origin },
+  });
+  assert.equal(forget.status, 204);
+  assert.match(forget.headers['set-cookie'].join(';'), /__Host-gate=; Max-Age=0/);
+
+  const after = await httpRequest(relay.port, { path: '/', headers: { Cookie: cookie, 'Sec-Fetch-Dest': 'empty' } });
+  assert.equal(after.status, 403, 'the dropped cookie no longer opens the site');
+});
+
+test('m3 an unknown /__gate path is 404, with or without a cookie', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  for (const headers of [{}, { Cookie: cookie }]) {
+    const res = await httpRequest(relay.port, { path: '/__gate/x', headers: { 'Sec-Fetch-Dest': 'document', ...headers } });
+    assert.equal(res.status, 404);
+  }
+  const wrongMethod = await httpRequest(relay.port, { path: '/__gate/decision', headers: { Cookie: cookie } });
+  assert.equal(wrongMethod.status, 404, 'the decision route takes POST only');
+});
+
+// Admin: list and delete (e2e_registration.rs), and the listing's count and no viewer IDs (e2e_m2.rs).
+
+function adminGet(port, bearer) {
+  return httpRequest(port, {
+    path: '/__gate/manage/pcs',
+    headers: bearer === undefined ? {} : { Authorization: `Bearer ${bearer}` },
+  });
+}
+
+test('m3 admin list and delete close the host, and a wrong bearer is 404', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const host = identity(81);
+  const { socket: hostSocket } = await registerHost(relay.port, host);
+  assert.equal((await adminGet(relay.port, undefined)).status, 404);
+  assert.equal((await adminGet(relay.port, 'wrong')).status, 404);
+
+  const listed = await adminGet(relay.port, ADMIN);
+  assert.equal(listed.status, 200);
+  const row = JSON.parse(listed.body.toString('utf8')).find((r) => r.id === host.id);
+  assert.ok(row, 'the registered PC is listed');
+  assert.equal(row.online, true);
+
+  const deleted = await httpRequest(relay.port, {
+    method: 'DELETE',
+    path: `/__gate/manage/pcs/${host.id}`,
+    headers: { Authorization: `Bearer ${ADMIN}` },
+  });
+  assert.equal(deleted.status, 204);
+  assert.deepEqual(await hostSocket.expectClose(10_000), { code: 1008, reason: 'peer removed' });
+
+  const after = JSON.parse((await adminGet(relay.port, ADMIN)).body.toString('utf8'));
+  assert.ok(after.every((r) => r.id !== host.id), 'the deleted PC is gone from the listing');
+  const again = await httpRequest(relay.port, {
+    method: 'DELETE',
+    path: `/__gate/manage/pcs/${host.id}`,
+    headers: { Authorization: `Bearer ${ADMIN}` },
+  });
+  assert.equal(again.status, 404);
+});
+
+test('m3 the admin listing shows the admitted count and no viewer IDs', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const host = identity(82);
+  await registerHost(relay.port, host);
+  const listed = await adminGet(relay.port, ADMIN);
+  const row = JSON.parse(listed.body.toString('utf8')).find((r) => r.id === host.id);
+  assert.equal(row.admitted, 1);
+  assert.ok(!listed.body.toString('utf8').includes(viewerIdentity().id), 'the listing has counts, not viewer IDs');
+});
+
+test('m3 an unknown admin route is 404 even with the admin bearer', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const res = await httpRequest(relay.port, {
+    path: '/__gate/manage/nope',
+    headers: { Authorization: `Bearer ${ADMIN}` },
+  });
+  assert.equal(res.status, 404);
+});
+
+// healthz (e2e_healthz_loopback_200_bad_host_404_head_empty). Cloudflare has no loopback, so the
+// admin bearer stands in for it. The request carries no CF-Connecting-IP, as the probe does.
+
+test('m3 healthz answers ok with the admin bearer, and HEAD has no body', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const headers = { Authorization: `Bearer ${ADMIN}` };
+  const get = await httpRequest(relay.port, { path: '/healthz', headers, ip: null });
+  assert.equal(get.status, 200);
+  assert.equal(get.body.toString('utf8'), 'ok');
+  const head = await httpRequest(relay.port, { method: 'HEAD', path: '/healthz', headers, ip: null });
+  assert.equal(head.status, 200);
+  assert.equal(head.body.length, 0);
+});
+
+test('m3 healthz without the admin bearer, or with a foreign Host, is 404', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const none = await httpRequest(relay.port, { path: '/healthz', ip: null });
+  assert.equal(none.status, 404);
+  const wrong = await httpRequest(relay.port, { path: '/healthz', ip: null, headers: { Authorization: 'Bearer wrong' } });
+  assert.equal(wrong.status, 404);
+  const badHost = await httpRequest(relay.port, {
+    path: '/healthz',
+    ip: null,
+    headers: { Authorization: `Bearer ${ADMIN}`, Host: 'evil.test' },
+  });
+  assert.equal(badHost.status, 404);
+});
+
+// Static assets (assets.rs): the gate runs first, then the JS Worker's public directory is served
+// through the ASSETS binding. Traversal, dotfiles and backslashes are refused before the fetch.
+
+test('m3 static files are served with the cookie, and HEAD has no body', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  const index = await httpRequest(relay.port, { path: '/', headers: { Cookie: cookie } });
+  assert.equal(index.status, 200);
+  assert.match(index.headers['content-type'] ?? '', /text\/html/);
+  const css = await httpRequest(relay.port, { path: '/bubbleplay.css', headers: { Cookie: cookie } });
+  assert.equal(css.status, 200);
+  const head = await httpRequest(relay.port, { method: 'HEAD', path: '/', headers: { Cookie: cookie } });
+  assert.equal(head.status, 200);
+  assert.equal(head.body.length, 0);
+});
+
+test('m3 static traversal, dotfile and backslash paths are 404, and POST is 404', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  for (const target of ['/..%2f..%2fwrangler.toml', '/%2e%2e%2fwrangler.toml', '/.env', '/.git/config', '/a%5cb']) {
+    const res = await httpRequest(relay.port, { path: target, headers: { Cookie: cookie } });
+    assert.equal(res.status, 404, target);
+  }
+  const post = await httpRequest(relay.port, { method: 'POST', path: '/', headers: { Cookie: cookie } });
+  assert.equal(post.status, 404);
+});
+
+// /pair is the browser page too (native: e2e_pair_* in e2e_gate_and_data.rs). The pairing code
+// rides in the fragment, which the page reads itself, so the Worker only maps the path.
+
+test('m3 GET /pair without a cookie opens the gate wait page', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const page = await httpRequest(relay.port, {
+    path: '/pair',
+    ip: freshClientIp(),
+    headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
+  });
+  assert.equal(page.status, 200);
+  assert.match(page.body.toString('utf8'), /Waiting for approval/);
+});
+
+test('m3 GET and HEAD /pair with a cookie serve index.html, as / does', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  const root = await httpRequest(relay.port, { path: '/', headers: { Cookie: cookie } });
+  const pair = await httpRequest(relay.port, { path: '/pair', headers: { Cookie: cookie } });
+  assert.equal(pair.status, 200);
+  assert.match(pair.headers['content-type'] ?? '', /text\/html/);
+  assert.deepEqual(pair.body, root.body);
+  const head = await httpRequest(relay.port, { method: 'HEAD', path: '/pair', headers: { Cookie: cookie } });
+  assert.equal(head.status, 200);
+  assert.equal(head.body.length, 0);
+});
+
+test('m3 /pair/x with a cookie is still 404, as before /pair was served', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  const below = await httpRequest(relay.port, { path: '/pair/x', headers: { Cookie: cookie } });
+  assert.equal(below.status, 404);
+});
+
+// TURN (e2e_ws_with_turn_adds_credentialed_ice_server): a TURN instance, so the TURN config is set.
+
+test('m3 a WebSocket hello with turn gets a credentialed TURN ICE server', { timeout: RESTART_TIMEOUT_MS }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bp-relay-m3-turn-'));
+  try {
+    await withRelay(
+      dir,
+      async (instance) => {
+        const host = identity(83);
+        await registerHost(instance.port, host);
+        const cookie = await approveBrowser(instance, ntfy);
+        const on = await browserJoin(instance.port, host.id, cookie, { turn: true });
+        assert.equal(on.ok.iceServers.length, 2, 'STUN plus TURN when the viewer asks for TURN');
+        assert.equal(typeof on.ok.iceServers[1].credential, 'string');
+        const off = await browserJoin(instance.port, host.id, cookie, { turn: false });
+        assert.equal(off.ok.iceServers.length, 1, 'STUN only when the viewer does not ask');
+      },
+      { ntfy, turn: true },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Restart with the gate cookie (e2e_restart_keeps_pcs_and_gate_cookie).
+
+test('m3 a restart keeps the gate cookie', { timeout: RESTART_TIMEOUT_MS }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bp-relay-m3-cookie-'));
+  const host = identity(84);
+  let cookie = '';
+  try {
+    await withRelay(
+      dir,
+      async (instance) => {
+        await registerHost(instance.port, host);
+        cookie = await approveBrowser(instance, ntfy);
+      },
+      { ntfy },
+    );
+    await withRelay(
+      dir,
+      async (instance) => {
+        const page = await httpRequest(instance.port, { path: '/', headers: { Cookie: cookie } });
+        assert.equal(page.status, 200, 'the cookie is still valid after the restart');
+        assert.match(page.body.toString('utf8'), /^<!doctype html>/i);
+      },
+      { ntfy },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -140,6 +140,23 @@ async fn m2_admitted_native_viewer_gets_a_working_media_ticket() {
 }
 
 #[tokio::test]
+async fn m2_admitted_native_viewer_is_announced_to_the_host_with_its_epoch() {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let host = identity(1);
+    let (mut host_ws, _) = register_host(&server, &host, Some(TOKEN)).await;
+    let pc = pc_id(&host);
+
+    let mut viewer = native_viewer(&server, &pc).await;
+    prove_viewer(&mut viewer, &viewer_identity(), None).await;
+    let ok = next_json_of(&mut viewer, "hello-ok").await;
+
+    let joined = next_json_of(&mut host_ws, "peer-joined").await;
+    assert_eq!(joined["mediaEpoch"], ok["mediaEpoch"]);
+    assert_eq!(joined["pairing"], json!(false));
+}
+
+#[tokio::test]
 async fn m2_unlisted_native_viewer_is_closed_1008_with_empty_reason() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
@@ -240,6 +257,9 @@ async fn m2_pairing_over_real_sockets_forwards_auth_and_drops_offers() {
     let ok = next_json_of(&mut viewer, "hello-ok").await;
     assert_eq!(ok["pairing"], json!(true));
     assert!(ok.get("ticket").is_none());
+    // The host is told of the admission first, so its peer-joined comes before the auth-hello.
+    let joined = next_json_of(&mut host_ws, "peer-joined").await;
+    assert_eq!(joined["pairing"], json!(true));
 
     // The offer is dropped, so the host's next text frame is the auth-hello.
     send_json(&mut viewer, json!({ "type": "offer", "sdp": "v=0" })).await;

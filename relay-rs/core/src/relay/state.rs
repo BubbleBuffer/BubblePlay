@@ -17,7 +17,8 @@ pub(crate) enum Kind {
 }
 
 /// The role a socket plays. Go's role strings: "host" and "client" are
-/// `Host` and `Viewer` here (the viewer alias is accepted only in the hello).
+/// `Host` and `Viewer` here. The hello accepts the viewer's new names as well;
+/// see `hello_roles`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Role {
     Host,
@@ -65,17 +66,18 @@ impl Role {
         }
     }
 
-    /// The hello `role` strings this socket accepts. The viewer signalling
-    /// socket accepts both "client" (old) and "viewer" (Q1).
+    /// The hello `role` strings this socket accepts: the viewer's new name first, then the old
+    /// name it replaces. The old names ("client", "media-client", "file-client") are the cutover
+    /// aliases. The cutover removes them here, and no other code matches a hello role string.
     pub(crate) fn hello_roles(self) -> &'static [&'static str] {
         match self {
             Role::Host => &["host"],
-            Role::Viewer => &["client", "viewer"],
+            Role::Viewer => &["viewer", "client"],
             Role::VersionProbe => &["version-probe"],
             Role::MediaHost => &["media-host"],
-            Role::MediaViewer => &["media-client"],
+            Role::MediaViewer => &["media-viewer", "media-client"],
             Role::FileHost => &["file-host"],
-            Role::FileViewer => &["file-client"],
+            Role::FileViewer => &["file-viewer", "file-client"],
         }
     }
 
@@ -224,5 +226,24 @@ pub(crate) fn read_limit(kind: Kind) -> usize {
         Kind::Signal => crate::limits::SIGNAL_LIMIT,
         Kind::Media => crate::limits::MEDIA_LIMIT,
         Kind::File => crate::limits::FILE_LIMIT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewer_roles_take_the_new_name_and_the_old_one() {
+        assert_eq!(Role::Viewer.hello_roles(), &["viewer", "client"]);
+        assert_eq!(
+            Role::MediaViewer.hello_roles(),
+            &["media-viewer", "media-client"]
+        );
+        assert_eq!(
+            Role::FileViewer.hello_roles(),
+            &["file-viewer", "file-client"]
+        );
+        assert_eq!(Role::MediaHost.hello_roles(), &["media-host"]);
     }
 }

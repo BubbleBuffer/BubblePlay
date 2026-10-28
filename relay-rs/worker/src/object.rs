@@ -4,19 +4,26 @@
 //! ConnId in a tag, so a socket survives eviction of the object.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::net::IpAddr;
 
 use bp_relay_core::gate::{Gate, GateEffect, GateSnapshot, Request as GateRequest, Verdict};
-use bp_relay_core::relay::{Action, ConnId, ConnSnapshot, Relay as CoreRelay, UpgradeRequest};
+use bp_relay_core::relay::{
+    Action, AdminError, ConnId, ConnSnapshot, Relay as CoreRelay, UpgradeRequest,
+};
+use serde_json::{Value, json};
 use worker::js_sys;
 use worker::wasm_bindgen::JsValue;
 use worker::worker_sys::WebSocketRequestResponsePair;
 use worker::{
-    Error, Request, Response, Result, ScheduledTime, State, Storage, WebSocket,
+    Error, Method, Request, Response, Result, ScheduledTime, State, Storage, Url, WebSocket,
     WebSocketIncomingMessage, WebSocketPair,
 };
 
+use crate::assets;
 use crate::config::{self, Settings};
+use crate::http;
 use crate::live::{Live, auto_response_ms, now_ms};
+use crate::ntfy;
 use crate::rng::WebCrypto;
 use crate::routes::{client_ip, query_values, route_for_path};
 use crate::store;
@@ -38,39 +45,63 @@ struct Woken {
 }
 
 impl crate::Relay {
-    /// An upgrade request, or a 404 for anything else. Non-WebSocket requests have no handler yet
-    /// (M3-C2 adds the HTTP router), so they get the stub's empty 404.
+    /// Every HTTP request and WebSocket upgrade, with the security headers added last. The order
+    /// is native's (app.rs): healthz, the body cap, the gate, then the admin API, a WebSocket
+    /// route or the static assets.
     pub(crate) async fn on_fetch(&self, req: Request) -> Result<Response> {
+        let response = self.route(req).await?;
+        http::finish(response)
+    }
+
+    async fn route(&self, req: Request) -> Result<Response> {
         if self.ready().await.is_err() {
             return server_error();
         }
-        let is_upgrade = req
-            .headers()
-            .get("Upgrade")?
-            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
-        if !is_upgrade {
-            return not_found();
-        }
         let url = req.url()?;
         let path = url.path().to_owned();
+        let method = req.method();
+        let method_text = method.to_string();
+        let headers = req.headers();
+        let host = headers.get("Host")?;
+        let authorization = headers.get("Authorization")?;
+
+        if path == "/healthz" && (method == Method::Get || method == Method::Head) {
+            let allowed = {
+                let guard = self.live.borrow();
+                let Some(live) = guard.as_ref() else {
+                    return server_error();
+                };
+                http::host_allowed(host.as_deref(), &live.public_host)
+                    && http::bearer_matches(authorization.as_deref(), &live.admin_token)
+            };
+            return if allowed {
+                http::healthz(method == Method::Head)
+            } else {
+                not_found()
+            };
+        }
+
+        let Some(body) = http::read_body(&req).await? else {
+            return http::status(413);
+        };
         let Some(client) = client_ip(&req) else {
             return not_found();
         };
-        let headers = req.headers();
         let origin = headers.get("Origin")?;
         let cookie = headers.get("Cookie")?;
-        let authorization = headers.get("Authorization")?;
         let sec_fetch_dest = headers.get("Sec-Fetch-Dest")?;
-        let method = req.method().to_string();
+        let websocket = headers
+            .get("Upgrade")?
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
         let gate_request = GateRequest {
-            method: &method,
+            method: &method_text,
             path: &path,
-            websocket: true,
+            websocket,
             origin: origin.as_deref(),
             cookie: cookie.as_deref(),
             authorization: authorization.as_deref(),
             sec_fetch_dest: sec_fetch_dest.as_deref(),
-            body: &[],
+            body: &body,
             client_ip: client,
             now_ms: now_ms(),
         };
@@ -85,11 +116,11 @@ impl crate::Relay {
             )
         };
         match verdict {
-            Verdict::Allow => {}
             Verdict::Refuse => {
                 // A browser socket that names the public origin is accepted and closed 1008, as
-                // the native server does. Any other refusal is a 404.
-                let browser_socket = origin.as_deref() == Some(public_origin.as_str())
+                // native does. Any other refusal is a 404.
+                let browser_socket = websocket
+                    && origin.as_deref() == Some(public_origin.as_str())
                     && route_for_path(&path).is_some();
                 return if browser_socket {
                     refused_socket(&self.state)
@@ -97,16 +128,37 @@ impl crate::Relay {
                     not_found()
                 };
             }
-            Verdict::Wait(_, effects) | Verdict::Handled(_, effects) => {
-                // The gate answers HTTP only, and its pages come in M3-C2. Its effects still run.
+            Verdict::Wait(response, effects) | Verdict::Handled(response, effects) => {
                 self.run_gate_effects(effects).await;
-                return not_found();
+                return http::gate_response(response);
+            }
+            Verdict::Allow => {}
+        }
+        if path.starts_with("/__gate/manage/") {
+            return self.admin(&method, &path, authorization.as_deref()).await;
+        }
+        if websocket {
+            return self.accept_socket(&path, &url, client).await;
+        }
+        match assets::plan(&method_text, &path) {
+            assets::Plan::Status(code) => http::status(code),
+            assets::Plan::Fetch {
+                path: asset_path,
+                index,
+            } => {
+                let head = method == Method::Head;
+                assets::serve(&self.env, &url, head, &asset_path, index).await
             }
         }
-        let Some(route) = route_for_path(&path) else {
+    }
+
+    /// Accepts a WebSocket upgrade on one of the seven routes. The core decides whether the
+    /// route takes it, and the socket hibernates with its snapshot as the attachment.
+    async fn accept_socket(&self, path: &str, url: &Url, client: IpAddr) -> Result<Response> {
+        let Some(route) = route_for_path(path) else {
             return not_found();
         };
-        let (pc, epoch) = query_values(&url);
+        let (pc, epoch) = query_values(url);
         let upgrade = UpgradeRequest {
             route,
             pc,
@@ -146,6 +198,83 @@ impl crate::Relay {
         }
         self.rearm().await?;
         Response::from_websocket(pair.client)
+    }
+
+    /// The admin API, behind the admin bearer. A wrong bearer, route or id is 404, as native.
+    async fn admin(
+        &self,
+        method: &Method,
+        path: &str,
+        authorization: Option<&str>,
+    ) -> Result<Response> {
+        let allowed = {
+            let guard = self.live.borrow();
+            let Some(live) = guard.as_ref() else {
+                return server_error();
+            };
+            http::bearer_matches(authorization, &live.admin_token)
+        };
+        if !allowed {
+            return not_found();
+        }
+        if *method == Method::Get && path == "/__gate/manage/pcs" {
+            let listing = {
+                let guard = self.live.borrow();
+                let Some(live) = guard.as_ref() else {
+                    return server_error();
+                };
+                live.core.list_pcs()
+            };
+            return match listing {
+                Ok(rows) => {
+                    let rows: Vec<Value> = rows
+                        .into_iter()
+                        .map(|row| {
+                            json!({
+                                "id": row.id,
+                                "public": row.public,
+                                "first_seen": row.first_seen,
+                                "last_seen": row.last_seen,
+                                "online": row.online,
+                                "admitted": row.admitted,
+                            })
+                        })
+                        .collect();
+                    http::json(&Value::Array(rows))
+                }
+                Err(AdminError::Unavailable) => http::status(503),
+                Err(AdminError::NotFound) => not_found(),
+            };
+        }
+        if let Some(id) = path.strip_prefix("/__gate/manage/pcs/")
+            && *method == Method::Delete
+            && !id.is_empty()
+            && !id.contains('/')
+        {
+            return self.delete_pc(id).await;
+        }
+        not_found()
+    }
+
+    async fn delete_pc(&self, id: &str) -> Result<Response> {
+        let result = {
+            let mut guard = self.live.borrow_mut();
+            let Some(live) = guard.as_mut() else {
+                return server_error();
+            };
+            live.core.delete_pc(id)
+        };
+        match result {
+            Ok(actions) => match self.apply(None, actions).await {
+                Ok(()) => {
+                    self.rearm().await?;
+                    http::status(204)
+                }
+                Err(_) => http::status(503),
+            },
+            Err(AdminError::NotFound) => not_found(),
+            Err(AdminError::Unavailable) => http::status(503),
+        }
     }
 
     pub(crate) async fn on_message(
@@ -453,9 +582,10 @@ impl crate::Relay {
     async fn run_gate_effects(&self, effects: Vec<GateEffect>) {
         for effect in effects {
             match effect {
-                // M3-C2: send the approval request to ntfy. It starts from an HTTP navigation,
-                // so no WebSocket event produces it yet.
-                GateEffect::NtfyPublish { .. } => {}
+                // The approval request goes to ntfy without holding up the response.
+                GateEffect::NtfyPublish { url, headers, body } => {
+                    self.state.wait_until(ntfy::publish(url, headers, body));
+                }
                 GateEffect::PersistGate(snapshot) => {
                     if self.write_gate(&snapshot).await.is_err() {
                         worker::console_error!("the gate records could not be written");
@@ -513,6 +643,11 @@ async fn wake_state(
     let gate_snapshot = store::decode_gate(gate_text.as_deref())?;
     let now = now_ms();
     let origin = settings.core.public_origin.clone();
+    let public_host = Url::parse(&origin)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .ok_or_else(|| "PUBLIC_ORIGIN has no host".to_owned())?;
+    let admin_token = settings.admin_token;
     let gate = Gate::new(settings.gate, gate_snapshot, now)
         .map_err(|_| "the gate configuration was rejected".to_owned())?;
     let (core, actions) = CoreRelay::rehydrate(settings.core, pcs, snapshots, now);
@@ -523,6 +658,8 @@ async fn wake_state(
             sockets,
             origin,
             pcs_healthy: true,
+            admin_token,
+            public_host,
             armed: None,
         },
         actions,
