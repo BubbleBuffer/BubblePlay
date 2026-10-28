@@ -205,7 +205,7 @@ jobs:
         working-directory: relay-rs
         run: cargo build --locked -p bp-relay-server --bin bp-relay
       - name: Browser viewer against the native relay
-        run: node --test worker/test-e2e/relay-rs.e2e.test.mjs
+        run: node --test worker/test-e2e/*.test.mjs
 
   host:
     name: Host checks (windows-latest)
