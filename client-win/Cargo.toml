@@ -90,3 +90,8 @@ opt-level = 3
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
 # --- end UI track tests ---
+
+# --- plumbing tests ---
+# The relay end-to-end tests (src/session/relay_e2e_tests.rs) start the native relay in-process.
+bp-relay-server = { path = "../relay-rs/server" }
+# --- end plumbing tests ---
