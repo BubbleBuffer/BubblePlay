@@ -117,7 +117,10 @@ mod tests {
             in_bounds: true,
             visible: false,
         };
-        assert_eq!(with_ack.encode(), vec![128, 0x02, 0x01, 0x04, 0x03, 0x06, 0x05, 3]);
+        assert_eq!(
+            with_ack.encode(),
+            vec![128, 0x02, 0x01, 0x04, 0x03, 0x06, 0x05, 3]
+        );
         let no_ack = Packet::State {
             ack: None,
             x: 0,

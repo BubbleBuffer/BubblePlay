@@ -262,11 +262,14 @@ mod tests {
             })
         );
         let pair = URL_SAFE_NO_PAD.encode([7u8; 32]);
-        let with_pair = json!({"type": "hello", "role": "viewer", "id": "a", "public": "b", "pair": pair});
+        let with_pair =
+            json!({"type": "hello", "role": "viewer", "id": "a", "public": "b", "pair": pair});
         assert!(parse_viewer_hello(&with_pair).is_ok());
-        let short_pair = json!({"type": "hello", "role": "viewer", "id": "a", "public": "b", "pair": "AAAA"});
+        let short_pair =
+            json!({"type": "hello", "role": "viewer", "id": "a", "public": "b", "pair": "AAAA"});
         assert!(parse_viewer_hello(&short_pair).is_err());
-        let extra = json!({"type": "hello", "role": "viewer", "id": "a", "public": "b", "turn": true});
+        let extra =
+            json!({"type": "hello", "role": "viewer", "id": "a", "public": "b", "turn": true});
         assert!(parse_viewer_hello(&extra).is_err());
         let no_public = json!({"type": "hello", "role": "viewer", "id": "a"});
         assert!(parse_viewer_hello(&no_public).is_err());

@@ -197,7 +197,10 @@ async fn a_media_ticket_from_an_earlier_signalling_socket_is_refused() {
     );
 
     let snap = harness.finish().await;
-    assert_eq!(snap.counters.media_attaches, 1, "only the good ticket attaches");
+    assert_eq!(
+        snap.counters.media_attaches, 1,
+        "only the good ticket attaches"
+    );
 }
 
 #[tokio::test]

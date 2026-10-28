@@ -251,7 +251,9 @@ pub fn register_proof_signature(text: &str) -> Option<[u8; 64]> {
     if value.get("type")?.as_str()? != "register-proof" {
         return None;
     }
-    let bytes = URL_SAFE_NO_PAD.decode(value.get("signature")?.as_str()?).ok()?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value.get("signature")?.as_str()?)
+        .ok()?;
     bytes.try_into().ok()
 }
 
