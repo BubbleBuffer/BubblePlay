@@ -12,8 +12,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use bp_device_key::phase2::{
     auth_bind_signed_bytes, auth_finish_signed_bytes, auth_host_signed_bytes, ctl_nonce,
-    sign_auth_bind, sign_auth_finish, sign_auth_host, verify_auth_bind, verify_auth_finish,
-    verify_auth_host, CtlKeys, CtlOpener, EphemeralSecret, PairingCode, Sas, Side, Transcript,
+    normalize_fingerprint, sdp_sha256_fingerprint, sign_auth_bind, sign_auth_finish,
+    sign_auth_host, verify_auth_bind, verify_auth_finish, verify_auth_host, CtlKeys, CtlOpener,
+    EphemeralSecret, PairingCode, Sas, Side, Transcript,
 };
 use bp_device_key::{DeviceId, DeviceIdentity, DeviceKeyError};
 use serde_json::Value;
@@ -557,4 +558,43 @@ fn dtls_bind_signatures() {
         sign_auth_bind(&hs.viewer.identity, &hs.h, "sha-256 AB", "sha-256 CD"),
         Err(DeviceKeyError::InvalidFingerprint)
     ));
+}
+
+/// Decision 23: a lowercase-hex fingerprint (as a stack may print it) normalises to exactly the
+/// fixture's value, so the signed bytes and signatures match the fixture's auth-bind vectors.
+#[test]
+fn lowercase_fingerprints_normalise_to_the_fixture_bytes() {
+    let hs = handshake();
+    let dtls = &hs.fixture["handshake"]["dtls"];
+    for (side, party) in [("viewer", &hs.viewer), ("pc", &hs.pc)] {
+        let v = &dtls[side];
+        let local = field(v, "localFingerprint");
+        let remote = field(v, "remoteFingerprint");
+        assert_eq!(
+            normalize_fingerprint(&local.to_lowercase()).expect("local"),
+            local
+        );
+        // From SDP text: lowercase hex, uppercase algorithm, a sha-1 line first.
+        let sdp = |fingerprint: &str| {
+            format!(
+                "v=0\r\na=fingerprint:sha-1 {}\r\na=fingerprint:{}\r\n",
+                ["0f"; 20].join(":"),
+                fingerprint.to_lowercase().replace("sha-256", "SHA-256")
+            )
+        };
+        let local_norm = sdp_sha256_fingerprint(&sdp(local)).expect("local sdp");
+        let remote_norm = sdp_sha256_fingerprint(&sdp(remote)).expect("remote sdp");
+        assert_eq!(local_norm, local);
+        assert_eq!(remote_norm, remote);
+        assert_eq!(
+            hex(&auth_bind_signed_bytes(&hs.h, &local_norm, &remote_norm).expect("bytes")),
+            field(v, "signedBytesHex"),
+            "{side}"
+        );
+        let signature =
+            sign_auth_bind(&party.identity, &hs.h, &local_norm, &remote_norm).expect("sign");
+        assert_eq!(signature.to_vec(), b64(field(v, "signature")), "{side}");
+        verify_auth_bind(&party.public, &hs.h, &local_norm, &remote_norm, &signature)
+            .expect("verifies");
+    }
 }
