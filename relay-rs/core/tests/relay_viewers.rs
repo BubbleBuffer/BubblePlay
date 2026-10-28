@@ -6,7 +6,7 @@ mod relay_harness;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use bp_relay_core::{Action, ConnId, PENDING_LIMIT, Route, TurnConfig};
+use bp_relay_core::{Action, ConnId, Route, TurnConfig};
 use hmac::{Hmac, Mac};
 use relay_harness::*;
 use serde_json::json;
