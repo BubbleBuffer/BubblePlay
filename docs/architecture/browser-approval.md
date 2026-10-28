@@ -2,7 +2,9 @@
 
 Status: approved 2026-10-06 (owner); Go methods, host/ntfy approval, methods endpoint and operator documentation implemented; live host/container acceptance remains unverified.
 
-A new browser needs the application password plus one second factor. The operator chooses which second factors a relay offers. There is no password-only mode.
+This page describes the Go and Cloudflare relays. The Rust relay's browser viewer does not use it: it needs only the ntfy site gate, then a device key ([browser viewer](../browser-viewer.md)).
+
+On the Go and Cloudflare relays, a new browser needs the application password plus one second factor. The operator chooses which second factors a relay offers. There is no password-only mode.
 
 ## Methods
 

@@ -3,6 +3,7 @@
 Start with a relay setup guide, then install the native Windows host. BubblePlay is preparing its first Windows/browser alpha; no public release has been published yet.
 
 - [Windows quickstart](windows-quickstart.md) — relay credentials, installation, first connection, update and removal.
+- [Browser viewer](browser-viewer.md) — the site gate, device keys, pairing a PC and the paired-PC list in the browser.
 - [Go/Docker self-hosting](self-host-docker.md) — one service, authenticator login and optional ntfy approval.
 - [Cloudflare self-hosting](self-host-cloudflare.md) — deploy your own existing relay and approval service.
 - [Security and privacy](security-and-privacy.md) — authentication, relay visibility and platform boundaries.

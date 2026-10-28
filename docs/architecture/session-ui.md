@@ -26,7 +26,7 @@ Desktop fullscreen hides the strip. Resting at the top edge reveals a handle tha
 
 The Monitors popover marks the current monitor and exposes [Follow active window](follow-active-window.md) only for a capable host. Files appears only with `fileTransfer`; an offer or active transfer adds an indicator without opening the popover automatically. Desktop drops, paste and picker uploads have different [file-transfer behavior](file-transfer.md).
 
-Settings opens a slide-over with stream quality, keyboard lock, scroll speed, pointer mode, default monitor, clipboard copying, browser access, diagnostics and version information. Browser support determines whether keyboard lock is available. Sign out ends the password session; Forget browser also removes approval.
+Settings opens a slide-over with stream quality, keyboard lock, scroll speed, pointer mode, default monitor, clipboard copying, browser access, diagnostics and version information. Browser support determines whether keyboard lock is available. Browser access offers Switch PC, Lock and Forget this browser. Lock forgets the unlocked device key in memory. Forget this browser clears the site-gate approval; it keeps the device key and the paired PCs.
 
 Copy from the PC automatically defaults on. Turning it off keeps host clipboard updates behind the Copy remote clipboard chip until it is clicked. Ctrl/Cmd+V uses the local clipboard; local paste, copy or cut drops a pending host snapshot.
 
