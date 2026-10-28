@@ -1,3 +1,31 @@
+// kept only for worker/src imports; delete with the cutover
+export const STREAM_LAB_ASSET_BUILD = "wss-v4-bench2-hevc-tiles-bpip4-v16";
+export const STREAM_LAB_COMPATIBILITY = Object.freeze({
+  schemaVersion: 1,
+  id: STREAM_LAB_ASSET_BUILD,
+  receiverBuild: STREAM_LAB_ASSET_BUILD,
+  mediaProtocol: 4,
+  benchStatusProtocol: 2,
+  privilegedIpc: Object.freeze({ version: 4 }),
+  roiModes: Object.freeze(["off", "damage", "text-edge", "feedback", "feedback-headroom"]),
+  hybridModes: Object.freeze([
+    "off", "png-static-roi", "png-quiescent-detail", "hevc-quiescent-tiles",
+  ]),
+  hybridCacheModes: Object.freeze(["dda-gated", "suppress-reactivate"]),
+  requiredTelemetry: Object.freeze([
+    "reconstructionFeedback:v1",
+    "reconstructionFeedbackHeadroom:v1",
+    "hybridActivity:png-quiescent-detail",
+    "hevcQuiescentTiles:v1",
+    "hybridDeferredReadback:v1",
+    "ddaDamageAudit:v1",
+    "hybridCacheSuppression:v1",
+    "hybridCachePolicy:v1",
+    "signalingRecycle:v1",
+    "networkRouteProbe:v2",
+    "wssImmediatePresentation:v1",
+  ]),
+});
 export const CODEC = Object.freeze({ HEVC: 1, H264: 2 });
 export const HYBRID_FRAME_MAGIC = 0x42504831;
 export const HYBRID_FRAME_VERSION = 1;
