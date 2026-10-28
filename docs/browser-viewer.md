@@ -46,7 +46,7 @@ The pairing code is valid for 5 minutes.
 1. The browser sends a signed viewer hello to the relay.
 2. The browser runs the handshake with the PC's pinned key. If the PC answers with a different key, the browser refuses with "PC key changed".
 3. Control, input and clipboard travel on `/ws` inside an encrypted channel (AES-GCM).
-4. In WebRTC mode, media and input wait until the PC's DTLS auth-bind is verified.
+4. In WebRTC mode, media and input wait until the PC's DTLS auth-bind is verified. Both sides sign and verify the sha-256 `a=fingerprint` values from the SDP each one sent and received, normalised to `sha-256 AA:BB:...` (lowercase algorithm, uppercase hex). An SDP without a sha-256 fingerprint ends the session with the ctl error `dtls-bind-required`.
 5. Media and file sockets use the ticket from `hello-ok`, with the roles `media-viewer` and `file-viewer`.
 
 ## Settings

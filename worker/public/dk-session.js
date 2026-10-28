@@ -176,7 +176,15 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
       bindTimer = schedule(() => fail("bind-failed"), AUTH_TIMEOUT_MS);
       bindWork = (async () => {
         try {
-          fingerprints = { local: parseSdpFingerprint(localSdp), remote: parseSdpFingerprint(remoteSdp) };
+          const local = parseSdpFingerprint(localSdp);
+          const remote = parseSdpFingerprint(remoteSdp);
+          if (!local || !remote) {
+            // Decision 23: no sha-256 fingerprint ends the session with a ctl error to the PC.
+            await sendSealed({ type: "error", code: "dtls-bind-required", message: "no sha-256 DTLS fingerprint in the SDP" });
+            if (revision === peerRevision) fail("bind-failed");
+            return;
+          }
+          fingerprints = { local, remote };
           const signature = await signBind(identity.privateKey, H, fingerprints.local, fingerprints.remote);
           if (ended || revision !== peerRevision) return;
           if (!sendWire({ type: "auth-bind", signature })) return fail("bind-failed");

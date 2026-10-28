@@ -444,14 +444,11 @@ export async function comparisonNumber(hash) {
   return String(new DataView(digestBytes.buffer).getUint32(0) % 1000000).padStart(6, "0");
 }
 
-// Each signer's own local and remote fingerprints, joined by one LF byte.
-function bindMessage(hash, localFingerprint, remoteFingerprint) {
-  for (const fingerprint of [localFingerprint, remoteFingerprint]) {
-    if (typeof fingerprint !== "string" || fingerprint.includes("\n")) {
-      throw new TypeError("fingerprints must be a=fingerprint values without a newline");
-    }
-  }
-  return concat(utf8("bubbleplay-dtls-v1"), expectBytes(hash, 32, "H"), utf8(`${localFingerprint}\n${remoteFingerprint}`));
+// Each signer's own local and remote fingerprints, normalised (decision 23), joined by one LF byte.
+export function bindMessage(hash, localFingerprint, remoteFingerprint) {
+  const local = normalizeFingerprint(localFingerprint);
+  const remote = normalizeFingerprint(remoteFingerprint);
+  return concat(utf8("bubbleplay-dtls-v1"), expectBytes(hash, 32, "H"), utf8(`${local}\n${remote}`));
 }
 
 /** DTLS bind signature. Pass the signer's own local and remote fingerprints. Returns base64url. */
@@ -473,20 +470,34 @@ export async function verifyBind(publicRaw, hash, localFingerprint, remoteFinger
 }
 
 /**
- * The `a=fingerprint` value of an SDP, exactly as written (for example "sha-256 AB:CD:...").
- * The SDP must carry one distinct value. Repeats of the same value are fine.
+ * Decision 23 form of a DTLS fingerprint: "sha-256", one space, uppercase hex pairs joined by
+ * colons. Accepts any letter case and spaces or tabs between the two parts. Only sha-256.
  * @returns {string}
+ */
+export function normalizeFingerprint(value) {
+  if (typeof value !== "string") throw new TypeError("fingerprint must be a string");
+  const match = /^([A-Za-z0-9-]+)[ \t]+((?:[0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2})$/.exec(value);
+  if (!match || match[1].toLowerCase() !== "sha-256") {
+    throw new TypeError("fingerprint must be sha-256 with 32 colon-separated hex bytes");
+  }
+  return `sha-256 ${match[2].toUpperCase()}`;
+}
+
+/**
+ * The normalised sha-256 `a=fingerprint` value of an SDP (decision 23). Other algorithms are
+ * skipped. Returns null when the SDP has no sha-256 fingerprint; throws on a malformed one or
+ * on several distinct ones. Repeats of the same value are fine.
+ * @returns {string|null}
  */
 export function parseSdpFingerprint(sdp) {
   if (typeof sdp !== "string") throw new TypeError("sdp must be a string");
   const values = new Set();
   for (const line of sdp.split(/\r?\n/)) {
-    if (line.startsWith("a=fingerprint:")) values.add(line.slice("a=fingerprint:".length));
+    if (!line.startsWith("a=fingerprint:")) continue;
+    const value = line.slice("a=fingerprint:".length);
+    if (/^[A-Za-z0-9-]+/.exec(value)?.[0].toLowerCase() !== "sha-256") continue;
+    try { values.add(normalizeFingerprint(value)); } catch { throw new RangeError("a=fingerprint sha-256 value is malformed"); }
   }
-  if (values.size !== 1) throw new RangeError(`SDP must carry one distinct a=fingerprint value, found ${values.size}`);
-  const [value] = values;
-  if (!/^[A-Za-z0-9-]+ (?:[0-9A-Fa-f]{2}:)*[0-9A-Fa-f]{2}$/.test(value)) {
-    throw new RangeError("a=fingerprint must be an algorithm and colon-separated hex");
-  }
-  return value;
+  if (values.size > 1) throw new RangeError(`SDP carries ${values.size} distinct sha-256 fingerprints`);
+  return values.size ? [...values][0] : null;
 }

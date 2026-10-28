@@ -233,6 +233,33 @@ test("wrong signer order, changed SDP and conflicting fingerprints close the ses
   }
 });
 
+test("decision 23: an SDP without a sha-256 fingerprint sends dtls-bind-required and ends the session", async () => {
+  for (const [local, remote] of [
+    ["v=0\r\na=fingerprint:sha-1 00:11:22\r\n", remoteSdp],
+    [localSdp, "v=0\r\n"],
+  ]) {
+    const h = await harness();
+    await h.authenticate();
+    await h.session.bindPeer({ localSdp: local, remoteSdp: remote });
+    assert.equal(h.events.sent.some(message => message.type === "auth-bind"), false);
+    const error = await h.pcCtl.openJson(h.events.sent.at(-1));
+    assert.equal(error.type, "error");
+    assert.equal(error.code, "dtls-bind-required");
+    assert.equal(h.events.failures[0].reason, "bind-failed");
+    assert.equal(h.session.mediaReady, false);
+  }
+});
+
+test("lowercase SDP fingerprints still produce the fixture's auth-bind", async () => {
+  const h = await harness();
+  await h.authenticate();
+  const lower = sdp => sdp.replace(/(a=fingerprint:)sha-256 ([0-9A-F:]+)/, (_, prefix, hex) => `${prefix}SHA-256 ${hex.toLowerCase()}`);
+  await h.session.bindPeer({ localSdp: lower(localSdp), remoteSdp: lower(remoteSdp) });
+  assert.deepEqual(h.events.sent.at(-1), hs.messages.authBind);
+  assert.equal(h.events.failures.length, 0);
+  h.session.close();
+});
+
 test("bind timeout ends the session, and a new peer cannot reuse an old readiness grant", async () => {
   const h = await harness();
   await h.authenticate();

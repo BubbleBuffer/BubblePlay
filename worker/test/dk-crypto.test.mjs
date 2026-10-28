@@ -401,13 +401,31 @@ test("DTLS bind signatures reproduce for both sides and verify only in the signe
   assert.equal(await dk.verifyBind(pcPublic, H, dtls.pc.localFingerprint, dtls.pc.remoteFingerprint, dtls.viewer.signature), false);
   assert.equal(await dk.verifyBind(viewerPublic, H, dtls.viewer.localFingerprint, dtls.viewer.remoteFingerprint, "not-a-signature"), false);
   await assert.rejects(dk.signBind(viewer.privateKey, H, `${dtls.viewer.localFingerprint}\n`, dtls.viewer.remoteFingerprint), TypeError);
+  await assert.rejects(dk.signBind(viewer.privateKey, H, dtls.viewer.localFingerprint.replace("sha-256", "sha-1"), dtls.viewer.remoteFingerprint), TypeError);
 });
 
-test("parseSdpFingerprint reads one a=fingerprint value and refuses anything else", () => {
+test("decision 23: lowercase-hex fingerprints normalise to the fixture's signed bytes", async () => {
+  const lower = fp => fp.replace("sha-256", "SHA-256").replace(/[0-9A-F]{2}(?=:|$)/g, pair => pair.toLowerCase());
+  const local = lower(dtls.viewer.localFingerprint);
+  const remote = lower(dtls.viewer.remoteFingerprint).replace(" ", "  ");
+  assert.notEqual(local, dtls.viewer.localFingerprint);
+  assert.equal(dk.normalizeFingerprint(local), dtls.viewer.localFingerprint);
+  assert.equal(dk.normalizeFingerprint(remote), dtls.viewer.remoteFingerprint);
+  assert.equal(toHex(dk.bindMessage(H, local, remote)), dtls.viewer.signedBytesHex);
+  const viewer = await ed25519(hs.viewer.seedHex);
+  assert.equal(await dk.signBind(viewer.privateKey, H, local, remote), dtls.viewer.signature);
+  assert.equal(await dk.verifyBind(pcPublic, H, lower(dtls.pc.localFingerprint), lower(dtls.pc.remoteFingerprint), dtls.pc.signature), true);
+});
+
+test("parseSdpFingerprint returns the one sha-256 value, normalised, and refuses anything else", () => {
   const line = `a=fingerprint:${dtls.viewer.localFingerprint}`;
+  const lowerLine = line.replace(/[A-F]/g, c => c.toLowerCase());
   assert.equal(dk.parseSdpFingerprint(`v=0\r\n${line}\r\na=setup:actpass\r\n${line}\r\n`), dtls.viewer.localFingerprint);
-  assert.equal(dk.parseSdpFingerprint(`v=0\n${line}\n`), dtls.viewer.localFingerprint);
-  assert.throws(() => dk.parseSdpFingerprint("v=0\r\n"), RangeError);
-  assert.throws(() => dk.parseSdpFingerprint(`${line}\r\na=fingerprint:sha-256 00:11\r\n`), RangeError);
+  assert.equal(dk.parseSdpFingerprint(`v=0\n${lowerLine}\n${line}\n`), dtls.viewer.localFingerprint);
+  assert.equal(dk.parseSdpFingerprint(`v=0\r\na=fingerprint:sha-1 00:11:22\r\n${lowerLine}\r\n`), dtls.viewer.localFingerprint);
+  assert.equal(dk.parseSdpFingerprint("v=0\r\n"), null);
+  assert.equal(dk.parseSdpFingerprint("v=0\r\na=fingerprint:sha-1 00:11:22\r\n"), null);
+  assert.throws(() => dk.parseSdpFingerprint(`${line}\r\na=fingerprint:${dtls.viewer.remoteFingerprint}\r\n`), RangeError);
+  assert.throws(() => dk.parseSdpFingerprint("a=fingerprint:sha-256 00:11\r\n"), RangeError);
   assert.throws(() => dk.parseSdpFingerprint("a=fingerprint:sha-256 ZZ:11\r\n"), RangeError);
 });
