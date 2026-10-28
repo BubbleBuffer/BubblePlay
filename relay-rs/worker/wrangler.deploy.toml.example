@@ -29,6 +29,42 @@ bindings = [{ name = "RELAY", class_name = "Relay" }]
 tag = "v1"
 new_sqlite_classes = ["Relay"]
 
+# In-place deploy on an existing JS relay script. The default above stays uncommented for a fresh
+# script. To deploy over the live JS script instead, comment out the default [durable_objects] table
+# and the v1 [[migrations]] block above, uncomment the block below, and set `name` to the live
+# script's name. Keep the tags and class names exactly as the live script has them.
+# The four stub classes (src/stubs.rs) answer every request with 404 and do nothing else. Nothing
+# routes to them, so the relay behaves as before. They keep the JS relay's stored data, which is why
+# this deploy works in place and a rollback to the JS relay stays possible.
+# [durable_objects]
+# bindings = [
+#   { name = "RELAY", class_name = "Relay" },
+#   { name = "ROOM", class_name = "Room" },
+#   { name = "MEDIA_ROOM", class_name = "MediaRoom" },
+#   { name = "GATE", class_name = "ApprovalGate" },
+#   { name = "AGENT_ROOM", class_name = "AgentRoom" },
+# ]
+#
+# [[migrations]]
+# tag = "v1"
+# new_sqlite_classes = ["Room"]
+#
+# [[migrations]]
+# tag = "v2"
+# new_sqlite_classes = ["ApprovalGate"]
+#
+# [[migrations]]
+# tag = "v3"
+# new_sqlite_classes = ["MediaRoom"]
+#
+# [[migrations]]
+# tag = "v4"
+# new_sqlite_classes = ["AgentRoom"]
+#
+# [[migrations]]
+# tag = "v5"
+# new_sqlite_classes = ["Relay"]
+
 [vars]
 # The public origin of the relay. The relay proof is bound to it, so bench-p99 needs the same value as --origin.
 PUBLIC_ORIGIN = "https://relay.example.com"

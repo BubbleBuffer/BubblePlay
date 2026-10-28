@@ -5,9 +5,10 @@
 // from relay-rs/server/tests.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   ADMIN,
   CASE_TIMEOUT_MS,
@@ -34,6 +35,8 @@ import {
   viewerIdentity,
   viewerJoin,
 } from './m3-support.mjs';
+
+const crateRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 let relay = null;
 let ntfy = null;
@@ -213,6 +216,14 @@ test('m3 admitted viewer gets hello-ok with a media epoch and a ticket', { timeo
   assert.ok(typeof ok.ticket === 'string' && ok.ticket.length > 0);
 });
 
+test('m3 admitted viewer is announced to the host as peer-joined with its media epoch', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const host = identity(90);
+  const { socket: hostSocket } = await registerHost(relay.port, host);
+  const { ok } = await viewerJoin(relay.port, host.id);
+  const joined = await hostSocket.nextJson('peer-joined', 10_000);
+  assert.deepEqual(joined, { type: 'peer-joined', mediaEpoch: ok.mediaEpoch, pairing: false });
+});
+
 // Browser origin: a browser Origin needs a valid gate cookie. Without one the gate refuses: a wrong
 // origin is 404, and the public origin is accepted then closed 1008.
 
@@ -266,6 +277,9 @@ test('m3 pairing viewer auth messages are forwarded to the host and its offers a
   const ok = await viewer.nextJson('hello-ok', 10_000);
   assert.equal(ok.pairing, true);
   assert.equal(ok.ticket, undefined);
+  // The host hears of the admission first, so its peer-joined comes before the auth-hello.
+  const joined = await hostSocket.nextJson('peer-joined', 10_000);
+  assert.equal(joined.pairing, true);
 
   viewer.sendJson({ type: 'offer', sdp: 'v=0' });
   viewer.sendJson(authHello(stranger));
@@ -662,6 +676,27 @@ test('m3 /pair/x with a cookie is still 404, as before /pair was served', { time
   const cookie = await approveBrowser(relay, ntfy);
   const below = await httpRequest(relay.port, { path: '/pair/x', headers: { Cookie: cookie } });
   assert.equal(below.status, 404);
+});
+
+// Inert stub classes (src/stubs.rs) exist only so an in-place deploy keeps the JS relay's classes.
+// Nothing routes to them: the local config binds only RELAY, and the routes keep their answers.
+
+test('m3 the local config binds only RELAY, so no request can reach a stub class', () => {
+  const toml = readFileSync(path.join(crateRoot, 'wrangler.toml'), 'utf8');
+  const classes = [...toml.matchAll(/class_name\s*=\s*"([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(classes, ['Relay']);
+});
+
+test('m3 stub-named paths keep the relay 404 with an empty body, and / still serves the page', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const cookie = await approveBrowser(relay, ntfy);
+  for (const target of ['/room', '/media-room', '/approval-gate', '/agent-room']) {
+    const res = await httpRequest(relay.port, { path: target, headers: { Cookie: cookie } });
+    assert.equal(res.status, 404, target);
+    assert.equal(res.body.length, 0, target);
+  }
+  const index = await httpRequest(relay.port, { path: '/', headers: { Cookie: cookie } });
+  assert.equal(index.status, 200);
+  assert.match(index.headers['content-type'] ?? '', /text\/html/);
 });
 
 // TURN (e2e_ws_with_turn_adds_credentialed_ice_server): a TURN instance, so the TURN config is set.
