@@ -377,10 +377,10 @@ Decided 2026-10-22 for the Rust relay (`relay-rs/`, lane rust-relay, M2). Consta
 
 **Viewer hello on `/ws?pc=<id>`** (the same exchange as host registration):
 
-1. The viewer sends `{"type":"hello","role":"viewer","id","public","turn"?,"pair"?}`. Unknown keys are refused. `id` is canonical and must match `public`; `pair` is 32 bytes. Until the cutover the relay also accepts the old role `client`.
+1. The viewer sends `{"type":"hello","role":"viewer","id","public","turn"?,"pair"?}`. Unknown keys are refused. `id` is canonical and must match `public`; `pair` is 32 bytes. The old roles `client`, `media-client` and `file-client` are refused (decision 12, no aliases).
 2. The relay answers `{"type":"register-challenge","nonce"}`. The nonce is 32 random bytes for this socket only. It is valid for one answer and 30 s.
 3. The viewer answers `{"type":"register-proof","signature"}`, a relay proof with role `viewer` and the relay's configured public origin, checked with strict Ed25519 verification.
-4. The relay checks admission (below). Only then does it send `hello-ok`, replay the cached capabilities and rotate the epoch. Until admission the socket receives nothing but the challenge, and it neither takes the viewer slot nor causes peer events.
+4. The relay checks admission (below). Only then does it rotate the epoch, send the host `{"type":"peer-joined","mediaEpoch","pairing"}` (the same opaque `mediaEpoch` string the viewer gets) and then send the viewer `hello-ok`. Until admission the socket receives nothing but the challenge, and it neither takes the viewer slot nor causes peer events.
 
 Media and file sockets keep the phase 1 ticket hello. A browser socket (one with `Origin`) also needs the gate cookie. A socket without `Origin` is native and is judged by the signed hello alone.
 
@@ -420,12 +420,9 @@ Media and file sockets keep the phase 1 ticket hello. A browser socket (one with
 
 `CTL_DATA_MAX` is the base64url length of the largest clipboard chunk the relay allows today (`CLIPBOARD_RAW_MAX`, 196,864 bytes) plus the 16-byte AEAD tag, rounded up to the next KiB. The relay does no cryptography on these types and does not track `seq`.
 
-Binary signalling frames are forwarded from the viewer to the PC only.
+These are the only types forwarded on `/ws` (decision 15): viewer to PC `auth-hello`, `auth-finish`, `auth-bind`, `pair-proof`, `ctl`; PC to viewer `auth-host`, `auth-bind`, `pair-proof`, `pair-done`, `pair-denied`, `ctl`. The relay also consumes `admit`, `pair-open` and `pair-close`, answers `ping` with `pong` and sends its own messages (`hello-ok`, `peer-joined`, `pair-closed` and the like). Every other type, and every binary frame, is dropped. Input, clipboard and other control travel only inside `ctl`; in WSS mode a binary input frame travels as `ctl` with `kind` `input`. Media and file sockets are unchanged.
 
-**Cutover commit** (lands with the host and client lanes, not before):
-
-- The relay accepts only the roles `viewer`, `media-viewer` and `file-viewer`. `client`, `media-client` and `file-client` are refused.
-- Input, clipboard and other control travel only inside `ctl`. The plaintext signalling types for them are removed from the allowlist. So are plaintext binary input frames from the viewer, which in WSS mode travel as `ctl` with `kind` `input` and `data` = AEAD(the binary frame). The list of types comes from the host's routes when the commit is made.
+**Cutover** (lane/rust-relay-cutover, 2026-10-28): the Go relay (`relay/`) and the JS relay (`worker/src`) are removed, the relay accepts only the roles `viewer`, `media-viewer` and `file-viewer`, and the allowlist above applies.
 
 **Proposed for the host and client lanes** (the lane's proposals, not settled; the relay forwards these as opaque bounded messages):
 
