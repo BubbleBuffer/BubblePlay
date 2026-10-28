@@ -714,17 +714,57 @@ fn run_serve_forever(args: &Args) -> Result<()> {
         start_vdd_keepalive(args)?
     };
     let (devices_host, devices_ui) = bubbleplay_host::devices_ui_api::channel();
-    bubbleplay_host::devices_ui_api::spawn_stdin_reader(
-        std::io::stdin(),
-        devices_ui.commands.clone(),
-    )?;
+    let relay_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The real Devices window needs the PC key; without one the events are only logged.
+    let devices_window = args.device_identity.as_ref().map(|identity| {
+        bubbleplay_host::devices_window::DevicesWindow::new(
+            bubbleplay_host::devices_window::DevicesWindowInfo {
+                pc_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
+                pc_id: identity.id().to_string(),
+                relay_origin: args
+                    .worker
+                    .as_deref()
+                    .and_then(bubbleplay_host::device_key::relay_origin)
+                    .unwrap_or_default(),
+                relay_online: relay_online.clone(),
+            },
+            devices_ui.commands.clone(),
+        )
+    });
+    match devices_window.clone() {
+        // The tray's "Devices..." line also raises an already-open window.
+        Some(window) => {
+            let (stdin_commands, stdin_lines) = std::sync::mpsc::channel();
+            bubbleplay_host::devices_ui_api::spawn_stdin_reader(std::io::stdin(), stdin_commands)?;
+            let commands = devices_ui.commands.clone();
+            std::thread::Builder::new()
+                .name("devices-open".into())
+                .spawn(move || {
+                    for command in stdin_lines {
+                        if command == bubbleplay_host::devices_ui_api::DevicesCommand::Open {
+                            window.open();
+                        }
+                        if commands.send(command).is_err() {
+                            break;
+                        }
+                    }
+                })?;
+        }
+        None => {
+            bubbleplay_host::devices_ui_api::spawn_stdin_reader(
+                std::io::stdin(),
+                devices_ui.commands.clone(),
+            )?;
+        }
+    }
     std::thread::Builder::new()
         .name("devices-ui".into())
-        .spawn(move || {
-            bubbleplay_host::devices_ui_api::run_ui(
+        .spawn(move || match devices_window {
+            Some(window) => bubbleplay_host::devices_ui_api::run_ui(window, devices_ui.events),
+            None => bubbleplay_host::devices_ui_api::run_ui(
                 bubbleplay_host::devices_ui_api::LogDevicesUi,
                 devices_ui.events,
-            );
+            ),
         })?;
     let devices_host = std::sync::Arc::new(std::sync::Mutex::new(devices_host));
     let mut selection = CaptureSelection::from_launch(args.monitor.as_deref());
@@ -753,7 +793,9 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                 unavailable_attempts = 0;
             }
         }
-        match run_serve(args, &mut selection, devices_host.clone()) {
+        let served = run_serve(args, &mut selection, devices_host.clone(), &relay_online);
+        relay_online.store(false, std::sync::atomic::Ordering::Relaxed);
+        match served {
             Ok(()) => {
                 info!("session ended — waiting for next client");
                 backoff = Duration::from_secs(1);
@@ -977,6 +1019,7 @@ fn run_serve(
     args: &Args,
     selection: &mut CaptureSelection,
     devices_ui: bubbleplay_host::dk_host::SharedDevicesUi,
+    relay_online: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     let watchdog = match session_watchdog::SessionWatchdog::start() {
         Ok(watchdog) => Some(watchdog),
@@ -1054,6 +1097,7 @@ fn run_serve(
             devices_ui,
         )
     )?;
+    relay_online.store(true, std::sync::atomic::Ordering::Relaxed);
     // Room and data-socket ticket for this signaling connection; the file and media sessions below
     // take copies and drop them when this run ends.
     let relay_route = signaling.relay_route();
