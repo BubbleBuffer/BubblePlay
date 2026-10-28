@@ -10,6 +10,11 @@ mod metrics;
 mod options;
 mod order;
 mod pacing;
+#[cfg(test)]
+mod relay_e2e_tests;
+#[cfg(test)]
+#[path = "../../tests/support/relay_pc.rs"]
+mod relay_pc;
 mod stats;
 
 pub use crate::audio::AudioHandle as SessionAudioControl;
@@ -160,8 +165,17 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
 /// or device work. A key that cannot be unlocked means no connection.
 fn viewer_auth(options: &DevOptions) -> Result<ViewerAuth> {
     let identity = crate::store::key::open_identity(options.key.as_deref())?;
-    let paired = crate::store::pcs::PcStore::default_location()?.pinned()?;
-    Ok(ViewerAuth::new(identity, options.pc).with_paired(paired))
+    let store = crate::store::pcs::PcStore::default_location()?;
+    viewer_auth_in(options, identity, &store)
+}
+
+/// The viewer auth for `identity`, trusting the PCs pinned in `store`.
+pub(crate) fn viewer_auth_in(
+    options: &DevOptions,
+    identity: bp_device_key::DeviceIdentity,
+    store: &crate::store::pcs::PcStore,
+) -> Result<ViewerAuth> {
+    Ok(ViewerAuth::new(identity, options.pc).with_paired(store.pinned()?))
 }
 
 /// `--pair <code> --pc <id> --dev-relay <origin>`: pair with the PC, print the number to
@@ -171,6 +185,22 @@ fn pair_dev(options: &DevOptions, code: &str) -> Result<()> {
     crate::store::console::attach();
     let store = crate::store::pcs::PcStore::default_location()?;
     let identity = crate::store::key::open_identity(options.key.as_deref())?;
+    let entry = pair_into(options, code, identity, &store, &mut |line: &str| {
+        println!("{line}")
+    })?;
+    println!("Paired with {} ({})", entry.id, store.path().display());
+    Ok(())
+}
+
+/// The `--pair` flow after the key and store are open: pair over `options.url`, write
+/// the number to compare and "Confirm on the PC" to `out`, and pin the PC in `store`.
+pub(crate) fn pair_into(
+    options: &DevOptions,
+    code: &str,
+    identity: bp_device_key::DeviceIdentity,
+    store: &crate::store::pcs::PcStore,
+    out: &mut dyn FnMut(&str),
+) -> Result<crate::store::pcs::PcEntry> {
     let config = NetConfig::new(
         options.url.clone(),
         net::Codec::H264,
@@ -178,13 +208,11 @@ fn pair_dev(options: &DevOptions, code: &str) -> Result<()> {
     );
     let code = net::phase2::parse_code(code).map_err(anyhow::Error::msg)?;
     let (id, public) = net::pair(&config, code, &mut |number: &str| {
-        println!("{number}");
-        println!("Confirm on the PC");
+        out(number);
+        out("Confirm on the PC");
     })?;
     let relay = options.relay_origin.as_deref().unwrap_or_default();
-    let entry = store.pin(&id, &public, relay)?;
-    println!("Paired with {} ({})", entry.id, store.path().display());
-    Ok(())
+    store.pin(&id, &public, relay)
 }
 
 fn finish_dev(options: &DevOptions, result: Result<()>) -> Result<()> {

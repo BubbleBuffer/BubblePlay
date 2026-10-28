@@ -729,7 +729,7 @@ pub(crate) mod test_pc {
         (identity.id(), identity.public_key())
     }
 
-    fn pc_identity() -> DeviceIdentity {
+    pub fn pc_identity() -> DeviceIdentity {
         DeviceIdentity::from_seed(&fixture_hex32(&["handshake", "pc", "seedHex"]))
     }
 
