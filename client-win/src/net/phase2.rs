@@ -644,8 +644,7 @@ impl Binder {
 /// The DTLS fingerprint to bind (decision 23), read from the SDP text that was sent or
 /// received (never rebuilt from the WebRTC stack) and normalised by the crate.
 fn sdp_fingerprint(sdp: &str, which: &'static str) -> Result<String, Phase2Error> {
-    p2::sdp_sha256_fingerprint(sdp)
-        .map_err(|_| Phase2Error::NoSha256Fingerprint(which))
+    p2::sdp_sha256_fingerprint(sdp).map_err(|_| Phase2Error::NoSha256Fingerprint(which))
 }
 
 // ---------------------------------------------------------------------------------------------
