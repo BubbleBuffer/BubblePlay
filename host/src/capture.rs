@@ -2006,6 +2006,24 @@ impl Capture {
         self.idle_snapshot.on_idr_cached();
     }
 
+    /// Capture watchdog: the duplication delivered nothing while a frame was
+    /// needed, without reporting an error (DXGI WAIT_TIMEOUT is silent). Send it
+    /// through the normal loss path: unavailable now, recreated on the next
+    /// acquire, active again on its first verified frame, which rebuilds the
+    /// encoder and so starts with an IDR. Returns false while a recovery is
+    /// already pending.
+    pub fn recreate_stalled_duplication(&mut self, now: Instant) -> bool {
+        if self.pending_recreate {
+            return false;
+        }
+        self.mark_unavailable(CaptureUnavailableReason::RecoveryAwaitingFrame);
+        self.next_recreate_attempt = now;
+        if let Some(activity) = self.event_activity.as_ref() {
+            activity.notify();
+        }
+        true
+    }
+
     /// Re-arm the GPU-resident desktop snapshot path for a forced keyframe.
     /// A static desktop may never produce another DDA present, so clearing the
     /// cached IDR must always be paired with an explicit snapshot request.
@@ -2502,6 +2520,35 @@ mod tests {
         }
         assert_eq!(capture.stats(), (0, 0));
         assert_eq!(capture.availability(), CaptureAvailability::Active);
+    }
+
+    #[test]
+    fn stalled_duplication_takes_the_loss_path_once_and_recreates_on_the_next_acquire() {
+        let now = Instant::now();
+        let mut capture = capture_without_native_session(now);
+        capture.pending_recreate = false;
+        capture.availability = CaptureAvailability::Active;
+        assert!(capture.recreate_stalled_duplication(now));
+        assert!(capture.pending_recreate);
+        assert_eq!(capture.availability(), CaptureAvailability::Unavailable);
+        assert_eq!(
+            capture.availability_transition,
+            Some(CaptureAvailability::Unavailable)
+        );
+        assert_eq!(
+            capture.unavailable_reason,
+            Some(super::CaptureUnavailableReason::RecoveryAwaitingFrame)
+        );
+        // The existing recovery runs it on the next acquire, without backoff.
+        assert!(super::recovery_attempt_due(
+            capture.pending_recreate,
+            now,
+            capture.next_recreate_attempt
+        ));
+        // A pending recovery is not stacked or postponed.
+        capture.next_recreate_attempt = now + Duration::from_secs(1);
+        assert!(!capture.recreate_stalled_duplication(now));
+        assert_eq!(capture.next_recreate_attempt, now + Duration::from_secs(1));
     }
 
     #[test]

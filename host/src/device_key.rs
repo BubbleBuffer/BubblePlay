@@ -1220,7 +1220,7 @@ mod relay_tests {
             Some("https://play.example")
         );
         assert_eq!(
-            relay_origin("wss://play.example:8443/lab-host-ws?run=a").as_deref(),
+            relay_origin("wss://play.example:8443/host-ws?pc=a").as_deref(),
             Some("https://play.example:8443")
         );
         assert_eq!(

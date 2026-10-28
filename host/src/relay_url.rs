@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn cleartext_relay_urls_are_accepted_only_for_loopback() {
         for url in [
-            "ws://localhost:8787/lab-host-ws?run=abc",
+            "ws://localhost:8787/host-ws",
             "ws://LOCALHOST/host-ws",
             "ws://127.0.0.1:8787/host-ws",
             "ws://127.8.9.10/host-ws",

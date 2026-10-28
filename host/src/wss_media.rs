@@ -21,12 +21,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::Deserialize;
 use tungstenite::client::IntoClientRequest;
-use tungstenite::http::{header::AUTHORIZATION, HeaderName, HeaderValue, Request};
+use tungstenite::http::{header::AUTHORIZATION, HeaderValue, Request};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 use zeroize::{Zeroize, Zeroizing};
-
-const STREAM_LAB_COMPATIBILITY_ID: &str = "wss-v4-bench2-hevc-tiles-bpip4-v16";
 
 /// Data-socket ticket from a keyed host's signaling `hello-ok`: 32 random bytes in unpadded
 /// base64url. It authorizes media and file sockets only while its signaling socket stays open.
@@ -115,6 +113,19 @@ impl RelayRoute {
             Self::Legacy | Self::LegacyTicket(_) => None,
             Self::Keyed { pc, .. } => Some(pc),
         }
+    }
+
+    /// The route carries a relay ticket, which expires (12 h) independently of
+    /// the signaling socket that received it.
+    pub fn has_ticket(&self) -> bool {
+        matches!(
+            self,
+            Self::LegacyTicket(_)
+                | Self::Keyed {
+                    ticket: Some(_),
+                    ..
+                }
+        )
     }
 }
 
@@ -244,7 +255,9 @@ impl WssMediaEgress {
     }
 
     /// Connect the media socket for `epoch` in the room `route` names. The route, including any
-    /// ticket, is kept for every reconnect the link makes.
+    /// ticket, is kept for every reconnect the link makes, so it must be the signaling connection's
+    /// current route when the link starts. A relay that keeps refusing it ends the link with
+    /// [`V4LinkEnd::Refused`](crate::wss_v4::V4LinkEnd) instead of looping.
     pub fn connect_routed(
         worker_url: &str,
         bearer: &str,
@@ -258,10 +271,12 @@ impl WssMediaEgress {
         }
         // Validate the route before the link thread starts retrying it.
         media_request(worker_url, bearer, epoch, route)?;
-        let (url, bearer, epoch) = (worker_url.to_owned(), bearer.to_owned(), epoch.to_owned());
+        let (url, bearer, epoch_label) =
+            (worker_url.to_owned(), bearer.to_owned(), epoch.to_owned());
         let route = route.clone();
-        let link = V4Link::spawn(
-            Box::new(move || connect_media_socket(&url, &bearer, &epoch, &route)),
+        let link = V4Link::spawn_for_epoch(
+            Box::new(move || connect_media_socket(&url, &bearer, &epoch_label, &route)),
+            epoch,
             bitrate_bps,
             max_bitrate_bps,
         )?;
@@ -319,6 +334,11 @@ impl WssMediaEgress {
 
     pub fn wire_payload_bytes(&self, access_unit_bytes: usize) -> u64 {
         (V4_HEADER_BYTES + access_unit_bytes) as u64
+    }
+
+    /// The host moved off this egress's epoch; see [`V4Link::retire_epoch`].
+    pub fn retire_epoch(&self) {
+        self.link.retire_epoch();
     }
 
     pub fn shutdown(self) {
@@ -381,16 +401,15 @@ pub enum HostSocket {
 }
 
 impl HostSocket {
-    fn paths(self) -> (&'static str, &'static str) {
+    fn path(self) -> &'static str {
         match self {
-            Self::Media => ("/host-media-ws", "/lab-host-media-ws"),
-            Self::File => ("/host-file-ws", "/lab-host-file-ws"),
+            Self::Media => "/host-media-ws",
+            Self::File => "/host-file-ws",
         }
     }
 }
 
-/// Upgrade request for an epoch-scoped host socket (`/host-media-ws` or
-/// `/host-file-ws`, or their lab twins when the Worker URL is a lab route),
+/// Upgrade request for an epoch-scoped host socket (`/host-media-ws` or `/host-file-ws`),
 /// authenticated with `Authorization: Bearer <bearer>`.
 pub fn host_socket_request(
     worker_url: &str,
@@ -412,48 +431,16 @@ pub fn host_socket_request_routed(
     if !valid_epoch(epoch) {
         bail!("invalid relay epoch");
     }
-    let worker_name = std::env::var("BUBBLEPLAY_LAB_WORKER_NAME")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let version_id = std::env::var("BUBBLEPLAY_LAB_WORKER_VERSION_ID")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let worker_version = match (worker_name.as_deref(), version_id.as_deref()) {
-        (None, None) => None,
-        (Some(worker_name), Some(version_id)) => Some((worker_name, version_id)),
-        _ => bail!(
-            "Stream Lab Worker version override requires both worker name and version identifier"
-        ),
-    };
-    socket_request_with_worker_version(worker_url, bearer, epoch, worker_version, kind, route)
+    socket_request(worker_url, bearer, epoch, kind, route)
 }
 
-#[cfg(test)]
-fn media_request_with_worker_version(
+fn socket_request(
     worker_url: &str,
     bearer: &str,
     epoch: &str,
-    worker_version: Option<(&str, &str)>,
-) -> Result<Request<()>> {
-    socket_request_with_worker_version(
-        worker_url,
-        bearer,
-        epoch,
-        worker_version,
-        HostSocket::Media,
-        &RelayRoute::Legacy,
-    )
-}
-
-fn socket_request_with_worker_version(
-    worker_url: &str,
-    bearer: &str,
-    epoch: &str,
-    worker_version: Option<(&str, &str)>,
     kind: HostSocket,
     route: &RelayRoute,
 ) -> Result<Request<()>> {
-    let (production_path, lab_path) = kind.paths();
     crate::relay_url::require_secure_relay_url(worker_url)?;
     let mut url = tungstenite::http::Uri::try_from(worker_url)
         .context("invalid Worker URL")?
@@ -470,34 +457,9 @@ fn socket_request_with_worker_version(
         .as_str()
         .to_owned();
     let scheme = parsed.scheme_str().unwrap_or("wss").to_owned();
-    let lab_route = if parsed.path() == "/lab-host-ws" {
-        let query = parsed.query().unwrap_or_default();
-        let run = query
-            .split('&')
-            .find_map(|field| field.strip_prefix("run="))
-            .filter(|run| canonical_uuid(run))
-            .map(str::to_owned)
-            .context("lab Worker URL requires a canonical run id")?;
-        let compatibility = query
-            .split('&')
-            .find_map(|field| field.strip_prefix("compat="))
-            .filter(|value| *value == STREAM_LAB_COMPATIBILITY_ID)
-            .map(str::to_owned)
-            .context("lab Worker URL requires the current compatibility identifier")?;
-        Some((run, compatibility))
-    } else {
-        None
-    };
-    let media_path = if lab_route.is_some() {
-        lab_path
-    } else {
-        production_path
-    };
-    let lab_query = lab_route
-        .map(|(run, compatibility)| format!("&run={run}&compat={compatibility}"))
-        .unwrap_or_default();
+    let media_path = kind.path();
     let pc_query = route.pc().map(|pc| format!("&pc={pc}")).unwrap_or_default();
-    parsed = format!("{scheme}://{authority}{media_path}?epoch={epoch}{pc_query}{lab_query}")
+    parsed = format!("{scheme}://{authority}{media_path}?epoch={epoch}{pc_query}")
         .parse()
         .expect("constructed media URL is valid");
     let mut request = parsed
@@ -509,58 +471,7 @@ fn socket_request_with_worker_version(
             .context("host bearer is not a valid HTTP header value")?;
         request.headers_mut().insert(AUTHORIZATION, value);
     }
-    if parsed.path() == lab_path {
-        if let Some((worker_name, version_id)) = worker_version {
-            if !canonical_worker_name(worker_name) || !canonical_worker_version_id(version_id) {
-                bail!("Stream Lab Worker version override is not canonical");
-            }
-            let value = HeaderValue::from_str(&format!("{worker_name}=\"{version_id}\""))
-                .context("Stream Lab Worker version override is not a valid HTTP header value")?;
-            request.headers_mut().insert(
-                HeaderName::from_static("cloudflare-workers-version-overrides"),
-                value,
-            );
-        }
-    }
     Ok(request)
-}
-
-fn canonical_worker_name(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (1..=63).contains(&bytes.len())
-        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-}
-
-fn canonical_worker_version_id(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 36
-        && [8, 13, 18, 23]
-            .into_iter()
-            .all(|index| bytes[index] == b'-')
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
-        && matches!(bytes[14], b'1'..=b'5')
-        && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
-}
-
-fn canonical_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value
-            .as_bytes()
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| match index {
-                8 | 13 | 18 | 23 => *byte == b'-',
-                14 => matches!(*byte, b'1'..=b'5'),
-                19 => matches!(byte.to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
-                _ => byte.is_ascii_hexdigit(),
-            })
 }
 
 #[cfg(test)]
@@ -568,15 +479,14 @@ mod tests {
     use super::*;
 
     const EPOCH: &str = "0123456789abcdef0123456789abcdef";
-    const LAB_URL: &str = "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v4-bench2-hevc-tiles-bpip4-v16";
 
     #[test]
     fn derives_the_single_media_endpoint_and_sends_bearer_only_in_upgrade_header() {
-        let request = media_request_with_worker_version(
+        let request = media_request(
             "https://worker.example/host-ws",
             "host-bearer",
             EPOCH,
-            None,
+            &RelayRoute::Legacy,
         )
         .unwrap();
         assert_eq!(
@@ -602,11 +512,10 @@ mod tests {
 
     #[test]
     fn legacy_media_socket_keeps_the_original_url_and_hello() {
-        let request = socket_request_with_worker_version(
+        let request = socket_request(
             "https://worker.example/host-ws",
             "host-bearer",
             EPOCH,
-            None,
             HostSocket::Media,
             &RelayRoute::Legacy,
         )
@@ -624,11 +533,10 @@ mod tests {
     #[test]
     fn keyed_media_socket_addresses_the_pc_and_sends_the_ticket_in_hello_only() {
         let route = keyed_route();
-        let request = socket_request_with_worker_version(
+        let request = socket_request(
             "https://worker.example/host-ws",
             "host-bearer",
             EPOCH,
-            None,
             HostSocket::Media,
             &route,
         )
@@ -647,24 +555,18 @@ mod tests {
     }
 
     #[test]
-    fn keyed_lab_socket_keeps_run_and_compatibility_after_pc() {
-        let request = socket_request_with_worker_version(
-            LAB_URL,
-            "b",
-            EPOCH,
-            None,
-            HostSocket::Media,
-            &keyed_route(),
-        )
-        .unwrap();
-        let uri = request.uri().to_string();
+    fn only_ticketed_routes_report_an_expiring_ticket() {
+        assert!(keyed_route().has_ticket());
         assert!(
-            uri.starts_with(&format!(
-                "wss://worker.example/lab-host-media-ws?epoch={EPOCH}&pc={PC}&run="
-            )),
-            "{uri}"
+            RelayRoute::LegacyTicket(RelayTicket::try_from(TICKET.to_owned()).unwrap())
+                .has_ticket()
         );
-        assert!(uri.ends_with("&compat=wss-v4-bench2-hevc-tiles-bpip4-v16"));
+        assert!(!RelayRoute::Legacy.has_ticket());
+        assert!(!RelayRoute::Keyed {
+            pc: "AAAA-AAAA-AAAA-AAAA".into(),
+            ticket: None
+        }
+        .has_ticket());
     }
 
     #[test]
@@ -683,7 +585,7 @@ mod tests {
     #[test]
     fn media_and_file_routes_keep_pc_and_ticket_independent() {
         for kind in [HostSocket::Media, HostSocket::File] {
-            let (path, _) = kind.paths();
+            let path = kind.path();
             let role = if matches!(kind, HostSocket::Media) {
                 "media-host"
             } else {
@@ -695,11 +597,10 @@ mod tests {
                         has_key.then(|| crate::device_key::DeviceId::parse(PC).unwrap()),
                         has_ticket.then(|| RelayTicket::try_from(TICKET.to_owned()).unwrap()),
                     );
-                    let request = socket_request_with_worker_version(
+                    let request = socket_request(
                         "wss://worker.example/host-ws",
                         "host-bearer",
                         EPOCH,
-                        None,
                         kind,
                         &route,
                     )
@@ -733,11 +634,10 @@ mod tests {
 
     #[test]
     fn derives_the_file_socket_endpoints() {
-        let request = socket_request_with_worker_version(
+        let request = socket_request(
             "https://worker.example/host-ws",
             "host-bearer",
             EPOCH,
-            None,
             HostSocket::File,
             &RelayRoute::Legacy,
         )
@@ -750,62 +650,6 @@ mod tests {
             request.headers().get(AUTHORIZATION).unwrap(),
             "Bearer host-bearer"
         );
-        let lab = socket_request_with_worker_version(
-            LAB_URL,
-            "b",
-            EPOCH,
-            None,
-            HostSocket::File,
-            &RelayRoute::Legacy,
-        )
-        .unwrap();
-        assert!(lab
-            .uri()
-            .to_string()
-            .starts_with("wss://worker.example/lab-host-file-ws?epoch="));
-        assert!(host_socket_request(LAB_URL, "b", "BAD", HostSocket::File).is_err());
-    }
-
-    #[test]
-    fn derives_run_scoped_lab_media_endpoint_from_lab_signaling_url() {
-        let request =
-            media_request_with_worker_version(LAB_URL, "host-bearer", EPOCH, None).unwrap();
-        assert_eq!(
-            request.uri().to_string(),
-            "wss://worker.example/lab-host-media-ws?epoch=0123456789abcdef0123456789abcdef&run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v4-bench2-hevc-tiles-bpip4-v16"
-        );
-        assert!(media_request_with_worker_version(
-            "wss://worker.example/lab-host-ws?run=not-a-uuid&compat=wss-v4-bench2-hevc-tiles-bpip4-v16",
-            "host-bearer",
-            EPOCH,
-            None,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn lab_media_worker_version_override_is_header_only_and_never_reaches_production() {
-        let version = Some(("playfull-cat", "1a10a2ec-6b6a-4d6a-a7e6-5fd5696360d1"));
-        let request =
-            media_request_with_worker_version(LAB_URL, "host-bearer", EPOCH, version).unwrap();
-        assert_eq!(
-            request
-                .headers()
-                .get("Cloudflare-Workers-Version-Overrides")
-                .unwrap(),
-            r#"playfull-cat="1a10a2ec-6b6a-4d6a-a7e6-5fd5696360d1""#
-        );
-        let production = media_request_with_worker_version(
-            "wss://worker.example/host-ws",
-            "host-bearer",
-            EPOCH,
-            version,
-        )
-        .unwrap();
-        assert!(production
-            .headers()
-            .get("Cloudflare-Workers-Version-Overrides")
-            .is_none());
     }
 
     #[test]
@@ -815,25 +659,18 @@ mod tests {
                 "ws://192.168.1.20:8787/host-ws",
                 "http://worker.example/host-ws",
             ] {
-                let error = socket_request_with_worker_version(
-                    url,
-                    "host-bearer",
-                    EPOCH,
-                    None,
-                    kind,
-                    &RelayRoute::Legacy,
-                )
-                .unwrap_err()
-                .to_string();
+                let error = socket_request(url, "host-bearer", EPOCH, kind, &RelayRoute::Legacy)
+                    .unwrap_err()
+                    .to_string();
                 assert!(error.contains("loopback"), "{error}");
                 assert!(!error.contains("host-bearer"), "{error}");
             }
         }
-        let request = media_request_with_worker_version(
+        let request = media_request(
             "http://127.0.0.1:8787/host-ws",
             "host-bearer",
             EPOCH,
-            None,
+            &RelayRoute::Legacy,
         )
         .unwrap();
         assert_eq!(
