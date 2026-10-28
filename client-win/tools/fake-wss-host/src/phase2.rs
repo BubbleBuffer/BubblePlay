@@ -481,7 +481,22 @@ mod tests {
             .expect("list")
         {
             let name = failure["name"].as_str().expect("name");
-            let (mut pc, _) = fixture_channels(&f);
+            let (mut pc, (_, mut viewer_opener)) = fixture_channels(&f);
+            if failure["direction"] == "pc-to-viewer" {
+                // Aimed at the viewer (e.g. sealed with the wrong direction's key): the
+                // viewer's opener must refuse it.
+                let message = &failure["message"];
+                let data = URL_SAFE_NO_PAD
+                    .decode(message["data"].as_str().expect("data"))
+                    .expect("base64url");
+                let kind = message["kind"].as_str().expect("kind");
+                let seq = message["seq"].as_u64().expect("seq");
+                assert!(
+                    viewer_opener.open(kind, seq, &data).is_err(),
+                    "{name} must not open"
+                );
+                continue;
+            }
             if name == "replayed-seq" {
                 // The first message opens, so the replay is the one that must fail.
                 pc.open(&messages[0]["message"]).expect("seq 0 opens first");

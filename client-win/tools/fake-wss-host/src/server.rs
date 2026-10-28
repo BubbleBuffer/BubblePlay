@@ -112,9 +112,9 @@ enum Event {
         id: u64,
         text: String,
     },
+    /// A raw binary frame; after the handshake binary input travels in `ctl`, so it is refused.
     Binary {
         id: u64,
-        bytes: Vec<u8>,
     },
     Closed {
         id: u64,
@@ -1453,8 +1453,8 @@ async fn connection(
                         break;
                     }
                 }
-                Some(Ok(Message::Binary(bytes))) => {
-                    let _ = events.send(Event::Binary { id, bytes: bytes.to_vec() }).await;
+                Some(Ok(Message::Binary(_))) => {
+                    let _ = events.send(Event::Binary { id }).await;
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(_)) => {}
