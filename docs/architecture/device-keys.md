@@ -57,7 +57,7 @@ One text file per key, extension `.bpkey`, UTF-8 JSON:
 - **KDF: Argon2id**, 64 MiB, 3 passes, 1 lane, the same parameters the Go relay uses for passwords today (`relay/auth.go` 57). Rust has the `argon2` crate and Android BouncyCastle's Argon2 generator. WebCrypto has no Argon2, so the browser ships a small vendored Argon2id WASM build with the other assets, listed in the third-party notices. PBKDF2 alone would make a stolen file much cheaper to guess on GPUs, which is why the owner's preference holds here despite the extra dependency.
 - **AEAD: AES-256-GCM**, native in WebCrypto, Rust (`aes-gcm`) and Android (JCA). A file is encrypted once per passphrase change with a fresh random nonce. The associated data is the canonical JSON of every field except `private` and `aead.nonce`, so a tampered ID, public key or KDF parameters fail to decrypt.
 - **On import**, the client derives the public key from the seed and refuses the file if it does not match `public` and `id`. Unknown `version` or `type` is refused with a clear message.
-- `label` is a suggestion for the device name at pairing; the PC's own name for the device wins.
+- `label` is the name the viewer sends in its `caps` control message after pairing; the PC stores "Unnamed device" at pairing ([Pairing A](#a-at-the-pc)).
 
 ### Where keys live
 
@@ -84,7 +84,7 @@ A key file can be imported on several devices. To the PC they are one identity: 
 ### Rotation, revocation, loss
 
 - **Rotation:** a viewer device rotates its ID by vouching for its own new key ([ID rotation](#id-rotation), phase 3). A PC rotating its own key signs a `rotate` statement with the old key naming the new one and sends it to its viewers; a viewer that has not seen the statement shows "PC key changed" and refuses, as SSH does. Manual only; no expiry.
-- **Revocation** is local and immediate: removing a key from the PC's list ends its open session and refuses it from then on. The relay's admission list updates on the next sync.
+- **Revocation** is local and immediate: removing a key from the PC's list ends its open session and refuses it from then on. **Revoke** also re-sends `admit` without that ID, and the relay closes the viewer's socket.
 - **Lost or stolen device or key file:** revoke the key in the tray. A passphrase-protected file costs the thief an Argon2id guess per try; an unprotected one is usable at once, until revoked.
 - **Lost browser key** (site data cleared, new profile) without an exported copy: the browser is a new device and pairs again. The old row shows "not seen for N days" until revoked.
 - **Passkeys** stay a possible later option and are not planned.
@@ -95,17 +95,23 @@ Pairing adds a viewer's public key to a PC's trusted list, with a name and permi
 
 ### A. At the PC
 
-1. Owner clicks **Pair device** in the tray. For 5 minutes the tray shows the PC's ID, a one-time 10-character code, and a QR code with `bubbleplay://pair?relay=<url>&pc=<id>&code=<code>` (the browser uses `https://<relay>/pair#...`; the fragment never reaches the relay).
-2. The viewer, key unlocked, scans the QR or types PC ID and code, and connects to the relay as an unpaired device asking for that PC.
-3. Viewer and PC exchange public keys and a pairing proof keyed by the code (HMAC over the transcript), so the PC accepts only requests from someone who saw its screen.
-4. Both sides show a 6-digit comparison number derived from the transcript. The tray shows "Pair 'Pixel 8' (ID B7QK-...)? Number on the device: 482 913" with the default permissions and **Allow** / **Deny**. The relay cannot fake the number without changing the keys. The code alone would not be enough: a relay could brute-force a short code under HMAC within its lifetime.
-5. The PC adds the entry; the viewer stores the PC (ID, public key, relay URL, name).
+1. Owner clicks **Pair device** in the tray. For 5 minutes the tray shows the PC's ID, a one-time pairing code, and a QR code with `bubbleplay://pair?relay=<url>&pc=<id>&code=<code>` (the browser uses `https://<relay>/pair#pc=<id>&code=<code>`; the fragment never reaches the relay). The code is 10 Crockford base32 characters from the PC's CSPRNG, shown as `XXXXX-XXXXX`, for example `70Q1K-9MXR1`.
+   - Normalisation, for any typed code or a code taken from a link: uppercase, O becomes 0, I and L become 1, dashes and spaces are dropped. `7oq-ik9 mxrl` normalises to `70Q1K9MXR1`.
+   - The PC registers the admit hash with the relay in `pair-open`: `b64url(SHA-256("bubbleplay-pair-admit-v1" || canonical PC ID || normalised code))` ([relay protocol](#phase-2-relay-protocol)).
+2. The viewer, key unlocked, opens the pairing link or types the PC ID and code. Android has no in-app QR scanner; the camera app opens `bubbleplay://pair`. The browser opens `https://<relay>/pair#pc=<id>&code=<code>` from the QR (any phone or desktop camera, or the link), or the user types the PC ID and code into the browser's pair form; the handshake and comparison number are the same (decision 14). The viewer sends the same admit hash as `pair` in its relay `hello` and connects as an unpaired device asking for that PC.
+3. The viewer and the PC run the handshake over the signaling socket with `pair-v1` in `caps`: `auth-hello`, `auth-host`, `auth-finish`. H is the transcript hash. Both sides derive the pair key K = HKDF-SHA256(ikm = normalised code as ASCII, salt empty, info `bubbleplay-pair-v1`, 32 bytes).
+4. The viewer sends `pair-proof` with `mac` = HMAC-SHA256(K, `"viewer"` || H). The PC verifies it in constant time. A wrong MAC ends the attempt with no number shown.
+5. The PC sends its own `pair-proof` with `mac` = HMAC-SHA256(K, `"pc"` || H). The viewer verifies it in constant time.
+6. Only after both proofs verify, both sides show the 6-digit comparison number: the first 4 bytes of SHA-256("bubbleplay-pair-sas-v1" || H) as a big-endian u32, mod 10^6, shown as `482 913`. The tray shows "Pair 'Unnamed device' (ID B7QK-...)? Number on the device: 482 913" with the default permissions and **Allow** / **Deny**. The relay cannot fake the number without changing the keys. The code alone would not be enough: the number binds the exact keys exchanged, so a relay that learned the code still cannot sit in the middle unseen.
+7. **Allow** adds the key to the PC's trusted list (`%LOCALAPPDATA%\BubblePlay\trusted-devices.json`, CurrentUser DPAPI, entries `{id, public, name, paired, lastSeen}`), sends `pair-done`, and re-sends `admit` with the new ID. **Deny** sends `pair-denied` and adds nothing. The viewer stores the PC (ID, public key, relay URL, name) after `pair-done`.
+
+**Device name.** The PC stores "Unnamed device" at pairing. Pairing mode carries no ctl, so the name comes in the viewer's next session: its first ctl message is kind `caps`, `{type:"caps", caps:[...], name:"<label, <=64 chars>"}`, mirroring the PC's caps. The PC strips control characters, truncates `name` to 64 characters, and updates the stored name on every session. Devices shows it.
 
 This is also the only way to pair the first device on a fresh install, so first setup needs no password.
 
 ### B. Remotely, approved at the PC or by a paired device
 
-For pairing while away from the PC. Off by default (**Allow remote pairing** in the tray). ntfy does not approve pairing.
+For pairing while away from the PC. Phase 3; phase 2 builds only pairing at the PC (A). Off by default (**Allow remote pairing** in the tray). ntfy does not approve pairing.
 
 1. The new device asks the relay to pair with a PC ID, without a code. The relay forwards the request only if the PC has remote pairing on (it publishes that flag), and within rate limits: one pending request per PC, a few per source prefix per hour, enforced at the relay and again at the PC.
 2. New device and PC exchange keys; both compute the comparison number. The new device shows it.
@@ -195,7 +201,9 @@ After the relay joins viewer and PC, and before the host starts capture or accep
 2. PC → viewer `auth-host`: PC ID, public key, nonce, ephemeral key, signature over the transcript so far.
 3. Viewer → PC `auth-finish`: signature over the full transcript.
 
-The transcript is `"bubbleplay-auth-v1"`, the relay origin, the session epoch, both IDs and public keys, both nonces and both ephemeral keys. The viewer checks the PC key against its pinned key; the PC checks the viewer key against its trusted list and loads that key's permissions. A mismatch closes the session with a reason the user sees ("PC key changed", "This device is not paired").
+The transcript is `"bubbleplay-auth-v1"`, the relay origin, the `mediaEpoch` string as received, both IDs and public keys, both nonces and both ephemeral keys. The viewer checks the PC key against its pinned key; the PC checks the viewer key against its trusted list and loads that key's permissions. A mismatch closes the session with a reason the user sees ("PC key changed", "This device is not paired").
+
+**Refusals:** in WebRTC mode, when the offer arrives from a viewer whose `auth-hello` lacked `dtls-bind-v1`, the PC sends a ctl `{type:"error", code:"dtls-bind-required", message}` and the session ends. Any other missing mandatory cap gets code `cap-missing`. An `auth-hello` without `control-aead-v1` gets nothing, since there is no channel yet, and the session ends. Viewers show each code as a clear message.
 
 **Binding, so a relay cannot splice:**
 
@@ -242,7 +250,7 @@ This PC   Office-PC   ID 7HQ2-K9MX-4RTD-P0ZB   Relay play.example.com (online)
 ```
 
 - Each row is one key. A key seen from more than one client kind or network in the last 30 days expands to its recent connections, so a shared key file is visible.
-- **Edit** opens name and permission checkboxes; "Elevated input" and "Before sign-in" are greyed with a note while their machine switch is off, and changing "Before sign-in" asks for UAC.
+- **Edit** (after phase 2; phase 2 has no rename, the name always comes from the device's `caps`) opens name and permission checkboxes; "Elevated input" and "Before sign-in" are greyed with a note while their machine switch is off, and changing "Before sign-in" asks for UAC.
 - **Revoke** asks once, removes the key, ends its session and syncs the relay list. If the device vouched for others, the same dialog asks whether to revoke them too.
 - **Pair device** shows the code, the QR and the confirmation from pairing at the PC, inside this window.
 - **Allow remote pairing** works without ntfy; ntfy only adds the heads-up. Pending requests appear at the top of the window with the comparison number and **Allow** / **Deny**.
@@ -337,7 +345,7 @@ Verified: repeated generation is byte-identical and matches the staged fixture; 
 
 - **IDs/key files:** SHA-256(raw 32-byte Ed25519 public), first 10 bytes, most-significant-bit-first Crockford base32, uppercase `XXXX-XXXX-XXXX-XXXX`. Ignore input hyphens/case; O→0, I/L→1. Seed: 32 bytes. Plain: `kdf`/`aead` null, `private` = seed. Protected: Argon2id v19, UTF-8 passphrase, m=65536 KiB, t=3, p=1, salt 16 bytes, output 32 bytes; AES-256-GCM nonce 12 bytes, `private` = ciphertext || 16-byte tag.
 - **Key-file AAD:** UTF-8 [RFC 8785 JCS](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON after removing `private` and nested `aead.nonce`; keep `aead.alg`, all other metadata and null `aead`. No trailing newline. The fixture records the AAD string/hex and exercises quotes and non-ASCII UTF-8.
-- **Transcript:** each field is uint32 big-endian byte length || bytes, ordered: `bubbleplay-auth-v1`, relay origin, decimal epoch string, canonical viewer ID, viewer public, canonical PC ID, PC public, viewer nonce, PC nonce, viewer ephemeral X25519 public, PC ephemeral X25519 public. Strings are UTF-8; public keys/nonces are raw 32 bytes. Preserve epoch bytes without numeric coercion.
+- **Transcript:** each field is uint32 big-endian byte length || bytes, ordered: `bubbleplay-auth-v1`, relay origin, epoch string (the `mediaEpoch` bytes as received, opaque ASCII), canonical viewer ID, viewer public, canonical PC ID, PC public, viewer nonce, PC nonce, viewer ephemeral X25519 public, PC ephemeral X25519 public. Strings are UTF-8; public keys/nonces are raw 32 bytes. Preserve epoch bytes without numeric coercion.
 - **Relay proof:** each field is uint32 big-endian byte length || bytes, ordered: UTF-8 `bubbleplay-relay-v1`, UTF-8 role (`host` or `viewer`), UTF-8 relay origin (the same origin form as the transcript), raw 32-byte nonce, UTF-8 canonical device ID, raw 32-byte Ed25519 public key. H = SHA-256(encoding); Ed25519 signs the 32 bytes of H directly. The label inside the encoding is the domain separator; no extra context prefix.
 - **Signatures:** H = SHA-256(transcript). PC signs `bubbleplay-auth-host-v1` || H; viewer signs `bubbleplay-auth-viewer-v1` || H || raw 64-byte PC signature. Ed25519 signs these bytes directly; contexts are raw UTF-8 without length prefixes.
 - **Control:** X25519 shared secret → HKDF-SHA-256, salt H, 32-byte outputs, UTF-8 info `bubbleplay-ctl-v1 viewer-to-pc` / `bubbleplay-ctl-v1 pc-to-viewer`. Per-direction AES-256-GCM nonce: four zero bytes || uint64 big-endian sequence starting at 0. AAD: raw UTF-8 `type`; ciphertext || 16-byte tag. `plaintextUtf8` fixes sample JSON serialization; capability strings are illustrative.
@@ -382,6 +390,8 @@ Decided 2026-10-22 for the Rust relay (`relay-rs/`, lane rust-relay, M2). Consta
 3. The viewer answers `{"type":"register-proof","signature"}`, a relay proof with role `viewer` and the relay's configured public origin, checked with strict Ed25519 verification.
 4. The relay checks admission (below). Only then does it send `hello-ok`, replay the cached capabilities and rotate the epoch. Until admission the socket receives nothing but the challenge, and it neither takes the viewer slot nor causes peer events.
 
+**Peer event to the host.** When the relay admits a viewer and rotates the epoch, it sends the host a plaintext relay-generated `{"type":"peer-joined","mediaEpoch":"<exact hello-ok mediaEpoch string>","pairing":<bool>}`, before the viewer's `hello-ok`. The `mediaEpoch` is an opaque ASCII string (relay-rs: 32 lowercase hex); nobody parses it as a number, and the transcript uses its bytes as received. An `auth-hello` that reaches the host before `peer-joined` is an error: the host ignores it and logs it. A new `peer-joined` resets any handshake in progress.
+
 Media and file sockets keep the phase 1 ticket hello. A browser socket (one with `Origin`) also needs the gate cookie. A socket without `Origin` is native and is judged by the signed hello alone.
 
 **Admission list:**
@@ -396,7 +406,7 @@ Media and file sockets keep the phase 1 ticket hello. A browser socket (one with
 
 - The host sends `{"type":"pair-open","admit":<b64url SHA-256("bubbleplay-pair-admit-v1" || canonical PC ID || code)>}`. It also sends `{"type":"pair-close"}`. The relay consumes both.
 - There is one window per PC. It is kept in memory only, ends 300 s after `pair-open`, and is replaced by a newer `pair-open`. It is removed by `pair-close` or by the host's signalling socket closing.
-- An unlisted viewer adds `pair` (the same hash, computed from the code it scanned or typed) to its hello. After a valid proof, the relay compares the value in constant time.
+- An unlisted viewer adds `pair` (the same hash, computed from the code in the link or typed in) to its hello. After a valid proof, the relay compares the value in constant time.
   - On a match, the window is consumed and the socket is admitted in **pairing mode**: `hello-ok` carries `"pairing":true` and no ticket.
   - Failures are limited to 5 per client prefix per 300 s. After 20 failures against a PC, its window is dropped and the host gets `{"type":"pair-closed"}`. This cap against brute force lets a stranger who knows the PC ID end a pairing window early. The tray then says so, and the user opens a new one.
 - Pairing mode takes the normal viewer slot.
@@ -427,16 +437,17 @@ Binary signalling frames are forwarded from the viewer to the PC only.
 - The relay accepts only the roles `viewer`, `media-viewer` and `file-viewer`. `client`, `media-client` and `file-client` are refused.
 - Input, clipboard and other control travel only inside `ctl`. The plaintext signalling types for them are removed from the allowlist. So are plaintext binary input frames from the viewer, which in WSS mode travel as `ctl` with `kind` `input` and `data` = AEAD(the binary frame). The list of types comes from the host's routes when the commit is made.
 
-**Proposed for the host and client lanes** (the lane's proposals, not settled; the relay forwards these as opaque bounded messages):
+**Settled for the host and client lanes** (approved as written, with these specifics; the relay forwards these as opaque bounded messages):
 
 - *Pairing exchange (3b):*
-  - The code is 10 Crockford base32 characters from the PC's CSPRNG, normalised like IDs.
+  - The code is 10 Crockford base32 characters from the PC's CSPRNG, shown `XXXXX-XXXXX`, normalised like IDs (uppercase, O becomes 0, I and L become 1, dashes and spaces dropped).
   - Pairing reuses `auth-hello`, `auth-host` and `auth-finish`, with `pair-v1` in `caps`.
-  - Each side sends `pair-proof` with `mac` = HMAC-SHA256(HKDF(code, "bubbleplay-pair-v1"), "viewer" or "pc" || H), where H is the transcript hash.
-  - The comparison number is the first 4 bytes of SHA-256("bubbleplay-pair-sas-v1" || H), as big-endian u32 mod 10^6, zero-padded to 6 digits.
-  - The PC ends with `pair-done` or `pair-denied`.
+  - The pair key is K = HKDF-SHA256(ikm = normalised code as ASCII, salt empty, info `bubbleplay-pair-v1`, 32 bytes).
+  - The viewer sends `pair-proof` with `mac` = HMAC-SHA256(K, "viewer" || H). The PC verifies it in constant time, then sends its own `pair-proof` with `mac` = HMAC-SHA256(K, "pc" || H), which the viewer verifies in constant time. A wrong MAC ends the attempt with no number.
+  - The comparison number is the first 4 bytes of SHA-256("bubbleplay-pair-sas-v1" || H), as big-endian u32 mod 10^6, zero-padded to 6 digits. Both sides show it only after both proofs verify.
+  - The PC ends with `pair-done` (after Allow) or `pair-denied`.
 - *Control channel (6):*
-  - The envelope is `{"type":"ctl","kind":<inner type>,"seq","data":<ciphertext || tag>}`. AAD is `kind`, and after decryption `plaintext.type` must equal `kind`.
+  - The envelope is `{"type":"ctl","kind":<inner type>,"seq","data":<ciphertext || tag>}`. AAD is `kind`, and after decryption `plaintext.type` must equal `kind`. For the binary kinds `input` and `cursor` the plaintext is the raw binary frame, and the type check is skipped.
   - The receiver accepts only `seq` equal to the expected value. Any gap, repeat or authentication failure ends the session.
   - Each handshake brings new keys and starts again at `seq` 0.
 - *Caps (8):*
