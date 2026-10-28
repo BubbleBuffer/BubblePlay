@@ -242,7 +242,31 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: gradle
+      # The relay e2e tests (android/app/src/test/.../e2e) run the viewer code against a real bp-relay.
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          # Pin the toolchain for this job only (build01 runners share RUSTUP_HOME).
+          echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
+          export RUSTUP_TOOLCHAIN=1.97.1
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: relay-rs -> target
+      - name: Build bp-relay for the e2e tests
+        working-directory: relay-rs
+        run: |
+          cargo build --locked -p bp-relay-server --bin bp-relay
+          echo "BP_RELAY_SERVER_BIN=$PWD/target/debug/bp-relay" >> "$GITHUB_ENV"
       - name: Gradle unit tests and lint
         working-directory: android
+        env:
+          # A missing relay binary fails the e2e tests instead of skipping them.
+          BP_E2E_REQUIRED: "1"
         # android/gradlew is committed without the executable bit (mode 100644), so run it via bash.
         run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug
