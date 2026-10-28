@@ -178,18 +178,9 @@ class Handshake private constructor(
         val signature: ByteArray,
     )
 
-    private fun transcript(host: Host): ByteArray = AuthCrypto.lengthPrefixed(
-        AuthCrypto.utf8("bubbleplay-auth-v1"),
-        AuthCrypto.utf8(relayOrigin),
-        AuthCrypto.utf8(sessionEpoch),
-        AuthCrypto.utf8(key.id),
-        key.publicKey,
-        AuthCrypto.utf8(host.id),
-        host.public,
-        nonce,
-        host.nonce,
-        ephemeralPublic,
-        host.ephemeral,
+    private fun transcript(host: Host): ByteArray = transcriptBytes(
+        relayOrigin, sessionEpoch, key.id, key.publicKey, host.id, host.public,
+        nonce, host.nonce, ephemeralPublic, host.ephemeral,
     )
 
     companion object {
@@ -220,6 +211,32 @@ class Handshake private constructor(
             val ephemeral = ByteArray(32).also(random::nextBytes)
             return Handshake(key, relayOrigin, sessionEpoch, mode, nonce, ephemeral, caps)
         }
+
+        /** The phase 0 transcript bytes; H is their SHA-256. Internal so test PCs build the same bytes. */
+        internal fun transcriptBytes(
+            relayOrigin: String,
+            sessionEpoch: String,
+            viewerId: String,
+            viewerPublic: ByteArray,
+            pcId: String,
+            pcPublic: ByteArray,
+            viewerNonce: ByteArray,
+            pcNonce: ByteArray,
+            viewerEphemeral: ByteArray,
+            pcEphemeral: ByteArray,
+        ): ByteArray = AuthCrypto.lengthPrefixed(
+            AuthCrypto.utf8("bubbleplay-auth-v1"),
+            AuthCrypto.utf8(relayOrigin),
+            AuthCrypto.utf8(sessionEpoch),
+            AuthCrypto.utf8(viewerId),
+            viewerPublic,
+            AuthCrypto.utf8(pcId),
+            pcPublic,
+            viewerNonce,
+            pcNonce,
+            viewerEphemeral,
+            pcEphemeral,
+        )
 
         /** "bubbleplay-auth-host-v1" || H: what the PC signs. */
         fun pcSignedBytes(transcriptHash: ByteArray): ByteArray =
