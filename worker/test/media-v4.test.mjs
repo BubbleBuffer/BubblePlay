@@ -225,9 +225,10 @@ test("receiver input stays on the signaling socket and the media socket carries 
     assert.ok(start >= 0, name);
     return source.slice(start, source.indexOf("\n}\n", start));
   };
-  // Input goes to the RTC data channel or, under WSS, to the signaling socket.
+  // Input goes to the RTC data channel or, under WSS, sealed as ctl "input" on the signaling socket.
   const sendInput = body("sendInput");
-  assert.match(sendInput, /ws\.send\(data\)/);
+  assert.match(sendInput, /authenticatedSession\.sendInput\(data\)/);
+  assert.doesNotMatch(sendInput, /ws\.send\(data\)/);
   assert.doesNotMatch(sendInput, /wssV4|sendWssV4/);
   assert.match(body("inputControlState"), /ws\.bufferedAmount/);
   assert.doesNotMatch(body("inputControlState"), /wssV4/);
@@ -235,8 +236,8 @@ test("receiver input stays on the signaling socket and the media socket carries 
   const calls = [...source.matchAll(/sendWssV4\(([^)]*)/g)].map(match => match[1]).filter(arg => arg !== "text");
   assert.equal(calls.length, 3);
   for (const arg of calls) assert.match(arg, /^(ackMessageV4|keyframeMessageV4|'\{"type":"ping"\}')/);
-  // Shared media sender, plus the media hello with or without a signaling ticket.
-  assert.equal([...source.matchAll(/(?<!ws)\bsocket\.send\(/g)].length, 3);
-  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-viewer", ticket: signalingTicket \}\)\)/);
-  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-viewer" \}\)\)/);
+  // Shared media sender, plus the media hello, which always carries its ticket (phase 2).
+  assert.equal([...source.matchAll(/(?<!ws)\bsocket\.send\(/g)].length, 2);
+  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-viewer", ticket \}\)\)/);
+  assert.doesNotMatch(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-viewer" \}\)\)/);
 });

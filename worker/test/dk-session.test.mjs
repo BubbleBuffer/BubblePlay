@@ -287,7 +287,8 @@ test("WSS requires control-aead only, starts without bind and wraps exact binary
   const input = new Uint8Array([0, 1, 2, 3]);
   assert.equal(h.session.sendInput(input), true);
   input.fill(255);
-  await flush();
+  // Sealing is async WebCrypto; wait for the envelope rather than a fixed number of turns.
+  for (let i = 0; i < 50 && h.events.sent.at(-1)?.kind !== "input"; i++) await flush();
   const envelope = h.events.sent.at(-1);
   assert.equal(envelope.kind, "input");
   assert.equal(envelope.seq, 1);
