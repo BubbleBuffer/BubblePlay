@@ -3,16 +3,15 @@
 //! The BPA1 packet cases describe the audio frame header, which the viewer's
 //! decoder checks. The relay only relays host frames longer than the 28-byte
 //! header, so for the packets the test asserts that size rule (and that a
-//! viewer can never send frames). The signaling texts are validated here.
+//! viewer can never send frames).
 
 mod common;
 
-use bp_relay_core::{Side, validate_media_binary, validate_signal_text};
+use bp_relay_core::{Side, validate_media_binary};
 use common::*;
 use serde_json::Value;
 
 const HEADER: usize = 28;
-const EPOCH: &str = "0123456789abcdef0123456789abcdef";
 
 #[test]
 fn contract_audio_packets_follow_the_relay_size_rule() {
@@ -41,29 +40,4 @@ fn contract_audio_packets_follow_the_relay_size_rule() {
             "{name}"
         );
     }
-}
-
-#[test]
-fn contract_audio_host_capabilities() {
-    let contract = fixture("audio-contract.json");
-    let text = as_str(&contract["signaling"]["hostCapabilities"], "text");
-    assert!(accepted("host", text, EPOCH), "{text}");
-}
-
-#[test]
-fn contract_audio_wss_start_is_a_media_control_from_the_viewer() {
-    let contract = fixture("audio-contract.json");
-    let text = as_str(&contract["signaling"]["wssStart"], "text");
-    assert!(
-        validate_signal_text(Side::Viewer, text, EPOCH).is_ok(),
-        "{text}"
-    );
-    assert!(
-        validate_signal_text(Side::Viewer, text, "ffffffffffffffffffffffffffffffff").is_err(),
-        "stale epoch accepted: {text}"
-    );
-    assert!(
-        validate_signal_text(Side::Host, text, EPOCH).is_err(),
-        "viewer message accepted from host: {text}"
-    );
 }

@@ -29,8 +29,8 @@ use state::{Conn, Kind, Phase, Role, Room, key_for, read_limit};
 
 pub use pcs::{MAX_PCS, PcRecord, PcTable};
 pub use types::{
-    Action, AdminError, CachedCapabilities, ConnId, ConnPhase, ConnSnapshot, CoreConfig, PcListing,
-    Reject, Route, SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig, UpgradeRequest,
+    Action, AdminError, ConnId, ConnPhase, ConnSnapshot, CoreConfig, PcListing, Reject, Route,
+    SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig, UpgradeRequest,
 };
 
 /// The routing state for one relay.
@@ -355,9 +355,6 @@ impl Relay {
             self.peers.remove(&key);
             if conn.role == Role::Viewer {
                 self.forget_viewer_state(&conn, out);
-            }
-            if let (Role::Host, Some(room)) = (conn.role, self.rooms.get_mut(&conn.pc)) {
-                room.cached.clear();
             }
             if conn.role == Role::Host {
                 // The host's signalling socket closing removes its pairing window.

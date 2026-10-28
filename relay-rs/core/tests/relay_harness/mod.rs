@@ -226,7 +226,7 @@ impl Harness {
     }
 
     /// Opens a data socket and sends its hello with `role` (for example
-    /// "media-client") and `ticket`. `route` picks the socket family.
+    /// "media-viewer") and `ticket`. `route` picks the socket family.
     pub fn data_hello(
         &mut self,
         route: Route,

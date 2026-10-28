@@ -1,7 +1,5 @@
 //! Internal state: sockets, peers, rooms and the route mapping.
 
-use std::collections::BTreeMap;
-
 use bp_device_key::DeviceId;
 
 use super::types::Route;
@@ -16,9 +14,8 @@ pub(crate) enum Kind {
     File,
 }
 
-/// The role a socket plays. Go's role strings: "host" and "client" are
-/// `Host` and `Viewer` here. The hello accepts the viewer's new names as well;
-/// see `hello_roles`.
+/// The role a socket plays. Go's host and client roles are `Host` and
+/// `Viewer` here; the hello accepts only the phase-2 names (see `hello_roles`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Role {
     Host,
@@ -66,18 +63,18 @@ impl Role {
         }
     }
 
-    /// The hello `role` strings this socket accepts: the viewer's new name first, then the old
-    /// name it replaces. The old names ("client", "media-client", "file-client") are the cutover
-    /// aliases. The cutover removes them here, and no other code matches a hello role string.
+    /// The hello `role` strings this socket accepts. The viewer roles are
+    /// `viewer`, `media-viewer` and `file-viewer`; any other name is refused
+    /// as an unknown role.
     pub(crate) fn hello_roles(self) -> &'static [&'static str] {
         match self {
             Role::Host => &["host"],
-            Role::Viewer => &["viewer", "client"],
+            Role::Viewer => &["viewer"],
             Role::VersionProbe => &["version-probe"],
             Role::MediaHost => &["media-host"],
-            Role::MediaViewer => &["media-viewer", "media-client"],
+            Role::MediaViewer => &["media-viewer"],
             Role::FileHost => &["file-host"],
-            Role::FileViewer => &["file-viewer", "file-client"],
+            Role::FileViewer => &["file-viewer"],
         }
     }
 
@@ -216,8 +213,6 @@ pub(crate) struct Pending {
 pub(crate) struct Room {
     pub current_epoch: Option<String>,
     pub pending: Vec<Pending>,
-    /// Cached host-capabilities and input-capabilities, by message type.
-    pub cached: BTreeMap<&'static str, String>,
 }
 
 /// The read limit of a socket family, in bytes.
@@ -234,16 +229,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn viewer_roles_take_the_new_name_and_the_old_one() {
-        assert_eq!(Role::Viewer.hello_roles(), &["viewer", "client"]);
-        assert_eq!(
-            Role::MediaViewer.hello_roles(),
-            &["media-viewer", "media-client"]
-        );
-        assert_eq!(
-            Role::FileViewer.hello_roles(),
-            &["file-viewer", "file-client"]
-        );
+    fn viewer_roles_are_the_phase_two_names() {
+        assert_eq!(Role::Viewer.hello_roles(), &["viewer"]);
+        assert_eq!(Role::MediaViewer.hello_roles(), &["media-viewer"]);
+        assert_eq!(Role::FileViewer.hello_roles(), &["file-viewer"]);
         assert_eq!(Role::MediaHost.hello_roles(), &["media-host"]);
+        assert!(!Role::Viewer.hello_roles().contains(&"client"));
+        assert!(!Role::MediaViewer.hello_roles().contains(&"media-client"));
+        assert!(!Role::FileViewer.hello_roles().contains(&"file-client"));
     }
 }

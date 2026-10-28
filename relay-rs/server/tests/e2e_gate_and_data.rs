@@ -221,7 +221,7 @@ async fn e2e_media_forwards_both_ways() {
         "/media-ws",
         &s.pc,
         &s.epoch,
-        "media-client",
+        "media-viewer",
         &s.viewer_ticket,
         Some(s.cookie.as_str()),
     )
@@ -259,7 +259,7 @@ async fn e2e_file_socket_forwards_both_ways_and_answers_ping() {
         "/file-ws",
         &s.pc,
         &s.epoch,
-        "file-client",
+        "file-viewer",
         &s.viewer_ticket,
         Some(s.cookie.as_str()),
     )
@@ -307,7 +307,7 @@ async fn e2e_wrong_ticket_closes_1008_with_empty_reason() {
     .unwrap();
     send_json(
         &mut viewer_side,
-        json!({ "type": "hello", "role": "media-client", "ticket": bogus }),
+        json!({ "type": "hello", "role": "media-viewer", "ticket": bogus }),
     )
     .await;
     assert_eq!(expect_close(&mut viewer_side).await, (1008, String::new()));
@@ -339,7 +339,7 @@ async fn e2e_new_viewer_epoch_evicts_stale_media_and_404s_old_epoch() {
         "/media-ws",
         &pc,
         &epoch1,
-        "media-client",
+        "media-viewer",
         first_ok["ticket"].as_str().unwrap(),
         Some(cookie.as_str()),
     )
@@ -387,7 +387,7 @@ async fn e2e_slow_peer_is_closed_with_1013() {
         "/media-ws",
         &s.pc,
         &s.epoch,
-        "media-client",
+        "media-viewer",
         &s.viewer_ticket,
         Some(s.cookie.as_str()),
     )
@@ -500,7 +500,7 @@ async fn e2e_pair_with_cookie_serves_the_page_and_nothing_below_it() {
     assert_eq!(below.status(), 404);
 }
 
-/// A media round trip with the viewer's hello role string as given, old name or new.
+/// A media round trip with the viewer's hello role string as given.
 async fn media_round_trip(viewer_role: &str, seed: u8) {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
@@ -537,14 +537,38 @@ async fn media_round_trip(viewer_role: &str, seed: u8) {
     assert_eq!(keyframe["reason"], viewer_role);
 }
 
-/// The media viewer's new name takes `/media-ws` the same way its old name does.
-#[tokio::test]
-async fn e2e_media_viewer_role_names_both_forward() {
-    media_round_trip("media-client", 30).await;
-    media_round_trip("media-viewer", 31).await;
+/// The old data role names are refused after the hello, with the reason an invalid hello.
+async fn old_data_role_is_refused(path: &str, old: &str, seed: u8) {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let s = session(&server, &env, seed).await;
+    let mut ws = connect(
+        server.addr,
+        &format!("{path}?pc={}&epoch={}", s.pc, s.epoch),
+        Some(ORIGIN),
+        Some(s.cookie.as_str()),
+    )
+    .await
+    .unwrap();
+    send_json(
+        &mut ws,
+        json!({ "type": "hello", "role": old, "ticket": s.viewer_ticket }),
+    )
+    .await;
+    assert_eq!(
+        expect_close(&mut ws).await,
+        (1008, "invalid hello".to_string())
+    );
 }
 
-/// A file round trip with the viewer's hello role string as given, old name or new.
+/// The media viewer takes `/media-ws` as `media-viewer`; the old `media-client` is refused.
+#[tokio::test]
+async fn e2e_media_viewer_takes_media_ws_and_the_old_name_is_refused() {
+    media_round_trip("media-viewer", 30).await;
+    old_data_role_is_refused("/media-ws", "media-client", 31).await;
+}
+
+/// A file round trip with the viewer's hello role string as given.
 async fn file_round_trip(viewer_role: &str, seed: u8) {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
@@ -579,33 +603,53 @@ async fn file_round_trip(viewer_role: &str, seed: u8) {
     assert_eq!(next_json_of(&mut file_client, "pong").await["type"], "pong");
 }
 
-/// The file viewer's new name takes `/file-ws` the same way its old name does.
+/// The file viewer takes `/file-ws` as `file-viewer`; the old `file-client` is refused.
 #[tokio::test]
-async fn e2e_file_viewer_role_names_both_forward() {
-    file_round_trip("file-client", 32).await;
-    file_round_trip("file-viewer", 33).await;
+async fn e2e_file_viewer_takes_file_ws_and_the_old_name_is_refused() {
+    file_round_trip("file-viewer", 32).await;
+    old_data_role_is_refused("/file-ws", "file-client", 33).await;
 }
 
-/// The signalling viewer takes `/ws` under its new name `viewer` and its old name `client`.
+/// Only `viewer` takes `/ws`. The old `client` is refused on the hello, before any challenge.
 #[tokio::test]
-async fn e2e_signal_viewer_role_names_both_take_ws() {
+async fn e2e_signal_viewer_takes_ws_and_the_old_name_is_refused() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let cookie = browser_cookie(&server, &env).await;
-    let mut hosts = Vec::new();
-    for (seed, role) in [(34u8, "client"), (35u8, "viewer")] {
-        let host = identity(seed);
-        let (host_ws, _) = register_host(&server, &host, Some(TOKEN)).await;
-        hosts.push(host_ws);
-        let mut ws = connect(
-            server.addr,
-            &format!("/ws?pc={}", pc_id(&host)),
-            Some(ORIGIN),
-            Some(cookie.as_str()),
-        )
-        .await
-        .unwrap();
-        let ok = viewer_join_as(&mut ws, role, &viewer_identity(), false, None).await;
-        assert!(ok["mediaEpoch"].is_string(), "{role} takes /ws");
-    }
+    let old_host = identity(34);
+    let (_old_host_ws, _) = register_host(&server, &old_host, Some(TOKEN)).await;
+    let mut old = connect(
+        server.addr,
+        &format!("/ws?pc={}", pc_id(&old_host)),
+        Some(ORIGIN),
+        Some(cookie.as_str()),
+    )
+    .await
+    .unwrap();
+    let viewer = viewer_identity();
+    send_json(
+        &mut old,
+        json!({
+            "type": "hello",
+            "role": "client",
+            "id": viewer.id().to_string(),
+            "public": b64(&viewer.public_key()),
+            "turn": false,
+        }),
+    )
+    .await;
+    assert_eq!(expect_close(&mut old).await, (1008, String::new()));
+
+    let host = identity(35);
+    let (_host_ws, _) = register_host(&server, &host, Some(TOKEN)).await;
+    let mut ws = connect(
+        server.addr,
+        &format!("/ws?pc={}", pc_id(&host)),
+        Some(ORIGIN),
+        Some(cookie.as_str()),
+    )
+    .await
+    .unwrap();
+    let ok = viewer_join_as(&mut ws, "viewer", &viewer_identity(), false, None).await;
+    assert!(ok["mediaEpoch"].is_string(), "viewer takes /ws");
 }

@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 
 use bp_relay_core::{
-    ATTACHMENT_MAX, Action, CachedCapabilities, ConnId, ConnPhase, ConnSnapshot, CoreConfig, Relay,
-    Route, SnapshotPairWindow, SnapshotTicket,
+    ATTACHMENT_MAX, Action, ConnId, ConnPhase, ConnSnapshot, CoreConfig, Relay, Route,
+    SnapshotPairWindow, SnapshotTicket,
 };
 use relay_harness::*;
 use serde_json::json;
@@ -18,8 +18,9 @@ use serde_json::json;
 const PAIR: [u8; 32] = [42; 32];
 const WRONG: [u8; 32] = [43; 32];
 const OFFER: &str = r#"{"type":"offer","sdp":"v=0"}"#;
-const ANSWER: &str = r#"{"type":"answer","sdp":"v=0"}"#;
-const HOST_CAPS: &str = r#"{"type":"host-capabilities","serviceMode":false,"coldBoot":false,"secureDesktop":false,"secureText":false}"#;
+/// A host ctl: forwarded to the viewer.
+const HOST_CTL: &str = r#"{"type":"ctl","kind":"sdp-answer","seq":0,"data":"AAAA"}"#;
+/// A removed type from the host: dropped, and it changes no state.
 const HOST_CAPS_SERVICE: &str = r#"{"type":"host-capabilities","serviceMode":true,"coldBoot":false,"secureDesktop":false,"secureText":false}"#;
 /// The idle step: a quarter of the 90 s idle timeout.
 const STEP_MS: u64 = 22_500;
@@ -41,10 +42,13 @@ struct Ids {
 #[derive(Clone, Copy, Debug)]
 enum Op {
     Ping,
+    /// A removed type from the viewer: dropped.
     ViewerOffer,
-    HostAnswer,
+    /// A host ctl: forwarded to the viewer.
+    HostCtl,
     MediaFrame,
-    HostCaps,
+    /// A removed type from the host: dropped.
+    RemovedHostCaps,
     Advance(u64),
     Close(ConnId),
 }
@@ -90,9 +94,9 @@ fn step(h: &mut Harness, attached: &mut Attached, ids: Ids, op: Op) -> Vec<Actio
     let actions = match op {
         Op::Ping => ping(h, ids.host),
         Op::ViewerOffer => h.raw(ids.viewer, OFFER),
-        Op::HostAnswer => h.raw(ids.host, ANSWER),
+        Op::HostCtl => h.raw(ids.host, HOST_CTL),
         Op::MediaFrame => h.binary(ids.media_host, &[7u8; 29]),
-        Op::HostCaps => h.raw(ids.host, HOST_CAPS_SERVICE),
+        Op::RemovedHostCaps => h.raw(ids.host, HOST_CAPS_SERVICE),
         Op::Advance(ms) => h.advance(ms),
         Op::Close(id) => {
             attached.remove(&id);
@@ -150,8 +154,7 @@ fn start_with(
     (h, host, pc, ticket)
 }
 
-/// The lockstep setup: a registered host with cached capabilities and an open
-/// pairing window, two refused strangers, an admitted viewer and a media pair.
+/// The lockstep setup: a registered host with an open pairing window, two refused strangers, an admitted viewer and a media pair.
 fn setup(attached: &mut Attached) -> (Harness, Ids) {
     let (mut h, host, pc, ticket) = start_with(|_| {}, attached);
     let actions = h.text(host, &json!({"type": "pair-open", "admit": b64(&PAIR)}));
@@ -160,8 +163,6 @@ fn setup(attached: &mut Attached) -> (Harness, Ids) {
         let (_, actions) = h.viewer_join(&identity(201), &pc, false, Some(&WRONG));
         settle(&mut h, attached, actions);
     }
-    let actions = h.raw(host, HOST_CAPS);
-    settle(&mut h, attached, actions);
     let (viewer, actions) = h.viewer_hello(&pc, false);
     settle(&mut h, attached, actions);
     let (media_host, actions) = h.data_hello(
@@ -176,7 +177,7 @@ fn setup(attached: &mut Attached) -> (Harness, Ids) {
         Route::MediaWs,
         &pc,
         &viewer.epoch,
-        "media-client",
+        "media-viewer",
         &viewer.ticket,
     );
     settle(&mut h, attached, actions);
@@ -197,10 +198,10 @@ fn m3_rehydrated_relay_answers_like_the_one_it_came_from() {
         let script: [Op; SCRIPT_LEN] = [
             Op::Ping,
             Op::ViewerOffer,
-            Op::HostAnswer,
+            Op::HostCtl,
             Op::MediaFrame,
             Op::Advance(1_000),
-            Op::HostCaps,
+            Op::RemovedHostCaps,
             Op::Close(ids.viewer),
         ];
         for op in &script[..cut] {
@@ -382,16 +383,6 @@ fn m3_worst_case_attachment_fits_the_limit() {
             hash: [0xff; 32],
             expires_ms: u64::MAX,
         }),
-        cached: vec![
-            CachedCapabilities {
-                kind: "host-capabilities".to_owned(),
-                raw: vec![0xff; 512],
-            },
-            CachedCapabilities {
-                kind: "input-capabilities".to_owned(),
-                raw: vec![0xff; 256],
-            },
-        ],
         pair_window: Some(SnapshotPairWindow {
             admit: [0xff; 32],
             expires_ms: u64::MAX,

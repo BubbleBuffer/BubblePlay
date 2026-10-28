@@ -198,18 +198,6 @@ pub struct SnapshotPairWindow {
     pub failures: u32,
 }
 
-/// The host's cached `host-capabilities` or `input-capabilities` text, which
-/// is replayed to viewers that join later.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CachedCapabilities {
-    /// `host-capabilities` or `input-capabilities`.
-    pub kind: String,
-    /// The raw message text. Base64url in the serialized form, so JSON
-    /// escaping of quotes cannot push the attachment past `ATTACHMENT_MAX`.
-    #[serde(with = "b64::any")]
-    pub raw: Vec<u8>,
-}
-
 /// What a socket needs to come back after the Durable Object hibernates. The
 /// adapter stores one per socket in its attachment (serialized as JSON) and
 /// passes them all to `Relay::rehydrate`. Pending viewer messages, the
@@ -236,9 +224,6 @@ pub struct ConnSnapshot {
     /// The signalling ticket, if one is held.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<SnapshotTicket>,
-    /// The host's cached capabilities for viewers. Host sockets only.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cached: Vec<CachedCapabilities>,
     /// The host's open pairing window. Host sockets only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pair_window: Option<SnapshotPairWindow>,

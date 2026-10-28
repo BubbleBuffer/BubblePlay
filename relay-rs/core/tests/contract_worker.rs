@@ -8,20 +8,6 @@ use bp_relay_core::{FileKind, Side, validate_file_binary, validate_media_binary}
 use common::*;
 
 #[test]
-fn contract_worker_signals_are_accepted() {
-    let fixture = test_data("worker-contract.json");
-    let epoch = as_str(&fixture, "epoch");
-    for signal in as_array(&fixture, "signals") {
-        let role = as_str(signal, "role");
-        let text = compact(&signal["message"]);
-        assert!(
-            accepted(role, &text, epoch),
-            "{role} producer shape rejected: {text}"
-        );
-    }
-}
-
-#[test]
 fn contract_worker_file_packets_are_accepted() {
     let fixture = test_data("worker-contract.json");
     for (index, value) in as_array(&fixture, "files").iter().enumerate() {

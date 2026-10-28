@@ -422,7 +422,7 @@ pub async fn data_socket(
     ticket: &str,
     viewer_cookie: Option<&str>,
 ) -> (Ws, Value) {
-    let viewer_side = role.ends_with("client") || role.ends_with("viewer");
+    let viewer_side = role.ends_with("viewer");
     let (origin, cookie) = if viewer_side {
         (Some(ORIGIN), viewer_cookie)
     } else {

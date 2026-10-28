@@ -323,7 +323,6 @@ impl Relay {
         }
         self.peers.insert(key, id);
         let room = self.rooms.entry(pc.to_owned()).or_default();
-        room.cached.clear();
         let pending = std::mem::take(&mut room.pending);
         self.make_live(id, now_ms);
         let ticket = self.issue_ticket(id, now_ms, rng);
@@ -375,10 +374,9 @@ impl Relay {
 
     /// Admits a viewer that has passed its proof and its admission check. It
     /// rotates the epoch, drops the old viewer's stale data sockets and sends
-    /// hello-ok, then replays the cached host capabilities (Go
-    /// server.go:553-600). A pairing-mode viewer gets `pairing: true` and no
-    /// ticket, and no replay. A host that is connected is told first, with
-    /// `peer-joined` carrying the same epoch and the pairing flag.
+    /// hello-ok. A pairing-mode viewer gets `pairing: true` and no ticket. A
+    /// host that is connected is told first, with `peer-joined` carrying the
+    /// same epoch and the pairing flag.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn viewer_admit(
         &mut self,
@@ -449,17 +447,6 @@ impl Relay {
             hello["pairing"] = json!(true);
         }
         self.send_text(id, hello.to_string(), out);
-        if pairing {
-            return;
-        }
-        let cached: Vec<String> = self
-            .rooms
-            .get(&pc)
-            .map(|r| r.cached.values().cloned().collect())
-            .unwrap_or_default();
-        for raw in cached {
-            self.send_text(id, raw, out);
-        }
     }
 
     /// A media or file socket's hello: checks the ticket and the epoch, then

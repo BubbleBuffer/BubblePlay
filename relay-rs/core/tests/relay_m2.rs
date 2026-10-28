@@ -908,23 +908,6 @@ fn m2_pairing_viewer_offer_is_not_buffered_for_the_next_host() {
     );
 }
 
-#[test]
-fn m2_listed_viewer_offer_is_buffered_while_the_host_is_away() {
-    // The control for the test above: a listed viewer's offer is held and
-    // flushed to the host that registers next.
-    let mut h = Harness::new();
-    let host = host_up(&mut h);
-    let (v, _) = h.viewer_hello(&host.pc, false);
-    h.close(host.id);
-    h.text(v.id, &json!({"type": "offer", "sdp": "v=0"}));
-    let (new_host, actions) = reregister(&mut h, &identity(1));
-    assert!(
-        sent_types(&actions, new_host)
-            .iter()
-            .any(|t| t.as_str() == "offer")
-    );
-}
-
 // ------------------------------------------------------------- allowlist
 
 #[test]
@@ -1053,4 +1036,121 @@ fn m2_ctl_data_must_be_base64url() {
 fn m2_ctl_is_accepted_from_both_sides() {
     accepted(Side::Viewer, &ctl_msg(0, ""));
     accepted(Side::Host, &ctl_msg(0, ""));
+}
+
+// ------------------------------------------- phase-2 roles and the /ws allowlist
+
+#[test]
+fn m2_old_viewer_role_names_are_refused_on_the_signalling_socket() {
+    for old in ["client", "media-client", "file-client"] {
+        hello_is_refused(|hello| hello["role"] = json!(old));
+    }
+}
+
+#[test]
+fn m2_old_data_role_names_are_refused() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let viewer = h.open_viewer(&host.pc);
+    let cases = [
+        (Route::MediaWs, "media-client"),
+        (Route::FileWs, "file-client"),
+    ];
+    for (route, old) in cases {
+        let (id, actions) = h.data_hello(route, &host.pc, &viewer.epoch, old, &viewer.ticket);
+        assert_eq!(
+            closed(&actions, id),
+            Some((1008, "invalid hello".to_owned())),
+            "{old} must be refused"
+        );
+    }
+}
+
+#[test]
+fn m2_allowlisted_viewer_messages_are_forwarded_to_the_host() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let viewer = h.open_viewer(&host.pc);
+    let messages = [
+        auth_hello_msg(201),
+        json!({"type": "auth-finish", "signature": b64(&[4u8; 64])}),
+        json!({"type": "auth-bind", "signature": b64(&[3u8; 64])}),
+        json!({"type": "pair-proof", "mac": b64(&[7u8; 32])}),
+        ctl_msg(0, "AAAA"),
+    ];
+    for msg in messages {
+        let kind = msg["type"].as_str().expect("type").to_owned();
+        let out = h.text(viewer.id, &msg);
+        assert_eq!(
+            sent_types(&out, host.id),
+            vec![kind.clone()],
+            "viewer to host: {kind}"
+        );
+        assert!(closed(&out, viewer.id).is_none(), "{kind} keeps the viewer");
+    }
+}
+
+#[test]
+fn m2_allowlisted_host_messages_are_forwarded_to_the_viewer() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let viewer = h.open_viewer(&host.pc);
+    let messages = [
+        auth_host_msg(),
+        json!({"type": "auth-bind", "signature": b64(&[3u8; 64])}),
+        json!({"type": "pair-proof", "mac": b64(&[7u8; 32])}),
+        json!({"type": "pair-done"}),
+        json!({"type": "pair-denied"}),
+        ctl_msg(1, "AAAA"),
+    ];
+    for msg in messages {
+        let kind = msg["type"].as_str().expect("type").to_owned();
+        let out = h.text(host.id, &msg);
+        assert_eq!(
+            sent_types(&out, viewer.id),
+            vec![kind.clone()],
+            "host to viewer: {kind}"
+        );
+        assert!(closed(&out, host.id).is_none(), "{kind} keeps the host");
+    }
+}
+
+#[test]
+fn m2_removed_types_are_dropped_in_both_directions() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let viewer = h.open_viewer(&host.pc);
+    let removed = [
+        json!({"type": "offer", "sdp": "v=0"}),
+        json!({"type": "ice", "candidate": "candidate:1"}),
+        json!({"type": "host-capabilities", "viewerAudio": true}),
+        json!({"type": "input", "data": "AAAA"}),
+        json!({"type": "clipboard", "text": "x"}),
+    ];
+    for msg in removed {
+        let kind = msg["type"].as_str().expect("type").to_owned();
+        let out = h.text(viewer.id, &msg);
+        assert!(
+            sent_text(&out, host.id).is_empty(),
+            "viewer to host: {kind}"
+        );
+        assert!(closed(&out, viewer.id).is_none(), "{kind} keeps the viewer");
+        let out = h.text(host.id, &msg);
+        assert!(
+            sent_text(&out, viewer.id).is_empty(),
+            "host to viewer: {kind}"
+        );
+        assert!(closed(&out, host.id).is_none(), "{kind} keeps the host");
+    }
+}
+
+#[test]
+fn m2_pairing_viewer_ctl_is_not_forwarded() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    send_pair_open(&mut h, host.id, &PAIR_VALUE);
+    let (p, _) = h.viewer_join(&stranger(), &host.pc, false, Some(&PAIR_VALUE));
+    let actions = h.text(p, &ctl_msg(0, "AAAA"));
+    assert!(sent_text(&actions, host.id).is_empty());
+    assert!(closed(&actions, p).is_none());
 }

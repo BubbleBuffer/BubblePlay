@@ -288,6 +288,39 @@ test('m3 pairing viewer auth messages are forwarded to the host and its offers a
   assert.equal(back.type, 'auth-host');
 });
 
+test('m3 the old media and file role names are refused with invalid hello', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const host = identity(72);
+  await registerHost(relay.port, host);
+  const { socket: viewer, ok } = await viewerJoin(relay.port, host.id);
+  for (const [target, role] of [['/media-ws', 'media-client'], ['/file-ws', 'file-client']]) {
+    const socket = await openOk(relay.port, `${target}?pc=${host.id}&epoch=${ok.mediaEpoch}`);
+    socket.sendJson({ type: 'hello', role, ticket: ok.ticket });
+    assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: 'invalid hello' });
+  }
+  viewer.close();
+});
+
+test('m3 a viewer offer never reaches an admitted host, and the ctl after it does', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const host = identity(73);
+  const { socket: hostSocket } = await registerHost(relay.port, host);
+  const { socket: viewer } = await viewerJoin(relay.port, host.id);
+  await hostSocket.nextJson('peer-joined', 10_000);
+
+  viewer.sendJson({ type: 'offer', sdp: 'v=0' });
+  viewer.sendJson({ type: 'ctl', kind: 'input', seq: 7, data: '' });
+  const seen = [];
+  for (;;) {
+    const msg = JSON.parse(await hostSocket.nextText(10_000));
+    seen.push(msg.type);
+    if (msg.type === 'ctl') {
+      assert.equal(msg.seq, 7);
+      break;
+    }
+  }
+  assert.ok(!seen.includes('offer'), `the offer must not reach the host: ${seen.join(', ')}`);
+  viewer.close();
+});
+
 // Ticket sockets: native e2e_gate_and_data.rs and e2e_m2.rs.
 
 test('m3 a wrong ticket closes both media sockets 1008 with an empty reason', { timeout: CASE_TIMEOUT_MS }, async () => {
@@ -301,7 +334,7 @@ test('m3 a wrong ticket closes both media sockets 1008 with an empty reason', { 
   assert.deepEqual(await hostMedia.expectClose(10_000), { code: 1008, reason: '' });
 
   const viewerMedia = await openOk(relay.port, `/media-ws?pc=${host.id}&epoch=${ok.mediaEpoch}`);
-  viewerMedia.sendJson({ type: 'hello', role: 'media-client', ticket: bogus });
+  viewerMedia.sendJson({ type: 'hello', role: 'media-viewer', ticket: bogus });
   assert.deepEqual(await viewerMedia.expectClose(10_000), { code: 1008, reason: '' });
   viewer.close();
 });
@@ -311,7 +344,7 @@ test('m3 an admitted viewer media ticket opens a working media socket', { timeou
   await registerHost(relay.port, host);
   const { ok } = await viewerJoin(relay.port, host.id);
   const media = await openOk(relay.port, `/media-ws?pc=${host.id}&epoch=${ok.mediaEpoch}`);
-  media.sendJson({ type: 'hello', role: 'media-client', ticket: ok.ticket });
+  media.sendJson({ type: 'hello', role: 'media-viewer', ticket: ok.ticket });
   const mediaOk = await media.nextJson('hello-ok', 10_000);
   assert.equal(mediaOk.type, 'hello-ok');
   assert.equal(typeof mediaOk.registeredAtMs, 'number');
@@ -325,7 +358,7 @@ test('m3 media frames forward host to viewer and keyframe requests forward viewe
   const { socket: viewer, ok: viewerOk } = await viewerJoin(relay.port, host.id);
   const epoch = viewerOk.mediaEpoch;
   const hostMedia = await dataSocket(relay.port, '/host-media-ws', host.id, epoch, 'media-host', hostOk.ticket);
-  const viewerMedia = await dataSocket(relay.port, '/media-ws', host.id, epoch, 'media-client', viewerOk.ticket);
+  const viewerMedia = await dataSocket(relay.port, '/media-ws', host.id, epoch, 'media-viewer', viewerOk.ticket);
 
   hostMedia.socket.sendBinary(Buffer.alloc(64, 9));
   assert.deepEqual(await viewerMedia.socket.nextBinary(10_000), Buffer.alloc(64, 9));
@@ -342,7 +375,7 @@ test('m3 file socket forwards both ways and answers the exact ping text', { time
   const { socket: viewer, ok: viewerOk } = await viewerJoin(relay.port, host.id);
   const epoch = viewerOk.mediaEpoch;
   const fileHost = await dataSocket(relay.port, '/host-file-ws', host.id, epoch, 'file-host', hostOk.ticket);
-  const fileClient = await dataSocket(relay.port, '/file-ws', host.id, epoch, 'file-client', viewerOk.ticket);
+  const fileClient = await dataSocket(relay.port, '/file-ws', host.id, epoch, 'file-viewer', viewerOk.ticket);
 
   const packet = filePacket(Buffer.from('hello', 'utf8'));
   fileHost.socket.sendBinary(packet);
@@ -361,7 +394,7 @@ test('m3 a new viewer epoch evicts stale media and refuses the old epoch with 40
   const first = await viewerJoin(relay.port, host.id);
   const epoch1 = first.ok.mediaEpoch;
   await dataSocket(relay.port, '/host-media-ws', host.id, epoch1, 'media-host', hostOk.ticket);
-  const staleMedia = await dataSocket(relay.port, '/media-ws', host.id, epoch1, 'media-client', first.ok.ticket);
+  const staleMedia = await dataSocket(relay.port, '/media-ws', host.id, epoch1, 'media-viewer', first.ok.ticket);
 
   const second = await viewerJoin(relay.port, host.id);
   assert.notEqual(second.ok.mediaEpoch, epoch1);
@@ -505,7 +538,7 @@ test('m3 a browser viewer with a gate cookie is admitted, and its media ticket o
   const cookie = await approveBrowser(relay, ntfy);
   const { ok } = await browserJoin(relay.port, host.id, cookie);
   const media = await openOk(relay.port, `/media-ws?pc=${host.id}&epoch=${ok.mediaEpoch}`);
-  media.sendJson({ type: 'hello', role: 'media-client', ticket: ok.ticket });
+  media.sendJson({ type: 'hello', role: 'media-viewer', ticket: ok.ticket });
   assert.equal((await media.nextJson('hello-ok', 10_000)).type, 'hello-ok');
   media.close();
 });
