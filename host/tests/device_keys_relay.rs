@@ -1,9 +1,9 @@
-//! Phase 2 end to end against a real `bp-relay` process (Windows only, ignored by default).
+//! Phase 2 end to end against the native relay (`bp-relay-server`), started in-process on an
+//! ephemeral loopback port (Windows only).
 //!
 //! What it runs, in order:
-//! 1. An isolated relay: `bp-relay serve` with a generated relay.json, state and assets in a
-//!    temp directory, bound to 127.0.0.1 on a free port. The child's `BP_RELAY_TOKEN` and
-//!    `BP_RELAY_ADMIN_TOKEN` are set to the test values, so inherited secrets cannot override them.
+//! 1. An isolated relay: `bp_relay_server::server::run` on its own tokio runtime, bound to
+//!    127.0.0.1:0, with state and assets in a temp directory and test-only tokens.
 //! 2. The real host `Signaling::connect_phase2` registers the fixture PC identity. The real host
 //!    controller opens pairing through `DevicesCommand::StartPairing`.
 //! 3. A scripted viewer pairs over `/ws?pc=ID`. It takes `mediaEpoch` from its hello-ok as text
@@ -19,28 +19,17 @@
 //! Not covered: WebRTC media, DTLS binding, and file, clipboard, cursor and input traffic. The
 //! test exchanges only the authenticated ctl channel (caps, ping and pong).
 //!
-//! How to run, on this PC, through the serialized check script (the test only runs the prebuilt
-//! binary and spawns no cargo):
-//!
-//!     BP_RELAY_SERVER_EXE=<path to prebuilt bp-relay.exe> \
-//!       bash /c/Users/Admin/Documents/ChatGPT/BubblePlay/.claude/dk2/win-check.sh \
-//!       /c/Users/Admin/Documents/ChatGPT/BubblePlay/.claude/worktrees/dk2-host \
-//!       host --test device_keys_relay -- --ignored
-//!
-//! The binary must be built from e2dd13d or later (package `bp-relay-server`, README
-//! `relay-rs/README.md`). Building it is a separate workspace: build it in a separately
-//! authorized build environment, not inside the host checks. The test fails rather than skips
-//! when `BP_RELAY_SERVER_EXE` is missing.
+//! The relay is a path dev-dependency (`../relay-rs/server`), so the normal host test run
+//! (win-check.sh, CI) builds and runs this test; it spawns no process.
 
 #![cfg(windows)]
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,6 +42,7 @@ use bp_device_key::phase2::{
     Side, Transcript,
 };
 use bp_device_key::{DeviceId, DeviceIdentity as ViewerIdentity, Role};
+use bp_relay_server::config::{Config, Secret};
 use bubbleplay_host::device_key::DeviceIdentity as HostIdentity;
 use bubbleplay_host::devices_ui_api::{channel, DevicesCommand, DevicesEvent, UiEnds};
 use bubbleplay_host::signaling::{SignalEvent, Signaling};
@@ -60,32 +50,21 @@ use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
 use tungstenite::{Message, WebSocket};
 
-const RELAY_EXE_ENV: &str = "BP_RELAY_SERVER_EXE";
 const FIXTURE: &str = "../fixtures/device-keys-contract.json";
 /// Upper bound for every wait on the relay or the host.
 const STEP: Duration = Duration::from_secs(20);
 /// Read timeout slice: each read returns quickly so the host can be pumped in between.
 const SLICE: Duration = Duration::from_millis(50);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
-const READY: Duration = Duration::from_secs(20);
 /// Host pumping after a state change, so the relay's ordering settles before the next step.
 const SETTLE: Duration = Duration::from_millis(300);
 
 #[test]
-#[ignore = "needs BP_RELAY_SERVER_EXE; run with win-check.sh host --test device_keys_relay -- --ignored"]
 fn phase2_pairing_then_trusted_reconnect_through_bp_relay() {
     run().expect("phase 2 relay end-to-end");
 }
 
 fn run() -> Result<()> {
-    let exe = env::var_os(RELAY_EXE_ENV).with_context(|| {
-        format!(
-            "{RELAY_EXE_ENV} is not set: this test needs a prebuilt bp-relay.exe and never skips"
-        )
-    })?;
-    let exe = PathBuf::from(exe);
-    ensure!(exe.is_file(), "{RELAY_EXE_ENV} does not name a file");
-
     let fixture = fixture()?;
     let host_key = serde_json::to_string(&fixture["keyFiles"]["plain"]["file"])?;
     let host = HostIdentity::from_plain_key_json(&host_key).context("fixture PC key")?;
@@ -111,9 +90,8 @@ fn run() -> Result<()> {
     // The host keeps its trust list under LOCALAPPDATA, so this never touches a real user list.
     env_guard.set("LOCALAPPDATA", &local_app_data);
 
-    let port = free_loopback_port()?;
-    let (mut relay, origin, token) = spawn_relay(&exe, &work, port)?;
-    wait_for_listener(&mut relay, port)?;
+    let relay = Relay::start(&work)?;
+    let (port, origin, token) = (relay.port, relay.origin.clone(), relay.token.clone());
     let target = Target {
         port,
         origin: &origin,
@@ -375,6 +353,9 @@ fn reconnect_and_ping(
         "encrypted reply is not a pong"
     );
 
+    // Earlier PeerLeft events are expected: the end of pairing and the reconnect's peer-joined
+    // both park the previous viewer. Only a teardown after the pong is a failure.
+    harness.peer_left = false;
     harness.settle()?;
     ensure!(
         harness.host.viewer_epoch() == Some(admitted.epoch.as_str()),
@@ -648,67 +629,73 @@ fn connect_viewer(target: &Target) -> Result<WebSocket<TcpStream>> {
     Ok(ws)
 }
 
-/// Bind to port 0, then release it so the relay can use it. A rare race with another process is
-/// possible, and it would show up as a failed readiness wait.
-fn free_loopback_port() -> Result<u16> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    Ok(listener.local_addr()?.port())
+/// The relay, served in-process on its own multi-threaded tokio runtime, so the blocking host and
+/// viewer code in this test can talk to it. Dropping it shuts the runtime (and the relay) down.
+struct Relay {
+    port: u16,
+    origin: String,
+    token: String,
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
-fn spawn_relay(exe: &Path, work: &TempDir, port: u16) -> Result<(RelayProcess, String, String)> {
-    let origin = format!("http://127.0.0.1:{port}");
-    let token = random_hex();
-    let admin_token = random_hex();
-    let assets = work.join("assets");
-    let state = work.join("state");
-    fs::create_dir_all(&assets)?;
-    fs::create_dir_all(&state)?;
-    fs::write(
-        assets.join("index.html"),
-        "<!doctype html><title>bp-relay test</title>",
-    )?;
-    let config = work.join("relay.json");
-    let body = json!({
-        "public_origin": origin,
-        "listen": format!("127.0.0.1:{port}"),
-        "assets_dir": assets,
-        "state_dir": state,
-        "token": token,
-        "admin_token": admin_token,
-    });
-    fs::write(&config, serde_json::to_vec_pretty(&body)?)?;
-
-    // stderr goes to a file in the temp directory, so no pipe can grow without bound.
-    let log = File::create(work.join("relay-stderr.log"))?;
-    let child = Command::new(exe)
-        .arg("serve")
-        .arg("--config")
-        .arg(&config)
-        .env("BP_RELAY_TOKEN", &token)
-        .env("BP_RELAY_ADMIN_TOKEN", &admin_token)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .with_context(|| format!("start {}", exe.display()))?;
-    Ok((RelayProcess { child }, origin, token))
+impl Relay {
+    fn start(work: &TempDir) -> Result<Self> {
+        let assets = work.join("assets");
+        let state = work.join("state");
+        fs::create_dir_all(&assets)?;
+        fs::create_dir_all(&state)?;
+        fs::write(
+            assets.join("index.html"),
+            "<!doctype html><title>bp-relay test</title>",
+        )?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .context("relay runtime")?;
+        // Bound before the relay starts, so the port is never released and taken by another
+        // process in between.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let listener = {
+            let _guard = runtime.enter();
+            tokio::net::TcpListener::from_std(listener).context("relay listener")?
+        };
+        let origin = format!("http://{addr}");
+        let token = random_hex();
+        let config = Config {
+            public_origin: origin.clone(),
+            listen: addr,
+            assets_dir: assets,
+            state_dir: state,
+            token: Secret::new(token.clone()),
+            admin_token: Secret::new(random_hex()),
+            max_connections: 32,
+            turn: None,
+            ntfy: None,
+            approval_ttl_s: 90,
+            trusted_proxy_cidrs: Vec::new(),
+        };
+        runtime.spawn(async move {
+            if let Err(error) = bp_relay_server::server::run(&config, listener).await {
+                eprintln!("in-process relay stopped: {error}");
+            }
+        });
+        Ok(Self {
+            port: addr.port(),
+            origin,
+            token,
+            runtime: Some(runtime),
+        })
+    }
 }
 
-fn wait_for_listener(relay: &mut RelayProcess, port: u16) -> Result<()> {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let until = Instant::now() + READY;
-    loop {
-        if let Some(status) = relay.child.try_wait()? {
-            bail!("bp-relay exited before it listened: {status}");
+impl Drop for Relay {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::from_secs(2));
         }
-        if TcpStream::connect_timeout(&addr, SLICE).is_ok() {
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < until,
-            "bp-relay did not listen on {addr} in time"
-        );
-        thread::sleep(SLICE);
     }
 }
 
@@ -761,18 +748,6 @@ fn seed_from_hex(text: &str) -> Result<[u8; 32]> {
             .context("fixture seed is not hex")?;
     }
     Ok(out)
-}
-
-/// The relay child. Killed and reaped on drop, whatever the outcome.
-struct RelayProcess {
-    child: Child,
-}
-
-impl Drop for RelayProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// A fresh directory under the system temp folder, removed on drop.

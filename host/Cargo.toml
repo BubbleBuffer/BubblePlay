@@ -77,6 +77,11 @@ zeroize = { version = "=1.9.0", features = ["alloc"] }
 # QR code for the pairing page (host/src/devices_window.rs). Exact pin, no image/svg features.
 qrcode = { version = "=0.14.1", default-features = false }
 
+[dev-dependencies]
+# tests/device_keys_relay.rs starts the native relay in-process on its own tokio runtime.
+bp-relay-server = { path = "../relay-rs/server" }
+tokio = { version = "1", features = ["net", "rt-multi-thread"] }
+
 [profile.release]
 lto = "thin"
 
