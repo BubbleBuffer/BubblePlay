@@ -1383,11 +1383,7 @@ fn a_relay_close_after_the_handshake_reconnects_with_a_fresh_handshake() {
         close_in_session: Some(1001),
         ..Scenario::new(EPOCH_A)
     };
-    let h = start(
-        vec![closing, scenario(EPOCH_B, vec![key(1)])],
-        timing(),
-        8,
-    );
+    let h = start(vec![closing, scenario(EPOCH_B, vec![key(1)])], timing(), 8);
     let _ = until_frame(&h.events);
     let seen = drain_log(&h.relay.log, QUIET);
     let auth = auth_messages(&seen);
@@ -1398,7 +1394,9 @@ fn a_relay_close_after_the_handshake_reconnects_with_a_fresh_handshake() {
     let finishes = auth.iter().filter(|m| m["type"] == "auth-finish").count();
     assert_eq!(finishes, 2, "{auth:?}");
     // The second PC opened the client's endpoint messages (start and first-frame).
-    assert!(texts(&seen, "/ws").iter().any(|m| m["type"] == "first-frame"));
+    assert!(texts(&seen, "/ws")
+        .iter()
+        .any(|m| m["type"] == "first-frame"));
     assert_eq!(h.stats.snapshot().attempts, 2);
     h.finish().expect("clean stop");
 }
@@ -1410,11 +1408,7 @@ fn a_policy_close_after_the_handshake_is_fatal_and_not_retried() {
         close_in_session: Some(1008),
         ..Scenario::new(EPOCH_A)
     };
-    let mut h = start(
-        vec![revoked, scenario(EPOCH_B, vec![key(1)])],
-        timing(),
-        8,
-    );
+    let mut h = start(vec![revoked, scenario(EPOCH_B, vec![key(1)])], timing(), 8);
     assert_eq!(h.join(), Err(NetError::NotAdmitted));
     assert_eq!(h.stats.snapshot().attempts, 1, "not retried");
 }

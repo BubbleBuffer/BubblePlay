@@ -111,7 +111,10 @@ fn wss_config(
 /// The PC's `caps` reply (its first ctl, seq 0).
 async fn pc_caps(host: &mut Ws, pc: &mut Viewer) {
     let seq = pc
-        .send(host, json!({ "type": "caps", "caps": [CAP_CONTROL_AEAD, CAP_DTLS_BIND] }))
+        .send(
+            host,
+            json!({ "type": "caps", "caps": [CAP_CONTROL_AEAD, CAP_DTLS_BIND] }),
+        )
         .await;
     assert_eq!(seq, 0, "the PC's first ctl is seq 0");
 }
@@ -226,7 +229,11 @@ async fn an_admitted_viewer_with_a_pinned_key_connects_and_exchanges_ctl_both_wa
             }
         }
     };
-    assert_eq!(received[3..], packet[3..], "the PC got the absolute position");
+    assert_eq!(
+        received[3..],
+        packet[3..],
+        "the PC got the absolute position"
+    );
 
     client.finish().await.expect("a clean stop");
     assert_eq!(client.stats.snapshot().attempts, 1);
@@ -250,7 +257,9 @@ async fn a_pinned_key_mismatch_is_refused_after_auth_host() {
     );
     let after = quiet(&mut host, Duration::from_millis(300)).await;
     assert!(
-        after.as_ref().is_none_or(|value| value["type"] != "auth-finish"),
+        after
+            .as_ref()
+            .is_none_or(|value| value["type"] != "auth-finish"),
         "no auth-finish after a key mismatch: {after:?}"
     );
     assert_eq!(client.stats.snapshot().attempts, 1);

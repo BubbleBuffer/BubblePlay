@@ -600,8 +600,7 @@ impl Binder {
         if self.remote.is_some() {
             return Ok(None);
         }
-        self.remote =
-            Some(sdp_fingerprint(sdp).ok_or(Phase2Error::NoSha256Fingerprint("answer"))?);
+        self.remote = Some(sdp_fingerprint(sdp).ok_or(Phase2Error::NoSha256Fingerprint("answer"))?);
         let (Some(local), Some(remote)) = (&self.local, &self.remote) else {
             return Ok(None);
         };
@@ -1275,26 +1274,19 @@ mod tests {
 
     #[test]
     fn the_sdp_fingerprint_is_the_sha_256_line_and_refused_without_one() {
-        let several = "v=0
-a=fingerprint:sha-1 AA:BB
-a=fingerprint:SHA-256 AB:CD
-a=fingerprint:sha-512 EE
-";
+        let several = "v=0\r\na=fingerprint:sha-1 AA:BB\r\n\
+                       a=fingerprint:SHA-256 AB:CD\r\na=fingerprint:sha-512 EE\r\n";
         // Case-insensitive here: the crate normaliser settles the case.
         assert_eq!(
             sdp_fingerprint(several).map(|value| value.to_ascii_lowercase()),
             Some("sha-256 ab:cd".to_owned())
         );
-        assert_eq!(sdp_fingerprint("v=0
-a=fingerprint:sha-1 AA:BB
-"), None);
-        assert_eq!(sdp_fingerprint("v=0
-"), None);
+        let sha1_only = "v=0\r\na=fingerprint:sha-1 AA:BB\r\n";
+        assert_eq!(sdp_fingerprint(sha1_only), None);
+        assert_eq!(sdp_fingerprint("v=0\r\n"), None);
         let mut binder = Binder::new([0; 32], [0; 32]);
         assert!(matches!(
-            binder.local_sdp("v=0
-a=fingerprint:sha-1 AA:BB
-"),
+            binder.local_sdp(sha1_only),
             Err(Phase2Error::NoSha256Fingerprint("offer"))
         ));
     }
@@ -1308,26 +1300,21 @@ a=fingerprint:sha-1 AA:BB
         let (shake, _) = fixed_start(pinned(), &[CAP_CONTROL_AEAD, CAP_DTLS_BIND]);
         let host = message(&["handshake", "messages", "authHost"]).to_string();
         let (established, _) = shake.on_auth_host(viewer.identity(), &host).unwrap();
-        let odd = |value: &Value| {
+        let odd = |path: &[&str]| {
+            let value = message(path);
             let (algorithm, hex) = value.as_str().unwrap().split_once(' ').unwrap();
-            format!("{}  {}", algorithm.to_ascii_uppercase(), hex.to_ascii_lowercase())
+            let algorithm = algorithm.to_ascii_uppercase();
+            format!("{algorithm}  {}", hex.to_ascii_lowercase())
         };
-        let local = odd(&message(&["handshake", "dtls", "viewer", "localFingerprint"]));
-        let remote = odd(&message(&["handshake", "dtls", "viewer", "remoteFingerprint"]));
+        let local = odd(&["handshake", "dtls", "viewer", "localFingerprint"]);
+        let remote = odd(&["handshake", "dtls", "viewer", "remoteFingerprint"]);
+        let offer = format!("v=0\r\na=fingerprint:{local}\r\n");
+        let sha1 = "a=fingerprint:sha-1 00:11";
+        let answer = format!("v=0\r\n{sha1}\r\na=fingerprint:{remote}\r\n");
         let mut binder = Binder::new(established.h, established.pc_public);
-        binder
-            .local_sdp(&format!("v=0
-a=fingerprint:{local}
-"))
-            .unwrap();
+        binder.local_sdp(&offer).unwrap();
         let ours = binder
-            .remote_sdp(
-                viewer.identity(),
-                &format!("v=0
-a=fingerprint:sha-1 00:11
-a=fingerprint:{remote}
-"),
-            )
+            .remote_sdp(viewer.identity(), &answer)
             .unwrap()
             .expect("our auth-bind");
         assert_eq!(

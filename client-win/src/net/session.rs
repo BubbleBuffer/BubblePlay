@@ -1905,7 +1905,6 @@ async fn await_register_challenge(
     }
 }
 
-
 /// Read until the relay's `hello-ok`. Returns its `mediaEpoch` and `ticket`, if present,
 /// and its `iceServers`.
 async fn await_hello_ok(

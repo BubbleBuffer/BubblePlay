@@ -280,7 +280,11 @@ impl Viewer {
 
     /// Seal `value` in `ctl` and send it; returns the `seq` it went out with.
     pub async fn send(&mut self, ws: &mut Ws, value: Value) -> u64 {
-        let sealed = self.session.ctl.seal_text(&value.to_string()).expect("seal");
+        let sealed = self
+            .session
+            .ctl
+            .seal_text(&value.to_string())
+            .expect("seal");
         let seq = serde_json::from_str::<Value>(&sealed).expect("envelope")["seq"]
             .as_u64()
             .expect("seq");
