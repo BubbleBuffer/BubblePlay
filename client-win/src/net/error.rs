@@ -12,8 +12,8 @@ pub enum NetError {
     PlaintextRefused(String),
     /// A WebSocket upgrade answered 401 or 403 (fatal).
     Auth(u16),
-    /// The relay closed `/ws` with 1008 before `hello-ok`: the signed hello or proof was
-    /// refused, or this viewer is not admitted to the PC (fatal).
+    /// The relay closed `/ws` with 1008, before or after `hello-ok`: the signed hello or
+    /// proof was refused, or this viewer is not (or no longer) admitted to the PC (fatal).
     NotAdmitted,
     /// The relay sent `{"type":"error"}` on `/ws` (fatal).
     RelayError(String),

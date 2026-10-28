@@ -1889,7 +1889,7 @@ async fn await_register_challenge(
     stats: &TransportStats,
 ) -> Result<[u8; 32], NetError> {
     loop {
-        match admission(source.next().await)? {
+        match classify(source.next().await, "signal")? {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(NetError::RelayError(message));
@@ -1905,16 +1905,6 @@ async fn await_register_challenge(
     }
 }
 
-/// [`classify`] for the signalling socket before `hello-ok`: the relay refuses a viewer
-/// (unknown key, not admitted to the PC, bad proof) by closing with 1008, which is fatal.
-fn admission(item: Option<Result<Message, tungstenite::Error>>) -> Result<Inbound, NetError> {
-    if let Some(Ok(Message::Close(Some(frame)))) = &item {
-        if frame.code == CloseCode::Policy {
-            return Err(NetError::NotAdmitted);
-        }
-    }
-    classify(item, "signal")
-}
 
 /// Read until the relay's `hello-ok`. Returns its `mediaEpoch` and `ticket`, if present,
 /// and its `iceServers`.
@@ -1923,7 +1913,7 @@ async fn await_hello_ok(
     stats: &TransportStats,
 ) -> Result<(Option<String>, Option<String>, Value), NetError> {
     loop {
-        match admission(source.next().await)? {
+        match classify(source.next().await, "signal")? {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(NetError::RelayError(message));
@@ -2016,12 +2006,19 @@ async fn await_ctl(
     }
 }
 
-/// Map one WebSocket item to what the session needs. A closed or broken socket
-/// is transient.
+/// Map one WebSocket item to what the session needs. A closed or broken socket is
+/// transient (the reconnect runs a fresh device-key handshake), except a 1008 close on the
+/// signalling socket: there the relay refuses this viewer (unknown key, not admitted or no
+/// longer admitted to the PC, bad proof), before or after the handshake, which is fatal.
 fn classify(
     item: Option<Result<Message, tungstenite::Error>>,
     label: &str,
 ) -> Result<Inbound, NetError> {
+    if let Some(Ok(Message::Close(Some(frame)))) = &item {
+        if label == "signal" && frame.code == CloseCode::Policy {
+            return Err(NetError::NotAdmitted);
+        }
+    }
     match item {
         None => Err(NetError::Socket(format!("{label} socket closed"))),
         Some(Err(error)) => Err(NetError::Socket(error.to_string())),

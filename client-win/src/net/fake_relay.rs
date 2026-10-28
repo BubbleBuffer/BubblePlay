@@ -67,6 +67,10 @@ pub(crate) struct Scenario {
     /// A pairing hello (with `pair`) gets a pairing-mode `hello-ok`; then the PC sends its
     /// `pair-proof` for this code, followed by `pair-done` (true) or `pair-denied` (false).
     pub pair: Option<(String, bool)>,
+    /// Close `/ws` with this code right after the PC's first `ctl` message.
+    pub close_after_caps: Option<u16>,
+    /// The PC skips one `ctl` sequence number before its first message (a seq gap).
+    pub pc_ctl_gap: bool,
 }
 
 impl Scenario {
@@ -500,7 +504,19 @@ async fn serve_signal(mut ws: ServerSocket, scenario: Scenario, origin: &str, lo
                     .unwrap_or_else(|| vec!["control-aead-v1".into(), "dtls-bind-v1".into()]),
             }),
         };
+        if let (true, Some(session)) = (scenario.pc_ctl_gap, &mut pc) {
+            let _skipped = session.ctl.seal_text("{}").expect("seal");
+        }
         send_ctl(&mut ws, &mut pc, first).await;
+        if let Some(code) = scenario.close_after_caps {
+            let _ = ws
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(code),
+                    reason: "".into(),
+                })))
+                .await;
+            return;
+        }
     }
     if scenario.signal_silent {
         let _held = ws;

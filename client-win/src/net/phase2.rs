@@ -89,7 +89,7 @@ impl fmt::Display for Phase2Error {
             }
             Phase2Error::NotPaired(pc) => write!(
                 f,
-                "PC {pc} is not paired with this viewer: pair it first with --pair <code> --pc {pc}"
+                "unknown PC {pc}: this viewer is not paired with it; pair with --pair <code> or the pairing link"
             ),
             Phase2Error::KeyChanged(pc) => write!(
                 f,

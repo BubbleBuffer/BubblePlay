@@ -1374,6 +1374,63 @@ fn no_auth_host_in_time_is_fatal_with_the_device_keys_message() {
     );
 }
 
+/// Ruling (a), transient branch: a relay close after the handshake that is not 1008
+/// reconnects, and the new attempt runs a fresh handshake (new ephemeral key; the fake PC's
+/// new `ctl` opener only accepts the client's messages from seq 0).
+#[test]
+fn a_relay_close_after_the_handshake_reconnects_with_a_fresh_handshake() {
+    let closing = Scenario {
+        close_after_caps: Some(1001),
+        ..Scenario::new(EPOCH_A)
+    };
+    let h = start(
+        vec![closing, scenario(EPOCH_B, vec![key(1)])],
+        timing(),
+        8,
+    );
+    let _ = until_frame(&h.events);
+    let seen = drain_log(&h.relay.log, QUIET);
+    let auth = auth_messages(&seen);
+    let hellos: Vec<&Value> = auth.iter().filter(|m| m["type"] == "auth-hello").collect();
+    assert_eq!(hellos.len(), 2, "{auth:?}");
+    assert_ne!(hellos[0]["ephemeral"], hellos[1]["ephemeral"]);
+    assert_ne!(hellos[0]["nonce"], hellos[1]["nonce"]);
+    let finishes = auth.iter().filter(|m| m["type"] == "auth-finish").count();
+    assert_eq!(finishes, 2, "{auth:?}");
+    // The second PC opened the client's endpoint messages (start and first-frame).
+    assert!(texts(&seen, "/ws").iter().any(|m| m["type"] == "first-frame"));
+    assert_eq!(h.stats.snapshot().attempts, 2);
+    h.finish().expect("clean stop");
+}
+
+/// Ruling (a): a 1008 close on `/ws` after the handshake is an auth refusal: fatal.
+#[test]
+fn a_policy_close_after_the_handshake_is_fatal_and_not_retried() {
+    let revoked = Scenario {
+        close_after_caps: Some(1008),
+        ..Scenario::new(EPOCH_A)
+    };
+    let mut h = start(
+        vec![revoked, scenario(EPOCH_B, vec![key(1)])],
+        timing(),
+        8,
+    );
+    assert_eq!(h.join(), Err(NetError::NotAdmitted));
+    assert_eq!(h.stats.snapshot().attempts, 1, "not retried");
+}
+
+/// Ruling (a), fatal branch: a `ctl` sequence gap from the PC ends the session.
+#[test]
+fn a_pc_ctl_sequence_gap_is_fatal_and_not_retried() {
+    let gap = Scenario {
+        pc_ctl_gap: true,
+        ..Scenario::new(EPOCH_A)
+    };
+    let mut h = start(vec![gap, scenario(EPOCH_B, vec![key(1)])], timing(), 8);
+    assert!(matches!(h.join(), Err(NetError::DeviceKeys(_))));
+    assert_eq!(h.stats.snapshot().attempts, 1, "not retried");
+}
+
 #[test]
 fn a_pc_ctl_error_is_fatal_and_shown() {
     let refusing = Scenario {
@@ -1426,7 +1483,11 @@ fn an_unpaired_pc_is_refused_with_a_pointer_to_pair() {
     let Err(NetError::DeviceKeys(message)) = result else {
         panic!("expected a device-key error")
     };
-    assert!(message.contains("--pair"), "{message}");
+    assert!(
+        message.contains("pair with --pair <code> or the pairing link"),
+        "{message}"
+    );
+    assert!(message.contains(PC), "names the PC: {message}");
 }
 
 type PairOutcome = (Result<String, NetError>, Vec<String>, Vec<Logged>);
