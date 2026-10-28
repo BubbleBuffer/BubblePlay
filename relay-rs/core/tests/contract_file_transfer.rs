@@ -1,5 +1,5 @@
-//! fixtures/file-transfer-contract.json: the file packet layout and the
-//! signaling file-offer / host-capabilities cases the relay validates.
+//! fixtures/file-transfer-contract.json: the file packet layout. The signaling
+//! file-offer and host-capabilities cases were removed at the cutover.
 //!
 //! receiverSessions describe the receiving browser's state machine, not the
 //! relay, so they are skipped.
@@ -115,28 +115,4 @@ fn rejected_bytes(case: &Value) -> Vec<u8> {
             bytes
         }
     }
-}
-
-#[test]
-fn contract_file_offer_messages() {
-    let contract = contract();
-    for case in as_array(&contract["signaling"], "fileOffer") {
-        let text = as_str(case, "text");
-        let expect = as_bool(case, "accepted");
-        assert_eq!(accepted("host", text, ""), expect, "{text}");
-        if expect {
-            assert!(
-                !accepted("client", text, ""),
-                "file-offer accepted from viewer: {text}"
-            );
-        }
-    }
-}
-
-#[test]
-fn contract_file_host_capabilities() {
-    let case = &contract()["signaling"]["hostCapabilities"];
-    let text = as_str(case, "text");
-    assert!(accepted("host", text, ""), "{text}");
-    assert!(!accepted("client", text, ""), "{text}");
 }

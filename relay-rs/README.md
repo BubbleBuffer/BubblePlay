@@ -79,6 +79,9 @@ A viewer's `/ws` hello is signed. The client sends `{"type":"hello","role":"view
 The relay answers `register-challenge` with a nonce. The viewer replies `register-proof` with a
 signature over that nonce and the public origin, made with the viewer's device key.
 
+The viewer role names are `viewer` on `/ws`, `media-viewer` on `/media-ws` and `file-viewer` on
+`/file-ws`. The old names `client`, `media-client` and `file-client` are refused like any unknown role.
+
 - An ID in the PC's `admitted` list is admitted. The relay sends `hello-ok` with a media ticket.
 - Otherwise, while the host has an open pairing window, a viewer that sends the window's 32-byte `pair` value is admitted in pairing mode. Its `hello-ok` carries `pairing: true` and no media ticket. A pairing viewer may send only `auth-hello`, `auth-finish`, `auth-bind` and `pair-proof`, and the host may send it only `auth-host`, `auth-bind`, `pair-proof`, `pair-done` and `pair-denied`. Everything else is dropped in that direction.
 - A pairing window opens with the host's `pair-open` and lasts 300 s. It closes on `pair-close`, when the host disconnects, or after 20 failed attempts against that PC. Five failures from one client prefix in 300 s refuse that prefix. The host gets `pair-closed` when a window closes on failures.
@@ -91,9 +94,16 @@ duplicates) and `remotePairing` (a boolean). The relay stores `remotePairing` wi
 reports it back, but admission does not read it. A viewer that drops off the admitted list is
 closed 1008 with an empty reason. A pairing viewer is not affected by that check.
 
-The host's `admit`, `pair-open` and `pair-close` are consumed by the relay and never forwarded.
-`pair-done` and `pair-denied` reach a pairing viewer from the host. `ctl` is forwarded between the
-host and a live viewer in both directions.
+On `/ws` the relay forwards text only, and only these types:
+
+- viewer to host: `auth-hello`, `auth-finish`, `auth-bind`, `pair-proof`, `ctl`;
+- host to viewer: `auth-host`, `auth-bind`, `pair-proof`, `pair-done`, `pair-denied`, `ctl`.
+
+In pairing mode only the `auth-*` and `pair-*` types above are forwarded, and `ctl` is not. The relay
+answers `ping` with `pong` itself. The host's `admit`, `pair-open` and `pair-close` are consumed by
+the relay and never forwarded. Any other type, including offer, ICE, capability and input messages,
+is dropped and the socket stays open. Binary frames on `/ws` are dropped in both directions.
+Media and file sockets are not affected by this list.
 
 ## Migrating from the Go relay
 

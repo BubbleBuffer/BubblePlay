@@ -2,23 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { validInputStatus } from "../src/protocol-validation.js";
 
 const receipt = { type: "input-status", protocol: 1, generation: 4,
   receivedPackets: 12, acceptedPackets: 11, failedPackets: 1, droppedPackets: 1,
   releasedInputs: 2, requestedEvents: 14, appliedEvents: 13 };
-const valid = message => validInputStatus(message, "host", JSON.stringify(message));
-
-test("input status accepts old receipts and additive warning enums", () => {
-  assert.equal(valid(receipt), true);
-  for (const reason of [null, "admin-required", "admin-unavailable"]) {
-    for (const route of ["local", "admin", "secure"]) {
-      assert.equal(valid({ ...receipt, reason, route }), true);
-    }
-  }
-  for (const reason of ["", "policy-off", false, 1, {}, []]) assert.equal(valid({ ...receipt, reason }), false);
-  for (const route of [null, "", "system", false, 1, {}, []]) assert.equal(valid({ ...receipt, route }), false);
-});
 
 test("browser shows and clears Admin warnings without changing input readiness", () => {
   const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");

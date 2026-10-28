@@ -1,13 +1,12 @@
 //! Viewer signalling and media: epochs, TURN credentials, replacement and
-//! departure, forwarding between the host and the viewer, host capability
-//! caching, the pending buffer, and per-PC isolation. Ports the viewer,
+//! departure, forwarding between the host and the viewer, and per-PC isolation. Ports the viewer,
 //! room and two-PC subtests of routing_test.go and server_test.go.
 
 mod relay_harness;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use bp_relay_core::{Action, ConnId, PENDING_LIMIT, Route, TurnConfig};
+use bp_relay_core::{Action, ConnId, Route, TurnConfig};
 use hmac::{Hmac, Mac};
 use relay_harness::*;
 use serde_json::json;
@@ -106,7 +105,7 @@ fn replaced_viewers_media_sockets_close_as_stale() {
         Route::MediaWs,
         &host.pc,
         &first.epoch,
-        "media-client",
+        "media-viewer",
         &first.ticket,
     );
     assert!(sent_types(&actions, media).contains(&"hello-ok".to_owned()));
@@ -137,7 +136,7 @@ fn media_pair(h: &mut Harness) -> MediaPair {
         Route::MediaWs,
         &host.pc,
         &viewer.epoch,
-        "media-client",
+        "media-viewer",
         &viewer.ticket,
     );
     (host, viewer, host_media, viewer_media, actions)
@@ -195,75 +194,19 @@ fn viewer_bye_tells_the_host_and_closes_the_viewer() {
 }
 
 #[test]
-fn offer_and_answer_are_forwarded_verbatim() {
+fn ctl_is_forwarded_verbatim_in_both_directions() {
     let mut h = Harness::new();
     let a = identity(1);
     let (host, _) = h.register_host(&a, Some(TOKEN));
     let viewer = h.open_viewer(&host.pc);
 
-    let offer = r#"{"type":"offer","sdp":"v=0"}"#;
+    let offer = r#"{"type":"ctl","kind":"sdp-offer","seq":0,"data":"AAAA"}"#;
     let out = h.raw(viewer.id, offer);
     assert_eq!(sent_text(&out, host.id), vec![offer.to_owned()]);
 
-    let answer = r#"{"type":"answer","sdp":"v=0"}"#;
+    let answer = r#"{"type":"ctl","kind":"sdp-answer","seq":0,"data":"AAAA"}"#;
     let out = h.raw(host.id, answer);
     assert_eq!(sent_text(&out, viewer.id), vec![answer.to_owned()]);
-}
-
-#[test]
-fn host_capabilities_are_cached_and_replayed_to_a_later_viewer() {
-    let mut h = Harness::new();
-    let a = identity(1);
-    let (host, _) = h.register_host(&a, Some(TOKEN));
-    let caps = r#"{"type":"host-capabilities","serviceMode":false,"coldBoot":false,"secureDesktop":false,"secureText":false}"#;
-    h.raw(host.id, caps);
-
-    let (later, actions) = h.viewer_hello(&host.pc, false);
-    assert!(sent_text(&actions, later.id).contains(&caps.to_owned()));
-}
-
-#[test]
-fn viewer_messages_wait_for_the_host_and_flush_after_registration() {
-    let mut h = Harness::new();
-    let a = identity(1);
-    // A viewer is admitted only through its PC's stored list, so the host
-    // registers once and goes away before the viewer joins.
-    let (first, _) = h.register_host(&a, Some(TOKEN));
-    h.close(first.id);
-    let viewer = h.open_viewer(&identity(1).id().to_string());
-    let offer = r#"{"type":"offer","sdp":"v=0"}"#;
-    assert!(
-        h.raw(viewer.id, offer).is_empty(),
-        "no host yet, nothing sent"
-    );
-
-    let (host, actions) = h.register_host(&a, Some(TOKEN));
-    let texts = sent_text(&actions, host.id);
-    assert!(texts[0].contains("hello-ok"));
-    assert_eq!(texts.last(), Some(&offer.to_owned()));
-}
-
-#[test]
-fn pending_buffer_keeps_the_newest_sixty_four_in_order() {
-    let mut h = Harness::new();
-    let a = identity(1);
-    let (first, _) = h.register_host(&a, Some(TOKEN));
-    h.close(first.id);
-    let viewer = h.open_viewer(&a.id().to_string());
-    for i in 0..(PENDING_LIMIT + 6) {
-        let ice = json!({"type": "ice", "candidate": format!("c{i}")});
-        assert!(h.text(viewer.id, &ice).is_empty());
-    }
-
-    let (host, actions) = h.register_host(&a, Some(TOKEN));
-    let candidates: Vec<String> = sent_json(&actions, host.id)
-        .iter()
-        .filter(|m| m["type"] == "ice")
-        .map(|m| m["candidate"].as_str().unwrap_or_default().to_owned())
-        .collect();
-    assert_eq!(candidates.len(), PENDING_LIMIT);
-    assert_eq!(candidates.first().map(String::as_str), Some("c6"));
-    assert_eq!(candidates.last().map(String::as_str), Some("c69"));
 }
 
 #[test]
@@ -288,31 +231,4 @@ fn two_pcs_keep_their_epochs_media_and_pending_apart() {
         h.try_upgrade(req(Route::MediaWs, Some(&host_b.pc), Some(&vb.epoch), true))
             .is_ok()
     );
-}
-
-#[test]
-fn pending_messages_and_capabilities_stay_in_their_own_room() {
-    let mut h = Harness::new();
-    let a = identity(1);
-    let b = identity(2);
-    let (first_a, _) = h.register_host(&a, Some(TOKEN));
-    h.close(first_a.id);
-    let va = h.open_viewer(&a.id().to_string());
-    let offer = r#"{"type":"offer","sdp":"v=0"}"#;
-    h.raw(va.id, offer);
-
-    let (host_b, _) = h.register_host(&b, Some(TOKEN));
-    let caps = r#"{"type":"host-capabilities","serviceMode":true,"coldBoot":false,"secureDesktop":false,"secureText":false}"#;
-    h.raw(host_b.id, caps);
-    let (vb, vb_actions) = h.viewer_hello(&b.id().to_string(), false);
-    assert!(sent_text(&vb_actions, vb.id).contains(&caps.to_owned()));
-    assert!(!sent_text(&vb_actions, vb.id).contains(&offer.to_owned()));
-
-    // Room A's buffered offer reaches A's host, and B's capabilities never reach A.
-    let (host_a, actions) = h.register_host(&a, Some(TOKEN));
-    let texts = sent_text(&actions, host_a.id);
-    assert!(texts.contains(&offer.to_owned()));
-    assert!(!texts.contains(&caps.to_owned()));
-    let (va2, va2_actions) = h.viewer_hello(&host_a.pc, false);
-    assert!(!sent_text(&va2_actions, va2.id).contains(&caps.to_owned()));
 }

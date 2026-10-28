@@ -12,6 +12,3 @@ Run these commands from the repository root.
 | `lab/verify-lab-qos.ps1` | Inspect Windows lab QoS cleanup and save a report under `artifacts/`; requires elevation. |
 
 The supported Windows installer commands live in [host/scripts](../host/scripts/).
-Worker password setup lives in [worker/tools](../worker/tools/).
-Stream experiments, browser automation and measurement tools live in
-[worker/tools/lab](../worker/tools/lab/).

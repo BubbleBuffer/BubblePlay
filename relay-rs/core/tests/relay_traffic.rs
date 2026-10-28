@@ -68,15 +68,31 @@ fn pre_auth_binary_closes_invalid_hello() {
 }
 
 #[test]
-fn signal_binary_is_relayed_in_range_and_dropped_when_empty() {
+fn signal_binary_is_not_forwarded_in_either_direction() {
     let mut h = Harness::new();
     let a = identity(1);
     let (host, _) = h.register_host(&a, Some(TOKEN));
     let viewer = h.open_viewer(&host.pc);
-    let frame = vec![1u8; 10];
-    let out = h.binary(viewer.id, &frame);
-    assert_eq!(sent_binary(&out, host.id), vec![frame]);
-    assert!(h.binary(viewer.id, &[]).is_empty(), "empty frame dropped");
+    for frame in [vec![1u8; 1], vec![1u8; 10], vec![1u8; 16384], Vec::new()] {
+        let out = h.binary(viewer.id, &frame);
+        assert!(
+            sent_binary(&out, host.id).is_empty(),
+            "viewer frame relayed"
+        );
+        assert!(
+            closes(&out, viewer.id).is_empty(),
+            "viewer frame closed the socket"
+        );
+        let out = h.binary(host.id, &frame);
+        assert!(
+            sent_binary(&out, viewer.id).is_empty(),
+            "host frame relayed"
+        );
+        assert!(
+            closes(&out, host.id).is_empty(),
+            "host frame closed the socket"
+        );
+    }
 }
 
 #[test]
@@ -89,7 +105,7 @@ fn file_socket_accepts_only_ping_text() {
         Route::FileWs,
         &host.pc,
         &viewer.epoch,
-        "file-client",
+        "file-viewer",
         &viewer.ticket,
     );
     assert!(sent_types(&actions, file).contains(&"hello-ok".to_owned()));
@@ -120,7 +136,7 @@ fn invalid_file_frame_closes_the_pair() {
         Route::FileWs,
         &host.pc,
         &viewer.epoch,
-        "file-client",
+        "file-viewer",
         &viewer.ticket,
     );
 
@@ -153,9 +169,9 @@ fn host_replacement_closes_the_old_host_and_tells_the_viewer() {
         vec!["peer-left".to_owned()]
     );
 
-    let offer = r#"{"type":"offer","sdp":"v=0"}"#;
-    let out = h.raw(viewer.id, offer);
-    assert_eq!(sent_text(&out, new_host.id), vec![offer.to_owned()]);
+    let ctl = r#"{"type":"ctl","kind":"sdp-offer","seq":0,"data":"AAAA"}"#;
+    let out = h.raw(viewer.id, ctl);
+    assert_eq!(sent_text(&out, new_host.id), vec![ctl.to_owned()]);
     assert!(sent_text(&out, old_host.id).is_empty());
 }
 

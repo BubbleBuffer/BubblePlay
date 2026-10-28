@@ -12,12 +12,10 @@ pub fn fixture(name: &str) -> Value {
     ))
 }
 
-/// Read a fixture from the Go relay's testdata/ directory.
+/// Read a browser-generated fixture from tests/data/ (moved there from the
+/// deleted Go relay's testdata/ at CUT-1).
 pub fn test_data(name: &str) -> Value {
-    load(&format!(
-        "{}/../../relay/testdata/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    ))
+    load(&format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR")))
 }
 
 fn load(path: &str) -> Value {
@@ -35,7 +33,7 @@ pub fn compact(value: &Value) -> String {
 pub fn side_for(role: &str) -> Option<Side> {
     match role {
         "host" => Some(Side::Host),
-        "client" | "viewer" => Some(Side::Viewer),
+        "viewer" => Some(Side::Viewer),
         _ => None,
     }
 }

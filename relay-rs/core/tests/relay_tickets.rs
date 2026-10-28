@@ -65,7 +65,7 @@ fn ticket_text_must_be_thirty_two_bytes() {
 }
 
 #[test]
-fn viewer_ticket_admits_media_client_and_host_ticket_does_not() {
+fn viewer_ticket_admits_media_viewer_and_host_ticket_does_not() {
     let mut h = Harness::new();
     let a = identity(1);
     let (host, _) = h.register_host(&a, Some(TOKEN));
@@ -75,7 +75,7 @@ fn viewer_ticket_admits_media_client_and_host_ticket_does_not() {
         Route::MediaWs,
         &host.pc,
         &viewer.epoch,
-        "media-client",
+        "media-viewer",
         &host.ticket,
     );
     assert_eq!(
@@ -88,7 +88,7 @@ fn viewer_ticket_admits_media_client_and_host_ticket_does_not() {
         Route::MediaWs,
         &host.pc,
         &viewer.epoch,
-        "media-client",
+        "media-viewer",
         &viewer.ticket,
     );
     assert!(admitted(&actions, id));
@@ -200,7 +200,7 @@ fn viewer_ticket_is_bound_to_the_current_epoch() {
         Route::MediaWs,
         &host.pc,
         &v2.epoch,
-        "media-client",
+        "media-viewer",
         &v1.ticket,
     );
     assert_eq!(closed(&actions, id), refused_data());
@@ -209,7 +209,7 @@ fn viewer_ticket_is_bound_to_the_current_epoch() {
         Route::MediaWs,
         &host.pc,
         &v2.epoch,
-        "media-client",
+        "media-viewer",
         &v2.ticket,
     );
     assert!(admitted(&actions, id));

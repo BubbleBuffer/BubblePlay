@@ -1,12 +1,12 @@
 # BubblePlay for Windows: first connection
 
-This is the quickstart for an unsigned Windows/browser alpha candidate. A public download is not available yet. Choose the Go/Docker relay with authenticator codes and optional ntfy, or the existing Cloudflare relay with ntfy approval. Docker runtime and a live desktop connection against Go remain release checks.
+This is the quickstart for an unsigned Windows/browser alpha candidate. A public download is not available yet. Set up the Rust relay ([relay setup](../relay-rs/README.md)) in Docker or on Cloudflare Workers; each new browser is approved through an ntfy notification. Docker runtime and a live desktop connection against the Rust relay remain release checks.
 
 ## Requirements
 
 - Windows x64 with an NVIDIA GPU and its current display driver. AMD, Intel and software encoding are not supported by the demonstrated host path.
 - A desktop Chromium browser for the receiver. HTTPS is required for normal internet access and browser clipboard features.
-- Your own configured BubblePlay relay. The relay address and its two host credentials are required. In a source checkout, relay setup guides are `docs/self-host-docker.md` and `docs/self-host-cloudflare.md`; this packaged quickstart assumes that setup is complete.
+- Your own configured BubblePlay relay. The relay address and its two host credentials are required. In a source checkout, the relay setup guide is `relay-rs/README.md`; this packaged quickstart assumes that setup is complete.
 - A visible Windows desktop or an existing compatible virtual display. The download does not install a display or mouse driver.
 
 The host runs as the signed-in Windows user. Secure desktop capture, including lock screens and UAC prompts, needs the secure-desktop helper. The default install adds it, and `-SkipAgent` leaves it out. Live acceptance of that capture is pending.
@@ -41,7 +41,7 @@ Windows may warn about the unsigned binaries. The candidate does not bypass thos
 
 1. Confirm the BubblePlay tray is running on the host PC.
 2. Open your relay's HTTPS address in the receiver browser.
-3. On Go, enter the application password and an authenticator code, or request ntfy approval and then enter the password. On Cloudflare, request ntfy approval and then enter the password.
+3. Approve the browser in the ntfy notification.
 4. Wait for the desktop stream.
 
 The Files menu uploads files into the host user's `Downloads\BubblePlay`. Desktop drag/drop can pass virtual files to a compatible Windows drop target directly. Native cursor shapes and clipboard synchronization work while input is ready. Image clipboard writes may need the browser's clipboard permission or the existing clipboard retry action.

@@ -9,8 +9,7 @@ use super::pairing::PairWindow;
 use super::pcs::PcTable;
 use super::state::{Conn, Kind, Phase, Role, Ticket, key_for};
 use super::types::{
-    Action, CachedCapabilities, ConnId, ConnPhase, ConnSnapshot, CoreConfig, Route,
-    SnapshotPairWindow, SnapshotTicket,
+    Action, ConnId, ConnPhase, ConnSnapshot, CoreConfig, Route, SnapshotPairWindow, SnapshotTicket,
 };
 use super::util;
 use crate::gate::Prefix;
@@ -32,17 +31,6 @@ impl Relay {
     pub fn snapshot_of(&self, id: ConnId) -> Option<ConnSnapshot> {
         let conn = self.conns.get(&id).filter(|conn| !conn.closing)?;
         let host = conn.role == Role::Host;
-        let cached: Vec<CachedCapabilities> = match self.rooms.get(&conn.pc) {
-            Some(room) if host => room
-                .cached
-                .iter()
-                .map(|(kind, raw)| CachedCapabilities {
-                    kind: (*kind).to_owned(),
-                    raw: raw.as_bytes().to_vec(),
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
         let pair_window = self
             .pair_windows
             .get(&conn.pc)
@@ -65,7 +53,6 @@ impl Relay {
                 hash: ticket.hash,
                 expires_ms: ticket.expires_ms,
             }),
-            cached,
             pair_window,
         })
     }
@@ -181,10 +168,10 @@ impl Relay {
     /// out and then calls `on_close`.
     ///
     /// Restored: live sockets, their epochs and tickets, the admitted viewers,
-    /// the host's cached capabilities and pairing window, and the rooms they
-    /// belong to. A live socket's activity is the saved value plus one step (at
-    /// most `now_ms`), so it is never closed early and an idle one closes within
-    /// one step of its real deadline.
+    /// the host's pairing window, and the rooms they belong to. A live socket's
+    /// activity is the saved value plus one step (at most `now_ms`), so it is
+    /// never closed early and an idle one closes within one step of its real
+    /// deadline.
     ///
     /// Lost on hibernation, and so not restored: viewer messages buffered while
     /// the host is away, the per-prefix pairing failure counts (the PC-wide count
@@ -273,7 +260,7 @@ impl Relay {
         if !device_ok
             || !epoch_ok
             || (snapshot.pairing && role != Role::Viewer)
-            || (!host && (!snapshot.cached.is_empty() || snapshot.pair_window.is_some()))
+            || (!host && snapshot.pair_window.is_some())
         {
             return None;
         }
@@ -304,25 +291,13 @@ impl Relay {
         })
     }
 
-    /// Restores a host. Refused when the PC has no record, already has a live
-    /// host, or the snapshot's cache or window is malformed.
+    /// Restores a host. Refused when the PC has no record or already has a live
+    /// host.
     fn adopt_host(&mut self, id: ConnId, snapshot: &ConnSnapshot, conn: Conn, now_ms: u64) -> bool {
         let pc = conn.pc.clone();
         let key = key_for(Role::Host, "", &pc);
         if !self.pcs.records.contains_key(&pc) || self.peers.contains_key(&key) {
             return false;
-        }
-        let mut cached = Vec::new();
-        for entry in &snapshot.cached {
-            let kind = match entry.kind.as_str() {
-                "host-capabilities" => "host-capabilities",
-                "input-capabilities" => "input-capabilities",
-                _ => return false,
-            };
-            let Ok(raw) = String::from_utf8(entry.raw.clone()) else {
-                return false;
-            };
-            cached.push((kind, raw));
         }
         // An expired window is gone; a window at the failure limit was dropped
         // by the live relay, so it is not restored either.
@@ -336,7 +311,9 @@ impl Relay {
             )
         });
         self.peers.insert(key, id);
-        self.rooms.entry(pc.clone()).or_default().cached = cached.into_iter().collect();
+        // The room holds the PC's current epoch and pending list. Create it
+        // when the host comes back, as the live host join does.
+        self.rooms.entry(pc.clone()).or_default();
         if let Some(window) = window {
             self.pair_windows.insert(pc, window);
         }

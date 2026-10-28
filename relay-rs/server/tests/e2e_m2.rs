@@ -132,7 +132,7 @@ async fn m2_admitted_native_viewer_gets_a_working_media_ticket() {
     .expect("the media upgrade is accepted");
     send_json(
         &mut media,
-        json!({ "type": "hello", "role": "media-client", "ticket": ticket }),
+        json!({ "type": "hello", "role": "media-viewer", "ticket": ticket }),
     )
     .await;
     let media_ok = next_json_of(&mut media, "hello-ok").await;
@@ -273,6 +273,42 @@ async fn m2_pairing_over_real_sockets_forwards_auth_and_drops_offers() {
     send_json(&mut host_ws, auth_host_json(&host)).await;
     let back = next_json_of(&mut viewer, "auth-host").await;
     assert_eq!(back["type"], json!("auth-host"));
+}
+
+/// A removed type from the viewer (an offer) is dropped by the relay and never reaches the
+/// host. The host's text frames up to the ctl that follows contain no offer.
+#[tokio::test]
+async fn m2_viewer_offer_never_reaches_the_host() {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let host = identity(1);
+    let (mut host_ws, _) = register_host(&server, &host, Some(TOKEN)).await;
+    let mut viewer = native_viewer(&server, &pc_id(&host)).await;
+    prove_viewer(&mut viewer, &viewer_identity(), None).await;
+    next_json_of(&mut viewer, "hello-ok").await;
+
+    send_json(&mut viewer, json!({ "type": "offer", "sdp": "v=0" })).await;
+    send_json(
+        &mut viewer,
+        json!({ "type": "ctl", "kind": "input", "seq": 7, "data": "" }),
+    )
+    .await;
+    let mut types = Vec::new();
+    loop {
+        let Frame::Text(text) = next_frame(&mut host_ws).await else {
+            panic!("the host receives text frames");
+        };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        types.push(value["type"].clone());
+        if value["type"] == json!("ctl") {
+            assert_eq!(value["seq"], json!(7));
+            break;
+        }
+    }
+    assert!(
+        !types.contains(&json!("offer")),
+        "the offer never reaches the host: {types:?}"
+    );
 }
 
 #[tokio::test]

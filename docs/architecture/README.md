@@ -9,9 +9,8 @@ BubblePlay has a native Windows host, a relay that serves the browser receiver, 
 | Windows host | [`host/src/main.rs`](../../host/src/main.rs), [`host/src/host_capture.rs`](../../host/src/host_capture.rs), [`host/src/host_encode.rs`](../../host/src/host_encode.rs) | DXGI capture, NVIDIA encoding, session state and input |
 | Per-user tray | [`host/src/bin/bubbleplay_tray.rs`](../../host/src/bin/bubbleplay_tray.rs), [`host/src/tray/`](../../host/src/tray) | Host supervision, settings, startup and rollback |
 | Optional admin-input helper | [`host/src/admin_agent/`](../../host/src/admin_agent) | Validated SendInput through a restricted local pipe for elevated apps |
-| Go relay | [`relay/server.go`](../../relay/server.go), [`relay/auth.go`](../../relay/auth.go), [`relay/protocol.go`](../../relay/protocol.go) | Site, password/authenticator or ntfy login, signaling and packet relay |
-| Cloudflare relay | [`worker/src/index.js`](../../worker/src/index.js), [`gate.js`](../../worker/src/gate.js), [`protocol-validation.js`](../../worker/src/protocol-validation.js) | Alternative relay using Durable Objects and ntfy approval |
-| Browser receiver | [`worker/public/receiver.js`](../../worker/public/receiver.js), [`transport.js`](../../worker/public/transport.js), [`media-v4.js`](../../worker/public/media-v4.js) | Session lifecycle, decode/presentation, input and media feedback; assets shared by both relays |
+| Rust relay | [`relay-rs/server/`](../../relay-rs/server), [`relay-rs/core/`](../../relay-rs/core), [`relay-rs/worker/`](../../relay-rs/worker) | The only relay: site gate with ntfy approval, signaling and packet relay; native server (Docker) and Cloudflare Workers adapter |
+| Browser receiver | [`worker/public/receiver.js`](../../worker/public/receiver.js), [`transport.js`](../../worker/public/transport.js), [`media-v4.js`](../../worker/public/media-v4.js) | Session lifecycle, decode/presentation, input and media feedback; assets served by the relay |
 | Android receiver | [`android/app/src/main/java/de/bubblebuffer/bubbleplay/`](../../android/app/src/main/java/de/bubblebuffer/bubbleplay) | Native Kotlin WSS receiver, MediaCodec and touch input |
 
 The Rust tree also retains older service/privileged-capture binaries, probes and stream-lab helpers. Those are development paths and are excluded from the public Windows ZIP. The admin-input helper above is the optional packaged component. Private command-execution companion packages are outside the public product.
@@ -37,7 +36,7 @@ Shared fixtures are the cross-language contract; update them and the affected im
 | [`audio-contract.json`](../../fixtures/audio-contract.json) | PC sound packets, opt-in and capability ([audio](audio.md)) |
 | [`browser-approval-contract.json`](../../fixtures/browser-approval-contract.json) | Host approval messages and login methods ([browser approval](browser-approval.md)) |
 
-See [file transfer](file-transfer.md), [monitor following](follow-active-window.md), [session UI](session-ui.md), and [secure desktop](secure-desktop.md) for the behavior behind these contracts. [Unattended access](unattended-access.md) is approved (2026-10-13) for access before sign-in and waits for [device IDs and keys](device-keys.md), approved 2026-10-13: per-device key files, pairing, routing by ID and the ntfy site gate. Go also consumes [browser-generated packet fixtures](../../relay/testdata/worker-contract.json).
+See [file transfer](file-transfer.md), [monitor following](follow-active-window.md), [session UI](session-ui.md), and [secure desktop](secure-desktop.md) for the behavior behind these contracts. [Unattended access](unattended-access.md) is approved (2026-10-13) for access before sign-in and waits for [device IDs and keys](device-keys.md), approved 2026-10-13: per-device key files, pairing, routing by ID and the ntfy site gate. The Rust relay's tests also read [browser-generated packet fixtures](../../relay-rs/core/tests/data/worker-contract.json); the Go relay that used them was deleted at CUT-1.
 
 ## Development boundaries
 
@@ -47,4 +46,4 @@ See [encoders](encoders.md) for backend selection, the shared bitstream contract
 
 The browser uses small modules for settings, session chrome, monitor selection, cursor translation, clipboard and files. The host separates capture adapters, encoding, session policy and telemetry from its main event loop. The lab separates process/browser orchestration from lifecycle and measurement logic.
 
-Deterministic fixture tests establish packet and state contracts. They do not establish capture-driver behavior, elevated input, physical display output or a deployed relay's interoperability. Use the [development guide](../development.md) for build commands, [Worker lab guide](../../worker/README.md#closed-loop-stream-lab) for isolated Windows acceptance, and [release status](../release-status.md) for remaining public-release checks.
+Deterministic fixture tests establish packet and state contracts. They do not establish capture-driver behavior, elevated input, physical display output or a deployed relay's interoperability. Use the [development guide](../development.md) for build commands, and [release status](../release-status.md) for remaining public-release checks.

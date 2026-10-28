@@ -25,9 +25,9 @@ use bp_device_key::DeviceId;
 use serde_json::{Map, Value};
 
 use crate::limits::{
-    ADMIT_MAX, ADMIT_VIEWERS_MAX, AUTH_MAX, CLIPBOARD_RAW_MAX, CTL_DATA_MAX, CTL_SEQ_MAX,
-    FILE_HEADER_BYTES, FILE_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT, PAIR_MAX,
-    SIGNAL_BINARY_MAX, SIGNAL_LIMIT,
+    ADMIT_MAX, ADMIT_VIEWERS_MAX, AUTH_MAX, CTL_DATA_MAX, CTL_SEQ_MAX, FILE_HEADER_BYTES,
+    FILE_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT, PAIR_MAX, SIGNAL_BINARY_MAX,
+    SIGNAL_LIMIT,
 };
 
 /// A message the relay refuses. Go does one of two things with it, and the
@@ -62,17 +62,17 @@ impl core::fmt::Display for Invalid {
 
 impl std::error::Error for Invalid {}
 
-/// The end of a socket a message came from. Go calls the viewer "client".
+/// The end of a socket a message came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Side {
     /// The PC: /host-ws, /host-media-ws, /host-file-ws.
     Host,
-    /// The browser: /ws, /media-ws, /file-ws (Go's "client").
+    /// The browser: /ws, /media-ws, /file-ws.
     Viewer,
 }
 
 impl Side {
-    /// Go's "host := role == \"host\"" and "client := role == \"client\"".
+    /// The (host, viewer) flags: exactly one is true for a known side.
     fn flags(self) -> (bool, bool) {
         match self {
             Side::Host => (true, false),
@@ -89,11 +89,6 @@ impl Side {
 /// string.
 fn text<'a>(m: &'a Map<String, Value>, key: &str) -> &'a str {
     m.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-/// Go's boolean helper: the value if it is a JSON bool, otherwise false.
-fn boolean(m: &Map<String, Value>, key: &str) -> bool {
-    matches!(m.get(key), Some(Value::Bool(true)))
 }
 
 /// Go's isBoolean helper: true only for a JSON true or false.
@@ -155,11 +150,6 @@ fn bounded_string(m: &Map<String, Value>, key: &str, min: usize, max: usize) -> 
     }
 }
 
-/// Go's protocol helper: the protocol field equals version.
-fn protocol(m: &Map<String, Value>, version: f64) -> bool {
-    integer(m, "protocol", version, version)
-}
-
 // ---------------------------------------------------------------------------
 // Go's regular expressions
 // ---------------------------------------------------------------------------
@@ -181,59 +171,30 @@ fn is_keyframe_reason(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
 }
 
-/// Go's "^[A-Za-z0-9+/]*={0,2}$" (clipboard image payload).
-fn is_base64_payload(value: &str) -> bool {
-    let (data, padding) = match value.find('=') {
-        Some(index) => value.split_at(index),
-        None => (value, ""),
-    };
-    padding.len() <= 2
-        && padding.bytes().all(|b| b == b'=')
-        && data
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
-}
-
-/// Go's "^[A-Za-z0-9_-]{8,64}$" (first-frame requestId).
-fn is_request_id(value: &str) -> bool {
-    (8..=64).contains(&value.len())
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-}
-
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
 
 /// The type of a validated signaling message.
+///
+/// After the phase-2 cutover a signaling socket accepts only the types listed
+/// here (decision 15 in dk2-decisions.md). Any other type fails
+/// validate_signal_text and gets the unknown-type handling: dropped, socket kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SignalKind {
+    /// The relay's own ping: answered with pong.
     Ping,
+    /// Either side: closes the socket.
     Bye,
+    /// Not accepted any more. Named only by SignalMessage::bufferable, which
+    /// the pending buffer still consults.
     Offer,
-    Answer,
+    /// Not accepted any more (see Offer).
     Ice,
-    Diag,
-    ClientLog,
-    Qos,
-    Quality,
-    HostCapabilities,
-    DesktopState,
-    SecureAction,
-    SecureActionResult,
-    InputStatus,
-    InputCapabilities,
-    Clipboard,
-    ClipboardImage,
-    FileOffer,
-    FileDragPreview,
-    MediaControl,
+    /// Not accepted any more (see Offer).
     FirstFrame,
-    MediaView,
-    MonitorList,
-    MonitorError,
-    BenchStatus,
+    /// Not accepted any more (see Offer).
+    MediaControl,
     /// Host to relay: the viewer IDs allowed to join. Consumed, never forwarded.
     Admit,
     /// Host to relay: opens a pairing window. Consumed, never forwarded.
@@ -265,28 +226,9 @@ impl SignalKind {
             SignalKind::Ping => "ping",
             SignalKind::Bye => "bye",
             SignalKind::Offer => "offer",
-            SignalKind::Answer => "answer",
             SignalKind::Ice => "ice",
-            SignalKind::Diag => "diag",
-            SignalKind::ClientLog => "client-log",
-            SignalKind::Qos => "qos",
-            SignalKind::Quality => "quality",
-            SignalKind::HostCapabilities => "host-capabilities",
-            SignalKind::DesktopState => "desktop-state",
-            SignalKind::SecureAction => "secure-action",
-            SignalKind::SecureActionResult => "secure-action-result",
-            SignalKind::InputStatus => "input-status",
-            SignalKind::InputCapabilities => "input-capabilities",
-            SignalKind::Clipboard => "clipboard",
-            SignalKind::ClipboardImage => "clipboard-image",
-            SignalKind::FileOffer => "file-offer",
-            SignalKind::FileDragPreview => "file-drag-preview",
-            SignalKind::MediaControl => "media-control",
             SignalKind::FirstFrame => "first-frame",
-            SignalKind::MediaView => "media-view",
-            SignalKind::MonitorList => "monitor-list",
-            SignalKind::MonitorError => "monitor-error",
-            SignalKind::BenchStatus => "bench-status",
+            SignalKind::MediaControl => "media-control",
             SignalKind::Admit => "admit",
             SignalKind::PairOpen => "pair-open",
             SignalKind::PairClose => "pair-close",
@@ -303,28 +245,16 @@ impl SignalKind {
 
     /// True for the types the router handles itself instead of only forwarding.
     ///
-    /// Go's forward answers ping with pong, turns bye into a close, and keeps
-    /// the last host-capabilities / input-capabilities for viewers that join
-    /// later (those two are forwarded as well).
+    /// Go's forward answers ping with pong and turns bye into a close. Admit,
+    /// pair-open and pair-close are host-to-relay messages the relay consumes.
     pub fn consumed_by_relay(self) -> bool {
         matches!(
             self,
             SignalKind::Ping
                 | SignalKind::Bye
-                | SignalKind::HostCapabilities
-                | SignalKind::InputCapabilities
                 | SignalKind::Admit
                 | SignalKind::PairOpen
                 | SignalKind::PairClose
-        )
-    }
-
-    /// True for the host messages the relay caches per room and replays to a
-    /// viewer that joins later.
-    pub fn cached_for_viewers(self) -> bool {
-        matches!(
-            self,
-            SignalKind::HostCapabilities | SignalKind::InputCapabilities
         )
     }
 }
@@ -374,16 +304,6 @@ impl<'a> SignalMessage<'a> {
         self.field("phase")
     }
 
-    /// browserApproval, which the relay caches per host connection. Only a
-    /// host-capabilities message can set it.
-    pub fn browser_approval(&self) -> bool {
-        self.kind == SignalKind::HostCapabilities
-            && self
-                .value
-                .as_object()
-                .is_some_and(|m| boolean(m, "browserApproval"))
-    }
-
     /// Go's bufferable helper: keep this viewer message while no host is
     /// connected.
     pub fn bufferable(&self) -> bool {
@@ -398,11 +318,6 @@ impl<'a> SignalMessage<'a> {
     /// See SignalKind::consumed_by_relay.
     pub fn consumed_by_relay(&self) -> bool {
         self.kind.consumed_by_relay()
-    }
-
-    /// See SignalKind::cached_for_viewers.
-    pub fn cached_for_viewers(&self) -> bool {
-        self.kind.cached_for_viewers()
     }
 }
 
@@ -499,29 +414,28 @@ impl FileKind {
 /// Validate a text message on a signaling socket.
 ///
 /// Returns the message type and the parsed body so the router can act on it.
-/// The epoch is the socket's current media epoch (Go's p.epoch), which
-/// media-control, file-drag-preview and the first-frame request phase are
-/// checked against.
+/// The epoch is kept for call compatibility. No allowed type checks it any
+/// more (the removed media-control, file-drag-preview and first-frame rules
+/// were the only users).
 ///
 /// A message longer than SIGNAL_LIMIT is rejected: that is the socket's read
 /// limit, so such a message never reaches the Go validator either.
 pub fn validate_signal_text<'a>(
     side: Side,
     raw: &'a str,
-    epoch: &str,
+    _epoch: &str,
 ) -> Result<SignalMessage<'a>, Invalid> {
-    validate_signal_text_for_role(Some(side), raw, epoch)
+    validate_signal_text_for_role(Some(side), raw, _epoch)
 }
 
 /// Validate a text message on a signaling socket, given Go's role string.
 ///
-/// Pass Some(side) for a signaling peer (host or client) and None for any
-/// other socket role (media-host, file-client, version-probe, ...), where Go's
-/// host and client flags are both false.
+/// Pass Some(side) for a signaling peer (host or viewer) and None for any
+/// other socket role (media, file, version probe), where both flags are false.
 pub fn validate_signal_text_for_role<'a>(
     side: Option<Side>,
     raw: &'a str,
-    epoch: &str,
+    _epoch: &str,
 ) -> Result<SignalMessage<'a>, Invalid> {
     if raw.len() > SIGNAL_LIMIT {
         return Err(Invalid::Close);
@@ -541,8 +455,7 @@ pub fn validate_signal_text_for_role<'a>(
         Some(side) => side.flags(),
         None => (false, false),
     };
-    let kind =
-        valid_signal_message(message, host, viewer, epoch, raw.len()).ok_or(Invalid::Drop)?;
+    let kind = valid_signal_message(message, host, viewer, raw.len()).ok_or(Invalid::Drop)?;
     Ok(SignalMessage { raw, value, kind })
 }
 
@@ -562,8 +475,8 @@ pub fn validate_media_text(side: Side, raw: &str, _epoch: &str) -> Result<MediaC
     if text(message, "type") == "ping" {
         return Ok(MediaControl::Ping);
     }
-    // Go drops text from a media host:
-    // "if p.role != \"media-client\" || !validMediaControl(m, len(data))".
+    // Go drops text from a media host: only the viewer may send media-control
+    // (its role check, then validMediaControl).
     if side != Side::Viewer || !valid_media_control(message, raw.len()) {
         return Err(Invalid::Drop);
     }
@@ -719,13 +632,13 @@ where
 // validSignalMessage
 // ---------------------------------------------------------------------------
 
-/// Go's validSignalMessage: Some(kind) when the relay accepts the message from
-/// this side, None when it must be dropped.
+/// The /ws allowlist (decision 15): Some(kind) when the relay accepts the message
+/// from this side, None when it must be dropped. Every other type, including the
+/// pre-cutover types, is None and gets the unknown-type handling.
 fn valid_signal_message(
     m: &Map<String, Value>,
     host: bool,
     viewer: bool,
-    epoch: &str,
     length: usize,
 ) -> Option<SignalKind> {
     if length > SIGNAL_LIMIT {
@@ -733,112 +646,6 @@ fn valid_signal_message(
     }
     match text(m, "type") {
         "bye" => (m.len() == 1).then_some(SignalKind::Bye),
-        "offer" => (viewer && length <= 256 * 1024 && bounded_string(m, "sdp", 1, 256 * 1024))
-            .then_some(SignalKind::Offer),
-        "answer" => (host && length <= 256 * 1024 && bounded_string(m, "sdp", 1, 256 * 1024))
-            .then_some(SignalKind::Answer),
-        "ice" => {
-            (length <= 16384 && (viewer || host) && has(m, "candidate")).then_some(SignalKind::Ice)
-        }
-        "diag" => (viewer && length <= 16384).then_some(SignalKind::Diag),
-        "client-log" => (viewer
-            && length <= 2048
-            && has(m, "seq")
-            && has(m, "atMs")
-            && bounded_string(m, "level", 1, 32)
-            && bounded_string(m, "event", 1, 128)
-            && object(m, "detail").is_some())
-        .then_some(SignalKind::ClientLog),
-        "qos" => (viewer && length <= 2048).then_some(SignalKind::Qos),
-        "quality" => (host && length <= 1024).then_some(SignalKind::Quality),
-        "host-capabilities" => {
-            // The approval-only form ({type, browserApproval} exactly) went
-            // away with browser approval; only the full form is accepted.
-            if !host
-                || length > 512
-                || !is_boolean(m, "serviceMode")
-                || !is_boolean(m, "coldBoot")
-                || !is_boolean(m, "secureDesktop")
-                || !is_boolean(m, "secureText")
-            {
-                return None;
-            }
-            if has(m, "browserApproval") && !is_boolean(m, "browserApproval") {
-                return None;
-            }
-            if has(m, "fileTransfer") && !integer(m, "fileTransfer", 0.0, 255.0) {
-                return None;
-            }
-            if has(m, "fileDrop")
-                && (!integer(m, "fileDrop", 1.0, 1.0) || !integer(m, "fileTransfer", 1.0, 1.0))
-            {
-                return None;
-            }
-            if has(m, "fileDropPreview")
-                && (!integer(m, "fileDropPreview", 1.0, 1.0)
-                    || !integer(m, "fileDrop", 1.0, 1.0)
-                    || boolean(m, "serviceMode"))
-            {
-                return None;
-            }
-            (!has(m, "followWindow") || integer(m, "followWindow", 0.0, 255.0))
-                .then_some(SignalKind::HostCapabilities)
-        }
-        "desktop-state" => {
-            (host && length <= 512 && valid_desktop_state(m)).then_some(SignalKind::DesktopState)
-        }
-        "secure-action" => (viewer
-            && length <= 512
-            && exact(m, &["type", "action"])
-            && text(m, "action") == "deny")
-            .then_some(SignalKind::SecureAction),
-        "secure-action-result" => (host
-            && length <= 512
-            && exact(m, &["type", "action", "ok", "reason"])
-            && text(m, "action") == "deny"
-            && is_boolean(m, "ok")
-            && bounded_string(m, "reason", 0, 96))
-        .then_some(SignalKind::SecureActionResult),
-        "input-status" => {
-            (host && valid_input_status(m, length)).then_some(SignalKind::InputStatus)
-        }
-        "input-capabilities" => (host
-            && length <= 256
-            && exact(
-                m,
-                &[
-                    "type",
-                    "protocol",
-                    "scancode",
-                    "clipboard",
-                    "clipboardMaxBytes",
-                ],
-            )
-            && protocol(m, 1.0)
-            && is_boolean(m, "scancode")
-            && is_boolean(m, "clipboard")
-            && integer(m, "clipboardMaxBytes", 0.0, 1024.0 * 1024.0))
-        .then_some(SignalKind::InputCapabilities),
-        "clipboard" => valid_clipboard(m, false, host, length).then_some(SignalKind::Clipboard),
-        "clipboard-image" => {
-            valid_clipboard(m, true, host, length).then_some(SignalKind::ClipboardImage)
-        }
-        "file-offer" => (host && valid_file_offer(m)).then_some(SignalKind::FileOffer),
-        "file-drag-preview" => {
-            valid_file_drag_preview(m, viewer, epoch, length).then_some(SignalKind::FileDragPreview)
-        }
-        "media-control" => {
-            valid_signal_media_control(m, viewer, epoch, length).then_some(SignalKind::MediaControl)
-        }
-        "first-frame" => {
-            valid_first_frame(m, host, viewer, epoch, length).then_some(SignalKind::FirstFrame)
-        }
-        "media-view" => (host && length <= 64 * 1024).then_some(SignalKind::MediaView),
-        "monitor-list" => (host && length <= 64 * 1024).then_some(SignalKind::MonitorList),
-        "monitor-error" => (host && length <= 64 * 1024).then_some(SignalKind::MonitorError),
-        "bench-status" => {
-            (host && length <= 16384 && protocol(m, 1.0)).then_some(SignalKind::BenchStatus)
-        }
         // Phase 2 and pairing. Exact keys, a direction and a size cap for each.
         "admit" => (host && valid_admit(m, length)).then_some(SignalKind::Admit),
         "pair-open" => (host && exact(m, &["type", "admit"]) && b64url_is(m, "admit", 32))
@@ -1000,234 +807,6 @@ fn valid_media_control(m: &Map<String, Value>, length: usize) -> bool {
     }
 }
 
-/// Go's media-control arm of validSignalMessage (the same shape on a signaling
-/// socket, plus the epoch rule).
-fn valid_signal_media_control(
-    m: &Map<String, Value>,
-    viewer: bool,
-    epoch: &str,
-    length: usize,
-) -> bool {
-    if !viewer || length > 2048 {
-        return false;
-    }
-    if protocol(m, 4.0) && text(m, "epoch") != epoch {
-        return false;
-    }
-    match text(m, "action") {
-        "monitors" => protocol(m, 4.0) && text(m, "epoch") == epoch,
-        "monitor" => bounded_string(m, "monitor", 1, 128),
-        "follow" => protocol(m, 4.0) && text(m, "epoch") == epoch && is_boolean(m, "follow"),
-        "start" | "stop" | "viewport" | "profile" | "keyframe" | "mode" | "quality" => true,
-        _ => false,
-    }
-}
-
-/// Go's first-frame arm.
-fn valid_first_frame(
-    m: &Map<String, Value>,
-    host: bool,
-    viewer: bool,
-    epoch: &str,
-    length: usize,
-) -> bool {
-    if length > 1024 || !protocol(m, 1.0) || !is_request_id(text(m, "requestId")) {
-        return false;
-    }
-    match text(m, "phase") {
-        "request" => {
-            viewer
-                && matches!(text(m, "transport"), "webrtc" | "wss")
-                && (!has(m, "epoch") || text(m, "epoch") == epoch)
-        }
-        "presented" => viewer && uint32_value(m, "generation"),
-        "admitted" | "ready" => host && uint32_value(m, "generation"),
-        "failed" => host && uint32_value(m, "generation") && bounded_string(m, "reason", 1, 96),
-        _ => false,
-    }
-}
-
-/// Go's file-drag-preview arm.
-fn valid_file_drag_preview(
-    m: &Map<String, Value>,
-    viewer: bool,
-    epoch: &str,
-    length: usize,
-) -> bool {
-    if !viewer
-        || length > 8192
-        || !protocol(m, 1.0)
-        || text(m, "epoch") != epoch
-        || !integer(m, "dragId", 1.0, 4_294_967_295.0)
-        || !only(
-            m,
-            &[
-                "type", "protocol", "epoch", "dragId", "action", "drop", "types",
-            ],
-        )
-    {
-        return false;
-    }
-    if text(m, "action") == "cancel" {
-        return !has(m, "drop") && !has(m, "types");
-    }
-    if text(m, "action") != "update" || !object(m, "drop").is_some_and(valid_drop) {
-        return false;
-    }
-    let Some(types) = m.get("types").and_then(Value::as_array) else {
-        return false;
-    };
-    if types.is_empty() || types.len() > 64 {
-        return false;
-    }
-    // Go decodes the array into []string, and a JSON null element decodes to
-    // "" without an error, so it passes the checks below.
-    types.iter().all(|value| match value {
-        Value::Null => true,
-        Value::String(value) => value.len() <= 96 && value.bytes().all(|b| (33..=126).contains(&b)),
-        _ => false,
-    })
-}
-
-/// Go's clipboard and clipboard-image arm.
-fn valid_clipboard(m: &Map<String, Value>, image: bool, host: bool, length: usize) -> bool {
-    let count = number(m, "count").unwrap_or_default();
-    let max_count = if image { 342.0 } else { 64.0 };
-    if !host
-        || length > CLIPBOARD_RAW_MAX
-        || !protocol(m, 1.0)
-        || !uint32_value(m, "id")
-        || !integer(m, "count", 1.0, max_count)
-        || !integer(m, "index", 0.0, count - 1.0)
-        || !bounded_string(m, "text", 0, 32 * 1024)
-    {
-        return false;
-    }
-    if image {
-        exact(
-            m,
-            &[
-                "count", "id", "index", "mimeType", "protocol", "text", "type",
-            ],
-        ) && text(m, "mimeType") == "image/png"
-            && is_base64_payload(text(m, "text"))
-    } else {
-        exact(m, &["count", "id", "index", "protocol", "text", "type"])
-    }
-}
-
-/// Go's input-status arm.
-fn valid_input_status(m: &Map<String, Value>, length: usize) -> bool {
-    if length > 1024 || !protocol(m, 1.0) || !uint32_value(m, "generation") {
-        return false;
-    }
-    // A JSON null reason is allowed and means "no reason".
-    if has(m, "reason")
-        && !matches!(m.get("reason"), Some(Value::Null))
-        && !matches!(text(m, "reason"), "admin-required" | "admin-unavailable")
-    {
-        return false;
-    }
-    if has(m, "route") && !matches!(text(m, "route"), "local" | "admin" | "secure") {
-        return false;
-    }
-    for key in [
-        "receivedPackets",
-        "acceptedPackets",
-        "failedPackets",
-        "droppedPackets",
-        "releasedInputs",
-        "requestedEvents",
-        "appliedEvents",
-    ] {
-        if !integer(m, key, 0.0, 9_007_199_254_740_991.0) {
-            return false;
-        }
-    }
-    let received = number(m, "receivedPackets").unwrap_or_default();
-    for key in ["acceptedPackets", "failedPackets", "droppedPackets"] {
-        if number(m, key).unwrap_or_default() > received {
-            return false;
-        }
-    }
-    let applied = number(m, "appliedEvents").unwrap_or_default();
-    let requested = number(m, "requestedEvents").unwrap_or_default();
-    if applied > requested {
-        return false;
-    }
-    if has(m, "lastErrorCode") && !integer(m, "lastErrorCode", -2_147_483_648.0, 2_147_483_647.0) {
-        return false;
-    }
-    if has(m, "lastSequence") && !integer(m, "lastSequence", 0.0, 65535.0) {
-        return false;
-    }
-    true
-}
-
-/// Go's secure-desktop state message (desktop-state).
-fn valid_desktop_state(m: &Map<String, Value>) -> bool {
-    if !only(
-        m,
-        &[
-            "type",
-            "state",
-            "desktop",
-            "input",
-            "generation",
-            "reason",
-            "secureKind",
-            "secureCapabilities",
-        ],
-    ) || !matches!(text(m, "state"), "active" | "unavailable")
-        || !uint32_value(m, "generation")
-        || !bounded_string(m, "reason", 0, 96)
-    {
-        return false;
-    }
-    if has(m, "desktop") && !matches!(text(m, "desktop"), "default" | "secure" | "none") {
-        return false;
-    }
-    if has(m, "input") && !matches!(text(m, "input"), "enabled" | "suspended" | "read-only") {
-        return false;
-    }
-    if has(m, "secureKind")
-        && (text(m, "desktop") != "secure"
-            || !matches!(text(m, "secureKind"), "uac" | "lock" | "other"))
-    {
-        return false;
-    }
-    if has(m, "secureCapabilities") {
-        // Go: only on a secure desktop; the list must decode (null is a nil
-        // slice and rejected; [] is accepted).
-        if text(m, "desktop") != "secure" {
-            return false;
-        }
-        let Some(values) = m.get("secureCapabilities").and_then(Value::as_array) else {
-            return false;
-        };
-        if values.len() > 3 {
-            return false;
-        }
-        let mut seen = [false; 3];
-        for value in values {
-            let Some(capability) = value.as_str() else {
-                return false;
-            };
-            let index = match capability {
-                "view" => 0,
-                "deny" => 1,
-                "input" => 2,
-                _ => return false,
-            };
-            if seen[index] {
-                return false;
-            }
-            seen[index] = true;
-        }
-    }
-    true
-}
-
 /// Go's validDrop: the pointer a drag was released at.
 fn valid_drop(m: &Map<String, Value>) -> bool {
     exact(m, &["x", "y", "generation", "viewportRevision"])
@@ -1257,41 +836,6 @@ fn valid_file_meta(m: &Map<String, Value>) -> bool {
         "drop" => object(m, "drop").is_some_and(valid_drop),
         _ => false,
     }
-}
-
-/// Go's validFileOffer: the signaling file-offer message.
-fn valid_file_offer(m: &Map<String, Value>) -> bool {
-    if !protocol(m, 1.0)
-        || !uint32_value(m, "offerId")
-        || !matches!(text(m, "source"), "clipboard" | "sendto")
-    {
-        return false;
-    }
-    let items: Vec<&Map<String, Value>> = match m.get("items") {
-        None => return false,
-        // Go decodes a JSON null into an empty slice without an error; a
-        // missing key is an error. Both are handled the way Go does.
-        Some(Value::Null) => Vec::new(),
-        Some(Value::Array(values)) => {
-            let mut items = Vec::with_capacity(values.len());
-            for value in values {
-                match value.as_object() {
-                    Some(item) => items.push(item),
-                    None => return false,
-                }
-            }
-            items
-        }
-        Some(_) => return false,
-    };
-    if items.len() > 64 {
-        return false;
-    }
-    items.iter().all(|item| {
-        uint32_value(item, "id")
-            && bounded_string(item, "name", 1, 1024)
-            && integer(item, "size", 0.0, 2.0 * 1024.0 * 1024.0 * 1024.0)
-    })
 }
 
 #[cfg(test)]
@@ -1400,24 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_payload_matches_go_pattern() {
-        assert!(is_base64_payload(""));
-        assert!(is_base64_payload("AQID"));
-        assert!(is_base64_payload("AQ=="));
-        assert!(is_base64_payload("=="));
-        assert!(!is_base64_payload("A==="));
-        assert!(!is_base64_payload("AQ=ID"));
-        assert!(!is_base64_payload("AQ-ID"));
-        assert!(!is_base64_payload("AQ ID"));
-    }
-
-    #[test]
-    fn request_id_and_epoch_match_go_patterns() {
-        assert!(is_request_id("fixture_1"));
-        assert!(is_request_id(&"a".repeat(64)));
-        assert!(!is_request_id(&"a".repeat(65)));
-        assert!(!is_request_id("short7c"));
-        assert!(!is_request_id("has space"));
+    fn epoch_matches_go_pattern() {
         assert!(validate_epoch("0123456789abcdef0123456789abcdef"));
         assert!(!validate_epoch("0123456789ABCDEF0123456789ABCDEF"));
         assert!(!validate_epoch("0123456789abcdef0123456789abcdeg"));

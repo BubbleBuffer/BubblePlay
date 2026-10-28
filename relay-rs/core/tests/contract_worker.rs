@@ -1,25 +1,11 @@
-//! relay/testdata/worker-contract.json: the shapes the browser and the host
-//! really produce (port of TestBrowserGeneratedProtocolFixtures in
-//! relay/server_test.go).
+//! tests/data/worker-contract.json: the shapes the browser and the host
+//! really produce (port of TestBrowserGeneratedProtocolFixtures in the
+//! Go relay's server_test.go, deleted at CUT-1).
 
 mod common;
 
 use bp_relay_core::{FileKind, Side, validate_file_binary, validate_media_binary};
 use common::*;
-
-#[test]
-fn contract_worker_signals_are_accepted() {
-    let fixture = test_data("worker-contract.json");
-    let epoch = as_str(&fixture, "epoch");
-    for signal in as_array(&fixture, "signals") {
-        let role = as_str(signal, "role");
-        let text = compact(&signal["message"]);
-        assert!(
-            accepted(role, &text, epoch),
-            "{role} producer shape rejected: {text}"
-        );
-    }
-}
 
 #[test]
 fn contract_worker_file_packets_are_accepted() {

@@ -2,21 +2,20 @@
 
 Stream your Windows desktop to a browser, with native cursor shapes, keyboard and mouse input, clipboard sharing, and file transfer. Use WebRTC or WebSocket streaming through your own relay.
 
-BubblePlay is being prepared for its first open-source alpha under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). The current Windows/browser path works. You run your own relay: a small Go/Docker service, or a Cloudflare Worker. A new browser needs your password plus a second factor you choose: an authenticator code, an ntfy notification, or an Allow/Deny prompt on the PC ([browser approval](docs/architecture/browser-approval.md)). The public GitHub release is still pending.
+BubblePlay is being prepared for its first open-source alpha under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). The current Windows/browser path works. You run your own relay: the Rust relay in a Docker container, or on Cloudflare Workers ([relay setup](relay-rs/README.md)). A new browser must be approved through an ntfy notification ([browser approval](docs/architecture/browser-approval.md)). The public GitHub release is still pending.
 
 ## Get started
 
 The Windows host currently requires **Windows x64, an NVIDIA GPU and its display driver**. Use a desktop Chromium browser as the receiver. The host runs as the signed-in Windows user; an optional elevated helper enables input in elevated applications.
 
 - [Windows installation and first connection](docs/windows-quickstart.md)
-- [Go/Docker self-hosting](docs/self-host-docker.md)
-- [Cloudflare self-hosting](docs/self-host-cloudflare.md)
+- [Relay setup (Docker and Cloudflare Workers)](relay-rs/README.md)
 - [Documentation](docs/README.md)
 - [Build and development checks](docs/development.md)
 - [Architecture and feature contracts](docs/architecture/README.md)
 - [Android client](android/README.md)
 
-Docker runs the site, authentication and relay. Desktop capture and encoding run on the native Windows host. The Go implementation has automated authentication/protocol checks and a browser-login smoke test; actual Docker runtime and live desktop-stream acceptance remain pending.
+Docker runs the site gate and relay ([relay-rs/Dockerfile](relay-rs/Dockerfile)). Desktop capture and encoding run on the native Windows host. The Rust relay has automated protocol and gate tests; live Docker and desktop-stream acceptance remain pending.
 
 See [release status](docs/release-status.md) for the remaining acceptance checks. Contributors can start with the [repository map and checks](docs/development.md).
 

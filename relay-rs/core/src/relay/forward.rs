@@ -13,7 +13,7 @@ use super::util;
 use crate::limits::PENDING_LIMIT;
 use crate::protocol::{
     FileText, Invalid, MediaControl, SignalKind, validate_file_binary, validate_file_text,
-    validate_media_binary, validate_media_text, validate_signal_binary, validate_signal_text,
+    validate_media_binary, validate_media_text, validate_signal_text,
 };
 
 impl Relay {
@@ -58,17 +58,11 @@ impl Relay {
         self.record_activity(id, now_ms, out);
         let side = conn.role.side();
         match conn.role.kind() {
-            // Go drops an invalid signal or media frame and keeps the socket.
-            // Binary signalling goes viewer to host only (M2 section 4). A
-            // pairing-mode viewer's frames are dropped.
-            Kind::Signal => {
-                if conn.role == Role::Viewer
-                    && !conn.pairing
-                    && validate_signal_binary(bytes).is_ok()
-                {
-                    self.forward_binary(&conn, bytes, out);
-                }
-            }
+            // Binary frames are never forwarded on a signalling socket (decision
+            // 15: the /ws allowlist is text only). Dropped in both directions,
+            // socket kept, the same as a frame in a disallowed direction.
+            Kind::Signal => {}
+            // Go drops an invalid media frame and keeps the socket.
             Kind::Media => {
                 if validate_media_binary(side, bytes).is_ok() {
                     self.forward_binary(&conn, bytes, out);
@@ -94,8 +88,8 @@ impl Relay {
     }
 
     /// Text on a signalling socket: ping, bye, the messages the relay consumes
-    /// (admit, pair-open, pair-close), capability caching, forwarding, and
-    /// buffering of viewer messages while the host is away.
+    /// (admit, pair-open, pair-close), forwarding, and buffering of viewer
+    /// messages while the host is away.
     fn signal_text(
         &mut self,
         id: ConnId,
@@ -142,11 +136,6 @@ impl Relay {
                 }
             }
             kind => {
-                if conn.role == Role::Host && kind.cached_for_viewers() {
-                    let room = self.rooms.entry(conn.pc.clone()).or_default();
-                    room.cached.insert(kind.as_str(), text.to_owned());
-                    self.persist(id, out);
-                }
                 if !self.pairing_allows(conn, kind) {
                     return;
                 }

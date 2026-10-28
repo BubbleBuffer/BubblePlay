@@ -49,37 +49,11 @@ jobs:
       - name: Fresh-install credential validation
         shell: pwsh
         run: ./host/scripts/test-setup-credentials.ps1
-      - name: Explicit Worker and password validation
-        shell: pwsh
-        run: ./worker/tools/test-set-app-password.ps1
       - name: Windows PowerShell compatibility
         shell: powershell
         run: |
           ./tools/tests/package-release.test.ps1
           ./host/scripts/test-setup-credentials.ps1
-          ./worker/tools/test-set-app-password.ps1
-
-  relay:
-    runs-on: [self-hosted, build01]
-    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
-    # Rust relay lane pushes only need the relay-rs job; the full suite runs on PRs to master.
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay')
-    defaults:
-      run:
-        working-directory: relay
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: 1.27.1
-          cache-dependency-path: relay/go.sum
-      - run: go test -race ./...
-      - run: go vet ./...
-      - name: Container build
-        working-directory: .
-        run: docker build -f relay/Dockerfile -t bubbleplay-relay:check .
 
   relay-rs:
     runs-on: [self-hosted, build01]
