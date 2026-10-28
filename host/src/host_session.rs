@@ -33,6 +33,15 @@ pub(super) fn valid_media_epoch(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// A media start may name only the authenticated session's epoch. A start without an epoch
+/// (WebRTC) passes; WSS media then refuses it for the missing epoch.
+pub(super) fn media_start_epoch_allowed(requested: Option<&str>, session: Option<&str>) -> bool {
+    match requested {
+        None => true,
+        Some(requested) => valid_media_epoch(requested) && session == Some(requested),
+    }
+}
+
 pub(super) fn should_replace_wss_media_session(
     has_active_media: bool,
     active_epoch: Option<&str>,
@@ -691,6 +700,19 @@ pub(super) fn encoder_mode_for_capture(
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+    #[test]
+    fn media_start_epoch_must_be_the_authenticated_one() {
+        let session = "0123456789abcdef0123456789abcdef";
+        let other = "fedcba9876543210fedcba9876543210";
+        assert!(media_start_epoch_allowed(Some(session), Some(session)));
+        assert!(media_start_epoch_allowed(None, Some(session)));
+        // A well-formed epoch that is not the session's is refused.
+        assert!(!media_start_epoch_allowed(Some(other), Some(session)));
+        assert!(!media_start_epoch_allowed(Some(session), None));
+        // A malformed epoch is refused even when it equals the session text.
+        assert!(!media_start_epoch_allowed(Some("not-hex"), Some("not-hex")));
+    }
+
     #[test]
     fn first_frame_timeout_extends_only_for_attached_capture_recovery_and_is_bounded() {
         let armed = Instant::now();

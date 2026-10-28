@@ -3390,6 +3390,17 @@ fn run_serve(
                         }
                         continue;
                     }
+                    if action == "start"
+                        && !media_start_epoch_allowed(epoch.as_deref(), signaling.viewer_epoch())
+                    {
+                        // Only the authenticated session's epoch may start or replace media.
+                        warn!(
+                            ?epoch,
+                            session_epoch = signaling.viewer_epoch(),
+                            "media start refused: epoch is not the authenticated session epoch"
+                        );
+                        continue;
+                    }
                     if let Some(next_mode) = StreamMode::parse(requested_stream_mode.as_deref()) {
                         if next_mode != stream_mode {
                             stream_mode = next_mode;
