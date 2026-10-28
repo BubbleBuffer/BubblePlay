@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use tungstenite::client::IntoClientRequest;
-use tungstenite::http::{header::AUTHORIZATION, HeaderName, HeaderValue, Request};
+use tungstenite::http::{header::AUTHORIZATION, HeaderValue, Request};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{client_tls_with_config, Error as WsError, Message, WebSocket};
 
@@ -2381,27 +2381,6 @@ fn first_frame_message(
 }
 
 fn signaling_request(url: &str, host_gate_token: Option<&str>) -> Result<Request<()>> {
-    let worker_name = std::env::var("BUBBLEPLAY_LAB_WORKER_NAME")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let version_id = std::env::var("BUBBLEPLAY_LAB_WORKER_VERSION_ID")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let worker_version = match (worker_name.as_deref(), version_id.as_deref()) {
-        (None, None) => None,
-        (Some(worker_name), Some(version_id)) => Some((worker_name, version_id)),
-        _ => bail!(
-            "Stream Lab Worker version override requires both worker name and version identifier"
-        ),
-    };
-    signaling_request_with_worker_version(url, host_gate_token, worker_version)
-}
-
-fn signaling_request_with_worker_version(
-    url: &str,
-    host_gate_token: Option<&str>,
-    worker_version: Option<(&str, &str)>,
-) -> Result<Request<()>> {
     crate::relay_url::require_secure_relay_url(url)?;
     let mut request = url
         .into_client_request()
@@ -2411,30 +2390,7 @@ fn signaling_request_with_worker_version(
             .context("host gate token is not a valid HTTP header value")?;
         request.headers_mut().insert(AUTHORIZATION, value);
     }
-    if request.uri().path() == "/lab-host-ws" {
-        if let Some((worker_name, version_id)) = worker_version {
-            if !canonical_worker_name(worker_name) || !canonical_worker_version_id(version_id) {
-                bail!("Stream Lab Worker version override is not canonical");
-            }
-            let value = HeaderValue::from_str(&format!("{worker_name}=\"{version_id}\""))
-                .context("Stream Lab Worker version override is not a valid HTTP header value")?;
-            request.headers_mut().insert(
-                HeaderName::from_static("cloudflare-workers-version-overrides"),
-                value,
-            );
-        }
-    }
     Ok(request)
-}
-
-fn canonical_worker_name(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (1..=63).contains(&bytes.len())
-        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
 fn canonical_worker_version_id(value: &str) -> bool {
@@ -2522,8 +2478,7 @@ fn probe_worker_version(
     }
 }
 
-/// Keyed signaling URL: `pc=<id>` appended to the worker URL's query. Lab twins keep their
-/// `run` and `compat` fields.
+/// Keyed signaling URL: `pc=<id>` appended to the worker URL's query.
 fn keyed_signaling_url(url: &str, id: &str) -> Result<String> {
     let uri: tungstenite::http::Uri = url.parse().context("invalid worker URL")?;
     if uri
@@ -2714,11 +2669,10 @@ fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        bench_status_wire, keepalive_expired, signaling_request,
-        signaling_request_with_worker_version, worker_version_changed, worker_version_probe_url,
-        BenchEncodeStages, BenchHybridActivity, BenchRoiActivity, BenchStageTiming,
-        BenchStatusEffective, BenchStatusEncoder, SignalMsg, WorkerVersionMonitor,
-        BENCH_STATUS_MAX_BYTES, KEEPALIVE_TIMEOUT, V2_REDUNDANT_BENCH_FIELDS,
+        bench_status_wire, keepalive_expired, signaling_request, worker_version_changed,
+        worker_version_probe_url, BenchEncodeStages, BenchHybridActivity, BenchRoiActivity,
+        BenchStageTiming, BenchStatusEffective, BenchStatusEncoder, SignalMsg,
+        WorkerVersionMonitor, BENCH_STATUS_MAX_BYTES, KEEPALIVE_TIMEOUT, V2_REDUNDANT_BENCH_FIELDS,
     };
     use std::time::{Duration, Instant};
 
@@ -2804,11 +2758,11 @@ mod tests {
             Some("wss://play.example/host-version-ws".to_string())
         );
         assert_eq!(
-            worker_version_probe_url("wss://play.example/lab-host-ws?run=abc").unwrap(),
+            worker_version_probe_url("wss://play.example/host-media-ws").unwrap(),
             None
         );
         assert_eq!(
-            worker_version_probe_url("ws://127.0.0.1:8787/lab-host-ws?run=abc").unwrap(),
+            worker_version_probe_url("ws://127.0.0.1:8787/host-media-ws").unwrap(),
             None
         );
         assert!(worker_version_probe_url("https://play.example/host-ws").is_err());
@@ -3508,63 +3462,24 @@ mod tests {
     }
 
     #[test]
-    fn lab_worker_version_override_is_header_only_and_never_reaches_production() {
-        let request = signaling_request_with_worker_version(
-            "wss://playfull-cat.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000",
-            None,
-            Some(("playfull-cat", "c9d1446b-5314-468c-bfad-12595f9a0090")),
-        )
-        .unwrap();
-        assert_eq!(
-            request
-                .headers()
-                .get("Cloudflare-Workers-Version-Overrides")
-                .unwrap(),
-            r#"playfull-cat="c9d1446b-5314-468c-bfad-12595f9a0090""#
-        );
-        assert!(!request.uri().to_string().contains("c9d1446b"));
-
-        let production = signaling_request_with_worker_version(
-            "wss://playfull-cat.example/host-ws",
-            None,
-            Some(("playfull-cat", "c9d1446b-5314-468c-bfad-12595f9a0090")),
-        )
-        .unwrap();
-        assert!(production
-            .headers()
-            .get("Cloudflare-Workers-Version-Overrides")
-            .is_none());
-    }
-
-    #[test]
-    fn lab_worker_version_override_rejects_noncanonical_values() {
-        assert!(signaling_request_with_worker_version(
-            "wss://playfull-cat.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000",
-            None,
-            Some(("Playfull-Cat", "not-a-version")),
-        )
-        .is_err());
-    }
-
-    #[test]
     fn signaling_refuses_cleartext_except_to_a_loopback_relay() {
         for url in [
             "ws://192.168.1.20:8787/host-ws",
             "ws://playfull-cat.example/host-ws",
             "ws://localhost.evil.com/host-ws",
         ] {
-            let error = signaling_request_with_worker_version(url, Some("gate-credential"), None)
+            let error = signaling_request(url, Some("gate-credential"))
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("loopback"), "{error}");
             assert!(!error.contains("gate-credential"), "{error}");
         }
         for url in [
-            "ws://127.0.0.1:8787/lab-host-ws?run=abc",
+            "ws://127.0.0.1:8787/host-ws",
             "ws://localhost:8787/host-ws",
             "ws://[::1]:8787/host-ws",
         ] {
-            signaling_request_with_worker_version(url, Some("gate-credential"), None).unwrap();
+            signaling_request(url, Some("gate-credential")).unwrap();
         }
     }
 
@@ -4615,15 +4530,11 @@ mod keyed_registration_tests {
     }
 
     #[test]
-    fn keyed_url_adds_the_pc_and_keeps_lab_fields() {
+    fn keyed_url_adds_the_pc() {
         assert_eq!(
             keyed_signaling_url("wss://worker.example/host-ws", "ABCD-EFGH-JKMN-PQRS").unwrap(),
             "wss://worker.example/host-ws?pc=ABCD-EFGH-JKMN-PQRS"
         );
-        let lab = "wss://worker.example/lab-host-ws?run=123e4567-e89b-42d3-a456-426614174000&compat=wss-v4-bench2-hevc-tiles-bpip4-v16";
-        let keyed = keyed_signaling_url(lab, "ABCD-EFGH-JKMN-PQRS").unwrap();
-        assert!(keyed.ends_with("&pc=ABCD-EFGH-JKMN-PQRS"), "{keyed}");
-        assert!(keyed.contains("?run=123e4567"), "{keyed}");
         assert!(keyed_signaling_url("wss://worker.example/host-ws?pc=X", "ABCD").is_err());
     }
 }
