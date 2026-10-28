@@ -504,9 +504,11 @@ fn socket_request_with_worker_version(
         .to_string()
         .into_client_request()
         .context("build media websocket request")?;
-    let value = HeaderValue::from_str(&format!("Bearer {bearer}"))
-        .context("host bearer is not a valid HTTP header value")?;
-    request.headers_mut().insert(AUTHORIZATION, value);
+    if matches!(route, RelayRoute::Legacy) {
+        let value = HeaderValue::from_str(&format!("Bearer {bearer}"))
+            .context("host bearer is not a valid HTTP header value")?;
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
     if parsed.path() == lab_path {
         if let Some((worker_name, version_id)) = worker_version {
             if !canonical_worker_name(worker_name) || !canonical_worker_version_id(version_id) {
@@ -711,7 +713,11 @@ mod tests {
                         request.uri().to_string(),
                         format!("wss://worker.example{path}?epoch={EPOCH}{selector}")
                     );
-                    assert_eq!(request.headers()[AUTHORIZATION], "Bearer host-bearer");
+                    if matches!(route, RelayRoute::Legacy) {
+                        assert_eq!(request.headers()[AUTHORIZATION], "Bearer host-bearer");
+                    } else {
+                        assert!(request.headers().get(AUTHORIZATION).is_none());
+                    }
                     assert!(!request.uri().to_string().contains(TICKET));
                     let hello: serde_json::Value =
                         serde_json::from_str(&data_hello(role, &route)).unwrap();

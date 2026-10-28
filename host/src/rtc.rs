@@ -97,6 +97,9 @@ pub struct RtcSession {
     pub audio_mid: Option<Mid>,
     pub audio_pt: Option<Pt>,
     pub ice_connected: bool,
+    /// Opened only after the device-key DTLS bindings have both verified.
+    application_authorized: bool,
+    dtls_connected: bool,
     /// ICE reported Disconnected; a later Connected is a recovery.
     ice_lost: bool,
     /// Base instant for the 90 kHz RTP clock.
@@ -138,6 +141,8 @@ impl RtcSession {
             audio_mid: None,
             audio_pt: None,
             ice_connected: false,
+            application_authorized: false,
+            dtls_connected: false,
             ice_lost: false,
             clock_start: now,
             last_rtp_90k: None,
@@ -204,6 +209,7 @@ impl RtcSession {
     pub fn on_event(&mut self, event: Event) -> Option<RtcAction> {
         match event {
             Event::Connected => {
+                self.dtls_connected = true;
                 self.ice_connected = true;
                 info!("ICE connected");
                 Some(RtcAction::IceConnected)
@@ -223,7 +229,7 @@ impl RtcSession {
                         self.ice_lost = false;
                         self.ice_connected = true;
                         info!(?state, "ICE reconnected");
-                        Some(RtcAction::IceConnected)
+                        self.dtls_connected.then_some(RtcAction::IceConnected)
                     }
                     _ => None,
                 }
@@ -295,7 +301,8 @@ impl RtcSession {
             }
             Event::ChannelData(data) => {
                 debug!(channel_id = ?data.id, binary = data.binary, len = data.data.len(), "channel data");
-                if !data.binary
+                if !self.application_authorized
+                    || !data.binary
                     || (Some(data.id) != self.input_control && Some(data.id) != self.input_motion)
                 {
                     return None;
@@ -337,6 +344,9 @@ impl RtcSession {
     /// media time verbatim into the RTP header (truncated to 32 bits), so the
     /// returned value is the timestamp the browser sees for this frame.
     pub fn write_video(&mut self, access_unit: Vec<u8>) -> Result<Option<u32>> {
+        if !self.application_authorized {
+            return Ok(None);
+        }
         let (Some(mid), Some(pt)) = (self.video_mid, self.video_pt) else {
             return Ok(None); // media not negotiated yet
         };
@@ -379,6 +389,9 @@ impl RtcSession {
     /// connected (str0m drops media written before then). Nothing is recorded
     /// for a frame that was not admitted, so the next one reads as a gap.
     pub fn write_audio(&mut self, frame: AudioFrame) -> Result<bool> {
+        if !self.application_authorized {
+            return Ok(false);
+        }
         let (Some(mid), Some(pt)) = (self.audio_mid, self.audio_pt) else {
             return Ok(false);
         };
@@ -410,6 +423,9 @@ impl RtcSession {
 
     /// Write authoritative cursor feedback on the browser-created input lane.
     pub fn write_cursor_state(&mut self, reliable: bool, data: &[u8]) -> Result<bool> {
+        if !self.application_authorized {
+            return Ok(false);
+        }
         let id = if reliable {
             self.input_control
         } else {
@@ -424,6 +440,10 @@ impl RtcSession {
         channel
             .write(true, data)
             .context("write cursor state data channel")
+    }
+
+    pub fn authorize_application(&mut self) {
+        self.application_authorized = true;
     }
 
     pub fn frames_written(&self) -> u64 {
@@ -488,6 +508,69 @@ fn next_audio_rtp_48k(
 mod tests {
     use super::{next_rtp_90k, preferred_negotiated_codec};
     use std::time::Duration;
+
+    #[test]
+    fn ice_recovery_before_dtls_does_not_request_a_bind() {
+        use str0m::{Event, IceConnectionState};
+        let mut host = super::RtcSession::new(std::time::Instant::now(), 2_000_000);
+        host.on_event(Event::IceConnectionStateChange(
+            IceConnectionState::Disconnected,
+        ));
+        assert!(host
+            .on_event(Event::IceConnectionStateChange(
+                IceConnectionState::Connected
+            ))
+            .is_none());
+        assert!(matches!(
+            host.on_event(Event::Connected),
+            Some(super::RtcAction::IceConnected)
+        ));
+        host.on_event(Event::IceConnectionStateChange(
+            IceConnectionState::Disconnected,
+        ));
+        assert!(matches!(
+            host.on_event(Event::IceConnectionStateChange(
+                IceConnectionState::Connected
+            )),
+            Some(super::RtcAction::IceConnected)
+        ));
+    }
+
+    #[test]
+    fn dtls_connection_alone_does_not_authorize_application_traffic() {
+        use super::{RtcAction, RtcSession};
+        use str0m::{channel::ChannelData, Event};
+        let now = std::time::Instant::now();
+        let mut host = RtcSession::new(now, 2_000_000);
+        let id = host.rtc.sdp_api().add_channel("input-control".into());
+        host.input_control = Some(id);
+        host.ice_connected = true;
+        let packet = || {
+            Event::ChannelData(ChannelData {
+                id,
+                binary: true,
+                data: vec![13, 2, 75, 0, 37, 0],
+            })
+        };
+        assert!(host.on_event(packet()).is_none());
+        assert_eq!(host.write_video(vec![0, 0, 0, 1, 0x65]).unwrap(), None);
+        assert!(!host
+            .write_audio(crate::audio::AudioFrame {
+                seq: 1,
+                capture_ts_us: 0,
+                discontinuity: false,
+                payload: vec![1],
+            })
+            .unwrap());
+        assert!(!host.write_cursor_state(true, &[1; 8]).unwrap());
+        host.authorize_application();
+        assert!(
+            matches!(host.on_event(packet()), Some(RtcAction::InputData(bytes)) if bytes == vec![13, 2, 75, 0, 37, 0])
+        );
+        // A replacement transport starts closed even when the old peer was bound.
+        let replacement = RtcSession::new(now, 2_000_000);
+        assert!(!replacement.application_authorized);
+    }
 
     #[test]
     fn rtp_media_time_is_strictly_increasing() {

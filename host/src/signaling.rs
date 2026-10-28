@@ -1,13 +1,9 @@
-//! Signaling client for the BubblePlay Cloudflare Worker relay.
+//! Phase 2 signaling client for the BubblePlay relay.
 //!
-//! Protocol (JSON text frames over one WebSocket):
-//! - host -> worker: {type:"hello", token, role:"host"}
-//! - worker -> host: {type:"hello-ok"} | {type:"error", message}
-//! - relayed: {type:"offer", sdp} (client -> host via worker),
-//!   {type:"answer", sdp} (host -> client),
-//!   {type:"ice", candidate} (both directions),
-//!   {type:"peer-left"},
-//!   {type:"ping"} (keepalive — consumed, never relayed)
+//! The PC registers with its key, publishes its admit list, and authenticates each viewer.
+//! Relay controls and signed auth/pairing messages remain plaintext; all endpoint messages
+//! (including SDP, ICE and binary cursor/input bytes) use the ctl AEAD channel. WebRTC binds
+//! its SDP fingerprints with plaintext auth-bind before application traffic is enabled.
 //!
 //! The socket runs non-blocking; call `poll()` once per loop iteration.
 
@@ -946,6 +942,8 @@ pub struct QosPresentation {
 }
 
 pub enum SignalEvent {
+    /// Both device-key DTLS bindings succeeded for the current peer.
+    Bound,
     SecureDeny,
     /// Worker accepted our hello.
     Registered,
@@ -1212,8 +1210,9 @@ pub struct Signaling {
     /// `None` when follow active window is unsupported (not advertised);
     /// otherwise the session's follow state, sent in monitor-list.
     follow_window: Option<bool>,
-    browser_approval: crate::browser_approval::BrowserApproval,
     audio_enabled: bool,
+    device_protocol: crate::dk_host::HostProtocol,
+    pending_events: Vec<SignalEvent>,
 }
 
 struct WorkerVersionMonitor {
@@ -1314,67 +1313,55 @@ fn input_routing_status_message(
 }
 
 impl Signaling {
-    /// Connect to the worker (wss://...), upgrade to WS, register as host. Legacy registration:
-    /// the shared room and no device ID.
-    pub fn connect(url: &str, token: &str, host_gate_token: Option<&str>) -> Result<Self> {
-        Self::connect_with_identity(url, token, host_gate_token, None)
-    }
-
-    /// Connect and register. With `identity`, the host registers by device ID: it connects to
-    /// `pc=<id>`, answers the relay's challenge with a relay proof, and keeps the ticket for its
-    /// data sockets. Without one, the legacy registration runs unchanged.
-    pub fn connect_with_identity(
+    /// Register only with the PC device key and a phase 2 relay ticket.
+    pub fn connect_phase2(
         url: &str,
         token: &str,
-        host_gate_token: Option<&str>,
-        identity: Option<&DeviceIdentity>,
+        identity: &DeviceIdentity,
+        devices_ui: crate::dk_host::SharedDevicesUi,
     ) -> Result<Self> {
-        let Some(identity) = identity else {
-            return Self::connect_legacy(url, token, host_gate_token);
-        };
-        info!(url, "connecting to signaling worker by device ID");
         let origin = relay_origin(url).context("worker URL has no usable relay origin")?;
-        let id = identity.id().to_string();
-        let request = signaling_request(&keyed_signaling_url(url, &id)?, host_gate_token)?;
+        let device_protocol = crate::dk_host::HostProtocol::open(identity, &origin, devices_ui)?;
+        let request =
+            signaling_request(&keyed_signaling_url(url, &identity.id().to_string())?, None)?;
         let (mut ws, _) = connect_with_timeout(request)?;
         ws.send(Message::text(host_hello(token, Some(identity))?))
             .context("send hello")?;
         let (worker_version_id, route) = complete_keyed_registration(&mut ws, identity, &origin)?;
-        Self::finish(ws, url, token, host_gate_token, worker_version_id, route)
+        anyhow::ensure!(
+            matches!(
+                &route,
+                RelayRoute::Keyed {
+                    ticket: Some(_),
+                    ..
+                }
+            ),
+            "relay ticket required"
+        );
+        // The legacy version probe requires TOKEN, unlike a known PC's registration.
+        let version_monitor = if token.is_empty() {
+            None
+        } else {
+            WorkerVersionMonitor::spawn(url, token, None, worker_version_id)?
+        };
+        Self::from_registered(ws, route, device_protocol, version_monitor)
     }
 
-    fn connect_legacy(url: &str, token: &str, host_gate_token: Option<&str>) -> Result<Self> {
-        info!(url, "connecting to signaling worker");
-        let request = signaling_request(url, host_gate_token)?;
-        let (mut ws, response) = connect_with_timeout(request)?;
-        debug!(status = %response.status(), "ws handshake done");
-
-        // Send hello, then wait (blocking, one-time) for hello-ok.
-        ws.send(Message::text(host_hello(token, None)?))
-            .context("send hello")?;
-        let (worker_version_id, route) = complete_registration(&mut ws, None)?;
-
-        Self::finish(ws, url, token, host_gate_token, worker_version_id, route)
-    }
-
-    /// Starts the version monitor and switches the registered socket to the run loop's mode.
-    fn finish(
+    fn from_registered(
         mut ws: WebSocket<MaybeTlsStream<TcpStream>>,
-        url: &str,
-        token: &str,
-        host_gate_token: Option<&str>,
-        worker_version_id: Option<String>,
         route: RelayRoute,
+        device_protocol: crate::dk_host::HostProtocol,
+        version_monitor: Option<WorkerVersionMonitor>,
     ) -> Result<Self> {
-        let version_monitor =
-            WorkerVersionMonitor::spawn(url, token, host_gate_token, worker_version_id.clone())?;
-
-        // Flip the underlying TCP stream to non-blocking for the run loop.
+        // Publish the authoritative list immediately after every registration.
+        ws.send(Message::text(device_protocol.admit_message().to_string()))?;
         set_nonblocking(&mut ws)?;
         info!("signaling registered as host");
         Ok(Self {
             ws,
             route,
+            device_protocol,
+            pending_events: Vec::new(),
             pending_cursor_state: PendingCursorState::default(),
             registered: true,
             peer_seen: false,
@@ -1383,9 +1370,60 @@ impl Signaling {
             file_transfer: false,
             file_drop: false,
             follow_window: None,
-            browser_approval: Default::default(),
             audio_enabled: false,
         })
+    }
+
+    pub fn application_ready(&self) -> bool {
+        self.device_protocol.application_ready()
+    }
+
+    pub fn viewer_epoch(&self) -> Option<&str> {
+        self.device_protocol.viewer_epoch()
+    }
+
+    pub fn dtls_connected(&mut self) -> Result<()> {
+        self.device_protocol.dtls_connected()?;
+        let mut events = std::mem::take(&mut self.pending_events);
+        self.flush_device_effects(&mut events)?;
+        self.pending_events = events;
+        Ok(())
+    }
+
+    fn send_wire(&mut self, message: serde_json::Value) -> Result<()> {
+        match self.ws.send(Message::text(message.to_string())) {
+            Ok(()) => Ok(()),
+            // Tungstenite has retained this encrypted frame. Re-sealing it would consume
+            // another sequence number; let the next flush finish this same frame.
+            Err(WsError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => {
+                self.device_protocol.terminate();
+                Err(error).context("send device-key wire message")
+            }
+        }
+    }
+
+    fn send_endpoint(&mut self, text: &str) -> Result<()> {
+        if let Some(message) = self.device_protocol.seal_text(text)? {
+            self.send_wire(message)?;
+        }
+        Ok(())
+    }
+
+    fn flush_device_effects(&mut self, events: &mut Vec<SignalEvent>) -> Result<()> {
+        for effect in self.device_protocol.take_effects() {
+            match effect {
+                crate::dk_host::Effect::Send(message) => self.send_wire(message)?,
+                crate::dk_host::Effect::Ui(event) => self.device_protocol.show(event),
+                crate::dk_host::Effect::Park => {
+                    self.pending_cursor_state.reset();
+                    events.clear();
+                    events.push(SignalEvent::PeerLeft);
+                }
+                crate::dk_host::Effect::Bound => events.push(SignalEvent::Bound),
+            }
+        }
+        Ok(())
     }
 
     /// The room and data-socket ticket for this connection. Clone it into media and file sessions.
@@ -1422,8 +1460,8 @@ impl Signaling {
 
     /// Send an already-serialized message (e.g. `file-offer`).
     pub fn send_text(&mut self, text: &str) {
-        if self.ws.send(Message::text(text)).is_ok() {
-            let _ = self.ws.flush();
+        if let Err(error) = self.send_endpoint(text) {
+            warn!(%error, "endpoint send failed");
         }
     }
 
@@ -1442,119 +1480,175 @@ impl Signaling {
 
     /// Drain pending messages without blocking. Call once per main-loop tick.
     pub fn poll(&mut self) -> Result<Vec<SignalEvent>> {
-        self.flush_cursor_state();
         if let Some((connected, current)) = self
             .version_monitor
             .as_ref()
             .and_then(WorkerVersionMonitor::changed)
         {
             self.registered = false;
-            self.browser_approval.disconnect();
             bail!("signaling Worker version changed from {connected} to {current}");
         }
-        let mut events = Vec::new();
-        loop {
+        let mut events = std::mem::take(&mut self.pending_events);
+        self.device_protocol.poll()?;
+        self.flush_device_effects(&mut events)?;
+        if events
+            .iter()
+            .any(|event| matches!(event, SignalEvent::PeerLeft))
+        {
+            return Ok(events);
+        }
+        self.flush_cursor_state();
+        // Bound each drain so UI decisions and pairing expiry cannot be starved by input.
+        for _ in 0..64 {
             let msg = match self.ws.read() {
                 Ok(m) => m,
                 Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 // TLS may surface "want read" as WouldBlock via native-tls too.
                 Err(e) => {
                     self.registered = false;
-                    self.browser_approval.disconnect();
                     return Err(e).context("ws read");
                 }
             };
             match msg {
                 Message::Text(text) => {
-                    if let Some(decisions) = self
-                        .browser_approval
-                        .handle_wire(&text, crate::browser_approval::now_ms())
-                    {
-                        self.send_approval_decisions(decisions);
-                        continue;
-                    }
-                    let parsed: SignalMsg = match serde_json::from_str(&text) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            warn!(%e, bytes = text.len(), "ignoring unparsable signal message");
+                    // Only relay-generated control messages bypass the authenticated channel.
+                    let kind = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("type").and_then(|v| v.as_str()).map(str::to_owned));
+                    match kind.as_deref() {
+                        Some("peer-joined") => {
+                            self.device_protocol.peer_joined(&text)?;
+                            self.flush_device_effects(&mut events)?;
+                            if events
+                                .iter()
+                                .any(|event| matches!(event, SignalEvent::PeerLeft))
+                            {
+                                return Ok(events);
+                            }
                             continue;
                         }
-                    };
-                    match parsed {
-                        SignalMsg::Offer { sdp } => {
-                            self.peer_seen = true;
-                            events.push(SignalEvent::Offer(sdp));
+                        Some("peer-left") => {
+                            self.device_protocol.peer_left();
+                            self.flush_device_effects(&mut events)?;
+                            if events
+                                .iter()
+                                .any(|event| matches!(event, SignalEvent::PeerLeft))
+                            {
+                                return Ok(events);
+                            }
+                            continue;
                         }
-                        SignalMsg::Ice { candidate } => {
-                            self.peer_seen = true;
-                            events.push(SignalEvent::RemoteCandidate(candidate));
+                        Some("pair-closed") => {
+                            self.device_protocol.pair_closed();
+                            self.flush_device_effects(&mut events)?;
+                            if events
+                                .iter()
+                                .any(|event| matches!(event, SignalEvent::PeerLeft))
+                            {
+                                return Ok(events);
+                            }
+                            continue;
                         }
-                        SignalMsg::Diag {
-                            seq,
-                            at_ms,
-                            profile,
-                        } => events.push(SignalEvent::ClientDiagnostics {
-                            seq,
-                            at_ms,
-                            profile,
-                        }),
-                        SignalMsg::ClientLog {
-                            seq,
-                            at_ms,
-                            level,
-                            event,
-                            detail,
-                        } => {
-                            events.push(SignalEvent::ClientLog {
+                        Some("hello-ok") => {
+                            self.send_wire(self.device_protocol.admit_message())?;
+                            continue;
+                        }
+                        Some("pong") => {
+                            self.last_keepalive_ack = Instant::now();
+                            continue;
+                        }
+                        Some("ping") => {
+                            self.send_wire(serde_json::json!({"type":"pong"}))?;
+                            continue;
+                        }
+                        Some("error") => {
+                            warn!("relay reported a signaling error");
+                            continue;
+                        }
+                        Some("register-challenge") => continue,
+                        _ => {}
+                    }
+                    let incoming = self.device_protocol.receive(&text)?;
+                    self.flush_device_effects(&mut events)?;
+                    if events
+                        .iter()
+                        .any(|event| matches!(event, SignalEvent::PeerLeft))
+                    {
+                        return Ok(events);
+                    }
+                    for incoming in incoming {
+                        let text = match incoming {
+                            crate::dk_host::Inbound::Json(text) => text,
+                            crate::dk_host::Inbound::Input(bytes) => {
+                                if self.device_protocol.application_ready() {
+                                    events.push(SignalEvent::InputData(bytes));
+                                }
+                                continue;
+                            }
+                        };
+                        let parsed: SignalMsg = match serde_json::from_str(&text) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!(%e, bytes = text.len(), "ignoring unparsable signal message");
+                                continue;
+                            }
+                        };
+                        match parsed {
+                            SignalMsg::Offer { sdp } => {
+                                self.peer_seen = true;
+                                events.push(SignalEvent::Offer(sdp));
+                            }
+                            SignalMsg::Ice { candidate } => {
+                                self.peer_seen = true;
+                                events.push(SignalEvent::RemoteCandidate(candidate));
+                            }
+                            SignalMsg::Diag {
+                                seq,
+                                at_ms,
+                                profile,
+                            } => events.push(SignalEvent::ClientDiagnostics {
+                                seq,
+                                at_ms,
+                                profile,
+                            }),
+                            SignalMsg::ClientLog {
                                 seq,
                                 at_ms,
                                 level,
                                 event,
                                 detail,
-                            });
-                        }
-                        SignalMsg::Qos {
-                            seq,
-                            at_ms,
-                            rx,
-                            presentation,
-                            ..
-                        } => events.push(SignalEvent::Qos {
-                            seq,
-                            at_ms,
-                            rx,
-                            presentation,
-                        }),
-                        SignalMsg::FileDragPreview { control } => {
-                            if valid_file_drag_preview_wire(&text, &control) {
-                                events.push(SignalEvent::FileDragPreview(control));
+                            } => {
+                                events.push(SignalEvent::ClientLog {
+                                    seq,
+                                    at_ms,
+                                    level,
+                                    event,
+                                    detail,
+                                });
                             }
-                        }
-                        SignalMsg::SecureAction { action } => {
-                            if action == "deny" && valid_secure_action_wire(&text) {
-                                events.push(SignalEvent::SecureDeny);
+                            SignalMsg::Qos {
+                                seq,
+                                at_ms,
+                                rx,
+                                presentation,
+                                ..
+                            } => events.push(SignalEvent::Qos {
+                                seq,
+                                at_ms,
+                                rx,
+                                presentation,
+                            }),
+                            SignalMsg::FileDragPreview { control } => {
+                                if valid_file_drag_preview_wire(&text, &control) {
+                                    events.push(SignalEvent::FileDragPreview(control));
+                                }
                             }
-                        }
-                        SignalMsg::MediaControl {
-                            action,
-                            request_id,
-                            stream_mode,
-                            codec,
-                            reason,
-                            protocol,
-                            epoch,
-                            quality,
-                            revision,
-                            enabled,
-                            x_q16,
-                            y_q16,
-                            width_q16,
-                            height_q16,
-                            monitor,
-                            follow,
-                            audio,
-                        } => {
-                            events.push(SignalEvent::MediaControl {
+                            SignalMsg::SecureAction { action } => {
+                                if action == "deny" && valid_secure_action_wire(&text) {
+                                    events.push(SignalEvent::SecureDeny);
+                                }
+                            }
+                            SignalMsg::MediaControl {
                                 action,
                                 request_id,
                                 stream_mode,
@@ -1571,22 +1665,29 @@ impl Signaling {
                                 height_q16,
                                 monitor,
                                 follow,
-                                audio: audio == 1,
-                            });
-                        }
-                        SignalMsg::MediaView {
-                            state,
-                            revision,
-                            generation,
-                            desktop_width,
-                            desktop_height,
-                            source_x,
-                            source_y,
-                            source_width,
-                            source_height,
-                            reason,
-                        } => {
-                            events.push(SignalEvent::MediaView {
+                                audio,
+                            } => {
+                                events.push(SignalEvent::MediaControl {
+                                    action,
+                                    request_id,
+                                    stream_mode,
+                                    codec,
+                                    reason,
+                                    protocol,
+                                    epoch,
+                                    quality,
+                                    revision,
+                                    enabled,
+                                    x_q16,
+                                    y_q16,
+                                    width_q16,
+                                    height_q16,
+                                    monitor,
+                                    follow,
+                                    audio: audio == 1,
+                                });
+                            }
+                            SignalMsg::MediaView {
                                 state,
                                 revision,
                                 generation,
@@ -1597,21 +1698,21 @@ impl Signaling {
                                 source_width,
                                 source_height,
                                 reason,
-                            });
-                        }
-                        SignalMsg::FirstFrame {
-                            protocol,
-                            phase,
-                            request_id,
-                            transport,
-                            epoch,
-                            generation,
-                            sequence,
-                            codec,
-                            reason,
-                            ..
-                        } => {
-                            events.push(SignalEvent::FirstFrame {
+                            } => {
+                                events.push(SignalEvent::MediaView {
+                                    state,
+                                    revision,
+                                    generation,
+                                    desktop_width,
+                                    desktop_height,
+                                    source_x,
+                                    source_y,
+                                    source_width,
+                                    source_height,
+                                    reason,
+                                });
+                            }
+                            SignalMsg::FirstFrame {
                                 protocol,
                                 phase,
                                 request_id,
@@ -1621,66 +1722,60 @@ impl Signaling {
                                 sequence,
                                 codec,
                                 reason,
-                            });
-                        }
-                        SignalMsg::PeerLeft => events.push(SignalEvent::PeerLeft),
-                        SignalMsg::Ping => {} // backward-compatible worker/client keepalive
-                        SignalMsg::Pong => self.last_keepalive_ack = Instant::now(),
-                        SignalMsg::HelloOk { .. } => {} // duplicate ack, ignore
-                        SignalMsg::Error { message } => {
-                            warn!(message, "worker error message");
-                        }
-                        other => {
-                            debug!(kind = ?std::mem::discriminant(&other), "ignoring signal message")
+                                ..
+                            } => {
+                                events.push(SignalEvent::FirstFrame {
+                                    protocol,
+                                    phase,
+                                    request_id,
+                                    transport,
+                                    epoch,
+                                    generation,
+                                    sequence,
+                                    codec,
+                                    reason,
+                                });
+                            }
+                            // Relay controls are never dispatched from a viewer's ctl envelope.
+                            SignalMsg::PeerLeft
+                            | SignalMsg::Ping
+                            | SignalMsg::Pong
+                            | SignalMsg::HelloOk { .. } => {}
+                            SignalMsg::Error { message } => {
+                                warn!(message, "endpoint error message");
+                            }
+                            other => {
+                                debug!(kind = ?std::mem::discriminant(&other), "ignoring signal message")
+                            }
                         }
                     }
                 }
                 Message::Ping(_) | Message::Pong(_) => {} // tungstenite auto-pongs
                 Message::Close(_) => {
                     self.registered = false;
-                    self.browser_approval.disconnect();
-                    events.push(SignalEvent::PeerLeft);
+                    self.device_protocol.terminate();
+                    self.flush_device_effects(&mut events)?;
                     break;
                 }
-                Message::Binary(data) if data.len() <= 16_384 => {
-                    events.push(SignalEvent::InputData(data.to_vec()));
-                }
+                Message::Binary(_) => self.device_protocol.drop_plaintext(),
                 _ => {}
             }
         }
         if keepalive_expired(self.last_keepalive_ack, Instant::now()) {
             self.registered = false;
-            self.browser_approval.disconnect();
             bail!("signaling keepalive acknowledgement timed out");
-        }
-        if self.registered {
-            let decisions = self
-                .browser_approval
-                .poll(crate::browser_approval::now_ms());
-            self.send_approval_decisions(decisions);
         }
         Ok(events)
     }
 
-    fn send_approval_decisions(
-        &mut self,
-        decisions: Vec<crate::browser_approval::ApprovalDecision>,
-    ) {
-        for decision in decisions {
-            if let Ok(text) = serde_json::to_string(&decision) {
-                self.send_text(&text);
-            }
-        }
-    }
-
     pub fn send_answer(&mut self, sdp: &str) -> Result<()> {
+        if !self.device_protocol.local_answer(sdp)? {
+            return Ok(());
+        }
         let msg = SignalMsg::Answer {
             sdp: sdp.to_string(),
         };
-        self.ws
-            .send(Message::text(serde_json::to_string(&msg)?))
-            .context("send answer")?;
-        self.ws.flush().ok();
+        self.send_endpoint(&serde_json::to_string(&msg)?)?;
         Ok(())
     }
 
@@ -1689,18 +1784,12 @@ impl Signaling {
         let msg = SignalMsg::Ice {
             candidate: candidate.to_string(),
         };
-        self.ws
-            .send(Message::text(serde_json::to_string(&msg)?))
-            .context("send ice")?;
-        self.ws.flush().ok();
+        self.send_endpoint(&serde_json::to_string(&msg)?)?;
         Ok(())
     }
 
     pub fn send_bye(&mut self) {
-        let _ = self.ws.send(Message::text(
-            serde_json::to_string(&SignalMsg::Bye).unwrap_or_default(),
-        ));
-        let _ = self.ws.flush();
+        self.send_text(&serde_json::to_string(&SignalMsg::Bye).unwrap_or_default());
     }
 
     /// Send an application-level keepalive so the relay's WebSocket stays
@@ -1722,8 +1811,17 @@ impl Signaling {
         if data.len() > 16_384 {
             return;
         }
-        if self.ws.send(Message::Binary(data.to_vec().into())).is_ok() {
-            self.ws.flush().ok();
+        match self.device_protocol.seal_cursor(data) {
+            Ok(Some(message)) => {
+                if let Err(error) = self.send_wire(message) {
+                    warn!(%error, "cursor send failed");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.device_protocol.terminate();
+                warn!(%error, "cursor encryption failed");
+            }
         }
     }
 
@@ -1750,12 +1848,7 @@ impl Signaling {
         let Some(state) = self.pending_cursor_state.latest.take() else {
             return;
         };
-        if let Err(WsError::WriteBufferFull(_)) =
-            self.ws.send(Message::Binary(state.to_vec().into()))
-        {
-            // WriteBufferFull is the only send result that did not admit it.
-            self.pending_cursor_state.latest = Some(state);
-        }
+        self.send_binary(&state);
     }
 
     /// Preserve feedback at an Agent input-status barrier. The Agent emits
@@ -1788,15 +1881,7 @@ impl Signaling {
             reason: reason.into(),
             stream_mode: Some(stream_mode.into()),
         };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            self.ws.flush().ok();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1937,9 +2022,7 @@ impl Signaling {
             wire = %wire,
             "benchmark status wire"
         );
-        if self.ws.send(Message::text(wire)).is_ok() {
-            self.ws.flush().ok();
-        }
+        self.send_text(&wire);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1968,15 +2051,7 @@ impl Signaling {
             source_height,
             reason: reason.into(),
         };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            self.ws.flush().ok();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     pub fn send_desktop_state(&mut self, state: &str, generation: u32, reason: &str) {
@@ -2000,15 +2075,7 @@ impl Signaling {
             generation,
             reason: reason.into(),
         };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     pub fn send_secure_desktop_state(
@@ -2056,9 +2123,7 @@ impl Signaling {
             .into(),
         };
         if let Ok(text) = serde_json::to_string(&msg) {
-            if self.ws.send(Message::text(text)).is_ok() {
-                let _ = self.ws.flush();
-            }
+            self.send_text(&text);
         }
     }
 
@@ -2102,15 +2167,7 @@ impl Signaling {
             reason: None,
             route: None,
         };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     /// An additive input-status announcement. Existing receipt-only messages
@@ -2145,32 +2202,16 @@ impl Signaling {
             self.file_transfer,
             self.file_drop,
             self.follow_window,
-            crate::browser_approval::capability_available(service_mode),
+            false,
             self.audio_enabled,
         );
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
         self.send_input_capabilities();
     }
 
     fn send_input_capabilities(&mut self) {
         let msg = input_capabilities_message();
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     /// Send one host clipboard chunk (see `clipboard::chunk_text`).
@@ -2204,15 +2245,7 @@ impl Signaling {
                 text: text.to_owned(),
             }
         };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     pub fn send_monitor_list(&mut self, monitors: Vec<MonitorInfo>) {
@@ -2220,15 +2253,7 @@ impl Signaling {
             monitors,
             follow: self.follow_window,
         };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     pub fn send_monitor_error(&mut self, selector: &str, reason: &str) {
@@ -2236,15 +2261,7 @@ impl Signaling {
             selector: selector.into(),
             reason: reason.into(),
         };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     pub fn send_first_frame(
@@ -2282,15 +2299,7 @@ impl Signaling {
             codec,
             rtp_timestamp,
         );
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     pub fn send_first_frame_failed(
@@ -2314,15 +2323,7 @@ impl Signaling {
             reason: Some(reason.chars().take(96).collect()),
             rtp_timestamp: None,
         };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 
     pub fn send_lab_quality_keyframe_admitted(
@@ -2344,15 +2345,7 @@ impl Signaling {
             reason: Some("stream-lab-quality-capture".into()),
             rtp_timestamp: None,
         };
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            let _ = self.ws.flush();
-        }
+        self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
     }
 }
 
@@ -2588,7 +2581,7 @@ fn registration_proof(identity: &DeviceIdentity, origin: &str, nonce: &str) -> R
 }
 
 /// Runs the registration after the keyed hello: answers one `register-challenge` with a
-/// `register-proof`, then reads `hello-ok`. Older relays can accept without a challenge or ticket.
+/// `register-proof`, then requires a matching PC ID and ticket in `hello-ok`.
 fn complete_keyed_registration(
     ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     identity: &DeviceIdentity,
@@ -2624,6 +2617,9 @@ fn complete_registration(
                 pc,
             } => {
                 let expected_pc = identity.map(|(identity, _)| identity.id());
+                if identity.is_some() && (!challenged || ticket.is_none() || pc.is_none()) {
+                    bail!("phase 2 registration requires a challenge, PC ID and ticket");
+                }
                 if let Some(pc) = pc {
                     let pc = DeviceId::parse(&pc)
                         .map_err(|_| anyhow::anyhow!("relay registered an invalid PC ID"))?;
@@ -4466,29 +4462,19 @@ mod keyed_registration_tests {
     }
 
     #[test]
-    fn a_relay_that_accepts_without_a_challenge_keeps_the_key_id() {
+    fn registration_without_challenge_or_ticket_is_refused() {
         let identity = fixture_identity();
-        let (port, relay) = scripted_relay(vec![json!({"type": "hello-ok"}).to_string()]);
-        let mut ws = client(port);
-        let (version, route) =
-            complete_keyed_registration(&mut ws, &identity, ORIGIN).expect("legacy relay");
-        assert_eq!(version, None);
-        assert!(
-            matches!(route, RelayRoute::Keyed { pc, ticket: None } if pc == identity.id().to_string())
-        );
-        relay.join().unwrap();
-    }
-
-    #[test]
-    fn a_challenged_registration_without_a_ticket_is_accepted() {
-        let identity = fixture_identity();
-        let (port, _relay) =
-            scripted_relay(vec![challenge(), json!({"type": "hello-ok"}).to_string()]);
-        let mut ws = client(port);
-        let (_, route) = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap();
-        assert!(
-            matches!(route, RelayRoute::Keyed { pc, ticket: None } if pc == identity.id().to_string())
-        );
+        for script in [
+            vec![json!({"type":"hello-ok"}).to_string()],
+            vec![
+                challenge(),
+                json!({"type":"hello-ok","pc":identity.id().to_string()}).to_string(),
+            ],
+        ] {
+            let (port, _relay) = scripted_relay(script);
+            let mut ws = client(port);
+            assert!(complete_keyed_registration(&mut ws, &identity, ORIGIN).is_err());
+        }
     }
 
     #[test]
@@ -4582,17 +4568,13 @@ mod keyed_registration_tests {
     }
 
     #[test]
-    fn no_challenge_ack_retains_a_ticket_and_validates_pc() {
+    fn a_ticket_without_a_challenge_is_refused() {
         let identity = fixture_identity();
-        let alias = identity.id().to_string().to_lowercase().replace('-', "");
         let (port, _relay) = scripted_relay(vec![
-            json!({"type":"hello-ok", "ticket":TICKET, "pc":alias}).to_string(),
+            json!({"type":"hello-ok", "ticket":TICKET, "pc":identity.id().to_string()}).to_string(),
         ]);
         let mut ws = client(port);
-        let (_, route) = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap();
-        assert!(
-            matches!(route, RelayRoute::Keyed { pc, ticket:Some(_) } if pc == identity.id().to_string())
-        );
+        assert!(complete_keyed_registration(&mut ws, &identity, ORIGIN).is_err());
     }
 
     #[test]
@@ -4625,5 +4607,180 @@ mod keyed_registration_tests {
         assert!(keyed.ends_with("&pc=ABCD-EFGH-JKMN-PQRS"), "{keyed}");
         assert!(keyed.contains("?run=123e4567"), "{keyed}");
         assert!(keyed_signaling_url("wss://worker.example/host-ws?pc=X", "ABCD").is_err());
+    }
+}
+
+#[cfg(test)]
+mod phase2_socket_tests {
+    use super::*;
+    use crate::dk_host::HostProtocol;
+    use crate::dk_session::{Randomness, SessionError};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use bp_device_key::phase2::CtlOpener;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
+
+    fn fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../fixtures/device-keys-contract.json")).unwrap()
+    }
+    fn bytes(value: &serde_json::Value) -> [u8; 32] {
+        URL_SAFE_NO_PAD
+            .decode(value.as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+    fn hex(value: &serde_json::Value) -> [u8; 32] {
+        let text = value.as_str().unwrap();
+        std::array::from_fn(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).unwrap())
+    }
+    struct FixtureRandom;
+    impl Randomness for FixtureRandom {
+        fn nonce(&mut self) -> std::result::Result<[u8; 32], SessionError> {
+            Ok(bytes(&fixture()["handshake"]["pc"]["nonce"]))
+        }
+        fn ephemeral(&mut self) -> std::result::Result<[u8; 32], SessionError> {
+            Ok(hex(&fixture()["handshake"]["pc"]["ephemeralPrivateHex"]))
+        }
+    }
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn read_json(ws: &mut WebSocket<TcpStream>) -> serde_json::Value {
+        match ws.read().unwrap() {
+            Message::Text(text) => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn socket_publishes_admit_drops_plaintext_dispatches_ctl_and_parks_on_replay() {
+        let f = fixture();
+        let hs = &f["handshake"];
+        let folder = Scratch(std::env::temp_dir().join(format!(
+            "bp-signaling-phase2-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        let mut trusted = crate::trusted_devices::load(folder.0.join("trusted.json")).unwrap();
+        trusted
+            .add(
+                hs["viewer"]["id"].as_str().unwrap(),
+                hs["viewer"]["public"].as_str().unwrap(),
+                "Viewer",
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = bp_device_key::DeviceIdentity::from_seed(&hex(&hs["pc"]["seedHex"]));
+        let (ui, _window) = crate::devices_ui_api::channel();
+        let controller = HostProtocol::with_store(
+            identity,
+            hs["relayOrigin"].as_str().unwrap(),
+            Arc::new(Mutex::new(ui)),
+            trusted,
+            Box::new(FixtureRandom),
+        )
+        .unwrap();
+        let expected_admit = controller.admit_message();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (replay_done_tx, replay_done_rx) = std::sync::mpsc::channel();
+        let relay = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            tcp.set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut ws = tungstenite::accept(tcp).unwrap();
+            assert_eq!(read_json(&mut ws), expected_admit);
+            ws.send(Message::text(r#"{"type":"hello-ok"}"#)).unwrap();
+            assert_eq!(read_json(&mut ws), expected_admit);
+            let f = fixture();
+            let hs = &f["handshake"];
+            ws.send(Message::text(
+                json!({"type":"peer-joined", "mediaEpoch":hs["sessionEpoch"], "pairing":false})
+                    .to_string(),
+            ))
+            .unwrap();
+            ws.send(Message::text(r#"{"type":"offer","sdp":"unauthenticated"}"#))
+                .unwrap();
+            ws.send(Message::binary(vec![13, 2, 75, 0, 37, 0])).unwrap();
+            ws.send(Message::text(hs["messages"]["authHello"].to_string()))
+                .unwrap();
+            assert_eq!(read_json(&mut ws), hs["messages"]["authHost"]);
+            ws.send(Message::text(hs["messages"]["authFinish"].to_string()))
+                .unwrap();
+            let caps = read_json(&mut ws);
+            assert_eq!(caps["kind"], "caps");
+            assert_eq!(caps["seq"], 0);
+            let mut opener = CtlOpener::new(&hex(&hs["controlKeys"]["pcToViewerHex"]));
+            let caps_bytes = URL_SAFE_NO_PAD
+                .decode(caps["data"].as_str().unwrap())
+                .unwrap();
+            let caps_plain = opener.open("caps", 0, &caps_bytes).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&caps_plain).unwrap()["type"],
+                "caps"
+            );
+            let input = f["phase2"]["ctl"]["messages"][0]["message"].to_string();
+            ws.send(Message::text(input.clone())).unwrap();
+            let cursor = read_json(&mut ws);
+            assert_eq!(cursor["kind"], "cursor");
+            assert_eq!(cursor["seq"], 1);
+            assert_eq!(
+                opener
+                    .open(
+                        "cursor",
+                        1,
+                        &URL_SAFE_NO_PAD
+                            .decode(cursor["data"].as_str().unwrap())
+                            .unwrap()
+                    )
+                    .unwrap(),
+                vec![12, 0, 1, 2]
+            );
+            ws.send(Message::text(input)).unwrap();
+            replay_done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        });
+        let ws = tungstenite::connect(format!("ws://{address}/ws"))
+            .unwrap()
+            .0;
+        let mut signaling =
+            Signaling::from_registered(ws, RelayRoute::Legacy, controller, None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got_input = false;
+        while !got_input && Instant::now() < deadline {
+            for event in signaling.poll().unwrap() {
+                match event {
+                    SignalEvent::InputData(data) => {
+                        assert_eq!(data, vec![13, 2, 75, 0, 37, 0]);
+                        got_input = true;
+                    }
+                    SignalEvent::Offer(_) => panic!("plaintext offer escaped the gate"),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(got_input, "encrypted input was not dispatched");
+        assert!(signaling.application_ready());
+        signaling.send_binary(&[12, 0, 1, 2]);
+        let mut parked = false;
+        while !parked && Instant::now() < deadline {
+            parked = signaling
+                .poll()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, SignalEvent::PeerLeft));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(parked, "ctl replay did not park viewer");
+        assert!(!signaling.application_ready());
+        replay_done_tx.send(()).unwrap();
+        relay.join().unwrap();
     }
 }

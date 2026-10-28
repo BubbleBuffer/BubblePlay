@@ -172,6 +172,8 @@ pub enum TransportCommand {
     /// The producer has selected the actual local encoder before negotiation.
     OfferWithCapabilities(String, EncoderCapabilities),
     RemoteCandidate(String),
+    /// The coordinator verified both device-key DTLS bindings for this peer.
+    AuthorizePeer,
     CursorStateReliable([u8; 8]),
     /// End the current peer while retaining the transport socket and thread.
     ResetPeer,
@@ -783,6 +785,9 @@ fn transport_loop(
                 rtc = fresh_epoch(&socket, host_addr, mapped, bitrate, encoder_capabilities)?;
                 emit(&events, TransportEvent::PeerReset);
                 mutated = true;
+            }
+            Ok(TransportCommand::AuthorizePeer) => {
+                rtc.authorize_application();
             }
             Ok(TransportCommand::RemoteCandidate(candidate)) => {
                 rtc.add_remote_candidate(&candidate);
@@ -1405,6 +1410,7 @@ mod tests {
         let mut host_connected = false;
         let mut hevc_selected = false;
         let mut submitted = false;
+        let mut unauthorized_rejected = false;
         let mut written_timestamp = None;
         let mut packets_to_viewer = 0;
         let mut buffer = [0u8; 65_536];
@@ -1435,7 +1441,9 @@ mod tests {
                             &mut received_media,
                         );
                     }
-                    TransportEvent::Action(RtcAction::IceConnected) => host_connected = true,
+                    TransportEvent::Action(RtcAction::IceConnected) => {
+                        host_connected = true;
+                    }
                     TransportEvent::Action(RtcAction::VideoCodecSelected(codec)) => {
                         assert_eq!(codec, VideoCodec::Hevc);
                         hevc_selected = true;
@@ -1450,7 +1458,12 @@ mod tests {
                         written_timestamp = Some(rtp_timestamp);
                     }
                     TransportEvent::AccessUnitNotAdmitted { id, .. } => {
-                        panic!("negotiated first HEVC IDR {id} was not admitted");
+                        assert_eq!(id, AU_ID - 1);
+                        assert!(!unauthorized_rejected);
+                        assert!(received_media.is_none());
+                        unauthorized_rejected = true;
+                        submitted = false;
+                        assert!(pump.command(TransportCommand::AuthorizePeer));
                     }
                     TransportEvent::OfferRejected => panic!("recvonly HEVC offer rejected"),
                     TransportEvent::Stopped | TransportEvent::Action(RtcAction::Closed) => {
@@ -1462,7 +1475,11 @@ mod tests {
             if host_connected && viewer_connected && hevc_selected && !submitted {
                 let reservation = pump.reserve_access_unit().expect("first AU slot available");
                 assert!(reservation.submit(AccessUnit {
-                    id: AU_ID,
+                    id: if unauthorized_rejected {
+                        AU_ID
+                    } else {
+                        AU_ID - 1
+                    },
                     data: IDR.to_vec(),
                     produced_at: Instant::now(),
                     is_idr: true,
@@ -1506,6 +1523,7 @@ mod tests {
                 Err(error) => panic!("receive viewer datagram: {error}"),
             }
         }
+        assert!(unauthorized_rejected, "DTLS alone must not admit media");
         let media = received_media.unwrap();
         assert_eq!(media.mid, video_mid);
         assert_eq!(media.params.spec().codec, Codec::H265);

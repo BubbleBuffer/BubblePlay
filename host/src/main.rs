@@ -713,6 +713,20 @@ fn run_serve_forever(args: &Args) -> Result<()> {
     } else {
         start_vdd_keepalive(args)?
     };
+    let (devices_host, devices_ui) = bubbleplay_host::devices_ui_api::channel();
+    bubbleplay_host::devices_ui_api::spawn_stdin_reader(
+        std::io::stdin(),
+        devices_ui.commands.clone(),
+    )?;
+    std::thread::Builder::new()
+        .name("devices-ui".into())
+        .spawn(move || {
+            bubbleplay_host::devices_ui_api::run_ui(
+                bubbleplay_host::devices_ui_api::LogDevicesUi,
+                devices_ui.events,
+            );
+        })?;
+    let devices_host = std::sync::Arc::new(std::sync::Mutex::new(devices_host));
     let mut selection = CaptureSelection::from_launch(args.monitor.as_deref());
     let mut backoff = Duration::from_secs(1);
     let mut unavailable_attempts = 0u32;
@@ -739,7 +753,7 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                 unavailable_attempts = 0;
             }
         }
-        match run_serve(args, &mut selection) {
+        match run_serve(args, &mut selection, devices_host.clone()) {
             Ok(()) => {
                 info!("session ended — waiting for next client");
                 backoff = Duration::from_secs(1);
@@ -959,7 +973,11 @@ fn unix_time_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
+fn run_serve(
+    args: &Args,
+    selection: &mut CaptureSelection,
+    devices_ui: bubbleplay_host::dk_host::SharedDevicesUi,
+) -> Result<()> {
     let watchdog = match session_watchdog::SessionWatchdog::start() {
         Ok(watchdog) => Some(watchdog),
         Err(error) => {
@@ -988,7 +1006,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         .clone()
         .context("--worker wss://... is required")?;
     bubbleplay_host::relay_url::require_secure_relay_url(&worker).context("--worker")?;
-    let token = args.token.clone().context("--token is required")?;
+    // TOKEN is only needed for the PC's first registration; a known PC proves its key.
+    let token = args.token.clone().unwrap_or_default();
     let reset_lab_encoder_on_diagnostic_keyframe =
         std::env::var("BUBBLEPLAY_LAB_RESET_ENCODER_ON_DIAGNOSTIC_KEYFRAME")
             .is_ok_and(|value| value == "1");
@@ -1026,35 +1045,34 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mapped_addr = stun::discover_mapped_address(&socket, STUN_SERVER).ok();
     let mut signaling = session_call!(
         Signaling,
-        Signaling::connect_with_identity(
+        Signaling::connect_phase2(
             &worker,
             &token,
-            args.host_gate_token.as_deref(),
-            args.device_identity.as_ref(),
+            args.device_identity
+                .as_ref()
+                .context("PC device key required")?,
+            devices_ui,
         )
     )?;
     // Room and data-socket ticket for this signaling connection; the file and media sessions below
     // take copies and drop them when this run ends.
     let relay_route = signaling.relay_route();
-    // File transfer runs only in the user-level host (Downloads, clipboard
-    // and Send To belong to the interactive user) and needs the host bearer
-    // for `/host-file-ws`.
-    let file_service = match args.host_gate_token.as_deref() {
-        Some(bearer) if !args.privileged_agent => {
-            match FileService::spawn_routed(
-                &worker,
-                bearer,
-                FileServiceConfig::from_env(),
-                relay_route.clone(),
-            ) {
-                Ok(service) => Some(service),
-                Err(error) => {
-                    warn!(error = %format!("{error:#}"), "file transfer unavailable");
-                    None
-                }
+    // The authenticated signaling route supplies the file socket ticket.
+    let file_service = if !args.privileged_agent {
+        match FileService::spawn_routed(
+            &worker,
+            "",
+            FileServiceConfig::from_env(),
+            relay_route.clone(),
+        ) {
+            Ok(service) => Some(service),
+            Err(error) => {
+                warn!(%error, "file transfer unavailable");
+                None
             }
         }
-        _ => None,
+    } else {
+        None
     };
     signaling.set_file_transfer(file_service.is_some());
     signaling.set_file_drop(file_service.is_some() && !capture.is_privileged());
@@ -1403,6 +1421,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     }
     macro_rules! park_viewer {
         ($reason:expr) => {{
+            if let Some(files) = &file_service {
+                files.set_epoch(None);
+            }
+            if let Some(egress) = wss_media.take() {
+                egress.shutdown();
+            }
+            active_wss_epoch = None;
             file_drag_preview.cancel();
             if let Some(pending) = pending_native_drop.take() {
                 pending.request.reject("viewer-disconnected");
@@ -1411,6 +1436,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             capture.release_input();
             capture.set_capture_demand(false)?;
             capture.end_viewer_session();
+            // Rotate the privileged producer lease: cancel outstanding permits and
+            // clear its input/clipboard gate while keeping heartbeat health alive.
+            capture.begin_viewer_session();
             carried_input.reset();
             remote_input_ready = false;
             viewer_attached = false;
@@ -1491,6 +1519,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     }
     let mut first_iteration = true;
     'session: loop {
+        // Apply authentication changes before draining transport input or file work.
+        let mut signal_events = signaling.poll()?;
+        if signal_events
+            .iter()
+            .any(|event| matches!(event, SignalEvent::PeerLeft))
+        {
+            park_viewer!("device-session-ended");
+        }
         session_stage!(CaptureDemand);
         let wait_now = Instant::now();
         let wss_peer_live = viewer_attached
@@ -1498,7 +1534,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 let stats = egress.stats();
                 stats.connected && stats.peer_present
             });
-        let capture_demand = viewer_attached
+        let capture_demand = signaling.application_ready()
+            && viewer_attached
             && (offer_in_flight || offer_accepted || ice_connected || wss_peer_live);
         let waiting_mode = profiles
             .staged
@@ -1509,7 +1546,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         let urgent_capture = latest_idr.is_none()
             || profiles.staged().is_some()
             || encoder.as_ref().is_some_and(VideoEncoder::idr_pending);
-        let recovery_due = viewer_attached
+        let recovery_due = signaling.application_ready()
+            && viewer_attached
             && local_recovery_probe_due(
                 capture.is_privileged(),
                 capture_available,
@@ -1527,8 +1565,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         if let Ok(wake) = &cursor_wake {
             wake.set_active(capture_demand && !capture.is_privileged());
         }
-        if !first_iteration {
-            let mut deadlines = vec![next_ping, next_benchmark_refresh, next_input_log];
+        if !first_iteration && signal_events.is_empty() {
+            let mut deadlines = vec![
+                next_ping,
+                next_benchmark_refresh,
+                next_input_log,
+                wait_now + Duration::from_millis(250),
+            ];
             if !viewer_attached {
                 if let Some(deadline) = capture.parked_maintenance_deadline() {
                     deadlines.push(deadline);
@@ -1593,6 +1636,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             )?;
         }
         first_iteration = false;
+        // The socket may have woken the wait. Authenticate those frames before any
+        // transport input, asynchronous file completions or capture work this tick.
+        let awakened_events = signaling.poll()?;
+        if awakened_events
+            .iter()
+            .any(|event| matches!(event, SignalEvent::PeerLeft))
+        {
+            signal_events.clear();
+            park_viewer!("device-session-ended-after-wait");
+        }
+        signal_events.extend(awakened_events);
         session_stage!(Housekeeping);
         producer_loop_iterations = producer_loop_iterations.saturating_add(1);
         let loop_now = Instant::now();
@@ -1935,7 +1989,11 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     count,
                     text,
                     png,
-                } => signaling.send_clipboard_content_chunk(id, index, count, &text, png),
+                } => {
+                    if signaling.application_ready() && viewer_attached && remote_input_ready {
+                        signaling.send_clipboard_content_chunk(id, index, count, &text, png);
+                    }
+                }
                 PrivilegedEvent::Monitors(monitors) => signaling.send_monitor_list(monitors),
                 PrivilegedEvent::MonitorSwitch {
                     accepted,
@@ -2133,8 +2191,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     rtc_audio_requested = true;
                 }
                 TransportEvent::Action(RtcAction::IceConnected) => {
+                    signaling.dtls_connected()?;
                     rtc_peer.on_connected();
-                    ice_connected = true;
+                    ice_connected = signaling.application_ready();
+                    if ice_connected {
+                        ensure!(
+                            pump.command(TransportCommand::AuthorizePeer),
+                            "RTC transport stopped"
+                        );
+                    }
                     replay.on_ice_connected();
                     next_idr = Instant::now() + IDR_INTERVAL;
                     if let Some(kind) = latest_cursor_kind {
@@ -2200,6 +2265,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 TransportEvent::Action(RtcAction::InputData(data)) => {
+                    if !signaling.application_ready() {
+                        continue;
+                    }
                     input_sink.note_packet_received(&data);
                     reconcile_carried_input(
                         &mut carried_input,
@@ -2504,7 +2572,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         if file_drag_preview.desired.is_some() || file_drag_preview.active.is_some() {
             file_drag_preview.tick(
                 NativeDropView {
-                    ready: file_service.is_some()
+                    ready: signaling.application_ready()
+                        && file_service.is_some()
                         && !capture.is_privileged()
                         && bubbleplay_host::clipboard::input_desktop_is_default()
                         && remote_input_ready
@@ -2522,9 +2591,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             );
         }
         if let Some(files) = file_service.as_ref() {
-            // The file socket pairs on the live WSS media epoch.
-            files.set_epoch(if viewer_attached {
-                wss_media.as_ref().and(active_wss_epoch.as_deref())
+            // Files use the authenticated viewer epoch in either media mode.
+            files.set_epoch(if signaling.application_ready() && viewer_attached {
+                signaling.viewer_epoch()
             } else {
                 None
             });
@@ -2546,7 +2615,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 && !capture.is_privileged()
                 && bubbleplay_host::clipboard::input_desktop_is_default();
             let view = NativeDropView {
-                ready: remote_input_ready
+                ready: signaling.application_ready()
+                    && remote_input_ready
                     && capture_available
                     && wss_media.is_some()
                     && pending_first_frame.is_none()
@@ -2660,7 +2730,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
             }
             for _ in 0..outbox.pastes {
-                if remote_input_ready
+                if signaling.application_ready()
+                    && viewer_attached
+                    && remote_input_ready
                     && capture_available
                     && capture.desktop_state().desktop != "secure"
                 {
@@ -2711,9 +2783,41 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             next_quality_tick = now + Duration::from_secs(1);
         }
         session_stage!(Signaling);
-        let mut signal_events = signaling.poll()?.into_iter().peekable();
+        let mut signal_events = signal_events.into_iter().peekable();
         while let Some(event) = signal_events.next() {
+            if signaling.viewer_epoch().is_none() && !matches!(event, SignalEvent::PeerLeft) {
+                continue;
+            }
             match event {
+                SignalEvent::Bound => {
+                    signaling.send_host_capabilities(
+                        args.privileged_agent,
+                        args.privileged_agent,
+                        args.privileged_agent || capture.secure_helper_ready(),
+                        capture.secure_helper_ready(),
+                    );
+                    if let Ok(monitors) = capture.monitors() {
+                        signaling.send_monitor_list(monitors);
+                    }
+                    announce_capture_state(
+                        &mut signaling,
+                        &mut capture,
+                        media_generation,
+                        "dtls-bound",
+                    );
+                    // An endpoint write can end the authenticated session. Do not
+                    // authorize transport after a failed state replay.
+                    if !signaling.application_ready() {
+                        continue;
+                    }
+                    ice_connected = true;
+                    ensure!(
+                        pump.command(TransportCommand::AuthorizePeer),
+                        "RTC transport stopped"
+                    );
+                    replay.on_ice_connected();
+                    next_idr = Instant::now();
+                }
                 SignalEvent::Offer(sdp) => {
                     input_sink.reset_status_delivery();
                     if !viewer_attached {
@@ -3011,15 +3115,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
                 SignalEvent::RemoteCandidate(c) => pending_candidates.push_back(c),
                 SignalEvent::FileDragPreview(control) => {
-                    if active_wss_epoch.as_deref() == Some(control.epoch.as_str())
+                    if !signaling.application_ready() {
+                        continue;
+                    }
+                    if signaling.viewer_epoch() == Some(control.epoch.as_str())
                         && (pending_native_drop.is_none() || control.action == "cancel")
                     {
                         file_drag_preview.control(control, Instant::now());
                     }
                 }
-                SignalEvent::PeerLeft => {
-                    park_viewer!("peer-left");
-                }
+                // Applied at the beginning of this tick, before transport and file work.
+                SignalEvent::PeerLeft => {}
                 SignalEvent::Qos {
                     seq: _,
                     at_ms: _,
@@ -3055,6 +3161,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 SignalEvent::InputData(data) => {
+                    if !signaling.application_ready() {
+                        continue;
+                    }
                     input_sink.note_packet_received(&data);
                     let mut packets = vec![data];
                     while matches!(signal_events.peek(), Some(SignalEvent::InputData(_))) {
@@ -3078,6 +3187,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         packets
                     };
                     for data in packets {
+                        if !signaling.application_ready() {
+                            break;
+                        }
                         reconcile_carried_input(
                             &mut carried_input,
                             capture_available,
@@ -3131,9 +3243,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             if let Some(state) =
                                 cursor_tracker.sample(outcome.accepted_sequence, Instant::now())
                             {
-                                // WSS mode uses the authenticated signaling socket
-                                // for cursor feedback; the Worker relays binary in
-                                // the opposite direction without JSON wrapping.
+                                // WSS cursor feedback uses the same ctl channel, with
+                                // its original binary bytes sealed as kind cursor.
                                 signaling
                                     .send_cursor_state(state.encode(), outcome.feedback_reliable);
                                 if outcome.sync_requested {
@@ -3144,6 +3255,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 SignalEvent::SecureDeny => {
+                    if !signaling.application_ready() {
+                        continue;
+                    }
                     let allowed = capture.desktop_state().available
                         && capture.secure_state().is_some_and(|state| {
                             state.available && state.kind == "uac" && state.caps.contains(&"deny")
@@ -3345,10 +3459,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                     }
                     if action == "start" && wss_media.is_none() {
-                        let Some(bearer) = args.host_gate_token.as_deref() else {
-                            warn!("WSS media requested but --host-gate-token is missing");
-                            continue;
-                        };
+                        let bearer = ""; // RelayRoute carries the authenticated ticket.
                         let Some(epoch) = epoch.as_deref().filter(|value| valid_media_epoch(value))
                         else {
                             warn!(?protocol, "WSS media request missing session epoch");
@@ -3702,8 +3813,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }
         signaling.flush_cursor_state();
         if !capture.is_privileged() {
-            let viewer_live =
-                capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
+            let viewer_live = signaling.application_ready()
+                && capture_available
+                && remote_input_ready
+                && (ice_connected || wss_media.is_some());
             // Apply queued RTC and WSS actions before a clipboard completion:
             // a newer press or disconnect must cancel a delayed paste first.
             if viewer_live {
@@ -3711,8 +3824,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
             local_clipboard.poll(viewer_live, Instant::now(), &mut input_sink, &mut signaling);
         }
-        let audio_wanted =
-            args.audio && viewer_attached && (wss_audio_requested || rtc_audio_requested);
+        let audio_wanted = signaling.application_ready()
+            && args.audio
+            && viewer_attached
+            && (wss_audio_requested || rtc_audio_requested);
+        if !audio_wanted {
+            audio_capture = None;
+        }
         if audio_wanted && audio_capture.is_none() && Instant::now() >= next_audio_start {
             match bubbleplay_host::audio::AudioCapture::start(media_clock_start, activity.clone()) {
                 Ok(capture) => audio_capture = Some(capture),
@@ -3791,7 +3909,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }
         let now = Instant::now();
         let recovering = !capture.is_privileged() && !capture.desktop_state().available;
-        let wake_default = viewer_attached
+        let wake_default = signaling.application_ready()
+            && viewer_attached
             && recovering
             && capture.secure_state().is_none()
             && bubbleplay_host::desktop_session::input_desktop_is_default();
@@ -3957,25 +4076,28 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         } else {
             None
         };
-        let negotiation_active = viewer_attached && (offer_in_flight || offer_accepted);
+        let negotiation_active =
+            signaling.application_ready() && viewer_attached && (offer_in_flight || offer_accepted);
         let prewarm_needed = negotiation_active && !ice_connected && latest_idr.is_none();
-        let local_recovery_probe = viewer_attached
+        let local_recovery_probe = signaling.application_ready()
+            && viewer_attached
             && local_recovery_probe_due(
                 capture.is_privileged(),
                 capture_available,
                 now,
                 next_local_recovery_probe,
             );
-        if local_recovery_probe
-            || capture_admission_ready(
-                capture_available,
-                capture.is_privileged() && !capture_available,
-                negotiation_active,
-                ice_connected,
-                wss_ready,
-                rtc_reservation.is_some(),
-                prewarm_needed,
-            )
+        if signaling.application_ready()
+            && (local_recovery_probe
+                || capture_admission_ready(
+                    capture_available,
+                    capture.is_privileged() && !capture_available,
+                    negotiation_active,
+                    ice_connected,
+                    wss_ready,
+                    rtc_reservation.is_some(),
+                    prewarm_needed,
+                ))
         {
             if local_recovery_probe {
                 next_local_recovery_probe = now + capture::CAPTURE_RECOVERY_INTERVAL;
