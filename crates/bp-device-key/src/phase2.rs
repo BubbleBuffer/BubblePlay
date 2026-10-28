@@ -139,7 +139,9 @@ pub fn auth_finish_signed_bytes(h: &[u8; 32], pc_signature: &[u8; 64]) -> Vec<u8
 /// The bytes each side signs in `auth-bind` (phase 0 encoding):
 /// `"bubbleplay-dtls-v1" || H || local fingerprint || "\n" || remote fingerprint`, where both
 /// fingerprints are the UTF-8 `a=fingerprint` values from the signer's point of view
-/// (`sha-256 AB:CD:...`, 32 uppercase hex pairs). Any other fingerprint form is refused.
+/// (`sha-256 AB:CD:...`, 32 uppercase hex pairs). Any other fingerprint form is refused: run the
+/// SDP through [`sdp_sha256_fingerprint`] (or a single value through [`normalize_fingerprint`])
+/// first, on both the signing and the verifying side.
 pub fn auth_bind_signed_bytes(
     h: &[u8; 32],
     local_fingerprint: &str,
@@ -239,6 +241,55 @@ pub fn check_fingerprint(value: &str) -> Result<(), DeviceKeyError> {
         }
     }
     Ok(())
+}
+
+/// Normalises one `a=fingerprint` value to the form auth-bind signs: algorithm lowercase, exactly
+/// one space, hex uppercase in colon-separated pairs (`sha-256 A0:A1:...`). Only sha-256 is
+/// accepted; anything else, or a hash that is not 32 colon-separated hex pairs, is
+/// [`DeviceKeyError::InvalidFingerprint`].
+pub fn normalize_fingerprint(value: &str) -> Result<String, DeviceKeyError> {
+    let (algorithm, hash) = value
+        .trim()
+        .split_once([' ', '\t'])
+        .ok_or(DeviceKeyError::InvalidFingerprint)?;
+    if !algorithm.eq_ignore_ascii_case("sha-256") {
+        return Err(DeviceKeyError::InvalidFingerprint);
+    }
+    let normalized = format!(
+        "{FINGERPRINT_PREFIX}{}",
+        hash.trim_start_matches([' ', '\t']).to_ascii_uppercase()
+    );
+    check_fingerprint(&normalized)?;
+    Ok(normalized)
+}
+
+/// The normalised sha-256 DTLS fingerprint of an SDP (see [`normalize_fingerprint`]), read from
+/// its `a=fingerprint:` lines. Lines for other algorithms are skipped. Several sha-256 lines
+/// (session and media level) must carry the same fingerprint. No sha-256 line, a malformed
+/// sha-256 line or two different sha-256 fingerprints is [`DeviceKeyError::InvalidFingerprint`].
+pub fn sdp_sha256_fingerprint(sdp: &str) -> Result<String, DeviceKeyError> {
+    let mut found: Option<String> = None;
+    for line in sdp.lines() {
+        let Some(value) = line.trim().strip_prefix("a=fingerprint:") else {
+            continue;
+        };
+        let is_sha256 = value
+            .split_whitespace()
+            .next()
+            .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case("sha-256"));
+        if !is_sha256 {
+            continue;
+        }
+        let normalized = normalize_fingerprint(value)?;
+        match &found {
+            Some(existing) if *existing != normalized => {
+                return Err(DeviceKeyError::InvalidFingerprint);
+            }
+            Some(_) => {}
+            None => found = Some(normalized),
+        }
+    }
+    found.ok_or(DeviceKeyError::InvalidFingerprint)
 }
 
 fn verify_strict(public: &[u8], message: &[u8], signature: &[u8]) -> Result<(), DeviceKeyError> {
@@ -880,6 +931,76 @@ mod tests {
                     Err(DeviceKeyError::InvalidFingerprint)
                 ),
                 "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprints_normalise_to_the_signed_form() {
+        let canonical = format!("sha-256 {}", ["AB"; 32].join(":"));
+        for input in [
+            canonical.clone(),
+            format!("sha-256 {}", ["ab"; 32].join(":")),
+            format!("SHA-256 {}", ["aB"; 32].join(":")),
+            format!("  Sha-256 \t  {}  ", ["Ab"; 32].join(":")),
+        ] {
+            assert_eq!(
+                normalize_fingerprint(&input).expect("normalises"),
+                canonical,
+                "{input:?}"
+            );
+        }
+        for bad in [
+            String::new(),
+            "sha-256".to_owned(),
+            format!("sha-1 {}", ["ab"; 20].join(":")),
+            format!("sha-256 {}", ["ab"; 31].join(":")),
+            format!("sha-256 {}", ["ab"; 32].join("")),
+            format!("sha-256 {}", ["ag"; 32].join(":")),
+        ] {
+            assert!(
+                matches!(
+                    normalize_fingerprint(&bad),
+                    Err(DeviceKeyError::InvalidFingerprint)
+                ),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sdp_fingerprint_picks_sha256() {
+        let sha1 = format!("sha-1 {}", ["0f"; 20].join(":"));
+        let sha256 = format!("sha-256 {}", ["cd"; 32].join(":"));
+        let canonical = format!("sha-256 {}", ["CD"; 32].join(":"));
+        // sha-1 first, then sha-256 at session and media level (CRLF and LF lines).
+        let sdp = format!(
+            "v=0\r\na=fingerprint:{sha1}\r\na=fingerprint:{sha256}\r\nm=application 9 UDP/DTLS/SCTP\na=fingerprint:{canonical}\n"
+        );
+        assert_eq!(sdp_sha256_fingerprint(&sdp).expect("sha-256"), canonical);
+        // sha-256 first, sha-1 after.
+        let sdp = format!("a=fingerprint:{sha256}\na=fingerprint:{sha1}\n");
+        assert_eq!(sdp_sha256_fingerprint(&sdp).expect("sha-256"), canonical);
+    }
+
+    #[test]
+    fn sdp_without_a_usable_sha256_fingerprint_is_an_error() {
+        let sha1 = format!("sha-1 {}", ["0F"; 20].join(":"));
+        let one = format!("sha-256 {}", ["AB"; 32].join(":"));
+        let other = format!("sha-256 {}", ["CD"; 32].join(":"));
+        for sdp in [
+            String::new(),
+            "v=0\r\na=setup:actpass\r\n".to_owned(),
+            format!("v=0\r\na=fingerprint:{sha1}\r\n"),
+            format!("a=fingerprint:sha-256 {}\n", ["AB"; 31].join(":")),
+            format!("a=fingerprint:{one}\na=fingerprint:{other}\n"),
+        ] {
+            assert!(
+                matches!(
+                    sdp_sha256_fingerprint(&sdp),
+                    Err(DeviceKeyError::InvalidFingerprint)
+                ),
+                "accepted {sdp:?}"
             );
         }
     }

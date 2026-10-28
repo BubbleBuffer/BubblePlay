@@ -15,7 +15,9 @@
 //! - `allow()`, `deny()`, `pair_saved(bool)` for the Devices decision; `stop(End)` when the
 //!   pairing window closes or expires.
 //! - `webrtc_offer(sdp)` when the viewer's offer arrives in ctl, `webrtc_answer(sdp)` with our
-//!   answer, `dtls_connected()` once DTLS is up. `sdp_fingerprint(sdp)` extracts `a=fingerprint`.
+//!   answer, `dtls_connected()` once DTLS is up. Both SDPs go through
+//!   `bp_device_key::phase2::sdp_sha256_fingerprint` (decision 23): the bind signs and verifies
+//!   the normalised sha-256 `a=fingerprint` of the SDP actually sent and received.
 //! - `seal_text(kind, json)` and `seal_binary("cursor", bytes)` return the ctl envelope text to
 //!   send. `seal_text` requires the JSON `type` to equal `kind`.
 //! - Gates and state: `is_established()`, `media_ready()` (input and media wait for both DTLS
@@ -31,7 +33,7 @@ use std::fmt;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use bp_device_key::phase2::{
-    check_fingerprint, sign_auth_bind, sign_auth_host, verify_auth_bind, verify_auth_finish,
+    sdp_sha256_fingerprint, sign_auth_bind, sign_auth_host, verify_auth_bind, verify_auth_finish,
     CtlKeys, CtlOpener, CtlSealer, EphemeralSecret, PairKey, PairingCode, Sas, Side, Transcript,
 };
 use bp_device_key::{DeviceId, DeviceIdentity, DeviceKeyError};
@@ -524,37 +526,30 @@ impl Session {
         vec![Event::Ended(reason)]
     }
 
-    /// The viewer's WebRTC offer, as a ctl message. A viewer without dtls-bind-v1 gets a ctl error
-    /// and the session ends.
+    /// The viewer's WebRTC offer, as a ctl message. A viewer without dtls-bind-v1, or an offer
+    /// without a sha-256 `a=fingerprint`, gets a `dtls-bind-required` ctl error and the session
+    /// ends.
     pub fn webrtc_offer(&mut self, offer_sdp: &str) -> Result<Vec<Event>, SessionError> {
         // The cap check comes before the SDP is read: a viewer without dtls-bind-v1 is refused
         // whatever the offer holds.
         let channel = self.channel_mut()?;
         if !channel.viewer.caps.iter().any(|cap| cap == CAP_DTLS) {
-            let error = json!({
-                "type": "error",
-                "code": "dtls-bind-required",
-                "message": "This viewer did not offer dtls-bind-v1, which WebRTC needs.",
-            });
-            let envelope = channel.seal("error", error.to_string().as_bytes())?;
-            self.state = State::Ended;
-            return Ok(vec![
-                Event::Send(envelope),
-                Event::Ended(End::DtlsBindRequired),
-            ]);
+            return self.refuse_dtls("This viewer did not offer dtls-bind-v1, which WebRTC needs.");
         }
-        let fingerprint = sdp_fingerprint(offer_sdp)?;
-        let channel = self.channel_mut()?;
         if channel.offer_fp.is_some() {
             return Err(SessionError::Misuse("offer already received"));
         }
-        channel.offer_fp = Some(fingerprint);
+        let Ok(fingerprint) = sdp_sha256_fingerprint(offer_sdp) else {
+            return self.refuse_dtls("The WebRTC offer has no sha-256 DTLS fingerprint.");
+        };
+        self.channel_mut()?.offer_fp = Some(fingerprint);
         Ok(Vec::new())
     }
 
-    /// Our WebRTC answer. Its fingerprint is the PC's side of the DTLS bind.
-    pub fn webrtc_answer(&mut self, answer_sdp: &str) -> Result<(), SessionError> {
-        let fingerprint = sdp_fingerprint(answer_sdp)?;
+    /// Our WebRTC answer, exactly as sent. Its fingerprint is the PC's side of the DTLS bind. An
+    /// answer without a sha-256 `a=fingerprint` sends a `dtls-bind-required` ctl error and ends
+    /// the session.
+    pub fn webrtc_answer(&mut self, answer_sdp: &str) -> Result<Vec<Event>, SessionError> {
         let channel = self.channel_mut()?;
         if channel.offer_fp.is_none() {
             return Err(SessionError::Misuse("answer before offer"));
@@ -562,8 +557,27 @@ impl Session {
         if channel.answer_fp.is_some() {
             return Err(SessionError::Misuse("answer already set"));
         }
-        channel.answer_fp = Some(fingerprint);
-        Ok(())
+        let Ok(fingerprint) = sdp_sha256_fingerprint(answer_sdp) else {
+            return self.refuse_dtls("This PC's WebRTC answer has no sha-256 DTLS fingerprint.");
+        };
+        self.channel_mut()?.answer_fp = Some(fingerprint);
+        Ok(Vec::new())
+    }
+
+    /// Sends a `dtls-bind-required` ctl error and ends the session.
+    fn refuse_dtls(&mut self, message: &str) -> Result<Vec<Event>, SessionError> {
+        let channel = self.channel_mut()?;
+        let error = json!({
+            "type": "error",
+            "code": "dtls-bind-required",
+            "message": message,
+        });
+        let envelope = channel.seal("error", error.to_string().as_bytes())?;
+        self.state = State::Ended;
+        Ok(vec![
+            Event::Send(envelope),
+            Event::Ended(End::DtlsBindRequired),
+        ])
     }
 
     /// Call once DTLS is up. Returns our auth-bind, plus `Bound` the first time both binds have
@@ -798,27 +812,6 @@ pub fn parse_peer_joined(text: &str) -> Result<PeerJoined, SessionError> {
         media_epoch: media_epoch.to_owned(),
         pairing,
     })
-}
-
-/// The `a=fingerprint` value of an SDP: `sha-256` plus 32 uppercase hex pairs. Every fingerprint
-/// line must carry the same value.
-pub fn sdp_fingerprint(sdp: &str) -> Result<String, SessionError> {
-    let mut found: Option<&str> = None;
-    for line in sdp.lines() {
-        let Some(value) = line.strip_prefix("a=fingerprint:") else {
-            continue;
-        };
-        match found {
-            Some(existing) if existing != value => {
-                return Err(SessionError::Input("SDP has conflicting fingerprints"));
-            }
-            _ => found = Some(value),
-        }
-    }
-    let value = found.ok_or(SessionError::Input("SDP has no a=fingerprint line"))?;
-    check_fingerprint(value)
-        .map_err(|_| SessionError::Input("SDP fingerprint is not sha-256 with uppercase hex"))?;
-    Ok(value.to_owned())
 }
 
 /// The epoch is opaque printable ASCII (no spaces, no control characters), 1 to 64 bytes.
@@ -1594,13 +1587,41 @@ mod tests {
     }
 
     #[test]
-    fn malformed_offer_with_dtls_bind_is_an_input_error_and_changes_nothing() {
+    fn offer_without_sha256_fingerprint_sends_dtls_bind_required_and_ends() {
+        let sha1 = format!("sha-1 {}", ["0F"; 20].join(":"));
+        for offer in [
+            "no fingerprint".to_owned(),
+            format!("v=0\r\na=fingerprint:{sha1}\r\n"),
+        ] {
+            let mut session = established_session();
+            let events = session.webrtc_offer(&offer).expect("offer");
+            match events.as_slice() {
+                [Event::Send(error), Event::Ended(End::DtlsBindRequired)] => {
+                    let error: Value = serde_json::from_str(error).expect("json");
+                    assert_eq!(error["type"], "ctl");
+                    assert_eq!(error["kind"], "error");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(session.is_ended());
+        }
+    }
+
+    #[test]
+    fn answer_without_sha256_fingerprint_sends_dtls_bind_required_and_ends() {
+        let f = fixture();
         let mut session = established_session();
+        let offer = format!(
+            "v=0\r\na=fingerprint:{}\r\n",
+            s(&f["handshake"]["dtls"]["viewer"]["localFingerprint"])
+        );
+        assert!(session.webrtc_offer(&offer).expect("offer").is_empty());
+        let events = session.webrtc_answer("v=0\r\n").expect("answer");
         assert!(matches!(
-            session.webrtc_offer("no fingerprint"),
-            Err(SessionError::Input(_))
+            events.as_slice(),
+            [Event::Send(_), Event::Ended(End::DtlsBindRequired)]
         ));
-        assert!(session.is_established());
+        assert!(session.is_ended());
     }
 
     fn assert_ignored_after_end(session: &mut Session, text: &str) {
@@ -1659,7 +1680,7 @@ mod tests {
             "v=0\r\na=fingerprint:{}\r\n",
             s(&dtls["pc"]["localFingerprint"])
         );
-        session.webrtc_answer(&answer).expect("answer");
+        assert!(session.webrtc_answer(&answer).expect("answer").is_empty());
         assert!(!session.media_ready());
 
         // The viewer's auth-bind may arrive before our DTLS is up.
@@ -1739,19 +1760,39 @@ mod tests {
     }
 
     #[test]
-    fn sdp_fingerprints_are_extracted_exactly() {
-        let value = format!("sha-256 {}", ["AB"; 32].join(":"));
-        let sdp = format!(
-            "v=0\r\na=setup:actpass\r\na=fingerprint:{value}\r\nm=application 9 UDP/DTLS/SCTP\r\na=fingerprint:{value}\r\n"
+    fn lowercase_hex_sdp_fingerprints_bind_like_the_fixture() {
+        // Decision 23: the SDPs as sent and received may print lowercase hex; both sides sign and
+        // verify the normalised form, so the binds are the fixture's.
+        let f = fixture();
+        let hs = &f["handshake"];
+        let dtls = &hs["dtls"];
+        let mut session = established_session();
+        let offer = format!(
+            "v=0
+a=fingerprint:{}
+m=application 9 UDP/DTLS/SCTP
+a=fingerprint:{}
+",
+            s(&dtls["viewer"]["localFingerprint"]).to_lowercase(),
+            s(&dtls["viewer"]["localFingerprint"]),
         );
-        assert_eq!(sdp_fingerprint(&sdp).expect("fingerprint"), value);
-        assert!(sdp_fingerprint("v=0\r\n").is_err());
-        let other = format!("sha-256 {}", ["CD"; 32].join(":"));
-        assert!(
-            sdp_fingerprint(&format!("a=fingerprint:{value}\na=fingerprint:{other}\n")).is_err()
+        assert!(session.webrtc_offer(&offer).expect("offer").is_empty());
+        let answer = format!(
+            "v=0
+a=fingerprint:{}
+",
+            s(&dtls["pc"]["localFingerprint"]).to_lowercase()
         );
-        let lowercase = format!("sha-256 {}", ["ab"; 32].join(":"));
-        assert!(sdp_fingerprint(&format!("a=fingerprint:{lowercase}\n")).is_err());
+        assert!(session.webrtc_answer(&answer).expect("answer").is_empty());
+        // The viewer's bind (over the uppercase fixture form) verifies.
+        assert!(session
+            .on_text(&hs["messages"]["authBind"].to_string())
+            .expect("viewer bind")
+            .is_empty());
+        let events = session.dtls_connected().expect("bind");
+        assert!(matches!(events.as_slice(), [Event::Send(_), Event::Bound]));
+        assert_eq!(sent(&events)["signature"], dtls["pc"]["signature"]);
+        assert!(session.media_ready());
     }
 
     #[test]

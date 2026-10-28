@@ -63,7 +63,8 @@ pub struct HostProtocol {
     pairing: Option<PairWindow>,
     peer_pairing: bool,
     epoch: Option<String>,
-    waiting_decision: bool,
+    /// The device ID of the pair request the UI is deciding on, if any.
+    waiting_decision: Option<String>,
     first_ctl_seen: bool,
     offer_seen: bool,
     answer_seen: bool,
@@ -122,7 +123,7 @@ impl HostProtocol {
             pairing: None,
             peer_pairing: false,
             epoch: None,
-            waiting_decision: false,
+            waiting_decision: None,
             first_ctl_seen: false,
             offer_seen: false,
             answer_seen: false,
@@ -300,9 +301,18 @@ impl HostProtocol {
         if !self.session.is_established() || !self.offer_seen || self.answer_seen {
             return Ok(false);
         }
-        if let Err(error) = self.session.webrtc_answer(sdp) {
-            self.terminate();
-            return Err(error.into());
+        match self.session.webrtc_answer(sdp) {
+            Ok(events) => {
+                // A non-empty result is the dtls-bind-required error and the end of the session.
+                if !events.is_empty() {
+                    self.consume(events, false)?;
+                    return Ok(false);
+                }
+            }
+            Err(error) => {
+                self.terminate();
+                return Err(error.into());
+            }
         }
         self.answer_seen = true;
         Ok(true)
@@ -371,7 +381,7 @@ impl HostProtocol {
         self.session.stop(End::Stopped("viewer reset"));
         self.epoch = None;
         self.peer_pairing = false;
-        self.waiting_decision = false;
+        self.waiting_decision = None;
         self.first_ctl_seen = false;
         self.offer_seen = false;
         self.answer_seen = false;
@@ -432,17 +442,24 @@ impl HostProtocol {
                     self.close_pairing(DevicesEvent::PairStopped, "pairing cancelled");
                 }
             }
-            DevicesCommand::Allow if self.waiting_decision => {
+            // A decision counts only for the request the window was showing: a click that
+            // arrives after that request ended, or names another device, is ignored.
+            DevicesCommand::Allow(id) if self.waiting_decision.as_deref() == Some(id.as_str()) => {
                 let events = self.session.allow()?;
-                self.waiting_decision = false;
+                self.waiting_decision = None;
                 self.consume(events, false)?;
             }
-            DevicesCommand::Deny if self.waiting_decision => {
+            DevicesCommand::Deny(id) if self.waiting_decision.as_deref() == Some(id.as_str()) => {
                 let events = self.session.deny()?;
-                self.waiting_decision = false;
+                self.waiting_decision = None;
                 self.consume(events, false)?;
             }
-            DevicesCommand::Allow | DevicesCommand::Deny => {
+            DevicesCommand::Allow(id) | DevicesCommand::Deny(id) => {
+                tracing::info!(
+                    device = %id,
+                    pending = ?self.waiting_decision,
+                    "ignored a pairing decision for a request that is not pending"
+                );
                 self.record_drop("stale pairing decision");
             }
             DevicesCommand::Revoke(id) => {
@@ -488,7 +505,7 @@ impl HostProtocol {
                     self.queue_list();
                 }
                 Event::PairRequest(request) => {
-                    self.waiting_decision = true;
+                    self.waiting_decision = Some(request.viewer_id.clone());
                     let name = self
                         .trusted
                         .get(&request.viewer_id)
@@ -593,7 +610,9 @@ impl HostProtocol {
             End::Protocol(reason) | End::Auth(reason) | End::Ctl(reason) | End::Refused(reason) => {
                 self.record_drop(reason)
             }
-            End::DtlsBindRequired => self.record_drop("viewer lacks dtls-bind-v1"),
+            End::DtlsBindRequired => {
+                self.record_drop("DTLS bind impossible: no dtls-bind-v1 or no sha-256 fingerprint")
+            }
             End::PairCodeMismatch => self.record_drop("pair proof verification failed"),
             _ => {}
         }
@@ -804,12 +823,13 @@ mod tests {
         assert!(!host.application_ready());
         assert!(host.viewer_epoch().is_none());
     }
-    fn request_pair(host: &mut HostProtocol) {
+    /// Runs pairing up to the PC-side decision and returns the pending request's device ID.
+    fn request_pair(host: &mut HostProtocol) -> String {
         begin_pair(host);
         host.receive(&fixture()["phase2"]["pairing"]["messages"]["pairProofViewer"].to_string())
             .unwrap();
-        assert!(host.waiting_decision);
         assert!(!host.application_ready());
+        host.waiting_decision.clone().expect("pending pair request")
     }
     fn sent(effects: &[Effect]) -> Vec<Value> {
         effects
@@ -852,10 +872,10 @@ mod tests {
     fn allow_commits_trust_before_pair_done_admit_and_close() {
         let scratch = Scratch::new();
         let (mut host, ui) = controller(&scratch.list(), false);
-        request_pair(&mut host);
+        let id = request_pair(&mut host);
         let request_effects = host.take_effects();
         assert!(request_effects.iter().any(|effect| matches!(effect, Effect::Ui(DevicesEvent::PairRequest { sas_display, .. }) if sas_display == "830 687")));
-        ui.commands.send(DevicesCommand::Allow).unwrap();
+        ui.commands.send(DevicesCommand::Allow(id)).unwrap();
         host.poll().unwrap();
         // The real persisted DPAPI file is readable before any queued wire effect is delivered.
         let saved = trusted_devices::load(scratch.list()).unwrap();
@@ -891,9 +911,9 @@ mod tests {
         let path = scratch.0.join("blocked").join("trusted.json");
         let (mut host, ui) = controller(&path, false);
         std::fs::write(scratch.0.join("blocked"), b"not a directory").unwrap();
-        request_pair(&mut host);
+        let id = request_pair(&mut host);
         host.take_effects();
-        ui.commands.send(DevicesCommand::Allow).unwrap();
+        ui.commands.send(DevicesCommand::Allow(id)).unwrap();
         host.poll().unwrap();
         let effects = host.take_effects();
         assert_eq!(
@@ -946,11 +966,11 @@ mod tests {
     fn expiry_beats_a_queued_allow_and_cancel_preserves_a_normal_viewer() {
         let scratch = Scratch::new();
         let (mut host, ui) = controller(&scratch.list(), false);
-        request_pair(&mut host);
+        let id = request_pair(&mut host);
         let deadline = host.pairing.as_ref().unwrap().deadline;
         host.take_effects();
         host.expire_pairing(deadline);
-        ui.commands.send(DevicesCommand::Allow).unwrap();
+        ui.commands.send(DevicesCommand::Allow(id)).unwrap();
         host.poll().unwrap();
         let effects = host.take_effects();
         assert!(effects
@@ -1081,9 +1101,11 @@ mod tests {
         host.take_effects();
         let f = fixture();
         let mut viewer = viewer_sealer();
+        // Decision 23: lowercase hex (and an uppercase algorithm) in the SDPs is normalised before
+        // signing and verifying, so the binds still match the fixture.
         let offer = format!(
             "v=0\r\na=fingerprint:{}\r\n",
-            string(&f["handshake"]["dtls"]["viewer"]["localFingerprint"])
+            string(&f["handshake"]["dtls"]["viewer"]["localFingerprint"]).to_lowercase()
         );
         let inbound = host
             .receive(&ctl_json(&mut viewer, json!({"type":"offer","sdp":offer})))
@@ -1106,8 +1128,11 @@ mod tests {
             .is_empty());
         assert!(host.seal_cursor(&[128, 0]).unwrap().is_none());
         let answer = format!(
-            "v=0\r\na=fingerprint:{}\r\n",
+            "v=0\r\na=fingerprint:sha-1 {}\r\na=fingerprint:{}\r\n",
+            ["0f"; 20].join(":"),
             string(&f["handshake"]["dtls"]["pc"]["localFingerprint"])
+                .to_lowercase()
+                .replace("sha-256", "SHA-256")
         );
         assert!(host.local_answer(&answer).unwrap());
         host.dtls_connected().unwrap();
@@ -1131,6 +1156,28 @@ mod tests {
                 .as_slice(),
             [Inbound::Input(_)]
         ));
+    }
+
+    #[test]
+    fn webrtc_offer_without_sha256_fingerprint_ends_the_viewer() {
+        let scratch = Scratch::new();
+        let (mut host, _) = controller(&scratch.list(), true);
+        establish(&mut host);
+        host.take_effects();
+        let mut viewer = viewer_sealer();
+        let offer = format!("v=0\r\na=fingerprint:sha-1 {}\r\n", ["0F"; 20].join(":"));
+        let inbound = host
+            .receive(&ctl_json(&mut viewer, json!({"type":"offer","sdp":offer})))
+            .unwrap();
+        assert!(inbound.is_empty());
+        assert!(!host.application_ready());
+        assert!(host.viewer_epoch().is_none());
+        let effects = host.take_effects();
+        // The ctl error goes out before the viewer is parked.
+        let messages = sent(&effects);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["type"], "ctl");
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::Park)));
     }
 
     #[test]
@@ -1298,9 +1345,9 @@ mod tests {
     fn denied_or_relay_stopped_pairing_never_adds_trust() {
         let scratch = Scratch::new();
         let (mut host, ui) = controller(&scratch.list(), false);
-        request_pair(&mut host);
+        let id = request_pair(&mut host);
         host.take_effects();
-        ui.commands.send(DevicesCommand::Deny).unwrap();
+        ui.commands.send(DevicesCommand::Deny(id)).unwrap();
         host.poll().unwrap();
         let effects = host.take_effects();
         assert_eq!(
@@ -1322,7 +1369,7 @@ mod tests {
             .iter()
             .any(|effect| matches!(effect, Effect::Ui(DevicesEvent::PairFailed))));
         assert!(host.pairing.is_none());
-        assert!(!host.waiting_decision);
+        assert!(host.waiting_decision.is_none());
         assert!(host.trusted.devices().is_empty());
     }
 
@@ -1342,19 +1389,53 @@ mod tests {
                 SystemTime::now(),
             )
             .unwrap();
-        request_pair(&mut host);
+        let id = request_pair(&mut host);
         host.take_effects();
         ui.commands.send(DevicesCommand::Revoke(other_id)).unwrap();
         host.poll().unwrap();
         assert!(host.pairing.is_none());
         assert!(!host.peer_pairing);
-        assert!(!host.waiting_decision);
-        ui.commands.send(DevicesCommand::Allow).unwrap();
+        assert!(host.waiting_decision.is_none());
+        ui.commands.send(DevicesCommand::Allow(id)).unwrap();
         host.poll().unwrap();
         let effects = host.take_effects();
         assert!(!sent(&effects)
             .iter()
             .any(|message| message["type"] == "pair-done"));
         assert!(host.trusted.devices().is_empty());
+    }
+
+    #[test]
+    fn a_decision_counts_only_for_the_pending_request() {
+        let scratch = Scratch::new();
+        let (mut host, ui) = controller(&scratch.list(), false);
+        let id = request_pair(&mut host);
+        host.take_effects();
+        // A click left over from another request (another device ID) is ignored, both ways.
+        let other = "0000-0000-0000-0000".to_owned();
+        assert_ne!(other, id);
+        ui.commands
+            .send(DevicesCommand::Allow(other.clone()))
+            .unwrap();
+        ui.commands.send(DevicesCommand::Deny(other)).unwrap();
+        host.poll().unwrap();
+        let effects = host.take_effects();
+        assert!(sent(&effects).is_empty());
+        assert_eq!(host.waiting_decision.as_deref(), Some(id.as_str()));
+        assert!(host.trusted.devices().is_empty());
+        // The decision for the request on screen still goes through.
+        ui.commands.send(DevicesCommand::Allow(id.clone())).unwrap();
+        host.poll().unwrap();
+        let effects = host.take_effects();
+        assert!(sent(&effects)
+            .iter()
+            .any(|message| message["type"] == "pair-done"));
+        assert_eq!(host.trusted.devices().len(), 1);
+        assert!(host.waiting_decision.is_none());
+        // A second click for the same, now decided, request changes nothing.
+        ui.commands.send(DevicesCommand::Deny(id)).unwrap();
+        host.poll().unwrap();
+        assert!(sent(&host.take_effects()).is_empty());
+        assert_eq!(host.trusted.devices().len(), 1);
     }
 }

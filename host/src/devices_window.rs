@@ -1918,13 +1918,19 @@ impl Ui {
                 self.sync();
             }
             Ctl::Allow => {
+                let id = self.model.borrow().request.as_ref().map(|r| r.id.clone());
                 self.model.borrow_mut().decided = true;
-                self.shared.send(DevicesCommand::Allow);
+                if let Some(id) = id {
+                    self.shared.send(DevicesCommand::Allow(id));
+                }
                 self.sync();
             }
             Ctl::Deny => {
+                let id = self.model.borrow().request.as_ref().map(|r| r.id.clone());
                 self.model.borrow_mut().decided = true;
-                self.shared.send(DevicesCommand::Deny);
+                if let Some(id) = id {
+                    self.shared.send(DevicesCommand::Deny(id));
+                }
                 self.sync();
             }
             _ => {}

@@ -9,7 +9,8 @@
 //! 3. A scripted viewer pairs over `/ws?pc=ID`. It takes `mediaEpoch` from its hello-ok as text
 //!    and checks it is 32 lowercase hex. It runs the pairing handshake and MACs from
 //!    `bp_device_key::phase2`, then checks the PC's SAS against the Devices window's
-//!    `PairRequest`. The test sends `DevicesCommand::Allow` and expects `pair-done` and `PairDone`.
+//!    `PairRequest`. The test sends `DevicesCommand::Allow(id)` for that request and expects
+//!    `pair-done` and `PairDone`.
 //! 4. The test waits until the relay's `pcs.json` lists the viewer as admitted for this PC.
 //! 5. The trusted viewer reconnects normally. Its hello-ok epoch must differ from the pairing
 //!    epoch. It completes the handshake, opens the encrypted `caps` and runs an encrypted
@@ -250,7 +251,7 @@ fn pair_viewer(
     harness
         .ui
         .commands
-        .send(DevicesCommand::Allow)
+        .send(DevicesCommand::Allow(id))
         .map_err(|_| anyhow!("Devices command channel closed"))?;
     next_json(harness, &mut admitted.ws, "pair-done", "pair-done")?;
     let done = harness.devices_event("PairDone", |event| {

@@ -65,8 +65,10 @@ pub enum DevicesCommand {
     Revoke(String),
     StartPairing,
     CancelPairing,
-    Allow,
-    Deny,
+    /// Allow the pending pair request for this device ID.
+    Allow(String),
+    /// Deny the pending pair request for this device ID.
+    Deny(String),
 }
 
 struct Redacted;
