@@ -61,6 +61,10 @@ pub struct DevOptions {
     pub key: Option<PathBuf>,
     /// `--pc <id>`: the PC to reach through the relay (required with `--dev-relay`).
     pub pc: Option<DeviceId>,
+    /// `--pair <code>` (canonical form): pair with `--pc` through `--dev-relay`, then exit.
+    pub pair: Option<String>,
+    /// The `--dev-relay` origin as given, stored in pcs.json on pairing.
+    pub relay_origin: Option<String>,
     pub stats_out_path: Option<PathBuf>,
 }
 
@@ -92,6 +96,7 @@ impl DevOptions {
         let mut relay = None;
         let mut key = None;
         let mut pc = None;
+        let mut pair = None;
         let mut stats_out_path = None;
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -137,6 +142,11 @@ impl DevOptions {
                 "--pc" => {
                     let id = iter.next().context("--pc requires a PC ID")?;
                     pc = Some(DeviceId::parse(&id).map_err(|_| anyhow!("invalid PC ID {id:?}"))?);
+                }
+                "--pair" => {
+                    let code = iter.next().context("--pair requires the pairing code")?;
+                    let code = crate::net::phase2::parse_code(&code).map_err(|e| anyhow!(e))?;
+                    pair = Some(code.as_str().to_owned());
                 }
                 "--stats-out" => {
                     stats_out_path = Some(PathBuf::from(
@@ -224,6 +234,10 @@ impl DevOptions {
                 _ => bail!("unknown development argument: {arg}"),
             }
         }
+        if pair.is_some() && relay.is_none() {
+            bail!("--pair requires --dev-relay <origin> and --pc <id>");
+        }
+        let relay_origin = relay.clone();
         if let Some(origin) = relay {
             if url.is_some() {
                 bail!("--dev-relay and --dev-wss are mutually exclusive");
@@ -333,6 +347,8 @@ impl DevOptions {
             session_script,
             key,
             pc,
+            pair,
+            relay_origin,
             stats_out_path,
         }))
     }
@@ -409,6 +425,7 @@ fn is_dev_flag(value: &str) -> bool {
             | "--transport"
             | "--ice-timeout-ms"
             | "--dev-relay"
+            | "--pair"
     )
 }
 

@@ -53,7 +53,7 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
 url = "2"
 # Device keys: the viewer key file, the relay proof and IDs (docs/architecture/device-keys.md).
-bp-device-key = { path = "../crates/bp-device-key", features = ["keygen", "keyfile"] }
+bp-device-key = { path = "../crates/bp-device-key", features = ["keygen", "keyfile", "phase2"] }
 base64 = "0.22"
 zeroize = "1"
 

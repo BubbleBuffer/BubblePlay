@@ -7,12 +7,13 @@ use bp_device_key::{DeviceId, DeviceIdentity};
 use super::controls::SessionControls;
 use super::error::NetError;
 
-/// Who connects and to which PC: the unlocked viewer key that signs the relay proof, and the
-/// PC ID that goes into `/ws?pc=` and `/media-ws?pc=`.
+/// Who connects and to which PC: the unlocked viewer key that signs the relay proof, the
+/// PC ID that goes into `/ws?pc=` and `/media-ws?pc=`, and the PC keys pinned in `pcs.json`.
 #[derive(Clone)]
 pub struct ViewerAuth {
     identity: Arc<DeviceIdentity>,
     pc: Option<DeviceId>,
+    paired: Arc<Vec<(DeviceId, [u8; 32])>>,
 }
 
 impl ViewerAuth {
@@ -21,7 +22,19 @@ impl ViewerAuth {
         Self {
             identity: Arc::new(identity),
             pc,
+            paired: Arc::new(Vec::new()),
         }
+    }
+
+    /// The paired PCs and their pinned public keys (`pcs.json`). The handshake refuses any
+    /// other PC, and any PC whose key differs from its pinned key.
+    pub fn with_paired(mut self, paired: Vec<(DeviceId, [u8; 32])>) -> Self {
+        self.paired = Arc::new(paired);
+        self
+    }
+
+    pub fn paired(&self) -> &[(DeviceId, [u8; 32])] {
+        &self.paired
     }
 
     pub fn identity(&self) -> &DeviceIdentity {
@@ -33,7 +46,7 @@ impl ViewerAuth {
     }
 
     /// The fixture viewer key (fixtures/device-keys-contract.json `ids[0]`) for PC
-    /// `77VH-7M56-8GJK-Y12J`. Test only.
+    /// `77VH-7M56-8GJK-Y12J`, paired with the fixture PC key (`handshake.pc`). Test only.
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         let seed: [u8; 32] = [
@@ -45,6 +58,7 @@ impl ViewerAuth {
             DeviceIdentity::from_seed(&seed),
             Some(DeviceId::parse("77VH-7M56-8GJK-Y12J").expect("fixture PC ID")),
         )
+        .with_paired(vec![super::phase2::test_pc::fixture_pc()])
     }
 }
 
@@ -53,6 +67,10 @@ impl std::fmt::Debug for ViewerAuth {
         f.debug_struct("ViewerAuth")
             .field("viewer", &self.identity.id())
             .field("pc", &self.pc)
+            .field(
+                "paired",
+                &self.paired.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            )
             .finish()
     }
 }

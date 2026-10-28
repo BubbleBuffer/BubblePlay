@@ -2,7 +2,7 @@
 //!
 //! A JSON array of `{name, id, public, relay}`. `id` is the PC's canonical device ID, `public`
 //! its pinned public key (base64url, 32 bytes; empty until paired) and `relay` the relay URL.
-//! Pairing adds entries through [`PcStore::add`].
+//! Pairing (`--pair`) pins entries through [`PcStore::pin`].
 
 use std::path::{Path, PathBuf};
 
@@ -66,7 +66,6 @@ impl PcStore {
         Ok(Self::in_dir(&super::viewer_dir()?))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -94,8 +93,6 @@ impl PcStore {
 
     /// Adds a PC and returns the stored (canonical) entry. A PC that is already listed is
     /// refused: replacing it could silently change its pinned key.
-    // Stage B pairing (`--pair <code>`) is the first caller outside the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn add(&self, entry: PcEntry) -> Result<PcEntry> {
         let entry = entry.validated()?;
         let mut entries = self.load()?;
@@ -105,6 +102,50 @@ impl PcStore {
         entries.push(entry.clone());
         self.save(&entries)?;
         Ok(entry)
+    }
+
+    /// Pins a PC after `pair-done`: adds it (named by its ID), or fills in the key of a listed
+    /// PC that has none yet. A listed PC with a different key is refused; the same key stays.
+    pub fn pin(&self, id: &DeviceId, public: &[u8; 32], relay: &str) -> Result<PcEntry> {
+        let id = id.to_string();
+        let public = URL_SAFE_NO_PAD.encode(public);
+        let mut entries = self.load()?;
+        let Some(known) = entries.iter_mut().find(|known| known.id == id) else {
+            return self.add(PcEntry {
+                name: id.clone(),
+                id,
+                public,
+                relay: relay.to_owned(),
+            });
+        };
+        if !known.public.is_empty() && known.public != public {
+            bail!("PC {id} is already listed with a different key; remove it first");
+        }
+        known.public = public;
+        if known.relay.is_empty() {
+            known.relay = relay.to_owned();
+        }
+        let entry = known.clone().validated()?;
+        self.save(&entries)?;
+        Ok(entry)
+    }
+
+    /// The listed PCs with a pinned key, for the device-key handshake.
+    pub fn pinned(&self) -> Result<Vec<(DeviceId, [u8; 32])>> {
+        self.load()?
+            .into_iter()
+            .filter(|entry| !entry.public.is_empty())
+            .map(|entry| {
+                let id = DeviceId::parse(&entry.id)
+                    .map_err(|_| anyhow!("invalid PC ID {:?}", entry.id))?;
+                let public: [u8; 32] = URL_SAFE_NO_PAD
+                    .decode(&entry.public)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| anyhow!("PC {}: public key is not 32 bytes", entry.id))?;
+                Ok((id, public))
+            })
+            .collect()
     }
 
     /// Removes a PC by ID (any accepted spelling). Returns whether it was listed.
@@ -183,6 +224,52 @@ mod tests {
         assert!(store.remove(&PC_ID.to_lowercase()).unwrap());
         assert!(!store.remove(PC_ID).unwrap());
         assert_eq!(store.load().unwrap(), vec![entry(OTHER_ID, "")]);
+    }
+
+    fn pc() -> (DeviceId, [u8; 32]) {
+        let public: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(PC_PUBLIC)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        (DeviceId::parse(PC_ID).unwrap(), public)
+    }
+
+    #[test]
+    fn pairing_pins_a_new_pc_or_fills_an_unpaired_one() {
+        let dir = TempDir::new("pcs-pin");
+        let store = PcStore::in_dir(dir.path());
+        let (id, public) = pc();
+        assert!(store.pinned().unwrap().is_empty());
+        let pinned = store.pin(&id, &public, "https://relay.example").unwrap();
+        assert_eq!(pinned.name, PC_ID);
+        assert_eq!(pinned.public, PC_PUBLIC);
+        assert_eq!(store.pinned().unwrap(), vec![(id, public)]);
+        // Pairing again with the same key keeps the entry.
+        store.pin(&id, &public, "https://other.example").unwrap();
+        assert_eq!(store.load().unwrap().len(), 1);
+        assert_eq!(store.load().unwrap()[0].relay, "https://relay.example");
+
+        // A listed but unpaired PC gets its key, keeping its name.
+        let dir = TempDir::new("pcs-fill");
+        let store = PcStore::in_dir(dir.path());
+        store.add(entry(PC_ID, "")).unwrap();
+        assert!(store.pinned().unwrap().is_empty());
+        let filled = store.pin(&id, &public, "https://relay.example").unwrap();
+        assert_eq!(filled, entry(PC_ID, PC_PUBLIC));
+        assert_eq!(store.load().unwrap(), vec![entry(PC_ID, PC_PUBLIC)]);
+    }
+
+    #[test]
+    fn pairing_never_replaces_a_pinned_key() {
+        let dir = TempDir::new("pcs-pin-other");
+        let store = PcStore::in_dir(dir.path());
+        let (id, public) = pc();
+        store.pin(&id, &public, "https://relay.example").unwrap();
+        let mut other = public;
+        other[0] ^= 1;
+        assert!(store.pin(&id, &other, "https://relay.example").is_err());
+        assert_eq!(store.pinned().unwrap(), vec![(id, public)]);
     }
 
     #[test]

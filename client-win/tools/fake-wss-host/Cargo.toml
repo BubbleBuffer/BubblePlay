@@ -22,7 +22,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-bp-device-key = { path = "../../../crates/bp-device-key" }
+bp-device-key = { path = "../../../crates/bp-device-key", features = ["phase2"] }
 futures-util = { version = "0.3", features = ["sink"] }
 opus = "0.4.0"
 # OS randomness for the register nonce and the media ticket. Pinned like

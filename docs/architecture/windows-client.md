@@ -35,7 +35,7 @@ The password, TOTP and cookie login is gone: `--password-file`, `--totp-provisio
 
 - **Key at rest:** `%LOCALAPPDATA%\BubblePlay\viewer\device-key.bpkey`, the portable `.bpkey` JSON (`crates/bp-device-key` `KeyFile`) wrapped in a CurrentUser DPAPI blob (`src/store/key.rs`, `src/store/dpapi.rs`). A key with a passphrase asks for it on the console, without echo, when a session opens it. A key that cannot be unlocked means no connection.
 - **`--key <file.bpkey>`** reads a plain (not DPAPI-wrapped) key file instead, for development.
-- **PC list:** `%LOCALAPPDATA%\BubblePlay\viewer\pcs.json`, a JSON array of `{name, id, public, relay}` (`public` is the pinned PC key, base64url, empty until paired). `PcStore::add` is the API stage B pairing (`--pair`) will call.
+- **PC list:** `%LOCALAPPDATA%\BubblePlay\viewer\pcs.json`, a JSON array of `{name, id, public, relay}` (`public` is the pinned PC key, base64url, empty until paired). `--pair` pins a PC there on `pair-done` (`PcStore::pin`); a listed PC with a different key is refused, never replaced.
 - **Subcommands** (the executable is a GUI program, so pipe it, for example `... | Out-Host`, to keep the shell from reading the console at the same time):
 
 ```powershell
@@ -47,15 +47,30 @@ The password, TOTP and cookie login is gone: `--password-file`, `--totp-provisio
 .\target\debug\bubbleplay-client.exe pcs remove <id>
 ```
 
-- **Relay session:** `--dev-relay <origin> --pc <id>`. The origin is `https://host[:port]`, or `http://` for a loopback relay only. `--pc` is required here and optional on `--dev-wss`. The PC need not be in `pcs.json`.
+- **Relay session:** `--dev-relay <origin> --pc <id>`. The origin is `https://host[:port]`, or `http://` for a loopback relay only. `--pc` is required here and optional on `--dev-wss`. Since stage B the PC must be paired (a pinned key in `pcs.json`); an unpaired PC is refused with a pointer to `--pair`.
+- **Pairing:** `--pair <code> --pc <id> --dev-relay <origin>` pairs and exits (see "Device-key session (phase 2, stage B)" below).
 
 ```powershell
 .\target\release\bubbleplay-client.exe --dev-relay https://relay.example --pc 77VH-7M56-8GJK-Y12J --codec auto --mode work --exit-after 30 --stats-out F:\build\relay-stats.json
 ```
 
-On the wire: `/ws?pc=<id>`, then `{"type":"hello","role":"viewer","id","public"}`. The relay answers `register-challenge {nonce}`, and the client replies `{"type":"register-proof","signature"}`, signed with `sign_relay_proof(Role::Viewer, origin, nonce)` where the origin is `relay_origin` of the relay URL. `hello-ok` carries `mediaEpoch`, `iceServers` and a `ticket`. The media socket is `/media-ws?pc=<id>&epoch=<epoch>`, with hello `{"type":"hello","role":"media-viewer","ticket"}`. A 1008 close before `hello-ok` is fatal (`NetError::NotAdmitted`) and is not retried. A `hello-ok` without a ticket is a protocol error, because pairing mode is stage B. The handshake (`auth-hello`), pairing, ctl AEAD and the DTLS bind are stage B. Input and clipboard sends are unchanged.
+On the wire: `/ws?pc=<id>`, then `{"type":"hello","role":"viewer","id","public"}`. The relay answers `register-challenge {nonce}`, and the client replies `{"type":"register-proof","signature"}`, signed with `sign_relay_proof(Role::Viewer, origin, nonce)` where the origin is `relay_origin` of the relay URL. `hello-ok` carries `mediaEpoch`, `iceServers` and a `ticket`. The media socket is `/media-ws?pc=<id>&epoch=<epoch>`, with hello `{"type":"hello","role":"media-viewer","ticket"}`. A 1008 close before `hello-ok` is fatal (`NetError::NotAdmitted`) and is not retried. A `hello-ok` without a ticket is a protocol error outside pairing. `mediaEpoch` is an opaque 32-lowercase-hex string (decision 22): it is checked, then used byte for byte in the media URL and the handshake transcript, never parsed as a number.
 
 Known gap: `tools/fake-wss-host` still expects the old `client` / `media-client` hellos and sends no challenge or ticket, so `--dev-wss` against it fails until it is updated. It is a separate crate and is not built in CI.
+
+### Device-key session (phase 2, stage B, 2026-10-27)
+
+All cryptography is `bp_device_key::phase2` (feature `phase2`); `src/net/phase2.rs` is only glue: message shapes, checks and the state machines (`ViewerHandshake`, `Ctl`, `Pairing`, `Binder`). Every phase-2 failure is fatal (`NetError::DeviceKeys`) and not retried.
+
+1. After `hello-ok` the viewer sends plaintext `auth-hello {id, public, nonce, ephemeral, caps}` with caps `control-aead-v1`, `dtls-bind-v1` (plus `pair-v1` when pairing). No `auth-host` within 10 s ends the session with "This PC does not support device keys or is not reachable".
+2. `auth-host` is checked against the pinned key for `--pc` (unknown PC: "pair first"; other key: "PC key changed"), the transcript hash `H` covers relay origin, epoch, both IDs, keys, nonces and ephemerals. The viewer answers `auth-finish` and switches `/ws` to `ctl`.
+3. The viewer's first `ctl` is `{type:"caps", caps, name}` with the computer name cut to 64 characters (decision 19). The PC's first `ctl` must be `caps`; WebRTC without `dtls-bind-v1` is refused. A `ctl` `{type:"error", code:"dtls-bind-required"|"cap-missing", message}` ends the session with a clear message (decision 21). Nothing (offer, `media-control` start) is sent before this.
+4. **Routing on `/ws` after the handshake.** Sealed in `ctl` (kind = the message `type`), outbound: `caps`, `media-control` (mode, start, keyframe, stop, monitor), `first-frame`, `offer`, `ice`, and binary input as kind `input`. Inbound: `caps`, `error`, `answer`, `ice`, `first-frame`, `desktop-state`, `monitor-list`, `monitor-error`, `input-capabilities`, and binary `cursor` frames (the old binary cursor frame as plaintext, decision 20; binary kinds skip the type check). Plaintext stays: relay messages (`hello-ok`, `register-challenge`, `error`, `peer-left`, `peer-joined`, `pair-closed`, `ping`, `pong`) and `auth-*`, `pair-*`. Any other plaintext or a bare binary frame after the handshake is dropped and counted; a `ctl` with a bad seq, tag or kind ends the session.
+5. **DTLS bind (WebRTC).** After the answer the viewer sends plaintext `auth-bind` over `H` and both DTLS fingerprints from the SDPs, and verifies the PC's. RTP media and input over the peer are accepted only once both binds verify. `/media-ws` (WSS) is unaffected.
+
+**Pairing** (`--pair <code> --pc <id> --dev-relay <origin>`): the code is normalised, the hello carries `pair` = the admit hash, and `hello-ok` must say `"pairing":true` (a ticket there is refused). After the handshake the viewer sends its `pair-proof` first; the number (`482 913`) and "Confirm on the PC" are printed only after the PC's proof verifies. `pair-done` stores `{name, id, public, relay}` in `pcs.json`; `pair-denied`, a wrong proof or a timeout (300 s) store nothing and exit non-zero.
+
+Test PC: `tools/fake-wss-host` and the in-crate fake relays play the PC with the fixture "PC test" key from `fixtures/device-keys-contract.json` (ID `77VH-7M56-8GJK-Y12J`).
 
 ### CI
 

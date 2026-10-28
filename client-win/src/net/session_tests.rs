@@ -14,6 +14,7 @@ use super::config::{Codec, NetConfig, ViewerAuth};
 use super::error::NetError;
 use super::events::{DecoderFeedback, NetEvent, ResetEvent, VideoFrame};
 use super::fake_relay::{FakeRelay, Logged, Scenario, Step, FAKE_TICKET};
+use super::phase2::{test_pc, Opened};
 use super::protocol::{encode_frame, FrameHeader, V4_HEADER_BYTES};
 use super::session::{run_with_timing, Timing};
 use super::stats::{NetState, TransportStats};
@@ -28,6 +29,7 @@ fn timing() -> Timing {
     Timing {
         tick: Duration::from_millis(5),
         handshake: Duration::from_secs(2),
+        auth_host: Duration::from_secs(2),
         heartbeat: Duration::from_secs(10),
         dead: Duration::from_secs(10),
         first_frame: Duration::from_secs(10),
@@ -97,9 +99,18 @@ fn start_audio(
     capacity: usize,
     audio: Option<crate::audio::AudioHandle>,
 ) -> Harness {
+    start_config(scenarios, timing, capacity, |config| config.audio = audio)
+}
+
+fn start_config(
+    scenarios: Vec<Scenario>,
+    timing: Timing,
+    capacity: usize,
+    adjust: impl FnOnce(&mut NetConfig),
+) -> Harness {
     let relay = FakeRelay::start(scenarios);
     let mut config = NetConfig::new(relay.origin.clone(), Codec::H264, ViewerAuth::fixture());
-    config.audio = audio;
+    adjust(&mut config);
     let (event_tx, events) = mpsc::sync_channel(capacity);
     let (feedback, feedback_rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1091,11 +1102,20 @@ fn shutdown_relay_case(keep_sending: bool) {
     let address = listener.local_addr().unwrap();
     let origin = format!("http://{address}");
     listener.set_nonblocking(true).unwrap();
+    let transcript_origin = origin.clone();
     let config = NetConfig::new(origin, Codec::H264, ViewerAuth::fixture());
     let (event_tx, events) = mpsc::sync_channel(8);
     let (feedback, feedback_rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let _cleanup = StopOnDrop(stop.clone());
+    // The opened body of the client's next ctl message.
+    fn open(pc: &mut test_pc::PcSession, text: &str) -> Value {
+        let value: Value = serde_json::from_str(text).unwrap();
+        match pc.ctl.open(&value).unwrap() {
+            Opened::Text { text, .. } => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected a JSON ctl body, got {other:?}"),
+        }
+    }
     let stats = Arc::new(TransportStats::new());
     let client = {
         let stop = stop.clone();
@@ -1135,6 +1155,26 @@ fn shutdown_relay_case(keep_sending: bool) {
                 ))
                 .await
                 .unwrap();
+            // The device-key handshake, then the viewer's caps and the PC's caps.
+            let Message::Text(hello) = signal.next().await.unwrap().unwrap() else {
+                panic!("expected auth-hello")
+            };
+            let (host, mut pc) =
+                test_pc::answer(&hello, &transcript_origin, EPOCH_A).expect("auth-hello");
+            signal.send(Message::Text(host.into())).await.unwrap();
+            let Message::Text(finish) = signal.next().await.unwrap().unwrap() else {
+                panic!("expected auth-finish")
+            };
+            assert!(pc.finish_ok(&finish));
+            let Message::Text(caps) = signal.next().await.unwrap().unwrap() else {
+                panic!("expected the viewer's caps")
+            };
+            assert_eq!(open(&mut pc, &caps)["type"], "caps");
+            let caps = pc
+                .ctl
+                .seal_text(r#"{"type":"caps","caps":["control-aead-v1","dtls-bind-v1"]}"#)
+                .unwrap();
+            signal.send(Message::Text(caps.into())).await.unwrap();
             let (media, _) = listener.accept().await.unwrap();
             let mut media = tokio_tungstenite::accept_async(media).await.unwrap();
             assert!(matches!(
@@ -1158,7 +1198,7 @@ fn shutdown_relay_case(keep_sending: bool) {
                 let Message::Text(text) = signal.next().await.unwrap().unwrap() else {
                     panic!("expected start control")
                 };
-                let value: Value = serde_json::from_str(&text).unwrap();
+                let value = open(&mut pc, &text);
                 assert_eq!(value["type"], expected);
             }
             media
@@ -1178,7 +1218,7 @@ fn shutdown_relay_case(keep_sending: bool) {
                 panic!("expected stop")
             };
             assert_eq!(
-                serde_json::from_str::<Value>(&text).unwrap(),
+                open(&mut pc, &text),
                 json!({
                     "type":"media-control", "action":"stop", "protocol":4, "epoch":EPOCH_A,
                 })
@@ -1262,4 +1302,187 @@ fn shutdown_relay_case(keep_sending: bool) {
         std::net::TcpStream::connect(address).is_err(),
         "relay listener must be dropped"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Device keys phase 2 on /ws
+
+/// Every device-key message the client sent on `/ws`, parsed.
+fn auth_messages(seen: &[Logged]) -> Vec<Value> {
+    seen.iter()
+        .filter_map(|item| match item {
+            Logged::Auth { text, .. } => serde_json::from_str(text).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_handshake_runs_before_start_and_endpoint_messages_travel_in_ctl() {
+    let h = start(vec![scenario(EPOCH_A, vec![key(1)])], timing(), 8);
+    let _ = until_frame(&h.events);
+    let seen = drain_log(&h.relay.log, QUIET);
+    let auth = auth_messages(&seen);
+    let types: Vec<&str> = auth.iter().filter_map(|m| m["type"].as_str()).collect();
+    assert_eq!(types, ["auth-hello", "auth-finish", "caps"], "{auth:?}");
+    assert_eq!(auth[0]["caps"], json!(["control-aead-v1", "dtls-bind-v1"]));
+    let name = auth[2]["name"].as_str().expect("the viewer label");
+    assert!(!name.is_empty() && name.chars().count() <= 64);
+    // The fake PC opened start and first-frame from ctl (texts() holds the opened bodies).
+    let signal = texts(&seen, "/ws");
+    assert_eq!(signal[2]["type"], "media-control");
+    assert_eq!(signal[3]["type"], "first-frame");
+    h.finish().expect("clean stop");
+}
+
+#[test]
+fn a_32_hex_epoch_survives_hello_ok_media_url_and_transcript() {
+    const EPOCH: &str = "0123456789abcdef0123456789abcdef";
+    let h = start(vec![scenario(EPOCH, vec![key(1)])], timing(), 8);
+    // The fake PC signs the transcript over the hello-ok mediaEpoch it sent; a client that
+    // changed the epoch would fail auth-host and never see a frame.
+    let _ = until_frame(&h.events);
+    let seen = drain_log(&h.relay.log, QUIET);
+    let (query, _, _) = first_connect(&seen, "/media-ws");
+    assert_eq!(query, format!("pc={PC}&epoch={EPOCH}"));
+    let signal = texts(&seen, "/ws");
+    assert_eq!(signal[2]["epoch"], EPOCH);
+    h.finish().expect("clean stop");
+}
+
+#[test]
+fn no_auth_host_in_time_is_fatal_with_the_device_keys_message() {
+    let silent_pc = Scenario {
+        no_auth_host: true,
+        ..Scenario::new(EPOCH_A)
+    };
+    let timing = Timing {
+        auth_host: Duration::from_millis(200),
+        ..timing()
+    };
+    let mut h = start(vec![silent_pc], timing, 8);
+    assert_eq!(
+        h.join(),
+        Err(NetError::DeviceKeys(
+            super::phase2::NO_DEVICE_KEYS.to_owned()
+        ))
+    );
+    assert_eq!(h.stats.snapshot().attempts, 1, "not retried");
+    assert_eq!(
+        connect_count(&drain_log(&h.relay.log, QUIET), "/media-ws"),
+        0
+    );
+}
+
+#[test]
+fn a_pc_ctl_error_is_fatal_and_shown() {
+    let refusing = Scenario {
+        pc_error: Some(("cap-missing".into(), "needs pair-v1".into())),
+        ..Scenario::new(EPOCH_A)
+    };
+    let mut h = start(vec![refusing], timing(), 8);
+    let Err(NetError::DeviceKeys(message)) = h.join() else {
+        panic!("expected a device-key error")
+    };
+    assert!(message.contains("cap-missing") && message.contains("needs pair-v1"));
+    assert_eq!(h.stats.snapshot().attempts, 1);
+}
+
+#[test]
+fn webrtc_without_dtls_bind_in_the_pc_caps_is_refused() {
+    let old_pc = Scenario {
+        pc_caps: Some(vec!["control-aead-v1".into()]),
+        ..Scenario::new(EPOCH_A)
+    };
+    let mut h = start_config(vec![old_pc], timing(), 8, |config| {
+        config.transport = super::config::TransportChoice::WebRtc;
+    });
+    let Err(NetError::DeviceKeys(message)) = h.join() else {
+        panic!("expected a device-key error")
+    };
+    assert!(message.contains("dtls-bind-v1"), "{message}");
+    let seen = drain_log(&h.relay.log, QUIET);
+    assert!(
+        !texts(&seen, "/ws").iter().any(|m| m["type"] == "offer"),
+        "no offer before the caps check"
+    );
+}
+
+#[test]
+fn an_unpaired_pc_is_refused_with_a_pointer_to_pair() {
+    let relay = FakeRelay::start(vec![Scenario::new(EPOCH_A)]);
+    let viewer = ViewerAuth::fixture().with_paired(Vec::new());
+    let config = NetConfig::new(relay.origin.clone(), Codec::H264, viewer);
+    let (event_tx, _events) = mpsc::sync_channel(8);
+    let (_feedback, feedback_rx) = mpsc::channel();
+    let result = run_with_timing(
+        config,
+        event_tx,
+        feedback_rx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(TransportStats::new()),
+        timing(),
+    );
+    let Err(NetError::DeviceKeys(message)) = result else {
+        panic!("expected a device-key error")
+    };
+    assert!(message.contains("--pair"), "{message}");
+}
+
+type PairOutcome = (Result<String, NetError>, Vec<String>, Vec<Logged>);
+
+fn pair_case(pc_code: &str, approve: bool) -> PairOutcome {
+    let relay = FakeRelay::start(vec![Scenario {
+        pair: Some((pc_code.to_owned(), approve)),
+        ..Scenario::new(EPOCH_A)
+    }]);
+    let viewer = ViewerAuth::fixture().with_paired(Vec::new());
+    let config = NetConfig::new(relay.origin.clone(), Codec::H264, viewer);
+    let mut shown = Vec::new();
+    let result = super::session::pair_with_timing(
+        &config,
+        super::phase2::parse_code("70Q1K-9MXR1").unwrap(),
+        &mut |number: &str| shown.push(number.to_owned()),
+        timing(),
+        Duration::from_secs(5),
+    )
+    .map(|(id, public)| {
+        assert_eq!((id, public), test_pc::fixture_pc());
+        id.to_string()
+    });
+    let seen = drain_log(&relay.log, QUIET);
+    (result, shown, seen)
+}
+
+#[test]
+fn pairing_shows_the_number_after_the_pc_proof_and_returns_the_pc_on_pair_done() {
+    let (result, shown, seen) = pair_case("70Q1K9MXR1", true);
+    assert_eq!(result, Ok(PC.to_owned()));
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].len(), 7, "a 482 913 style number: {shown:?}");
+    let hello = &texts(&seen, "/ws")[0];
+    assert_eq!(hello["type"], "hello");
+    assert!(hello["pair"].is_string());
+    let order: Vec<String> = auth_messages(&seen)
+        .iter()
+        .filter_map(|m| m["type"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(order, ["auth-hello", "auth-finish", "pair-proof"]);
+}
+
+#[test]
+fn pair_denied_returns_nothing() {
+    let (result, shown, _) = pair_case("70Q1K9MXR1", false);
+    assert_eq!(shown.len(), 1);
+    let Err(NetError::DeviceKeys(message)) = result else {
+        panic!("expected a refusal, got {result:?}")
+    };
+    assert!(message.contains("denied"), "{message}");
+}
+
+#[test]
+fn a_wrong_pc_proof_shows_no_number() {
+    let (result, shown, _) = pair_case("70Q1K9MXR2", true);
+    assert!(shown.is_empty());
+    assert!(matches!(result, Err(NetError::DeviceKeys(_))));
 }

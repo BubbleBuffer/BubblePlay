@@ -48,17 +48,6 @@ async fn expect_json(ws: &mut Ws) -> Value {
     next_json(ws, WAIT).await.expect("a message from the fake")
 }
 
-/// The next message of `kind`; anything else on the socket is skipped.
-async fn until_type(ws: &mut Ws, kind: &str) -> Value {
-    for _ in 0..16 {
-        let value = expect_json(ws).await;
-        if value["type"] == kind {
-            return value;
-        }
-    }
-    panic!("no {kind} message arrived");
-}
-
 #[tokio::test]
 async fn hello_lists_two_monitors_with_the_fixture_geometry() {
     let harness = spawn_monitored(
@@ -115,7 +104,11 @@ async fn a_switch_is_unavailable_then_active_then_the_list_with_the_new_selectio
     assert_eq!(active["state"], "active");
     assert_eq!(active["reason"], "monitor-switched");
     let before = unavailable["generation"].as_u64().expect("generation");
-    assert_eq!(active["generation"].as_u64(), Some(before + 1), "generation bumped once");
+    assert_eq!(
+        active["generation"].as_u64(),
+        Some(before + 1),
+        "generation bumped once"
+    );
     let list = expect_json(&mut ws).await;
     assert_eq!(list["type"], "monitor-list", "{list}");
     assert_eq!(list["monitors"][0]["selected"], false);
@@ -128,7 +121,9 @@ async fn a_switch_is_unavailable_then_active_then_the_list_with_the_new_selectio
     assert_eq!(snap.counters.monitor_selected.as_deref(), Some(DISPLAY2));
     assert_eq!(snap.counters.monitor_list_sent, 2, "hello and the switch");
     assert!(
-        snap.recoveries.iter().any(|r| r.kind == Injection::MonitorSwitch),
+        snap.recoveries
+            .iter()
+            .any(|r| r.kind == Injection::MonitorSwitch),
         "the switch opens a recovery row"
     );
 }
@@ -155,11 +150,17 @@ async fn a_scripted_error_keeps_the_display_and_an_unknown_selector_is_not_found
     assert_eq!(error["selector"], DISPLAY2);
     assert_eq!(error["reason"], "scripted monitor error");
     let active = until_type(&mut ws, "desktop-state").await;
-    assert_eq!(active["state"], "active", "the previous capture is retained");
+    assert_eq!(
+        active["state"], "active",
+        "the previous capture is retained"
+    );
     assert_eq!(active["reason"], "monitor-switched");
     assert!(active["generation"].as_u64() > unavailable["generation"].as_u64());
     let list = until_type(&mut ws, "monitor-list").await;
-    assert_eq!(list["monitors"][0]["selected"], true, "the previous display is kept");
+    assert_eq!(
+        list["monitors"][0]["selected"], true,
+        "the previous display is kept"
+    );
     assert_eq!(list["monitors"][1]["selected"], false);
 
     send_json(&mut ws, switch(&epoch, r"\\.\DISPLAY9")).await;
@@ -231,7 +232,10 @@ async fn mode_changes_are_counted_repeats_are_noops_and_unknown_modes_are_unhand
 
     let snap = harness.finish().await;
     assert_eq!(snap.counters.stream_mode.as_deref(), Some("game"));
-    assert_eq!(snap.counters.stream_mode_changes, 1, "the repeat is a no-op");
+    assert_eq!(
+        snap.counters.stream_mode_changes, 1,
+        "the repeat is a no-op"
+    );
     assert_eq!(snap.counters.unhandled_control.get("mode"), Some(&1));
     assert_eq!(snap.counters.monitor_refreshes, 1);
     assert_eq!(snap.counters.monitor_list_sent, 2, "hello and the refresh");
@@ -318,7 +322,10 @@ async fn a_switch_moves_the_wss_stream_to_a_new_generation_that_starts_at_an_idr
         .iter()
         .position(|f| f.generation == new)
         .expect("frames at the new generation");
-    assert!(after.frames[start].key, "the new generation starts at an IDR");
+    assert!(
+        after.frames[start].key,
+        "the new generation starts at an IDR"
+    );
     assert!(
         after.frames[start..].iter().all(|f| f.generation == new),
         "no old-generation frame after the switch"

@@ -394,6 +394,19 @@ pub fn viewer_hello(identity: &DeviceIdentity) -> String {
     .to_string()
 }
 
+/// The pairing `hello` (decision 17): the normal viewer hello plus `pair`, the relay admit
+/// hash of the PC ID and the pairing code (base64url).
+pub fn viewer_hello_pairing(identity: &DeviceIdentity, admit: &str) -> String {
+    json!({
+        "type": "hello",
+        "role": "viewer",
+        "id": identity.id().to_string(),
+        "public": identity.public_b64(),
+        "pair": admit,
+    })
+    .to_string()
+}
+
 /// The 32-byte nonce of a `{"type":"register-challenge","nonce"}`, or `None` for anything else.
 pub fn parse_register_challenge(text: &str) -> Option<[u8; 32]> {
     let value: Value = serde_json::from_str(text).ok()?;

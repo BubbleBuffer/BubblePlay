@@ -27,6 +27,10 @@ pub enum NetError {
     Stalled(&'static str),
     /// No decoded frame after the first-frame retry (transient).
     FirstFrameTimeout,
+    /// The device-key handshake, pairing or `ctl` channel failed, or the PC refused the
+    /// session (fatal): a wrong or unpaired PC, a PC without device keys, a broken `ctl`
+    /// sequence, a missing mandatory capability.
+    DeviceKeys(String),
 }
 
 impl NetError {
@@ -39,6 +43,7 @@ impl NetError {
                 | NetError::Auth(_)
                 | NetError::NotAdmitted
                 | NetError::RelayError(_)
+                | NetError::DeviceKeys(_)
         )
     }
 }
@@ -64,8 +69,15 @@ impl fmt::Display for NetError {
             NetError::Socket(message) => write!(f, "socket error: {message}"),
             NetError::Stalled(name) => write!(f, "{name} socket silent past the dead interval"),
             NetError::FirstFrameTimeout => write!(f, "no first frame after retry"),
+            NetError::DeviceKeys(message) => write!(f, "{message}"),
         }
     }
 }
 
 impl std::error::Error for NetError {}
+
+impl From<super::phase2::Phase2Error> for NetError {
+    fn from(error: super::phase2::Phase2Error) -> Self {
+        NetError::DeviceKeys(error.to_string())
+    }
+}

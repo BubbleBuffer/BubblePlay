@@ -8,26 +8,153 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use anyhow::Result;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use bp_device_key::{relay_origin, DeviceIdentity, Role};
+use bp_device_key::phase2::{
+    sign_auth_finish, verify_auth_host, CtlKeys, CtlOpener, CtlSealer, EphemeralSecret, Side,
+    Transcript,
+};
+use bp_device_key::{relay_origin, DeviceId, DeviceIdentity, Role};
 use fake_wss_host::audio::Script;
 use fake_wss_host::model::{Injections, Source};
 use fake_wss_host::monitors::Knobs as MonitorKnobs;
+use fake_wss_host::phase2::{is_plain, INPUT_KIND};
 use fake_wss_host::protocol::{decode_frame, is_valid_epoch, ReceiveGate};
 use fake_wss_host::rtc::Knobs;
 use fake_wss_host::server::{self, ServerConfig, Snapshot};
 use fake_wss_host::stream::Codec;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// A socket to the fake. On `/ws`, once `signal_hello_ticket` has run the viewer side of the
+/// device-keys handshake, the socket has a channel: a JSON message goes out sealed in `ctl`
+/// under its own type, binary input goes out as `ctl` kind `input`, and every `ctl` coming in
+/// is opened before the caller reads it. Tests write and read endpoint messages in plain
+/// form either way. Other sockets have no channel and pass through unchanged.
+pub struct Ws {
+    inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    channel: Option<ViewerChannel>,
+}
+
+/// The viewer's side of the `ctl` channel.
+struct ViewerChannel {
+    sealer: CtlSealer,
+    opener: CtlOpener,
+}
+
+impl Ws {
+    fn new(inner: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        Self {
+            inner,
+            channel: None,
+        }
+    }
+}
+
+impl ViewerChannel {
+    /// A JSON endpoint message, sealed under its own type.
+    fn seal_text(&mut self, text: &str) -> Option<String> {
+        let kind = serde_json::from_str::<Value>(text)
+            .ok()?
+            .get("type")?
+            .as_str()?
+            .to_owned();
+        self.seal(&kind, text.as_bytes())
+    }
+
+    fn seal(&mut self, kind: &str, plaintext: &[u8]) -> Option<String> {
+        let (seq, data) = self.sealer.seal(kind, plaintext).ok()?;
+        Some(
+            json!({"type": "ctl", "kind": kind, "seq": seq, "data": URL_SAFE_NO_PAD.encode(data)})
+                .to_string(),
+        )
+    }
+
+    /// Opens one `ctl` envelope: text when its body is JSON of its own type, binary otherwise.
+    fn open(&mut self, envelope: &Value) -> Option<Message> {
+        let kind = envelope["kind"].as_str()?;
+        let seq = envelope["seq"].as_u64()?;
+        let data = URL_SAFE_NO_PAD.decode(envelope["data"].as_str()?).ok()?;
+        let plain = self.opener.open(kind, seq, &data).ok()?;
+        match serde_json::from_slice::<Value>(&plain) {
+            Ok(body) if body["type"] == kind => {
+                Some(Message::Text(String::from_utf8(plain).ok()?.into()))
+            }
+            _ => Some(Message::Binary(plain.into())),
+        }
+    }
+}
+
+impl Stream for Ws {
+    type Item = std::result::Result<Message, tungstenite::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let next = std::task::ready!(Pin::new(&mut this.inner).poll_next(cx));
+        Poll::Ready(match (next, this.channel.as_mut()) {
+            (Some(Ok(Message::Text(text))), Some(channel)) => {
+                let opened = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .filter(|value| value["type"] == "ctl")
+                    .and_then(|value| channel.open(&value));
+                Some(Ok(opened.unwrap_or(Message::Text(text))))
+            }
+            (next, _) => next,
+        })
+    }
+}
+
+impl Sink<Message> for Ws {
+    type Error = tungstenite::Error;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_ready(cx)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> std::result::Result<(), Self::Error> {
+        let item = match self.channel.as_mut() {
+            None => item,
+            Some(channel) => match item {
+                Message::Text(text) if !is_plain(&text) => match channel.seal_text(&text) {
+                    Some(sealed) => Message::Text(sealed.into()),
+                    None => Message::Text(text),
+                },
+                Message::Binary(bytes) => match channel.seal(INPUT_KIND, &bytes) {
+                    Some(sealed) => Message::Text(sealed.into()),
+                    None => Message::Binary(bytes),
+                },
+                other => other,
+            },
+        };
+        Pin::new(&mut self.inner).start_send(item)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_close(cx)
+    }
+}
 
 /// Access units of `payload_bytes` each; every `gop`-th unit is an IDR. The
 /// payload is not a real NAL stream, which the server never parses.
@@ -263,7 +390,7 @@ pub async fn open(
     if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
         tcp.set_nodelay(true)?;
     }
-    Ok(ws)
+    Ok(Ws::new(ws))
 }
 
 pub async fn send_json(ws: &mut Ws, value: Value) {
@@ -284,6 +411,20 @@ pub async fn next_binary(ws: &mut Ws, wait: Duration) -> Option<Vec<u8>> {
             _ => return None,
         }
     }
+}
+
+/// The next message of `kind`. Anything else on the socket is skipped, so a test does not
+/// depend on the post-handshake `monitor-list` being present.
+pub async fn until_type(ws: &mut Ws, kind: &str) -> Value {
+    for _ in 0..16 {
+        let value = next_json(ws, Duration::from_secs(2))
+            .await
+            .expect("a message from the fake");
+        if value["type"] == kind {
+            return value;
+        }
+    }
+    panic!("no {kind} message arrived");
 }
 
 /// Inbound packet records, excluding the separately marked lifecycle rows.
@@ -364,9 +505,95 @@ pub async fn signal_hello_ticket(addr: SocketAddr) -> (Ws, String, String) {
     let epoch = reply["mediaEpoch"].as_str().expect("mediaEpoch").to_owned();
     assert!(is_valid_epoch(&epoch), "bad epoch {epoch}");
     let ticket = reply["ticket"].as_str().expect("ticket").to_owned();
-    let ticket_bytes = URL_SAFE_NO_PAD.decode(&ticket).expect("ticket is base64url");
+    let ticket_bytes = URL_SAFE_NO_PAD
+        .decode(&ticket)
+        .expect("ticket is base64url");
     assert_eq!(ticket_bytes.len(), 32, "ticket is 32 bytes");
+    viewer_handshake(&mut ws, &origin, &epoch).await;
     (ws, epoch, ticket)
+}
+
+/// The viewer side of the device-keys handshake on an admitted `/ws`: `auth-hello`, then
+/// `auth-host` checked against the transcript, then `auth-finish`. The socket then has its
+/// channel. The viewer's `caps` go first, and the PC's sealed `caps` comes back.
+async fn viewer_handshake(ws: &mut Ws, origin: &str, epoch: &str) {
+    let identity = viewer_identity();
+    let viewer_nonce = [0x5a; 32];
+    let viewer_secret = EphemeralSecret::from_bytes([0x6b; 32]);
+    let viewer_ephemeral = viewer_secret.public_key();
+    send_json(
+        ws,
+        json!({
+            "type": "auth-hello",
+            "id": identity.id().to_string(),
+            "public": identity.public_b64(),
+            "nonce": URL_SAFE_NO_PAD.encode(viewer_nonce),
+            "ephemeral": URL_SAFE_NO_PAD.encode(viewer_ephemeral),
+            "caps": ["control-aead-v1", "dtls-bind-v1"],
+        }),
+    )
+    .await;
+    let host = next_json(ws, Duration::from_secs(2))
+        .await
+        .expect("auth-host");
+    assert_eq!(host["type"], "auth-host", "{host}");
+    let pc_id = DeviceId::parse(host["id"].as_str().expect("pc id")).expect("pc id parses");
+    let pc_public = decode32(&host["public"]);
+    let pc_nonce = decode32(&host["nonce"]);
+    let pc_ephemeral = decode32(&host["ephemeral"]);
+    let pc_signature: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(host["signature"].as_str().expect("signature"))
+        .expect("signature is base64url")
+        .try_into()
+        .expect("signature is 64 bytes");
+    let h = Transcript {
+        relay_origin: origin,
+        epoch,
+        viewer_id: identity.id(),
+        viewer_public: identity.public_key(),
+        pc_id,
+        pc_public,
+        viewer_nonce,
+        pc_nonce,
+        viewer_ephemeral,
+        pc_ephemeral,
+    }
+    .hash();
+    verify_auth_host(&pc_public, &h, &pc_signature).expect("auth-host verifies");
+    let shared = viewer_secret
+        .diffie_hellman(&pc_ephemeral)
+        .expect("key agreement");
+    let (sealer, opener) = CtlKeys::derive(&shared, &h).channel(Side::Viewer);
+    let finish = sign_auth_finish(&identity, &h, &pc_signature);
+    send_json(
+        ws,
+        json!({"type": "auth-finish", "signature": URL_SAFE_NO_PAD.encode(finish)}),
+    )
+    .await;
+    ws.channel = Some(ViewerChannel { sealer, opener });
+    send_json(
+        ws,
+        json!({"type": "caps", "caps": ["control-aead-v1", "dtls-bind-v1"]}),
+    )
+    .await;
+    let caps = next_json(ws, Duration::from_secs(2))
+        .await
+        .expect("the PC's caps");
+    assert_eq!(caps["type"], "caps", "{caps}");
+    assert!(
+        caps["caps"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|cap| cap == "control-aead-v1")),
+        "{caps}"
+    );
+}
+
+fn decode32(value: &Value) -> [u8; 32] {
+    URL_SAFE_NO_PAD
+        .decode(value.as_str().expect("base64url field"))
+        .expect("base64url")
+        .try_into()
+        .expect("32 bytes")
 }
 
 /// `signal_hello_ticket` without the ticket.
@@ -408,7 +635,9 @@ pub fn start_with_audio(epoch: &str, codec: &str) -> Value {
 /// Start the fake streaming on a fresh session with media attached.
 pub async fn streaming_session(addr: SocketAddr, codec: &str) -> (Ws, Ws, String) {
     let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
-    let mut media = media_open(addr, &epoch, &ticket).await.expect("media upgrade");
+    let mut media = media_open(addr, &epoch, &ticket)
+        .await
+        .expect("media upgrade");
     let reply = next_json(&mut media, Duration::from_secs(2))
         .await
         .expect("media hello-ok");

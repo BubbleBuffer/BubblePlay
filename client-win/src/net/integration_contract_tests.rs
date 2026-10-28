@@ -20,6 +20,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_hdr_async, WebSocketStream};
 
+use super::phase2::{test_pc, Opened};
 use super::protocol::{encode_frame, FrameHeader};
 use super::session::{run_with_timing, Timing};
 use super::{
@@ -183,7 +184,8 @@ async fn serve_socket(
 ) {
     // The handlers operate on any socket owner; keep all connection work in this task.
     if path == "/ws" {
-        let Some(hello) = socket_json(&mut ws, "/ws", &state).await else {
+        let mut pc = None;
+        let Some(hello) = socket_json(&mut ws, "/ws", &state, &mut pc).await else {
             return;
         };
         let viewer = ViewerAuth::fixture();
@@ -201,7 +203,7 @@ async fn serve_socket(
             json!({"type":"register-challenge", "nonce": URL_SAFE_NO_PAD.encode(NONCE)}),
         )
         .await;
-        let Some(proof) = socket_json(&mut ws, "/ws", &state).await else {
+        let Some(proof) = socket_json(&mut ws, "/ws", &state, &mut pc).await else {
             return;
         };
         assert_eq!(proof.as_object().unwrap().len(), 2, "{proof}");
@@ -226,7 +228,30 @@ async fn serve_socket(
             json!({"type":"hello-ok", "pc": PC, "mediaEpoch":EPOCH, "iceServers": [], "ticket": TICKET}),
         )
         .await;
-        while let Some(message) = socket_json(&mut ws, "/ws", &state).await {
+        // The device-key handshake with the fixture PC, then the caps exchange in ctl.
+        let Some(auth_hello) = socket_json(&mut ws, "/ws", &state, &mut pc).await else {
+            return;
+        };
+        let (host, session) = test_pc::answer(&auth_hello.to_string(), &state.origin, EPOCH)
+            .expect("a valid auth-hello");
+        ws.send(Message::Text(host.into())).await.unwrap();
+        let Some(finish) = socket_json(&mut ws, "/ws", &state, &mut pc).await else {
+            return;
+        };
+        assert!(session.finish_ok(&finish.to_string()));
+        pc = Some(session);
+        let Some(caps) = socket_json(&mut ws, "/ws", &state, &mut pc).await else {
+            return;
+        };
+        assert_eq!(caps["type"], "caps");
+        let sealed = pc
+            .as_mut()
+            .unwrap()
+            .ctl
+            .seal_text(r#"{"type":"caps","caps":["control-aead-v1","dtls-bind-v1"]}"#)
+            .unwrap();
+        ws.send(Message::Text(sealed.into())).await.unwrap();
+        while let Some(message) = socket_json(&mut ws, "/ws", &state, &mut pc).await {
             if message["type"] == "media-control" && message["action"] == "start" {
                 if !state.hello_sent.load(SeqCst) || !state.peer_sent.load(SeqCst) {
                     let _ = state.log.send(Seen::RejectedStart);
@@ -244,7 +269,7 @@ async fn serve_socket(
             }
         }
     } else if path == "/media-ws" {
-        let Some(hello) = socket_json(&mut ws, "/media-ws", &state).await else {
+        let Some(hello) = socket_json(&mut ws, "/media-ws", &state, &mut None).await else {
             return;
         };
         assert_eq!(
@@ -271,6 +296,7 @@ async fn serve_socket(
             .await
             .take()
             .expect("one media connection per test");
+        let mut no_ctl = None;
         loop {
             tokio::select! {
                 packet = commands.recv() => {
@@ -278,7 +304,7 @@ async fn serve_socket(
                     assert!(state.started.load(SeqCst), "test sends frames only after start");
                     if ws.send(Message::Binary(packet.into())).await.is_err() { return; }
                 }
-                message = socket_json(&mut ws, "/media-ws", &state) => {
+                message = socket_json(&mut ws, "/media-ws", &state, &mut no_ctl) => {
                     let Some(message) = message else { return };
                     if message["type"] == "ping" { socket_send(&mut ws, json!({"type":"pong"})).await; }
                 }
@@ -295,11 +321,25 @@ async fn socket_send(ws: &mut Socket, value: Value) {
         .unwrap();
 }
 
-async fn socket_json(ws: &mut Socket, path: &'static str, state: &RelayState) -> Option<Value> {
+/// The next text message; a `ctl` envelope is opened with the PC's channel (binary input
+/// inside `ctl` is skipped), so the log holds the endpoint bodies.
+async fn socket_json(
+    ws: &mut Socket,
+    path: &'static str,
+    state: &RelayState,
+    pc: &mut Option<test_pc::PcSession>,
+) -> Option<Value> {
     loop {
         match ws.next().await? {
             Ok(Message::Text(text)) => {
-                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                let mut value: Value = serde_json::from_str(text.as_str()).unwrap();
+                if value["type"] == "ctl" {
+                    let session = pc.as_mut().expect("ctl only after the handshake");
+                    match session.ctl.open(&value).expect("a valid ctl message") {
+                        Opened::Text { text, .. } => value = serde_json::from_str(&text).unwrap(),
+                        Opened::Binary { .. } => continue,
+                    }
+                }
                 let _ = state.log.send(Seen::Text(path, value.clone()));
                 return Some(value);
             }
@@ -358,6 +398,7 @@ impl Client {
                 Timing {
                     tick: TICK,
                     handshake: WAIT,
+                    auth_host: WAIT,
                     heartbeat: Duration::from_secs(10),
                     dead: Duration::from_secs(20),
                     first_frame: Duration::from_secs(20),

@@ -41,7 +41,9 @@ fn meta(script: Script) -> RunMeta {
 
 /// The media socket for `epoch`, with the hello answered and the peer seen.
 async fn attach(addr: SocketAddr, epoch: &str, ticket: &str) -> Ws {
-    let mut media = media_open(addr, epoch, ticket).await.expect("media upgrade");
+    let mut media = media_open(addr, epoch, ticket)
+        .await
+        .expect("media upgrade");
     let reply = next_json(&mut media, REPLY_WAIT)
         .await
         .expect("media hello-ok");
@@ -133,9 +135,7 @@ async fn an_audio_only_run_serves_bpa1_with_no_recordings() {
     .await;
     let addr = harness.addr;
     let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
-    let caps = next_json(&mut signal, REPLY_WAIT)
-        .await
-        .expect("host-capabilities after hello-ok");
+    let caps = until_type(&mut signal, "host-capabilities").await;
     assert_eq!(caps["type"], "host-capabilities", "{caps}");
     assert_eq!(caps["audio"], 1, "{caps}");
 
@@ -333,9 +333,7 @@ async fn starts_without_audio_one_get_no_audio_but_the_host_still_advertises_it(
     .await;
     let addr = harness.addr;
     let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
-    let caps = next_json(&mut signal, REPLY_WAIT)
-        .await
-        .expect("host-capabilities");
+    let caps = until_type(&mut signal, "host-capabilities").await;
     assert_eq!(caps["audio"], 1, "{caps}");
     let mut media = attach(addr, &epoch, &ticket).await;
 
