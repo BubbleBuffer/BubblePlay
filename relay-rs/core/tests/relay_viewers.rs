@@ -89,10 +89,11 @@ fn second_viewer_replaces_the_first_silently_and_rotates_the_epoch() {
         closed(&actions, first.id),
         Some((1008, "peer replaced".to_owned()))
     );
-    assert!(
-        sent_text(&actions, host.id).is_empty(),
-        "no peer-left on replacement"
-    );
+    // The host hears only the new viewer's admission: no peer-left for the old one.
+    let to_host = sent_json(&actions, host.id);
+    assert_eq!(to_host.len(), 1, "{to_host:?}");
+    assert_eq!(to_host[0]["type"], json!("peer-joined"));
+    assert_eq!(to_host[0]["mediaEpoch"], json!(second.epoch));
 }
 
 #[test]

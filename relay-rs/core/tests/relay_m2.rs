@@ -616,6 +616,45 @@ fn m2_matching_pair_admits_in_pairing_mode_without_a_ticket() {
     assert!(ok.get("ticket").is_none());
 }
 
+/// The host gets one peer-joined for the admission in `actions`: the viewer's
+/// epoch, the pairing flag, and queued before the viewer's hello-ok.
+fn assert_peer_joined(actions: &[Action], host: ConnId, viewer: ConnId, pairing: bool) {
+    let ok = hello_ok(actions, viewer);
+    let to_host = sent_json(actions, host);
+    assert_eq!(to_host.len(), 1, "{to_host:?}");
+    assert_eq!(
+        to_host[0],
+        json!({"type": "peer-joined", "mediaEpoch": ok["mediaEpoch"], "pairing": pairing})
+    );
+    let host_at = actions
+        .iter()
+        .position(|a| matches!(a, Action::SendText(to, _) if *to == host));
+    let viewer_at = actions
+        .iter()
+        .position(|a| matches!(a, Action::SendText(to, _) if *to == viewer));
+    let (Some(host_at), Some(viewer_at)) = (host_at, viewer_at) else {
+        panic!("{actions:?}");
+    };
+    assert!(host_at < viewer_at, "the host hears first: {actions:?}");
+}
+
+#[test]
+fn m2_admitted_viewer_is_announced_to_the_host_before_its_hello_ok() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let (viewer, actions) = h.viewer_hello(&host.pc, false);
+    assert_peer_joined(&actions, host.id, viewer.id, false);
+}
+
+#[test]
+fn m2_pairing_viewer_is_announced_to_the_host_with_pairing_true() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    send_pair_open(&mut h, host.id, &PAIR_VALUE);
+    let (id, actions) = h.viewer_join(&stranger(), &host.pc, false, Some(&PAIR_VALUE));
+    assert_peer_joined(&actions, host.id, id, true);
+}
+
 #[test]
 fn m2_pairing_admission_does_not_add_the_viewer_to_the_list() {
     let mut h = Harness::new();
