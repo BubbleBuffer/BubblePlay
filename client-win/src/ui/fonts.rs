@@ -11,7 +11,8 @@ use egui::{FontData, FontDefinitions, FontFamily, TextStyle};
 
 use super::theme::{self, size};
 
-static DISPLAY: &[u8] = include_bytes!("fonts/bricolage-grotesque-display-wdth86-wght650-opsz28.ttf");
+static DISPLAY: &[u8] =
+    include_bytes!("fonts/bricolage-grotesque-display-wdth86-wght650-opsz28.ttf");
 static UI: &[u8] = include_bytes!("fonts/atkinson-hyperlegible-next-ui-wght450.ttf");
 static UI_BOLD: &[u8] = include_bytes!("fonts/atkinson-hyperlegible-next-ui-bold-wght720.ttf");
 static MONO: &[u8] = include_bytes!("fonts/fragment-mono.ttf");
@@ -24,8 +25,16 @@ pub fn install(ctx: &egui::Context) {
 
     // egui's own fonts stay behind ours, so symbols and anything we do not
     // ship still render.
-    let prop_fallback: Vec<String> = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    let mono_fallback: Vec<String> = defs.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
+    let prop_fallback: Vec<String> = defs
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let mono_fallback: Vec<String> = defs
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
 
     let faces: [(&str, &'static [u8]); 4] = [
         (theme::FAMILY_DISPLAY, DISPLAY),
@@ -34,7 +43,8 @@ pub fn install(ctx: &egui::Context) {
         (theme::FAMILY_MONO, MONO),
     ];
     for (name, bytes) in faces {
-        defs.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
+        defs.font_data
+            .insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
     }
 
     let chain = |first: &str, fallback: &[String]| -> Vec<String> {
@@ -43,12 +53,26 @@ pub fn install(ctx: &egui::Context) {
         v
     };
 
-    for name in [theme::FAMILY_DISPLAY, theme::FAMILY_UI, theme::FAMILY_UI_BOLD] {
-        defs.families.insert(FontFamily::Name(name.into()), chain(name, &prop_fallback));
+    for name in [
+        theme::FAMILY_DISPLAY,
+        theme::FAMILY_UI,
+        theme::FAMILY_UI_BOLD,
+    ] {
+        defs.families
+            .insert(FontFamily::Name(name.into()), chain(name, &prop_fallback));
     }
-    defs.families.insert(FontFamily::Name(theme::FAMILY_MONO.into()), chain(theme::FAMILY_MONO, &mono_fallback));
-    defs.families.insert(FontFamily::Proportional, chain(theme::FAMILY_UI, &prop_fallback));
-    defs.families.insert(FontFamily::Monospace, chain(theme::FAMILY_MONO, &mono_fallback));
+    defs.families.insert(
+        FontFamily::Name(theme::FAMILY_MONO.into()),
+        chain(theme::FAMILY_MONO, &mono_fallback),
+    );
+    defs.families.insert(
+        FontFamily::Proportional,
+        chain(theme::FAMILY_UI, &prop_fallback),
+    );
+    defs.families.insert(
+        FontFamily::Monospace,
+        chain(theme::FAMILY_MONO, &mono_fallback),
+    );
 
     ctx.set_fonts(defs);
 

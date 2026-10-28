@@ -6,16 +6,16 @@
 
 #![windows_subsystem = "windows"]
 
-mod model;
-mod mock;
-mod shell;
-mod ui;
 mod audio;
 mod input;
 mod media;
+mod mock;
+mod model;
 mod net;
 mod session;
+mod shell;
 mod store;
+mod ui;
 
 use std::path::PathBuf;
 

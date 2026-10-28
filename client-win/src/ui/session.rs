@@ -23,21 +23,41 @@ use super::{Cx, StripView, Toast, UiState};
 use crate::model::{Action, AppState, Link, Quality, Session, SessionNotice, StreamMode};
 
 /// Mockup `.tb-btn` and `.cap` corners (5 8 4 7).
-const SEAM_R: CornerRadius = CornerRadius { nw: 5, ne: 8, se: 4, sw: 7 };
+const SEAM_R: CornerRadius = CornerRadius {
+    nw: 5,
+    ne: 8,
+    se: 4,
+    sw: 7,
+};
 /// Mockup `.handle` corners: square top, 8 10 at the bottom.
-const TAB_R: CornerRadius = CornerRadius { nw: 0, ne: 0, se: 8, sw: 10 };
+const TAB_R: CornerRadius = CornerRadius {
+    nw: 0,
+    ne: 0,
+    se: 8,
+    sw: 10,
+};
 /// Collapsed tab opacity (mockup `.handle`).
 const TAB_OPACITY: f32 = 0.82;
 /// Gap between the stats panel and the window's right edge.
 const STATS_MARGIN: f32 = 12.0;
 /// Mockup `.banner` corners.
-const BANNER_R: CornerRadius = CornerRadius { nw: 0, ne: 0, se: 12, sw: 14 };
+const BANNER_R: CornerRadius = CornerRadius {
+    nw: 0,
+    ne: 0,
+    se: 12,
+    sw: 14,
+};
 /// Mockup `.banner` width.
 const BANNER_W: f32 = 620.0;
 /// Room kept for the Dismiss button on the banner's right.
 const BANNER_DISMISS_SLOT: f32 = 110.0;
 /// Mockup `.toast .ic` and `.layout` corners.
-const ICON_BOX_R: CornerRadius = CornerRadius { nw: 6, ne: 9, se: 6, sw: 8 };
+const ICON_BOX_R: CornerRadius = CornerRadius {
+    nw: 6,
+    ne: 9,
+    se: 6,
+    sw: 8,
+};
 
 const BTN_H: f32 = 32.0;
 /// Round trip at or below this reads as good (CONSTRUCTIVE). Judgement value.
@@ -124,7 +144,8 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, state: &AppState, sess: &Session, 
             .fixed_pos(screen.min)
             .interactable(false)
             .show(ctx, |ui| {
-                ui.painter().rect_filled(screen, CornerRadius::ZERO, tint(theme::VOID, DIM_ALPHA));
+                ui.painter()
+                    .rect_filled(screen, CornerRadius::ZERO, tint(theme::VOID, DIM_ALPHA));
             });
     }
 
@@ -145,7 +166,11 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, state: &AppState, sess: &Session, 
             stats_panel(ctx, sess, chrome_h);
         }
         if let Some(t) = us.session.toast {
-            let top = if open { theme::STRIP_H + POP_GAP } else { TOAST_TOP_TAB };
+            let top = if open {
+                theme::STRIP_H + POP_GAP
+            } else {
+                TOAST_TOP_TAB
+            };
             toast(ctx, cxr, sess, t, top);
         }
         if admin && !dismissed {
@@ -156,7 +181,15 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, state: &AppState, sess: &Session, 
         }
     }
 
-    let Picks { mut acts, drag, no_drag, mut strip, toggle_stats, dismiss, .. } = o;
+    let Picks {
+        mut acts,
+        drag,
+        no_drag,
+        mut strip,
+        toggle_stats,
+        dismiss,
+        ..
+    } = o;
     if picker {
         if let Some(n) = num {
             // While a switch is pending the number keys do nothing; Esc still closes.
@@ -226,7 +259,8 @@ fn chip(ui: &mut Ui, warn: bool, name: &str, evidence: &str, compact: bool) {
 fn seam(ui: &mut Ui) {
     ui.add_space(5.0);
     let (r, _) = ui.allocate_exact_size(vec2(1.0, 22.0), Sense::hover());
-    ui.painter().rect_filled(r, CornerRadius::ZERO, theme::THREAD_STRONG);
+    ui.painter()
+        .rect_filled(r, CornerRadius::ZERO, theme::THREAD_STRONG);
     ui.add_space(5.0);
 }
 
@@ -252,7 +286,12 @@ fn strip_frame() -> Frame {
         .fill(theme::CHROME_BG)
         .corner_radius(theme::R_STRIP)
         .shadow(theme::CHROME_SHADOW)
-        .inner_margin(Margin { left: 5, right: 5, top: 0, bottom: 0 })
+        .inner_margin(Margin {
+            left: 5,
+            right: 5,
+            top: 0,
+            bottom: 0,
+        })
 }
 
 /// Keeps a button's rect clickable inside the draggable strip.
@@ -284,7 +323,12 @@ fn tb_btn(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str) -> Response {
 fn tb_btn_enabled(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str, enabled: bool) -> Response {
     let font = theme::bold(12.5);
     let label_w = match b.label {
-        Some(t) => ui.painter().layout_no_wrap(t.to_owned(), font.clone(), theme::INK).size().x,
+        Some(t) => {
+            ui.painter()
+                .layout_no_wrap(t.to_owned(), font.clone(), theme::INK)
+                .size()
+                .x
+        }
         None => 0.0,
     };
     let icon_w = if b.icon.is_some() { 14.0 } else { 0.0 };
@@ -295,9 +339,17 @@ fn tb_btn_enabled(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str, enabled: bool) 
         .count();
     let gaps = parts.saturating_sub(1) as f32 * 7.0;
     let icon_only = b.label.is_none() && b.chev.is_none();
-    let w = if icon_only { 34.0 } else { 20.0 + icon_w + label_w + chev_w + gaps };
+    let w = if icon_only {
+        34.0
+    } else {
+        20.0 + icon_w + label_w + chev_w + gaps
+    };
 
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, resp) = ui.allocate_exact_size(vec2(w, BTN_H), sense);
     let hot = enabled && resp.hovered();
     let (bg, fg) = if b.open {
@@ -316,9 +368,18 @@ fn tb_btn_enabled(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str, enabled: bool) 
         p.rect_filled(rect, SEAM_R, bg);
     }
     let cy = rect.center().y;
-    let mut x = if icon_only { rect.center().x - 7.0 } else { rect.left() + 10.0 };
+    let mut x = if icon_only {
+        rect.center().x - 7.0
+    } else {
+        rect.left() + 10.0
+    };
     if let Some(name) = b.icon {
-        icons.paint(&p, Rect::from_center_size(pos2(x + 7.0, cy), vec2(14.0, 14.0)), name, fg);
+        icons.paint(
+            &p,
+            Rect::from_center_size(pos2(x + 7.0, cy), vec2(14.0, 14.0)),
+            name,
+            fg,
+        );
         x += icon_w + 7.0;
     }
     if let Some(t) = b.label {
@@ -326,9 +387,20 @@ fn tb_btn_enabled(ui: &mut Ui, icons: &Icons, b: Btn, tip: &str, enabled: bool) 
         x += label_w + 7.0;
     }
     if let Some(name) = b.chev {
-        icons.paint(&p, Rect::from_center_size(pos2(x + 6.5, cy), vec2(13.0, 13.0)), name, fg.linear_multiply(0.7));
+        icons.paint(
+            &p,
+            Rect::from_center_size(pos2(x + 6.5, cy), vec2(13.0, 13.0)),
+            name,
+            fg.linear_multiply(0.7),
+        );
     }
-    contract::mark_widget(&resp, egui::WidgetType::Button, "button", b.label.unwrap_or(if tip.is_empty() { "button" } else { tip }));
+    contract::mark_widget(
+        &resp,
+        egui::WidgetType::Button,
+        "button",
+        b.label
+            .unwrap_or(if tip.is_empty() { "button" } else { tip }),
+    );
     if tip.is_empty() {
         resp
     } else {
@@ -356,7 +428,11 @@ fn display_btn(ui: &mut Ui, cx: &Cx, sess: &Session, picker: bool, o: &mut Picks
     );
     o.display = Some(r.rect);
     if r.clicked() {
-        o.strip = Some(if picker { StripView::Toolbar } else { StripView::MonitorPicker });
+        o.strip = Some(if picker {
+            StripView::Toolbar
+        } else {
+            StripView::MonitorPicker
+        });
     }
 }
 
@@ -366,7 +442,13 @@ fn stats_btn(ui: &mut Ui, icons: &Icons, open: bool, o: &mut Picks) {
         tb_btn(
             ui,
             icons,
-            Btn { icon: Some("activity"), label: Some("Stats"), chev: None, open, leave: false },
+            Btn {
+                icon: Some("activity"),
+                label: Some("Stats"),
+                chev: None,
+                open,
+                leave: false,
+            },
             "Stream stats (Ctrl+Alt+Shift+S)",
         ),
     );
@@ -381,7 +463,13 @@ fn leave_btn(ui: &mut Ui, icons: &Icons, o: &mut Picks) {
         tb_btn(
             ui,
             icons,
-            Btn { icon: Some("log-out"), label: Some("Leave"), chev: None, open: false, leave: true },
+            Btn {
+                icon: Some("log-out"),
+                label: Some("Leave"),
+                chev: None,
+                open: false,
+                leave: true,
+            },
             "",
         ),
     );
@@ -406,15 +494,44 @@ const STRIP_COMPACT_BELOW: f32 = 1000.0;
 
 fn cap(ui: &mut Ui, cx: &Cx, kind: Cap, compact: bool) {
     let (icon, text, fg, bg, keys) = match kind {
-        Cap::Captured => ("mouse-pointer-2", "Captured", theme::SIGNAL, tint(theme::SIGNAL, 31), true),
-        Cap::Blocked => ("shield-alert", "Input blocked", theme::ATTENTION, tint(theme::ATTENTION, 31), false),
-        Cap::Paused => ("pause", "Input paused", theme::INK_MUTED, Color32::TRANSPARENT, false),
-        Cap::Released => ("mouse-pointer-2", "Released", theme::INK_MUTED, Color32::TRANSPARENT, false),
+        Cap::Captured => (
+            "mouse-pointer-2",
+            "Captured",
+            theme::SIGNAL,
+            tint(theme::SIGNAL, 31),
+            true,
+        ),
+        Cap::Blocked => (
+            "shield-alert",
+            "Input blocked",
+            theme::ATTENTION,
+            tint(theme::ATTENTION, 31),
+            false,
+        ),
+        Cap::Paused => (
+            "pause",
+            "Input paused",
+            theme::INK_MUTED,
+            Color32::TRANSPARENT,
+            false,
+        ),
+        Cap::Released => (
+            "mouse-pointer-2",
+            "Released",
+            theme::INK_MUTED,
+            Color32::TRANSPARENT,
+            false,
+        ),
     };
     let mut f = Frame::NONE
         .fill(bg)
         .corner_radius(SEAM_R)
-        .inner_margin(Margin { left: 9, right: 8, top: 0, bottom: 0 });
+        .inner_margin(Margin {
+            left: 9,
+            right: 8,
+            top: 0,
+            bottom: 0,
+        });
     if matches!(kind, Cap::Paused | Cap::Released) {
         f = f.stroke(Stroke::new(1.0, theme::THREAD_STRONG));
     }
@@ -440,13 +557,23 @@ fn secure_badge(ui: &mut Ui, cx: &Cx) {
     Frame::NONE
         .fill(tint(theme::ATTENTION, 36))
         .corner_radius(theme::R_PILL)
-        .inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 0 })
+        .inner_margin(Margin {
+            left: 10,
+            right: 10,
+            top: 0,
+            bottom: 0,
+        })
         .show(ui, |ui| {
             ui.set_min_height(26.0);
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 7.0;
                 widgets::icon(ui, cx, "shield-alert", 14.0, theme::ATTENTION);
-                label(ui, "Windows secure desktop · protected input", theme::bold(12.0), theme::ATTENTION);
+                label(
+                    ui,
+                    "Windows secure desktop · protected input",
+                    theme::bold(12.0),
+                    theme::ATTENTION,
+                );
             });
         });
 }
@@ -454,7 +581,14 @@ fn secure_badge(ui: &mut Ui, cx: &Cx) {
 // ------------------------------------------------------------ strips
 
 /// Expanded strip: connection, capture, stream controls, then Leave.
-fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_open: bool, o: &mut Picks) {
+fn toolbar(
+    ctx: &egui::Context,
+    cx: &Cx,
+    sess: &Session,
+    view: StripView,
+    stats_open: bool,
+    o: &mut Picks,
+) {
     let reconnecting = matches!(sess.link, Link::Reconnecting { .. });
     let admin = sess.notice == Some(SessionNotice::AdminRequired);
     let picker = view == StripView::MonitorPicker;
@@ -468,9 +602,21 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     if reconnecting {
-                        chip(ui, true, "Reconnecting", &format!("attempt {}", attempt_of(sess)), compact);
+                        chip(
+                            ui,
+                            true,
+                            "Reconnecting",
+                            &format!("attempt {}", attempt_of(sess)),
+                            compact,
+                        );
                     } else {
-                        chip(ui, false, &sess.pc_name, &format!("{} ms", sess.rtt_ms), compact);
+                        chip(
+                            ui,
+                            false,
+                            &sess.pc_name,
+                            &format!("{} ms", sess.rtt_ms),
+                            compact,
+                        );
                     }
                     seam(ui);
                     if reconnecting {
@@ -538,7 +684,10 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
                         o.acts.push(Action::SetQuality(qnext));
                     }
                     let (audio_icon, audio_tip) = if !sess.audio_controls_available {
-                        (if sess.audio { "volume-2" } else { "volume-x" }, "Audio: not available yet")
+                        (
+                            if sess.audio { "volume-2" } else { "volume-x" },
+                            "Audio: not available yet",
+                        )
                     } else if sess.audio {
                         ("volume-2", "Audio on")
                     } else {
@@ -549,7 +698,13 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
                         tb_btn_enabled(
                             ui,
                             cx.icons,
-                            Btn { icon: Some(audio_icon), label: None, chev: None, open: false, leave: false },
+                            Btn {
+                                icon: Some(audio_icon),
+                                label: None,
+                                chev: None,
+                                open: false,
+                                leave: false,
+                            },
                             audio_tip,
                             sess.audio_controls_available,
                         ),
@@ -564,7 +719,13 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
                         tb_btn(
                             ui,
                             cx.icons,
-                            Btn { icon: Some("settings"), label: None, chev: None, open: false, leave: false },
+                            Btn {
+                                icon: Some("settings"),
+                                label: None,
+                                chev: None,
+                                open: false,
+                                leave: false,
+                            },
                             "Settings",
                         ),
                     );
@@ -575,7 +736,13 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
                         tb_btn(
                             ui,
                             cx.icons,
-                            Btn { icon: Some("chevron-up"), label: None, chev: None, open: false, leave: false },
+                            Btn {
+                                icon: Some("chevron-up"),
+                                label: None,
+                                chev: None,
+                                open: false,
+                                leave: false,
+                            },
                             "Collapse",
                         ),
                     );
@@ -591,7 +758,14 @@ fn toolbar(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_
 }
 
 /// Secure desktop: the strip stays open, with the badge in place of capture.
-fn secure_strip(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, stats_open: bool, o: &mut Picks) {
+fn secure_strip(
+    ctx: &egui::Context,
+    cx: &Cx,
+    sess: &Session,
+    view: StripView,
+    stats_open: bool,
+    o: &mut Picks,
+) {
     egui::Area::new(Id::new("session.strip"))
         .order(Order::Foreground)
         .anchor(Align2::CENTER_TOP, vec2(0.0, 0.0))
@@ -600,7 +774,13 @@ fn secure_strip(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, s
                 ui.set_min_height(theme::STRIP_H);
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    chip(ui, false, &sess.pc_name, &format!("{} ms", sess.rtt_ms), false);
+                    chip(
+                        ui,
+                        false,
+                        &sess.pc_name,
+                        &format!("{} ms", sess.rtt_ms),
+                        false,
+                    );
                     seam(ui);
                     secure_badge(ui, cx);
                     seam(ui);
@@ -617,7 +797,14 @@ fn secure_strip(ctx: &egui::Context, cx: &Cx, sess: &Session, view: StripView, s
 }
 
 /// Collapsed: a 26 px tab on the top edge. Click opens the toolbar.
-fn tab(ctx: &egui::Context, cx: &Cx, sess: &Session, secure: bool, reconnecting: bool, o: &mut Picks) {
+fn tab(
+    ctx: &egui::Context,
+    cx: &Cx,
+    sess: &Session,
+    secure: bool,
+    reconnecting: bool,
+    o: &mut Picks,
+) {
     let clicked = egui::Area::new(Id::new("session.tab"))
         .order(Order::Foreground)
         .anchor(Align2::CENTER_TOP, vec2(0.0, 0.0))
@@ -628,7 +815,12 @@ fn tab(ctx: &egui::Context, cx: &Cx, sess: &Session, secure: bool, reconnecting:
                 .fill(theme::CHROME_BG)
                 .corner_radius(TAB_R)
                 .shadow(theme::CHROME_SHADOW)
-                .inner_margin(Margin { left: 10, right: 12, top: 0, bottom: 0 })
+                .inner_margin(Margin {
+                    left: 10,
+                    right: 12,
+                    top: 0,
+                    bottom: 0,
+                })
                 .show(ui, |ui| {
                     ui.set_min_height(theme::TAB_H);
                     ui.horizontal_centered(|ui| {
@@ -639,11 +831,21 @@ fn tab(ctx: &egui::Context, cx: &Cx, sess: &Session, secure: bool, reconnecting:
                         } else if reconnecting {
                             live_dot(ui, theme::ATTENTION, tint(theme::ATTENTION, 46));
                             label(ui, "Reconnecting", theme::bold(12.0), theme::INK_MUTED);
-                            label(ui, &format!("attempt {}", attempt_of(sess)), theme::mono(11.0), theme::INK);
+                            label(
+                                ui,
+                                &format!("attempt {}", attempt_of(sess)),
+                                theme::mono(11.0),
+                                theme::INK,
+                            );
                         } else {
                             live_dot(ui, theme::SIGNAL, tint(theme::SIGNAL, 46));
                             label(ui, &sess.pc_name, theme::bold(12.0), theme::INK_MUTED);
-                            label(ui, &format!("{} ms", sess.rtt_ms), theme::mono(11.0), theme::INK);
+                            label(
+                                ui,
+                                &format!("{} ms", sess.rtt_ms),
+                                theme::mono(11.0),
+                                theme::INK,
+                            );
                         }
                         widgets::icon(ui, cx, "chevron-down", 14.0, theme::INK_MUTED);
                     });
@@ -660,7 +862,14 @@ fn tab(ctx: &egui::Context, cx: &Cx, sess: &Session, secure: bool, reconnecting:
 
 // ------------------------------------------------------------ monitor picker
 
-fn picker_panel(ctx: &egui::Context, cx: &Cx, sess: &Session, screen: Rect, display: Option<Rect>, o: &mut Picks) {
+fn picker_panel(
+    ctx: &egui::Context,
+    cx: &Cx,
+    sess: &Session,
+    screen: Rect,
+    display: Option<Rect>,
+    o: &mut Picks,
+) {
     let centre = display.map(|r| r.center().x).unwrap_or(screen.center().x);
     let max_x = (screen.right() - PICKER_W - 8.0).max(screen.left() + 8.0);
     let x = (centre - PICKER_W / 2.0).clamp(screen.left() + 8.0, max_x);
@@ -694,12 +903,22 @@ fn picker_panel(ctx: &egui::Context, cx: &Cx, sess: &Session, screen: Rect, disp
                     if sess.monitor_pending {
                         ui.add_space(10.0);
                         widgets::notice(ui, cx, NoticeKind::Neutral, "loader-circle", |ui| {
-                            label(ui, "Switching display…", theme::body(13.0), theme::INK_MUTED);
+                            label(
+                                ui,
+                                "Switching display…",
+                                theme::body(13.0),
+                                theme::INK_MUTED,
+                            );
                         });
                     } else if let Some(err) = &sess.monitor_error {
                         ui.add_space(10.0);
                         widgets::notice(ui, cx, NoticeKind::Error, "circle-alert", |ui| {
-                            label(ui, &format!("Couldn't switch display: {err}"), theme::body(13.0), theme::INK_MUTED);
+                            label(
+                                ui,
+                                &format!("Couldn't switch display: {err}"),
+                                theme::body(13.0),
+                                theme::INK_MUTED,
+                            );
                         });
                     }
                 });
@@ -715,8 +934,18 @@ fn monitor_map(ui: &mut Ui, sess: &Session, o: &mut Picks) {
     }
     let minx = sess.monitors.iter().map(|m| m.x).min().unwrap_or(0) as f32;
     let miny = sess.monitors.iter().map(|m| m.y).min().unwrap_or(0) as f32;
-    let maxx = sess.monitors.iter().map(|m| m.x + m.width as i32).max().unwrap_or(1) as f32;
-    let maxy = sess.monitors.iter().map(|m| m.y + m.height as i32).max().unwrap_or(1) as f32;
+    let maxx = sess
+        .monitors
+        .iter()
+        .map(|m| m.x + m.width as i32)
+        .max()
+        .unwrap_or(1) as f32;
+    let maxy = sess
+        .monitors
+        .iter()
+        .map(|m| m.y + m.height as i32)
+        .max()
+        .unwrap_or(1) as f32;
     let bw = (maxx - minx).max(1.0);
     let bh = (maxy - miny).max(1.0);
     let s = ((PICKER_INNER_W - 24.0) / bw).min((MAP_H - 24.0) / bh);
@@ -730,7 +959,11 @@ fn monitor_map(ui: &mut Ui, sess: &Session, o: &mut Picks) {
             pos2(ox + (m.x as f32 - minx) * s, oy + (m.y as f32 - miny) * s),
             vec2(m.width as f32 * s, m.height as f32 * s),
         );
-        let resp = ui.interact(r, ui.id().with(("mon", i)), if live { Sense::click() } else { Sense::hover() });
+        let resp = ui.interact(
+            r,
+            ui.id().with(("mon", i)),
+            if live { Sense::click() } else { Sense::hover() },
+        );
         let hot = live && resp.hovered();
         let cur = i == sess.monitor;
         let edge = if cur {
@@ -747,9 +980,20 @@ fn monitor_map(ui: &mut Ui, sess: &Session, o: &mut Picks) {
         };
         let p = ui.painter();
         p.rect_filled(r, CornerRadius::same(4), dim(live, fill));
-        p.rect_stroke(r, CornerRadius::same(4), Stroke::new(1.5, dim(live, edge)), StrokeKind::Inside);
+        p.rect_stroke(
+            r,
+            CornerRadius::same(4),
+            Stroke::new(1.5, dim(live, edge)),
+            StrokeKind::Inside,
+        );
         let ink = if cur { theme::INK } else { theme::INK_MUTED };
-        p.text(r.center(), Align2::CENTER_CENTER, (i + 1).to_string(), theme::display(20.0), dim(live, ink));
+        p.text(
+            r.center(),
+            Align2::CENTER_CENTER,
+            (i + 1).to_string(),
+            theme::display(20.0),
+            dim(live, ink),
+        );
         if cur {
             p.text(
                 pos2(r.center().x, r.bottom() - 5.0),
@@ -772,7 +1016,11 @@ fn monitor_rows(ui: &mut Ui, cx: &Cx, sess: &Session, o: &mut Picks) {
     let live = !sess.monitor_pending;
     for (i, m) in sess.monitors.iter().enumerate() {
         let (rect, _) = ui.allocate_exact_size(vec2(PICKER_INNER_W, 40.0), Sense::hover());
-        let resp = ui.interact(rect, ui.id().with(("mrow", i)), if live { Sense::click() } else { Sense::hover() });
+        let resp = ui.interact(
+            rect,
+            ui.id().with(("mrow", i)),
+            if live { Sense::click() } else { Sense::hover() },
+        );
         let hot = live && resp.hovered();
         let cur = i == sess.monitor;
         let p = ui.painter();
@@ -784,16 +1032,39 @@ fn monitor_rows(ui: &mut Ui, cx: &Cx, sess: &Session, o: &mut Picks) {
         let cy = rect.center().y;
         let mut x = rect.left() + 10.0;
         if cur {
-            cx.icons.paint(p, Rect::from_center_size(pos2(x + 8.0, cy), vec2(16.0, 16.0)), "check", dim(live, theme::SIGNAL));
+            cx.icons.paint(
+                p,
+                Rect::from_center_size(pos2(x + 8.0, cy), vec2(16.0, 16.0)),
+                "check",
+                dim(live, theme::SIGNAL),
+            );
         } else {
             let key = Rect::from_min_size(pos2(x, cy - 9.0), vec2(18.0, 18.0));
             p.rect_filled(key, CornerRadius::same(4), dim(live, theme::SURFACE_RAISED));
-            p.text(key.center(), Align2::CENTER_CENTER, (i + 1).to_string(), theme::mono(10.5), dim(live, theme::INK_MUTED));
+            p.text(
+                key.center(),
+                Align2::CENTER_CENTER,
+                (i + 1).to_string(),
+                theme::mono(10.5),
+                dim(live, theme::INK_MUTED),
+            );
         }
         x += 32.0;
-        let name = p.text(pos2(x, cy), Align2::LEFT_CENTER, format!("Display {}", i + 1), theme::bold(13.0), dim(live, theme::INK));
+        let name = p.text(
+            pos2(x, cy),
+            Align2::LEFT_CENTER,
+            format!("Display {}", i + 1),
+            theme::bold(13.0),
+            dim(live, theme::INK),
+        );
         if m.primary {
-            p.text(pos2(name.right(), cy), Align2::LEFT_CENTER, " · main", theme::body(13.0), dim(live, theme::INK_MUTED));
+            p.text(
+                pos2(name.right(), cy),
+                Align2::LEFT_CENTER,
+                " · main",
+                theme::body(13.0),
+                dim(live, theme::INK_MUTED),
+            );
         }
         p.text(
             pos2(rect.right() - 10.0, cy),
@@ -826,7 +1097,12 @@ fn stats_panel(ctx: &egui::Context, sess: &Session, top: f32) {
                 .stroke(Stroke::new(1.0, theme::THREAD_STRONG))
                 .corner_radius(theme::R_PANEL)
                 .shadow(theme::CHROME_SHADOW)
-                .inner_margin(Margin { left: 14, right: 14, top: 10, bottom: 12 })
+                .inner_margin(Margin {
+                    left: 14,
+                    right: 14,
+                    top: 10,
+                    bottom: 12,
+                })
                 .show(ui, |ui| {
                     ui.set_width(240.0);
                     ui.horizontal(|ui| {
@@ -838,7 +1114,12 @@ fn stats_panel(ctx: &egui::Context, sess: &Session, top: f32) {
                     ui.add_space(6.0);
                     sparkline(ui, &s.frame_ms);
                     ui.horizontal(|ui| {
-                        label(ui, "frame time, last 4 s", theme::mono(10.0), theme::INK_FAINT);
+                        label(
+                            ui,
+                            "frame time, last 4 s",
+                            theme::mono(10.0),
+                            theme::INK_FAINT,
+                        );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             label(ui, "16.7 ms line", theme::mono(10.0), theme::INK_FAINT);
                         });
@@ -848,7 +1129,12 @@ fn stats_panel(ctx: &egui::Context, sess: &Session, top: f32) {
                         .num_columns(2)
                         .spacing([12.0, 0.0])
                         .show(ui, |ui| {
-                            kv(ui, "round trip", &format!("{} ms", s.rtt_ms), s.rtt_ms <= GOOD_RTT_MS);
+                            kv(
+                                ui,
+                                "round trip",
+                                &format!("{} ms", s.rtt_ms),
+                                s.rtt_ms <= GOOD_RTT_MS,
+                            );
                             kv(ui, "decode", &format!("{:.1} ms", s.decode_ms), false);
                             kv(ui, "frames", &format!("{:.1} fps", s.fps), false);
                             kv(ui, "dropped", &s.dropped.to_string(), false);
@@ -864,7 +1150,11 @@ fn stats_panel(ctx: &egui::Context, sess: &Session, top: f32) {
 fn kv(ui: &mut Ui, key: &str, value: &str, good: bool) {
     label(ui, key, theme::mono(11.0), theme::INK_FAINT);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        let color = if good { theme::CONSTRUCTIVE } else { theme::INK };
+        let color = if good {
+            theme::CONSTRUCTIVE
+        } else {
+            theme::INK
+        };
         label(ui, value, theme::mono(11.0), color);
     });
     ui.end_row();
@@ -882,7 +1172,10 @@ fn sparkline(ui: &mut Ui, frames: &[f32]) {
         p.line_segment([pos2(x, mid), pos2((x + 2.0).min(r.right()), mid)], dash);
         x += 5.0;
     }
-    p.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, theme::THREAD));
+    p.line_segment(
+        [r.left_bottom(), r.right_bottom()],
+        Stroke::new(1.0, theme::THREAD),
+    );
     let tail = &frames[frames.len().saturating_sub(SPARK_N)..];
     if tail.len() >= 2 {
         let step = r.width() / (tail.len() - 1) as f32;
@@ -904,7 +1197,11 @@ fn sparkline(ui: &mut Ui, frames: &[f32]) {
 fn toast(ctx: &egui::Context, cx: &Cx, sess: &Session, which: Toast, top: f32) {
     let captured = which == Toast::Captured;
     let (icon, fg, box_bg) = if captured {
-        ("mouse-pointer-click", theme::SIGNAL, tint(theme::SIGNAL, 36))
+        (
+            "mouse-pointer-click",
+            theme::SIGNAL,
+            tint(theme::SIGNAL, 36),
+        )
     } else {
         ("mouse-pointer-2", theme::INK_MUTED, theme::SURFACE_MUTED)
     };
@@ -922,14 +1219,24 @@ fn toast(ctx: &egui::Context, cx: &Cx, sess: &Session, which: Toast, top: f32) {
                 .stroke(Stroke::new(1.0, theme::THREAD_STRONG))
                 .corner_radius(theme::R_PANEL)
                 .shadow(theme::CHROME_SHADOW)
-                .inner_margin(Margin { left: 14, right: 16, top: 12, bottom: 12 })
+                .inner_margin(Margin {
+                    left: 14,
+                    right: 16,
+                    top: 12,
+                    bottom: 12,
+                })
                 .show(ui, |ui| {
                     ui.set_min_width(440.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
                         let (b, _) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
                         ui.painter().rect_filled(b, ICON_BOX_R, box_bg);
-                        cx.icons.paint(ui.painter(), Rect::from_center_size(b.center(), vec2(18.0, 18.0)), icon, fg);
+                        cx.icons.paint(
+                            ui.painter(),
+                            Rect::from_center_size(b.center(), vec2(18.0, 18.0)),
+                            icon,
+                            fg,
+                        );
                         ui.vertical(|ui| {
                             label(ui, &title, theme::bold(14.0), theme::INK);
                             ui.add_space(3.0);
@@ -939,7 +1246,12 @@ fn toast(ctx: &egui::Context, cx: &Cx, sess: &Session, which: Toast, top: f32) {
                                     label(ui, "Release with", theme::body(12.5), theme::INK_MUTED);
                                     widgets::chord(ui, &["Ctrl", "Alt", "Shift", "Z"]);
                                 } else {
-                                    label(ui, "Click the stream to capture again ·", theme::body(12.5), theme::INK_MUTED);
+                                    label(
+                                        ui,
+                                        "Click the stream to capture again ·",
+                                        theme::body(12.5),
+                                        theme::INK_MUTED,
+                                    );
                                     widgets::chord(ui, &["Ctrl", "Alt", "Shift", "Q"]);
                                     label(ui, "leaves", theme::body(12.5), theme::INK_MUTED);
                                 }
@@ -948,8 +1260,15 @@ fn toast(ctx: &egui::Context, cx: &Cx, sess: &Session, which: Toast, top: f32) {
                     });
                 });
             let r = f.response.rect;
-            let line = Rect::from_min_size(pos2(r.left(), r.bottom() - 2.0), vec2(r.width() * 0.64, 2.0));
-            let line_fg = if captured { tint(theme::SIGNAL, 179) } else { theme::INK_FAINT };
+            let line = Rect::from_min_size(
+                pos2(r.left(), r.bottom() - 2.0),
+                vec2(r.width() * 0.64, 2.0),
+            );
+            let line_fg = if captured {
+                tint(theme::SIGNAL, 179)
+            } else {
+                theme::INK_FAINT
+            };
             ui.painter().rect_filled(line, CornerRadius::ZERO, line_fg);
         });
 }

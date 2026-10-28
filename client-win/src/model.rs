@@ -174,7 +174,9 @@ pub enum HostRun {
     Starting,
     #[default]
     Running,
-    Restarting { in_secs: u32 },
+    Restarting {
+        in_secs: u32,
+    },
     Stopped,
     NotConfigured,
 }
@@ -272,12 +274,28 @@ pub enum Flow {
     /// PC is at the Windows sign-in screen: a fresh ntfy approval sent by
     /// the PC itself is needed. `Approved` is never shown: the flow moves on
     /// to `Connecting`.
-    Approval { pc_id: String, waiting_secs: u32, outcome: Outcome },
-    Connecting { pc_id: String, mode: StreamMode, steps: Vec<ConnStep> },
-    Failed { pc_id: String, steps: Vec<ConnStep>, error: ConnError },
+    Approval {
+        pc_id: String,
+        waiting_secs: u32,
+        outcome: Outcome,
+    },
+    Connecting {
+        pc_id: String,
+        mode: StreamMode,
+        steps: Vec<ConnStep>,
+    },
+    Failed {
+        pc_id: String,
+        steps: Vec<ConnStep>,
+        error: ConnError,
+    },
     /// The PC did not accept this device's key (revoked or never paired).
     Refused { pc_id: String },
-    Rotate { old_id: String, new_id: String, pcs: Vec<RotatePc> },
+    Rotate {
+        old_id: String,
+        new_id: String,
+        pcs: Vec<RotatePc>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,7 +306,10 @@ pub enum EnrollStep {
     Created,
     /// The chosen key file has a passphrase; it is asked once, then the key
     /// is kept with Windows data protection like a created one.
-    ImportUnlock { file_name: String, error: Option<String> },
+    ImportUnlock {
+        file_name: String,
+        error: Option<String>,
+    },
     /// The file is not a usable key (format, version, or ID and key do not
     /// match). `reason` is the sentence shown.
     ImportRefused { file_name: String, reason: String },
@@ -298,8 +319,12 @@ pub enum EnrollStep {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     Waiting,
-    Approved { by: Answerer },
-    Denied { by: Answerer },
+    Approved {
+        by: Answerer,
+    },
+    Denied {
+        by: Answerer,
+    },
     /// Nobody answered before the request expired.
     TimedOut,
     /// The request was closed at the PC before anyone answered (the tray's
@@ -417,7 +442,10 @@ pub enum Quality {
 pub enum Link {
     #[default]
     Live,
-    Reconnecting { attempt: u32, secs: u32 },
+    Reconnecting {
+        attempt: u32,
+        secs: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,24 +475,51 @@ pub struct Stats {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Action {
     // Your PCs and connecting
-    Connect { pc_id: String },
+    Connect {
+        pc_id: String,
+    },
     CancelFlow,
     Retry,
     RetryWebSocket,
-    Forget { pc_id: String },
-    Rename { pc_id: String, name: String },
+    Forget {
+        pc_id: String,
+    },
+    Rename {
+        pc_id: String,
+        name: String,
+    },
     // pairing (this device joins a PC)
     StartPairing,
     /// Switch the pairing input to a remote request (no code).
     StartRemotePairing,
-    SubmitPairing { link: Option<String>, pc_id: String, code: String, relay: String },
-    RequestRemotePairing { pc_id: String, relay: String },
+    SubmitPairing {
+        link: Option<String>,
+        pc_id: String,
+        code: String,
+        relay: String,
+    },
+    RequestRemotePairing {
+        pc_id: String,
+        relay: String,
+    },
     // vouching for another device on a remote PC
-    Vouch { request_id: String, accept: bool, permissions: Vec<String> },
+    Vouch {
+        request_id: String,
+        accept: bool,
+        permissions: Vec<String>,
+    },
     // This PC
-    AnswerPairing { request_id: String, allow: bool },
-    Revoke { device_id: String },
-    SetMayVouch { device_id: String, may_vouch: bool },
+    AnswerPairing {
+        request_id: String,
+        allow: bool,
+    },
+    Revoke {
+        device_id: String,
+    },
+    SetMayVouch {
+        device_id: String,
+        may_vouch: bool,
+    },
     SetHostSetting(HostSetting),
     StartHosting,
     StopHosting,
@@ -476,7 +531,9 @@ pub enum Action {
     CreateKey,
     /// Answers `EnrollStep::ImportUnlock`. The passphrase only unlocks the
     /// file locally; it is never sent anywhere.
-    UnlockImport { passphrase: String },
+    UnlockImport {
+        passphrase: String,
+    },
     ExportKey,
     ImportKey,
     ReplaceKey,

@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 use egui::{
-    pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, RichText, Sense, Stroke, TextEdit,
-    Ui, UiBuilder,
+    pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, RichText,
+    Sense, Stroke, TextEdit, Ui, UiBuilder,
 };
 
 use super::contract;
@@ -18,27 +18,63 @@ use super::theme;
 use super::widgets::{self, BtnKind, BtnSize, NoticeKind};
 use super::{Cx, UiState};
 use crate::model::{
-    Action, Answerer, AppState, ConnError, ConnStep, EnrollStep, Flow, Outcome, RotatePc, StepStatus, StreamMode,
+    Action, Answerer, AppState, ConnError, ConnStep, EnrollStep, Flow, Outcome, RotatePc,
+    StepStatus, StreamMode,
 };
-
 
 pub fn show(ui: &mut Ui, cx: &mut Cx, state: &AppState, flow: &Flow, _us: &mut UiState) {
     let back = match flow {
         Flow::Enroll(step) => enroll(ui, cx, state, step),
-        Flow::PairEnter { remote: false, error } => pair_enter(ui, cx, state, error.as_deref()),
-        Flow::PairEnter { remote: true, error } => pair_remote(ui, cx, state, error.as_deref()),
-        Flow::PairConfirm { pc_name, pc_id, number, waiting_secs, remote, outcome } => match outcome {
-            Outcome::Waiting => pair_confirm(ui, cx, state, pc_name, pc_id, *number, *waiting_secs, *remote),
+        Flow::PairEnter {
+            remote: false,
+            error,
+        } => pair_enter(ui, cx, state, error.as_deref()),
+        Flow::PairEnter {
+            remote: true,
+            error,
+        } => pair_remote(ui, cx, state, error.as_deref()),
+        Flow::PairConfirm {
+            pc_name,
+            pc_id,
+            number,
+            waiting_secs,
+            remote,
+            outcome,
+        } => match outcome {
+            Outcome::Waiting => pair_confirm(
+                ui,
+                cx,
+                state,
+                pc_name,
+                pc_id,
+                *number,
+                *waiting_secs,
+                *remote,
+            ),
             _ => pair_result(ui, cx, state, pc_name, pc_id, *remote, outcome),
         },
-        Flow::Approval { pc_id, waiting_secs, outcome } => match outcome {
-            Outcome::Waiting | Outcome::Approved { .. } => approval(ui, cx, state, pc_id, *waiting_secs),
+        Flow::Approval {
+            pc_id,
+            waiting_secs,
+            outcome,
+        } => match outcome {
+            Outcome::Waiting | Outcome::Approved { .. } => {
+                approval(ui, cx, state, pc_id, *waiting_secs)
+            }
             _ => approval_result(ui, cx, state, pc_id, outcome),
         },
         Flow::Connecting { pc_id, mode, steps } => connecting(ui, cx, state, pc_id, *mode, steps),
-        Flow::Failed { pc_id, steps, error } => failed(ui, cx, state, pc_id, steps, error),
+        Flow::Failed {
+            pc_id,
+            steps,
+            error,
+        } => failed(ui, cx, state, pc_id, steps, error),
         Flow::Refused { pc_id } => refused(ui, cx, state, pc_id),
-        Flow::Rotate { old_id, new_id, pcs } => rotate(ui, cx, state, old_id, new_id, pcs),
+        Flow::Rotate {
+            old_id,
+            new_id,
+            pcs,
+        } => rotate(ui, cx, state, old_id, new_id, pcs),
     };
     if back {
         cx.actions.push(Action::CancelFlow);
@@ -54,7 +90,11 @@ fn enroll(ui: &mut Ui, cx: &mut Cx, state: &AppState, step: &EnrollStep) -> bool
         EnrollStep::ImportUnlock { .. } => ("Unlock the key file", StepStatus::Now),
         EnrollStep::ImportRefused { .. } => ("File not usable", StepStatus::Failed),
     };
-    let pair_status = if *step == EnrollStep::Created { StepStatus::Now } else { StepStatus::Waiting };
+    let pair_status = if *step == EnrollStep::Created {
+        StepStatus::Now
+    } else {
+        StepStatus::Waiting
+    };
     // No back link: there is nothing to go back to before a key exists.
     layout_ex(
         ui,
@@ -77,8 +117,12 @@ fn enroll(ui: &mut Ui, cx: &mut Cx, state: &AppState, step: &EnrollStep) -> bool
         |ui, cx| match step {
             EnrollStep::Choose => enroll_choose(ui, cx),
             EnrollStep::Created => enroll_created(ui, cx, state),
-            EnrollStep::ImportUnlock { file_name, error } => enroll_unlock(ui, cx, file_name, error.as_deref()),
-            EnrollStep::ImportRefused { file_name, reason } => enroll_refused(ui, cx, file_name, reason),
+            EnrollStep::ImportUnlock { file_name, error } => {
+                enroll_unlock(ui, cx, file_name, error.as_deref())
+            }
+            EnrollStep::ImportRefused { file_name, reason } => {
+                enroll_refused(ui, cx, file_name, reason)
+            }
         },
     )
 }
@@ -127,17 +171,31 @@ fn enroll_choose(ui: &mut Ui, cx: &mut Cx) {
 fn enroll_created(ui: &mut Ui, cx: &mut Cx, state: &AppState) {
     title_row(ui, "Key created", None);
     lead(ui, "This is this device's ID. A PC shows it when you pair, so you can check it is this device.");
-    card(ui, theme::SURFACE, theme::THREAD, theme::R_PANEL, Margin { left: 20, right: 20, top: 18, bottom: 18 }, |ui| {
-        widgets::section_label(ui, "This device");
-        ui.add_space(4.0);
-        widgets::mono_text(ui, &state.this_device.id, 22.0, theme::INK);
-        ui.add_space(6.0);
-        contract::text(
-            ui,
-            RichText::new(&state.this_device.key_path).font(theme::mono(12.0)).color(theme::INK_FAINT),
-            true,
-        );
-    });
+    card(
+        ui,
+        theme::SURFACE,
+        theme::THREAD,
+        theme::R_PANEL,
+        Margin {
+            left: 20,
+            right: 20,
+            top: 18,
+            bottom: 18,
+        },
+        |ui| {
+            widgets::section_label(ui, "This device");
+            ui.add_space(4.0);
+            widgets::mono_text(ui, &state.this_device.id, 22.0, theme::INK);
+            ui.add_space(6.0);
+            contract::text(
+                ui,
+                RichText::new(&state.this_device.key_path)
+                    .font(theme::mono(12.0))
+                    .color(theme::INK_FAINT),
+                true,
+            );
+        },
+    );
     ui.add_space(18.0);
     widgets::notice(ui, cx, NoticeKind::Info, "download", |ui| {
         body_muted(
@@ -146,10 +204,28 @@ fn enroll_created(ui: &mut Ui, cx: &mut Cx, state: &AppState) {
         );
     });
     actions(ui, |ui| {
-        if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("arrow-right"), "Pair a PC").clicked() {
+        if widgets::button(
+            ui,
+            cx,
+            BtnKind::Primary,
+            BtnSize::Large,
+            Some("arrow-right"),
+            "Pair a PC",
+        )
+        .clicked()
+        {
             cx.actions.push(Action::StartPairing);
         }
-        if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("download"), "Export backup…").clicked() {
+        if widgets::button(
+            ui,
+            cx,
+            BtnKind::Secondary,
+            BtnSize::Normal,
+            Some("download"),
+            "Export backup…",
+        )
+        .clicked()
+        {
             cx.actions.push(Action::ExportKey);
         }
         if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Normal, None, "Later").clicked() {
@@ -170,17 +246,55 @@ fn enroll_unlock(ui: &mut Ui, cx: &mut Cx, file_name: &str, error: Option<&str>)
         error_notice(ui, cx, e);
         ui.add_space(18.0);
     }
-    text_field(ui, cx, "passphrase", "Passphrase", Some("lock"), "", theme::body(14.0), true, |_, _| {});
-    hint(ui, "Checked on this PC only. It is never sent to a relay or a PC.");
+    text_field(
+        ui,
+        cx,
+        "passphrase",
+        "Passphrase",
+        Some("lock"),
+        "",
+        theme::body(14.0),
+        true,
+        |_, _| {},
+    );
+    hint(
+        ui,
+        "Checked on this PC only. It is never sent to a relay or a PC.",
+    );
     let passphrase = stored(ui, "passphrase");
     actions(ui, |ui| {
         if passphrase.is_empty() {
-            widgets::button_disabled(ui, cx, BtnKind::Primary, BtnSize::Large, Some("key-round"), "Unlock");
-        } else if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("key-round"), "Unlock").clicked() {
+            widgets::button_disabled(
+                ui,
+                cx,
+                BtnKind::Primary,
+                BtnSize::Large,
+                Some("key-round"),
+                "Unlock",
+            );
+        } else if widgets::button(
+            ui,
+            cx,
+            BtnKind::Primary,
+            BtnSize::Large,
+            Some("key-round"),
+            "Unlock",
+        )
+        .clicked()
+        {
             store(ui, "passphrase", String::new());
             cx.actions.push(Action::UnlockImport { passphrase });
         }
-        if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("file-up"), "Choose another file").clicked() {
+        if widgets::button(
+            ui,
+            cx,
+            BtnKind::Secondary,
+            BtnSize::Normal,
+            Some("file-up"),
+            "Choose another file",
+        )
+        .clicked()
+        {
             store(ui, "passphrase", String::new());
             cx.actions.push(Action::ImportKey);
         }
@@ -193,18 +307,43 @@ fn enroll_unlock(ui: &mut Ui, cx: &mut Cx, file_name: &str, error: Option<&str>)
 
 fn enroll_refused(ui: &mut Ui, cx: &mut Cx, file_name: &str, reason: &str) {
     title_row(ui, "This file can't be used", None);
-    lead_tight(ui, "BubblePlay checked the key file and stopped before keeping anything.");
+    lead_tight(
+        ui,
+        "BubblePlay checked the key file and stopped before keeping anything.",
+    );
     ui.add_space(20.0);
     widgets::notice(ui, cx, NoticeKind::Error, "shield-x", |ui| {
-        ui.label(RichText::new(file_name).font(theme::mono(12.5)).color(theme::INK));
+        ui.label(
+            RichText::new(file_name)
+                .font(theme::mono(12.5))
+                .color(theme::INK),
+        );
         ui.add_space(4.0);
         body_muted(ui, reason);
     });
     actions(ui, |ui| {
-        if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("file-up"), "Choose another file").clicked() {
+        if widgets::button(
+            ui,
+            cx,
+            BtnKind::Primary,
+            BtnSize::Large,
+            Some("file-up"),
+            "Choose another file",
+        )
+        .clicked()
+        {
             cx.actions.push(Action::ImportKey);
         }
-        if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("key-round"), "Create a new key").clicked() {
+        if widgets::button(
+            ui,
+            cx,
+            BtnKind::Secondary,
+            BtnSize::Normal,
+            Some("key-round"),
+            "Create a new key",
+        )
+        .clicked()
+        {
             cx.actions.push(Action::CreateKey);
         }
     });
@@ -221,19 +360,35 @@ fn choice(
     body: &str,
     button: impl FnOnce(&mut Ui, &mut Cx),
 ) {
-    card(ui, theme::SURFACE, theme::THREAD, theme::R_PANEL, Margin { left: 18, right: 18, top: 16, bottom: 16 }, |ui| {
-        top_row(ui, |ui| {
-            widgets::icon(ui, cx, icon, theme::ICON_LG, icon_color);
-            ui.add_space(14.0);
-            ui.vertical(|ui| {
-                ui.label(RichText::new(title).font(theme::bold(15.0)).color(theme::INK));
-                ui.add_space(2.0);
-                body_muted(ui, body);
-                ui.add_space(12.0);
-                button(ui, cx);
+    card(
+        ui,
+        theme::SURFACE,
+        theme::THREAD,
+        theme::R_PANEL,
+        Margin {
+            left: 18,
+            right: 18,
+            top: 16,
+            bottom: 16,
+        },
+        |ui| {
+            top_row(ui, |ui| {
+                widgets::icon(ui, cx, icon, theme::ICON_LG, icon_color);
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(title)
+                            .font(theme::bold(15.0))
+                            .color(theme::INK),
+                    );
+                    ui.add_space(2.0);
+                    body_muted(ui, body);
+                    ui.add_space(12.0);
+                    button(ui, cx);
+                });
             });
-        });
-    });
+        },
+    );
 }
 
 // ------------------------------------------------------------ pairing
@@ -257,11 +412,19 @@ impl PairInput {
     }
 
     fn link_ok(&self) -> bool {
-        (self.link.starts_with("https://") || self.link.starts_with("bubbleplay://")) && self.link.contains("pair")
+        (self.link.starts_with("https://") || self.link.starts_with("bubbleplay://"))
+            && self.link.contains("pair")
     }
 
     fn typed_ok(&self) -> bool {
-        valid_id(&self.pc_id) && self.code.chars().filter(|c| c.is_ascii_alphanumeric()).count() == 10 && !self.relay.is_empty()
+        valid_id(&self.pc_id)
+            && self
+                .code
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .count()
+                == 10
+            && !self.relay.is_empty()
     }
 }
 
@@ -277,8 +440,16 @@ fn pair_enter(ui: &mut Ui, cx: &mut Cx, state: &AppState, error: Option<&str>) -
                 ui,
                 cx,
                 &[
-                    ("PC ID and code", "From the tray, valid 5 minutes", StepStatus::Now),
-                    ("Compare the number", "Allowed at the PC or vouched", StepStatus::Waiting),
+                    (
+                        "PC ID and code",
+                        "From the tray, valid 5 minutes",
+                        StepStatus::Now,
+                    ),
+                    (
+                        "Compare the number",
+                        "Allowed at the PC or vouched",
+                        StepStatus::Waiting,
+                    ),
                     ("Done", "The PC joins Your PCs", StepStatus::Waiting),
                 ],
             );
@@ -304,23 +475,64 @@ fn pair_enter(ui: &mut Ui, cx: &mut Cx, state: &AppState, error: Option<&str>) -
                 "https://<relay>/pair#…",
                 theme::body(14.0),
                 false,
-                |ui, cx| widgets::button_disabled(ui, cx, BtnKind::Ghost, BtnSize::Small, None, "Paste"),
+                |ui, cx| {
+                    widgets::button_disabled(ui, cx, BtnKind::Ghost, BtnSize::Small, None, "Paste")
+                },
             );
             ui.add_space(18.0);
             or_divider(ui, "or type them");
             ui.add_space(18.0);
-            text_field(ui, cx, "pc-id", "PC ID", None, "XXXX-XXXX-XXXX-XXXX", theme::mono(15.0), false, |_, _| {});
+            text_field(
+                ui,
+                cx,
+                "pc-id",
+                "PC ID",
+                None,
+                "XXXX-XXXX-XXXX-XXXX",
+                theme::mono(15.0),
+                false,
+                |_, _| {},
+            );
             ui.add_space(18.0);
-            text_field(ui, cx, "code", "One-time code", None, "", theme::mono(15.0), false, |_, _| {});
-            hint(ui, "10 characters, shown under the QR. It works once and expires after 5 minutes.");
+            text_field(
+                ui,
+                cx,
+                "code",
+                "One-time code",
+                None,
+                "",
+                theme::mono(15.0),
+                false,
+                |_, _| {},
+            );
+            hint(
+                ui,
+                "10 characters, shown under the QR. It works once and expires after 5 minutes.",
+            );
             ui.add_space(18.0);
             relay_field(ui, cx);
             let input = PairInput::read(ui);
             actions(ui, |ui| {
                 let ready = input.link_ok() || input.typed_ok();
                 if !ready {
-                    widgets::button_disabled(ui, cx, BtnKind::Primary, BtnSize::Large, Some("arrow-right"), "Continue");
-                } else if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("arrow-right"), "Continue").clicked() {
+                    widgets::button_disabled(
+                        ui,
+                        cx,
+                        BtnKind::Primary,
+                        BtnSize::Large,
+                        Some("arrow-right"),
+                        "Continue",
+                    );
+                } else if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Primary,
+                    BtnSize::Large,
+                    Some("arrow-right"),
+                    "Continue",
+                )
+                .clicked()
+                {
                     // The code works once: never keep it for a second try.
                     store(ui, "code", String::new());
                     let link = input.link_ok().then(|| input.link.clone());
@@ -331,11 +543,19 @@ fn pair_enter(ui: &mut Ui, cx: &mut Cx, state: &AppState, error: Option<&str>) -
                         relay: input.relay.clone(),
                     });
                 }
-                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Normal, None, "Cancel").clicked() {
+                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Normal, None, "Cancel")
+                    .clicked()
+                {
                     cx.actions.push(Action::CancelFlow);
                 }
             });
-            switch_row(ui, cx, "Nobody at the PC?", "Ask for remote pairing", Action::StartRemotePairing);
+            switch_row(
+                ui,
+                cx,
+                "Nobody at the PC?",
+                "Ask for remote pairing",
+                Action::StartRemotePairing,
+            );
         },
     )
 }
@@ -353,7 +573,11 @@ fn pair_remote(ui: &mut Ui, cx: &mut Cx, state: &AppState, error: Option<&str>) 
                 cx,
                 &[
                     ("PC ID", "Remote pairing on at the PC", StepStatus::Now),
-                    ("Compare the number", "Allowed at the PC or vouched", StepStatus::Waiting),
+                    (
+                        "Compare the number",
+                        "Allowed at the PC or vouched",
+                        StepStatus::Waiting,
+                    ),
                     ("Done", "The PC joins Your PCs", StepStatus::Waiting),
                 ],
             );
@@ -368,27 +592,70 @@ fn pair_remote(ui: &mut Ui, cx: &mut Cx, state: &AppState, error: Option<&str>) 
                 error_notice(ui, cx, e);
                 ui.add_space(18.0);
             }
-            text_field(ui, cx, "pc-id", "PC ID", None, "XXXX-XXXX-XXXX-XXXX", theme::mono(15.0), false, |_, _| {});
-            hint(ui, "In the tray on the PC, under Devices. A paired device shows it under the PC too.");
+            text_field(
+                ui,
+                cx,
+                "pc-id",
+                "PC ID",
+                None,
+                "XXXX-XXXX-XXXX-XXXX",
+                theme::mono(15.0),
+                false,
+                |_, _| {},
+            );
+            hint(
+                ui,
+                "In the tray on the PC, under Devices. A paired device shows it under the PC too.",
+            );
             ui.add_space(18.0);
             relay_field(ui, cx);
             ui.add_space(20.0);
             widgets::notice(ui, cx, NoticeKind::Neutral, "clock", |ui| {
-                body_muted(ui, "A request expires after 10 minutes, and a PC takes one request at a time.");
+                body_muted(
+                    ui,
+                    "A request expires after 10 minutes, and a PC takes one request at a time.",
+                );
             });
             let input = PairInput::read(ui);
             actions(ui, |ui| {
                 let ready = valid_id(&input.pc_id) && !input.relay.is_empty();
                 if !ready {
-                    widgets::button_disabled(ui, cx, BtnKind::Primary, BtnSize::Large, Some("arrow-right"), "Send request");
-                } else if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("arrow-right"), "Send request").clicked() {
-                    cx.actions.push(Action::RequestRemotePairing { pc_id: input.pc_id.clone(), relay: input.relay.clone() });
+                    widgets::button_disabled(
+                        ui,
+                        cx,
+                        BtnKind::Primary,
+                        BtnSize::Large,
+                        Some("arrow-right"),
+                        "Send request",
+                    );
+                } else if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Primary,
+                    BtnSize::Large,
+                    Some("arrow-right"),
+                    "Send request",
+                )
+                .clicked()
+                {
+                    cx.actions.push(Action::RequestRemotePairing {
+                        pc_id: input.pc_id.clone(),
+                        relay: input.relay.clone(),
+                    });
                 }
-                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Normal, None, "Cancel").clicked() {
+                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Normal, None, "Cancel")
+                    .clicked()
+                {
                     cx.actions.push(Action::CancelFlow);
                 }
             });
-            switch_row(ui, cx, "At the PC?", "Use a code instead", Action::StartPairing);
+            switch_row(
+                ui,
+                cx,
+                "At the PC?",
+                "Use a code instead",
+                Action::StartPairing,
+            );
         },
     )
 }
@@ -414,12 +681,16 @@ fn switch_row(ui: &mut Ui, cx: &mut Cx, question: &str, label: &str, action: Act
     widgets::divider(ui);
     ui.add_space(14.0);
     // One 32 px row, centred, so the hint sits on the button's centre line.
-    ui.allocate_ui_with_layout(vec2(ui.available_width(), 32.0), Layout::left_to_right(Align::Center), |ui| {
-        hint(ui, question);
-        if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, None, label).clicked() {
-            cx.actions.push(action);
-        }
-    });
+    ui.allocate_ui_with_layout(
+        vec2(ui.available_width(), 32.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            hint(ui, question);
+            if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, None, label).clicked() {
+                cx.actions.push(action);
+            }
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -441,7 +712,14 @@ fn pair_confirm(
         &state.this_device.id,
         |ui, cx| {
             rail_title(ui, "Pair a new PC");
-            rail_text(ui, if remote { "Remotely, without a code." } else { "On the PC: BubblePlay tray icon, Pair device." });
+            rail_text(
+                ui,
+                if remote {
+                    "Remotely, without a code."
+                } else {
+                    "On the PC: BubblePlay tray icon, Pair device."
+                },
+            );
             steps_block(
                 ui,
                 cx,
@@ -465,13 +743,26 @@ fn pair_confirm(
                 theme::SURFACE,
                 theme::THREAD,
                 theme::R_PANEL,
-                Margin { left: 20, right: 20, top: 18, bottom: 18 },
+                Margin {
+                    left: 20,
+                    right: 20,
+                    top: 18,
+                    bottom: 18,
+                },
                 |ui| {
-                    ui.label(RichText::new("Number on this device").font(theme::bold(12.0)).color(theme::INK_FAINT));
+                    ui.label(
+                        RichText::new("Number on this device")
+                            .font(theme::bold(12.0))
+                            .color(theme::INK_FAINT),
+                    );
                     ui.add_space(6.0);
                     widgets::number(ui, number, 44.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{pc_name} · ")).font(theme::body(12.0)).color(theme::INK_FAINT));
+                        ui.label(
+                            RichText::new(format!("{pc_name} · "))
+                                .font(theme::body(12.0))
+                                .color(theme::INK_FAINT),
+                        );
                         widgets::id_text(ui, pc_id, false);
                     });
                 },
@@ -500,10 +791,24 @@ fn pair_confirm(
                 );
             });
             actions(ui, |ui| {
-                if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Cancel pairing").clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Secondary,
+                    BtnSize::Normal,
+                    None,
+                    "Cancel pairing",
+                )
+                .clicked()
+                {
                     cx.actions.push(Action::CancelFlow);
                 }
-                widgets::mono_text(ui, &format!("Waiting {}", clock(waiting_secs)), 12.0, theme::INK_FAINT);
+                widgets::mono_text(
+                    ui,
+                    &format!("Waiting {}", clock(waiting_secs)),
+                    12.0,
+                    theme::INK_FAINT,
+                );
             });
         },
     )
@@ -537,11 +842,21 @@ fn pair_result(
         Outcome::Approved { by } => (answered(by, true), StepStatus::Done),
         Outcome::Denied { by } => (answered(by, false), StepStatus::Failed),
         Outcome::TimedOut => ("Nobody answered".to_string(), StepStatus::Failed),
-        Outcome::Cancelled | Outcome::Waiting => ("Closed at the PC".to_string(), StepStatus::Failed),
+        Outcome::Cancelled | Outcome::Waiting => {
+            ("Closed at the PC".to_string(), StepStatus::Failed)
+        }
     };
     let approved = matches!(outcome, Outcome::Approved { .. });
-    let done_sub = if approved { format!("{pc_name} is in Your PCs") } else { "Nothing was added".to_string() };
-    let done_status = if approved { StepStatus::Done } else { StepStatus::Waiting };
+    let done_sub = if approved {
+        format!("{pc_name} is in Your PCs")
+    } else {
+        "Nothing was added".to_string()
+    };
+    let done_status = if approved {
+        StepStatus::Done
+    } else {
+        StepStatus::Waiting
+    };
     let pc = state.pcs.iter().find(|p| p.id == pc_id);
     layout(
         ui,
@@ -549,7 +864,14 @@ fn pair_result(
         &state.this_device.id,
         |ui, cx| {
             rail_title(ui, "Pair a new PC");
-            rail_text(ui, if remote { "Remotely, without a code." } else { "On the PC: BubblePlay tray icon, Pair device." });
+            rail_text(
+                ui,
+                if remote {
+                    "Remotely, without a code."
+                } else {
+                    "On the PC: BubblePlay tray icon, Pair device."
+                },
+            );
             steps_block(
                 ui,
                 cx,
@@ -561,7 +883,11 @@ fn pair_result(
             );
         },
         |ui, cx| {
-            let again = if remote { Action::StartRemotePairing } else { Action::StartPairing };
+            let again = if remote {
+                Action::StartRemotePairing
+            } else {
+                Action::StartPairing
+            };
             match outcome {
                 Outcome::Approved { by } => {
                     result_tile(ui, cx, "circle-check", theme::CONSTRUCTIVE, theme::SURFACE);
@@ -570,32 +896,68 @@ fn pair_result(
                         Answerer::Pc => format!("Allowed at {pc_name}."),
                         Answerer::Device(d) => format!("{d} vouched for this device."),
                     };
-                    lead(ui, &format!("{why} It is in Your PCs now, and this device is on its list."));
+                    lead(
+                        ui,
+                        &format!("{why} It is in Your PCs now, and this device is on its list."),
+                    );
                     let relay = pc.map(|p| p.relay.as_str()).unwrap_or("");
                     let allowed = pc.map(|p| p.allowed.as_str()).unwrap_or("View and input");
-                    card(ui, theme::SURFACE, theme::THREAD, theme::R_PANEL, Margin { left: 20, right: 20, top: 16, bottom: 16 }, |ui| {
-                        egui::Grid::new("pair_result_facts").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
-                            fact_key(ui, "PC ID");
-                            widgets::id_text(ui, pc_id, false);
-                            ui.end_row();
-                            fact_key(ui, "Relay");
-                            widgets::mono_text(ui, relay, 12.0, theme::INK);
-                            ui.end_row();
-                            fact_key(ui, "Allowed");
-                            fact_text(ui, allowed);
-                            ui.end_row();
-                            fact_key(ui, "First mode");
-                            fact_text(ui, "Work. Switch to Game from the session strip.");
-                            ui.end_row();
-                        });
-                    });
+                    card(
+                        ui,
+                        theme::SURFACE,
+                        theme::THREAD,
+                        theme::R_PANEL,
+                        Margin {
+                            left: 20,
+                            right: 20,
+                            top: 16,
+                            bottom: 16,
+                        },
+                        |ui| {
+                            egui::Grid::new("pair_result_facts")
+                                .num_columns(2)
+                                .spacing([20.0, 10.0])
+                                .show(ui, |ui| {
+                                    fact_key(ui, "PC ID");
+                                    widgets::id_text(ui, pc_id, false);
+                                    ui.end_row();
+                                    fact_key(ui, "Relay");
+                                    widgets::mono_text(ui, relay, 12.0, theme::INK);
+                                    ui.end_row();
+                                    fact_key(ui, "Allowed");
+                                    fact_text(ui, allowed);
+                                    ui.end_row();
+                                    fact_key(ui, "First mode");
+                                    fact_text(ui, "Work. Switch to Game from the session strip.");
+                                    ui.end_row();
+                                });
+                        },
+                    );
                     actions(ui, |ui| {
-                        if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("monitor-play"), &format!("Connect to {pc_name}"))
-                            .clicked()
+                        if widgets::button(
+                            ui,
+                            cx,
+                            BtnKind::Primary,
+                            BtnSize::Large,
+                            Some("monitor-play"),
+                            &format!("Connect to {pc_name}"),
+                        )
+                        .clicked()
                         {
-                            cx.actions.push(Action::Connect { pc_id: pc_id.to_string() });
+                            cx.actions.push(Action::Connect {
+                                pc_id: pc_id.to_string(),
+                            });
                         }
-                        if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Back to your PCs").clicked() {
+                        if widgets::button(
+                            ui,
+                            cx,
+                            BtnKind::Secondary,
+                            BtnSize::Normal,
+                            None,
+                            "Back to your PCs",
+                        )
+                        .clicked()
+                        {
                             cx.actions.push(Action::CancelFlow);
                         }
                     });
@@ -648,12 +1010,32 @@ fn pair_result(
                     result_tile(ui, cx, icon, color, theme::SURFACE);
                     title_row(ui, &title, None);
                     lead(ui, &text);
-                    widgets::notice(ui, cx, NoticeKind::Neutral, "info", |ui| body_muted(ui, &tip));
+                    widgets::notice(ui, cx, NoticeKind::Neutral, "info", |ui| {
+                        body_muted(ui, &tip)
+                    });
                     actions(ui, |ui| {
-                        if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("refresh-cw"), "Start again").clicked() {
+                        if widgets::button(
+                            ui,
+                            cx,
+                            BtnKind::Primary,
+                            BtnSize::Large,
+                            Some("refresh-cw"),
+                            "Start again",
+                        )
+                        .clicked()
+                        {
                             cx.actions.push(again);
                         }
-                        if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Back to your PCs").clicked() {
+                        if widgets::button(
+                            ui,
+                            cx,
+                            BtnKind::Secondary,
+                            BtnSize::Normal,
+                            None,
+                            "Back to your PCs",
+                        )
+                        .clicked()
+                        {
                             cx.actions.push(Action::CancelFlow);
                         }
                     });
@@ -680,7 +1062,11 @@ fn approval(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, waiting_sec
                 cx,
                 &[
                     ("Device key", accepted.as_str(), StepStatus::Done),
-                    ("Before sign-in approval", "Needed every time", StepStatus::Now),
+                    (
+                        "Before sign-in approval",
+                        "Needed every time",
+                        StepStatus::Now,
+                    ),
                     ("Stream", "Sign-in screen", StepStatus::Waiting),
                 ],
             );
@@ -719,7 +1105,16 @@ fn approval(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, waiting_sec
                 );
             });
             actions(ui, |ui| {
-                if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Cancel request").clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Secondary,
+                    BtnSize::Normal,
+                    None,
+                    "Cancel request",
+                )
+                .clicked()
+                {
                     cx.actions.push(Action::CancelFlow);
                 }
                 hint(ui, "Moves on by itself once approved.");
@@ -729,7 +1124,13 @@ fn approval(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, waiting_sec
 }
 
 /// A before-sign-in approval that was denied, expired or withdrawn.
-fn approval_result(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, outcome: &Outcome) -> bool {
+fn approval_result(
+    ui: &mut Ui,
+    cx: &mut Cx,
+    state: &AppState,
+    pc_id: &str,
+    outcome: &Outcome,
+) -> bool {
     let pc = pc_name(state, pc_id);
     let accepted = format!("Accepted by {pc}");
     let (icon, color, sub, title, text) = match outcome {
@@ -777,13 +1178,36 @@ fn approval_result(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, outc
             title_row(ui, title, None);
             lead(ui, &text);
             widgets::notice(ui, cx, NoticeKind::Neutral, "smartphone", |ui| {
-                body_muted(ui, &format!("Asking again sends a new notification from {pc}. Each one works once."));
+                body_muted(
+                    ui,
+                    &format!(
+                        "Asking again sends a new notification from {pc}. Each one works once."
+                    ),
+                );
             });
             actions(ui, |ui| {
-                if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("refresh-cw"), "Ask again").clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Primary,
+                    BtnSize::Large,
+                    Some("refresh-cw"),
+                    "Ask again",
+                )
+                .clicked()
+                {
                     cx.actions.push(Action::Retry);
                 }
-                if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Back to your PCs").clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Secondary,
+                    BtnSize::Normal,
+                    None,
+                    "Back to your PCs",
+                )
+                .clicked()
+                {
                     cx.actions.push(Action::CancelFlow);
                 }
             });
@@ -793,15 +1217,32 @@ fn approval_result(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, outc
 
 // ------------------------------------------------------------ connecting
 
-fn connecting(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, mode: StreamMode, steps: &[ConnStep]) -> bool {
+fn connecting(
+    ui: &mut Ui,
+    cx: &mut Cx,
+    state: &AppState,
+    pc_id: &str,
+    mode: StreamMode,
+    steps: &[ConnStep],
+) -> bool {
     let pc = pc_name(state, pc_id);
     let mode_text = mode_name(mode);
     let accepted = format!("Accepted by {pc}");
     // A PC never connected to has no last mode: it opens in Work.
-    let first_time = state.pcs.iter().find(|p| p.id == pc_id).is_some_and(|p| p.last_mode.is_none());
-    let mode_line = if first_time { format!("Mode: {mode_text} (new PC)") } else { format!("Last mode: {mode_text}") };
+    let first_time = state
+        .pcs
+        .iter()
+        .find(|p| p.id == pc_id)
+        .is_some_and(|p| p.last_mode.is_none());
+    let mode_line = if first_time {
+        format!("Mode: {mode_text} (new PC)")
+    } else {
+        format!("Last mode: {mode_text}")
+    };
     let mode_lead = if first_time {
-        format!("{mode_text} mode, the start for a new PC. Change it from the strip once you are in.")
+        format!(
+            "{mode_text} mode, the start for a new PC. Change it from the strip once you are in."
+        )
     } else {
         format!("{mode_text} mode, as last time. Change it from the strip once you are in.")
     };
@@ -815,7 +1256,10 @@ fn connecting(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, mode: Str
             steps_block(
                 ui,
                 cx,
-                &[("Device key", accepted.as_str(), StepStatus::Done), ("Stream", mode_line.as_str(), StepStatus::Now)],
+                &[
+                    ("Device key", accepted.as_str(), StepStatus::Done),
+                    ("Stream", mode_line.as_str(), StepStatus::Now),
+                ],
             );
         },
         |ui, cx| {
@@ -825,7 +1269,9 @@ fn connecting(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, mode: Str
             widgets::conn_steps(ui, cx, steps);
             indeterminate_bar(ui);
             actions(ui, |ui| {
-                if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Cancel").clicked() {
+                if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Cancel")
+                    .clicked()
+                {
                     cx.actions.push(Action::CancelFlow);
                 }
             });
@@ -841,7 +1287,13 @@ struct FailCopy {
 }
 
 fn fail_copy(pc: &str, relay: &str, error: &ConnError) -> FailCopy {
-    let key_done = || ("Device key".to_string(), format!("Accepted by {pc}"), StepStatus::Done);
+    let key_done = || {
+        (
+            "Device key".to_string(),
+            format!("Accepted by {pc}"),
+            StepStatus::Done,
+        )
+    };
     let s = |a: &str, b: &str, st| (a.to_string(), b.to_string(), st);
     match error {
         ConnError::NoFirstFrame { secs } => FailCopy {
@@ -885,9 +1337,21 @@ fn fail_copy(pc: &str, relay: &str, error: &ConnError) -> FailCopy {
     }
 }
 
-fn failed(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, steps: &[ConnStep], error: &ConnError) -> bool {
+fn failed(
+    ui: &mut Ui,
+    cx: &mut Cx,
+    state: &AppState,
+    pc_id: &str,
+    steps: &[ConnStep],
+    error: &ConnError,
+) -> bool {
     let pc = pc_name(state, pc_id);
-    let relay = state.pcs.iter().find(|p| p.id == pc_id).map(|p| p.relay.clone()).unwrap_or_default();
+    let relay = state
+        .pcs
+        .iter()
+        .find(|p| p.id == pc_id)
+        .map(|p| p.relay.clone())
+        .unwrap_or_default();
     let copy = fail_copy(&pc, &relay, error);
     layout(
         ui,
@@ -896,7 +1360,11 @@ fn failed(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, steps: &[Conn
         |ui, cx| {
             rail_title(ui, &pc);
             widgets::id_text(ui, pc_id, false);
-            let rail: Vec<(&str, &str, StepStatus)> = copy.rail.iter().map(|(a, b, s)| (a.as_str(), b.as_str(), *s)).collect();
+            let rail: Vec<(&str, &str, StepStatus)> = copy
+                .rail
+                .iter()
+                .map(|(a, b, s)| (a.as_str(), b.as_str(), *s))
+                .collect();
             steps_block(ui, cx, &rail);
         },
         |ui, cx| {
@@ -905,12 +1373,23 @@ fn failed(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, steps: &[Conn
             ui.add_space(12.0);
             widgets::conn_steps(ui, cx, steps);
             let back = |ui: &mut Ui, cx: &mut Cx, kind: BtnKind| {
-                if widgets::button(ui, cx, kind, BtnSize::Normal, None, "Back to your PCs").clicked() {
+                if widgets::button(ui, cx, kind, BtnSize::Normal, None, "Back to your PCs")
+                    .clicked()
+                {
                     cx.actions.push(Action::CancelFlow);
                 }
             };
             let try_again = |ui: &mut Ui, cx: &mut Cx, label: &str| {
-                if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("refresh-cw"), label).clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Primary,
+                    BtnSize::Large,
+                    Some("refresh-cw"),
+                    label,
+                )
+                .clicked()
+                {
                     cx.actions.push(Action::Retry);
                 }
             };
@@ -918,7 +1397,16 @@ fn failed(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, steps: &[Conn
                 ConnError::NoFirstFrame { .. } => {
                     actions(ui, |ui| {
                         try_again(ui, cx, "Try again");
-                        if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Try again over WebSocket").clicked() {
+                        if widgets::button(
+                            ui,
+                            cx,
+                            BtnKind::Secondary,
+                            BtnSize::Normal,
+                            None,
+                            "Try again over WebSocket",
+                        )
+                        .clicked()
+                        {
                             cx.actions.push(Action::RetryWebSocket);
                         }
                         back(ui, cx, BtnKind::Ghost);
@@ -965,13 +1453,30 @@ fn failed(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, steps: &[Conn
                 ConnError::NoHardwareDecoder { detail, .. } => {
                     ui.add_space(18.0);
                     widgets::notice(ui, cx, NoticeKind::Error, "cpu", |ui| {
-                        ui.label(RichText::new("What Windows reported").font(theme::bold(13.0)).color(theme::INK));
+                        ui.label(
+                            RichText::new("What Windows reported")
+                                .font(theme::bold(13.0))
+                                .color(theme::INK),
+                        );
                         ui.add_space(4.0);
-                        ui.label(RichText::new(detail.as_str()).font(theme::mono(12.0)).color(theme::INK_MUTED));
+                        ui.label(
+                            RichText::new(detail.as_str())
+                                .font(theme::mono(12.0))
+                                .color(theme::INK_MUTED),
+                        );
                     });
                     actions(ui, |ui| {
                         back(ui, cx, BtnKind::Secondary);
-                        if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Normal, Some("copy"), "Copy details").clicked() {
+                        if widgets::button(
+                            ui,
+                            cx,
+                            BtnKind::Ghost,
+                            BtnSize::Normal,
+                            Some("copy"),
+                            "Copy details",
+                        )
+                        .clicked()
+                        {
                             ui.ctx().copy_text(detail.clone());
                         }
                     });
@@ -993,10 +1498,19 @@ fn failed(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, steps: &[Conn
                     });
                     actions(ui, |ui| {
                         back(ui, cx, BtnKind::Secondary);
-                        if widgets::button(ui, cx, BtnKind::Danger, BtnSize::Normal, Some("trash-2"), &format!("Forget {pc}"))
-                            .clicked()
+                        if widgets::button(
+                            ui,
+                            cx,
+                            BtnKind::Danger,
+                            BtnSize::Normal,
+                            Some("trash-2"),
+                            &format!("Forget {pc}"),
+                        )
+                        .clicked()
                         {
-                            cx.actions.push(Action::Forget { pc_id: pc_id.to_string() });
+                            cx.actions.push(Action::Forget {
+                                pc_id: pc_id.to_string(),
+                            });
                         }
                     });
                     (
@@ -1014,7 +1528,12 @@ fn failed(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str, steps: &[Conn
 
 fn refused(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str) -> bool {
     let pc = pc_name(state, pc_id);
-    let relay = state.pcs.iter().find(|p| p.id == pc_id).map(|p| p.relay.clone()).unwrap_or_default();
+    let relay = state
+        .pcs
+        .iter()
+        .find(|p| p.id == pc_id)
+        .map(|p| p.relay.clone())
+        .unwrap_or_default();
     let key = format!("{}-…", short(&state.this_device.id, 9));
     layout(
         ui,
@@ -1026,7 +1545,10 @@ fn refused(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str) -> bool {
             steps_block(
                 ui,
                 cx,
-                &[("Device key", "Not accepted", StepStatus::Failed), ("Stream", "Not started", StepStatus::Waiting)],
+                &[
+                    ("Device key", "Not accepted", StepStatus::Failed),
+                    ("Stream", "Not started", StepStatus::Waiting),
+                ],
             );
         },
         |ui, cx| {
@@ -1035,8 +1557,24 @@ fn refused(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str) -> bool {
                 ui,
                 &format!("Its key is not on {pc}'s list. Either it was removed at the PC, or this device was never paired with it."),
             );
-            refused_row(ui, cx, "circle-check", theme::CONSTRUCTIVE, "Relay reached", &relay, false);
-            refused_row(ui, cx, "shield-x", theme::DANGER, "Device key not accepted", &key, true);
+            refused_row(
+                ui,
+                cx,
+                "circle-check",
+                theme::CONSTRUCTIVE,
+                "Relay reached",
+                &relay,
+                false,
+            );
+            refused_row(
+                ui,
+                cx,
+                "shield-x",
+                theme::DANGER,
+                "Device key not accepted",
+                &key,
+                true,
+            );
             ui.add_space(18.0);
             widgets::notice(ui, cx, NoticeKind::Neutral, "info", |ui| {
                 ui.label(
@@ -1060,10 +1598,19 @@ fn refused(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str) -> bool {
                 {
                     cx.actions.push(Action::StartPairing);
                 }
-                if widgets::button(ui, cx, BtnKind::Danger, BtnSize::Normal, Some("trash-2"), &format!("Forget {pc}"))
-                    .clicked()
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Danger,
+                    BtnSize::Normal,
+                    Some("trash-2"),
+                    &format!("Forget {pc}"),
+                )
+                .clicked()
                 {
-                    cx.actions.push(Action::Forget { pc_id: pc_id.to_string() });
+                    cx.actions.push(Action::Forget {
+                        pc_id: pc_id.to_string(),
+                    });
                 }
             });
             ui.add_space(22.0);
@@ -1071,8 +1618,16 @@ fn refused(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str) -> bool {
                 // One paragraph with a bold lead-in run: two labels in a
                 // wrapped row broke the second one onto its own block.
                 let mut job = egui::text::LayoutJob::default();
-                let fmt = |font: egui::FontId, color| egui::TextFormat { font_id: font, color, ..Default::default() };
-                job.append("Different case: PC key changed.", 0.0, fmt(theme::bold(13.0), theme::INK));
+                let fmt = |font: egui::FontId, color| egui::TextFormat {
+                    font_id: font,
+                    color,
+                    ..Default::default()
+                };
+                job.append(
+                    "Different case: PC key changed.",
+                    0.0,
+                    fmt(theme::bold(13.0), theme::INK),
+                );
                 job.append(
                     &format!(
                         " If {pc} answers with a key BubblePlay doesn't know and no signed rotation, the connection stops before anything is sent. Only pair again if someone at the PC confirms they changed it."
@@ -1089,14 +1644,25 @@ fn refused(ui: &mut Ui, cx: &mut Cx, state: &AppState, pc_id: &str) -> bool {
 /// Card width below which the old and new IDs stack.
 const ROTATE_SIDE_BY_SIDE_W: f32 = 380.0;
 
-fn rotate(ui: &mut Ui, cx: &mut Cx, state: &AppState, old_id: &str, new_id: &str, pcs: &[RotatePc]) -> bool {
+fn rotate(
+    ui: &mut Ui,
+    cx: &mut Cx,
+    state: &AppState,
+    old_id: &str,
+    new_id: &str,
+    pcs: &[RotatePc],
+) -> bool {
     let total = pcs.len();
     let confirmed = pcs.iter().filter(|p| p.status == StepStatus::Done).count();
     let new_prefix = format!("{}-…", short(new_id, 4));
     let progress = format!("{confirmed} of {total} so far");
     let conn: Vec<ConnStep> = pcs
         .iter()
-        .map(|p| ConnStep { label: p.name.clone(), detail: p.detail.clone(), status: p.status })
+        .map(|p| ConnStep {
+            label: p.name.clone(),
+            detail: p.detail.clone(),
+            status: p.status,
+        })
         .collect();
     layout(
         ui,
@@ -1111,12 +1677,20 @@ fn rotate(ui: &mut Ui, cx: &mut Cx, state: &AppState, old_id: &str, new_id: &str
                 &[
                     ("New key created", new_prefix.as_str(), StepStatus::Done),
                     ("Each PC confirms", progress.as_str(), StepStatus::Now),
-                    ("Old key removed", "After the last PC confirms", StepStatus::Waiting),
+                    (
+                        "Old key removed",
+                        "After the last PC confirms",
+                        StepStatus::Waiting,
+                    ),
                 ],
             );
         },
         |ui, cx| {
-            title_row(ui, "Replacing this device's key", Some(("Draft copy", true)));
+            title_row(
+                ui,
+                "Replacing this device's key",
+                Some(("Draft copy", true)),
+            );
             lead(
                 ui,
                 "Each PC moves this device's name, permissions and history to the new ID. The old key stays until every PC has confirmed.",
@@ -1126,7 +1700,12 @@ fn rotate(ui: &mut Ui, cx: &mut Cx, state: &AppState, old_id: &str, new_id: &str
                 theme::SURFACE,
                 theme::THREAD,
                 theme::R_PANEL,
-                Margin { left: 18, right: 18, top: 16, bottom: 16 },
+                Margin {
+                    left: 18,
+                    right: 18,
+                    top: 16,
+                    bottom: 16,
+                },
                 |ui| {
                     let old = |ui: &mut Ui| {
                         ui.vertical(|ui| {
@@ -1193,7 +1772,16 @@ fn rotate(ui: &mut Ui, cx: &mut Cx, state: &AppState, old_id: &str, new_id: &str
                 });
             });
             actions(ui, |ui| {
-                if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Back to your PCs").clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Secondary,
+                    BtnSize::Normal,
+                    None,
+                    "Back to your PCs",
+                )
+                .clicked()
+                {
                     cx.actions.push(Action::CancelFlow);
                 }
             });
@@ -1232,11 +1820,24 @@ fn layout_ex(
         // The rail/pane divider is drawn below in THREAD; egui's own panel
         // separator (which can turn white on hover) is switched off.
         .show_separator_line(false)
-        .frame(Frame::NONE.fill(theme::RAIL).inner_margin(Margin { left: 28, right: 28, top: 32, bottom: 28 }))
+        .frame(Frame::NONE.fill(theme::RAIL).inner_margin(Margin {
+            left: 28,
+            right: 28,
+            top: 32,
+            bottom: 28,
+        }))
         .show(ui, |ui| {
             let short = ui.available_height() < 520.0;
             if with_back {
-                back = widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("chevron-left"), "Your PCs").clicked();
+                back = widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Ghost,
+                    BtnSize::Small,
+                    Some("chevron-left"),
+                    "Your PCs",
+                )
+                .clicked();
                 ui.add_space(if short { 16.0 } else { 30.0 });
             } else {
                 // Where the back link sits on the other screens, so titles
@@ -1249,52 +1850,96 @@ fn layout_ex(
             contract::scroll(
                 ui,
                 "rail-body",
-                egui::ScrollArea::vertical().max_height(body_h).auto_shrink([false, true]),
+                egui::ScrollArea::vertical()
+                    .max_height(body_h)
+                    .auto_shrink([false, true]),
                 |ui| rail(ui, cx),
             );
             let spare = ui.available_height() - 44.0;
             if spare > 0.0 {
                 ui.add_space(spare);
             }
-            ui.label(RichText::new("This device").font(theme::body(12.0)).color(theme::INK_FAINT));
+            ui.label(
+                RichText::new("This device")
+                    .font(theme::body(12.0))
+                    .color(theme::INK_FAINT),
+            );
             if device_id.is_empty() {
-                ui.label(RichText::new("No key yet").font(theme::body(13.0)).color(theme::INK_MUTED));
+                ui.label(
+                    RichText::new("No key yet")
+                        .font(theme::body(13.0))
+                        .color(theme::INK_MUTED),
+                );
             } else {
                 widgets::id_text(ui, device_id, false);
             }
-            contract::mark(ui.ctx(), ui.unique_id(), contract::BOX, "rail", ui.max_rect());
+            contract::mark(
+                ui.ctx(),
+                ui.unique_id(),
+                contract::BOX,
+                "rail",
+                ui.max_rect(),
+            );
         })
         .response
         .rect;
-    ui.painter().vline(rail_rect.right(), rail_rect.y_range(), Stroke::new(1.0, theme::THREAD));
+    ui.painter().vline(
+        rail_rect.right(),
+        rail_rect.y_range(),
+        Stroke::new(1.0, theme::THREAD),
+    );
 
-    Frame::NONE.inner_margin(Margin { left: 52, right: 56, top: 38, bottom: 30 }).show(ui, |ui| {
-        // The viewport width, measured outside the scroll area: inside it the
-        // content ui keeps the previous frame's widest item as its width (and
-        // its clip rect is wider than the viewport), so the pane is pinned to
-        // this width in an explicit child ui; otherwise content runs past the
-        // window at the minimum size.
-        // Bounded by the window too: the parent ui can be wider than it.
-        let window_w = ui.ctx().content_rect().right() - 56.0 - ui.max_rect().left();
-        let w = (ui.available_width().min(window_w) - ui.spacing().scroll.allocated_width()).min(theme::PANE_MAX_W);
-        contract::scroll(ui, "pane", egui::ScrollArea::vertical().auto_shrink([false, false]), |ui| {
-            let top = ui.max_rect().min;
-            ui.scope_builder(UiBuilder::new().max_rect(Rect::from_min_size(top, vec2(w, f32::INFINITY))), |ui| {
-                ui.set_max_width(w);
-                pane(ui, cx);
-            });
+    Frame::NONE
+        .inner_margin(Margin {
+            left: 52,
+            right: 56,
+            top: 38,
+            bottom: 30,
+        })
+        .show(ui, |ui| {
+            // The viewport width, measured outside the scroll area: inside it the
+            // content ui keeps the previous frame's widest item as its width (and
+            // its clip rect is wider than the viewport), so the pane is pinned to
+            // this width in an explicit child ui; otherwise content runs past the
+            // window at the minimum size.
+            // Bounded by the window too: the parent ui can be wider than it.
+            let window_w = ui.ctx().content_rect().right() - 56.0 - ui.max_rect().left();
+            let w = (ui.available_width().min(window_w) - ui.spacing().scroll.allocated_width())
+                .min(theme::PANE_MAX_W);
+            contract::scroll(
+                ui,
+                "pane",
+                egui::ScrollArea::vertical().auto_shrink([false, false]),
+                |ui| {
+                    let top = ui.max_rect().min;
+                    ui.scope_builder(
+                        UiBuilder::new().max_rect(Rect::from_min_size(top, vec2(w, f32::INFINITY))),
+                        |ui| {
+                            ui.set_max_width(w);
+                            pane(ui, cx);
+                        },
+                    );
+                },
+            );
         });
-    });
     back
 }
 
 pub(super) fn rail_title(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::display(30.0)).color(theme::INK));
+    ui.label(
+        RichText::new(text)
+            .font(theme::display(30.0))
+            .color(theme::INK),
+    );
     ui.add_space(8.0);
 }
 
 pub(super) fn rail_text(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::body(13.0)).color(theme::INK_FAINT));
+    ui.label(
+        RichText::new(text)
+            .font(theme::body(13.0))
+            .color(theme::INK_FAINT),
+    );
 }
 
 fn steps_block(ui: &mut Ui, cx: &Cx, steps: &[(&str, &str, StepStatus)]) {
@@ -1304,13 +1949,21 @@ fn steps_block(ui: &mut Ui, cx: &Cx, steps: &[(&str, &str, StepStatus)]) {
 
 /// Pane title with an optional tag beside it (Draft, Temporary).
 pub(super) fn title_row(ui: &mut Ui, text: &str, tag: Option<(&str, bool)>) {
-    let title = RichText::new(text).font(theme::display(theme::size::TITLE)).color(theme::INK);
+    let title = RichText::new(text)
+        .font(theme::display(theme::size::TITLE))
+        .color(theme::INK);
     let title_w = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), theme::display(theme::size::TITLE), theme::INK)
+        .layout_no_wrap(
+            text.to_owned(),
+            theme::display(theme::size::TITLE),
+            theme::INK,
+        )
         .size()
         .x;
-    let tag_w = tag.map(|(t, _)| widgets::tag_width(ui, t) + ui.spacing().item_spacing.x).unwrap_or(0.0);
+    let tag_w = tag
+        .map(|(t, _)| widgets::tag_width(ui, t) + ui.spacing().item_spacing.x)
+        .unwrap_or(0.0);
     if title_w + tag_w <= ui.available_width() {
         ui.horizontal(|ui| {
             ui.label(title);
@@ -1336,7 +1989,11 @@ pub(super) fn lead(ui: &mut Ui, text: &str) {
 
 /// Lead paragraph with no gap below (the content follows directly).
 pub(super) fn lead_tight(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::body(theme::size::BODY)).color(theme::INK_MUTED));
+    ui.label(
+        RichText::new(text)
+            .font(theme::body(theme::size::BODY))
+            .color(theme::INK_MUTED),
+    );
 }
 
 /// The button row under a pane: 26 px above, 10 px between buttons. In a
@@ -1355,11 +2012,26 @@ pub(super) fn actions(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 /// same-named helper in widgets.rs for why not `horizontal_top`).
 fn top_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     let h = ui.spacing().interact_size.y;
-    ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(Align::Min), add);
+    ui.allocate_ui_with_layout(
+        vec2(ui.available_width(), h),
+        Layout::left_to_right(Align::Min),
+        add,
+    );
 }
 
-fn card(ui: &mut Ui, fill: Color32, border: Color32, radius: CornerRadius, pad: Margin, add: impl FnOnce(&mut Ui)) {
-    let frame = Frame::NONE.fill(fill).stroke(Stroke::new(1.0, border)).corner_radius(radius).inner_margin(pad);
+fn card(
+    ui: &mut Ui,
+    fill: Color32,
+    border: Color32,
+    radius: CornerRadius,
+    pad: Margin,
+    add: impl FnOnce(&mut Ui),
+) {
+    let frame = Frame::NONE
+        .fill(fill)
+        .stroke(Stroke::new(1.0, border))
+        .corner_radius(radius)
+        .inner_margin(pad);
     contract::framed(ui, "card", frame, |ui| {
         ui.set_width(ui.available_width());
         add(ui);
@@ -1372,14 +2044,27 @@ fn way(ui: &mut Ui, cx: &Cx, icon: &str, title: &str, body: &str) {
         theme::SURFACE_RAISED,
         theme::THREAD,
         theme::R_FIELD,
-        Margin { left: 14, right: 14, top: 12, bottom: 12 },
+        Margin {
+            left: 14,
+            right: 14,
+            top: 12,
+            bottom: 12,
+        },
         |ui| {
             top_row(ui, |ui| {
                 widgets::icon(ui, cx, icon, theme::ICON, theme::INK_MUTED);
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(title).font(theme::bold(13.0)).color(theme::INK));
-                    ui.label(RichText::new(body).font(theme::body(13.0)).color(theme::INK_MUTED));
+                    ui.label(
+                        RichText::new(title)
+                            .font(theme::bold(13.0))
+                            .color(theme::INK),
+                    );
+                    ui.label(
+                        RichText::new(body)
+                            .font(theme::body(13.0))
+                            .color(theme::INK_MUTED),
+                    );
                 });
             });
         },
@@ -1398,19 +2083,33 @@ fn or_divider(ui: &mut Ui, text: &str) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
     let p = ui.painter();
     let line = Stroke::new(1.0, theme::THREAD);
-    let tr = p.text(rect.center(), Align2::CENTER_CENTER, text, theme::body(12.0), theme::INK_FAINT);
+    let tr = p.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        theme::body(12.0),
+        theme::INK_FAINT,
+    );
     let y = rect.center().y;
     p.hline(rect.left()..=(tr.left() - 12.0), y, line);
     p.hline((tr.right() + 12.0)..=rect.right(), y, line);
 }
 
 fn hint(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::body(12.0)).color(theme::INK_FAINT));
+    ui.label(
+        RichText::new(text)
+            .font(theme::body(12.0))
+            .color(theme::INK_FAINT),
+    );
 }
 
 /// A 13 px paragraph in muted ink: notice bodies and card text.
 fn body_muted(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::body(13.0)).color(theme::INK_MUTED));
+    ui.label(
+        RichText::new(text)
+            .font(theme::body(13.0))
+            .color(theme::INK_MUTED),
+    );
 }
 
 /// The 56 px tile above an outcome's title: one icon in the outcome's
@@ -1419,22 +2118,47 @@ fn result_tile(ui: &mut Ui, cx: &Cx, icon: &str, color: Color32, fill: Color32) 
     let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, theme::R_PANEL, fill);
-    p.rect_stroke(rect, theme::R_PANEL, Stroke::new(1.0, theme::THREAD), egui::StrokeKind::Inside);
-    cx.icons.paint(p, Rect::from_center_size(rect.center(), vec2(24.0, 24.0)), icon, color);
+    p.rect_stroke(
+        rect,
+        theme::R_PANEL,
+        Stroke::new(1.0, theme::THREAD),
+        egui::StrokeKind::Inside,
+    );
+    cx.icons.paint(
+        p,
+        Rect::from_center_size(rect.center(), vec2(24.0, 24.0)),
+        icon,
+        color,
+    );
     ui.add_space(18.0);
 }
 
 fn fact_key(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::body(13.0)).color(theme::INK_FAINT));
+    ui.label(
+        RichText::new(text)
+            .font(theme::body(13.0))
+            .color(theme::INK_FAINT),
+    );
 }
 
 fn fact_text(ui: &mut Ui, text: &str) {
-    ui.add(egui::Label::new(RichText::new(text).font(theme::body(13.0)).color(theme::INK)).wrap());
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .font(theme::body(13.0))
+                .color(theme::INK),
+        )
+        .wrap(),
+    );
 }
 
 fn error_notice(ui: &mut Ui, cx: &Cx, text: &str) {
     widgets::notice(ui, cx, NoticeKind::Error, "shield-alert", |ui| {
-        ui.label(RichText::new(text).font(theme::body(13.0)).color(theme::INK_MUTED));
+        ui.label(
+            RichText::new(text)
+                .font(theme::body(13.0))
+                .color(theme::INK_MUTED),
+        );
     });
 }
 
@@ -1473,26 +2197,51 @@ fn text_field(
 
 /// One row of the Refused checklist. Its icon is set per row (shield-x on
 /// the failed step), which the shared `conn_steps` widget cannot do.
-fn refused_row(ui: &mut Ui, cx: &Cx, icon: &str, color: Color32, label: &str, detail: &str, failed: bool) {
-    let fill = if failed { theme::SURFACE } else { Color32::TRANSPARENT };
+fn refused_row(
+    ui: &mut Ui,
+    cx: &Cx,
+    icon: &str,
+    color: Color32,
+    label: &str,
+    detail: &str,
+    failed: bool,
+) {
+    let fill = if failed {
+        theme::SURFACE
+    } else {
+        Color32::TRANSPARENT
+    };
     let frame = Frame::NONE
         .fill(fill)
         .corner_radius(theme::R_FIELD)
-        .inner_margin(Margin { left: 12, right: 12, top: 0, bottom: 0 });
+        .inner_margin(Margin {
+            left: 12,
+            right: 12,
+            top: 0,
+            bottom: 0,
+        });
     contract::framed(ui, "check-row", frame, |ui| {
-            ui.set_width(ui.available_width());
-            // A 40 px row; `horizontal_centered` would claim all remaining height.
-            ui.allocate_ui_with_layout(vec2(ui.available_width(), 40.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_width(ui.available_width());
+        // A 40 px row; `horizontal_centered` would claim all remaining height.
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), 40.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
                 ui.set_min_height(40.0);
                 widgets::icon(ui, cx, icon, theme::ICON, color);
                 ui.add_space(12.0);
-                let text = RichText::new(label).font(if failed { theme::bold(14.0) } else { theme::body(14.0) });
+                let text = RichText::new(label).font(if failed {
+                    theme::bold(14.0)
+                } else {
+                    theme::body(14.0)
+                });
                 ui.label(text.color(if failed { theme::INK } else { theme::INK_MUTED }));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     widgets::mono_text(ui, detail, 11.0, theme::INK_FAINT);
                 });
-            });
-        });
+            },
+        );
+    });
 }
 
 /// The pulsing bell in the approval pane: a ring grows from 0.92 to 1.12
@@ -1511,11 +2260,21 @@ fn pulse(ui: &mut Ui, cx: &Cx) {
     let alpha = 0.7 * (1.0 - phase);
     p.rect_stroke(
         rect.expand(grow),
-        egui::CornerRadius { nw: 16, ne: 22, se: 14, sw: 20 },
+        egui::CornerRadius {
+            nw: 16,
+            ne: 22,
+            se: 14,
+            sw: 20,
+        },
         Stroke::new(1.5, theme::SIGNAL.linear_multiply(alpha)),
         egui::StrokeKind::Middle,
     );
-    cx.icons.paint(p, Rect::from_center_size(rect.center(), vec2(22.0, 22.0)), "bell-ring", theme::SIGNAL);
+    cx.icons.paint(
+        p,
+        Rect::from_center_size(rect.center(), vec2(22.0, 22.0)),
+        "bell-ring",
+        theme::SIGNAL,
+    );
 }
 
 /// Indeterminate progress bar in apricot: a segment slides across a thread
@@ -1577,8 +2336,16 @@ const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// A typed PC ID in the shown form: upper case, groups of four.
 fn normalize_id(raw: &str) -> String {
-    let chars: Vec<char> = raw.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect();
-    chars.chunks(4).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join("-")
+    let chars: Vec<char> = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    chars
+        .chunks(4)
+        .map(|c| c.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// 16 Crockford base32 characters, as `normalize_id` returns them.
@@ -1588,7 +2355,10 @@ fn valid_id(id: &str) -> bool {
 }
 
 fn stored(ui: &mut Ui, key: &str) -> String {
-    ui.data_mut(|d| d.get_temp_mut_or_default::<String>(Id::new(("flow-input", key))).clone())
+    ui.data_mut(|d| {
+        d.get_temp_mut_or_default::<String>(Id::new(("flow-input", key)))
+            .clone()
+    })
 }
 
 fn store(ui: &mut Ui, key: &str, value: String) {

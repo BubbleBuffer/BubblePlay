@@ -14,15 +14,15 @@ use std::time::Instant;
 use crate::model::{Action, AppState, Backend};
 use crate::shell::{FrameRequests, ShellApp, WindowCommand, WindowInfo};
 
-pub mod theme;
 pub mod contract;
-pub mod fonts;
-pub mod icons;
-pub mod widgets;
-pub mod home;
 pub mod flow;
-pub mod settings;
+pub mod fonts;
+pub mod home;
+pub mod icons;
 pub mod session;
+pub mod settings;
+pub mod theme;
+pub mod widgets;
 
 pub use icons::Icons;
 
@@ -135,15 +135,33 @@ struct Demo {
 
 impl App {
     pub fn new(backend: Box<dyn Backend>) -> Self {
-        Self { backend, ui: UiState::default(), icons: None, demo: None }
+        Self {
+            backend,
+            ui: UiState::default(),
+            icons: None,
+            demo: None,
+        }
     }
 
     /// Demo mode: F12 cycles scenes. With `shots`, every scene is captured
     /// to `<dir>/NN-label.png` and the window closes after the last one.
-    pub fn with_demo(mut self, mut driver: Box<dyn DemoDriver>, shots: Option<std::path::PathBuf>) -> Self {
+    pub fn with_demo(
+        mut self,
+        mut driver: Box<dyn DemoDriver>,
+        shots: Option<std::path::PathBuf>,
+    ) -> Self {
         let (label, ui) = driver.scene(0);
-        self.ui = UiState { demo_label: Some(label), ..ui };
-        self.demo = Some(Demo { driver, index: 0, shots, settle: 0, started: Instant::now() });
+        self.ui = UiState {
+            demo_label: Some(label),
+            ..ui
+        };
+        self.demo = Some(Demo {
+            driver,
+            index: 0,
+            shots,
+            settle: 0,
+            started: Instant::now(),
+        });
         self
     }
 
@@ -157,7 +175,10 @@ impl App {
         let demo = self.demo.as_mut()?;
         demo.index = index % demo.driver.len();
         let (label, ui) = demo.driver.scene(demo.index);
-        self.ui = UiState { demo_label: None, ..ui };
+        self.ui = UiState {
+            demo_label: None,
+            ..ui
+        };
         Some(label)
     }
 
@@ -169,7 +190,9 @@ impl App {
     }
 
     fn demo_step(&mut self, ctx: &egui::Context, out: &mut FrameRequests) {
-        let Some(demo) = self.demo.as_mut() else { return };
+        let Some(demo) = self.demo.as_mut() else {
+            return;
+        };
         let next = ctx.input(|i| i.key_pressed(egui::Key::F12));
         if let Some(dir) = demo.shots.clone() {
             // Give fonts, icon textures, layout and fade-ins time to settle:
@@ -193,14 +216,20 @@ impl App {
                 demo.settle = 0;
                 demo.started = Instant::now();
                 let (label, ui) = demo.driver.scene(demo.index);
-                self.ui = UiState { demo_label: Some(label), ..ui };
+                self.ui = UiState {
+                    demo_label: Some(label),
+                    ..ui
+                };
             }
             return;
         }
         if next {
             demo.index = (demo.index + 1) % demo.driver.len();
             let (label, ui) = demo.driver.scene(demo.index);
-            self.ui = UiState { demo_label: Some(label), ..ui };
+            self.ui = UiState {
+                demo_label: Some(label),
+                ..ui
+            };
         }
     }
 }
@@ -234,7 +263,12 @@ impl ShellApp for App {
         let mut actions = Vec::new();
         {
             let icons = self.icons.as_ref().expect("icons loaded");
-            let mut cx = Cx { icons, actions: &mut actions, out, window: info };
+            let mut cx = Cx {
+                icons,
+                actions: &mut actions,
+                out,
+                window: info,
+            };
             if let Some(sess) = state.session.as_ref() {
                 session::show(ctx, &mut cx, &state, sess, &mut self.ui);
             } else {
@@ -264,7 +298,12 @@ impl ShellApp for App {
 fn titlebar_context(state: &AppState, ui: &UiState) -> String {
     use crate::model::Flow;
     let pc_name = |id: &str| {
-        state.pcs.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default()
+        state
+            .pcs
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
     };
     match &state.flow {
         Some(Flow::Enroll(_)) => "Set up this device".into(),

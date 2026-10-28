@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 
 use egui::text::CCursor;
 use egui::text_selection::CCursorRange;
-use egui::{pos2, vec2, Align, Color32, Frame, Id, Key, Layout, Margin, Painter, Rect, RichText, Sense, Stroke, StrokeKind, TextEdit, UiBuilder};
+use egui::{
+    pos2, vec2, Align, Color32, Frame, Id, Key, Layout, Margin, Painter, Rect, RichText, Sense,
+    Stroke, StrokeKind, TextEdit, UiBuilder,
+};
 
 use super::contract;
 use super::theme::{self, size};
@@ -65,7 +68,11 @@ pub fn show(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiState) 
     let target = resolve(state, us);
     let this_pc = matches!(target, Target::ThisPc);
     let full = ui.max_rect();
-    let list_w = if this_pc { 350.0 } else { (full.width() - theme::DETAIL_W).max(0.0) };
+    let list_w = if this_pc {
+        350.0
+    } else {
+        (full.width() - theme::DETAIL_W).max(0.0)
+    };
     let list = Rect::from_min_max(full.min, pos2(full.min.x + list_w, full.max.y));
     let right = Rect::from_min_max(pos2(list.max.x, full.min.y), full.max);
 
@@ -143,12 +150,22 @@ fn panel_border(p: &Painter, rect: Rect) {
 }
 
 fn meta_text(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::body(size::SMALL)).color(theme::INK_FAINT));
+    ui.label(
+        RichText::new(text)
+            .font(theme::body(size::SMALL))
+            .color(theme::INK_FAINT),
+    );
 }
 
 /// One line of faint meta text that may be cut short with an ellipsis.
 fn meta_line(ui: &mut egui::Ui, text: &str) {
-    contract::text(ui, RichText::new(text).font(theme::body(size::SMALL)).color(theme::INK_FAINT), true);
+    contract::text(
+        ui,
+        RichText::new(text)
+            .font(theme::body(size::SMALL))
+            .color(theme::INK_FAINT),
+        true,
+    );
 }
 
 /// The name line and the sub line of a row's text column, as two fixed
@@ -157,18 +174,34 @@ fn row_lines(text: Rect) -> (Rect, Rect) {
     let block = NAME_LINE_H + LINE_GAP + SUB_LINE_H;
     let top = text.center().y - block / 2.0;
     let name = Rect::from_min_size(pos2(text.min.x, top), vec2(text.width(), NAME_LINE_H));
-    let sub = Rect::from_min_size(pos2(text.min.x, name.max.y + LINE_GAP), vec2(text.width(), SUB_LINE_H));
+    let sub = Rect::from_min_size(
+        pos2(text.min.x, name.max.y + LINE_GAP),
+        vec2(text.width(), SUB_LINE_H),
+    );
     (name, sub)
 }
 
 /// A row name: bold, truncates if the column is too narrow.
 fn row_name(ui: &mut egui::Ui, name: &str) {
-    contract::text(ui, RichText::new(name).font(theme::bold(size::ROW_NAME)).color(theme::INK), true);
+    contract::text(
+        ui,
+        RichText::new(name)
+            .font(theme::bold(size::ROW_NAME))
+            .color(theme::INK),
+        true,
+    );
 }
 
 // ------------------------------------------------------------ list column
 
-fn list_column(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiState, target: &Target, rect: Rect) {
+fn list_column(
+    ui: &mut egui::Ui,
+    cx: &mut Cx,
+    state: &AppState,
+    us: &mut UiState,
+    target: &Target,
+    rect: Rect,
+) {
     let this_pc = matches!(target, Target::ThisPc);
     let selected_pc = match target {
         Target::Pc(i) => Some(*i),
@@ -192,7 +225,10 @@ fn list_column(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiStat
     // The bar shows only when the list overflows. Overflow is read from the
     // previous frame's content size; while hidden the list still scrolls.
     let overflow_key = Id::new("home_list_overflow");
-    let overflow = ui.ctx().data(|d| d.get_temp::<bool>(overflow_key)).unwrap_or(false);
+    let overflow = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(overflow_key))
+        .unwrap_or(false);
     let bar = if overflow {
         egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
     } else {
@@ -205,7 +241,12 @@ fn list_column(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiStat
             .scroll_bar_visibility(bar)
             .show(ui, |ui| {
                 Frame::NONE
-                    .inner_margin(Margin { left: 20, right: 0, top: 0, bottom: 0 })
+                    .inner_margin(Margin {
+                        left: 20,
+                        right: 0,
+                        top: 0,
+                        bottom: 0,
+                    })
                     .show(ui, |ui| {
                         if let Some(host) = &state.host {
                             pinned_section(ui, cx, host, this_pc, us);
@@ -229,7 +270,13 @@ fn list_column(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiStat
     place(ui, foot, |ui| list_foot(ui, cx, state, us, this_pc));
 }
 
-fn pinned_section(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus, this_pc: bool, us: &mut UiState) {
+fn pinned_section(
+    ui: &mut egui::Ui,
+    cx: &mut Cx,
+    host: &HostStatus,
+    this_pc: bool,
+    us: &mut UiState,
+) {
     ui.horizontal(|ui| {
         widgets::icon(ui, cx, "radio-tower", theme::ICON_SM, theme::INK_FAINT);
         widgets::section_label(ui, "This PC");
@@ -247,13 +294,22 @@ fn empty_list_card(ui: &mut egui::Ui, cx: &mut Cx, panel_has_button: bool) {
     let frame = Frame::NONE
         .stroke(Stroke::new(1.0, theme::THREAD))
         .corner_radius(theme::R_PANEL)
-        .inner_margin(Margin { left: 18, right: 18, top: 16, bottom: 16 });
+        .inner_margin(Margin {
+            left: 18,
+            right: 18,
+            top: 16,
+            bottom: 16,
+        });
     contract::framed(ui, "empty-list", frame, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             widgets::icon(ui, cx, "monitor", theme::ICON, theme::INK_FAINT);
             ui.add_space(4.0);
-            ui.label(RichText::new("No PCs yet").font(theme::bold(size::ROW_NAME)).color(theme::INK));
+            ui.label(
+                RichText::new("No PCs yet")
+                    .font(theme::bold(size::ROW_NAME))
+                    .color(theme::INK),
+            );
         });
         ui.add_space(4.0);
         ui.add(
@@ -266,7 +322,16 @@ fn empty_list_card(ui: &mut egui::Ui, cx: &mut Cx, panel_has_button: bool) {
         );
         if !panel_has_button {
             ui.add_space(12.0);
-            if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("plus"), "Pair a new PC").clicked() {
+            if widgets::button(
+                ui,
+                cx,
+                BtnKind::Secondary,
+                BtnSize::Normal,
+                Some("plus"),
+                "Pair a new PC",
+            )
+            .clicked()
+            {
                 cx.actions.push(Action::StartPairing);
             }
         }
@@ -277,17 +342,38 @@ fn list_head(ui: &mut egui::Ui, cx: &mut Cx, this_pc: bool) {
     const SUB: &str = "PCs paired with this device.";
     let heading = |ui: &mut egui::Ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new("Your PCs").font(theme::display(size::LIST_TITLE)).color(theme::INK));
-            ui.label(RichText::new(SUB).font(theme::body(size::LABEL)).color(theme::INK_FAINT));
+            ui.label(
+                RichText::new("Your PCs")
+                    .font(theme::display(size::LIST_TITLE))
+                    .color(theme::INK),
+            );
+            ui.label(
+                RichText::new(SUB)
+                    .font(theme::body(size::LABEL))
+                    .color(theme::INK_FAINT),
+            );
         });
     };
     let pair = |ui: &mut egui::Ui, cx: &mut Cx| {
-        if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("plus"), "Pair a new PC").clicked() {
+        if widgets::button(
+            ui,
+            cx,
+            BtnKind::Secondary,
+            BtnSize::Normal,
+            Some("plus"),
+            "Pair a new PC",
+        )
+        .clicked()
+        {
             cx.actions.push(Action::StartPairing);
         }
     };
     // Beside the heading when both fit.
-    let sub_w = ui.painter().layout_no_wrap(SUB.to_owned(), theme::body(size::LABEL), theme::INK).size().x;
+    let sub_w = ui
+        .painter()
+        .layout_no_wrap(SUB.to_owned(), theme::body(size::LABEL), theme::INK)
+        .size()
+        .x;
     let btn_w = widgets::button_width(ui, BtnSize::Normal, Some("plus"), "Pair a new PC");
     let side_by_side = sub_w + 16.0 + btn_w <= ui.available_width();
     if this_pc {
@@ -301,7 +387,11 @@ fn list_head(ui: &mut egui::Ui, cx: &mut Cx, this_pc: bool) {
         // Narrow list: the sub line goes so the button fits beside the title
         // without pushing the rows down.
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Your PCs").font(theme::display(size::LIST_TITLE)).color(theme::INK));
+            ui.label(
+                RichText::new("Your PCs")
+                    .font(theme::display(size::LIST_TITLE))
+                    .color(theme::INK),
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| pair(ui, cx));
         });
     }
@@ -310,7 +400,10 @@ fn list_head(ui: &mut egui::Ui, cx: &mut Cx, this_pc: bool) {
 
 /// Icon box, text column and the right-hand end column of a row.
 fn row_parts(rect: Rect, end_w: f32) -> (Rect, Rect, Rect) {
-    let icon = Rect::from_min_size(pos2(rect.min.x + 12.0, rect.center().y - 20.0), vec2(40.0, 40.0));
+    let icon = Rect::from_min_size(
+        pos2(rect.min.x + 12.0, rect.center().y - 20.0),
+        vec2(40.0, 40.0),
+    );
     let end = Rect::from_min_max(
         pos2(rect.max.x - 12.0 - end_w, rect.min.y),
         pos2(rect.max.x - 12.0, rect.max.y),
@@ -324,7 +417,10 @@ fn row_parts(rect: Rect, end_w: f32) -> (Rect, Rect, Rect) {
 
 /// The 3 px marker that sits left of a selected row.
 fn marker(p: &Painter, rect: Rect, color: Color32) {
-    let m = Rect::from_min_max(pos2(rect.min.x - 10.0, rect.min.y + 12.0), pos2(rect.min.x - 7.0, rect.max.y - 12.0));
+    let m = Rect::from_min_max(
+        pos2(rect.min.x - 10.0, rect.min.y + 12.0),
+        pos2(rect.min.x - 7.0, rect.max.y - 12.0),
+    );
     p.rect_filled(m, 2.0, color);
 }
 
@@ -339,7 +435,15 @@ fn row_fill(rect: Rect, p: &Painter, selected: bool, hovered: bool) {
     p.rect_filled(rect, theme::R_FIELD, fill);
 }
 
-fn icon_box(ui: &mut egui::Ui, cx: &Cx, p: &Painter, icon: Rect, name: &str, bg: Color32, fg: Color32) {
+fn icon_box(
+    ui: &mut egui::Ui,
+    cx: &Cx,
+    p: &Painter,
+    icon: Rect,
+    name: &str,
+    bg: Color32,
+    fg: Color32,
+) {
     p.rect_filled(icon, theme::R_FIELD, bg);
     place(ui, icon.shrink(9.0), |ui| {
         widgets::icon(ui, cx, name, theme::ICON_LG, fg);
@@ -382,48 +486,68 @@ fn host_row(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus, this_pc: bool, us
         marker(&p, rect, theme::MOSS);
     }
     let manage = contract::boxed(ui, "host-row", rect, Layout::top_down(Align::Min), |ui| {
-    // In the This PC rail there is nothing at the row's end.
-    let end_w = if this_pc { 0.0 } else { widgets::button_width(ui, BtnSize::Small, Some("settings"), "Manage") };
-    let (icon, text, end) = row_parts(rect, end_w);
-    let (bg, fg) = if selected {
-        (theme::MOSS, theme::INK)
-    } else {
-        (theme::MOSS.gamma_multiply(0.35), theme::CONSTRUCTIVE)
-    };
-    icon_box(ui, cx, &p, icon, "server", bg, fg);
-
-    let (run_kind, run_word) = run_state(&host.run);
-    let run_word = if matches!(host.run, HostRun::Running) { "Hosting".to_string() } else { run_word };
-    let (name_line, sub_line) = row_lines(text);
-    contract::row_at(ui, "host-row-name", name_line, |ui| {
-        // The pill is laid out first (right to left) so a long name
-        // truncates instead of pushing it out.
-        row_name_with_pill(ui, &host.pc_name, run_kind, &run_word);
-    });
-    contract::row_at(ui, "host-row-sub", sub_line, |ui| {
-        if this_pc {
-            if host.request.is_some() {
-                widgets::pill(ui, PillKind::Warn, "1 pairing request");
-            } else if let Some(ans) = &host.answered {
-                meta_line(ui, &format!("Request answered on {}", ans.answered_on));
-            } else if host.viewer.is_some() {
-                meta_line(ui, "1 viewer connected");
-            } else {
-                meta_line(ui, "No viewer connected");
-            }
+        // In the This PC rail there is nothing at the row's end.
+        let end_w = if this_pc {
+            0.0
         } else {
-            let admin = if host.settings.admin_mode { "Admin mode on" } else { "Admin mode off" };
-            meta_line(ui, &format!("{} · {admin}", viewer_short(host)));
-        }
-    });
+            widgets::button_width(ui, BtnSize::Small, Some("settings"), "Manage")
+        };
+        let (icon, text, end) = row_parts(rect, end_w);
+        let (bg, fg) = if selected {
+            (theme::MOSS, theme::INK)
+        } else {
+            (theme::MOSS.gamma_multiply(0.35), theme::CONSTRUCTIVE)
+        };
+        icon_box(ui, cx, &p, icon, "server", bg, fg);
 
-    let mut manage = false;
-    if !this_pc {
-        place_layout(ui, end, Layout::right_to_left(Align::Center), |ui| {
-            manage = widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("settings"), "Manage").clicked();
+        let (run_kind, run_word) = run_state(&host.run);
+        let run_word = if matches!(host.run, HostRun::Running) {
+            "Hosting".to_string()
+        } else {
+            run_word
+        };
+        let (name_line, sub_line) = row_lines(text);
+        contract::row_at(ui, "host-row-name", name_line, |ui| {
+            // The pill is laid out first (right to left) so a long name
+            // truncates instead of pushing it out.
+            row_name_with_pill(ui, &host.pc_name, run_kind, &run_word);
         });
-    }
-    manage
+        contract::row_at(ui, "host-row-sub", sub_line, |ui| {
+            if this_pc {
+                if host.request.is_some() {
+                    widgets::pill(ui, PillKind::Warn, "1 pairing request");
+                } else if let Some(ans) = &host.answered {
+                    meta_line(ui, &format!("Request answered on {}", ans.answered_on));
+                } else if host.viewer.is_some() {
+                    meta_line(ui, "1 viewer connected");
+                } else {
+                    meta_line(ui, "No viewer connected");
+                }
+            } else {
+                let admin = if host.settings.admin_mode {
+                    "Admin mode on"
+                } else {
+                    "Admin mode off"
+                };
+                meta_line(ui, &format!("{} · {admin}", viewer_short(host)));
+            }
+        });
+
+        let mut manage = false;
+        if !this_pc {
+            place_layout(ui, end, Layout::right_to_left(Align::Center), |ui| {
+                manage = widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Ghost,
+                    BtnSize::Small,
+                    Some("settings"),
+                    "Manage",
+                )
+                .clicked();
+            });
+        }
+        manage
     });
     if manage || resp.clicked() {
         us.view = View::Home(HomeSel::ThisPc);
@@ -477,7 +601,14 @@ fn mode_word(mode: StreamMode) -> &'static str {
     }
 }
 
-fn pc_row(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, selected: bool, this_pc: bool, us: &mut UiState) {
+fn pc_row(
+    ui: &mut egui::Ui,
+    cx: &mut Cx,
+    pc: &RemotePc,
+    selected: bool,
+    this_pc: bool,
+    us: &mut UiState,
+) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let p = ui.painter().clone();
@@ -486,95 +617,129 @@ fn pc_row(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, selected: bool, this_pc
         marker(&p, rect, theme::SIGNAL);
     }
     let connect = contract::boxed(ui, "pc-row", rect, Layout::top_down(Align::Min), |ui| {
-    let narrow = rect.width() < NARROW_LIST_W;
-    // Narrow list: a pairing request takes the status pill's place on the
-    // name line instead of the end column, so the ID line keeps its room.
-    let request_inline = narrow && pc.vouch_request.is_some();
-    let end_w = if this_pc || request_inline {
-        0.0
-    } else if pc.vouch_request.is_some() {
-        widgets::pill_width(ui, "1 pairing request")
-    } else if narrow {
-        theme::CONTROL_H
-    } else {
-        END_W.min(widgets::button_width(ui, BtnSize::Normal, Some("monitor-play"), "Connect"))
-    };
-    let (icon, text, end) = row_parts(rect, end_w);
-    let (bg, fg) = if selected {
-        (theme::INK, theme::SIGNAL_INK)
-    } else {
-        (theme::SURFACE_MUTED, theme::INK_MUTED)
-    };
-    let kind_icon = match pc.kind {
-        PcKind::Desktop => "monitor",
-        PcKind::Laptop => "laptop",
-    };
-    icon_box(ui, cx, &p, icon, kind_icon, bg, fg);
+        let narrow = rect.width() < NARROW_LIST_W;
+        // Narrow list: a pairing request takes the status pill's place on the
+        // name line instead of the end column, so the ID line keeps its room.
+        let request_inline = narrow && pc.vouch_request.is_some();
+        let end_w = if this_pc || request_inline {
+            0.0
+        } else if pc.vouch_request.is_some() {
+            widgets::pill_width(ui, "1 pairing request")
+        } else if narrow {
+            theme::CONTROL_H
+        } else {
+            END_W.min(widgets::button_width(
+                ui,
+                BtnSize::Normal,
+                Some("monitor-play"),
+                "Connect",
+            ))
+        };
+        let (icon, text, end) = row_parts(rect, end_w);
+        let (bg, fg) = if selected {
+            (theme::INK, theme::SIGNAL_INK)
+        } else {
+            (theme::SURFACE_MUTED, theme::INK_MUTED)
+        };
+        let kind_icon = match pc.kind {
+            PcKind::Desktop => "monitor",
+            PcKind::Laptop => "laptop",
+        };
+        icon_box(ui, cx, &p, icon, kind_icon, bg, fg);
 
-    let (pill_kind, pill_word) = if request_inline {
-        (PillKind::Warn, "1 pairing request")
-    } else if pc.problem == Some(PcProblem::RelayUnreachable) {
-        // The relay did not answer, so whether the PC is up is unknown.
-        (PillKind::Off, "Unknown")
-    } else if pc.online {
-        (PillKind::Online, "Online")
-    } else {
-        (PillKind::Off, "Offline")
-    };
-    let edit_key = rename_key(&pc.id);
-    let editing = ui.ctx().data(|d| d.get_temp::<RenameEdit>(edit_key));
-    let (name_line, sub_line) = row_lines(text);
-    contract::row_at(ui, "pc-row-name", name_line, |ui| match editing {
-        Some(edit) => {
-            let reserve = widgets::pill_width(ui, pill_word) + ui.spacing().item_spacing.x;
-            rename_field(ui, cx, pc, edit_key, edit, reserve);
-            widgets::pill(ui, pill_kind, pill_word);
-        }
-        None => row_name_with_pill(ui, &pc.name, pill_kind, pill_word),
-    });
-    contract::row_at(ui, "pc-row-sub", sub_line, |ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        // A narrow row has no room for both: the problem is what matters,
-        // and the detail panel shows the ID.
-        if !(narrow && pc.problem.is_some() && !this_pc) {
-            widgets::id_text(ui, &pc.id, false);
-        }
-        if !this_pc {
-            match pc.problem {
-                Some(problem) => {
-                    let (word, color) = problem_word(problem);
-                    contract::text(ui, RichText::new(word).font(theme::bold(size::SMALL)).color(color), true);
-                }
-                None => meta_line(ui, &pc_meta(pc)),
+        let (pill_kind, pill_word) = if request_inline {
+            (PillKind::Warn, "1 pairing request")
+        } else if pc.problem == Some(PcProblem::RelayUnreachable) {
+            // The relay did not answer, so whether the PC is up is unknown.
+            (PillKind::Off, "Unknown")
+        } else if pc.online {
+            (PillKind::Online, "Online")
+        } else {
+            (PillKind::Off, "Offline")
+        };
+        let edit_key = rename_key(&pc.id);
+        let editing = ui.ctx().data(|d| d.get_temp::<RenameEdit>(edit_key));
+        let (name_line, sub_line) = row_lines(text);
+        contract::row_at(ui, "pc-row-name", name_line, |ui| match editing {
+            Some(edit) => {
+                let reserve = widgets::pill_width(ui, pill_word) + ui.spacing().item_spacing.x;
+                rename_field(ui, cx, pc, edit_key, edit, reserve);
+                widgets::pill(ui, pill_kind, pill_word);
             }
-        }
-    });
-
-    let mut connect = false;
-    if !this_pc {
-        place_layout(ui, end, Layout::right_to_left(Align::Center), |ui| {
-            if request_inline {
-            } else if pc.vouch_request.is_some() {
-                widgets::pill(ui, PillKind::Warn, "1 pairing request");
-            } else if can_connect(pc) {
-                let kind = if selected { BtnKind::Primary } else { BtnKind::Secondary };
-                connect = if narrow {
-                    widgets::icon_button(ui, cx, kind, "monitor-play", "Connect").clicked()
-                } else {
-                    widgets::button(ui, cx, kind, BtnSize::Normal, Some("monitor-play"), "Connect").clicked()
-                };
-            } else if narrow {
-                ui.add_enabled_ui(false, |ui| widgets::icon_button(ui, cx, BtnKind::Secondary, "monitor-play", "Connect"));
-            } else {
-                widgets::button_disabled(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("monitor-play"), "Connect");
+            None => row_name_with_pill(ui, &pc.name, pill_kind, pill_word),
+        });
+        contract::row_at(ui, "pc-row-sub", sub_line, |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            // A narrow row has no room for both: the problem is what matters,
+            // and the detail panel shows the ID.
+            if !(narrow && pc.problem.is_some() && !this_pc) {
+                widgets::id_text(ui, &pc.id, false);
+            }
+            if !this_pc {
+                match pc.problem {
+                    Some(problem) => {
+                        let (word, color) = problem_word(problem);
+                        contract::text(
+                            ui,
+                            RichText::new(word)
+                                .font(theme::bold(size::SMALL))
+                                .color(color),
+                            true,
+                        );
+                    }
+                    None => meta_line(ui, &pc_meta(pc)),
+                }
             }
         });
-    }
-    connect
+
+        let mut connect = false;
+        if !this_pc {
+            place_layout(ui, end, Layout::right_to_left(Align::Center), |ui| {
+                if request_inline {
+                } else if pc.vouch_request.is_some() {
+                    widgets::pill(ui, PillKind::Warn, "1 pairing request");
+                } else if can_connect(pc) {
+                    let kind = if selected {
+                        BtnKind::Primary
+                    } else {
+                        BtnKind::Secondary
+                    };
+                    connect = if narrow {
+                        widgets::icon_button(ui, cx, kind, "monitor-play", "Connect").clicked()
+                    } else {
+                        widgets::button(
+                            ui,
+                            cx,
+                            kind,
+                            BtnSize::Normal,
+                            Some("monitor-play"),
+                            "Connect",
+                        )
+                        .clicked()
+                    };
+                } else if narrow {
+                    ui.add_enabled_ui(false, |ui| {
+                        widgets::icon_button(ui, cx, BtnKind::Secondary, "monitor-play", "Connect")
+                    });
+                } else {
+                    widgets::button_disabled(
+                        ui,
+                        cx,
+                        BtnKind::Secondary,
+                        BtnSize::Normal,
+                        Some("monitor-play"),
+                        "Connect",
+                    );
+                }
+            });
+        }
+        connect
     });
 
     if connect {
-        cx.actions.push(Action::Connect { pc_id: pc.id.clone() });
+        cx.actions.push(Action::Connect {
+            pc_id: pc.id.clone(),
+        });
     } else if resp.clicked() {
         us.view = View::Home(HomeSel::Pc(pc.id.clone()));
     }
@@ -594,7 +759,10 @@ fn rename_key(pc_id: &str) -> Id {
 
 /// Opens the inline rename for one PC; the row shows the field from the next frame.
 fn start_rename(ctx: &egui::Context, pc: &RemotePc) {
-    let edit = RenameEdit { text: pc.name.clone(), armed: true };
+    let edit = RenameEdit {
+        text: pc.name.clone(),
+        armed: true,
+    };
     ctx.data_mut(|d| d.insert_temp(rename_key(&pc.id), edit));
     ctx.request_repaint();
 }
@@ -604,20 +772,34 @@ fn start_rename(ctx: &egui::Context, pc: &RemotePc) {
 /// Width for the rename text: the text plus 48 px, at least 140, at most
 /// what the line leaves after `reserve`.
 fn rename_width(ui: &egui::Ui, text: &str, reserve: f32) -> f32 {
-    let text_w = ui.painter().layout_no_wrap(text.to_owned(), theme::bold(size::ROW_NAME), theme::INK).size().x;
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), theme::bold(size::ROW_NAME), theme::INK)
+        .size()
+        .x;
     let room = (ui.available_width() - reserve - 14.0).max(60.0);
     (text_w + 48.0).max(140.0).min(room)
 }
 
 /// `reserve` is the width kept to the field's right (the row's pill).
-fn rename_field(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, key: Id, mut edit: RenameEdit, reserve: f32) {
+fn rename_field(
+    ui: &mut egui::Ui,
+    cx: &mut Cx,
+    pc: &RemotePc,
+    key: Id,
+    mut edit: RenameEdit,
+    reserve: f32,
+) {
     let text_id = key.with("text");
     if edit.armed {
         edit.armed = false;
         ui.memory_mut(|m| m.request_focus(text_id));
         let mut st = TextEdit::load_state(ui.ctx(), text_id).unwrap_or_default();
         let len = edit.text.chars().count();
-        st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0usize), CCursor::new(len))));
+        st.cursor.set_char_range(Some(CCursorRange::two(
+            CCursor::new(0usize),
+            CCursor::new(len),
+        )));
         st.store(ui.ctx(), text_id);
     }
 
@@ -641,7 +823,12 @@ fn rename_field(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, key: Id, mut edit
     let input = out.inner;
     let rect = out.response.rect;
     if input.has_focus() {
-        ui.painter().rect_stroke(rect.expand(1.0), theme::R_FIELD, Stroke::new(2.0, theme::FOCUS), StrokeKind::Outside);
+        ui.painter().rect_stroke(
+            rect.expand(1.0),
+            theme::R_FIELD,
+            Stroke::new(2.0, theme::FOCUS),
+            StrokeKind::Outside,
+        );
     }
 
     let escape = ui.input(|i| i.key_pressed(Key::Escape));
@@ -653,7 +840,10 @@ fn rename_field(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, key: Id, mut edit
         if enter {
             let name = edit.text.trim();
             if !name.is_empty() && name != pc.name {
-                cx.actions.push(Action::Rename { pc_id: pc.id.clone(), name: name.to_string() });
+                cx.actions.push(Action::Rename {
+                    pc_id: pc.id.clone(),
+                    name: name.to_string(),
+                });
             }
         }
         true
@@ -695,7 +885,16 @@ fn list_foot(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiState,
             });
         } else if !this_pc {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("settings"), "Settings").clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Ghost,
+                    BtnSize::Small,
+                    Some("settings"),
+                    "Settings",
+                )
+                .clicked()
+                {
                     us.view = View::Settings;
                 }
                 ui.add_space(4.0);
@@ -716,7 +915,9 @@ fn list_foot(ui: &mut egui::Ui, cx: &mut Cx, state: &AppState, us: &mut UiState,
 /// Seconds left on a request. The clock starts the first time this screen
 /// shows the request, counting down from the value the backend sent.
 fn countdown(ui: &egui::Ui, key: Id, total: u32) -> u32 {
-    let start = ui.ctx().data_mut(|d| *d.get_temp_mut_or_insert_with(key, Instant::now));
+    let start = ui
+        .ctx()
+        .data_mut(|d| *d.get_temp_mut_or_insert_with(key, Instant::now));
     ui.ctx().request_repaint_after(Duration::from_millis(500));
     total.saturating_sub(start.elapsed().as_secs() as u32)
 }
@@ -726,11 +927,19 @@ fn fmt_mmss(secs: u32) -> String {
 }
 
 fn fact_key(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::body(size::LABEL)).color(theme::INK_FAINT));
+    ui.label(
+        RichText::new(text)
+            .font(theme::body(size::LABEL))
+            .color(theme::INK_FAINT),
+    );
 }
 
 fn fact_text(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::body(size::LABEL)).color(theme::INK));
+    ui.label(
+        RichText::new(text)
+            .font(theme::body(size::LABEL))
+            .color(theme::INK),
+    );
 }
 
 fn last_session(pc: &RemotePc) -> String {
@@ -774,32 +983,48 @@ fn detail_panel(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, us: &mut UiState,
 
     // The top scrolls when a notice makes it taller than the window allows.
     place(ui, top, |ui| {
-        contract::scroll(ui, "detail-top", egui::ScrollArea::vertical().auto_shrink([false, false]), |ui| {
-            if !short {
-                widgets::section_label(ui, "Selected");
-                ui.add_space(8.0);
-            }
-            ui.label(RichText::new(&pc.name).font(theme::display(size::PANEL_NAME)).color(theme::INK));
-            widgets::id_text(ui, &pc.id, true);
-            ui.add_space(if short { 10.0 } else { 14.0 });
-            egui::Grid::new("home_detail_facts").num_columns(2).spacing([16.0, 9.0]).show(ui, |ui| {
-                fact_key(ui, "Relay");
-                widgets::mono_text(ui, &pc.relay, 12.0, theme::INK);
-                ui.end_row();
-                fact_key(ui, "Allowed");
-                fact_text(ui, &pc.allowed);
-                ui.end_row();
-                fact_key(ui, "Last session");
-                fact_text(ui, &last_session(pc));
-                ui.end_row();
-            });
-            if let Some((kind, icon, text)) = detail_notice(pc) {
-                ui.add_space(if short { 12.0 } else { 18.0 });
-                widgets::notice(ui, cx, kind, icon, |ui| {
-                    ui.label(RichText::new(text).font(theme::body(13.0)).color(theme::INK_MUTED));
-                });
-            }
-        });
+        contract::scroll(
+            ui,
+            "detail-top",
+            egui::ScrollArea::vertical().auto_shrink([false, false]),
+            |ui| {
+                if !short {
+                    widgets::section_label(ui, "Selected");
+                    ui.add_space(8.0);
+                }
+                ui.label(
+                    RichText::new(&pc.name)
+                        .font(theme::display(size::PANEL_NAME))
+                        .color(theme::INK),
+                );
+                widgets::id_text(ui, &pc.id, true);
+                ui.add_space(if short { 10.0 } else { 14.0 });
+                egui::Grid::new("home_detail_facts")
+                    .num_columns(2)
+                    .spacing([16.0, 9.0])
+                    .show(ui, |ui| {
+                        fact_key(ui, "Relay");
+                        widgets::mono_text(ui, &pc.relay, 12.0, theme::INK);
+                        ui.end_row();
+                        fact_key(ui, "Allowed");
+                        fact_text(ui, &pc.allowed);
+                        ui.end_row();
+                        fact_key(ui, "Last session");
+                        fact_text(ui, &last_session(pc));
+                        ui.end_row();
+                    });
+                if let Some((kind, icon, text)) = detail_notice(pc) {
+                    ui.add_space(if short { 12.0 } else { 18.0 });
+                    widgets::notice(ui, cx, kind, icon, |ui| {
+                        ui.label(
+                            RichText::new(text)
+                                .font(theme::body(13.0))
+                                .color(theme::INK_MUTED),
+                        );
+                    });
+                }
+            },
+        );
     });
 
     if confirming {
@@ -813,15 +1038,42 @@ fn detail_panel(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, us: &mut UiState,
             if pc.problem == Some(PcProblem::NotAccepted) {
                 // Connecting again would be refused again: pairing is the fix.
                 let again = format!("Pair {} again", pc.name);
-                if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("key-round"), &again).clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Primary,
+                    BtnSize::Large,
+                    Some("key-round"),
+                    &again,
+                )
+                .clicked()
+                {
                     cx.actions.push(Action::StartPairing);
                 }
             } else if can_connect(pc) {
-                if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("monitor-play"), &label).clicked() {
-                    cx.actions.push(Action::Connect { pc_id: pc.id.clone() });
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Primary,
+                    BtnSize::Large,
+                    Some("monitor-play"),
+                    &label,
+                )
+                .clicked()
+                {
+                    cx.actions.push(Action::Connect {
+                        pc_id: pc.id.clone(),
+                    });
                 }
             } else {
-                widgets::button_disabled(ui, cx, BtnKind::Primary, BtnSize::Large, Some("monitor-play"), &label);
+                widgets::button_disabled(
+                    ui,
+                    cx,
+                    BtnKind::Primary,
+                    BtnSize::Large,
+                    Some("monitor-play"),
+                    &label,
+                );
             }
             ui.add_space(10.0);
             let chords: &[(&str, [&str; 4])] = if short {
@@ -845,12 +1097,30 @@ fn detail_panel(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, us: &mut UiState,
             widgets::divider(ui);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("pencil"), "Rename").clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Ghost,
+                    BtnSize::Small,
+                    Some("pencil"),
+                    "Rename",
+                )
+                .clicked()
+                {
                     start_rename(ui.ctx(), pc);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let forget = format!("Forget {}", pc.name);
-                    if widgets::button(ui, cx, BtnKind::Danger, BtnSize::Small, Some("trash-2"), &forget).clicked() {
+                    if widgets::button(
+                        ui,
+                        cx,
+                        BtnKind::Danger,
+                        BtnSize::Small,
+                        Some("trash-2"),
+                        &forget,
+                    )
+                    .clicked()
+                    {
                         us.home_edit = Some(HomeEdit::ConfirmForget(pc.id.clone()));
                     }
                 });
@@ -895,10 +1165,19 @@ fn forget_confirm(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, us: &mut UiStat
         .fill(theme::SURFACE_RAISED)
         .stroke(Stroke::new(1.0, theme::THREAD_STRONG))
         .corner_radius(theme::R_PANEL)
-        .inner_margin(Margin { left: 18, right: 18, top: 16, bottom: 16 });
+        .inner_margin(Margin {
+            left: 18,
+            right: 18,
+            top: 16,
+            bottom: 16,
+        });
     contract::framed(ui, "forget-confirm", frame, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(RichText::new(format!("Forget {}?", pc.name)).font(theme::bold(15.0)).color(theme::INK));
+        ui.label(
+            RichText::new(format!("Forget {}?", pc.name))
+                .font(theme::bold(15.0))
+                .color(theme::INK),
+        );
         ui.add_space(6.0);
         ui.add(
             egui::Label::new(
@@ -914,11 +1193,23 @@ fn forget_confirm(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, us: &mut UiStat
         ui.add_space(14.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if widgets::button(ui, cx, BtnKind::Danger, BtnSize::Normal, Some("trash-2"), "Forget").clicked() {
-                cx.actions.push(Action::Forget { pc_id: pc.id.clone() });
+            if widgets::button(
+                ui,
+                cx,
+                BtnKind::Danger,
+                BtnSize::Normal,
+                Some("trash-2"),
+                "Forget",
+            )
+            .clicked()
+            {
+                cx.actions.push(Action::Forget {
+                    pc_id: pc.id.clone(),
+                });
                 us.home_edit = None;
             }
-            if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Keep").clicked() {
+            if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Keep").clicked()
+            {
                 us.home_edit = None;
             }
         });
@@ -934,12 +1225,20 @@ fn empty_panel(ui: &mut egui::Ui, cx: &mut Cx, rect: Rect) {
     panel_border(&p, rect);
     let inner = Rect::from_min_max(rect.min + vec2(28.0, 28.0), rect.max - vec2(28.0, 22.0));
     place(ui, inner, |ui| {
-        contract::scroll(ui, "empty-panel", egui::ScrollArea::vertical().auto_shrink([false, false]), |ui| {
-            widgets::section_label(ui, "Get started");
-            ui.add_space(8.0);
-            ui.label(RichText::new("Pair your first PC").font(theme::display(size::PANEL_NAME)).color(theme::INK));
-            ui.add_space(6.0);
-            ui.add(
+        contract::scroll(
+            ui,
+            "empty-panel",
+            egui::ScrollArea::vertical().auto_shrink([false, false]),
+            |ui| {
+                widgets::section_label(ui, "Get started");
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Pair your first PC")
+                        .font(theme::display(size::PANEL_NAME))
+                        .color(theme::INK),
+                );
+                ui.add_space(6.0);
+                ui.add(
                 egui::Label::new(
                     RichText::new("BubblePlay needs to run on the PC you want to reach. Pairing introduces this device to it once.")
                         .font(theme::body(size::LEAD))
@@ -947,30 +1246,69 @@ fn empty_panel(ui: &mut egui::Ui, cx: &mut Cx, rect: Rect) {
                 )
                 .wrap(),
             );
-            ui.add_space(18.0);
-            for (n, text) in [
-                ("1", "On the PC, open the BubblePlay tray icon and choose Pair device."),
-                ("2", "Type the PC ID and code here, or paste the pairing link."),
-                ("3", "Check that both show the same number, and allow it at the PC."),
-            ] {
-                ui.horizontal_top(|ui| {
-                    ui.label(RichText::new(n).font(theme::mono(13.0)).color(theme::SIGNAL));
-                    ui.add_space(6.0);
-                    ui.add(egui::Label::new(RichText::new(text).font(theme::body(13.0)).color(theme::INK)).wrap());
+                ui.add_space(18.0);
+                for (n, text) in [
+                    (
+                        "1",
+                        "On the PC, open the BubblePlay tray icon and choose Pair device.",
+                    ),
+                    (
+                        "2",
+                        "Type the PC ID and code here, or paste the pairing link.",
+                    ),
+                    (
+                        "3",
+                        "Check that both show the same number, and allow it at the PC.",
+                    ),
+                ] {
+                    ui.horizontal_top(|ui| {
+                        ui.label(
+                            RichText::new(n)
+                                .font(theme::mono(13.0))
+                                .color(theme::SIGNAL),
+                        );
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(text)
+                                    .font(theme::body(13.0))
+                                    .color(theme::INK),
+                            )
+                            .wrap(),
+                        );
+                    });
+                    ui.add_space(8.0);
+                }
+                ui.add_space(14.0);
+                ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
+                    if widgets::button(
+                        ui,
+                        cx,
+                        BtnKind::Primary,
+                        BtnSize::Large,
+                        Some("plus"),
+                        "Pair a new PC",
+                    )
+                    .clicked()
+                    {
+                        cx.actions.push(Action::StartPairing);
+                    }
+                    ui.add_space(8.0);
+                    if widgets::button(
+                        ui,
+                        cx,
+                        BtnKind::Ghost,
+                        BtnSize::Normal,
+                        None,
+                        "Nobody at the PC? Ask remotely",
+                    )
+                    .clicked()
+                    {
+                        cx.actions.push(Action::StartRemotePairing);
+                    }
                 });
-                ui.add_space(8.0);
-            }
-            ui.add_space(14.0);
-            ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
-                if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("plus"), "Pair a new PC").clicked() {
-                    cx.actions.push(Action::StartPairing);
-                }
-                ui.add_space(8.0);
-                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Normal, None, "Nobody at the PC? Ask remotely").clicked() {
-                    cx.actions.push(Action::StartRemotePairing);
-                }
-            });
-        });
+            },
+        );
     });
 }
 
@@ -980,33 +1318,54 @@ fn vouch_panel(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, req: &VouchRequest
     let p = ui.painter().clone();
     p.rect_filled(rect, 0.0, theme::SURFACE);
     panel_border(&p, rect);
-    p.rect_filled(Rect::from_min_max(rect.min, pos2(rect.min.x + 4.0, rect.max.y)), 0.0, theme::ATTENTION);
+    p.rect_filled(
+        Rect::from_min_max(rect.min, pos2(rect.min.x + 4.0, rect.max.y)),
+        0.0,
+        theme::ATTENTION,
+    );
 
     let inner = Rect::from_min_max(rect.min + vec2(32.0, 26.0), rect.max - vec2(28.0, 22.0));
 
     // Permission switches: local choices until "Numbers match, vouch".
     let perm_key = Id::new(("home_vouch_perms", req.request_id.as_str()));
     let mut on: Vec<bool> = ui.ctx().data_mut(|d| {
-        d.get_temp_mut_or_insert_with(perm_key, || req.permissions.iter().map(|p| p.granted).collect::<Vec<bool>>())
-            .clone()
+        d.get_temp_mut_or_insert_with(perm_key, || {
+            req.permissions
+                .iter()
+                .map(|p| p.granted)
+                .collect::<Vec<bool>>()
+        })
+        .clone()
     });
     if on.len() != req.permissions.len() {
         on = req.permissions.iter().map(|p| p.granted).collect();
     }
     let mut changed = false;
-    let left = countdown(ui, Id::new(("home_vouch_seen", req.request_id.as_str())), req.expires_in_secs);
+    let left = countdown(
+        ui,
+        Id::new(("home_vouch_seen", req.request_id.as_str())),
+        req.expires_in_secs,
+    );
 
     place(ui, inner, |ui| {
-    // Scrolls at the minimum window, where the panel is taller than 520 px.
-    contract::scroll(ui, "vouch", egui::ScrollArea::vertical().auto_shrink([false, false]), |ui| {
-        widgets::pill(ui, PillKind::Warn, &format!("Pairing request · {}", pc.name));
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(format!("Vouch for {}?", req.device_name))
-                .font(theme::display(24.0))
-                .color(theme::INK),
-        );
-        ui.label(
+        // Scrolls at the minimum window, where the panel is taller than 520 px.
+        contract::scroll(
+            ui,
+            "vouch",
+            egui::ScrollArea::vertical().auto_shrink([false, false]),
+            |ui| {
+                widgets::pill(
+                    ui,
+                    PillKind::Warn,
+                    &format!("Pairing request · {}", pc.name),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("Vouch for {}?", req.device_name))
+                        .font(theme::display(24.0))
+                        .color(theme::INK),
+                );
+                ui.label(
             RichText::new(format!(
                 "A new device wants to pair with {}. Only vouch if you know it is yours or someone you trust.",
                 pc.name
@@ -1014,86 +1373,106 @@ fn vouch_panel(ui: &mut egui::Ui, cx: &mut Cx, pc: &RemotePc, req: &VouchRequest
             .font(theme::body(size::LABEL))
             .color(theme::INK_MUTED),
         );
-        ui.add_space(14.0);
-        egui::Grid::new("home_vouch_facts").num_columns(2).spacing([16.0, 9.0]).show(ui, |ui| {
-            fact_key(ui, "Device");
-            fact_text(ui, &req.device_name);
-            ui.end_row();
-            fact_key(ui, "ID");
-            widgets::id_text(ui, &req.device_id, false);
-            ui.end_row();
-        });
-        ui.add_space(14.0);
-        widgets::number(ui, req.number, size::NUMBER);
-        ui.label(
-            RichText::new(format!("The number on {} must match exactly.", req.device_name))
-                .font(theme::body(size::LABEL))
-                .color(theme::INK_MUTED),
-        );
-        ui.add_space(14.0);
+                ui.add_space(14.0);
+                egui::Grid::new("home_vouch_facts")
+                    .num_columns(2)
+                    .spacing([16.0, 9.0])
+                    .show(ui, |ui| {
+                        fact_key(ui, "Device");
+                        fact_text(ui, &req.device_name);
+                        ui.end_row();
+                        fact_key(ui, "ID");
+                        widgets::id_text(ui, &req.device_id, false);
+                        ui.end_row();
+                    });
+                ui.add_space(14.0);
+                widgets::number(ui, req.number, size::NUMBER);
+                ui.label(
+                    RichText::new(format!(
+                        "The number on {} must match exactly.",
+                        req.device_name
+                    ))
+                    .font(theme::body(size::LABEL))
+                    .color(theme::INK_MUTED),
+                );
+                ui.add_space(14.0);
 
-        for (i, perm) in req.permissions.iter().enumerate() {
-            ui.horizontal(|ui| {
-                fact_text(ui, &perm.label);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::switch(ui, on[i]).clicked() {
-                        on[i] = !on[i];
-                        changed = true;
+                for (i, perm) in req.permissions.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        fact_text(ui, &perm.label);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if widgets::switch(ui, on[i]).clicked() {
+                                on[i] = !on[i];
+                                changed = true;
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
+                ui.horizontal(|ui| {
+                    meta_text(ui, "Before sign-in (only at the PC)");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_enabled_ui(false, |ui| {
+                            widgets::switch(ui, false);
+                        });
+                    });
+                });
+
+                ui.add_space(18.0);
+                ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
+                    if widgets::button(
+                        ui,
+                        cx,
+                        BtnKind::Primary,
+                        BtnSize::Large,
+                        Some("user-check"),
+                        "Numbers match, vouch",
+                    )
+                    .clicked()
+                    {
+                        let permissions: Vec<String> = req
+                            .permissions
+                            .iter()
+                            .zip(on.iter())
+                            .filter(|(_, granted)| **granted)
+                            .map(|(perm, _)| perm.key.clone())
+                            .collect();
+                        cx.actions.push(Action::Vouch {
+                            request_id: req.request_id.clone(),
+                            accept: true,
+                            permissions,
+                        });
                     }
+                    if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Deny")
+                        .clicked()
+                    {
+                        cx.actions.push(Action::Vouch {
+                            request_id: req.request_id.clone(),
+                            accept: false,
+                            permissions: Vec::new(),
+                        });
+                    }
+                    // One wrapped paragraph with the time as a mono run, so the
+                    // full stop sits right after it (separate labels left a gap).
+                    let mut job = egui::text::LayoutJob::default();
+                    let fmt = |font: egui::FontId| egui::TextFormat {
+                        font_id: font,
+                        color: theme::INK_FAINT,
+                        ..Default::default()
+                    };
+                    job.append("Request expires in ", 0.0, fmt(theme::body(size::SMALL)));
+                    job.append(&fmt_mmss(left), 0.0, fmt(theme::mono(size::SMALL)));
+                    job.append(
+                        &format!(". You can vouch because {} allows this device to.", pc.name),
+                        0.0,
+                        fmt(theme::body(size::SMALL)),
+                    );
+                    job.halign = Align::Center;
+                    ui.add_space(4.0);
+                    ui.label(job);
                 });
-            });
-            ui.add_space(8.0);
-        }
-        ui.horizontal(|ui| {
-            meta_text(ui, "Before sign-in (only at the PC)");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(false, |ui| {
-                    widgets::switch(ui, false);
-                });
-            });
-        });
-
-        ui.add_space(18.0);
-        ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
-            if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Large, Some("user-check"), "Numbers match, vouch")
-                .clicked()
-            {
-                let permissions: Vec<String> = req
-                    .permissions
-                    .iter()
-                    .zip(on.iter())
-                    .filter(|(_, granted)| **granted)
-                    .map(|(perm, _)| perm.key.clone())
-                    .collect();
-                cx.actions.push(Action::Vouch {
-                    request_id: req.request_id.clone(),
-                    accept: true,
-                    permissions,
-                });
-            }
-            if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Deny").clicked() {
-                cx.actions.push(Action::Vouch {
-                    request_id: req.request_id.clone(),
-                    accept: false,
-                    permissions: Vec::new(),
-                });
-            }
-            // One wrapped paragraph with the time as a mono run, so the
-            // full stop sits right after it (separate labels left a gap).
-            let mut job = egui::text::LayoutJob::default();
-            let fmt = |font: egui::FontId| egui::TextFormat { font_id: font, color: theme::INK_FAINT, ..Default::default() };
-            job.append("Request expires in ", 0.0, fmt(theme::body(size::SMALL)));
-            job.append(&fmt_mmss(left), 0.0, fmt(theme::mono(size::SMALL)));
-            job.append(
-                &format!(". You can vouch because {} allows this device to.", pc.name),
-                0.0,
-                fmt(theme::body(size::SMALL)),
-            );
-            job.halign = Align::Center;
-            ui.add_space(4.0);
-            ui.label(job);
-        });
-    });
+            },
+        );
     });
 
     if changed {
@@ -1113,50 +1492,103 @@ const HEAD_KEY_W: f32 = 56.0;
 /// A field label in the This PC header, in a fixed-width column.
 fn head_key(ui: &mut egui::Ui, text: &str) {
     let (rect, _) = ui.allocate_exact_size(vec2(HEAD_KEY_W, 22.0), Sense::hover());
-    let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
-    contract::text(&mut child, RichText::new(text).font(theme::body(size::SMALL)).color(theme::INK_FAINT), false);
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .max_rect(rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    contract::text(
+        &mut child,
+        RichText::new(text)
+            .font(theme::body(size::SMALL))
+            .color(theme::INK_FAINT),
+        false,
+    );
 }
 
 fn host_panel(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus, rect: Rect) {
     let p = ui.painter().clone();
     p.rect_filled(rect, 0.0, theme::SURFACE);
     panel_border(&p, rect);
-    p.rect_filled(Rect::from_min_max(rect.min, pos2(rect.min.x + 4.0, rect.max.y)), 0.0, theme::MOSS);
+    p.rect_filled(
+        Rect::from_min_max(rect.min, pos2(rect.min.x + 4.0, rect.max.y)),
+        0.0,
+        theme::MOSS,
+    );
 
     let inner = Rect::from_min_max(rect.min + vec2(30.0, 24.0), rect.max - vec2(26.0, 18.0));
     let top = Rect::from_min_max(inner.min, pos2(inner.max.x, inner.min.y + HEAD_H));
     let maint = Rect::from_min_max(pos2(inner.min.x, inner.max.y - 40.0), inner.max);
-    let body = Rect::from_min_max(pos2(inner.min.x, top.max.y + 24.0), pos2(inner.max.x, maint.min.y - 8.0));
-    p.hline(inner.x_range(), top.max.y + 12.0, Stroke::new(1.0, theme::THREAD));
-    p.hline(inner.x_range(), maint.min.y, Stroke::new(1.0, theme::THREAD));
+    let body = Rect::from_min_max(
+        pos2(inner.min.x, top.max.y + 24.0),
+        pos2(inner.max.x, maint.min.y - 8.0),
+    );
+    p.hline(
+        inner.x_range(),
+        top.max.y + 12.0,
+        Stroke::new(1.0, theme::THREAD),
+    );
+    p.hline(
+        inner.x_range(),
+        maint.min.y,
+        Stroke::new(1.0, theme::THREAD),
+    );
 
     // Header: the title with the host actions on its right, then two
     // labelled lines under it: Status (pill and viewer) and PC ID. Each line
     // has its own rect, so nothing runs into anything else at any width.
     contract::boxed(ui, "host-head", top, Layout::top_down(Align::Min), |ui| {
         let title = Rect::from_min_size(top.min, vec2(top.width(), HEAD_TITLE_H));
-        let status = Rect::from_min_size(pos2(top.min.x, title.max.y + 8.0), vec2(top.width(), 22.0));
+        let status =
+            Rect::from_min_size(pos2(top.min.x, title.max.y + 8.0), vec2(top.width(), 22.0));
         let id = Rect::from_min_size(pos2(top.min.x, status.max.y + 4.0), vec2(top.width(), 22.0));
         contract::row_at(ui, "host-head-title", title, |ui| {
-            contract::text(ui, RichText::new("This PC").font(theme::display(32.0)).color(theme::INK), false);
+            contract::text(
+                ui,
+                RichText::new("This PC")
+                    .font(theme::display(32.0))
+                    .color(theme::INK),
+                false,
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| match host.run {
                 HostRun::NotConfigured => {}
                 HostRun::Stopped => {
-                    if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("play"), "Start hosting")
-                        .clicked()
+                    if widgets::button(
+                        ui,
+                        cx,
+                        BtnKind::Secondary,
+                        BtnSize::Normal,
+                        Some("play"),
+                        "Start hosting",
+                    )
+                    .clicked()
                     {
                         cx.actions.push(Action::StartHosting);
                     }
                 }
                 _ => {
                     // Right-to-left: the first button added sits at the far right.
-                    if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("circle-stop"), "Stop hosting")
-                        .clicked()
+                    if widgets::button(
+                        ui,
+                        cx,
+                        BtnKind::Secondary,
+                        BtnSize::Normal,
+                        Some("circle-stop"),
+                        "Stop hosting",
+                    )
+                    .clicked()
                     {
                         cx.actions.push(Action::StopHosting);
                     }
-                    if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, Some("rotate-ccw"), "Restart")
-                        .clicked()
+                    if widgets::button(
+                        ui,
+                        cx,
+                        BtnKind::Secondary,
+                        BtnSize::Normal,
+                        Some("rotate-ccw"),
+                        "Restart",
+                    )
+                    .clicked()
                     {
                         cx.actions.push(Action::RestartHost);
                     }
@@ -1182,26 +1614,35 @@ fn host_panel(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus, rect: Rect) {
     });
 
     place(ui, body, |ui| {
-        contract::scroll(ui, "host-body", egui::ScrollArea::vertical().auto_shrink([false, false]), |ui| {
-            // Two columns from 600 px; below that (the minimum window) the
-            // devices go under the settings, so neither column gets cramped.
-            if ui.available_width() >= 600.0 {
-                ui.spacing_mut().item_spacing.x = 28.0;
-                ui.columns(2, |cols| {
-                    if let [left, right] = cols {
-                        settings_column(left, cx, host);
-                        devices_column(right, cx, host);
-                    }
-                });
-            } else {
-                settings_column(ui, cx, host);
-                ui.add_space(20.0);
-                devices_column(ui, cx, host);
-            }
-        });
+        contract::scroll(
+            ui,
+            "host-body",
+            egui::ScrollArea::vertical().auto_shrink([false, false]),
+            |ui| {
+                // Two columns from 600 px; below that (the minimum window) the
+                // devices go under the settings, so neither column gets cramped.
+                if ui.available_width() >= 600.0 {
+                    ui.spacing_mut().item_spacing.x = 28.0;
+                    ui.columns(2, |cols| {
+                        if let [left, right] = cols {
+                            settings_column(left, cx, host);
+                            devices_column(right, cx, host);
+                        }
+                    });
+                } else {
+                    settings_column(ui, cx, host);
+                    ui.add_space(20.0);
+                    devices_column(ui, cx, host);
+                }
+            },
+        );
     });
 
-    place(ui, Rect::from_min_max(maint.min + vec2(0.0, 8.0), maint.max), |ui| host_footer(ui, cx, host));
+    place(
+        ui,
+        Rect::from_min_max(maint.min + vec2(0.0, 8.0), maint.max),
+        |ui| host_footer(ui, cx, host),
+    );
 }
 
 fn settings_column(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus) {
@@ -1249,10 +1690,23 @@ fn settings_column(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus) {
 
 /// A setting: bold label with its switch on the right (one 20 px line),
 /// the help text under it, wrapped short of the switch column.
-fn setting_line(ui: &mut egui::Ui, cx: &mut Cx, label: &str, help: &str, on: bool, make: fn(bool) -> HostSetting) {
+fn setting_line(
+    ui: &mut egui::Ui,
+    cx: &mut Cx,
+    label: &str,
+    help: &str,
+    on: bool,
+    make: fn(bool) -> HostSetting,
+) {
     ui.add_space(8.0);
     contract::row(ui, "setting", theme::LINE_H, |ui| {
-        contract::text(ui, RichText::new(label).font(theme::bold(size::LABEL)).color(theme::INK), true);
+        contract::text(
+            ui,
+            RichText::new(label)
+                .font(theme::bold(size::LABEL))
+                .color(theme::INK),
+            true,
+        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if widgets::switch(ui, on).clicked() {
                 cx.actions.push(Action::SetHostSetting(make(!on)));
@@ -1262,7 +1716,11 @@ fn setting_line(ui: &mut egui::Ui, cx: &mut Cx, label: &str, help: &str, on: boo
     ui.add_space(2.0);
     ui.scope(|ui| {
         ui.set_max_width((ui.available_width() - 48.0).max(120.0));
-        ui.label(RichText::new(help).font(theme::body(size::HINT)).color(theme::INK_FAINT));
+        ui.label(
+            RichText::new(help)
+                .font(theme::body(size::HINT))
+                .color(theme::INK_FAINT),
+        );
     });
     ui.add_space(8.0);
 }
@@ -1277,7 +1735,16 @@ fn devices_column(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus) {
     contract::row(ui, "devices-head", theme::CONTROL_SM_H, |ui| {
         widgets::section_label(ui, "Paired devices");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("qr-code"), "Pair a device").clicked() {
+            if widgets::button(
+                ui,
+                cx,
+                BtnKind::Ghost,
+                BtnSize::Small,
+                Some("qr-code"),
+                "Pair a device",
+            )
+            .clicked()
+            {
                 cx.actions.push(Action::ShowPairDevice);
             }
         });
@@ -1293,12 +1760,21 @@ fn devices_column(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus) {
 }
 
 fn request_card(ui: &mut egui::Ui, cx: &mut Cx, req: &PairingRequest) {
-    let left = countdown(ui, Id::new(("home_pair_seen", req.request_id.as_str())), req.expires_in_secs);
+    let left = countdown(
+        ui,
+        Id::new(("home_pair_seen", req.request_id.as_str())),
+        req.expires_in_secs,
+    );
     let frame = Frame::NONE
         .fill(theme::SURFACE_RAISED)
         .stroke(Stroke::new(1.0, theme::ATTENTION.gamma_multiply(0.4)))
         .corner_radius(theme::R_FIELD)
-        .inner_margin(Margin { left: 16, right: 14, top: 12, bottom: 12 });
+        .inner_margin(Margin {
+            left: 16,
+            right: 14,
+            top: 12,
+            bottom: 12,
+        });
     let resp = frame.show(ui, |ui| {
         ui.label(
             RichText::new(format!("Pair '{}'?", req.device_name))
@@ -1307,22 +1783,41 @@ fn request_card(ui: &mut egui::Ui, cx: &mut Cx, req: &PairingRequest) {
         );
         widgets::id_text(ui, &req.device_id, false);
         widgets::number(ui, req.number, 26.0);
-        meta_text(ui, &format!("Allow only if {} shows this number.", req.device_name));
+        meta_text(
+            ui,
+            &format!("Allow only if {} shows this number.", req.device_name),
+        );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if widgets::button(ui, cx, BtnKind::Primary, BtnSize::Normal, None, "Allow").clicked() {
-                cx.actions.push(Action::AnswerPairing { request_id: req.request_id.clone(), allow: true });
+                cx.actions.push(Action::AnswerPairing {
+                    request_id: req.request_id.clone(),
+                    allow: true,
+                });
             }
-            if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Deny").clicked() {
-                cx.actions.push(Action::AnswerPairing { request_id: req.request_id.clone(), allow: false });
+            if widgets::button(ui, cx, BtnKind::Secondary, BtnSize::Normal, None, "Deny").clicked()
+            {
+                cx.actions.push(Action::AnswerPairing {
+                    request_id: req.request_id.clone(),
+                    allow: false,
+                });
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                widgets::mono_text(ui, &format!("{} left", fmt_mmss(left)), size::SMALL, theme::INK_FAINT);
+                widgets::mono_text(
+                    ui,
+                    &format!("{} left", fmt_mmss(left)),
+                    size::SMALL,
+                    theme::INK_FAINT,
+                );
             });
         });
     });
     let r = resp.response.rect;
-    ui.painter().rect_filled(Rect::from_min_max(r.min, pos2(r.min.x + 3.0, r.max.y)), 0.0, theme::ATTENTION);
+    ui.painter().rect_filled(
+        Rect::from_min_max(r.min, pos2(r.min.x + 3.0, r.max.y)),
+        0.0,
+        theme::ATTENTION,
+    );
     ui.add_space(12.0);
 }
 
@@ -1330,7 +1825,12 @@ fn answered_card(ui: &mut egui::Ui, cx: &mut Cx, ans: &AnsweredRequest) {
     let frame = Frame::NONE
         .stroke(Stroke::new(1.0, theme::THREAD_STRONG))
         .corner_radius(theme::R_FIELD)
-        .inner_margin(Margin { left: 16, right: 14, top: 12, bottom: 12 });
+        .inner_margin(Margin {
+            left: 16,
+            right: 14,
+            top: 12,
+            bottom: 12,
+        });
     let resp = frame.show(ui, |ui| {
         ui.label(
             RichText::new(format!("Pair '{}'?", ans.request.device_name))
@@ -1350,7 +1850,11 @@ fn answered_card(ui: &mut egui::Ui, cx: &mut Cx, ans: &AnsweredRequest) {
         meta_text(ui, "Closes by itself in a few seconds.");
     });
     let r = resp.response.rect;
-    ui.painter().rect_filled(Rect::from_min_max(r.min, pos2(r.min.x + 3.0, r.max.y)), 0.0, theme::THREAD_STRONG);
+    ui.painter().rect_filled(
+        Rect::from_min_max(r.min, pos2(r.min.x + 3.0, r.max.y)),
+        0.0,
+        theme::THREAD_STRONG,
+    );
     ui.add_space(12.0);
 }
 
@@ -1359,24 +1863,37 @@ fn answered_card(ui: &mut egui::Ui, cx: &mut Cx, ans: &AnsweredRequest) {
 /// Revoke on the right; the ID and the allowed / last-seen detail on the
 /// line below (20).
 fn device_row(ui: &mut egui::Ui, cx: &mut Cx, d: &PairedDevice) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), DEVICE_ROW_H), Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), DEVICE_ROW_H), Sense::hover());
     contract::boxed(ui, "device-row", rect, Layout::top_down(Align::Min), |ui| {
         let top = Rect::from_min_size(rect.min, vec2(rect.width(), theme::CONTROL_SM_H));
-        let sub = Rect::from_min_size(pos2(rect.min.x, top.max.y), vec2(rect.width(), theme::LINE_H));
+        let sub = Rect::from_min_size(
+            pos2(rect.min.x, top.max.y),
+            vec2(rect.width(), theme::LINE_H),
+        );
         // The controls on the right: the may-vouch switch, then Revoke at
         // the far edge. The name side gets what is left and truncates.
         let spacing = ui.spacing().item_spacing.x;
-        let controls_w = widgets::SWITCH_W + spacing + widgets::button_width(ui, BtnSize::Small, None, "Revoke");
+        let controls_w =
+            widgets::SWITCH_W + spacing + widgets::button_width(ui, BtnSize::Small, None, "Revoke");
         let controls = Rect::from_min_max(pos2(top.max.x - controls_w, top.min.y), top.max);
         contract::row_at(ui, "device-controls", controls, |ui| {
             if widgets::switch(ui, d.may_vouch).clicked() {
-                cx.actions.push(Action::SetMayVouch { device_id: d.id.clone(), may_vouch: !d.may_vouch });
+                cx.actions.push(Action::SetMayVouch {
+                    device_id: d.id.clone(),
+                    may_vouch: !d.may_vouch,
+                });
             }
             if widgets::button(ui, cx, BtnKind::Danger, BtnSize::Small, None, "Revoke").clicked() {
-                cx.actions.push(Action::Revoke { device_id: d.id.clone() });
+                cx.actions.push(Action::Revoke {
+                    device_id: d.id.clone(),
+                });
             }
         });
-        let left = Rect::from_min_max(top.min, pos2((controls.min.x - 12.0).max(top.min.x), top.max.y));
+        let left = Rect::from_min_max(
+            top.min,
+            pos2((controls.min.x - 12.0).max(top.min.x), top.max.y),
+        );
         contract::row_at(ui, "device-name", left, |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let vouched = d.vouched_by.as_ref().map(|by| format!("vouched by {by}"));
@@ -1389,7 +1906,13 @@ fn device_row(ui: &mut egui::Ui, cx: &mut Cx, d: &PairedDevice) {
             }
             ui.scope(|ui| {
                 ui.set_max_width((ui.available_width() - tail).max(0.0));
-                contract::text(ui, RichText::new(&d.name).font(theme::bold(size::LABEL)).color(theme::INK), true);
+                contract::text(
+                    ui,
+                    RichText::new(&d.name)
+                        .font(theme::bold(size::LABEL))
+                        .color(theme::INK),
+                    true,
+                );
             });
             if d.connected {
                 widgets::pill(ui, PillKind::Live, "Connected");
@@ -1403,7 +1926,9 @@ fn device_row(ui: &mut egui::Ui, cx: &mut Cx, d: &PairedDevice) {
             widgets::id_text(ui, &d.id, false);
             contract::text(
                 ui,
-                RichText::new(format!("{} · {}", d.allowed, d.last_seen)).font(theme::body(size::HINT)).color(theme::INK_FAINT),
+                RichText::new(format!("{} · {}", d.allowed, d.last_seen))
+                    .font(theme::body(size::HINT))
+                    .color(theme::INK_FAINT),
                 true,
             );
         });
@@ -1418,28 +1943,62 @@ const DEVICE_ROW_H: f32 = 52.0;
 fn host_footer(ui: &mut egui::Ui, cx: &mut Cx, host: &HostStatus) {
     contract::row(ui, "host-foot", theme::CONTROL_SM_H, |ui| {
         let gap = ui.spacing().item_spacing.x;
-        let buttons_w = widgets::button_width(ui, BtnSize::Small, Some("folder-open"), "Open logs folder")
-            + gap
-            + widgets::button_width(ui, BtnSize::Small, Some("undo-2"), "Roll back host");
+        let buttons_w =
+            widgets::button_width(ui, BtnSize::Small, Some("folder-open"), "Open logs folder")
+                + gap
+                + widgets::button_width(ui, BtnSize::Small, Some("undo-2"), "Roll back host");
         let mut job = egui::text::LayoutJob::default();
-        let fmt = |font: egui::FontId| egui::TextFormat { font_id: font, color: theme::INK_FAINT, ..Default::default() };
+        let fmt = |font: egui::FontId| egui::TextFormat {
+            font_id: font,
+            color: theme::INK_FAINT,
+            ..Default::default()
+        };
         job.append("Host build ", 0.0, fmt(theme::body(size::HINT)));
         job.append(&host.build.hash, 0.0, fmt(theme::mono(11.0)));
-        job.append(&format!(": {}", build_word(host.build.state)), 0.0, fmt(theme::body(size::HINT)));
+        job.append(
+            &format!(": {}", build_word(host.build.state)),
+            0.0,
+            fmt(theme::body(size::HINT)),
+        );
         ui.scope(|ui| {
             ui.set_max_width((ui.available_width() - buttons_w - 16.0).max(0.0));
             contract::text(ui, job, true);
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("folder-open"), "Open logs folder").clicked() {
+            if widgets::button(
+                ui,
+                cx,
+                BtnKind::Ghost,
+                BtnSize::Small,
+                Some("folder-open"),
+                "Open logs folder",
+            )
+            .clicked()
+            {
                 cx.actions.push(Action::OpenLogsFolder);
             }
             if host.can_roll_back {
-                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("undo-2"), "Roll back host").clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Ghost,
+                    BtnSize::Small,
+                    Some("undo-2"),
+                    "Roll back host",
+                )
+                .clicked()
+                {
                     cx.actions.push(Action::RollBackHost);
                 }
             } else {
-                widgets::button_disabled(ui, cx, BtnKind::Ghost, BtnSize::Small, Some("undo-2"), "Roll back host");
+                widgets::button_disabled(
+                    ui,
+                    cx,
+                    BtnKind::Ghost,
+                    BtnSize::Small,
+                    Some("undo-2"),
+                    "Roll back host",
+                );
             }
         });
     });
