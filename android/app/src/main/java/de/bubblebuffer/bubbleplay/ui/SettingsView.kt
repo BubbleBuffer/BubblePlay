@@ -298,7 +298,7 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         val lines = ArrayList<String>()
         lines += "BubblePlay for Android ${appVersion()}"
         lines += "Device: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
-        lines += "Server: ${config?.base?.host ?: "invalid"}${if (config?.isLab == true) " (lab run)" else ""}"
+        lines += "Server: ${config?.base?.host ?: "invalid"}"
         lines += "Session: ${if (host.inSession) "running" else "none"}"
         lines += "Codec setting: ${prefs.codec}"
         lines += "Touch: ${if (prefs.directTouch) "direct" else "trackpad"}, pointer speed ${prefs.pointerSpeed}, tap to click ${if (prefs.tapToClick) "on" else "off"}"
