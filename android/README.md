@@ -151,6 +151,10 @@ Cleartext HTTP is allowed only for `10.0.2.2`, `127.0.0.1` and `localhost`. See 
 - **Resume:** the reconnect loop (backoff reset on start, no attempts while in the background), the surface watchdog not counting while signaling is down, and the frozen-frame overlay state (shown on return with a snapshot, cleared on the first presented frame, dropped on disconnect).
 - **Also covered:** clipboard chunking and reassembly, the touch gesture state machine and viewport, input coalescing and text splitting, and IME text reconciliation.
 
+### End-to-end tests
+
+`app/src/test/.../e2e/` runs the real `auth/` package, `PairingClient` and `SessionWire` (the signalling core that `Session` drives) against a real `bp-relay` process from `relay-rs/` and a scripted PC (`FakePc`, built from the same auth primitives). Each test starts the relay on a free 127.0.0.1 port with a temp state dir and kills it afterwards. The tests cover pairing (same comparison number, pair-done, wrong code, pair-denied, a wrong PC proof), an admitted session (peer-joined epoch, handshake with the pinned key, caps with name first, input and cursor as ctl, no plaintext afterwards) and refusals (not admitted, PC key changed, no auth-host within 10 s). Set `BP_RELAY_SERVER_BIN` to the binary (`cargo build -p bp-relay-server --bin bp-relay` in `relay-rs/`) to run them; without it they are skipped. CI sets `BP_E2E_REQUIRED=1`, so there a missing binary fails them.
+
 ## Historical lab measurements (2026-09-30)
 
 These earlier runs describe those devices and builds; they do not establish acceptance of the current APK or Go relay. No input was sent to the desktop. logcat shows the numbers under the `BubblePlaySession` tag, with a `stats` line every 5 s.
