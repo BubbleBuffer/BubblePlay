@@ -205,6 +205,13 @@ class MainActivity : Activity(), SettingsView.Host {
             setTextColor(KeyPalette.CREAM)
             setPadding(0, views.dp(1), 0, 0)
         })
+        val status = PcStatusLine.line(pc.lastSeen, problemText(pc.problem), System.currentTimeMillis(), java.util.TimeZone.getDefault(), statusTexts())
+        text.addView(TextView(this).apply {
+            this.text = status.text
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(if (status.bad) KeyPalette.DANGER else KeyPalette.THREAD_STRONG)
+            setPadding(0, views.dp(1), 0, 0)
+        })
         row.addView(text)
         row.addView(ImageButton(this).apply {
             setImageResource(R.drawable.ic_bar_more)
@@ -215,6 +222,32 @@ class MainActivity : Activity(), SettingsView.Host {
             layoutParams = LinearLayout.LayoutParams(views.dp(48), views.dp(48))
         })
         return row
+    }
+
+    private fun statusTexts(): PcStatusLine.Texts {
+        val timeFormat = android.text.format.DateFormat.getTimeFormat(this)
+        val locale = resources.configuration.locales[0]
+        val dateFormat = java.text.SimpleDateFormat(
+            android.text.format.DateFormat.getBestDateTimePattern(locale, "d MMM"), locale,
+        )
+        return PcStatusLine.Texts(
+            neverConnected = getString(R.string.pcs_status_never),
+            lastSeen = getString(R.string.pcs_status_last_seen),
+            today = getString(R.string.pcs_status_today),
+            withProblem = getString(R.string.pcs_status_with_problem),
+            time = { timeFormat.format(java.util.Date(it)) },
+            date = { dateFormat.format(java.util.Date(it)) },
+        )
+    }
+
+    /** Resolves the stored problem (a string resource name) to text; a detail placeholder is dropped. */
+    private fun problemText(problem: String?): String? {
+        if (problem == null) return null
+        val id = resources.getIdentifier(problem, "string", packageName)
+        if (id == 0) return null
+        val raw = getString(id)
+        val cut = raw.indexOf("%s")
+        return if (cut < 0) raw else raw.substring(0, cut).trimEnd().trimEnd(':').trim().ifEmpty { null }
     }
 
     // ---- PC actions -------------------------------------------------------------------------------

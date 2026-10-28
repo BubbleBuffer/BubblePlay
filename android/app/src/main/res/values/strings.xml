@@ -277,6 +277,10 @@
     <string name="pcs_empty">No PCs yet. On the PC, open BubblePlay in the tray, choose Devices &gt; Pair device, then scan the QR code with this phone\'s camera, or tap Pair a PC and type the PC ID and code.</string>
     <string name="pcs_pair">Pair a PC</string>
     <string name="pcs_actions">PC actions</string>
+    <string name="pcs_status_never">Not connected yet</string>
+    <string name="pcs_status_last_seen">Last seen %1$s</string>
+    <string name="pcs_status_today">today, %1$s</string>
+    <string name="pcs_status_with_problem">%1$s · %2$s</string>
     <string name="pcs_rename">Rename</string>
     <string name="pcs_details">Details</string>
     <string name="pcs_remove">Remove</string>
