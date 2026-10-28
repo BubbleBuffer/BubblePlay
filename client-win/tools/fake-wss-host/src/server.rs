@@ -521,6 +521,10 @@ impl Hub {
         }
         self.offer_fingerprint = phase2::sdp_fingerprint(&sdp);
         self.answer_fingerprint = None;
+        if self.offer_fingerprint.is_none() {
+            // Decision 23: an offer without a sha-256 fingerprint cannot be bound.
+            return self.refuse_unbindable_offer();
+        }
         self.end_rtc("superseded");
         let Some((knobs, fps, sources)) = self
             .rtc
@@ -855,6 +859,26 @@ impl Hub {
 
     /// The PC's `auth-bind`, after its answer: signed over the answer's fingerprint, then
     /// the offer's.
+    /// Decision 23: a `ctl` error `dtls-bind-required`, then the signalling viewer is closed.
+    fn refuse_unbindable_offer(&mut self) {
+        let Some(signal) = self.signal else { return };
+        let error = serde_json::json!({
+            "type": "error",
+            "code": "dtls-bind-required",
+            "message": "the offer has no sha-256 DTLS fingerprint",
+        })
+        .to_string();
+        // Sealed directly: a plain `error` would read as the relay's own.
+        let sealed = match self.link.as_mut() {
+            Some(Link::Open(channel)) => channel.seal_text(&error).ok(),
+            _ => None,
+        };
+        if let (Some(sealed), Some(conn)) = (sealed, self.conns.get(&signal)) {
+            let _ = conn.out.try_send(Outbound::Text(sealed));
+        }
+        self.fail_signal(signal, "dtls-bind-required");
+    }
+
     fn send_pc_bind(&mut self, id: u64) {
         let (Some(local), Some(remote)) = (
             self.answer_fingerprint.clone(),

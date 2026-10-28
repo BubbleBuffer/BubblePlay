@@ -47,12 +47,22 @@ pub fn is_plain(text: &str) -> bool {
     }
 }
 
-/// The value of the first `a=fingerprint:` line of an SDP, e.g. `sha-256 AB:CD:...`.
+/// The DTLS fingerprint to bind (decision 23): the value of the SDP's `a=fingerprint:` line
+/// whose algorithm is `sha-256` (any case; other algorithms are skipped), normalised to
+/// `sha-256 AB:CD:...`. `None` when the SDP lists no sha-256 fingerprint. Always read from
+/// the SDP text that was sent or received, never rebuilt from the WebRTC stack.
 pub fn sdp_fingerprint(sdp: &str) -> Option<String> {
-    sdp.lines()
-        .find_map(|line| line.trim_end().strip_prefix("a=fingerprint:"))
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+    let value = sdp
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("a=fingerprint:"))
+        .map(str::trim)
+        .find(|value| {
+            value
+                .split_whitespace()
+                .next()
+                .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case("sha-256"))
+        })?;
+    Some(value.to_owned()) // D23: crate normaliser (bp_device_key::phase2) replaces this pass-through
 }
 
 /// The PC's side of one handshake, from `auth-host` until `auth-finish`.
@@ -604,9 +614,10 @@ mod tests {
     }
 
     #[test]
-    fn the_sdp_fingerprint_is_the_first_a_fingerprint_line() {
-        let sdp = "v=0\r\na=setup:passive\r\na=fingerprint:sha-256 AB:CD\r\na=fingerprint:x\r\n";
+    fn the_sdp_fingerprint_is_the_sha_256_line() {
+        let sdp = "v=0\r\na=setup:passive\r\na=fingerprint:sha-1 00:11\r\na=fingerprint:sha-256 AB:CD\r\na=fingerprint:x\r\n";
         assert_eq!(sdp_fingerprint(sdp).as_deref(), Some("sha-256 AB:CD"));
+        assert_eq!(sdp_fingerprint("v=0\r\na=fingerprint:sha-1 00:11\r\n"), None);
         assert_eq!(sdp_fingerprint("v=0\r\n"), None);
     }
 }
