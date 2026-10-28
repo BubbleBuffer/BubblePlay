@@ -285,16 +285,50 @@ impl TrustedDevices {
     }
 }
 
-/// Makes a device name safe to store and show: control characters are removed, the rest is
-/// trimmed and cut to [`NAME_MAX_CHARS`] characters. An empty result becomes [`UNNAMED_DEVICE`].
+/// Makes a device name safe to store and show: control characters (Cc) and format characters
+/// (Cf: bidi overrides and isolates, zero-width characters, ...) are removed, the rest is trimmed
+/// and cut to [`NAME_MAX_CHARS`] characters. An empty result becomes [`UNNAMED_DEVICE`].
 pub fn sanitize_name(raw: &str) -> String {
-    let stripped: String = raw.chars().filter(|ch| !ch.is_control()).collect();
+    let stripped: String = raw
+        .chars()
+        .filter(|&ch| !ch.is_control() && !is_format_char(ch))
+        .collect();
     let truncated: String = stripped.trim().chars().take(NAME_MAX_CHARS).collect();
     if truncated.is_empty() {
         UNNAMED_DEVICE.to_owned()
     } else {
         truncated
     }
+}
+
+/// Unicode general category Cf (format characters), Unicode 16.0. The table is small and
+/// stable, so it is kept here instead of pulling in a Unicode data crate.
+fn is_format_char(ch: char) -> bool {
+    const CF: &[(u32, u32)] = &[
+        (0x00AD, 0x00AD),
+        (0x0600, 0x0605),
+        (0x061C, 0x061C),
+        (0x06DD, 0x06DD),
+        (0x070F, 0x070F),
+        (0x0890, 0x0891),
+        (0x08E2, 0x08E2),
+        (0x180E, 0x180E),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x2064),
+        (0x2066, 0x206F),
+        (0xFEFF, 0xFEFF),
+        (0xFFF9, 0xFFFB),
+        (0x110BD, 0x110BD),
+        (0x110CD, 0x110CD),
+        (0x13430, 0x1343F),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0001, 0xE0001),
+        (0xE0020, 0xE007F),
+    ];
+    let code = u32::from(ch);
+    CF.iter().any(|&(low, high)| (low..=high).contains(&code))
 }
 
 /// The canonical ID of a public key given as unpadded base64url. The key must be 32 bytes and
@@ -799,6 +833,16 @@ mod tests {
         assert_eq!(sanitize_name(""), UNNAMED_DEVICE);
         let long = "é".repeat(100);
         assert_eq!(sanitize_name(&long).chars().count(), NAME_MAX_CHARS);
+        // Bidi overrides and isolates, zero-width characters and the BOM are format characters.
+        assert_eq!(sanitize_name("\u{202E}Phone\u{202C}"), "Phone");
+        assert_eq!(
+            sanitize_name("Lap\u{200B}top\u{2066}\u{2069}\u{200D}\u{FEFF}"),
+            "Laptop"
+        );
+        assert_eq!(sanitize_name(" \u{202E} \u{200B} "), UNNAMED_DEVICE);
+        // Stripping happens before the cut, so format characters do not use up the 64.
+        let padded = format!("{}{}", "\u{200B}".repeat(10), "a".repeat(100));
+        assert_eq!(sanitize_name(&padded), "a".repeat(NAME_MAX_CHARS));
 
         let dir = TestDir::new("names");
         let mut list = load(dir.file()).expect("load");
