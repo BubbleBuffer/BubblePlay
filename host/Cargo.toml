@@ -7,6 +7,7 @@ license = "AGPL-3.0-or-later"
 build = "build.rs"
 
 [dependencies]
+bp-device-key = { path = "../crates/bp-device-key", features = ["phase2", "keygen"] }
 windows-capture = "2.0.0"
 nvidia-video-codec-sdk = "0.4.0"
 # Select CUDA bindings before the SDK's auto-detection feature can invoke nvcc.

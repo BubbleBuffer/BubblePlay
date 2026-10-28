@@ -16,6 +16,7 @@ mod clipboard_worker;
 pub mod content_class;
 pub mod desktop_session;
 pub mod device_key;
+pub mod dk_session;
 pub mod encode;
 pub(crate) mod encoder_reconfigure;
 pub mod feedback_roi;
