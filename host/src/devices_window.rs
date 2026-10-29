@@ -734,7 +734,7 @@ impl Model {
             Ctl::PairPcIdLabel => "PC ID".to_owned(),
             Ctl::PairPcId => self.pair.as_ref().map(|pair| pair.pc_id.clone())?,
             Ctl::Instruction => format!(
-                "Scan with the BubblePlay app, or open {}/pair in a browser and enter the PC ID and code.",
+                "Scan with your phone camera, or open {}/pair in a browser and enter the PC ID and code.",
                 self.relay_host
             ),
             Ctl::Countdown => self.countdown_text(now),
