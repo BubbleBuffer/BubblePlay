@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_SOURCE_URL, loadSourceLink, sourceURL } from "../public/settings.js";
+import { DEFAULT_SOURCE_URL, sourceURL } from "../public/settings.js";
 
 test("About source URL accepts operator sources and refuses executable schemes", async () => {
   const modified = "https://example.org/modified-source";
@@ -9,13 +9,4 @@ test("About source URL accepts operator sources and refuses executable schemes",
     for (const value of [undefined, "", "javascript:alert(1)", "file:///tmp/source", "https://user:password@example.org/"])
       assert.equal(normalize(value), DEFAULT_SOURCE_URL);
   }
-  const link = {};
-  await loadSourceLink(link, async (path, options) => {
-    assert.equal(path, "/__auth/methods");
-    assert.equal(options.cache, "no-store");
-    return Response.json({ sourceURL: modified });
-  });
-  assert.equal(link.href, modified);
-  await loadSourceLink(link, async () => { throw new Error("offline"); });
-  assert.equal(link.href, DEFAULT_SOURCE_URL);
 });

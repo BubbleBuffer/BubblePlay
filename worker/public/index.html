@@ -59,6 +59,7 @@
 </style>
 <link rel="stylesheet" href="/bubbleplay.css">
 <link rel="stylesheet" href="/devicekey-ui.css">
+<link rel="stylesheet" href="/dk-gate.css">
 </head>
 <body class="session-page mode-work">
 <!-- Session strip: docked top row (desktop, ≤32 px) or docked bottom bar (touch).
@@ -174,8 +175,8 @@
   </section>
   <section class="settings-section" aria-labelledby="settings-access">
     <h3 id="settings-access">Browser access</h3>
-    <p class="setting-help">Sign out keeps this browser approved. Forgetting it requires new browser approval.</p>
-    <div class="settings-actions"><button id="logout-session" type="button">Sign out</button><button id="forget-browser" type="button">Forget this browser</button></div>
+    <p class="setting-help">Lock keeps this browser approved and asks for the key again. Forgetting it requires new browser approval.</p>
+    <div class="settings-actions"><button id="switch-pc" type="button">Switch PC</button><button id="lock-key" type="button">Lock</button><button id="forget-browser" type="button">Forget this browser</button></div>
     <p id="session-action-status" class="setting-help" role="status" aria-live="polite"></p>
   </section>
   <section class="settings-section" aria-labelledby="settings-diagnostics">
@@ -214,9 +215,6 @@
     : crypto.randomUUID();
   const state = {
     attemptId,
-    runId: uuid.test(search.get("labRun") || "") ? search.get("labRun").toLowerCase() : null,
-    compatibilityId: search.get("labCompat") || null,
-    receiverBuild: null,
     seq: 0,
   };
   const normalizeDetail = detail => Object.fromEntries(Object.entries(detail || {}).slice(0, 16).map(([key, value]) => {
@@ -228,9 +226,6 @@
     const payload = {
       schemaVersion: 1,
       attemptId: state.attemptId,
-      runId: state.runId,
-      compatibilityId: state.compatibilityId,
-      receiverBuild: state.receiverBuild,
       seq: ++state.seq,
       atMs: Date.now(),
       stage,
@@ -246,11 +241,6 @@
   };
   window.__bubbleplayDebugTrace = {
     attemptId: state.attemptId,
-    configure({ runId, compatibilityId, receiverBuild }) {
-      if (runId === null || uuid.test(runId || "")) state.runId = runId?.toLowerCase() ?? null;
-      state.compatibilityId = compatibilityId || null;
-      state.receiverBuild = receiverBuild || null;
-    },
     trace,
   };
   addEventListener("error", event => trace("window-error", {
@@ -263,18 +253,9 @@
     pathname: location.pathname,
     transport: search.get("transport") || "auto",
     decoderPath: search.get("decoderPath") || "native",
-    hasLabRun: state.runId !== null,
   });
 })();
 </script>
-<script type="module" src="/receiver.js"></script>
-<script type="module">
-  import { loadSourceLink } from "/settings.js";
-  loadSourceLink(document.getElementById("about-source"));
-</script>
-<script type="module">
-  import { installDeviceKeyUi } from "/devicekey-ui.js";
-  installDeviceKeyUi();
-</script>
+<script type="module" src="/dk-app.js"></script>
 </body>
 </html>

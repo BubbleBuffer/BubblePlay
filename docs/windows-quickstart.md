@@ -40,9 +40,9 @@ Windows may warn about the unsigned binaries. The candidate does not bypass thos
 
 1. Confirm the BubblePlay tray is running on the host PC.
 2. Open your relay's HTTPS address in the receiver browser.
-3. Approve the browser in the ntfy notification.
+3. Approve the browser in the ntfy notification, then create or unlock your device key ([browser viewer](browser-viewer.md)).
 4. Pair this device. In the tray, open **Devices** and click **Pair device**. Scan the QR code it shows with the phone camera. Check that the 6-digit number on the phone matches the one on the PC, then approve the request on the PC.
-5. Wait for the desktop stream.
+5. Pick the PC and wait for the desktop stream.
 
 The Files menu uploads files into the host user's `Downloads\BubblePlay`. Desktop drag/drop can pass virtual files to a compatible Windows drop target directly. Native cursor shapes and clipboard synchronization work while input is ready. Image clipboard writes may need the browser's clipboard permission or the existing clipboard retry action.
 

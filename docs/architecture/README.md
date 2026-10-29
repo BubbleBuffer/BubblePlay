@@ -10,6 +10,7 @@ BubblePlay has a native Windows host, a relay that serves the browser receiver, 
 | Per-user tray | [`host/src/bin/bubbleplay_tray.rs`](../../host/src/bin/bubbleplay_tray.rs), [`host/src/tray/`](../../host/src/tray) | Host supervision, settings, startup and rollback |
 | Optional admin-input helper | [`host/src/admin_agent/`](../../host/src/admin_agent) | Validated SendInput through a restricted local pipe for elevated apps |
 | Rust relay | [`relay-rs/server/`](../../relay-rs/server), [`relay-rs/core/`](../../relay-rs/core), [`relay-rs/worker/`](../../relay-rs/worker) | The only relay: site gate with ntfy approval, signaling and packet relay; native server (Docker) and Cloudflare Workers adapter |
+| Browser viewer | [`worker/public/dk-app.js`](../../worker/public/dk-app.js), [`dk-session.js`](../../worker/public/dk-session.js), [`devicekey-store.js`](../../worker/public/devicekey-store.js) | Device-key unlock, pairing, paired-PC list and session handshake ([browser viewer](../browser-viewer.md)) |
 | Browser receiver | [`worker/public/receiver.js`](../../worker/public/receiver.js), [`transport.js`](../../worker/public/transport.js), [`media-v4.js`](../../worker/public/media-v4.js) | Session lifecycle, decode/presentation, input and media feedback; assets served by the relay |
 | Android receiver | [`android/app/src/main/java/de/bubblebuffer/bubbleplay/`](../../android/app/src/main/java/de/bubblebuffer/bubbleplay) | Native Kotlin WSS receiver, MediaCodec and touch input |
 

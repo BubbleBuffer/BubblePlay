@@ -145,6 +145,42 @@ jobs:
       - name: Container build
         run: docker build -f relay-rs/Dockerfile -t bubbleplay-relay-rs:check .
 
+  browser-e2e:
+    runs-on: [self-hosted, build01]
+    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          # Pinned for this job only, as in the relay-rs job: runners share RUSTUP_HOME.
+          echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: relay-rs -> target
+          # Runners on build01 share one ~/.cargo, so the cache must not clean ~/.cargo/bin.
+          cache-bin: "false"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - run: npm --prefix worker ci --ignore-scripts
+      - name: Build the relay binary
+        working-directory: relay-rs
+        run: cargo build --locked -p bp-relay-server --bin bp-relay
+      - name: Browser viewer against the native relay
+        run: node --test worker/test-e2e/*.test.mjs
+
   host:
     name: Host checks (windows-latest)
     runs-on: windows-latest

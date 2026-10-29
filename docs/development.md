@@ -215,7 +215,7 @@ user (local DXGI capture + SendInput). The relay token reaches the host only as
   the pointer on the top edge shows a handle that brings it back.
 - Monitors, Shortcuts, Files, Keys, Arrows and More open small popovers that
   close on an outside click or Esc. Settings (quality, keyboard lock, scroll
-  speed, pointer mode, default monitor, sign out, diagnostics, about) is a
+  speed, pointer mode, default monitor, Switch PC, Lock, Forget this browser, diagnostics, about) is a
   slide-over saved in `localStorage` under `bubbleplay.settings`.
 - Behavior and implementation: [session UI](architecture/session-ui.md).
 

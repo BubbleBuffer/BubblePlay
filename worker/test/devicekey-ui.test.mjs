@@ -1,48 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  OFFER_DISMISSED_KEY, defaultKeyLabel, deviceKeyErrorMessage, exportFileName, passphraseValue,
-  readOfferDismissed, shouldOfferKey, summarizeKeyFile, writeOfferDismissed,
+  defaultKeyLabel, deviceKeyErrorMessage, exportFileName, passphraseValue, summarizeKeyFile,
 } from "../public/devicekey-ui.js";
-
-function memoryStorage() {
-  const items = new Map();
-  return {
-    items,
-    getItem: key => (items.has(key) ? items.get(key) : null),
-    setItem: (key, value) => { items.set(key, String(value)); },
-  };
-}
-
-const throwingStorage = {
-  getItem() { throw new DOMException("blocked", "SecurityError"); },
-  setItem() { throw new DOMException("quota", "QuotaExceededError"); },
-};
-
-test("the first-open offer shows only with no stored key, no dismissal and no stream", () => {
-  assert.equal(shouldOfferKey({ hasKey: false, dismissed: false }), true);
-  assert.equal(shouldOfferKey({ hasKey: true, dismissed: false }), false, "a stored key hides the offer");
-  assert.equal(shouldOfferKey({ hasKey: false, dismissed: true }), false, "Not now hides the offer for good");
-  assert.equal(shouldOfferKey({ hasKey: false, dismissed: false, streaming: true }), false, "never over an active stream");
-});
-
-test("Not now is remembered on this browser through its storage flag", () => {
-  const storage = memoryStorage();
-  assert.equal(readOfferDismissed(storage), false, "a fresh browser has not dismissed the offer");
-  assert.equal(writeOfferDismissed(storage), true);
-  assert.equal(storage.items.get(OFFER_DISMISSED_KEY), "1");
-  assert.equal(readOfferDismissed(storage), true);
-  assert.equal(shouldOfferKey({ hasKey: false, dismissed: readOfferDismissed(storage) }), false);
-});
-
-test("storage that throws or is missing counts as not dismissed and never throws", () => {
-  assert.equal(readOfferDismissed(throwingStorage), false);
-  assert.equal(writeOfferDismissed(throwingStorage), false, "a refused write is reported, not thrown");
-  assert.equal(readOfferDismissed(null), false);
-  assert.equal(writeOfferDismissed(null), false);
-  assert.equal(shouldOfferKey({ hasKey: false, dismissed: readOfferDismissed(throwingStorage) }), true,
-    "without a working flag the offer still shows on the next load");
-});
 
 test("export file name uses the label, falls back to the ID, and drops characters Windows rejects", () => {
   assert.equal(exportFileName("Chrome on Windows", "B7QK-2M9X-H4PD-R8TN"), "Chrome on Windows.bpkey");

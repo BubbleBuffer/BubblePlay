@@ -17,14 +17,6 @@ export function sourceURL(value) {
   return DEFAULT_SOURCE_URL;
 }
 
-export async function loadSourceLink(link, fetcher = globalThis.fetch) {
-  link.href = DEFAULT_SOURCE_URL;
-  try {
-    const response = await fetcher("/__auth/methods", { cache: "no-store" });
-    if (response.ok) link.href = sourceURL((await response.json()).sourceURL);
-  } catch { /* offline: retain the default */ }
-}
-
 export const DEFAULT_SETTINGS = Object.freeze({
   version: SETTINGS_VERSION,
   quality: "high",

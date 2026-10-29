@@ -1,13 +1,13 @@
-// Device-key screens for the browser viewer: the first-open offer, the settings entry and the
-// create, import, unlock, export, change-passphrase and remove dialogs. Key format and crypto:
-// devicekey.js. Storage: devicekey-store.js. Spec: docs/architecture/device-keys.md.
-// Phase 1 keys are optional: nothing here blocks the connection, and nothing is sent to the relay.
+// Device-key screens for the browser viewer: the settings entry and the create, import, export,
+// change-passphrase and remove dialogs. Key format and crypto: devicekey.js. Storage:
+// devicekey-store.js. Spec: docs/architecture/device-keys.md. A key is mandatory: dk-app.js unlocks
+// it before anything connects and opens the create/import dialogs from here through the returned
+// createKey/importKey.
 // The unlocked key is never kept. Passphrases are read from inputs, and the dialog that held them
 // is removed when it closes (JavaScript strings cannot be wiped, so references are dropped).
 import { createKeyFile, parseKeyFile, rewrapKeyFile } from "./devicekey.js";
 import { createDeviceKeyStore } from "./devicekey-store.js";
 
-export const OFFER_DISMISSED_KEY = "bubbleplay.deviceKeyOfferDismissed";
 const KEY_EXTENSION = ".bpkey";
 const BROWSER_LABEL = "Browser";
 const GENERIC_ERROR = "Something went wrong.";
@@ -28,31 +28,6 @@ const ERROR_TEXT = Object.freeze({
 
 let sequence = 0;
 const nextId = prefix => `${prefix}-${++sequence}`;
-
-/** The offer shows only when no key is stored and the offer was not dismissed on this browser. */
-export function shouldOfferKey({ hasKey, dismissed, streaming = false }) {
-  return !hasKey && !dismissed && !streaming;
-}
-
-/** Reads the "Not now" flag. A storage that throws or is missing counts as not dismissed. */
-export function readOfferDismissed(storage) {
-  try {
-    return storage?.getItem(OFFER_DISMISSED_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-/** Records "Not now". Returns false when the browser refused the write; the card still hides for this page. */
-export function writeOfferDismissed(storage) {
-  if (!storage) return false;
-  try {
-    storage.setItem(OFFER_DISMISSED_KEY, "1");
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /** Default label such as "Chrome on Windows", from the user agent string. */
 export function defaultKeyLabel(userAgent = "") {
@@ -112,14 +87,6 @@ export function summarizeKeyFile(file) {
   };
 }
 
-function browserLocalStorage() {
-  try {
-    return globalThis.localStorage ?? null;
-  } catch {
-    return null;
-  }
-}
-
 function passphraseProblem(values, required) {
   if (required && !values.passphrase) return "Enter a passphrase.";
   if (values.passphrase !== values.confirm) return "The passphrases do not match.";
@@ -135,7 +102,6 @@ function newPassphraseFields() {
 
 export async function installDeviceKeyUi({
   doc = globalThis.document,
-  storage = browserLocalStorage(),
   store = createDeviceKeyStore(),
   userAgent = globalThis.navigator?.userAgent ?? "",
   clipboard = globalThis.navigator?.clipboard ?? null,
@@ -167,14 +133,6 @@ export async function installDeviceKeyUi({
   root.addEventListener("keyup", event => event.stopPropagation());
   doc.body.append(root);
 
-  const offer = make("section", { id: "devicekey-offer", class: "dk-offer", "aria-label": "Device key", hidden: true },
-    make("p", { class: "dk-offer-copy" }, "Set up a device key for this browser. BubblePlay will use it to connect instead of the password."),
-    make("div", { class: "dk-actions" },
-      make("button", { type: "button", class: "dk-primary", on: { click: () => offerAction(createFlow) } }, "Create key"),
-      make("button", { type: "button", on: { click: () => offerAction(importFlow) } }, "Import key"),
-      make("button", { type: "button", on: { click: dismissOffer } }, "Not now")));
-  root.append(offer);
-
   const content = make("div", { class: "dk-settings-content" });
   const statusLine = make("p", { class: "setting-help dk-status", role: "status", "aria-live": "polite" });
   mount.replaceChildren(content, statusLine);
@@ -203,19 +161,6 @@ export async function installDeviceKeyUi({
       setStatus(deviceKeyErrorMessage(error), "error");
       return false;
     }
-  }
-
-  function hideOffer() {
-    offer.hidden = true;
-  }
-
-  function dismissOffer() {
-    writeOfferDismissed(storage);
-    hideOffer();
-  }
-
-  async function offerAction(flow) {
-    if (await act(flow)) hideOffer();
   }
 
   function saveFile(name, text) {
@@ -623,7 +568,7 @@ export async function installDeviceKeyUi({
     }
     if (!entry) {
       content.append(
-        help("This browser has no device key. A key is optional for now."),
+        help("This browser has no device key."),
         make("div", { class: "dk-actions" },
           actionButton("Create key", createFlow, "dk-primary"),
           actionButton("Import key", importFlow)));
@@ -661,8 +606,7 @@ export async function installDeviceKeyUi({
   }
   loaded = true;
   renderSettings();
-  if (!loadError && shouldOfferKey({ hasKey: entry !== null, dismissed: readOfferDismissed(storage) })) {
-    offer.hidden = false;
-  }
-  return { offerShown: () => !offer.hidden };
+  // For the device-key gate: each resolves true once a key is stored, false when cancelled.
+  // Errors propagate to the caller, which shows them.
+  return { createKey: () => createFlow(), importKey: () => importFlow() };
 }
