@@ -7,5 +7,8 @@
     "test": "node --test test/*.test.mjs",
     "check:syntax": "node ../tools/check.mjs syntax",
     "check": "node ../tools/check.mjs client"
+  },
+  "devDependencies": {
+    "ws": "^8.21.3"
   }
 }
