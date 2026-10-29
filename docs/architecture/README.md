@@ -14,11 +14,11 @@ BubblePlay has a native Windows host, a relay that serves the browser receiver, 
 | Browser receiver | [`worker/public/receiver.js`](../../worker/public/receiver.js), [`transport.js`](../../worker/public/transport.js), [`media-v4.js`](../../worker/public/media-v4.js) | Session lifecycle, decode/presentation, input and media feedback; assets served by the relay |
 | Android receiver | [`android/app/src/main/java/de/bubblebuffer/bubbleplay/`](../../android/app/src/main/java/de/bubblebuffer/bubbleplay) | Native Kotlin WSS receiver, MediaCodec and touch input |
 
-The Rust tree also retains older service/privileged-capture binaries, probes and stream-lab helpers. Those are development paths and are excluded from the public Windows ZIP. The admin-input helper above is the optional packaged component. Private command-execution companion packages are outside the public product.
+Development-only tools in the Rust tree are excluded from the public Windows ZIP. The admin-input helper above is the optional packaged component. Private command-execution companion packages are outside the public product.
 
 ## Transports and contracts
 
-The `/host-ws` and `/ws` sockets carry registration, session signaling, desktop state, cursor/clipboard controls and input. WebRTC carries media directly or through separately configured TURN. WSS uses `/host-media-ws` and `/media-ws`, paired by the current session epoch; files have separate `/host-file-ws` and `/file-ws` sockets. A reconnect or changed epoch invalidates old sockets and input state.
+The `/host-ws` and `/ws` sockets carry registration and the auth and pairing handshake. After that, session signaling, desktop state, cursor/clipboard controls and input travel inside `ctl`. WebRTC carries media directly or through separately configured TURN. WSS uses `/host-media-ws` and `/media-ws`, paired by the current session epoch; files have separate `/host-file-ws` and `/file-ws` sockets. A reconnect or changed epoch invalidates old sockets and input state.
 
 WSS v4 sends one encoded access unit per binary message, with a 28-byte header describing codec, generation, sequence, capture time and dimensions. The receiver returns frame ACKs and keyframe requests on that media socket. Generation/sequence gates prevent stale deltas from being presented after recovery or a monitor switch. Host feedback controls capture/encoding admission instead of accumulating a queue of old frames.
 
@@ -45,6 +45,6 @@ See [host performance](performance.md) for the event-driven producer, damage/til
 
 See [encoders](encoders.md) for backend selection, the shared bitstream contract, CPU mode and its diagnostic knobs.
 
-The browser uses small modules for settings, session chrome, monitor selection, cursor translation, clipboard and files. The host separates capture adapters, encoding, session policy and telemetry from its main event loop. The lab separates process/browser orchestration from lifecycle and measurement logic.
+The browser uses small modules for settings, session chrome, monitor selection, cursor translation, clipboard and files. The host separates capture adapters, encoding, session policy and telemetry from its main event loop.
 
 Deterministic fixture tests establish packet and state contracts. They do not establish capture-driver behavior, elevated input, physical display output or a deployed relay's interoperability. Use the [development guide](../development.md) for build commands, and [release status](../release-status.md) for remaining public-release checks.

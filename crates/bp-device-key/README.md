@@ -30,7 +30,7 @@ later the host can share one implementation. No Windows dependencies; it builds 
   kind is left to the caller (the crate has no JSON parser).
 
 Docs: `docs/architecture/device-keys.md`. Contract fixture: `fixtures/device-keys-contract.json`,
-checked by `tests/contract.rs` (the Go relay and the host check the same file).
+checked by `tests/contract.rs` (the Node test in `tools/tests/` checks the same file).
 
 ## Features
 

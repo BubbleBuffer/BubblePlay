@@ -4,7 +4,7 @@ Status: stack A approved 2026-10-13. Decode route: Media Foundation (spike 2026-
 
 ## Current state
 
-Step 6 adds live monitor selection and Work/Game controls over the existing signaling `media-control` messages on both WSS and WebRTC. Monitor selection exposes pending and error state to the picker, and WebRTC keeps its peer and track through a switch, reopening admission only after the new generation's admitted RTP timestamp. Live quality and audio actions are unavailable; the mock keeps them available. Follow is not offered.
+Step 6 adds live monitor selection and Work/Game controls over `media-control` messages on both WSS and WebRTC, sent as `ctl` kinds on the authenticated control channel. Monitor selection exposes pending and error state to the picker, and WebRTC keeps its peer and track through a switch, reopening admission only after the new generation's admitted RTP timestamp. Live quality and audio actions are unavailable; the mock keeps them available. Follow is not offered.
 
 The first monitor list applies `RemotePc::default_monitor` once per session, and a user pick updates that field in memory. Persistence remains a known gap until the saved-devices store is implemented; step 6 introduces no storage format.
 
@@ -155,7 +155,7 @@ Backlog: MF software H.264 decode fallback for adapters without `ID3D11VideoDevi
 
 A native Windows viewer that feels clearly better than the browser receiver: low latency and smooth frame pacing, hardware decode, full keyboard capture (Win, Alt+Tab, Ctrl+Esc go to the remote PC while focused, with an obvious escape chord), proper pointer capture, a fast polished UI (connect screen, saved devices, in-session chrome) and audio.
 
-v1 scope: today's login and approval flows, video, mouse/keyboard/scroll input, audio, monitor selection, and session chrome matching [session UI](session-ui.md). File transfer, clipboard and the rest come after v1.
+v1 scope: device-key pairing and the approval wait, video, mouse/keyboard/scroll input, audio, monitor selection, and session chrome matching [session UI](session-ui.md). File transfer, clipboard and the rest come after v1.
 
 Constraint: no host, relay or protocol changes. The client speaks exactly what the browser receiver speaks.
 
@@ -169,7 +169,7 @@ Learned from `worker/public/`, `relay/` and `worker/src/` (both relays deleted a
   - **WebRTC** (browser default in auto mode): the client offers recvonly HEVC + H.264 video and Opus audio, and opens two data channels, `input-control` (ordered, reliable) and `input-motion` (unordered, no retransmits). The host is str0m 0.21, prefers HEVC, gathers host and server-reflexive candidates only (no TURN client on the host side).
   - **WSS v4**: `/media-ws?pc=<id>&epoch=E`, hello `media-viewer` with the ticket. One Annex-B access unit per binary message behind a 28-byte `BPV4` header; the client ACKs every frame and asks for keyframes on gaps. Audio rides the same socket as BPA1 packets (one 10 ms Opus frame each) when `start` carries `audio:1`. Input goes as binary on `/ws`. Traffic passes through the relay.
 - **Input.** Little-endian binary packets from `fixtures/input-contract.json`: set-1 scan codes with an E0 flag (type 13), relative motion with wheel (7), absolute position (8), buttons-at (9), release-all (6), with one wrapping u16 sequence per epoch. Cursor state and cursor kind come back as packets 128 and 129.
-- **Monitor switch.** `media-control` `monitor`. The browser's in-place switch needs `requestVideoFrameCallback` RTP timestamps; a native client can match the admitted `rtpTimestamp` itself on WebRTC, or restart in a new epoch as the browser's fallback does.
+- **Monitor switch.** `media-control` `monitor` (a `ctl` kind). The browser's in-place switch needs `requestVideoFrameCallback` RTP timestamps; a native client can match the admitted `rtpTimestamp` itself on WebRTC, or restart in a new epoch as the browser's fallback does.
 
 Nothing in the protocol depends on a browser.
 

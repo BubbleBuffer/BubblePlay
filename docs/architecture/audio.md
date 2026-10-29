@@ -28,7 +28,7 @@ WSS uses the protocol-4 media socket. Each binary message contains one Opus pack
 | 26 | 2 | Reserved, zero |
 | 28 | 1–1500 | Opus payload |
 
-The viewer opts in with `audio:1` on a protocol-4 `media-control` `start`. The host remembers the opt-in for the media epoch; absent or other values do not opt in. Older viewers receive only video. The configured host advertises optional `audio:1` in `host-capabilities`; disabling audio omits the field.
+The viewer opts in with `audio:1` on a protocol-4 `media-control` `start` (a `ctl` kind). The host remembers the opt-in for the media epoch; absent or other values do not opt in. Older viewers receive only video. The configured host advertises optional `audio:1` in `host-capabilities` (a `ctl` kind); disabling audio omits the field.
 
 Audio has its own bounded queue of about ten packets, dropping the oldest packet when full. The socket writer drains audio ahead of video. Audio consumes no video admission slots or in-flight budget and never requests a keyframe. Sends pause while the oldest unacknowledged video frame is older than one second, and resume on ACK progress. Otherwise audio does not wait for video. Queue drops, transport gaps and reconnections mark a discontinuity.
 
@@ -42,7 +42,7 @@ Audio defaults on. The standalone host accepts `--no-audio`. The tray stores `au
 
 ## Viewer playback
 
-Both viewers show their sound control only when `host-capabilities` carries `audio:1`. Mute is local: the host keeps sending, and mute is not persisted, so each session starts unmuted. Playback never delays video.
+Both viewers show their sound control only when `host-capabilities` carries `audio:1`. `host-capabilities` is a `ctl` kind, sent by the host after auth and not cached by the relay. Mute is local: the host keeps sending, and mute is not persisted, so each session starts unmuted. Playback never delays video.
 
 The browser ([`audio.js`](../../worker/public/audio.js), wired in [`receiver.js`](../../worker/public/receiver.js)) always offers a receive-only audio transceiver next to the video one; older hosts leave it unused. A WebRTC audio track plays through a separate, unmuted `<audio>` element. Over WSS, BPA1 packets are recognized by magic before the v4 parser, get no ACK and never touch the video sequence or keyframe logic. The browser sends `audio:1` only when WebCodecs `AudioDecoder` supports Opus. It decodes with `AudioDecoder` and schedules into an `AudioContext` about 40 ms ahead, drops packets while more than 150 ms is queued, and resets the schedule on a discontinuity or sequence gap. The **Mute sound** button sits in the session strip before Fullscreen and uses the Lucide `volume-2` and `volume-x` icons (ISC). When autoplay is blocked, the button shows muted, and the first click, tap or key press anywhere starts sound. `__bubbleplayDiagnostics.snapshot().audio` reports the controller state, WSS packet/decode/drop counters and WebRTC inbound audio stats.
 

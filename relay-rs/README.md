@@ -52,7 +52,7 @@ missing file counts as empty.
 - `bp-relay healthcheck [--config <path>]` requests `/healthz` on the local listen address and exits 0 on `200`. The Docker HEALTHCHECK uses it, so the image needs no curl.
 - `bp-relay import-go-auth <auth.json> [--config <path>]` copies the registered PCs from a Go relay auth file into `pcs.json`. See the migration section.
 
-Static assets follow the Go relay's rules. Only GET and HEAD are served. Paths are cleaned, so
+Static assets are served under these rules. Only GET and HEAD are served. Paths are cleaned, so
 `..` cannot leave `assets_dir`. A path with a backslash is a 404. A dotfile, a directory or a
 missing file is a 404. A request for `/index.html` redirects to `./`. Responses carry
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.

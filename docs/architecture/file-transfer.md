@@ -19,11 +19,11 @@ The temporary native cache is private and carries Mark-of-the-Web. Destination a
 
 ## Implementation and checks
 
-[`host/src/file_service.rs`](../../host/src/file_service.rs) owns host file sessions, [`file_transfer.rs`](../../host/src/file_transfer.rs) framing, and [`native_file_drop.rs`](../../host/src/native_file_drop.rs) the Windows target integration. Browser behavior lives in [`file-client.js`](../../worker/public/file-client.js), [`file-transfer.js`](../../worker/public/file-transfer.js) and [`file-ui.js`](../../worker/public/file-ui.js). Both relays validate and pair file sockets by epoch.
+[`host/src/file_service.rs`](../../host/src/file_service.rs) owns host file sessions, [`file_transfer.rs`](../../host/src/file_transfer.rs) framing, and [`native_file_drop.rs`](../../host/src/native_file_drop.rs) the Windows target integration. Browser behavior lives in [`file-client.js`](../../worker/public/file-client.js), [`file-transfer.js`](../../worker/public/file-transfer.js) and [`file-ui.js`](../../worker/public/file-ui.js). The relay validates and pairs file sockets by epoch.
 
 The setup/update scripts create Send To > BubblePlay. The tray stages requests under `%LOCALAPPDATA%\BubblePlay\sendto`; the host rejects old requests and skips folders. `BUBBLEPLAY_DOWNLOADS_DIR` and `BUBBLEPLAY_SENDTO_DIR` override those local locations. `BUBBLEPLAY_FILE_CLIPBOARD=0` disables clipboard file reading/placement and paste for isolated tests.
 
-Rust, JavaScript and Kotlin exercise the shared fixture. The isolated Windows lab checks for this (`stream-lab-file-transfer`, `stream-lab-native-file-drop`) were removed at CUT-1 with the JavaScript Worker relay. Source checks and prior Chrome/Explorer evidence do not prove a fresh installation or native interoperability through the Go relay; see [release status](../release-status.md).
+Rust, JavaScript and Kotlin exercise the shared fixture. The isolated Windows lab checks for this (`stream-lab-file-transfer`, `stream-lab-native-file-drop`) were removed at CUT-1 with the JavaScript Worker relay. Source checks and prior Chrome/Explorer evidence do not prove a fresh installation or native interoperability through the Rust relay; see [release status](../release-status.md).
 
 ## Wire contract (v1)
 
@@ -31,18 +31,18 @@ Capability: host capabilities gain `fileTransfer: 1`. Clients hide all file UI w
 Native drops additionally require `fileDrop: 1`. Older clients and mobile clients continue using save/paste.
 Pre-release host hover additionally requires `fileDropPreview: 1` alongside both existing capabilities, and remains desktop-only.
 
-Signaling (`/ws`, JSON):
+Signaling (`/ws`, JSON; after the handshake each message is a `ctl` kind, with its type as `kind`):
 
 - host → client `{"type":"file-offer","protocol":1,"offerId":u32,"items":[{"id":u32,"name":string,"size":u64}],"source":"clipboard"|"sendto"}`; a new offer replaces the previous one; `items: []` withdraws it.
 - client → host `{"type":"file-drag-preview","protocol":1,"epoch":currentMediaEpoch,"dragId":positiveU32,"action":"update","drop":{"x":u16,"y":u16,"generation":nonzeroU32,"viewportRevision":u32},"types":[mimeHints]}`. One to 64 hints, each at most 96 ASCII graphic bytes; empty means unknown. No names, paths or bytes. Controls are at most 8192 UTF-8 bytes, current-epoch client-only, and never buffered for a later host. `action:"cancel"` omits `drop` and `types`. Client throttles motion to 200 ms and renews stationary hover every 500 ms. Host lease expires after two seconds without controls or 120 seconds overall; readiness/geometry/session changes cancel it. A refused/expired drag ID is not repeatedly restarted. Actual local drop cancels before upload; the final handover waits at most two seconds for complete native cleanup without blocking capture.
 
-File socket: `/file-ws?epoch=<mediaEpoch>` (client, gate cookie and device key) and `/host-file-ws?epoch=<mediaEpoch>` (host, device key, no bearer). The relay pairs one file-client with one file-host per epoch.
+File socket: `/file-ws?epoch=<mediaEpoch>` (viewer: ticket hello as on media sockets; a browser viewer also needs the gate cookie) and `/host-file-ws?epoch=<mediaEpoch>` (host: phase-2 host auth, no host gate token). The relay pairs one file-viewer with one file-host per epoch.
 
 Text messages on the file socket (JSON):
 
-- first message from either side `{"type":"hello","role":"file-client"|"file-host"}`; relay answers `{"type":"hello-ok"}` then `{"type":"file-peer","present":bool}`, and sends `file-peer` again when the other side arrives. Send OFFER/REQUEST only while the peer is present.
+- first message from either side `{"type":"hello","role":"file-viewer"|"file-host"}` (plus the ticket fields the relay requires; `file-client` is refused); relay answers `{"type":"hello-ok"}` then `{"type":"file-peer","present":bool}`, and sends `file-peer` again when the other side arrives. Send OFFER/REQUEST only while the peer is present.
 - `{"type":"ping"}` every 15 s while open; the relay answers `{"type":"pong"}` and never relays it.
-- When one side closes, the relay closes the other with 1001 `file-peer-left`; a binary packet that fails validation closes the sender with 1008. REQUEST is accepted only from the file-client.
+- When one side closes, the relay closes the other with 1001 `file-peer-left`; a binary packet that fails validation closes the sender with 1008. REQUEST is accepted only from the file-viewer.
 - The client picks every transferId (its OFFER for an upload, its REQUEST for a download). The host keeps its socket open while a viewer epoch is live and reconnects 1 s after a close; clients open on demand and close after 60 s without a transfer.
 
 Binary messages: 16-byte header + payload.

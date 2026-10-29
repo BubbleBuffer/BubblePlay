@@ -1,6 +1,6 @@
 # BubblePlay for Android
 
-A native Kotlin app (sideloaded APK, no Google Play services) that uses the home desktop through the Cloudflare Worker relay.
+A native Kotlin app (sideloaded APK, no Google Play services) that uses the home desktop through the Rust relay.
 It uses the same WSS v4 media path and input contract as the browser receiver (`worker/public/receiver.js`).
 
 Start with the [public documentation](../docs/README.md) for host/relay setup and [architecture](../docs/architecture/README.md) for the shared contracts. Android's packaged/device acceptance is separate from the Windows/browser alpha. Interoperability with the new Go relay has not been demonstrated.
@@ -151,7 +151,7 @@ Cleartext HTTP is allowed only for `10.0.2.2`, `127.0.0.1` and `localhost`. See 
 
 ## Historical lab measurements (2026-09-30)
 
-These earlier runs describe those devices and builds; they do not establish acceptance of the current APK or Go relay. No input was sent to the desktop. logcat shows the numbers under the `BubblePlaySession` tag, with a `stats` line every 5 s.
+These earlier runs describe those devices and builds; they do not establish acceptance of the current APK or relay. No input was sent to the desktop. logcat shows the numbers under the `BubblePlaySession` tag, with a `stats` line every 5 s.
 
 - **Pixel 8 Pro:**
   - The app chose `c2.exynos.hevc.decoder` (hardware, low latency on).

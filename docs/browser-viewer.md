@@ -1,6 +1,6 @@
 # Browser viewer
 
-The browser viewer shows your PC's desktop. It signs in with a device key, not a password. This page covers the viewer served by the Rust relay ([`relay-rs`](../relay-rs/README.md)). The Go and Cloudflare relays still use their password login until their cutover; see [browser approval](architecture/browser-approval.md). The protocol is in [device keys](architecture/device-keys.md).
+The browser viewer shows your PC's desktop. It signs in with a device key, not a password. This page covers the viewer served by the Rust relay ([`relay-rs`](../relay-rs/README.md)). The protocol is in [device keys](architecture/device-keys.md).
 
 ## Site gate
 

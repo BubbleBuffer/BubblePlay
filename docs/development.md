@@ -149,9 +149,9 @@ user (local DXGI capture + SendInput). The relay token reaches the host only as
   triggers an idempotent `\BubblePlay\AdminAgent` task attempt; retries are
   at least 5 s apart. A session-scoped, host-owned event publishes demand and
   survives tray reconnection without replaying log edges. Launch/probe failures
-  remain visible in logs and the additive input-status `detail` field (task
+  remain visible in logs and the additive `detail` field of the `input-status` `ctl` kind (task
   query/launch codes, task result, or hello failure), and the
-  host retains its protected-target `input-status` reason `admin-unavailable`
+  host retains its protected-target reason `admin-unavailable` (an `input-status` `ctl` kind)
   until the agent answers. Trust and protocol checks still apply.
   The tray keeps a running agent for 30 s after the last session ends (a
   reconnect or page reload within that time keeps it running); this idle
@@ -261,7 +261,7 @@ transient display.
 ## Stabilization acceptance
 
 Deterministic checks do not prove Windows display/service or live decoder health.
-Before further optimization, build an isolated candidate and use the stream lab
-to compare with a same-machine baseline: WSS, WebRTC Gaming, H264 fallback,
+Before further optimization, build an isolated candidate and compare it with a
+same-machine baseline. Cover: WSS, WebRTC Gaming, H264 fallback,
 relay/child recovery, ten-minute soak, then helper/display/QoS/browser cleanup
 and idle recovery. Keep production deployment separate from candidate validation.

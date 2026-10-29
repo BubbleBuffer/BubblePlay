@@ -12,14 +12,14 @@ The implementation also contains an edge-hold carry path: during a window move, 
 
 ## Monitor transitions in the browser
 
-Both transports switch monitors in place on the existing WebRTC peer or WSS epoch. The browser keeps the last frame and runs a forced first-frame handshake for the new media generation. On WebRTC the host's `admitted` message carries the new IDR's RTP timestamp; native video opens the input gate only for a presented frame at or after it, and WebCodecs only after a keyframe at or after it. A frame presented after admission but from the old monitor therefore no longer opens the gate. If the host omits the timestamp, the browser cannot read `rtpTimestamp` from `requestVideoFrameCallback`, or the handshake fails, the browser restarts the peer in a new signaling epoch with input gated. Desktop-source transitions use the same gate ([secure-desktop.md](secure-desktop.md#in-place-desktop-transitions-on-webrtc)) but release held input.
+Both transports switch monitors in place on the existing WebRTC peer or WSS epoch. The browser keeps the last frame and runs a forced first-frame handshake for the new media generation. On WebRTC the host's `admitted` message (a `ctl` kind) carries the new IDR's RTP timestamp; native video opens the input gate only for a presented frame at or after it, and WebCodecs only after a keyframe at or after it. A frame presented after admission but from the old monitor therefore no longer opens the gate. If the host omits the timestamp, the browser cannot read `rtpTimestamp` from `requestVideoFrameCallback`, or the handshake fails, the browser restarts the peer in a new signaling epoch with input gated. Desktop-source transitions use the same gate ([secure-desktop.md](secure-desktop.md#in-place-desktop-transitions-on-webrtc)) but release held input.
 
 Held keys and buttons survive the transition on the client. While the handshake gates input, `InputController` drops refused packets without recording gated presses. On presentation it sends release-all only if a held key or button was let go during the gate; otherwise it resumes without one, so a carried drag continues. The host's `CarriedInput` applies the same rule to packets that reach its own gate. After a non-carry switch the host has already released everything, so the client may still believe something is held. Its later release packets for that input are no-ops on the host. The Android client applies the same rule to `monitor-switch` and `monitor-switched` (`RemoteInput.resumeAfterTransition` and `Session.inputGated`, with JVM tests in `RemoteInputTest`); desktop-source changes and dead transports still release.
 
 ## Wire contract
 
-- `host-capabilities.followWindow` is an integer version, absent when unsupported.
-- Client signaling sends `{"type":"media-control","action":"follow","follow":true,"protocol":4,"epoch":"…","reason":"user-follow"}`; `follow` must be boolean and the epoch current.
+- `host-capabilities.followWindow` (a `ctl` kind) is an integer version, absent when unsupported.
+- Client sends, inside `ctl`, `{"type":"media-control","action":"follow","follow":true,"protocol":4,"epoch":"…","reason":"user-follow"}`; `follow` must be boolean and the epoch current.
 - `monitor-list.follow` reports host state when supported.
 - Host state starts off for each signaling session; clients that never send follow controls retain ordinary monitor selection.
 
