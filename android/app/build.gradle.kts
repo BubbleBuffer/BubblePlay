@@ -65,6 +65,14 @@ android {
         unitTests.all {
             // The JVM tests read the shared contracts in <repo>/fixtures.
             it.systemProperty("bubbleplay.fixtures", rootProject.file("../fixtures").absolutePath)
+            // Relay e2e tests (src/test/.../e2e): BP_RELAY_SERVER_BIN names the bp-relay binary, and
+            // BP_E2E_REQUIRED=1 (CI) turns a missing binary into a failure instead of a skip.
+            it.inputs.property("bpRelayServerBin", System.getenv("BP_RELAY_SERVER_BIN") ?: "")
+            it.inputs.property("bpE2eRequired", System.getenv("BP_E2E_REQUIRED") ?: "")
+            it.testLogging {
+                events("passed", "skipped", "failed")
+                exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+            }
         }
     }
 }

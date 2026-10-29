@@ -5,15 +5,16 @@ It uses the same WSS v4 media path and input contract as the browser receiver (`
 
 Start with the [public documentation](../docs/README.md) for host/relay setup and [architecture](../docs/architecture/README.md) for the shared contracts. Android's packaged/device acceptance is separate from the Windows/browser alpha. Interoperability with the new Go relay has not been demonstrated.
 
-On a fresh install, enter your own relay address before connecting. Existing saved addresses are retained; the app has no built-in personal relay destination.
+On a fresh install, create or import a device key, then pair each PC with its relay address and PC ID. The app has no built-in relay destination.
 
 ## How it works
 
-- **Sign-in:** a WebView opens `<server>/`, which is the unchanged Worker gate (ntfy approval, then the password page).
-  - When the page navigates back to `/` with both `__Host-gate` and `__Host-bp-session` cookies set, the app intercepts that navigation. The browser receiver never loads.
-  - The app then passes the cookies to the native session.
-- **Signaling:** an OkHttp WebSocket to `/ws` carries hello, media-control, the first-frame handshake, desktop state, clipboard, monitors and binary input.
-- **Media:** an OkHttp WebSocket to `/media-ws?epoch=…` using v4 framing.
+- **Device key and PC list:** the app opens to the PC list only with an unlocked device key. Without a key it shows setup (create or import); a locked key shows an unlock step (`ui/DeviceKeyActivity.kt`, `START_UNLOCK`). Each PC row shows its name, ID, relay host and a status line: "Not connected yet", or "Last seen …" plus the last problem (in the danger colour) if the last session ended with one. The list never shows "online".
+  - **Pairing:** Pair a PC takes the relay address, the PC ID, the code shown on the PC and an optional name (`ui/PairActivity.kt`). A `bubbleplay://pair` link only fills the form; it never submits. Each paired PC is kept on the phone with its name and relay.
+  - Tap a PC to connect through its saved relay.
+- **Signaling:** `/ws?pc=<id>` uses a signed viewer hello and relay challenge, then authenticates the PC against its pinned public key. All endpoint control messages, including input, use the encrypted ctl channel. A relay refusal (1008) or changed PC key stops automatic reconnect; tap the status line to retry or pair again.
+- **Media:** `/media-ws?epoch=…&pc=…` uses the current signaling ticket and v4 framing; it starts after authentication.
+- **DTLS bind:** WSS media only; no DTLS bind (decision 23 n/a).
   - The app sends a per-frame ACK (with `decodedSeq`), sends keyframe requests (limited to one per 250 ms), and sends a 15 s `ping` heartbeat.
   - Reconnect backoff runs from 250 ms up to 5 s, and the app forces a keyframe after each reconnect.
 - **Decode:** MediaCodec renders to a SurfaceView.
@@ -36,7 +37,7 @@ On a fresh install, enter your own relay address before connecting. Existing sav
   - A status line shows state, codec and size. Tap it to reconnect after an error. Full screen and touch mode can also be switched from the bar for the current session only.
   - Foreground windows that need Admin mode show “This window needs Admin mode — turn it on at the PC” in that status line. An unavailable Admin mode helper shows “Admin mode helper isn’t responding”. The warning clears when the host clears its reason, and controls stay enabled. Optional `input-status` reason and route fields are validated; older receipt-only messages preserve the current warning.
   - **Background:** with **Stay connected in the background** on (default), a foreground service (`ui/SessionService.kt`, type `dataSync`) starts with the session and stops with it. While it runs, the session, file transfers and reconnects continue when the app leaves the foreground, and an ongoing low-priority notification ("Connected to <host>") returns to the stream on tap and has a Disconnect action. Android 13+ asks for the notification permission at the first session start. The service only starts while the app is in the foreground. When Android refuses it, ends it (Android 15+: 6 h of `dataSync` per 24 h), or the setting is off, the session is stopped 30 s after the app leaves the foreground (see "Known limits").
-  - **Resume:** when the app pauses, it copies the current video frame (`PixelCopy`). On return that frame stays on screen, dimmed, with a "Reconnecting…" label, until the first live frame is presented; it then fades out over 150 ms. If the copy failed, the screen is black until the stream returns. The frame is kept across the 30 s background stop and dropped on Disconnect or Sign out.
+  - **Resume:** when the app pauses, it copies the current video frame (`PixelCopy`). On return that frame stays on screen, dimmed, with a "Reconnecting…" label, until the first live frame is presented; it then fades out over 150 ms. If the copy failed, the screen is black until the stream returns. The frame is kept across the 30 s background stop and dropped on Disconnect.
   - **Reconnect in the background:** without the background service, lost signaling or media sockets are not reconnected while the app is in the background. On return (`onStart`) the backoff resets and any held or waiting retry runs at once.
   - **Surface watchdog:** the 2 s steps (forced keyframe, media restart, give up) count only while signaling is up, and restart from the next `hello-ok`, so a slow host reconnect does not end in "Stream recovery stopped".
   - logcat (`BubblePlayStream`) logs `foreground to first live frame N ms` on each return.
@@ -50,25 +51,27 @@ Code layout (`app/src/main/java/de/bubblebuffer/bubbleplay/`):
 - `files/`: file transfer v1 (flow control, names, the transfer engine, MediaStore downloads).
 - `ui/`: the activities, the IME target view and the cursor overlay.
 
+Pair a new PC using its relay address, PC ID and pairing code. The PC and viewer display a comparison number; allow the request on the PC to save its public key in the PC list.
+
 ### Settings
 
 See the shared [session UI](../docs/architecture/session-ui.md). One view (`ui/SettingsView.kt`), opened from More in the bar and from the connection screen. From the bar it opens over the stream inside `StreamActivity`, so the stream stays in the foreground; Disconnect stays a separate item in More. Values persist in `Prefs` (SharedPreferences, schema version 2) and apply live:
 
-- **Connection:** server address (saved here applies to the next connection), Sign out (expires the `__Host-gate` and `__Host-bp-session` cookies for that server, ends the session, returns to the connection screen), stay connected in the background (default on; turning it off in a session stops the service now).
+- **Connection:** stay connected in the background (default on; turning it off in a session stops the service now). The relay belongs to each PC and is set when it is paired.
 - **Touch:** default touch mode, trackpad pointer speed (levels 1 to 9; 5 is the old fixed gain 1.6, each step 25 %), tap to click (trackpad one-finger tap; when off, long-press clicks and a two-finger tap still right-clicks).
 - **Mouse and keyboard:** pointer mode for a hardware mouse (Work or Game, default Work; a change in a session switches the host's stream mode now), capture keyboard shortcuts (default on).
 - **Display:** start in full screen, keep screen on, default monitor (requested once when a session starts, if the host lists it and is not already showing it; choosing one in a session switches to it now).
 - **Video:** codec (Auto, HEVC, H.264). A change reconnects the stream with a short notice; transfers in flight end with the old session.
-- **Diagnostics:** decoder, resolution and codec, presented frames/s and media bitrate (1 s windows), relay round trip (signaling ping to pong; the view sends an extra ping every 5 s while open). Copy report puts these plus app, device and settings (server host only, no cookies) on the clipboard.
+- **Diagnostics:** decoder, resolution and codec, presented frames/s and media bitrate (1 s windows), relay round trip (signaling ping to pong; the view sends an extra ping every 5 s while open). Copy report puts these plus app, device and settings (relay host only) on the clipboard.
 - **About:** app version.
 
 ### File transfer (v1)
 
 See [file-transfer behavior](../docs/architecture/file-transfer.md) and the [shared fixture](../fixtures/file-transfer-contract.json). All of it is hidden unless the host's `host-capabilities` carries `fileTransfer` >= 1.
 
-- **Socket:** a second OkHttp WebSocket, `/file-ws?epoch=<mediaEpoch>` (lab: `/lab-file-ws` with `run` and `compat`), with the same gate cookie as `/ws`. It opens on demand, sends `hello`, waits for `file-peer` present (10 s), pings every 15 s and closes after 60 s idle. One transfer runs per direction; the rest queue.
+- **Socket:** a second OkHttp WebSocket, `/file-ws?epoch=<mediaEpoch>&pc=<id>`, using the current signaling ticket. It opens on demand, sends `hello`, waits for `file-peer` present (10 s), pings every 15 s and closes after 60 s idle. One transfer runs per direction; the rest queue.
 - **Upload:**
-  - Share sheet: "BubblePlay" accepts `SEND`/`SEND_MULTIPLE` of any type, purpose `save`. Without a session it opens the app (connect or sign in first), then uploads. At most 64 files go; the rest are reported.
+  - Share sheet: "BubblePlay" accepts `SEND`/`SEND_MULTIPLE` of any type, purpose `save`. Without a session it opens the PC list; the files wait there until you pick a PC, then they upload. At most 64 files go; the rest are reported.
   - The Attach icon in the quick bar opens the system picker (multiple).
   - Shortcuts → Paste: a content URI on the phone clipboard is uploaded with purpose `paste` instead of pasting text.
   - Files are read through `ContentResolver`; no storage permission. A source without a known size is copied to the app cache first.
@@ -122,14 +125,9 @@ adb install -r app\build\outputs\apk\release\app-release.apk
 
 Alternatively, copy the APK to the phone and open it after allowing installs from that source.
 
-## Testing against the local Stream Lab relay (not production)
+## Testing against a local relay
 
-1. Install dependencies with `npm --prefix worker ci` from the repository root, then start `node worker/tools/lab/stream-lab-direct-relay.mjs --port 8787`.
-2. Start a candidate host against that relay. `<compat>` is `compatibility.id` from `http://127.0.0.1:8787/lab-compat`, and `<uuid>` is any new UUID:
-   `host\target\release\bubbleplay-host.exe --mode serve --worker "ws://127.0.0.1:8787/lab-host-ws?run=<uuid>&compat=<compat>"`
-3. In the app, set **Server** to `http://10.0.2.2:8787/` (emulator) and **Lab run** to the same UUID, then tap Connect.
-   - For a USB phone, run `adb reverse tcp:8787 tcp:8787` and use `http://127.0.0.1:8787/`.
-   - Lab mode skips the sign-in gate.
+The old Stream Lab steps (Server field, Lab run) were removed with the PC list. Pair the app with a host on a local `bp-relay` (`relay-rs/README.md`) through the normal pairing flow; the automated version of this is the end-to-end tests below.
 
 Cleartext HTTP is allowed only for `10.0.2.2`, `127.0.0.1` and `localhost`. See `res/xml/network_security_config.xml`.
 
@@ -146,6 +144,10 @@ Cleartext HTTP is allowed only for `10.0.2.2`, `127.0.0.1` and `localhost`. See 
 - **File transfer:** every packet, rejected case, receiver session and signaling case in `fixtures/file-transfer-contract.json`; the send window and ACK pacing; size and hash mismatch; MediaStore names; share-intent parsing.
 - **Resume:** the reconnect loop (backoff reset on start, no attempts while in the background), the surface watchdog not counting while signaling is down, and the frozen-frame overlay state (shown on return with a snapshot, cleared on the first presented frame, dropped on disconnect).
 - **Also covered:** clipboard chunking and reassembly, the touch gesture state machine and viewport, input coalescing and text splitting, and IME text reconciliation.
+
+### End-to-end tests
+
+`app/src/test/.../e2e/` runs the real `auth/` package, `PairingClient` and `SessionWire` (the signalling core that `Session` drives) against a real `bp-relay` process from `relay-rs/` and a scripted PC (`FakePc`, built from the same auth primitives). Each test starts the relay on a free 127.0.0.1 port with a temp state dir and kills it afterwards. The tests cover pairing (same comparison number, pair-done, wrong code, pair-denied, a wrong PC proof), an admitted session (peer-joined epoch, handshake with the pinned key, caps with name first, input and cursor as ctl, no plaintext afterwards) and refusals (not admitted, PC key changed, no auth-host within 10 s). Set `BP_RELAY_SERVER_BIN` to the binary (`cargo build -p bp-relay-server --bin bp-relay` in `relay-rs/`) to run them; without it they are skipped. CI sets `BP_E2E_REQUIRED=1`, so there a missing binary fails them.
 
 ## Historical lab measurements (2026-09-30)
 

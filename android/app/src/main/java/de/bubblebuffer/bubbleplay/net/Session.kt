@@ -5,6 +5,10 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import de.bubblebuffer.bubbleplay.auth.ViewerAuth
+import de.bubblebuffer.bubbleplay.keys.DeviceKey
+import de.bubblebuffer.bubbleplay.keys.StrictBase64Url
+import de.bubblebuffer.bubbleplay.pcs.PcEntry
 import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.media.AudioPlayer
 import de.bubblebuffer.bubbleplay.media.VideoDecoder
@@ -28,30 +32,21 @@ import java.security.SecureRandom
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 
-/**
- * One remote-desktop session: the authenticated signaling socket (/ws), the
- * single v4 media socket (/media-ws) and the decoder. Mirrors the browser
- * receiver's WSS flow (worker/public/receiver.js):
- *
- *  1. /ws with the gate cookie, hello role=client -> hello-ok {mediaEpoch}.
- *  2. media-control mode, then /media-ws?epoch=..., hello role=media-client.
- *  3. On media hello-ok: media-control start {codec} + first-frame request.
- *  4. Binary frames: ACK each, gate, decode; keyframe requests on gaps and
- *     decoder errors; 15 s heartbeats on both sockets.
- *  5. Input and cursor state stay on /ws as small binary packets.
- *
- * All state lives on one session thread; listener calls arrive on the main thread.
+/** One device-key authenticated WSS desktop session. State lives on the session thread;
+ * listener callbacks arrive on the main thread. Every signaling reconnect authenticates afresh.
  */
 class Session(
     config: ServerConfig,
-    private val cookieProvider: () -> String?,
+    private val pc: PcEntry,
+    private val key: DeviceKey,
+    private val deviceName: String,
     val preferredCodec: String,
     private val listener: Listener,
+    private val onPcState: (lastSeen: Long, problem: String?) -> Unit = { _, _ -> },
 ) : RemoteInput.Transport, VideoDecoder.Listener {
 
     interface Listener {
         fun onStatus(status: Status)
-        fun onAuthRequired()
         fun onCursor(state: CursorState)
         fun onCursorType(kind: CursorKind)
         fun onRemoteClipboard(text: String)
@@ -87,7 +82,11 @@ class Session(
 
     enum class State { CONNECTING, CONNECTED, STATIC, RECONNECTING, ERROR }
 
-    data class Status(val state: State, val text: String, val inputWarning: Boolean = false)
+    data class Status(
+        val state: State, val text: String, val inputWarning: Boolean = false,
+        /** Resource name for a terminal failure; [text] remains a usable fallback. */
+        val problem: String? = null, val detail: String? = null,
+    )
 
     /** Live values for the settings view's Diagnostics (null: not known yet). */
     data class Diagnostics(
@@ -102,7 +101,7 @@ class Session(
 
     data class Monitor(val selector: String, val name: String, val width: Int, val height: Int, val selected: Boolean)
 
-    private var config = config
+    private val config = config
     private val thread = HandlerThread("bp-session").apply { start() }
     private val handler = Handler(thread.looper)
     private val main = Handler(Looper.getMainLooper())
@@ -124,6 +123,9 @@ class Session(
     private var running = false
     @Volatile private var cursorCallbacksEnabled = true
     private var terminal: String? = null
+    private var terminalProblem: String? = null
+    private var terminalDetail: String? = null
+    private var lastSeen = pc.lastSeen
 
     // Signaling (/ws).
     @Volatile private var sig: WebSocket? = null
@@ -137,7 +139,9 @@ class Session(
     private var sigRetryTimer: Runnable? = null
     private var sigReconnecting = false
     private var mediaEpoch: String? = null
-    private val grant = ViewerGrantSlot()
+    private var grant = ViewerGrant.NONE
+    @Volatile private var wire: SessionWire? = null
+    private var authTimer: Runnable? = null
 
     // Host state.
     @Volatile private var scancode = false
@@ -286,6 +290,7 @@ class Session(
             try { sig?.close(1000, "client-stop") } catch (_: Exception) {}
             sig = null; sigOpen = false; registered = false
             clearGrant()
+            closeWire()
             thread.quitSafely()
         }
         decoder.release()
@@ -322,13 +327,21 @@ class Session(
     }
 
     // ---- RemoteInput.Transport (any thread) ----------------------------------
-    // Input only ever goes out on the current, hello-completed, first-frame-ready socket.
+    // Input only ever goes out on the current, authenticated, first-frame-ready socket.
     override fun inputOpen() = link.inputSocket() != null && inputEnabled && desktopAvailable && !awaitingFrame
     override fun inputGated() = monitorHold && sigOpen && link.inputSocket() != null && inputEnabled && desktopAvailable
     override fun send(bytes: ByteArray): Boolean {
         val socket = link.inputSocket() ?: return false
-        liveness.input(now())
-        return socket.send(bytes.toByteString())
+        val current = wire ?: return false
+        // A reconnect between the input gate and channel lookup must not move old input
+        // onto the new channel before that generation presents its first frame.
+        if (socket !== sig) return false
+        return try {
+            current.sendInput(bytes).also { if (it) liveness.input(now()) }
+        } catch (_: Exception) {
+            controlFailed(current)
+            false
+        }
     }
     override fun queuedBytes(): Long = sig?.queueSize() ?: 0L
     override fun scancodeHost() = scancode
@@ -336,25 +349,23 @@ class Session(
 
     // ---- signaling ------------------------------------------------------------
     private fun openSignaling() {
-        // A new signaling socket starts without the previous one's credentials.
         clearGrant()
+        closeWire()
         if (!running || terminal != null) return
-        if (config.isLab && config.labCompat == null) {
-            val compat = fetchLabCompat()
-            if (compat == null) { scheduleSignalingReconnect("lab-compat"); return }
-            config = config.copy(labCompat = compat)
-        }
-        val cookie = if (config.isLab) null else cookieProvider()
-        if (!config.isLab && !ServerConfig.hasSessionCookies(cookie)) { authRequired(); return }
         // The generation is assigned right after newWebSocket returns, on this
         // thread; callbacks read it on this thread too (via handler.post).
         var id = 0
-        val request = Request.Builder().url(config.signalingUrl()).apply { if (cookie != null) header("Cookie", cookie) }.build()
+        val request = Request.Builder().url(config.signalingUrl()).build()
         val socket = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = post({ id }) {
                 sigOpen = true
                 liveness.opened(now())
-                sendSig(ServerConfig.signalingHello())
+                wire = SessionWire(key, pc.relay, pc.id, StrictBase64Url.decode(pc.publicKey, 32), deviceName,
+                    send = { text ->
+                        if (webSocket !== sig || !sigOpen) false
+                        else webSocket.send(text).also { if (it) liveness.sent(now()) else webSocket.cancel() }
+                    })
+                if (wire?.start() != true) webSocket.cancel()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) = post({ id }) {
@@ -362,24 +373,15 @@ class Session(
                 handleSignal(text, id)
             }
 
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                if (webSocket !== sig || !PendingCursor.accepts(bytes)) return
-                liveness.inbound(now())
-                if (!pendingCursor.offer(webSocket, bytes)) return
-                main.post deliver@{
-                    val update = pendingCursor.take() ?: return@deliver
-                    // A queued packet must not restore old appearance after a reset/disconnect.
-                    if (!cursorCallbacksEnabled || update.source !== sig) return@deliver
-                    update.kind?.let { listener.onCursorType(it) }
-                    update.state?.let { listener.onCursor(it) }
-                }
-            }
+            // Binary signaling is never accepted outside the authenticated ctl envelope.
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) = Unit
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                webSocket.close(1000, null)
+                post({ id }) { signalingDown(id, code, "closed $code") }
+                webSocket.close(code, null)
             }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = post({ id }) { signalingDown(id, null, "closed $code") }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = post({ id }) { signalingDown(id, code, "closed $code") }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 val code = response?.code
@@ -392,7 +394,8 @@ class Session(
 
     /** Signaling closed: forget the PC and ticket (session memory only) and tell the listener. */
     private fun clearGrant() {
-        if (!grant.clear()) return
+        if (grant === ViewerGrant.NONE) return
+        grant = ViewerGrant.NONE
         main.post { listener.onViewerGrant(ViewerGrant.NONE) }
     }
 
@@ -403,7 +406,9 @@ class Session(
 
     private fun signalingDown(id: Int, httpCode: Int?, why: String) {
         if (!link.lost(id)) return
-        Log.i(TAG, "signaling down: $why (http=$httpCode)")
+        val problem = SessionProblem.closed(httpCode, wire?.admitted == true)
+        closeWire()
+        Log.i(TAG, "signaling down: $why (code=$httpCode)")
         inputWarning.reset()
         sigOpen = false
         registered = false
@@ -413,7 +418,7 @@ class Session(
         // bound to this signaling epoch and is replaced after the next hello-ok.
         resetFirstFrame()
         main.post { listener.onInputLost() }
-        if (!config.isLab && httpCode != null && httpCode in listOf(401, 403, 404)) { authRequired(); return }
+        if (problem != null) { endSession(problem); return }
         scheduleSignalingReconnect(why)
     }
 
@@ -461,49 +466,118 @@ class Session(
         }
     }
 
-    private fun authRequired() {
-        running = false
-        handler.removeCallbacksAndMessages(null)
-        main.post { listener.onAuthRequired() }
+    private fun cancelAuthTimer() {
+        authTimer?.let { handler.removeCallbacks(it) }
+        authTimer = null
+    }
+
+    private fun closeWire() {
+        cancelAuthTimer()
+        wire?.close()
+        wire = null
+    }
+
+    private fun endSession(problem: SessionProblem, detail: String? = null) {
+        if (terminal != null) return
+        terminalProblem = problem.resource
+        terminalDetail = detail
+        terminal = if (detail == null) problem.text else problem.text.replace("%s", detail)
+        sigRetry.cancel()
+        cancelSigRetryTimer()
+        closeWire()
+        link.reset()
+        try { sig?.close(1000, "session-ended") } catch (_: Exception) {}
+        sig = null; sigOpen = false; registered = false
+        clearGrant()
+        closeMedia()
+        mediaEpoch = null
+        main.post {
+            listener.onInputLost()
+            listener.onFileEpoch(null)
+            listener.onFileCapability(null)
+            listener.onSoundCapability(false)
+            onPcState(lastSeen, problem.resource)
+        }
+        publishStatus()
+    }
+
+    /** A control failure from the input thread is handled only if that channel is still current. */
+    private fun controlFailed(current: SessionWire) {
+        current.close()
+        handler.post { if (wire === current) endSession(SessionProblem.CONTROL_FAILED) }
     }
 
     private fun sendSig(message: JSONObject): Boolean {
-        val socket = sig ?: return false
-        if (!sigOpen) return false
-        liveness.sent(now())
-        return socket.send(message.toString())
+        val current = wire ?: return false
+        return try {
+            current.sendJson(message.toString())
+        } catch (_: Exception) {
+            controlFailed(current)
+            false
+        }
     }
 
     private fun handleSignal(text: String, id: Int) {
-        val msg = try { JSONObject(text) } catch (_: Exception) { return }
-        when (msg.optString("type")) {
-            "hello-ok" -> {
-                // Every hello-ok on the current socket replaces the credentials, before any early return.
-                if (!link.isCurrent(id)) return
-                val granted = grant.helloOk(msg)
-                main.post { listener.onViewerGrant(granted) }
-                val epoch = ViewerGrant.stringField(msg, "mediaEpoch")?.takeIf { Regex("^[a-f0-9]{32}$").matches(it) }
-                if (!link.helloOk(id, epoch)) return
+        val current = wire ?: return
+        when (val event = current.receive(text)) {
+            is SessionWire.Event.Admitted -> {
+                closeMedia()
+                mediaEpoch = event.hello.mediaEpoch
+                grant = ViewerGrant.from(event.hello.pc, requireNotNull(event.hello.ticket))
+                val watchdog = Runnable {
+                    if (wire === current) {
+                        val failure = current.authHostTimedOut()
+                        if (failure is SessionWire.Event.Failed) endSession(failure.problem, failure.detail)
+                    }
+                }
+                authTimer = watchdog
+                handler.postDelayed(watchdog, ViewerAuth.AUTH_HOST_TIMEOUT_MS)
+            }
+            SessionWire.Event.Authenticated -> {
+                cancelAuthTimer()
+                if (!link.authenticated(id, mediaEpoch)) return
                 registered = true
                 sigRetry.succeeded()
                 sigReconnecting = false
-                // Surface misses were not counted while signaling was down: give the
-                // waiting surface a full window from here.
+                lastSeen = System.currentTimeMillis()
+                val currentGrant = grant
+                val epoch = mediaEpoch
+                main.post {
+                    listener.onViewerGrant(currentGrant)
+                    listener.onFileEpoch(epoch)
+                    onPcState(lastSeen, null)
+                }
                 surfaceRecovery.waitingGeneration()?.let { generation ->
                     surfaceWatchdog?.let { handler.removeCallbacks(it) }
                     armSurfaceWatchdog(generation)
                 }
-                // A new signaling epoch: the old media socket belongs to the old
-                // epoch, and the host needs a fresh first-frame handshake before it
-                // accepts input again (it ignores input until then).
-                closeMedia()
-                resetFirstFrame()
-                mediaEpoch = epoch
-                main.post { listener.onFileEpoch(epoch) }
                 sendSig(JSONObject().put("type", "media-control").put("action", "mode").put("protocol", V4.VERSION)
                     .put("epoch", mediaEpoch).put("streamMode", streamMode).put("reason", "signaling-start"))
                 startMedia()
             }
+            is SessionWire.Event.Cursor -> deliverCursor(event.bytes)
+            is SessionWire.Event.Endpoint -> handleEndpoint(JSONObject(event.text))
+            is SessionWire.Event.Relay -> handleRelay(JSONObject(event.text))
+            is SessionWire.Event.Failed -> endSession(event.problem, event.detail)
+            SessionWire.Event.Disconnected -> sig?.cancel()
+            SessionWire.Event.Ignored -> Unit
+        }
+    }
+
+    private fun deliverCursor(bytes: ByteArray) {
+        val socket = sig ?: return
+        if (!pendingCursor.offer(socket, bytes.toByteString())) return
+        main.post deliver@{
+            val update = pendingCursor.take() ?: return@deliver
+            if (!cursorCallbacksEnabled || update.source !== sig) return@deliver
+            update.kind?.let { listener.onCursorType(it) }
+            update.state?.let { listener.onCursor(it) }
+        }
+    }
+
+    private fun handleEndpoint(msg: JSONObject) {
+        when (msg.optString("type")) {
+            "caps" -> Unit // Full protocol caps; feature details follow as host-capabilities.
             "host-capabilities" -> {
                 val files = msg.optInt("fileTransfer") >= 1
                 val sound = msg.optInt("audio") >= 1
@@ -514,9 +588,6 @@ class Session(
                 // Host follow state starts off for each signaling session: resend a wanted "on".
                 if (follow && followWanted) sendSig(FollowWindow.control(true, mediaEpoch))
                 if (!mediaOpen && media == null && registered) startMedia()
-            }
-            "pong" -> {
-                if (pingSentAt != 0L) { rttMs = now() - pingSentAt; pingSentAt = 0L }
             }
             "file-offer" -> {
                 val offer = FileWire.parseOfferMessage(msg) ?: return
@@ -562,6 +633,11 @@ class Session(
                 val reason = msg.optString("reason").ifEmpty { "unknown error" }.take(180)
                 main.post { listener.onMonitors(emptyList(), reason) }
             }
+        }
+    }
+
+    private fun handleRelay(msg: JSONObject) {
+        when (msg.optString("type")) {
             "peer-left" -> {
                 // The host went away: start a fresh signaling epoch, as the browser does.
                 Log.i(TAG, "peer-left: recycling signaling")
@@ -570,7 +646,9 @@ class Session(
                 try { sig?.close(1000, "peer-left") } catch (_: Exception) {}
                 sig = null; sigOpen = false; registered = false
                 clearGrant()
+                closeWire()
                 closeMedia()
+                mediaEpoch = null
                 resetFirstFrame()
                 desktopKind = "default"; secureDesktop = null
                 followCapable = false
@@ -578,12 +656,9 @@ class Session(
                 sigRetry.resetBackoff()
                 scheduleSignalingReconnect("peer-left")
             }
-            "error" -> {
-                terminal = msg.optString("message").ifEmpty { "relay error" }
-                clearGrant()
-                Log.w(TAG, "relay error: $terminal")
-                publishStatus()
-            }
+            "error" -> endSession(SessionProblem.RELAY_ERROR, msg.optString("message").ifEmpty { "relay error" }.take(180))
+            "ping" -> sendSig(JSONObject().put("type", "pong"))
+            "pong" -> if (pingSentAt != 0L) { rttMs = now() - pingSentAt; pingSentAt = 0L }
         }
     }
 
@@ -768,7 +843,7 @@ class Session(
 
     // ---- media (v4) -------------------------------------------------------------
     private fun startMedia() {
-        if (mediaEpoch == null || media != null || !surfaceRecovery.canRestartMedia()) return
+        if (!registered || terminal != null || mediaEpoch == null || media != null || !surfaceRecovery.canRestartMedia()) return
         openMedia()
     }
 
@@ -776,15 +851,15 @@ class Session(
         val epoch = mediaEpoch ?: return
         if (!running || !registered || !surfaceRecovery.canRestartMedia()) return
         val id = mediaLeg.open()
-        val cookie = if (config.isLab) null else cookieProvider()
-        val current = grant.current
-        val request = Request.Builder().url(config.mediaUrl(epoch, current.pc)).apply { if (cookie != null) header("Cookie", cookie) }.build()
+        val current = grant
+        if (current === ViewerGrant.NONE) return
+        val request = Request.Builder().url(config.mediaUrl(epoch)).build()
         media = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = mediaPost(id) {
                 // Signaling closed or replaced the grant while this socket connected: its ticket is stale, so it never sends it.
-                if (grant.current !== current) { webSocket.cancel(); return@mediaPost }
+                if (grant !== current) { webSocket.cancel(); return@mediaPost }
                 mediaLastSend = now(); mediaLastInbound = now()
-                webSocket.send(current.hello("media-client"))
+                webSocket.send(current.hello("media-viewer"))
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) = mediaPost(id) {
@@ -1039,7 +1114,7 @@ class Session(
     }
 
     private fun computeStatus(): Status {
-        terminal?.let { return Status(State.ERROR, "Session ended: $it") }
+        terminal?.let { return Status(State.ERROR, it, problem = terminalProblem, detail = terminalDetail) }
         if (surfaceRecovery.exhausted) return Status(State.ERROR, "Stream recovery stopped. Tap to retry.")
         if (link.inputReconnecting && framesPresented > 0) return Status(State.RECONNECTING, "Input reconnecting…")
         if (!sigOpen || !registered) return Status(if (sigReconnecting) State.RECONNECTING else State.CONNECTING, if (sigReconnecting) "Reconnecting…" else "Connecting…")
@@ -1063,17 +1138,6 @@ class Session(
     }
 
     private fun codecName() = when (activeCodec) { V4.CODEC_HEVC -> "hevc"; V4.CODEC_H264 -> "h264"; else -> preferredCodec }
-
-    private fun fetchLabCompat(): String? = try {
-        val url = config.base.newBuilder().encodedPath("/lab-compat").build()
-        http.newCall(Request.Builder().url(url).build()).execute().use { response ->
-            if (!response.isSuccessful) null
-            else JSONObject(response.body?.string() ?: "").optJSONObject("compatibility")?.optString("id")?.ifEmpty { null }
-        }
-    } catch (e: Exception) {
-        Log.w(TAG, "lab-compat fetch failed", e)
-        null
-    }
 
     private fun now() = SystemClock.elapsedRealtime()
 

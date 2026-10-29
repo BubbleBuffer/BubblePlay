@@ -2,7 +2,6 @@ package de.bubblebuffer.bubbleplay.ui
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.webkit.CookieManager
 import de.bubblebuffer.bubbleplay.input.PointerSpeed
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 
@@ -48,15 +47,6 @@ class Prefs(private val store: PrefStore) {
     constructor(context: Context) : this(SharedPrefStore(context.getSharedPreferences("bubbleplay", Context.MODE_PRIVATE)))
 
     init { migrate() }
-
-    var server: String
-        get() = store.getString(KEY_SERVER)?.takeIf { it.isNotBlank() } ?: ServerConfig.DEFAULT_SERVER
-        set(value) = store.edit { putString(KEY_SERVER, value) }
-
-    /** Stream Lab run id (UUID) for the local direct relay; blank for production. */
-    var labRun: String
-        get() = store.getString(KEY_LAB_RUN) ?: ""
-        set(value) = store.edit { putString(KEY_LAB_RUN, value) }
 
     /** [CODEC_AUTO], [CODEC_HEVC] or [CODEC_H264]. */
     var codec: String
@@ -110,11 +100,6 @@ class Prefs(private val store: PrefStore) {
         get() = store.getBoolean(KEY_AUTO_COPY_REMOTE_CLIPBOARD) ?: true
         set(value) = store.edit { putBoolean(KEY_AUTO_COPY_REMOTE_CLIPBOARD, value) }
 
-    /** The start-screen device-key offer was dismissed with **Not now**; it stays hidden after that. */
-    var deviceKeyOfferDismissed: Boolean
-        get() = store.getBoolean(KEY_DEVICE_KEY_OFFER_DISMISSED) ?: false
-        set(value) = store.edit { putBoolean(KEY_DEVICE_KEY_OFFER_DISMISSED, value) }
-
     /** The host monitor selector requested when a session starts; blank = the host's choice. */
     val defaultMonitor: String get() = store.getString(KEY_DEFAULT_MONITOR) ?: ""
 
@@ -126,11 +111,8 @@ class Prefs(private val store: PrefStore) {
         else { putString(KEY_DEFAULT_MONITOR, selector); putString(KEY_DEFAULT_MONITOR_NAME, name) }
     }
 
-    fun serverConfig(): ServerConfig? {
-        val base = ServerConfig.parseServer(server) ?: return null
-        val run = labRun.trim()
-        return if (ServerConfig.validLabRun(run)) ServerConfig(base, run.lowercase()) else ServerConfig(base)
-    }
+    // The PC list has no active relay until a PC is selected.
+    fun serverConfig(): ServerConfig? = null
 
     /**
      * Version 1 (unversioned) stored only server, labRun, codec and the last
@@ -156,8 +138,6 @@ class Prefs(private val store: PrefStore) {
         private val CODECS = setOf(CODEC_AUTO, CODEC_HEVC, CODEC_H264)
 
         const val KEY_VERSION = "prefsVersion"
-        const val KEY_SERVER = "server"
-        const val KEY_LAB_RUN = "labRun"
         const val KEY_CODEC = "codec"
         const val KEY_DIRECT_TOUCH = "directTouch"
         const val KEY_POINTER_SPEED = "pointerSpeed"
@@ -171,7 +151,6 @@ class Prefs(private val store: PrefStore) {
         const val KEY_AUTO_COPY_REMOTE_CLIPBOARD = "autoCopyRemoteClipboard"
         const val KEY_DEFAULT_MONITOR = "defaultMonitor"
         const val KEY_DEFAULT_MONITOR_NAME = "defaultMonitorName"
-        const val KEY_DEVICE_KEY_OFFER_DISMISSED = "deviceKeyOfferDismissed"
 
         fun normalizeCodec(value: String): String = when (value.trim().lowercase().replace(".", "").replace("-", "")) {
             "hevc", "h265" -> CODEC_HEVC
@@ -179,25 +158,5 @@ class Prefs(private val store: PrefStore) {
             else -> CODEC_AUTO
         }
 
-        fun cookieHeader(config: ServerConfig): String? = CookieManager.getInstance().getCookie(config.base.toString())
-
-        /**
-         * Sign out of this server: expires the gate and session cookies the
-         * relay set (both are `__Host-` cookies: Path=/, Secure, no Domain), so
-         * the next connection goes through sign-in again.
-         */
-        fun signOut(config: ServerConfig, done: () -> Unit) {
-            val cookies = CookieManager.getInstance()
-            val url = config.base.toString()
-            val names = listOf(ServerConfig.GATE_COOKIE, ServerConfig.AUTH_COOKIE)
-            var left = names.size
-            for (name in names) {
-                cookies.setCookie(url, "$name=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; Secure") {
-                    if (--left == 0) { cookies.flush(); done() }
-                }
-            }
-        }
-
-        fun signedIn(config: ServerConfig): Boolean = !config.isLab && ServerConfig.hasSessionCookies(cookieHeader(config))
     }
 }

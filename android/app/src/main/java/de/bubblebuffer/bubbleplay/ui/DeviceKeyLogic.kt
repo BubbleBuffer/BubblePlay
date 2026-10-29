@@ -20,7 +20,10 @@ internal sealed class StoredKey {
     class Unreadable(val reason: DeviceKeyException.Reason?) : StoredKey()
 }
 
-/** Non-visual device-key logic: what is stored, when the offer shows, file names and error text. */
+/** The first screen of the app, from the stored key and whether this process holds it unlocked. */
+internal enum class StartScreen { Setup, Unlock, PcList }
+
+/** Non-visual device-key logic: what is stored, which screen starts, file names and error text. */
 internal object DeviceKeyLogic {
     /** Reads the stored key. Does disk and Keystore work, so call it off the UI thread. */
     fun read(store: DeviceKeyStore): StoredKey = try {
@@ -32,9 +35,14 @@ internal object DeviceKeyLogic {
         StoredKey.Unreadable(null)
     }
 
-    /** The start-screen offer shows only with no readable key, and only until **Not now**. */
-    fun offerVisible(stored: StoredKey, dismissed: Boolean): Boolean =
-        stored is StoredKey.Missing && !dismissed
+    /**
+     * The app needs an unlocked key before it shows PCs. Without a key, or with one that cannot be
+     * read, the setup card shows (an unreadable key is never silently replaced: it has its own text).
+     */
+    fun startScreen(stored: StoredKey, unlocked: Boolean): StartScreen = when (stored) {
+        is StoredKey.Present -> if (unlocked) StartScreen.PcList else StartScreen.Unlock
+        is StoredKey.Missing, is StoredKey.Unreadable -> StartScreen.Setup
+    }
 
     /** Suggested name for an exported key file, e.g. `bubbleplay-B7QK-2M9X-H4PD-R8TN.bpkey`. */
     fun exportFileName(id: String): String {

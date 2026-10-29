@@ -4,47 +4,24 @@ import de.bubblebuffer.bubbleplay.keys.DeviceKeyException
 import de.bubblebuffer.bubbleplay.keys.KeyFileCodec
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
-import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 
 class DeviceKeyLogicTest {
     private val present = StoredKey.Present("", KeyFileCodec.create("Test phone", null).file)
 
-    /** SharedPreferences stand-in, as in PrefsTest. */
-    private class MapStore(val map: HashMap<String, Any> = HashMap()) : PrefStore {
-        override fun getString(key: String) = map[key] as? String
-        override fun getBoolean(key: String) = map[key] as? Boolean
-        override fun getInt(key: String) = map[key] as? Int
-        override fun edit(block: PrefStore.Editor.() -> Unit) {
-            object : PrefStore.Editor {
-                override fun putString(key: String, value: String) { map[key] = value }
-                override fun putBoolean(key: String, value: Boolean) { map[key] = value }
-                override fun putInt(key: String, value: Int) { map[key] = value }
-                override fun remove(key: String) { map.remove(key) }
-            }.block()
-        }
+    @Test
+    fun startScreenNeedsAnUnlockedKeyForThePcList() {
+        assertEquals(StartScreen.Setup, DeviceKeyLogic.startScreen(StoredKey.Missing, unlocked = false))
+        assertEquals(StartScreen.Setup, DeviceKeyLogic.startScreen(StoredKey.Unreadable(null), unlocked = false))
+        assertEquals(StartScreen.Unlock, DeviceKeyLogic.startScreen(present, unlocked = false))
+        assertEquals(StartScreen.PcList, DeviceKeyLogic.startScreen(present, unlocked = true))
     }
 
     @Test
-    fun offerShowsOnlyWithoutAKeyAndUntilNotNow() {
-        assertTrue(DeviceKeyLogic.offerVisible(StoredKey.Missing, dismissed = false))
-        assertFalse("Not now hides it for good", DeviceKeyLogic.offerVisible(StoredKey.Missing, dismissed = true))
-        assertFalse("a key is stored", DeviceKeyLogic.offerVisible(present, dismissed = false))
-        assertFalse("an unreadable key is not 'no key': Create would replace it", DeviceKeyLogic.offerVisible(StoredKey.Unreadable(null), dismissed = false))
-    }
-
-    @Test
-    fun notNowIsStoredInPrefsAndDefaultsToShowing() {
-        val store = MapStore()
-        val prefs = Prefs(store)
-        assertFalse(prefs.deviceKeyOfferDismissed)
-        prefs.deviceKeyOfferDismissed = true
-
-        assertTrue(Prefs(store).deviceKeyOfferDismissed)
-        assertFalse(DeviceKeyLogic.offerVisible(StoredKey.Missing, Prefs(store).deviceKeyOfferDismissed))
+    fun anUnreadableKeyNeverOpensThePcListEvenIfAnotherIsUnlocked() {
+        assertEquals(StartScreen.Setup, DeviceKeyLogic.startScreen(StoredKey.Unreadable(DeviceKeyException.Reason.MALFORMED), unlocked = true))
     }
 
     @Test

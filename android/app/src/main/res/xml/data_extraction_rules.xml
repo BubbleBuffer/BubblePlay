@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Sign-in cookies stay on the device: no cloud backup, no device transfer. -->
+<!-- The device key and the PC list stay on the device: no cloud backup, no device transfer. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" />
