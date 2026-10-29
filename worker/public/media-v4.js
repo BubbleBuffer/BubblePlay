@@ -1,4 +1,4 @@
-// WSS media protocol v4, shared by the relay (worker/src) and the receiver.
+// WSS media protocol v4 for the receiver; the Rust relay (relay-rs) forwards it.
 //
 // One media socket per session. Host -> client: binary frames with a
 // 28-byte big-endian header followed by one Annex-B access unit:

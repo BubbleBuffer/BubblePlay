@@ -819,7 +819,7 @@ mod tests {
         );
     }
 
-    /// Mirrors `validFileOfferMessage` in worker/src/protocol-validation.js.
+    /// Mirrors `valid_file_meta` in relay-rs/core/src/protocol.rs.
     fn valid_file_offer_text(text: &str) -> bool {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return false;

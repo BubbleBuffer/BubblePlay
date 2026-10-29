@@ -1,5 +1,5 @@
-// File transfer protocol v1, shared by the relay (worker/src) and the web
-// receiver. Intent and wire contract: docs/architecture/file-transfer.md. Shared
+// File transfer protocol v1, used by the web receiver; the Rust relay
+// (relay-rs/core/src/protocol.rs) validates the same messages. Intent and wire contract: docs/architecture/file-transfer.md. Shared
 // vectors: fixtures/file-transfer-contract.json (also tested from Rust in
 // host/src/file_transfer.rs and from Kotlin).
 //

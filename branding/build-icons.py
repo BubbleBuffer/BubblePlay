@@ -21,13 +21,10 @@ Writes
   branding/preview/*.png               (unless --no-preview)
 
 Not written, maintained separately:
-  worker/public/login.html, relay/auth.go   login brand mark (old art, between BRAND-MARK markers)
   android/.../drawable/ic_launcher_monochrome.xml   monochrome layer (old art, in a design round)
 """
 from __future__ import annotations
 
-import functools
-import http.server
 import io
 import math
 import os
@@ -37,7 +34,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -338,62 +334,6 @@ def windows_preview(frames: dict[int, Image.Image]) -> None:
     sheet.save(PREVIEW / "windows-ico.png")
 
 
-LOGIN_CSP = ("default-src 'none'; img-src 'self'; style-src 'self'; font-src 'self'; script-src 'unsafe-inline'; "
-             "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
-
-
-class LoginHandler(http.server.SimpleHTTPRequestHandler):
-    """Serves worker/public the way the relay serves the login page: `/` is
-    login.html with the gate's CSP (copied from worker/src/gate.js)."""
-
-    def log_message(self, *args) -> None:
-        pass
-
-    def do_GET(self) -> None:
-        if self.path.split("?")[0] == "/__auth/methods":
-            body = b'{"totp":false,"approval":["host"],"hostOnline":true}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if self.path.split("?")[0] == "/go-login":
-            source = (ROOT / "relay" / "auth.go").read_text(encoding="utf-8")
-            page = source.split("const relayLoginPage = `", 1)[1].split("`", 1)[0]
-            page = page.replace("{{NONCE}}", "branding-preview").replace("{{FACTOR}}", "").replace("{{APPROVAL}}", "")
-            body = page.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Security-Policy", LOGIN_CSP.replace("style-src 'self'", "style-src 'self' 'nonce-branding-preview'").replace("script-src 'unsafe-inline'", "script-src 'nonce-branding-preview'"))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if self.path.split("?")[0] == "/":
-            body = (PUBLIC / "login.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Security-Policy", LOGIN_CSP)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        super().do_GET()
-
-
-def login_preview(chrome: Chrome) -> None:
-    handler = functools.partial(LoginHandler, directory=str(PUBLIC))
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        url = f"http://127.0.0.1:{server.server_address[1]}/"
-        chrome.screenshot(url, 1280, 800, False).convert("RGB").save(PREVIEW / "login-desktop.png")
-        chrome.screenshot(url, 500, 900, False).convert("RGB").save(PREVIEW / "login-narrow.png")
-        chrome.screenshot(url + "go-login", 1280, 800, False).convert("RGB").save(PREVIEW / "login-go-desktop.png")
-        chrome.screenshot(url + "go-login", 500, 900, False).convert("RGB").save(PREVIEW / "login-go-narrow.png")
-    finally:
-        server.shutdown()
-
-
 # --------------------------------------------------------------------------- main
 
 def main() -> None:
@@ -435,7 +375,6 @@ def main() -> None:
                 monochrome = (RES / "drawable" / "ic_launcher_monochrome.xml").read_text(encoding="utf-8")
                 launcher_preview(chrome, foreground, monochrome, m.field)
             windows_preview(frames)
-            login_preview(chrome)
     finally:
         chrome.close()
     print("icons written")

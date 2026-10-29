@@ -1,8 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import worker, { Room } from "../src/index.js";
-import { RELAY_SECRETS } from "./helpers/relay-secrets.mjs";
 import {
   V4_HEADER_BYTES,
   V4_MAX_PAYLOAD_BYTES,
@@ -21,19 +19,6 @@ import {
 const contract = JSON.parse(readFileSync(new URL("../../fixtures/wss-v4-contract.json", import.meta.url), "utf8"));
 const hex = value => Uint8Array.from(value.match(/../g) || [], byte => parseInt(byte, 16));
 const toHex = bytes => Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
-
-class FakeSocket {
-  constructor(role, stripe, extra = {}) {
-    this.attachment = { role, stripe, ...extra };
-    this.readyState = 1;
-    this.messages = [];
-    this.closed = [];
-  }
-  deserializeAttachment() { return this.attachment; }
-  serializeAttachment(value) { this.attachment = value; }
-  send(value) { this.messages.push(value); }
-  close(code, reason) { this.closed.push({ code, reason }); }
-}
 
 test("v4 packets match the shared host/receiver fixture", () => {
   assert.equal(contract.headerBytes, V4_HEADER_BYTES);
@@ -76,96 +61,6 @@ test("v4 message builders produce relay-valid text", () => {
   assert.ok(validateClientMessageV4(ackMessageV4({ generation: 1, seq: 2, recvTsMs: 3 })));
   assert.deepEqual(JSON.parse(keyframeMessageV4("decoder error!")), { type: "keyframe", reason: "decoder-error-" });
   assert.ok(validateClientMessageV4(keyframeMessageV4("x".repeat(90))));
-});
-
-test("v4 routes accept one epoch-scoped socket per side and nothing else", async () => {
-  const selected = [];
-  const mediaResponse = new Response("media", { status: 200 });
-  const env = {
-    ...RELAY_SECRETS,
-    APPROVAL_METHODS: "host",
-    GATE: { idFromName: () => "gate", get: () => ({ fetch: async (request) => (new URL(request.url).pathname === "/__pc/resolve"
-      ? Response.json({ pc: null }) : new Response(null, { status: 204 })) }) },
-    ROOM: { idFromName: name => name, get: () => ({ fetch: async () => new Response("signal") }) },
-    MEDIA_ROOM: { idFromName: name => { selected.push(name); return name; }, get: () => ({ fetch: async () => mediaResponse }) },
-  };
-  const epoch = "0123456789abcdef0123456789abcdef";
-  const hostHeaders = { Upgrade: "websocket", Authorization: `Bearer ${RELAY_SECRETS.HOST_GATE_TOKEN}` };
-  const browserHeaders = { Upgrade: "websocket" };
-  assert.equal(await worker.fetch(new Request(
-    `https://playfull-cat.example/host-media-ws?epoch=${epoch}`, { headers: hostHeaders }), env), mediaResponse);
-  assert.equal(await worker.fetch(new Request(
-    `https://playfull-cat.example/media-ws?epoch=${epoch}`, { headers: browserHeaders }), env), mediaResponse);
-  assert.deepEqual(selected, [`media-v4:${epoch}`, `media-v4:${epoch}`]);
-  for (const url of [
-    "https://playfull-cat.example/host-media-ws",
-    "https://playfull-cat.example/host-media-ws?epoch=BAD",
-    `https://playfull-cat.example/host-media-ws?epoch=${epoch.toUpperCase()}`,
-  ]) assert.equal((await worker.fetch(new Request(url, { headers: hostHeaders }), env)).status, 404, url);
-  assert.equal(selected.length, 2);
-});
-
-test("v4 relay forwards frames host->client and validated control client->host on one socket", async () => {
-  const host = new FakeSocket("media-host", 0, { version: 4, epoch: "e" });
-  const client = new FakeSocket("media-client", 0, { version: 4, epoch: "e" });
-  const room = new Room({ getWebSockets: () => [host, client] }, {});
-  const frame = encodeFrameV4({ key: true, codec: 1, generation: 1, seq: 1, data: Uint8Array.of(1, 2, 3) }).buffer;
-  await room.webSocketMessage(host, frame);
-  assert.deepEqual(client.messages, [frame]);
-
-  // Header-only and oversized packets never reach the receiver.
-  await room.webSocketMessage(host, new Uint8Array(V4_HEADER_BYTES).buffer);
-  await room.webSocketMessage(host, new Uint8Array(V4_HEADER_BYTES + V4_MAX_PAYLOAD_BYTES + 1).buffer);
-  // The client may not send binary media to the host.
-  await room.webSocketMessage(client, frame);
-  assert.equal(client.messages.length, 1);
-  assert.equal(host.messages.length, 0);
-
-  const ack = ackMessageV4({ generation: 1, seq: 1, recvTsMs: 10 });
-  await room.webSocketMessage(client, ack);
-  await room.webSocketMessage(client, keyframeMessageV4("sequence-gap"));
-  await room.webSocketMessage(client, '{"type":"viewport","x":1}');
-  await room.webSocketMessage(client, "not json");
-  assert.deepEqual(host.messages, [ack, '{"type":"keyframe","reason":"sequence-gap"}']);
-
-  // Heartbeats are answered by the relay and never relayed, in both directions.
-  await room.webSocketMessage(client, '{"type":"ping"}');
-  await room.webSocketMessage(host, '{"type":"ping"}');
-  assert.equal(client.messages.at(-1), '{"type":"pong"}');
-  assert.equal(host.messages.at(-1), '{"type":"pong"}');
-  assert.equal(host.messages.length, 3);
-  // Host text is never relayed to the browser.
-  await room.webSocketMessage(host, ack);
-  assert.equal(client.messages.length, 2);
-});
-
-test("v4 relay drops traffic without a live peer", async () => {
-  const host = new FakeSocket("media-host", 0, { version: 4 });
-  const room = new Room({ getWebSockets: () => [host] }, {});
-  const frame = encodeFrameV4({ codec: 2, generation: 1, seq: 2, data: Uint8Array.of(9) }).buffer;
-  await room.webSocketMessage(host, frame);
-  assert.deepEqual(host.messages, []);
-});
-
-test("v4 hello and close announce peer presence to the other side", async () => {
-  const host = new FakeSocket(null, 0, { version: 4, expectedRole: "media-host" });
-  let sockets = [host];
-  const room = new Room({ getWebSockets: () => sockets }, {});
-  await room.webSocketMessage(host, JSON.stringify({ type: "hello", role: "media-host" }));
-  assert.deepEqual(host.messages.map(message => JSON.parse(message)), [
-    { type: "hello-ok" },
-    { type: "media-peer", present: false },
-  ]);
-  const client = new FakeSocket(null, 0, { version: 4, expectedRole: "media-client" });
-  sockets = [host, client];
-  await room.webSocketMessage(client, JSON.stringify({ type: "hello", role: "media-client" }));
-  assert.deepEqual(JSON.parse(host.messages.at(-1)), { type: "media-peer", present: true });
-  assert.deepEqual(JSON.parse(client.messages.at(-1)), { type: "media-peer", present: true });
-
-  client.readyState = 3;
-  sockets = [host];
-  await room.webSocketClose(client, 1006, "", false);
-  assert.deepEqual(JSON.parse(host.messages.at(-1)), { type: "media-peer", present: false });
 });
 
 test("v4 receive gate decodes in order and drops deltas until a keyframe after any gap", () => {
