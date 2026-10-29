@@ -229,8 +229,8 @@ fn quit_running_tray() -> Result<i32> {
 // Tray
 // ---------------------------------------------------------------------------
 
-/// Owned copy of the embedded BubblePlay mark at the system's small-icon size.
-/// Resource ID 1 is linked into this executable by build.rs.
+/// Owned copy of the embedded tray mark (no tile) at the system's small-icon size.
+/// Resource ID 2 is linked into this executable by build.rs; resource 1 stays the exe icon.
 struct TrayIcon {
     handle: HICON,
     size: (i32, i32),
@@ -243,14 +243,14 @@ impl TrayIcon {
     }
 
     fn load(size: (i32, i32)) -> Result<Self> {
-        // SAFETY: module is our executable; PCWSTR(1) is MAKEINTRESOURCEW(1).
+        // SAFETY: module is our executable; PCWSTR(2) is MAKEINTRESOURCEW(2).
         // Omitting LR_SHARED gives this object ownership of the loaded icon.
         let handle = unsafe {
             let module = GetModuleHandleW(PCWSTR::null()).context("GetModuleHandleW")?;
             LoadImageW(
                 Some(module.into()),
-                // MAKEINTRESOURCE(1): the icon resource ID, not a pointer. (`dangling()` is 2.)
-                PCWSTR(std::ptr::without_provenance::<u16>(1)),
+                // MAKEINTRESOURCE(2): the tray icon resource ID, not a pointer.
+                PCWSTR(std::ptr::without_provenance::<u16>(2)),
                 IMAGE_ICON,
                 size.0,
                 size.1,
@@ -1599,7 +1599,7 @@ unsafe extern "system" fn window_proc(
 
 fn run_tray() -> Result<i32> {
     // SAFETY: opt this tray process into system DPI before creating any windows,
-    // so small-icon metrics select the matching embedded frame (16/20/24/32 px).
+    // so small-icon metrics select the matching embedded frame (16/20/24/32/40/48 px).
     let _ = unsafe { SetProcessDPIAware() };
     let icon = TrayIcon::load(TrayIcon::small_size())?;
     let data = data_dir();

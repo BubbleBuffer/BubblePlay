@@ -11,6 +11,7 @@ Needs: Python 3.10+, Pillow, and a Chrome/Chromium binary for rasterising
 
 Writes
   branding/out/bubbleplay.ico          16..256, each frame rendered from the master tile at its size
+  branding/out/bubbleplay-tray.ico     16..48 notification-area frames: the tileless mark, transparent
   branding/small/*.png                 exact native-pixel copies of the 16/20/24 ICO frames
   branding/out/tray-32.bgra            premultiplied BGRA candidate for future tray wiring
   branding/out/bubbleplay-tile.svg     the master (ivory tile, full bleed)
@@ -55,6 +56,8 @@ SAFE_ZONE_DP = 66        # Android adaptive icon safe zone (diameter) on a 108dp
 ADAPTIVE_PX = 432        # adaptive foreground raster: 4 px per dp at xxxhdpi
 ICO_SMALL = (16, 20, 24)
 ICO_SIZES = (16, 20, 24, 32, 48, 64, 256)
+TRAY_SIZES = (16, 20, 24, 32, 40, 48)   # small-icon sizes at 100..300% DPI
+TRAY_MARGIN = 1 / 16     # clear margin on each side of a tray frame: 1px at 16px
 SUPERSAMPLE = 1024
 
 # The master's ivory tile is the only <g> with id "background"; the rest is the mark.
@@ -95,6 +98,19 @@ def tile_svg(m: Master) -> str:
 def tight_svg(m: Master) -> str:
     """The mark alone, no tile, master viewBox."""
     return m.art_text
+
+
+def tray_svg(m: Master, tight_big: Image.Image) -> str:
+    """The tileless mark cropped to a square around its own bounds, so it fills a tray frame."""
+    left, top, right, bottom = tight_big.getchannel("A").getbbox()
+    unit = 1280 / tight_big.width                       # master viewBox units per raster pixel
+    side = max(right - left, bottom - top) * unit / (1 - 2 * TRAY_MARGIN)
+    cx, cy = (left + right) / 2 * unit, (top + bottom) / 2 * unit
+    box = " ".join(fmt(v) for v in (cx - side / 2, cy - side / 2, side, side))
+    text, count = re.subn(r'viewBox="0 0 1280 1280"', f'viewBox="{box}"', m.art_text, count=1)
+    if count != 1:
+        raise SystemExit(f"{MASTER} must keep its 1280 viewBox")
+    return text
 
 
 def svg_doc(view_box: tuple[float, float, float, float], body: str) -> str:
@@ -313,10 +329,11 @@ def launcher_preview(chrome: Chrome, foreground: Image.Image, monochrome: str, f
         PREVIEW / "android-monochrome.png")
 
 
-def windows_preview(frames: dict[int, Image.Image]) -> None:
+def windows_preview(frames: dict[int, Image.Image], sizes: tuple[int, ...] = (16, 20, 24, 32, 48),
+                    name: str = "windows-ico.png") -> None:
     zoom_to = 192
     backgrounds = [("#F3F3F3", "light taskbar"), ("#202020", "dark taskbar")]
-    items = [frames[size] for size in (16, 20, 24, 32, 48)]
+    items = [frames[size] for size in sizes]
     gap = 20
     row = zoom_to + 64 + 3 * gap
     sheet = Image.new("RGB", (gap + len(items) * (zoom_to + gap), 2 * row), (90, 90, 90))
@@ -331,7 +348,7 @@ def windows_preview(frames: dict[int, Image.Image]) -> None:
             sheet.paste(flat, (x, y))                                         # 1:1
             scale = zoom_to // image.width
             sheet.paste(flat.resize((image.width * scale, image.height * scale), Image.NEAREST), (x, y + 64 + gap))
-    sheet.save(PREVIEW / "windows-ico.png")
+    sheet.save(PREVIEW / name)
 
 
 # --------------------------------------------------------------------------- main
@@ -358,6 +375,10 @@ def main() -> None:
             frames[size].save(small / f"{size}.png", optimize=True)
         write_ico(OUT / "bubbleplay.ico", [frames[size] for size in sorted(frames)])
         (OUT / "tray-32.bgra").write_bytes(premultiplied_bgra(downsample(tight_big, 32)))
+        # The notification area gets the mark without its tile, cropped to fill each frame.
+        tray = tray_svg(m, tight_big)
+        tray_frames = {size: chrome.svg(tray, size) for size in TRAY_SIZES}
+        write_ico(OUT / "bubbleplay-tray.ico", [tray_frames[size] for size in TRAY_SIZES])
 
         if not followups:
             write_text(PUBLIC / "favicon.svg", tile)
@@ -375,6 +396,7 @@ def main() -> None:
                 monochrome = (RES / "drawable" / "ic_launcher_monochrome.xml").read_text(encoding="utf-8")
                 launcher_preview(chrome, foreground, monochrome, m.field)
             windows_preview(frames)
+            windows_preview(tray_frames, TRAY_SIZES, "windows-tray.png")
     finally:
         chrome.close()
     print("icons written")

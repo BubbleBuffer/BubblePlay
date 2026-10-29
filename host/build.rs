@@ -8,6 +8,7 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=NVIDIA_VIDEO_CODEC_SDK_PATH");
     println!("cargo:rerun-if-changed=../branding/out/bubbleplay.ico");
+    println!("cargo:rerun-if-changed=../branding/out/bubbleplay-tray.ico");
     println!("cargo:rerun-if-env-changed=RC");
     println!("cargo:rerun-if-env-changed=WindowsSdkDir");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
@@ -36,12 +37,18 @@ fn main() {
         "1 ICON \"{}\"\n",
         icon.display().to_string().replace('\\', "/")
     );
+    // Resource 2 (tray only): the notification-area icon, the mark without its ivory tile.
+    let tray_icon = root
+        .join("../branding/out/bubbleplay-tray.ico")
+        .canonicalize()
+        .expect("run python branding/build-icons.py --followups before building the host");
     // Common Controls 6 is embedded in the tray only, so its dialogs and message boxes get the
     // current Windows look. The host binary keeps its icon-only resource.
     let manifest = out.join("bubbleplay_tray.manifest");
     std::fs::write(&manifest, TRAY_MANIFEST).unwrap();
     let tray_resource = format!(
-        "{icon_line}1 24 \"{}\"\n",
+        "{icon_line}2 ICON \"{}\"\n1 24 \"{}\"\n",
+        tray_icon.display().to_string().replace('\\', "/"),
         manifest.display().to_string().replace('\\', "/")
     );
     let host = compile_resource(&out, "bubbleplay-host", &icon_line);
