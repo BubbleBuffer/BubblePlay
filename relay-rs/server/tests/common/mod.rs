@@ -18,6 +18,7 @@ use axum::routing::post;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bp_device_key::{DeviceIdentity, Role};
+use bp_relay_core::gate::GATE_HOLD_MS;
 use bp_relay_server::config::{Config, Ntfy, Secret, Turn};
 use bp_relay_server::server::run;
 use futures_util::{SinkExt, StreamExt};
@@ -126,6 +127,11 @@ impl Drop for Server {
 
 impl Server {
     pub async fn start(env: &Env, turn: Option<Turn>) -> Server {
+        Server::start_with_hold(env, turn, GATE_HOLD_MS).await
+    }
+
+    /// A relay whose gate holds an unapproved navigation for `gate_hold_ms` instead of the 30 s.
+    pub async fn start_with_hold(env: &Env, turn: Option<Turn>, gate_hold_ms: u64) -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let cfg = Config {
@@ -144,6 +150,7 @@ impl Server {
             }),
             approval_ttl_s: 90,
             trusted_proxy_cidrs: Vec::new(),
+            gate_hold_ms,
         };
         let task = tokio::spawn(async move {
             run(&cfg, listener).await.expect("server run");
@@ -445,65 +452,83 @@ pub async fn data_socket(
     (ws, ok)
 }
 
-/// Runs a browser through the gate: navigation without a cookie, then the ntfy approve
-/// bearer, then the poll that trades the poll token for the cookie. Returns the Cookie header
-/// value, `__Host-gate=<value>`.
-pub async fn browser_cookie(server: &Server, env: &Env) -> String {
-    let client = http();
-    let page = client
-        .get(format!("{}/", base(server.addr)))
+/// A top-level navigation to `path` without a cookie, as a browser sends it.
+pub fn navigate(server: &Server, path: &str) -> reqwest::RequestBuilder {
+    http()
+        .get(format!("{}{path}", base(server.addr)))
         .header("Accept", "text/html")
         .header("Sec-Fetch-Dest", "document")
         .header("Sec-Fetch-Mode", "navigate")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(page.status(), 200);
-    let poll = token_in_page(&page.text().await.unwrap());
-    let ntfy = env.wait_for_ntfy().await;
-    let approve = ntfy["actions"][0]["headers"]["Authorization"]
+}
+
+/// The approve (index 0) or deny (index 1) bearer of an ntfy publish.
+pub fn ntfy_bearer(ntfy: &Value, index: usize) -> String {
+    ntfy["actions"][index]["headers"]["Authorization"]
         .as_str()
         .unwrap()
         .strip_prefix("Bearer ")
         .unwrap()
-        .to_string();
-    let decision = client
+        .to_string()
+}
+
+/// POSTs a decision with `bearer` and `action` and checks the 204.
+pub async fn decide(server: &Server, bearer: &str, action: &str) {
+    let decision = http()
         .post(format!("{}/__gate/decision", base(server.addr)))
-        .header("Authorization", format!("Bearer {approve}"))
-        .body("approve")
+        .header("Authorization", format!("Bearer {bearer}"))
+        .body(action.to_string())
         .send()
         .await
         .unwrap();
     assert_eq!(decision.status(), 204);
-    let poll_reply = client
-        .post(format!("{}/__gate/poll", base(server.addr)))
-        .header("Content-Type", "application/json")
-        .body(json!({ "pending": poll }).to_string())
-        .send()
-        .await
-        .unwrap();
-    let cookie = poll_reply
+}
+
+/// The `__Host-gate=<value>` pair a response sets, if any.
+pub fn gate_cookie_of(response: &reqwest::Response) -> Option<String> {
+    response
         .headers()
         .get_all("set-cookie")
         .iter()
         .filter_map(|value| value.to_str().ok())
         .find(|value| value.starts_with("__Host-gate="))
-        .expect("approved poll sets the gate cookie")
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    let state: Value = read_json(poll_reply).await;
-    assert_eq!(state["state"], "approved");
-    cookie
+        .map(|value| value.split(';').next().unwrap().to_string())
 }
 
-/// The poll token the wait page carries in its script.
-fn token_in_page(html: &str) -> String {
-    let start = html
-        .find("var token = \"")
-        .expect("wait page has a poll token")
-        + 13;
-    let end = start + html[start..].find('"').unwrap();
-    html[start..end].to_string()
+/// Runs a browser through the gate: a navigation without a cookie is held open, the ntfy approve
+/// bearer is posted, and the held navigation is answered with a 302 to the same URL that sets the
+/// cookie. Returns the Cookie header value, `__Host-gate=<value>`.
+pub async fn browser_cookie(server: &Server, env: &Env) -> String {
+    let held = tokio::spawn(navigate(server, "/").send());
+    let ntfy = env.wait_for_ntfy().await;
+    decide(server, &ntfy_bearer(&ntfy, 0), "approve").await;
+    let admitted = timeout(Duration::from_secs(10), held)
+        .await
+        .expect("the held navigation is answered after the approval")
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.status(), 302);
+    assert_eq!(
+        admitted.headers().get("location").unwrap(),
+        &format!("{ORIGIN}/")
+    );
+    gate_cookie_of(&admitted).expect("the admitted navigation sets the gate cookie")
+}
+
+/// Sends a raw HTTP/1.1 navigation without a cookie and reads until the server closes the
+/// connection. Returns every byte the server wrote, and how long it took.
+pub async fn raw_navigation(addr: SocketAddr, path: &str) -> (Vec<u8>, Duration) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let started = std::time::Instant::now();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/html\r\n\
+         Sec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut received = Vec::new();
+    // A reset counts as a close: what was read before it is kept.
+    let _ = timeout(Duration::from_secs(40), stream.read_to_end(&mut received))
+        .await
+        .expect("the server ends the connection");
+    (received, started.elapsed())
 }

@@ -112,6 +112,21 @@ pub fn gate_response(response: GateResponse) -> Result<Response> {
     Ok(out)
 }
 
+/// A response whose body stream fails before its first byte, for a request the gate drops. A
+/// Worker cannot close the client connection itself, and a thrown error would show Cloudflare's
+/// error page. The failed stream makes the runtime abort the response instead: the client gets a
+/// network error (on HTTP/2 a reset stream, on HTTP/1.1 a closed connection) and no content. The
+/// status and the few headers that may go out before the abort name nothing: no body type, no
+/// product, no HTML.
+pub fn dropped() -> Result<Response> {
+    let failed = futures_util::stream::once(async {
+        Err::<Vec<u8>, worker::Error>(worker::Error::RustError("dropped".to_owned()))
+    });
+    let mut response = Response::from_stream(failed)?.with_status(403);
+    response.headers_mut().set("Cache-Control", "no-store")?;
+    Ok(response)
+}
+
 /// A 200 JSON response that no cache may keep.
 pub fn json(value: &serde_json::Value) -> Result<Response> {
     let mut response = Response::from_json(value)?;

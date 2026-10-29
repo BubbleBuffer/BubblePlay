@@ -5,8 +5,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
+use std::time::Duration;
 
-use bp_relay_core::gate::{Gate, GateEffect, GateSnapshot, Request as GateRequest, Verdict};
+use bp_relay_core::gate::{
+    Gate, GateEffect, GateSnapshot, Hold, HoldCheck, Request as GateRequest, Verdict,
+};
 use bp_relay_core::relay::{
     Action, AdminError, ConnId, ConnSnapshot, Relay as CoreRelay, UpgradeRequest,
 };
@@ -15,7 +18,7 @@ use worker::js_sys;
 use worker::wasm_bindgen::JsValue;
 use worker::worker_sys::WebSocketRequestResponsePair;
 use worker::{
-    Error, Method, Request, Response, Result, ScheduledTime, State, Storage, Url, WebSocket,
+    Delay, Error, Method, Request, Response, Result, ScheduledTime, State, Storage, Url, WebSocket,
     WebSocketIncomingMessage, WebSocketPair,
 };
 
@@ -34,6 +37,8 @@ const TAG_PREFIX: &str = "conn:";
 /// Answered by the runtime itself, so a keepalive does not wake the object.
 const PING: &str = r#"{"type":"ping"}"#;
 const PONG: &str = r#"{"type":"pong"}"#;
+/// How often a held navigation looks at the gate's in-memory state.
+const HOLD_CHECK_MS: u64 = 250;
 
 /// The PC store could not be written. The batch stops and the origin socket was closed 1011.
 struct StoreFailed;
@@ -96,6 +101,7 @@ impl crate::Relay {
         let gate_request = GateRequest {
             method: &method_text,
             path: &path,
+            query: url.query(),
             websocket,
             origin: origin.as_deref(),
             cookie: cookie.as_deref(),
@@ -128,10 +134,15 @@ impl crate::Relay {
                     not_found()
                 };
             }
-            Verdict::Wait(response, effects) | Verdict::Handled(response, effects) => {
+            Verdict::Handled(response, effects) => {
                 self.run_gate_effects(effects).await;
                 return http::gate_response(response);
             }
+            Verdict::Hold(hold, effects) => {
+                self.run_gate_effects(effects).await;
+                return self.hold_navigation(hold).await;
+            }
+            Verdict::Drop => return http::dropped(),
             Verdict::Allow => {}
         }
         if path.starts_with("/__gate/manage/") {
@@ -148,6 +159,33 @@ impl crate::Relay {
             } => {
                 let head = method == Method::Head;
                 assets::serve(&self.env, &url, head, &asset_path, index).await
+            }
+        }
+    }
+
+    /// Holds an unapproved navigation open until the gate admits it (a 302 with the cookie) or
+    /// drops it. Each check reads in-memory state only, and the timer between checks leaves the
+    /// object free to handle other events, the decision among them.
+    async fn hold_navigation(&self, hold: Hold) -> Result<Response> {
+        loop {
+            let now = now_ms();
+            let check = {
+                let mut guard = self.live.borrow_mut();
+                match guard.as_mut() {
+                    Some(live) => live.gate.check_hold(&mut WebCrypto, &hold, now),
+                    None => HoldCheck::Drop,
+                }
+            };
+            match check {
+                HoldCheck::Waiting => {
+                    let left = hold.until_ms().saturating_sub(now).clamp(1, HOLD_CHECK_MS);
+                    Delay::from(Duration::from_millis(left)).await;
+                }
+                HoldCheck::Admit(response, effects) => {
+                    self.run_gate_effects(effects).await;
+                    return http::gate_response(response);
+                }
+                HoldCheck::Drop => return http::dropped(),
             }
         }
     }
@@ -648,8 +686,11 @@ async fn wake_state(
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .ok_or_else(|| "PUBLIC_ORIGIN has no host".to_owned())?;
     let admin_token = settings.admin_token;
-    let gate = Gate::new(settings.gate, gate_snapshot, now)
+    let mut gate = Gate::new(settings.gate, gate_snapshot, now)
         .map_err(|_| "the gate configuration was rejected".to_owned())?;
+    if let Some(hold_ms) = settings.gate_hold_ms {
+        gate.set_hold_ms(hold_ms);
+    }
     let (core, actions) = CoreRelay::rehydrate(settings.core, pcs, snapshots, now);
     Ok(Woken {
         live: Live {

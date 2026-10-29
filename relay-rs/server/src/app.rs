@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
@@ -13,7 +14,9 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use bp_relay_core::gate::{Request as GateRequest, Response as GateResponse, Verdict};
+use bp_relay_core::gate::{
+    Hold, HoldCheck, Request as GateRequest, Response as GateResponse, Verdict,
+};
 use bp_relay_core::relay::{AdminError, UpgradeRequest};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -29,6 +32,9 @@ pub type AppState = Arc<Shared>;
 
 /// The largest body a request may carry into the gate. A larger body is 413 and never reaches it.
 const GATE_BODY_LIMIT: usize = 16 * 1024;
+
+/// How often a held navigation looks at the gate's in-memory state.
+const HOLD_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -74,6 +80,7 @@ async fn dispatch(
         let req = GateRequest {
             method: parts.method.as_str(),
             path,
+            query: parts.uri.query(),
             websocket,
             origin: header_str(&parts.headers, "origin"),
             cookie: header_str(&parts.headers, "cookie"),
@@ -98,10 +105,15 @@ async fn dispatch(
             }
             StatusCode::NOT_FOUND.into_response()
         }
-        Verdict::Wait(response, effects) | Verdict::Handled(response, effects) => {
+        Verdict::Handled(response, effects) => {
             state.run_gate_effects(effects).await;
             gate_response(response)
         }
+        Verdict::Hold(hold, effects) => {
+            state.run_gate_effects(effects).await;
+            hold_navigation(&state, hold).await
+        }
+        Verdict::Drop => dropped(),
         Verdict::Allow => {
             if path.starts_with("/__gate/manage/") {
                 return admin(&state, &parts.method, path, &parts.headers).await;
@@ -133,9 +145,38 @@ async fn dispatch(
     }
 }
 
+/// Holds an unapproved navigation open until the gate admits it (a 302 with the cookie) or drops
+/// it. Nothing is written while it waits. The check reads in-memory state only.
+async fn hold_navigation(state: &AppState, hold: Hold) -> Response {
+    loop {
+        let now = now_ms();
+        let check = state.gate().check_hold(&mut OsRandom, &hold, now);
+        match check {
+            HoldCheck::Waiting => {
+                let left = hold.until_ms().saturating_sub(now).max(1);
+                tokio::time::sleep(HOLD_CHECK_INTERVAL.min(Duration::from_millis(left))).await;
+            }
+            HoldCheck::Admit(response, effects) => {
+                state.run_gate_effects(effects).await;
+                return gate_response(response);
+            }
+            HoldCheck::Drop => return dropped(),
+        }
+    }
+}
+
+/// A response whose body fails before its first byte. hyper then closes the connection without
+/// writing the status line or any header, so the client sees the connection end with no content.
+fn dropped() -> Response {
+    let failed = futures_util::stream::once(async {
+        Err::<Bytes, std::io::Error>(std::io::Error::other("gate dropped the request"))
+    });
+    Response::new(Body::from_stream(failed))
+}
+
 /// Accepts a refused browser socket and closes it 1008 with an empty reason. A failed upgrade
 /// reaches the browser as a bare 1006, and the browser reconnects in a loop. A 1008 tells it to
-/// stop, and the page reloads into the wait page.
+/// stop.
 async fn refused_socket(state: &AppState, parts: &mut Parts) -> Response {
     let upgrade = match WebSocketUpgrade::from_request_parts(parts, state).await {
         Ok(upgrade) => upgrade,

@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use bp_device_key::relay_origin;
+use bp_relay_core::gate::GATE_HOLD_MS;
 use ipnet::IpNet;
 use serde::Deserialize;
 use url::Url;
@@ -71,6 +72,9 @@ pub struct Config {
     pub ntfy: Option<Ntfy>,
     pub approval_ttl_s: u32,
     pub trusted_proxy_cidrs: Vec<IpNet>,
+    /// How long the gate holds an unapproved navigation. Not read from relay.json: it is always
+    /// `GATE_HOLD_MS` there, and tests shorten it. The gate clamps it to `1..=GATE_HOLD_MS`.
+    pub gate_hold_ms: u64,
 }
 
 #[derive(Debug)]
@@ -212,6 +216,7 @@ pub fn parse_config(
         ntfy,
         approval_ttl_s,
         trusted_proxy_cidrs,
+        gate_hold_ms: GATE_HOLD_MS,
     })
 }
 

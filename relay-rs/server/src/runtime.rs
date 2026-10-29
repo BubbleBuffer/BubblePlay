@@ -163,8 +163,9 @@ impl Shared {
                 token: ntfy.token.as_ref().map(|t| t.expose().to_string()),
             }),
         };
-        let gate = Gate::new(gate_config, snapshot, now_ms())
+        let mut gate = Gate::new(gate_config, snapshot, now_ms())
             .map_err(|e| format!("gate configuration: {e:?}"))?;
+        gate.set_hold_ms(cfg.gate_hold_ms);
         let http = reqwest::Client::builder()
             .timeout(NTFY_TIMEOUT)
             .build()

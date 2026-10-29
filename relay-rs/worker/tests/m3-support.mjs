@@ -450,13 +450,42 @@ export function httpRequest(
   });
 }
 
-// The wait page carries the poll token in its script as `var token = "...";`.
-export function pollTokenOf(html) {
-  const marker = 'var token = "';
-  const start = html.indexOf(marker);
-  if (start < 0) throw new Error('the wait page has no poll token');
-  const from = start + marker.length;
-  return html.slice(from, html.indexOf('"', from));
+// A top-level navigation without a cookie, as a browser sends it. The gate holds it open while the
+// approval is pending; it resolves with the 302 that admits it, or rejects when the gate drops the
+// connection. Resolves to { response, ms } or rejects with { error, ms }.
+export async function heldNavigation(port, { path: target = '/', ip = CLIENT_IP } = {}) {
+  const started = Date.now();
+  try {
+    const response = await httpRequest(port, {
+      path: target,
+      ip,
+      headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
+    });
+    return { response, ms: Date.now() - started };
+  } catch (error) {
+    const dropped = new Error(`navigation dropped after ${Date.now() - started} ms: ${error.message}`);
+    dropped.ms = Date.now() - started;
+    dropped.cause = error;
+    throw dropped;
+  }
+}
+
+// The decision POST, as the ntfy action sends it.
+export async function decide(port, bearer, action, ip = CLIENT_IP) {
+  const decision = await httpRequest(port, {
+    method: 'POST',
+    path: '/__gate/decision',
+    ip,
+    headers: { Authorization: `Bearer ${bearer}` },
+    body: action,
+  });
+  if (decision.status !== 204) throw new Error(`decision answered ${decision.status}`);
+}
+
+// The `__Host-gate=<value>` pair a response sets, or undefined.
+export function gateCookieOf(response) {
+  const cookie = (response.headers['set-cookie'] ?? []).find((value) => value.startsWith('__Host-gate='));
+  return cookie?.split(';')[0];
 }
 
 // A fake ntfy server. Each publish is recorded in order as { method, headers, body }, with the JSON
@@ -514,49 +543,34 @@ export function freshClientIp() {
   return `198.18.${approvalCount}.20`;
 }
 
-// The browser approval, as the wait page drives it: a top-level navigation opens the wait page, ntfy
-// carries the approve bearer, the decision posts it, and the poll returns the gate cookie. Returns
-// the cookie pair as a browser sends it back.
+// The browser approval: a top-level navigation is held open, ntfy carries the approve bearer, the
+// decision posts it, and the held navigation is answered with a 302 to the same URL that sets the
+// gate cookie. Returns the cookie pair as a browser sends it back.
 export async function approveBrowser(relay, ntfy, ip = freshClientIp()) {
   const before = ntfy.count();
-  const page = await httpRequest(relay.port, {
-    path: '/',
-    ip,
-    headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
-  });
-  if (page.status !== 200) throw new Error(`wait page answered ${page.status}`);
-  const pending = pollTokenOf(page.body.toString('utf8'));
+  const held = heldNavigation(relay.port, { path: '/', ip });
+  held.catch(() => {});
   const prefix = `${ip.split('.').slice(0, 3).join('.')}.0/24`;
   const expected = `Browser navigation awaiting approval from client prefix ${prefix}`;
   const publish = await ntfy.waitFor(before, (p) => p.body?.message === expected);
   const approve = publish.body.actions[0].headers.Authorization.replace(/^Bearer /, '');
-  const decision = await httpRequest(relay.port, {
-    method: 'POST',
-    path: '/__gate/decision',
-    ip,
-    headers: { Authorization: `Bearer ${approve}` },
-    body: 'approve',
-  });
-  if (decision.status !== 204) throw new Error(`decision answered ${decision.status}`);
-  const reply = await httpRequest(relay.port, {
-    method: 'POST',
-    path: '/__gate/poll',
-    ip,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pending }),
-  });
-  const state = JSON.parse(reply.body.toString('utf8'));
-  if (state.state !== 'approved') throw new Error(`poll answered ${state.state}`);
-  const cookie = (reply.headers['set-cookie'] ?? []).find((value) => value.startsWith('__Host-gate='));
-  if (!cookie) throw new Error('the approved poll set no gate cookie');
-  return cookie.split(';')[0];
+  await decide(relay.port, approve, 'approve', ip);
+  const { response } = await held;
+  if (response.status !== 302) throw new Error(`the held navigation answered ${response.status}`);
+  if (response.headers.location !== `${relay.origin}/`) {
+    throw new Error(`the admitted navigation went to ${response.headers.location}`);
+  }
+  const cookie = gateCookieOf(response);
+  if (!cookie) throw new Error('the admitted navigation set no gate cookie');
+  return cookie;
 }
 
 // Starts `wrangler dev --local` on a free port with the throwaway config as --var values and the
 // given --persist-to directory. Resolves when the Worker answers /healthz with the admin bearer. A
 // config rejection (500) fails the start, so the cause shows up in the log instead of in a test.
-// `ntfy` (from startNtfy) turns approvals on, and `turn` adds the TURN ICE server.
-export async function startRelay({ persistDir, maxConnections = 256, ntfy = null, turn = false }) {
+// `ntfy` (from startNtfy) turns approvals on, and `turn` adds the TURN ICE server. `gateHoldMs`
+// shortens the gate's 30 s hold (the test-only GATE_HOLD_MS var).
+export async function startRelay({ persistDir, maxConnections = 256, ntfy = null, turn = false, gateHoldMs = null }) {
   if (!existsSync(path.join(crateRoot, 'build', 'worker', 'shim.mjs'))) {
     throw new Error('build/worker/shim.mjs is missing: run worker-build --release first');
   }
@@ -574,6 +588,7 @@ export async function startRelay({ persistDir, maxConnections = 256, ntfy = null
   ];
   if (ntfy) vars.push(['NTFY_URL', ntfy.url], ['NTFY_TOPIC', NTFY_TOPIC], ['NTFY_TOKEN', NTFY_TOKEN]);
   if (turn) vars.push(['TURN_HOST', TURN_HOST], ['TURN_SECRET', TURN_SECRET]);
+  if (gateHoldMs !== null) vars.push(['GATE_HOLD_MS', String(gateHoldMs)]);
   let output = '';
   const child = spawn(
     wranglerBin,

@@ -57,38 +57,112 @@ async fn session(server: &Server, env: &Env, seed: u8) -> Session {
     }
 }
 
+/// A navigation without a cookie gets nothing while it waits: ntfy gets the prefix only, and the
+/// approval answers the same held request with a 302 to the URL it asked for (query included).
 #[tokio::test]
-async fn e2e_viewer_without_cookie_gets_wait_page_and_ntfy_prefix_only() {
+async fn e2e_held_navigation_is_admitted_by_an_approval_within_the_hold() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
+    let held = tokio::spawn(navigate(&server, "/pair?x=1").send());
+
+    let ntfy = env.wait_for_ntfy().await;
+    assert!(ntfy["message"].as_str().unwrap().contains("client prefix"));
+    assert!(!ntfy["message"].as_str().unwrap().contains("127.0.0.1"));
+    assert_eq!(ntfy["actions"][0]["label"], "Approve");
+    assert_eq!(ntfy["actions"][1]["label"], "Deny");
+    assert!(
+        !held.is_finished(),
+        "nothing is answered before the decision"
+    );
+
+    decide(&server, &ntfy_bearer(&ntfy, 0), "approve").await;
+    let admitted = tokio::time::timeout(WAIT, held)
+        .await
+        .expect("the held navigation is answered")
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.status(), 302);
+    assert_eq!(
+        admitted.headers().get("location").unwrap(),
+        &format!("{ORIGIN}/pair?x=1")
+    );
+    let cookie = gate_cookie_of(&admitted).expect("the gate cookie is set");
+    assert!(admitted.bytes().await.unwrap().is_empty());
+
     let page = http()
-        .get(format!("{}/", base(server.addr)))
-        .header("Accept", "text/html")
-        .header("Sec-Fetch-Dest", "document")
-        .header("Sec-Fetch-Mode", "navigate")
+        .get(format!("{}/pair?x=1", base(server.addr)))
+        .header("Cookie", cookie.as_str())
         .send()
         .await
         .unwrap();
     assert_eq!(page.status(), 200);
-    let html = page.text().await.unwrap();
-    assert!(html.contains("/__gate/poll"));
-    let poll = html
-        .split("var token = \"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap()
-        .to_string();
+}
 
-    let ntfy = env.wait_for_ntfy().await;
-    assert!(ntfy["message"].as_str().unwrap().contains("client prefix"));
+/// With no decision, the held navigation ends when the hold does: the connection closes without a
+/// status line, a header or a byte of body.
+#[tokio::test]
+async fn e2e_held_navigation_is_dropped_without_content_when_the_hold_ends() {
+    let env = Env::new().await;
+    let server = Server::start_with_hold(&env, None, 700).await;
+    let (received, took) = raw_navigation(server.addr, "/").await;
     assert!(
-        !ntfy.to_string().contains(&poll),
-        "ntfy never carries the poll token"
+        received.is_empty(),
+        "a dropped navigation gets no bytes, got {:?}",
+        String::from_utf8_lossy(&received)
     );
-    assert_eq!(ntfy["actions"][0]["label"], "Approve");
-    assert_eq!(ntfy["actions"][1]["label"], "Deny");
+    assert!(
+        took >= std::time::Duration::from_millis(600),
+        "held for {took:?}"
+    );
+    env.wait_for_ntfy().await;
+}
+
+/// A deny drops the held navigation at once, with no content, and the prefix then cools down: the
+/// next navigation is dropped too and opens no second approval.
+#[tokio::test]
+async fn e2e_denied_navigation_is_dropped_without_content() {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let addr = server.addr;
+    let held = tokio::spawn(async move { raw_navigation(addr, "/").await });
+    let ntfy = env.wait_for_ntfy().await;
+    decide(&server, &ntfy_bearer(&ntfy, 1), "deny").await;
+    let (received, took) = tokio::time::timeout(WAIT, held)
+        .await
+        .expect("the deny ends the hold")
+        .unwrap();
+    assert!(received.is_empty(), "a denied navigation gets no bytes");
+    assert!(took < std::time::Duration::from_secs(10));
+
+    let (again, _) = raw_navigation(server.addr, "/").await;
+    assert!(again.is_empty(), "a cooling prefix is dropped");
+    assert_eq!(
+        env.ntfy.lock().unwrap().len(),
+        1,
+        "no second approval opens"
+    );
+}
+
+/// An approval that lands after the hold ended is claimed by the next navigation from the prefix,
+/// once: the reload gets the 302 with the cookie, and the one after it is dropped again.
+#[tokio::test]
+async fn e2e_approval_after_the_hold_is_claimed_once_by_the_next_navigation() {
+    let env = Env::new().await;
+    let server = Server::start_with_hold(&env, None, 300).await;
+    let (received, _) = raw_navigation(server.addr, "/").await;
+    assert!(received.is_empty());
+    let ntfy = env.wait_for_ntfy().await;
+    decide(&server, &ntfy_bearer(&ntfy, 0), "approve").await;
+
+    let reload = navigate(&server, "/").send().await.unwrap();
+    assert_eq!(reload.status(), 302);
+    assert!(
+        gate_cookie_of(&reload).is_some(),
+        "the reload claims the cookie"
+    );
+
+    let (again, _) = raw_navigation(server.addr, "/").await;
+    assert!(again.is_empty(), "the approval is claimed only once");
 }
 
 #[tokio::test]
@@ -108,7 +182,7 @@ async fn e2e_approval_grants_cookie_and_asset_access() {
     assert_eq!(with_cookie.status(), 200);
     assert_eq!(with_cookie.text().await.unwrap(), "home");
 
-    // A non-navigation request without the cookie gets the plain 403, not the wait page. The
+    // A non-navigation request without the cookie gets the plain 403, and is not held. The
     // gate treats a request with no Sec-Fetch-Dest as a navigation, so this one states that it is
     // a subresource fetch.
     let bare = client
@@ -439,23 +513,6 @@ async fn e2e_native_viewer_without_origin_upgrades_and_bare_hello_is_1008() {
         .expect("the upgrade is accepted without a cookie");
     send_json(&mut ws, json!({ "type": "hello", "role": "viewer" })).await;
     assert_eq!(expect_close(&mut ws).await, (1008, String::new()));
-}
-
-/// `/pair` is the browser page too. Without a cookie, a top-level GET gets the gate's wait page.
-#[tokio::test]
-async fn e2e_pair_without_cookie_gets_wait_page() {
-    let env = Env::new().await;
-    let server = Server::start(&env, None).await;
-    let page = http()
-        .get(format!("{}/pair", base(server.addr)))
-        .header("Accept", "text/html")
-        .header("Sec-Fetch-Dest", "document")
-        .header("Sec-Fetch-Mode", "navigate")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(page.status(), 200);
-    assert!(page.text().await.unwrap().contains("/__gate/poll"));
 }
 
 /// With the gate cookie, GET and HEAD `/pair` serve the page as `/` does, and `/pair/x` stays 404.
