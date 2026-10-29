@@ -20,8 +20,10 @@
 //!   the normalised sha-256 `a=fingerprint` of the SDP actually sent and received.
 //! - `seal_text(kind, json)` and `seal_binary("cursor", bytes)` return the ctl envelope text to
 //!   send. `seal_text` requires the JSON `type` to equal `kind`.
-//! - Gates and state: `is_established()`, `media_ready()` (input and media wait for both DTLS
-//!   binds), `viewer()` (id, public key, caps), `is_ended()`.
+//! - Transport latch (decision 24, see [`Mode`]): `webrtc_offer` latches WebRTC, `latch_wss`
+//!   latches WSS; `mode()` reads it.
+//! - Gates and state: `is_established()`, `media_ready()` (input and media wait for the latch,
+//!   and in WebRTC for both DTLS binds), `viewer()` (id, public key, caps), `is_ended()`.
 //!
 //! Results: `Ok(events)` carries `Event::Send` (text to write on /ws), state events, `Ignored`
 //! (dropped, no state change; log at debug) and `Ended` (drop the viewer). A viewer that breaks the
@@ -243,11 +245,36 @@ struct Hand {
     pair: Option<PairKey>,
 }
 
+/// The session's media transport, latched by what the viewer actually does (decision 24).
+///
+/// Client behaviour (checked 2026-10-29): the browser (`switchToWss`, via `useWss()`) and
+/// client-win (`fallback_wss`) fall back from WebRTC to WSS within one session, on the same /ws,
+/// with no new handshake. No client goes from WSS to WebRTC without reconnecting (a new
+/// handshake). Android is WSS only. Each client sends at most one offer per /ws connection.
+///
+/// Rule: switching is allowed and needs no new message type.
+/// - Unset: only answer, ice, caps, ping and bye pass (plus the PC's error and pong), and a
+///   `media-control` start for protocol 4 with this session's epoch. Input and application ctl
+///   are dropped, not fatal, and the viewer does not count as live.
+/// - An accepted offer latches WebRtc, clears both binds and closes the gate until both binds
+///   for that offer verify. The host still drops a repeated offer in one device-key session, so
+///   today this covers the first offer; the clear-binds rule also covers any future accepted
+///   re-offer.
+/// - The `media-control` start above latches Wss from Unset, and re-latches Wss after WebRtc
+///   (the RTC→WSS fallback). WSS has no DTLS, so no bind is needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Unset,
+    WebRtc,
+    Wss,
+}
+
 struct Channel {
     viewer: Viewer,
     h: [u8; 32],
     sealer: CtlSealer,
     opener: CtlOpener,
+    mode: Mode,
     offer_fp: Option<String>,
     answer_fp: Option<String>,
     /// Our auth-bind signature, once signed. Repeated `dtls_connected` calls re-send it.
@@ -417,6 +444,7 @@ impl Session {
             h: hand.h,
             sealer,
             opener,
+            mode: Mode::Unset,
             offer_fp: None,
             answer_fp: None,
             bind_signature: None,
@@ -528,7 +556,7 @@ impl Session {
 
     /// The viewer's WebRTC offer, as a ctl message. A viewer without dtls-bind-v1, or an offer
     /// without a sha-256 `a=fingerprint`, gets a `dtls-bind-required` ctl error and the session
-    /// ends.
+    /// ends. An accepted offer latches [`Mode::WebRtc`] and clears both binds.
     pub fn webrtc_offer(&mut self, offer_sdp: &str) -> Result<Vec<Event>, SessionError> {
         // The cap check comes before the SDP is read: a viewer without dtls-bind-v1 is refused
         // whatever the offer holds.
@@ -536,13 +564,15 @@ impl Session {
         if !channel.viewer.caps.iter().any(|cap| cap == CAP_DTLS) {
             return self.refuse_dtls("This viewer did not offer dtls-bind-v1, which WebRTC needs.");
         }
-        if channel.offer_fp.is_some() {
-            return Err(SessionError::Misuse("offer already received"));
-        }
         let Ok(fingerprint) = sdp_sha256_fingerprint(offer_sdp) else {
             return self.refuse_dtls("The WebRTC offer has no sha-256 DTLS fingerprint.");
         };
-        self.channel_mut()?.offer_fp = Some(fingerprint);
+        let channel = self.channel_mut()?;
+        channel.mode = Mode::WebRtc;
+        channel.offer_fp = Some(fingerprint);
+        channel.answer_fp = None;
+        channel.bind_signature = None;
+        channel.viewer_bound = false;
         Ok(Vec::new())
     }
 
@@ -641,10 +671,24 @@ impl Session {
         matches!(self.state, State::Established(_))
     }
 
-    /// Input and media may flow: established, and in WebRTC mode both DTLS binds verified.
-    /// Call `webrtc_offer` before starting WebRTC media; WSS has no offer and no bind.
+    /// Input and media may flow: established, the transport latched, and in WebRTC mode both
+    /// DTLS binds verified. See [`Mode`].
     pub fn media_ready(&self) -> bool {
         matches!(&self.state, State::Established(channel) if channel.media_ready())
+    }
+
+    /// The viewer's accepted WSS media start: latches (or re-latches) [`Mode::Wss`].
+    pub fn latch_wss(&mut self) -> Result<(), SessionError> {
+        self.channel_mut()?.mode = Mode::Wss;
+        Ok(())
+    }
+
+    /// The latched transport, once established.
+    pub fn mode(&self) -> Option<Mode> {
+        match &self.state {
+            State::Established(channel) => Some(channel.mode),
+            _ => None,
+        }
     }
 
     pub fn is_ended(&self) -> bool {
@@ -677,9 +721,13 @@ impl Channel {
         Ok(json!({"type": "ctl", "kind": kind, "seq": seq, "data": b64(&data)}).to_string())
     }
 
-    /// Input and media wait for both DTLS binds once an offer has arrived (WebRTC).
+    /// Nothing flows before the mode latches; WebRTC also waits for both DTLS binds.
     fn media_ready(&self) -> bool {
-        self.offer_fp.is_none() || (self.bind_signature.is_some() && self.viewer_bound)
+        match self.mode {
+            Mode::Unset => false,
+            Mode::Wss => true,
+            Mode::WebRtc => self.bind_signature.is_some() && self.viewer_bound,
+        }
     }
 }
 
@@ -720,7 +768,9 @@ fn open_ctl(
         if !channel.media_ready() {
             return Ok((
                 State::Established(channel),
-                vec![Event::Ignored("input before the DTLS bind")],
+                vec![Event::Ignored(
+                    "input before the transport latch or the DTLS bind",
+                )],
             ));
         }
         // Input is always the exact plaintext bytes, whatever the first byte: a binary frame may
@@ -1145,7 +1195,9 @@ mod tests {
             matches!(&events[1], Event::Established(viewer) if viewer.id == "47Z3-3QX1-AJH6-2RKB")
         );
 
-        // Viewer-to-PC fixture messages open in order and dispatch with their plaintext.
+        // Viewer-to-PC fixture messages open in order and dispatch with their plaintext once the
+        // transport has latched.
+        session.latch_wss().expect("wss");
         for message in hs["controlMessages"]
             .as_array()
             .expect("array")
@@ -1187,6 +1239,7 @@ mod tests {
         let ctl = &f["phase2"]["ctl"];
 
         let mut session = established_session();
+        session.latch_wss().expect("wss");
         let input = &ctl["messages"][0]["message"];
         match session
             .on_text(&input.to_string())
@@ -1530,6 +1583,7 @@ mod tests {
         let f = fixture();
         let hs = &f["handshake"];
         let mut session = established_session();
+        session.latch_wss().expect("wss");
         let mut viewer = CtlSealer::new(&hex32(s(&hs["controlKeys"]["viewerToPcHex"])));
         // A frame starting with `{` is still binary input; so are whitespace-led and empty bytes.
         let frames: [&[u8]; 5] = [b"{", b"{\"type\":\"input\"}", b" {", b"\n\t0", b""];
@@ -1705,6 +1759,43 @@ mod tests {
         let again = session.dtls_connected().expect("repeat");
         assert_eq!(sent(&again)["signature"], dtls["pc"]["signature"]);
         assert!(matches!(again.as_slice(), [Event::Send(_)]));
+    }
+
+    #[test]
+    fn mode_latch_gates_media_and_an_offer_after_wss_closes_the_gate_until_both_binds() {
+        let f = fixture();
+        let hs = &f["handshake"];
+        let dtls = &hs["dtls"];
+        let mut session = established_session();
+        assert_eq!(session.mode(), Some(Mode::Unset));
+        assert!(!session.media_ready());
+        session.latch_wss().expect("wss");
+        assert_eq!(session.mode(), Some(Mode::Wss));
+        assert!(session.media_ready());
+        // An accepted offer latches WebRTC and closes the gate until both binds for it verify.
+        let offer = format!(
+            "v=0\r\na=fingerprint:{}\r\n",
+            s(&dtls["viewer"]["localFingerprint"])
+        );
+        assert!(session.webrtc_offer(&offer).expect("offer").is_empty());
+        assert_eq!(session.mode(), Some(Mode::WebRtc));
+        assert!(!session.media_ready());
+        let answer = format!(
+            "v=0\r\na=fingerprint:{}\r\n",
+            s(&dtls["pc"]["localFingerprint"])
+        );
+        assert!(session.webrtc_answer(&answer).expect("answer").is_empty());
+        assert!(session
+            .on_text(&hs["messages"]["authBind"].to_string())
+            .expect("viewer bind")
+            .is_empty());
+        assert!(!session.media_ready());
+        let events = session.dtls_connected().expect("bind");
+        assert!(matches!(events.as_slice(), [Event::Send(_), Event::Bound]));
+        assert!(session.media_ready());
+        // The WSS fallback re-latches without binds.
+        session.latch_wss().expect("wss again");
+        assert!(session.media_ready());
     }
 
     #[test]

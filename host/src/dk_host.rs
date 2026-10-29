@@ -377,6 +377,17 @@ impl HostProtocol {
             .collect()
     }
 
+    /// A viewer `media-control` start for WSS protocol 4 with this session's epoch.
+    fn is_wss_start(&self, json: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<Value>(json) else {
+            return false;
+        };
+        value["action"] == "start"
+            && value["protocol"].as_u64() == Some(4)
+            && value["epoch"].as_str().is_some()
+            && value["epoch"].as_str() == self.epoch.as_deref()
+    }
+
     fn reset_peer(&mut self) {
         self.session.stop(End::Stopped("viewer reset"));
         self.epoch = None;
@@ -556,7 +567,17 @@ impl HostProtocol {
                         }
                         continue;
                     }
+                    // Decision 24 (see dk_session::Mode): a WSS media start for protocol 4 and this
+                    // session's epoch latches WSS, from Unset or after WebRTC (the fallback).
+                    if kind == "media-control" && self.is_wss_start(&json) {
+                        self.session.latch_wss()?;
+                        incoming.push(Inbound::Json(json));
+                        continue;
+                    }
                     if kind == "offer" {
+                        // Clients send at most one offer per /ws, so a second one is dropped today.
+                        // The session's clear-binds rule covers the first offer and any future
+                        // accepted re-offer.
                         if self.offer_seen {
                             self.record_drop("repeated offer in one device-key session");
                             continue;
@@ -579,14 +600,16 @@ impl HostProtocol {
                     } else if self.application_ready() || kind == "ice" {
                         incoming.push(Inbound::Json(json));
                     } else {
-                        self.record_drop("endpoint message before the DTLS bind");
+                        self.record_drop(
+                            "endpoint message before the transport latch or the DTLS bind",
+                        );
                     }
                 }
                 Event::Input(bytes) => {
                     if self.application_ready() {
                         incoming.push(Inbound::Input(bytes));
                     } else {
-                        self.record_drop("input before the DTLS bind");
+                        self.record_drop("input before the transport latch or the DTLS bind");
                     }
                 }
                 Event::Bound => self.effects.push(Effect::Bound),
@@ -799,13 +822,159 @@ mod tests {
     fn joined(pairing: bool) -> String {
         json!({"type":"peer-joined", "mediaEpoch":fixture()["handshake"]["sessionEpoch"], "pairing":pairing}).to_string()
     }
-    fn establish(host: &mut HostProtocol) {
+    /// The device-key handshake only: the transport mode is still unset.
+    fn handshake(host: &mut HostProtocol) {
         let f = fixture();
         host.peer_joined(&joined(false)).unwrap();
         host.receive(&f["handshake"]["messages"]["authHello"].to_string())
             .unwrap();
         host.receive(&f["handshake"]["messages"]["authFinish"].to_string())
             .unwrap();
+        assert!(host.viewer_epoch().is_some());
+        assert!(!host.application_ready());
+    }
+    /// The handshake plus a WSS latch, so application traffic flows.
+    fn establish(host: &mut HostProtocol) {
+        handshake(host);
+        host.session.latch_wss().unwrap();
+        assert!(host.application_ready());
+    }
+    fn wss_start(epoch: &Value, protocol: u64) -> Value {
+        json!({"type":"media-control","action":"start","protocol":protocol,"epoch":epoch})
+    }
+    fn webrtc_offer_and_binds(host: &mut HostProtocol, viewer: &mut CtlSealer) {
+        let f = fixture();
+        let offer = format!(
+            "v=0\r\na=fingerprint:{}\r\n",
+            string(&f["handshake"]["dtls"]["viewer"]["localFingerprint"])
+        );
+        assert_eq!(
+            host.receive(&ctl_json(viewer, json!({"type":"offer","sdp":offer})))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!host.application_ready());
+        let answer = format!(
+            "v=0\r\na=fingerprint:{}\r\n",
+            string(&f["handshake"]["dtls"]["pc"]["localFingerprint"])
+        );
+        assert!(host.local_answer(&answer).unwrap());
+        host.dtls_connected().unwrap();
+        assert!(!host.application_ready());
+        host.receive(&f["handshake"]["messages"]["authBind"].to_string())
+            .unwrap();
+        assert!(host.application_ready());
+    }
+
+    #[test]
+    fn input_and_application_ctl_before_the_mode_latch_are_dropped() {
+        let scratch = Scratch::new();
+        let (mut host, _) = controller(&scratch.list(), true);
+        handshake(&mut host);
+        host.take_effects();
+        let mut viewer = viewer_sealer();
+        assert!(host
+            .receive(&ctl(&mut viewer, "input", &[13, 0]))
+            .unwrap()
+            .is_empty());
+        for kind in ["clipboard", "file-offer"] {
+            assert!(host
+                .receive(&ctl_json(&mut viewer, json!({"type":kind})))
+                .unwrap()
+                .is_empty());
+        }
+        // Dropped, not fatal: the viewer stays connected but not live.
+        assert!(host.viewer_epoch().is_some());
+        assert!(!host.application_ready());
+        assert!(!host
+            .take_effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Park)));
+    }
+
+    #[test]
+    fn input_flows_after_both_webrtc_binds() {
+        let scratch = Scratch::new();
+        let (mut host, _) = controller(&scratch.list(), true);
+        handshake(&mut host);
+        host.take_effects();
+        let mut viewer = viewer_sealer();
+        webrtc_offer_and_binds(&mut host, &mut viewer);
+        assert_eq!(host.session.mode(), Some(dk_session::Mode::WebRtc));
+        assert!(matches!(
+            host.receive(&ctl(&mut viewer, "input", &[13, 0]))
+                .unwrap()
+                .as_slice(),
+            [Inbound::Input(_)]
+        ));
+    }
+
+    #[test]
+    fn wss_start_relatches_after_webrtc_and_input_flows_without_binds() {
+        let scratch = Scratch::new();
+        let (mut host, _) = controller(&scratch.list(), true);
+        handshake(&mut host);
+        host.take_effects();
+        let f = fixture();
+        let mut viewer = viewer_sealer();
+        webrtc_offer_and_binds(&mut host, &mut viewer);
+        let start = wss_start(&f["handshake"]["sessionEpoch"], 4);
+        assert!(matches!(
+            host.receive(&ctl_json(&mut viewer, start))
+                .unwrap()
+                .as_slice(),
+            [Inbound::Json(_)]
+        ));
+        assert_eq!(host.session.mode(), Some(dk_session::Mode::Wss));
+        assert!(host.application_ready());
+        assert!(matches!(
+            host.receive(&ctl(&mut viewer, "input", &[13, 0]))
+                .unwrap()
+                .as_slice(),
+            [Inbound::Input(_)]
+        ));
+        // The host still drops a second offer in the same device-key session.
+        let offer = format!(
+            "v=0\r\na=fingerprint:{}\r\n",
+            string(&f["handshake"]["dtls"]["viewer"]["localFingerprint"])
+        );
+        assert!(host
+            .receive(&ctl_json(&mut viewer, json!({"type":"offer","sdp":offer})))
+            .unwrap()
+            .is_empty());
+        assert_eq!(host.session.mode(), Some(dk_session::Mode::Wss));
+    }
+
+    #[test]
+    fn wss_start_from_unset_latches_only_with_protocol_4_and_this_epoch() {
+        let scratch = Scratch::new();
+        let (mut host, _) = controller(&scratch.list(), true);
+        handshake(&mut host);
+        host.take_effects();
+        let f = fixture();
+        let mut viewer = viewer_sealer();
+        for start in [
+            wss_start(&json!("not-this-epoch"), 4),
+            wss_start(&f["handshake"]["sessionEpoch"], 3),
+            json!({"type":"media-control","action":"start","protocol":4}),
+            json!({"type":"media-control","action":"stop","protocol":4,"epoch":f["handshake"]["sessionEpoch"]}),
+        ] {
+            assert!(host
+                .receive(&ctl_json(&mut viewer, start))
+                .unwrap()
+                .is_empty());
+            assert_eq!(host.session.mode(), Some(dk_session::Mode::Unset));
+            assert!(!host.application_ready());
+        }
+        let start = wss_start(&f["handshake"]["sessionEpoch"], 4);
+        assert!(matches!(
+            host.receive(&ctl_json(&mut viewer, start))
+                .unwrap()
+                .as_slice(),
+            [Inbound::Json(_)]
+        ));
+        assert_eq!(host.session.mode(), Some(dk_session::Mode::Wss));
         assert!(host.application_ready());
     }
     fn begin_pair(host: &mut HostProtocol) {

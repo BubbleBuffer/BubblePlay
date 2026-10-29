@@ -4420,7 +4420,7 @@ mod phase2_socket_tests {
     use crate::dk_host::HostProtocol;
     use crate::dk_session::{Randomness, SessionError};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use bp_device_key::phase2::CtlOpener;
+    use bp_device_key::phase2::{CtlOpener, CtlSealer};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
@@ -4528,7 +4528,20 @@ mod phase2_socket_tests {
                 serde_json::from_slice::<serde_json::Value>(&caps_plain).unwrap()["type"],
                 "caps"
             );
-            let input = f["phase2"]["ctl"]["messages"][0]["message"].to_string();
+            // Decision 24: input waits for the transport latch, so the viewer starts WSS first.
+            let mut viewer = CtlSealer::new(&hex(&hs["controlKeys"]["viewerToPcHex"]));
+            let mut sealed = |kind: &str, bytes: &[u8]| {
+                let (seq, data) = viewer.seal(kind, bytes).unwrap();
+                json!({"type":"ctl","kind":kind,"seq":seq,"data":URL_SAFE_NO_PAD.encode(data)})
+                    .to_string()
+            };
+            let start = json!({"type":"media-control","action":"start","protocol":4,"epoch":hs["sessionEpoch"]});
+            ws.send(Message::text(sealed(
+                "media-control",
+                start.to_string().as_bytes(),
+            )))
+            .unwrap();
+            let input = sealed("input", &[13, 2, 75, 0, 37, 0]);
             ws.send(Message::text(input.clone())).unwrap();
             let cursor = read_json(&mut ws);
             assert_eq!(cursor["kind"], "cursor");

@@ -330,9 +330,10 @@ fn reconnect_and_ping(
     let (mut sealer, mut opener) = CtlKeys::derive(&shared, &transcript).channel(Side::Viewer);
 
     let caps = open_ctl(harness, &mut admitted.ws, &mut opener, "caps", 0)?;
+    // Decision 24: established, but not live until the viewer latches WebRTC or WSS.
     ensure!(
-        harness.host.application_ready(),
-        "normal handshake did not establish"
+        harness.host.viewer_epoch().is_some() && !harness.host.application_ready(),
+        "normal handshake did not establish, or went live before the transport latch"
     );
     let listed = caps["caps"].as_array().context("caps is not an array")?;
     let has = |cap: &str| listed.iter().any(|item| item.as_str() == Some(cap));
