@@ -163,20 +163,7 @@ export function encodeResult(transferId, ok, error) {
 }
 export function encodeRequest(transferId, offerId, id) { return jsonPacket(FT.REQUEST, transferId, { offerId, id }); }
 
-/**
- * Relay check for one file-socket message. `role` is "file-client" or
- * "file-host". The relay is stateless: it validates each packet on its own
- * and enforces direction only for REQUEST (client -> host).
- */
-export function relayAcceptsFilePacket(message, role) {
-  if (typeof message === "string") return false;
-  const packet = decodeFilePacket(message);
-  if (!packet.ok) return false;
-  if (packet.type === FT.REQUEST && role !== "file-client") return false;
-  return true;
-}
-
-/** Validates host -> client `file-offer` signaling text (also used by the relay). */
+/** Validates host -> client `file-offer` signaling text. */
 export function validFileOffer(message) {
   return plainObject(message) && message.type === "file-offer" && message.protocol === 1 &&
     uint32(message.offerId) && (message.source === "clipboard" || message.source === "sendto") &&
