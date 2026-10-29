@@ -108,7 +108,7 @@ test('m3 GET / without a cookie opens the gate wait page instead of a 404', { ti
     headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document' },
   });
   assert.equal(page.status, 200);
-  assert.match(page.body.toString('utf8'), /Waiting for approval/);
+  assert.match(page.body.toString('utf8'), /__gate\/poll/);
 });
 
 test(
@@ -497,7 +497,7 @@ test('m3 a viewer without a cookie gets the wait page, and ntfy names only the c
   });
   assert.equal(page.status, 200);
   const html = page.body.toString('utf8');
-  assert.match(html, /Waiting for approval/);
+  assert.match(html, /__gate\/poll/);
   const pending = pollTokenOf(html);
 
   const publish = await ntfy.waitFor(
@@ -690,7 +690,7 @@ test('m3 GET /pair without a cookie opens the gate wait page', { timeout: CASE_T
     headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
   });
   assert.equal(page.status, 200);
-  assert.match(page.body.toString('utf8'), /Waiting for approval/);
+  assert.match(page.body.toString('utf8'), /__gate\/poll/);
 });
 
 test('m3 GET and HEAD /pair with a cookie serve index.html, as / does', { timeout: CASE_TIMEOUT_MS }, async () => {

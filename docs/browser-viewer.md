@@ -5,7 +5,7 @@ The browser viewer shows your PC's desktop. It signs in with a device key, not a
 ## Site gate
 
 The relay serves nothing of the viewer until the browser is approved.
-An unapproved browser sees only a wait page: "Waiting for approval", or "Not approved" after a deny or expiry.
+An unapproved browser sees only a blank wait page, or "Not approved" after a deny or expiry.
 The relay sends the approval request to your ntfy topic as Approve and Deny links.
 An approved browser keeps a `__Host-gate` cookie.
 Forget this browser clears that cookie. It does not delete the device key or the paired PCs.

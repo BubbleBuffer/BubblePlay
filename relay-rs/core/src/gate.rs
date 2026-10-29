@@ -753,7 +753,7 @@ fn page(rng: &mut dyn RelayRng, status: u16, notice: Notice, head: bool) -> Resp
     let nonce = random_string(rng, 16);
     let (text, script) = match notice {
         Notice::Waiting(token) => (
-            "Waiting for approval",
+            "",
             WAIT_SCRIPT.replace("__TOKEN__", &token),
         ),
         Notice::TryLater => (

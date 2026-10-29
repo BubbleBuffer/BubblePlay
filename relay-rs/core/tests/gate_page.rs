@@ -66,7 +66,7 @@ fn gate_wait_page_is_minimal_and_unbranded() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(402);
     let body = body_text(&wait_page(&mut gate, &mut rng, CLIENT, T0));
-    assert!(body.contains("Waiting for approval"));
+    assert!(body.contains("<p id=\"msg\"></p>"), "the waiting page shows no text");
     assert!(!body.contains("BubblePlay"));
     assert!(!body.contains("<title"));
     assert!(!body.contains("src="));

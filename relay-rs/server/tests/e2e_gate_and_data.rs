@@ -71,7 +71,7 @@ async fn e2e_viewer_without_cookie_gets_wait_page_and_ntfy_prefix_only() {
         .unwrap();
     assert_eq!(page.status(), 200);
     let html = page.text().await.unwrap();
-    assert!(html.contains("Waiting for approval"));
+    assert!(html.contains("/__gate/poll"));
     let poll = html
         .split("var token = \"")
         .nth(1)
@@ -455,7 +455,7 @@ async fn e2e_pair_without_cookie_gets_wait_page() {
         .await
         .unwrap();
     assert_eq!(page.status(), 200);
-    assert!(page.text().await.unwrap().contains("Waiting for approval"));
+    assert!(page.text().await.unwrap().contains("/__gate/poll"));
 }
 
 /// With the gate cookie, GET and HEAD `/pair` serve the page as `/` does, and `/pair/x` stays 404.
