@@ -1048,15 +1048,17 @@ fn run_serve(
     // File transfer runs in the user-level host (Downloads, clipboard and Send To
     // belong to the interactive user); the authenticated signaling route supplies
     // the file socket ticket.
-    let file_service =
-        match FileService::spawn_routed(&worker, FileServiceConfig::from_env(), relay_route.clone())
-        {
-            Ok(service) => Some(service),
-            Err(error) => {
-                warn!(error = %format!("{error:#}"), "file transfer unavailable");
-                None
-            }
-        };
+    let file_service = match FileService::spawn_routed(
+        &worker,
+        FileServiceConfig::from_env(),
+        relay_route.clone(),
+    ) {
+        Ok(service) => Some(service),
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "file transfer unavailable");
+            None
+        }
+    };
     signaling.set_file_transfer(file_service.is_some());
     signaling.set_file_drop(file_service.is_some());
     // Follow active window needs the interactive user's foreground window,
