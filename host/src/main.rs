@@ -178,10 +178,9 @@ fn wss_v4_refine_bitrate(current_bps: u32) -> u32 {
 struct Args {
     mode: String, // "spike" | "serve"
     worker: Option<String>,
-    /// The unlocked PC key from the tray. `None` runs the legacy registration.
+    /// The unlocked PC key from the tray. Relay registration requires it.
     device_identity: Option<bubbleplay_host::device_key::DeviceIdentity>,
     token: Option<String>,
-    host_gate_token: Option<String>,
     duration_secs: u32,
     bitrate_bps: u32,
     max_bitrate_bps: u32,
@@ -217,7 +216,6 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
         worker: None,
         device_identity: None,
         token: std::env::var("BUBBLEPLAY_TOKEN").ok(),
-        host_gate_token: std::env::var("BUBBLEPLAY_HOST_GATE_TOKEN").ok(),
         duration_secs: 10,
         bitrate_bps: DEFAULT_BITRATE_BPS,
         max_bitrate_bps: 12_000_000,
@@ -238,9 +236,6 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
             "--mode" => args.mode = it.next().context("--mode value")?,
             "--worker" => args.worker = Some(it.next().context("--worker value")?),
             "--token" => args.token = Some(it.next().context("--token value")?),
-            "--host-gate-token" => {
-                args.host_gate_token = Some(it.next().context("--host-gate-token value")?)
-            }
             "--duration" => args.duration_secs = it.next().context("--duration value")?.parse()?,
             "--bitrate" => args.bitrate_bps = it.next().context("--bitrate value")?.parse()?,
             "--max-bitrate" => {
@@ -265,7 +260,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
             // Diagnostic override for the encoder backend; not in --help.
             "--encoder" => args.encoder = it.next().context("--encoder value")?.parse()?,
             "-h" | "--help" => {
-                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--host-gate-token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--privileged-agent] [--no-audio] [--benchmark-profile absolute-path] [--cpu-mode]");
+                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--privileged-agent] [--no-audio] [--benchmark-profile absolute-path] [--cpu-mode]");
                 std::process::exit(0);
             }
             other => bail!("unknown argument: {other}"),
@@ -618,7 +613,7 @@ fn main() -> Result<()> {
         .init();
 
     let mut args = parse_args()?;
-    // Privileged and admin serving keep the legacy registration.
+    // The privileged agent gets no PC key, so it cannot register with the relay.
     args.device_identity = if args.privileged_agent {
         None
     } else {
@@ -1106,12 +1101,8 @@ fn run_serve(
     let relay_registered_at = Instant::now();
     // The authenticated signaling route supplies the file socket ticket.
     let file_service = if !args.privileged_agent {
-        match FileService::spawn_routed(
-            &worker,
-            "",
-            FileServiceConfig::from_env(),
-            relay_route.clone(),
-        ) {
+        match FileService::spawn_routed(&worker, FileServiceConfig::from_env(), relay_route.clone())
+        {
             Ok(service) => Some(service),
             Err(error) => {
                 warn!(error = %format!("{error:#}"), "file transfer unavailable");
@@ -3522,7 +3513,6 @@ fn run_serve(
                         }
                     }
                     if action == "start" && wss_media.is_none() {
-                        let bearer = ""; // RelayRoute carries the authenticated ticket.
                         let Some(epoch) = epoch.as_deref().filter(|value| valid_media_epoch(value))
                         else {
                             warn!(?protocol, "WSS media request missing session epoch");
@@ -3538,7 +3528,6 @@ fn run_serve(
                             );
                             WssMediaEgress::connect_routed(
                                 &worker,
-                                bearer,
                                 epoch,
                                 u64::from(preset.target_bps),
                                 u64::from(preset.target_bps),
@@ -4044,12 +4033,7 @@ fn run_serve(
                 }
             }
         }
-        if relay_ticket_refresh_due(
-            relay_registered_at,
-            relay_route.has_ticket(),
-            viewer_attached,
-            now,
-        ) {
+        if relay_ticket_refresh_due(relay_registered_at, viewer_attached, now) {
             info!(
                 registered_for_secs = now.saturating_duration_since(relay_registered_at).as_secs(),
                 "idle signaling registration nears its relay ticket expiry; re-registering"

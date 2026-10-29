@@ -1,6 +1,6 @@
 # Architecture
 
-BubblePlay has a native Windows host, a relay that serves the browser receiver, and an optional Android receiver. One relay room pairs one host with one viewer. Docker runs the relay and site; it does not capture or encode a Windows desktop.
+BubblePlay has a native Windows host, a relay that serves the browser receiver, and an optional Android receiver. The relay routes each viewer to a PC by its device ID; one session pairs one host with one viewer. Docker runs the relay and site; it does not capture or encode a Windows desktop.
 
 ## Runtime paths
 
@@ -34,7 +34,7 @@ Shared fixtures are the cross-language contract; update them and the affected im
 | [`file-transfer-contract.json`](../../fixtures/file-transfer-contract.json) | File packets, validation limits and socket behavior |
 | [`follow-window-contract.json`](../../fixtures/follow-window-contract.json) | Monitor-follow capability and controls |
 | [`audio-contract.json`](../../fixtures/audio-contract.json) | PC sound packets, opt-in and capability ([audio](audio.md)) |
-| [`browser-approval-contract.json`](../../fixtures/browser-approval-contract.json) | Host approval messages and login methods ([browser approval](browser-approval.md)) |
+| [`browser-approval-contract.json`](../../fixtures/browser-approval-contract.json) | Host approval messages and login methods |
 
 See [file transfer](file-transfer.md), [monitor following](follow-active-window.md), [session UI](session-ui.md), and [secure desktop](secure-desktop.md) for the behavior behind these contracts. [Unattended access](unattended-access.md) is approved (2026-10-13) for access before sign-in and waits for [device IDs and keys](device-keys.md), approved 2026-10-13: per-device key files, pairing, routing by ID and the ntfy site gate. The Rust relay's tests also read [browser-generated packet fixtures](../../relay-rs/core/tests/data/worker-contract.json); the Go relay that used them was deleted at CUT-1.
 

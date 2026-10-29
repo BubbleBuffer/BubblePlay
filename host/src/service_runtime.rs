@@ -584,13 +584,11 @@ impl BrokerSupervisor {
 struct StoredTransportConfig {
     worker: String,
     token_dpapi_hex: String,
-    host_gate_token_dpapi_hex: Option<String>,
 }
 
 struct TransportConfig {
     worker: OsString,
     token: OsString,
-    host_gate_token: Option<OsString>,
 }
 
 impl TransportConfig {
@@ -605,18 +603,9 @@ impl TransportConfig {
             .with_context(|| format!("worker in {}", path.display()))?;
         let token = String::from_utf8(dpapi_unprotect_hex(&stored.token_dpapi_hex)?)
             .context("stored BubblePlay token is not UTF-8")?;
-        let host_gate_token = stored
-            .host_gate_token_dpapi_hex
-            .as_deref()
-            .map(dpapi_unprotect_hex)
-            .transpose()?
-            .map(String::from_utf8)
-            .transpose()
-            .context("stored BubblePlay host-gate token is not UTF-8")?;
         Ok(Self {
             worker: OsString::from(stored.worker),
             token: OsString::from(token),
-            host_gate_token: host_gate_token.map(OsString::from),
         })
     }
 
@@ -636,9 +625,6 @@ fn configure_transport_host_command(command: &mut Command, config: &TransportCon
         .args(config.host_args())
         .env("BUBBLEPLAY_TOKEN", &config.token)
         .env("RUST_BACKTRACE", "1");
-    if let Some(token) = &config.host_gate_token {
-        command.env("BUBBLEPLAY_HOST_GATE_TOKEN", token);
-    }
 }
 
 #[derive(Debug)]
@@ -1739,7 +1725,6 @@ mod tests {
         let config = TransportConfig {
             worker: OsString::from("wss://example.invalid/ws"),
             token: OsString::from("opaque"),
-            host_gate_token: None,
         };
         let args = config.host_args();
         assert!(args.iter().any(|arg| arg == "--privileged-agent"));
@@ -1754,7 +1739,6 @@ mod tests {
         let config = TransportConfig {
             worker: OsString::from("wss://example.invalid/ws"),
             token: OsString::from("opaque"),
-            host_gate_token: None,
         };
         let mut command = Command::new("ignored.exe");
         configure_transport_host_command(&mut command, &config);

@@ -149,27 +149,13 @@ fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog, events: Option<Send
 
 struct Secrets {
     token: String,
-    host_gate_token: Option<String>,
 }
 
 fn load(config: &SupervisorConfig) -> Result<(StoredHostConfig, Secrets)> {
     let stored = StoredHostConfig::load(&config.host_config)?;
     let token = String::from_utf8(dpapi_unprotect_hex(&stored.token_dpapi_hex)?)
         .context("stored token is not UTF-8")?;
-    let host_gate_token = match stored.host_gate_token_dpapi_hex.as_deref() {
-        Some(hex) if !hex.trim().is_empty() => Some(
-            String::from_utf8(dpapi_unprotect_hex(hex)?)
-                .context("stored host-gate token is not UTF-8")?,
-        ),
-        _ => None,
-    };
-    Ok((
-        stored,
-        Secrets {
-            token,
-            host_gate_token,
-        },
-    ))
+    Ok((stored, Secrets { token }))
 }
 
 /// `tray.json` sits beside `host.json` in the per-user data directory.
@@ -211,7 +197,6 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob, stdin: &HostStdin) -> 
         .env("RUST_BACKTRACE", "1")
         // Panics keep backtraces; anyhow errors (logged on every retry) do not.
         .env("RUST_LIB_BACKTRACE", "0")
-        .env_remove("BUBBLEPLAY_HOST_GATE_TOKEN")
         .env_remove("BUBBLEPLAY_ADMIN_AGENT_PIPE")
         .env_remove("BUBBLEPLAY_ADMIN_AGENT_ALLOW_DEV")
         // Never inherited: only the child command below may carry the device key.
@@ -223,9 +208,6 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob, stdin: &HostStdin) -> 
         .creation_flags(CREATE_NO_WINDOW);
     if let Some(parent) = config.host_exe.parent() {
         command.current_dir(parent);
-    }
-    if let Some(gate) = &secrets.host_gate_token {
-        command.env("BUBBLEPLAY_HOST_GATE_TOKEN", gate);
     }
     if let Some(key) = &device_key {
         command.env(device_key_file::HANDOFF_ENV, key.as_str());

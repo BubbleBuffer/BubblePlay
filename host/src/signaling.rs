@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use tungstenite::client::IntoClientRequest;
-use tungstenite::http::{header::AUTHORIZATION, HeaderValue, Request};
+use tungstenite::http::Request;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{client_tls_with_config, Error as WsError, Message, WebSocket};
 
@@ -322,11 +322,9 @@ fn host_capabilities_message(
     file_transfer: bool,
     file_drop: bool,
     follow_window: Option<bool>,
-    browser_approval_eligible: bool,
     audio_enabled: bool,
 ) -> SignalMsg {
     SignalMsg::HostCapabilities {
-        browser_approval: !service_mode && browser_approval_eligible,
         service_mode,
         cold_boot,
         secure_desktop,
@@ -337,10 +335,6 @@ fn host_capabilities_message(
         follow_window: follow_window.map(|_| crate::follow_window::PROTOCOL_VERSION),
         audio: audio_enabled.then_some(1),
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn u8_is_zero(value: &u8) -> bool {
@@ -747,8 +741,6 @@ pub enum SignalMsg {
     },
     #[serde(rename = "host-capabilities")]
     HostCapabilities {
-        #[serde(rename = "browserApproval", default, skip_serializing_if = "is_false")]
-        browser_approval: bool,
         #[serde(rename = "serviceMode")]
         service_mode: bool,
         #[serde(rename = "coldBoot")]
@@ -1221,18 +1213,12 @@ struct WorkerVersionMonitor {
 }
 
 impl WorkerVersionMonitor {
-    fn spawn(
-        url: &str,
-        token: &str,
-        host_gate_token: Option<&str>,
-        connected_version: Option<String>,
-    ) -> Result<Option<Self>> {
+    fn spawn(url: &str, token: &str, connected_version: Option<String>) -> Result<Option<Self>> {
         if worker_version_probe_url(url)?.is_none() {
             return Ok(None);
         }
         let url = url.to_string();
         let token = token.to_string();
-        let host_gate_token = host_gate_token.map(str::to_string);
         let (stop_tx, stop_rx) = mpsc::channel();
         let (change_tx, change_rx) = mpsc::channel();
         thread::Builder::new()
@@ -1244,11 +1230,10 @@ impl WorkerVersionMonitor {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    let current =
-                        match probe_worker_version(&url, &token, host_gate_token.as_deref()) {
-                            Ok(Some(current)) => current,
-                            Ok(None) | Err(_) => continue,
-                        };
+                    let current = match probe_worker_version(&url, &token) {
+                        Ok(Some(current)) => current,
+                        Ok(None) | Err(_) => continue,
+                    };
                     if worker_version_changed(known.as_deref(), Some(&current)) {
                         let connected = known.unwrap_or_else(|| "unversioned".to_string());
                         let _ = change_tx.send((connected, current));
@@ -1322,27 +1307,16 @@ impl Signaling {
     ) -> Result<Self> {
         let origin = relay_origin(url).context("worker URL has no usable relay origin")?;
         let device_protocol = crate::dk_host::HostProtocol::open(identity, &origin, devices_ui)?;
-        let request =
-            signaling_request(&keyed_signaling_url(url, &identity.id().to_string())?, None)?;
+        let request = signaling_request(&keyed_signaling_url(url, &identity.id().to_string())?)?;
         let (mut ws, _) = connect_with_timeout(request)?;
-        ws.send(Message::text(host_hello(token, Some(identity))?))
+        ws.send(Message::text(host_hello(token, identity)))
             .context("send hello")?;
         let (worker_version_id, route) = complete_keyed_registration(&mut ws, identity, &origin)?;
-        anyhow::ensure!(
-            matches!(
-                &route,
-                RelayRoute::Keyed {
-                    ticket: Some(_),
-                    ..
-                }
-            ),
-            "relay ticket required"
-        );
         // The legacy version probe requires TOKEN, unlike a known PC's registration.
         let version_monitor = if token.is_empty() {
             None
         } else {
-            WorkerVersionMonitor::spawn(url, token, None, worker_version_id)?
+            WorkerVersionMonitor::spawn(url, token, worker_version_id)?
         };
         Self::from_registered(ws, route, device_protocol, version_monitor)
     }
@@ -2204,7 +2178,6 @@ impl Signaling {
             self.file_transfer,
             self.file_drop,
             self.follow_window,
-            false,
             self.audio_enabled,
         );
         self.send_text(&serde_json::to_string(&msg).unwrap_or_default());
@@ -2375,17 +2348,9 @@ fn first_frame_message(
     }
 }
 
-fn signaling_request(url: &str, host_gate_token: Option<&str>) -> Result<Request<()>> {
+fn signaling_request(url: &str) -> Result<Request<()>> {
     crate::relay_url::require_secure_relay_url(url)?;
-    let mut request = url
-        .into_client_request()
-        .context("build websocket request")?;
-    if let Some(token) = host_gate_token.filter(|value| !value.is_empty()) {
-        let value = HeaderValue::from_str(&format!("Bearer {token}"))
-            .context("host gate token is not a valid HTTP header value")?;
-        request.headers_mut().insert(AUTHORIZATION, value);
-    }
-    Ok(request)
+    url.into_client_request().context("build websocket request")
 }
 
 fn canonical_worker_version_id(value: &str) -> bool {
@@ -2437,15 +2402,11 @@ fn worker_version_probe_url(url: &str) -> Result<Option<String>> {
     Ok(Some(format!("wss://{authority}/host-version-ws")))
 }
 
-fn probe_worker_version(
-    url: &str,
-    token: &str,
-    host_gate_token: Option<&str>,
-) -> Result<Option<String>> {
+fn probe_worker_version(url: &str, token: &str) -> Result<Option<String>> {
     let Some(probe_url) = worker_version_probe_url(url)? else {
         return Ok(None);
     };
-    let request = signaling_request(&probe_url, host_gate_token)?;
+    let request = signaling_request(&probe_url)?;
     let (mut ws, _) = connect_with_timeout(request)?;
     ws.send(Message::text(serde_json::to_string(&SignalMsg::Hello {
         token: token.to_string(),
@@ -2488,18 +2449,12 @@ fn keyed_signaling_url(url: &str, id: &str) -> Result<String> {
     Ok(format!("{url}{separator}pc={id}"))
 }
 
-fn host_hello(token: &str, identity: Option<&DeviceIdentity>) -> Result<String> {
-    match identity {
-        Some(identity) => Ok(json!({
-            "type": "hello", "role": "host", "token": token,
-            "id": identity.id().to_string(), "public": identity.public_b64(),
-        })
-        .to_string()),
-        None => Ok(serde_json::to_string(&SignalMsg::Hello {
-            token: token.to_owned(),
-            role: "host".to_owned(),
-        })?),
-    }
+fn host_hello(token: &str, identity: &DeviceIdentity) -> String {
+    json!({
+        "type": "hello", "role": "host", "token": token,
+        "id": identity.id().to_string(), "public": identity.public_b64(),
+    })
+    .to_string()
 }
 
 /// The relay's messages during a keyed registration. Parsing never echoes the text, so a malformed
@@ -2538,18 +2493,11 @@ fn registration_proof(identity: &DeviceIdentity, origin: &str, nonce: &str) -> R
 }
 
 /// Runs the registration after the keyed hello: answers one `register-challenge` with a
-/// `register-proof`, then requires a matching PC ID and ticket in `hello-ok`.
+/// `register-proof`, then requires a matching PC ID and a relay ticket in `hello-ok`.
 fn complete_keyed_registration(
     ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     identity: &DeviceIdentity,
     origin: &str,
-) -> Result<(Option<String>, RelayRoute)> {
-    complete_registration(ws, Some((identity, origin)))
-}
-
-fn complete_registration(
-    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-    identity: Option<(&DeviceIdentity, &str)>,
 ) -> Result<(Option<String>, RelayRoute)> {
     let mut challenged = false;
     loop {
@@ -2558,7 +2506,6 @@ fn complete_registration(
         };
         match parse_registration_reply(&text)? {
             RegistrationReply::RegisterChallenge { nonce } if !challenged => {
-                let (identity, origin) = identity.context("relay challenged an ID-less host")?;
                 challenged = true;
                 let signature = registration_proof(identity, origin, &nonce)?;
                 let proof = json!({"type": "register-proof", "signature": signature});
@@ -2573,18 +2520,17 @@ fn complete_registration(
                 ticket,
                 pc,
             } => {
-                let expected_pc = identity.map(|(identity, _)| identity.id());
-                if identity.is_some() && (!challenged || ticket.is_none() || pc.is_none()) {
-                    bail!("phase 2 registration requires a challenge, PC ID and ticket");
+                let ticket = ticket.context("relay ticket required")?;
+                let pc = pc.context("phase 2 registration requires a PC ID")?;
+                if !challenged {
+                    bail!("phase 2 registration requires a challenge");
                 }
-                if let Some(pc) = pc {
-                    let pc = DeviceId::parse(&pc)
-                        .map_err(|_| anyhow::anyhow!("relay registered an invalid PC ID"))?;
-                    if Some(pc) != expected_pc {
-                        bail!("relay registered a different PC ID");
-                    }
+                let pc = DeviceId::parse(&pc)
+                    .map_err(|_| anyhow::anyhow!("relay registered an invalid PC ID"))?;
+                if pc != identity.id() {
+                    bail!("relay registered a different PC ID");
                 }
-                let route = RelayRoute::from_registration(expected_pc, ticket);
+                let route = RelayRoute::keyed(pc.to_string(), ticket);
                 return Ok((worker_version_id, route));
             }
             RegistrationReply::Error {} => bail!("worker rejected host registration"),
@@ -2776,7 +2722,7 @@ mod tests {
         ] {
             assert_eq!(worker_version_probe_url(url).unwrap(), None, "{url}");
             assert!(
-                WorkerVersionMonitor::spawn(url, "token", None, None)
+                WorkerVersionMonitor::spawn(url, "token", None)
                     .unwrap()
                     .is_none(),
                 "{url}"
@@ -2794,7 +2740,7 @@ mod tests {
             let error = worker_version_probe_url(url).unwrap_err().to_string();
             assert!(error.contains("requires a wss signaling URL"), "{error}");
             assert!(
-                WorkerVersionMonitor::spawn(url, "token", None, None).is_err(),
+                WorkerVersionMonitor::spawn(url, "token", None).is_err(),
                 "{url}"
             );
         }
@@ -2803,7 +2749,7 @@ mod tests {
     #[test]
     fn wss_relay_gets_a_worker_version_monitor() {
         let monitor =
-            WorkerVersionMonitor::spawn("wss://play.example/host-ws", "token", None, None).unwrap();
+            WorkerVersionMonitor::spawn("wss://play.example/host-ws", "token", None).unwrap();
         assert!(monitor.is_some());
     }
 
@@ -3442,42 +3388,21 @@ mod tests {
     }
 
     #[test]
-    fn host_gate_credential_is_sent_only_as_an_authorization_header() {
-        let request = signaling_request(
-            "wss://playfull-cat.example/host-ws",
-            Some("separate-gate-credential"),
-        )
-        .unwrap();
-        assert_eq!(
-            request.uri().to_string(),
-            "wss://playfull-cat.example/host-ws"
-        );
-        assert_eq!(
-            request.headers().get("Authorization").unwrap(),
-            "Bearer separate-gate-credential"
-        );
-        assert!(!request.uri().to_string().contains("credential"));
-    }
-
-    #[test]
     fn signaling_refuses_cleartext_except_to_a_loopback_relay() {
         for url in [
             "ws://192.168.1.20:8787/host-ws",
             "ws://playfull-cat.example/host-ws",
             "ws://localhost.evil.com/host-ws",
         ] {
-            let error = signaling_request(url, Some("gate-credential"))
-                .unwrap_err()
-                .to_string();
+            let error = signaling_request(url).unwrap_err().to_string();
             assert!(error.contains("loopback"), "{error}");
-            assert!(!error.contains("gate-credential"), "{error}");
         }
         for url in [
             "ws://127.0.0.1:8787/host-ws",
             "ws://localhost:8787/host-ws",
             "ws://[::1]:8787/host-ws",
         ] {
-            signaling_request(url, Some("gate-credential")).unwrap();
+            signaling_request(url).unwrap();
         }
     }
 
@@ -3708,7 +3633,6 @@ mod tests {
     #[test]
     fn host_capabilities_carry_no_media_protocol_negotiation() {
         let message = SignalMsg::HostCapabilities {
-            browser_approval: false,
             service_mode: true,
             cold_boot: true,
             secure_desktop: true,
@@ -3733,27 +3657,10 @@ mod tests {
     }
 
     #[test]
-    fn host_capabilities_announce_browser_approval_as_in_contract() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../fixtures/browser-approval-contract.json"
-        ))
-        .unwrap();
-        let value = serde_json::to_value(super::host_capabilities_message(
-            false, false, false, false, false, false, None, true, false,
-        ))
-        .unwrap();
-        assert_eq!(value["type"], fixture["capability"]["type"]);
-        assert_eq!(
-            value["browserApproval"],
-            fixture["capability"]["browserApproval"]
-        );
-    }
-
-    #[test]
-    fn host_capabilities_omit_browser_approval_for_ineligible_or_service_hosts() {
-        for (service, eligible) in [(false, false), (true, false), (true, true)] {
+    fn host_capabilities_never_announce_browser_approval() {
+        for service in [false, true] {
             let value = serde_json::to_value(super::host_capabilities_message(
-                service, false, false, false, false, false, None, eligible, false,
+                service, false, false, false, false, false, None, false,
             ))
             .unwrap();
             assert!(!value.as_object().unwrap().contains_key("browserApproval"));
@@ -3766,7 +3673,6 @@ mod tests {
             serde_json::from_str(include_str!("../../fixtures/file-transfer-contract.json"))
                 .unwrap();
         let message = SignalMsg::HostCapabilities {
-            browser_approval: false,
             service_mode: false,
             cold_boot: false,
             secure_desktop: false,
@@ -3788,7 +3694,6 @@ mod tests {
     #[test]
     fn host_capabilities_advertise_native_drop_independently() {
         let message = SignalMsg::HostCapabilities {
-            browser_approval: false,
             service_mode: false,
             cold_boot: false,
             secure_desktop: false,
@@ -3978,13 +3883,11 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let enabled = super::host_capabilities_message(
-            false, false, false, false, false, false, None, false, true,
-        );
+        let enabled =
+            super::host_capabilities_message(false, false, false, false, false, false, None, true);
         assert_eq!(serde_json::to_value(enabled).unwrap(), expected);
-        let disabled = super::host_capabilities_message(
-            false, false, false, false, false, false, None, false, false,
-        );
+        let disabled =
+            super::host_capabilities_message(false, false, false, false, false, false, None, false);
         let wire = serde_json::to_string(&disabled).unwrap();
         assert!(wire.len() < 512);
         assert!(serde_json::from_str::<serde_json::Value>(&wire)
@@ -4001,7 +3904,6 @@ mod tests {
             true,
             true,
             Some(false),
-            true,
             true,
         );
         assert!(serde_json::to_string(&all).unwrap().len() < 512);
@@ -4130,7 +4032,6 @@ mod tests {
         let fixture = follow_fixture();
         assert_eq!(fixture["protocol"], crate::follow_window::PROTOCOL_VERSION);
         let message = SignalMsg::HostCapabilities {
-            browser_approval: false,
             service_mode: false,
             cold_boot: false,
             secure_desktop: false,
@@ -4152,7 +4053,6 @@ mod tests {
     #[test]
     fn host_capabilities_without_follow_serialize_as_before() {
         let message = SignalMsg::HostCapabilities {
-            browser_approval: false,
             service_mode: true,
             cold_boot: true,
             secure_desktop: true,
@@ -4364,11 +4264,11 @@ mod keyed_registration_tests {
         let (version, route) =
             complete_keyed_registration(&mut ws, &identity, ORIGIN).expect("keyed registration");
         assert_eq!(version.as_deref(), Some("v1"));
-        let RelayRoute::Keyed { pc, ticket } = route else {
-            panic!("expected a keyed route");
-        };
-        assert_eq!(pc, identity.id().to_string());
-        assert_eq!(format!("{:?}", ticket.unwrap()), "RelayTicket(<redacted>)");
+        assert_eq!(route.pc(), identity.id().to_string());
+        assert!(format!("{route:?}").contains("RelayTicket(<redacted>)"));
+        let hello: serde_json::Value =
+            serde_json::from_str(&crate::wss_media::data_hello("media-host", &route)).unwrap();
+        assert_eq!(hello["ticket"], TICKET);
         let received = relay.join().unwrap();
         let proof: serde_json::Value = serde_json::from_str(&received[0]).unwrap();
         assert_eq!(proof["type"], "register-proof");
@@ -4392,6 +4292,18 @@ mod keyed_registration_tests {
             let mut ws = client(port);
             assert!(complete_keyed_registration(&mut ws, &identity, ORIGIN).is_err());
         }
+    }
+
+    #[test]
+    fn registration_without_a_ticket_is_refused() {
+        let identity = fixture_identity();
+        let (port, _relay) = scripted_relay(vec![
+            challenge(),
+            json!({"type":"hello-ok","pc":identity.id().to_string()}).to_string(),
+        ]);
+        let mut ws = client(port);
+        let error = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap_err();
+        assert_eq!(error.to_string(), "relay ticket required");
     }
 
     #[test]
@@ -4455,33 +4367,11 @@ mod keyed_registration_tests {
     }
 
     #[test]
-    fn host_hello_with_and_without_a_key_matches_the_contract() {
+    fn host_hello_matches_the_contract() {
         let identity = fixture_identity();
-        let keyed: serde_json::Value = serde_json::from_str(
-            &host_hello("test-only-registration-token", Some(&identity)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(keyed, fixture()["relayProof"]["messages"]["hello"]);
-        let legacy: serde_json::Value =
-            serde_json::from_str(&host_hello("legacy-token", None).unwrap()).unwrap();
-        assert_eq!(
-            legacy,
-            json!({"type":"hello", "role":"host", "token":"legacy-token"})
-        );
-    }
-
-    #[test]
-    fn legacy_registration_retains_an_optional_ticket() {
-        for ticket in [None, Some(TICKET)] {
-            let (port, _relay) =
-                scripted_relay(vec![json!({"type":"hello-ok", "ticket":ticket}).to_string()]);
-            let mut ws = client(port);
-            let (_, route) = complete_registration(&mut ws, None).unwrap();
-            assert_eq!(
-                matches!(route, RelayRoute::LegacyTicket(_)),
-                ticket.is_some()
-            );
-        }
+        let hello: serde_json::Value =
+            serde_json::from_str(&host_hello("test-only-registration-token", &identity)).unwrap();
+        assert_eq!(hello, fixture()["relayProof"]["messages"]["hello"]);
     }
 
     #[test]
@@ -4495,12 +4385,13 @@ mod keyed_registration_tests {
     }
 
     #[test]
-    fn legacy_registration_errors_never_echo_reply_content() {
+    fn malformed_registration_errors_never_echo_reply_content() {
+        let identity = fixture_identity();
         let (port, _relay) = scripted_relay(vec![
             r#"{"type":"hello-ok","ticket":"SECRET-TICKET",bad}"#.to_owned(),
         ]);
         let mut ws = client(port);
-        let error = complete_registration(&mut ws, None).unwrap_err();
+        let error = complete_keyed_registration(&mut ws, &identity, ORIGIN).unwrap_err();
         assert!(!format!("{error:?}").contains("SECRET-TICKET"));
     }
 
@@ -4662,8 +4553,12 @@ mod phase2_socket_tests {
         let ws = tungstenite::connect(format!("ws://{address}/ws"))
             .unwrap()
             .0;
-        let mut signaling =
-            Signaling::from_registered(ws, RelayRoute::Legacy, controller, None).unwrap();
+        let ticket = "4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6-_z9_v8";
+        let route = RelayRoute::keyed(
+            "ABCD-EFGH-JKMN-PQRS".to_owned(),
+            RelayTicket::try_from(ticket.to_owned()).unwrap(),
+        );
+        let mut signaling = Signaling::from_registered(ws, route, controller, None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut got_input = false;
         while !got_input && Instant::now() < deadline {

@@ -7,7 +7,6 @@ pub mod agent_runtime;
 pub mod audio;
 pub mod benchmark;
 pub(crate) mod bounded_pipe;
-pub mod browser_approval;
 pub mod capture;
 pub mod capture_wait;
 pub mod clipboard;

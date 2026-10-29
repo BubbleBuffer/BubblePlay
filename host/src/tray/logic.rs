@@ -267,8 +267,6 @@ pub struct StoredHostConfig {
     pub worker: String,
     pub token_dpapi_hex: String,
     #[serde(default)]
-    pub host_gate_token_dpapi_hex: Option<String>,
-    #[serde(default)]
     pub monitor: Option<String>,
 }
 
@@ -748,7 +746,6 @@ mod tests {
         StoredHostConfig {
             worker: "wss://play.example/host-ws".into(),
             token_dpapi_hex: "01AB".into(),
-            host_gate_token_dpapi_hex: Some("CD".into()),
             monitor: None,
         }
     }
@@ -763,9 +760,7 @@ mod tests {
                 .to_vec()
         );
         assert!(!args.iter().any(|a| a == "--privileged-agent"));
-        assert!(!args
-            .iter()
-            .any(|a| a == "--token" || a == "--host-gate-token"));
+        assert!(!args.iter().any(|a| a == "--token"));
         assert!(!args.iter().any(|a| a.to_string_lossy().contains("01AB")));
         let mut with_monitor = config();
         with_monitor.monitor = Some("primary".into());
@@ -843,13 +838,14 @@ mod tests {
     fn host_config_parses_service_shape_and_validates() {
         let dir = temp_dir("config");
         let path = dir.join("host.json");
+        // A host.json from an older setup may still carry the removed host-gate field; it is ignored.
         fs::write(
             &path,
-            br#"{"worker":"wss://w.example/host-ws","tokenDpapiHex":"0102","hostGateTokenDpapiHex":null}"#,
+            br#"{"worker":"wss://w.example/host-ws","tokenDpapiHex":"0102","hostGateTokenDpapiHex":"CD"}"#,
         )
         .unwrap();
         let parsed = StoredHostConfig::load(&path).unwrap();
-        assert_eq!(parsed.host_gate_token_dpapi_hex, None);
+        assert_eq!(parsed.token_dpapi_hex, "0102");
         assert_eq!(parsed.monitor, None);
         fs::write(&path, br#"{"worker":"ftp://x","tokenDpapiHex":"01"}"#).unwrap();
         assert!(StoredHostConfig::load(&path).is_err());

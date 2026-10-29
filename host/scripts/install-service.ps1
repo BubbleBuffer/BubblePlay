@@ -9,8 +9,6 @@ param(
 
     [string]$WorkerUrl,
     [Security.SecureString]$Token,
-    [Security.SecureString]$HostGateToken,
-    [switch]$ClearHostGateToken,
     [switch]$StartServices,
     [switch]$ResetLabOwner,
     [switch]$ConfirmRemoval
@@ -367,9 +365,6 @@ function Update-ProtectedTransportConfig {
     if ($null -eq $Token -and $env:BUBBLEPLAY_TOKEN) {
         $script:Token = ConvertTo-SecureString $env:BUBBLEPLAY_TOKEN -AsPlainText -Force
     }
-    if ($null -eq $HostGateToken -and -not $ClearHostGateToken -and $env:BUBBLEPLAY_HOST_GATE_TOKEN) {
-        $script:HostGateToken = ConvertTo-SecureString $env:BUBBLEPLAY_HOST_GATE_TOKEN -AsPlainText -Force
-    }
     $configPath = Join-Path $DataDir 'transport.json'
     Assert-NoReparsePath $configPath
     $existing = $null
@@ -387,19 +382,6 @@ function Update-ProtectedTransportConfig {
     else {
         $null
     }
-    $effectiveGate = if ($ClearHostGateToken) {
-        $null
-    }
-    elseif ($null -ne $HostGateToken) {
-        ConvertTo-DpapiHex $HostGateToken
-    }
-    elseif ($existing) {
-        $existing.hostGateTokenDpapiHex
-    }
-    else {
-        $null
-    }
-
     if (-not $effectiveWorker) {
         throw 'WorkerUrl is required for the first installation.'
     }
@@ -410,7 +392,6 @@ function Update-ProtectedTransportConfig {
     $config = [ordered]@{
         worker = $effectiveWorker
         tokenDpapiHex = $effectiveToken
-        hostGateTokenDpapiHex = $effectiveGate
     }
     $configJson = $config | ConvertTo-Json
     Write-ProtectedUtf8File $configPath $configJson ([Security.AccessControl.FileSystemRights]::Read)

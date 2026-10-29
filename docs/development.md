@@ -95,14 +95,14 @@ The checker uses the current Node executable directly. Missing dependencies fail
 
 BubblePlay is a per-user app. `bubbleplay_tray.exe` runs as the signed-in user
 and always supervises `bubbleplay-host.exe --mode serve --worker <url>` as that
-user (local DXGI capture + SendInput). Tokens reach the host only as
-`BUBBLEPLAY_TOKEN` / `BUBBLEPLAY_HOST_GATE_TOKEN` environment variables.
+user (local DXGI capture + SendInput). The relay token reaches the host only as
+`BUBBLEPLAY_TOKEN` environment variable.
 
 - Install: `%LOCALAPPDATA%\Programs\BubblePlay` (host, tray, staged admin
   agent, `setup-tray.ps1`, `uninstall-tray.ps1`), HKCU Run autostart, a
   Start-menu shortcut and a per-user "Apps" entry (HKCU `...\Uninstall\BubblePlay`).
 - Config: `%LOCALAPPDATA%\BubblePlay\host.json` (`worker`, `tokenDpapiHex`,
-  `hostGateTokenDpapiHex`, optional `monitor`; secrets CurrentUser DPAPI) and
+  optional `monitor`; secrets CurrentUser DPAPI) and
   `tray.json` (`adminMode`, `startAtLogin`).
 - Logs: `%LOCALAPPDATA%\BubblePlay\logs` (`tray.log`, `host.log`), each capped
   at 5 x 5 MiB; the elevated agent logs to

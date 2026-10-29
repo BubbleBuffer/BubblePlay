@@ -1,9 +1,9 @@
 //! Relay URL transport rule, shared by config load and every site that turns
 //! a relay URL into a socket URL.
 //!
-//! The host sends bearer credentials in the WebSocket upgrade (and the host
-//! token in the first signaling message), so a relay URL must be TLS. The one
-//! exception is a relay on this machine, which the Stream Lab uses.
+//! The host sends the registration token in the first signaling message and
+//! relay tickets on its data sockets, so a relay URL must be TLS. The one
+//! exception is a relay on this machine (local tests).
 
 use std::net::IpAddr;
 

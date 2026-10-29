@@ -12,9 +12,9 @@
       - Copy bubbleplay-host.exe, bubbleplay_tray.exe, the staged
         bubbleplay_admin_agent.exe, bubbleplay_secure_helper.exe, setup-tray.ps1 and uninstall-tray.ps1 to
         %LOCALAPPDATA%\Programs\BubblePlay.
-      - Write %LOCALAPPDATA%\BubblePlay\host.json (worker URL + tokens,
-        CurrentUser DPAPI) from -WorkerUrl/-Token/-HostGateToken or an
-        existing host.json. Both tokens must contain at least 32 characters.
+      - Write %LOCALAPPDATA%\BubblePlay\host.json (worker URL + registration
+        token, CurrentUser DPAPI) from -WorkerUrl/-Token or an existing
+        host.json. The token must contain at least 32 characters.
       - HKCU Run autostart, a Start-menu shortcut, an HKCU "Apps" uninstall
         entry (uninstall-tray.ps1) and tray.json.
       - Start the tray.
@@ -57,7 +57,6 @@ param(
     [string]$ServiceDataDir = (Join-Path $env:ProgramData 'BubblePlay'),
     [string]$WorkerUrl,
     [Security.SecureString]$Token,
-    [Security.SecureString]$HostGateToken,
     [string]$Monitor,
     [switch]$KeepServices,
     [Alias('SkipElevatedTask')]
@@ -265,13 +264,11 @@ function Get-ServiceConfig {
             [Security.Cryptography.DataProtectionScope]::LocalMachine)
         try { [Text.Encoding]::UTF8.GetString($plain) } finally { [Array]::Clear($plain, 0, $plain.Length) }
     }
-    $gateHex = if ($json.PSObject.Properties['hostGateTokenDpapiHex']) { $json.hostGateTokenDpapiHex } else { $null }
     return [pscustomobject]@{
-        Path          = $path
-        Readable      = $true
-        Worker        = [string]$json.worker
-        Token         = & $unprotect ([string]$json.tokenDpapiHex)
-        HostGateToken = & $unprotect ([string]$gateHex)
+        Path     = $path
+        Readable = $true
+        Worker   = [string]$json.worker
+        Token    = & $unprotect ([string]$json.tokenDpapiHex)
     }
 }
 
@@ -279,13 +276,13 @@ function Get-ExistingHostConfig {
     if (-not (Test-Path -LiteralPath $HostConfigPath -PathType Leaf)) { return $null }
     try {
         $json = Get-Content -Raw -LiteralPath $HostConfigPath | ConvertFrom-Json
-        $gateHex = if ($json.PSObject.Properties['hostGateTokenDpapiHex']) { $json.hostGateTokenDpapiHex } else { $null }
         $monitorValue = if ($json.PSObject.Properties['monitor']) { $json.monitor } else { $null }
         return [pscustomobject]@{
-            Worker        = [string]$json.worker
-            Token         = Unprotect-Hex ([string]$json.tokenDpapiHex)
-            HostGateToken = Unprotect-Hex ([string]$gateHex)
-            Monitor       = $monitorValue
+            Worker  = [string]$json.worker
+            Token   = Unprotect-Hex ([string]$json.tokenDpapiHex)
+            Monitor = $monitorValue
+            # A host.json from an older setup may carry fields that are no longer written; rewrite it then.
+            Extra   = @($json.PSObject.Properties.Name | Where-Object { $_ -notin @('worker', 'tokenDpapiHex', 'monitor') }).Count -gt 0
         }
     }
     catch {
@@ -296,13 +293,10 @@ function Get-ExistingHostConfig {
 
 # Returns 'machine' when only the elevated part can read the config (the old
 # service config under ProgramData); otherwise writes/plans host.json itself.
-function Assert-HostCredentials([string]$RegistrationToken, [string]$EndpointToken) {
-    # Keep these minimums aligned with worker/src/index.js MIN_SECRET_LENGTHS.
+function Assert-HostCredentials([string]$RegistrationToken) {
+    # Keep this minimum aligned with the relay's TOKEN minimum.
     if ([string]::IsNullOrWhiteSpace($RegistrationToken) -or $RegistrationToken.Length -lt 32) {
         throw 'Host registration token (TOKEN / -Token) must contain at least 32 characters.'
-    }
-    if ([string]::IsNullOrWhiteSpace($EndpointToken) -or $EndpointToken.Length -lt 32) {
-        throw 'Host endpoint token (HOST_GATE_TOKEN / -HostGateToken) must contain at least 32 characters.'
     }
 }
 
@@ -310,46 +304,42 @@ function Update-HostConfig {
     $existing = Get-ExistingHostConfig
     $service = Get-ServiceConfig
     $explicitToken = ConvertFrom-Secure $Token
-    $explicitGate = ConvertFrom-Secure $HostGateToken
     $hasExplicitToken = $null -ne $Token
-    $hasExplicitGate = $null -ne $HostGateToken
 
-    $source = $null; $worker = $null; $tok = $null; $gate = $null
-    if ($WorkerUrl -or $hasExplicitToken -or $hasExplicitGate) {
+    $source = $null; $worker = $null; $tok = $null
+    if ($WorkerUrl -or $hasExplicitToken) {
         $source = 'parameters'
         $worker = if ($WorkerUrl) { $WorkerUrl } elseif ($existing) { $existing.Worker } elseif ($service -and $service.Readable) { $service.Worker } else { $null }
         $tok = if ($hasExplicitToken) { $explicitToken } elseif ($existing) { $existing.Token } elseif ($service -and $service.Readable) { $service.Token } else { $null }
-        $gate = if ($hasExplicitGate) { $explicitGate } elseif ($existing) { $existing.HostGateToken } elseif ($service -and $service.Readable) { $service.HostGateToken } else { $null }
     }
     elseif ($existing) {
         $source = 'existing host.json'
-        $worker = $existing.Worker; $tok = $existing.Token; $gate = $existing.HostGateToken
+        $worker = $existing.Worker; $tok = $existing.Token
     }
     elseif ($service -and $service.Readable) {
         $source = "service config $($service.Path)"
-        $worker = $service.Worker; $tok = $service.Token; $gate = $service.HostGateToken
+        $worker = $service.Worker; $tok = $service.Token
     }
     elseif ($service -and -not $service.Readable) {
         return 'machine'
     }
     else {
-        throw 'No existing configuration found. Pass -WorkerUrl wss://.../host-ws, -Token and -HostGateToken (SecureString).'
+        throw 'No existing configuration found. Pass -WorkerUrl wss://.../host-ws and -Token (SecureString).'
     }
     if (-not $worker -or $worker -notmatch '^wss?://') { throw "Worker URL must be ws:// or wss:// (got '$worker')." }
-    Assert-HostCredentials $tok $gate
+    Assert-HostCredentials $tok
     $monitorValue = if ($PSBoundParameters.ContainsKey('Monitor') -or $Monitor) { $Monitor } elseif ($existing) { $existing.Monitor } else { $null }
 
     if ($existing -and $existing.Worker -eq $worker -and $existing.Token -eq $tok -and
-        $existing.HostGateToken -eq $gate -and $existing.Monitor -eq $monitorValue) {
+        -not $existing.Extra -and $existing.Monitor -eq $monitorValue) {
         Add-Step 'config' 'unchanged' "$HostConfigPath already matches ($source)."
         return 'done'
     }
     if ($PSCmdlet.ShouldProcess($HostConfigPath, "Write host config from $source (secrets CurrentUser-DPAPI)")) {
         $config = [ordered]@{
-            worker                = $worker
-            tokenDpapiHex         = Protect-UserHex $tok
-            hostGateTokenDpapiHex = Protect-UserHex $gate
-            monitor               = if ($monitorValue) { $monitorValue } else { $null }
+            worker        = $worker
+            tokenDpapiHex = Protect-UserHex $tok
+            monitor       = if ($monitorValue) { $monitorValue } else { $null }
         }
         New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
         $temp = "$HostConfigPath.tmp"
@@ -357,11 +347,11 @@ function Update-HostConfig {
         Move-Item -Force -LiteralPath $temp -Destination $HostConfigPath
         # Round-trip to prove the tray (same user) can decrypt it.
         $check = Get-ExistingHostConfig
-        if (-not $check -or $check.Token -ne $tok -or $check.HostGateToken -ne $gate) { throw 'host.json round-trip verification failed.' }
-        Add-Step 'config' 'done' "Wrote $HostConfigPath from $source (worker $worker, gate token: $([bool]$gate))."
+        if (-not $check -or $check.Token -ne $tok) { throw 'host.json round-trip verification failed.' }
+        Add-Step 'config' 'done' "Wrote $HostConfigPath from $source (worker $worker)."
     }
     else {
-        Add-Step 'config' 'planned' "Write $HostConfigPath from $source (worker $worker, gate token: $([bool]$gate))."
+        Add-Step 'config' 'planned' "Write $HostConfigPath from $source (worker $worker)."
     }
     return 'done'
 }
@@ -1083,7 +1073,7 @@ try {
         elseif ($IsElevated) { Invoke-MachineSteps $configNeedsMachine }
         else { Invoke-ElevatedMachinePhase $work }
         if ($configNeedsMachine -and -not $IsWhatIf -and -not (Test-Path -LiteralPath $HostConfigPath -PathType Leaf)) {
-            throw "The service config could not be migrated to $HostConfigPath; pass -WorkerUrl, -Token and -HostGateToken."
+            throw "The service config could not be migrated to $HostConfigPath; pass -WorkerUrl and -Token."
         }
         Set-UserRegistration
         Start-Tray

@@ -21,7 +21,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::Deserialize;
 use tungstenite::client::IntoClientRequest;
-use tungstenite::http::{header::AUTHORIZATION, HeaderValue, Request};
+use tungstenite::http::Request;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 use zeroize::{Zeroize, Zeroizing};
@@ -73,76 +73,27 @@ impl fmt::Debug for RelayTicket {
     }
 }
 
-/// Room and optional ticket for one signaling connection. A key selects its PC even when an older
-/// relay issues no ticket; a new relay can also issue a ticket for the legacy room.
-#[derive(Clone, Debug, Default)]
-pub enum RelayRoute {
-    #[default]
-    Legacy,
-    LegacyTicket(RelayTicket),
-    Keyed {
-        pc: String,
-        ticket: Option<RelayTicket>,
-    },
+/// Room and relay ticket for one keyed signaling connection. The ticket expires (12 h)
+/// independently of the signaling socket that received it.
+#[derive(Clone, Debug)]
+pub struct RelayRoute {
+    pc: String,
+    ticket: RelayTicket,
 }
 
 impl RelayRoute {
     pub fn keyed(pc: String, ticket: RelayTicket) -> Self {
-        Self::Keyed {
-            pc,
-            ticket: Some(ticket),
-        }
+        Self { pc, ticket }
     }
 
-    pub(crate) fn from_registration(
-        pc: Option<crate::device_key::DeviceId>,
-        ticket: Option<RelayTicket>,
-    ) -> Self {
-        match (pc, ticket) {
-            (Some(pc), ticket) => Self::Keyed {
-                pc: pc.to_string(),
-                ticket,
-            },
-            (None, Some(ticket)) => Self::LegacyTicket(ticket),
-            (None, None) => Self::Legacy,
-        }
-    }
-
-    fn pc(&self) -> Option<&str> {
-        match self {
-            Self::Legacy | Self::LegacyTicket(_) => None,
-            Self::Keyed { pc, .. } => Some(pc),
-        }
-    }
-
-    /// The route carries a relay ticket, which expires (12 h) independently of
-    /// the signaling socket that received it.
-    pub fn has_ticket(&self) -> bool {
-        matches!(
-            self,
-            Self::LegacyTicket(_)
-                | Self::Keyed {
-                    ticket: Some(_),
-                    ..
-                }
-        )
+    pub fn pc(&self) -> &str {
+        &self.pc
     }
 }
 
-/// The first frame a host data socket sends. Legacy hosts send exactly the bytes they always did.
+/// The first frame a host data socket sends.
 pub(crate) fn data_hello(role: &str, route: &RelayRoute) -> String {
-    let ticket = match route {
-        RelayRoute::Legacy => None,
-        RelayRoute::LegacyTicket(ticket) => Some(ticket),
-        RelayRoute::Keyed { ticket, .. } => ticket.as_ref(),
-    };
-    match ticket {
-        None => format!(r#"{{"type":"hello","role":"{role}"}}"#),
-        Some(ticket) => {
-            serde_json::json!({"type": "hello", "role": role, "ticket": ticket.as_str()})
-                .to_string()
-        }
-    }
+    serde_json::json!({"type": "hello", "role": role, "ticket": route.ticket.as_str()}).to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,32 +186,12 @@ impl WssMediaEgress {
         })
     }
 
-    /// Connect the single media socket for `epoch`, authenticating the HTTP
-    /// upgrade with `Authorization: Bearer <bearer>`.
-    pub fn connect(
-        worker_url: &str,
-        bearer: &str,
-        epoch: &str,
-        bitrate_bps: u64,
-        max_bitrate_bps: u64,
-    ) -> Result<Self> {
-        Self::connect_routed(
-            worker_url,
-            bearer,
-            epoch,
-            bitrate_bps,
-            max_bitrate_bps,
-            &RelayRoute::Legacy,
-        )
-    }
-
-    /// Connect the media socket for `epoch` in the room `route` names. The route, including any
+    /// Connect the media socket for `epoch` in the room `route` names. The route, including its
     /// ticket, is kept for every reconnect the link makes, so it must be the signaling connection's
     /// current route when the link starts. A relay that keeps refusing it ends the link with
     /// [`V4LinkEnd::Refused`](crate::wss_v4::V4LinkEnd) instead of looping.
     pub fn connect_routed(
         worker_url: &str,
-        bearer: &str,
         epoch: &str,
         bitrate_bps: u64,
         max_bitrate_bps: u64,
@@ -270,12 +201,11 @@ impl WssMediaEgress {
             bail!("invalid WSS media epoch");
         }
         // Validate the route before the link thread starts retrying it.
-        media_request(worker_url, bearer, epoch, route)?;
-        let (url, bearer, epoch_label) =
-            (worker_url.to_owned(), bearer.to_owned(), epoch.to_owned());
+        media_request(worker_url, epoch, route)?;
+        let (url, epoch_label) = (worker_url.to_owned(), epoch.to_owned());
         let route = route.clone();
         let link = V4Link::spawn_for_epoch(
-            Box::new(move || connect_media_socket(&url, &bearer, &epoch_label, &route)),
+            Box::new(move || connect_media_socket(&url, &epoch_label, &route)),
             epoch,
             bitrate_bps,
             max_bitrate_bps,
@@ -371,11 +301,10 @@ fn set_socket_timeouts(
 
 fn connect_media_socket(
     worker_url: &str,
-    bearer: &str,
     epoch: &str,
     route: &RelayRoute,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>> {
-    let request = media_request(worker_url, bearer, epoch, route)?;
+    let request = media_request(worker_url, epoch, route)?;
     let (mut ws, _) = connect(request).context("connect media socket")?;
     set_socket_timeouts(&mut ws, Duration::from_millis(500))?;
     ws.send(Message::text(data_hello("media-host", route)))
@@ -384,13 +313,8 @@ fn connect_media_socket(
     Ok(ws)
 }
 
-fn media_request(
-    worker_url: &str,
-    bearer: &str,
-    epoch: &str,
-    route: &RelayRoute,
-) -> Result<Request<()>> {
-    host_socket_request_routed(worker_url, bearer, epoch, HostSocket::Media, route)
+fn media_request(worker_url: &str, epoch: &str, route: &RelayRoute) -> Result<Request<()>> {
+    host_socket_request_routed(worker_url, epoch, HostSocket::Media, route)
 }
 
 /// The host's epoch-scoped relay sockets.
@@ -409,21 +333,10 @@ impl HostSocket {
     }
 }
 
-/// Upgrade request for an epoch-scoped host socket (`/host-media-ws` or `/host-file-ws`),
-/// authenticated with `Authorization: Bearer <bearer>`.
-pub fn host_socket_request(
-    worker_url: &str,
-    bearer: &str,
-    epoch: &str,
-    kind: HostSocket,
-) -> Result<Request<()>> {
-    host_socket_request_routed(worker_url, bearer, epoch, kind, &RelayRoute::Legacy)
-}
-
-/// [`host_socket_request`] for the room `route` names: a keyed route adds `pc=<id>` after `epoch`.
+/// Upgrade request for an epoch-scoped host socket (`/host-media-ws` or `/host-file-ws`). The URL
+/// names the room `route` holds as `pc=<id>` after `epoch`; the ticket travels only in the hello.
 pub fn host_socket_request_routed(
     worker_url: &str,
-    bearer: &str,
     epoch: &str,
     kind: HostSocket,
     route: &RelayRoute,
@@ -431,12 +344,11 @@ pub fn host_socket_request_routed(
     if !valid_epoch(epoch) {
         bail!("invalid relay epoch");
     }
-    socket_request(worker_url, bearer, epoch, kind, route)
+    socket_request(worker_url, epoch, kind, route)
 }
 
 fn socket_request(
     worker_url: &str,
-    bearer: &str,
     epoch: &str,
     kind: HostSocket,
     route: &RelayRoute,
@@ -458,20 +370,14 @@ fn socket_request(
         .to_owned();
     let scheme = parsed.scheme_str().unwrap_or("wss").to_owned();
     let media_path = kind.path();
-    let pc_query = route.pc().map(|pc| format!("&pc={pc}")).unwrap_or_default();
-    parsed = format!("{scheme}://{authority}{media_path}?epoch={epoch}{pc_query}")
+    let pc = route.pc();
+    parsed = format!("{scheme}://{authority}{media_path}?epoch={epoch}&pc={pc}")
         .parse()
         .expect("constructed media URL is valid");
-    let mut request = parsed
+    parsed
         .to_string()
         .into_client_request()
-        .context("build media websocket request")?;
-    if matches!(route, RelayRoute::Legacy) {
-        let value = HeaderValue::from_str(&format!("Bearer {bearer}"))
-            .context("host bearer is not a valid HTTP header value")?;
-        request.headers_mut().insert(AUTHORIZATION, value);
-    }
-    Ok(request)
+        .context("build media websocket request")
 }
 
 #[cfg(test)]
@@ -479,27 +385,6 @@ mod tests {
     use super::*;
 
     const EPOCH: &str = "0123456789abcdef0123456789abcdef";
-
-    #[test]
-    fn derives_the_single_media_endpoint_and_sends_bearer_only_in_upgrade_header() {
-        let request = media_request(
-            "https://worker.example/host-ws",
-            "host-bearer",
-            EPOCH,
-            &RelayRoute::Legacy,
-        )
-        .unwrap();
-        assert_eq!(
-            request.uri().to_string(),
-            "wss://worker.example/host-media-ws?epoch=0123456789abcdef0123456789abcdef"
-        );
-        assert!(!request.uri().to_string().contains("host-bearer"));
-        assert_eq!(
-            request.headers().get(AUTHORIZATION).unwrap(),
-            "Bearer host-bearer"
-        );
-    }
-
     const TICKET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const PC: &str = "ABCD-EFGH-JKMN-PQRS";
 
@@ -511,31 +396,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_media_socket_keeps_the_original_url_and_hello() {
-        let request = socket_request(
-            "https://worker.example/host-ws",
-            "host-bearer",
-            EPOCH,
-            HostSocket::Media,
-            &RelayRoute::Legacy,
-        )
-        .unwrap();
-        assert_eq!(
-            request.uri().to_string(),
-            format!("wss://worker.example/host-media-ws?epoch={EPOCH}")
-        );
-        assert_eq!(
-            data_hello("media-host", &RelayRoute::Legacy),
-            r#"{"type":"hello","role":"media-host"}"#
-        );
-    }
-
-    #[test]
     fn keyed_media_socket_addresses_the_pc_and_sends_the_ticket_in_hello_only() {
         let route = keyed_route();
         let request = socket_request(
             "https://worker.example/host-ws",
-            "host-bearer",
             EPOCH,
             HostSocket::Media,
             &route,
@@ -547,6 +411,7 @@ mod tests {
         );
         assert!(!request.uri().to_string().contains(TICKET));
         assert!(!format!("{:?}", request.headers()).contains(TICKET));
+        assert!(request.headers().get("authorization").is_none());
         let hello: serde_json::Value =
             serde_json::from_str(&data_hello("media-host", &route)).unwrap();
         assert_eq!(hello["type"], "hello");
@@ -555,18 +420,10 @@ mod tests {
     }
 
     #[test]
-    fn only_ticketed_routes_report_an_expiring_ticket() {
-        assert!(keyed_route().has_ticket());
-        assert!(
-            RelayRoute::LegacyTicket(RelayTicket::try_from(TICKET.to_owned()).unwrap())
-                .has_ticket()
-        );
-        assert!(!RelayRoute::Legacy.has_ticket());
-        assert!(!RelayRoute::Keyed {
-            pc: "AAAA-AAAA-AAAA-AAAA".into(),
-            ticket: None
-        }
-        .has_ticket());
+    fn route_debug_never_prints_the_ticket() {
+        let debug = format!("{:?}", keyed_route());
+        assert!(debug.contains("RelayTicket(<redacted>)"), "{debug}");
+        assert!(!debug.contains(TICKET), "{debug}");
     }
 
     #[test]
@@ -583,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn media_and_file_routes_keep_pc_and_ticket_independent() {
+    fn media_and_file_sockets_address_the_pc_and_send_the_ticket_in_hello() {
         for kind in [HostSocket::Media, HostSocket::File] {
             let path = kind.path();
             let role = if matches!(kind, HostSocket::Media) {
@@ -591,65 +448,19 @@ mod tests {
             } else {
                 "file-host"
             };
-            for has_key in [false, true] {
-                for has_ticket in [false, true] {
-                    let route = RelayRoute::from_registration(
-                        has_key.then(|| crate::device_key::DeviceId::parse(PC).unwrap()),
-                        has_ticket.then(|| RelayTicket::try_from(TICKET.to_owned()).unwrap()),
-                    );
-                    let request = socket_request(
-                        "wss://worker.example/host-ws",
-                        "host-bearer",
-                        EPOCH,
-                        kind,
-                        &route,
-                    )
-                    .unwrap();
-                    let selector = if has_key {
-                        format!("&pc={PC}")
-                    } else {
-                        String::new()
-                    };
-                    assert_eq!(
-                        request.uri().to_string(),
-                        format!("wss://worker.example{path}?epoch={EPOCH}{selector}")
-                    );
-                    if matches!(route, RelayRoute::Legacy) {
-                        assert_eq!(request.headers()[AUTHORIZATION], "Bearer host-bearer");
-                    } else {
-                        assert!(request.headers().get(AUTHORIZATION).is_none());
-                    }
-                    assert!(!request.uri().to_string().contains(TICKET));
-                    let hello: serde_json::Value =
-                        serde_json::from_str(&data_hello(role, &route)).unwrap();
-                    assert_eq!(hello["role"], role);
-                    assert_eq!(hello.get("ticket").is_some(), has_ticket);
-                    if has_ticket {
-                        assert_eq!(hello["ticket"], TICKET);
-                    }
-                }
-            }
+            let route = keyed_route();
+            let request =
+                socket_request("wss://worker.example/host-ws", EPOCH, kind, &route).unwrap();
+            assert_eq!(
+                request.uri().to_string(),
+                format!("wss://worker.example{path}?epoch={EPOCH}&pc={PC}")
+            );
+            assert!(!request.uri().to_string().contains(TICKET));
+            assert!(!format!("{:?}", request.headers()).contains(TICKET));
+            let hello: serde_json::Value = serde_json::from_str(&data_hello(role, &route)).unwrap();
+            assert_eq!(hello["role"], role);
+            assert_eq!(hello["ticket"], TICKET);
         }
-    }
-
-    #[test]
-    fn derives_the_file_socket_endpoints() {
-        let request = socket_request(
-            "https://worker.example/host-ws",
-            "host-bearer",
-            EPOCH,
-            HostSocket::File,
-            &RelayRoute::Legacy,
-        )
-        .unwrap();
-        assert_eq!(
-            request.uri().to_string(),
-            "wss://worker.example/host-file-ws?epoch=0123456789abcdef0123456789abcdef"
-        );
-        assert_eq!(
-            request.headers().get(AUTHORIZATION).unwrap(),
-            "Bearer host-bearer"
-        );
     }
 
     #[test]
@@ -659,23 +470,18 @@ mod tests {
                 "ws://192.168.1.20:8787/host-ws",
                 "http://worker.example/host-ws",
             ] {
-                let error = socket_request(url, "host-bearer", EPOCH, kind, &RelayRoute::Legacy)
+                let error = socket_request(url, EPOCH, kind, &keyed_route())
                     .unwrap_err()
                     .to_string();
                 assert!(error.contains("loopback"), "{error}");
-                assert!(!error.contains("host-bearer"), "{error}");
+                assert!(!error.contains(TICKET), "{error}");
             }
         }
-        let request = media_request(
-            "http://127.0.0.1:8787/host-ws",
-            "host-bearer",
-            EPOCH,
-            &RelayRoute::Legacy,
-        )
-        .unwrap();
+        let request =
+            media_request("http://127.0.0.1:8787/host-ws", EPOCH, &keyed_route()).unwrap();
         assert_eq!(
             request.uri().to_string(),
-            "ws://127.0.0.1:8787/host-media-ws?epoch=0123456789abcdef0123456789abcdef"
+            format!("ws://127.0.0.1:8787/host-media-ws?epoch={EPOCH}&pc={PC}")
         );
     }
 

@@ -704,16 +704,13 @@ pub(super) fn encoder_mode_for_capture(
 pub(super) const RELAY_TICKET_REFRESH_AGE: Duration = Duration::from_secs(11 * 60 * 60);
 
 /// An idle host's signaling registration is old enough that its ticket must be
-/// renewed by re-registering. A routed-ticketless (legacy) host never expires.
+/// renewed by re-registering.
 pub(super) fn relay_ticket_refresh_due(
     registered_at: Instant,
-    has_ticket: bool,
     viewer_attached: bool,
     now: Instant,
 ) -> bool {
-    has_ticket
-        && !viewer_attached
-        && now.saturating_duration_since(registered_at) >= RELAY_TICKET_REFRESH_AGE
+    !viewer_attached && now.saturating_duration_since(registered_at) >= RELAY_TICKET_REFRESH_AGE
 }
 
 /// What the session does when a WSS v4 link stopped on its own.
@@ -815,13 +812,12 @@ mod stall_tests {
     fn idle_hosts_reregister_before_the_relay_ticket_expires() {
         let registered = Instant::now();
         let at = |hours: u64| registered + Duration::from_secs(hours * 60 * 60);
-        assert!(!relay_ticket_refresh_due(registered, true, false, at(10)));
-        assert!(relay_ticket_refresh_due(registered, true, false, at(11)));
+        assert!(!relay_ticket_refresh_due(registered, false, at(10)));
+        assert!(relay_ticket_refresh_due(registered, false, at(11)));
         // The 2026-10-25 host held one registration for 58 h.
-        assert!(relay_ticket_refresh_due(registered, true, false, at(58)));
-        // A watching viewer is not cut off; a ticketless route never expires.
-        assert!(!relay_ticket_refresh_due(registered, true, true, at(58)));
-        assert!(!relay_ticket_refresh_due(registered, false, false, at(58)));
+        assert!(relay_ticket_refresh_due(registered, false, at(58)));
+        // A watching viewer is not cut off.
+        assert!(!relay_ticket_refresh_due(registered, true, at(58)));
         assert!(RELAY_TICKET_REFRESH_AGE < Duration::from_secs(12 * 60 * 60));
     }
 

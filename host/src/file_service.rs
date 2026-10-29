@@ -201,15 +201,10 @@ pub struct FileService {
 }
 
 impl FileService {
-    pub fn spawn(worker_url: &str, bearer: &str, config: FileServiceConfig) -> Result<Self> {
-        Self::spawn_routed(worker_url, bearer, config, RelayRoute::Legacy)
-    }
-
-    /// [`FileService::spawn`] for the room `route` names. The route, including any ticket, lives in
+    /// Starts the file service for the room `route` names. The route, with its ticket, lives in
     /// the socket thread and goes away when the service is dropped.
     pub fn spawn_routed(
         worker_url: &str,
-        bearer: &str,
         config: FileServiceConfig,
         route: RelayRoute,
     ) -> Result<Self> {
@@ -228,11 +223,11 @@ impl FileService {
         let mut threads = Vec::new();
         {
             let (shared, stop, config) = (shared.clone(), stop.clone(), config.clone());
-            let (url, bearer) = (worker_url.to_owned(), bearer.to_owned());
+            let url = worker_url.to_owned();
             threads.push(
                 thread::Builder::new()
                     .name("bubbleplay-file-socket".into())
-                    .spawn(move || socket_loop(&url, &bearer, &route, &config, &shared, &stop))
+                    .spawn(move || socket_loop(&url, &route, &config, &shared, &stop))
                     .context("spawn file socket thread")?,
             );
         }
@@ -514,13 +509,8 @@ fn poll_spool(shared: &Mutex<Shared>, dir: &Path) {
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
-fn connect_file_socket(
-    worker_url: &str,
-    bearer: &str,
-    epoch: &str,
-    route: &RelayRoute,
-) -> Result<Socket> {
-    let request = host_socket_request_routed(worker_url, bearer, epoch, HostSocket::File, route)?;
+fn connect_file_socket(worker_url: &str, epoch: &str, route: &RelayRoute) -> Result<Socket> {
+    let request = host_socket_request_routed(worker_url, epoch, HostSocket::File, route)?;
     let (mut ws, _) = tungstenite::connect(request).context("connect file socket")?;
     ws.send(Message::text(data_hello("file-host", route)))
         .context("send file hello")?;
@@ -537,7 +527,6 @@ fn connect_file_socket(
 
 fn socket_loop(
     worker_url: &str,
-    bearer: &str,
     route: &RelayRoute,
     config: &FileServiceConfig,
     shared: &Mutex<Shared>,
@@ -549,7 +538,7 @@ fn socket_loop(
             sleep_unless_stopped(stop, Duration::from_millis(200));
             continue;
         };
-        let mut ws = match connect_file_socket(worker_url, bearer, &bound.epoch, route) {
+        let mut ws = match connect_file_socket(worker_url, &bound.epoch, route) {
             Ok(ws) => ws,
             Err(error) => {
                 warn!(error = %format!("{error:#}"), ?delay, "file socket connect failed");

@@ -330,7 +330,7 @@ function analyze(summary) {
 try {
   await mkdir(path.join(outDir, 'profile'), { recursive: true });
   child = spawn(exe, ['--mode', 'serve', '--worker', workerUrl, '--token', 'local-probe-synthetic-token',
-    '--host-gate-token', 'local-probe-synthetic-bearer', '--monitor', monitor],
+    '--monitor', monitor],
   { cwd: path.join(repo, 'host'), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: {
     ...process.env, RUST_LOG: 'info', LOCALAPPDATA: path.join(outDir, 'profile'),
     BUBBLEPLAY_FILE_CLIPBOARD: '0', BUBBLEPLAY_DOWNLOADS_DIR: path.join(outDir, 'downloads'),

@@ -2,7 +2,7 @@
 
 Start with a relay setup guide, then install the native Windows host. BubblePlay is preparing its first Windows/browser alpha; no public release has been published yet.
 
-- [Windows quickstart](windows-quickstart.md) — relay credentials, installation, first connection, update and removal.
+- [Windows quickstart](windows-quickstart.md) — relay token, installation, pairing and first connection, update and removal.
 - [Relay setup](../relay-rs/README.md) — the Rust relay: Docker image, Cloudflare Worker, configuration and ntfy approval.
 - [Security and privacy](security-and-privacy.md) — authentication, relay visibility and platform boundaries.
 - [Development](development.md) — contributor setup, repository map, builds and checks.
