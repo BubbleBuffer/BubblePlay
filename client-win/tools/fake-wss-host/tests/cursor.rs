@@ -51,7 +51,9 @@ async fn cursor_script_is_sent_on_ws_after_start_in_order_with_exact_bytes() {
     }
     // The script is finite: nothing more follows it.
     assert!(
-        next_binary(&mut signal, Duration::from_millis(300)).await.is_none(),
+        next_binary(&mut signal, Duration::from_millis(300))
+            .await
+            .is_none(),
         "no cursor packet after the script"
     );
     harness.finish().await;
@@ -68,7 +70,9 @@ async fn cursor_script_waits_for_the_browser_start() {
     .await;
     let (mut signal, _epoch) = signal_hello(harness.addr).await;
     assert!(
-        next_binary(&mut signal, Duration::from_millis(400)).await.is_none(),
+        next_binary(&mut signal, Duration::from_millis(400))
+            .await
+            .is_none(),
         "hello alone sends no cursor packets"
     );
     harness.finish().await;

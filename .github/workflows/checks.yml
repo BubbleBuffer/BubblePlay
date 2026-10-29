@@ -238,6 +238,36 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
 
+  client-win:
+    name: Windows client checks (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt --no-self-update
+          rustup default 1.97.1
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: client-win -> target
+      - name: Fetch locked crates
+        run: cargo fetch --locked --manifest-path client-win/Cargo.toml
+      - name: Client tests (unit, session contracts and UI layout snapshots)
+        run: cargo test --locked --offline --manifest-path client-win/Cargo.toml
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --locked --offline --manifest-path client-win/Cargo.toml --all-targets -- -D warnings
+      - name: Rustfmt
+        # The frozen mock UI (src/ui, src/mock.rs, src/model.rs, tests/ui_layout.rs) predates
+        # this check and is skipped: main.rs marks those modules #[rustfmt::skip] and the
+        # check starts at main.rs rather than covering every target.
+        run: rustfmt --check --edition 2021 client-win/src/main.rs
+
   android:
     name: Android unit tests and lint (build01)
     runs-on: [self-hosted, build01]

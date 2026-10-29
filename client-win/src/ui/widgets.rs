@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Layout, Margin,
-    Rect, Response, Sense, Shadow, Stroke, StrokeKind, Ui, Vec2, WidgetText,
+    pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Layout, Margin, Rect,
+    Response, Sense, Shadow, Stroke, StrokeKind, Ui, Vec2, WidgetText,
 };
 
 use super::contract;
@@ -22,10 +22,20 @@ use crate::shell::WindowCommand;
 
 // Shapes the theme does not name. Radii come from the mockups' fitted
 // values (kbd.key, .switch .trk, the brand dot); see the notes in each use.
-const R_KEY: CornerRadius = CornerRadius { nw: 4, ne: 5, se: 4, sw: 5 };
+const R_KEY: CornerRadius = CornerRadius {
+    nw: 4,
+    ne: 5,
+    se: 4,
+    sw: 5,
+};
 const R_KNOB: CornerRadius = CornerRadius::same(3);
 /// The brand dot and the step markers (2 3 2 3).
-const R_DOT: CornerRadius = CornerRadius { nw: 2, ne: 3, se: 2, sw: 3 };
+const R_DOT: CornerRadius = CornerRadius {
+    nw: 2,
+    ne: 3,
+    se: 2,
+    sw: 3,
+};
 /// Caption close hover. The mockup uses #C42B1C; the theme has no red fill token.
 const CLOSE_HOVER: Color32 = Color32::from_rgb(0xC4, 0x2B, 0x1C);
 const CAPTION_W: f32 = 46.0;
@@ -106,7 +116,10 @@ pub fn titlebar(root: &mut egui::Ui, cx: &mut Cx, context: &str, demo_label: Opt
             let painter = ui.painter().clone();
             painter.rect_filled(bar, CornerRadius::ZERO, theme::FIELD);
             painter.line_segment(
-                [pos2(bar.left(), bar.bottom() - 0.5), pos2(bar.right(), bar.bottom() - 0.5)],
+                [
+                    pos2(bar.left(), bar.bottom() - 0.5),
+                    pos2(bar.right(), bar.bottom() - 0.5),
+                ],
                 Stroke::new(1.0, theme::THREAD),
             );
             cx.out.drag.push(bar);
@@ -135,10 +148,21 @@ pub fn titlebar(root: &mut egui::Ui, cx: &mut Cx, context: &str, demo_label: Opt
             );
             x = ctx_rect.right() + 12.0;
             if let Some(d) = demo_label {
-                contract::paint_text(ui, pos2(x, cy), Align2::LEFT_CENTER, d, theme::mono(11.0), theme::INK_FAINT);
+                contract::paint_text(
+                    ui,
+                    pos2(x, cy),
+                    Align2::LEFT_CENTER,
+                    d,
+                    theme::mono(11.0),
+                    theme::INK_FAINT,
+                );
             }
 
-            let maximise_icon = if cx.window.maximized { "copy" } else { "square" };
+            let maximise_icon = if cx.window.maximized {
+                "copy"
+            } else {
+                "square"
+            };
             let caps = [
                 ("minus", WindowCommand::Minimize),
                 (maximise_icon, WindowCommand::ToggleMaximize),
@@ -208,21 +232,40 @@ fn btn_metrics(size: BtnSize) -> (f32, f32, f32) {
 /// The natural width of a [`button`] (outside justified layouts).
 pub fn button_width(ui: &Ui, size: BtnSize, icon: Option<&str>, label: &str) -> f32 {
     let (_, font_size, pad) = btn_metrics(size);
-    let icon_w = if icon.is_some() { theme::ICON_SM + theme::SP2 } else { 0.0 };
+    let icon_w = if icon.is_some() {
+        theme::ICON_SM + theme::SP2
+    } else {
+        0.0
+    };
     pad * 2.0 + icon_w + text_width(ui, label, theme::bold(font_size), theme::INK)
 }
 
 /// A button with an optional Lucide icon before the label.
-pub fn button(ui: &mut Ui, cx: &Cx, kind: BtnKind, size: BtnSize, icon: Option<&str>, label: &str) -> Response {
+pub fn button(
+    ui: &mut Ui,
+    cx: &Cx,
+    kind: BtnKind,
+    size: BtnSize,
+    icon: Option<&str>,
+    label: &str,
+) -> Response {
     let enabled = ui.is_enabled();
     let (height, font_size, pad) = btn_metrics(size);
     let font = theme::bold(font_size);
     let text_w = text_width(ui, label, font.clone(), theme::INK);
-    let icon_w = if icon.is_some() { theme::ICON_SM + theme::SP2 } else { 0.0 };
+    let icon_w = if icon.is_some() {
+        theme::ICON_SM + theme::SP2
+    } else {
+        0.0
+    };
     // In a justified layout (the main action of a panel) the button takes
     // the full width, as the mockups' block buttons do.
     let natural = pad * 2.0 + icon_w + text_w;
-    let width = if ui.layout().horizontal_justify() { ui.available_width().max(natural) } else { natural };
+    let width = if ui.layout().horizontal_justify() {
+        ui.available_width().max(natural)
+    } else {
+        natural
+    };
     let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
 
     let hovered = enabled && resp.hovered();
@@ -239,11 +282,19 @@ pub fn button(ui: &mut Ui, cx: &Cx, kind: BtnKind, size: BtnSize, icon: Option<&
             (fill, fill, theme::SIGNAL_INK)
         }
         BtnKind::Secondary => {
-            let fill = if pressed || hovered { theme::SURFACE_MUTED } else { theme::SURFACE_RAISED };
+            let fill = if pressed || hovered {
+                theme::SURFACE_MUTED
+            } else {
+                theme::SURFACE_RAISED
+            };
             (fill, theme::THREAD_STRONG, theme::INK)
         }
         BtnKind::Ghost | BtnKind::Danger => {
-            let fill = if pressed || hovered { theme::SURFACE_MUTED } else { Color32::TRANSPARENT };
+            let fill = if pressed || hovered {
+                theme::SURFACE_MUTED
+            } else {
+                Color32::TRANSPARENT
+            };
             let fg = if kind == BtnKind::Danger {
                 theme::DANGER
             } else if hovered {
@@ -260,14 +311,28 @@ pub fn button(ui: &mut Ui, cx: &Cx, kind: BtnKind, size: BtnSize, icon: Option<&
 
     let painter = ui.painter().clone();
     if resp.has_focus() {
-        painter.rect_stroke(rect.expand(2.0), theme::R_CONTROL, Stroke::new(2.0, theme::FOCUS), StrokeKind::Outside);
+        painter.rect_stroke(
+            rect.expand(2.0),
+            theme::R_CONTROL,
+            Stroke::new(2.0, theme::FOCUS),
+            StrokeKind::Outside,
+        );
     }
-    painter.rect(rect, theme::R_CONTROL, fill, Stroke::new(1.0, border), StrokeKind::Inside);
+    painter.rect(
+        rect,
+        theme::R_CONTROL,
+        fill,
+        Stroke::new(1.0, border),
+        StrokeKind::Inside,
+    );
 
     let cy = rect.center().y;
     let mut x = rect.center().x - (icon_w + text_w) / 2.0;
     if let Some(name) = icon {
-        let icon_rect = Rect::from_center_size(pos2(x + theme::ICON_SM / 2.0, cy), Vec2::splat(theme::ICON_SM));
+        let icon_rect = Rect::from_center_size(
+            pos2(x + theme::ICON_SM / 2.0, cy),
+            Vec2::splat(theme::ICON_SM),
+        );
         cx.icons.paint(&painter, icon_rect, name, fg);
         x += icon_w;
     }
@@ -289,21 +354,41 @@ pub fn icon_button(ui: &mut Ui, cx: &Cx, kind: BtnKind, icon_name: &str, label: 
     let hovered = enabled && resp.hovered();
     let (fill, border, fg) = match kind {
         BtnKind::Primary => {
-            let fill = if hovered { theme::SIGNAL.lerp_to_gamma(theme::INK, 0.08) } else { theme::SIGNAL };
+            let fill = if hovered {
+                theme::SIGNAL.lerp_to_gamma(theme::INK, 0.08)
+            } else {
+                theme::SIGNAL
+            };
             (fill, fill, theme::SIGNAL_INK)
         }
         _ => {
-            let fill = if hovered { theme::SURFACE_MUTED } else { theme::SURFACE_RAISED };
+            let fill = if hovered {
+                theme::SURFACE_MUTED
+            } else {
+                theme::SURFACE_RAISED
+            };
             (fill, theme::THREAD_STRONG, theme::INK)
         }
     };
     let painter = ui.painter().clone();
     if resp.has_focus() {
-        painter.rect_stroke(rect.expand(2.0), theme::R_CONTROL, Stroke::new(2.0, theme::FOCUS), StrokeKind::Outside);
+        painter.rect_stroke(
+            rect.expand(2.0),
+            theme::R_CONTROL,
+            Stroke::new(2.0, theme::FOCUS),
+            StrokeKind::Outside,
+        );
     }
-    painter.rect(rect, theme::R_CONTROL, dim(enabled, fill), Stroke::new(1.0, dim(enabled, border)), StrokeKind::Inside);
+    painter.rect(
+        rect,
+        theme::R_CONTROL,
+        dim(enabled, fill),
+        Stroke::new(1.0, dim(enabled, border)),
+        StrokeKind::Inside,
+    );
     let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(theme::ICON_SM));
-    cx.icons.paint(&painter, icon_rect, icon_name, dim(enabled, fg));
+    cx.icons
+        .paint(&painter, icon_rect, icon_name, dim(enabled, fg));
     contract::mark_widget(&resp, egui::WidgetType::Button, "button", label);
     let resp = resp.on_hover_text(label);
     if enabled {
@@ -314,7 +399,14 @@ pub fn icon_button(ui: &mut Ui, cx: &Cx, kind: BtnKind, icon_name: &str, label: 
 }
 
 /// Like [`button`], but disabled (drawn faint, never clicked).
-pub fn button_disabled(ui: &mut Ui, cx: &Cx, kind: BtnKind, size: BtnSize, icon: Option<&str>, label: &str) {
+pub fn button_disabled(
+    ui: &mut Ui,
+    cx: &Cx,
+    kind: BtnKind,
+    size: BtnSize,
+    icon: Option<&str>,
+    label: &str,
+) {
     ui.add_enabled_ui(false, |ui| {
         button(ui, cx, kind, size, icon, label);
     });
@@ -348,7 +440,8 @@ pub fn pill(ui: &mut Ui, kind: PillKind, text: &str) -> Response {
     let font = theme::bold(theme::size::HINT);
     let text_w = text_width(ui, text, font.clone(), color);
     // 9 px inset, 6 px dot, 6 px gap, text, 9 px inset (mockup .status-pill).
-    let (rect, resp) = ui.allocate_exact_size(vec2(9.0 + 6.0 + 6.0 + text_w + 9.0, 22.0), Sense::hover());
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(9.0 + 6.0 + 6.0 + text_w + 9.0, 22.0), Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, theme::R_PILL, theme::SURFACE_MUTED);
     let cy = rect.center().y;
@@ -359,7 +452,13 @@ pub fn pill(ui: &mut Ui, kind: PillKind, text: &str) -> Response {
         // Hollow ring: 1.5 px stroke, outer radius 3.
         painter.circle_stroke(dot, 2.25, Stroke::new(1.5, color));
     }
-    painter.text(pos2(rect.left() + 21.0, cy), Align2::LEFT_CENTER, text, font, color);
+    painter.text(
+        pos2(rect.left() + 21.0, cy),
+        Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
     contract::mark_widget(&resp, egui::WidgetType::Label, "pill", text);
     resp
 }
@@ -379,11 +478,19 @@ pub fn switch(ui: &mut Ui, on: bool) -> Response {
     let edge = theme::THREAD_STRONG.lerp_to_gamma(theme::MOSS, t);
     let knob = theme::INK_FAINT.lerp_to_gamma(theme::INK, t);
     let knob_x = 2.0 + 16.0 * t;
-    let knob_rect = Rect::from_min_size(pos2(rect.left() + knob_x, rect.top() + 2.0), Vec2::splat(14.0));
+    let knob_rect = Rect::from_min_size(
+        pos2(rect.left() + knob_x, rect.top() + 2.0),
+        Vec2::splat(14.0),
+    );
 
     let painter = ui.painter();
     if resp.has_focus() {
-        painter.rect_stroke(rect.expand(2.0), theme::R_FIELD, Stroke::new(2.0, theme::FOCUS), StrokeKind::Outside);
+        painter.rect_stroke(
+            rect.expand(2.0),
+            theme::R_FIELD,
+            Stroke::new(2.0, theme::FOCUS),
+            StrokeKind::Outside,
+        );
     }
     painter.rect(
         rect,
@@ -393,7 +500,12 @@ pub fn switch(ui: &mut Ui, on: bool) -> Response {
         StrokeKind::Inside,
     );
     painter.rect_filled(knob_rect, R_KNOB, dim(enabled, knob));
-    contract::mark_widget(&resp, egui::WidgetType::Checkbox, "switch", if on { "on" } else { "off" });
+    contract::mark_widget(
+        &resp,
+        egui::WidgetType::Checkbox,
+        "switch",
+        if on { "on" } else { "off" },
+    );
 
     if enabled {
         resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -424,7 +536,13 @@ pub fn chord(ui: &mut Ui, keys: &[&str]) {
     for (i, (k, w)) in keys.iter().zip(key_widths).enumerate() {
         if i > 0 {
             x += 3.0;
-            painter.text(pos2(x, cy), Align2::LEFT_CENTER, "+", sep_font.clone(), theme::INK_FAINT);
+            painter.text(
+                pos2(x, cy),
+                Align2::LEFT_CENTER,
+                "+",
+                sep_font.clone(),
+                theme::INK_FAINT,
+            );
             x += plus_w + 3.0;
         }
         let key = Rect::from_min_size(pos2(x, rect.top()), vec2(w, KEY_H));
@@ -437,10 +555,19 @@ pub fn chord(ui: &mut Ui, keys: &[&str]) {
         );
         // The 2 px bottom border of kbd.key.
         painter.line_segment(
-            [pos2(key.left() + 4.0, key.bottom() - 1.0), pos2(key.right() - 4.0, key.bottom() - 1.0)],
+            [
+                pos2(key.left() + 4.0, key.bottom() - 1.0),
+                pos2(key.right() - 4.0, key.bottom() - 1.0),
+            ],
             Stroke::new(2.0, theme::THREAD_STRONG),
         );
-        painter.text(key.center(), Align2::CENTER_CENTER, k, key_font.clone(), theme::INK);
+        painter.text(
+            key.center(),
+            Align2::CENTER_CENTER,
+            k,
+            key_font.clone(),
+            theme::INK,
+        );
         x += w;
     }
 }
@@ -457,7 +584,11 @@ pub fn id_text(ui: &mut Ui, id: &str, large: bool) -> Response {
 
 /// Any monospace evidence text (codes, timers, paths).
 pub fn mono_text(ui: &mut Ui, text: &str, size: f32, color: Color32) -> Response {
-    ui.label(egui::RichText::new(text).font(theme::mono(size)).color(color))
+    ui.label(
+        egui::RichText::new(text)
+            .font(theme::mono(size))
+            .color(color),
+    )
 }
 
 /// A Lucide icon at `size` points tinted `color`.
@@ -477,35 +608,55 @@ pub enum NoticeKind {
 
 /// A notice block: icon on the left, contents on the right, fitted field
 /// radius, a 3 px seam on the left in the kind's colour.
-pub fn notice(ui: &mut Ui, cx: &Cx, kind: NoticeKind, icon_name: &str, add: impl FnOnce(&mut Ui)) -> Response {
+pub fn notice(
+    ui: &mut Ui,
+    cx: &Cx,
+    kind: NoticeKind,
+    icon_name: &str,
+    add: impl FnOnce(&mut Ui),
+) -> Response {
     let (seam, icon_color, border) = match kind {
         NoticeKind::Neutral => (theme::THREAD_STRONG, theme::INK_FAINT, theme::THREAD),
         NoticeKind::Info => (theme::INFORMATION, theme::INFORMATION, theme::THREAD),
-        NoticeKind::Error => (theme::DANGER, theme::DANGER, theme::DANGER.gamma_multiply(0.45)),
+        NoticeKind::Error => (
+            theme::DANGER,
+            theme::DANGER,
+            theme::DANGER.gamma_multiply(0.45),
+        ),
     };
     // Padding 12 / 14 / 12 / 12 from the mockup, plus the 3 px seam on the left.
     let frame = egui::Frame::NONE
         .fill(theme::SURFACE_RAISED)
         .stroke(Stroke::new(1.0, border))
         .corner_radius(theme::R_FIELD)
-        .inner_margin(Margin { left: 15, right: 14, top: 12, bottom: 12 });
+        .inner_margin(Margin {
+            left: 15,
+            right: 14,
+            top: 12,
+            bottom: 12,
+        });
     let out = contract::framed(ui, "notice", frame, |ui| {
-            ui.set_width(ui.available_width());
-            top_row(ui, |ui| {
-                icon(ui, cx, icon_name, theme::ICON, icon_color);
-                ui.add_space(theme::SP2 + 2.0);
-                ui.vertical(|ui| {
-                    ui.style_mut().visuals.override_text_color = Some(theme::INK_MUTED);
-                    add(ui);
-                });
+        ui.set_width(ui.available_width());
+        top_row(ui, |ui| {
+            icon(ui, cx, icon_name, theme::ICON, icon_color);
+            ui.add_space(theme::SP2 + 2.0);
+            ui.vertical(|ui| {
+                ui.style_mut().visuals.override_text_color = Some(theme::INK_MUTED);
+                add(ui);
             });
         });
+    });
     let r = out.response.rect;
     let seam_rect = Rect::from_min_max(r.min, pos2(r.left() + 3.0, r.bottom()));
     let field = theme::R_FIELD;
     ui.painter().rect_filled(
         seam_rect,
-        CornerRadius { nw: field.nw, ne: 0, se: 0, sw: field.sw },
+        CornerRadius {
+            nw: field.nw,
+            ne: 0,
+            se: 0,
+            sw: field.sw,
+        },
         seam,
     );
     out.response
@@ -524,12 +675,20 @@ pub fn tag(ui: &mut Ui, text: &str, draft: bool) -> Response {
     } else {
         (theme::INK_FAINT, theme::THREAD_STRONG)
     };
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), theme::bold(10.5), fg);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), theme::bold(10.5), fg);
     // Padding 3 px / 5 px plus 1 px border on each side.
     let size = vec2(galley.size().x + 12.0, galley.size().y + 8.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
-    painter.rect(rect, theme::R_COMPACT, Color32::TRANSPARENT, Stroke::new(1.0, border), StrokeKind::Inside);
+    painter.rect(
+        rect,
+        theme::R_COMPACT,
+        Color32::TRANSPARENT,
+        Stroke::new(1.0, border),
+        StrokeKind::Inside,
+    );
     painter.galley(rect.min + vec2(6.0, 4.0), galley, fg);
     contract::mark_widget(&resp, egui::WidgetType::Label, "tag", text);
     resp
@@ -537,39 +696,67 @@ pub fn tag(ui: &mut Ui, text: &str, draft: bool) -> Response {
 
 /// Section label (12 px bold, faint), like the mockups' h3 / eyebrow.
 pub fn section_label(ui: &mut Ui, text: &str) -> Response {
-    ui.label(egui::RichText::new(text).font(theme::bold(theme::size::SMALL)).color(theme::INK_FAINT))
+    ui.label(
+        egui::RichText::new(text)
+            .font(theme::bold(theme::size::SMALL))
+            .color(theme::INK_FAINT),
+    )
 }
 
 /// A read-only input box look (label above, value inside), used where the
 /// mockups show a filled or focused field. `focused` draws the focus ring.
-pub fn field(ui: &mut Ui, cx: &Cx, label: &str, icon_name: Option<&str>, focused: bool, add: impl FnOnce(&mut Ui)) -> Response {
+pub fn field(
+    ui: &mut Ui,
+    cx: &Cx,
+    label: &str,
+    icon_name: Option<&str>,
+    focused: bool,
+    add: impl FnOnce(&mut Ui),
+) -> Response {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
-        ui.label(egui::RichText::new(label).font(theme::bold(theme::size::SMALL)).color(theme::INK_MUTED));
-        let border = if focused { theme::INK_FAINT } else { theme::THREAD_STRONG };
+        ui.label(
+            egui::RichText::new(label)
+                .font(theme::bold(theme::size::SMALL))
+                .color(theme::INK_MUTED),
+        );
+        let border = if focused {
+            theme::INK_FAINT
+        } else {
+            theme::THREAD_STRONG
+        };
         let frame = egui::Frame::NONE
             .fill(theme::SURFACE_RAISED)
             .stroke(Stroke::new(1.0, border))
             .corner_radius(theme::R_FIELD)
             .inner_margin(Margin::symmetric(12, 0));
         let out = contract::framed(ui, "field", frame, |ui| {
-                // One line of FIELD_H - 2 (inside the 1 px border). A row of
-                // exactly that height; `horizontal_centered` would claim all
-                // the remaining height of the pane.
-                let h = theme::FIELD_H - 2.0;
-                ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(Align::Center), |ui| {
+            // One line of FIELD_H - 2 (inside the 1 px border). A row of
+            // exactly that height; `horizontal_centered` would claim all
+            // the remaining height of the pane.
+            let h = theme::FIELD_H - 2.0;
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), h),
+                Layout::left_to_right(Align::Center),
+                |ui| {
                     ui.set_min_height(h);
                     if let Some(name) = icon_name {
                         icon(ui, cx, name, theme::ICON, theme::INK_FAINT);
                         ui.add_space(theme::SP2 + 2.0);
                     }
                     add(ui);
-                });
-            });
+                },
+            );
+        });
         let rect = out.response.rect;
         if focused {
             // 2 px ring, 1 px outside the border (outline 2 px, offset 1 px).
-            ui.painter().rect_stroke(rect.expand(1.0), theme::R_FIELD, Stroke::new(2.0, theme::FOCUS), StrokeKind::Outside);
+            ui.painter().rect_stroke(
+                rect.expand(1.0),
+                theme::R_FIELD,
+                Stroke::new(2.0, theme::FOCUS),
+                StrokeKind::Outside,
+            );
         }
         out.response
     })
@@ -588,13 +775,21 @@ pub fn rail_steps(ui: &mut Ui, cx: &Cx, steps: &[(&str, &str, StepStatus)]) {
         };
         // 30 px indent for the marker column, then title over sub.
         let row = top_row(ui, |ui| {
-                ui.add_space(30.0);
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(*title).font(theme::bold(13.0)).color(title_color));
-                    ui.label(egui::RichText::new(*sub).font(theme::body(13.0)).color(theme::INK_FAINT));
-                });
-            })
-            .rect;
+            ui.add_space(30.0);
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(*title)
+                        .font(theme::bold(13.0))
+                        .color(title_color),
+                );
+                ui.label(
+                    egui::RichText::new(*sub)
+                        .font(theme::body(13.0))
+                        .color(theme::INK_FAINT),
+                );
+            });
+        })
+        .rect;
 
         let painter = ui.painter().clone();
         let (fill, edge) = match status {
@@ -604,7 +799,13 @@ pub fn rail_steps(ui: &mut Ui, cx: &Cx, steps: &[(&str, &str, StepStatus)]) {
             StepStatus::Waiting => (theme::VOID, theme::THREAD_STRONG),
         };
         let marker = Rect::from_min_size(pos2(row.left() + 6.0, row.top() + 4.0), Vec2::splat(9.0));
-        painter.rect(marker, R_DOT, fill, Stroke::new(1.5, edge), StrokeKind::Inside);
+        painter.rect(
+            marker,
+            R_DOT,
+            fill,
+            Stroke::new(1.5, edge),
+            StrokeKind::Inside,
+        );
         if i + 1 < count {
             // Connector from under the marker to just above the next one.
             let x = row.left() + 11.0;
@@ -633,44 +834,71 @@ pub fn conn_steps(ui: &mut Ui, cx: &Cx, steps: &[ConnStep]) {
         }
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
         contract::row_at(ui, "conn-step", rect, |ui| {
-        let (icon_name, icon_color, label_color, label_font, bg) = match s.status {
-            StepStatus::Done => ("circle-check", theme::CONSTRUCTIVE, theme::INK_MUTED, theme::body(14.0), None),
-            StepStatus::Now => ("loader-circle", theme::SIGNAL, theme::INK, theme::bold(14.0), Some(theme::SURFACE)),
-            StepStatus::Failed => ("circle-alert", theme::DANGER, theme::INK, theme::bold(14.0), Some(theme::SURFACE)),
-            StepStatus::Waiting => ("clock", theme::INK_FAINT, theme::INK_FAINT, theme::body(14.0), None),
-        };
+            let (icon_name, icon_color, label_color, label_font, bg) = match s.status {
+                StepStatus::Done => (
+                    "circle-check",
+                    theme::CONSTRUCTIVE,
+                    theme::INK_MUTED,
+                    theme::body(14.0),
+                    None,
+                ),
+                StepStatus::Now => (
+                    "loader-circle",
+                    theme::SIGNAL,
+                    theme::INK,
+                    theme::bold(14.0),
+                    Some(theme::SURFACE),
+                ),
+                StepStatus::Failed => (
+                    "circle-alert",
+                    theme::DANGER,
+                    theme::INK,
+                    theme::bold(14.0),
+                    Some(theme::SURFACE),
+                ),
+                StepStatus::Waiting => (
+                    "clock",
+                    theme::INK_FAINT,
+                    theme::INK_FAINT,
+                    theme::body(14.0),
+                    None,
+                ),
+            };
 
-        let painter = ui.painter().clone();
-        if let Some(bg) = bg {
-            painter.rect_filled(rect, theme::R_FIELD, bg);
-        }
-        let cy = rect.center().y;
-        // Icon column: 22 px at the 12 px inset, icon 18 px centred in it.
-        let icon_rect = Rect::from_center_size(pos2(rect.left() + 12.0 + STEP_COL / 2.0, cy), Vec2::splat(theme::ICON));
-        if s.status == StepStatus::Now {
-            cx.icons
-                .image(icon_name, theme::ICON, icon_color)
-                .rotate(angle, vec2(0.5, 0.5))
-                .paint_at(ui, icon_rect);
-        } else {
-            cx.icons.paint(&painter, icon_rect, icon_name, icon_color);
-        }
-        contract::paint_text(
-            ui,
-            pos2(rect.left() + 12.0 + STEP_COL + 12.0, cy),
-            Align2::LEFT_CENTER,
-            &s.label,
-            label_font,
-            label_color,
-        );
-        contract::paint_text(
-            ui,
-            pos2(rect.right() - 12.0, cy),
-            Align2::RIGHT_CENTER,
-            &s.detail,
-            theme::mono(theme::size::HINT),
-            theme::INK_FAINT,
-        );
+            let painter = ui.painter().clone();
+            if let Some(bg) = bg {
+                painter.rect_filled(rect, theme::R_FIELD, bg);
+            }
+            let cy = rect.center().y;
+            // Icon column: 22 px at the 12 px inset, icon 18 px centred in it.
+            let icon_rect = Rect::from_center_size(
+                pos2(rect.left() + 12.0 + STEP_COL / 2.0, cy),
+                Vec2::splat(theme::ICON),
+            );
+            if s.status == StepStatus::Now {
+                cx.icons
+                    .image(icon_name, theme::ICON, icon_color)
+                    .rotate(angle, vec2(0.5, 0.5))
+                    .paint_at(ui, icon_rect);
+            } else {
+                cx.icons.paint(&painter, icon_rect, icon_name, icon_color);
+            }
+            contract::paint_text(
+                ui,
+                pos2(rect.left() + 12.0 + STEP_COL + 12.0, cy),
+                Align2::LEFT_CENTER,
+                &s.label,
+                label_font,
+                label_color,
+            );
+            contract::paint_text(
+                ui,
+                pos2(rect.right() - 12.0, cy),
+                Align2::RIGHT_CENTER,
+                &s.detail,
+                theme::mono(theme::size::HINT),
+                theme::INK_FAINT,
+            );
         });
     }
 }
@@ -684,7 +912,8 @@ pub fn number(ui: &mut Ui, n: u32, size: f32) -> Response {
 /// A thin horizontal divider in THREAD colour.
 pub fn divider(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, theme::THREAD);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, theme::THREAD);
 }
 
 // ------------------------------------------------------------ helpers
@@ -695,7 +924,12 @@ pub fn divider(ui: &mut Ui) {
 /// everything after it in a pane was pushed out of view.
 fn top_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> Response {
     let h = ui.spacing().interact_size.y;
-    ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(Align::Min), add).response
+    ui.allocate_ui_with_layout(
+        vec2(ui.available_width(), h),
+        Layout::left_to_right(Align::Min),
+        add,
+    )
+    .response
 }
 
 /// Colour with the disabled opacity applied when `enabled` is false.
@@ -709,12 +943,20 @@ pub fn dim(enabled: bool, c: Color32) -> Color32 {
 
 /// Width of one line of text in the given font and colour.
 fn text_width(ui: &Ui, text: &str, font: FontId, color: Color32) -> f32 {
-    ui.painter().layout_no_wrap(text.to_owned(), font, color).size().x
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font, color)
+        .size()
+        .x
 }
 
 /// Text with letter spacing in em (CSS `letter-spacing`), as a label.
 fn spaced(text: &str, font: FontId, color: Color32, em: f32) -> WidgetText {
     let extra_letter_spacing = font.size * em;
-    let format = TextFormat { font_id: font, color, extra_letter_spacing, ..Default::default() };
+    let format = TextFormat {
+        font_id: font,
+        color,
+        extra_letter_spacing,
+        ..Default::default()
+    };
     LayoutJob::single_section(text.to_owned(), format).into()
 }

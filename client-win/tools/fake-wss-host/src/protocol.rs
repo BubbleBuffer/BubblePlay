@@ -8,7 +8,13 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use rand_core::{OsRng, RngCore};
 use serde_json::{json, Map, Value};
+
+/// The PC the fake relay reports in its `/ws` hello-ok.
+pub const FAKE_PC: &str = "77VH-7M56-8GJK-Y12J";
 
 pub const V4_MAGIC: u32 = 0x4250_5634;
 pub const V4_VERSION: u8 = 4;
@@ -220,8 +226,53 @@ fn valid_reason(reason: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
 }
 
-pub fn hello_ok_signal(media_epoch: &str) -> String {
-    json!({"type": "hello-ok", "mediaEpoch": media_epoch, "iceServers": []}).to_string()
+/// The `/ws` hello-ok sent after a valid `register-proof`: the media epoch, the
+/// PC and the media ticket the viewer presents on `/media-ws`.
+pub fn hello_ok_signal(media_epoch: &str, ticket: &str) -> String {
+    json!({
+        "type": "hello-ok",
+        "pc": FAKE_PC,
+        "mediaEpoch": media_epoch,
+        "iceServers": [],
+        "ticket": ticket,
+    })
+    .to_string()
+}
+
+/// `{"type":"register-challenge","nonce"}` with the nonce as unpadded base64url.
+pub fn register_challenge(nonce: &[u8; 32]) -> String {
+    json!({"type": "register-challenge", "nonce": URL_SAFE_NO_PAD.encode(nonce)}).to_string()
+}
+
+/// The signature of a `register-proof`, or `None` for any other message or a
+/// signature that is not 64 bytes of unpadded base64url.
+pub fn register_proof_signature(text: &str) -> Option<[u8; 64]> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    if value.get("type")?.as_str()? != "register-proof" {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value.get("signature")?.as_str()?)
+        .ok()?;
+    bytes.try_into().ok()
+}
+
+/// Unpadded base64url decoding, `None` when the text is not valid.
+pub fn b64url_decode(text: &str) -> Option<Vec<u8>> {
+    URL_SAFE_NO_PAD.decode(text).ok()
+}
+
+/// Unpadded base64url encoding, the form the relay uses for nonces and tickets.
+pub fn b64url_encode(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// 32 bytes from the operating system's RNG. Panics if it is unavailable: a
+/// test relay that cannot get entropy should stop, not issue weak nonces.
+pub fn random32() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
 }
 
 pub fn media_hello_ok(registered_at_ms: u64) -> String {

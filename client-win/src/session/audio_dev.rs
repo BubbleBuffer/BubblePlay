@@ -90,7 +90,7 @@ fn receive(options: &DevOptions) -> Result<()> {
     let control = player.handle();
     control.set_volume(options.audio_volume);
     control.set_muted(options.audio_muted);
-    let mut config = net::NetConfig::new(endpoint, net::Codec::H264, net::CookieJar::new());
+    let mut config = net::NetConfig::new(endpoint, net::Codec::H264, super::viewer_auth(options)?);
     config.audio = Some(control.clone());
     config.video_watchdog = false;
     config.transport = options.transport;

@@ -60,13 +60,33 @@ pub const CHROME_SHADOW: egui::Shadow = egui::Shadow {
 // egui is nw, ne, sw, se.
 pub const R_COMPACT: CornerRadius = CornerRadius::same(5);
 /// Fitted control: 7 11 6 9.
-pub const R_CONTROL: CornerRadius = CornerRadius { nw: 7, ne: 11, se: 6, sw: 9 };
+pub const R_CONTROL: CornerRadius = CornerRadius {
+    nw: 7,
+    ne: 11,
+    se: 6,
+    sw: 9,
+};
 /// Fitted field: 6 10 6 8.
-pub const R_FIELD: CornerRadius = CornerRadius { nw: 6, ne: 10, se: 6, sw: 8 };
+pub const R_FIELD: CornerRadius = CornerRadius {
+    nw: 6,
+    ne: 10,
+    se: 6,
+    sw: 8,
+};
 /// Fitted panel: 12 18 10 16.
-pub const R_PANEL: CornerRadius = CornerRadius { nw: 12, ne: 18, se: 10, sw: 16 };
+pub const R_PANEL: CornerRadius = CornerRadius {
+    nw: 12,
+    ne: 18,
+    se: 10,
+    sw: 16,
+};
 /// Edge-attached strip: square at the window edge, 0 0 10 12.
-pub const R_STRIP: CornerRadius = CornerRadius { nw: 0, ne: 0, se: 10, sw: 12 };
+pub const R_STRIP: CornerRadius = CornerRadius {
+    nw: 0,
+    ne: 0,
+    se: 10,
+    sw: 12,
+};
 /// Status pills are the only round shapes.
 pub const R_PILL: CornerRadius = CornerRadius::same(255);
 

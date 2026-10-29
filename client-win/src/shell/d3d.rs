@@ -8,7 +8,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use windows::core::{Interface, BOOL};
 use windows::Win32::Foundation::{HANDLE, HMODULE, HWND};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -16,7 +18,12 @@ use windows::Win32::Graphics::Dxgi::*;
 use super::{Rect, VideoLayer};
 
 /// Clear colour of the canvas behind the video and the UI: #26282D.
-const FIELD: [f32; 4] = [0x26 as f32 / 255.0, 0x28 as f32 / 255.0, 0x2D as f32 / 255.0, 1.0];
+const FIELD: [f32; 4] = [
+    0x26 as f32 / 255.0,
+    0x28 as f32 / 255.0,
+    0x2D as f32 / 255.0,
+    1.0,
+];
 
 /// Device, swap chain and egui renderer for one window.
 pub(super) struct Gfx {
@@ -82,7 +89,10 @@ impl Gfx {
             Width: w,
             Height: h,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
             Scaling: DXGI_SCALING_STRETCH,
@@ -91,8 +101,11 @@ impl Gfx {
             Flags: swap_flags,
             ..Default::default()
         };
-        let swap: IDXGISwapChain3 =
-            unsafe { factory.CreateSwapChainForHwnd(&device, hwnd, &sd, None, None)?.cast()? };
+        let swap: IDXGISwapChain3 = unsafe {
+            factory
+                .CreateSwapChainForHwnd(&device, hwnd, &sd, None, None)?
+                .cast()?
+        };
         unsafe {
             factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)?;
             swap.SetMaximumFrameLatency(1)?;
@@ -131,7 +144,13 @@ impl Gfx {
         unsafe {
             self.context.OMSetRenderTargets(None, None);
             // DXGI_FORMAT_UNKNOWN keeps the existing format; the flags must match creation.
-            self.swap.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(self.swap_flags as i32))?;
+            self.swap.ResizeBuffers(
+                0,
+                w,
+                h,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(self.swap_flags as i32),
+            )?;
         }
         self.size = (w, h);
         self.rtv = Some(create_rtv(&self.device, &self.swap)?);
@@ -152,7 +171,8 @@ impl Gfx {
         if let Some(rect) = video_rect {
             video.draw(&self.context, &rtv, rect);
         }
-        self.renderer.render(&self.context, &rtv, &self.egui_ctx, egui_out)?;
+        self.renderer
+            .render(&self.context, &rtv, &self.egui_ctx, egui_out)?;
         if let Some(path) = capture {
             if let Err(e) = self.capture(path) {
                 eprintln!("capture to {} failed: {e:#}", path.display());
@@ -180,17 +200,25 @@ impl Gfx {
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
         desc.MiscFlags = 0;
         let mut staging = None;
-        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut staging))? };
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut staging))?
+        };
         let staging: ID3D11Texture2D = staging.context("staging texture")?;
         unsafe { self.context.CopyResource(&staging, &back) };
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { self.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+        unsafe {
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?
+        };
         let (w, h) = (desc.Width as usize, desc.Height as usize);
         let pitch = mapped.RowPitch as usize;
         let mut rgba = vec![0u8; w * h * 4];
         for y in 0..h {
-            let row = unsafe { std::slice::from_raw_parts((mapped.pData as *const u8).add(y * pitch), w * 4) };
+            let row = unsafe {
+                std::slice::from_raw_parts((mapped.pData as *const u8).add(y * pitch), w * 4)
+            };
             for x in 0..w {
                 let s = &row[x * 4..x * 4 + 4];
                 let d = &mut rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];

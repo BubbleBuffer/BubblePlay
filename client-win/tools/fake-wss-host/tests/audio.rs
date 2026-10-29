@@ -40,8 +40,10 @@ fn meta(script: Script) -> RunMeta {
 }
 
 /// The media socket for `epoch`, with the hello answered and the peer seen.
-async fn attach(addr: SocketAddr, epoch: &str) -> Ws {
-    let mut media = media_open(addr, epoch).await.expect("media upgrade");
+async fn attach(addr: SocketAddr, epoch: &str, ticket: &str) -> Ws {
+    let mut media = media_open(addr, epoch, ticket)
+        .await
+        .expect("media upgrade");
     let reply = next_json(&mut media, REPLY_WAIT)
         .await
         .expect("media hello-ok");
@@ -132,14 +134,12 @@ async fn an_audio_only_run_serves_bpa1_with_no_recordings() {
     )
     .await;
     let addr = harness.addr;
-    let (mut signal, epoch) = signal_hello(addr).await;
-    let caps = next_json(&mut signal, REPLY_WAIT)
-        .await
-        .expect("host-capabilities after hello-ok");
+    let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
+    let caps = until_type(&mut signal, "host-capabilities").await;
     assert_eq!(caps["type"], "host-capabilities", "{caps}");
     assert_eq!(caps["audio"], 1, "{caps}");
 
-    let mut media = attach(addr, &epoch).await;
+    let mut media = attach(addr, &epoch, &ticket).await;
     send_json(&mut signal, start_with_audio(&epoch, "h264")).await;
     // No recording is offered, so the video start is refused; audio still flows.
     let read = packets(&mut media, 60).await;
@@ -174,8 +174,8 @@ async fn scripted_loss_and_reorder_show_on_the_wire_and_in_the_counts() {
     )
     .await;
     let addr = harness.addr;
-    let (mut signal, epoch) = signal_hello(addr).await;
-    let mut media = attach(addr, &epoch).await;
+    let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
+    let mut media = attach(addr, &epoch, &ticket).await;
     send_json(&mut signal, start_with_audio(&epoch, "h264")).await;
     // 80 packets on the wire is more than 37 encoded, so the loss at 37 and the
     // reorder at 23 have both happened by the time these are read.
@@ -231,8 +231,8 @@ async fn a_scripted_loss_is_an_unflagged_sequence_gap_on_the_wire() {
     )
     .await;
     let addr = harness.addr;
-    let (mut signal, epoch) = signal_hello(addr).await;
-    let mut media = attach(addr, &epoch).await;
+    let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
+    let mut media = attach(addr, &epoch, &ticket).await;
     send_json(&mut signal, start_with_audio(&epoch, "h264")).await;
     // 40 packets on the wire is more than 8 losses' worth, so the first loss at
     // index 5 (sequence 4) is well inside the read.
@@ -282,8 +282,8 @@ async fn stop_and_media_reattach_each_resume_with_a_discontinuity() {
     )
     .await;
     let addr = harness.addr;
-    let (mut signal, epoch) = signal_hello(addr).await;
-    let mut media = attach(addr, &epoch).await;
+    let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
+    let mut media = attach(addr, &epoch, &ticket).await;
 
     send_json(&mut signal, start_with_audio(&epoch, "h264")).await;
     let first = packets(&mut media, 3).await;
@@ -306,7 +306,7 @@ async fn stop_and_media_reattach_each_resume_with_a_discontinuity() {
     // Dropping the media socket stops audio. The epoch keeps its opt-in, so a
     // reattach resumes with a discontinuity and no new start.
     drop(media);
-    let mut media = attach(addr, &epoch).await;
+    let mut media = attach(addr, &epoch, &ticket).await;
     let reattached = next_discontinuity(&mut media).await;
     assert!(reattached.discontinuity, "a reattach after a media drop");
     drop(signal);
@@ -332,12 +332,10 @@ async fn starts_without_audio_one_get_no_audio_but_the_host_still_advertises_it(
     )
     .await;
     let addr = harness.addr;
-    let (mut signal, epoch) = signal_hello(addr).await;
-    let caps = next_json(&mut signal, REPLY_WAIT)
-        .await
-        .expect("host-capabilities");
+    let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
+    let caps = until_type(&mut signal, "host-capabilities").await;
     assert_eq!(caps["audio"], 1, "{caps}");
-    let mut media = attach(addr, &epoch).await;
+    let mut media = attach(addr, &epoch, &ticket).await;
 
     // A plain start, an integer that is not 1, and a string "1": none opts in.
     send_json(&mut signal, start_message(&epoch, "h264")).await;
@@ -382,17 +380,17 @@ async fn a_new_epoch_does_not_inherit_the_opt_in() {
     .await;
     let addr = harness.addr;
 
-    let (mut signal, epoch) = signal_hello(addr).await;
-    let mut media = attach(addr, &epoch).await;
+    let (mut signal, epoch, ticket) = signal_hello_ticket(addr).await;
+    let mut media = attach(addr, &epoch, &ticket).await;
     send_json(&mut signal, start_with_audio(&epoch, "h264")).await;
     assert!(!packets(&mut media, 3).await.is_empty());
     drop(signal);
     drop(media);
 
     // A fresh session attaches its media socket without a start: nothing flows.
-    let (signal, epoch2) = signal_hello(addr).await;
+    let (signal, epoch2, ticket2) = signal_hello_ticket(addr).await;
     assert_ne!(epoch, epoch2, "a new hello issues a new epoch");
-    let mut media = attach(addr, &epoch2).await;
+    let mut media = attach(addr, &epoch2, &ticket2).await;
     let packets = packets_for(&mut media, Duration::from_millis(400)).await;
     drop(signal);
     drop(media);

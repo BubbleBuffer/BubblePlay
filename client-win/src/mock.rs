@@ -10,10 +10,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::model::{
-    Action, Answerer, AnsweredRequest, AppState, Backend, BuildInfo, BuildState, ConnError, ConnStep,
-    ConnectedViewer, EnrollStep, Flow, HostRun, HostSetting, HostSettings, HostStatus, Link, Monitor,
-    Notifier, Outcome, PairedDevice, PairingRequest, PcKind, PcProblem, Permission, Quality, RemotePc,
-    RotatePc, Session, SessionNotice, Stats, StepStatus, StreamMode, ThisDevice, VouchRequest,
+    Action, AnsweredRequest, Answerer, AppState, Backend, BuildInfo, BuildState, ConnError,
+    ConnStep, ConnectedViewer, EnrollStep, Flow, HostRun, HostSetting, HostSettings, HostStatus,
+    Link, Monitor, Notifier, Outcome, PairedDevice, PairingRequest, PcKind, PcProblem, Permission,
+    Quality, RemotePc, RotatePc, Session, SessionNotice, Stats, StepStatus, StreamMode, ThisDevice,
+    VouchRequest,
 };
 use crate::ui::{DemoDriver, HomeEdit, HomeSel, SessionUi, StripView, Toast, UiState, View};
 
@@ -107,7 +108,10 @@ fn studio_sel() -> HomeSel {
 
 fn base_state() -> AppState {
     AppState {
-        this_device: ThisDevice { id: THIS_DEVICE_ID.into(), key_path: KEY_PATH.into() },
+        this_device: ThisDevice {
+            id: THIS_DEVICE_ID.into(),
+            key_path: KEY_PATH.into(),
+        },
         pcs: vec![
             RemotePc {
                 id: STUDIO_ID.into(),
@@ -160,14 +164,20 @@ fn host_base() -> HostStatus {
         pc_name: "DESKTOP-K9TR".into(),
         pc_id: Some(HOST_ID.into()),
         run: HostRun::Running,
-        viewer: Some(ConnectedViewer { name: "Pixel 8".into(), since: "09:12".into() }),
+        viewer: Some(ConnectedViewer {
+            name: "Pixel 8".into(),
+            since: "09:12".into(),
+        }),
         settings: HostSettings {
             stream_sound: true,
             admin_mode: false,
             start_at_login: true,
             cpu_mode: false,
         },
-        build: BuildInfo { hash: "3f9c2e1".into(), state: BuildState::Good },
+        build: BuildInfo {
+            hash: "3f9c2e1".into(),
+            state: BuildState::Good,
+        },
         can_roll_back: true,
         paired: vec![
             PairedDevice {
@@ -222,8 +232,16 @@ fn vouch_request() -> VouchRequest {
         expires_in_secs: 521,
         // "Before sign-in" is never offered by vouching, so it is not listed.
         permissions: vec![
-            Permission { key: "view".into(), label: "View the screen".into(), granted: true },
-            Permission { key: "input".into(), label: "Mouse and keyboard".into(), granted: true },
+            Permission {
+                key: "view".into(),
+                label: "View the screen".into(),
+                granted: true,
+            },
+            Permission {
+                key: "input".into(),
+                label: "Mouse and keyboard".into(),
+                granted: true,
+            },
         ],
     }
 }
@@ -237,7 +255,11 @@ fn answered_request() -> AnsweredRequest {
 }
 
 fn step(label: &str, detail: &str, status: StepStatus) -> ConnStep {
-    ConnStep { label: label.into(), detail: detail.into(), status }
+    ConnStep {
+        label: label.into(),
+        detail: detail.into(),
+        status,
+    }
 }
 
 fn connecting_steps() -> Vec<ConnStep> {
@@ -287,13 +309,25 @@ fn pair_wait(remote: bool, outcome: Outcome) -> Flow {
 }
 
 fn studio_failed(steps: Vec<ConnStep>, error: ConnError) -> Flow {
-    Flow::Failed { pc_id: STUDIO_ID.into(), steps, error }
+    Flow::Failed {
+        pc_id: STUDIO_ID.into(),
+        steps,
+        error,
+    }
 }
 
 fn rotate_pcs() -> Vec<RotatePc> {
     vec![
-        RotatePc { name: "Studio PC".into(), status: StepStatus::Done, detail: "confirmed 14:02".into() },
-        RotatePc { name: "Living room".into(), status: StepStatus::Done, detail: "confirmed 14:03".into() },
+        RotatePc {
+            name: "Studio PC".into(),
+            status: StepStatus::Done,
+            detail: "confirmed 14:02".into(),
+        },
+        RotatePc {
+            name: "Living room".into(),
+            status: StepStatus::Done,
+            detail: "confirmed 14:03".into(),
+        },
         RotatePc {
             name: "Office tower".into(),
             status: StepStatus::Waiting,
@@ -391,7 +425,10 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
             View::Home(HomeSel::ThisPc)
         }
         5 => {
-            s.flow = Some(Flow::PairEnter { remote: false, error: None });
+            s.flow = Some(Flow::PairEnter {
+                remote: false,
+                error: None,
+            });
             View::Home(HomeSel::FirstPc)
         }
         6 => {
@@ -411,7 +448,11 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
             View::Home(HomeSel::FirstPc)
         }
         8 => {
-            s.flow = Some(Flow::Approval { pc_id: STUDIO_ID.into(), waiting_secs: 42, outcome: Outcome::Waiting });
+            s.flow = Some(Flow::Approval {
+                pc_id: STUDIO_ID.into(),
+                waiting_secs: 42,
+                outcome: Outcome::Waiting,
+            });
             View::Home(studio_sel())
         }
         9 => {
@@ -423,11 +464,16 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
             View::Home(studio_sel())
         }
         10 => {
-            s.flow = Some(studio_failed(failed_steps(), ConnError::NoFirstFrame { secs: 8 }));
+            s.flow = Some(studio_failed(
+                failed_steps(),
+                ConnError::NoFirstFrame { secs: 8 },
+            ));
             View::Home(studio_sel())
         }
         11 => {
-            s.flow = Some(Flow::Refused { pc_id: STUDIO_ID.into() });
+            s.flow = Some(Flow::Refused {
+                pc_id: STUDIO_ID.into(),
+            });
             View::Home(studio_sel())
         }
         12 => View::Settings,
@@ -485,7 +531,10 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
             View::Home(HomeSel::FirstPc)
         }
         33 => {
-            s.flow = Some(Flow::PairEnter { remote: true, error: None });
+            s.flow = Some(Flow::PairEnter {
+                remote: true,
+                error: None,
+            });
             View::Home(HomeSel::FirstPc)
         }
         34 => {
@@ -505,13 +554,25 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
             View::Home(HomeSel::FirstPc)
         }
         38 | 39 => {
-            let outcome = if index == 38 { Outcome::Denied { by: Answerer::Pc } } else { Outcome::TimedOut };
-            s.flow = Some(Flow::Approval { pc_id: STUDIO_ID.into(), waiting_secs: 0, outcome });
+            let outcome = if index == 38 {
+                Outcome::Denied { by: Answerer::Pc }
+            } else {
+                Outcome::TimedOut
+            };
+            s.flow = Some(Flow::Approval {
+                pc_id: STUDIO_ID.into(),
+                waiting_secs: 0,
+                outcome,
+            });
             View::Home(studio_sel())
         }
         40 => {
             s.pcs.push(den_pc());
-            s.flow = Some(Flow::Connecting { pc_id: DEN_ID.into(), mode: StreamMode::Work, steps: connecting_steps() });
+            s.flow = Some(Flow::Connecting {
+                pc_id: DEN_ID.into(),
+                mode: StreamMode::Work,
+                steps: connecting_steps(),
+            });
             View::Home(HomeSel::FirstPc)
         }
         41 => {
@@ -569,7 +630,11 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
             View::Home(studio_sel())
         }
         46 => {
-            s.flow = Some(Flow::Approval { pc_id: STUDIO_ID.into(), waiting_secs: 0, outcome: Outcome::Cancelled });
+            s.flow = Some(Flow::Approval {
+                pc_id: STUDIO_ID.into(),
+                waiting_secs: 0,
+                outcome: Outcome::Cancelled,
+            });
             View::Home(studio_sel())
         }
         _ => {
@@ -587,7 +652,10 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
                 }
                 19 => ui.toast = Some(Toast::Released),
                 20 => {
-                    sess.link = Link::Reconnecting { attempt: 2, secs: 2 };
+                    sess.link = Link::Reconnecting {
+                        attempt: 2,
+                        secs: 2,
+                    };
                     ui.strip = StripView::Toolbar;
                 }
                 21 => {
@@ -620,7 +688,9 @@ fn scene_parts(index: usize) -> (AppState, View, SessionUi, Option<HomeEdit>) {
 }
 
 fn host_mut(s: &mut AppState) -> &mut HostStatus {
-    s.host.as_mut().expect("the demo base state always has a host")
+    s.host
+        .as_mut()
+        .expect("the demo base state always has a host")
 }
 
 // ------------------------------------------------------------- backend
@@ -635,7 +705,10 @@ pub struct MockBackend(Rc<RefCell<Shared>>);
 pub struct MockDemo(Rc<RefCell<Shared>>);
 
 pub fn new() -> (MockBackend, MockDemo) {
-    let s = Rc::new(RefCell::new(Shared { state: base_state(), notify: None }));
+    let s = Rc::new(RefCell::new(Shared {
+        state: base_state(),
+        notify: None,
+    }));
     (MockBackend(s.clone()), MockDemo(s))
 }
 
@@ -661,7 +734,12 @@ fn apply(state: &mut AppState, action: Action) {
             state.pcs.retain(|p| p.id != pc_id);
             state.flow = None;
         }
-        Action::StartRemotePairing => state.flow = Some(Flow::PairEnter { remote: true, error: None }),
+        Action::StartRemotePairing => {
+            state.flow = Some(Flow::PairEnter {
+                remote: true,
+                error: None,
+            })
+        }
         Action::SubmitPairing { .. } => state.flow = Some(pair_wait(false, Outcome::Waiting)),
         Action::RequestRemotePairing { .. } => state.flow = Some(pair_wait(true, Outcome::Waiting)),
         Action::CreateKey => {
@@ -670,8 +748,10 @@ fn apply(state: &mut AppState, action: Action) {
         }
         Action::ImportKey => {
             if matches!(state.flow, Some(Flow::Enroll(_))) {
-                state.flow =
-                    Some(Flow::Enroll(EnrollStep::ImportUnlock { file_name: IMPORT_FILE.into(), error: None }));
+                state.flow = Some(Flow::Enroll(EnrollStep::ImportUnlock {
+                    file_name: IMPORT_FILE.into(),
+                    error: None,
+                }));
             }
         }
         Action::UnlockImport { passphrase } => {
@@ -687,7 +767,9 @@ fn apply(state: &mut AppState, action: Action) {
         }
         Action::Retry => {
             let pc_id = match &state.flow {
-                Some(Flow::Failed { pc_id, .. } | Flow::Approval { pc_id, .. }) => Some(pc_id.clone()),
+                Some(Flow::Failed { pc_id, .. } | Flow::Approval { pc_id, .. }) => {
+                    Some(pc_id.clone())
+                }
                 _ => None,
             };
             if let Some(pc_id) = pc_id {
@@ -701,18 +783,27 @@ fn apply(state: &mut AppState, action: Action) {
                 .find(|p| p.id == pc_id)
                 .and_then(|p| p.last_mode)
                 .unwrap_or_default();
-            state.flow = Some(Flow::Connecting { pc_id, mode, steps: connecting_steps() });
+            state.flow = Some(Flow::Connecting {
+                pc_id,
+                mode,
+                steps: connecting_steps(),
+            });
         }
         Action::CancelFlow => {
             state.flow = match &state.flow {
                 // Leaving an import goes back to the first-start choice.
-                Some(Flow::Enroll(EnrollStep::ImportUnlock { .. } | EnrollStep::ImportRefused { .. })) => {
-                    Some(Flow::Enroll(EnrollStep::Choose))
-                }
+                Some(Flow::Enroll(
+                    EnrollStep::ImportUnlock { .. } | EnrollStep::ImportRefused { .. },
+                )) => Some(Flow::Enroll(EnrollStep::Choose)),
                 _ => None,
             }
         }
-        Action::StartPairing => state.flow = Some(Flow::PairEnter { remote: false, error: None }),
+        Action::StartPairing => {
+            state.flow = Some(Flow::PairEnter {
+                remote: false,
+                error: None,
+            })
+        }
         Action::SetHostSetting(setting) => {
             if let Some(host) = state.host.as_mut() {
                 let s = &mut host.settings;
@@ -724,7 +815,10 @@ fn apply(state: &mut AppState, action: Action) {
                 }
             }
         }
-        Action::SetMayVouch { device_id, may_vouch } => {
+        Action::SetMayVouch {
+            device_id,
+            may_vouch,
+        } => {
             if let Some(host) = state.host.as_mut() {
                 if let Some(dev) = host.paired.iter_mut().find(|d| d.id == device_id) {
                     dev.may_vouch = may_vouch;
@@ -738,7 +832,10 @@ fn apply(state: &mut AppState, action: Action) {
         }
         Action::AnswerPairing { request_id, allow } => {
             if let Some(host) = state.host.as_mut() {
-                let is_current = host.request.as_ref().is_some_and(|r| r.request_id == request_id);
+                let is_current = host
+                    .request
+                    .as_ref()
+                    .is_some_and(|r| r.request_id == request_id);
                 if is_current {
                     if let Some(req) = host.request.take() {
                         if allow {
@@ -815,7 +912,15 @@ impl DemoDriver for MockDemo {
         let (state, view, session, home_edit) = scene_parts(index);
         self.0.borrow_mut().state = state;
         notify(&self.0);
-        (LABELS[index].to_string(), UiState { view, session, home_edit, demo_label: None })
+        (
+            LABELS[index].to_string(),
+            UiState {
+                view,
+                session,
+                home_edit,
+                demo_label: None,
+            },
+        )
     }
 }
 
@@ -842,7 +947,9 @@ mod tests {
     fn toggling_a_host_setting_changes_the_snapshot() {
         let (mut backend, _demo) = new();
         let before = backend.snapshot().host.expect("host").settings;
-        backend.act(Action::SetHostSetting(HostSetting::StreamSound(!before.stream_sound)));
+        backend.act(Action::SetHostSetting(HostSetting::StreamSound(
+            !before.stream_sound,
+        )));
         let after = backend.snapshot().host.expect("host").settings;
         assert_ne!(before, after);
         assert_eq!(after.stream_sound, !before.stream_sound);
@@ -851,13 +958,21 @@ mod tests {
     #[test]
     fn connect_cancel_and_pairing_answer_update_state() {
         let (mut backend, mut demo) = new();
-        backend.act(Action::Connect { pc_id: STUDIO_ID.into() });
-        assert!(matches!(backend.snapshot().flow, Some(Flow::Connecting { .. })));
+        backend.act(Action::Connect {
+            pc_id: STUDIO_ID.into(),
+        });
+        assert!(matches!(
+            backend.snapshot().flow,
+            Some(Flow::Connecting { .. })
+        ));
         backend.act(Action::CancelFlow);
         assert!(backend.snapshot().flow.is_none());
 
         demo.scene(3);
-        backend.act(Action::AnswerPairing { request_id: REQUEST_ID.into(), allow: true });
+        backend.act(Action::AnswerPairing {
+            request_id: REQUEST_ID.into(),
+            allow: true,
+        });
         let host = backend.snapshot().host.expect("host");
         assert!(host.request.is_none());
         assert!(host.paired.iter().any(|d| d.id == REQUEST_DEVICE_ID));
@@ -869,39 +984,74 @@ mod tests {
         demo.scene(28);
         assert!(backend.snapshot().this_device.id.is_empty());
         backend.act(Action::ImportKey);
-        assert!(matches!(backend.snapshot().flow, Some(Flow::Enroll(EnrollStep::ImportUnlock { error: None, .. }))));
-        backend.act(Action::UnlockImport { passphrase: String::new() });
-        assert!(matches!(backend.snapshot().flow, Some(Flow::Enroll(EnrollStep::ImportUnlock { error: Some(_), .. }))));
+        assert!(matches!(
+            backend.snapshot().flow,
+            Some(Flow::Enroll(EnrollStep::ImportUnlock { error: None, .. }))
+        ));
+        backend.act(Action::UnlockImport {
+            passphrase: String::new(),
+        });
+        assert!(matches!(
+            backend.snapshot().flow,
+            Some(Flow::Enroll(EnrollStep::ImportUnlock {
+                error: Some(_),
+                ..
+            }))
+        ));
         backend.act(Action::CancelFlow);
-        assert!(matches!(backend.snapshot().flow, Some(Flow::Enroll(EnrollStep::Choose))));
+        assert!(matches!(
+            backend.snapshot().flow,
+            Some(Flow::Enroll(EnrollStep::Choose))
+        ));
         backend.act(Action::CreateKey);
         let state = backend.snapshot();
-        assert!(matches!(state.flow, Some(Flow::Enroll(EnrollStep::Created))));
+        assert!(matches!(
+            state.flow,
+            Some(Flow::Enroll(EnrollStep::Created))
+        ));
         assert_eq!(state.this_device.id, THIS_DEVICE_ID);
     }
 
     #[test]
     fn rename_forget_and_retry_update_state() {
         let (mut backend, mut demo) = new();
-        backend.act(Action::Rename { pc_id: STUDIO_ID.into(), name: "Studio".into() });
+        backend.act(Action::Rename {
+            pc_id: STUDIO_ID.into(),
+            name: "Studio".into(),
+        });
         assert_eq!(backend.snapshot().pcs[0].name, "Studio");
-        backend.act(Action::Forget { pc_id: STUDIO_ID.into() });
+        backend.act(Action::Forget {
+            pc_id: STUDIO_ID.into(),
+        });
         assert!(backend.snapshot().pcs.iter().all(|p| p.id != STUDIO_ID));
 
         demo.scene(43);
         backend.act(Action::Retry);
-        assert!(matches!(backend.snapshot().flow, Some(Flow::Connecting { .. })));
+        assert!(matches!(
+            backend.snapshot().flow,
+            Some(Flow::Connecting { .. })
+        ));
     }
 
     #[test]
     fn pairing_requests_lead_to_the_wait() {
         let (mut backend, _demo) = new();
         backend.act(Action::StartRemotePairing);
-        assert!(matches!(backend.snapshot().flow, Some(Flow::PairEnter { remote: true, .. })));
-        backend.act(Action::RequestRemotePairing { pc_id: DEN_ID.into(), relay: RELAY.into() });
         assert!(matches!(
             backend.snapshot().flow,
-            Some(Flow::PairConfirm { remote: true, outcome: Outcome::Waiting, .. })
+            Some(Flow::PairEnter { remote: true, .. })
+        ));
+        backend.act(Action::RequestRemotePairing {
+            pc_id: DEN_ID.into(),
+            relay: RELAY.into(),
+        });
+        assert!(matches!(
+            backend.snapshot().flow,
+            Some(Flow::PairConfirm {
+                remote: true,
+                outcome: Outcome::Waiting,
+                ..
+            })
         ));
     }
 }

@@ -9,17 +9,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
-use windows::Win32::UI::Controls::MARGINS;
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObjectEx};
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -27,7 +30,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use super::d3d::Gfx;
 use super::input::{self, InputState};
 use super::{
-    FrameRequests, InputCapture, Rect, ShellApp, ShellConfig, VideoLayer, WakeHandle, WindowCommand, WindowInfo,
+    FrameRequests, InputCapture, Rect, ShellApp, ShellConfig, VideoLayer, WakeHandle,
+    WindowCommand, WindowInfo,
 };
 
 /// Width of the resize border, in device-independent pixels (scaled by DPI).
@@ -183,9 +187,12 @@ impl State {
     ) -> Result<Option<WindowCommand>> {
         self.frame_due = false;
         let ppp = self.ppp();
-        let Some(gfx) = self.gfx.as_mut() else { return Ok(None) };
+        let Some(gfx) = self.gfx.as_mut() else {
+            return Ok(None);
+        };
         let (w, h) = gfx.size;
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32 / ppp, h as f32 / ppp));
+        let screen =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32 / ppp, h as f32 / ppp));
         let raw = self.input.raw_input(
             screen,
             ppp,
@@ -193,7 +200,9 @@ impl State {
             self.maximized,
             self.start.elapsed().as_secs_f64(),
         );
-        let info = WindowInfo { maximized: self.maximized };
+        let info = WindowInfo {
+            maximized: self.maximized,
+        };
         let mut req = FrameRequests::default();
         let full = gfx.egui_ctx.run_ui(raw, |ui| app.frame(ui, info, &mut req));
         let repaint = full
@@ -219,9 +228,15 @@ impl State {
             }
         }
 
-        let Some(gfx) = self.gfx.as_mut() else { return Ok(None) };
+        let Some(gfx) = self.gfx.as_mut() else {
+            return Ok(None);
+        };
         gfx.draw(render_out, video_px, video, capture.as_deref())?;
-        self.next_repaint = if repaint == Duration::MAX { None } else { Instant::now().checked_add(repaint) };
+        self.next_repaint = if repaint == Duration::MAX {
+            None
+        } else {
+            Instant::now().checked_add(repaint)
+        };
         // While captured, the cursor belongs to the capture.
         if self.input.pointer.is_some() && !self.captured {
             apply_cursor(self.cursor);
@@ -232,12 +247,23 @@ impl State {
 
 /// An egui rect in points to client-area physical pixels.
 fn to_px(video: Option<egui::Rect>, ppo: f32) -> Option<Rect> {
-    video.map(|r| Rect { x: r.min.x * ppo, y: r.min.y * ppo, w: r.width() * ppo, h: r.height() * ppo })
+    video.map(|r| Rect {
+        x: r.min.x * ppo,
+        y: r.min.y * ppo,
+        w: r.width() * ppo,
+        h: r.height() * ppo,
+    })
 }
 
 /// Offers a message to the input capture first. `Some` means the capture
 /// consumed it and the window procedure returns that result.
-fn capture_message(st: &mut State, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+fn capture_message(
+    st: &mut State,
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> Option<LRESULT> {
     let mut cap = st.capture.take()?;
     let result = cap.on_message(hwnd, msg, wp, lp);
     if st.capture.is_none() {
@@ -279,7 +305,11 @@ impl Window {
         let wake = Arc::new(WakeEvent::new()?);
         let ptr = Box::into_raw(Box::new(State::new(wake.clone(), config.min_size, dpi)));
         // From here on, Drop frees the box, even if creation fails.
-        let mut this = Self { hwnd: HWND::default(), wake, ptr };
+        let mut this = Self {
+            hwnd: HWND::default(),
+            wake,
+            ptr,
+        };
 
         let w = (config.size.0 * scale).round() as i32;
         let h = (config.size.1 * scale).round() as i32;
@@ -289,11 +319,20 @@ impl Window {
             st.dpi = GetDpiForWindow(this.hwnd).max(96);
             st.maximized = IsZoomed(this.hwnd).as_bool();
             // Keep the DWM shadow on the frame-less client area.
-            let margins = MARGINS { cxLeftWidth: 1, cxRightWidth: 1, cyTopHeight: 1, cyBottomHeight: 1 };
+            let margins = MARGINS {
+                cxLeftWidth: 1,
+                cxRightWidth: 1,
+                cyTopHeight: 1,
+                cyBottomHeight: 1,
+            };
             let _ = DwmExtendFrameIntoClientArea(this.hwnd, &margins);
             let mut rc = RECT::default();
             GetClientRect(this.hwnd, &mut rc)?;
-            let gfx = Gfx::new(this.hwnd, (rc.right - rc.left).max(1) as u32, (rc.bottom - rc.top).max(1) as u32)?;
+            let gfx = Gfx::new(
+                this.hwnd,
+                (rc.right - rc.left).max(1) as u32,
+                (rc.bottom - rc.top).max(1) as u32,
+            )?;
             st.gfx = Some(gfx);
             let _ = ShowWindow(this.hwnd, SW_SHOW);
         }
@@ -313,7 +352,12 @@ impl Window {
 
     /// The D3D11 device the window renders with.
     pub fn device(&self) -> ID3D11Device {
-        unsafe { &*self.ptr }.gfx.as_ref().expect("gfx created in new").device().clone()
+        unsafe { &*self.ptr }
+            .gfx
+            .as_ref()
+            .expect("gfx created in new")
+            .device()
+            .clone()
     }
 
     /// Runs the event loop until the window closes.
@@ -387,7 +431,8 @@ unsafe fn pump_messages() -> bool {
 /// Waits on `handles` plus window messages. Returns the index of the handle
 /// that fired; `handles.len()` or more means a message or a timeout.
 unsafe fn wait_index(handles: &[HANDLE], timeout_ms: u32) -> Result<usize> {
-    let r = MsgWaitForMultipleObjectsEx(Some(handles), timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    let r =
+        MsgWaitForMultipleObjectsEx(Some(handles), timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     if r == WAIT_FAILED {
         bail!("MsgWaitForMultipleObjectsEx failed");
     }
@@ -437,7 +482,11 @@ unsafe fn event_loop(st: *mut State) -> Result<()> {
                 continue;
             }
             // Frame due, swap chain busy: wait for it, a wake or a message.
-            let latency = s.gfx.as_ref().map(|g| g.latency_handle()).unwrap_or_default();
+            let latency = s
+                .gfx
+                .as_ref()
+                .map(|g| g.latency_handle())
+                .unwrap_or_default();
             let handles = [s.wake.handle(), latency];
             match wait_index(&handles, 100)? {
                 0 => s.frame_due = true,
@@ -468,7 +517,11 @@ unsafe fn execute_command(hwnd: HWND, cmd: WindowCommand) {
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
         }
         WindowCommand::ToggleMaximize => {
-            let show = if IsZoomed(hwnd).as_bool() { SW_RESTORE } else { SW_MAXIMIZE };
+            let show = if IsZoomed(hwnd).as_bool() {
+                SW_RESTORE
+            } else {
+                SW_MAXIMIZE
+            };
             let _ = ShowWindow(hwnd, show);
         }
         WindowCommand::Close => {
@@ -483,7 +536,9 @@ fn modal_redraw(st: &mut State) {
     if st.minimized {
         return;
     }
-    let Some(latency) = st.gfx.as_ref().map(|g| g.latency_handle()) else { return };
+    let Some(latency) = st.gfx.as_ref().map(|g| g.latency_handle()) else {
+        return;
+    };
     if unsafe { WaitForSingleObjectEx(latency, 50, false) } != WAIT_OBJECT_0 {
         return;
     }
@@ -565,8 +620,13 @@ unsafe fn hit_test(st: &State, hwnd: HWND, lp: LPARAM) -> LRESULT {
         }
     }
     let p = egui::pos2(px as f32 / ppp, py as f32 / ppp);
-    let in_drag = st.hit_drag.iter().any(|r| r.contains(p)) && !st.hit_no_drag.iter().any(|r| r.contains(p));
-    LRESULT(if in_drag { HTCAPTION as isize } else { HTCLIENT as isize })
+    let in_drag =
+        st.hit_drag.iter().any(|r| r.contains(p)) && !st.hit_no_drag.iter().any(|r| r.contains(p));
+    LRESULT(if in_drag {
+        HTCAPTION as isize
+    } else {
+        HTCLIENT as isize
+    })
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -597,7 +657,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if wp.0 != 0 && IsZoomed(hwnd).as_bool() {
                 let params = lp.0 as usize as *mut NCCALCSIZE_PARAMS;
                 let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+                let mut mi = MONITORINFO {
+                    cbSize: size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
                 if GetMonitorInfoW(mon, &mut mi).as_bool() {
                     (*params).rgrc[0] = mi.rcWork;
                 }
@@ -711,7 +774,13 @@ mod tests {
     }
 
     impl InputCapture for Fake {
-        fn on_message(&mut self, _hwnd: HWND, msg: u32, _wp: WPARAM, _lp: LPARAM) -> Option<LRESULT> {
+        fn on_message(
+            &mut self,
+            _hwnd: HWND,
+            msg: u32,
+            _wp: WPARAM,
+            _lp: LPARAM,
+        ) -> Option<LRESULT> {
             self.log.borrow_mut().messages.push(msg);
             (msg == self.consume).then_some(LRESULT(7))
         }
@@ -727,14 +796,19 @@ mod tests {
         let mut st = State::new(Arc::new(WakeEvent::new().unwrap()), (760.0, 520.0), 96);
         let log = Rc::new(RefCell::new(Log::default()));
         let captured = Rc::new(Cell::new(false));
-        st.capture = Some(Box::new(Fake { log: log.clone(), captured: captured.clone(), consume }));
+        st.capture = Some(Box::new(Fake {
+            log: log.clone(),
+            captured: captured.clone(),
+            consume,
+        }));
         (st, log, captured)
     }
 
     /// What the window procedure does before its own message handling.
     fn deliver(st: &mut State, msg: u32, wp: usize, lp: isize) -> Option<LRESULT> {
         let (wp, lp) = (WPARAM(wp), LPARAM(lp));
-        capture_message(st, HWND::default(), msg, wp, lp).or_else(|| input::message(st, HWND::default(), msg, wp, lp))
+        capture_message(st, HWND::default(), msg, wp, lp)
+            .or_else(|| input::message(st, HWND::default(), msg, wp, lp))
     }
 
     fn at(x: isize, y: isize) -> isize {
@@ -742,14 +816,22 @@ mod tests {
     }
 
     fn moves(st: &State) -> usize {
-        st.input.events.iter().filter(|e| matches!(e, egui::Event::PointerMoved(_))).count()
+        st.input
+            .events
+            .iter()
+            .filter(|e| matches!(e, egui::Event::PointerMoved(_)))
+            .count()
     }
 
     #[test]
     fn consumed_messages_skip_egui() {
         let (mut st, log, _) = state_with(WM_KEYDOWN);
         assert_eq!(deliver(&mut st, WM_KEYDOWN, 0x41, 0), Some(LRESULT(7)));
-        assert!(st.input.events.is_empty(), "a consumed key reached egui: {:?}", st.input.events);
+        assert!(
+            st.input.events.is_empty(),
+            "a consumed key reached egui: {:?}",
+            st.input.events
+        );
         // Not consumed: the capture still sees it first, then egui gets it.
         deliver(&mut st, WM_MOUSEMOVE, 0, at(10, 10));
         assert_eq!(log.borrow().messages, vec![WM_KEYDOWN, WM_MOUSEMOVE]);
@@ -773,7 +855,17 @@ mod tests {
         // after it reached egui.
         let ev = &st.input.events;
         assert!(
-            matches!(ev.as_slice(), [egui::Event::Key { key: egui::Key::A, pressed: false, .. }, egui::Event::PointerGone]),
+            matches!(
+                ev.as_slice(),
+                [
+                    egui::Event::Key {
+                        key: egui::Key::A,
+                        pressed: false,
+                        ..
+                    },
+                    egui::Event::PointerGone
+                ]
+            ),
             "events while captured: {ev:?}"
         );
         assert_eq!(st.input.pointer, None);
@@ -783,7 +875,12 @@ mod tests {
         captured.set(false);
         deliver(&mut st, WM_MOUSEMOVE, 0, at(30, 30));
         assert!(!st.captured);
-        assert_eq!(moves(&st), 1, "egui does not get the pointer back: {:?}", st.input.events);
+        assert_eq!(
+            moves(&st),
+            1,
+            "egui does not get the pointer back: {:?}",
+            st.input.events
+        );
     }
 
     #[test]
@@ -793,8 +890,18 @@ mod tests {
         let px1 = st.frame_hook(Some(video), 1.0);
         let px15 = st.frame_hook(Some(video), 1.5);
         st.frame_hook(None, 1.5);
-        let r1 = Rect { x: 10.0, y: 20.0, w: 300.0, h: 200.0 };
-        let r15 = Rect { x: 15.0, y: 30.0, w: 450.0, h: 300.0 };
+        let r1 = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 300.0,
+            h: 200.0,
+        };
+        let r15 = Rect {
+            x: 15.0,
+            y: 30.0,
+            w: 450.0,
+            h: 300.0,
+        };
         assert_eq!(px1, Some(r1));
         assert_eq!(px15, Some(r15));
         assert_eq!(log.borrow().frames, vec![Some(r1), Some(r15), None]);

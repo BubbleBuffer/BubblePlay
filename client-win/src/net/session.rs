@@ -19,28 +19,33 @@ use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{COOKIE, ORIGIN};
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
-use super::config::{Codec, NetConfig, RelayEndpoint};
+use super::config::{Codec, NetConfig, RelayEndpoint, ViewerAuth};
 use super::controls::{stream_mode_wire, SessionControls};
 use super::error::NetError;
 use super::events::{DecoderFeedback, NetEvent, ResetEvent, VideoFrame};
 use super::gate::{next_backoff, GateVerdict, KeyframeThrottle, ReceiveGate};
+use super::phase2::{
+    self as p2, Binder, Opened, PairStep, Pairing, PcTrust, Phase2Error, Route, CAP_CONTROL_AEAD,
+    CAP_DTLS_BIND, CAP_PAIR, NO_DEVICE_KEYS,
+};
 use super::protocol::{
-    ack_message, first_frame_keyframe, first_frame_presented, first_frame_request, hello_message,
-    is_audio_packet, keyframe_message, mode_control_message, monitor_control_message,
-    new_request_id, parse_frame, parse_monitor_error, parse_monitor_list, parse_relay_control,
-    ping_message, sanitize_reason, start_message, valid_epoch, validate_host_control, RelayControl,
-    V4_HEADER_BYTES,
+    ack_message, first_frame_keyframe, first_frame_presented, first_frame_request, is_audio_packet,
+    keyframe_message, media_hello, mode_control_message, monitor_control_message, new_request_id,
+    parse_frame, parse_monitor_error, parse_monitor_list, parse_register_challenge,
+    parse_relay_control, ping_message, register_proof, sanitize_reason, start_message, valid_epoch,
+    validate_host_control, viewer_hello, viewer_hello_pairing, RelayControl, V4_HEADER_BYTES,
 };
 use super::stats::{count, NetState, TransportStats};
 use super::{
     webrtc::{auto::Action, Peer},
     TransportChoice,
 };
+use bp_device_key::phase2::PairingCode;
+use bp_device_key::DeviceId;
 use str0m::{Event as RtcEvent, IceConnectionState};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -59,8 +64,10 @@ const SHUTDOWN_CLOSE: Duration = Duration::from_millis(200);
 pub(crate) struct Timing {
     /// How often the loop wakes to drain feedback, flush resets and check the stop flag.
     pub tick: Duration,
-    /// Limit for each handshake step (`hello-ok`, the WebSocket upgrade).
+    /// Limit for each handshake step (`hello-ok`, the WebSocket upgrade, the PC's caps).
     pub handshake: Duration,
+    /// Wait for `auth-host` after `auth-hello` (decision 16).
+    pub auth_host: Duration,
     /// Quiet time on a socket before a `ping` is sent.
     pub heartbeat: Duration,
     /// Silence on a socket before it is declared dead.
@@ -79,6 +86,7 @@ impl Default for Timing {
         Self {
             tick: Duration::from_millis(25),
             handshake: Duration::from_secs(10),
+            auth_host: p2::AUTH_HOST_TIMEOUT,
             heartbeat: Duration::from_secs(15),
             dead: Duration::from_secs(40),
             first_frame: Duration::from_secs(5),
@@ -161,11 +169,18 @@ enum Wake {
     Udp(Vec<u8>, std::net::SocketAddr),
 }
 
-/// Per-socket send and receive times, for heartbeats and dead detection.
+/// Per-socket send and receive times, for heartbeats and dead detection. On `/ws`, once the
+/// device-key handshake is done, `ctl` seals every endpoint message (decision 15).
 struct Lane {
     tx: Sink,
     last_sent: Instant,
     last_seen: Instant,
+    ctl: Option<p2::Ctl>,
+}
+
+/// A phase 2 failure ends the session (fatal, decision 15/16).
+fn device_keys(error: Phase2Error) -> Halt {
+    Halt::Fatal(error.into())
 }
 
 impl Lane {
@@ -175,10 +190,21 @@ impl Lane {
             tx,
             last_sent: now,
             last_seen: now,
+            ctl: None,
         }
     }
 
+    /// An endpoint message: sealed in `ctl` after the handshake.
     async fn send(&mut self, text: String) -> Result<(), Halt> {
+        let text = match &mut self.ctl {
+            Some(ctl) => ctl.seal_text(&text).map_err(device_keys)?,
+            None => text,
+        };
+        self.send_plain(text).await
+    }
+
+    /// A relay keepalive or an auth-* / pair-* message: never sealed.
+    async fn send_plain(&mut self, text: String) -> Result<(), Halt> {
         self.tx
             .send(Message::Text(text.into()))
             .await
@@ -186,7 +212,12 @@ impl Lane {
         self.last_sent = Instant::now();
         Ok(())
     }
+    /// A binary input frame: `ctl` kind `input` after the handshake.
     async fn send_binary(&mut self, bytes: Vec<u8>) -> Result<(), Halt> {
+        if let Some(ctl) = &mut self.ctl {
+            let text = ctl.seal_binary(&bytes).map_err(device_keys)?;
+            return self.send_plain(text).await;
+        }
         self.tx
             .send(Message::Binary(bytes.into()))
             .await
@@ -200,6 +231,8 @@ impl Lane {
 /// `host-joined` tracking. Replaced on every reconnect.
 struct Epoch {
     wire: String,
+    /// The `/media-ws` ticket from this epoch's `hello-ok`.
+    ticket: String,
     request_id: String,
     codec: Codec,
     host_present: bool,
@@ -244,6 +277,16 @@ struct Link {
     media: Option<Lane>,
     rtc: Option<Peer>,
     epoch: Epoch,
+    /// The `auth-bind` exchange of the WebRTC peer; RTC media and input wait for it.
+    binder: Option<Binder>,
+    /// Our `auth-bind`, sent on the next tick.
+    pending_bind: Option<String>,
+}
+
+impl Link {
+    fn rtc_bound(&self) -> bool {
+        self.binder.as_ref().is_some_and(Binder::verified)
+    }
 }
 
 struct Session {
@@ -318,13 +361,71 @@ impl Session {
         &self,
         future: impl Future<Output = Result<T, NetError>>,
     ) -> Result<T, Halt> {
+        self.within(
+            self.timing.handshake,
+            NetError::Handshake("timed out".to_owned()),
+            future,
+        )
+        .await
+    }
+
+    /// Race `future` against `limit` (then `expired`) and the stop flag.
+    async fn within<T>(
+        &self,
+        limit: Duration,
+        expired: NetError,
+        future: impl Future<Output = Result<T, NetError>>,
+    ) -> Result<T, Halt> {
         tokio::select! {
-            result = timeout(self.timing.handshake, future) => {
-                let value = result.unwrap_or_else(|_| Err(NetError::Handshake("timed out".to_owned())));
-                Ok(value?)
-            }
+            result = timeout(limit, future) => Ok(result.unwrap_or(Err(expired))?),
             _ = Self::wait_stop(self.stop.clone(), self.timing.tick) => Err(Halt::Stop),
         }
+    }
+
+    /// The device-key handshake on `/ws` after `hello-ok` (decisions 15-19): `auth-hello`,
+    /// `auth-host` within [`Timing::auth_host`], `auth-finish`; then the control channel is
+    /// on, the viewer's `caps` goes first and the PC's `caps` must come first. Returns the
+    /// transcript hash and the PC key for the DTLS bind.
+    async fn device_handshake(
+        &self,
+        signal: &mut Lane,
+        signal_rx: &mut Source,
+        viewer: &ViewerAuth,
+        origin: &str,
+        epoch: &str,
+        webrtc: bool,
+    ) -> Result<([u8; 32], [u8; 32]), Halt> {
+        let caps = [CAP_CONTROL_AEAD, CAP_DTLS_BIND];
+        let (shake, hello) = p2::ViewerHandshake::start(
+            viewer.identity(),
+            PcTrust::Pinned(viewer.paired().to_vec()),
+            viewer.pc(),
+            origin,
+            epoch,
+            &caps,
+        )
+        .map_err(device_keys)?;
+        signal.send_plain(hello).await?;
+        let host = self
+            .within(
+                self.timing.auth_host,
+                NetError::DeviceKeys(NO_DEVICE_KEYS.to_owned()),
+                await_plain(signal_rx, "auth-host", &self.stats),
+            )
+            .await?;
+        let (established, finish) = shake
+            .on_auth_host(viewer.identity(), &host)
+            .map_err(device_keys)?;
+        signal.send_plain(finish).await?;
+        signal.ctl = Some(established.ctl);
+        signal
+            .send(p2::viewer_caps(&caps, &p2::computer_name()))
+            .await?;
+        let first = self
+            .handshake(await_ctl(signal_rx, signal, &self.stats))
+            .await?;
+        p2::check_caps(&first, webrtc).map_err(device_keys)?;
+        Ok((established.h, established.pc_public))
     }
 
     /// Sleep for `delay` in ticks. Returns true when stop was requested first.
@@ -403,17 +504,18 @@ impl Session {
         self.stats.set_state(NetState::Signaling);
     }
 
-    /// One full attempt: `/ws` hello, start and first-frame request, `/media-ws`
-    /// hello, then the stream loop. Always ends with `Err`.
+    /// The `pc=<id>` query of both sockets, when a PC is chosen.
+    fn pc_query(&self) -> Option<String> {
+        self.config.viewer.pc().map(|pc| format!("pc={pc}"))
+    }
+
+    /// One full attempt: signed `/ws` hello and proof, start and first-frame request,
+    /// `/media-ws` ticket hello, then the stream loop. Always ends with `Err`.
     async fn attempt(&mut self, endpoint: &RelayEndpoint) -> Result<(), Halt> {
         self.begin_epoch();
+        let query = self.pc_query();
         let socket = self
-            .handshake(open_socket(
-                endpoint,
-                self.config.cookies.cookie_header(),
-                "/ws",
-                None,
-            ))
+            .handshake(open_socket(endpoint, "/ws", query.as_deref()))
             .await?;
         let route_ip = match socket.get_ref() {
             MaybeTlsStream::Plain(tcp) => tcp.local_addr().ok().map(|addr| addr.ip()),
@@ -422,15 +524,41 @@ impl Session {
         };
         let (tx, mut signal_rx) = socket.split();
         let mut signal = Lane::new(tx);
-        signal.send(hello_message("client")).await?;
-        let (epoch, ice_servers) = self
-            .handshake(await_hello_ok(&mut signal_rx, &self.stats, "signal"))
+        // A cheap clone (the key sits behind an Arc): `handshake` borrows `self` mutably.
+        let viewer = self.config.viewer.clone();
+        signal.send(viewer_hello(viewer.identity())).await?;
+        let nonce = self
+            .handshake(await_register_challenge(&mut signal_rx, &self.stats))
+            .await?;
+        let proof_origin = bp_device_key::relay_origin(endpoint.origin())
+            .unwrap_or_else(|| endpoint.origin().to_owned());
+        signal
+            .send(register_proof(viewer.identity(), &proof_origin, &nonce))
+            .await?;
+        let (epoch, ticket, ice_servers) = self
+            .handshake(await_hello_ok(&mut signal_rx, &self.stats))
             .await?;
         let wire = epoch.filter(|epoch| valid_epoch(epoch)).ok_or_else(|| {
             Halt::from(NetError::Protocol(
                 "hello-ok without a valid mediaEpoch".into(),
             ))
         })?;
+        let ticket = ticket.ok_or_else(|| {
+            Halt::from(NetError::Protocol("hello-ok without a media ticket".into()))
+        })?;
+        let rtc_selected = self.config.transport != TransportChoice::Wss
+            && !(self.config.transport == TransportChoice::Auto && self.remembered_rtc_failure);
+        // The transcript epoch is the `hello-ok` mediaEpoch, byte for byte.
+        let (h, pc_public) = self
+            .device_handshake(
+                &mut signal,
+                &mut signal_rx,
+                &viewer,
+                &proof_origin,
+                &wire,
+                rtc_selected,
+            )
+            .await?;
         self.config.controls.epoch_registered(&wire);
         // A live mode the user chose (also before connect) is the start mode on reconnect.
         if let Some(mode) = self.config.controls.configured_mode() {
@@ -440,14 +568,13 @@ impl Session {
             signal.send(json!({"type":"media-control","action":"mode","protocol":4,"epoch":wire,"streamMode":mode,"reason":"signaling-start"}).to_string()).await?;
         }
         let request_id = new_request_id();
-        let rtc_selected = self.config.transport != TransportChoice::Wss
-            && !(self.config.transport == TransportChoice::Auto && self.remembered_rtc_failure);
         let mut link = Link {
             signal,
             media: None,
             rtc: None,
             epoch: Epoch {
                 wire,
+                ticket,
                 request_id,
                 codec: self.config.codec,
                 host_present: true,
@@ -463,6 +590,8 @@ impl Session {
                 rtc_require_admission: false,
                 rtc_admitted_timestamp: None,
             },
+            binder: None,
+            pending_bind: None,
         };
         let mut media_rx = None;
         if rtc_selected {
@@ -477,6 +606,9 @@ impl Session {
                 route_ip,
             )
             .await?;
+            let mut binder = Binder::new(h, pc_public);
+            binder.local_sdp(&peer.offer).map_err(device_keys)?;
+            link.binder = Some(binder);
             link.signal
                 .send(json!({"type":"offer","sdp":peer.offer}).to_string())
                 .await?;
@@ -508,18 +640,16 @@ impl Session {
         media_rx: &mut Option<Source>,
     ) -> Result<(), Halt> {
         self.stats.set_state(NetState::MediaHandshake);
-        let query = format!("epoch={}", link.epoch.wire);
+        let query = match self.pc_query() {
+            Some(pc) => format!("{pc}&epoch={}", link.epoch.wire),
+            None => format!("epoch={}", link.epoch.wire),
+        };
         let socket = self
-            .handshake(open_socket(
-                endpoint,
-                self.config.cookies.cookie_header(),
-                "/media-ws",
-                Some(&query),
-            ))
+            .handshake(open_socket(endpoint, "/media-ws", Some(&query)))
             .await?;
         let (tx, mut rx) = socket.split();
         let mut media = Lane::new(tx);
-        media.send(hello_message("media-client")).await?;
+        media.send(media_hello(&link.epoch.ticket)).await?;
         link.epoch.host_present = self
             .handshake(await_media_ready(&mut rx, &self.stats))
             .await?;
@@ -841,93 +971,130 @@ impl Session {
         }
     }
 
+    /// One `/ws` message after the handshake (decision 15): `ctl` is opened and dispatched,
+    /// relay messages and auth-* / pair-* stay plaintext, plaintext endpoint messages and
+    /// plaintext binary frames are dropped.
     fn on_signal(&mut self, link: &mut Link, inbound: Inbound) -> Result<(), Halt> {
         match inbound {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(Halt::from(NetError::RelayError(message)));
                 }
-                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                    match value["type"].as_str() {
-                        Some("answer") => {
-                            if let (Some(peer), Some(sdp)) = (&mut link.rtc, value["sdp"].as_str())
-                            {
-                                peer.answer(sdp)?;
-                            }
-                            return Ok(());
+                let value = serde_json::from_str::<Value>(&text).ok();
+                let kind = value.as_ref().and_then(|value| value["type"].as_str());
+                match p2::route(kind) {
+                    Route::Ctl => {
+                        let opened = link
+                            .signal
+                            .ctl
+                            .as_mut()
+                            .ok_or_else(|| device_keys(Phase2Error::Malformed("ctl before auth")))?
+                            .open(value.as_ref().expect("a ctl envelope is JSON"))
+                            .map_err(device_keys)?;
+                        if let Some(error) = p2::pc_error(&opened) {
+                            return Err(device_keys(error));
                         }
-                        Some("ice") => {
-                            if let (Some(peer), Some(candidate)) =
-                                (&mut link.rtc, value["candidate"].as_str())
-                            {
-                                if peer.candidate(candidate).is_err() {
-                                    self.stats.webrtc.lock().unwrap().malformed_candidates += 1;
-                                }
-                            }
-                            return Ok(());
-                        }
-                        Some("first-frame") if value["requestId"] == link.epoch.request_id => {
-                            if value["phase"] == "admitted" {
-                                if let Some(peer) = &mut link.rtc {
-                                    peer.startup.progress(Instant::now());
-                                }
-                                link.epoch.rtc_admitted_timestamp = value["rtpTimestamp"]
-                                    .as_u64()
-                                    .and_then(|v| u32::try_from(v).ok());
-                                if let Some(generation) = value["generation"]
-                                    .as_u64()
-                                    .and_then(|v| u32::try_from(v).ok())
+                        match opened {
+                            Opened::Text { text, .. } => return self.on_endpoint(link, &text),
+                            Opened::Binary { frame, .. } => {
+                                if !self
+                                    .config
+                                    .input
+                                    .as_ref()
+                                    .is_some_and(|input| input.receive(&frame))
                                 {
-                                    link.epoch.rtc_generation = generation;
+                                    count(&self.stats.rejected_controls);
                                 }
                             }
-                            return Ok(());
                         }
+                    }
+                    Route::Plain => match kind {
                         Some("peer-left") => {
                             return Err(Halt::from(NetError::Socket("host left session".into())))
                         }
-                        // Handled before input, so a session without native input still regates.
-                        Some("desktop-state")
-                            if text.len() <= 16384
-                                && matches!(
-                                    value["state"].as_str(),
-                                    Some("active" | "unavailable")
-                                ) =>
-                        {
-                            self.desktop_state(link, &value);
-                            return Ok(());
-                        }
-                        Some("monitor-list" | "monitor-error") => {
-                            if !monitor_message(&self.config.controls, &link.epoch.wire, &value) {
-                                count(&self.stats.rejected_controls);
-                            }
-                            return Ok(());
-                        }
-                        _ => {}
-                    }
-                }
-                if self.input_control(&text) {
-                    return Ok(());
-                }
-                match parse_relay_control(&text) {
-                    Some(RelayControl::Pong) => {}
-                    _ => count(&self.stats.rejected_controls),
+                        Some("auth-bind") => match &mut link.binder {
+                            Some(binder) => binder.on_pc_bind(&text).map_err(device_keys)?,
+                            None => count(&self.stats.rejected_controls),
+                        },
+                        Some("pong") => {}
+                        _ => count(&self.stats.rejected_controls),
+                    },
+                    Route::Drop => count(&self.stats.rejected_controls),
                 }
             }
-            Inbound::Binary(data) => {
-                if !self
-                    .config
-                    .input
-                    .as_ref()
-                    .is_some_and(|input| input.receive(&data))
-                {
-                    count(&self.stats.rejected_controls);
-                }
-            }
+            // Binary input travels inside ctl; a plaintext binary frame is dropped.
+            Inbound::Binary(_) => count(&self.stats.rejected_controls),
             Inbound::Other => {}
         }
         Ok(())
     }
+
+    /// An opened endpoint message from the PC.
+    fn on_endpoint(&mut self, link: &mut Link, text: &str) -> Result<(), Halt> {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            match value["type"].as_str() {
+                Some("answer") => {
+                    if let (Some(peer), Some(sdp)) = (&mut link.rtc, value["sdp"].as_str()) {
+                        peer.answer(sdp)?;
+                        if let Some(binder) = &mut link.binder {
+                            link.pending_bind = binder
+                                .remote_sdp(self.config.viewer.identity(), sdp)
+                                .map_err(device_keys)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                Some("ice") => {
+                    if let (Some(peer), Some(candidate)) =
+                        (&mut link.rtc, value["candidate"].as_str())
+                    {
+                        if peer.candidate(candidate).is_err() {
+                            self.stats.webrtc.lock().unwrap().malformed_candidates += 1;
+                        }
+                    }
+                    return Ok(());
+                }
+                Some("first-frame") if value["requestId"] == link.epoch.request_id => {
+                    if value["phase"] == "admitted" {
+                        if let Some(peer) = &mut link.rtc {
+                            peer.startup.progress(Instant::now());
+                        }
+                        link.epoch.rtc_admitted_timestamp = value["rtpTimestamp"]
+                            .as_u64()
+                            .and_then(|v| u32::try_from(v).ok());
+                        if let Some(generation) = value["generation"]
+                            .as_u64()
+                            .and_then(|v| u32::try_from(v).ok())
+                        {
+                            link.epoch.rtc_generation = generation;
+                        }
+                    }
+                    return Ok(());
+                }
+                // Handled before input, so a session without native input still regates.
+                Some("desktop-state")
+                    if text.len() <= 16384
+                        && matches!(value["state"].as_str(), Some("active" | "unavailable")) =>
+                {
+                    self.desktop_state(link, &value);
+                    return Ok(());
+                }
+                Some("monitor-list" | "monitor-error") => {
+                    if !monitor_message(&self.config.controls, &link.epoch.wire, &value) {
+                        count(&self.stats.rejected_controls);
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if self.input_control(text) {
+            return Ok(());
+        }
+        count(&self.stats.rejected_controls);
+        Ok(())
+    }
+
     fn input_control(&mut self, text: &str) -> bool {
         if self.config.input.is_none() || text.len() > 16384 {
             return false;
@@ -1032,7 +1199,8 @@ impl Session {
             && link.epoch.desktop_enabled
             && link.epoch.input_generation.is_some()
             && link.epoch.input_generation == self.gate_generation
-            && (link.media.is_some() || link.rtc.as_ref().is_some_and(Peer::lanes_ready));
+            && (link.media.is_some()
+                || (link.rtc.as_ref().is_some_and(Peer::lanes_ready) && link.rtc_bound()));
         // Monitor carry (browser inputTransitionHold): the gate stays closed and held
         // input is kept until the new frame reopens it. Losing the host or the
         // desktop input still releases through set_ready below.
@@ -1074,7 +1242,8 @@ impl Session {
         let framed = super::webrtc::channels::frame_outbound(&packet)
             .map_err(|e| Halt::from(NetError::Protocol(e.to_string())))?;
         let motion = framed.lane == super::webrtc::channels::Lane::Motion;
-        if let Some(peer) = &mut link.rtc {
+        let bound = link.rtc_bound();
+        if let Some(peer) = link.rtc.as_mut().filter(|_| bound) {
             if peer.send_input(framed.bytes, motion)? {
                 let mut stats = self.stats.webrtc.lock().unwrap();
                 if motion {
@@ -1239,6 +1408,11 @@ impl Session {
     }
 
     fn on_rtp(&mut self, link: &mut Link, packet: str0m::rtp::RtpPacket) -> Result<(), Halt> {
+        // RTC media waits for both auth-bind signatures (decision 10).
+        if link.media.is_none() && !link.rtc_bound() {
+            count(&self.stats.rejected_packets);
+            return Ok(());
+        }
         let Some(peer) = &mut link.rtc else {
             return Ok(());
         };
@@ -1391,6 +1565,9 @@ impl Session {
         if self.stop_requested() {
             return Err(Halt::Stop);
         }
+        if let Some(bind) = link.pending_bind.take() {
+            link.signal.send_plain(bind).await?;
+        }
         // A bounded packet reorder window must also release an idle, incomplete
         // access unit. Live frames normally resolve gaps on the next timestamp;
         // this only expires assembly when RTP itself has gone quiet.
@@ -1437,7 +1614,7 @@ impl Session {
             return Err(Halt::from(NetError::Stalled("media")));
         }
         if now.duration_since(link.signal.last_sent) >= self.timing.heartbeat {
-            link.signal.send(ping_message()).await?;
+            link.signal.send_plain(ping_message()).await?;
             count(&self.stats.heartbeats_sent);
         }
         if let Some(media) = &mut link.media {
@@ -1647,23 +1824,18 @@ async fn close_lane(lane: &mut Lane, source: &mut Source) {
     .await;
 }
 
-/// Open one WebSocket with `Origin` and the cookie header.
+/// Open one WebSocket. No `Origin` header and no cookies: the relay admits a native
+/// viewer by its signed hello alone.
 async fn open_socket(
     endpoint: &RelayEndpoint,
-    cookie: Option<String>,
     path: &str,
     query: Option<&str>,
 ) -> Result<Socket, NetError> {
     let url = endpoint.ws_url(path, query);
-    let mut request = url
+    let request = url
         .as_str()
         .into_client_request()
         .map_err(|error| NetError::Handshake(error.to_string()))?;
-    let headers = request.headers_mut();
-    headers.insert(ORIGIN, header_value(endpoint.origin())?);
-    if let Some(cookie) = cookie {
-        headers.insert(COOKIE, header_value(&cookie)?);
-    }
     // Keep media access units and small ACK/control messages from waiting for
     // TCP's delayed-ACK/Nagle interaction before the decoder can see them.
     match connect_async_with_config(request, None, true).await {
@@ -1677,10 +1849,6 @@ async fn open_socket(
         }
         Err(error) => Err(NetError::Handshake(error.to_string())),
     }
-}
-
-fn header_value(value: &str) -> Result<HeaderValue, NetError> {
-    HeaderValue::from_str(value).map_err(|error| NetError::Handshake(error.to_string()))
 }
 
 /// Both media controls must arrive before start; controls can arrive in either
@@ -1714,22 +1882,49 @@ async fn await_media_ready(source: &mut Source, stats: &TransportStats) -> Resul
     }
 }
 
-/// Read until the relay's `hello-ok`. Returns its `mediaEpoch`, if it has one.
+/// Read until the relay's `register-challenge` and return its nonce. A 1008 close here
+/// means the hello was refused.
+async fn await_register_challenge(
+    source: &mut Source,
+    stats: &TransportStats,
+) -> Result<[u8; 32], NetError> {
+    loop {
+        match classify(source.next().await, "signal")? {
+            Inbound::Text(text) => {
+                if let Some(message) = relay_error(&text) {
+                    return Err(NetError::RelayError(message));
+                }
+                match parse_register_challenge(&text) {
+                    Some(nonce) => return Ok(nonce),
+                    None => count(&stats.rejected_controls),
+                }
+            }
+            Inbound::Binary(_) => count(&stats.rejected_controls),
+            Inbound::Other => {}
+        }
+    }
+}
+
+/// Read until the relay's `hello-ok`. Returns its `mediaEpoch` and `ticket`, if present,
+/// and its `iceServers`.
 async fn await_hello_ok(
     source: &mut Source,
     stats: &TransportStats,
-    label: &str,
-) -> Result<(Option<String>, Value), NetError> {
+) -> Result<(Option<String>, Option<String>, Value), NetError> {
     loop {
-        match classify(source.next().await, label)? {
+        match classify(source.next().await, "signal")? {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(NetError::RelayError(message));
                 }
                 match parse_relay_control(&text) {
-                    Some(RelayControl::HelloOk { media_epoch }) => {
+                    Some(RelayControl::HelloOk {
+                        media_epoch,
+                        ticket,
+                    }) => {
                         return Ok((
                             media_epoch,
+                            ticket,
                             serde_json::from_str::<Value>(&text).unwrap_or(Value::Null)
                                 ["iceServers"]
                                 .clone(),
@@ -1744,12 +1939,85 @@ async fn await_hello_ok(
     }
 }
 
-/// Map one WebSocket item to what the session needs. A closed or broken socket
-/// is transient.
+/// Read `/ws` until a plaintext message of type `kind` (`auth-host`, a pairing message).
+/// Relay errors end the wait; anything else is dropped.
+async fn await_plain(
+    source: &mut Source,
+    kind: &str,
+    stats: &TransportStats,
+) -> Result<String, NetError> {
+    loop {
+        match classify(source.next().await, "signal")? {
+            Inbound::Text(text) => {
+                if let Some(message) = relay_error(&text) {
+                    return Err(NetError::RelayError(message));
+                }
+                let found = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .is_some_and(|value| value["type"] == kind);
+                if found {
+                    return Ok(text);
+                }
+                if !matches!(parse_relay_control(&text), Some(RelayControl::Pong)) {
+                    count(&stats.rejected_controls);
+                }
+            }
+            Inbound::Binary(_) => count(&stats.rejected_controls),
+            Inbound::Other => {}
+        }
+    }
+}
+
+/// Read `/ws` until the next `ctl` message and open it. Plaintext endpoint messages are
+/// dropped; a relay error, a peer leaving or a broken `ctl` ends the wait.
+async fn await_ctl(
+    source: &mut Source,
+    lane: &mut Lane,
+    stats: &TransportStats,
+) -> Result<Opened, NetError> {
+    loop {
+        match classify(source.next().await, "signal")? {
+            Inbound::Text(text) => {
+                lane.last_seen = Instant::now();
+                if let Some(message) = relay_error(&text) {
+                    return Err(NetError::RelayError(message));
+                }
+                let value = serde_json::from_str::<Value>(&text).ok();
+                let kind = value.as_ref().and_then(|value| value["type"].as_str());
+                match (p2::route(kind), kind) {
+                    (Route::Ctl, _) => {
+                        let ctl = lane
+                            .ctl
+                            .as_mut()
+                            .ok_or(Phase2Error::Malformed("ctl before auth"))?;
+                        return Ok(ctl.open(value.as_ref().expect("JSON"))?);
+                    }
+                    (_, Some("peer-left")) => {
+                        return Err(NetError::Socket("host left session".into()))
+                    }
+                    (_, Some("pong")) => {}
+                    _ => count(&stats.rejected_controls),
+                }
+            }
+            Inbound::Binary(_) => count(&stats.rejected_controls),
+            Inbound::Other => {}
+        }
+    }
+}
+
+/// Map one WebSocket item to what the session needs. A closed or broken socket is
+/// transient (the reconnect runs a fresh device-key handshake), except a 1008 close on the
+/// signalling socket: there the relay refuses this viewer (unknown key, not admitted or no
+/// longer admitted to the PC, bad proof), before or after the handshake, which is fatal.
 fn classify(
     item: Option<Result<Message, tungstenite::Error>>,
     label: &str,
 ) -> Result<Inbound, NetError> {
+    if let Some(Ok(Message::Close(Some(frame)))) = &item {
+        if label == "signal" && frame.code == CloseCode::Policy {
+            return Err(NetError::NotAdmitted);
+        }
+    }
     match item {
         None => Err(NetError::Socket(format!("{label} socket closed"))),
         Some(Err(error)) => Err(NetError::Socket(error.to_string())),
@@ -1776,6 +2044,160 @@ fn relay_error(text: &str) -> Option<String> {
             .unwrap_or("relay error")
             .to_owned(),
     )
+}
+
+/// How long pairing waits for the PC's proof and the user's decision there: the pairing
+/// window's own lifetime (device-keys.md "Pairing window").
+const PAIR_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Pair with the PC named in `config.viewer.pc()` using a pairing code (decision 17):
+/// signed `hello` with `pair`, `hello-ok` in pairing mode, `auth-hello` / `auth-host` /
+/// `auth-finish`, then `pair-proof` both ways. `show` gets the comparison number only after
+/// the PC's proof verified. Returns the PC's ID and key on `pair-done`; on `pair-denied`, a
+/// wrong proof or any other failure nothing is returned.
+pub fn pair(
+    config: &NetConfig,
+    code: PairingCode,
+    show: &mut dyn FnMut(&str),
+) -> Result<(DeviceId, [u8; 32]), NetError> {
+    pair_with_timing(config, code, show, Timing::default(), PAIR_TIMEOUT)
+}
+
+pub(crate) fn pair_with_timing(
+    config: &NetConfig,
+    code: PairingCode,
+    show: &mut dyn FnMut(&str),
+    timing: Timing,
+    decision: Duration,
+) -> Result<(DeviceId, [u8; 32]), NetError> {
+    let endpoint = RelayEndpoint::parse(&config.relay)?;
+    let pc = config.viewer.pc().ok_or_else(|| {
+        NetError::DeviceKeys("pairing needs the PC ID: add --pc <PC ID>".to_owned())
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| NetError::Socket(error.to_string()))?;
+    runtime.block_on(pair_session(
+        &endpoint,
+        &config.viewer,
+        pc,
+        code,
+        show,
+        timing,
+        decision,
+    ))
+}
+
+async fn pair_session(
+    endpoint: &RelayEndpoint,
+    viewer: &ViewerAuth,
+    pc: DeviceId,
+    code: PairingCode,
+    show: &mut dyn FnMut(&str),
+    timing: Timing,
+    decision: Duration,
+) -> Result<(DeviceId, [u8; 32]), NetError> {
+    let stats = TransportStats::default();
+    let step = |what: &str| NetError::Handshake(format!("{what} timed out"));
+    let halt = |halt: Halt| match halt {
+        Halt::Fatal(error) | Halt::Transient(error) => error,
+        Halt::Stop => NetError::Socket("stopped".into()),
+    };
+    let query = format!("pc={pc}");
+    let socket = timeout(timing.handshake, open_socket(endpoint, "/ws", Some(&query)))
+        .await
+        .map_err(|_| step("connect"))??;
+    let (tx, mut rx) = socket.split();
+    let mut lane = Lane::new(tx);
+    lane.send_plain(viewer_hello_pairing(
+        viewer.identity(),
+        &p2::admit_b64(&code, &pc),
+    ))
+    .await
+    .map_err(halt)?;
+    let nonce = timeout(timing.handshake, await_register_challenge(&mut rx, &stats))
+        .await
+        .map_err(|_| step("register-challenge"))??;
+    let origin = bp_device_key::relay_origin(endpoint.origin())
+        .unwrap_or_else(|| endpoint.origin().to_owned());
+    lane.send_plain(register_proof(viewer.identity(), &origin, &nonce))
+        .await
+        .map_err(halt)?;
+    let (epoch, ticket, _) = timeout(timing.handshake, await_hello_ok(&mut rx, &stats))
+        .await
+        .map_err(|_| step("hello-ok"))??;
+    if ticket.is_some() {
+        return Err(NetError::DeviceKeys(
+            "the relay did not open a pairing session (this viewer is already admitted; \
+             connect without --pair)"
+                .to_owned(),
+        ));
+    }
+    let wire = epoch
+        .filter(|epoch| valid_epoch(epoch))
+        .ok_or_else(|| NetError::Protocol("hello-ok without a valid mediaEpoch".into()))?;
+    let (shake, hello) = p2::ViewerHandshake::start(
+        viewer.identity(),
+        PcTrust::Pairing(pc),
+        Some(pc),
+        &origin,
+        &wire,
+        &[CAP_CONTROL_AEAD, CAP_DTLS_BIND, CAP_PAIR],
+    )?;
+    lane.send_plain(hello).await.map_err(halt)?;
+    let host = timeout(timing.auth_host, await_plain(&mut rx, "auth-host", &stats))
+        .await
+        .map_err(|_| NetError::DeviceKeys(NO_DEVICE_KEYS.to_owned()))??;
+    let (established, finish) = shake.on_auth_host(viewer.identity(), &host)?;
+    lane.send_plain(finish).await.map_err(halt)?;
+    let (mut pairing, proof) = Pairing::start(code, established.h);
+    lane.send_plain(proof).await.map_err(halt)?;
+    let deadline = tokio::time::Instant::now() + decision;
+    loop {
+        let item = tokio::select! {
+            item = rx.next() => item,
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(NetError::DeviceKeys(
+                    "pairing timed out: nothing was confirmed on the PC".to_owned(),
+                ))
+            }
+            _ = sleep(timing.heartbeat) => {
+                lane.send_plain(ping_message()).await.map_err(halt)?;
+                continue;
+            }
+        };
+        let Inbound::Text(text) = classify(item, "signal")? else {
+            continue;
+        };
+        if let Some(message) = relay_error(&text) {
+            return Err(NetError::RelayError(message));
+        }
+        let kind = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|value| value["type"].as_str().map(str::to_owned));
+        match kind.as_deref() {
+            Some("pair-closed") => {
+                return Err(NetError::DeviceKeys(
+                    "the pairing window on the PC closed".to_owned(),
+                ))
+            }
+            Some("peer-left") => {
+                return Err(NetError::DeviceKeys(
+                    "the PC left before pairing finished".to_owned(),
+                ))
+            }
+            _ => {}
+        }
+        match pairing.on_message(&text)? {
+            PairStep::Wait => {}
+            PairStep::ShowNumber(number) => show(&number),
+            PairStep::Done => {
+                close_lane(&mut lane, &mut rx).await;
+                return Ok((established.pc_id, established.pc_public));
+            }
+        }
+    }
 }
 
 fn rtc_first_frame_request(request_id: &str) -> String {
@@ -1992,6 +2414,7 @@ mod input_readiness_tests {
     fn desktop_state_reuses_inflight_but_never_completed_or_unavailable_presentation() {
         let mut epoch = Epoch {
             wire: "epoch".into(),
+            ticket: "ticket".into(),
             request_id: "original".into(),
             codec: Codec::H264,
             host_present: true,

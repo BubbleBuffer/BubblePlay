@@ -24,10 +24,10 @@
 
 #![allow(dead_code)]
 
-#[path = "../src/model.rs"]
-mod model;
 #[path = "../src/mock.rs"]
 mod mock;
+#[path = "../src/model.rs"]
+mod model;
 #[path = "../src/shell/mod.rs"]
 mod shell;
 #[path = "../src/ui/mod.rs"]
@@ -57,7 +57,9 @@ struct St {
 /// main.rs so the test follows it.
 fn min_size() -> (f32, f32) {
     let src = include_str!("../src/main.rs");
-    let at = src.find("min_size:").expect("main.rs sets ShellConfig::min_size");
+    let at = src
+        .find("min_size:")
+        .expect("main.rs sets ShellConfig::min_size");
     let rest = &src[at..];
     let open = rest.find('(').expect("min_size tuple");
     let close = rest.find(')').expect("min_size tuple");
@@ -72,7 +74,10 @@ fn harness(scene: usize, size: (f32, f32)) -> (Harness<'static, St>, String) {
     let (backend, driver) = mock::new();
     let mut app = ui::App::new(Box::new(backend)).with_demo(Box::new(driver), None);
     let label = app.demo_scene(scene).expect("demo mode");
-    let st = St { app, out: shell::FrameRequests::default() };
+    let st = St {
+        app,
+        out: shell::FrameRequests::default(),
+    };
     let mut h = Harness::builder()
         .with_size(vec2(size.0, size.1))
         .with_pixels_per_point(1.0)
@@ -144,14 +149,29 @@ struct Tree {
 
 fn rect_of(node: &AccessKitNode<'_>) -> Option<Rect> {
     let b = node.bounding_box()?;
-    let r = Rect::from_min_max(pos2(b.x0 as f32, b.y0 as f32), pos2(b.x1 as f32, b.y1 as f32));
+    let r = Rect::from_min_max(
+        pos2(b.x0 as f32, b.y0 as f32),
+        pos2(b.x1 as f32, b.y1 as f32),
+    );
     (r.is_finite() && r.is_positive()).then_some(r)
 }
 
 fn describe(node: &AccessKitNode<'_>) -> String {
-    let text = node.data().label().map(str::to_owned).or_else(|| node.value()).unwrap_or_default();
-    let class = node.class_name().map(|c| format!(" [{}]", c.split(' ').next().unwrap_or(""))).unwrap_or_default();
-    format!("{:?}{class} '{}'", node.role(), text.chars().take(48).collect::<String>())
+    let text = node
+        .data()
+        .label()
+        .map(str::to_owned)
+        .or_else(|| node.value())
+        .unwrap_or_default();
+    let class = node
+        .class_name()
+        .map(|c| format!(" [{}]", c.split(' ').next().unwrap_or("")))
+        .unwrap_or_default();
+    format!(
+        "{:?}{class} '{}'",
+        node.role(),
+        text.chars().take(48).collect::<String>()
+    )
 }
 
 fn walk(node: AccessKitNode<'_>, container: Option<usize>, tree: &mut Tree) {
@@ -162,11 +182,18 @@ fn walk(node: AccessKitNode<'_>, container: Option<usize>, tree: &mut Tree) {
         } else if let Some(n) = author.strip_prefix(ui::contract::ROW) {
             Some((Kind::Row, n))
         } else {
-            author.strip_prefix(ui::contract::SCROLL).map(|n| (Kind::Scroll, n))
+            author
+                .strip_prefix(ui::contract::SCROLL)
+                .map(|n| (Kind::Scroll, n))
         };
         if let (Some((kind, name)), Some(rect)) = (kind, rect_of(&node)) {
             let index = tree.containers.len();
-            tree.containers.push(Container { name: name.to_owned(), kind, rect, parent: container });
+            tree.containers.push(Container {
+                name: name.to_owned(),
+                kind,
+                rect,
+                parent: container,
+            });
             tree.items.push(Item {
                 desc: author.to_string(),
                 rect,
@@ -177,7 +204,10 @@ fn walk(node: AccessKitNode<'_>, container: Option<usize>, tree: &mut Tree) {
             });
             current = Some(index);
         }
-    } else if !matches!(node.role(), egui::accesskit::Role::GenericContainer | egui::accesskit::Role::Window) {
+    } else if !matches!(
+        node.role(),
+        egui::accesskit::Role::GenericContainer | egui::accesskit::Role::Window
+    ) {
         if let Some(rect) = rect_of(&node) {
             tree.items.push(Item {
                 desc: describe(&node),
@@ -213,7 +243,13 @@ fn overlaps(a: Rect, b: Rect) -> bool {
 }
 
 fn fmt_rect(r: Rect) -> String {
-    format!("[{:.1},{:.1} {:.1}x{:.1}]", r.min.x, r.min.y, r.width(), r.height())
+    format!(
+        "[{:.1},{:.1} {:.1}x{:.1}]",
+        r.min.x,
+        r.min.y,
+        r.width(),
+        r.height()
+    )
 }
 
 /// Most texts allowed in one run on a line, and the gap that ends a run.
@@ -224,19 +260,27 @@ const RUN_GAP: f32 = 16.0;
 fn is_text(it: &Item) -> bool {
     it.is_container.is_none()
         && it.desc.starts_with("Label")
-        && !["[tag]", "[chord]", "[switch]"].iter().any(|c| it.desc.contains(c))
+        && !["[tag]", "[chord]", "[switch]"]
+            .iter()
+            .any(|c| it.desc.contains(c))
 }
 
 fn baseline(class: &str) -> Option<f32> {
     if class.contains(" multi") {
         return None;
     }
-    class.split(' ').find_map(|p| p.strip_prefix("b=")).and_then(|b| b.parse().ok())
+    class
+        .split(' ')
+        .find_map(|p| p.strip_prefix("b="))
+        .and_then(|b| b.parse().ok())
 }
 
 /// Every broken invariant in the harness's current frame, one line each.
 fn check(h: &Harness<'_, St>, size: (f32, f32)) -> Vec<String> {
-    let mut tree = Tree { containers: Vec::new(), items: Vec::new() };
+    let mut tree = Tree {
+        containers: Vec::new(),
+        items: Vec::new(),
+    };
     walk(h.root().accesskit_node(), None, &mut tree);
     let window = Rect::from_min_size(pos2(0.0, 0.0), vec2(size.0, size.1));
     let mut out = Vec::new();
@@ -302,12 +346,18 @@ fn check(h: &Harness<'_, St>, size: (f32, f32)) -> Vec<String> {
             continue;
         }
         if !contains(window, shown(it)) {
-            out.push(format!("outside the window: {} at {}", it.desc, fmt_rect(it.rect)));
+            out.push(format!(
+                "outside the window: {} at {}",
+                it.desc,
+                fmt_rect(it.rect)
+            ));
         }
         if let Some(ci) = it.container {
             let c = &tree.containers[ci];
             let inside = match c.kind {
-                Kind::Scroll => it.rect.min.x >= c.rect.min.x - TOL && it.rect.max.x <= c.rect.max.x + TOL,
+                Kind::Scroll => {
+                    it.rect.min.x >= c.rect.min.x - TOL && it.rect.max.x <= c.rect.max.x + TOL
+                }
                 Kind::Box | Kind::Row => contains(c.rect, it.rect),
             };
             if !inside {
@@ -321,10 +371,17 @@ fn check(h: &Harness<'_, St>, size: (f32, f32)) -> Vec<String> {
             }
         }
         if it.button && it.rect.height() < MIN_BUTTON_H - 0.01 {
-            out.push(format!("button lower than {MIN_BUTTON_H} px: {} at {}", it.desc, fmt_rect(it.rect)));
+            out.push(format!(
+                "button lower than {MIN_BUTTON_H} px: {} at {}",
+                it.desc,
+                fmt_rect(it.rect)
+            ));
         }
         if it.class.contains(" elided") && !it.class.contains(" trunc") {
-            out.push(format!("elided text not marked as allowed to truncate: {}", it.desc));
+            out.push(format!(
+                "elided text not marked as allowed to truncate: {}",
+                it.desc
+            ));
         }
     }
 
@@ -337,7 +394,10 @@ fn check(h: &Harness<'_, St>, size: (f32, f32)) -> Vec<String> {
             .iter()
             // Scroll bars float over their content by design.
             .filter(|it| {
-                it.container == Some(ci) && visible(it) && !same(it.rect, crect) && !it.desc.starts_with("ScrollBar")
+                it.container == Some(ci)
+                    && visible(it)
+                    && !same(it.rect, crect)
+                    && !it.desc.starts_with("ScrollBar")
             })
             .collect();
         for (a_i, a) in members.iter().enumerate() {
@@ -359,15 +419,22 @@ fn check(h: &Harness<'_, St>, size: (f32, f32)) -> Vec<String> {
         // words (the old This PC header: status, viewers, "PC ID" and the
         // ID). Such lines need labelled fields or a second line.
         let mut texts: Vec<&Item> = members.iter().copied().filter(|it| is_text(it)).collect();
-        texts.sort_by(|a, b| a.rect.center().y.total_cmp(&b.rect.center().y).then(a.rect.min.x.total_cmp(&b.rect.min.x)));
+        texts.sort_by(|a, b| {
+            a.rect
+                .center()
+                .y
+                .total_cmp(&b.rect.center().y)
+                .then(a.rect.min.x.total_cmp(&b.rect.min.x))
+        });
         let mut used = vec![false; texts.len()];
         for i in 0..texts.len() {
             if used[i] {
                 continue;
             }
             let cy = texts[i].rect.center().y;
-            let mut line: Vec<usize> =
-                (i..texts.len()).filter(|&j| !used[j] && (texts[j].rect.center().y - cy).abs() <= 3.0).collect();
+            let mut line: Vec<usize> = (i..texts.len())
+                .filter(|&j| !used[j] && (texts[j].rect.center().y - cy).abs() <= 3.0)
+                .collect();
             line.sort_by(|&a, &b| texts[a].rect.min.x.total_cmp(&texts[b].rect.min.x));
             for &j in &line {
                 used[j] = true;
@@ -376,7 +443,12 @@ fn check(h: &Harness<'_, St>, size: (f32, f32)) -> Vec<String> {
             let flush = |run: &Vec<usize>, out: &mut Vec<String>| {
                 if run.len() > MAX_RUN {
                     let words: Vec<String> = run.iter().map(|&k| texts[k].desc.clone()).collect();
-                    out.push(format!("run-on line in {} ({} texts): {}", cname(ci), run.len(), words.join(", ")));
+                    out.push(format!(
+                        "run-on line in {} ({} texts): {}",
+                        cname(ci),
+                        run.len(),
+                        words.join(", ")
+                    ));
                 }
             };
             for w in line.windows(2) {
@@ -391,7 +463,10 @@ fn check(h: &Harness<'_, St>, size: (f32, f32)) -> Vec<String> {
             flush(&run, &mut out);
         }
         if tree.containers[ci].kind == Kind::Row {
-            let lines: Vec<(f32, &Item)> = members.iter().filter_map(|it| baseline(&it.class).map(|b| (b, *it))).collect();
+            let lines: Vec<(f32, &Item)> = members
+                .iter()
+                .filter_map(|it| baseline(&it.class).map(|b| (b, *it)))
+                .collect();
             if let (Some(lo), Some(hi)) = (
                 lines.iter().min_by(|a, b| a.0.total_cmp(&b.0)),
                 lines.iter().max_by(|a, b| a.0.total_cmp(&b.0)),
@@ -415,7 +490,9 @@ fn check(h: &Harness<'_, St>, size: (f32, f32)) -> Vec<String> {
 
 fn scene_count() -> usize {
     let (backend, driver) = mock::new();
-    ui::App::new(Box::new(backend)).with_demo(Box::new(driver), None).demo_len()
+    ui::App::new(Box::new(backend))
+        .with_demo(Box::new(driver), None)
+        .demo_len()
 }
 
 fn layout_at(size: (f32, f32)) {
@@ -434,7 +511,13 @@ fn layout_at(size: (f32, f32)) {
     for line in &report {
         println!("{line}");
     }
-    assert!(report.is_empty(), "{} layout problems in {broken} scenes at {}x{} (listed above)", report.len(), size.0, size.1);
+    assert!(
+        report.is_empty(),
+        "{} layout problems in {broken} scenes at {}x{} (listed above)",
+        report.len(),
+        size.0,
+        size.1
+    );
 }
 
 #[test]
@@ -451,17 +534,26 @@ fn layout_at_minimum_size() {
 fn snapshots_at_default_size() {
     // Font hinting and the GPU's rasteriser vary a little between machines;
     // a few hundred changed pixels pass, real layout changes do not.
-    let options = SnapshotOptions::new().threshold(0.8).failed_pixel_count_threshold(400);
+    let options = SnapshotOptions::new()
+        .threshold(0.8)
+        .failed_pixel_count_threshold(400);
     let mut results = Vec::new();
     for scene in 0..scene_count() {
         let (mut h, name) = harness(scene, FULL);
         results.push(h.try_snapshot_options(name, &options));
     }
-    let failed: Vec<String> = results.into_iter().filter_map(|r| r.err().map(|e| e.to_string())).collect();
+    let failed: Vec<String> = results
+        .into_iter()
+        .filter_map(|r| r.err().map(|e| e.to_string()))
+        .collect();
     for f in &failed {
         println!("{f}");
     }
-    assert!(failed.is_empty(), "{} snapshots differ (listed above)", failed.len());
+    assert!(
+        failed.is_empty(),
+        "{} snapshots differ (listed above)",
+        failed.len()
+    );
 }
 
 /// Scenes snapshotted at the minimum size as well: the step 4 screens (from
@@ -475,15 +567,24 @@ fn min_size_snapshot_scenes() -> Vec<usize> {
 
 #[test]
 fn snapshots_at_minimum_size() {
-    let options = SnapshotOptions::new().threshold(0.8).failed_pixel_count_threshold(400);
+    let options = SnapshotOptions::new()
+        .threshold(0.8)
+        .failed_pixel_count_threshold(400);
     let mut results = Vec::new();
     for scene in min_size_snapshot_scenes() {
         let (mut h, name) = harness(scene, min_size());
         results.push(h.try_snapshot_options(format!("{name}-min"), &options));
     }
-    let failed: Vec<String> = results.into_iter().filter_map(|r| r.err().map(|e| e.to_string())).collect();
+    let failed: Vec<String> = results
+        .into_iter()
+        .filter_map(|r| r.err().map(|e| e.to_string()))
+        .collect();
     for f in &failed {
         println!("{f}");
     }
-    assert!(failed.is_empty(), "{} snapshots differ (listed above)", failed.len());
+    assert!(
+        failed.is_empty(),
+        "{} snapshots differ (listed above)",
+        failed.len()
+    );
 }

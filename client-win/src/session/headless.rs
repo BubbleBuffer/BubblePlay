@@ -37,7 +37,7 @@ use super::{
     decode::{self, DecodeCallbacks, FrameMeta},
     metrics::percentile,
     options::{require_loopback_websocket, CodecChoice, InputScript},
-    session_cookies, write_dev_report, DevOptions, Diagnostics, Running,
+    viewer_auth, write_dev_report, DevOptions, Diagnostics, Running,
 };
 use crate::{
     audio::{AudioPlayer, OutputMode},
@@ -380,7 +380,7 @@ fn summary(values: &[f64]) -> Value {
 pub(super) fn run(options: DevOptions) -> Result<()> {
     // Refusals come before the first device, audio or network start.
     let endpoint = relay_origin(&options.url)?;
-    let cookies = session_cookies(&options)?;
+    let viewer = viewer_auth(&options)?;
     let started = Instant::now();
     let mut codec = match options.codec {
         CodecChoice::Auto | CodecChoice::H264 => Codec::H264,
@@ -413,7 +413,7 @@ pub(super) fn run(options: DevOptions) -> Result<()> {
         Codec::H264 => net::Codec::H264,
         Codec::Hevc => net::Codec::Hevc,
     };
-    let mut config = NetConfig::new(endpoint, net_codec, cookies);
+    let mut config = NetConfig::new(endpoint, net_codec, viewer);
     config.audio = Some(audio.clone());
     config.input = Some(input.clone());
     config.stream_mode = Some(options.mode.stream_mode().into());

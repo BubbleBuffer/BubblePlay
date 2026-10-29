@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use bp_device_key::phase2::{sdp_sha256_fingerprint, EphemeralSecret};
+use bp_device_key::{relay_origin, verify_relay_proof, Role};
 use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -28,6 +31,7 @@ use crate::model::{
     Action, Counters, Emitted, Injections, Model, ModelConfig, Recovery, Source, StartOutcome,
 };
 use crate::monitors;
+use crate::phase2::{self, Channel, Handshake, Opened};
 use crate::protocol::{self, ClientMessage};
 use crate::rtc;
 use crate::signal::{self, MediaControl, Signal};
@@ -94,7 +98,7 @@ enum Kind {
 enum Outbound {
     Text(String),
     Binary(Vec<u8>),
-    Close(&'static str),
+    Close(CloseCode, &'static str),
 }
 
 #[derive(Debug)]
@@ -108,9 +112,9 @@ enum Event {
         id: u64,
         text: String,
     },
+    /// A raw binary frame; after the handshake binary input travels in `ctl`, so it is refused.
     Binary {
         id: u64,
-        bytes: Vec<u8>,
     },
     Closed {
         id: u64,
@@ -123,6 +127,15 @@ struct Conn {
     kind: Kind,
     out: mpsc::Sender<Outbound>,
     hello: bool,
+    /// A viewer hello that got its challenge and waits for `register-proof`.
+    pending: Option<Pending>,
+}
+
+/// What a `register-proof` must answer, from the viewer's hello and the challenge.
+struct Pending {
+    id: String,
+    public: String,
+    nonce: [u8; 32],
 }
 
 struct FirstFrame {
@@ -160,6 +173,16 @@ struct RtcSession {
     commands: mpsc::Sender<rtc::Command>,
 }
 
+/// The viewer's `ctl` handshake on the signalling socket, from `auth-hello` to the open channel.
+enum Link {
+    /// `auth-host` is sent; waiting for `auth-finish`.
+    Finish(Handshake),
+    /// `auth-finish` verified; waiting for the viewer's `caps`.
+    Caps(Channel),
+    /// The `ctl` channel is up: every endpoint message goes sealed.
+    Open(Channel),
+}
+
 struct Hub {
     model: Model,
     run_start: Instant,
@@ -167,6 +190,10 @@ struct Hub {
     drain: Duration,
     mirror: EpochMirror,
     epoch: Option<String>,
+    /// The media ticket issued by the admitted `/ws` hello. Cleared with the epoch.
+    ticket: Option<String>,
+    /// The relay origin the viewers sign for: `relay_origin` of this server's `ws://` URL.
+    origin: String,
     epochs: Vec<String>,
     conns: HashMap<u64, Conn>,
     signal: Option<u64>,
@@ -205,6 +232,13 @@ struct Hub {
     /// The monitor surface (`--monitors`) and the index of the display in use.
     monitors: monitors::Knobs,
     selected: usize,
+    /// The signalling viewer's `ctl` handshake. None until its `auth-hello`.
+    link: Option<Link>,
+    /// The admitted viewer's device ID, from its `register-proof`.
+    viewer_id: Option<String>,
+    /// The `a=fingerprint` of the viewer's offer and of the PC's answer, for `auth-bind`.
+    offer_fingerprint: Option<String>,
+    answer_fingerprint: Option<String>,
 }
 
 impl Hub {
@@ -212,22 +246,65 @@ impl Hub {
         now.saturating_duration_since(self.run_start)
     }
 
-    fn send(&self, id: u64, msg: Outbound) -> bool {
+    /// Sends one message to a connection. On the signalling socket the framing is
+    /// `seal_for_signal`'s; other sockets get the message as it is.
+    fn send(&mut self, id: u64, msg: Outbound) -> bool {
+        let msg = if self.signal == Some(id) {
+            match self.seal_for_signal(msg) {
+                Some(msg) => msg,
+                None => return false,
+            }
+        } else {
+            msg
+        };
         self.conns
             .get(&id)
             .is_some_and(|conn| conn.out.try_send(msg).is_ok())
     }
 
+    /// Plain types go as they are. Every other text, and every binary frame (a cursor),
+    /// goes sealed in `ctl` once the channel is open. Nothing else can be sent on `/ws`:
+    /// `None` drops the message.
+    fn seal_for_signal(&mut self, msg: Outbound) -> Option<Outbound> {
+        match msg {
+            Outbound::Text(text) if phase2::is_plain(&text) => Some(Outbound::Text(text)),
+            Outbound::Text(text) => match self.link.as_mut() {
+                Some(Link::Open(channel)) => channel.seal_text(&text).ok().map(Outbound::Text),
+                _ => None,
+            },
+            Outbound::Binary(bytes) => match self.link.as_mut() {
+                Some(Link::Open(channel)) => channel
+                    .seal_frame(phase2::CURSOR_KIND, &bytes)
+                    .ok()
+                    .map(Outbound::Text),
+                _ => None,
+            },
+            close @ Outbound::Close(..) => Some(close),
+        }
+    }
+
     /// Remove the connection and ask its task to close the socket. Dropping
     /// the sender also ends the task if the close frame cannot be queued.
     fn close_conn(&mut self, id: u64, reason: &'static str) {
+        self.close_with(id, CloseCode::Normal, reason);
+    }
+
+    /// As `close_conn`, with close code 1008 (Policy): a failed admission.
+    fn close_policy(&mut self, id: u64, reason: &'static str) {
+        self.close_with(id, CloseCode::Policy, reason);
+    }
+
+    fn close_with(&mut self, id: u64, code: CloseCode, reason: &'static str) {
         if let Some(conn) = self.conns.remove(&id) {
-            let _ = conn.out.try_send(Outbound::Close(reason));
+            let _ = conn.out.try_send(Outbound::Close(code, reason));
         }
     }
 
     fn set_epoch(&mut self, value: Option<String>) {
         *self.mirror.lock().unwrap_or_else(|e| e.into_inner()) = value.clone();
+        if value.is_none() {
+            self.ticket = None;
+        }
         self.epoch = value;
     }
 
@@ -367,6 +444,7 @@ impl Hub {
                         kind,
                         out,
                         hello: false,
+                        pending: None,
                     },
                 );
             }
@@ -375,16 +453,10 @@ impl Hub {
                 Some(Kind::Media) => self.on_media_text(id, &text, now),
                 None => {}
             },
-            Event::Binary { id, bytes } => {
-                if let Some(kind) = self.conns.get(&id).map(|c| c.kind) {
-                    if kind == Kind::Signal {
-                        if !crate::input_record::classify(&bytes).valid {
-                            self.reject();
-                        }
-                        self.record_input(&bytes, "ws", now);
-                    } else {
-                        self.reject();
-                    }
+            Event::Binary { id, .. } => {
+                // Binary input travels as `ctl` kind `input` on /ws, so a raw frame is refused.
+                if self.conns.contains_key(&id) {
+                    self.reject();
                 }
             }
             Event::Closed { id } => self.on_closed(id),
@@ -396,6 +468,13 @@ impl Hub {
         if self.conns.remove(&id).is_none() {
             return;
         }
+        self.lost(id);
+    }
+
+    /// The teardown of a connection that is gone: its media or signalling role ends.
+    /// Called on a close event, and directly when the hub closes the socket itself
+    /// (its close event then finds no connection and does nothing).
+    fn lost(&mut self, id: u64) {
         if self.media == Some(id) {
             self.media = None;
             self.model.media_detach();
@@ -439,6 +518,12 @@ impl Hub {
     fn on_offer(&mut self, sdp: String) {
         if self.rtc.is_none() {
             return self.count_unhandled("offer");
+        }
+        self.offer_fingerprint = sdp_sha256_fingerprint(&sdp).ok();
+        self.answer_fingerprint = None;
+        if self.offer_fingerprint.is_none() {
+            // Decision 23: an offer without a sha-256 fingerprint cannot be bound.
+            return self.refuse_unbindable_offer();
         }
         self.end_rtc("superseded");
         let Some((knobs, fps, sources)) = self
@@ -532,8 +617,10 @@ impl Hub {
         let Some(signal) = self.signal else { return };
         match notice {
             rtc::Notice::Answer(sdp) => {
+                self.answer_fingerprint = sdp_sha256_fingerprint(&sdp).ok();
                 let text = serde_json::json!({"type": "answer", "sdp": sdp}).to_string();
                 self.send(signal, Outbound::Text(text));
+                self.send_pc_bind(signal);
             }
             rtc::Notice::Candidate(candidate) => {
                 let text = serde_json::json!({"type": "ice", "candidate": candidate}).to_string();
@@ -598,14 +685,139 @@ impl Hub {
     }
 
     fn on_signal_text(&mut self, id: u64, text: &str, now: Instant) {
+        if self.conns.get(&id).is_some_and(|c| c.pending.is_some()) {
+            return self.on_register_proof(id, text, now);
+        }
         let hello = self.conns.get(&id).is_some_and(|c| c.hello);
         let message = match signal::parse_signal(text) {
             Ok(message) => message,
             Err(_) => return self.reject(),
         };
         match message {
-            Signal::Hello { role } => self.on_signal_hello(id, &role, now),
+            Signal::Hello { role, body } => self.on_signal_hello(id, &role, &body),
             _ if !hello => self.reject(),
+            Signal::Ping => {
+                self.send(id, Outbound::Text(protocol::pong()));
+            }
+            // The plaintext handshake, then every endpoint message inside `ctl`.
+            Signal::Other(kind) if kind == "auth-hello" => self.on_auth_hello(id, text),
+            Signal::Other(kind) if kind == "auth-finish" => self.on_auth_finish(id, text),
+            Signal::Other(kind) if kind == "auth-bind" => self.on_auth_bind(text),
+            Signal::Other(kind) if kind == "ctl" => self.on_ctl(id, text, now),
+            // Any other plaintext endpoint message is refused: after hello-ok they go in ctl.
+            _ => self.reject(),
+        }
+    }
+
+    /// The viewer's `auth-hello`, answered with `auth-host`. Only the admitted viewer,
+    /// once, before its `auth-finish`.
+    fn on_auth_hello(&mut self, id: u64, text: &str) {
+        let (Some(viewer_id), Some(epoch)) = (self.viewer_id.clone(), self.epoch.clone()) else {
+            return self.reject();
+        };
+        if self.signal != Some(id) || self.link.is_some() {
+            return self.reject();
+        }
+        let ephemeral = EphemeralSecret::from_bytes(protocol::random32());
+        match phase2::answer(
+            text,
+            &viewer_id,
+            &self.origin,
+            &epoch,
+            protocol::random32(),
+            ephemeral,
+        ) {
+            Ok((host, handshake)) => {
+                self.link = Some(Link::Finish(handshake));
+                self.send(id, Outbound::Text(host));
+            }
+            Err(reason) => self.fail_signal(id, reason),
+        }
+    }
+
+    /// The viewer's `auth-finish`. A signature that does not verify closes the socket.
+    fn on_auth_finish(&mut self, id: u64, text: &str) {
+        match self.link.take() {
+            Some(Link::Finish(handshake)) if self.signal == Some(id) => {
+                match handshake.finish(text) {
+                    Ok(channel) => self.link = Some(Link::Caps(channel)),
+                    Err(reason) => self.fail_signal(id, reason),
+                }
+            }
+            other => {
+                self.link = other;
+                self.reject();
+            }
+        }
+    }
+
+    /// One viewer `ctl` message. It must open. Its first is the viewer's `caps`; after
+    /// that, a binary `input` frame or an endpoint message, handled as it arrives on /ws.
+    fn on_ctl(&mut self, id: u64, text: &str, now: Instant) {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return self.reject();
+        };
+        let awaiting_caps = matches!(self.link, Some(Link::Caps(_)));
+        let opened = match self.link.as_mut() {
+            Some(Link::Caps(channel) | Link::Open(channel)) => channel.open(&value),
+            _ => return self.reject(),
+        };
+        match opened {
+            Err(reason) => self.fail_signal(id, reason),
+            Ok(Opened::Text { kind, text }) if awaiting_caps => self.on_caps(id, &kind, &text),
+            Ok(_) if awaiting_caps => self.fail_signal(id, "first ctl is not caps"),
+            Ok(Opened::Text { text, .. }) => self.on_endpoint(id, &text, now),
+            Ok(Opened::Binary { kind, frame }) if kind == phase2::INPUT_KIND => {
+                self.on_signal_binary(&frame, now)
+            }
+            Ok(Opened::Binary { .. }) => self.reject(),
+        }
+    }
+
+    /// The viewer's first `ctl`: its `caps`, which must offer `control-aead-v1`. The PC
+    /// answers with its own `caps`, sealed, then sends its endpoint messages.
+    fn on_caps(&mut self, id: u64, kind: &str, text: &str) {
+        let offers = serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|value| value.get("caps").and_then(Value::as_array).cloned())
+            .is_some_and(|caps| {
+                caps.iter()
+                    .any(|cap| cap.as_str() == Some(phase2::CAP_CONTROL_AEAD))
+            });
+        if kind != "caps" || !offers {
+            return self.fail_signal(id, "viewer caps do not offer control-aead-v1");
+        }
+        let Some(Link::Caps(channel)) = self.link.take() else {
+            return self.reject();
+        };
+        self.link = Some(Link::Open(channel));
+        let caps = serde_json::json!({
+            "type": "caps",
+            "caps": [phase2::CAP_CONTROL_AEAD, phase2::CAP_DTLS_BIND],
+        })
+        .to_string();
+        // Sealed by `send`, since the channel is open now.
+        self.send(id, Outbound::Text(caps));
+        self.send_post_handshake(id);
+    }
+
+    /// What the PC sends once the viewer's channel is up: the monitor list and, with
+    /// audio, the audio capabilities. Each goes sealed in `ctl`.
+    fn send_post_handshake(&mut self, id: u64) {
+        self.send_monitor_list(id);
+        if self.audio.is_some() {
+            self.send(id, Outbound::Text(protocol::host_capabilities_audio()));
+        }
+    }
+
+    /// An endpoint message from the viewer, inside a verified `ctl`.
+    fn on_endpoint(&mut self, id: u64, text: &str, now: Instant) {
+        let message = match signal::parse_signal(text) {
+            Ok(message) => message,
+            Err(_) => return self.reject(),
+        };
+        match message {
+            Signal::Hello { .. } => self.reject(),
             Signal::Ping => {
                 self.send(id, Outbound::Text(protocol::pong()));
             }
@@ -615,25 +827,143 @@ impl Hub {
             Signal::FirstFrame { phase, request_id } => {
                 self.on_first_frame(id, &phase, &request_id)
             }
-            Signal::Other(kind) => {
-                *self
-                    .model
-                    .counters
-                    .unhandled_control
-                    .entry(kind)
-                    .or_insert(0) += 1
-            }
+            Signal::Other(kind) => self.count_unhandled(&kind),
         }
     }
 
-    /// A client hello on `/ws` rotates the epoch: the previous media socket
-    /// is closed, the previous signalling socket is superseded, and the model
-    /// starts a new generation that begins at a keyframe.
-    fn on_signal_hello(&mut self, id: u64, role: &str, now: Instant) {
+    /// A binary input frame from the viewer's `ctl` (kind `input`).
+    fn on_signal_binary(&mut self, frame: &[u8], now: Instant) {
+        if !crate::input_record::classify(frame).valid {
+            self.reject();
+        }
+        self.record_input(frame, "ws", now);
+    }
+
+    /// The viewer's `auth-bind`, checked against its offer and the PC's answer. A failure
+    /// is counted, and nothing else changes.
+    fn on_auth_bind(&mut self, text: &str) {
+        let (Some(local), Some(remote)) = (
+            self.offer_fingerprint.clone(),
+            self.answer_fingerprint.clone(),
+        ) else {
+            return self.reject();
+        };
+        let verified = match self.link.as_ref() {
+            Some(Link::Open(channel)) => channel.verify_viewer_bind(text, &local, &remote).is_ok(),
+            _ => false,
+        };
+        if !verified {
+            self.reject();
+        }
+    }
+
+    /// The PC's `auth-bind`, after its answer: signed over the answer's fingerprint, then
+    /// the offer's.
+    /// Decision 23: a `ctl` error `dtls-bind-required`, then the signalling viewer is closed.
+    fn refuse_unbindable_offer(&mut self) {
+        let Some(signal) = self.signal else { return };
+        let error = serde_json::json!({
+            "type": "error",
+            "code": "dtls-bind-required",
+            "message": "the offer has no sha-256 DTLS fingerprint",
+        })
+        .to_string();
+        // Sealed directly: a plain `error` would read as the relay's own.
+        let sealed = match self.link.as_mut() {
+            Some(Link::Open(channel)) => channel.seal_text(&error).ok(),
+            _ => None,
+        };
+        if let (Some(sealed), Some(conn)) = (sealed, self.conns.get(&signal)) {
+            let _ = conn.out.try_send(Outbound::Text(sealed));
+        }
+        self.fail_signal(signal, "dtls-bind-required");
+    }
+
+    fn send_pc_bind(&mut self, id: u64) {
+        let (Some(local), Some(remote)) = (
+            self.answer_fingerprint.clone(),
+            self.offer_fingerprint.clone(),
+        ) else {
+            return self.reject();
+        };
+        let bound = match self.link.as_ref() {
+            Some(Link::Open(channel)) => channel.bind(&local, &remote).ok(),
+            _ => None,
+        };
+        match bound {
+            Some(text) => {
+                self.send(id, Outbound::Text(text));
+            }
+            None => self.reject(),
+        }
+    }
+
+    /// Refuses the signalling viewer: counted, closed with 1008, and torn down here, since
+    /// its close event finds no connection.
+    fn fail_signal(&mut self, id: u64, reason: &'static str) {
+        self.reject();
+        self.close_policy(id, reason);
+        self.lost(id);
+    }
+
+    /// The first `/ws` hello. Only a viewer with the right keys gets a
+    /// challenge; nothing is admitted, and no epoch rotates, until its proof
+    /// verifies (see `on_register_proof`).
+    fn on_signal_hello(&mut self, id: u64, role: &str, body: &Value) {
         let already = self.conns.get(&id).is_some_and(|c| c.hello);
-        if role != "client" || already {
+        if already {
             return self.reject();
         }
+        let hello = match (role, signal::parse_viewer_hello(body)) {
+            ("viewer", Ok(hello)) => hello,
+            _ => return self.close_policy(id, "bad-hello"),
+        };
+        let nonce = protocol::random32();
+        if let Some(conn) = self.conns.get_mut(&id) {
+            conn.pending = Some(Pending {
+                id: hello.id,
+                public: hello.public,
+                nonce,
+            });
+        }
+        self.send(id, Outbound::Text(protocol::register_challenge(&nonce)));
+    }
+
+    /// The answer to the challenge. Any other message, or a proof that does not
+    /// verify for this viewer, origin and nonce, closes with 1008 and admits nothing.
+    fn on_register_proof(&mut self, id: u64, text: &str, now: Instant) {
+        let pending = self.conns.get_mut(&id).and_then(|c| c.pending.take());
+        let Some(pending) = pending else { return };
+        if !self.proof_verifies(&pending, text) {
+            return self.close_policy(id, "bad-proof");
+        }
+        self.viewer_id = Some(pending.id.clone());
+        self.admit(id, now);
+    }
+
+    fn proof_verifies(&self, pending: &Pending, text: &str) -> bool {
+        let Some(signature) = protocol::register_proof_signature(text) else {
+            return false;
+        };
+        let Some(public) = protocol::b64url_decode(&pending.public) else {
+            return false;
+        };
+        verify_relay_proof(
+            Role::Viewer,
+            &self.origin,
+            &pending.nonce,
+            &pending.id,
+            &public,
+            &signature,
+        )
+        .is_ok()
+    }
+
+    /// An admitted viewer rotates the epoch: the previous media socket is
+    /// closed, the previous signalling socket is superseded, and the model
+    /// starts a new generation that begins at a keyframe. The media ticket is
+    /// issued here, for this signalling socket only.
+    fn admit(&mut self, id: u64, now: Instant) {
         if self.epoch.is_some() {
             self.input_disconnected("epoch-rotated", now);
         }
@@ -648,19 +978,24 @@ impl Hub {
         self.model.begin_epoch(now);
         let epoch = protocol::new_epoch(self.model.counters.epochs_issued);
         self.set_epoch(Some(epoch.clone()));
+        let ticket = protocol::b64url_encode(&protocol::random32());
+        self.ticket = Some(ticket.clone());
         self.epochs.push(epoch.clone());
         self.signal = Some(id);
+        self.link = None;
+        self.offer_fingerprint = None;
+        self.answer_fingerprint = None;
         self.first_frame = None;
         self.start_refused = false;
         self.cursor = None;
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.hello = true;
         }
-        self.send(id, Outbound::Text(protocol::hello_ok_signal(&epoch)));
-        self.send_monitor_list(id);
-        if self.audio.is_some() {
-            self.send(id, Outbound::Text(protocol::host_capabilities_audio()));
-        }
+        // The monitor list and the audio capabilities wait for the viewer's `ctl` handshake.
+        self.send(
+            id,
+            Outbound::Text(protocol::hello_ok_signal(&epoch, &ticket)),
+        );
     }
 
     fn on_media_control(&mut self, id: u64, control: MediaControl, now: Instant) {
@@ -873,7 +1208,7 @@ impl Hub {
         let hello = self.conns.get(&id).is_some_and(|c| c.hello);
         if !hello {
             return match signal::parse_signal(text) {
-                Ok(Signal::Hello { role }) => self.on_media_hello(id, &role, now),
+                Ok(Signal::Hello { role, body }) => self.on_media_hello(id, &role, &body, now),
                 _ => self.reject(),
             };
         }
@@ -898,8 +1233,15 @@ impl Hub {
         }
     }
 
-    fn on_media_hello(&mut self, id: u64, role: &str, now: Instant) {
-        if role != "media-client" || self.epoch.is_none() {
+    /// The media hello: role `media-viewer` and the ticket of the current
+    /// signalling socket. Anything else is closed as before.
+    fn on_media_hello(&mut self, id: u64, role: &str, body: &Value, now: Instant) {
+        let ticket = body.get("ticket").and_then(Value::as_str);
+        let admitted = role == "media-viewer"
+            && self.epoch.is_some()
+            && ticket.is_some()
+            && ticket == self.ticket.as_deref();
+        if !admitted {
             self.reject();
             self.close_conn(id, "bad-media-hello");
             return;
@@ -934,6 +1276,10 @@ impl Hub {
         self.stop_audio();
         self.first_frame = None;
         self.cursor = None;
+        self.link = None;
+        self.viewer_id = None;
+        self.offer_fingerprint = None;
+        self.answer_fingerprint = None;
         self.set_epoch(None);
     }
 
@@ -1131,8 +1477,8 @@ async fn connection(
                         break;
                     }
                 }
-                Some(Ok(Message::Binary(bytes))) => {
-                    let _ = events.send(Event::Binary { id, bytes: bytes.to_vec() }).await;
+                Some(Ok(Message::Binary(_))) => {
+                    let _ = events.send(Event::Binary { id }).await;
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(_)) => {}
@@ -1148,8 +1494,8 @@ async fn connection(
                         break;
                     }
                 }
-                Some(Outbound::Close(reason)) => {
-                    let frame = CloseFrame { code: CloseCode::Normal, reason: reason.into() };
+                Some(Outbound::Close(code, reason)) => {
+                    let frame = CloseFrame { code, reason: reason.into() };
                     let _ = sink.send(Message::Close(Some(frame))).await;
                     break;
                 }
@@ -1162,6 +1508,13 @@ async fn connection(
 
 /// Serve until `exit_after`, then drain, close every socket and return.
 pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapshot> {
+    // The origin a viewer signs for is the one of the `ws://` URL this server
+    // is reachable at, as the client computes it (`relay_origin`).
+    let bound = listener
+        .local_addr()
+        .context("the listener has no local address")?;
+    let origin =
+        relay_origin(&format!("ws://{bound}")).context("no relay origin for the listener")?;
     let mirror: EpochMirror = Arc::new(Mutex::new(None));
     let (events_tx, events_rx) = mpsc::channel(EVENT_DEPTH);
     let recorder = config
@@ -1199,6 +1552,8 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
         drain: config.drain,
         mirror: mirror.clone(),
         epoch: None,
+        ticket: None,
+        origin,
         epochs: Vec::new(),
         conns: HashMap::new(),
         signal: None,
@@ -1223,6 +1578,10 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
         rtc_generation: 0,
         monitors: config.monitors.clone(),
         selected: 0,
+        link: None,
+        viewer_id: None,
+        offer_fingerprint: None,
+        answer_fingerprint: None,
     };
     let mut hub_task = tokio::spawn(run_hub(hub, events_rx, notices_rx));
     let slots = Arc::new(Semaphore::new(config.max_connections));

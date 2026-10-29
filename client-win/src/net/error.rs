@@ -2,37 +2,19 @@
 
 use std::fmt;
 
-/// Why a login request did not produce session cookies.
-#[cfg(any(test, feature = "dev-login"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoginError {
-    /// Wrong password or TOTP (HTTP 401).
-    Rejected,
-    /// Too many attempts (HTTP 429); `retry_after_secs` comes from `Retry-After`.
-    RateLimited { retry_after_secs: Option<u64> },
-    /// The relay is not healthy yet (HTTP 503).
-    Unavailable,
-    /// Any other HTTP status.
-    Status(u16),
-    /// HTTP 204 without both `__Host-gate` and `__Host-bp-session`.
-    MissingCookies,
-    /// Connection, TLS or timeout failure.
-    Transport(String),
-}
-
 /// Errors from the net module. Transient errors never leave [`crate::net::run`];
 /// they reconnect. Only the fatal ones are returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetError {
     /// The relay URL is malformed or not an origin (fatal).
     InvalidRelayUrl(String),
-    /// `http://` or `ws://` to a host other than `127.0.0.1` (fatal).
+    /// `http://` or `ws://` to a host that is not loopback (fatal).
     PlaintextRefused(String),
-    /// Login failed (returned by `login`, never by `run`).
-    #[cfg(any(test, feature = "dev-login"))]
-    Login(LoginError),
-    /// A WebSocket handshake answered 401 or 403; cookies are missing or stale (fatal).
+    /// A WebSocket upgrade answered 401 or 403 (fatal).
     Auth(u16),
+    /// The relay closed `/ws` with 1008, before or after `hello-ok`: the signed hello or
+    /// proof was refused, or this viewer is not (or no longer) admitted to the PC (fatal).
+    NotAdmitted,
     /// The relay sent `{"type":"error"}` on `/ws` (fatal).
     RelayError(String),
     /// Handshake failed or timed out (transient).
@@ -45,6 +27,10 @@ pub enum NetError {
     Stalled(&'static str),
     /// No decoded frame after the first-frame retry (transient).
     FirstFrameTimeout,
+    /// The device-key handshake, pairing or `ctl` channel failed, or the PC refused the
+    /// session (fatal): a wrong or unpaired PC, a PC without device keys, a broken `ctl`
+    /// sequence, a missing mandatory capability.
+    DeviceKeys(String),
 }
 
 impl NetError {
@@ -55,29 +41,10 @@ impl NetError {
             NetError::InvalidRelayUrl(_)
                 | NetError::PlaintextRefused(_)
                 | NetError::Auth(_)
+                | NetError::NotAdmitted
                 | NetError::RelayError(_)
+                | NetError::DeviceKeys(_)
         )
-    }
-}
-
-#[cfg(any(test, feature = "dev-login"))]
-impl fmt::Display for LoginError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LoginError::Rejected => write!(f, "login rejected (401)"),
-            LoginError::RateLimited {
-                retry_after_secs: Some(secs),
-            } => {
-                write!(f, "login rate limited (429), retry after {secs} s")
-            }
-            LoginError::RateLimited {
-                retry_after_secs: None,
-            } => write!(f, "login rate limited (429)"),
-            LoginError::Unavailable => write!(f, "relay unavailable (503)"),
-            LoginError::Status(status) => write!(f, "login failed (HTTP {status})"),
-            LoginError::MissingCookies => write!(f, "login succeeded without session cookies"),
-            LoginError::Transport(message) => write!(f, "login transport error: {message}"),
-        }
     }
 }
 
@@ -88,22 +55,29 @@ impl fmt::Display for NetError {
             NetError::PlaintextRefused(url) => {
                 write!(
                     f,
-                    "plaintext relay refused (only https, or http to 127.0.0.1): {url}"
+                    "plaintext relay refused (only https, or http to a loopback host): {url}"
                 )
             }
-            #[cfg(any(test, feature = "dev-login"))]
-            NetError::Login(error) => write!(f, "{error}"),
             NetError::Auth(status) => write!(f, "relay refused the session (HTTP {status})"),
+            NetError::NotAdmitted => write!(
+                f,
+                "the relay refused this viewer key (not admitted to the PC, or a bad proof)"
+            ),
             NetError::RelayError(message) => write!(f, "relay error: {message}"),
             NetError::Handshake(message) => write!(f, "handshake failed: {message}"),
             NetError::Protocol(message) => write!(f, "protocol error: {message}"),
             NetError::Socket(message) => write!(f, "socket error: {message}"),
             NetError::Stalled(name) => write!(f, "{name} socket silent past the dead interval"),
             NetError::FirstFrameTimeout => write!(f, "no first frame after retry"),
+            NetError::DeviceKeys(message) => write!(f, "{message}"),
         }
     }
 }
 
-#[cfg(any(test, feature = "dev-login"))]
-impl std::error::Error for LoginError {}
 impl std::error::Error for NetError {}
+
+impl From<super::phase2::Phase2Error> for NetError {
+    fn from(error: super::phase2::Phase2Error) -> Self {
+        NetError::DeviceKeys(error.to_string())
+    }
+}

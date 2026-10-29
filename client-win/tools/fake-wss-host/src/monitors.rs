@@ -135,7 +135,9 @@ mod tests {
         let list = value["monitors"].as_array().unwrap();
         assert_eq!(list.len(), 2);
         for entry in list {
-            for key in ["selector", "name", "width", "height", "origin_x", "origin_y", "selected"] {
+            for key in [
+                "selector", "name", "width", "height", "origin_x", "origin_y", "selected",
+            ] {
                 assert!(entry.get(key).is_some(), "monitor-list entry has {key}");
             }
         }

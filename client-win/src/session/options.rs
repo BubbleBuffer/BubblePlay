@@ -1,6 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use bp_device_key::DeviceId;
 
 use crate::net::TransportChoice;
 
@@ -23,7 +24,8 @@ pub enum InputScript {
 }
 
 /// Development-only connection controls. The regular UI/demo path keeps its
-/// existing argument handling; no credentials are accepted on the command line.
+/// existing argument handling. The relay admits the viewer by its device key
+/// (`--key` or the stored key); no credentials are accepted on the command line.
 #[derive(Clone, Debug)]
 pub struct DevOptions {
     pub url: String,
@@ -55,8 +57,14 @@ pub struct DevOptions {
     pub input_script: Option<InputScript>,
     /// Exercise live monitor/mode controls with decoded readiness and synthetic input.
     pub session_script: bool,
-    #[cfg(feature = "dev-login")]
-    pub login: Option<super::dev_login::DevLogin>,
+    /// `--key <file.bpkey>`: a plain key file instead of the stored DPAPI-wrapped key.
+    pub key: Option<PathBuf>,
+    /// `--pc <id>`: the PC to reach through the relay (required with `--dev-relay`).
+    pub pc: Option<DeviceId>,
+    /// `--pair <code>` (canonical form): pair with `--pc` through `--dev-relay`, then exit.
+    pub pair: Option<String>,
+    /// The `--dev-relay` origin as given, stored in pcs.json on pairing.
+    pub relay_origin: Option<String>,
     pub stats_out_path: Option<PathBuf>,
 }
 
@@ -85,12 +93,10 @@ impl DevOptions {
         let mut count_only = false;
         let mut input_script = None;
         let mut session_script = false;
-        #[cfg(feature = "dev-login")]
         let mut relay = None;
-        #[cfg(feature = "dev-login")]
-        let mut password_file = None;
-        #[cfg(feature = "dev-login")]
-        let mut provision_file = None;
+        let mut key = None;
+        let mut pc = None;
+        let mut pair = None;
         let mut stats_out_path = None;
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -122,24 +128,25 @@ impl DevOptions {
                 }
                 "--dev-audio-render-test" => audio_render_test = true,
                 "--dev-decoder-probe" => decoder_probe = true,
-                #[cfg(feature = "dev-login")]
                 "--dev-relay" => {
                     relay = Some(
                         iter.next()
                             .context("--dev-relay requires an http/https origin")?,
                     )
                 }
-                #[cfg(feature = "dev-login")]
-                "--password-file" => {
-                    password_file = Some(PathBuf::from(
-                        iter.next().context("--password-file requires a path")?,
+                "--key" => {
+                    key = Some(PathBuf::from(
+                        iter.next().context("--key requires a .bpkey file")?,
                     ))
                 }
-                #[cfg(feature = "dev-login")]
-                "--totp-provision" => {
-                    provision_file = Some(PathBuf::from(
-                        iter.next().context("--totp-provision requires a path")?,
-                    ))
+                "--pc" => {
+                    let id = iter.next().context("--pc requires a PC ID")?;
+                    pc = Some(DeviceId::parse(&id).map_err(|_| anyhow!("invalid PC ID {id:?}"))?);
+                }
+                "--pair" => {
+                    let code = iter.next().context("--pair requires the pairing code")?;
+                    let code = crate::net::phase2::parse_code(&code).map_err(|e| anyhow!(e))?;
+                    pair = Some(code.as_str().to_owned());
                 }
                 "--stats-out" => {
                     stats_out_path = Some(PathBuf::from(
@@ -227,8 +234,11 @@ impl DevOptions {
                 _ => bail!("unknown development argument: {arg}"),
             }
         }
-        #[cfg(feature = "dev-login")]
-        let login = if let Some(origin) = relay {
+        if pair.is_some() && relay.is_none() {
+            bail!("--pair requires --dev-relay <origin> and --pc <id>");
+        }
+        let relay_origin = relay.clone();
+        if let Some(origin) = relay {
             if url.is_some() {
                 bail!("--dev-relay and --dev-wss are mutually exclusive");
             }
@@ -238,28 +248,11 @@ impl DevOptions {
             if input_only || audio_only || audio_render_test || decoder_probe {
                 bail!("development harnesses cannot be combined with --dev-relay");
             }
-            let mut parsed = super::dev_login::validate_origin(&origin)?;
-            let normalized = parsed.origin().ascii_serialization();
-            let scheme = if parsed.scheme() == "https" {
-                "wss"
-            } else {
-                "ws"
-            };
-            parsed
-                .set_scheme(scheme)
-                .map_err(|_| anyhow::anyhow!("cannot derive WebSocket origin"))?;
-            url = Some(parsed.to_string());
-            Some(super::dev_login::DevLogin {
-                origin: normalized,
-                password_file: password_file.context("--dev-relay requires --password-file")?,
-                provision_file: provision_file.context("--dev-relay requires --totp-provision")?,
-            })
-        } else {
-            if password_file.is_some() || provision_file.is_some() {
-                bail!("credential files require --dev-relay");
+            if pc.is_none() {
+                bail!("--dev-relay requires --pc <id>");
             }
-            None
-        };
+            url = Some(relay_websocket_url(&origin)?);
+        }
         if [
             input_only,
             audio_only,
@@ -352,11 +345,44 @@ impl DevOptions {
             count_only,
             input_script,
             session_script,
-            #[cfg(feature = "dev-login")]
-            login,
+            key,
+            pc,
+            pair,
+            relay_origin,
             stats_out_path,
         }))
     }
+}
+
+/// The `ws`/`wss` URL for a `--dev-relay` origin: `https://host[:port]`, or `http://` for a
+/// loopback relay only (the network layer refuses plaintext elsewhere as well).
+fn relay_websocket_url(origin: &str) -> Result<String> {
+    let mut parsed = url::Url::parse(origin)
+        .map_err(|_| anyhow!("--dev-relay requires an http/https origin"))?;
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    let scheme = match parsed.scheme() {
+        "https" => "wss",
+        "http" if loopback => "ws",
+        "http" => bail!("--dev-relay accepts http:// only for a loopback relay"),
+        _ => bail!("--dev-relay requires an http/https origin"),
+    };
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        bail!("--dev-relay takes an origin without credentials, path, query or fragment");
+    }
+    parsed
+        .set_scheme(scheme)
+        .map_err(|_| anyhow!("cannot derive the WebSocket origin"))?;
+    Ok(parsed.to_string())
 }
 
 /// Headless sessions connect only to loopback, checked before any network,
@@ -386,7 +412,7 @@ pub(super) fn require_loopback_websocket(value: &str) -> Result<()> {
 }
 
 fn is_dev_flag(value: &str) -> bool {
-    if matches!(
+    matches!(
         value,
         "--dev-wss"
             | "--dev-audio-only"
@@ -398,14 +424,9 @@ fn is_dev_flag(value: &str) -> bool {
             | "--dev-session-script"
             | "--transport"
             | "--ice-timeout-ms"
-    ) {
-        return true;
-    }
-    #[cfg(feature = "dev-login")]
-    if value == "--dev-relay" {
-        return true;
-    }
-    false
+            | "--dev-relay"
+            | "--pair"
+    )
 }
 
 #[cfg(test)]
@@ -534,78 +555,56 @@ mod tests {
         }
     }
     #[test]
-    #[cfg(feature = "dev-login")]
-    fn authenticated_relay_derives_websocket_scheme_without_reading_credentials() {
+    fn dev_relay_derives_the_websocket_url_and_needs_a_pc() {
+        const PC: &str = "77VH-7M56-8GJK-Y12J";
         for (origin, websocket) in [
             ("http://127.0.0.1:8788", "ws://127.0.0.1:8788/"),
             ("https://localhost:8788", "wss://localhost:8788/"),
+            ("https://relay.example", "wss://relay.example/"),
         ] {
             let options = parse(&[
                 "--dev-relay",
                 origin,
-                "--password-file",
-                "fake-password",
-                "--totp-provision",
-                "fake-provision",
+                "--pc",
+                &PC.to_lowercase(),
+                "--key",
+                "viewer.bpkey",
                 "--stats-out",
                 "stats.json",
             ])
             .unwrap()
             .unwrap();
             assert_eq!(options.url, websocket);
-            assert_eq!(options.login.unwrap().origin, origin);
+            assert_eq!(options.pc.unwrap().to_string(), PC);
+            assert_eq!(options.key, Some(PathBuf::from("viewer.bpkey")));
             assert_eq!(options.stats_out_path, Some(PathBuf::from("stats.json")));
         }
-        assert!(parse(&["--dev-relay", "http://127.0.0.1:8788"]).is_err());
+        assert!(is_dev_flag("--dev-relay"));
+        assert!(parse(&["--dev-relay", "https://relay.example"]).is_err());
+        assert!(parse(&["--dev-relay", "http://relay.example", "--pc", PC]).is_err());
+        assert!(parse(&["--dev-relay", "https://relay.example/path", "--pc", PC]).is_err());
+        assert!(parse(&["--dev-relay", "https://relay.example", "--pc", "not-an-id"]).is_err());
         assert!(parse(&[
             "--dev-relay",
-            "http://127.0.0.1:8788",
-            "--password-file",
-            "p",
-            "--totp-provision",
-            "t",
+            "https://relay.example",
+            "--pc",
+            PC,
             "--codec",
             "hevc"
         ])
         .is_err());
-        assert!(parse(&["--dev-wss", "ws://127.0.0.1:8788", "--password-file", "p"]).is_err());
-    }
-    #[cfg(not(feature = "dev-login"))]
-    #[test]
-    fn dev_login_module_and_flags_are_disabled_by_default() {
-        const {
-            assert!(!cfg!(feature = "dev-login"));
-        }
-        // The auth module declaration and its option fields are cfg-gated;
-        // compiling this default build cannot resolve or include that module.
-        assert!(!is_dev_flag("--dev-relay"));
-        assert!(parse(&["--dev-relay", "http://127.0.0.1:8788"])
-            .unwrap()
-            .is_none());
-        assert!(parse(&["--dev-wss", "ws://127.0.0.1", "--password-file", "p"]).is_err());
+        assert!(parse(&[
+            "--dev-relay",
+            "https://relay.example",
+            "--pc",
+            PC,
+            "--dev-wss",
+            "ws://127.0.0.1:8788"
+        ])
+        .is_err());
+        // --pc is optional for the loopback fake host.
         let options = parse(&["--dev-wss", "ws://127.0.0.1"]).unwrap().unwrap();
-        let DevOptions {
-            url: _,
-            codec: _,
-            exit_after: _,
-            stats_path: _,
-            capture_path: _,
-            mode: _,
-            input_only: _,
-            audio_only: _,
-            audio_wasapi: _,
-            audio_volume: _,
-            audio_muted: _,
-            audio_render_test: _,
-            decoder_probe: _,
-            transport: _,
-            ice_timeout: _,
-            headless: _,
-            count_only: _,
-            input_script: _,
-            session_script: _,
-            stats_out_path: _,
-        } = options;
+        assert_eq!((options.pc, options.key), (None, None));
     }
 
     #[test]
@@ -826,28 +825,23 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "dev-login")]
     fn headless_accepts_loopback_dev_relay_and_refuses_remote_origins() {
         let options = parse(&[
             "--dev-headless",
             "--dev-relay",
             "http://127.0.0.1:8788",
-            "--password-file",
-            "fake-password",
-            "--totp-provision",
-            "fake-provision",
+            "--pc",
+            "77VH-7M56-8GJK-Y12J",
         ])
         .unwrap()
         .unwrap();
-        assert!(options.headless && options.login.is_some());
+        assert!(options.headless && options.pc.is_some());
         assert!(parse(&[
             "--dev-headless",
             "--dev-relay",
             "https://relay.example",
-            "--password-file",
-            "p",
-            "--totp-provision",
-            "t",
+            "--pc",
+            "77VH-7M56-8GJK-Y12J",
         ])
         .is_err());
     }

@@ -33,9 +33,17 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, state: &AppState, us: &mut UiState) {
             let w = ui.available_width().min(620.0);
             ui.set_max_width(w);
             let id = state.this_device.id.as_str();
-            line(ui, cx, "Device ID", false, "PCs show this ID when they pair or list this device.", false, |ui, _| {
-                widgets::id_text(ui, id, true);
-            });
+            line(
+                ui,
+                cx,
+                "Device ID",
+                false,
+                "PCs show this ID when they pair or list this device.",
+                false,
+                |ui, _| {
+                    widgets::id_text(ui, id, true);
+                },
+            );
             line(
                 ui,
                 cx,
@@ -89,7 +97,16 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, state: &AppState, us: &mut UiState) {
                 },
             );
             flow::actions(ui, |ui| {
-                if widgets::button(ui, cx, BtnKind::Ghost, BtnSize::Normal, None, "Back to your PCs").clicked() {
+                if widgets::button(
+                    ui,
+                    cx,
+                    BtnKind::Ghost,
+                    BtnSize::Normal,
+                    None,
+                    "Back to your PCs",
+                )
+                .clicked()
+                {
                     go_home = true;
                 }
             });
@@ -139,14 +156,22 @@ fn line(
     }
     let top = ui.cursor().min;
     let ctrl_max = (full - MIN_TEXT_W - GAP).max(0.0);
-    let ctrl_rect = Rect::from_min_max(pos2(top.x + full - ctrl_max, top.y), pos2(top.x + full, top.y + text_h));
-    let mut ctrl_ui = ui.new_child(UiBuilder::new().max_rect(ctrl_rect).layout(Layout::right_to_left(Align::Center)));
+    let ctrl_rect = Rect::from_min_max(
+        pos2(top.x + full - ctrl_max, top.y),
+        pos2(top.x + full, top.y + text_h),
+    );
+    let mut ctrl_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(ctrl_rect)
+            .layout(Layout::right_to_left(Align::Center)),
+    );
     control(&mut ctrl_ui, cx);
     let used = ctrl_ui.min_rect().width();
     let text_w = (full - used - GAP).max(MIN_TEXT_W);
     let text_rect = line_text(ui, label, draft, hint, text_w);
     if (text_rect.height() - text_h).abs() > 0.5 {
-        ui.ctx().data_mut(|d| d.insert_temp(key, text_rect.height()));
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(key, text_rect.height()));
         ui.ctx().request_repaint();
     }
     ui.add_space(8.0);
@@ -161,13 +186,23 @@ fn line_text(ui: &mut Ui, label: &str, draft: bool, hint: &str, width: f32) -> R
         ui.set_width(width);
         // 22 px: the Draft tag's height.
         contract::row(ui, "setting-label", 22.0, |ui| {
-            contract::text(ui, RichText::new(label).font(theme::bold(13.0)).color(theme::INK), true);
+            contract::text(
+                ui,
+                RichText::new(label)
+                    .font(theme::bold(13.0))
+                    .color(theme::INK),
+                true,
+            );
             if draft {
                 widgets::tag(ui, "Draft", true);
             }
         });
         ui.add_space(2.0);
-        ui.label(RichText::new(hint).font(theme::body(11.5)).color(theme::INK_FAINT));
+        ui.label(
+            RichText::new(hint)
+                .font(theme::body(11.5))
+                .color(theme::INK_FAINT),
+        );
     })
     .response
     .rect

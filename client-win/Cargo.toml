@@ -52,9 +52,10 @@ tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
 url = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-hmac = { version = "0.12", optional = true }
-sha1 = { version = "0.10", optional = true }
+# Device keys: the viewer key file, the relay proof and IDs (docs/architecture/device-keys.md).
+bp-device-key = { path = "../crates/bp-device-key", features = ["keygen", "keyfile", "phase2"] }
+base64 = "0.22"
+zeroize = "1"
 
 # The same windows package as the shell; Cargo unions these target features.
 [target.'cfg(windows)'.dependencies]
@@ -67,15 +68,21 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_System_Registry",
     "Win32_UI_Input",
+    "Win32_Security_Cryptography",
+    "Win32_System_Console",
 ] }
-
-[features]
-default = []
-dev-login = ["dep:hmac", "dep:sha1"]
 # --- end plumbing ---
 
 [profile.release]
 debug = "line-tables-only"
+
+# The key-file KDF (Argon2id, 64 MiB, 3 passes) is far too slow unoptimised; the key-store
+# tests and `key create --passphrase-prompt` in debug builds run it.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 # --- UI track: layout and snapshot tests ---
 # TOML cannot reopen [dependencies]' neighbour table from inside the UI block
@@ -83,3 +90,8 @@ debug = "line-tables-only"
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }
 # --- end UI track tests ---
+
+# --- plumbing tests ---
+# The relay end-to-end tests (src/session/relay_e2e_tests.rs) start the native relay in-process.
+bp-relay-server = { path = "../relay-rs/server" }
+# --- end plumbing tests ---

@@ -638,8 +638,15 @@ async fn a_monitor_switch_admits_the_new_keyframe_on_the_same_peer() {
     .await;
     browser
         .drive(&mut ws, Instant::now() + Duration::from_secs(3), |seen| {
-            seen.signals.iter().any(|m| m["reason"] == "monitor-switched")
-                && seen.signals.iter().filter(|m| m["type"] == "monitor-list").count() == 2
+            seen.signals
+                .iter()
+                .any(|m| m["reason"] == "monitor-switched")
+                && seen
+                    .signals
+                    .iter()
+                    .filter(|m| m["type"] == "monitor-list")
+                    .count()
+                    == 2
         })
         .await;
 
@@ -656,7 +663,10 @@ async fn a_monitor_switch_admits_the_new_keyframe_on_the_same_peer() {
         .collect();
     assert_eq!(
         states,
-        vec![("unavailable", "monitor-switch"), ("active", "monitor-switched")],
+        vec![
+            ("unavailable", "monitor-switch"),
+            ("active", "monitor-switched")
+        ],
         "{signals:?}"
     );
     let switched = signals
@@ -680,13 +690,19 @@ async fn a_monitor_switch_admits_the_new_keyframe_on_the_same_peer() {
     send_json(&mut ws, request_first_frame("ff-2")).await;
     browser
         .drive(&mut ws, Instant::now() + Duration::from_secs(4), |seen| {
-            seen.admitted.as_ref().is_some_and(|a| a["requestId"] == "ff-2")
+            seen.admitted
+                .as_ref()
+                .is_some_and(|a| a["requestId"] == "ff-2")
         })
         .await;
     let second = browser.seen.admitted.clone().expect("second admission");
     assert_eq!(second["requestId"], "ff-2", "{second}");
     assert_eq!(second["transport"], "webrtc", "{second}");
-    assert_eq!(second["generation"].as_u64(), Some(u64::from(new_generation)), "{second}");
+    assert_eq!(
+        second["generation"].as_u64(),
+        Some(u64::from(new_generation)),
+        "{second}"
+    );
     assert_ne!(
         second["rtpTimestamp"].as_u64(),
         Some(first_ts),
@@ -700,7 +716,10 @@ async fn a_monitor_switch_admits_the_new_keyframe_on_the_same_peer() {
     assert_eq!(snapshot.counters.monitor_switches, 1);
     let report = &snapshot.rtc[0];
     assert_eq!(report.reseeks, 1, "the switch is the only reseek");
-    assert!(report.admissions >= 2, "one admission per keyframe asked for");
+    assert!(
+        report.admissions >= 2,
+        "one admission per keyframe asked for"
+    );
     assert_eq!(report.admitted_generation, Some(new_generation));
     assert_eq!(
         report.admitted_rtp_timestamp.map(u64::from),

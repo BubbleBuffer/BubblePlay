@@ -3,8 +3,6 @@
 mod app;
 mod audio_dev;
 mod decode;
-#[cfg(feature = "dev-login")]
-mod dev_login;
 mod headless;
 pub(crate) mod input_dev;
 mod live_input;
@@ -12,6 +10,11 @@ mod metrics;
 mod options;
 mod order;
 mod pacing;
+#[cfg(test)]
+mod relay_e2e_tests;
+#[cfg(test)]
+#[path = "../../tests/support/relay_pc.rs"]
+mod relay_pc;
 mod stats;
 
 pub use crate::audio::AudioHandle as SessionAudioControl;
@@ -31,7 +34,7 @@ use std::{
 use crate::{
     media::{Codec, MediaRuntime, MediaStats, StatsSnapshot, VideoRenderer},
     model::{AppState, Backend, Link, Monitor, PcKind, Quality, RemotePc, Session, Stats},
-    net::{self, CookieJar, DecoderFeedback, NetConfig, NetState, TransportStats},
+    net::{self, DecoderFeedback, NetConfig, NetState, TransportStats, ViewerAuth},
     shell::{Shell, ShellConfig},
 };
 use anyhow::{bail, Context, Result};
@@ -145,6 +148,9 @@ impl Drop for Running {
 }
 
 pub fn run_dev(options: DevOptions) -> Result<()> {
+    if let Some(code) = &options.pair {
+        return pair_dev(&options, code);
+    }
     let result = if options.audio_only || options.audio_render_test || options.decoder_probe {
         audio_dev::run(&options)
     } else if options.headless {
@@ -155,19 +161,58 @@ pub fn run_dev(options: DevOptions) -> Result<()> {
     finish_dev(&options, result)
 }
 
-/// Development login happens once, before any window, network or device work.
-/// Reconnects reuse this jar and never repeat the single-use TOTP POST.
-#[cfg(feature = "dev-login")]
-fn session_cookies(options: &DevOptions) -> Result<CookieJar> {
-    match &options.login {
-        Some(login) => Ok(dev_login::login(login)?),
-        None => Ok(CookieJar::new()),
-    }
+/// The viewer key is opened (and its passphrase asked) once, before any window, network
+/// or device work. A key that cannot be unlocked means no connection.
+fn viewer_auth(options: &DevOptions) -> Result<ViewerAuth> {
+    let identity = crate::store::key::open_identity(options.key.as_deref())?;
+    let store = crate::store::pcs::PcStore::default_location()?;
+    viewer_auth_in(options, identity, &store)
 }
 
-#[cfg(not(feature = "dev-login"))]
-fn session_cookies(_options: &DevOptions) -> Result<CookieJar> {
-    Ok(CookieJar::new())
+/// The viewer auth for `identity`, trusting the PCs pinned in `store`.
+pub(crate) fn viewer_auth_in(
+    options: &DevOptions,
+    identity: bp_device_key::DeviceIdentity,
+    store: &crate::store::pcs::PcStore,
+) -> Result<ViewerAuth> {
+    Ok(ViewerAuth::new(identity, options.pc).with_paired(store.pinned()?))
+}
+
+/// `--pair <code> --pc <id> --dev-relay <origin>`: pair with the PC, print the number to
+/// compare once both proofs verify, and pin the PC in pcs.json on `pair-done`. A denied or
+/// failed pairing stores nothing and exits non-zero.
+fn pair_dev(options: &DevOptions, code: &str) -> Result<()> {
+    crate::store::console::attach();
+    let store = crate::store::pcs::PcStore::default_location()?;
+    let identity = crate::store::key::open_identity(options.key.as_deref())?;
+    let entry = pair_into(options, code, identity, &store, &mut |line: &str| {
+        println!("{line}")
+    })?;
+    println!("Paired with {} ({})", entry.id, store.path().display());
+    Ok(())
+}
+
+/// The `--pair` flow after the key and store are open: pair over `options.url`, write
+/// the number to compare and "Confirm on the PC" to `out`, and pin the PC in `store`.
+pub(crate) fn pair_into(
+    options: &DevOptions,
+    code: &str,
+    identity: bp_device_key::DeviceIdentity,
+    store: &crate::store::pcs::PcStore,
+    out: &mut dyn FnMut(&str),
+) -> Result<crate::store::pcs::PcEntry> {
+    let config = NetConfig::new(
+        options.url.clone(),
+        net::Codec::H264,
+        ViewerAuth::new(identity, options.pc),
+    );
+    let code = net::phase2::parse_code(code).map_err(anyhow::Error::msg)?;
+    let (id, public) = net::pair(&config, code, &mut |number: &str| {
+        out(number);
+        out("Confirm on the PC");
+    })?;
+    let relay = options.relay_origin.as_deref().unwrap_or_default();
+    store.pin(&id, &public, relay)
 }
 
 fn finish_dev(options: &DevOptions, result: Result<()>) -> Result<()> {
@@ -214,7 +259,7 @@ fn run_windowed(options: DevOptions) -> Result<()> {
     if options.input_only {
         return input_dev::run(options);
     }
-    let cookies = session_cookies(&options)?;
+    let viewer = viewer_auth(&options)?;
     let started = Instant::now();
     let pacing = pacing::Pacing::new(started);
     pacing.mark("runtime_start");
@@ -270,7 +315,7 @@ fn run_windowed(options: DevOptions) -> Result<()> {
             Codec::H264 => net::Codec::H264,
             Codec::Hevc => net::Codec::Hevc,
         },
-        cookies,
+        viewer,
     );
     config.transport = options.transport;
     config.ice_checking_timeout = options

@@ -7,6 +7,9 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use bp_device_key::{DeviceIdentity, Role};
 use serde_json::{json, Map, Value};
 
 use super::config::Codec;
@@ -186,6 +189,8 @@ pub enum RelayControl {
     /// Handshake reply. `/ws` carries `mediaEpoch`; `/media-ws` does not.
     HelloOk {
         media_epoch: Option<String>,
+        /// The media-socket ticket (`/ws` only).
+        ticket: Option<String>,
     },
     /// Whether the host is on the other side of the media room.
     MediaPeer {
@@ -201,6 +206,10 @@ pub fn parse_relay_control(text: &str) -> Option<RelayControl> {
         "hello-ok" => Some(RelayControl::HelloOk {
             media_epoch: object
                 .get("mediaEpoch")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            ticket: object
+                .get("ticket")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         }),
@@ -372,8 +381,58 @@ fn uint32_value(value: &Value) -> Option<u32> {
 
 // ---- Outbound messages (byte-for-byte shape of receiver.js) -------------------
 
-pub fn hello_message(role: &str) -> String {
-    json!({ "type": "hello", "role": role }).to_string()
+// ---- Phase 2 viewer hello (docs/architecture/device-keys.md, "Phase 2 relay protocol") ----
+
+/// The viewer's signed hello on `/ws?pc=<id>`: exactly `type`, `role`, `id`, `public`.
+pub fn viewer_hello(identity: &DeviceIdentity) -> String {
+    json!({
+        "type": "hello",
+        "role": "viewer",
+        "id": identity.id().to_string(),
+        "public": identity.public_b64(),
+    })
+    .to_string()
+}
+
+/// The pairing `hello` (decision 17): the normal viewer hello plus `pair`, the relay admit
+/// hash of the PC ID and the pairing code (base64url).
+pub fn viewer_hello_pairing(identity: &DeviceIdentity, admit: &str) -> String {
+    json!({
+        "type": "hello",
+        "role": "viewer",
+        "id": identity.id().to_string(),
+        "public": identity.public_b64(),
+        "pair": admit,
+    })
+    .to_string()
+}
+
+/// The 32-byte nonce of a `{"type":"register-challenge","nonce"}`, or `None` for anything else.
+pub fn parse_register_challenge(text: &str) -> Option<[u8; 32]> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let object = value.as_object()?;
+    if object.get("type")?.as_str()? != "register-challenge" {
+        return None;
+    }
+    let nonce = URL_SAFE_NO_PAD
+        .decode(object.get("nonce")?.as_str()?)
+        .ok()?;
+    nonce.try_into().ok()
+}
+
+/// The answer to the challenge: a relay proof for role `viewer` at the relay's public `origin`.
+pub fn register_proof(identity: &DeviceIdentity, origin: &str, nonce: &[u8; 32]) -> String {
+    let signature = identity.sign_relay_proof(Role::Viewer, origin, nonce);
+    json!({
+        "type": "register-proof",
+        "signature": URL_SAFE_NO_PAD.encode(signature),
+    })
+    .to_string()
+}
+
+/// The media socket's ticket hello on `/media-ws?pc=<id>&epoch=<epoch>`.
+pub fn media_hello(ticket: &str) -> String {
+    json!({ "type": "hello", "role": "media-viewer", "ticket": ticket }).to_string()
 }
 
 pub fn start_message(epoch: &str, codec: Codec) -> String {
@@ -773,7 +832,7 @@ mod tests {
             r#"42"#,
             r#"{"noType":true}"#,
             r#"{"type":7}"#,
-            r#"{"type":"hello","role":"client"}"#,
+            r#"{"type":"hello","role":"viewer"}"#,
             "",
         ] {
             assert!(
@@ -790,7 +849,7 @@ mod tests {
             r#"{"type":"hello","role":"media-host"}"#
         ));
         for text in [
-            r#"{"type":"hello","role":"client"}"#,
+            r#"{"type":"hello","role":"viewer"}"#,
             r#"{"type":"hello"}"#,
             r#"{"type":"pong"}"#,
             r#"{"type":"ack","generation":1,"seq":1,"recvTsMs":1}"#,
@@ -807,12 +866,16 @@ mod tests {
                 r#"{"type":"hello-ok","mediaEpoch":"0123456789abcdef0123456789abcdef"}"#
             ),
             Some(RelayControl::HelloOk {
-                media_epoch: Some("0123456789abcdef0123456789abcdef".into())
+                media_epoch: Some("0123456789abcdef0123456789abcdef".into()),
+                ticket: None,
             })
         );
         assert_eq!(
             parse_relay_control(r#"{"type":"hello-ok","registeredAtMs":5}"#),
-            Some(RelayControl::HelloOk { media_epoch: None })
+            Some(RelayControl::HelloOk {
+                media_epoch: None,
+                ticket: None
+            })
         );
         assert_eq!(
             parse_relay_control(r#"{"type":"media-peer","present":true}"#),
@@ -938,8 +1001,109 @@ mod tests {
         assert_eq!(keyframe["action"], "keyframe");
         assert_eq!(keyframe["reason"], "first-frame-timeout");
         assert_eq!(keyframe["codec"], "h264");
-        let hello: Value = serde_json::from_str(&hello_message("media-client")).unwrap();
-        assert_eq!(hello, json!({ "type": "hello", "role": "media-client" }));
+        let hello: Value = serde_json::from_str(&media_hello("TICKET")).unwrap();
+        assert_eq!(
+            hello,
+            json!({ "type": "hello", "role": "media-viewer", "ticket": "TICKET" })
+        );
+    }
+
+    fn fixture_viewer() -> (DeviceIdentity, Value) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fixtures/device-keys-contract.json");
+        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let viewer = fixture["ids"][0].clone();
+        let hex = viewer["seedHex"].as_str().unwrap();
+        let seed: Vec<u8> = (0..64)
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let seed: [u8; 32] = seed.try_into().unwrap();
+        (DeviceIdentity::from_seed(&seed), viewer)
+    }
+
+    #[test]
+    fn viewer_hello_has_exactly_the_phase_two_keys() {
+        let (identity, viewer) = fixture_viewer();
+        let hello: Value = serde_json::from_str(&viewer_hello(&identity)).unwrap();
+        assert_eq!(
+            hello,
+            json!({
+                "type": "hello",
+                "role": "viewer",
+                "id": viewer["id"],
+                "public": viewer["public"],
+            })
+        );
+    }
+
+    #[test]
+    fn register_proof_verifies_for_the_viewer_role_and_origin_only() {
+        let (identity, viewer) = fixture_viewer();
+        let challenge = json!({
+            "type": "register-challenge",
+            "nonce": URL_SAFE_NO_PAD.encode([7u8; 32]),
+        })
+        .to_string();
+        let nonce = parse_register_challenge(&challenge).expect("challenge nonce");
+        assert_eq!(nonce, [7u8; 32]);
+        let origin = "https://example.test";
+        let proof: Value =
+            serde_json::from_str(&register_proof(&identity, origin, &nonce)).unwrap();
+        let mut keys: Vec<&str> = proof
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["signature", "type"]);
+        assert_eq!(proof["type"], "register-proof");
+        let signature = URL_SAFE_NO_PAD
+            .decode(proof["signature"].as_str().unwrap())
+            .unwrap();
+        let signature: [u8; 64] = signature.try_into().unwrap();
+        let public = URL_SAFE_NO_PAD
+            .decode(viewer["public"].as_str().unwrap())
+            .unwrap();
+        let public: [u8; 32] = public.try_into().unwrap();
+        let id = viewer["id"].as_str().unwrap();
+        let verify = |role, origin: &str, nonce: &[u8; 32]| {
+            bp_device_key::verify_relay_proof(role, origin, nonce, id, &public, &signature)
+        };
+        assert!(verify(Role::Viewer, origin, &nonce).is_ok());
+        assert!(verify(Role::Host, origin, &nonce).is_err());
+        assert!(verify(Role::Viewer, "https://other.test", &nonce).is_err());
+        assert!(verify(Role::Viewer, origin, &[8u8; 32]).is_err());
+    }
+
+    #[test]
+    fn register_challenge_needs_a_32_byte_nonce() {
+        let short = json!({"type": "register-challenge", "nonce": "c2hvcnQ"}).to_string();
+        assert!(parse_register_challenge(&short).is_none());
+        let other =
+            json!({"type": "hello-ok", "nonce": URL_SAFE_NO_PAD.encode([7u8; 32])}).to_string();
+        assert!(parse_register_challenge(&other).is_none());
+        assert!(parse_register_challenge("not json").is_none());
+    }
+
+    #[test]
+    fn hello_ok_carries_the_ticket() {
+        let text = json!({
+            "type": "hello-ok",
+            "pc": "77VH-7M56-8GJK-Y12J",
+            "mediaEpoch": "0123456789abcdef0123456789abcdef",
+            "iceServers": [],
+            "ticket": "TICKET",
+        })
+        .to_string();
+        assert_eq!(
+            parse_relay_control(&text),
+            Some(RelayControl::HelloOk {
+                media_epoch: Some("0123456789abcdef0123456789abcdef".into()),
+                ticket: Some("TICKET".into()),
+            })
+        );
     }
 
     fn entry(selector: &str, selected: bool) -> Value {

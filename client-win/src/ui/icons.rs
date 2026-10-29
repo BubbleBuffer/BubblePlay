@@ -9,7 +9,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use egui::{Color32, ColorImage, Context, Painter, Rect, TextureHandle, TextureId, TextureOptions, load::SizedTexture, pos2, vec2};
+use egui::{
+    load::SizedTexture, pos2, vec2, Color32, ColorImage, Context, Painter, Rect, TextureHandle,
+    TextureId, TextureOptions,
+};
 use resvg::{tiny_skia, usvg};
 
 /// Side of the rasterised icon, in pixels (enough for 16-22 pt at 2x).
@@ -18,7 +21,10 @@ const RASTER_PX: u32 = 64;
 /// (Lucide name, SVG source). Generated from src/ui/icons/*.svg.
 const ICONS: &[(&str, &str)] = &[
     ("activity", include_str!("icons/activity.svg")),
-    ("arrow-left-right", include_str!("icons/arrow-left-right.svg")),
+    (
+        "arrow-left-right",
+        include_str!("icons/arrow-left-right.svg"),
+    ),
     ("arrow-right", include_str!("icons/arrow-right.svg")),
     ("badge-check", include_str!("icons/badge-check.svg")),
     ("ban", include_str!("icons/ban.svg")),
@@ -28,7 +34,10 @@ const ICONS: &[(&str, &str)] = &[
     ("chevron-down", include_str!("icons/chevron-down.svg")),
     ("chevron-left", include_str!("icons/chevron-left.svg")),
     ("chevron-up", include_str!("icons/chevron-up.svg")),
-    ("chevrons-up-down", include_str!("icons/chevrons-up-down.svg")),
+    (
+        "chevrons-up-down",
+        include_str!("icons/chevrons-up-down.svg"),
+    ),
     ("circle-alert", include_str!("icons/circle-alert.svg")),
     ("circle-check", include_str!("icons/circle-check.svg")),
     ("circle-stop", include_str!("icons/circle-stop.svg")),
@@ -70,7 +79,10 @@ const ICONS: &[(&str, &str)] = &[
     ("monitor-play", include_str!("icons/monitor-play.svg")),
     ("mouse", include_str!("icons/mouse.svg")),
     ("mouse-pointer-2", include_str!("icons/mouse-pointer-2.svg")),
-    ("mouse-pointer-click", include_str!("icons/mouse-pointer-click.svg")),
+    (
+        "mouse-pointer-click",
+        include_str!("icons/mouse-pointer-click.svg"),
+    ),
     ("pause", include_str!("icons/pause.svg")),
     ("pencil", include_str!("icons/pencil.svg")),
     ("pin", include_str!("icons/pin.svg")),
@@ -120,7 +132,8 @@ impl Icons {
         for (name, svg) in ICONS {
             match rasterise(svg) {
                 Ok(img) => {
-                    let handle = ctx.load_texture(format!("icon:{name}"), img, TextureOptions::LINEAR);
+                    let handle =
+                        ctx.load_texture(format!("icon:{name}"), img, TextureOptions::LINEAR);
                     textures.insert(*name, handle);
                 }
                 Err(e) => eprintln!("icon {name} failed to rasterise: {e}"),
@@ -131,7 +144,11 @@ impl Icons {
             ColorImage::new([1, 1], vec![Color32::TRANSPARENT]),
             TextureOptions::LINEAR,
         );
-        Self { textures, blank, warned: Mutex::new(HashSet::new()) }
+        Self {
+            textures,
+            blank,
+            warned: Mutex::new(HashSet::new()),
+        }
     }
 
     /// The texture for `name`, or None (logged once) for an unknown name.
@@ -171,16 +188,21 @@ impl Icons {
 /// premultiplied RGBA at RASTER_PX square.
 fn rasterise(svg: &str) -> Result<ColorImage, String> {
     let white = svg.replace("currentColor", "#ffffff");
-    let tree = usvg::Tree::from_str(&white, &usvg::Options::default()).map_err(|e| e.to_string())?;
+    let tree =
+        usvg::Tree::from_str(&white, &usvg::Options::default()).map_err(|e| e.to_string())?;
     let size = tree.size();
-    let mut pixmap = tiny_skia::Pixmap::new(RASTER_PX, RASTER_PX).ok_or_else(|| "zero-size pixmap".to_owned())?;
+    let mut pixmap = tiny_skia::Pixmap::new(RASTER_PX, RASTER_PX)
+        .ok_or_else(|| "zero-size pixmap".to_owned())?;
     let transform = tiny_skia::Transform::from_scale(
         RASTER_PX as f32 / size.width(),
         RASTER_PX as f32 / size.height(),
     );
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     let side = RASTER_PX as usize;
-    Ok(ColorImage::from_rgba_premultiplied([side, side], pixmap.data()))
+    Ok(ColorImage::from_rgba_premultiplied(
+        [side, side],
+        pixmap.data(),
+    ))
 }
 
 #[cfg(test)]

@@ -6,23 +6,39 @@
 
 #![windows_subsystem = "windows"]
 
-mod model;
-mod mock;
-mod shell;
-mod ui;
-mod net; mod media; mod session;
-mod input;
 mod audio;
+mod input;
+mod media;
+mod mock;
+mod model;
+mod net;
+mod session;
+mod shell;
+mod store;
+mod ui;
 
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if store::cli::is_subcommand(&args) {
+        // `key ...` / `pcs ...`: print to the console the command was started from.
+        store::console::attach();
+        if let Err(error) = store::cli::run(&args) {
+            eprintln!("BubblePlay: {error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if let Some(dev) = session::DevOptions::from_args(std::env::args().skip(1))? {
         if let Err(error) = session::run_dev(dev) {
             if let Some(capability) = error.downcast_ref::<media::NoHardwareVideoDecoder>() {
                 eprintln!("BubblePlay: {capability}");
             } else {
-                eprintln!("BubblePlay: {}", error.to_string().replace(['\r', '\n'], " "));
+                eprintln!(
+                    "BubblePlay: {}",
+                    error.to_string().replace(['\r', '\n'], " ")
+                );
             }
             std::process::exit(1);
         }

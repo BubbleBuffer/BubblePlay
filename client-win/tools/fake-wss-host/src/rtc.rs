@@ -442,7 +442,8 @@ impl Pump {
         self.report.admissions += 1;
         self.report.admitted_rtp_timestamp = Some(rtp_timestamp);
         self.report.admitted_generation = Some(self.generation);
-        self.report.first_keyframe_ms
+        self.report
+            .first_keyframe_ms
             .get_or_insert(self.offered_at.elapsed().as_secs_f64() * 1000.0);
         let codec = self
             .video
