@@ -600,6 +600,12 @@ fn native_drop_view_rejection(
     }
 }
 
+/// Decision 25: the service-mode host (`--privileged-agent`) needs phase 3 device keys, so in
+/// phase 2 it exits with this line instead of connecting.
+fn service_mode_refusal(privileged_agent: bool) -> Option<&'static str> {
+    privileged_agent.then_some(bubbleplay_host::service_runtime::SERVICE_MODE_UNSUPPORTED)
+}
+
 fn main() -> Result<()> {
     // Read and remove the tray's key handoff before anything else can spawn a child process.
     let device_key_handoff = bubbleplay_host::device_key::take_handoff_env();
@@ -613,10 +619,13 @@ fn main() -> Result<()> {
         .init();
 
     let mut args = parse_args()?;
-    // The privileged agent gets no PC key, so it cannot register with the relay.
-    args.device_identity = if args.privileged_agent {
-        None
-    } else {
+    // Decision 25: no service-mode host in phase 2. Exit once, before any relay connect; the
+    // Transport service treats this exit code as final and stops instead of restarting.
+    if let Some(line) = service_mode_refusal(args.privileged_agent) {
+        error!("{line}");
+        std::process::exit(bubbleplay_host::service_runtime::SERVICE_MODE_UNSUPPORTED_EXIT);
+    }
+    args.device_identity = {
         let handoff = device_key_handoff.as_deref().map(String::as_str);
         match bubbleplay_host::device_key::identity_from_handoff(handoff) {
             Ok(identity) => {
@@ -7194,6 +7203,21 @@ fn physical_monitor_count() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn privileged_agent_gets_the_phase_3_exit_not_a_connect() {
+        let args = super::parse_args_from(
+            ["--mode", "serve", "--privileged-agent"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(
+            super::service_mode_refusal(args.privileged_agent),
+            Some("service mode needs phase 3 device keys")
+        );
+        assert_eq!(super::service_mode_refusal(false), None);
+    }
+
     #[test]
     fn audio_cli_defaults_on_and_accepts_no_audio() {
         assert!(super::parse_args_from(std::iter::empty()).unwrap().audio);

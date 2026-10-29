@@ -5,7 +5,7 @@ $path = Join-Path $PSScriptRoot 'setup-tray.ps1'
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'setup-tray.ps1 has syntax errors.' }
-foreach ($name in @('ConvertFrom-Secure', 'Assert-HostCredentials', 'Update-HostConfig')) {
+foreach ($name in @('ConvertFrom-Secure', 'Assert-HostCredentials', 'Update-HostConfig', 'Get-RemovableServiceNames', 'Remove-BubblePlayServices')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if (-not $node) { throw "Missing tested function $name." }
     Invoke-Expression $node.Extent.Text
@@ -22,7 +22,7 @@ function Secure([string]$Value) {
 }
 function Get-ExistingHostConfig { $script:fixtureExisting }
 function Get-ServiceConfig { $script:fixtureService }
-function Add-Step { param($Name, $Status, $Detail) $script:steps.Add([string]$Status) }
+function Add-Step { param($Name, $Status, $Detail) $script:steps.Add([string]$Status); $script:stepDetails.Add("$Name $Status $Detail") }
 function Protect-UserHex { throw 'Test must never write configuration.' }
 function Invoke-ConfigPreview {
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -30,6 +30,7 @@ function Invoke-ConfigPreview {
     Update-HostConfig
 }
 $steps = [Collections.Generic.List[string]]::new()
+$stepDetails = [Collections.Generic.List[string]]::new()
 $fixtureExisting = $null; $fixtureService = $null
 $Token = $null; $WorkerUrl = $null; $Monitor = $null
 $HostConfigPath = 'synthetic-host.json'; $IsWhatIf = $true
@@ -59,4 +60,22 @@ $fixtureService = [pscustomobject]@{ Readable = $true; Path = 'synthetic-service
 Assert-Rejected { Invoke-ConfigPreview -WhatIf } 'registration token'
 $fixtureService.Token = $goodToken
 if ((Invoke-ConfigPreview -WhatIf) -ne 'done') { throw 'Valid synthetic migration should plan config.' }
-Write-Output 'setup credential tests passed (boundaries, fresh/saved/migrated config, removed-field rewrite, explicit empty/token-only updates; no writes).'
+# Decision 25: an older install's Transport service is always removed, even with -KeepServices.
+$ServiceNames = @('BubblePlayLabHelper', 'BubblePlayTransport', 'BubblePlayBroker')
+$TransportServiceName = 'BubblePlayTransport'
+$fixtureServices = @('BubblePlayTransport', 'BubblePlayBroker')
+function Get-Service { param($Name, $ErrorAction) if ($script:fixtureServices -contains $Name) { [pscustomobject]@{ Name = $Name } } }
+function Invoke-ServicesPreview {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+    Remove-BubblePlayServices
+}
+$KeepServices = $false
+if ((@(Get-RemovableServiceNames) -join ',') -ne ($ServiceNames -join ',')) { throw 'Without -KeepServices every BubblePlay service is removable.' }
+$stepDetails.Clear()
+$KeepServices = $true
+if ((@(Get-RemovableServiceNames) -join ',') -ne 'BubblePlayTransport') { throw '-KeepServices must still remove Transport.' }
+Invoke-ServicesPreview -WhatIf
+if ($stepDetails[0] -ne 'services planned Stop and delete: BubblePlayTransport (ProgramData is kept).') { throw "Transport removal must be planned and recorded: $($stepDetails[0])" }
+if ($stepDetails[1] -notlike 'services-kept skipped *') { throw 'The kept services must be recorded.' }
+Write-Output 'setup credential tests passed (boundaries, fresh/saved/migrated config, removed-field rewrite, explicit empty/token-only updates, Transport removal; no writes).'

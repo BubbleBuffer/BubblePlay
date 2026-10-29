@@ -95,6 +95,9 @@ $ServiceBinaries = @('bubbleplay_broker.exe', 'bubbleplay_transport.exe', 'bubbl
     'bubbleplay_input_proxy.exe', 'bubbleplay_lab_helper.exe', 'bubbleplay-host.exe')
 $TrustedSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
 $ServiceNames = @('BubblePlayLabHelper', 'BubblePlayTransport', 'BubblePlayBroker')
+# Decision 25: the service-mode host is unsupported in phase 2, so setup never installs or starts
+# Transport and removes one left by an older install, even with -KeepServices.
+$TransportServiceName = 'BubblePlayTransport'
 $ServiceProcessNames = @('bubbleplay_broker', 'bubbleplay_transport', 'bubbleplay_agent',
     'bubbleplay_input_proxy', 'bubbleplay_lab_helper', 'bubbleplay_lab_activity_guard', 'bubbleplay-host')
 $UserBinaries = @('bubbleplay-host.exe', 'bubbleplay_tray.exe') + $PrivilegedBinaries
@@ -579,9 +582,9 @@ function Get-MachineWork([bool]$ConfigNeedsMachine) {
     if (Test-Path -LiteralPath $LegacyElevatedDir) { $work.Add("remove the old elevated host copy $LegacyElevatedDir") }
     if (-not $AgentOnly) {
         if ($ConfigNeedsMachine) { $work.Add("migrate $ServiceDataDir\transport.json into $HostConfigPath (CurrentUser DPAPI)") }
+        $services = @(Get-RemovableServiceNames | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
+        if ($services.Count) { $work.Add("stop and delete services $($services -join ', ') (ProgramData is kept)") }
         if (-not $KeepServices) {
-            $services = @($ServiceNames | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
-            if ($services.Count) { $work.Add("stop and delete services $($services -join ', ') (ProgramData is kept)") }
             $binaries = @()
             try { $binaries = @($ServiceBinaries | Where-Object { Test-Path -LiteralPath (Join-Path $MachineDir $_) -PathType Leaf }) } catch { }
             if ($binaries.Count) { $work.Add("delete old service binaries in $MachineDir that match installed-hashes.json ($($binaries -join ', '))") }
@@ -904,9 +907,13 @@ function Remove-LegacyElevated {
     if ((Test-Path -LiteralPath $stale) -and $PSCmdlet.ShouldProcess($stale, 'Delete stale heartbeat')) { Remove-Item -Force -LiteralPath $stale }
 }
 
+function Get-RemovableServiceNames {
+    if ($KeepServices) { return @($TransportServiceName) }
+    return @($ServiceNames)
+}
+
 function Remove-BubblePlayServices {
-    if ($KeepServices) { Add-Step 'services' 'skipped' '-KeepServices given.'; return }
-    $present = @($ServiceNames | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
+    $present = @(Get-RemovableServiceNames | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
     if ($present.Count -eq 0) {
         Add-Step 'services' 'unchanged' 'No BubblePlay services registered.'
     }
@@ -926,6 +933,7 @@ function Remove-BubblePlayServices {
     else {
         Add-Step 'services' 'planned' "Stop and delete: $($present -join ', ') (ProgramData is kept)."
     }
+    if ($KeepServices) { Add-Step 'services-kept' 'skipped' '-KeepServices given; only Transport is removed (decision 25).'; return }
 
     $leftovers = @(Get-Process -Name $ServiceProcessNames -ErrorAction SilentlyContinue |
             Where-Object { $_.Path -and $_.Path.StartsWith($MachineDir, [StringComparison]::OrdinalIgnoreCase) })

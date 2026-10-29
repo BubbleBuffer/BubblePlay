@@ -55,6 +55,18 @@ const MAX_SUPERVISED_LOG_BYTES: u64 = 8 * 1024 * 1024;
 const LIVE_RETAINED_LOG_BYTES: u64 = 7 * 1024 * 1024;
 const MAX_CONSECUTIVE_START_FAILURES: usize = 5;
 
+/// Decision 25: the service-mode host (`--privileged-agent`) is unsupported in phase 2, because
+/// it needs a machine-scoped PC key (phase 3). It logs this line and exits once with
+/// [`SERVICE_MODE_UNSUPPORTED_EXIT`]; the Transport service then stops cleanly (exit code 0, so
+/// no SCM failure action) instead of restarting it.
+pub const SERVICE_MODE_UNSUPPORTED: &str = "service mode needs phase 3 device keys";
+pub const SERVICE_MODE_UNSUPPORTED_EXIT: i32 = 78;
+
+/// A Transport host exit that must not be restarted (decision 25).
+fn transport_exit_is_final(code: Option<i32>) -> bool {
+    code == Some(SERVICE_MODE_UNSUPPORTED_EXIT)
+}
+
 fn agent_creation_flags() -> PROCESS_CREATION_FLAGS {
     CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_NO_WINDOW
 }
@@ -245,6 +257,9 @@ fn run_loop(
         if let Some(supervisor) = supervisor.as_mut() {
             let result = supervisor.tick(desired_session);
             stop_on_failure(result, || supervisor.stop(), &bubbleplay_data_dir())?;
+            if supervisor.finished() {
+                break;
+            }
         }
     }
 
@@ -329,6 +344,11 @@ impl Supervisor {
                 install_dir.join("bubbleplay-host.exe"),
             )),
         })
+    }
+
+    /// The supervised work ended for good (decision 25); the service stops cleanly.
+    fn finished(&self) -> bool {
+        matches!(self, Self::Transport(supervisor) if supervisor.finished)
     }
 
     fn tick(&mut self, desired_session: Option<u32>) -> Result<()> {
@@ -633,6 +653,8 @@ struct TransportSupervisor {
     child: Option<JobChild>,
     child_started: Option<Instant>,
     restart: RestartPolicy,
+    /// The host reported decision 25; it is not restarted.
+    finished: bool,
 }
 
 impl TransportSupervisor {
@@ -642,10 +664,14 @@ impl TransportSupervisor {
             child: None,
             child_started: None,
             restart: RestartPolicy::new(Instant::now()),
+            finished: false,
         }
     }
 
     fn tick(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
         let now = Instant::now();
         if let Some(child) = self.child.as_mut() {
             match child.child.try_wait() {
@@ -655,6 +681,13 @@ impl TransportSupervisor {
                     }) {
                         self.restart.healthy(now);
                     }
+                    return Ok(());
+                }
+                Ok(Some(status)) if transport_exit_is_final(status.code()) => {
+                    warn!("{SERVICE_MODE_UNSUPPORTED}; stopping the Transport service");
+                    self.child = None;
+                    self.child_started = None;
+                    self.finished = true;
                     return Ok(());
                 }
                 Ok(Some(status)) => warn!(?status, "BubblePlay transport host exited"),
@@ -1371,6 +1404,14 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_decision_25_exit_stops_transport_restarts() {
+        assert!(transport_exit_is_final(Some(SERVICE_MODE_UNSUPPORTED_EXIT)));
+        for code in [None, Some(0), Some(1), Some(101)] {
+            assert!(!transport_exit_is_final(code));
+        }
+    }
 
     #[test]
     fn lifecycle_reaches_running_then_stops_idempotently() {
