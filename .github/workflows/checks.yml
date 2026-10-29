@@ -10,10 +10,10 @@ on:
 permissions:
   contents: read
 
-# A newer push to a lane branch cancels its older run, so superseded runs don't hold build01 runners.
+# A newer push or PR update cancels its older run, so superseded runs don't hold runners. Master runs always finish.
 concurrency:
   group: checks-${{ github.ref }}
-  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/lane/') }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
   browser:
@@ -39,6 +39,9 @@ jobs:
 
   windows-packaging:
     runs-on: windows-latest
+    # GitHub-hosted Windows minutes are billed: run on PRs, master and manual runs only, not on lane pushes.
+    if: github.event_name != 'push' || github.ref == 'refs/heads/master'
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -184,7 +187,9 @@ jobs:
   host:
     name: Host checks (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 60
+    # GitHub-hosted Windows minutes are billed: run on PRs, master and manual runs only, not on lane pushes.
+    if: github.event_name != 'push' || github.ref == 'refs/heads/master'
+    timeout-minutes: 30
     env:
       # Read by the nvidia-video-codec-sdk build script. Set for every step, because
       # clippy and fmt run cargo from the repo root, which skips host/.cargo/config.toml.
@@ -241,7 +246,9 @@ jobs:
   client-win:
     name: Windows client checks (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 60
+    # GitHub-hosted Windows minutes are billed: run on PRs, master and manual runs only, not on lane pushes.
+    if: github.event_name != 'push' || github.ref == 'refs/heads/master'
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
