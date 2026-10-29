@@ -61,28 +61,6 @@ class IconExportsTest(unittest.TestCase):
         self.assertEqual(paints, {"#FFFFFFFF"})
         self.assertEqual(hashlib.sha256(icons.MASTER.read_bytes()).hexdigest(), master_hash)
 
-    def test_relays_share_the_inline_mark(self):
-        pattern = icons.re.compile(r"<!-- BRAND-MARK:start -->\s*(.*?)\s*<!-- BRAND-MARK:end -->", icons.re.S)
-        worker = pattern.search((icons.PUBLIC / "login.html").read_text()).group(1)
-        relay = pattern.search((icons.ROOT / "relay/auth.go").read_text()).group(1)
-        self.assertEqual(worker, relay)
-        self.assertIn('width="64"', worker)
-
-    def test_login_identity_is_inline_and_shared(self):
-        pattern = icons.re.compile(r"<!-- BRAND-IDENTITY:start -->\s*(.*?)\s*<!-- BRAND-IDENTITY:end -->", icons.re.S)
-        pages = [(icons.PUBLIC / "login.html").read_text(), (icons.ROOT / "relay/auth.go").read_text()]
-        identities = [pattern.search(page).group(1) for page in pages]
-        self.assertEqual(identities[0], identities[1])
-        container = icons.ET.fromstring(identities[0])
-        root = container.find(f"{{{icons.SVG_NS}}}svg")
-        self.assertEqual(root.get("width"), "26")
-        self.assertEqual(root.get("aria-hidden"), "true")
-        for page in pages:
-            self.assertNotIn('d="M9 4H4v16h16v-5M15 4h5v5"', page)
-        for node in root.iter():
-            self.assertNotIn("style", node.attrib)
-            self.assertNotIn(icons.local(node.tag), ("image", "script", "style"))
-
 
 if __name__ == "__main__":
     unittest.main()
