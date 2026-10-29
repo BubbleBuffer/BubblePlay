@@ -267,13 +267,15 @@ test("DTLS binding signatures preserve each side's local/remote order", () => {
 
 test("four signaling examples have exact shapes and match the handshake", () => {
   const h = fixture.handshake, messages = h.messages;
-  assert.deepEqual(Object.keys(messages).sort(), ["authBind", "authFinish", "authHello", "authHost"]);
+  assert.deepEqual(Object.keys(messages).sort(), ["authBind", "authBindPc", "authFinish", "authHello", "authHost"]);
   assert.deepEqual(messages.authHello, { type: "auth-hello", id: h.viewer.id, public: h.viewer.public,
     nonce: h.viewer.nonce, ephemeral: h.viewer.ephemeral, caps: ["control-aead-v1", "dtls-bind-v1"] });
   assert.deepEqual(messages.authHost, { type: "auth-host", id: h.pc.id, public: h.pc.public,
     nonce: h.pc.nonce, ephemeral: h.pc.ephemeral, signature: h.pcSignature });
   assert.deepEqual(messages.authFinish, { type: "auth-finish", signature: h.viewerSignature });
   assert.deepEqual(messages.authBind, { type: "auth-bind", signature: h.dtls.viewer.signature });
+  assert.deepEqual(messages.authBindPc, { type: "auth-bind", signature: h.dtls.pc.signature });
+  assert.equal(crypto.verify(null, fromHex(h.dtls.pc.signedBytesHex), publicKey(bytes(h.pc.public, 32)), bytes(messages.authBindPc.signature, 64)), true);
 });
 
 test("relay registration proofs recompute encodings, hashes and signatures", () => {

@@ -6,7 +6,6 @@ import {
   desktopTransitionPlan, rtcAdmissionGate, rtcGateOpens, rtcInPlaceCapable, rtpTimestampAtOrAfter,
   transitionKeyframeAdmits, transitionKeyframeVerdict,
 } from "../public/monitor-selection.js";
-import { validFirstFrameMessage } from "../src/protocol-validation.js";
 
 const contract = JSON.parse(readFileSync(new URL("../../fixtures/secure-desktop-contract.json", import.meta.url), "utf8")).webrtcInPlaceTransition;
 const SOURCE_REASONS = ["desktop-switched", "capture-recovered", "session-changed", "agent-restarted"];
@@ -82,13 +81,6 @@ test("desktop-source and monitor transitions on WebRTC stay in place only with t
   }
   assert.deepEqual(desktopTransitionPlan({ ...base, reason: "monitor-switched", rtcInPlace: true }), { kind: "monitor", holdInput: true, action: "handshake" });
   assert.deepEqual(desktopTransitionPlan({ ...base, reason: "monitor-switched", rtcInPlace: false }), { kind: "monitor", holdInput: false, action: "restart-peer" });
-});
-
-test("both relays' validator shape accepts the optional rtpTimestamp on admission", () => {
-  for (const message of [contract.admitted, contract.legacyAdmitted])
-    assert.equal(validFirstFrameMessage(message, "host", JSON.stringify(message)), true);
-  assert.equal(contract.admitted.rtpTimestamp, contract.gateCases[0].admitted);
-  assert.equal("rtpTimestamp" in contract.legacyAdmitted, false);
 });
 
 // Runs the receiver's real handshake functions in a sandbox.

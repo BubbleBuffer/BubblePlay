@@ -1,0 +1,44 @@
+[package]
+name = "bp-relay-server"
+description = "Native axum and tokio shell of the BubblePlay relay: config, state files, subcommands, static assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "bp_relay_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bp-relay"
+path = "src/main.rs"
+
+[features]
+default = []
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+bp-relay-core = { path = "../core" }
+futures-util = "0.3"
+base64 = "0.22"
+bp-device-key = { path = "../../crates/bp-device-key" }
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+ipnet = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+sha2 = "0.10"
+mime_guess = "2"
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2.6"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.26"
+tower = { version = "0.5", features = ["util"] }

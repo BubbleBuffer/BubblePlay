@@ -7,13 +7,12 @@ Run development commands below from the repository root. For the public product 
 | Path | What to change here |
 | --- | --- |
 | [`host/`](../host) | Rust Windows capture/encoding, input, clipboard, files, tray and optional admin-input helper; the retired LocalSystem service path was removed |
-| [`relay/`](../relay/README.md) | Go relay/authentication and Docker definitions |
-| [`worker/src/`](../worker/src) | Cloudflare relay, authentication and protocol validation |
-| [`worker/public/`](../worker/public) | Browser receiver shared by Go and Cloudflare; no frontend bundler |
+| [`relay-rs/`](../relay-rs/README.md) | The relay: signaling, authentication, static assets, Cloudflare Worker and Docker definitions |
+| [`worker/public/`](../worker/public) | Browser receiver served by the relay; no frontend bundler |
 | [`android/`](../android/README.md) | Native Kotlin receiver, gestures, codec and APK build |
 | [`fixtures/`](../fixtures) | Shared packet and feature contracts; update affected language implementations together |
 | [`tools/`](../tools/README.md) | Repository checks, release packaging and dependency notices |
-| [`worker/tools/`](../worker/tools/README.md) | Worker administration and isolated stream-lab tooling |
+| [`worker/`](../worker/README.md) | Browser receiver (`worker/public/`) and its tests; the stream lab was removed at CUT-1 |
 | [`branding/`](../branding) | Editable branding source |
 | [`docs/`](README.md) | Current public guides, architecture and release status |
 
@@ -21,11 +20,11 @@ Generated reports, captures and packages belong under ignored `artifacts/`; Rust
 
 Start with the affected module's checks. Changes to packet semantics should include the shared fixture and both sides of the exchange. Keep credentials, local deployment logs, captures and benchmark outputs outside public documentation. See [architecture](architecture/README.md) for runtime entry points and [release status](release-status.md) for checks requiring a real environment.
 
-## Go relay and release checks
+## Relay and release checks
 
-The standalone relay is in `relay/`. It serves the existing browser assets; Windows capture and encoding remain in the Rust host. Use `go test ./...` and `go vet ./...` from `relay/`, then follow its setup guide for a separate development instance. Never reuse production credentials for fixtures.
+The relay is in `relay-rs/`, the only relay in the repository. It serves the browser assets from `worker/public/`; Windows capture and encoding remain in the Rust host. Run its tests from `relay-rs/` as CI does (`cargo test --locked --workspace`), then follow [its setup guide](../relay-rs/README.md) for a separate development instance. Never reuse production credentials for fixtures.
 
-The CI definition covers browser checks on Node 22/24, synthetic Windows packaging/setup checks in both PowerShell versions, Go race tests, a container build, the host's Rust tests, clippy and fmt on a hosted Windows runner, and Android unit tests and lint on a hosted Ubuntu runner. The host job links against generated NVENC/NVDEC import libraries without an NVIDIA driver, so it does not establish an NVENC encode or a physical desktop-stream test: those need the Windows/NVIDIA build environment and explicit runtime evidence.
+The CI definition covers browser checks on Node 22/24, synthetic Windows packaging/setup checks in both PowerShell versions, the relay-rs tests, clippy, fmt and wasm32 builds and a container build, the host's Rust tests, clippy and fmt on a hosted Windows runner, and Android unit tests and lint on a hosted Ubuntu runner. The host job links against generated NVENC/NVDEC import libraries without an NVIDIA driver, so it does not establish an NVENC encode or a physical desktop-stream test: those need the Windows/NVIDIA build environment and explicit runtime evidence.
 
 From the root, run the release tooling checks separately:
 
@@ -33,14 +32,13 @@ From the root, run the release tooling checks separately:
 node --test tools/tests/*.test.mjs
 ./tools/tests/package-release.test.ps1
 ./host/scripts/test-setup-credentials.ps1
-./worker/tools/test-set-app-password.ps1
 ```
 
 `tools/package-release.ps1` packages only explicit public files and verifies every ZIP entry. Supply `docs/windows-quickstart.md`, `docs/THIRD-PARTY-NOTICES.md` and the root LICENSE. `-PublicRelease` requires that license; source provenance must reflect uncommitted changes. Review the exact binaries and manifest before publishing.
 
 `tools/generate-notices.mjs` reads an existing locked Windows Cargo metadata snapshot and cached dependency licenses offline. It retains full license/notice texts and fails if provenance/texts are missing. The exact upstream exceptions live in `tools/third-party/notice-overrides.json`.
 
-Windows desktop streaming uses the Rust capture/encode host, either relay, and a Chromium receiver. See [Go relay setup](../relay/README.md) or [Worker setup](../worker/README.md); the stream lab currently uses the Worker/local lab paths.
+Windows desktop streaming uses the Rust capture/encode host, the relay and a Chromium receiver. See [relay setup](../relay-rs/README.md). The stream lab was removed at CUT-1 with the JavaScript Worker relay it drove.
 
 ## Cursor translation
 
@@ -235,10 +233,8 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   Files icon gets a dot and its popover shows "N files from PC · Download".
   Only offered files can be read.
 - Bytes use a separate `/file-ws` socket, with host downloads rate-capped below video. Contract
-  and behavior: [file transfer](architecture/file-transfer.md); lab check:
-  `node worker/tools/lab/stream-lab-file-transfer.mjs`.
-  Native desktop acceptance: `node worker/tools/lab/stream-lab-native-file-drop.mjs`
-  (synthetic files and local destinations).
+  and behavior: [file transfer](architecture/file-transfer.md). The isolated lab checks
+  (`stream-lab-file-transfer`, `stream-lab-native-file-drop`) were removed at CUT-1.
 
 ## Runtime boundaries
 
@@ -247,7 +243,7 @@ user (local DXGI capture + SendInput). Tokens reach the host only as
   session/profile policies, and lab telemetry from the host event loop.
 - The browser page keeps the early diagnostic bootstrap; `receiver.js` starts
   the session and uses the separately testable media ACK scheduler.
-- The relay applies `protocol-validation.js` at its existing message boundaries.
+- The Rust relay validates signal, file and media packets at its message boundaries (`relay-rs/core/src/protocol.rs`).
 - The lab lifecycle module owns lease renewal, checkpoints, and termination;
   the measurement module owns alignment, cohort readiness, and ranking policy.
   The live runner retains browser/process orchestration and measurement I/O.

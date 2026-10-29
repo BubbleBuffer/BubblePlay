@@ -1,0 +1,87 @@
+# Deploy template for the Rust relay Worker (bp-relay-worker). Not deployed by anything in the repo.
+# Copy it, then edit the copy. The copy holds your account's values, so keep it out of git:
+#   cp wrangler.deploy.toml.example wrangler.deploy.toml
+#
+# Every value below is a placeholder. Build first, from relay-rs/worker:
+#   worker-build --release
+# Deploy and tear down with the wrangler version CI pins:
+#   npx wrangler@4.148.0 deploy -c wrangler.deploy.toml
+#   npx wrangler@4.148.0 delete -c wrangler.deploy.toml
+#
+# Secrets are not in this file. Set each with wrangler, which then prompts for the value:
+#   npx wrangler@4.148.0 secret put RELAY_TOKEN -c wrangler.deploy.toml    # registration token, required
+#   npx wrangler@4.148.0 secret put ADMIN_TOKEN -c wrangler.deploy.toml    # admin bearer token, required
+#   npx wrangler@4.148.0 secret put TURN_SECRET -c wrangler.deploy.toml    # needed when TURN_HOST is set, 32 bytes or more
+#   npx wrangler@4.148.0 secret put NTFY_TOKEN -c wrangler.deploy.toml     # optional, for ntfy approval pushes
+
+# Becomes the workers.dev subdomain unless a route is enabled.
+name = "bp-relay-change-me"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-07-15"
+# Placeholder route. Uncomment and set a domain on a zone you own, or leave it commented to use workers.dev.
+# Keep top-level keys like this one above the first [table], or TOML will read them as part of that table.
+# routes = [{ pattern = "relay.example.com", custom_domain = true }]
+
+[durable_objects]
+bindings = [{ name = "RELAY", class_name = "Relay" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Relay"]
+
+# In-place deploy on an existing JS relay script. The default above stays uncommented for a fresh
+# script. To deploy over the live JS script instead, comment out the default [durable_objects] table
+# and the v1 [[migrations]] block above, uncomment the block below, and set `name` to the live
+# script's name. Keep the tags and class names exactly as the live script has them.
+# The four stub classes (src/stubs.rs) answer every request with 404 and do nothing else. Nothing
+# routes to them, so the relay behaves as before. They keep the JS relay's stored data, which is why
+# this deploy works in place and a rollback to the JS relay stays possible.
+# [durable_objects]
+# bindings = [
+#   { name = "RELAY", class_name = "Relay" },
+#   { name = "ROOM", class_name = "Room" },
+#   { name = "MEDIA_ROOM", class_name = "MediaRoom" },
+#   { name = "GATE", class_name = "ApprovalGate" },
+#   { name = "AGENT_ROOM", class_name = "AgentRoom" },
+# ]
+#
+# [[migrations]]
+# tag = "v1"
+# new_sqlite_classes = ["Room"]
+#
+# [[migrations]]
+# tag = "v2"
+# new_sqlite_classes = ["ApprovalGate"]
+#
+# [[migrations]]
+# tag = "v3"
+# new_sqlite_classes = ["MediaRoom"]
+#
+# [[migrations]]
+# tag = "v4"
+# new_sqlite_classes = ["AgentRoom"]
+#
+# [[migrations]]
+# tag = "v5"
+# new_sqlite_classes = ["Relay"]
+
+[vars]
+# The public origin of the relay. The relay proof is bound to it, so bench-p99 needs the same value as --origin.
+PUBLIC_ORIGIN = "https://relay.example.com"
+# Optional TURN settings. TURN_TTL_S is 300 to 86400 seconds.
+TURN_HOST = "turn.example.com"
+TURN_TTL_S = "21600"
+# Optional ntfy approval pushes.
+NTFY_URL = "https://ntfy.example.com"
+NTFY_TOPIC = "replace-with-your-topic"
+# Approval window in seconds, 30 to 120.
+APPROVAL_TTL_S = "90"
+# At least 1.
+MAX_CONNECTIONS = "32"
+
+# Static files from the JS Worker's public directory, the same block as wrangler.toml. Relative to this file.
+[assets]
+directory = "../../worker/public"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "none"

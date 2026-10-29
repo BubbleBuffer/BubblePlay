@@ -1,5 +1,7 @@
 # Browser approval
 
+> **Superseded in part (CUT-1, 2026-10-25):** the Go relay and the Cloudflare Worker relay described below were deleted. The [Rust relay](../../relay-rs/README.md) gates the site with ntfy only: no password, TOTP or host approval, and no `/__auth/methods`. The method table, configuration, login page and the password flow in this page are kept as history of the approved design. The host protocol section is the 2026-10-06 spec; whether the host still implements it is not checked by CUT-1.
+
 Status: approved 2026-10-06 (owner); Go methods, host/ntfy approval, methods endpoint and operator documentation implemented; live host/container acceptance remains unverified.
 
 A new browser needs the application password plus one second factor. The operator chooses which second factors a relay offers. There is no password-only mode.
@@ -38,4 +40,4 @@ Carried on the existing `/host-ws` signaling socket.
 - The host shows one topmost dialog at a time, owned by the host process: "Allow a new browser to sign in?" with the client prefix, browser summary and remaining time, and the buttons **Allow** and **Deny**. It closes on cancel or expiry. Requests that arrive while a dialog is open are denied.
 - Host approval proves presence at the PC, not identity. Anyone already viewing the desktop can see and click the dialog.
 
-The fixture [`browser-approval-contract.json`](../../fixtures/browser-approval-contract.json) holds example messages; the Go relay, the Cloudflare relay and the host test against it.
+The fixture [`browser-approval-contract.json`](../../fixtures/browser-approval-contract.json) holds example messages; the host test checks against it. The Go and Cloudflare relay tests that used it were deleted at CUT-1.

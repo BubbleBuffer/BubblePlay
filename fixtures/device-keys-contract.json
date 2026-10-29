@@ -232,6 +232,10 @@
       "authBind": {
         "type": "auth-bind",
         "signature": "0R94dRISC4LRC9JJ-QyBCc1ud8WxZ_VXostTuF4CEERjyasJDDUOa5wlVCIToBHnDULeyY-7vyADuP80sADfBA"
+      },
+      "authBindPc": {
+        "type": "auth-bind",
+        "signature": "Gb_DstpSErqaRpE_UeV0KEVgKHLdvdWq9PUCau2Uc1tt1xQ9xjzLYd6E3aMIbE_rgOqo1t6Te4gSE2HFvi3hBA"
       }
     }
   },

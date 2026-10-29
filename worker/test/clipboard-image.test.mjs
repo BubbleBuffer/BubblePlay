@@ -2,21 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ClipboardReceiver, CLIPBOARD_IMAGE, InputController } from "../public/input.js";
 import { RemoteClipboardWriter, sameClipboardImage, pasteHostClipboard } from "../public/remote-clipboard.js";
-import { validClipboardMessage } from "../src/protocol-validation.js";
 
 const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64"));
 const message = text => ({ type: "clipboard-image", protocol: 1, id: 4, index: 0, count: 1, mimeType: "image/png", text });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-test("native PNG chunks reach browser as an image and relay admits only host PNG", () => {
+test("native PNG chunks reach browser as an image", () => {
   const m = message(Buffer.from(png).toString("base64"));
   const received = new ClipboardReceiver().push(m);
   assert.equal(received.mimeType, "image/png");
   assert.deepEqual(received.data, png);
-  assert.equal(validClipboardMessage(m, "host", JSON.stringify(m)), true);
-  assert.equal(validClipboardMessage(m, "client", JSON.stringify(m)), false);
-  assert.equal(validClipboardMessage({ ...m, mimeType: "image/svg+xml" }, "host", JSON.stringify(m)), false);
-  assert.equal(validClipboardMessage({ ...m, count: CLIPBOARD_IMAGE.maxChunks + 1 }, "host", JSON.stringify(m)), false);
   assert.equal(new ClipboardReceiver().push({ ...m, text: "AA==" }), null);
 });
 
