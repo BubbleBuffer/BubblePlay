@@ -11,11 +11,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE,
-    HLOCAL,
-};
-use windows::Win32::Security::Cryptography::{
-    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -32,6 +28,9 @@ use windows::Win32::System::Threading::{
 };
 
 use super::logic::decode_hex;
+
+// The DPAPI helpers live in the host library so the trusted device list shares them.
+pub use bubbleplay_host::dpapi::{dpapi_protect_bytes, dpapi_unprotect_bytes};
 
 pub use bubbleplay_host::admin_agent::protocol::{AGENT_MUTEX, AGENT_STOP_EVENT, TRAY_MUTEX};
 /// On-demand task that starts the elevated admin input agent
@@ -71,71 +70,6 @@ pub fn dpapi_unprotect_hex(value: &str) -> Result<Vec<u8>> {
     let plain = dpapi_unprotect_bytes(&encrypted);
     encrypted.fill(0);
     plain
-}
-
-/// Decrypt raw DPAPI bytes (CurrentUser or LocalMachine scope). UI is forbidden, so this never
-/// prompts; a blob protected for another user or scope fails.
-pub fn dpapi_unprotect_bytes(encrypted: &[u8]) -> Result<Vec<u8>> {
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: encrypted.len().try_into().context("DPAPI blob too large")?,
-        // DPAPI reads its input and does not write to it.
-        pbData: encrypted.as_ptr() as *mut u8,
-    };
-    let mut output = CRYPT_INTEGER_BLOB::default();
-    // SAFETY: input points at live memory; output is freed with LocalFree below.
-    unsafe {
-        CryptUnprotectData(
-            &input,
-            None,
-            None,
-            None,
-            None,
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    }
-    .context("DPAPI could not decrypt the stored secret (was it protected for another user?)")?;
-    let plain = take_dpapi_output(&output);
-    Ok(plain)
-}
-
-/// Encrypt raw bytes with CurrentUser DPAPI. No entropy and no UI: only this user's logon can
-/// decrypt the result.
-pub fn dpapi_protect_bytes(plain: &[u8]) -> Result<Vec<u8>> {
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: plain.len().try_into().context("DPAPI input too large")?,
-        // DPAPI reads its input and does not write to it.
-        pbData: plain.as_ptr() as *mut u8,
-    };
-    let mut output = CRYPT_INTEGER_BLOB::default();
-    // SAFETY: input points at live memory; output is freed with LocalFree below.
-    unsafe {
-        CryptProtectData(
-            &input,
-            PCWSTR::null(),
-            None,
-            None,
-            None,
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    }
-    .context("DPAPI could not protect the data for this user")?;
-    Ok(take_dpapi_output(&output))
-}
-
-/// Copies a DPAPI output buffer into a Vec and frees it.
-fn take_dpapi_output(output: &CRYPT_INTEGER_BLOB) -> Vec<u8> {
-    if output.pbData.is_null() {
-        return Vec::new();
-    }
-    // SAFETY: DPAPI returned cbData bytes at pbData, which we own until LocalFree below.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize) };
-    let copied = bytes.to_vec();
-    zeroize::Zeroize::zeroize(bytes);
-    // SAFETY: allocated by the DPAPI call that filled `output`.
-    let _ = unsafe { LocalFree(Some(HLOCAL(output.pbData.cast()))) };
-    copied
 }
 
 /// Job object that kills every assigned process when the last handle closes,

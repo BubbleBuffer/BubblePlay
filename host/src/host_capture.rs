@@ -513,6 +513,19 @@ impl CaptureSource {
         source.request_idle_snapshot();
     }
 
+    /// Capture watchdog: re-create a local duplication that delivers nothing.
+    /// Returns false when nothing was re-created (privileged capture, no open
+    /// duplication, or a recovery already pending).
+    pub(super) fn recreate_stalled_duplication(&mut self, now: Instant) -> bool {
+        match self {
+            Self::Local(source) => source
+                .capture
+                .as_mut()
+                .is_some_and(|capture| capture.recreate_stalled_duplication(now)),
+            Self::Privileged(_) => false,
+        }
+    }
+
     pub(super) fn request_idle_followup_snapshot(&mut self, delay: Duration) {
         let Self::Local(source) = self;
         if let Some(capture) = source.capture.as_mut() {

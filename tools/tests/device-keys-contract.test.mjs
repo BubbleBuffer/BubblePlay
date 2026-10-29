@@ -343,3 +343,140 @@ test("relay registration proofs recompute encodings, hashes and signatures", () 
   assert.equal(m.helloOk.type, "hello-ok");
   bytes(m.helloOk.ticket, 32);
 });
+
+// ---- Phase 2 (decisions 2026-10-25). Recomputed independently from the phase 0 handshake inputs.
+const hkdf32 = (ikm, salt, info) => {
+  const prk = crypto.createHmac("sha256", salt).update(ikm).digest();
+  return crypto.createHmac("sha256", prk).update(info).update(Buffer.from([1])).digest();
+};
+const normaliseCode = input => input.toUpperCase().replace(/[-\s]/g, "").replaceAll("O", "0").replace(/[IL]/g, "1");
+
+test("phase 2 pairing: code normalisation, relay admit hash, pair key, MACs and comparison number", () => {
+  const { h, hash } = handshakeInputs();
+  const p = fixture.phase2.pairing;
+  assert.match(p.code, /^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{10}$/);
+  assert.equal(p.codeDisplay, `${p.code.slice(0, 5)}-${p.code.slice(5)}`);
+  for (const v of p.normalise) assert.equal(normaliseCode(v.input), v.canonical);
+  assert.equal(p.pcId, h.pc.id);
+  const admitBytes = Buffer.concat([text("bubbleplay-pair-admit-v1"), text(h.pc.id), text(p.code)]);
+  assert.equal(admitBytes.toString("hex"), p.admitBytesHex);
+  assert.deepEqual(bytes(p.admit, 32), digest(admitBytes));
+  const key = hkdf32(text(p.code), Buffer.alloc(0), text("bubbleplay-pair-v1"));
+  assert.equal(key.toString("hex"), p.pairKeyHex);
+  const viewerMac = crypto.createHmac("sha256", key).update(text("viewer")).update(hash).digest();
+  const pcMac = crypto.createHmac("sha256", key).update(text("pc")).update(hash).digest();
+  assert.deepEqual(bytes(p.viewerMac, 32), viewerMac);
+  assert.deepEqual(bytes(p.pcMac, 32), pcMac);
+  assert.notDeepEqual(viewerMac, pcMac);
+  assert.equal(crypto.timingSafeEqual(viewerMac, bytes(p.viewerMac, 32)), true);
+  assert.notEqual(p.wrongCode, p.code);
+  assert.equal(crypto.timingSafeEqual(bytes(p.wrongCodeViewerMac, 32), viewerMac), false);
+  const wrongKey = hkdf32(text(p.wrongCode), Buffer.alloc(0), text("bubbleplay-pair-v1"));
+  assert.deepEqual(crypto.createHmac("sha256", wrongKey).update(text("viewer")).update(hash).digest(), bytes(p.wrongCodeViewerMac, 32));
+  const sasBytes = Buffer.concat([text("bubbleplay-pair-sas-v1"), hash]);
+  assert.equal(sasBytes.toString("hex"), p.sasBytesHex);
+  const u32 = digest(sasBytes).readUInt32BE(0);
+  assert.equal(u32, p.sasU32);
+  assert.equal(p.sasNumber, String(u32 % 1000000).padStart(6, "0"));
+  assert.match(p.sasNumber, /^[0-9]{6}$/);
+  assert.equal(p.sasDisplay, `${p.sasNumber.slice(0, 3)} ${p.sasNumber.slice(3)}`);
+  assert.equal(p.qr.android, `bubbleplay://pair?relay=${encodeURIComponent(h.relayOrigin)}&pc=${h.pc.id}&code=${p.code}`);
+  assert.equal(p.qr.browser, `${h.relayOrigin}/pair#pc=${h.pc.id}&code=${p.code}`);
+  const m = p.messages;
+  assert.deepEqual(m.pairOpen, { type: "pair-open", admit: p.admit });
+  assert.deepEqual(m.pairClose, { type: "pair-close" });
+  assert.deepEqual(m.pairClosed, { type: "pair-closed" });
+  assert.deepEqual(m.viewerHello, { type: "hello", role: "viewer", id: h.viewer.id, public: h.viewer.public, pair: p.admit });
+  assert.deepEqual(m.authHello, { ...h.messages.authHello, caps: ["control-aead-v1", "dtls-bind-v1", "pair-v1"] });
+  assert.deepEqual(m.pairProofViewer, { type: "pair-proof", mac: p.viewerMac });
+  assert.deepEqual(m.pairProofPc, { type: "pair-proof", mac: p.pcMac });
+  assert.deepEqual(m.pairDone, { type: "pair-done" });
+  assert.deepEqual(m.pairDenied, { type: "pair-denied" });
+});
+
+test("phase 2 admit list and caps", () => {
+  const { h } = handshakeInputs();
+  assert.deepEqual(fixture.phase2.admit, { type: "admit", viewers: [h.viewer.id], remotePairing: false });
+  assert.deepEqual(fixture.phase2.caps, { mandatory: ["control-aead-v1"], mandatoryWebRtc: ["control-aead-v1", "dtls-bind-v1"], pairing: "pair-v1" });
+  // auth-bind keeps the phase 0 encoding (amendment 2026-10-25); checked by the DTLS test above.
+  assert.equal(fixture.phase2.bind.encoding, "phase0");
+});
+
+function ctlKeys() {
+  const { h, hash } = handshakeInputs();
+  const shared = crypto.diffieHellman({ privateKey: secret(h.pc.ephemeralPrivateHex, "x25519"), publicKey: publicKey(bytes(h.viewer.ephemeral, 32), "x25519") });
+  return {
+    "viewer-to-pc": hkdf32(shared, hash, text("bubbleplay-ctl-v1 viewer-to-pc")),
+    "pc-to-viewer": hkdf32(shared, hash, text("bubbleplay-ctl-v1 pc-to-viewer")),
+  };
+}
+// Receiver per the decisions: exact next seq, AAD = kind, JSON plaintext.type must equal kind.
+function receiveCtl(keys, direction, expectedSeq, message) {
+  assert.deepEqual(Object.keys(message).sort(), ["data", "kind", "seq", "type"]);
+  assert.equal(message.type, "ctl");
+  assert.match(message.kind, /^[a-z0-9-]{1,32}$/);
+  if (message.seq !== expectedSeq) throw new Error("ctl sequence mismatch");
+  const nonce = Buffer.alloc(12);
+  nonce.writeBigUInt64BE(BigInt(message.seq), 4);
+  const plain = open(keys[direction], nonce, text(message.kind), bytes(message.data));
+  if (message.kind !== "input") {
+    if (JSON.parse(plain.toString("utf8")).type !== message.kind) throw new Error("ctl kind mismatch");
+  }
+  return plain;
+}
+
+test("phase 2 ctl envelopes: seq 0 and 1 each direction, JSON and binary input", () => {
+  const keys = ctlKeys();
+  const h = fixture.handshake;
+  assert.equal(keys["viewer-to-pc"].toString("hex"), h.controlKeys.viewerToPcHex);
+  assert.equal(keys["pc-to-viewer"].toString("hex"), h.controlKeys.pcToViewerHex);
+  const msgs = fixture.phase2.ctl.messages;
+  assert.deepEqual(msgs.map(v => [v.direction, v.seq]), [["viewer-to-pc", 0], ["viewer-to-pc", 1], ["pc-to-viewer", 0], ["pc-to-viewer", 1]]);
+  assert.ok(msgs.some(v => v.encoding === "binary") && msgs.some(v => v.encoding === "json"));
+  for (const v of msgs) {
+    const nonce = Buffer.alloc(12);
+    nonce.writeBigUInt64BE(BigInt(v.seq), 4);
+    assert.equal(nonce.toString("hex"), v.nonceHex);
+    assert.equal(v.aadUtf8, v.kind);
+    assert.equal(v.message.kind, v.kind);
+    assert.equal(v.message.seq, v.seq);
+    const plain = fromHex(v.plaintextHex);
+    if (v.encoding === "json") assert.equal(plain.toString("utf8"), v.plaintextUtf8);
+    else { assert.equal(v.kind, "input"); assert.equal(v.direction, "viewer-to-pc"); assert.equal(v.plaintextUtf8, undefined); }
+    assert.deepEqual(seal(keys[v.direction], nonce, text(v.kind), plain), bytes(v.message.data));
+    assert.deepEqual(receiveCtl(keys, v.direction, v.seq, v.message), plain);
+  }
+  // The binary input frame is the input-contract "arrow-left-down" packet.
+  const inputContract = JSON.parse(readFileSync(new URL("../../fixtures/input-contract.json", import.meta.url), "utf8"));
+  const packet = JSON.stringify(inputContract.packets.find(p => p.name === "arrow-left-down").bytes);
+  assert.equal(packet, JSON.stringify([...fromHex(msgs[0].plaintextHex)]));
+});
+
+for (const vector of fixture.phase2.ctl.failures) {
+  test(`phase 2 ctl refuses ${vector.name}`, () => {
+    assert.equal(vector.expected, "end-session");
+    assert.throws(() => receiveCtl(ctlKeys(), vector.direction, vector.expectedSeq, vector.message), /authenticate|sequence|kind/i);
+  });
+}
+
+test("phase 2 hex epoch handshake: opaque 32-hex epoch bytes in the transcript", () => {
+  const { h } = handshakeInputs();
+  const v = fixture.phase2.hexEpochHandshake;
+  assert.match(v.sessionEpoch, /^[0-9a-f]{32}$/);
+  const transcript = lengthPrefixed([text("bubbleplay-auth-v1"), text(h.relayOrigin), text(v.sessionEpoch),
+    text(h.viewer.id), bytes(h.viewer.public, 32), text(h.pc.id), bytes(h.pc.public, 32),
+    bytes(h.viewer.nonce, 32), bytes(h.pc.nonce, 32), bytes(h.viewer.ephemeral, 32), bytes(h.pc.ephemeral, 32)]);
+  assert.equal(transcript.toString("hex"), v.transcriptHex);
+  const hash = digest(transcript);
+  assert.equal(hash.toString("hex"), v.transcriptHashHex);
+  const hostBytes = Buffer.concat([text("bubbleplay-auth-host-v1"), hash]);
+  assert.deepEqual(crypto.sign(null, hostBytes, secret(h.pc.seedHex)), bytes(v.pcSignature, 64));
+  const viewerBytes = Buffer.concat([text("bubbleplay-auth-viewer-v1"), hash, bytes(v.pcSignature, 64)]);
+  assert.deepEqual(crypto.sign(null, viewerBytes, secret(h.viewer.seedHex)), bytes(v.viewerSignature, 64));
+  const shared = fromHex(h.sharedSecretHex);
+  assert.equal(hkdf32(shared, hash, text("bubbleplay-ctl-v1 viewer-to-pc")).toString("hex"), v.controlKeys.viewerToPcHex);
+  assert.equal(hkdf32(shared, hash, text("bubbleplay-ctl-v1 pc-to-viewer")).toString("hex"), v.controlKeys.pcToViewerHex);
+  assert.notEqual(v.controlKeys.viewerToPcHex, h.controlKeys.viewerToPcHex);
+  assert.equal(v.sasNumber, String(digest(Buffer.concat([text("bubbleplay-pair-sas-v1"), hash])).readUInt32BE(0) % 1000000).padStart(6, "0"));
+  assert.deepEqual(v.peerJoined, { type: "peer-joined", mediaEpoch: v.sessionEpoch, pairing: false });
+});

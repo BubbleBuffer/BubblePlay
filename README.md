@@ -2,7 +2,7 @@
 
 Stream your Windows desktop to a browser, with native cursor shapes, keyboard and mouse input, clipboard sharing, and file transfer. Use WebRTC or WebSocket streaming through your own relay.
 
-BubblePlay is being prepared for its first open-source alpha under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). The current Windows/browser path works. You run your own relay: the Rust relay in a Docker container, or on Cloudflare Workers ([relay setup](relay-rs/README.md)). A new browser must be approved through an ntfy notification ([browser approval](docs/architecture/browser-approval.md)). The public GitHub release is still pending.
+BubblePlay is being prepared for its first open-source alpha under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). The current Windows/browser path works. You run your own relay: the Rust relay in a Docker container, or on Cloudflare Workers ([relay setup](relay-rs/README.md)). A new browser must be approved through an ntfy notification ([site gate](docs/architecture/device-keys.md#site-gate)). The public GitHub release is still pending.
 
 ## Get started
 

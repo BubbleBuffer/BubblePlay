@@ -3,16 +3,17 @@
 //! `bubbleplay-host.exe` in a kill-on-close job, pipe its output into a
 //! rotating log, restart with backoff.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bubbleplay_host::devices_ui_api::OPEN_DEVICES_LINE;
 use windows::Win32::Foundation::HANDLE;
 
 use zeroize::Zeroizing;
@@ -72,6 +73,38 @@ fn emit(events: &Option<Sender<HostEvent>>, event: HostEvent) {
 
 pub type SharedState = Arc<Mutex<HostState>>;
 
+/// Write end of the stdin of the host child that is running now. The
+/// supervisor fills it at spawn and empties it before anything else once the
+/// child is gone, so a request can only reach the child that is running.
+#[derive(Clone, Default)]
+pub struct HostStdin(Arc<Mutex<Option<ChildStdin>>>);
+
+impl HostStdin {
+    fn set(&self, stdin: Option<ChildStdin>) {
+        match self.0.lock() {
+            Ok(mut guard) => *guard = stdin,
+            Err(poisoned) => *poisoned.into_inner() = stdin,
+        }
+    }
+
+    /// Writes the fixed `open-devices` line to the current child. Fails with
+    /// `NotConnected` when no child is running.
+    pub fn request_open_devices(&self) -> io::Result<()> {
+        let mut guard = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(stdin) = guard.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "host is not running",
+            ));
+        };
+        stdin.write_all(OPEN_DEVICES_LINE)?;
+        stdin.flush()
+    }
+}
+
 fn publish(state: &SharedState, value: HostState) {
     match state.lock() {
         Ok(mut guard) => *guard = value,
@@ -116,27 +149,13 @@ fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog, events: Option<Send
 
 struct Secrets {
     token: String,
-    host_gate_token: Option<String>,
 }
 
 fn load(config: &SupervisorConfig) -> Result<(StoredHostConfig, Secrets)> {
     let stored = StoredHostConfig::load(&config.host_config)?;
     let token = String::from_utf8(dpapi_unprotect_hex(&stored.token_dpapi_hex)?)
         .context("stored token is not UTF-8")?;
-    let host_gate_token = match stored.host_gate_token_dpapi_hex.as_deref() {
-        Some(hex) if !hex.trim().is_empty() => Some(
-            String::from_utf8(dpapi_unprotect_hex(hex)?)
-                .context("stored host-gate token is not UTF-8")?,
-        ),
-        _ => None,
-    };
-    Ok((
-        stored,
-        Secrets {
-            token,
-            host_gate_token,
-        },
-    ))
+    Ok((stored, Secrets { token }))
 }
 
 /// `tray.json` sits beside `host.json` in the per-user data directory.
@@ -163,7 +182,7 @@ fn device_key_handoff(config: &SupervisorConfig) -> Option<Zeroizing<String>> {
     }
 }
 
-fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
+fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob, stdin: &HostStdin) -> Result<Child> {
     if !config.host_exe.is_file() {
         anyhow::bail!("host executable missing: {}", config.host_exe.display());
     }
@@ -178,21 +197,17 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
         .env("RUST_BACKTRACE", "1")
         // Panics keep backtraces; anyhow errors (logged on every retry) do not.
         .env("RUST_LIB_BACKTRACE", "0")
-        .env_remove("BUBBLEPLAY_HOST_GATE_TOKEN")
         .env_remove("BUBBLEPLAY_ADMIN_AGENT_PIPE")
         .env_remove("BUBBLEPLAY_ADMIN_AGENT_ALLOW_DEV")
         // Never inherited: only the child command below may carry the device key.
         .env_remove(device_key_file::HANDOFF_ENV)
         .envs(config.extra_env.iter().map(|(key, value)| (key, value)))
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW);
     if let Some(parent) = config.host_exe.parent() {
         command.current_dir(parent);
-    }
-    if let Some(gate) = &secrets.host_gate_token {
-        command.env("BUBBLEPLAY_HOST_GATE_TOKEN", gate);
     }
     if let Some(key) = &device_key {
         command.env(device_key_file::HANDOFF_ENV, key.as_str());
@@ -204,6 +219,7 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob) -> Result<Child> {
         bubbleplay_host::input::restore_headless_cursor_after_exit(child.id());
         return Err(error);
     }
+    stdin.set(child.stdin.take());
     if let Some(out) = child.stdout.take() {
         pump(out, config.host_log.clone(), config.events.clone());
     }
@@ -222,7 +238,12 @@ fn is_not_configured(error: &anyhow::Error) -> bool {
 }
 
 /// Supervise until `stop` fires. The child is killed before returning.
-pub fn supervise(config: SupervisorConfig, state: SharedState, stop: Receiver<()>) {
+pub fn supervise(
+    config: SupervisorConfig,
+    state: SharedState,
+    stop: Receiver<()>,
+    stdin: HostStdin,
+) {
     let job = match KillOnCloseJob::new() {
         Ok(job) => job,
         Err(error) => {
@@ -242,7 +263,7 @@ pub fn supervise(config: SupervisorConfig, state: SharedState, stop: Receiver<()
     publish(&state, HostState::Starting);
     loop {
         let started = Instant::now();
-        let mut child = match spawn(&config, &job) {
+        let mut child = match spawn(&config, &job, &stdin) {
             Ok(child) => child,
             Err(error) => {
                 let reason = format!("{error:#}");
@@ -285,6 +306,9 @@ pub fn supervise(config: SupervisorConfig, state: SharedState, stop: Receiver<()
                 break None;
             }
         };
+        // Close the pipe before anything else: a request after this point
+        // must not reach this child, and the next spawn fills the slot again.
+        stdin.set(None);
         let Some(status) = status else {
             tracing::info!(pid, "stopping host");
             let _ = child.kill();
@@ -317,21 +341,25 @@ pub struct SupervisorThread {
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub state: SharedState,
+    stdin: HostStdin,
 }
 
 impl SupervisorThread {
     pub fn start(config: SupervisorConfig) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let state: SharedState = Arc::new(Mutex::new(HostState::Starting));
+        let stdin = HostStdin::default();
         let thread_state = state.clone();
+        let thread_stdin = stdin.clone();
         let thread = std::thread::Builder::new()
             .name("host-supervisor".into())
-            .spawn(move || supervise(config, thread_state, rx))
+            .spawn(move || supervise(config, thread_state, rx, thread_stdin))
             .ok();
         Self {
             stop: Some(tx),
             thread,
             state,
+            stdin,
         }
     }
 
@@ -340,6 +368,12 @@ impl SupervisorThread {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    /// Asks the running host to open its Devices window. Fails with
+    /// `NotConnected` when no host child is running.
+    pub fn request_open_devices(&self) -> io::Result<()> {
+        self.stdin.request_open_devices()
     }
 
     pub fn stop(&mut self) {
@@ -369,6 +403,17 @@ mod tests {
             tray_settings_path(host),
             PathBuf::from(r"C:\Users\me\AppData\Local\BubblePlay\tray.json")
         );
+    }
+
+    #[test]
+    fn devices_request_without_a_running_host_is_refused() {
+        let stdin = HostStdin::default();
+        let error = stdin
+            .request_open_devices()
+            .expect_err("no child is running");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        stdin.set(None);
+        assert!(stdin.request_open_devices().is_err());
     }
 
     #[test]

@@ -1048,6 +1048,14 @@ impl DeviceIdentity {
     }
 }
 
+impl DeviceIdentity {
+    /// The same key as the crate's `DeviceIdentity`, for `bp_device_key::phase2` (the handshake
+    /// and pairing crypto). The signing key is cloned; this copy is unchanged.
+    pub fn to_phase2_identity(&self) -> bp_device_key::DeviceIdentity {
+        bp_device_key::DeviceIdentity::from_signing_key(self.signing.clone())
+    }
+}
+
 impl fmt::Debug for DeviceIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceIdentity")
@@ -1212,7 +1220,7 @@ mod relay_tests {
             Some("https://play.example")
         );
         assert_eq!(
-            relay_origin("wss://play.example:8443/lab-host-ws?run=a").as_deref(),
+            relay_origin("wss://play.example:8443/host-ws?pc=a").as_deref(),
             Some("https://play.example:8443")
         );
         assert_eq!(

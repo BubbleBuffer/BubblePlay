@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::DeviceKeyError;
 
 const DEVICE_ID_BYTES: usize = 10;
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+pub(crate) const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// The 80-bit device ID: the first 10 bytes of SHA-256 over the raw Ed25519 public key.
 /// Displayed as 16 Crockford base32 characters in four hyphenated groups.

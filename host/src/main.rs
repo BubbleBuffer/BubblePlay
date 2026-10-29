@@ -159,10 +159,9 @@ fn wss_v4_refine_bitrate(current_bps: u32) -> u32 {
 struct Args {
     mode: String, // "spike" | "serve"
     worker: Option<String>,
-    /// The unlocked PC key from the tray. `None` runs the legacy registration.
+    /// The unlocked PC key from the tray. Relay registration requires it.
     device_identity: Option<bubbleplay_host::device_key::DeviceIdentity>,
     token: Option<String>,
-    host_gate_token: Option<String>,
     duration_secs: u32,
     bitrate_bps: u32,
     max_bitrate_bps: u32,
@@ -197,7 +196,6 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
         worker: None,
         device_identity: None,
         token: std::env::var("BUBBLEPLAY_TOKEN").ok(),
-        host_gate_token: std::env::var("BUBBLEPLAY_HOST_GATE_TOKEN").ok(),
         duration_secs: 10,
         bitrate_bps: DEFAULT_BITRATE_BPS,
         max_bitrate_bps: 12_000_000,
@@ -217,9 +215,6 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
             "--mode" => args.mode = it.next().context("--mode value")?,
             "--worker" => args.worker = Some(it.next().context("--worker value")?),
             "--token" => args.token = Some(it.next().context("--token value")?),
-            "--host-gate-token" => {
-                args.host_gate_token = Some(it.next().context("--host-gate-token value")?)
-            }
             "--duration" => args.duration_secs = it.next().context("--duration value")?.parse()?,
             "--bitrate" => args.bitrate_bps = it.next().context("--bitrate value")?.parse()?,
             "--max-bitrate" => {
@@ -243,7 +238,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args> {
             // Diagnostic override for the encoder backend; not in --help.
             "--encoder" => args.encoder = it.next().context("--encoder value")?.parse()?,
             "-h" | "--help" => {
-                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--host-gate-token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--no-audio] [--benchmark-profile absolute-path] [--cpu-mode]");
+                println!("bubbleplay-host --mode spike|serve [--worker wss://...] [--token ...] [--duration secs] [--bitrate bps] [--max-bitrate bps] [--fixed-bitrate bps] [--quality auto|480p24|540p30|720p30|1080p60] [--preset p1|p3] [--out file] [--monitor primary|<index>|<name-substr>] [--vdd] [--no-audio] [--benchmark-profile absolute-path] [--cpu-mode]");
                 std::process::exit(0);
             }
             other => bail!("unknown argument: {other}"),
@@ -669,6 +664,60 @@ fn run_serve_forever(args: &Args) -> Result<()> {
     // The inline VDD keepalive outlives a single session: dropping it between
     // sessions would unplug a remembered virtual display.
     let _vdd = start_vdd_keepalive(args)?;
+    let (devices_host, devices_ui) = bubbleplay_host::devices_ui_api::channel();
+    let relay_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The real Devices window needs the PC key; without one the events are only logged.
+    let devices_window = args.device_identity.as_ref().map(|identity| {
+        bubbleplay_host::devices_window::DevicesWindow::new(
+            bubbleplay_host::devices_window::DevicesWindowInfo {
+                pc_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
+                pc_id: identity.id().to_string(),
+                relay_origin: args
+                    .worker
+                    .as_deref()
+                    .and_then(bubbleplay_host::device_key::relay_origin)
+                    .unwrap_or_default(),
+                relay_online: relay_online.clone(),
+            },
+            devices_ui.commands.clone(),
+        )
+    });
+    match devices_window.clone() {
+        // The tray's "Devices..." line also raises an already-open window.
+        Some(window) => {
+            let (stdin_commands, stdin_lines) = std::sync::mpsc::channel();
+            bubbleplay_host::devices_ui_api::spawn_stdin_reader(std::io::stdin(), stdin_commands)?;
+            let commands = devices_ui.commands.clone();
+            std::thread::Builder::new()
+                .name("devices-open".into())
+                .spawn(move || {
+                    for command in stdin_lines {
+                        if command == bubbleplay_host::devices_ui_api::DevicesCommand::Open {
+                            window.open();
+                        }
+                        if commands.send(command).is_err() {
+                            break;
+                        }
+                    }
+                })?;
+        }
+        None => {
+            bubbleplay_host::devices_ui_api::spawn_stdin_reader(
+                std::io::stdin(),
+                devices_ui.commands.clone(),
+            )?;
+        }
+    }
+    std::thread::Builder::new()
+        .name("devices-ui".into())
+        .spawn(move || match devices_window {
+            Some(window) => bubbleplay_host::devices_ui_api::run_ui(window, devices_ui.events),
+            None => bubbleplay_host::devices_ui_api::run_ui(
+                bubbleplay_host::devices_ui_api::LogDevicesUi,
+                devices_ui.events,
+            ),
+        })?;
+    let devices_host = std::sync::Arc::new(std::sync::Mutex::new(devices_host));
     let mut selection = CaptureSelection::from_launch(args.monitor.as_deref());
     let mut backoff = Duration::from_secs(1);
     let mut unavailable_attempts = 0u32;
@@ -695,7 +744,9 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                 unavailable_attempts = 0;
             }
         }
-        match run_serve(args, &mut selection) {
+        let served = run_serve(args, &mut selection, devices_host.clone(), &relay_online);
+        relay_online.store(false, std::sync::atomic::Ordering::Relaxed);
+        match served {
             Ok(()) => {
                 info!("session ended — waiting for next client");
                 backoff = Duration::from_secs(1);
@@ -906,7 +957,12 @@ fn unix_time_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
+fn run_serve(
+    args: &Args,
+    selection: &mut CaptureSelection,
+    devices_ui: bubbleplay_host::dk_host::SharedDevicesUi,
+    relay_online: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     let watchdog = match session_watchdog::SessionWatchdog::start() {
         Ok(watchdog) => Some(watchdog),
         Err(error) => {
@@ -935,7 +991,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         .clone()
         .context("--worker wss://... is required")?;
     bubbleplay_host::relay_url::require_secure_relay_url(&worker).context("--worker")?;
-    let token = args.token.clone().context("--token is required")?;
+    // TOKEN is only needed for the PC's first registration; a known PC proves its key.
+    let token = args.token.clone().unwrap_or_default();
     let reset_lab_encoder_on_diagnostic_keyframe =
         std::env::var("BUBBLEPLAY_LAB_RESET_ENCODER_ON_DIAGNOSTIC_KEYFRAME")
             .is_ok_and(|value| value == "1");
@@ -972,36 +1029,34 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mapped_addr = stun::discover_mapped_address(&socket, STUN_SERVER).ok();
     let mut signaling = session_call!(
         Signaling,
-        Signaling::connect_with_identity(
+        Signaling::connect_phase2(
             &worker,
             &token,
-            args.host_gate_token.as_deref(),
-            args.device_identity.as_ref(),
+            args.device_identity
+                .as_ref()
+                .context("PC device key required")?,
+            devices_ui,
         )
     )?;
+    relay_online.store(true, std::sync::atomic::Ordering::Relaxed);
     // Room and data-socket ticket for this signaling connection; the file and media sessions below
     // take copies and drop them when this run ends.
     let relay_route = signaling.relay_route();
-    // File transfer runs only in the user-level host (Downloads, clipboard
-    // and Send To belong to the interactive user) and needs the host bearer
-    // for `/host-file-ws`.
-    let file_service = match args.host_gate_token.as_deref() {
-        Some(bearer) => {
-            match FileService::spawn_routed(
-                &worker,
-                bearer,
-                FileServiceConfig::from_env(),
-                relay_route.clone(),
-            ) {
-                Ok(service) => Some(service),
-                Err(error) => {
-                    warn!(error = %format!("{error:#}"), "file transfer unavailable");
-                    None
-                }
+    // The route's ticket expires 12 h after this hello-ok while the socket can
+    // stay open; an idle session re-registers before then.
+    let relay_registered_at = Instant::now();
+    // File transfer runs in the user-level host (Downloads, clipboard and Send To
+    // belong to the interactive user); the authenticated signaling route supplies
+    // the file socket ticket.
+    let file_service =
+        match FileService::spawn_routed(&worker, FileServiceConfig::from_env(), relay_route.clone())
+        {
+            Ok(service) => Some(service),
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "file transfer unavailable");
+                None
             }
-        }
-        _ => None,
-    };
+        };
     signaling.set_file_transfer(file_service.is_some());
     signaling.set_file_drop(file_service.is_some());
     // Follow active window needs the interactive user's foreground window,
@@ -1197,6 +1252,7 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     let mut pending_wss_idr: Option<PendingWssIdr> = None;
     let mut pending_lab_quality_keyframe: Option<String> = None;
     let mut pending_first_frame: Option<PendingFirstFrame> = None;
+    let mut capture_watchdog = CaptureStallWatchdog::default();
     // (generation, RTP timestamp) of the startup IDR last admitted on WebRTC.
     let mut startup_idr_rtp: Option<(u32, u32)> = None;
     let mut completed_first_frame: Option<(String, u32, String, Option<String>)> = None;
@@ -1332,6 +1388,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }};
         // For a caller that re-arms remote input itself right afterwards.
         (@keep_input $reason:expr) => {{
+            if let Some(files) = &file_service {
+                files.set_epoch(None);
+            }
             file_drag_preview.cancel();
             if let Some(pending) = pending_native_drop.take() {
                 pending.request.reject("viewer-disconnected");
@@ -1341,9 +1400,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             capture.end_viewer_session();
             carried_input.reset();
             viewer_attached = false;
-            if let Some(egress) = &wss_media {
-                egress.set_audio_enabled(false);
+            // The viewer's media epoch ends with it. A kept egress would keep
+            // reconnecting to a retired epoch that the relay refuses.
+            if let Some(egress) = wss_media.take() {
+                egress.retire_epoch();
+                egress.shutdown();
             }
+            active_wss_epoch = None;
             audio_capture = None;
             rtc_audio_requested = false;
             wss_audio_requested = false;
@@ -1419,6 +1482,14 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
     }
     let mut first_iteration = true;
     'session: loop {
+        // Apply authentication changes before draining transport input or file work.
+        let mut signal_events = signaling.poll()?;
+        if signal_events
+            .iter()
+            .any(|event| matches!(event, SignalEvent::PeerLeft))
+        {
+            park_viewer!("device-session-ended");
+        }
         session_stage!(CaptureDemand);
         let wait_now = Instant::now();
         let wss_peer_live = viewer_attached
@@ -1426,7 +1497,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 let stats = egress.stats();
                 stats.connected && stats.peer_present
             });
-        let capture_demand = viewer_attached
+        let capture_demand = signaling.application_ready()
+            && viewer_attached
             && (offer_in_flight || offer_accepted || ice_connected || wss_peer_live);
         let waiting_mode = profiles
             .staged
@@ -1437,7 +1509,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         let urgent_capture = latest_idr.is_none()
             || profiles.staged().is_some()
             || encoder.as_ref().is_some_and(VideoEncoder::idr_pending);
-        let recovery_due = viewer_attached
+        let recovery_due = signaling.application_ready()
+            && viewer_attached
             && local_recovery_probe_due(capture_available, wait_now, next_local_recovery_probe);
         capture.set_capture_demand(capture_demand || recovery_due)?;
         if capture_demand || recovery_due {
@@ -1450,8 +1523,13 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         if let Ok(wake) = &cursor_wake {
             wake.set_active(capture_demand);
         }
-        if !first_iteration {
-            let mut deadlines = vec![next_ping, next_benchmark_refresh, next_input_log];
+        if !first_iteration && signal_events.is_empty() {
+            let mut deadlines = vec![
+                next_ping,
+                next_benchmark_refresh,
+                next_input_log,
+                wait_now + Duration::from_millis(250),
+            ];
             if !viewer_attached {
                 if let Some(deadline) = capture.parked_maintenance_deadline() {
                     deadlines.push(deadline);
@@ -1512,6 +1590,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             )?;
         }
         first_iteration = false;
+        // The socket may have woken the wait. Authenticate those frames before any
+        // transport input, asynchronous file completions or capture work this tick.
+        let awakened_events = signaling.poll()?;
+        if awakened_events
+            .iter()
+            .any(|event| matches!(event, SignalEvent::PeerLeft))
+        {
+            signal_events.clear();
+            park_viewer!("device-session-ended-after-wait");
+        }
+        signal_events.extend(awakened_events);
         session_stage!(Housekeeping);
         producer_loop_iterations = producer_loop_iterations.saturating_add(1);
         let loop_now = Instant::now();
@@ -1922,8 +2011,15 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     rtc_audio_requested = true;
                 }
                 TransportEvent::Action(RtcAction::IceConnected) => {
+                    signaling.dtls_connected()?;
                     rtc_peer.on_connected();
-                    ice_connected = true;
+                    ice_connected = signaling.application_ready();
+                    if ice_connected {
+                        ensure!(
+                            pump.command(TransportCommand::AuthorizePeer),
+                            "RTC transport stopped"
+                        );
+                    }
                     replay.on_ice_connected();
                     next_idr = Instant::now() + IDR_INTERVAL;
                     if let Some(kind) = latest_cursor_kind {
@@ -1989,6 +2085,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 TransportEvent::Action(RtcAction::InputData(data)) => {
+                    if !signaling.application_ready() {
+                        continue;
+                    }
                     input_sink.note_packet_received(&data);
                     reconcile_carried_input(
                         &mut carried_input,
@@ -2278,7 +2377,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         if file_drag_preview.desired.is_some() || file_drag_preview.active.is_some() {
             file_drag_preview.tick(
                 NativeDropView {
-                    ready: file_service.is_some()
+                    ready: signaling.application_ready()
+                        && file_service.is_some()
                         && bubbleplay_host::clipboard::input_desktop_is_default()
                         && remote_input_ready
                         && capture_available
@@ -2295,9 +2395,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             );
         }
         if let Some(files) = file_service.as_ref() {
-            // The file socket pairs on the live WSS media epoch.
-            files.set_epoch(if viewer_attached {
-                wss_media.as_ref().and(active_wss_epoch.as_deref())
+            // Files use the authenticated viewer epoch in either media mode.
+            files.set_epoch(if signaling.application_ready() && viewer_attached {
+                signaling.viewer_epoch()
             } else {
                 None
             });
@@ -2318,7 +2418,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             let desktop = (!outbox.drops.is_empty() || pending_native_drop.is_some())
                 && bubbleplay_host::clipboard::input_desktop_is_default();
             let view = NativeDropView {
-                ready: remote_input_ready
+                ready: signaling.application_ready()
+                    && remote_input_ready
                     && capture_available
                     && wss_media.is_some()
                     && pending_first_frame.is_none()
@@ -2432,7 +2533,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
             }
             for _ in 0..outbox.pastes {
-                if remote_input_ready
+                if signaling.application_ready()
+                    && viewer_attached
+                    && remote_input_ready
                     && capture_available
                     && capture.desktop_state().desktop != "secure"
                 {
@@ -2483,9 +2586,41 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             next_quality_tick = now + Duration::from_secs(1);
         }
         session_stage!(Signaling);
-        let mut signal_events = signaling.poll()?.into_iter().peekable();
+        let mut signal_events = signal_events.into_iter().peekable();
         while let Some(event) = signal_events.next() {
+            if signaling.viewer_epoch().is_none() && !matches!(event, SignalEvent::PeerLeft) {
+                continue;
+            }
             match event {
+                SignalEvent::Bound => {
+                    signaling.send_host_capabilities(
+                        false,
+                        false,
+                        capture.secure_helper_ready(),
+                        capture.secure_helper_ready(),
+                    );
+                    if let Ok(monitors) = capture.monitors() {
+                        signaling.send_monitor_list(monitors);
+                    }
+                    announce_capture_state(
+                        &mut signaling,
+                        &mut capture,
+                        media_generation,
+                        "dtls-bound",
+                    );
+                    // An endpoint write can end the authenticated session. Do not
+                    // authorize transport after a failed state replay.
+                    if !signaling.application_ready() {
+                        continue;
+                    }
+                    ice_connected = true;
+                    ensure!(
+                        pump.command(TransportCommand::AuthorizePeer),
+                        "RTC transport stopped"
+                    );
+                    replay.on_ice_connected();
+                    next_idr = Instant::now();
+                }
                 SignalEvent::Offer(sdp) => {
                     input_sink.reset_status_delivery();
                     if !viewer_attached {
@@ -2765,15 +2900,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 }
                 SignalEvent::RemoteCandidate(c) => pending_candidates.push_back(c),
                 SignalEvent::FileDragPreview(control) => {
-                    if active_wss_epoch.as_deref() == Some(control.epoch.as_str())
+                    if !signaling.application_ready() {
+                        continue;
+                    }
+                    if signaling.viewer_epoch() == Some(control.epoch.as_str())
                         && (pending_native_drop.is_none() || control.action == "cancel")
                     {
                         file_drag_preview.control(control, Instant::now());
                     }
                 }
-                SignalEvent::PeerLeft => {
-                    park_viewer!("peer-left");
-                }
+                // Applied at the beginning of this tick, before transport and file work.
+                SignalEvent::PeerLeft => {}
                 SignalEvent::Qos {
                     seq: _,
                     at_ms: _,
@@ -2809,6 +2946,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 SignalEvent::InputData(data) => {
+                    if !signaling.application_ready() {
+                        continue;
+                    }
                     input_sink.note_packet_received(&data);
                     let mut packets = vec![data];
                     while matches!(signal_events.peek(), Some(SignalEvent::InputData(_))) {
@@ -2832,6 +2972,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         packets
                     };
                     for data in packets {
+                        if !signaling.application_ready() {
+                            break;
+                        }
                         reconcile_carried_input(
                             &mut carried_input,
                             capture_available,
@@ -2881,9 +3024,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             if let Some(state) =
                                 cursor_tracker.sample(outcome.accepted_sequence, Instant::now())
                             {
-                                // WSS mode uses the authenticated signaling socket
-                                // for cursor feedback; the Worker relays binary in
-                                // the opposite direction without JSON wrapping.
+                                // WSS cursor feedback uses the same ctl channel, with
+                                // its original binary bytes sealed as kind cursor.
                                 signaling
                                     .send_cursor_state(state.encode(), outcome.feedback_reliable);
                                 if outcome.sync_requested {
@@ -2894,6 +3036,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     }
                 }
                 SignalEvent::SecureDeny => {
+                    if !signaling.application_ready() {
+                        continue;
+                    }
                     let allowed = capture.desktop_state().available
                         && capture.secure_state().is_some_and(|state| {
                             state.available && state.kind == "uac" && state.caps.contains(&"deny")
@@ -2978,6 +3123,17 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                         continue;
                     }
+                    if action == "start"
+                        && !media_start_epoch_allowed(epoch.as_deref(), signaling.viewer_epoch())
+                    {
+                        // Only the authenticated session's epoch may start or replace media.
+                        warn!(
+                            ?epoch,
+                            session_epoch = signaling.viewer_epoch(),
+                            "media start refused: epoch is not the authenticated session epoch"
+                        );
+                        continue;
+                    }
                     if let Some(next_mode) = StreamMode::parse(requested_stream_mode.as_deref()) {
                         if next_mode != stream_mode {
                             stream_mode = next_mode;
@@ -3037,6 +3193,10 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                                 // Fence queued/late input on the old RTC peer
                                 // before clearing the producer's stale barrier.
                                 park_viewer!(@keep_input "wss-epoch-replaced");
+                                // Parking stopped the old egress, so the
+                                // replacement below does not run; keep its
+                                // immediate IDR for the new epoch.
+                                next_idr = Instant::now();
                             }
                             if !viewer_attached {
                                 begin_viewer_input!(@keep_input);
@@ -3089,10 +3249,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                         }
                     }
                     if action == "start" && wss_media.is_none() {
-                        let Some(bearer) = args.host_gate_token.as_deref() else {
-                            warn!("WSS media requested but --host-gate-token is missing");
-                            continue;
-                        };
                         let Some(epoch) = epoch.as_deref().filter(|value| valid_media_epoch(value))
                         else {
                             warn!(?protocol, "WSS media request missing session epoch");
@@ -3108,7 +3264,6 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                             );
                             WssMediaEgress::connect_routed(
                                 &worker,
-                                bearer,
                                 epoch,
                                 u64::from(preset.target_bps),
                                 u64::from(preset.target_bps),
@@ -3440,16 +3595,23 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             }
         }
         signaling.flush_cursor_state();
-        let viewer_live =
-            capture_available && remote_input_ready && (ice_connected || wss_media.is_some());
+        let viewer_live = signaling.application_ready()
+            && capture_available
+            && remote_input_ready
+            && (ice_connected || wss_media.is_some());
         // Apply queued RTC and WSS actions before a clipboard completion:
         // a newer press or disconnect must cancel a delayed paste first.
         if viewer_live {
             session_call!(Input, input_sink.finish_clipboard());
         }
         local_clipboard.poll(viewer_live, Instant::now(), &mut input_sink, &mut signaling);
-        let audio_wanted =
-            args.audio && viewer_attached && (wss_audio_requested || rtc_audio_requested);
+        let audio_wanted = signaling.application_ready()
+            && args.audio
+            && viewer_attached
+            && (wss_audio_requested || rtc_audio_requested);
+        if !audio_wanted {
+            audio_capture = None;
+        }
         if audio_wanted && audio_capture.is_none() && Instant::now() >= next_audio_start {
             match bubbleplay_host::audio::AudioCapture::start(media_clock_start, activity.clone()) {
                 Ok(capture) => audio_capture = Some(capture),
@@ -3528,7 +3690,8 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         }
         let now = Instant::now();
         let recovering = !capture.desktop_state().available;
-        let wake_default = viewer_attached
+        let wake_default = signaling.application_ready()
+            && viewer_attached
             && recovering
             && capture.secure_state().is_none()
             && bubbleplay_host::desktop_session::input_desktop_is_default();
@@ -3556,7 +3719,18 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                     Some(active_codec.name()),
                     reason,
                 );
-                warn!(generation = pending.generation, transport = %pending.transport, reason, "first-frame handshake failed");
+                // Name the capture-demand inputs that are false (empty: demand
+                // was true), so a failure without demand says why.
+                let wss_stats = wss_media.as_ref().map(WssMediaEgress::stats);
+                let demand_false_inputs = capture_demand_gaps(
+                    viewer_attached,
+                    offer_in_flight,
+                    offer_accepted,
+                    ice_connected,
+                    wss_stats.is_some_and(|stats| stats.connected),
+                    wss_stats.is_some_and(|stats| stats.peer_present),
+                );
+                warn!(generation = pending.generation, transport = %pending.transport, reason, demand_false_inputs, "first-frame handshake failed");
             }
         }
         let wss_ready = viewer_attached
@@ -3569,6 +3743,52 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
             .as_ref()
             .map(WssMediaEgress::take_events)
             .unwrap_or_default();
+        if let Some(end) = &wss_v4_events.link_end {
+            match wss_link_end_action(end) {
+                WssLinkEndAction::Reregister => {
+                    warn!(
+                        ?end,
+                        epoch = active_wss_epoch.as_deref(),
+                        "relay keeps refusing WSS media for this signaling registration; ending the session to re-register for a fresh ticket"
+                    );
+                    break 'session;
+                }
+                WssLinkEndAction::AwaitNextStart => {
+                    info!(
+                        ?end,
+                        epoch = active_wss_epoch.as_deref(),
+                        "WSS media epoch retired by relay; awaiting the next media start"
+                    );
+                }
+            }
+        }
+        if relay_ticket_refresh_due(relay_registered_at, viewer_attached, now) {
+            info!(
+                registered_for_secs = now.saturating_duration_since(relay_registered_at).as_secs(),
+                "idle signaling registration nears its relay ticket expiry; re-registering"
+            );
+            break 'session;
+        }
+        if let Some(reason) = capture_watchdog.poll(
+            capture_demand,
+            capture_available,
+            pending_first_frame.is_some(),
+            latest_idr.is_none(),
+            now,
+        ) {
+            if capture.recreate_stalled_duplication(now) {
+                warn!(
+                    reason,
+                    stall_ms = CAPTURE_STALL_LIMIT.as_millis() as u64,
+                    "capture watchdog: no captured frame while one is needed; re-creating the duplication"
+                );
+                latest_idr = None;
+                if let Some(enc) = encoder.as_mut() {
+                    enc.force_idr();
+                }
+                next_idr = now;
+            }
+        }
         if let Some(reason) = wss_v4_events
             .keyframe
             .as_deref()
@@ -3694,19 +3914,22 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
         } else {
             None
         };
-        let negotiation_active = viewer_attached && (offer_in_flight || offer_accepted);
+        let negotiation_active =
+            signaling.application_ready() && viewer_attached && (offer_in_flight || offer_accepted);
         let prewarm_needed = negotiation_active && !ice_connected && latest_idr.is_none();
-        let local_recovery_probe = viewer_attached
+        let local_recovery_probe = signaling.application_ready()
+            && viewer_attached
             && local_recovery_probe_due(capture_available, now, next_local_recovery_probe);
-        if local_recovery_probe
-            || capture_admission_ready(
-                capture_available,
-                negotiation_active,
-                ice_connected,
-                wss_ready,
-                rtc_reservation.is_some(),
-                prewarm_needed,
-            )
+        if signaling.application_ready()
+            && (local_recovery_probe
+                || capture_admission_ready(
+                    capture_available,
+                    negotiation_active,
+                    ice_connected,
+                    wss_ready,
+                    rtc_reservation.is_some(),
+                    prewarm_needed,
+                ))
         {
             if local_recovery_probe {
                 next_local_recovery_probe = now + capture::CAPTURE_RECOVERY_INTERVAL;
@@ -3750,6 +3973,9 @@ fn run_serve(args: &Args, selection: &mut CaptureSelection) -> Result<()> {
                 None => None,
             };
             if let Some((mut frame, is_new, recovered)) = captured {
+                if is_new {
+                    capture_watchdog.frame_captured();
+                }
                 if recovered {
                     if let Some(region) = frame.desktop_region() {
                         refresh_input_geometry(

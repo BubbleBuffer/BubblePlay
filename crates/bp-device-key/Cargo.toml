@@ -14,6 +14,9 @@ default = []
 keygen = ["dep:rand_core", "rand_core/getrandom"]
 # The passphrase-encrypted key file format. Pulls argon2 and aes-gcm.
 keyfile = ["dep:argon2", "dep:aes-gcm"]
+# Phase 2 handshake, ctl envelope and pairing primitives (the `phase2` module). No getrandom
+# unless `keygen` is on too, so it builds for wasm32-unknown-unknown.
+phase2 = ["dep:aes-gcm", "dep:aes", "dep:polyval", "dep:x25519-dalek", "dep:hkdf", "dep:hmac"]
 
 [dependencies]
 base64 = "0.22"
@@ -25,7 +28,16 @@ url = "2"
 zeroize = { version = "=1.9.0", features = ["alloc"] }
 rand_core = { version = "=0.6.4", default-features = false, optional = true }
 argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"], optional = true }
-aes-gcm = { version = "=0.10.3", features = ["zeroize"], optional = true }
+# No default features: the default `getrandom` feature would not build for wasm32 and nothing
+# here uses aead's own RNG (key generation goes through rand_core behind `keygen`).
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"], optional = true }
+# Listed only to turn on zeroize-on-drop for the AES key schedule and the GHASH (POLYVAL) key
+# state inside aes-gcm; aes-gcm's own `zeroize` feature does not forward to them.
+aes = { version = "=0.8.4", default-features = false, features = ["zeroize"], optional = true }
+polyval = { version = "=0.6.2", default-features = false, features = ["zeroize"], optional = true }
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"], optional = true }
+hkdf = { version = "=0.12.4", optional = true }
+hmac = { version = "=0.12.1", optional = true }
 
 [dev-dependencies]
 base64 = "0.22"

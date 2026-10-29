@@ -181,6 +181,9 @@ pub struct FileOutbox {
 
 struct Shared {
     epoch: Option<String>,
+    /// Bumped on every epoch change, so work bound to an older viewer is stale
+    /// even when a new viewer reuses the same epoch string.
+    generation: u64,
     rate_cap_bps: u64,
     offer: Option<CurrentOffer>,
     next_offer_id: u32,
@@ -198,20 +201,16 @@ pub struct FileService {
 }
 
 impl FileService {
-    pub fn spawn(worker_url: &str, bearer: &str, config: FileServiceConfig) -> Result<Self> {
-        Self::spawn_routed(worker_url, bearer, config, RelayRoute::Legacy)
-    }
-
-    /// [`FileService::spawn`] for the room `route` names. The route, including any ticket, lives in
+    /// Starts the file service for the room `route` names. The route, with its ticket, lives in
     /// the socket thread and goes away when the service is dropped.
     pub fn spawn_routed(
         worker_url: &str,
-        bearer: &str,
         config: FileServiceConfig,
         route: RelayRoute,
     ) -> Result<Self> {
         let shared = Arc::new(Mutex::new(Shared {
             epoch: None,
+            generation: 0,
             rate_cap_bps: 0,
             offer: None,
             next_offer_id: 1,
@@ -224,11 +223,11 @@ impl FileService {
         let mut threads = Vec::new();
         {
             let (shared, stop, config) = (shared.clone(), stop.clone(), config.clone());
-            let (url, bearer) = (worker_url.to_owned(), bearer.to_owned());
+            let url = worker_url.to_owned();
             threads.push(
                 thread::Builder::new()
                     .name("bubbleplay-file-socket".into())
-                    .spawn(move || socket_loop(&url, &bearer, &route, &config, &shared, &stop))
+                    .spawn(move || socket_loop(&url, &route, &config, &shared, &stop))
                     .context("spawn file socket thread")?,
             );
         }
@@ -256,15 +255,10 @@ impl FileService {
     /// The viewer epoch the file socket pairs on; `None` closes it. A new
     /// epoch re-announces the current offer.
     pub fn set_epoch(&self, epoch: Option<&str>) {
-        let mut shared = self.lock();
-        if shared.epoch.as_deref() == epoch {
-            return;
-        }
-        shared.epoch = epoch.map(str::to_owned);
-        if epoch.is_some() {
-            if let Some(message) = shared.offer.as_ref().map(CurrentOffer::message) {
-                shared.outbox.signals.push(message);
-            }
+        // Rejected outside the lock: a native drop may touch the filesystem.
+        let stale = rebind(&mut self.lock(), epoch);
+        for request in stale {
+            request.reject("viewer-changed");
         }
     }
 
@@ -297,6 +291,46 @@ impl Drop for FileService {
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// The viewer a socket session or a commit was started for: its epoch and the
+/// generation it was live in. Once the generation moves on, it is stale.
+#[derive(Clone, Debug)]
+struct Bound {
+    epoch: String,
+    generation: u64,
+}
+
+impl Shared {
+    fn bound(&self) -> Option<Bound> {
+        self.epoch.clone().map(|epoch| Bound {
+            epoch,
+            generation: self.generation,
+        })
+    }
+
+    fn is_bound(&self, bound: &Bound) -> bool {
+        self.generation == bound.generation && self.epoch.as_deref() == Some(bound.epoch.as_str())
+    }
+}
+
+/// Change the viewer epoch (`None` closes it). Every change bumps the
+/// generation, and the outbox is discarded: its signals, pastes and native
+/// drops belong to the previous viewer. A new epoch re-announces the offer.
+/// Returns the discarded native drops for the caller to reject outside the lock.
+fn rebind(state: &mut Shared, epoch: Option<&str>) -> Vec<NativeDropRequest> {
+    if state.epoch.as_deref() == epoch {
+        return Vec::new();
+    }
+    state.epoch = epoch.map(str::to_owned);
+    state.generation = state.generation.wrapping_add(1);
+    let stale = std::mem::take(&mut state.outbox);
+    if epoch.is_some() {
+        if let Some(message) = state.offer.as_ref().map(CurrentOffer::message) {
+            state.outbox.signals.push(message);
+        }
+    }
+    stale.drops
 }
 
 fn sleep_unless_stopped(stop: &AtomicBool, delay: Duration) {
@@ -475,13 +509,8 @@ fn poll_spool(shared: &Mutex<Shared>, dir: &Path) {
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
-fn connect_file_socket(
-    worker_url: &str,
-    bearer: &str,
-    epoch: &str,
-    route: &RelayRoute,
-) -> Result<Socket> {
-    let request = host_socket_request_routed(worker_url, bearer, epoch, HostSocket::File, route)?;
+fn connect_file_socket(worker_url: &str, epoch: &str, route: &RelayRoute) -> Result<Socket> {
+    let request = host_socket_request_routed(worker_url, epoch, HostSocket::File, route)?;
     let (mut ws, _) = tungstenite::connect(request).context("connect file socket")?;
     ws.send(Message::text(data_hello("file-host", route)))
         .context("send file hello")?;
@@ -498,7 +527,6 @@ fn connect_file_socket(
 
 fn socket_loop(
     worker_url: &str,
-    bearer: &str,
     route: &RelayRoute,
     config: &FileServiceConfig,
     shared: &Mutex<Shared>,
@@ -506,11 +534,11 @@ fn socket_loop(
 ) {
     let mut delay = RECONNECT_DELAY;
     while !stop.load(Ordering::Acquire) {
-        let Some(epoch) = lock(shared).epoch.clone() else {
+        let Some(bound) = lock(shared).bound() else {
             sleep_unless_stopped(stop, Duration::from_millis(200));
             continue;
         };
-        let mut ws = match connect_file_socket(worker_url, bearer, &epoch, route) {
+        let mut ws = match connect_file_socket(worker_url, &bound.epoch, route) {
             Ok(ws) => ws,
             Err(error) => {
                 warn!(error = %format!("{error:#}"), ?delay, "file socket connect failed");
@@ -522,8 +550,8 @@ fn socket_loop(
         delay = RECONNECT_DELAY;
         lock(shared).connected = true;
         debug!("file socket connected");
-        let mut session = Session::new(config.clone());
-        let result = session.serve(&mut ws, &epoch, shared, stop);
+        let mut session = Session::new(config.clone(), bound);
+        let result = session.serve(&mut ws, shared, stop);
         session.abort_all("socket-closed");
         lock(shared).connected = false;
         let _ = ws.close(None);
@@ -576,6 +604,8 @@ struct Sending {
 
 struct Session {
     config: FileServiceConfig,
+    /// The viewer this socket serves. Every packet, send and commit rechecks it.
+    bound: Bound,
     receiving: Option<Receiving>,
     batch: Batch,
     sending: Option<Sending>,
@@ -596,9 +626,10 @@ struct DropUpload {
 }
 
 impl Session {
-    fn new(config: FileServiceConfig) -> Self {
+    fn new(config: FileServiceConfig, bound: Bound) -> Self {
         Self {
             config,
+            bound,
             receiving: None,
             batch: Batch::default(),
             sending: None,
@@ -610,25 +641,24 @@ impl Session {
         }
     }
 
-    fn serve(
-        &mut self,
-        ws: &mut Socket,
-        epoch: &str,
-        shared: &Mutex<Shared>,
-        stop: &AtomicBool,
-    ) -> Result<()> {
+    /// True while this session's viewer is still the live one.
+    fn is_live(&self, shared: &Mutex<Shared>) -> bool {
+        lock(shared).is_bound(&self.bound)
+    }
+
+    fn serve(&mut self, ws: &mut Socket, shared: &Mutex<Shared>, stop: &AtomicBool) -> Result<()> {
         let mut last_inbound = Instant::now();
         let mut last_outbound = Instant::now();
         loop {
-            if stop.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if lock(shared).epoch.as_deref() != Some(epoch) {
+            if stop.load(Ordering::Acquire) || !self.is_live(shared) {
                 return Ok(());
             }
             let mut progressed = false;
             self.poll_drop(ws, shared)?;
             loop {
+                if !self.is_live(shared) {
+                    return Ok(());
+                }
                 match ws.read() {
                     Ok(Message::Binary(bytes)) => {
                         last_inbound = Instant::now();
@@ -644,6 +674,11 @@ impl Session {
                     Err(error) if would_block(&error) => break,
                     Err(error) => return Err(error).context("read file socket"),
                 }
+            }
+            // The reads above may have taken a while: nothing below may send
+            // for a viewer that has since changed.
+            if !self.is_live(shared) {
+                return Ok(());
             }
             if let Some(receiving) = self.receiving.as_mut() {
                 let now_ms = self.clock.elapsed().as_millis() as u64;
@@ -716,6 +751,9 @@ impl Session {
     }
 
     fn on_packet(&mut self, ws: &mut Socket, bytes: &[u8], shared: &Mutex<Shared>) -> Result<()> {
+        if !self.is_live(shared) {
+            return Ok(());
+        }
         let packet = match ft::decode(bytes) {
             Ok(packet) => packet,
             Err(reject) => {
@@ -902,11 +940,15 @@ impl Session {
                 }
             }
             let mut state = lock(shared);
-            let epoch = state.epoch.clone().unwrap_or_default();
-            state
-                .outbox
-                .drops
-                .push(NativeDropRequest::new(batch, point, epoch));
+            if !state.is_bound(&self.bound) {
+                std::mem::drop(state);
+                return self.cancel_drop(ws, "viewer-changed", shared);
+            }
+            state.outbox.drops.push(NativeDropRequest::new(
+                batch,
+                point,
+                self.bound.epoch.clone(),
+            ));
             info!(
                 files = drop.offers.len(),
                 bytes = total,
@@ -1291,19 +1333,34 @@ impl Session {
             );
             return;
         }
-        let epoch = lock(shared).epoch.clone();
+        // The upload belongs to the viewer this socket is bound to. A newer
+        // viewer must never see its files on the clipboard or a paste for them.
+        if !lock(shared).is_bound(&self.bound) {
+            info!(
+                files = batch.saved.len(),
+                "uploaded files not placed: viewer changed"
+            );
+            return;
+        }
         // EmptyClipboard may message a hung owner. Never hold the mutex the
         // input/session thread uses for take_outbox, epochs and rate updates.
         match set_files(&batch.saved) {
             Ok(seq) => {
                 let mut state = lock(shared);
+                // Recorded even when stale, so our own write is never offered back.
                 state.own_clipboard_seq = Some(seq);
+                if !state.is_bound(&self.bound) {
+                    info!(
+                        files = batch.saved.len(),
+                        "uploaded files were placed while the viewer changed; no paste"
+                    );
+                    return;
+                }
                 info!(
                     files = batch.saved.len(),
                     "uploaded files placed on the clipboard"
                 );
-                if batch.purpose == Some(Purpose::Paste) && epoch.is_some() && state.epoch == epoch
-                {
+                if batch.purpose == Some(Purpose::Paste) {
                     state.outbox.pastes += 1;
                 }
             }
@@ -1435,6 +1492,9 @@ impl Session {
         let mut chunk = vec![0u8; ft::MAX_DATA_BYTES];
         // A few chunks per loop turn keep ACKs and uploads moving.
         for _ in 0..8 {
+            if !self.is_live(shared) {
+                return Ok(sent_any);
+            }
             let sending = self.sending.as_mut().expect("checked above");
             let remaining = sending.size - sending.window.sent();
             if remaining == 0 {
@@ -1703,7 +1763,7 @@ mod tests {
             let mut state = shared
                 .try_lock()
                 .expect("clipboard write held session mutex");
-            state.epoch = Some("replacement-viewer".into());
+            rebind(&mut state, Some("replacement-viewer"));
             Ok(42)
         });
         let state = lock(&shared);
@@ -1713,6 +1773,108 @@ mod tests {
             "old viewer must not paste into a new session"
         );
         drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn live_paste_batch_queues_one_paste_for_the_bound_viewer() {
+        let (mut session, _server, _client, shared, dir) = native_test_session();
+        session.config.clipboard = true;
+        session.batch.saved = vec![dir.join("synthetic.txt")];
+        session.batch.purpose = Some(Purpose::Paste);
+        session.finish_batch_with(&shared, |_| Ok(9));
+        let state = lock(&shared);
+        assert_eq!(state.own_clipboard_seq, Some(9));
+        assert_eq!(state.outbox.pastes, 1);
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_batch_never_reaches_the_clipboard_or_queues_a_paste() {
+        let (mut session, _server, _client, shared, dir) = native_test_session();
+        session.config.clipboard = true;
+        session.batch.saved = vec![dir.join("synthetic.txt")];
+        session.batch.purpose = Some(Purpose::Paste);
+        rebind(&mut lock(&shared), Some("replacement-viewer"));
+        let mut called = false;
+        session.finish_batch_with(&shared, |_| {
+            called = true;
+            Ok(7)
+        });
+        assert!(!called, "a stale batch must not call the clipboard");
+        let state = lock(&shared);
+        assert_eq!(state.own_clipboard_seq, None);
+        assert_eq!(state.outbox.pastes, 0);
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clearing_the_epoch_discards_the_old_outbox_and_pending_native_drops() {
+        let (_session, _server, _client, shared, dir) = native_test_session();
+        let batch = DropBatch::new(vec![drop_meta(0, 1)]).unwrap();
+        let point = ft::DropPoint {
+            x: 12,
+            y: 34,
+            generation: 1,
+            viewport_revision: 2,
+        };
+        {
+            let mut state = lock(&shared);
+            state.outbox.signals.push("old-offer".into());
+            state.outbox.pastes = 2;
+            state
+                .outbox
+                .drops
+                .push(NativeDropRequest::new(batch, point, "test".into()));
+        }
+        let stale = rebind(&mut lock(&shared), None);
+        assert_eq!(stale.len(), 1, "the pending drop is handed back to reject");
+        for request in stale {
+            request.reject("viewer-changed");
+        }
+        let state = lock(&shared);
+        assert_eq!(state.epoch, None);
+        assert!(state.outbox.signals.is_empty());
+        assert_eq!(state.outbox.pastes, 0);
+        assert!(state.outbox.drops.is_empty());
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_socket_session_stops_before_reading_and_removes_its_partial_upload() {
+        let (mut session, mut ws, _client, shared, dir) = native_test_session();
+        session.receiving = Some(receiving(&dir, "pending.bin", 3));
+        let partial = session.receiving.as_ref().unwrap().partial.clone();
+        rebind(&mut lock(&shared), Some("replacement-viewer"));
+        let stop = AtomicBool::new(false);
+        session.serve(&mut ws, &shared, &stop).unwrap();
+        session.abort_all("socket-closed");
+        assert!(!partial.exists());
+        assert!(session.receiving.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_viewer_packets_are_not_processed_while_the_bound_viewer_gets_them() {
+        let (mut session, mut ws, _client, shared, dir) = native_test_session();
+        let offer = ft::encode(&Packet {
+            transfer_id: 41,
+            seq: 0,
+            body: Body::Offer(meta("a.bin", 3)),
+        });
+        session.on_packet(&mut ws, &offer, &shared).unwrap();
+        assert!(
+            session.receiving.is_some(),
+            "control: the bound viewer's offer is accepted"
+        );
+        session.abort_all("socket-closed");
+        rebind(&mut lock(&shared), Some("replacement-viewer"));
+        session.on_packet(&mut ws, &offer, &shared).unwrap();
+        assert!(session.receiving.is_none());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1778,13 +1940,20 @@ mod tests {
             "native-socket-{}",
             NEXT_NATIVE_TEST.fetch_add(1, Ordering::Relaxed)
         ));
-        let session = Session::new(FileServiceConfig {
-            downloads_dir: dir.clone(),
-            sendto_dir: None,
-            clipboard: false,
-        });
+        let session = Session::new(
+            FileServiceConfig {
+                downloads_dir: dir.clone(),
+                sendto_dir: None,
+                clipboard: false,
+            },
+            Bound {
+                epoch: "test".into(),
+                generation: 1,
+            },
+        );
         let shared = Mutex::new(Shared {
             epoch: Some("test".into()),
+            generation: 1,
             rate_cap_bps: 0,
             offer: None,
             next_offer_id: 1,
@@ -2004,6 +2173,7 @@ mod tests {
         let dir = scratch("partial");
         let shared = Mutex::new(Shared {
             epoch: None,
+            generation: 0,
             rate_cap_bps: 0,
             offer: None,
             next_offer_id: 1,
@@ -2017,8 +2187,12 @@ mod tests {
             sendto_dir: None,
             clipboard: false,
         };
+        let bound = Bound {
+            epoch: "e".into(),
+            generation: 0,
+        };
         // Cancel mid-file.
-        let mut session = Session::new(config.clone());
+        let mut session = Session::new(config.clone(), bound);
         session.receiving = Some(receiving(&dir, "a.bin", 10));
         let partial = session.receiving.as_ref().unwrap().partial.clone();
         assert!(partial.exists());
@@ -2046,6 +2220,7 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         let shared = Mutex::new(Shared {
             epoch: Some("e".into()),
+            generation: 1,
             rate_cap_bps: 0,
             offer: None,
             next_offer_id: 1,

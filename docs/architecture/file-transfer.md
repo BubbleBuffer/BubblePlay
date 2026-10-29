@@ -36,7 +36,7 @@ Signaling (`/ws`, JSON):
 - host → client `{"type":"file-offer","protocol":1,"offerId":u32,"items":[{"id":u32,"name":string,"size":u64}],"source":"clipboard"|"sendto"}`; a new offer replaces the previous one; `items: []` withdraws it.
 - client → host `{"type":"file-drag-preview","protocol":1,"epoch":currentMediaEpoch,"dragId":positiveU32,"action":"update","drop":{"x":u16,"y":u16,"generation":nonzeroU32,"viewportRevision":u32},"types":[mimeHints]}`. One to 64 hints, each at most 96 ASCII graphic bytes; empty means unknown. No names, paths or bytes. Controls are at most 8192 UTF-8 bytes, current-epoch client-only, and never buffered for a later host. `action:"cancel"` omits `drop` and `types`. Client throttles motion to 200 ms and renews stationary hover every 500 ms. Host lease expires after two seconds without controls or 120 seconds overall; readiness/geometry/session changes cancel it. A refused/expired drag ID is not repeatedly restarted. Actual local drop cancels before upload; the final handover waits at most two seconds for complete native cleanup without blocking capture.
 
-File socket: `/file-ws?epoch=<mediaEpoch>` (client, gate cookie) and `/host-file-ws?epoch=<mediaEpoch>` (host, `Authorization: Bearer <host gate token>`); the Stream Lab relay serves `/lab-file-ws` and `/lab-host-file-ws` with `run` and `compat` as on its media sockets. The relay pairs one file-client with one file-host per epoch.
+File socket: `/file-ws?epoch=<mediaEpoch>` (client, gate cookie and device key) and `/host-file-ws?epoch=<mediaEpoch>` (host, device key, no bearer). The relay pairs one file-client with one file-host per epoch.
 
 Text messages on the file socket (JSON):
 

@@ -2,7 +2,7 @@
 
 The public product is Windows desktop streaming, input, clipboard and file transfer. The private Node companion, command execution and its identity packages are excluded from the public Windows ZIP and public relay source. The optional Windows admin-input helper is a different, restricted component.
 
-The site gate requires ntfy approval for each new browser; an approved browser keeps its gate cookie until it expires. The Rust relay has no application password or authenticator code; the Go and Cloudflare password logins were deleted at CUT-1. Native host registration and endpoints use separate credentials. Host relay addresses require TLS except for loopback development, and browser WebSocket upgrades enforce their own origin. Configuration files on Windows store host secrets using CurrentUser DPAPI.
+The site gate requires ntfy approval for each new browser; an approved browser keeps its gate cookie until it expires. The Rust relay has no application password or authenticator code. A host registers with the relay `TOKEN` once and then with its device key. Viewers connect with a device key and are admitted by each PC's trusted-key list. Host relay addresses require TLS except for loopback development, and browser WebSocket upgrades enforce their own origin. Configuration files on Windows store host secrets using CurrentUser DPAPI.
 
 In WebSocket mode, TLS protects the connection between each endpoint and the relay. The relay can see video, input, clipboard and file payloads above that TLS layer. This is not endpoint-to-endpoint encryption; self-host on trusted infrastructure. WebRTC media uses its own encrypted transport, while signaling still passes through the relay.
 

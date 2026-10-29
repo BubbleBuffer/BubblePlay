@@ -24,7 +24,7 @@
 //! The send policy and the delay-based bitrate controller are pure logic so
 //! they can be unit tested without a socket or an encoder.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::os::windows::io::{AsRawSocket, RawSocket};
@@ -76,6 +76,9 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub const INBOUND_SILENCE_LIMIT: Duration = Duration::from_secs(40);
 pub const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(250);
 pub const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// Consecutive relay refusals of the media hello for the still-active epoch
+/// after which the link stops and reports [`V4LinkEnd::Refused`].
+pub const MEDIA_REFUSAL_LIMIT: u32 = 5;
 /// Bitrate floor at 1080p; other frame sizes scale it by pixel count.
 pub const RATE_FLOOR_1080P_BPS: u64 = 2_500_000;
 /// Absolute floor for tiny frames (and profiles capped below the floor).
@@ -778,6 +781,71 @@ pub struct V4Events {
     pub bitrate_reason: Option<&'static str>,
     /// Highest (generation, seq) ACKed by the receiver since the last poll.
     pub latest_ack: Option<(u32, u32)>,
+    /// The link stopped reconnecting on its own (reported once).
+    pub link_end: Option<V4LinkEnd>,
+}
+
+/// Why a link stopped reconnecting without being shut down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V4LinkEnd {
+    /// The relay closed a socket of an epoch that is no longer active. A newer
+    /// media start replaces the link; it never reconnects.
+    Retired { code: u16, reason: String },
+    /// The relay refused `refusals` consecutive media hellos for the active
+    /// epoch (for example an expired ticket). The session must re-register to
+    /// get a fresh ticket and route.
+    Refused {
+        code: u16,
+        reason: String,
+        refusals: u32,
+    },
+}
+
+/// A Close frame from the relay. A missing frame is reported as 1005.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayClose {
+    code: u16,
+    reason: String,
+}
+
+impl std::fmt::Display for RelayClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "v4 media socket closed by relay (code {}, reason {:?})",
+            self.code, self.reason
+        )
+    }
+}
+
+impl std::error::Error for RelayClose {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseVerdict {
+    Retry,
+    Retired,
+    Refused,
+}
+
+/// What a socket's end means for the link. `refusals` counts consecutive
+/// refusals including this one. Only relay Close frames can end the link.
+fn close_verdict(
+    close: Option<&RelayClose>,
+    accepted: bool,
+    epoch_active: bool,
+    refusals: u32,
+) -> CloseVerdict {
+    let Some(close) = close else {
+        return CloseVerdict::Retry;
+    };
+    let reason = close.reason.to_ascii_lowercase();
+    if reason.contains("stale") || reason.contains("retired") || !epoch_active {
+        return CloseVerdict::Retired;
+    }
+    if !accepted && refusals >= MEDIA_REFUSAL_LIMIT {
+        return CloseVerdict::Refused;
+    }
+    CloseVerdict::Retry
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -819,6 +887,10 @@ struct Shared {
     producer_activity: Option<Activity>,
     peer_epoch: u64,
     connected: bool,
+    /// The relay accepted the current socket's hello (hello-ok, presence or ACK).
+    accepted: bool,
+    /// Cleared by [`V4Link::retire_epoch`] once the host moved off this epoch.
+    epoch_active: bool,
     peer_present: bool,
     policy: SendPolicy,
     rate: DelayRateController,
@@ -1046,12 +1118,25 @@ pub struct V4Link {
 
 impl V4Link {
     pub fn spawn(connector: Connector, bitrate_bps: u64, max_bps: u64) -> Result<Self> {
+        Self::spawn_for_epoch(connector, "", bitrate_bps, max_bps)
+    }
+
+    /// [`Self::spawn`] with the epoch the connector addresses, for logs.
+    pub fn spawn_for_epoch(
+        connector: Connector,
+        epoch: &str,
+        bitrate_bps: u64,
+        max_bps: u64,
+    ) -> Result<Self> {
+        let epoch = epoch.to_owned();
         let now = Instant::now();
         let activity = Activity::new()?;
         let shared = Arc::new(Mutex::new(Shared {
             producer_activity: None,
             peer_epoch: 0,
             connected: false,
+            accepted: false,
+            epoch_active: true,
             peer_present: false,
             policy: SendPolicy::new(now),
             rate: DelayRateController::new(now, bitrate_bps, max_bps),
@@ -1078,7 +1163,14 @@ impl V4Link {
                 // is freed first, then the exit signal disconnects.
                 let _exit = exit_tx;
                 let _slot = slot;
-                link_loop(connector, rx, thread_shared, thread_stop, thread_activity)
+                link_loop(
+                    connector,
+                    &epoch,
+                    rx,
+                    thread_shared,
+                    thread_stop,
+                    thread_activity,
+                )
             })
             .context("spawn v4 media link")?;
         Ok(Self {
@@ -1214,6 +1306,13 @@ impl V4Link {
 
     pub fn take_events(&self) -> V4Events {
         std::mem::take(&mut self.lock().events)
+    }
+
+    /// The host moved off this link's epoch: the next relay close ends the
+    /// link for good instead of reconnecting.
+    pub fn retire_epoch(&self) {
+        self.lock().epoch_active = false;
+        self.activity.notify();
     }
 
     pub fn request_keyframe(&self) {
@@ -1410,6 +1509,7 @@ fn tcp_socket(ws: &WebSocket<MaybeTlsStream<TcpStream>>) -> Result<RawSocket> {
 
 fn link_loop(
     connector: Connector,
+    epoch: &str,
     rx: Receiver<Outgoing>,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
@@ -1420,6 +1520,10 @@ fn link_loop(
     let lock = || shared.lock().unwrap_or_else(|poison| poison.into_inner());
     let mut backoff = Backoff::default();
     let mut first = true;
+    // Consecutive relay closes before the relay accepted the media hello.
+    let mut refusals = 0u32;
+    // Relay closes already logged at WARN for this link (and so this epoch).
+    let mut logged_closes: HashSet<(u16, String)> = HashSet::new();
     while !stop.load(Ordering::Acquire) {
         let mut ws = match connector().and_then(|mut ws| {
             set_nonblocking(&mut ws)?;
@@ -1433,7 +1537,8 @@ fn link_loop(
                 continue;
             }
         };
-        backoff.reset();
+        // The backoff resets only once the relay accepts the hello: a socket
+        // refused right after connect must not retry at the minimum delay.
         while rx.try_recv().is_ok() {}
         {
             let mut state = lock();
@@ -1444,6 +1549,7 @@ fn link_loop(
             let now = Instant::now();
             state.peer_epoch = state.peer_epoch.wrapping_add(1);
             state.connected = true;
+            state.accepted = false;
             // Presence is announced by the relay right after hello.
             state.peer_present = false;
             state.policy.reset(now);
@@ -1456,7 +1562,7 @@ fn link_loop(
         first = false;
         info!("WSS v4 media socket connected");
         let result = serve_socket(&mut ws, &rx, &shared, &stop, &activity);
-        {
+        let (accepted, epoch_active) = {
             let mut state = lock();
             state.connected = false;
             state.peer_present = false;
@@ -1466,14 +1572,76 @@ fn link_loop(
             if let Some(activity) = &state.producer_activity {
                 activity.notify();
             }
-        }
+            (state.accepted, state.epoch_active)
+        };
         let _ = ws.close(None);
         let _ = ws.flush();
-        if let Err(error) = result {
-            let delay = backoff.next_delay();
-            warn!(error = %format!("{error:#}"), ?delay, "WSS v4 media socket lost; reconnecting");
-            sleep_unless_stopped(&stop, &activity, delay);
+        if accepted {
+            backoff.reset();
+            refusals = 0;
         }
+        let Err(error) = result else {
+            continue;
+        };
+        let close = error.downcast_ref::<RelayClose>().cloned();
+        if close.is_some() && !accepted {
+            refusals += 1;
+        }
+        let verdict = close_verdict(close.as_ref(), accepted, epoch_active, refusals);
+        if let Some(close) = &close {
+            if logged_closes.insert((close.code, close.reason.clone())) {
+                warn!(
+                    code = close.code,
+                    reason = %close.reason,
+                    epoch,
+                    accepted,
+                    epoch_active,
+                    refusals,
+                    "WSS v4 media socket closed by relay"
+                );
+            }
+        }
+        let end = match (verdict, close.clone()) {
+            (CloseVerdict::Retry, _) | (_, None) => None,
+            (CloseVerdict::Retired, Some(close)) => {
+                warn!(
+                    code = close.code,
+                    epoch, "WSS v4 media epoch retired by relay; link stopped"
+                );
+                Some(V4LinkEnd::Retired {
+                    code: close.code,
+                    reason: close.reason,
+                })
+            }
+            (CloseVerdict::Refused, Some(close)) => {
+                warn!(
+                    code = close.code,
+                    epoch,
+                    refusals,
+                    "relay refused the WSS v4 media hello repeatedly; link stopped"
+                );
+                Some(V4LinkEnd::Refused {
+                    code: close.code,
+                    reason: close.reason,
+                    refusals,
+                })
+            }
+        };
+        if let Some(end) = end {
+            let mut state = lock();
+            state.events.link_end = Some(end);
+            if let Some(activity) = &state.producer_activity {
+                activity.notify();
+            }
+            break;
+        }
+        let delay = backoff.next_delay();
+        if close.is_some() {
+            debug!(error = %format!("{error:#}"), ?delay, "WSS v4 media socket closed by relay; reconnecting");
+        } else {
+            warn!(error = %format!("{error:#}"), ?delay, "WSS v4 media socket lost; reconnecting");
+        }
+        sleep_unless_stopped(&stop, &activity, delay);
     }
 }
 
@@ -1534,7 +1702,19 @@ fn read_available(
                 any = true;
                 handle_inbound(text.as_str(), shared);
             }
-            Ok(Message::Close(_)) => bail!("v4 media socket closed by relay"),
+            Ok(Message::Close(frame)) => {
+                let close = frame.map_or_else(
+                    || RelayClose {
+                        code: 1005,
+                        reason: String::new(),
+                    },
+                    |frame| RelayClose {
+                        code: u16::from(frame.code),
+                        reason: frame.reason.as_str().to_owned(),
+                    },
+                );
+                return Err(close.into());
+            }
             Ok(_) => any = true,
             Err(error) if would_block(&error) => return Ok(any),
             Err(error) => return Err(error).context("read v4 media socket"),
@@ -1553,6 +1733,7 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
         V4Inbound::Ack {
             generation, seq, ..
         } => {
+            state.accepted = true;
             state.stats.acks += 1;
             state.capacity.on_ack(now, generation, seq);
             apply_capacity(&mut state, now);
@@ -1581,6 +1762,7 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
             state.events.keyframe = Some(reason);
         }
         V4Inbound::MediaPeer { present } => {
+            state.accepted = true;
             state.peer_epoch = state.peer_epoch.wrapping_add(1);
             state.events = V4Events::default();
             state.peer_present = present;
@@ -1591,7 +1773,8 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
                 state.events.keyframe = Some("peer-joined".into());
             }
         }
-        V4Inbound::Ping | V4Inbound::Pong | V4Inbound::HelloOk => {}
+        V4Inbound::HelloOk => state.accepted = true,
+        V4Inbound::Ping | V4Inbound::Pong => {}
     }
     if let Some(activity) = &state.producer_activity {
         activity.notify();
@@ -1782,6 +1965,8 @@ mod tests {
             producer_activity: None,
             peer_epoch: 0,
             connected: true,
+            accepted: true,
+            epoch_active: true,
             peer_present: false,
             policy: SendPolicy::new(now),
             rate: DelayRateController::new(now, 6_000_000, 6_000_000),
@@ -2732,6 +2917,179 @@ mod tests {
                 (stats.reconnects >= 1).then_some(stats.reconnects)
             }),
             1
+        );
+        link.shutdown();
+    }
+
+    #[test]
+    fn close_verdict_ends_only_retired_epochs_and_repeated_refusals() {
+        let close = |code, reason: &str| RelayClose {
+            code,
+            reason: reason.to_owned(),
+        };
+        // Network errors and closes after acceptance keep reconnecting.
+        assert_eq!(close_verdict(None, false, true, 9), CloseVerdict::Retry);
+        assert_eq!(
+            close_verdict(Some(&close(1001, "")), true, true, 0),
+            CloseVerdict::Retry
+        );
+        // Refusals of the active epoch retry until the limit.
+        assert_eq!(
+            close_verdict(Some(&close(1008, "")), false, true, 1),
+            CloseVerdict::Retry
+        );
+        assert_eq!(
+            close_verdict(Some(&close(1008, "")), false, true, MEDIA_REFUSAL_LIMIT - 1),
+            CloseVerdict::Retry
+        );
+        assert_eq!(
+            close_verdict(Some(&close(1008, "")), false, true, MEDIA_REFUSAL_LIMIT),
+            CloseVerdict::Refused
+        );
+        // A stale or retired epoch never reconnects.
+        assert_eq!(
+            close_verdict(Some(&close(1001, "stale epoch")), true, true, 0),
+            CloseVerdict::Retired
+        );
+        assert_eq!(
+            close_verdict(Some(&close(1008, "")), false, false, 1),
+            CloseVerdict::Retired
+        );
+        assert_eq!(
+            close_verdict(Some(&close(1001, "")), true, false, 0),
+            CloseVerdict::Retired
+        );
+    }
+
+    /// A relay stand-in that answers every connect with `Close(code, reason)`
+    /// before any hello-ok, holding the first one until `gate` fires. Returns
+    /// the accept times once `done` is set.
+    fn refusing_relay(
+        code: u16,
+        reason: &'static str,
+        gate: Option<Receiver<()>>,
+    ) -> (String, Arc<AtomicBool>, JoinHandle<Vec<Instant>>) {
+        use tungstenite::protocol::frame::coding::CloseCode;
+        use tungstenite::protocol::frame::CloseFrame;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let done = Arc::new(AtomicBool::new(false));
+        let server_done = done.clone();
+        let server = thread::spawn(move || {
+            let mut accepts = Vec::new();
+            while !server_done.load(Ordering::Acquire) {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                };
+                accepts.push(Instant::now());
+                stream.set_nonblocking(false).unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                if accepts.len() == 1 {
+                    if let Some(gate) = &gate {
+                        gate.recv().unwrap();
+                    }
+                }
+                ws.close(Some(CloseFrame {
+                    code: CloseCode::from(code),
+                    reason: reason.into(),
+                }))
+                .unwrap();
+                // Finish the close handshake or see the host drop the socket.
+                while ws.read().is_ok() {}
+            }
+            accepts
+        });
+        (url, done, server)
+    }
+
+    fn flagged_connector(url: String, ended: Arc<AtomicBool>) -> Connector {
+        let exit = ExitFlag(ended);
+        Box::new(move || {
+            let _ = &exit;
+            Ok(tungstenite::connect(url.as_str())?.0)
+        })
+    }
+
+    /// The 2026-10-25 loop: a relay refusing a retired epoch's socket must not
+    /// be reconnected every 250 ms.
+    #[test]
+    fn a_relay_refusal_of_a_retired_epoch_ends_the_link_after_one_connect() {
+        for (code, reason, retire) in [(1008u16, "", true), (1001, "stale epoch", false)] {
+            let (gate_tx, gate_rx) = mpsc::channel();
+            let (url, done, server) = refusing_relay(code, reason, Some(gate_rx));
+            let ended = Arc::new(AtomicBool::new(false));
+            let started = Instant::now();
+            let link = V4Link::spawn_for_epoch(
+                flagged_connector(url, ended.clone()),
+                "0123456789abcdef0123456789abcdef",
+                6_000_000,
+                6_000_000,
+            )
+            .unwrap();
+            if retire {
+                link.retire_epoch();
+            }
+            gate_tx.send(()).unwrap();
+            assert!(wait_for_flag(&ended), "link kept reconnecting");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            // Linger past the minimum backoff so a reconnect would be seen.
+            thread::sleep(RECONNECT_BACKOFF_MIN * 2);
+            done.store(true, Ordering::Release);
+            assert_eq!(server.join().unwrap().len(), 1, "close {code} {reason:?}");
+            assert_eq!(
+                link.take_events().link_end,
+                Some(V4LinkEnd::Retired {
+                    code,
+                    reason: reason.to_owned()
+                })
+            );
+            assert!(!link.stats().connected);
+            // A self-ended link backpressures; it never reports Stopped.
+            assert_eq!(link.reserve(true), V4Reserve::Backpressured);
+            link.shutdown();
+        }
+    }
+
+    #[test]
+    fn repeated_refusals_of_the_active_epoch_back_off_and_end_the_link() {
+        let (url, done, server) = refusing_relay(1008, "", None);
+        let ended = Arc::new(AtomicBool::new(false));
+        let link = V4Link::spawn_for_epoch(
+            flagged_connector(url, ended.clone()),
+            "0123456789abcdef0123456789abcdef",
+            6_000_000,
+            6_000_000,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ended.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "link never gave up");
+            thread::sleep(Duration::from_millis(10));
+        }
+        done.store(true, Ordering::Release);
+        let accepts = server.join().unwrap();
+        assert_eq!(accepts.len(), MEDIA_REFUSAL_LIMIT as usize);
+        let gaps: Vec<Duration> = accepts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        // A connect the relay refuses never resets the backoff.
+        for (gap, expected_ms) in gaps.iter().zip([250u64, 500, 1_000, 2_000]) {
+            assert!(
+                *gap >= Duration::from_millis(expected_ms - 20),
+                "gaps {gaps:?}"
+            );
+        }
+        assert_eq!(
+            link.take_events().link_end,
+            Some(V4LinkEnd::Refused {
+                code: 1008,
+                reason: String::new(),
+                refusals: MEDIA_REFUSAL_LIMIT
+            })
         );
         link.shutdown();
     }

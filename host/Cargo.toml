@@ -7,6 +7,7 @@ license = "AGPL-3.0-or-later"
 build = "build.rs"
 
 [dependencies]
+bp-device-key = { path = "../crates/bp-device-key", features = ["phase2", "keygen"] }
 windows-capture = "2.0.0"
 nvidia-video-codec-sdk = "0.4.0"
 # Select CUDA bindings before the SDK's auto-detection feature can invoke nvcc.
@@ -51,6 +52,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
+    "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
 ] }
 windows-service = "0.8.1"
@@ -72,6 +74,13 @@ aes-gcm = { version = "=0.10.3", features = ["zeroize"] }
 sha2 = "=0.10.9"
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 zeroize = { version = "=1.9.0", features = ["alloc"] }
+# QR code for the pairing page (host/src/devices_window.rs). Exact pin, no image/svg features.
+qrcode = { version = "=0.14.1", default-features = false }
+
+[dev-dependencies]
+# tests/device_keys_relay.rs starts the native relay in-process on its own tokio runtime.
+bp-relay-server = { path = "../relay-rs/server" }
+tokio = { version = "1", features = ["net", "rt-multi-thread"] }
 
 [profile.release]
 lto = "thin"

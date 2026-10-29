@@ -23,6 +23,12 @@ Code reads of master on 2026-10-22, before the cutover; no live tests. Kept for 
   - Unlock on open is not required yet. It becomes mandatory at the phase 2 cutover.
 - **Phases 2 and 3: not started.** Pairing, the handshake, the Devices window, per-device permissions, remote pairing and ID rotation are not built.
 - A Rust relay that replaces both the Go and Worker relays is in progress on branch `lane/rust-relay`. Switching to it is the phase 2 cutover.
+- **Host viewer authentication (updated 2026-10-27):** the host uses `bp-device-key::phase2` for signed handshakes, pins normal viewers against its CurrentUser DPAPI trusted list, and runs code/SAS pairing with a local Allow/Deny decision. `peer-joined.mediaEpoch` supplies the exact opaque ASCII transcript epoch; `pairing` fixes the handshake mode. An auth-hello before that relay event is rejected. Capture, input, clipboard and file access wait for authentication.
+- **Host registration (updated 2026-10-27):** the PC key signs the relay challenge and registration requires a PC ID and data-socket ticket. Host, media-host and file-host use the phase 2 route without a bearer. The host publishes its admit list after hello-ok and after trusted-list changes. Legacy setup/tray credential fields remain for the later cleanup deliverable.
+- **Host transport binding (updated 2026-10-27):** every endpoint message on `/ws` uses ctl AEAD, including exact binary input/cursor bytes; plaintext endpoint frames are dropped. WebRTC requires `dtls-bind-v1`, signs the normalised sha-256 SDP fingerprints (see DTLS under the encodings), and gates media and data-channel input until both binds verify. WSS media and file payload protocols remain unchanged; their end-to-end encryption is phase 4.
+- **Host permission gates (updated 2026-10-27):** authentication and, for WebRTC, both DTLS binds precede the existing Admin mode, secure-desktop and first-frame input gates. Files use the authenticated viewer epoch. The Devices API uses mpsc commands/events; the tray sends `open-devices` through stdin. A redacted log UI is wired until the separately built Devices window is connected. Relay interoperability and on-screen UI operation have not been checked live.
+- **Transport latch (decision 24, 2026-10-29):** after the handshake the host passes only answer, ice, caps, ping and bye until the mode latches. An accepted offer latches WebRTC, clears both binds and keeps the gate closed until both binds for that offer verify. A `media-control` start for protocol 4 with this session's epoch latches WSS, and re-latches it after WebRTC (the in-session fallback). Before the latch, input and application ctl are dropped and the viewer does not count as live.
+- **No service-mode host (2026-10-29):** the service-mode host (Transport service, `--privileged-agent`) was removed from the repo; phase 2 runs the per-user tray host only. Pre-login access is phase 3, which needs a machine-scoped copy of the PC key.
 
 What changes: the endpoints authenticate each other with keys, and the relay only routes and keeps strangers out. Password login, TOTP and host approval, the session cookie and the Android WebView login are deleted. ntfy approval stays at the relay as a [site gate](#site-gate) in front of the browser page, unrelated to device keys. On the PC, ntfy becomes the second factor for pre-login sessions and a heads-up for waiting pairing requests; remote pairing is approved at the PC or by a voucher from a paired device.
 
@@ -65,7 +71,7 @@ One text file per key, extension `.bpkey`, UTF-8 JSON:
 - **KDF: Argon2id**, 64 MiB, 3 passes, 1 lane, the same parameters the Go relay used for passwords before the cutover (`relay/auth.go` 57). Rust has the `argon2` crate and Android BouncyCastle's Argon2 generator. WebCrypto has no Argon2, so the browser ships a small vendored Argon2id WASM build with the other assets, listed in the third-party notices. PBKDF2 alone would make a stolen file much cheaper to guess on GPUs, which is why the owner's preference holds here despite the extra dependency.
 - **AEAD: AES-256-GCM**, native in WebCrypto, Rust (`aes-gcm`) and Android (JCA). A file is encrypted once per passphrase change with a fresh random nonce. The associated data is the canonical JSON of every field except `private` and `aead.nonce`, so a tampered ID, public key or KDF parameters fail to decrypt.
 - **On import**, the client derives the public key from the seed and refuses the file if it does not match `public` and `id`. Unknown `version` or `type` is refused with a clear message.
-- `label` is a suggestion for the device name at pairing; the PC's own name for the device wins.
+- `label` is the name the viewer sends in its `caps` control message after pairing; the PC stores "Unnamed device" at pairing ([Pairing A](#a-at-the-pc)).
 
 ### Where keys live
 
@@ -92,7 +98,7 @@ A key file can be imported on several devices. To the PC they are one identity: 
 ### Rotation, revocation, loss
 
 - **Rotation:** a viewer device rotates its ID by vouching for its own new key ([ID rotation](#id-rotation), phase 3). A PC rotating its own key signs a `rotate` statement with the old key naming the new one and sends it to its viewers; a viewer that has not seen the statement shows "PC key changed" and refuses, as SSH does. Manual only; no expiry.
-- **Revocation** is local and immediate: removing a key from the PC's list ends its open session and refuses it from then on. The relay's admission list updates on the next sync.
+- **Revocation** is local and immediate: removing a key from the PC's list ends its open session and refuses it from then on. **Revoke** also re-sends `admit` without that ID, and the relay closes the viewer's socket.
 - **Lost or stolen device or key file:** revoke the key in the tray. A passphrase-protected file costs the thief an Argon2id guess per try; an unprotected one is usable at once, until revoked.
 - **Lost browser key** (site data cleared, new profile) without an exported copy: the browser is a new device and pairs again. The old row shows "not seen for N days" until revoked.
 - **Passkeys** stay a possible later option and are not planned.
@@ -103,17 +109,23 @@ Pairing adds a viewer's public key to a PC's trusted list, with a name and permi
 
 ### A. At the PC
 
-1. Owner clicks **Pair device** in the tray. For 5 minutes the tray shows the PC's ID, a one-time 10-character code, and a QR code with `bubbleplay://pair?relay=<url>&pc=<id>&code=<code>` (the browser uses `https://<relay>/pair#...`; the fragment never reaches the relay).
-2. The viewer, key unlocked, scans the QR or types PC ID and code, and connects to the relay as an unpaired device asking for that PC.
-3. Viewer and PC exchange public keys and a pairing proof keyed by the code (HMAC over the transcript), so the PC accepts only requests from someone who saw its screen.
-4. Both sides show a 6-digit comparison number derived from the transcript. The tray shows "Pair 'Pixel 8' (ID B7QK-...)? Number on the device: 482 913" with the default permissions and **Allow** / **Deny**. The relay cannot fake the number without changing the keys. The code alone would not be enough: a relay could brute-force a short code under HMAC within its lifetime.
-5. The PC adds the entry; the viewer stores the PC (ID, public key, relay URL, name).
+1. Owner clicks **Pair device** in the tray. For 5 minutes the tray shows the PC's ID, a one-time pairing code, and a QR code with `bubbleplay://pair?relay=<url>&pc=<id>&code=<code>` (the browser uses `https://<relay>/pair#pc=<id>&code=<code>`; the fragment never reaches the relay). The code is 10 Crockford base32 characters from the PC's CSPRNG, shown as `XXXXX-XXXXX`, for example `70Q1K-9MXR1`.
+   - Normalisation, for any typed code or a code taken from a link: uppercase, O becomes 0, I and L become 1, dashes and spaces are dropped. `7oq-ik9 mxrl` normalises to `70Q1K9MXR1`.
+   - The PC registers the admit hash with the relay in `pair-open`: `b64url(SHA-256("bubbleplay-pair-admit-v1" || canonical PC ID || normalised code))` ([relay protocol](#phase-2-relay-protocol)).
+2. The viewer, key unlocked, opens the pairing link or types the PC ID and code. Android has no in-app QR scanner; the camera app opens `bubbleplay://pair`. The browser opens `https://<relay>/pair#pc=<id>&code=<code>` from the QR (any phone or desktop camera, or the link), or the user types the PC ID and code into the browser's pair form; the handshake and comparison number are the same (decision 14). The viewer sends the same admit hash as `pair` in its relay `hello` and connects as an unpaired device asking for that PC.
+3. The viewer and the PC run the handshake over the signaling socket with `pair-v1` in `caps`: `auth-hello`, `auth-host`, `auth-finish`. H is the transcript hash. Both sides derive the pair key K = HKDF-SHA256(ikm = normalised code as ASCII, salt empty, info `bubbleplay-pair-v1`, 32 bytes).
+4. The viewer sends `pair-proof` with `mac` = HMAC-SHA256(K, `"viewer"` || H). The PC verifies it in constant time. A wrong MAC ends the attempt with no number shown.
+5. The PC sends its own `pair-proof` with `mac` = HMAC-SHA256(K, `"pc"` || H). The viewer verifies it in constant time.
+6. Only after both proofs verify, both sides show the 6-digit comparison number: the first 4 bytes of SHA-256("bubbleplay-pair-sas-v1" || H) as a big-endian u32, mod 10^6, shown as `482 913`. The tray shows "Pair 'Unnamed device' (ID B7QK-...)? Number on the device: 482 913" with the default permissions and **Allow** / **Deny**. The relay cannot fake the number without changing the keys. The code alone would not be enough: the number binds the exact keys exchanged, so a relay that learned the code still cannot sit in the middle unseen.
+7. **Allow** adds the key to the PC's trusted list (`%LOCALAPPDATA%\BubblePlay\trusted-devices.json`, CurrentUser DPAPI, entries `{id, public, name, paired, lastSeen}`), sends `pair-done`, and re-sends `admit` with the new ID. **Deny** sends `pair-denied` and adds nothing. The viewer stores the PC (ID, public key, relay URL, name) after `pair-done`.
+
+**Device name.** The PC stores "Unnamed device" at pairing. Pairing mode carries no ctl, so the name comes in the viewer's next session: its first ctl message is kind `caps`, `{type:"caps", caps:[...], name:"<label, <=64 chars>"}`, mirroring the PC's caps. The PC strips control characters, truncates `name` to 64 characters, and updates the stored name on every session. Devices shows it.
 
 This is also the only way to pair the first device on a fresh install, so first setup needs no password.
 
 ### B. Remotely, approved at the PC or by a paired device
 
-For pairing while away from the PC. Off by default (**Allow remote pairing** in the tray). ntfy does not approve pairing.
+For pairing while away from the PC. Phase 3; phase 2 builds only pairing at the PC (A). Off by default (**Allow remote pairing** in the tray). ntfy does not approve pairing.
 
 1. The new device asks the relay to pair with a PC ID, without a code. The relay forwards the request only if the PC has remote pairing on (it publishes that flag), and within rate limits: one pending request per PC, a few per source prefix per hour, enforced at the relay and again at the PC.
 2. New device and PC exchange keys; both compute the comparison number. The new device shows it.
@@ -177,7 +189,7 @@ Pairing runs end to end over the signaling socket, so the old Go and Cloudflare 
 Kept from the old relays, independent of device keys: a browser must pass ntfy approval before the relay serves anything of the site. The owner does not want anyone browsing or probing what the relay hosts.
 
 - **What is behind it:** every browser-facing path: the page, its scripts and styles, the Argon2id WASM, the key create/import and unlock screens, `/pair`, and the browser upgrades of `/ws`, `/media-ws` and `/file-ws`. A browser socket needs the gate cookie **and** a valid key signature. Phase 2 checks that no asset path is reachable without the cookie.
-- **How it works, both old relays:** the ntfy flow from [browser approval](browser-approval.md), reduced to one method. Opening any path without a valid gate cookie holds the navigation and publishes Approve/Deny to the relay's ntfy topic, with the client prefix and a short browser summary; the decision links are single-use capabilities posted to `/__gate/decision`; at most ten pending requests and one per client prefix; requests expire after the approval TTL (Go `approvalTTLSeconds`, 30-120 s, default 90) or when the browser leaves. The old Go relay used `ntfyURL`, `ntfyTopic`, `ntfyToken`; the old Cloudflare relay used `NTFY_URL`, `NTFY_TOPIC`, `NTFY_TOKEN`. TOTP and host approval are removed, so `approvalMethods` / `APPROVAL_METHODS` go away and ntfy becomes required for any relay that serves the browser.
+- **How it works, both old relays:** the ntfy flow from [browser approval](#site-gate), reduced to one method. Opening any path without a valid gate cookie holds the navigation and publishes Approve/Deny to the relay's ntfy topic, with the client prefix and a short browser summary; the decision links are single-use capabilities posted to `/__gate/decision`; at most ten pending requests and one per client prefix; requests expire after the approval TTL (Go `approvalTTLSeconds`, 30-120 s, default 90) or when the browser leaves. The old Go relay used `ntfyURL`, `ntfyTopic`, `ntfyToken`; the old Cloudflare relay used `NTFY_URL`, `NTFY_TOPIC`, `NTFY_TOKEN`. TOTP and host approval are removed, so `approvalMethods` / `APPROVAL_METHODS` go away and ntfy becomes required for any relay that serves the browser.
 - **How long an approval lasts:** the `__Host-gate` cookie (Secure, HttpOnly, SameSite=Lax), valid for 30 days from approval for that browser profile, not extended by use. The operator revokes gate sessions with the admin token, as the old relays did; the page offers **Forget this browser**, which clears the cookie. A revoked or expired cookie closes the browser's sockets on their next check and starts a new approval on the next navigation.
 - **What an unapproved visitor sees:** a minimal wait page: no title, favicon, product name, version or script, only "Waiting for approval" and, after a deny or expiry, "Not approved". Every unknown path returns the same page; the default route, error pages and response headers carry no product name. `/__auth/methods` is removed. `/healthz` answers only on loopback or to the operator's admin token, since the old `/healthz` named the backend. The AGPL source link moves behind the gate (open question 3).
 - **Android:** recommended exempt. The app does not load the page; its sockets send no `Origin`, and the relay admits them only after the device-key signature check. Before that check a native socket gets a nonce and nothing else, and an invalid or unlisted signature closes it without a reason text, so a native-protocol probe learns no more than the wait page shows. Requiring the gate in the app would bring back a WebView or a cookie flow just to repeat what the key already proves. A pairing request from an unpaired app still needs an open pairing window or remote pairing on the PC.
@@ -203,11 +215,13 @@ After the relay joins viewer and PC, and before the host starts capture or accep
 2. PC → viewer `auth-host`: PC ID, public key, nonce, ephemeral key, signature over the transcript so far.
 3. Viewer → PC `auth-finish`: signature over the full transcript.
 
-The transcript is `"bubbleplay-auth-v1"`, the relay origin, the session epoch, both IDs and public keys, both nonces and both ephemeral keys. The viewer checks the PC key against its pinned key; the PC checks the viewer key against its trusted list and loads that key's permissions. A mismatch closes the session with a reason the user sees ("PC key changed", "This device is not paired").
+The transcript is `"bubbleplay-auth-v1"`, the relay origin, the `mediaEpoch` string as received, both IDs and public keys, both nonces and both ephemeral keys. The viewer checks the PC key against its pinned key; the PC checks the viewer key against its trusted list and loads that key's permissions. A mismatch closes the session with a reason the user sees ("PC key changed", "This device is not paired").
+
+**Refusals:** in WebRTC mode, when the offer arrives from a viewer whose `auth-hello` lacked `dtls-bind-v1`, the PC sends a ctl `{type:"error", code:"dtls-bind-required", message}` and the session ends. Any other missing mandatory cap gets code `cap-missing`. An `auth-hello` without `control-aead-v1` gets nothing, since there is no channel yet, and the session ends. Viewers show each code as a clear message.
 
 **Binding, so a relay cannot splice:**
 
-- **WebRTC:** once DTLS is up, each side signs the local and remote certificate fingerprints from the local and remote SDP (`a=fingerprint`). DTLS already checks the remote certificate against the remote SDP, so a relay that rewrote SDP to sit in the middle produces fingerprints the peer did not generate, and the signatures fail. Media and input wait for this step.
+- **WebRTC:** once DTLS is up, each side signs the local and remote certificate fingerprints from the local SDP it sent and the remote SDP it received (`a=fingerprint`, sha-256 only, normalised as below). DTLS already checks the remote certificate against the remote SDP, so a relay that rewrote SDP to sit in the middle produces fingerprints the peer did not generate, and the signatures fail. Media and input wait for this step.
 - **Control channel, both modes:** TLS ends at the relay, and input and clipboard travel on `/ws` in both transport modes. HKDF over the ephemeral shared secret gives per-direction keys no relay knows. Every control and input message is authenticated with AES-GCM under them (sequence number as nonce, replays refused). Without this, the handshake proves who connected but a relay could still inject input afterwards, so it ships in the same phase as the handshake.
 
 **End-to-end encryption for WSS media** (future work in [release status](../release-status.md)) becomes possible with the same keys: AES-GCM per WSS v4 access unit, the 28-byte header as associated data, generation and sequence as the nonce. In scope here: the key schedule and a capability flag. The framing change, per-frame WebCrypto cost in the browser decode path, and file-socket encryption are a separate proposal.
@@ -250,7 +264,7 @@ This PC   Office-PC   ID 7HQ2-K9MX-4RTD-P0ZB   Relay play.example.com (online)
 ```
 
 - Each row is one key. A key seen from more than one client kind or network in the last 30 days expands to its recent connections, so a shared key file is visible.
-- **Edit** opens name and permission checkboxes; "Elevated input" and "Before sign-in" are greyed with a note while their machine switch is off, and changing "Before sign-in" asks for UAC.
+- **Edit** (after phase 2; phase 2 has no rename, the name always comes from the device's `caps`) opens name and permission checkboxes; "Elevated input" and "Before sign-in" are greyed with a note while their machine switch is off, and changing "Before sign-in" asks for UAC.
 - **Revoke** asks once, removes the key, ends its session and syncs the relay list. If the device vouched for others, the same dialog asks whether to revoke them too.
 - **Pair device** shows the code, the QR and the confirmation from pairing at the PC, inside this window.
 - **Allow remote pairing** works without ntfy; ntfy only adds the heads-up. Pending requests appear at the top of the window with the comparison number and **Allow** / **Deny**.
@@ -271,7 +285,7 @@ Deleted in phase 2:
 - **Browser:** `login.html` and the password form; the approval wait page is reduced to the minimal site-gate page. The key unlock or create/import screen and the PC list replace the login.
 - **Host:** the browser approval dialog (`host/src/browser_approval.rs`) and `browserApproval` capability, `HOST_GATE_TOKEN` handling in setup, tray and signaling.
 - **Android:** `LoginActivity` WebView login, cookie storage and replay, "Forget browser".
-- **Docs and fixtures:** [browser approval](browser-approval.md) rewritten as the site gate (ntfy only); the host-approval messages in `fixtures/browser-approval-contract.json` removed; setup guides rewritten for key pairing.
+- **Docs and fixtures:** [browser approval](#site-gate) rewritten as the site gate (ntfy only); the host-approval messages in `fixtures/browser-approval-contract.json` removed; setup guides rewritten for key pairing.
 - **Ticketless media and file sockets:** require a ticket on `/media-ws` and `/file-ws` for ID'd PCs, in every relay. In phase 1 a pc-less socket without a ticket is still accepted when its epoch matches the resolved room, because old viewers send no ticket and the upgrade stays behind today's login.
 
 Kept: the ntfy site gate with the `__Host-gate` cookie and `/__gate/decision`, `TOKEN` as the first-registration ticket, the admin token for operator management, the per-prefix rate limiting (now also on pairing requests and handshakes), TURN credential issuance.
@@ -339,15 +353,17 @@ Sizes: S under a week, M one to three weeks, L three to six weeks, each with tes
 
 Verified: repeated generation is byte-identical and matches the staged fixture; Node 24 passes 10 checks, Node 22 passes 7 with the required 3 skips. On 2026-10-15, `cd relay && go test ./... -run DeviceKeys -v` passes all four checks on linux01 with Go 1.27.1, including relay proofs; `go vet ./...` also passes. No Go ran on the PC.
 
+2026-10-25: the fixture gained a `phase2` section (phase 0 content unchanged): pairing code and its normalisation, the relay admit hash (`"bubbleplay-pair-admit-v1"` || canonical PC ID || normalised code, no length prefixes), pair key (HKDF-SHA256, code ASCII as IKM, empty salt, info `bubbleplay-pair-v1`), both `pair-proof` MACs plus a wrong-code MAC, the comparison number, the QR and link forms, `pair-open`/`pair-close`/`pair-closed`/`pair-done`/`pair-denied`, an `admit` list, mandatory caps, and `ctl` envelopes for sequences 0/1 in each direction (the viewer's sequence 0 is a binary input frame, the rest JSON) with replay, skip, wrong-kind and wrong-direction failures. `auth-bind` keeps the phase 0 `handshake.dtls` encoding below. Where phase 0 defines an encoding, it wins.
+
 ### Encodings for implementers
 
 - **IDs/key files:** SHA-256(raw 32-byte Ed25519 public), first 10 bytes, most-significant-bit-first Crockford base32, uppercase `XXXX-XXXX-XXXX-XXXX`. Ignore input hyphens/case; O→0, I/L→1. Seed: 32 bytes. Plain: `kdf`/`aead` null, `private` = seed. Protected: Argon2id v19, UTF-8 passphrase, m=65536 KiB, t=3, p=1, salt 16 bytes, output 32 bytes; AES-256-GCM nonce 12 bytes, `private` = ciphertext || 16-byte tag.
 - **Key-file AAD:** UTF-8 [RFC 8785 JCS](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON after removing `private` and nested `aead.nonce`; keep `aead.alg`, all other metadata and null `aead`. No trailing newline. The fixture records the AAD string/hex and exercises quotes and non-ASCII UTF-8.
-- **Transcript:** each field is uint32 big-endian byte length || bytes, ordered: `bubbleplay-auth-v1`, relay origin, decimal epoch string, canonical viewer ID, viewer public, canonical PC ID, PC public, viewer nonce, PC nonce, viewer ephemeral X25519 public, PC ephemeral X25519 public. Strings are UTF-8; public keys/nonces are raw 32 bytes. Preserve epoch bytes without numeric coercion.
+- **Transcript:** each field is uint32 big-endian byte length || bytes, ordered: `bubbleplay-auth-v1`, relay origin, epoch string (the `mediaEpoch` bytes as received, opaque ASCII), canonical viewer ID, viewer public, canonical PC ID, PC public, viewer nonce, PC nonce, viewer ephemeral X25519 public, PC ephemeral X25519 public. Strings are UTF-8; public keys/nonces are raw 32 bytes. Preserve epoch bytes without numeric coercion.
 - **Relay proof:** each field is uint32 big-endian byte length || bytes, ordered: UTF-8 `bubbleplay-relay-v1`, UTF-8 role (`host` or `viewer`), UTF-8 relay origin (the same origin form as the transcript), raw 32-byte nonce, UTF-8 canonical device ID, raw 32-byte Ed25519 public key. H = SHA-256(encoding); Ed25519 signs the 32 bytes of H directly. The label inside the encoding is the domain separator; no extra context prefix.
 - **Signatures:** H = SHA-256(transcript). PC signs `bubbleplay-auth-host-v1` || H; viewer signs `bubbleplay-auth-viewer-v1` || H || raw 64-byte PC signature. Ed25519 signs these bytes directly; contexts are raw UTF-8 without length prefixes.
 - **Control:** X25519 shared secret → HKDF-SHA-256, salt H, 32-byte outputs, UTF-8 info `bubbleplay-ctl-v1 viewer-to-pc` / `bubbleplay-ctl-v1 pc-to-viewer`. Per-direction AES-256-GCM nonce: four zero bytes || uint64 big-endian sequence starting at 0. AAD: raw UTF-8 `type`; ciphertext || 16-byte tag. `plaintextUtf8` fixes sample JSON serialization; capability strings are illustrative.
-- **DTLS:** each side signs raw UTF-8 `bubbleplay-dtls-v1` || H || local fingerprint || newline || remote fingerprint. Fingerprints are UTF-8 SDP `a=fingerprint` **values**, including algorithm/spaces/colons, excluding `a=fingerprint:`. Each signer uses its own local/remote order.
+- **DTLS:** each side signs raw UTF-8 `bubbleplay-dtls-v1` || H || local fingerprint || newline || remote fingerprint. Fingerprints come from the `a=fingerprint` line of the SDP actually sent (local) and received (remote), never rebuilt from the WebRTC stack's API, and are normalised before both signing and verifying (decided 2026-10-28, D23): algorithm lowercase, exactly one space, hex uppercase in colon-separated pairs (`sha-256 A0:A1:...:BF`). Only sha-256 is used: if an SDP lists several fingerprints, the sha-256 one is taken; an SDP with none ends the session with ctl error code `dtls-bind-required`. In Rust, `bp_device_key::phase2::sdp_sha256_fingerprint` and `normalize_fingerprint` implement this. Each signer uses its own local/remote order.
 - **Signaling:** `auth-hello` `{type, id, public, nonce, ephemeral, caps}` (string-array `caps`); `auth-host` `{type, id, public, nonce, ephemeral, signature}`; `auth-finish`/`auth-bind` `{type, signature}`. `type` is the hyphenated message name, IDs canonical, binary fields unpadded base64url. Both sides send `auth-bind`, each signing its own local/remote order (decided 2026-10-22, D9). The fixture's `messages.authBind` is the viewer's, and `messages.authBindPc` is the PC's.
 
 ### Browser research (docs and web only)
@@ -388,6 +404,8 @@ Decided 2026-10-22 for the Rust relay (`relay-rs/`, lane rust-relay, M2). Consta
 3. The viewer answers `{"type":"register-proof","signature"}`, a relay proof with role `viewer` and the relay's configured public origin, checked with strict Ed25519 verification.
 4. The relay checks admission (below). Only then does it rotate the epoch, send the host `{"type":"peer-joined","mediaEpoch","pairing"}` (the same opaque `mediaEpoch` string the viewer gets) and then send the viewer `hello-ok`. Until admission the socket receives nothing but the challenge, and it neither takes the viewer slot nor causes peer events.
 
+**Peer event to the host.** When the relay admits a viewer and rotates the epoch, it sends the host a plaintext relay-generated `{"type":"peer-joined","mediaEpoch":"<exact hello-ok mediaEpoch string>","pairing":<bool>}`, before the viewer's `hello-ok`. The `mediaEpoch` is an opaque ASCII string (relay-rs: 32 lowercase hex); nobody parses it as a number, and the transcript uses its bytes as received. An `auth-hello` that reaches the host before `peer-joined` is an error: the host ignores it and logs it. A new `peer-joined` resets any handshake in progress.
+
 Media and file sockets keep the phase 1 ticket hello. A browser socket (one with `Origin`) also needs the gate cookie. A socket without `Origin` is native and is judged by the signed hello alone.
 
 **Admission list:**
@@ -402,7 +420,7 @@ Media and file sockets keep the phase 1 ticket hello. A browser socket (one with
 
 - The host sends `{"type":"pair-open","admit":<b64url SHA-256("bubbleplay-pair-admit-v1" || canonical PC ID || code)>}`. It also sends `{"type":"pair-close"}`. The relay consumes both.
 - There is one window per PC. It is kept in memory only, ends 300 s after `pair-open`, and is replaced by a newer `pair-open`. It is removed by `pair-close` or by the host's signalling socket closing.
-- An unlisted viewer adds `pair` (the same hash, computed from the code it scanned or typed) to its hello. After a valid proof, the relay compares the value in constant time.
+- An unlisted viewer adds `pair` (the same hash, computed from the code in the link or typed in) to its hello. After a valid proof, the relay compares the value in constant time.
   - On a match, the window is consumed and the socket is admitted in **pairing mode**: `hello-ok` carries `"pairing":true` and no ticket.
   - Failures are limited to 5 per client prefix per 300 s. After 20 failures against a PC, its window is dropped and the host gets `{"type":"pair-closed"}`. This cap against brute force lets a stranger who knows the PC ID end a pairing window early. The tray then says so, and the user opens a new one.
 - Pairing mode takes the normal viewer slot.
@@ -430,16 +448,17 @@ These are the only types forwarded on `/ws` (decision 15): viewer to PC `auth-he
 
 **Cutover** (lane/rust-relay-cutover, 2026-10-28): the Go relay (`relay/`) and the JS relay (`worker/src`) are removed, the relay accepts only the roles `viewer`, `media-viewer` and `file-viewer`, and the allowlist above applies.
 
-**Proposed for the host and client lanes** (the lane's proposals, not settled; the relay forwards these as opaque bounded messages):
+**Settled for the host and client lanes** (approved as written, with these specifics; the relay forwards these as opaque bounded messages):
 
 - *Pairing exchange (3b):*
-  - The code is 10 Crockford base32 characters from the PC's CSPRNG, normalised like IDs.
+  - The code is 10 Crockford base32 characters from the PC's CSPRNG, shown `XXXXX-XXXXX`, normalised like IDs (uppercase, O becomes 0, I and L become 1, dashes and spaces dropped).
   - Pairing reuses `auth-hello`, `auth-host` and `auth-finish`, with `pair-v1` in `caps`.
-  - Each side sends `pair-proof` with `mac` = HMAC-SHA256(HKDF(code, "bubbleplay-pair-v1"), "viewer" or "pc" || H), where H is the transcript hash.
-  - The comparison number is the first 4 bytes of SHA-256("bubbleplay-pair-sas-v1" || H), as big-endian u32 mod 10^6, zero-padded to 6 digits.
-  - The PC ends with `pair-done` or `pair-denied`.
+  - The pair key is K = HKDF-SHA256(ikm = normalised code as ASCII, salt empty, info `bubbleplay-pair-v1`, 32 bytes).
+  - The viewer sends `pair-proof` with `mac` = HMAC-SHA256(K, "viewer" || H). The PC verifies it in constant time, then sends its own `pair-proof` with `mac` = HMAC-SHA256(K, "pc" || H), which the viewer verifies in constant time. A wrong MAC ends the attempt with no number.
+  - The comparison number is the first 4 bytes of SHA-256("bubbleplay-pair-sas-v1" || H), as big-endian u32 mod 10^6, zero-padded to 6 digits. Both sides show it only after both proofs verify.
+  - The PC ends with `pair-done` (after Allow) or `pair-denied`.
 - *Control channel (6):*
-  - The envelope is `{"type":"ctl","kind":<inner type>,"seq","data":<ciphertext || tag>}`. AAD is `kind`, and after decryption `plaintext.type` must equal `kind`.
+  - The envelope is `{"type":"ctl","kind":<inner type>,"seq","data":<ciphertext || tag>}`. AAD is `kind`, and after decryption `plaintext.type` must equal `kind`. For the binary kinds `input` and `cursor` the plaintext is the raw binary frame, and the type check is skipped.
   - The receiver accepts only `seq` equal to the expected value. Any gap, repeat or authentication failure ends the session.
   - Each handshake brings new keys and starts again at `seq` 0.
 - *Caps (8):*
