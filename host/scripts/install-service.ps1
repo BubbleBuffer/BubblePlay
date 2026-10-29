@@ -736,6 +736,12 @@ if ($Action -eq 'Status') {
     return
 }
 
+# Decision 25: the service-mode host is unsupported in phase 2, so this script no longer installs,
+# upgrades or repairs services. Status and Uninstall still work for older installs.
+if ($Action -ne 'Uninstall') {
+    throw 'Service mode needs phase 3 device keys (decision 25). Use setup-tray.ps1; -Action Uninstall removes an older service install.'
+}
+
 Assert-Administrator
 
 if ($Action -eq 'Uninstall') {

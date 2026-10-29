@@ -190,6 +190,8 @@ struct Args {
     out: String,
     monitor: Option<String>,
     vdd: bool,
+    /// Service-mode host. Decision 25: it exits at startup in phase 2; its branches are kept for
+    /// phase 3, which adds a machine-scoped PC key.
     privileged_agent: bool,
     audio: bool,
     benchmark_profile: Option<PathBuf>,
