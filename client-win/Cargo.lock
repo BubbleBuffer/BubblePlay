@@ -463,7 +463,9 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "base64 0.22.1",
+ "bubblebuffer-device-key",
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "hkdf",
  "hmac",
  "polyval",
@@ -510,6 +512,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "bubblebuffer-device-key"
+version = "0.1.0"
+source = "git+https://github.com/BubbleBuffer/bubblebuffer-identity?tag=v0.1.0#a539c7e8ba505734e9b0bae1a23a4eb5c3ef7f6e"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "base64 0.22.1",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "rand_core 0.6.4",
+ "sha2",
+ "zeroize",
 ]
 
 [[package]]
@@ -918,6 +935,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -1159,6 +1177,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "subtle",

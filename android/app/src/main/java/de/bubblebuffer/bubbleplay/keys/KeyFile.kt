@@ -13,6 +13,8 @@ class KeyFile internal constructor(
     salt: ByteArray?,
     nonce: ByteArray?,
     sealedSeed: ByteArray,
+    /** The format name the file was read in. [KeyFileCodec.authenticatedData] builds the AAD from it. */
+    val format: String,
 ) {
     private val publicBytes = publicKey.copyOf()
     private val saltBytes = salt?.copyOf()
@@ -32,4 +34,7 @@ class KeyFile internal constructor(
     val sealedSeed: ByteArray get() = sealed.copyOf()
 
     val isProtected: Boolean get() = saltBytes != null
+
+    /** True for a file in the old format name. [KeyFileCodec.serialize] never writes it. */
+    val isLegacyFormat: Boolean get() = format == KeyFileCodec.LEGACY_FORMAT
 }

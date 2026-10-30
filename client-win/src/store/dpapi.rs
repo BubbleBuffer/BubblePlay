@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn protect_round_trips_and_hides_the_plaintext() {
-        let plain = b"{\"format\":\"bubbleplay-device-key\"}";
+        let plain = b"{\"format\":\"bubblebuffer-device-key\"}";
         let wrapped = protect(plain).unwrap();
         assert!(!wrapped.windows(plain.len()).any(|w| w == plain));
         assert_eq!(unprotect(&wrapped).unwrap(), plain);

@@ -101,6 +101,8 @@ jobs:
           node-version: 24
       - name: Device-key fixture contract (JS)
         run: node --test tools/tests/device-keys-contract.test.mjs
+      - name: Vendored shared device-key fixture is intact
+        run: node tools/device-keys/gen-contract.mjs --check
       - name: bp-device-key tests, clippy and fmt
         working-directory: crates/bp-device-key
         run: |

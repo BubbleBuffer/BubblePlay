@@ -26,8 +26,10 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::ids::CROCKFORD;
 use crate::{DeviceId, DeviceIdentity, DeviceKeyError};
+
+/// Crockford base32 without I, L, O and U: the pairing code alphabet (same as device IDs).
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 const TRANSCRIPT_CONTEXT: &str = "bubbleplay-auth-v1";
 const AUTH_HOST_CONTEXT: &[u8] = b"bubbleplay-auth-host-v1";

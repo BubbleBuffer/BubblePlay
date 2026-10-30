@@ -6,14 +6,14 @@ import { readFileSync } from "node:fs";
 // the same Argon2id build the browser worker runs, with the same fixed parameters.
 import "../public/vendor/hash-wasm/argon2.umd.min.js";
 import {
-  DeviceKeyError, canonicalId, createDeviceKeyApi, createKeyFile, deriveId, keyFileAAD,
+  DeviceKeyError, canonicalId, createDeviceKeyApi, createKeyFile, deriveId, isLegacyKeyFileText, keyFileAAD,
   parseKeyFile, rewrapKeyFile, unlockKeyFile,
 } from "../public/devicekey.js";
 
 // TEST ONLY: every seed, passphrase, salt and nonce in the fixture is public and deterministic.
 const fixture = JSON.parse(readFileSync(new URL("../../fixtures/device-keys-contract.json", import.meta.url), "utf8"));
 const { subtle } = webcrypto;
-const PASSPHRASE = fixture.keyFiles.passphrase.passphrase;
+const PASSPHRASE = fixture.legacyKeyFiles.passphrase.passphrase;
 const hex = bytes => Buffer.from(bytes).toString("hex");
 const fromB64 = text => Buffer.from(text, "base64url");
 const utf8 = text => Buffer.from(text, "utf8");
@@ -66,8 +66,8 @@ async function expectError(promise, code, pattern) {
 }
 
 // The fixture files as JSON text, which is what every unlock, parse and rewrap call takes.
-const PLAIN = fixture.keyFiles.plain.file;
-const PROTECTED = fixture.keyFiles.passphrase.file;
+const PLAIN = fixture.legacyKeyFiles.plain.file;
+const PROTECTED = fixture.legacyKeyFiles.passphrase.file;
 const PLAIN_TEXT = JSON.stringify(PLAIN);
 const PROTECTED_TEXT = JSON.stringify(PROTECTED);
 const PC_SIGNED = Buffer.from(fixture.handshake.pcSignedBytesHex, "hex");
@@ -106,7 +106,7 @@ test("canonicalId rejects wrong length, excluded letters, spaces and non-ASCII",
 });
 
 test("keyFileAAD matches the fixture bytes, ignores member order and omits private and nonce", () => {
-  const vector = fixture.keyFiles.passphrase;
+  const vector = fixture.legacyKeyFiles.passphrase;
   assert.equal(Buffer.from(keyFileAAD(PROTECTED)).toString("utf8"), vector.aadUtf8);
   assert.equal(hex(keyFileAAD(PROTECTED)), vector.aadHex);
   assert.deepEqual(keyFileAAD(Object.fromEntries(Object.entries(PROTECTED).reverse())), keyFileAAD(PROTECTED));
@@ -136,7 +136,7 @@ test("keyFileAAD refuses invalid Unicode, non-finite numbers and non-JSON values
 test("plain fixture parses, unlocks and signs exactly as the fixture signature", async () => {
   assert.deepEqual(await api.parseKeyFile(PLAIN_TEXT), PLAIN);
   const unlocked = await api.unlockKeyFile(PLAIN_TEXT);
-  assert.equal(unlocked.id, fixture.keyFiles.plain.file.id);
+  assert.equal(unlocked.id, fixture.legacyKeyFiles.plain.file.id);
   assert.equal(hex(unlocked.publicKey), hex(fromB64(PLAIN.public)));
   assert.equal(unlocked.privateKey.type, "private");
   assert.equal(unlocked.privateKey.algorithm.name, "Ed25519");
@@ -163,13 +163,13 @@ test("protected fixture: parse with the passphrase verifies identity; unlock sig
 });
 
 test("Argon2id through the injected KDF reproduces the fixture key, from the 16-byte salt", async () => {
-  const { passphrase, kdfKeyHex } = fixture.keyFiles.passphrase;
+  const { passphrase, kdfKeyHex } = fixture.legacyKeyFiles.passphrase;
   const derived = await argon2Kdf({ password: utf8(passphrase), salt: fromB64(PROTECTED.kdf.salt) });
   assert.equal(hex(derived), kdfKeyHex);
 });
 
 test("protected fixture: wrong passphrase and tampered AAD fail with authentication-failed", async () => {
-  const [wrong, tampered] = fixture.keyFiles.failures;
+  const [wrong, tampered] = fixture.legacyKeyFiles.failures;
   await expectError(api.parseKeyFile(JSON.stringify(wrong.file), wrong.passphrase), "authentication-failed", /wrong passphrase/);
   await expectError(api.unlockKeyFile(JSON.stringify(wrong.file), wrong.passphrase), "authentication-failed");
   await expectError(api.parseKeyFile(JSON.stringify(tampered.file), tampered.passphrase), "authentication-failed");
@@ -310,7 +310,7 @@ const PLAIN_CASES = [
   ["unhyphenated id", () => JSON.stringify({ ...PLAIN, id: PLAIN.id.replaceAll("-", "") }), "invalid-id", /canonical/],
   ["id not matching the key", () => JSON.stringify({ ...PLAIN, id: "77VH-7M56-8GJK-Y12K" }), "identity-mismatch", /does not match/],
   ["label not a string", () => JSON.stringify({ ...PLAIN, label: 7 }), "invalid-file", /label must be a string/],
-  ["label with lone surrogate", () => '{"format":"bubbleplay-device-key","version":1,"type":"ed25519","id":"77VH-7M56-8GJK-Y12J","label":"\\ud800","created":"2026-10-13T09:30:00Z","public":"PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw","kdf":null,"aead":null,"private":"TM0Imyj_ltqdtsNG7BFOD1uKMZ81q6Yk2oz27U-4pvs"}', "invalid-file", /well-formed Unicode/],
+  ["label with lone surrogate", () => '{"format":"bubblebuffer-device-key","version":1,"type":"ed25519","id":"77VH-7M56-8GJK-Y12J","label":"\\ud800","created":"2026-10-13T09:30:00Z","public":"PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw","kdf":null,"aead":null,"private":"TM0Imyj_ltqdtsNG7BFOD1uKMZ81q6Yk2oz27U-4pvs"}', "invalid-file", /well-formed Unicode/],
   ["public 30 bytes", () => JSON.stringify({ ...PLAIN, public: PLAIN.public.slice(0, -3) }), "invalid-file", /public must be 32 bytes, got 30/],
   ["public padded", () => JSON.stringify({ ...PLAIN, public: `${PLAIN.public}=` }), "invalid-file", /unpadded base64url/],
   ["public standard alphabet", () => JSON.stringify({ ...PLAIN, public: PLAIN.public.replaceAll("-", "+") }), "invalid-file", /unpadded base64url/],
@@ -478,7 +478,7 @@ test("rewrap plain -> protected and protected -> plain keep the identity", async
   const back = await api.rewrapKeyFile(JSON.stringify(protectedFile), PASSPHRASE, undefined);
   assert.equal(back.kdf, null);
   assert.equal(back.aead, null);
-  assert.equal(hex(fromB64(back.private)), fixture.keyFiles.plain.seedHex);
+  assert.equal(hex(fromB64(back.private)), fixture.legacyKeyFiles.plain.seedHex);
   assert.equal(back.id, PLAIN.id);
 });
 
@@ -611,10 +611,55 @@ test("named exports run the browser-worker KDF path, with the Worker shim, on pl
   assert.equal(typeof globalThis.Worker, workerBefore, "the shim is removed afterwards");
 });
 
+// Legacy files (format bubbleplay-device-key) are read and converted once. A protected file's AAD
+// carries its own format name, so the same bytes under the shared name must not open.
+const LEGACY_PLAIN = fixture.legacyKeyFiles.plain.file;
+const LEGACY_PROTECTED = fixture.legacyKeyFiles.passphrase.file;
+
+test("a legacy plain file converts to the shared format with the same key, ID, label and created time", async () => {
+  const converted = JSON.parse(await api.convertLegacyKeyFile(JSON.stringify(LEGACY_PLAIN)));
+  assert.deepEqual(Object.keys(converted), ["format", "version", "type", "id", "label", "created", "public", "kdf", "aead", "private"]);
+  assert.equal(converted.format, "bubblebuffer-device-key");
+  assert.equal(converted.kdf, null);
+  assert.deepEqual({ ...converted, format: LEGACY_PLAIN.format }, LEGACY_PLAIN);
+  assert.equal((await api.unlockKeyFile(JSON.stringify(converted))).id, LEGACY_PLAIN.id);
+});
+
+test("a legacy protected file converts under the same passphrase with a fresh salt and nonce", async () => {
+  const converted = JSON.parse(await api.convertLegacyKeyFile(JSON.stringify(LEGACY_PROTECTED), PASSPHRASE));
+  assert.equal(converted.format, "bubblebuffer-device-key");
+  for (const field of ["id", "label", "created", "public"]) assert.equal(converted[field], LEGACY_PROTECTED[field], field);
+  assert.notEqual(converted.kdf.salt, LEGACY_PROTECTED.kdf.salt);
+  assert.notEqual(converted.aead.nonce, LEGACY_PROTECTED.aead.nonce);
+  const unlocked = await api.unlockKeyFile(JSON.stringify(converted), PASSPHRASE);
+  assert.equal(unlocked.id, LEGACY_PROTECTED.id);
+  assert.equal(hex(unlocked.publicKey), hex(fromB64(LEGACY_PROTECTED.public)));
+  await expectError(api.unlockKeyFile(JSON.stringify(converted), "wrong passphrase"), "authentication-failed");
+});
+
+test("conversion refuses a shared-format file, a missing passphrase and a wrong passphrase", async () => {
+  const shared = await api.createKeyFile({ label: "already shared" });
+  await expectError(api.convertLegacyKeyFile(JSON.stringify(shared)), "invalid-input", /only a legacy key file/);
+  await expectError(api.convertLegacyKeyFile(JSON.stringify(LEGACY_PROTECTED)), "passphrase-required");
+  await expectError(api.convertLegacyKeyFile(JSON.stringify(LEGACY_PROTECTED), "wrong passphrase"), "authentication-failed");
+});
+
+test("a protected legacy file does not open under the shared format name, only under its own", async () => {
+  await expectError(api.unlockKeyFile(JSON.stringify({ ...LEGACY_PROTECTED, format: "bubblebuffer-device-key" }), PASSPHRASE), "authentication-failed");
+  assert.equal((await api.unlockKeyFile(JSON.stringify(LEGACY_PROTECTED), PASSPHRASE)).id, LEGACY_PROTECTED.id);
+});
+
+test("isLegacyKeyFileText recognises only the legacy format name and tolerates text that is not JSON", () => {
+  assert.equal(isLegacyKeyFileText(JSON.stringify(LEGACY_PLAIN)), true);
+  assert.equal(isLegacyKeyFileText(JSON.stringify({ ...LEGACY_PLAIN, format: "bubblebuffer-device-key" })), false);
+  assert.equal(isLegacyKeyFileText("{"), false);
+  assert.equal(isLegacyKeyFileText("[]"), false);
+});
+
 test("createDeviceKeyApi returns the full API and needs a function KDF", () => {
   assert.throws(() => createDeviceKeyApi({ kdf: "not a function" }), DeviceKeyError);
   const methods = createDeviceKeyApi({ kdf: argon2Kdf });
-  assert.deepEqual(Object.keys(methods).sort(), ["canonicalId", "createKeyFile", "deriveId", "keyFileAAD", "parseKeyFile", "rewrapKeyFile", "unlockKeyFile"]);
+  assert.deepEqual(Object.keys(methods).sort(), ["canonicalId", "convertLegacyKeyFile", "createKeyFile", "deriveId", "keyFileAAD", "parseKeyFile", "rewrapKeyFile", "unlockKeyFile"]);
   assert.equal(typeof createKeyFile, "function");
   assert.equal(typeof parseKeyFile, "function");
   assert.equal(typeof unlockKeyFile, "function");
@@ -689,7 +734,7 @@ function memoryIDB({ existing = [] } = {}) {
           put: (value, key) => {
             writable();
             if (name === "pcs") { assert.equal(key, undefined); key = value.id; }
-            else assert.equal(key, "device");
+            else assert.ok(key === "device" || key === "device-backup", `unexpected key ${key}`);
             const copy = structuredClone(value);
             return run(() => key, () => data.set(key, copy));
           },
@@ -720,7 +765,7 @@ test("IndexedDB stores the original JSON text in exactly one device record and c
   const indexedDB = memoryIDB();
   const store = createDeviceKeyStore({ indexedDB });
   assert.equal(await store.load(), null);
-  const original = "  " + JSON.stringify(fixture.keyFiles.passphrase.file, null, 2) + "\n";
+  const original = "  " + JSON.stringify(fixture.legacyKeyFiles.passphrase.file, null, 2) + "\n";
   await store.save(original);
   assert.equal(await createDeviceKeyStore({ indexedDB }).load(), original);
   assert.deepEqual([...indexedDB.state.records], [["device", original]]);
@@ -728,6 +773,23 @@ test("IndexedDB stores the original JSON text in exactly one device record and c
   await store.clear();
   await store.clear();
   assert.equal(await store.load(), null);
+  assert.equal(indexedDB.state.records.size, 0);
+  assert.equal(indexedDB.state.opens, indexedDB.state.closes);
+});
+
+test("IndexedDB keeps a backup record beside the key until it is cleared, and clear removes both", async () => {
+  const indexedDB = memoryIDB();
+  const store = createDeviceKeyStore({ indexedDB });
+  await store.save("legacy text");
+  await store.saveBackup("legacy text");
+  await store.save("shared text");
+  assert.equal(indexedDB.state.records.get("device"), "shared text");
+  assert.equal(indexedDB.state.records.get("device-backup"), "legacy text");
+  await store.clearBackup();
+  assert.equal(indexedDB.state.records.has("device-backup"), false);
+  assert.equal(indexedDB.state.records.get("device"), "shared text");
+  await store.saveBackup("legacy text");
+  await store.clear();
   assert.equal(indexedDB.state.records.size, 0);
   assert.equal(indexedDB.state.opens, indexedDB.state.closes);
 });
@@ -843,7 +905,7 @@ class ModuleWorkerBridge {
 test("dedicated module Worker derives the fixture Argon2id key and terminates", async () => {
   const original = globalThis.Worker;
   globalThis.Worker = ModuleWorkerBridge;
-  const vector = fixture.keyFiles.passphrase;
+  const vector = fixture.legacyKeyFiles.passphrase;
   const password = new TextEncoder().encode(vector.passphrase);
   const salt = new Uint8Array(Buffer.from(vector.file.kdf.salt, "base64url"));
   let ticked = false;

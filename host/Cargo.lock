@@ -331,8 +331,11 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "argon2",
  "base64 0.22.1",
+ "bubblebuffer-device-key",
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "hkdf",
  "hmac",
  "polyval",
@@ -382,17 +385,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "bubblebuffer-device-key"
+version = "0.1.0"
+source = "git+https://github.com/BubbleBuffer/bubblebuffer-identity?tag=v0.1.0#a539c7e8ba505734e9b0bae1a23a4eb5c3ef7f6e"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "base64 0.22.1",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "rand_core 0.6.4",
+ "sha2",
+ "zeroize",
+]
+
+[[package]]
 name = "bubbleplay-host"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
- "argon2",
  "base64 0.22.1",
  "bp-device-key",
  "bp-relay-server",
  "cudarc",
- "ed25519-dalek",
  "nvidia-video-codec-sdk",
  "opus",
  "png",
@@ -400,7 +415,6 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "serde_json",
- "sha2",
  "str0m",
  "tokio",
  "tracing",

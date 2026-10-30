@@ -79,15 +79,14 @@ fn key_create(flags: &[&str]) -> Result<()> {
 fn key_import(file: &Path) -> Result<()> {
     let store = KeyStore::default_location()?;
     let key = super::key::read_plain(file)?;
-    let text = zeroize::Zeroizing::new(key.to_json()?);
     let prompt = format!("Passphrase for {}: ", key.id());
-    let imported = store.import(&text, &mut || read_passphrase(&prompt))?;
+    let imported = store.import(key, &mut || read_passphrase(&prompt))?;
     print_line(&imported.id().to_string())
 }
 
 fn key_export(file: &Path) -> Result<()> {
     let store = KeyStore::default_location()?;
-    let text = store.export()?;
+    let text = store.export(&mut |id| read_passphrase(&format!("Passphrase for {id}: ")))?;
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

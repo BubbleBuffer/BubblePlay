@@ -127,7 +127,8 @@ class DeviceKeyActivity : Activity() {
             R.string.dk_unlock_message,
             R.string.dk_unlock_action,
             onCancel = { finish() },
-        ) { key ->
+            migrate = true,
+        ) { key, _ ->
             UnlockedKey.set(key)
             setResult(RESULT_OK)
             finish()
@@ -179,7 +180,7 @@ class DeviceKeyActivity : Activity() {
         statusLine()
         column.addView(views.button(R.string.dk_export, KeyViews.Style.PRIMARY) { chooseExport(key) })
         column.addView(views.button(R.string.dk_change_passphrase, KeyViews.Style.SECONDARY) {
-            reseal(key, askNewPassphrase = true) { writeStored(it, R.string.dk_passphrase_changed) }
+            reseal(key, askNewPassphrase = true) { text -> writeStored(R.string.dk_passphrase_changed) { text } }
         })
         column.addView(views.button(R.string.dk_remove, KeyViews.Style.DANGER) { confirmRemove() })
     }
@@ -297,7 +298,7 @@ class DeviceKeyActivity : Activity() {
             .setTitle(R.string.dk_export_choice_title)
             .setItems(options.map { getString(it.first) }.toTypedArray()) { _, which ->
                 when (val choice = options[which].second) {
-                    Export.KEEP -> saveAs(key.text, key.file.id)
+                    Export.KEEP -> keepExport(key)
                     Export.NEW, Export.NONE -> reseal(key, askNewPassphrase = choice == Export.NEW) {
                         saveAs(it, key.file.id)
                     }
@@ -305,6 +306,26 @@ class DeviceKeyActivity : Activity() {
             }
             .setNegativeButton(R.string.dk_cancel, null)
             .show()
+    }
+
+    /**
+     * Exports the stored file as it is, in the shared format. A plain legacy file is converted on the
+     * worker first. A protected legacy file needs its passphrase, which this flow does not have, so its
+     * export is refused until an unlock has converted the stored file.
+     */
+    private fun keepExport(key: StoredKey.Present) {
+        when {
+            !key.file.isLegacyFormat -> saveAs(key.text, key.file.id)
+            key.file.isProtected -> Toast.makeText(this, R.string.dk_export_failed, Toast.LENGTH_LONG).show()
+            else -> worker.execute {
+                val result = runCatching { KeyFileCodec.convertLegacy(key.file, null) }
+                runOnUiThread {
+                    if (isDestroyed) return@runOnUiThread
+                    result.onSuccess { saveAs(it, key.file.id) }
+                        .onFailure { showError(DeviceKeyLogic.messageFor(it)) }
+                }
+            }
+        }
     }
 
     /** Opens the save picker for [text]. The file is written only after the user picks a place. */
@@ -397,9 +418,12 @@ class DeviceKeyActivity : Activity() {
     }
 
     private fun continueImport(file: KeyFile, text: String) {
-        unlockCurrent(file, R.string.dk_import_title, R.string.dk_import_message, R.string.dk_import_action) { key ->
-            // Unlocking proves the passphrase and the key match before anything is replaced.
-            writeStored(text, R.string.dk_imported, unlocked = key)
+        unlockCurrent(file, R.string.dk_import_title, R.string.dk_import_message, R.string.dk_import_action) { key, pass ->
+            // Unlocking proves the passphrase and the key match before anything is replaced. A file in the
+            // old format is converted on the worker, with the passphrase that just unlocked it.
+            writeStored(R.string.dk_imported, unlocked = key) {
+                if (file.isLegacyFormat) KeyFileCodec.convertLegacy(file, pass) else text
+            }
         }
     }
 
@@ -411,7 +435,13 @@ class DeviceKeyActivity : Activity() {
      * every path.
      */
     private fun reseal(key: StoredKey.Present, askNewPassphrase: Boolean, then: (String) -> Unit) {
-        unlockCurrent(key.file, R.string.dk_unlock_title, R.string.dk_unlock_message, R.string.dk_unlock_action) { unlocked ->
+        unlockCurrent(
+            key.file,
+            R.string.dk_unlock_title,
+            R.string.dk_unlock_message,
+            R.string.dk_unlock_action,
+            migrate = true,
+        ) { unlocked, _ ->
             fun commit(newPassphrase: String?, dialog: PassphraseDialog?) {
                 worker.execute {
                     val result = runCatching {
@@ -460,17 +490,19 @@ class DeviceKeyActivity : Activity() {
         message: Int,
         action: Int,
         onCancel: () -> Unit = {},
-        onUnlocked: (DeviceKey) -> Unit,
+        migrate: Boolean = false,
+        onUnlocked: (DeviceKey, String?) -> Unit,
     ) {
         if (!file.isProtected) {
             worker.execute {
                 val result = runCatching { KeyFileCodec.unlock(file, null) }
+                if (migrate && result.isSuccess) migrateStored(file, null)
                 runOnUiThread {
                     if (isDestroyed) {
                         result.getOrNull()?.close()
                         return@runOnUiThread
                     }
-                    result.onSuccess(onUnlocked).onFailure { showError(DeviceKeyLogic.messageFor(it)) }
+                    result.onSuccess { onUnlocked(it, null) }.onFailure { showError(DeviceKeyLogic.messageFor(it)) }
                 }
             }
             return
@@ -484,6 +516,7 @@ class DeviceKeyActivity : Activity() {
             onSubmit = { pass, dialog ->
                 worker.execute {
                     val result = runCatching { KeyFileCodec.unlock(file, pass) }
+                    if (migrate && result.isSuccess) migrateStored(file, pass)
                     runOnUiThread {
                         if (isDestroyed) {
                             result.getOrNull()?.close()
@@ -491,7 +524,7 @@ class DeviceKeyActivity : Activity() {
                         }
                         result.onSuccess { key ->
                             dialog.finish()
-                            onUnlocked(key)
+                            onUnlocked(key, pass)
                         }.onFailure { dialog.fail(DeviceKeyLogic.messageFor(it)) }
                     }
                 }
@@ -503,13 +536,14 @@ class DeviceKeyActivity : Activity() {
     // ---- store changes ----------------------------------------------------------------------------
 
     /**
-     * Saves [text] as this phone's key, then shows the result with [done] as its notice. An
-     * [unlocked] key (already proven by its passphrase) becomes the app's unlocked key once saved,
-     * and is closed if the save fails.
+     * Saves the text that [portable] builds as this phone's key, then shows the result with [done] as
+     * its notice. [portable] runs on the worker, so a conversion stays off the UI thread. An [unlocked]
+     * key (already proven by its passphrase) becomes the app's unlocked key once saved, and is closed if
+     * the save fails.
      */
-    private fun writeStored(text: String, done: Int, unlocked: DeviceKey? = null) {
+    private fun writeStored(done: Int, unlocked: DeviceKey? = null, portable: () -> String) {
         worker.execute {
-            val result = runCatching { store.savePortable(text) }
+            val result = runCatching { store.savePortable(portable()) }
             if (result.isSuccess) unlocked?.let { UnlockedKey.set(it) } else unlocked?.close()
             runOnUiThread {
                 if (isDestroyed) return@runOnUiThread
@@ -546,6 +580,14 @@ class DeviceKeyActivity : Activity() {
     }
 
     // ---- shared helpers ---------------------------------------------------------------------------
+
+    /**
+     * Runs on the worker once a passphrase or a plain unlock has proven the stored key: converts a
+     * legacy stored file once. The store logs a failure and keeps the old file, so nothing is returned.
+     */
+    private fun migrateStored(file: KeyFile, passphrase: String?) {
+        if (file.isLegacyFormat) store.migrateLegacy(passphrase)
+    }
 
     /** Re-reads the store on the worker, then runs [after] on the UI thread (default: redraw). */
     private fun reload(after: () -> Unit = { render() }) {

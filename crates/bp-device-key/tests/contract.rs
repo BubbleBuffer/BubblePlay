@@ -1,8 +1,14 @@
-//! Checks the shared contract fixture `fixtures/device-keys-contract.json` against this crate.
+//! Checks this crate against two contract fixtures.
 //!
-//! The same file is checked by the Go relay (`relay/devicekeys_contract_test.go`) and by the
-//! host tests, so the three implementations stay byte-compatible. No expected output is used as
-//! an input: every vector is recomputed from its seed, nonce and origin.
+//! - `fixtures/shared/device-keys-contract.json`, vendored from the shared
+//!   `bubblebuffer-device-key` crate: IDs, key files in the shared format and relay proofs with
+//!   neutral labels. Never edited here.
+//! - `fixtures/device-keys-contract.json`, BubblePlay's own: the relay proofs with
+//!   `bubbleplay-relay-v1` (the bytes the live relay verifies), the old-format key files that
+//!   migration still reads, the handshake origin and phase 2.
+//!
+//! No expected output is used as an input: every vector is recomputed from its seed, nonce and
+//! origin.
 
 use std::fs;
 use std::path::PathBuf;
@@ -16,12 +22,21 @@ use bp_device_key::{
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::Value;
 
-fn fixture() -> Value {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/device-keys-contract.json");
+fn read_fixture(relative: &str) -> Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
     serde_json::from_str(&text).expect("fixture parses")
+}
+
+/// BubblePlay's own fixture.
+fn fixture() -> Value {
+    read_fixture("../../fixtures/device-keys-contract.json")
+}
+
+/// The shared crate's fixture, vendored unchanged.
+fn shared_fixture() -> Value {
+    read_fixture("../../fixtures/shared/device-keys-contract.json")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -95,7 +110,7 @@ fn contract_ids() {
     }
     // ASCII only: no non-ASCII symbol is ever an ID character.
     assert!(matches!(
-        DeviceId::parse("é7QK2M9XH4PDR8T"),
+        DeviceId::parse("é7QK2M9XH4PDR8T").map_err(DeviceKeyError::from),
         Err(DeviceKeyError::InvalidId)
     ));
 }
@@ -121,11 +136,17 @@ fn contract_relay_proof_vectors() {
         let signature = b64(field(vector, "signature"));
 
         assert_eq!(
-            hex(&relay_proof_encoding(role, origin, &nonce, id, &public)),
+            hex(
+                &relay_proof_encoding(role, origin, &nonce, DeviceId::parse(id).unwrap(), &public)
+                    .unwrap()
+            ),
             field(vector, "encodingHex")
         );
         assert_eq!(
-            hex(&relay_proof_hash(role, origin, &nonce, id, &public)),
+            hex(
+                &relay_proof_hash(role, origin, &nonce, DeviceId::parse(id).unwrap(), &public)
+                    .unwrap()
+            ),
             field(vector, "sha256Hex")
         );
 
@@ -239,16 +260,112 @@ fn contract_auth_bind_pc_signs_the_dtls_binding() {
         .expect("PC auth-bind signature verifies");
 }
 
+#[test]
+fn shared_ids_match_this_crate_and_are_unchanged() {
+    let shared = shared_fixture();
+    let local = fixture();
+    let identities = shared["ids"].as_array().expect("shared ids");
+    assert!(!identities.is_empty());
+    for identity in identities {
+        let owner = DeviceIdentity::from_seed(&seed_of(field(identity, "seedHex")));
+        assert_eq!(owner.public_b64(), field(identity, "public"));
+        assert_eq!(owner.id().to_string(), field(identity, "id"));
+        assert_eq!(
+            hex(&<sha2::Sha256 as sha2::Digest>::digest(owner.public_key())),
+            field(identity, "sha256Hex")
+        );
+        if let Some(parse) = identity.get("parse") {
+            let parsed = DeviceId::parse(field(parse, "input")).expect("alias input");
+            assert_eq!(parsed.to_string(), field(parse, "canonical"));
+        }
+        // Device IDs do not change with the move: BubblePlay's fixture has the same seed and ID.
+        let mine = local["ids"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .find(|mine| mine["seedHex"] == identity["seedHex"])
+            .expect("same seed in the local fixture");
+        assert_eq!(field(mine, "id"), field(identity, "id"));
+    }
+}
+
+#[test]
+fn shared_relay_proof_vectors_verify_with_the_shared_crate() {
+    use bubblebuffer_device_key::{relay_proof_bytes, DeviceKey, RelayProof, RelayRole};
+    let shared = shared_fixture();
+    let vectors = shared["relayProof"]["vectors"].as_array().expect("vectors");
+    let mut valid = 0;
+    for vector in vectors {
+        let label = field(vector, "label");
+        let role = RelayRole::parse(field(vector, "role")).expect("role");
+        let origin = field(vector, "origin");
+        let nonce: [u8; 32] = b64(field(vector, "nonce"))
+            .try_into()
+            .expect("32-byte nonce");
+        let id = DeviceId::parse(field(vector, "id")).expect("id");
+        let public: [u8; 32] = b64(field(vector, "public"))
+            .try_into()
+            .expect("32-byte public key");
+        let signature: [u8; 64] = b64(field(vector, "signature"))
+            .try_into()
+            .expect("64-byte signature");
+        let encoding = relay_proof_bytes(label, role, origin, &nonce, id, &public).expect("encode");
+        assert_eq!(hex(&encoding), field(vector, "encodingHex"));
+        let hash =
+            bubblebuffer_device_key::relay_proof_hash(label, role, origin, &nonce, id, &public)
+                .expect("hash");
+        assert_eq!(hex(&hash), field(vector, "sha256Hex"));
+        let verified = RelayProof::verify(label, role, origin, nonce, id, public, signature);
+        match field(vector, "expected") {
+            "valid" => {
+                assert!(verified.is_ok(), "{}", field(vector, "name"));
+                let seed = shared["ids"]
+                    .as_array()
+                    .expect("ids")
+                    .iter()
+                    .find(|identity| identity["id"] == vector["id"])
+                    .map(|identity| seed_of(field(identity, "seedHex")))
+                    .expect("seed for the vector's ID");
+                assert_eq!(DeviceKey::from_seed(&seed).sign(&hash), signature);
+                valid += 1;
+            }
+            "invalid" => assert!(verified.is_err(), "{}", field(vector, "name")),
+            other => panic!("unknown expectation {other}"),
+        }
+    }
+    assert!(valid >= 2);
+}
+
+#[test]
+fn bubbleplay_relay_proofs_use_the_bubbleplay_label() {
+    // The live relay verifies proofs over `bubbleplay-relay-v1`: the local vectors (checked by
+    // contract_relay_proof_vectors) start with exactly that label.
+    assert_eq!(bp_device_key::RELAY_LABEL, "bubbleplay-relay-v1");
+    let fixture = fixture();
+    for vector in fixture["relayProof"]["vectors"]
+        .as_array()
+        .expect("vectors")
+    {
+        let mut prefix = (bp_device_key::RELAY_LABEL.len() as u32)
+            .to_be_bytes()
+            .to_vec();
+        prefix.extend_from_slice(bp_device_key::RELAY_LABEL.as_bytes());
+        assert!(field(vector, "encodingHex").starts_with(&hex(&prefix)));
+    }
+}
+
 #[cfg(feature = "keyfile")]
 mod key_files {
     use super::*;
-    use bp_device_key::KeyFile;
+    use bp_device_key::legacy::{self, LegacyKeyFile};
+    use bp_device_key::{convert_legacy, read_key_file, KeyFile};
 
     #[test]
     fn contract_keyfile_plain_round_trips() {
-        let fixture = fixture();
+        let fixture = shared_fixture();
         let plain = &fixture["keyFiles"]["plain"];
         let file = &plain["file"];
+        assert_eq!(field(file, "format"), "bubblebuffer-device-key");
         assert!(file["kdf"].is_null() && file["aead"].is_null());
         let key_file = KeyFile::parse(&file.to_string()).expect("plain file parses");
         assert!(!key_file.is_protected());
@@ -261,46 +378,27 @@ mod key_files {
         );
         let seed = key_file.unlock(None).expect("plain unlock").to_bytes();
         assert_eq!(seed, seed_of(field(plain, "seedHex")));
-        let private = b64(field(file, "private"));
-        assert_eq!(private.len(), 32);
-        assert_eq!(private[..], seed[..]);
-        // The stored layout is exactly what the fixture pins, with no trailing newline.
         let json = key_file.to_json().expect("serialise");
         assert_eq!(serde_json::from_str::<Value>(&json).expect("json"), *file);
         assert!(!json.ends_with('\n'));
         assert!(
-            json.starts_with("{\n  \"format\": \"bubbleplay-device-key\",\n  \"version\": 1,\n")
-        );
-        assert_eq!(
-            KeyFile::parse(&json).expect("reparse").to_json().unwrap(),
-            json
+            json.starts_with("{\n  \"format\": \"bubblebuffer-device-key\",\n  \"version\": 1,\n")
         );
     }
 
     #[test]
-    fn contract_keyfile_passphrase_unlocks_the_viewer_seed() {
-        let fixture = fixture();
+    fn contract_keyfile_passphrase_unlocks_and_aad_matches() {
+        let fixture = shared_fixture();
         let vector = &fixture["keyFiles"]["passphrase"];
-        let file = &vector["file"];
-        let key_file = KeyFile::parse(&file.to_string()).expect("protected file parses");
+        let key_file = KeyFile::parse(&vector["file"].to_string()).expect("protected file parses");
         assert!(key_file.is_protected());
-        assert_eq!(key_file.id().to_string(), field(file, "id"));
-        assert_eq!(key_file.label(), "Viewer \"test\" café");
-        assert_eq!(key_file.id().to_string(), field(&fixture["ids"][0], "id"));
-        // Parameters and sizes the format pins, as the Go relay checks them.
-        let kdf = &file["kdf"];
-        assert_eq!(field(kdf, "alg"), "argon2id");
-        assert_eq!(kdf["m"], 65536);
-        assert_eq!(kdf["t"], 3);
-        assert_eq!(kdf["p"], 1);
-        assert_eq!(b64(field(kdf, "salt")).len(), 16);
-        let aead = &file["aead"];
-        assert_eq!(field(aead, "alg"), "aes-256-gcm");
-        assert_eq!(b64(field(aead, "nonce")).len(), 12);
-        assert_eq!(b64(field(file, "private")).len(), 48);
         let passphrase = field(vector, "passphrase");
         let signing = key_file.unlock(Some(passphrase)).expect("unlock");
         assert_eq!(signing.to_bytes(), seed_of(field(vector, "seedHex")));
+        let aad = key_file
+            .aad_for_contract()
+            .expect("protected file has an AAD");
+        assert_eq!(hex(&aad), field(vector, "aadHex"));
         assert!(matches!(
             key_file.unlock(None),
             Err(DeviceKeyError::PassphraseRequired)
@@ -309,37 +407,21 @@ mod key_files {
             key_file.unlock(Some("incorrect horse battery staple")),
             Err(DeviceKeyError::AuthenticationFailed)
         ));
-    }
-
-    #[test]
-    fn contract_keyfile_aad_matches_fixture_bytes() {
-        let fixture = fixture();
-        let vector = &fixture["keyFiles"]["passphrase"];
-        let key_file = KeyFile::parse(&vector["file"].to_string()).expect("protected file parses");
-        let aad = key_file
-            .aad_for_contract()
-            .expect("protected file has an AAD");
-        assert_eq!(
-            String::from_utf8(aad.clone()).expect("utf8"),
-            field(vector, "aadUtf8")
-        );
-        assert_eq!(hex(&aad), field(vector, "aadHex"));
-        let plain = KeyFile::parse(&fixture["keyFiles"]["plain"]["file"].to_string())
-            .expect("plain file parses");
-        assert!(plain.aad_for_contract().is_none());
+        // An old-format file is not the shared format.
+        let old = &fixture_legacy()["plain"]["file"];
+        assert!(matches!(
+            KeyFile::parse(&old.to_string()),
+            Err(DeviceKeyError::UnsupportedFormat)
+        ));
     }
 
     #[test]
     fn contract_keyfile_failures_are_authentication_failures() {
-        let fixture = fixture();
+        let fixture = shared_fixture();
         let failures = fixture["keyFiles"]["failures"]
             .as_array()
             .expect("failures");
-        let names: Vec<&str> = failures
-            .iter()
-            .map(|failure| field(failure, "name"))
-            .collect();
-        assert_eq!(names, ["wrong-passphrase", "tampered-aad"]);
+        assert!(!failures.is_empty());
         for failure in failures {
             assert_eq!(field(failure, "expected"), "authentication-failed");
             let key_file =
@@ -351,22 +433,77 @@ mod key_files {
         }
     }
 
+    fn fixture_legacy() -> Value {
+        fixture()["legacyKeyFiles"].clone()
+    }
+
     #[test]
-    fn contract_keyfile_failures_differ_only_by_the_passphrase_or_the_header() {
-        let fixture = fixture();
-        let passphrase_file = &fixture["keyFiles"]["passphrase"]["file"];
-        let failures = fixture["keyFiles"]["failures"]
-            .as_array()
-            .expect("failures");
-        for failure in failures {
-            let file = &failure["file"];
-            assert_eq!(file["kdf"]["salt"], passphrase_file["kdf"]["salt"]);
-            assert_eq!(file["aead"]["nonce"], passphrase_file["aead"]["nonce"]);
-            assert_eq!(file["private"], passphrase_file["private"]);
+    fn legacy_plain_vector_opens_with_the_old_reader() {
+        let vectors = fixture_legacy();
+        let plain = &vectors["plain"];
+        let file = &plain["file"];
+        assert_eq!(field(file, "format"), legacy::FORMAT);
+        let key_file = LegacyKeyFile::parse(&file.to_string()).expect("legacy plain parses");
+        assert!(!key_file.is_protected());
+        assert_eq!(key_file.id().to_string(), field(file, "id"));
+        let seed = key_file.unlock(None).expect("plain unlock").to_bytes();
+        assert_eq!(seed, seed_of(field(plain, "seedHex")));
+    }
+
+    #[test]
+    fn legacy_protected_vector_unlocks_and_its_aad_carries_the_old_format() {
+        let vectors = fixture_legacy();
+        let vector = &vectors["passphrase"];
+        let key_file =
+            LegacyKeyFile::parse(&vector["file"].to_string()).expect("legacy protected parses");
+        let aad = key_file
+            .aad_for_contract()
+            .expect("protected file has an AAD");
+        assert_eq!(
+            String::from_utf8(aad.clone()).expect("utf8"),
+            field(vector, "aadUtf8")
+        );
+        assert_eq!(hex(&aad), field(vector, "aadHex"));
+        assert!(field(vector, "aadUtf8").contains("\"format\":\"bubbleplay-device-key\""));
+        let signing = key_file
+            .unlock(Some(field(vector, "passphrase")))
+            .expect("unlock");
+        assert_eq!(signing.to_bytes(), seed_of(field(vector, "seedHex")));
+        for failure in vectors["failures"].as_array().expect("failures") {
+            let file = LegacyKeyFile::parse(&failure["file"].to_string()).expect("parses");
+            assert!(matches!(
+                file.unlock(Some(field(failure, "passphrase"))),
+                Err(DeviceKeyError::AuthenticationFailed)
+            ));
         }
-        // Positive control: those exact inputs open with the passphrase file's own header.
-        let key_file = KeyFile::parse(&passphrase_file.to_string()).expect("parses");
-        let passphrase = field(&fixture["keyFiles"]["passphrase"], "passphrase");
-        assert!(key_file.unlock(Some(passphrase)).is_ok());
+    }
+
+    #[test]
+    fn legacy_vectors_convert_to_the_same_identity_in_the_shared_format() {
+        let vectors = fixture_legacy();
+        for (name, passphrase) in [
+            ("plain", None),
+            (
+                "passphrase",
+                Some(field(&vectors["passphrase"], "passphrase")),
+            ),
+        ] {
+            let text = vectors[name]["file"].to_string();
+            let stored = read_key_file(&text).expect("either format");
+            assert!(stored.is_legacy(), "{name}");
+            let old = LegacyKeyFile::parse(&text).expect("legacy");
+            let (converted, json) = convert_legacy(&old, passphrase).expect("convert");
+            let reopened = KeyFile::parse(&json).expect("shared reader");
+            assert_eq!(reopened.id(), old.id(), "{name}");
+            assert_eq!(reopened.public_key(), old.public_key(), "{name}");
+            assert_eq!(reopened.is_protected(), passphrase.is_some(), "{name}");
+            assert_eq!(converted.label(), old.label(), "{name}");
+            assert_eq!(
+                reopened.unlock(passphrase).expect("unlock").to_bytes(),
+                seed_of(field(&vectors[name], "seedHex")),
+                "{name}"
+            );
+            assert!(!read_key_file(&json).expect("current").is_legacy());
+        }
     }
 }

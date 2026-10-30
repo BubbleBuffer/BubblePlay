@@ -21,7 +21,7 @@ export async function deriveKeyInWorker({ password, salt }) {
   let worker, timer;
   try {
     worker = new Worker(new URL("./devicekey-kdf-worker.js", import.meta.url), {
-      type: "module", name: "bubbleplay-device-key-kdf",
+      type: "module", name: "bubblebuffer-device-key-kdf",
     });
     return await new Promise((resolve, reject) => {
       worker.onmessage = ({ data }) => {

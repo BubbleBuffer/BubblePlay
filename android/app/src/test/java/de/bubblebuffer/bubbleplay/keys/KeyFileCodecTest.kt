@@ -12,7 +12,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class KeyFileCodecTest {
-    private val keyFiles = contractKeyFiles()
+    private val keyFiles = sharedKeyFiles()
     private val plainVector = keyFiles.getJSONObject("plain")
     private val plainFile = plainVector.getJSONObject("file")
     private val protectedVector = keyFiles.getJSONObject("passphrase")
@@ -185,7 +185,7 @@ class KeyFileCodecTest {
     @Test
     fun keyFileArraysAreOwnedAndCopiedAtBothEnds() {
         val source = byteArrayOf(1, 2, 3)
-        val file = KeyFile("ID", "x", "2026-10-13T09:30:00Z", ByteArray(32), null, null, source)
+        val file = KeyFile("ID", "x", "2026-10-13T09:30:00Z", ByteArray(32), null, null, source, KeyFileCodec.FORMAT)
         source.fill(9)
         assertArrayEquals(byteArrayOf(1, 2, 3), file.sealedSeed)
         file.sealedSeed.fill(9)

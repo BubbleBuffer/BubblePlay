@@ -14,19 +14,39 @@ object RelayProof {
     const val ROLE_HOST = "host"
     private const val LABEL = "bubbleplay-relay-v1"
 
-    fun encoding(role: String, origin: String, nonce: ByteArray, id: String, publicKey: ByteArray): ByteArray {
+    fun encoding(role: String, origin: String, nonce: ByteArray, id: String, publicKey: ByteArray): ByteArray =
+        encoding(LABEL, role, origin, nonce, id, publicKey)
+
+    /** [encoding] under [label]. The shared fixture carries relay proofs under its own label. */
+    internal fun encoding(
+        label: String,
+        role: String,
+        origin: String,
+        nonce: ByteArray,
+        id: String,
+        publicKey: ByteArray,
+    ): ByteArray {
         require(role == ROLE_VIEWER || role == ROLE_HOST) { "unknown relay proof role" }
         require(nonce.size == 32) { "relay nonces are 32 bytes" }
         require(publicKey.size == 32) { "Ed25519 public keys are 32 bytes" }
         require(DeviceId.isCanonical(id)) { "device IDs must be canonical" }
         return AuthCrypto.lengthPrefixed(
-            AuthCrypto.utf8(LABEL), AuthCrypto.utf8(role), AuthCrypto.utf8(origin),
+            AuthCrypto.utf8(label), AuthCrypto.utf8(role), AuthCrypto.utf8(origin),
             nonce, AuthCrypto.utf8(id), publicKey,
         )
     }
 
     fun hash(role: String, origin: String, nonce: ByteArray, id: String, publicKey: ByteArray): ByteArray =
         AuthCrypto.sha256(encoding(role, origin, nonce, id, publicKey))
+
+    internal fun hash(
+        label: String,
+        role: String,
+        origin: String,
+        nonce: ByteArray,
+        id: String,
+        publicKey: ByteArray,
+    ): ByteArray = AuthCrypto.sha256(encoding(label, role, origin, nonce, id, publicKey))
 
     /** The 64-byte signature for [key] answering [nonce] on the relay at [origin]. */
     fun sign(key: DeviceKey, origin: String, nonce: ByteArray, role: String = ROLE_VIEWER): ByteArray =
@@ -40,11 +60,22 @@ object RelayProof {
         id: String,
         publicKey: ByteArray,
         signature: ByteArray,
+    ): Boolean = verify(LABEL, role, origin, nonce, id, publicKey, signature)
+
+    /** [verify] under [label], for the shared fixture's relay proofs. */
+    internal fun verify(
+        label: String,
+        role: String,
+        origin: String,
+        nonce: ByteArray,
+        id: String,
+        publicKey: ByteArray,
+        signature: ByteArray,
     ): Boolean {
         if (nonce.size != 32 || publicKey.size != 32 || signature.size != 64) return false
         if (role != ROLE_VIEWER && role != ROLE_HOST) return false
         if (!DeviceId.isCanonical(id) || DeviceId.fromPublicKey(publicKey) != id) return false
-        return Ed25519Verify.verify(publicKey, hash(role, origin, nonce, id, publicKey), signature)
+        return Ed25519Verify.verify(publicKey, hash(label, role, origin, nonce, id, publicKey), signature)
     }
 }
 

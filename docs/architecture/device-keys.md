@@ -51,11 +51,11 @@ The first 80 bits of `SHA-256(raw 32-byte Ed25519 public key)`, written as 16 Cr
 
 ### Key file format
 
-One text file per key, extension `.bpkey`, UTF-8 JSON:
+One text file per key, extension `.bpkey`, UTF-8 JSON in the format `bubblebuffer-device-key` of the shared crate [`bubblebuffer-device-key`](https://github.com/BubbleBuffer/bubblebuffer-identity) (git tag v0.1.0, commit a539c7e). Rust uses the crate itself through `crates/bp-device-key`; the browser (`worker/public/devicekey.js`) and Android (`KeyFileCodec.kt`) implement the same format and are checked against the vendored shared fixture `fixtures/shared/device-keys-contract.json`.
 
 ```json
 {
-  "format": "bubbleplay-device-key",
+  "format": "bubblebuffer-device-key",
   "version": 1,
   "type": "ed25519",
   "id": "B7QK-2M9X-H4PD-R8TN",
@@ -73,6 +73,8 @@ One text file per key, extension `.bpkey`, UTF-8 JSON:
 - **AEAD: AES-256-GCM**, native in WebCrypto, Rust (`aes-gcm`) and Android (JCA). A file is encrypted once per passphrase change with a fresh random nonce. The associated data is the canonical JSON of every field except `private` and `aead.nonce`, so a tampered ID, public key or KDF parameters fail to decrypt.
 - **On import**, the client derives the public key from the seed and refuses the file if it does not match `public` and `id`. Unknown `version` or `type` is refused with a clear message.
 - `label` is the name the viewer sends in its `caps` control message after pairing; the PC stores "Unnamed device" at pairing ([Pairing A](#a-at-the-pc)).
+
+**Migration from `bubbleplay-device-key` (2026-10-30).** Files written before the move carry the old format name, which is also part of a protected file's associated data. Each platform keeps a reader for the old format (`bp_device_key::legacy`, `KeyFileCodec` and `devicekey.js`) and converts its stored key once: an unprotected key at start (the PC key in the tray, the Windows viewer, Android and the browser), a protected one at the next successful unlock, when the passphrase is in hand. The conversion keeps the key, ID, label and created time, reseals a protected key under the same passphrase with a fresh salt and nonce, writes the new file atomically beside a backup of the old one, reopens it and checks the ID and public key, and only then removes the backup. Any failure leaves the old file in place, logs one line and the app keeps using the old file for that run. Import accepts both formats and stores the new one; export writes only the new one. IDs, relay proofs (label `bubbleplay-relay-v1`) and the phase 2 handshake are unchanged.
 
 ### Where keys live
 
@@ -353,6 +355,8 @@ Sizes: S under a week, M one to three weeks, L three to six weeks, each with tes
 2026-10-15: [the fixture](../../fixtures/device-keys-contract.json) contains three Ed25519 ID derivations (including lowercase/O/I/L/unhyphenated parsing), plain and protected `.bpkey` files, wrong-passphrase and tampered-AAD failures, a full handshake, control ciphertexts for sequences 0/1 in each direction, both DTLS bindings and four signaling examples. Private inputs are public, fixed and **test-only**. Fields ending in `Hex` are hexadecimal; other binary fields use unpadded base64url. `aadUtf8` and `plaintextUtf8` fix exact UTF-8 bytes. The decimal epoch vector exceeds JavaScript's safe integer range.
 
 [Generate](../../tools/device-keys/gen-contract.mjs) on linux01 with Node 24: `crypto.argon2Sync` is required; output is UTF-8 JSON, two-space indentation, final LF. Independent [Node](../../tools/tests/device-keys-contract.test.mjs) and Go checks (`relay/devicekeys_contract_test.go`, deleted at CUT-1) recompute from inputs. Node 22 skips only three Argon2 cases; Go checked them with the existing `golang.org/x/crypto/argon2` dependency and ran only on linux01 (`cd relay && go test ./... -run DeviceKeys -v`, not runnable after CUT-1).
+
+Since 2026-10-30 the generator writes only BubblePlay's local sections (its old-format key files are now `legacyKeyFiles`); the shared crate's fixture is vendored as [fixtures/shared/device-keys-contract.json](../../fixtures/shared/device-keys-contract.json) and `node tools/device-keys/gen-contract.mjs --check` verifies it without rewriting it. The Node contract test covers both files and skips six Argon2 cases on Node 22.
 
 Verified: repeated generation is byte-identical and matches the staged fixture; Node 24 passes 10 checks, Node 22 passes 7 with the required 3 skips. On 2026-10-15, `cd relay && go test ./... -run DeviceKeys -v` passes all four checks on linux01 with Go 1.27.1, including relay proofs; `go vet ./...` also passes. No Go ran on the PC.
 

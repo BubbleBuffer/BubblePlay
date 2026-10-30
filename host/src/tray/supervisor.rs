@@ -189,6 +189,7 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob, stdin: &HostStdin) -> 
     let (stored, secrets) = load(config)?;
     // Read at every spawn, so a changed setting applies on the next host start.
     let settings = TraySettings::load(&tray_settings_path(&config.host_config));
+    device_key_file::migrate_legacy(&device_key_file::path_beside(&config.host_config));
     let device_key = device_key_handoff(config);
     let mut command = Command::new(&config.host_exe);
     command

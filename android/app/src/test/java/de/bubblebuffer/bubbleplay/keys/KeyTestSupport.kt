@@ -5,9 +5,15 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.fail
 
-/** The `keyFiles` section of the shared device-key contract (test-only vectors). */
-internal fun contractKeyFiles(): JSONObject =
-    Fixtures.json("device-keys-contract.json").getJSONObject("keyFiles")
+/** The shared device-key contract (fixtures/shared), which holds the new format name only. */
+internal fun sharedContract(): JSONObject = Fixtures.json("shared/device-keys-contract.json")
+
+/** The `keyFiles` section of the shared contract: files in the shared format. */
+internal fun sharedKeyFiles(): JSONObject = sharedContract().getJSONObject("keyFiles")
+
+/** The `legacyKeyFiles` section of the local contract: files in the format name written before the move. */
+internal fun legacyKeyFiles(): JSONObject =
+    Fixtures.json("device-keys-contract.json").getJSONObject("legacyKeyFiles")
 
 internal fun contractIds(): List<JSONObject> =
     Fixtures.objects(Fixtures.json("device-keys-contract.json").getJSONArray("ids"))

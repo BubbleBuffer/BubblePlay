@@ -25,14 +25,26 @@ internal enum class StartScreen { Setup, Unlock, PcList }
 
 /** Non-visual device-key logic: what is stored, which screen starts, file names and error text. */
 internal object DeviceKeyLogic {
-    /** Reads the stored key. Does disk and Keystore work, so call it off the UI thread. */
+    /**
+     * Reads the stored key. Does disk and Keystore work, so call it off the UI thread. A plain file in
+     * the old format is converted here, once; a protected one is converted at its next unlock.
+     */
     fun read(store: DeviceKeyStore): StoredKey = try {
         val text = store.loadPortable()
-        if (text == null) StoredKey.Missing else StoredKey.Present(text, KeyFileCodec.parse(text))
+        if (text == null) StoredKey.Missing else present(store, text)
     } catch (e: DeviceKeyException) {
         StoredKey.Unreadable(e.reason)
     } catch (e: Exception) {
         StoredKey.Unreadable(null)
+    }
+
+    private fun present(store: DeviceKeyStore, text: String): StoredKey.Present {
+        val file = KeyFileCodec.parse(text)
+        if (!file.isLegacyFormat || file.isProtected || !store.migrateLegacy(null)) {
+            return StoredKey.Present(text, file)
+        }
+        val converted = store.loadPortable() ?: error("converted key file is missing")
+        return StoredKey.Present(converted, KeyFileCodec.parse(converted))
     }
 
     /**

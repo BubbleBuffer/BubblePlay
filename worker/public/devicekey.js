@@ -7,7 +7,11 @@
 // drop their references after use. Nothing is written to storage, sessionStorage or localStorage.
 import { deriveKeyInWorker } from "./devicekey-kdf-worker.js";
 
-const FORMAT = "bubbleplay-device-key";
+// The shared format name (bubblebuffer-identity v0.1.0). Everything written uses it.
+const FORMAT = "bubblebuffer-device-key";
+// The name this app wrote before the move. Read and converted once, never written; a protected
+// file's AAD carries whichever name the file has, so each file opens only with its own name.
+export const LEGACY_FORMAT = "bubbleplay-device-key";
 const VERSION = 1;
 const TYPE = "ed25519";
 const KDF_ALG = "argon2id";
@@ -291,7 +295,7 @@ function checkExactFields(object, fields, name) {
  */
 function checkFile(file) {
   if (!isPlainObject(file)) throw invalidFile("key file must be a JSON object");
-  if (file.format !== FORMAT) {
+  if (file.format !== FORMAT && file.format !== LEGACY_FORMAT) {
     throw new DeviceKeyError("unsupported-format", `not a BubblePlay device key file (format ${JSON.stringify(file.format)})`);
   }
   if (file.version !== VERSION) {
@@ -540,6 +544,40 @@ async function rewrapKeyFileWith(kdf, text, passphrase, newPassphrase) {
 }
 
 /**
+ * Converts a legacy key file to the shared format with the same seed, ID, label, created time and
+ * protection (a fresh salt and nonce when protected). Returns JSON text. The new text is parsed and
+ * unlocked again before it is returned, and refused unless its ID and public key match the legacy file.
+ */
+async function convertLegacyKeyFileWith(kdf, text, passphrase) {
+  const legacy = parseStructure(text);
+  if (legacy.format !== LEGACY_FORMAT) throw invalidInput("only a legacy key file can be converted");
+  const converted = JSON.stringify(await rewrapKeyFileWith(kdf, text, passphrase, passphrase), null, 2);
+  if (parseStructure(converted).format !== FORMAT) throw invalidFile("the converted key file is not in the shared format");
+  const reread = await unlockKeyFileWith(kdf, converted, passphrase);
+  let legacyPublic;
+  try {
+    legacyPublic = b64urlDecode(legacy.public, PUBLIC_BYTES, "public");
+    if (reread.id !== legacy.id || !bytesEqual(reread.publicKey, legacyPublic)) {
+      throw new DeviceKeyError("identity-mismatch", "the converted key file does not match the original key");
+    }
+  } finally {
+    wipe(legacyPublic, reread.publicKey);
+  }
+  return converted;
+}
+
+/** True when JSON text is a key file in the legacy format. Text that does not parse is false; the parse paths report it. */
+export function isLegacyKeyFileText(text) {
+  let file;
+  try {
+    file = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  return isPlainObject(file) && file.format === LEGACY_FORMAT;
+}
+
+/**
  * Creates the API bound to a KDF. The KDF takes {password: Uint8Array, salt: Uint8Array} and
  * resolves to 32 bytes of Argon2id output. The default is the browser worker, which starts no
  * Worker until called, so importing this module is safe in Node.
@@ -555,7 +593,10 @@ async function rewrapKeyFileWith(kdf, text, passphrase, newPassphrase) {
  * - unlockKeyFile(text, passphrase?) -> Promise<{id, publicKey: Uint8Array, privateKey: CryptoKey}>.
  *   The CryptoKey is non-extractable and signs Ed25519 only.
  * - rewrapKeyFile(text, passphrase?, newPassphrase?) -> Promise<file object>. Same identity, label
- *   and created time; fresh salt and nonce when protected.
+ *   and created time; fresh salt and nonce when protected. Always writes the shared format.
+ * - convertLegacyKeyFile(text, passphrase?) -> Promise<string>. A legacy (bubbleplay-device-key) file
+ *   becomes shared-format JSON text with the same key, label, created time and protection. Refused
+ *   unless the converted file unlocks to the same ID and public key.
  * Unlock and rewrap decrypt once, through the same structural parse as parseKeyFile.
  * @param {{kdf?: (input: {password: Uint8Array, salt: Uint8Array}) => Promise<Uint8Array>}} [options]
  */
@@ -569,6 +610,7 @@ export function createDeviceKeyApi({ kdf = deriveKeyInWorker } = {}) {
     createKeyFile: options => createKeyFileWith(kdf, options),
     unlockKeyFile: (text, passphrase) => unlockKeyFileWith(kdf, text, passphrase),
     rewrapKeyFile: (text, passphrase, newPassphrase) => rewrapKeyFileWith(kdf, text, passphrase, newPassphrase),
+    convertLegacyKeyFile: (text, passphrase) => convertLegacyKeyFileWith(kdf, text, passphrase),
   };
 }
 
@@ -578,3 +620,4 @@ export const parseKeyFile = defaultApi.parseKeyFile;
 export const createKeyFile = defaultApi.createKeyFile;
 export const unlockKeyFile = defaultApi.unlockKeyFile;
 export const rewrapKeyFile = defaultApi.rewrapKeyFile;
+export const convertLegacyKeyFile = defaultApi.convertLegacyKeyFile;
