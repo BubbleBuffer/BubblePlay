@@ -2,6 +2,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import '../rust/api.dart' as api;
 import 'devices_channel.dart';
 
 /// Windows: the host's devices pipe through flutter_rust_bridge. A thin adapter over the three
@@ -16,17 +17,19 @@ class FrbDevicesChannel implements DevicesChannel {
         _disconnect = disconnect,
         lines = connect();
 
-  /// Opens the channel. Returns null until the generated binding exists (then this body is the
-  /// whole change):
-  ///
-  /// ```dart
-  /// return FrbDevicesChannel(
-  ///   connect: api.devicesConnect, // Stream<String> devicesConnect()
-  ///   sendLine: (line) => api.devicesSend(line: line),
-  ///   disconnect: api.devicesDisconnect,
-  /// );
-  /// ```
-  static FrbDevicesChannel? tryOpen() => null;
+  /// Opens the channel over the generated binding (RustLib must be initialised). Returns null
+  /// if that fails, so the app runs without a Devices UI.
+  static FrbDevicesChannel? tryOpen() {
+    try {
+      return FrbDevicesChannel(
+        connect: api.devicesConnect,
+        sendLine: (line) => api.devicesSend(line: line),
+        disconnect: () => unawaited(api.devicesDisconnect()),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
 
   final void Function(String line) _sendLine;
   final void Function() _disconnect;

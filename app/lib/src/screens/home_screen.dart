@@ -65,10 +65,21 @@ class _HomeScreenState extends State<HomeScreen> {
     final mobile = context.mobile;
     final list = _PcList(
       state: widget.state,
-      showThisPc: env.isWindows && !mobile,
+      showThisPc: env.isWindows,
       devices: env.devices,
       thisPcSelected: _thisPcSelected,
-      onSelectThisPc: () => setState(() => _thisPcSelected = true),
+      onSelectThisPc: () {
+        final devices = env.devices;
+        if (mobile && devices != null) {
+          // Narrow window: the detail is a pushed page, like a PC's actions.
+          pushScreen<void>(
+            context,
+            (_) => ScreenScaffold(title: 'This PC', body: ThisPcDetail(devices: devices)),
+          );
+          return;
+        }
+        setState(() => _thisPcSelected = true);
+      },
       selectedId: _thisPcSelected ? null : _selected?.id,
       onSelect: (pc) => setState(() {
         _selectedId = pc.id;

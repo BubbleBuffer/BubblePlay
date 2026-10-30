@@ -1,4 +1,6 @@
 import 'package:bubbleplay_app/src/devices/devices_model.dart';
+import 'package:bubbleplay_app/src/devices/devices_controller.dart';
+import 'package:bubbleplay_app/src/devices/fake_devices_channel.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import '../support/devices_fixtures.dart';
@@ -12,9 +14,10 @@ void main() {
       expect(find.text('Pair a device'), findsNothing);
     });
 
-    testWidgets('a narrow Windows window hides This PC', (tester) async {
+    testWidgets('a narrow Windows window shows the row and opens the detail as a page',
+        (tester) async {
       await pumpApp(tester, contractState('home'), screen: Screen.phone, windows: true);
-      expect(find.text('This PC'), findsNothing);
+      expect(find.text('This PC'), findsOneWidget);
     });
   });
 
@@ -188,6 +191,21 @@ void main() {
   });
 
   group('selection', () {
+    testWidgets('on a narrow Windows window the row pushes the detail page', (tester) async {
+      final channel = FakeDevicesChannel();
+      final controller = DevicesController(channel, now: () => devicesNow);
+      addTearDown(controller.dispose);
+      for (final m in connectedHost()) {
+        channel.emit(m);
+      }
+      await pumpApp(tester, contractState('home'), screen: Screen.phone, devices: controller);
+      await tester.tap(find.text('3 paired devices'));
+      await tester.pumpAndSettle();
+      expect(find.text('Pair a device'), findsOneWidget);
+      await tester.tap(find.text('Pair a device'));
+      expect(channel.sent.single, {'type': 'startPairing'});
+    });
+
     testWidgets('picking a PC leaves This PC; a show event returns to it', (tester) async {
       final app = await pumpThisPc(tester, connectedHost());
       expect(find.text('Pair a device'), findsOneWidget);
