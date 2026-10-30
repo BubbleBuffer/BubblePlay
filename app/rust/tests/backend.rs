@@ -244,7 +244,7 @@ fn cancelling_a_pairing_drops_its_late_result() {
 }
 
 #[test]
-fn connect_opens_the_placeholder_session_and_disconnect_closes_it() {
+fn connect_starts_a_session_or_says_why_not_and_disconnect_closes_it() {
     let dir = Dir::new("connect");
     let id = DeviceId::from_public_key(&[7u8; 32]);
     PcStore::in_dir(&dir.0)
@@ -264,12 +264,22 @@ fn connect_opens_the_placeholder_session_and_disconnect_closes_it() {
     backend.act(Action::Connect {
         pc_id: id.to_string(),
     });
-    let session = backend.snapshot().session.expect("a session");
-    assert_eq!(session.pc_name, "Studio");
-    assert_eq!(session.mode, StreamMode::Work);
-
-    backend.act(Action::SetMode(StreamMode::Game));
-    assert_eq!(backend.snapshot().session.unwrap().mode, StreamMode::Game);
+    // The real session needs a hardware decoder and a reachable relay: without them Connect
+    // reports why (a failed flow and a problem on the PC) instead of opening a session.
+    let state = backend.snapshot();
+    match state.session {
+        Some(session) => {
+            assert_eq!(session.pc_name, "Studio");
+            assert_eq!(session.mode, StreamMode::Work);
+        }
+        None => {
+            assert!(
+                matches!(state.flow, Some(Flow::Failed { .. } | Flow::Refused { .. })),
+                "no session and no reason: {:?}",
+                state.flow
+            );
+        }
+    }
     backend.act(Action::Disconnect);
     assert!(backend.snapshot().session.is_none());
 

@@ -9,3 +9,4 @@ pub mod backend;
 pub mod contract;
 mod frb_generated;
 mod link;
+pub mod stream_host;

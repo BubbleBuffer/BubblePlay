@@ -3,6 +3,7 @@ import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import 'app_controller.dart';
 import 'platform/key_files.dart';
+import 'session/stream_channel.dart';
 import 'screens/gate.dart';
 
 /// What every screen needs besides the snapshot: the controller to act through, the platform
@@ -13,11 +14,15 @@ class AppEnv {
     required this.isWindows,
     required this.keyFiles,
     this.theme,
+    this.stream = const NoStreamChannel(),
   });
 
   final AppController controller;
   final bool isWindows;
   final KeyFiles keyFiles;
+
+  /// The native session video and input (see session/stream_channel.dart).
+  final StreamChannel stream;
 
   /// The person's light/dark choice; null follows the system.
   final ValueNotifier<Brightness?>? theme;

@@ -8,6 +8,7 @@ import 'src/backend/channel.dart';
 import 'src/backend/frb_channel.dart';
 import 'src/backend/pigeon_channel.dart';
 import 'src/platform/key_files.dart';
+import 'src/session/stream_channel.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -21,6 +22,7 @@ Future<void> main() async {
         controller: controller,
         isWindows: isWindows,
         keyFiles: const SystemKeyFiles(),
+        stream: MethodStreamChannel(),
         theme: ValueNotifier<Brightness?>(null),
       ),
     ),
