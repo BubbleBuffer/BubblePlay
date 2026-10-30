@@ -10,7 +10,7 @@ One Flutter app in `app/` for Windows and Android, built on [bb-ui](https://gith
 - Settings (key facts, export, theme) and the empty and error states.
 - Connect opens a placeholder session: bb-ui's session chrome over a black area. No video.
 
-Not in this version, and not offered in the UI: streaming, retrying a connect, vouching, remote pairing, key replacement, online presence of PCs.
+Not in this version, and not offered in the UI: streaming, retrying a connect, vouching, remote pairing, key replacement.
 
 ## Architecture
 
@@ -53,5 +53,7 @@ Tests in `app/test/`:
 ## Known limits
 
 - Hosted Windows CI is not available (budget): the Windows build and the Rust tests run on the developer PC.
-- Android runs the existing Kotlin core as is; presence (`online`) and per-PC problems are not asked yet on either platform.
+- Online state comes from the relay's unauthenticated `GET /presence?ids=` (max 20 ids, per-prefix rate limit, no gate hold or ntfy). `PresenceService` (`app/lib/src/presence/`) asks on the PC list and every 30 s while it is visible and no session or enrollment is open; failures keep the last value and never show online. A PC with no relay URL stays offline. The Rust and Kotlin cores still report `online: false`; Dart overlays it.
+- Android fills `RemotePc.problem` from the Kotlin core's stored resource (`StateJson.pcProblem`): key changed, not accepted (relay refused or device removed), relay unreachable; anything else is null. Windows never sets a problem yet.
+- Decision 2026-10-30: the old Win32 Devices window, the egui client UI and the Android View UI stay until M2 is accepted, then are removed.
 - bb-ui v0.7.1 has `ObscuredField`, which `app/lib/src/screens/enroll_screen.dart` uses. The `PassphraseField` stand-in is removed.
