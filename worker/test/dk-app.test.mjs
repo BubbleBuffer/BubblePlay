@@ -5,9 +5,9 @@ import { createApp, normalizePairingInput, readPairingLink, sortPcs, FORGET_ENDP
 const VIEWER_ID = "47Z3-3QX1-AJH6-2RKB";
 const PC_ID = "77VH-7M56-8GJK-Y12J";
 const SHARED_NAME = "bubblebuffer-device-key";
-const PLAIN = JSON.stringify({ format: SHARED_NAME, id: VIEWER_ID, label: "Test", kdf: null, aead: null });
-const PROTECTED = JSON.stringify({ format: SHARED_NAME, id: VIEWER_ID, label: "Test", kdf: { alg: "argon2id" }, aead: { alg: "aes-256-gcm" } });
 const PUBLIC = "A".repeat(43);
+const PLAIN = JSON.stringify({ format: SHARED_NAME, id: VIEWER_ID, label: "Test", public: PUBLIC, kdf: null, aead: null });
+const PROTECTED = JSON.stringify({ format: SHARED_NAME, id: VIEWER_ID, label: "Test", public: PUBLIC, kdf: { alg: "argon2id" }, aead: { alg: "aes-256-gcm" } });
 
 function fakeGate() {
   const calls = [];
@@ -17,14 +17,18 @@ function fakeGate() {
   return gate;
 }
 
-function memoryStore({ key = null, pcs = [] } = {}) {
+function memoryStore({ key = null, pcs = [], unlocked = null } = {}) {
   const records = new Map(pcs.map(pc => [pc.id, { ...pc }]));
   const log = [];
   return {
     log, records,
+    unlocked: () => unlocked,
     async load() { return key; },
-    async save(text) { key = text; },
-    async clear() { log.push(["clear"]); key = null; },
+    async save(text) { key = text; unlocked = null; },
+    async clear() { log.push(["clear"]); key = null; unlocked = null; },
+    async loadUnlocked() { return unlocked; },
+    async saveUnlocked(record) { log.push(["saveUnlocked", record.id]); unlocked = record; },
+    async clearUnlocked() { log.push(["clearUnlocked"]); unlocked = null; },
     async listPcs() { return [...records.values()]; },
     async getPc(id) { return records.get(id) ?? null; },
     async putPc(record) { records.set(record.id, record); },
@@ -53,9 +57,9 @@ function fakeLocation(href) {
   return { location, history };
 }
 
-function app({ key = PLAIN, pcs = [], href = "https://relay.test/", keyUi = null, fetch, openPairing, unlockCalls, store, unlock } = {}) {
+function app({ key = PLAIN, pcs = [], href = "https://relay.test/", keyUi = null, fetch, openPairing, unlockCalls, store, unlock, unlocked } = {}) {
   const gate = fakeGate();
-  store ??= memoryStore({ key, pcs });
+  store ??= memoryStore({ key, pcs, unlocked });
   const { location, history } = fakeLocation(href);
   const sessions = [];
   const pairings = [];
@@ -228,8 +232,9 @@ test("list rename, remove, forget and lock call the store, fetch and reload", as
   assert.deepEqual(fetches, [[FORGET_ENDPOINT, { method: "POST", credentials: "same-origin" }]]);
   assert.equal(FORGET_ENDPOINT, "/__gate/forget");
   assert.equal(h.location.reloads, 1);
-  h.gate.last("showPcList").onLock();
+  await h.gate.last("showPcList").onLock();
   assert.equal(h.location.reloads, 2);
+  assert.deepEqual(h.store.log.at(-1), ["clearUnlocked"]);
 });
 
 test("a failed forget rejects for the gate and does not reload", async () => {
@@ -249,8 +254,9 @@ test("connect from the list starts the session, then lock ends it before reload"
   assert.equal(h.sessions[0].pc, PC_ID);
   assert.equal(new URL(h.location.href).searchParams.get("pc"), PC_ID);
   assert.equal(h.gate.last("showBusy"), "Connecting to Desk…");
-  h.instance.lock();
+  await h.instance.lock();
   assert.deepEqual(h.sessions.at(-1), "ended");
+  assert.equal(h.store.unlocked(), null, "lock deletes the kept unlocked key");
   h.instance.switchPc();
   assert.deepEqual(h.location.assigned, ["https://relay.test/"]);
 });
@@ -295,4 +301,68 @@ test("creating a key replaces a stored key in another format and continues to th
   await again.gate.last("showKeyScreen").onCreate();
   assert.equal(await store.load(), PLAIN);
   assert.ok(again.gate.calls.some(([name]) => name === "showPcList"));
+});
+
+// ---- Stay unlocked: the kept non-extractable key replaces the passphrase on refresh.
+const KEPT = Object.freeze({ id: VIEWER_ID, publicRaw: new Uint8Array(32), privateKey: { type: "private" } });
+
+test("unlocking a protected key keeps it, so a refresh needs no passphrase", async () => {
+  const calls = [];
+  const h = app({ key: PROTECTED, unlockCalls: calls });
+  await h.instance.start();
+  await h.gate.last("showKeyScreen").onUnlock("right");
+  assert.deepEqual(h.store.log, [["saveUnlocked", VIEWER_ID]]);
+  assert.ok(h.store.unlocked());
+  // Refresh: a new app on the same store.
+  const again = app({ store: h.store, unlockCalls: calls });
+  await again.instance.start();
+  assert.equal(again.gate.last("showKeyScreen"), undefined, "no passphrase screen");
+  assert.equal(again.gate.last("showPcList").deviceId, VIEWER_ID);
+  assert.deepEqual(calls, ["right"], "the key file is not unlocked again");
+});
+
+test("a wrong passphrase keeps nothing", async () => {
+  const h = app({ key: PROTECTED });
+  await h.instance.start();
+  await assert.rejects(h.gate.last("showKeyScreen").onUnlock("wrong"), /Wrong passphrase/);
+  assert.equal(h.store.unlocked(), null);
+});
+
+test("refresh on a PC page reconnects to that PC with the kept key and no input", async () => {
+  const calls = [];
+  const h = app({ key: PROTECTED, unlocked: KEPT, unlockCalls: calls, href: `https://relay.test/?pc=${PC_ID}`,
+    pcs: [{ id: PC_ID, name: "Desk", public: PUBLIC, paired: 1, lastUsed: 5 }] });
+  await h.instance.start();
+  assert.deepEqual(calls, []);
+  assert.equal(h.gate.last("showKeyScreen"), undefined);
+  assert.equal(h.sessions.length, 1);
+  assert.equal(h.sessions[0].pc, PC_ID);
+  assert.equal(h.sessions[0].identity.privateKey, KEPT.privateKey);
+  assert.equal(h.gate.last("showBusy"), "Connecting to Desk…");
+});
+
+test("refresh naming a PC that is no longer paired shows the PC list", async () => {
+  const h = app({ key: PROTECTED, unlocked: KEPT, href: `https://relay.test/?pc=${PC_ID}` });
+  await h.instance.start();
+  assert.equal(h.sessions.length, 0);
+  assert.ok(h.gate.last("showPcList"));
+});
+
+test("a kept key that belongs to another key file is deleted and the passphrase is asked", async () => {
+  const other = Object.freeze({ ...KEPT, id: PC_ID });
+  const h = app({ key: PROTECTED, unlocked: other });
+  await h.instance.start();
+  assert.equal(h.store.unlocked(), null);
+  assert.deepEqual(h.store.log, [["clearUnlocked"]]);
+  assert.equal(h.gate.last("showKeyScreen").mode, "unlock");
+});
+
+test("after Lock this browser, the next visit asks for the passphrase again", async () => {
+  const h = app({ key: PROTECTED, unlocked: KEPT });
+  await h.instance.start();
+  await h.gate.last("showPcList").onLock();
+  assert.equal(h.location.reloads, 1);
+  const again = app({ store: h.store });
+  await again.instance.start();
+  assert.equal(again.gate.last("showKeyScreen").mode, "unlock");
 });

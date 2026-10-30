@@ -179,8 +179,10 @@ impl Relay {
     /// A restored socket's `prefix` is a placeholder that a live socket never reads.
     ///
     /// Closed with 1008 and an empty reason: any socket that is not live; a route
-    /// or identity that does not check out; the higher-id duplicate of a live
-    /// host or viewer for one PC; a host with no PC record; a viewer that is not
+    /// or identity that does not check out; the lower-id duplicate of a live
+    /// host, viewer or data socket (ids only grow, so the higher id is the one
+    /// that replaced it, as the live relay's "peer replaced" decided); a host
+    /// with no PC record; a viewer that is not
     /// admitted and not in pairing mode; a data socket whose epoch is not its
     /// room's current epoch; and a second snapshot for the same socket id.
     pub fn rehydrate(
@@ -214,8 +216,9 @@ impl Relay {
             }
         }
         // Signalling first: a data socket's epoch is checked against its room,
-        // and the room's epoch comes from the viewer.
-        for (snapshot, conn) in signalling {
+        // and the room's epoch comes from the viewer. Newest first in each
+        // group, so a replacement wins over the socket it replaced.
+        for (snapshot, conn) in signalling.into_iter().rev() {
             let id = snapshot.id;
             let role = conn.role;
             let adopted = match role {
@@ -227,7 +230,7 @@ impl Relay {
                 out.push(Action::Close(id, 1008, String::new()));
             }
         }
-        for (snapshot, conn) in data {
+        for (snapshot, conn) in data.into_iter().rev() {
             let id = snapshot.id;
             if !relay.adopt_data(id, conn) {
                 out.push(Action::Close(id, 1008, String::new()));

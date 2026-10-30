@@ -80,7 +80,7 @@ One text file per key, extension `.bpkey`, UTF-8 JSON in the format `bubblebuffe
 
 | Device | At rest | Unlock | Export / import |
 | --- | --- | --- | --- |
-| Browser | The `.bpkey` file as created or imported, in IndexedDB for the relay origin. | Asks for the passphrase when the page opens, if the key has one. | **Export key** downloads the file; **Import key** reads one. |
+| Browser | The `.bpkey` file as created or imported, in IndexedDB for the relay origin; after the first unlock, also a non-extractable `CryptoKey` in the same database. | Asks for the passphrase once per browser, if the key has one; later visits use the kept `CryptoKey` until **Lock this browser**. | **Export key** downloads the file; **Import key** reads one. |
 | Android | `files/device-key.bpkey` in app-private storage, additionally wrapped with a Keystore AES key so a copied file is useless off the phone. Backup stays off. | Asks for the passphrase when the app opens, if the key has one. | Export and import through the system file picker; export unwraps the Keystore layer and writes the portable file. |
 | PC user host | `%LOCALAPPDATA%\BubblePlay\device-key.bpkey`, CurrentUser DPAPI-wrapped, no passphrase, because the host starts unattended at sign-in. | None. | Tray menu **Export PC key...** asks for an optional export passphrase; **Import PC key...** keeps a PC's ID across a reinstall. |
 | Pre-login logon host | `ProgramData\BubblePlay\prelogin\device-key.bpkey`, LocalMachine DPAPI, ACL SYSTEM and `NT SERVICE\BubblePlayLogon`. | None. | Not exported; it is created by the elevated pre-login opt-in. Its own ID, as decided in [unattended access](unattended-access.md#decisions). |
@@ -88,9 +88,9 @@ One text file per key, extension `.bpkey`, UTF-8 JSON in the format `bubblebuffe
 
 **First open of a viewer:** with no key yet, the browser and the Android app offer **Create key** and **Import key**. Create asks for an optional passphrase (recommended, with a short note that without one anyone who copies the file is this device) and offers export right away.
 
-**Unlocked-key lifetime:** memory only, never written back in unlocked form.
+**Unlocked-key lifetime:** never written back as key bytes.
 
-- Browser: the decrypted seed is imported into WebCrypto as a non-extractable `CryptoKey` and the byte buffers are overwritten. The key lives until the tab closes or reloads; a reload asks again. Nothing goes to `sessionStorage` or `localStorage`.
+- Browser (since 2026-10-30, owner decision): the decrypted seed is imported into WebCrypto as a non-extractable Ed25519 `CryptoKey` (usage `sign`) and the byte buffers are overwritten. That `CryptoKey` is stored in IndexedDB (`bubbleplay-device`, store `keys`, record `unlocked`: `{id, publicRaw, privateKey}`), the browser's equivalent of the Android Keystore wrap. On open, `dk-app.js` uses it when its ID and public key match the stored key file; otherwise it deletes it and asks for the passphrase. `devicekey-store.js` refuses to store or return a key that is extractable, public or not Ed25519. **Lock this browser** deletes the record; saving or clearing the key file deletes it too. Page script cannot export the key, but the browser keeps it in its profile on disk, so a copied profile can use it until the key is revoked. Nothing goes to `sessionStorage` or `localStorage`.
 - Android: the seed is held in process memory until the app is closed (task removed, or the user backs out of the PC list) or the process dies. Backgrounding during a session keeps it, so the planned background survival works.
 - Unlocking is local; a wrong passphrase never reaches the relay or the PC.
 
@@ -313,7 +313,7 @@ Kept: the ntfy site gate with the `__Host-gate` cookie and `/__gate/decision`, `
 | PC key copied by malware running as the user | DPAPI at rest. | A same-user process can read it; same boundary as today's host credentials. |
 | Replay of a handshake or input | Fresh nonces and epoch in the transcript; per-message sequence numbers. | None known. |
 
-Stays prohibited: accepting a key without a confirmation at the PC or a valid voucher from a trusted device allowed to vouch; approving a pairing through ntfy; granting "Before sign-in" by voucher or rotation; pairing before sign-in; any password or shared-secret login for viewers; treating the site gate as access to a PC; serving any page asset before the site gate; the relay storing names, permissions or the PC's second-factor secrets; writing an unlocked key to disk; any inbound listener on the PC; and everything already prohibited in [unattended access](unattended-access.md#recommendation).
+Stays prohibited: accepting a key without a confirmation at the PC or a valid voucher from a trusted device allowed to vouch; approving a pairing through ntfy; granting "Before sign-in" by voucher or rotation; pairing before sign-in; any password or shared-secret login for viewers; treating the site gate as access to a PC; serving any page asset before the site gate; the relay storing names, permissions or the PC's second-factor secrets; writing unlocked key bytes to disk (the browser's non-extractable `CryptoKey` in IndexedDB is the one exception, 2026-10-30); any inbound listener on the PC; and everything already prohibited in [unattended access](unattended-access.md#recommendation).
 
 ## Phased plan
 
@@ -337,7 +337,7 @@ Sizes: S under a week, M one to three weeks, L three to six weeks, each with tes
 
 2026-10-13, owner:
 
-1. **Portable key files, SSH-style.** Keys can be exported and imported; each key has an optional passphrase. Browser and Android ask for it on open, and offer **Create key** and **Import key** when there is none. No non-extractable WebCrypto key and no Keystore-bound identity; the Keystore may wrap the file at rest. This supersedes the earlier recommendation of a non-extractable browser key with optional passkeys. Passkeys remain a possible later option, not planned. Consequences above: Ed25519 instead of P-256, the `.bpkey` format with Argon2id and AES-256-GCM, unlocked keys in memory only, and one tray row per key with connections shown per place.
+1. **Portable key files, SSH-style.** Keys can be exported and imported; each key has an optional passphrase. Browser and Android ask for it on open, and offer **Create key** and **Import key** when there is none. No non-extractable WebCrypto key as the identity and no Keystore-bound identity; the Keystore may wrap the file at rest. (2026-10-30: the browser keeps its unlocked key as a non-extractable `CryptoKey` in IndexedDB, so the passphrase is asked once per browser; the portable file stays the identity and the backup.) This supersedes the earlier recommendation of a non-extractable browser key with optional passkeys. Passkeys remain a possible later option, not planned. Consequences above: Ed25519 instead of P-256, the `.bpkey` format with Argon2id and AES-256-GCM, unlocked keys in memory only, and one tray row per key with connections shown per place.
 2. **Remote pairing:** allowed, off by default, view and input only, flagged in the tray. The ntfy approval in the first version of this decision is superseded by decision 6.
 3. **Android fingerprint or PIN per connection:** replaced by the passphrase-on-open rule.
 4. **No legacy path:** the application password, its session login, TOTP login and host approval are deleted at once, with no compatibility mode, no "Require device keys" switch and no migration period. Device keys are the only way to connect. Kept: `TOKEN` for a PC's first registration. (ntfy as the authentication for remote pairing is superseded by decision 6.)

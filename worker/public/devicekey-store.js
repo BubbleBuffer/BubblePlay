@@ -1,5 +1,8 @@
-// Persist only the .bpkey JSON text, byte-for-byte as created or imported.
-// Unlocked CryptoKeys and seed buffers never belong in this database.
+// Persist the .bpkey JSON text, byte-for-byte as created or imported, and, once it is
+// unlocked, its signing key as a NON-EXTRACTABLE CryptoKey (the browser's equivalent of a
+// Keystore wrap): {id, publicRaw: Uint8Array(32), privateKey}. The browser keeps that key's
+// material out of reach of page script; seed buffers and raw private bytes never belong here.
+// Saving or clearing the key file, and Lock this browser, delete the unlocked record.
 // The "pcs" store holds the paired PCs; IndexedDB is per origin, so the list is
 // per relay origin. Records: {id (canonical), name, public (b64url raw 32 bytes,
 // pinned at pairing), paired (ms), lastUsed (ms or null)}.
@@ -12,7 +15,22 @@ const PCS = "pcs";
 const RECORD = "device";
 // A record an earlier release could leave behind. Never read; deleted whenever a key is saved or cleared.
 const STALE = "device-backup";
+const UNLOCKED = "unlocked";
 const PC_NAME_MAX = 80;
+
+/** Throws unless the record holds a private, non-extractable Ed25519 signing key and a 32-byte public key. */
+export function checkUnlockedRecord(record) {
+  const key = record?.privateKey;
+  const C = globalThis.CryptoKey;
+  if (!key || (C && !(key instanceof C)) || key.type !== "private" || key.extractable !== false ||
+      key.algorithm?.name !== "Ed25519" || !Array.isArray(key.usages) || key.usages.join() !== "sign") {
+    throw new TypeError("Only a non-extractable Ed25519 signing key can be kept unlocked.");
+  }
+  if (typeof record.id !== "string" || !(record.publicRaw instanceof Uint8Array) || record.publicRaw.length !== 32) {
+    throw new TypeError("An unlocked key record needs its ID and 32-byte public key.");
+  }
+  return { id: record.id, publicRaw: record.publicRaw, privateKey: key };
+}
 
 /** Trims and caps a PC name at 80 code points; an empty name falls back to the ID. */
 export function pcName(name, id) {
@@ -134,10 +152,25 @@ export function createDeviceKeyStore({ indexedDB = globalThis.indexedDB } = {}) 
     },
     async save(text) {
       if (typeof text !== "string") throw new TypeError("Device-key storage accepts JSON text only.");
-      await transact("readwrite", store => { store.delete(STALE); return store.put(text, RECORD); });
+      await transact("readwrite", store => { store.delete(STALE); store.delete(UNLOCKED); return store.put(text, RECORD); });
     },
     async clear() {
-      await transact("readwrite", store => { store.delete(RECORD); return store.delete(STALE); });
+      await transact("readwrite", store => { store.delete(RECORD); store.delete(UNLOCKED); return store.delete(STALE); });
+    },
+    /** The unlocked key, or null. A malformed or extractable record is never returned. */
+    async loadUnlocked() {
+      const record = await transact("readonly", store => store.get(UNLOCKED));
+      if (record === undefined || record === null) return null;
+      try { return checkUnlockedRecord(record); } catch { return null; }
+    },
+    /** Keeps a non-extractable signing key so the next visit needs no passphrase. Refuses anything else. */
+    async saveUnlocked(record) {
+      const next = checkUnlockedRecord(record);
+      await transact("readwrite", store => store.put({ id: next.id, publicRaw: new Uint8Array(next.publicRaw), privateKey: next.privateKey }, UNLOCKED));
+    },
+    /** Lock this browser: forget the unlocked key; the key file stays. */
+    async clearUnlocked() {
+      await transact("readwrite", store => store.delete(UNLOCKED));
     },
     ...pcStore,
   };

@@ -1,10 +1,12 @@
 // Browser viewer entry: nothing connects until this browser's device key is unlocked.
-// Boot: load the stored key, unlock it (plain: at once; protected: passphrase), then route:
+// Boot: load the stored key; use the kept unlocked key when it matches, else unlock it
+// (plain: at once; protected: passphrase) and keep the result; then route:
 //   /pair#pc=<id>&code=<code>  -> pairing (the fragment is dropped from the URL at once)
 //   ?pc=<id> naming a stored PC -> connect
 //   otherwise                   -> the PC list
 // UI: dk-gate.js (screens only). Session: receiver.js startSession. Protocol: dk-relay.js.
-// The unlocked Ed25519 private key is a non-extractable CryptoKey held in memory only.
+// The unlocked Ed25519 private key is a non-extractable CryptoKey. It is kept in IndexedDB
+// (devicekey-store.js) so a refresh needs no passphrase; Lock this browser deletes it.
 // Spec: docs/architecture/device-keys.md.
 import { canonicalId, isOtherFormatKeyFileText, unlockKeyFile } from "./devicekey.js";
 import { createDeviceKeyStore } from "./devicekey-store.js";
@@ -76,11 +78,25 @@ export function createApp({
       const key = await unlock(text, passphrase);
       identity = Object.freeze({ id: key.id, publicRaw: key.publicKey, privateKey: key.privateKey });
     } catch (error) {
+      identity = null;
       if (error?.code === "authentication-failed") throw wrongPassphrase();
       const shown = new Error(deviceKeyErrorMessage(error));
       shown.code = error?.code ?? "unlock-failed";
       throw shown;
     }
+    // Keep it for the next visit. The store refuses an extractable key; if the browser cannot
+    // store a CryptoKey at all, the passphrase is simply asked again next time.
+    try { await store.saveUnlocked(identity); } catch { /* not kept */ }
+  }
+
+  /** The kept unlocked key, if it belongs to this key file; a stale one is deleted. */
+  async function keptIdentity(file) {
+    let kept = null;
+    try { kept = await store.loadUnlocked(); } catch { return null; }
+    if (!kept) return null;
+    if (kept.id === file.id && b64u.encode(kept.publicRaw) === file.public) return Object.freeze(kept);
+    try { await store.clearUnlocked(); } catch { /* next boot retries */ }
+    return null;
   }
 
   async function afterKeyFlow(flow) {
@@ -110,9 +126,14 @@ export function createApp({
     if (text === null || text === undefined) return showSetup(false);
     // A stored key in any other format counts as no key: setup replaces it.
     if (isOtherFormatKeyFileText(text)) return showSetup(false);
-    let info = null;
-    try { info = summarizeKeyFile(JSON.parse(text)); } catch { /* unreadable: offer replacement */ }
+    let info = null, file = null;
+    try { file = JSON.parse(text); info = summarizeKeyFile(file); } catch { /* unreadable: offer replacement */ }
     if (!info) return showSetup(true);
+    const kept = await keptIdentity(file);
+    if (kept) {
+      identity = kept;
+      return route();
+    }
     if (!info.protected) {
       gate.showBusy("Unlocking key…");
       await unlockWith(text, undefined);
@@ -333,9 +354,11 @@ export function createApp({
     location.assign(pcListUrl(location.href));
   }
 
-  function lock() {
+  /** Lock this browser: end the session, delete the kept unlocked key, then start over. */
+  async function lock() {
     stopPairing();
     session?.endSession?.();
+    await store.clearUnlocked();
     reload();
   }
 
@@ -371,7 +394,10 @@ function wireSettings(doc, app) {
     if (button) button.onclick = event => { event.stopPropagation(); handler(); };
   };
   on("switch-pc", () => app.switchPc());
-  on("lock-key", () => app.lock());
+  on("lock-key", async () => {
+    try { await app.lock(); }
+    catch { if (status) status.textContent = "This browser could not be locked. Close other tabs and try again."; }
+  });
   on("forget-browser", async () => {
     if (!globalThis.confirm("Forget this browser? The next visit will require new browser approval.")) return;
     if (status) status.textContent = "Forgetting this browser…";

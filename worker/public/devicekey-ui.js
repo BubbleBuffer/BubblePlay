@@ -3,7 +3,8 @@
 // devicekey-store.js. Spec: docs/architecture/device-keys.md. A key is mandatory: dk-app.js unlocks
 // it before anything connects and opens the create/import dialogs from here through the returned
 // createKey/importKey.
-// The unlocked key is never kept. Passphrases are read from inputs, and the dialog that held them
+// These dialogs never keep an unlocked key; dk-app.js keeps the session's non-extractable one, and saving a
+// new key file here (create, import, change passphrase) deletes it. Passphrases are read from inputs, and the dialog that held them
 // is removed when it closes (JavaScript strings cannot be wiped, so references are dropped).
 import { createKeyFile, isOtherFormatKeyFileText, parseKeyFile, rewrapKeyFile } from "./devicekey.js";
 import { createDeviceKeyStore } from "./devicekey-store.js";

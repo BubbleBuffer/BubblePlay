@@ -528,7 +528,7 @@ test("receiver drains a final encrypted refusal before processing socket close o
     static OPEN = 1; static CONNECTING = 0;
     constructor() { this.readyState = 0; sockets.push(this); }
   }
-  const context = vm.createContext({ WebSocket: Socket, URL, Promise,
+  const context = vm.createContext({ WebSocket: Socket, URL, Promise, performance: { now: () => 1 },
     authenticatedSession: null, terminalSignalingFailure: false, reconnectTimer: null,
     ws: null, signalingGeneration: 0, signalingRegistered: true, signalingPc: hs.pc.id, signalingTicket: "ticket",
     latestInputStatus: null, inputStatusReason: null, hudState: {}, hud: { classList: { add() {} } },
