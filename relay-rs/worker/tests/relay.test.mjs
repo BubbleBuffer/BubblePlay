@@ -537,10 +537,8 @@ test('m3 an approval after the hold is claimed once by the next navigation', { t
   assert.ok(ms < GATE_HOLD_MS, 'the claim is answered at once');
   assert.equal(response.headers.location, `${relay.origin}/?a=1`);
   assert.ok(gateCookieOf(response), 'the reload claims the cookie');
-  await heldNavigation(relay.port, { path: '/', ip }).then(
-    ({ response: again }) => assert.fail(`the approval was claimed twice (${again.status})`),
-    () => {},
-  );
+  // Claimed once: the next navigation from the prefix is dropped (the decision's cooldown).
+  await expectDropped(heldNavigation(relay.port, { path: '/', ip }));
 });
 
 test('m3 approval grants the gate cookie, and the page is served with it', { timeout: CASE_TIMEOUT_MS }, async () => {
