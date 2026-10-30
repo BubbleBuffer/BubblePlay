@@ -43,7 +43,7 @@ impl KeyFile {
         passphrase: Option<&str>,
     ) -> Result<Self, DeviceKeyError> {
         Ok(Self(bubblebuffer_device_key::KeyFile::from_device(
-            identity.key(),
+            &identity.key(),
             label,
             created,
             passphrase,

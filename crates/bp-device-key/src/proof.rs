@@ -66,34 +66,44 @@ impl fmt::Debug for Role {
     }
 }
 
-/// An unlocked device key (the shared crate's `DeviceKey`, zeroized on drop) with its ID.
-/// `Debug` shows the ID only.
+/// An unlocked device key with its ID. Holds the Ed25519 signing key (zeroized on drop) and
+/// signs through the shared crate's `DeviceKey`. `Debug` shows the ID only.
 pub struct DeviceIdentity {
     id: DeviceId,
-    key: DeviceKey,
+    signing: SigningKey,
 }
 
 impl DeviceIdentity {
     /// Wraps an unlocked signing key. The ID is derived from the public key.
     pub fn from_signing_key(signing: SigningKey) -> Self {
-        Self::from_key(DeviceKey::from(signing))
+        let id = DeviceId::from_public_key(&signing.verifying_key().to_bytes());
+        Self { id, signing }
     }
 
     /// Builds an identity from the raw 32-byte Ed25519 seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        Self::from_key(DeviceKey::from_seed(seed))
+        Self::from_signing_key(SigningKey::from_bytes(seed))
     }
 
-    /// Wraps a shared-crate key.
-    pub fn from_key(key: DeviceKey) -> Self {
-        Self { id: key.id(), key }
+    /// A second, independent copy of this identity, for a caller that must hand one owner the
+    /// key and keep using it. Deliberately not `Clone`, so every copy of the secret is explicit.
+    pub fn duplicate(&self) -> Self {
+        Self {
+            id: self.id,
+            signing: self.signing.clone(),
+        }
     }
 
     /// Generates a new key from OS randomness, in memory only. Storing it is the caller's job;
     /// with the `keyfile` feature, `KeyFile::create` also writes the key file format.
     #[cfg(feature = "keygen")]
     pub fn generate() -> Result<Self, DeviceKeyError> {
-        Ok(Self::from_key(DeviceKey::generate()?))
+        use rand_core::RngCore as _;
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        rand_core::OsRng
+            .try_fill_bytes(seed.as_mut())
+            .map_err(|_| DeviceKeyError::Entropy)?;
+        Ok(Self::from_seed(&seed))
     }
 
     /// Unlocks a plain (unprotected) key file in the current format. A passphrase-protected
@@ -112,18 +122,19 @@ impl DeviceIdentity {
     }
 
     pub fn public_key(&self) -> [u8; 32] {
-        self.key.public_key()
+        self.signing.verifying_key().to_bytes()
     }
 
-    /// The shared-crate key, for wrapping it in a key file.
-    pub fn key(&self) -> &DeviceKey {
-        &self.key
+    /// The key as the shared crate's `DeviceKey` (a fresh copy, zeroized on drop), for signing
+    /// or for wrapping it in a key file.
+    pub fn key(&self) -> DeviceKey {
+        DeviceKey::from(self.signing.clone())
     }
 
     /// Ed25519 over `message` itself (phase 2 signs its context-prefixed bytes directly).
     #[cfg(feature = "phase2")]
     pub(crate) fn sign_bytes(&self, message: &[u8]) -> [u8; 64] {
-        self.key.sign(message)
+        self.key().sign(message)
     }
 
     /// The raw public key as unpadded base64url, the form the relay expects in `hello`.
@@ -137,7 +148,7 @@ impl DeviceIdentity {
         // The only failure is a field longer than u32::MAX bytes; an origin never is.
         let hash = relay_proof_hash(role, origin, nonce, self.id, &self.public_key())
             .expect("relay origin shorter than 4 GiB");
-        self.key.sign(&hash)
+        self.key().sign(&hash)
     }
 }
 
