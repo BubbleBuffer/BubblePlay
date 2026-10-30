@@ -152,6 +152,10 @@ const ALL_CTLS: [Ctl; 37] = [
     Ctl::Deny,
 ];
 
+/// Controls that only paint a background for the controls over them, bottom first. They sit
+/// at the bottom of the sibling z-order, in this order, with the list container just above.
+const BACKGROUND_CTLS: [Ctl; 3] = [Ctl::Band, Ctl::ListFrame, Ctl::LvHead];
+
 impl Ctl {
     pub fn id(self) -> i32 {
         self as i32
@@ -864,7 +868,8 @@ impl Model {
 const ROW_HEIGHT: i32 = 44;
 const CLIENT_W: i32 = 560;
 const CLIENT_H: i32 = 408;
-const LIST_BODY: [i32; 4] = [17, 178, 526, 214];
+// Inside the list frame: below the column band, clear of the frame's 1 px border on three sides.
+const LIST_BODY: [i32; 4] = [17, 178, 526, 213];
 const ROWS_ID: i32 = 1500;
 const ID_REVOKE_BASE: i32 = 2000;
 const ID_CELL_BASE: i32 = 3000;
@@ -1278,8 +1283,10 @@ impl Ui {
     }
 
     unsafe fn create_controls(&self, hwnd: HWND, instance: HINSTANCE) -> Option<()> {
+        // New children go to the bottom of the z-order, so creation order alone would put the
+        // first-created Band on top. With WS_CLIPSIBLINGS the upper sibling wins where controls
+        // overlap, so the background controls and the list container move down after the loop.
         for ctl in ALL_CTLS {
-            // The list container sits above the frame and column band in z-order, below the empty text.
             let (class, style) = spec(ctl);
             let class = wide(class);
             CreateWindowExW(
@@ -1315,6 +1322,24 @@ impl Ui {
                 .ok()?;
                 self.rows_hwnd.set(rows);
             }
+        }
+        // Bottom-up: Band, ListFrame, LvHead, then the list container above the frame and column
+        // band but below the empty text and every other control.
+        let mut lowered = vec![self.rows_hwnd.get()];
+        for ctl in BACKGROUND_CTLS.iter().rev() {
+            lowered.push(self.ctl(*ctl)?);
+        }
+        for handle in lowered {
+            SetWindowPos(
+                handle,
+                Some(HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW,
+            )
+            .ok()?;
         }
         Some(())
     }
