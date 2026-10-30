@@ -10,12 +10,15 @@ import 'src/backend/pigeon_channel.dart';
 import 'src/devices/devices_controller.dart';
 import 'src/devices/frb_devices_channel.dart';
 import 'src/platform/key_files.dart';
+import 'src/presence/presence_lifecycle.dart';
+import 'src/presence/presence_service.dart';
 
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
   final isWindows = Platform.isWindows;
   final AppChannel channel = isWindows ? await FrbChannel.open() : PigeonChannel();
-  final controller = AppController(channel);
+  final controller = AppController(channel, presence: PresenceService());
+  PresenceLifecycle(controller.setForeground);
   await controller.refresh();
   final devicesChannel = isWindows ? FrbDevicesChannel.tryOpen() : null;
   const sectionFlag = '--section=';
