@@ -13,10 +13,9 @@ class AppController extends ChangeNotifier {
   /// [presence], when given, fills in `RemotePc.online` from the relays (the cores report false).
   AppController(
     this._channel, {
-    // ignore: prefer_initializing_formals
     PresenceService? presence,
     this.presenceInterval = const Duration(seconds: 30),
-  }) : _presence = presence {
+  }) : _presence = presence { // ignore: prefer_initializing_formals
     _subscription = _channel.changes.listen((_) => refresh());
   }
 
