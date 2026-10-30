@@ -96,5 +96,9 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
     // Released 2026-09-10; 4.17 is the newest 4.x and supports compileSdk 35.
-    testImplementation("org.robolectric:robolectric:4.17")
+    testImplementation("org.robolectric:robolectric:4.17") {
+        // Its androidx.test AARs trip AGP's AndroidX check (android.useAndroidX is not set), and the tests use none of them.
+        exclude(group = "androidx.test")
+        exclude(group = "androidx.test.espresso")
+    }
 }
