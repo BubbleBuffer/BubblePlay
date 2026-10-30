@@ -1,0 +1,125 @@
+{
+  "answer_pairing": {
+    "AnswerPairing": {
+      "allow": false,
+      "request_id": "req"
+    }
+  },
+  "cancel_flow": "CancelFlow",
+  "connect": {
+    "Connect": {
+      "pc_id": "77VH-7M56-8GJK-Y12J"
+    }
+  },
+  "create_key": "CreateKey",
+  "disconnect": "Disconnect",
+  "export_key": "ExportKey",
+  "forget": {
+    "Forget": {
+      "pc_id": "77VH-7M56-8GJK-Y12J"
+    }
+  },
+  "import_key": "ImportKey",
+  "import_key_text": {
+    "ImportKeyText": {
+      "file_name": "viewer.bpkey",
+      "text": "{}"
+    }
+  },
+  "open_logs_folder": "OpenLogsFolder",
+  "rename": {
+    "Rename": {
+      "name": "Studio",
+      "pc_id": "77VH-7M56-8GJK-Y12J"
+    }
+  },
+  "replace_key": "ReplaceKey",
+  "request_remote_pairing": {
+    "RequestRemotePairing": {
+      "pc_id": "77VH-7M56-8GJK-Y12J",
+      "relay": "https://relay.example"
+    }
+  },
+  "restart_host": "RestartHost",
+  "retry": "Retry",
+  "retry_web_socket": "RetryWebSocket",
+  "revoke": {
+    "Revoke": {
+      "device_id": "77VH-7M56-8GJK-Y12J"
+    }
+  },
+  "roll_back_host": "RollBackHost",
+  "set_audio": {
+    "SetAudio": true
+  },
+  "set_host_setting_admin_mode": {
+    "SetHostSetting": {
+      "AdminMode": false
+    }
+  },
+  "set_host_setting_cpu_mode": {
+    "SetHostSetting": {
+      "CpuMode": true
+    }
+  },
+  "set_host_setting_start_at_login": {
+    "SetHostSetting": {
+      "StartAtLogin": true
+    }
+  },
+  "set_host_setting_stream_sound": {
+    "SetHostSetting": {
+      "StreamSound": true
+    }
+  },
+  "set_may_vouch": {
+    "SetMayVouch": {
+      "device_id": "77VH-7M56-8GJK-Y12J",
+      "may_vouch": true
+    }
+  },
+  "set_mode": {
+    "SetMode": "Game"
+  },
+  "set_monitor": {
+    "SetMonitor": 1
+  },
+  "set_quality": {
+    "SetQuality": "Smooth"
+  },
+  "show_pair_device": "ShowPairDevice",
+  "start_hosting": "StartHosting",
+  "start_pairing": "StartPairing",
+  "start_remote_pairing": "StartRemotePairing",
+  "stop_hosting": "StopHosting",
+  "submit_pairing": {
+    "SubmitPairing": {
+      "code": "70Q1K-9MXR1",
+      "link": null,
+      "pc_id": "77VH-7M56-8GJK-Y12J",
+      "relay": "https://relay.example"
+    }
+  },
+  "submit_pairing_link": {
+    "SubmitPairing": {
+      "code": "",
+      "link": "bubbleplay://pair?relay=x&pc=y&code=z",
+      "pc_id": "",
+      "relay": ""
+    }
+  },
+  "unlock_import": {
+    "UnlockImport": {
+      "passphrase": "secret"
+    }
+  },
+  "vouch": {
+    "Vouch": {
+      "accept": true,
+      "permissions": [
+        "view"
+      ],
+      "request_id": "r1"
+    }
+  }
+}
