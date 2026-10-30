@@ -4,8 +4,7 @@
 //!   `bubblebuffer-device-key` crate: IDs, key files in the shared format and relay proofs with
 //!   neutral labels. Never edited here.
 //! - `fixtures/device-keys-contract.json`, BubblePlay's own: the relay proofs with
-//!   `bubbleplay-relay-v1` (the bytes the live relay verifies), the old-format key files that
-//!   migration still reads, the handshake origin and phase 2.
+//!   `bubbleplay-relay-v1` (the bytes the live relay verifies), the handshake origin and phase 2.
 //!
 //! No expected output is used as an input: every vector is recomputed from its seed, nonce and
 //! origin.
@@ -357,8 +356,7 @@ fn bubbleplay_relay_proofs_use_the_bubbleplay_label() {
 #[cfg(feature = "keyfile")]
 mod key_files {
     use super::*;
-    use bp_device_key::legacy::{self, LegacyKeyFile};
-    use bp_device_key::{convert_legacy, read_key_file, KeyFile};
+    use bp_device_key::KeyFile;
 
     #[test]
     fn contract_keyfile_plain_round_trips() {
@@ -407,12 +405,6 @@ mod key_files {
             key_file.unlock(Some("incorrect horse battery staple")),
             Err(DeviceKeyError::AuthenticationFailed)
         ));
-        // An old-format file is not the shared format.
-        let old = &fixture_legacy()["plain"]["file"];
-        assert!(matches!(
-            KeyFile::parse(&old.to_string()),
-            Err(DeviceKeyError::UnsupportedFormat)
-        ));
     }
 
     #[test]
@@ -433,77 +425,14 @@ mod key_files {
         }
     }
 
-    fn fixture_legacy() -> Value {
-        fixture()["legacyKeyFiles"].clone()
-    }
-
     #[test]
-    fn legacy_plain_vector_opens_with_the_old_reader() {
-        let vectors = fixture_legacy();
-        let plain = &vectors["plain"];
-        let file = &plain["file"];
-        assert_eq!(field(file, "format"), legacy::FORMAT);
-        let key_file = LegacyKeyFile::parse(&file.to_string()).expect("legacy plain parses");
-        assert!(!key_file.is_protected());
-        assert_eq!(key_file.id().to_string(), field(file, "id"));
-        let seed = key_file.unlock(None).expect("plain unlock").to_bytes();
-        assert_eq!(seed, seed_of(field(plain, "seedHex")));
-    }
-
-    #[test]
-    fn legacy_protected_vector_unlocks_and_its_aad_carries_the_old_format() {
-        let vectors = fixture_legacy();
-        let vector = &vectors["passphrase"];
-        let key_file =
-            LegacyKeyFile::parse(&vector["file"].to_string()).expect("legacy protected parses");
-        let aad = key_file
-            .aad_for_contract()
-            .expect("protected file has an AAD");
-        assert_eq!(
-            String::from_utf8(aad.clone()).expect("utf8"),
-            field(vector, "aadUtf8")
-        );
-        assert_eq!(hex(&aad), field(vector, "aadHex"));
-        assert!(field(vector, "aadUtf8").contains("\"format\":\"bubbleplay-device-key\""));
-        let signing = key_file
-            .unlock(Some(field(vector, "passphrase")))
-            .expect("unlock");
-        assert_eq!(signing.to_bytes(), seed_of(field(vector, "seedHex")));
-        for failure in vectors["failures"].as_array().expect("failures") {
-            let file = LegacyKeyFile::parse(&failure["file"].to_string()).expect("parses");
-            assert!(matches!(
-                file.unlock(Some(field(failure, "passphrase"))),
-                Err(DeviceKeyError::AuthenticationFailed)
-            ));
-        }
-    }
-
-    #[test]
-    fn legacy_vectors_convert_to_the_same_identity_in_the_shared_format() {
-        let vectors = fixture_legacy();
-        for (name, passphrase) in [
-            ("plain", None),
-            (
-                "passphrase",
-                Some(field(&vectors["passphrase"], "passphrase")),
-            ),
-        ] {
-            let text = vectors[name]["file"].to_string();
-            let stored = read_key_file(&text).expect("either format");
-            assert!(stored.is_legacy(), "{name}");
-            let old = LegacyKeyFile::parse(&text).expect("legacy");
-            let (converted, json) = convert_legacy(&old, passphrase).expect("convert");
-            let reopened = KeyFile::parse(&json).expect("shared reader");
-            assert_eq!(reopened.id(), old.id(), "{name}");
-            assert_eq!(reopened.public_key(), old.public_key(), "{name}");
-            assert_eq!(reopened.is_protected(), passphrase.is_some(), "{name}");
-            assert_eq!(converted.label(), old.label(), "{name}");
-            assert_eq!(
-                reopened.unlock(passphrase).expect("unlock").to_bytes(),
-                seed_of(field(&vectors[name], "seedHex")),
-                "{name}"
-            );
-            assert!(!read_key_file(&json).expect("current").is_legacy());
-        }
+    fn a_file_in_another_format_is_unsupported() {
+        let fixture = shared_fixture();
+        let mut file = fixture["keyFiles"]["plain"]["file"].clone();
+        file["format"] = Value::from("other-format");
+        assert!(matches!(
+            KeyFile::parse(&file.to_string()),
+            Err(DeviceKeyError::UnsupportedFormat)
+        ));
     }
 }

@@ -4,8 +4,9 @@ import { createApp, normalizePairingInput, readPairingLink, sortPcs, FORGET_ENDP
 
 const VIEWER_ID = "47Z3-3QX1-AJH6-2RKB";
 const PC_ID = "77VH-7M56-8GJK-Y12J";
-const PLAIN = JSON.stringify({ id: VIEWER_ID, label: "Test", kdf: null, aead: null });
-const PROTECTED = JSON.stringify({ id: VIEWER_ID, label: "Test", kdf: { alg: "argon2id" }, aead: { alg: "aes-256-gcm" } });
+const SHARED_NAME = "bubblebuffer-device-key";
+const PLAIN = JSON.stringify({ format: SHARED_NAME, id: VIEWER_ID, label: "Test", kdf: null, aead: null });
+const PROTECTED = JSON.stringify({ format: SHARED_NAME, id: VIEWER_ID, label: "Test", kdf: { alg: "argon2id" }, aead: { alg: "aes-256-gcm" } });
 const PUBLIC = "A".repeat(43);
 
 function fakeGate() {
@@ -16,19 +17,14 @@ function fakeGate() {
   return gate;
 }
 
-function memoryStore({ key = null, pcs = [], backup: initialBackup = null } = {}) {
+function memoryStore({ key = null, pcs = [] } = {}) {
   const records = new Map(pcs.map(pc => [pc.id, { ...pc }]));
   const log = [];
-  let backup = initialBackup;
   return {
     log, records,
-    get backup() { return backup; },
     async load() { return key; },
     async save(text) { key = text; },
-    async loadBackup() { return backup; },
-    async saveBackup(text) { backup = text; },
-    async clearBackup() { backup = null; },
-    async clear() { log.push(["clear"]); key = null; backup = null; },
+    async clear() { log.push(["clear"]); key = null; },
     async listPcs() { return [...records.values()]; },
     async getPc(id) { return records.get(id) ?? null; },
     async putPc(record) { records.set(record.id, record); },
@@ -57,18 +53,14 @@ function fakeLocation(href) {
   return { location, history };
 }
 
-// Stands in for the real conversion: same content, shared format name, as devicekey.js writes it.
-const SHARED_NAME = "bubblebuffer-device-key";
-const fakeConvert = async (text, passphrase) => JSON.stringify({ ...JSON.parse(text), format: SHARED_NAME });
-
-function app({ key = PLAIN, pcs = [], href = "https://relay.test/", keyUi = null, fetch, openPairing, unlockCalls, store, convert = fakeConvert, unlock } = {}) {
+function app({ key = PLAIN, pcs = [], href = "https://relay.test/", keyUi = null, fetch, openPairing, unlockCalls, store, unlock } = {}) {
   const gate = fakeGate();
   store ??= memoryStore({ key, pcs });
   const { location, history } = fakeLocation(href);
   const sessions = [];
   const pairings = [];
   const instance = createApp({
-    gate, store, keyUi, location, history, unlock: unlock ?? fakeUnlock(unlockCalls), convert,
+    gate, store, keyUi, location, history, unlock: unlock ?? fakeUnlock(unlockCalls),
     loadSession: async () => ({ startSession: options => sessions.push(options), endSession: () => sessions.push("ended") }),
     fetch: fetch ?? (async () => ({ ok: true })),
     reload: () => location.reload(),
@@ -279,146 +271,28 @@ test("an unreadable stored key offers setup with removal", async () => {
   assert.equal(typeof screen.onRemove, "function");
 });
 
-// ---- One-time move of a stored legacy key to the shared format.
-const LEGACY_PLAIN_TEXT = JSON.stringify({ format: "bubbleplay-device-key", id: VIEWER_ID, label: "Test", kdf: null, aead: null });
-const LEGACY_PROTECTED_TEXT = JSON.stringify({ format: "bubbleplay-device-key", id: VIEWER_ID, label: "Test", kdf: { alg: "argon2id" }, aead: { alg: "aes-256-gcm" } });
-const SHARED_PLAIN_TEXT = JSON.stringify({ format: SHARED_NAME, id: VIEWER_ID, label: "Test", kdf: null, aead: null });
+// ---- A stored key in another format counts as no key.
+const OTHER_PLAIN_TEXT = JSON.stringify({ format: "other-format", id: VIEWER_ID, label: "Test", kdf: null, aead: null });
+const OTHER_PROTECTED_TEXT = JSON.stringify({ format: "other-format", id: VIEWER_ID, label: "Test", kdf: { alg: "argon2id" }, aead: { alg: "aes-256-gcm" } });
 
-// Collects console.warn lines while fn runs.
-async function warnings(fn) {
-  const lines = [];
-  const warn = console.warn;
-  console.warn = (...args) => lines.push(args.join(" "));
-  try { await fn(); } finally { console.warn = warn; }
-  return lines;
-}
-
-test("a stored legacy plain key is converted on boot, read back, and its backup dropped", async () => {
-  const h = app({ key: LEGACY_PLAIN_TEXT });
-  await h.instance.start();
-  assert.equal(await h.store.load(), SHARED_PLAIN_TEXT);
-  assert.equal(h.store.backup, null);
-  assert.ok(h.gate.calls.some(([name]) => name === "showPcList"), "the app still routes to the PC list");
-});
-
-test("a stored key already in the shared format is left alone", async () => {
-  let converts = 0;
-  const h = app({ key: SHARED_PLAIN_TEXT, convert: async () => { converts++; return SHARED_PLAIN_TEXT; } });
-  await h.instance.start();
-  assert.equal(converts, 0);
-  assert.equal(await h.store.load(), SHARED_PLAIN_TEXT);
-  assert.equal(h.store.backup, null);
-});
-
-test("a stored legacy protected key converts at the next successful unlock, not before", async () => {
-  const h = app({ key: LEGACY_PROTECTED_TEXT });
-  await h.instance.start();
-  assert.equal(await h.store.load(), LEGACY_PROTECTED_TEXT, "nothing changes before the passphrase");
-  await assert.rejects(h.gate.last("showKeyScreen").onUnlock("wrong"), { code: "wrong-passphrase" });
-  assert.equal(await h.store.load(), LEGACY_PROTECTED_TEXT, "a failed unlock converts nothing");
-  await h.gate.last("showKeyScreen").onUnlock("right");
-  assert.equal(JSON.parse(await h.store.load()).format, SHARED_NAME);
-  assert.equal(h.store.backup, null);
-});
-
-test("a failed conversion keeps the old stored text, logs one line and uses the old key this session", async () => {
-  const h = app({ key: LEGACY_PLAIN_TEXT, convert: async () => { throw Object.assign(new Error("secret detail"), { code: "invalid-file" }); } });
-  let routed = false;
-  const lines = await warnings(async () => { await h.instance.start(); routed = h.gate.calls.some(([name]) => name === "showPcList"); });
-  assert.equal(await h.store.load(), LEGACY_PLAIN_TEXT);
-  assert.equal(h.store.backup, null);
-  assert.equal(routed, true, "the app keeps working on the old key");
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /convert: invalid-file/);
-  assert.ok(!lines[0].includes(VIEWER_ID) && !lines[0].includes("secret detail"), "the log line carries no key material");
-});
-
-test("a read-back that does not match the old ID restores the old text and drops the backup", async () => {
-  const unlock = async text => {
-    if (text === SHARED_PLAIN_TEXT) return { id: "77VH-7M56-8GJK-Y12J", publicKey: IDENTITY_KEY.publicKey, privateKey: {} };
-    return IDENTITY_KEY;
-  };
-  const h = app({ key: LEGACY_PLAIN_TEXT, unlock });
-  const lines = await warnings(() => h.instance.start());
-  assert.equal(await h.store.load(), LEGACY_PLAIN_TEXT);
-  assert.equal(h.store.backup, null);
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /read back: identity-mismatch/);
-});
-
-test("a failed write leaves the old record in place and drops the backup", async () => {
-  const h = app({ key: LEGACY_PLAIN_TEXT });
-  const store = h.store;
-  const save = store.save;
-  store.save = async text => {
-    if (text === SHARED_PLAIN_TEXT) throw new Error("quota exceeded");
-    return save.call(store, text);
-  };
-  const lines = await warnings(() => h.instance.start());
-  assert.equal(await store.load(), LEGACY_PLAIN_TEXT);
-  assert.equal(store.backup, null);
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /write: error/);
-});
-
-test("a backup write that fails stops before the record is touched", async () => {
-  const h = app({ key: LEGACY_PLAIN_TEXT });
-  h.store.saveBackup = async () => { throw new Error("blocked"); };
-  let saved = 0;
-  const save = h.store.save;
-  h.store.save = async text => { saved++; return save.call(h.store, text); };
-  const lines = await warnings(() => h.instance.start());
-  assert.equal(saved, 0);
-  assert.equal(await h.store.load(), LEGACY_PLAIN_TEXT);
-  assert.match(lines[0], /backup: error/);
-});
-
-// A backup left by a crash between writing it and clearing it (recoverBackup, run first on boot).
-// These texts carry id and public, as real key files do; recoverBackup compares those two fields.
-const KEY_FIELDS = { id: VIEWER_ID, public: PUBLIC };
-const plainKey = (format, fields = KEY_FIELDS) => JSON.stringify({ format, ...fields, label: "Test", kdf: null, aead: null });
-const protectedKey = (format, fields = KEY_FIELDS) => JSON.stringify({ format, ...fields, label: "Test", kdf: { alg: "argon2id" }, aead: { alg: "aes-256-gcm" } });
-const LEGACY_PLAIN_KEY = plainKey("bubbleplay-device-key");
-const SHARED_PLAIN_KEY = plainKey(SHARED_NAME);
-const LEGACY_PROTECTED_KEY = protectedKey("bubbleplay-device-key");
-const SHARED_PROTECTED_KEY = protectedKey(SHARED_NAME);
-
-test("a backup of the same key is dropped on boot when the stored key is in the shared format and opens", async () => {
-  const h = app({ store: memoryStore({ key: SHARED_PLAIN_KEY, backup: LEGACY_PLAIN_KEY }) });
-  await h.instance.start();
-  assert.equal(h.store.backup, null);
-  assert.equal(await h.store.load(), SHARED_PLAIN_KEY, "the stored key is kept, not replaced by the backup");
-  assert.ok(h.gate.calls.some(([name]) => name === "showPcList"));
-});
-
-test("a backup of the same key is dropped for a protected stored key, without asking for the passphrase first", async () => {
-  const h = app({ store: memoryStore({ key: SHARED_PROTECTED_KEY, backup: LEGACY_PROTECTED_KEY }) });
-  await h.instance.start();
-  assert.equal(h.store.backup, null);
-  assert.equal(await h.store.load(), SHARED_PROTECTED_KEY, "the stored key is kept, not replaced by the backup");
-  assert.equal(h.gate.last("showKeyScreen").mode, "unlock");
-});
-
-test("a backup is restored as the stored key when the stored key is missing or unreadable, then converted", async () => {
-  for (const key of [null, "{not json"]) {
-    const h = app({ store: memoryStore({ key, backup: LEGACY_PLAIN_KEY }) });
-    const lines = await warnings(() => h.instance.start());
-    assert.equal(h.store.backup, null);
-    assert.deepEqual(JSON.parse(await h.store.load()), JSON.parse(SHARED_PLAIN_KEY), "the backup came back and was then converted");
-    assert.equal(lines.length, 1);
-    assert.match(lines[0], /restored from its backup/);
+test("a stored key in another format shows the setup screen without removal, whether plain or protected", async () => {
+  for (const key of [OTHER_PLAIN_TEXT, OTHER_PROTECTED_TEXT]) {
+    const h = app({ key, unlockCalls: [] });
+    await h.instance.start();
+    const screen = h.gate.last("showKeyScreen");
+    assert.equal(screen.mode, "setup");
+    assert.equal(screen.onRemove, undefined);
+    assert.equal(h.gate.last("showPcList"), undefined);
+    assert.equal(await h.store.load(), key, "nothing is converted or rewritten at boot");
   }
 });
 
-test("a backup with a different ID is kept beside the stored key, with one line and no key material", async () => {
-  const OTHER_LEGACY = plainKey("bubbleplay-device-key", { id: PC_ID, public: "B".repeat(43) });
-  const store = memoryStore({ key: SHARED_PLAIN_KEY, backup: OTHER_LEGACY });
-  const h = app({ store });
-  const lines = await warnings(() => h.instance.start());
-  assert.equal(await store.load(), SHARED_PLAIN_KEY);
-  assert.equal(store.backup, OTHER_LEGACY);
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /backup kept/);
-  assert.ok(!lines[0].includes(VIEWER_ID) && !lines[0].includes(PC_ID), "the log line carries no IDs");
-  assert.ok(h.gate.calls.some(([name]) => name === "showPcList"), "boot still uses the stored key");
+test("creating a key replaces a stored key in another format and continues to the PC list", async () => {
+  const store = memoryStore({ key: OTHER_PLAIN_TEXT });
+  const keyUi = { createKey: async () => { await store.save(PLAIN); return true; } };
+  const again = app({ store, keyUi });
+  await again.instance.start();
+  await again.gate.last("showKeyScreen").onCreate();
+  assert.equal(await store.load(), PLAIN);
+  assert.ok(again.gate.calls.some(([name]) => name === "showPcList"));
 });

@@ -23,11 +23,6 @@ the one-time conversion, and the phase 2 primitives. No Windows dependencies; it
   dropped, `ws`->`http`, `wss`->`https`).
 - `KeyFile` (feature `keyfile`): the `.bpkey` file in the shared format, plain or
   passphrase-protected (Argon2id m=64 MiB t=3 p=1, AES-256-GCM, AAD = JCS of the header).
-- `legacy::LegacyKeyFile` (feature `keyfile`): the reader for the old `bubbleplay-device-key`
-  format. Used only by migration and import; nothing writes the old format.
-- `read_key_file` accepts either format; `convert_legacy` turns an old file into a shared-format
-  file with the same key, label and created time (same passphrase, fresh salt and nonce) and
-  checks the result opens to the same ID and public key.
 - `phase2` (feature `phase2`): the device-keys phase 2 primitives. `Transcript` (the phase 0
   length-prefixed handshake transcript and its hash `H`), the auth-host, auth-finish and
   auth-bind signatures (sign and `verify_strict`; auth-bind keeps the phase 0 encoding and only
@@ -42,7 +37,7 @@ the one-time conversion, and the phase 2 primitives. No Windows dependencies; it
 
 Docs: `docs/architecture/device-keys.md`. Fixtures: `fixtures/shared/device-keys-contract.json`
 (vendored from the shared crate, never edited here) and `fixtures/device-keys-contract.json`
-(BubblePlay's relay label vectors, old-format key files, handshake and phase 2). Both are
+(BubblePlay's relay label vectors, handshake and phase 2). Both are
 checked by `tests/contract.rs` and by the Node test in `tools/tests/`.
 
 ## Features
@@ -51,7 +46,7 @@ checked by `tests/contract.rs` and by the Node test in `tools/tests/`.
 | --- | --- | --- |
 | (none) | yes | IDs, proof encoding/hash/sign/verify, origin canonicaliser, `DeviceIdentity` from an existing seed |
 | `keygen` | no | `DeviceIdentity::generate`; with `phase2` also `EphemeralSecret::generate` and `PairingCode::generate` |
-| `keyfile` | no | `KeyFile`, the old-format reader and the conversion (`argon2`, `aes-gcm`) |
+| `keyfile` | no | `KeyFile`, the shared key file |
 | `phase2` | no | the `phase2` module (`x25519-dalek`, `hkdf`, `hmac`, `aes-gcm`) |
 
 The shared crate has no features of its own: it always links `argon2`, `aes-gcm` and

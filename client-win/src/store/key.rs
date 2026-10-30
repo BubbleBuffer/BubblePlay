@@ -6,18 +6,15 @@
 //! `--key <file.bpkey>` replaces the stored key with a plain (not DPAPI-wrapped) file for
 //! development.
 //!
-//! Only the shared `bubblebuffer-device-key` format is written. A key stored in the old
-//! `bubbleplay-device-key` format is converted the first time it is unlocked. The old blob is
-//! kept as `device-key.bpkey.legacy-backup` until the new blob has been read back and checked.
+//! Only the shared `bubblebuffer-device-key` format is read and written. A stored key in any
+//! other format counts as no key: `exists` is false, `load` reports no key, and `create` or
+//! `import` replace the file.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use bp_device_key::legacy::LegacyKeyFile;
-use bp_device_key::{
-    convert_legacy, read_key_file, DeviceId, DeviceIdentity, DeviceKeyError, KeyFile, StoredKeyFile,
-};
+use bp_device_key::{DeviceId, DeviceIdentity, DeviceKeyError, KeyFile};
 use zeroize::Zeroizing;
 
 use super::dpapi;
@@ -48,20 +45,54 @@ impl KeyStore {
         &self.path
     }
 
+    /// True when a usable-format key is stored. A file in another format counts as no key (one
+    /// line is logged); a corrupt file still counts as a key, so it is never replaced silently.
     pub fn exists(&self) -> bool {
-        self.path.exists()
+        if !self.path.exists() {
+            return false;
+        }
+        !self.is_other_format()
     }
 
-    /// Reads, unwraps and parses the stored key in either format. The key stays locked.
-    pub fn load(&self) -> Result<StoredKeyFile> {
+    /// True (with one log line) when the stored key unwraps to a key file in another format.
+    fn is_other_format(&self) -> bool {
+        let other = self.read_text().is_ok_and(|text| {
+            matches!(
+                KeyFile::parse(&text),
+                Err(DeviceKeyError::UnsupportedFormat)
+            )
+        });
+        if other {
+            log_other_format();
+        }
+        other
+    }
+
+    /// The unwrapped key file text.
+    fn read_text(&self) -> Result<Zeroizing<String>> {
         let wrapped = self.read_wrapped()?;
         let plain = Zeroizing::new(dpapi::unprotect(&wrapped)?);
         let text = std::str::from_utf8(&plain).context("the stored key is not UTF-8")?;
-        read_key_file(text).map_err(|error| anyhow!("the stored key is invalid: {error}"))
+        Ok(Zeroizing::new(text.to_owned()))
+    }
+
+    /// Reads, unwraps and parses the stored key. The key stays locked. A key in another format
+    /// is reported as no key.
+    pub fn load(&self) -> Result<KeyFile> {
+        let text = self.read_text()?;
+        match KeyFile::parse(&text) {
+            Ok(file) => Ok(file),
+            Err(DeviceKeyError::UnsupportedFormat) => {
+                log_other_format();
+                Err(self.no_key())
+            }
+            Err(error) => Err(anyhow!("the stored key is invalid: {error}")),
+        }
     }
 
     /// Wraps and writes `key`. Refuses to replace an existing key: that would lose the
-    /// viewer's identity, so the user exports and removes it on purpose first.
+    /// viewer's identity, so the user exports and removes it on purpose first. A file in another
+    /// format is not a key and is replaced.
     pub fn save_new(&self, key: &KeyFile) -> Result<()> {
         if self.exists() {
             bail!(
@@ -76,175 +107,47 @@ impl KeyStore {
 
     /// Creates a new key, with a passphrase when one is given, and stores it.
     pub fn create(&self, label: &str, passphrase: Option<&str>) -> Result<KeyFile> {
-        if self.exists() {
-            bail!("a viewer key already exists at {}", self.path.display());
-        }
         let key = KeyFile::create(label, &utc_now(), passphrase)?;
         self.save_new(&key)?;
         Ok(key)
     }
 
-    /// Imports a `.bpkey` file in either format and stores it in the shared format. A protected
-    /// key is unlocked once first (a key in the old format is converted, which checks it the same
-    /// way), so a file whose seed does not match its public key and ID is refused before it is
-    /// stored.
-    pub fn import(
-        &self,
-        stored: StoredKeyFile,
-        passphrase: PassphraseSource<'_>,
-    ) -> Result<KeyFile> {
-        if self.exists() {
-            bail!("a viewer key already exists at {}", self.path.display());
-        }
-        let secret = passphrase_for(&stored, passphrase)?;
-        let secret = secret.as_ref().map(|s| s.as_str());
-        let key = match stored {
-            StoredKeyFile::Current(file) => {
-                unlocked(file.id(), file.unlock(secret))?;
-                file
-            }
-            StoredKeyFile::Legacy(legacy) => {
-                let (converted, json) = unlocked(legacy.id(), convert_legacy(&legacy, secret))?;
-                let _json = Zeroizing::new(json);
-                converted
-            }
-        };
+    /// Imports a `.bpkey` file and stores it. A protected key is unlocked once first, so a file
+    /// whose seed does not match its public key and ID is refused before it is stored.
+    pub fn import(&self, key: KeyFile, passphrase: PassphraseSource<'_>) -> Result<KeyFile> {
+        let secret = passphrase_for(&key, passphrase)?;
+        unlocked(key.id(), key.unlock(secret.as_ref().map(|s| s.as_str())))?;
         self.save_new(&key)?;
         Ok(key)
     }
 
-    /// The portable `.bpkey` text of the stored key, always in the shared format (DPAPI removed).
-    /// A protected key in the old format asks for its passphrase, through `passphrase` with the
-    /// key ID, and is converted in memory. The stored file is not changed.
-    pub fn export(
-        &self,
-        passphrase: &mut dyn FnMut(DeviceId) -> Result<Zeroizing<String>>,
-    ) -> Result<Zeroizing<String>> {
-        match self.load()? {
-            StoredKeyFile::Current(file) => Ok(Zeroizing::new(file.to_json()?)),
-            StoredKeyFile::Legacy(legacy) => {
-                let secret = if legacy.is_protected() {
-                    Some(passphrase(legacy.id())?)
-                } else {
-                    None
-                };
-                let secret = secret.as_ref().map(|s| s.as_str());
-                let (_, json) = unlocked(legacy.id(), convert_legacy(&legacy, secret))?;
-                Ok(Zeroizing::new(json))
-            }
-        }
-    }
-
-    /// Unlocks the stored key for a session. A key in the old format is converted once, right
-    /// after it has unlocked (a protected one after its passphrase was accepted). A failed
-    /// conversion is logged and the session goes on with the old key.
-    pub fn unlock_stored(
-        &self,
-        key: &StoredKeyFile,
-        passphrase: PassphraseSource<'_>,
-    ) -> Result<DeviceIdentity> {
-        let secret = passphrase_for(key, passphrase)?;
-        let secret = secret.as_ref().map(|s| s.as_str());
-        let signing = unlocked(key.id(), key.unlock(secret))?;
-        if let StoredKeyFile::Legacy(legacy) = key {
-            self.migrate(legacy, secret);
-        }
-        Ok(DeviceIdentity::from_signing_key(signing))
-    }
-
-    /// Converts the stored old-format key. Logs a failure on one line, without secrets.
-    fn migrate(&self, legacy: &LegacyKeyFile, passphrase: Option<&str>) {
-        if let Err(error) = self.migrate_with(legacy, passphrase, dpapi::protect) {
-            eprintln!(
-                "BubblePlay: viewer key {} stays in the old format: {error:#}",
-                legacy.id()
-            );
-        }
-    }
-
-    /// Writes the converted key in place of the old blob, after keeping the old blob as a
-    /// backup. The backup is removed once the new blob reads back and matches the old key. On
-    /// any failure after the backup exists, the old blob is written back first.
-    fn migrate_with(
-        &self,
-        legacy: &LegacyKeyFile,
-        passphrase: Option<&str>,
-        wrap: fn(&[u8]) -> Result<Vec<u8>>,
-    ) -> Result<()> {
-        let old = self.read_wrapped()?;
-        let (_, json) = convert_legacy(legacy, passphrase)?;
-        let json = Zeroizing::new(json);
-        let backup = self.backup_path();
-        super::write_replacing(&backup, &old).context("write the legacy backup")?;
-
-        let outcome = self
-            .write_converted(&json, wrap)
-            .and_then(|()| self.check_converted(legacy, passphrase));
-        if let Err(error) = outcome {
-            if let Err(restore) = super::write_replacing(&self.path, &old) {
-                return Err(error.context(format!(
-                    "the old blob could not be restored ({restore:#}); it is kept at {}",
-                    backup.display()
-                )));
-            }
-            drop_backup(&backup);
-            return Err(error);
-        }
-        drop_backup(&backup);
-        Ok(())
-    }
-
-    fn write_converted(&self, json: &str, wrap: fn(&[u8]) -> Result<Vec<u8>>) -> Result<()> {
-        let wrapped = wrap(json.as_bytes())?;
-        super::write_replacing(&self.path, &wrapped)
-    }
-
-    /// Reads the new blob back. It must be in the shared format with the old key's ID and public
-    /// key, still protected when the old key was, and unlock with the same passphrase.
-    fn check_converted(&self, legacy: &LegacyKeyFile, passphrase: Option<&str>) -> Result<()> {
-        let StoredKeyFile::Current(file) = self.load()? else {
-            bail!("the converted key is not in the shared format");
-        };
-        if file.id() != legacy.id()
-            || file.public_key() != legacy.public_key()
-            || file.is_protected() != legacy.is_protected()
-        {
-            bail!("the converted key has a different identity");
-        }
-        let signing = unlocked(file.id(), file.unlock(passphrase))?;
-        if signing.verifying_key().to_bytes() != *legacy.public_key() {
-            bail!("the converted key has a different public key");
-        }
-        Ok(())
+    /// The portable `.bpkey` text of the stored key (DPAPI removed). The stored file is not
+    /// changed.
+    pub fn export(&self) -> Result<Zeroizing<String>> {
+        Ok(Zeroizing::new(self.load()?.to_json()?))
     }
 
     /// The stored DPAPI blob as it is on disk.
     fn read_wrapped(&self) -> Result<Vec<u8>> {
         match std::fs::read(&self.path) {
             Ok(bytes) => Ok(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
-                "no viewer key at {}: run `bubbleplay-client key create` or `key import <file>`",
-                self.path.display()
-            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(self.no_key()),
             Err(error) => Err(error).with_context(|| format!("read {}", self.path.display())),
         }
     }
 
-    /// Where the old blob is kept during a conversion: `device-key.bpkey.legacy-backup`.
-    fn backup_path(&self) -> PathBuf {
-        let mut name = self.path.as_os_str().to_owned();
-        name.push(".legacy-backup");
-        PathBuf::from(name)
+    fn no_key(&self) -> anyhow::Error {
+        anyhow!(
+            "no viewer key at {}: run `bubbleplay-client key create` or `key import <file>`",
+            self.path.display()
+        )
     }
 }
 
-/// Removes a conversion backup. A failure is logged: the key itself is already in place.
-fn drop_backup(backup: &Path) {
-    if let Err(error) = std::fs::remove_file(backup) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("BubblePlay: could not remove {}: {error}", backup.display());
-        }
-    }
+fn log_other_format() {
+    eprintln!(
+        "BubblePlay: the stored viewer key is in an unsupported format; treating it as no key"
+    );
 }
 
 /// Maps a failed unlock to the console message. A wrong passphrase is named as such.
@@ -257,7 +160,7 @@ fn unlocked<T>(id: DeviceId, result: Result<T, DeviceKeyError>) -> Result<T> {
 
 /// The passphrase for `key`, asked for only when the key is protected.
 fn passphrase_for(
-    key: &StoredKeyFile,
+    key: &KeyFile,
     passphrase: PassphraseSource<'_>,
 ) -> Result<Option<Zeroizing<String>>> {
     if key.is_protected() {
@@ -267,12 +170,12 @@ fn passphrase_for(
     }
 }
 
-fn parse(text: &str) -> Result<StoredKeyFile> {
-    read_key_file(text).map_err(|error| anyhow!("not a usable .bpkey file: {error}"))
+fn parse(text: &str) -> Result<KeyFile> {
+    KeyFile::parse(text).map_err(|error| anyhow!("not a usable .bpkey file: {error}"))
 }
 
-/// Unlocks `key` in either format, asking `passphrase` only when the key is protected.
-pub fn unlock(key: &StoredKeyFile, passphrase: PassphraseSource<'_>) -> Result<DeviceIdentity> {
+/// Unlocks `key`, asking `passphrase` only when the key is protected.
+pub fn unlock(key: &KeyFile, passphrase: PassphraseSource<'_>) -> Result<DeviceIdentity> {
     let secret = passphrase_for(key, passphrase)?;
     let signing = unlocked(key.id(), key.unlock(secret.as_ref().map(|s| s.as_str())))?;
     Ok(DeviceIdentity::from_signing_key(signing))
@@ -291,13 +194,13 @@ pub fn open_identity(key_override: Option<&Path>) -> Result<DeviceIdentity> {
             let store = KeyStore::default_location()?;
             let key = store.load()?;
             let prompt = format!("Passphrase for viewer key {}: ", key.id());
-            store.unlock_stored(&key, &mut || super::console::read_passphrase(&prompt))
+            unlock(&key, &mut || super::console::read_passphrase(&prompt))
         }
     }
 }
 
-/// Reads a portable (not DPAPI-wrapped) `.bpkey` file, in either format. Nothing is converted.
-pub fn read_plain(path: &Path) -> Result<StoredKeyFile> {
+/// Reads a portable (not DPAPI-wrapped) `.bpkey` file.
+pub fn read_plain(path: &Path) -> Result<KeyFile> {
     let bytes =
         Zeroizing::new(std::fs::read(path).with_context(|| format!("read {}", path.display()))?);
     let text = std::str::from_utf8(&bytes)
@@ -345,11 +248,6 @@ mod tests {
     use crate::store::test_dir::TempDir;
     use serde_json::Value;
 
-    /// BubblePlay's own vectors: the old format under `legacyKeyFiles`.
-    fn legacy_fixture() -> Value {
-        read_fixture("../fixtures/device-keys-contract.json")
-    }
-
     /// The shared format's vectors: `keyFiles` and `ids`.
     fn shared_fixture() -> Value {
         read_fixture("../fixtures/shared/device-keys-contract.json")
@@ -360,18 +258,6 @@ mod tests {
         serde_json::from_str(&std::fs::read_to_string(path).expect("contract fixture")).unwrap()
     }
 
-    /// An old-format vector: its file text and the whole vector (seed, passphrase, ...).
-    fn legacy_text(name: &str) -> (String, Value) {
-        let vector = legacy_fixture()["legacyKeyFiles"][name].clone();
-        (vector["file"].to_string(), vector)
-    }
-
-    /// Stores `text` the way the old build did: in the old format, DPAPI-wrapped.
-    fn store_legacy(store: &KeyStore, text: &str) {
-        let wrapped = dpapi::protect(text.as_bytes()).unwrap();
-        std::fs::write(store.path(), wrapped).unwrap();
-    }
-
     fn fixed(text: &str) -> impl FnMut() -> Result<Zeroizing<String>> + '_ {
         move || Ok(Zeroizing::new(text.to_owned()))
     }
@@ -380,16 +266,66 @@ mod tests {
         panic!("a plain key must not ask for a passphrase")
     }
 
-    fn never_id(_: DeviceId) -> Result<Zeroizing<String>> {
-        panic!("this key must not ask for a passphrase")
+    /// A key file in another format, stored the way a key is: DPAPI-wrapped.
+    fn store_other_format(store: &KeyStore) -> Vec<u8> {
+        let mut file: Value = serde_json::from_str(
+            &KeyFile::create("old", "2026-10-13T09:30:00Z", None)
+                .unwrap()
+                .to_json()
+                .unwrap(),
+        )
+        .unwrap();
+        file["format"] = Value::from("other-format");
+        let wrapped = dpapi::protect(file.to_string().as_bytes()).unwrap();
+        std::fs::write(store.path(), &wrapped).unwrap();
+        wrapped
     }
 
-    fn not_dpapi(_: &[u8]) -> Result<Vec<u8>> {
-        Ok(b"not a DPAPI blob".to_vec())
+    #[test]
+    fn a_key_in_another_format_counts_as_no_key() {
+        let dir = TempDir::new("other-format");
+        let store = KeyStore::in_dir(dir.path());
+        let before = store_other_format(&store);
+        assert!(!store.exists());
+        let error = store.load().unwrap_err();
+        assert!(error.to_string().contains("no viewer key"), "{error}");
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
     }
 
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    #[test]
+    fn creating_a_key_replaces_a_key_in_another_format() {
+        let dir = TempDir::new("other-format-create");
+        let store = KeyStore::in_dir(dir.path());
+        let before = store_other_format(&store);
+        let created = store.create("New", None).unwrap();
+        assert!(store.exists());
+        assert_eq!(store.load().unwrap().id(), created.id());
+        assert_ne!(std::fs::read(store.path()).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no backup is kept"
+        );
+    }
+
+    #[test]
+    fn importing_replaces_a_key_in_another_format_and_refuses_such_a_file() {
+        let fixture = shared_fixture();
+        let plain = &fixture["keyFiles"]["plain"]["file"];
+        let dir = TempDir::new("other-format-import");
+        let store = KeyStore::in_dir(dir.path());
+        store_other_format(&store);
+        let key = store
+            .import(KeyFile::parse(&plain.to_string()).unwrap(), &mut never)
+            .unwrap();
+        assert_eq!(store.load().unwrap().id(), key.id());
+
+        let mut foreign = plain.clone();
+        foreign["format"] = Value::from("other-format");
+        let file = dir.path().join("foreign.bpkey");
+        std::fs::write(&file, foreign.to_string()).unwrap();
+        assert!(read_plain(&file).is_err());
+        assert!(open_identity(Some(&file)).is_err());
     }
 
     #[test]
@@ -406,7 +342,6 @@ mod tests {
         assert!(!String::from_utf8_lossy(&raw).contains(KeyFile::FORMAT));
 
         let loaded = store.load().unwrap();
-        assert!(matches!(loaded, StoredKeyFile::Current(_)));
         assert_eq!(loaded.id(), created.id());
         assert_eq!(loaded.label(), "Test viewer");
         assert!(!loaded.is_protected());
@@ -437,7 +372,7 @@ mod tests {
         let first = TempDir::new("export");
         let store = KeyStore::in_dir(first.path());
         let created = store.create("Portable", None).unwrap();
-        let exported = store.export(&mut never_id).unwrap();
+        let exported = store.export().unwrap();
         let value: Value = serde_json::from_str(&exported).unwrap();
         assert_eq!(value["format"], KeyFile::FORMAT);
         assert_eq!(value["id"], created.id().to_string());
@@ -445,7 +380,7 @@ mod tests {
         let second = TempDir::new("import");
         let other = KeyStore::in_dir(second.path());
         let imported = other
-            .import(read_key_file(&exported).unwrap(), &mut never)
+            .import(KeyFile::parse(&exported).unwrap(), &mut never)
             .unwrap();
         assert_eq!(imported.id(), created.id());
         assert_eq!(other.load().unwrap().id(), created.id());
@@ -460,7 +395,7 @@ mod tests {
         let dir = TempDir::new("fixture-plain");
         let store = KeyStore::in_dir(dir.path());
         let key = store
-            .import(read_key_file(&plain.to_string()).unwrap(), &mut never)
+            .import(KeyFile::parse(&plain.to_string()).unwrap(), &mut never)
             .unwrap();
         assert_eq!(key.id().to_string(), plain["id"].as_str().unwrap());
         assert_eq!(
@@ -473,7 +408,7 @@ mod tests {
         let passphrase = protected["passphrase"].as_str().unwrap();
         let key = store
             .import(
-                read_key_file(&protected["file"].to_string()).unwrap(),
+                KeyFile::parse(&protected["file"].to_string()).unwrap(),
                 &mut fixed(passphrase),
             )
             .unwrap();
@@ -488,7 +423,7 @@ mod tests {
         let store = KeyStore::in_dir(dir.path());
         assert!(store
             .import(
-                read_key_file(&protected["file"].to_string()).unwrap(),
+                KeyFile::parse(&protected["file"].to_string()).unwrap(),
                 &mut fixed("incorrect horse battery staple")
             )
             .is_err());
@@ -508,208 +443,9 @@ mod tests {
         // A DPAPI-wrapped file is not a plain key file.
         let store = KeyStore::in_dir(dir.path());
         store
-            .import(read_key_file(&plain.to_string()).unwrap(), &mut never)
+            .import(KeyFile::parse(&plain.to_string()).unwrap(), &mut never)
             .unwrap();
         assert!(open_identity(Some(store.path())).is_err());
-    }
-
-    #[test]
-    fn key_override_reads_an_old_plain_file_without_converting_it() {
-        let (text, _) = legacy_text("plain");
-        let dir = TempDir::new("override-legacy");
-        let path = dir.path().join("old.bpkey");
-        std::fs::write(&path, &text).unwrap();
-        let identity = open_identity(Some(&path)).unwrap();
-        assert_eq!(identity.id(), read_key_file(&text).unwrap().id());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-    }
-
-    #[test]
-    fn legacy_plain_key_converts_when_it_is_unlocked() {
-        let (text, vector) = legacy_text("plain");
-        let dir = TempDir::new("legacy-plain");
-        let store = KeyStore::in_dir(dir.path());
-        store_legacy(&store, &text);
-        let before = std::fs::read(store.path()).unwrap();
-
-        let legacy = store.load().unwrap();
-        assert!(legacy.is_legacy() && !legacy.is_protected());
-        let identity = store.unlock_stored(&legacy, &mut never).unwrap();
-        assert_eq!(identity.id(), legacy.id());
-        assert!(!store.backup_path().exists());
-
-        let StoredKeyFile::Current(file) = store.load().unwrap() else {
-            panic!("the stored key was not converted");
-        };
-        assert_eq!(file.id(), legacy.id());
-        assert_eq!(file.public_key(), legacy.public_key());
-        assert!(!file.is_protected());
-        let seed = file.unlock(None).unwrap().to_bytes();
-        assert_eq!(hex(&seed), vector["seedHex"].as_str().unwrap());
-        assert_ne!(std::fs::read(store.path()).unwrap(), before);
-
-        // Once converted, a second unlock changes nothing.
-        let converted = std::fs::read(store.path()).unwrap();
-        let again = store.load().unwrap();
-        store.unlock_stored(&again, &mut never).unwrap();
-        assert_eq!(std::fs::read(store.path()).unwrap(), converted);
-        assert!(!store.backup_path().exists());
-    }
-
-    #[test]
-    fn legacy_protected_key_converts_once_its_passphrase_unlocks_it() {
-        let (text, vector) = legacy_text("passphrase");
-        let passphrase = vector["passphrase"].as_str().unwrap();
-        let dir = TempDir::new("legacy-protected");
-        let store = KeyStore::in_dir(dir.path());
-        store_legacy(&store, &text);
-        let before = std::fs::read(store.path()).unwrap();
-
-        let legacy = store.load().unwrap();
-        assert!(legacy.is_legacy() && legacy.is_protected());
-        // A wrong passphrase leaves the old blob alone.
-        assert!(store
-            .unlock_stored(&legacy, &mut fixed("wrong horse"))
-            .is_err());
-        assert_eq!(std::fs::read(store.path()).unwrap(), before);
-        assert!(!store.backup_path().exists());
-
-        let identity = store
-            .unlock_stored(&legacy, &mut fixed(passphrase))
-            .unwrap();
-        assert_eq!(identity.id(), legacy.id());
-        assert!(!store.backup_path().exists());
-        let StoredKeyFile::Current(file) = store.load().unwrap() else {
-            panic!("the stored key was not converted");
-        };
-        assert!(file.is_protected());
-        assert_eq!(file.id(), legacy.id());
-        assert_eq!(file.public_key(), legacy.public_key());
-        let seed = file.unlock(Some(passphrase)).unwrap().to_bytes();
-        assert_eq!(hex(&seed), vector["seedHex"].as_str().unwrap());
-    }
-
-    #[test]
-    fn failed_conversion_puts_the_old_blob_back_byte_for_byte() {
-        let (text, _) = legacy_text("plain");
-        let dir = TempDir::new("failed-convert");
-        let store = KeyStore::in_dir(dir.path());
-        store_legacy(&store, &text);
-        let before = std::fs::read(store.path()).unwrap();
-        let StoredKeyFile::Legacy(old) = store.load().unwrap() else {
-            panic!("expected a key in the old format");
-        };
-
-        // The new blob is not DPAPI, so reading it back fails and the old blob returns.
-        assert!(store.migrate_with(&old, None, not_dpapi).is_err());
-        assert_eq!(std::fs::read(store.path()).unwrap(), before);
-        assert!(!store.backup_path().exists());
-        assert!(store.load().unwrap().is_legacy());
-    }
-
-    #[test]
-    fn failed_backup_stops_before_the_old_blob_is_touched() {
-        let (text, _) = legacy_text("plain");
-        let dir = TempDir::new("failed-backup");
-        let store = KeyStore::in_dir(dir.path());
-        store_legacy(&store, &text);
-        let before = std::fs::read(store.path()).unwrap();
-        let StoredKeyFile::Legacy(old) = store.load().unwrap() else {
-            panic!("expected a key in the old format");
-        };
-
-        // A directory in the backup's place: the backup cannot be written.
-        std::fs::create_dir(store.backup_path()).unwrap();
-        assert!(store.migrate_with(&old, None, dpapi::protect).is_err());
-        assert_eq!(std::fs::read(store.path()).unwrap(), before);
-    }
-
-    #[test]
-    fn a_current_key_is_left_alone_on_unlock() {
-        let dir = TempDir::new("current-untouched");
-        let store = KeyStore::in_dir(dir.path());
-        store.create("Current", None).unwrap();
-        let before = std::fs::read(store.path()).unwrap();
-        let stored = store.load().unwrap();
-        assert!(!stored.is_legacy());
-        store.unlock_stored(&stored, &mut never).unwrap();
-        assert_eq!(std::fs::read(store.path()).unwrap(), before);
-        assert!(!store.backup_path().exists());
-    }
-
-    #[test]
-    fn importing_an_old_plain_file_stores_the_new_format() {
-        let (text, _) = legacy_text("plain");
-        let dir = TempDir::new("import-legacy");
-        let store = KeyStore::in_dir(dir.path());
-        let legacy = read_key_file(&text).unwrap();
-        let id = legacy.id();
-        let key = store.import(legacy, &mut never).unwrap();
-        assert_eq!(key.id(), id);
-        assert!(matches!(store.load().unwrap(), StoredKeyFile::Current(_)));
-
-        let exported = store.export(&mut never_id).unwrap();
-        let value: Value = serde_json::from_str(&exported).unwrap();
-        assert_eq!(value["format"], KeyFile::FORMAT);
-        assert_eq!(value["id"], id.to_string());
-    }
-
-    #[test]
-    fn importing_an_old_protected_file_stores_the_new_format_under_its_passphrase() {
-        let (text, vector) = legacy_text("passphrase");
-        let passphrase = vector["passphrase"].as_str().unwrap();
-        let dir = TempDir::new("import-legacy-protected");
-        let store = KeyStore::in_dir(dir.path());
-        assert!(store
-            .import(read_key_file(&text).unwrap(), &mut fixed("wrong horse"))
-            .is_err());
-        assert!(!store.exists());
-
-        store
-            .import(read_key_file(&text).unwrap(), &mut fixed(passphrase))
-            .unwrap();
-        let stored = store.load().unwrap();
-        assert!(!stored.is_legacy() && stored.is_protected());
-        unlock(&stored, &mut fixed(passphrase)).unwrap();
-    }
-
-    #[test]
-    fn export_of_an_old_plain_key_converts_in_memory_and_leaves_the_file() {
-        let (text, _) = legacy_text("plain");
-        let dir = TempDir::new("export-legacy");
-        let store = KeyStore::in_dir(dir.path());
-        store_legacy(&store, &text);
-        let before = std::fs::read(store.path()).unwrap();
-
-        let exported = store.export(&mut never_id).unwrap();
-        let value: Value = serde_json::from_str(&exported).unwrap();
-        assert_eq!(value["format"], KeyFile::FORMAT);
-        assert!(!exported.contains("bubbleplay-device-key"));
-        assert_eq!(std::fs::read(store.path()).unwrap(), before);
-    }
-
-    #[test]
-    fn export_of_an_old_protected_key_asks_for_its_passphrase() {
-        let (text, vector) = legacy_text("passphrase");
-        let passphrase = vector["passphrase"].as_str().unwrap();
-        let expected = read_key_file(&text).unwrap().id();
-        let dir = TempDir::new("export-legacy-protected");
-        let store = KeyStore::in_dir(dir.path());
-        store_legacy(&store, &text);
-
-        let exported = store
-            .export(&mut |id| {
-                assert_eq!(id, expected);
-                Ok(Zeroizing::new(passphrase.to_owned()))
-            })
-            .unwrap();
-        let file = KeyFile::parse(&exported).unwrap();
-        assert!(file.is_protected());
-        file.unlock(Some(passphrase)).unwrap();
-
-        assert!(store
-            .export(&mut |_| Ok(Zeroizing::new("wrong horse".to_owned())))
-            .is_err());
     }
 
     #[test]
@@ -717,7 +453,7 @@ mod tests {
         let dir = TempDir::new("export-current-protected");
         let store = KeyStore::in_dir(dir.path());
         store.create("Locked", Some("right horse")).unwrap();
-        let exported = store.export(&mut never_id).unwrap();
+        let exported = store.export().unwrap();
         assert!(KeyFile::parse(&exported).unwrap().is_protected());
     }
 

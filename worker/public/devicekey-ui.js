@@ -5,7 +5,7 @@
 // createKey/importKey.
 // The unlocked key is never kept. Passphrases are read from inputs, and the dialog that held them
 // is removed when it closes (JavaScript strings cannot be wiped, so references are dropped).
-import { convertLegacyKeyFile, createKeyFile, isLegacyKeyFileText, parseKeyFile, rewrapKeyFile } from "./devicekey.js";
+import { createKeyFile, isOtherFormatKeyFileText, parseKeyFile, rewrapKeyFile } from "./devicekey.js";
 import { createDeviceKeyStore } from "./devicekey-store.js";
 
 const KEY_EXTENSION = ".bpkey";
@@ -78,14 +78,6 @@ export function passphraseValue(text) {
   return text === "" ? undefined : text;
 }
 
-/**
- * The text to store or export. A legacy key file is converted to the shared format, with the
- * passphrase when it is protected; any other text is returned unchanged.
- */
-export async function shareableKeyText(text, passphrase, convert) {
-  return isLegacyKeyFileText(text) ? convert(text, passphrase) : text;
-}
-
 /** Display fields from a parsed key file. A file with a KDF block is protected by a passphrase. */
 export function summarizeKeyFile(file) {
   return {
@@ -113,7 +105,7 @@ export async function installDeviceKeyUi({
   store = createDeviceKeyStore(),
   userAgent = globalThis.navigator?.userAgent ?? "",
   clipboard = globalThis.navigator?.clipboard ?? null,
-  keys = { createKeyFile, parseKeyFile, rewrapKeyFile, convertLegacyKeyFile },
+  keys = { createKeyFile, parseKeyFile, rewrapKeyFile },
 } = {}) {
   const mount = doc.getElementById("device-key-settings");
   if (!mount) return null;
@@ -385,8 +377,6 @@ export async function installDeviceKeyUi({
     return true;
   }
 
-  const storableText = (text, passphrase) => shareableKeyText(text, passphrase, keys.convertLegacyKeyFile);
-
   async function importFlow() {
     const picked = await formModal({
       title: "Import device key",
@@ -399,7 +389,7 @@ export async function installDeviceKeyUi({
         const text = await values.file.text();
         try {
           const file = await keys.parseKeyFile(text);
-          return { text: await storableText(text), file, protected: false };
+          return { text, file, protected: false };
         } catch (error) {
           if (error?.code === "passphrase-required") return { text, file: null, protected: true };
           throw error;
@@ -417,7 +407,7 @@ export async function installDeviceKeyUi({
         submitLabel: "Check key",
         run: async passphrase => ({
           file: await keys.parseKeyFile(picked.text, passphrase),
-          text: await storableText(picked.text, passphrase),
+          text: picked.text,
         }),
       });
       if (!checked) return false;
@@ -435,7 +425,7 @@ export async function installDeviceKeyUi({
       if (!replace) return false;
     }
 
-    // A shared-format file is stored byte for byte, as it was checked; a legacy one is stored converted.
+    // The file is stored byte for byte, as it was checked.
     await store.save(stored);
     entry = makeEntry(stored);
     renderSettings();
@@ -467,8 +457,7 @@ export async function installDeviceKeyUi({
     });
     if (!mode) return false;
     if (mode === "keep") {
-      // A legacy protected key has no passphrase here, so this throws passphrase-required (shown as ERROR_TEXT).
-      saveFile(name, await storableText(text));
+      saveFile(name, text);
       setStatus(`Exported ${name}.`);
       return true;
     }
@@ -617,7 +606,8 @@ export async function installDeviceKeyUi({
   renderSettings();
   try {
     const text = await store.load();
-    entry = text === null || text === undefined ? null : makeEntry(text);
+    // A stored key in another format counts as no key: create or import replaces it.
+    entry = text === null || text === undefined || isOtherFormatKeyFileText(text) ? null : makeEntry(text);
   } catch (error) {
     loadError = error;
   }

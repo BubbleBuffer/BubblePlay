@@ -11,10 +11,6 @@ internal fun sharedContract(): JSONObject = Fixtures.json("shared/device-keys-co
 /** The `keyFiles` section of the shared contract: files in the shared format. */
 internal fun sharedKeyFiles(): JSONObject = sharedContract().getJSONObject("keyFiles")
 
-/** The `legacyKeyFiles` section of the local contract: files in the format name written before the move. */
-internal fun legacyKeyFiles(): JSONObject =
-    Fixtures.json("device-keys-contract.json").getJSONObject("legacyKeyFiles")
-
 internal fun contractIds(): List<JSONObject> =
     Fixtures.objects(Fixtures.json("device-keys-contract.json").getJSONArray("ids"))
 

@@ -6,7 +6,7 @@
 // UI: dk-gate.js (screens only). Session: receiver.js startSession. Protocol: dk-relay.js.
 // The unlocked Ed25519 private key is a non-extractable CryptoKey held in memory only.
 // Spec: docs/architecture/device-keys.md.
-import { canonicalId, convertLegacyKeyFile, isLegacyKeyFileText, unlockKeyFile } from "./devicekey.js";
+import { canonicalId, isOtherFormatKeyFileText, unlockKeyFile } from "./devicekey.js";
 import { createDeviceKeyStore } from "./devicekey-store.js";
 import { deviceKeyErrorMessage, passphraseValue, summarizeKeyFile } from "./devicekey-ui.js";
 import { normalizePairingCode, openPairingSocket, pairAdmitHash, pcListUrl, relayOrigin } from "./dk-relay.js";
@@ -43,7 +43,6 @@ export function createApp({
   gate,
   store = createDeviceKeyStore(),
   unlock = unlockKeyFile,
-  convert = convertLegacyKeyFile,
   keyUi = null,                      // { createKey, importKey } from devicekey-ui.js installDeviceKeyUi
   loadSession,                       // async () => receiver.js module ({ startSession, endSession })
   location = globalThis.location,
@@ -103,104 +102,20 @@ export function createApp({
     });
   }
 
-  /**
-   * One-time move of the stored key to the shared format, run after the old key unlocked. The old
-   * record stays as a backup until the new one reads back through the normal load path with the same
-   * ID and public key. A failure before that restores the old record. Logs one line; this session
-   * keeps using the unlocked key either way.
-   */
-  async function migrateStoredKey(text, passphrase) {
-    let step = "convert";
-    try {
-      const converted = await convert(text, passphrase);
-      step = "backup";
-      await store.saveBackup(text);
-      step = "write";
-      await store.save(converted);
-      step = "read back";
-      const reread = await unlock(await store.load(), passphrase);
-      const samePublic = reread.publicKey.length === identity.publicRaw.length
-        && reread.publicKey.every((byte, i) => byte === identity.publicRaw[i]);
-      if (reread.id !== identity.id || !samePublic) throw Object.assign(new Error("read back mismatch"), { code: "identity-mismatch" });
-      step = "drop backup";
-      await store.clearBackup();
-    } catch (error) {
-      // Only a step that may have replaced the record needs the old text back.
-      const replaced = step === "write" || step === "read back" || step === "drop backup";
-      const restored = !replaced || await store.save(text).then(() => true, () => false);
-      if (restored) await store.clearBackup().catch(() => {});
-      console.warn(`Device key not moved to the shared format (${step}: ${error?.code ?? "error"}); this session uses the old key.`);
-    }
-  }
-
-  /** The public header of a key file text, or null. Holds no secret. */
-  function keyHeader(text) {
-    try {
-      const file = JSON.parse(text);
-      return typeof file?.id === "string" && typeof file.public === "string" ? { id: file.id, public: file.public } : null;
-    } catch {
-      return null;
-    }
-  }
-
-  async function restoreBackup(backup, reason) {
-    try {
-      await store.save(backup);
-      await store.clearBackup();
-      console.warn(`Device key restored from its backup (${reason}).`);
-    } catch {
-      console.warn("Device key backup could not be restored; it is kept for the next start.");
-    }
-  }
-
-  /**
-   * Runs first on boot, for a backup left by a crash during migrateStoredKey. The backup is dropped when
-   * the stored key has the same ID and public key and is in the shared format (a plain one must open).
-   * It is restored when the stored key is missing or unreadable. A legacy stored key is left to
-   * migrateStoredKey. Different IDs keep both, with one log line that carries no key material.
-   */
-  async function recoverBackup() {
-    const backup = await store.loadBackup();
-    if (backup === null) return;
-    let stored;
-    try {
-      stored = await store.load();
-    } catch {
-      return restoreBackup(backup, "the stored key was unreadable");
-    }
-    if (stored === null) return restoreBackup(backup, "the stored key was missing");
-    const header = keyHeader(stored);
-    if (!header) return restoreBackup(backup, "the stored key was unreadable");
-    const old = keyHeader(backup);
-    if (!old || old.id !== header.id || old.public !== header.public) {
-      console.warn("Device key backup kept: its ID or public key differs from the stored key.");
-      return;
-    }
-    if (isLegacyKeyFileText(stored)) return;
-    if (!summarizeKeyFile(JSON.parse(stored)).protected) {
-      try {
-        await unlock(stored, undefined);
-      } catch {
-        return restoreBackup(backup, "the stored key does not open");
-      }
-    }
-    await store.clearBackup();
-  }
-
   /** Loads and unlocks the key, then routes. Re-entered after create, import or remove. */
   async function boot() {
     stopPairing();
     identity = null;
-    await recoverBackup().catch(() => console.warn("Device key backup check failed; the stored key is used as it is."));
     const text = await store.load();
     if (text === null || text === undefined) return showSetup(false);
+    // A stored key in any other format counts as no key: setup replaces it.
+    if (isOtherFormatKeyFileText(text)) return showSetup(false);
     let info = null;
     try { info = summarizeKeyFile(JSON.parse(text)); } catch { /* unreadable: offer replacement */ }
     if (!info) return showSetup(true);
     if (!info.protected) {
       gate.showBusy("Unlocking key…");
       await unlockWith(text, undefined);
-      if (isLegacyKeyFileText(text)) await migrateStoredKey(text, undefined);
       return route();
     }
     gate.showKeyScreen({
@@ -208,7 +123,6 @@ export function createApp({
       onUnlock: async passphrase => {
         const value = passphraseValue(passphrase ?? "");
         await unlockWith(text, value);
-        if (isLegacyKeyFileText(text)) await migrateStoredKey(text, value);
         await route();
       },
       onCreate: undefined,

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Writes BubblePlay's local sections of fixtures/device-keys-contract.json: ids, legacyKeyFiles
-// (bubbleplay-device-key vectors), handshake, relayProof (bubbleplay-relay-v1) and phase2.
+// Writes BubblePlay's local sections of fixtures/device-keys-contract.json: ids, handshake,
+// relayProof (bubbleplay-relay-v1) and phase2.
 // `--check` never writes. It verifies the vendored shared fixture, fixtures/shared/device-keys-contract.json.
 // TEST ONLY: every private key, salt and nonce below is public and deterministic.
 // Never use these values for real identities, key files or sessions.
@@ -8,10 +8,6 @@ import * as crypto from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 
 const checking = process.argv.includes("--check");
-if (!checking && typeof crypto.argon2Sync !== "function") {
-  console.error("Device-key contract generation requires crypto.argon2Sync (Node >= 24.7); no fixture was written.");
-  process.exit(1);
-}
 
 const b64 = bytes => Buffer.from(bytes).toString("base64url");
 const hex = value => Buffer.from(value, "hex");
@@ -146,27 +142,6 @@ const ids = [
   identity("crockford-aliases", "0000000000000000000000000000000000000000000000000000000000000006"),
 ];
 ids[2].parse = { input: "hnobw2w6oqqilm47", canonical: ids[2].id };
-
-function keyFile(identity, label) {
-  return {
-    format: "bubbleplay-device-key", version: 1, type: "ed25519", id: identity.id,
-    label, created: "2026-10-13T09:30:00Z", public: identity.public,
-    kdf: null, aead: null, private: b64(hex(identity.seedHex)),
-  };
-}
-const plainFile = keyFile(ids[1], "PC test");
-const protectedFile = keyFile(ids[0], 'Viewer "test" café');
-const passphrase = "correct horse battery staple";
-protectedFile.kdf = { alg: "argon2id", m: 65536, t: 3, p: 1, salt: b64(hex("000102030405060708090a0b0c0d0e0f")) };
-protectedFile.aead = { alg: "aes-256-gcm", nonce: b64(hex("101112131415161718191a1b")) };
-const kdfKey = crypto.argon2Sync("argon2id", {
-  message: utf8(passphrase), nonce: Buffer.from(protectedFile.kdf.salt, "base64url"),
-  parallelism: 1, tagLength: 32, memory: 65536, passes: 3,
-});
-const associated = aad(protectedFile);
-protectedFile.private = b64(encrypt(kdfKey, Buffer.from(protectedFile.aead.nonce, "base64url"), associated, hex(ids[0].seedHex)));
-const tamperedFile = structuredClone(protectedFile);
-tamperedFile.label = "Tampered viewer label";
 
 function peer(identity, nonceHex, ephemeralPrivateHex) {
   return {
@@ -358,15 +333,6 @@ const fixture = {
   version: 1,
   notes: "See docs/architecture/device-keys.md, Phase 0 results. TEST ONLY: all private keys, passphrases, salts and nonces are public deterministic vectors; never use them in production. Binary JSON fields use unpadded base64url unless named Hex; plaintextUtf8 and aadUtf8 are exact UTF-8 strings.",
   ids,
-  legacyKeyFiles: {
-    plain: { seedHex: ids[1].seedHex, file: plainFile },
-    passphrase: { seedHex: ids[0].seedHex, passphrase, kdfKeyHex: kdfKey.toString("hex"),
-      aadUtf8: associated.toString("utf8"), aadHex: associated.toString("hex"), file: protectedFile },
-    failures: [
-      { name: "wrong-passphrase", passphrase: "incorrect horse battery staple", file: protectedFile, expected: "authentication-failed" },
-      { name: "tampered-aad", passphrase, file: tamperedFile, expected: "authentication-failed" },
-    ],
-  },
   handshake: {
     relayOrigin, sessionEpoch, viewer, pc,
     transcriptHex: transcript.toString("hex"), transcriptHashHex: transcriptHash.toString("hex"),
