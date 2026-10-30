@@ -78,7 +78,7 @@ impl HostProtocol {
     /// A damaged trust file is an error, never an empty replacement list. The UI receives the
     /// load error even when startup cannot proceed.
     pub fn open(
-        identity: &crate::device_key::DeviceIdentity,
+        identity: &bp_device_key::DeviceIdentity,
         origin: &str,
         ui: SharedDevicesUi,
     ) -> Result<Self> {
@@ -90,7 +90,7 @@ impl HostProtocol {
             }
         };
         Self::with_store(
-            identity.to_phase2_identity(),
+            identity.duplicate(),
             origin,
             ui,
             trusted,

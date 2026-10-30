@@ -51,6 +51,8 @@ use serde_json::{json, Value};
 use tungstenite::{Message, WebSocket};
 
 const FIXTURE: &str = "../fixtures/device-keys-contract.json";
+/// The vendored shared fixture: the current key file format lives only here.
+const SHARED_FIXTURE: &str = "../fixtures/shared/device-keys-contract.json";
 /// Upper bound for every wait on the relay or the host.
 const STEP: Duration = Duration::from_secs(20);
 /// Read timeout slice: each read returns quickly so the host can be pumped in between.
@@ -66,7 +68,7 @@ fn phase2_pairing_then_trusted_reconnect_through_bp_relay() {
 
 fn run() -> Result<()> {
     let fixture = fixture()?;
-    let host_key = serde_json::to_string(&fixture["keyFiles"]["plain"]["file"])?;
+    let host_key = serde_json::to_string(&shared_fixture()?["keyFiles"]["plain"]["file"])?;
     let host = HostIdentity::from_plain_key_json(&host_key).context("fixture PC key")?;
     let host_id = host.id().to_string();
     ensure!(
@@ -162,7 +164,15 @@ struct Target<'a> {
 
 /// The fixture file, read-only.
 fn fixture() -> Result<Value> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
+    read_json(FIXTURE)
+}
+
+fn shared_fixture() -> Result<Value> {
+    read_json(SHARED_FIXTURE)
+}
+
+fn read_json(relative: &str) -> Result<Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&text).context("parse device-keys-contract.json")
 }

@@ -2489,7 +2489,13 @@ fn registration_proof(identity: &DeviceIdentity, origin: &str, nonce: &str) -> R
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
         .filter(|bytes| URL_SAFE_NO_PAD.encode(bytes) == nonce)
         .ok_or_else(|| anyhow::anyhow!("relay sent a malformed registration challenge"))?;
-    Ok(URL_SAFE_NO_PAD.encode(identity.sign_relay_proof(origin, &nonce)))
+    Ok(
+        URL_SAFE_NO_PAD.encode(identity.sign_relay_proof(
+            bp_device_key::Role::Host,
+            origin,
+            &nonce,
+        )),
+    )
 }
 
 /// Runs the registration after the keyed hello: answers one `register-challenge` with a
@@ -4169,7 +4175,12 @@ mod keyed_registration_tests {
     }
 
     fn fixture_identity() -> DeviceIdentity {
-        DeviceIdentity::from_plain_key_json(&fixture()["keyFiles"]["plain"]["file"].to_string())
+        // The shared fixture holds the current-format plain key; the local one keeps the old format.
+        let shared: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/shared/device-keys-contract.json"
+        ))
+        .unwrap();
+        DeviceIdentity::from_plain_key_json(&shared["keyFiles"]["plain"]["file"].to_string())
             .unwrap()
     }
 
