@@ -687,6 +687,8 @@ impl Relay {
             ntfy: None,
             approval_ttl_s: 90,
             trusted_proxy_cidrs: Vec::new(),
+            // The relay's production hold (bp_relay_core::gate::GATE_HOLD_MS).
+            gate_hold_ms: 30_000,
         };
         runtime.spawn(async move {
             if let Err(error) = bp_relay_server::server::run(&config, listener).await {
