@@ -457,6 +457,40 @@ pub fn status_line(state: &HostState, agent: &AgentStatus) -> String {
     format!("BubblePlay: {} ({input})", state.label())
 }
 
+/// Tray icon resource for light taskbars (dark outline), linked by build.rs.
+pub const TRAY_ICON_LIGHT: u16 = 2;
+/// Tray icon resource for dark taskbars (light outline), linked by build.rs.
+pub const TRAY_ICON_DARK: u16 = 3;
+
+/// Picks the tray icon from `SystemUsesLightTheme`: 0 or missing means a dark taskbar.
+pub fn tray_icon_resource(system_uses_light_theme: Option<u32>) -> u16 {
+    match system_uses_light_theme {
+        Some(0) | None => TRAY_ICON_DARK,
+        Some(_) => TRAY_ICON_LIGHT,
+    }
+}
+
+/// Lets one left-click through per double-click interval, so a double-click
+/// (button-up, double-click, button-up) opens BubblePlay once.
+#[derive(Debug, Default)]
+pub struct ClickDebounce {
+    last: Option<Instant>,
+}
+
+impl ClickDebounce {
+    /// True when this click should act; `window` is the system double-click time.
+    pub fn accept(&mut self, now: Instant, window: Duration) -> bool {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < window)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
 /// The Admin mode line shown under the "Admin mode" menu item.
 pub fn admin_mode_line(agent: &AgentStatus) -> Option<&'static str> {
     match agent {
@@ -781,6 +815,27 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn tray_icon_follows_system_theme_value() {
+        assert_eq!(tray_icon_resource(Some(1)), TRAY_ICON_LIGHT);
+        assert_eq!(tray_icon_resource(Some(0)), TRAY_ICON_DARK);
+        assert_eq!(tray_icon_resource(None), TRAY_ICON_DARK);
+        assert_eq!(tray_icon_resource(Some(7)), TRAY_ICON_LIGHT);
+    }
+
+    #[test]
+    fn click_debounce_lets_one_click_through_per_window() {
+        let window = Duration::from_millis(500);
+        let start = Instant::now();
+        let mut debounce = ClickDebounce::default();
+        assert!(debounce.accept(start, window));
+        // The second button-up of a double-click.
+        assert!(!debounce.accept(start + Duration::from_millis(200), window));
+        assert!(debounce.accept(start + Duration::from_millis(700), window));
+        assert!(!debounce.accept(start + Duration::from_millis(1100), window));
+        assert!(debounce.accept(start + Duration::from_millis(1300), window));
     }
 
     #[test]

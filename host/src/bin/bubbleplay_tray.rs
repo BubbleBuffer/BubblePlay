@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD,
     NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_INFOTIP_FLAGS,
@@ -48,7 +49,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, MENU_ITEM_FLAGS, MF_CHECKED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_ENDSESSION,
-    WM_LBUTTONUP, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    WM_LBUTTONUP, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 
 use bubbleplay_host::admin_agent::client::{probe, ProbeResult, AGENT_EXE};
@@ -63,18 +65,19 @@ use bubbleplay_host::secure_helper::protocol::{
 };
 use logic::{
     admin_menu_enabled, admin_mode_line, menu_layout, run_key_command, running_probe_status,
-    secure_helper_should_launch, start_secure_helper_for_viewer, status_line, unix_ms_now,
-    AgentStatus, HostState, MenuEntry, MenuState, ProbeGate, SecureHelperStatus, SharedLog,
-    TraySettings, ViewerGate, AGENT_UPDATE_LABEL, CMD_ADMIN, CMD_AGENT_UPDATE, CMD_AUDIO,
-    CMD_CPU_MODE, CMD_DEVICES, CMD_EXPORT_KEY, CMD_IMPORT_KEY, CMD_LOGIN, CMD_LOGS, CMD_QUIT,
-    CMD_RESTART, CMD_ROLLBACK, CMD_SECURE_HELPER_UPDATE, SECURE_HELPER_UPDATE_LABEL,
+    secure_helper_should_launch, start_secure_helper_for_viewer, status_line, tray_icon_resource,
+    unix_ms_now, AgentStatus, ClickDebounce, HostState, MenuEntry, MenuState, ProbeGate,
+    SecureHelperStatus, SharedLog, TraySettings, ViewerGate, AGENT_UPDATE_LABEL, CMD_ADMIN,
+    CMD_AGENT_UPDATE, CMD_AUDIO, CMD_CPU_MODE, CMD_DEVICES, CMD_EXPORT_KEY, CMD_IMPORT_KEY,
+    CMD_LOGIN, CMD_LOGS, CMD_QUIT, CMD_RESTART, CMD_ROLLBACK, CMD_SECURE_HELPER_UPDATE,
+    SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
     acquire_single_instance, create_manual_event, data_dir, end_agent_task, ensure_agent_task,
     host_exe_beside, named_mutex_exists, open_folder, read_run_value, run_admin_mode_off_task,
     run_agent_task, run_elevated_and_wait, run_secure_helper_task, secure_helper_task_exists,
-    set_event, set_run_value, sha256_file, wide, Handle, AGENT_MUTEX, AGENT_STOP_EVENT,
-    SECURE_HELPER_TASK, TRAY_MUTEX,
+    set_event, set_run_value, sha256_file, system_uses_light_theme, wide, Handle, AGENT_MUTEX,
+    AGENT_STOP_EVENT, SECURE_HELPER_TASK, TRAY_MUTEX,
 };
 use supervisor::{HostEvent, SupervisorConfig, SupervisorThread};
 use update::{
@@ -216,10 +219,11 @@ fn quit_running_tray() -> Result<i32> {
 // ---------------------------------------------------------------------------
 
 /// Owned copy of the embedded tray mark (no tile) at the system's small-icon size.
-/// Resource ID 2 is linked into this executable by build.rs; resource 1 stays the exe icon.
+/// build.rs links resource 2 (light taskbar) and 3 (dark taskbar); resource 1 stays the exe icon.
 struct TrayIcon {
     handle: HICON,
     size: (i32, i32),
+    resource: u16,
 }
 
 impl TrayIcon {
@@ -228,15 +232,20 @@ impl TrayIcon {
         unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) }
     }
 
-    fn load(size: (i32, i32)) -> Result<Self> {
-        // SAFETY: module is our executable; PCWSTR(2) is MAKEINTRESOURCEW(2).
+    /// The resource matching the current taskbar theme.
+    fn themed_resource() -> u16 {
+        tray_icon_resource(system_uses_light_theme())
+    }
+
+    fn load(size: (i32, i32), resource: u16) -> Result<Self> {
+        // SAFETY: module is our executable; PCWSTR(resource) is MAKEINTRESOURCEW(resource).
         // Omitting LR_SHARED gives this object ownership of the loaded icon.
         let handle = unsafe {
             let module = GetModuleHandleW(PCWSTR::null()).context("GetModuleHandleW")?;
             LoadImageW(
                 Some(module.into()),
-                // MAKEINTRESOURCE(2): the tray icon resource ID, not a pointer.
-                PCWSTR(std::ptr::without_provenance::<u16>(2)),
+                // MAKEINTRESOURCE: the tray icon resource ID, not a pointer.
+                PCWSTR(std::ptr::without_provenance::<u16>(usize::from(resource))),
                 IMAGE_ICON,
                 size.0,
                 size.1,
@@ -247,6 +256,7 @@ impl TrayIcon {
         Ok(Self {
             handle: HICON(handle.0),
             size,
+            resource,
         })
     }
 }
@@ -298,6 +308,8 @@ struct App {
     icon: TrayIcon,
     shown: Option<String>,
     taskbar_created: u32,
+    /// Collapses a double-click on the icon into one Open request.
+    left_clicks: ClickDebounce,
     shut_down: bool,
     events_tx: std::sync::mpsc::Sender<HostEvent>,
     events_rx: std::sync::mpsc::Receiver<HostEvent>,
@@ -312,10 +324,13 @@ struct App {
 }
 
 impl App {
+    /// Reloads the icon when the small-icon size or the taskbar theme changed.
+    /// Clearing `shown` makes the next tick push it with NIM_MODIFY.
     fn refresh_icon(&mut self) {
         let size = TrayIcon::small_size();
-        if size != self.icon.size {
-            match TrayIcon::load(size) {
+        let resource = TrayIcon::themed_resource();
+        if size != self.icon.size || resource != self.icon.resource {
+            match TrayIcon::load(size, resource) {
                 Ok(icon) => {
                     self.icon = icon;
                     self.shown = None;
@@ -1471,6 +1486,16 @@ unsafe fn append_menu_entries(menu: HMENU, entries: &[MenuEntry]) {
     }
 }
 
+/// True when a WM_SETTINGCHANGE lParam names "ImmersiveColorSet" (a light/dark theme change).
+fn is_immersive_color_set(lparam: LPARAM) -> bool {
+    if lparam.0 == 0 {
+        return false;
+    }
+    // SAFETY: for WM_SETTINGCHANGE a non-null lParam is a NUL-terminated UTF-16 string.
+    let name = unsafe { PCWSTR(lparam.0 as *const u16).to_string() };
+    name.is_ok_and(|name| name == "ImmersiveColorSet")
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -1481,8 +1506,16 @@ unsafe extern "system" fn window_proc(
         WM_TRAY => {
             let event = (lparam.0 & 0xffff) as u32;
             // Legacy (pre-version-4) icon messages: left-click opens BubblePlay, right-click the menu.
+            // A double-click sends a second button-up (and WM_LBUTTONDBLCLK, ignored), so only
+            // one click per double-click interval opens BubblePlay.
             if event == WM_LBUTTONUP {
-                with_app(|app| app.handle_command(CMD_DEVICES));
+                // SAFETY: no arguments.
+                let window = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+                with_app(|app| {
+                    if app.left_clicks.accept(Instant::now(), window) {
+                        app.handle_command(CMD_DEVICES);
+                    }
+                });
             } else if event == WM_RBUTTONUP {
                 show_menu(hwnd);
             }
@@ -1491,6 +1524,12 @@ unsafe extern "system" fn window_proc(
         WM_TIMER => {
             with_app(|app| app.tick());
             LRESULT(0)
+        }
+        // The taskbar theme changed: swap the light/dark tray icon now rather than on the next tick.
+        WM_SETTINGCHANGE if is_immersive_color_set(lparam) => {
+            with_app(|app| app.tick());
+            // SAFETY: default handling.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_ADMIN_CHANGED => {
             with_app(|app| {
@@ -1542,7 +1581,7 @@ fn run_tray() -> Result<i32> {
     // SAFETY: opt this tray process into system DPI before creating any windows,
     // so small-icon metrics select the matching embedded frame (16/20/24/32/40/48 px).
     let _ = unsafe { SetProcessDPIAware() };
-    let icon = TrayIcon::load(TrayIcon::small_size())?;
+    let icon = TrayIcon::load(TrayIcon::small_size(), TrayIcon::themed_resource())?;
     let data = data_dir();
     let test_mode = std::env::var_os("BUBBLEPLAY_TRAY_DATA_DIR").is_some();
     let logs = logs_dir(&data);
@@ -1634,6 +1673,7 @@ fn run_tray() -> Result<i32> {
         probation: None,
         exits: Vec::new(),
         host_hash: None,
+        left_clicks: ClickDebounce::default(),
         host_error: None,
         key_ui_running: false,
     };

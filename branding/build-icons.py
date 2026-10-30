@@ -12,6 +12,7 @@ Needs: Python 3.10+, Pillow, and a Chrome/Chromium binary for rasterising
 Writes
   branding/out/bubbleplay.ico          16..256, each frame rendered from the master tile at its size
   branding/out/bubbleplay-tray.ico     16..48 notification-area frames: the tileless mark, transparent
+  branding/out/bubbleplay-tray-dark.ico  the same frames with the outer outline in the tile colour (dark taskbars)
   branding/small/*.png                 exact native-pixel copies of the 16/20/24 ICO frames
   branding/out/tray-32.bgra            premultiplied BGRA candidate for future tray wiring
   branding/out/bubbleplay-tile.svg     the master (ivory tile, full bleed)
@@ -58,6 +59,9 @@ ICO_SMALL = (16, 20, 24)
 ICO_SIZES = (16, 20, 24, 32, 48, 64, 256)
 TRAY_SIZES = (16, 20, 24, 32, 40, 48)   # small-icon sizes at 100..300% DPI
 TRAY_MARGIN = 1 / 16     # clear margin on each side of a tray frame: 1px at 16px
+# The outer outline (monitor silhouette, neck, foot) vanishes on a dark taskbar; the dark-taskbar
+# tray icon draws these in the tile colour. Screen edge, face and cursor keep their charcoal.
+TRAY_DARK_OUTLINE = ("bezel-outline", "neck", "foot")
 SUPERSAMPLE = 1024
 
 # The master's ivory tile is the only <g> with id "background"; the rest is the mark.
@@ -111,6 +115,16 @@ def tray_svg(m: Master, tight_big: Image.Image) -> str:
     if count != 1:
         raise SystemExit(f"{MASTER} must keep its 1280 viewBox")
     return text
+
+
+def tray_dark_svg(m: Master, tray: str) -> str:
+    """The tray mark for dark taskbars: its outer outline recoloured to the master's tile colour."""
+    for part in TRAY_DARK_OUTLINE:
+        tray, count = re.subn(rf'(<path id="{part}"[^>]*?stroke=")#[0-9A-Fa-f]{{6}}(")',
+                              rf"\g<1>{m.field}\g<2>", tray, count=1)
+        if count != 1:
+            raise SystemExit(f"{MASTER}: expected a stroked path#{part}")
+    return tray
 
 
 def svg_doc(view_box: tuple[float, float, float, float], body: str) -> str:
@@ -330,21 +344,26 @@ def launcher_preview(chrome: Chrome, foreground: Image.Image, monochrome: str, f
 
 
 def windows_preview(frames: dict[int, Image.Image], sizes: tuple[int, ...] = (16, 20, 24, 32, 48),
-                    name: str = "windows-ico.png") -> None:
+                    name: str = "windows-ico.png",
+                    variants: dict[str, dict[int, Image.Image]] | None = None) -> None:
+    """Frames at 1:1 and enlarged, one band per (variant, taskbar colour)."""
     zoom_to = 192
     backgrounds = [("#F3F3F3", "light taskbar"), ("#202020", "dark taskbar")]
-    items = [frames[size] for size in sizes]
+    variants = variants or {"": frames}
+    bands = [(label, frames_of, colour) for label, frames_of in variants.items() for colour, _ in backgrounds]
     gap = 20
     row = zoom_to + 64 + 3 * gap
-    sheet = Image.new("RGB", (gap + len(items) * (zoom_to + gap), 2 * row), (90, 90, 90))
-    for band, (colour, _) in enumerate(backgrounds):
+    sheet = Image.new("RGB", (gap + len(sizes) * (zoom_to + gap), len(bands) * row), (90, 90, 90))
+    for band, (label, frames_of, colour) in enumerate(bands):
+        dark = colour == "#202020"
         ImageDraw.Draw(sheet).rectangle((0, band * row, sheet.width, (band + 1) * row), fill=hex_rgb(colour))
-        for index, image in enumerate(items):
+        for index, image in enumerate(frames_of[size] for size in sizes):
             x = gap + index * (zoom_to + gap)
             y = band * row + gap
             backdrop = Image.new("RGBA", image.size, hex_rgb(colour) + (255,))
             flat = Image.alpha_composite(backdrop, image).convert("RGB")
-            ImageDraw.Draw(sheet).text((x + 64, y + 4), f"{image.width}px / 1:1", fill=(110, 110, 110) if band == 0 else (210, 210, 210))
+            caption = f"{label} {image.width}px / 1:1".strip()
+            ImageDraw.Draw(sheet).text((x + 64, y + 4), caption, fill=(210, 210, 210) if dark else (110, 110, 110))
             sheet.paste(flat, (x, y))                                         # 1:1
             scale = zoom_to // image.width
             sheet.paste(flat.resize((image.width * scale, image.height * scale), Image.NEAREST), (x, y + 64 + gap))
@@ -379,6 +398,9 @@ def main() -> None:
         tray = tray_svg(m, tight_big)
         tray_frames = {size: chrome.svg(tray, size) for size in TRAY_SIZES}
         write_ico(OUT / "bubbleplay-tray.ico", [tray_frames[size] for size in TRAY_SIZES])
+        tray_dark = tray_dark_svg(m, tray)
+        tray_dark_frames = {size: chrome.svg(tray_dark, size) for size in TRAY_SIZES}
+        write_ico(OUT / "bubbleplay-tray-dark.ico", [tray_dark_frames[size] for size in TRAY_SIZES])
 
         if not followups:
             write_text(PUBLIC / "favicon.svg", tile)
@@ -396,7 +418,8 @@ def main() -> None:
                 monochrome = (RES / "drawable" / "ic_launcher_monochrome.xml").read_text(encoding="utf-8")
                 launcher_preview(chrome, foreground, monochrome, m.field)
             windows_preview(frames)
-            windows_preview(tray_frames, TRAY_SIZES, "windows-tray.png")
+            windows_preview(tray_frames, TRAY_SIZES, "windows-tray.png",
+                            {"light icon": tray_frames, "dark icon": tray_dark_frames})
     finally:
         chrome.close()
     print("icons written")
