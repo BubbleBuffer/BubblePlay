@@ -413,8 +413,10 @@ impl AppBackend {
                 Ok(_) => self.store_imported(inner, file, Some(passphrase.as_str()), &shown_name),
                 Err(DeviceKeyError::AuthenticationFailed) => {
                     inner.import_pending = Some(file);
-                    inner.state.flow =
-                        unlock_step(shown_name, Some("That passphrase did not open the key.".to_owned()));
+                    inner.state.flow = unlock_step(
+                        shown_name,
+                        Some("That passphrase did not open the key.".to_owned()),
+                    );
                 }
                 Err(error) => {
                     inner.state.flow = Some(refused(
@@ -447,7 +449,8 @@ impl AppBackend {
         match &inner.state.flow {
             // The stored key still needs its passphrase, and the first choice stays: no way back.
             Some(Flow::Enroll(EnrollStep::Choose)) => {}
-            Some(Flow::Enroll(EnrollStep::ImportUnlock { .. })) if inner.stored_locked.is_some() => {}
+            Some(Flow::Enroll(EnrollStep::ImportUnlock { .. }))
+                if inner.stored_locked.is_some() => {}
             Some(Flow::Enroll(EnrollStep::Created)) => inner.state.flow = None,
             Some(Flow::Enroll(_)) => {
                 inner.import_pending = None;
@@ -541,7 +544,12 @@ impl AppBackend {
         } else {
             format!("https://{relay}")
         };
-        if inner.state.pcs.iter().any(|known| known.id == pc.to_string()) {
+        if inner
+            .state
+            .pcs
+            .iter()
+            .any(|known| known.id == pc.to_string())
+        {
             return fail(inner, "This PC is already in Your PCs.");
         }
 
