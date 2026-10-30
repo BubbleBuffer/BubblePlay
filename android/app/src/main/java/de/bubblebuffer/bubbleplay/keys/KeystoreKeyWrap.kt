@@ -14,8 +14,8 @@ import javax.crypto.spec.GCMParameterSpec
  * callers must import a portable backup rather than silently replace the identity.
  * Requires Android Keystore and therefore cannot be exercised by JVM unit tests.
  */
-class KeystoreKeyWrap {
-    fun wrap(portableBytes: ByteArray): ByteArray {
+internal class KeystoreKeyWrap : EnvelopeWrap {
+    override fun wrap(portableBytes: ByteArray): ByteArray {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         // Android Keystore generates the nonce; caller-supplied IVs are forbidden
         // for encryption by its randomized-encryption requirement.
@@ -25,7 +25,7 @@ class KeystoreKeyWrap {
         return nonce + cipher.doFinal(portableBytes)
     }
 
-    fun unwrap(envelope: ByteArray): ByteArray {
+    override fun unwrap(envelope: ByteArray): ByteArray {
         require(envelope.size >= NONCE_BYTES + TAG_BYTES) { "Truncated device-key envelope" }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(
