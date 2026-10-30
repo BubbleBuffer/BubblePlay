@@ -47,3 +47,33 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+// The Kotlin core (keys, auth, pcs, pairing) is compiled from the native app's source tree, not
+// copied: the files stay where they are and this module takes only the packages the app contract
+// needs. Everything else in that tree (ui, media, input, files, protocol, the session) is left out.
+val nativeCore = rootProject.file("../../android/app/src/main/java")
+android.sourceSets.getByName("main").java.srcDir(nativeCore)
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    include(
+        "de/bubblebuffer/bubbleplay/flutter/**",
+        "de/bubblebuffer/bubbleplay/keys/**",
+        "de/bubblebuffer/bubbleplay/auth/**",
+        "de/bubblebuffer/bubbleplay/pcs/**",
+        "de/bubblebuffer/bubbleplay/net/PairingClient.kt",
+        "de/bubblebuffer/bubbleplay/net/ServerConfig.kt",
+    )
+}
+
+dependencies {
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.86")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
+}
+
+android.testOptions.unitTests.all {
+    // The JVM tests read the shared contract fixtures in <repo>/app/test/fixtures.
+    it.systemProperty("bubbleplay.contract", rootProject.file("../test/fixtures/contract").absolutePath)
+}

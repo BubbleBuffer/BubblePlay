@@ -1,0 +1,106 @@
+name: App
+
+# The Flutter app (app/): Dart analysis, widget and golden tests, the Android debug APK and the
+# Kotlin host-API tests. Goldens are rendered here on Linux (build01), never on a developer PC.
+# The Windows side (flutter build windows, the Rust core's FFI tests) runs on the developer's PC:
+# hosted Windows runners are out of budget.
+
+on:
+  push:
+    branches: [master, "lane/**"]
+    paths:
+      - "app/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/keys/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/auth/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/pcs/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/PairingClient.kt"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/ServerConfig.kt"
+      - ".github/workflows/app.yml"
+  pull_request:
+    branches: [master, "lane/**"]
+    paths:
+      - "app/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/keys/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/auth/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/pcs/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/PairingClient.kt"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/ServerConfig.kt"
+      - ".github/workflows/app.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  FLUTTER_VERSION: "3.47.5"
+
+jobs:
+  flutter:
+    name: Flutter analyze, tests, Android APK (build01)
+    runs-on: [self-hosted, build01]
+    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Flutter SDK
+        # One copy per version in the runner's home, reused by later runs.
+        run: |
+          dir="$HOME/flutter-$FLUTTER_VERSION"
+          if [ ! -x "$dir/bin/flutter" ]; then
+            tmp="$(mktemp -d)"
+            curl --proto '=https' --tlsv1.2 -sSfL -o "$tmp/flutter.tar.xz" \
+              "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
+            tar -xJf "$tmp/flutter.tar.xz" -C "$tmp"
+            rm -rf "$dir"
+            mv "$tmp/flutter" "$dir"
+            rm -rf "$tmp"
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          echo "PUB_CACHE=$HOME/.pub-cache" >> "$GITHUB_ENV"
+          "$dir/bin/flutter" --version
+          "$dir/bin/flutter" config --no-analytics --no-cli-animations
+      - name: Dependencies
+        working-directory: app
+        run: flutter pub get
+      - name: Analyze
+        working-directory: app
+        run: flutter analyze lib test
+      - name: Widget, golden and contract tests
+        working-directory: app
+        run: flutter test
+      - name: Android debug APK
+        working-directory: app
+        run: flutter build apk --debug
+      - name: Kotlin host-API tests
+        working-directory: app/android
+        # The wrapper is committed without the executable bit on some checkouts, so run it via bash.
+        run: bash ./gradlew --no-daemon :app:testDebugUnitTest
+      - name: Upload debug APK
+        continue-on-error: true
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: bubbleplay-app-debug-apk
+          path: app/build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload golden failures
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: app-golden-failures
+          path: app/test/**/failures/
+          if-no-files-found: ignore
+          retention-days: 7
