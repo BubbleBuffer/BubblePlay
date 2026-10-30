@@ -32,7 +32,7 @@ use crate::{
     surface::{InputCapture, Rect},
 };
 
-use super::SessionInputState as CaptureStatus;
+use crate::input::CaptureStatus;
 
 /// Builds the capture for a mode, with its status handle when it has one.
 /// The live client passes [`crate::input::SessionInput`]; tests pass a fake.
