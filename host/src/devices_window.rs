@@ -152,6 +152,10 @@ const ALL_CTLS: [Ctl; 37] = [
     Ctl::Deny,
 ];
 
+/// Controls that only paint a background for the controls over them, bottom first. They sit
+/// at the bottom of the sibling z-order, in this order, with the list container just above.
+const BACKGROUND_CTLS: [Ctl; 3] = [Ctl::Band, Ctl::ListFrame, Ctl::LvHead];
+
 impl Ctl {
     pub fn id(self) -> i32 {
         self as i32
@@ -864,7 +868,8 @@ impl Model {
 const ROW_HEIGHT: i32 = 44;
 const CLIENT_W: i32 = 560;
 const CLIENT_H: i32 = 408;
-const LIST_BODY: [i32; 4] = [17, 178, 526, 214];
+// Inside the list frame: below the column band, clear of the frame's 1 px border on three sides.
+const LIST_BODY: [i32; 4] = [17, 178, 526, 213];
 const ROWS_ID: i32 = 1500;
 const ID_REVOKE_BASE: i32 = 2000;
 const ID_CELL_BASE: i32 = 3000;
@@ -1278,8 +1283,10 @@ impl Ui {
     }
 
     unsafe fn create_controls(&self, hwnd: HWND, instance: HINSTANCE) -> Option<()> {
+        // New children go to the bottom of the z-order, so creation order alone would put the
+        // first-created Band on top. With WS_CLIPSIBLINGS the upper sibling wins where controls
+        // overlap, so the background controls and the list container move down after the loop.
         for ctl in ALL_CTLS {
-            // The list container sits above the frame and column band in z-order, below the empty text.
             let (class, style) = spec(ctl);
             let class = wide(class);
             CreateWindowExW(
@@ -1315,6 +1322,24 @@ impl Ui {
                 .ok()?;
                 self.rows_hwnd.set(rows);
             }
+        }
+        // Bottom-up: Band, ListFrame, LvHead, then the list container above the frame and column
+        // band but below the empty text and every other control.
+        let mut lowered = vec![self.rows_hwnd.get()];
+        for ctl in BACKGROUND_CTLS.iter().rev() {
+            lowered.push(self.ctl(*ctl)?);
+        }
+        for handle in lowered {
+            SetWindowPos(
+                handle,
+                Some(HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW,
+            )
+            .ok()?;
         }
         Some(())
     }
@@ -2803,12 +2828,22 @@ mod tests {
     // Screenshot harness: `devices_window_screenshots`, run through win-check with
     // `-- --ignored` and BP_SCREENSHOT_DIR set. The windows are created far outside every
     // monitor with tool-window and no-activate styles, are never activated, and are captured
-    // with PrintWindow into memory bitmaps.
+    // with PrintWindow(PW_RENDERFULLCONTENT) into memory bitmaps. That copies what DWM composes,
+    // so sibling clipping shows up as it does on screen (WM_PRINT painted every child in turn
+    // and hid z-order bugs).
     // -----------------------------------------------------------------------------------------
 
+    #[link(name = "user32")]
+    extern "system" {
+        fn PrintWindow(hwnd: HWND, hdc: HDC, flags: u32) -> i32;
+    }
+
+    const PW_RENDERFULLCONTENT: u32 = 0x2;
+
     use windows::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, DeleteDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        DIB_RGB_COLORS,
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, RedrawWindow, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, DIB_RGB_COLORS, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
+        RDW_UPDATENOW,
     };
 
     fn rfc3339_ago(secs: i64) -> String {
@@ -2857,13 +2892,18 @@ mod tests {
         let bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
             .expect("dib section");
         let old = SelectObject(dc, HGDIOBJ(bitmap.0));
-        // An off-screen window has an empty visible region and never paints itself, so ask it
-        // to print into the bitmap: client, non-client, background and children.
-        let _ = SendMessageW(
-            window,
-            WM_PRINT,
-            Some(WPARAM(dc.0 as usize)),
-            Some(LPARAM(0x2 | 0x4 | 0x8 | 0x10)),
+        // Repaint everything now and let DWM compose a frame, so its copy is current.
+        let _ = RedrawWindow(
+            Some(window),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME,
+        );
+        settle();
+        let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+        assert!(
+            PrintWindow(window, dc, PW_RENDERFULLCONTENT) != 0,
+            "PrintWindow failed"
         );
         let size = (width * height * 4) as usize;
         let pixels = std::slice::from_raw_parts(bits as *const u8, size).to_vec();
@@ -2893,6 +2933,89 @@ mod tests {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+    }
+
+    /// Stacking layer of a main-window child: a child may only sit above an overlapping sibling
+    /// of the same or a lower layer.
+    fn z_layer(id: i32) -> u8 {
+        match Ctl::from_id(id) {
+            Some(Ctl::Band | Ctl::ListFrame) => 0,
+            Some(Ctl::LvHead) => 1,
+            _ if id == ROWS_ID => 2,
+            _ => 3,
+        }
+    }
+
+    /// Every overlapping pair of children, on every page, stacks by layer. With
+    /// WS_CLIPSIBLINGS a background above a label hides the label on screen.
+    #[test]
+    fn background_controls_sit_below_what_they_overlap() {
+        let (commands, _unused) = std::sync::mpsc::channel();
+        let shared = Arc::new(Shared {
+            info: info(true),
+            commands,
+            inner: Mutex::new(Inner {
+                slot: Slot::Closed,
+                queue: VecDeque::new(),
+            }),
+        });
+        let rows = vec![row("B7QK-2M9X-H4PD-R8TN", "Pixel 8", None, true)];
+        let request = || DevicesEvent::PairRequest {
+            id: "B7QK-2M9X-H4PD-R8TN".into(),
+            name: "Pixel 8".into(),
+            sas_display: "482 913".into(),
+        };
+        let wait = || waiting(Duration::from_secs(272));
+        let pages: Vec<(Page, Vec<DevicesEvent>)> = vec![
+            (Page::List, vec![DevicesEvent::List(rows.clone())]),
+            (Page::List, vec![DevicesEvent::List(vec![])]),
+            (Page::Waiting, vec![wait()]),
+            (Page::Expired, vec![wait(), DevicesEvent::PairExpired]),
+            (Page::Stopped, vec![wait(), DevicesEvent::PairStopped]),
+            (Page::Failed, vec![wait(), DevicesEvent::PairFailed]),
+            (Page::Request, vec![wait(), request()]),
+        ];
+        // SAFETY: the window is created, never shown, inspected and destroyed on this thread.
+        unsafe {
+            let ui = Ui::new(Arc::clone(&shared));
+            ui.offscreen.set(true);
+            let window = ui.create().expect("window");
+            for (page, events) in pages {
+                for event in events {
+                    ui.model.borrow_mut().apply(event);
+                }
+                ui.sync();
+                settle();
+                assert_eq!(ui.model.borrow().page(), page);
+                // GW_CHILD is the top of the sibling z-order; GW_HWNDNEXT walks down.
+                let mut stack: Vec<(i32, RECT)> = Vec::new();
+                let mut child = GetWindow(window, GW_CHILD).ok();
+                while let Some(handle) = child {
+                    let mut rect = RECT::default();
+                    GetWindowRect(handle, &mut rect).expect("child rect");
+                    stack.push((GetDlgCtrlID(handle), rect));
+                    child = GetWindow(handle, GW_HWNDNEXT).ok();
+                }
+                assert_eq!(stack.len(), ALL_CTLS.len() + 1, "{page:?}");
+                for (above, (upper, a)) in stack.iter().enumerate() {
+                    for (lower, b) in &stack[above + 1..] {
+                        let overlap = a.left < b.right
+                            && b.left < a.right
+                            && a.top < b.bottom
+                            && b.top < a.bottom;
+                        assert!(
+                            !overlap || z_layer(*upper) >= z_layer(*lower),
+                            "{page:?}: {:?} ({upper}) is above {:?} ({lower}) and covers it",
+                            Ctl::from_id(*upper),
+                            Ctl::from_id(*lower),
+                        );
+                    }
+                }
+            }
+            let _ = DestroyWindow(window);
+            settle();
+            ui.release_resources();
         }
     }
 
