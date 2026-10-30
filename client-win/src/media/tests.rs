@@ -2,7 +2,7 @@
 //! every output through `VideoRenderer`. Run with `cargo test media -- --ignored`.
 
 use super::*;
-use crate::shell::{Rect, VideoLayer};
+use crate::surface::{Rect, VideoLayer};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
     collections::BTreeSet,

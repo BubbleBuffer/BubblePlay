@@ -1,0 +1,1319 @@
+{
+  "approval": {
+    "flow": {
+      "Approval": {
+        "outcome": "Waiting",
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "waiting_secs": 12
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "connecting": {
+    "flow": {
+      "Connecting": {
+        "mode": "Work",
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "steps": [
+          {
+            "detail": "relay.example",
+            "label": "Reach relay",
+            "status": "Done"
+          },
+          {
+            "detail": "",
+            "label": "Wait for first frame",
+            "status": "Now"
+          },
+          {
+            "detail": "",
+            "label": "Start stream",
+            "status": "Waiting"
+          }
+        ]
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "enroll_created": {
+    "flow": {
+      "Enroll": "Created"
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "enroll_refused": {
+    "flow": {
+      "Enroll": {
+        "ImportRefused": {
+          "file_name": "notes.txt",
+          "reason": "This is not a BubblePlay key file."
+        }
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "enroll_unlock": {
+    "flow": {
+      "Enroll": {
+        "ImportUnlock": {
+          "error": "That passphrase did not open the key.",
+          "file_name": "viewer.bpkey"
+        }
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "enroll_unlock_clean": {
+    "flow": {
+      "Enroll": {
+        "ImportUnlock": {
+          "error": null,
+          "file_name": "viewer.bpkey"
+        }
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "failed_busy": {
+    "flow": {
+      "Failed": {
+        "error": "PcBusy",
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "steps": [
+          {
+            "detail": "relay.example",
+            "label": "Reach relay",
+            "status": "Done"
+          },
+          {
+            "detail": "",
+            "label": "Wait for first frame",
+            "status": "Now"
+          },
+          {
+            "detail": "",
+            "label": "Start stream",
+            "status": "Waiting"
+          }
+        ]
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "failed_decoder": {
+    "flow": {
+      "Failed": {
+        "error": {
+          "NoHardwareDecoder": {
+            "codec": "hevc",
+            "detail": "no hardware decoder"
+          }
+        },
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "steps": [
+          {
+            "detail": "relay.example",
+            "label": "Reach relay",
+            "status": "Done"
+          },
+          {
+            "detail": "",
+            "label": "Wait for first frame",
+            "status": "Now"
+          },
+          {
+            "detail": "",
+            "label": "Start stream",
+            "status": "Waiting"
+          }
+        ]
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "failed_key_changed": {
+    "flow": {
+      "Failed": {
+        "error": "PcKeyChanged",
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "steps": [
+          {
+            "detail": "relay.example",
+            "label": "Reach relay",
+            "status": "Done"
+          },
+          {
+            "detail": "",
+            "label": "Wait for first frame",
+            "status": "Now"
+          },
+          {
+            "detail": "",
+            "label": "Start stream",
+            "status": "Waiting"
+          }
+        ]
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "failed_lost": {
+    "flow": {
+      "Failed": {
+        "error": {
+          "Lost": {
+            "attempts": 5
+          }
+        },
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "steps": [
+          {
+            "detail": "relay.example",
+            "label": "Reach relay",
+            "status": "Done"
+          },
+          {
+            "detail": "",
+            "label": "Wait for first frame",
+            "status": "Now"
+          },
+          {
+            "detail": "",
+            "label": "Start stream",
+            "status": "Waiting"
+          }
+        ]
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "failed_no_first_frame": {
+    "flow": {
+      "Failed": {
+        "error": {
+          "NoFirstFrame": {
+            "secs": 15
+          }
+        },
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "steps": [
+          {
+            "detail": "relay.example",
+            "label": "Reach relay",
+            "status": "Done"
+          },
+          {
+            "detail": "",
+            "label": "Wait for first frame",
+            "status": "Now"
+          },
+          {
+            "detail": "",
+            "label": "Start stream",
+            "status": "Waiting"
+          }
+        ]
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "failed_relay": {
+    "flow": {
+      "Failed": {
+        "error": "RelayUnreachable",
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "steps": [
+          {
+            "detail": "relay.example",
+            "label": "Reach relay",
+            "status": "Done"
+          },
+          {
+            "detail": "",
+            "label": "Wait for first frame",
+            "status": "Now"
+          },
+          {
+            "detail": "",
+            "label": "Start stream",
+            "status": "Waiting"
+          }
+        ]
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "first_run": {
+    "flow": {
+      "Enroll": "Choose"
+    },
+    "host": null,
+    "pcs": [],
+    "session": null,
+    "this_device": {
+      "id": "",
+      "key_path": ""
+    }
+  },
+  "home": {
+    "flow": null,
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "home_empty": {
+    "flow": null,
+    "host": null,
+    "pcs": [],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "home_problems": {
+    "flow": null,
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "11AA-22BB-33CC-44DD",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Relay down",
+        "online": false,
+        "problem": "RelayUnreachable",
+        "relay": "https://relay.example",
+        "vouch_request": null
+      },
+      {
+        "allowed": "View and input",
+        "default_monitor": null,
+        "id": "55EE-66FF-77GG-88HH",
+        "kind": "Laptop",
+        "last_mode": null,
+        "last_seen": null,
+        "name": "Laptop",
+        "online": true,
+        "problem": "NotAccepted",
+        "relay": "https://relay.example",
+        "vouch_request": null
+      },
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "TTVV-WWXX-YYZZ-0011",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Office",
+        "online": true,
+        "problem": "KeyChanged",
+        "relay": "https://relay.example",
+        "vouch_request": {
+          "device_id": "9JJK-MMNN-PPQQ-RRSS",
+          "device_name": "Phone",
+          "expires_in_secs": 240,
+          "number": 123456,
+          "permissions": [
+            {
+              "granted": true,
+              "key": "view",
+              "label": "View"
+            },
+            {
+              "granted": false,
+              "key": "input",
+              "label": "Input"
+            }
+          ],
+          "request_id": "r1"
+        }
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "home_with_host": {
+    "flow": null,
+    "host": {
+      "answered": {
+        "allowed": true,
+        "answered_on": "the tray",
+        "request": {
+          "device_id": "",
+          "device_name": "",
+          "expires_in_secs": 0,
+          "number": 0,
+          "request_id": ""
+        }
+      },
+      "build": {
+        "hash": "abc1234",
+        "state": "Probation"
+      },
+      "can_roll_back": true,
+      "paired": [
+        {
+          "allowed": "View, input",
+          "connected": true,
+          "id": "9JJK-MMNN-PPQQ-RRSS",
+          "last_seen": "Seen today",
+          "may_vouch": true,
+          "name": "Phone",
+          "vouched_by": "Laptop"
+        }
+      ],
+      "pc_id": "1234-5678-9ABC-DEFG",
+      "pc_name": "DESKTOP-1",
+      "request": {
+        "device_id": "ABCD-EFGH-JKMN-PQRS",
+        "device_name": "Tablet",
+        "expires_in_secs": 200,
+        "number": 654321,
+        "request_id": "req"
+      },
+      "run": {
+        "Restarting": {
+          "in_secs": 5
+        }
+      },
+      "settings": {
+        "admin_mode": false,
+        "cpu_mode": false,
+        "start_at_login": true,
+        "stream_sound": true
+      },
+      "viewer": {
+        "name": "Phone",
+        "since": "09:12"
+      }
+    },
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "host_not_configured": {
+    "flow": null,
+    "host": {
+      "answered": null,
+      "build": {
+        "hash": "",
+        "state": "Good"
+      },
+      "can_roll_back": false,
+      "paired": [],
+      "pc_id": null,
+      "pc_name": "",
+      "request": null,
+      "run": "NotConfigured",
+      "settings": {
+        "admin_mode": false,
+        "cpu_mode": false,
+        "start_at_login": false,
+        "stream_sound": false
+      },
+      "viewer": null
+    },
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "host_running": {
+    "flow": null,
+    "host": {
+      "answered": null,
+      "build": {
+        "hash": "",
+        "state": "Good"
+      },
+      "can_roll_back": false,
+      "paired": [],
+      "pc_id": null,
+      "pc_name": "",
+      "request": null,
+      "run": "Running",
+      "settings": {
+        "admin_mode": false,
+        "cpu_mode": false,
+        "start_at_login": false,
+        "stream_sound": false
+      },
+      "viewer": null
+    },
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "host_starting": {
+    "flow": null,
+    "host": {
+      "answered": null,
+      "build": {
+        "hash": "",
+        "state": "Good"
+      },
+      "can_roll_back": false,
+      "paired": [],
+      "pc_id": null,
+      "pc_name": "",
+      "request": null,
+      "run": "Starting",
+      "settings": {
+        "admin_mode": false,
+        "cpu_mode": false,
+        "start_at_login": false,
+        "stream_sound": false
+      },
+      "viewer": null
+    },
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "host_stopped": {
+    "flow": null,
+    "host": {
+      "answered": null,
+      "build": {
+        "hash": "",
+        "state": "Good"
+      },
+      "can_roll_back": false,
+      "paired": [],
+      "pc_id": null,
+      "pc_name": "",
+      "request": null,
+      "run": "Stopped",
+      "settings": {
+        "admin_mode": false,
+        "cpu_mode": false,
+        "start_at_login": false,
+        "stream_sound": false
+      },
+      "viewer": null
+    },
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "pair_approved_device": {
+    "flow": {
+      "PairConfirm": {
+        "number": 482913,
+        "outcome": {
+          "Approved": {
+            "by": {
+              "Device": "Laptop"
+            }
+          }
+        },
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "pc_name": "Studio",
+        "remote": true,
+        "waiting_secs": 42
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "pair_approved_pc": {
+    "flow": {
+      "PairConfirm": {
+        "number": 482913,
+        "outcome": {
+          "Approved": {
+            "by": "Pc"
+          }
+        },
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "pc_name": "Studio",
+        "remote": false,
+        "waiting_secs": 42
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "pair_cancelled": {
+    "flow": {
+      "PairConfirm": {
+        "number": 482913,
+        "outcome": "Cancelled",
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "pc_name": "Studio",
+        "remote": false,
+        "waiting_secs": 42
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "pair_denied": {
+    "flow": {
+      "PairConfirm": {
+        "number": 482913,
+        "outcome": {
+          "Denied": {
+            "by": "Pc"
+          }
+        },
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "pc_name": "Studio",
+        "remote": false,
+        "waiting_secs": 42
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "pair_enter": {
+    "flow": {
+      "PairEnter": {
+        "error": null,
+        "remote": false
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "pair_enter_remote_error": {
+    "flow": {
+      "PairEnter": {
+        "error": "Remote pairing is not available in this version.",
+        "remote": true
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "pair_timed_out": {
+    "flow": {
+      "PairConfirm": {
+        "number": 482913,
+        "outcome": "TimedOut",
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "pc_name": "Studio",
+        "remote": false,
+        "waiting_secs": 42
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "pair_waiting": {
+    "flow": {
+      "PairConfirm": {
+        "number": 482913,
+        "outcome": "Waiting",
+        "pc_id": "77VH-7M56-8GJK-Y12J",
+        "pc_name": "Studio",
+        "remote": false,
+        "waiting_secs": 42
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "refused": {
+    "flow": {
+      "Refused": {
+        "pc_id": "77VH-7M56-8GJK-Y12J"
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "rotate": {
+    "flow": {
+      "Rotate": {
+        "new_id": "ZZ99-YY88-XX77-WW66",
+        "old_id": "AB12-CD34-EF56-GH78",
+        "pcs": [
+          {
+            "detail": "Updated",
+            "name": "Studio",
+            "status": "Done"
+          },
+          {
+            "detail": "Offline",
+            "name": "Office",
+            "status": "Failed"
+          }
+        ]
+      }
+    },
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": null,
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "session": {
+    "flow": null,
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": {
+      "audio": true,
+      "audio_controls_available": true,
+      "captured": true,
+      "link": {
+        "Reconnecting": {
+          "attempt": 2,
+          "secs": 4
+        }
+      },
+      "mode": "Game",
+      "monitor": 1,
+      "monitor_error": "The PC could not switch displays.",
+      "monitor_pending": true,
+      "monitors": [
+        {
+          "height": 1440,
+          "name": "Display 1",
+          "primary": true,
+          "refresh_hz": 144,
+          "selector": "DISPLAY1",
+          "width": 2560,
+          "x": 0,
+          "y": 0
+        },
+        {
+          "height": 1080,
+          "name": "Display 2",
+          "primary": false,
+          "refresh_hz": 60,
+          "selector": "DISPLAY2",
+          "width": 1920,
+          "x": -1920,
+          "y": 0
+        }
+      ],
+      "notice": "SecureDesktop",
+      "pc_id": "77VH-7M56-8GJK-Y12J",
+      "pc_name": "Studio",
+      "quality": "Sharp",
+      "quality_controls_available": true,
+      "rtt_ms": 18,
+      "stats": {
+        "bitrate_mbps": 24.5,
+        "codec": "H.264",
+        "decode_ms": 2.5,
+        "dropped": 3,
+        "fps": 59.5,
+        "frame_ms": [
+          16.5,
+          16.75,
+          17.0
+        ],
+        "resolution": "2560x1440",
+        "rtt_ms": 18,
+        "transport": "WebRTC"
+      }
+    },
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  },
+  "session_placeholder": {
+    "flow": null,
+    "host": null,
+    "pcs": [
+      {
+        "allowed": "View and input",
+        "default_monitor": "DISPLAY1",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kind": "Desktop",
+        "last_mode": "Game",
+        "last_seen": "Today 09:12",
+        "name": "Studio",
+        "online": true,
+        "problem": null,
+        "relay": "https://relay.example",
+        "vouch_request": null
+      }
+    ],
+    "session": {
+      "audio": false,
+      "audio_controls_available": false,
+      "captured": false,
+      "link": "Live",
+      "mode": "Work",
+      "monitor": 0,
+      "monitor_error": null,
+      "monitor_pending": false,
+      "monitors": [],
+      "notice": "AdminRequired",
+      "pc_id": "77VH-7M56-8GJK-Y12J",
+      "pc_name": "Studio",
+      "quality": "Auto",
+      "quality_controls_available": false,
+      "rtt_ms": 0,
+      "stats": {
+        "bitrate_mbps": 0.0,
+        "codec": "",
+        "decode_ms": 0.0,
+        "dropped": 0,
+        "fps": 0.0,
+        "frame_ms": [],
+        "resolution": "",
+        "rtt_ms": 0,
+        "transport": ""
+      }
+    },
+    "this_device": {
+      "id": "AB12-CD34-EF56-GH78",
+      "key_path": "C:\\Users\\me\\AppData\\Local\\BubblePlay\\viewer\\device-key.bpkey"
+    }
+  }
+}

@@ -28,6 +28,8 @@
 mod mock;
 #[path = "../src/model.rs"]
 mod model;
+#[path = "../src/surface.rs"]
+mod surface;
 #[path = "../src/shell/mod.rs"]
 mod shell;
 #[path = "../src/ui/mod.rs"]

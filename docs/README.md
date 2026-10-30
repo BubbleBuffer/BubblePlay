@@ -16,6 +16,7 @@ Start with a relay setup guide, then install the native Windows host. BubblePlay
 - [Third-party notices](THIRD-PARTY-NOTICES.md) — locked Windows dependencies and retained license texts.
 - [Release status](release-status.md) — available evidence, alpha limits and acceptance still required.
 - [Roadmap](roadmap.md) — planned and deferred work beyond the release blockers, with status per entry.
+- [Flutter app](app/README.md) — the one Windows and Android app: architecture, JSON contract, screens, tests and builds.
 - [Android](../android/README.md) — separate mobile client setup and validation scope.
 
 Docker runs the relay and browser site; Windows capture and encoding stay native. The Rust relay has automated checks. Container execution and native streaming against it remain [release acceptance checks](release-status.md).

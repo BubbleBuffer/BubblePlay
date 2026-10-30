@@ -536,6 +536,12 @@ pub enum Action {
     },
     ExportKey,
     ImportKey,
+    /// `ImportKey` for hosts that pick the file themselves (the Flutter app, on both
+    /// platforms): the host read the chosen file and hands over its name and text.
+    ImportKeyText {
+        file_name: String,
+        text: String,
+    },
     ReplaceKey,
     // session
     SetMode(StreamMode),

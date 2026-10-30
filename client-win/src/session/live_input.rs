@@ -29,7 +29,7 @@ use crate::{
     input::{Mode, SessionInput},
     model::StreamMode,
     net::{InputLink, ModeOutcome, SessionControls},
-    shell::{InputCapture, Rect},
+    surface::{InputCapture, Rect},
 };
 
 use super::SessionInputState as CaptureStatus;
