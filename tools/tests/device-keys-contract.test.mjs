@@ -2,9 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import * as crypto from "node:crypto";
+import { DeviceKeyError, createDeviceKeyApi, keyFileAAD } from "../../worker/public/devicekey.js";
 
 // Deliberately independent of tools/device-keys/gen-contract.mjs.
 const fixture = JSON.parse(readFileSync(new URL("../../fixtures/device-keys-contract.json", import.meta.url), "utf8"));
+// Vendored from the shared crate; never edited here.
+const shared = JSON.parse(readFileSync(new URL("../../fixtures/shared/device-keys-contract.json", import.meta.url), "utf8"));
 const fromHex = value => {
   assert.match(value, /^(?:[0-9a-f]{2})+$/);
   return Buffer.from(value, "hex");
@@ -125,7 +128,7 @@ test("three ID derivations and lowercase, O/I/L, unhyphenated parsing", () => {
 });
 
 test("plain bpkey contains the seed and consistent public key/ID", () => {
-  const { seedHex, file } = fixture.keyFiles.plain;
+  const { seedHex, file } = fixture.legacyKeyFiles.plain;
   assert.equal(file.kdf, null);
   assert.equal(file.aead, null);
   const seed = bytes(file.private, 32);
@@ -134,7 +137,7 @@ test("plain bpkey contains the seed and consistent public key/ID", () => {
 });
 
 test("protected bpkey metadata and RFC 8785 AAD remain checkable on Node 22", () => {
-  const vector = fixture.keyFiles.passphrase, file = vector.file;
+  const vector = fixture.legacyKeyFiles.passphrase, file = vector.file;
   assert.deepEqual(Object.keys(file).sort(), ["format", "version", "type", "id", "label", "created", "public", "kdf", "aead", "private"].sort());
   assert.deepEqual(file.kdf, { alg: "argon2id", m: 65536, t: 3, p: 1, salt: file.kdf.salt });
   assert.deepEqual(file.aead, { alg: "aes-256-gcm", nonce: file.aead.nonce });
@@ -146,8 +149,8 @@ test("protected bpkey metadata and RFC 8785 AAD remain checkable on Node 22", ()
   assert.equal(fileAAD(file).toString("hex"), vector.aadHex);
   // Sorting is independent of the order used by the serialized key file.
   assert.deepEqual(fileAAD(Object.fromEntries(Object.entries(file).reverse())), fileAAD(file));
-  const [wrong, tampered] = fixture.keyFiles.failures;
-  assert.deepEqual(fixture.keyFiles.failures.map(v => v.name), ["wrong-passphrase", "tampered-aad"]);
+  const [wrong, tampered] = fixture.legacyKeyFiles.failures;
+  assert.deepEqual(fixture.legacyKeyFiles.failures.map(v => v.name), ["wrong-passphrase", "tampered-aad"]);
   assert.deepEqual(wrong.file, file);
   assert.notEqual(wrong.passphrase, vector.passphrase);
   assert.equal(tampered.passphrase, vector.passphrase);
@@ -157,7 +160,7 @@ test("protected bpkey metadata and RFC 8785 AAD remain checkable on Node 22", ()
 
 test("Argon2id protected bpkey encrypts and decrypts the seed", t => {
   if (typeof crypto.argon2Sync !== "function") return t.skip("needs Node >= 24.7 for argon2");
-  const { seedHex, passphrase, kdfKeyHex, file } = fixture.keyFiles.passphrase;
+  const { seedHex, passphrase, kdfKeyHex, file } = fixture.legacyKeyFiles.passphrase;
   const key = keyFromPassphrase(file, passphrase);
   assert.equal(key.toString("hex"), kdfKeyHex);
   const encrypted = seal(key, bytes(file.aead.nonce, 12), fileAAD(file), fromHex(seedHex));
@@ -166,7 +169,7 @@ test("Argon2id protected bpkey encrypts and decrypts the seed", t => {
   assert.deepEqual(seed, fromHex(seedHex));
   validateIdentity(file, seed);
 });
-for (const vector of fixture.keyFiles.failures) {
+for (const vector of fixture.legacyKeyFiles.failures) {
   test(`protected bpkey refuses ${vector.name}`, t => {
     if (typeof crypto.argon2Sync !== "function") return t.skip("needs Node >= 24.7 for argon2");
     assert.equal(vector.expected, "authentication-failed");
@@ -342,6 +345,71 @@ test("relay registration proofs recompute encodings, hashes and signatures", () 
   assert.deepEqual(Object.keys(m.helloOk).sort(), ["ticket", "type"]);
   assert.equal(m.helloOk.type, "hello-ok");
   bytes(m.helloOk.ticket, 32);
+});
+
+// ---- Shared fixture (fixtures/shared): checked against the browser module, worker/public/devicekey.js.
+// Protected vectors need crypto.argon2Sync (Node >= 24.7); Node 22 skips them. CI runs this file on Node 22 and 24.
+const argon2Skip = typeof crypto.argon2Sync === "function" ? false : "needs Node >= 24.7 for argon2";
+const nodeKdf = ({ password, salt }) => crypto.argon2Sync("argon2id", {
+  message: password, nonce: salt, parallelism: 1, tagLength: 32, memory: 65536, passes: 3,
+});
+const sharedApi = createDeviceKeyApi({ kdf: nodeKdf });
+
+test("shared fixture: three ID derivations match their public keys", () => {
+  assert.equal(shared.ids.length, 3);
+  for (const vector of shared.ids) {
+    const publicBytes = rawPublic(secret(vector.seedHex));
+    assert.deepEqual(publicBytes, bytes(vector.public, 32));
+    assert.equal(digest(publicBytes).toString("hex"), vector.sha256Hex);
+    assert.equal(idOf(publicBytes), vector.id);
+  }
+});
+
+test("shared fixture: plain key file unlocks in the module to its public key and ID", async () => {
+  const { file } = shared.keyFiles.plain;
+  const unlocked = await sharedApi.unlockKeyFile(JSON.stringify(file));
+  assert.equal(unlocked.id, file.id);
+  assert.deepEqual(Buffer.from(unlocked.publicKey), bytes(file.public, 32));
+});
+
+test("shared fixture: protected key file AAD matches the module's AAD byte for byte", () => {
+  const { file, aadUtf8, aadHex } = shared.keyFiles.passphrase;
+  assert.equal(Buffer.from(keyFileAAD(file)).toString("utf8"), aadUtf8);
+  assert.equal(Buffer.from(keyFileAAD(file)).toString("hex"), aadHex);
+});
+
+test("shared fixture: protected key file unlocks with its passphrase in the module", { skip: argon2Skip }, async () => {
+  const { file, passphrase } = shared.keyFiles.passphrase;
+  const unlocked = await sharedApi.unlockKeyFile(JSON.stringify(file), passphrase);
+  assert.equal(unlocked.id, file.id);
+  assert.deepEqual(Buffer.from(unlocked.publicKey), bytes(file.public, 32));
+});
+
+for (const vector of shared.keyFiles.failures) {
+  test(`shared fixture: the module refuses protected key file ${vector.name}`, { skip: argon2Skip }, async () => {
+    await assert.rejects(sharedApi.unlockKeyFile(JSON.stringify(vector.file), vector.passphrase),
+      error => error instanceof DeviceKeyError && error.code === vector.expected);
+  });
+}
+
+test("shared fixture: relay proofs recompute with each vector's own label, hash and signature", () => {
+  // alternate-label is valid under its own label: the label is part of the signed encoding, not a constant.
+  assert.deepEqual(shared.relayProof.vectors.map(v => v.name), ["host", "viewer", "alternate-label", "wrong-origin"]);
+  assert.deepEqual(shared.relayProof.vectors.map(v => v.label),
+    ["bubblebuffer-relay-v1", "bubblebuffer-relay-v1", "independent-project-proof-v2", "bubblebuffer-relay-v1"]);
+  for (const vector of shared.relayProof.vectors) {
+    assert.ok(["valid", "invalid"].includes(vector.expected), vector.name);
+    const publicBytes = bytes(vector.public, 32);
+    const nonce = bytes(vector.nonce, 32);
+    assert.equal(idOf(publicBytes), vector.id);
+    assert.deepEqual(nonce, fromHex(vector.nonceHex));
+    const encoding = lengthPrefixed([text(vector.label), text(vector.role), text(vector.origin), nonce, text(vector.id), publicBytes]);
+    assert.equal(encoding.toString("hex"), vector.encodingHex, vector.name);
+    const hash = digest(encoding);
+    assert.equal(hash.toString("hex"), vector.sha256Hex, vector.name);
+    const verified = crypto.verify(null, hash, publicKey(publicBytes), bytes(vector.signature, 64));
+    assert.equal(verified, vector.expected === "valid", vector.name);
+  }
 });
 
 // ---- Phase 2 (decisions 2026-10-25). Recomputed independently from the phase 0 handshake inputs.

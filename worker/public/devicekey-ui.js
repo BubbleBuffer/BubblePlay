@@ -5,7 +5,7 @@
 // createKey/importKey.
 // The unlocked key is never kept. Passphrases are read from inputs, and the dialog that held them
 // is removed when it closes (JavaScript strings cannot be wiped, so references are dropped).
-import { createKeyFile, parseKeyFile, rewrapKeyFile } from "./devicekey.js";
+import { convertLegacyKeyFile, createKeyFile, isLegacyKeyFileText, parseKeyFile, rewrapKeyFile } from "./devicekey.js";
 import { createDeviceKeyStore } from "./devicekey-store.js";
 
 const KEY_EXTENSION = ".bpkey";
@@ -78,6 +78,14 @@ export function passphraseValue(text) {
   return text === "" ? undefined : text;
 }
 
+/**
+ * The text to store or export. A legacy key file is converted to the shared format, with the
+ * passphrase when it is protected; any other text is returned unchanged.
+ */
+export async function shareableKeyText(text, passphrase, convert) {
+  return isLegacyKeyFileText(text) ? convert(text, passphrase) : text;
+}
+
 /** Display fields from a parsed key file. A file with a KDF block is protected by a passphrase. */
 export function summarizeKeyFile(file) {
   return {
@@ -105,7 +113,7 @@ export async function installDeviceKeyUi({
   store = createDeviceKeyStore(),
   userAgent = globalThis.navigator?.userAgent ?? "",
   clipboard = globalThis.navigator?.clipboard ?? null,
-  keys = { createKeyFile, parseKeyFile, rewrapKeyFile },
+  keys = { createKeyFile, parseKeyFile, rewrapKeyFile, convertLegacyKeyFile },
 } = {}) {
   const mount = doc.getElementById("device-key-settings");
   if (!mount) return null;
@@ -377,6 +385,8 @@ export async function installDeviceKeyUi({
     return true;
   }
 
+  const storableText = (text, passphrase) => shareableKeyText(text, passphrase, keys.convertLegacyKeyFile);
+
   async function importFlow() {
     const picked = await formModal({
       title: "Import device key",
@@ -389,7 +399,7 @@ export async function installDeviceKeyUi({
         const text = await values.file.text();
         try {
           const file = await keys.parseKeyFile(text);
-          return { text, file, protected: false };
+          return { text: await storableText(text), file, protected: false };
         } catch (error) {
           if (error?.code === "passphrase-required") return { text, file: null, protected: true };
           throw error;
@@ -399,14 +409,20 @@ export async function installDeviceKeyUi({
     if (!picked) return false;
 
     let file = picked.file;
+    let stored = picked.text;
     if (picked.protected) {
-      file = await passphrasePrompt({
+      const checked = await passphrasePrompt({
         title: "Import device key",
         lead: "This key file is protected. Enter its passphrase to check it.",
         submitLabel: "Check key",
-        run: passphrase => keys.parseKeyFile(picked.text, passphrase),
+        run: async passphrase => ({
+          file: await keys.parseKeyFile(picked.text, passphrase),
+          text: await storableText(picked.text, passphrase),
+        }),
       });
-      if (!file) return false;
+      if (!checked) return false;
+      file = checked.file;
+      stored = checked.text;
     }
 
     if (entry) {
@@ -419,9 +435,9 @@ export async function installDeviceKeyUi({
       if (!replace) return false;
     }
 
-    // The imported text is stored byte for byte, as the file was checked.
-    await store.save(picked.text);
-    entry = makeEntry(picked.text);
+    // A shared-format file is stored byte for byte, as it was checked; a legacy one is stored converted.
+    await store.save(stored);
+    entry = makeEntry(stored);
     renderSettings();
     setStatus(`Key imported: ${summarizeKeyFile(file).label || file.id}.`);
     return true;
@@ -451,7 +467,8 @@ export async function installDeviceKeyUi({
     });
     if (!mode) return false;
     if (mode === "keep") {
-      saveFile(name, text);
+      // A legacy protected key has no passphrase here, so this throws passphrase-required (shown as ERROR_TEXT).
+      saveFile(name, await storableText(text));
       setStatus(`Exported ${name}.`);
       return true;
     }

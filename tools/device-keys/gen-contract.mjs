@@ -1,10 +1,14 @@
 #!/usr/bin/env node
+// Writes BubblePlay's local sections of fixtures/device-keys-contract.json: ids, legacyKeyFiles
+// (bubbleplay-device-key vectors), handshake, relayProof (bubbleplay-relay-v1) and phase2.
+// `--check` never writes. It verifies the vendored shared fixture, fixtures/shared/device-keys-contract.json.
 // TEST ONLY: every private key, salt and nonce below is public and deterministic.
 // Never use these values for real identities, key files or sessions.
 import * as crypto from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 
-if (typeof crypto.argon2Sync !== "function") {
+const checking = process.argv.includes("--check");
+if (!checking && typeof crypto.argon2Sync !== "function") {
   console.error("Device-key contract generation requires crypto.argon2Sync (Node >= 24.7); no fixture was written.");
   process.exit(1);
 }
@@ -62,6 +66,78 @@ function identity(name, seedHex) {
   const publicKey = publicRaw(privateKey(hex(seedHex), "ed25519"));
   return { name, seedHex, public: b64(publicKey), sha256Hex: sha256(publicKey).toString("hex"), id: deviceId(publicKey) };
 }
+function decrypt(key, nonce, associated, sealed) {
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
+  decipher.setAAD(associated);
+  decipher.setAuthTag(sealed.subarray(-16));
+  return Buffer.concat([decipher.update(sealed.subarray(0, -16)), decipher.final()]);
+}
+
+// --check: recomputes every vector of the shared fixture from its own inputs and labels. Exits
+// non-zero on any mismatch. Protected key files need argon2Sync (Node >= 24.7); without it they are
+// reported as skipped, not passed.
+function checkSharedFixture() {
+  const shared = JSON.parse(readFileSync(new URL("../../fixtures/shared/device-keys-contract.json", import.meta.url), "utf8"));
+  const problems = [];
+  const skipped = [];
+  let checks = 0;
+  const check = (ok, what) => {
+    checks++;
+    if (!ok) problems.push(what);
+  };
+  for (const vector of shared.ids) {
+    const publicBytes = publicRaw(privateKey(hex(vector.seedHex), "ed25519"));
+    check(b64(publicBytes) === vector.public, `ids ${vector.name}: public key`);
+    check(sha256(publicBytes).toString("hex") === vector.sha256Hex, `ids ${vector.name}: sha256`);
+    check(deviceId(publicBytes) === vector.id, `ids ${vector.name}: ID`);
+  }
+  const plain = shared.keyFiles.plain;
+  const plainPublic = publicRaw(privateKey(hex(plain.seedHex), "ed25519"));
+  check(plain.file.format === "bubblebuffer-device-key" && plain.file.kdf === null && plain.file.aead === null, "keyFiles.plain: shape");
+  check(plain.file.private === b64(hex(plain.seedHex)), "keyFiles.plain: private is the seed");
+  check(plain.file.public === b64(plainPublic) && plain.file.id === deviceId(plainPublic), "keyFiles.plain: public key and ID");
+  if (typeof crypto.argon2Sync !== "function") {
+    skipped.push("keyFiles.passphrase and failures (argon2Sync needs Node >= 24.7)");
+  } else {
+    const kdfOf = (file, passphrase) => crypto.argon2Sync("argon2id", {
+      message: Buffer.from(passphrase, "utf8"), nonce: Buffer.from(file.kdf.salt, "base64url"),
+      parallelism: file.kdf.p, tagLength: 32, memory: file.kdf.m, passes: file.kdf.t,
+    });
+    const opens = (file, passphrase) => {
+      try {
+        decrypt(kdfOf(file, passphrase), Buffer.from(file.aead.nonce, "base64url"), aad(file), Buffer.from(file.private, "base64url"));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const protectedVector = shared.keyFiles.passphrase;
+    check(protectedVector.file.format === "bubblebuffer-device-key", "keyFiles.passphrase: format");
+    check(aad(protectedVector.file).toString("utf8") === protectedVector.aadUtf8, "keyFiles.passphrase: AAD (UTF-8)");
+    check(aad(protectedVector.file).toString("hex") === protectedVector.aadHex, "keyFiles.passphrase: AAD (hex)");
+    check(kdfOf(protectedVector.file, protectedVector.passphrase).toString("hex") === protectedVector.kdfKeyHex, "keyFiles.passphrase: Argon2id key");
+    check(opens(protectedVector.file, protectedVector.passphrase), "keyFiles.passphrase: opens with its passphrase");
+    for (const vector of shared.keyFiles.failures) {
+      check(!opens(vector.file, vector.passphrase), `keyFiles.failures ${vector.name}: refused`);
+    }
+  }
+  for (const vector of shared.relayProof.vectors) {
+    const publicBytes = Buffer.from(vector.public, "base64url");
+    const encoding = lengthPrefixed([utf8(vector.label), utf8(vector.role), utf8(vector.origin),
+      Buffer.from(vector.nonce, "base64url"), utf8(vector.id), publicBytes]);
+    check(deviceId(publicBytes) === vector.id, `relayProof ${vector.name}: ID`);
+    check(encoding.toString("hex") === vector.encodingHex, `relayProof ${vector.name}: encoding (label ${vector.label})`);
+    const hash = sha256(encoding);
+    check(hash.toString("hex") === vector.sha256Hex, `relayProof ${vector.name}: SHA-256`);
+    const verifyKey = crypto.createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: vector.public }, format: "jwk" });
+    check(crypto.verify(null, hash, verifyKey, Buffer.from(vector.signature, "base64url")) === (vector.expected === "valid"),
+      `relayProof ${vector.name}: signature is ${vector.expected}`);
+  }
+  for (const problem of problems) console.error(`MISMATCH ${problem}`);
+  console.log(`shared fixture: ${checks} checks, ${problems.length} mismatches${skipped.length ? `; skipped ${skipped.join("; ")}` : ""}`);
+  return problems.length ? 1 : 0;
+}
+if (checking) process.exit(checkSharedFixture());
 
 // TEST ONLY: RFC 8032 seeds for the first two identities; fixed alias-test seed.
 const ids = [
@@ -282,7 +358,7 @@ const fixture = {
   version: 1,
   notes: "See docs/architecture/device-keys.md, Phase 0 results. TEST ONLY: all private keys, passphrases, salts and nonces are public deterministic vectors; never use them in production. Binary JSON fields use unpadded base64url unless named Hex; plaintextUtf8 and aadUtf8 are exact UTF-8 strings.",
   ids,
-  keyFiles: {
+  legacyKeyFiles: {
     plain: { seedHex: ids[1].seedHex, file: plainFile },
     passphrase: { seedHex: ids[0].seedHex, passphrase, kdfKeyHex: kdfKey.toString("hex"),
       aadUtf8: associated.toString("utf8"), aadHex: associated.toString("hex"), file: protectedFile },
