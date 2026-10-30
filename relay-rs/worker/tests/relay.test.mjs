@@ -22,6 +22,7 @@ import {
   b64,
   decide,
   gateCookieOf,
+  expectDropped,
   heldNavigation,
   browserJoin,
   dataSocket,
@@ -110,10 +111,7 @@ function authHost(host) {
 // held open with no page, and with no decision it is dropped when the hold ends: the connection
 // fails with no content.
 test('m3 GET / without a cookie is held, then dropped with no content', { timeout: CASE_TIMEOUT_MS }, async () => {
-  const error = await heldNavigation(relay.port, { path: '/', ip: freshClientIp() }).then(
-    ({ response }) => assert.fail(`expected a dropped connection, got ${response.status}`),
-    (err) => err,
-  );
+  const error = await expectDropped(heldNavigation(relay.port, { path: '/', ip: freshClientIp() }));
   assert.ok(error.ms >= GATE_HOLD_MS - 500, `held for ${error.ms} ms`);
 });
 
@@ -515,10 +513,7 @@ test('m3 a held viewer opens one ntfy approval naming only the client prefix, an
   const deny = publish.body.actions[1].headers.Authorization.replace(/^Bearer /, '');
   await decide(relay.port, deny, 'deny', ip);
   for (const pending of [held, joined]) {
-    const error = await pending.then(
-      ({ response }) => assert.fail(`expected a dropped connection, got ${response.status}`),
-      (err) => err,
-    );
+    const error = await expectDropped(pending);
     assert.ok(error.ms < GATE_HOLD_MS, `the deny ends the hold early (${error.ms} ms)`);
   }
   assert.equal(ntfy.count() - before, 1, 'the joined navigation opened no second approval');
@@ -534,10 +529,7 @@ test('m3 an approval after the hold is claimed once by the next navigation', { t
     before,
     (p) => p.body?.message === `Browser navigation awaiting approval from client prefix ${prefix}`,
   );
-  await first.then(
-    ({ response }) => assert.fail(`expected a dropped connection, got ${response.status}`),
-    () => {},
-  );
+  await expectDropped(first);
   const approve = publish.body.actions[0].headers.Authorization.replace(/^Bearer /, '');
   await decide(relay.port, approve, 'approve', ip);
   const { response, ms } = await heldNavigation(relay.port, { path: '/?a=1', ip });
@@ -722,10 +714,7 @@ test('m3 static traversal, dotfile and backslash paths are 404, and POST is 404'
 // rides in the fragment, which the page reads itself, so the Worker only maps the path.
 
 test('m3 GET /pair without a cookie is held and dropped like /', { timeout: CASE_TIMEOUT_MS }, async () => {
-  const error = await heldNavigation(relay.port, { path: '/pair', ip: freshClientIp() }).then(
-    ({ response }) => assert.fail(`expected a dropped connection, got ${response.status}`),
-    (err) => err,
-  );
+  const error = await expectDropped(heldNavigation(relay.port, { path: '/pair', ip: freshClientIp() }));
   assert.ok(error.ms >= GATE_HOLD_MS - 500, `held for ${error.ms} ms`);
 });
 

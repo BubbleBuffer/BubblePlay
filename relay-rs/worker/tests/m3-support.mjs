@@ -470,6 +470,22 @@ export async function heldNavigation(port, { path: target = '/', ip = CLIENT_IP 
   }
 }
 
+// Settles a heldNavigation that the gate is expected to drop. The Worker answers a drop with a
+// 403 whose body stream errors before its first byte. Local workerd (wrangler dev) ends that
+// response cleanly with an empty body, so a drop here is either a failed connection or an empty
+// 403 with no cookie. Anything else (a page, a redirect, a cookie) fails. Resolves to { ms, how }.
+export async function expectDropped(pending) {
+  return pending.then(
+    ({ response, ms }) => {
+      if (response.status !== 403 || response.body.length !== 0 || response.headers['set-cookie']) {
+        throw new Error(`expected a dropped navigation, got ${response.status} with ${response.body.length} bytes`);
+      }
+      return { ms, how: 'empty 403' };
+    },
+    (error) => ({ ms: error.ms, how: 'connection error' }),
+  );
+}
+
 // The decision POST, as the ntfy action sends it.
 export async function decide(port, bearer, action, ip = CLIENT_IP) {
   const decision = await httpRequest(port, {
