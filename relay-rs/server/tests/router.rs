@@ -361,3 +361,111 @@ async fn assets_symlink_escaping_the_root_is_404() {
         StatusCode::NOT_FOUND
     );
 }
+
+// -- GET /presence ----------------------------------------------------------------------------
+
+fn presence_id(seed: u8) -> String {
+    bp_device_key::DeviceIdentity::from_seed(&[seed; 32])
+        .id()
+        .to_string()
+}
+
+/// A request without the gate cookie, as the native app sends it.
+fn cookieless(method: &str, uri: &str, peer: &str) -> Request<Body> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let peer: SocketAddr = peer.parse().unwrap();
+    request.extensions_mut().insert(ConnectInfo(peer));
+    request
+}
+
+#[tokio::test]
+async fn presence_cookieless_get_answers_json_no_store() {
+    let site = site();
+    let (a, b) = (presence_id(1), presence_id(2));
+    let uri = format!("/presence?ids={a}%2C{b}");
+    let response = send(
+        app(&site.assets),
+        cookieless("GET", &uri, "203.0.113.9:5000"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(headers.get("set-cookie").is_none());
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body, serde_json::json!({ a: false, b: false }));
+}
+
+#[tokio::test]
+async fn presence_refuses_bad_queries_with_400() {
+    let site = site();
+    let router = app(&site.assets);
+    let many = (0..21).map(presence_id).collect::<Vec<_>>().join(",");
+    for uri in [
+        format!("/presence?ids={many}"),
+        "/presence?ids=not-an-id".to_string(),
+        format!("/presence?ids={},", presence_id(1)),
+        "/presence".to_string(),
+    ] {
+        let response = send(router.clone(), cookieless("GET", &uri, "203.0.113.9:5000")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+}
+
+#[tokio::test]
+async fn presence_rate_limit_is_per_prefix() {
+    let site = site();
+    let router = app(&site.assets);
+    let uri = format!("/presence?ids={}", presence_id(1));
+    for n in 0..60 {
+        let peer = format!("203.0.113.{}:5000", n % 200);
+        let response = send(router.clone(), cookieless("GET", &uri, &peer)).await;
+        assert_eq!(response.status(), StatusCode::OK, "request {n}");
+    }
+    let response = send(
+        router.clone(),
+        cookieless("GET", &uri, "203.0.113.250:5000"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&retry));
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let response = send(router.clone(), cookieless("GET", &uri, "198.51.100.9:5000")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn presence_foreign_origin_and_other_methods_keep_gate_answers() {
+    let site = site();
+    let router = app(&site.assets);
+    let uri = format!("/presence?ids={}", presence_id(1));
+    let req = with_header(
+        cookieless("GET", &uri, "203.0.113.9:5000"),
+        "origin",
+        "https://evil.example",
+    );
+    assert_eq!(
+        send(router.clone(), req).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let req = with_header(
+        cookieless("GET", &uri, "203.0.113.9:5000"),
+        "origin",
+        "https://relay.test",
+    );
+    assert_eq!(send(router.clone(), req).await.status(), StatusCode::OK);
+    let response = send(router.clone(), cookieless("POST", &uri, "203.0.113.9:5000")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}

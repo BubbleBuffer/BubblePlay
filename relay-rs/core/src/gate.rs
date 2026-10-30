@@ -32,6 +32,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 
+use crate::presence::PRESENCE_PATH;
 use crate::rng::RelayRng;
 
 /// Name of the gate cookie. The `__Host-` prefix forces Secure and Path=/.
@@ -466,6 +467,12 @@ impl Gate {
             };
         }
         if req.path.starts_with(MANAGE_PREFIX) {
+            return Verdict::Allow;
+        }
+        // The presence query is answered by the adapter before any cookie or
+        // navigation handling, so it never opens an approval, holds, pushes
+        // ntfy or sets a cookie. Other methods on the path are unchanged.
+        if req.path == PRESENCE_PATH && req.method == "GET" {
             return Verdict::Allow;
         }
         if gate_path {

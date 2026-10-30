@@ -34,6 +34,10 @@ The browser profile holds the kept key on disk. Anyone who can copy that profile
 A refresh on a PC page (`?pc=<id>`) goes straight back to that PC. If that PC is no longer in the list, the PC list opens.
 The page pings the relay every 15 seconds. If a ping goes unanswered for 30 seconds, the page reopens its relay socket and re-authenticates without showing anything; other socket drops reconnect the same way after 250 ms.
 
+## Online status
+
+The relay also answers `GET /presence?ids=<id>,<id>` with which of up to 20 PCs have their host connected (see [the relay README](../relay-rs/README.md#presence-get-presence)). Native clients use it. The browser viewer does not yet; it may later use it to mark paired PCs online or offline in the PC list. The route is for same-origin use only: a request from another origin is refused, and there is no CORS.
+
 ## Paired PCs
 
 Paired PCs are kept in the `pcs` store of the same database, per relay origin.

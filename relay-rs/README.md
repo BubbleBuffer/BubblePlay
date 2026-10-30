@@ -7,8 +7,28 @@ the state files, the subcommands, the static asset handler and `/healthz`.
 `serve` runs the relay state machine (`bp-relay-core`) and the site gate behind one axum router.
 Every HTTP path and every WebSocket upgrade passes the gate first. The signalling, media and file
 WebSocket routes (`/host-ws`, `/ws`, `/host-version-ws`, `/host-media-ws`, `/media-ws`,
-`/host-file-ws`, `/file-ws`) go to the relay. `/healthz` and the `/__gate/manage/` admin API are
-handled by the server itself. Static assets come from `assets_dir`.
+`/host-file-ws`, `/file-ws`) go to the relay. `/healthz`, `GET /presence` and the
+`/__gate/manage/` admin API are handled by the server itself. Static assets come from `assets_dir`.
+
+## Presence: GET /presence
+
+`GET /presence?ids=A,B,C` tells a native client which PCs are online. It needs no cookie and no
+bearer, and it has no side effects: it only reads whether a host socket for each PC is open (the
+same state as `online` in the admin listing).
+
+- Up to 20 device ids, comma-separated (`%2C` works too). More than 20, a missing or empty `ids`,
+  or any malformed id is `400` with a JSON body such as `{"error":"too many ids"}`.
+- `200 application/json`: one key per requested id in canonical form (`77VH-7M56-8GJK-Y12J`),
+  `true` while that PC's host socket is open, else `false`. An unknown id is `false`.
+- 60 requests per minute per client prefix (IPv4 /24, IPv6 /56, as the gate counts). Over that,
+  `429` with `Retry-After` in seconds. The counter is in memory only.
+- Every answer carries `Cache-Control: no-store`. Ids are not logged.
+- The gate lets only a GET on exactly `/presence` through, before its navigation step, so a
+  cookieless query never opens an approval, holds, publishes to ntfy or sets a cookie, whatever
+  its `Sec-Fetch-Dest`. A request whose `Origin` is not `public_origin` is still refused (404), and
+  there is no CORS: the route is for native clients. Other methods on the path get the gate's
+  usual answers (cookieless POST 403, HEAD dropped).
+- The Cloudflare build answers the route the same way from the Durable Object.
 
 ## Configuration: relay.json
 
