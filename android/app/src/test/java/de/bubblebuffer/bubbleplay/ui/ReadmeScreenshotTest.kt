@@ -236,7 +236,8 @@ private object FakeAndroidKeyStore {
 
     private fun names(): List<String> = synchronized(keys) { keys.keys.toList() }
 
-    private class FakeProvider : Provider(NAME, "1.0", "in-memory stand-in for AndroidKeyStore") {
+    // The double-version constructor: android.jar, which compiles the unit tests, has no String one.
+    private class FakeProvider : Provider(NAME, 1.0, "in-memory stand-in for AndroidKeyStore") {
         init {
             putService(object : Provider.Service(this, "KeyStore", NAME, "", emptyList(), emptyMap()) {
                 override fun newInstance(constructorParameter: Any?): Any = FakeKeyStore()
