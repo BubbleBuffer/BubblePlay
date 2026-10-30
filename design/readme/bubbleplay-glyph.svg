@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="382 374 538 552">
+<title>BubblePlay E1e: screen cat, cursor in the corner</title>
+<desc>E1 with a smaller apricot cursor tucked into the lower-right corner of the display.</desc>
+<metadata id="pawth-style" type="application/json">{"version":1,"kit":"kits/bubblebuffer.kit.svg"}</metadata>
+<metadata id="pawth-icon" type="application/json">{"version":1,"template":"android-adaptive"}</metadata>
+<g id="safe-fit" data-name="Safe-circle fit" transform="translate(640 640) scale(0.725) translate(-621.5 -608)">
+<g id="monitor-head" data-name="Monitor head" data-part="head/monitor">
+<path id="bezel" data-name="Milk bezel" d="M275  790V250L450  370H780L955  250V790Q955  840  905  840H325Q275  840  275  790Z" fill="#FFFAF1"/>
+<path id="ear-left" data-name="Charcoal ear patch" d="M275  250L450  370H275Z" fill="#282A2F"/>
+<path id="ear-right" data-name="Apricot ear patch" d="M955  250L780  370H955Z" fill="#DE945F"/>
+<path id="display" data-name="Facet display" d="M375  420H855Q885  420  885  450V735Q885  765  855  765H375Q345  765  345  735V450Q345  420  375  420Z" fill="#E4DCCD" stroke="#282A2F" stroke-width="52.32" stroke-linecap="round" stroke-linejoin="round"/>
+<path id="bezel-outline" data-name="Monitor outline" d="M275  790V250L450  370H780L955  250V790Q955  840  905  840H325Q275  840  275  790Z" fill="none" stroke="#282A2F" stroke-width="57.21" stroke-linecap="round" stroke-linejoin="round"/>
+<path id="neck" data-name="Screen neck" d="M615  840V915" fill="none" stroke="#282A2F" stroke-width="57.21" stroke-linecap="round" stroke-linejoin="round"/>
+<path id="foot" data-name="Screen foot" d="M495  935H735" fill="none" stroke="#282A2F" stroke-width="57.21" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<g id="face" data-name="Happy face" data-part="face/happy">
+<path id="eye-left" data-name="Left happy eye" d="M451.92  549.17L497.78  503.3H513.07L558.95  549.17" fill="none" stroke="#282A2F" stroke-width="52.32" stroke-linecap="round" stroke-linejoin="round"/>
+<path id="eye-right" data-name="Right happy eye" d="M671.06  549.17L716.93  503.3H732.22L778.08  549.17" fill="none" stroke="#282A2F" stroke-width="52.32" stroke-linecap="round" stroke-linejoin="round"/>
+<path id="nose" data-name="Soft triangular nose" d="M600.73  589.94H629.27Q636.41  589.94  631.31  595.54L620.1  606.24Q615  610.83  609.9  606.24L598.69  595.54Q593.59  589.94  600.73  589.94Z" fill="#DE945F"/>
+<path id="smile" data-name="Double smile" d="M548.75  620.51C548.75  696.96  615  696.96  615  625.61C615  696.96  681.25  696.96  681.25  620.51" fill="none" stroke="#282A2F" stroke-width="52.32" stroke-linecap="round" stroke-linejoin="round"/>
+<path id="cheek-left" data-name="Left rosy cheek" d="M431.54  610.32L462.11  617.46" fill="none" stroke="#DDA39D" stroke-width="26.07" stroke-linecap="round" stroke-linejoin="round"/>
+<path id="cheek-right" data-name="Right rosy cheek" d="M767.89  617.46L798.46  610.32" fill="none" stroke="#DDA39D" stroke-width="26.07" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<g id="cursor" data-name="Apricot cursor" data-part="object/cursor" transform="translate(800 690)">
+<path id="arrow" data-name="Apricot arrow" d="M0  0L0  264L64  204L112  304L164  280L116  182.4L200  182.4Z" fill="#DE945F" stroke="#282A2F" stroke-width="57.21" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</g>
+</svg>
