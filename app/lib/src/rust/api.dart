@@ -7,7 +7,7 @@ import 'frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `core`
+// These functions are ignored because they are not marked as `pub`: `core`, `devices`
 
 /// Opens the viewer key and PC list in `%LOCALAPPDATA%\BubblePlay\viewer`. Call once.
 Future<void> appStart() => RustLib.instance.api.crateApiAppStart();
@@ -24,3 +24,18 @@ Future<String> appExportKey() => RustLib.instance.api.crateApiAppExportKey();
 
 /// One event per snapshot change.
 Stream<void> appChanges() => RustLib.instance.api.crateApiAppChanges();
+
+/// Connects to the host's Devices pipe and keeps reconnecting while the stream is listened to.
+/// Every event is one raw JSON line: the host's lines verbatim, plus `{"type":"connected"}` and
+/// `{"type":"disconnected","reason":...}` for the link itself. A second call replaces the first.
+Stream<String> devicesConnect() =>
+    RustLib.instance.api.crateApiDevicesConnect();
+
+/// Sends one command line (a JSON object: open, revoke, startPairing, cancelPairing, allow,
+/// deny). Fails when the line is invalid or the host is not connected.
+void devicesSend({required String line}) =>
+    RustLib.instance.api.crateApiDevicesSend(line: line);
+
+/// Stops the Devices pipe client.
+Future<void> devicesDisconnect() =>
+    RustLib.instance.api.crateApiDevicesDisconnect();

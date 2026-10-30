@@ -193,8 +193,13 @@ fn pairing_input_is_checked_before_anything_is_sent() {
         }
     };
     assert!(submit(&mut backend, "nope", "70Q1K-9MXR1", "https://relay.example").contains("PC ID"));
-    assert!(submit(&mut backend, "77VH-7M56-8GJK-Y12J", "xx", "https://relay.example")
-        .contains("pairing code"));
+    assert!(submit(
+        &mut backend,
+        "77VH-7M56-8GJK-Y12J",
+        "xx",
+        "https://relay.example"
+    )
+    .contains("pairing code"));
     assert!(submit(&mut backend, "77VH-7M56-8GJK-Y12J", "70Q1K-9MXR1", " ").contains("relay"));
 }
 
