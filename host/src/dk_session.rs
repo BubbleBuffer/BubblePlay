@@ -703,6 +703,17 @@ impl Session {
         }
     }
 
+    /// The device ID the current viewer claimed in its auth-hello, for diagnostics only. Before
+    /// auth-finish verifies it this is a claim, not an identity; it is never a secret.
+    pub fn claimed_viewer_id(&self) -> Option<&str> {
+        match &self.state {
+            State::AwaitFinish(hand) | State::AwaitViewerProof(hand) => Some(&hand.viewer.id),
+            State::AwaitDecision(viewer) | State::AwaitSave(viewer) => Some(&viewer.id),
+            State::Established(channel) => Some(&channel.viewer.id),
+            State::Idle | State::AwaitHello(_) | State::Ended => None,
+        }
+    }
+
     fn channel_mut(&mut self) -> Result<&mut Channel, SessionError> {
         match &mut self.state {
             State::Established(channel) => Ok(channel.as_mut()),
