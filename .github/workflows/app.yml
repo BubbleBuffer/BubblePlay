@@ -34,7 +34,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: app-${{ github.ref }}
@@ -90,8 +90,22 @@ jobs:
           else
             flutter test
           fi
+      - name: Commit golden pictures
+        # Artifacts can hit the account quota, so the pictures are also pushed back to the branch.
+        if: ${{ inputs.update_goldens }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "BubblePlay CI"
+          git config user.email "ci@users.noreply.github.com"
+          git add app/test/screens/goldens
+          if git diff --cached --quiet; then echo "goldens unchanged"; else
+            git commit -m "App: golden pictures rendered on build01"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${{ github.ref_name }}"
+          fi
       - name: Upload golden pictures
         if: ${{ inputs.update_goldens }}
+        continue-on-error: true
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: app-goldens
