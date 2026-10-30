@@ -48,21 +48,27 @@ flutter {
     source = "../.."
 }
 
-// The Kotlin core (keys, auth, pcs, pairing) is compiled from the native app's source tree, not
-// copied: the files stay where they are and this module takes only the packages the app contract
-// needs. Everything else in that tree (ui, media, input, files, protocol, the session) is left out.
+// The Kotlin core (keys, auth, pcs, pairing) is compiled from the native app's source tree. A Sync
+// task stages only the packages the app contract needs (the Kotlin compile task ignores include
+// filters on shared source dirs); everything else there (ui, media, input, files, protocol, the
+// session) is left out. The staged copy is build output and is regenerated on every build.
 val nativeCore = rootProject.file("../../android/app/src/main/java")
-android.sourceSets.getByName("main").java.srcDir(nativeCore)
-
-tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
-    include(
-        "de/bubblebuffer/bubbleplay/flutter/**",
-        "de/bubblebuffer/bubbleplay/keys/**",
-        "de/bubblebuffer/bubbleplay/auth/**",
-        "de/bubblebuffer/bubbleplay/pcs/**",
-        "de/bubblebuffer/bubbleplay/net/PairingClient.kt",
-        "de/bubblebuffer/bubbleplay/net/ServerConfig.kt",
-    )
+val stageNativeCore by tasks.registering(Sync::class) {
+    from(nativeCore) {
+        include(
+            "de/bubblebuffer/bubbleplay/keys/**",
+            "de/bubblebuffer/bubbleplay/auth/**",
+            "de/bubblebuffer/bubbleplay/pcs/**",
+            "de/bubblebuffer/bubbleplay/net/PairingClient.kt",
+            "de/bubblebuffer/bubbleplay/net/ServerConfig.kt",
+        )
+    }
+    into(layout.buildDirectory.dir("nativeCore"))
+}
+android.sourceSets.getByName("main").java.srcDir(stageNativeCore.map { it.destinationDir })
+tasks.configureEach {
+    if (name.startsWith("compile") && name.contains("Kotlin")) dependsOn(stageNativeCore)
+    if (name.startsWith("ksp") || name.startsWith("lint")) dependsOn(stageNativeCore)
 }
 
 dependencies {
