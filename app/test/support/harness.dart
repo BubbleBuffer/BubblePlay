@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:ui' show Brightness;
 
 import 'package:bubbleplay_app/src/app.dart';
 import 'package:bubbleplay_app/src/app_controller.dart';
@@ -52,6 +51,7 @@ Future<TestApp> pumpApp(
   Screen screen = Screen.desktop,
   Brightness brightness = Brightness.dark,
   bool windows = true,
+  ValueNotifier<Brightness?>? theme,
 }) async {
   tester.view.physicalSize = Size(screen.width, screen.height);
   tester.view.devicePixelRatio = 1;
@@ -64,30 +64,48 @@ Future<TestApp> pumpApp(
   await tester.pumpWidget(
     BubblePlayApp(
       brightness: brightness,
-      env: AppEnv(controller: controller, isWindows: windows, keyFiles: keyFiles),
+      env: AppEnv(
+        controller: controller,
+        isWindows: windows,
+        keyFiles: keyFiles,
+        theme: theme,
+      ),
     ),
   );
   await tester.pump();
   return TestApp._(channel, controller, keyFiles);
 }
 
-/// Registers one golden per size and theme for each scene of [screen]: `scenes` maps a scene
-/// name to the snapshot to show. Files land in `test/goldens/<screen>_<scene>_<size>_<theme>.png`
-/// and are written on the CI platform (Linux), never on a developer PC. Call from a test file
-/// tagged `@Tags(['golden'])`.
+/// A golden scene: a snapshot, plus an optional [setUp] that drives the UI before the picture
+/// (open a panel, tap a tab). [windows] forces the platform; by default desktop is Windows and
+/// the phone is Android.
+class Scene {
+  const Scene(this.state, {this.setUp, this.windows});
+
+  final Object? state;
+  final Future<void> Function(WidgetTester tester)? setUp;
+  final bool? windows;
+}
+
+/// Registers one golden per size and theme for each scene of [screen]. `scenes` maps a scene
+/// name to a snapshot or a [Scene]. Files land in `goldens/<screen>_<scene>_<size>_<theme>.png`
+/// next to the test file and are written on the CI platform (Linux), never on a developer PC.
+/// Call from a test file tagged `@Tags(['golden'])`.
 void goldenScenes(String screen, Map<String, Object?> scenes) {
-  for (final MapEntry(key: scene, value: state) in scenes.entries) {
+  for (final MapEntry(key: sceneName, value: value) in scenes.entries) {
+    final scene = value is Scene ? value : Scene(value);
     for (final size in Screen.values) {
       for (final brightness in Brightness.values) {
-        final name = '${screen}_${scene}_${size.name}_${brightness.name}';
+        final name = '${screen}_${sceneName}_${size.name}_${brightness.name}';
         testWidgets('golden $name', (tester) async {
           await pumpApp(
             tester,
-            state,
+            scene.state,
             screen: size,
             brightness: brightness,
-            windows: size == Screen.desktop,
+            windows: scene.windows ?? size == Screen.desktop,
           );
+          await scene.setUp?.call(tester);
           await expectLater(
             find.byType(WidgetsApp),
             matchesGoldenFile('goldens/$name.png'),
