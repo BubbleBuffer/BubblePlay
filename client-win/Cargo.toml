@@ -5,18 +5,29 @@ edition = "2021"
 publish = false
 description = "BubblePlay native Windows viewer"
 
+[lib]
+name = "bubbleplay_client"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bubbleplay-client"
 path = "src/main.rs"
+required-features = ["egui-client"]
+
+[features]
+# The egui window client (shell, ui, mock, and the windowed dev session). The Flutter app's
+# core library builds with `default-features = false`.
+default = ["egui-client"]
+egui-client = ["dep:egui", "dep:egui-directx11", "dep:resvg", "dep:png"]
 
 [dependencies]
 # --- UI track: shell, ui, model, mock ---
 # egui-directx11 0.13 pins egui 0.35 and windows 0.62; every D3D11 type the
 # shell hands out (VideoLayer) comes from this windows version.
-egui = "0.35"
-egui-directx11 = "0.13"
-resvg = "0.48"
-png = "0.18"
+egui = { version = "0.35", optional = true }
+egui-directx11 = { version = "0.13", optional = true }
+resvg = { version = "0.48", optional = true }
+png = { version = "0.18", optional = true }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 windows = { version = "0.62", features = [

@@ -9,7 +9,7 @@ mod state;
 
 use crate::{
     net::InputLink,
-    shell::{InputCapture, Rect},
+    surface::{InputCapture, Rect},
 };
 use chords::{Chords, Escape};
 use hook::{KeyEvent, KeyboardHook};

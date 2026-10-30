@@ -6,17 +6,7 @@
 
 #![windows_subsystem = "windows"]
 
-mod audio;
-mod input;
-mod media;
-mod mock;
-mod model;
-mod net;
-mod session;
-mod shell;
-mod store;
-mod ui;
-
+use bubbleplay_client::{media, mock, model, session, shell, store, ui};
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {

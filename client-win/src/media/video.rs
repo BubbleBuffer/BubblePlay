@@ -11,7 +11,7 @@ use super::{
     mf::video_interface_error,
     stats::MediaStats,
 };
-use crate::shell::{Rect, VideoLayer};
+use crate::surface::{Rect, VideoLayer};
 use anyhow::{bail, Context, Result};
 use std::{
     collections::VecDeque,
