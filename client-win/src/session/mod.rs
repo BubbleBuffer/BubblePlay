@@ -15,7 +15,7 @@ mod relay_pc;
 
 pub use crate::audio::AudioHandle as SessionAudioControl;
 pub use options::DevOptions;
-pub(crate) use crate::stream::{decode, live_input, stats};
+pub(crate) use crate::stream::{decode, live_input};
 pub use crate::stream::{SessionInputState, SessionStats};
 
 use std::{

@@ -128,6 +128,11 @@ impl SharedPair {
         self.surfaces[0].size()
     }
 
+    /// The two shared handles, in creation order.
+    pub fn handles(&self) -> [HANDLE; 2] {
+        [self.surfaces[0].handle(), self.surfaces[1].handle()]
+    }
+
     /// The surface to draw the next frame into.
     pub fn back(&self) -> &SharedSurface {
         &self.surfaces[self.next]
