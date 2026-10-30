@@ -17,6 +17,7 @@ dependencies:
       url: https://github.com/BubbleBuffer/bb-ui.git
       ref: v0.7.0
       path: packages/bb_ui
+  file_picker: ^13.3.0
 
 dev_dependencies:
   flutter_test:
@@ -26,3 +27,17 @@ dev_dependencies:
 
 flutter:
   uses-material-design: false
+  fonts:
+    - family: Bricolage Grotesque
+      fonts:
+        - asset: assets/fonts/BricolageGrotesque[opsz,wdth,wght].ttf
+    - family: Atkinson Hyperlegible Next
+      fonts:
+        - asset: assets/fonts/AtkinsonHyperlegibleNext[wght].ttf
+        - asset: assets/fonts/AtkinsonHyperlegibleNext-Italic[wght].ttf
+          style: italic
+    - family: Fragment Mono
+      fonts:
+        - asset: assets/fonts/FragmentMono-Regular.ttf
+        - asset: assets/fonts/FragmentMono-Italic.ttf
+          style: italic
