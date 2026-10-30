@@ -15,6 +15,8 @@
 //!                                offer (Explorer "Send to > BubblePlay")
 #![windows_subsystem = "windows"]
 
+#[path = "../tray/app_launch.rs"]
+mod app_launch;
 #[path = "../tray/device_key_file.rs"]
 mod device_key_file;
 #[path = "../tray/key_ui.rs"]
@@ -1241,10 +1243,38 @@ impl App {
         self.start_user();
     }
 
-    /// Asks the host child that is running now to open its Devices window.
-    /// A replaced or exited child never receives the request.
-    /// "Open BubblePlay" stays enabled while the host is down, so this explains instead.
+    /// Opens Devices. With the Flutter app beside the tray: raise its window or
+    /// start it, then ask the host to tell it to show This PC (skipped quietly
+    /// when the host is down). Without the app: ask the host child that is
+    /// running now to open its Win32 Devices window; a replaced or exited
+    /// child never receives the request. "Open BubblePlay" stays enabled while
+    /// the host is down, so that path explains instead.
     fn open_devices(&self) {
+        let app = std::env::current_exe()
+            .ok()
+            .map(|exe| app_launch::app_exe_beside(&exe))
+            .filter(|app| app.is_file());
+        match app_launch::open_app(app.as_deref(), &app_launch::Win32AppOps) {
+            Ok(app_launch::OpenOutcome::App { focus_refused }) => {
+                if focus_refused {
+                    tracing::warn!("Windows refused to raise the Devices app window");
+                }
+                if let Some(Err(error)) = self.user.as_ref().map(|u| u.request_show_devices_app()) {
+                    tracing::debug!(?error, "show-devices-app not delivered");
+                }
+                return;
+            }
+            Ok(app_launch::OpenOutcome::Legacy) => {}
+            Err(error) => {
+                tracing::warn!(?error, "could not start the Devices app");
+                self.balloon(
+                    "BubblePlay",
+                    "The Devices app could not start.",
+                    NIIF_WARNING,
+                );
+                return;
+            }
+        }
         let delivered = match &self.user {
             Some(user) => user.request_open_devices(),
             None => Err(std::io::Error::other("no host child")),

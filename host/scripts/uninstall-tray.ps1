@@ -191,6 +191,32 @@ try {
         if ($PSCmdlet.ShouldProcess($item, 'Remove')) { Remove-Item -Recurse -Force -LiteralPath $item; Write-Step 'registration' 'done' "Removed $item." }
         else { Write-Step 'registration' 'planned' "Remove $item." }
     }
+    # Flutter app files that update-tray.ps1 mirrored into the install folder (listed in app-files.json).
+    $appManifest = Join-Path $InstallDir 'app-files.json'
+    if (Test-Path -LiteralPath $appManifest -PathType Leaf) {
+        $appFiles = @()
+        try {
+            foreach ($file in @((Get-Content -LiteralPath $appManifest -Raw | ConvertFrom-Json).files)) {
+                $relative = [string]$file.path
+                if ($relative -and -not [IO.Path]::IsPathRooted($relative) -and -not (($relative -split '[\\/]') -contains '..')) {
+                    $appFiles += (Join-Path $InstallDir $relative)
+                }
+            }
+        }
+        catch { }
+        $appRunning = @(Get-Process bubbleplay_app -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -and $_.Path.StartsWith("$InstallDir\", [StringComparison]::OrdinalIgnoreCase) })
+        if ($PSCmdlet.ShouldProcess($InstallDir, "Remove $($appFiles.Count) Flutter app file(s) listed in app-files.json")) {
+            foreach ($process in $appRunning) {
+                [void]$process.CloseMainWindow()
+                if (-not $process.WaitForExit(10000)) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+            }
+            foreach ($path in $appFiles) { Remove-Item -Force -LiteralPath $path -ErrorAction SilentlyContinue }
+            Remove-Item -Force -LiteralPath $appManifest -ErrorAction SilentlyContinue
+            Write-Step 'app-files' 'done' "Removed $($appFiles.Count) Flutter app file(s)."
+        }
+        else { Write-Step 'app-files' 'planned' "Remove $($appFiles.Count) Flutter app file(s) listed in app-files.json." }
+    }
     if (Test-Path -LiteralPath $InstallDir) {
         if ($PSCmdlet.ShouldProcess($InstallDir, 'Delete per-user install')) { Remove-WithRetry $InstallDir; Write-Step 'files' 'done' "Deleted $InstallDir." }
         else { Write-Step 'files' 'planned' "Delete $InstallDir." }
