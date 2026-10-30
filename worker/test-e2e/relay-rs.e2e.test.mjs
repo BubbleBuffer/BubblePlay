@@ -132,7 +132,7 @@ test("pairing from a /pair link: the same number on both sides, then pair-done",
   const location = { href: `${relay.origin}/pair#pc=${PC.id}&code=${pairing.code}`, reload() {} };
   const history = { replaceState(_state, _title, url) { location.href = new URL(url, location.href).href; } };
   const store = {
-    async load() { return JSON.stringify({ id: VIEWER.id, label: "Viewer", kdf: null, aead: null }); },
+    async load() { return JSON.stringify({ format: "bubblebuffer-device-key", id: VIEWER.id, label: "Viewer", kdf: null, aead: null }); },
     async listPcs() { return []; },
     async getPc() { return null; },
     async putPc() { throw new Error("pair-done must not save before the user confirms"); },
