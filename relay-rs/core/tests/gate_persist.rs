@@ -2,28 +2,19 @@
 
 mod gate_support;
 
-use bp_relay_core::gate::{COOKIE_MAX_AGE_SECS, Gate, GateSnapshot, Verdict};
+use bp_relay_core::gate::{COOKIE_MAX_AGE_SECS, Gate, GateEffect, GateSnapshot, Response, Verdict};
 use gate_support::*;
 use sha2::{Digest, Sha256};
 
 const COOKIE_MS: u64 = COOKIE_MAX_AGE_SECS * 1000;
 const DECIDER: &str = "198.51.100.200";
 
-/// Run the approval for CLIENT and return the poll response and its effects.
-/// The cookie is minted at `poll_at`.
-fn approve_at(
-    gate: &mut Gate,
-    rng: &mut TestRng,
-    poll_at: u64,
-) -> (
-    bp_relay_core::gate::Response,
-    Vec<bp_relay_core::gate::GateEffect>,
-) {
-    let (page, effects) = wait_parts(get(gate, rng, CLIENT, T0));
-    let token = poll_token(&page);
-    let (approve, _) = bearer_tokens(&effects[0]);
+/// Run the approval for CLIENT and return the admitted 302 and its effects.
+/// The held navigation is checked at `check_at`, which mints the cookie.
+fn approve_at(gate: &mut Gate, rng: &mut TestRng, check_at: u64) -> (Response, Vec<GateEffect>) {
+    let (hold, approve, _) = open_hold(gate, rng, CLIENT, T0);
     decide(gate, rng, &approve, "approve", DECIDER, T0 + 1_000);
-    handled_parts(poll(gate, rng, &token, CLIENT, poll_at))
+    admit_parts(check(gate, rng, &hold, check_at))
 }
 
 #[test]
@@ -61,7 +52,7 @@ fn gate_reload_drops_records_that_expired_before_the_reload() {
     snapshot.records[0].expires_ms = T0 + 10_000;
     let mut reloaded = Gate::new(config(true), snapshot, T0 + 10_000).expect("valid config");
     let verdict = get_with_cookie(&mut reloaded, &mut rng, "/", &cookie, T0 + 10_000);
-    assert!(matches!(verdict, Verdict::Wait(_, _)), "got {verdict:?}");
+    assert!(matches!(verdict, Verdict::Hold(_, _)), "got {verdict:?}");
     assert!(reloaded.snapshot().records.is_empty());
 }
 
@@ -109,7 +100,7 @@ fn gate_cookie_lasts_30_days_from_approval_with_the_fixed_attributes() {
     let valid = get_with_cookie(&mut gate, &mut rng, "/", &cookie, mint + COOKIE_MS - 1);
     assert_eq!(valid, Verdict::Allow);
     let expired = get_with_cookie(&mut gate, &mut rng, "/", &cookie, mint + COOKIE_MS);
-    assert!(matches!(expired, Verdict::Wait(_, _)), "got {expired:?}");
+    assert!(matches!(expired, Verdict::Hold(_, _)), "got {expired:?}");
 }
 
 #[test]
@@ -128,18 +119,18 @@ fn gate_cookie_expiry_is_not_extended_by_use() {
     );
     assert_eq!(used, Verdict::Allow);
     let after = get_with_cookie(&mut gate, &mut rng, "/", &cookie, mint + COOKIE_MS);
-    assert!(matches!(after, Verdict::Wait(_, _)), "got {after:?}");
+    assert!(matches!(after, Verdict::Hold(_, _)), "got {after:?}");
 }
 
 #[test]
 fn gate_pending_approvals_are_not_persisted() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(308);
-    let (_, effects) = wait_parts(get(&mut gate, &mut rng, CLIENT, T0));
+    let (_, effects) = hold_parts(get(&mut gate, &mut rng, CLIENT, T0));
     assert!(
         effects
             .iter()
-            .all(|effect| !matches!(effect, bp_relay_core::gate::GateEffect::PersistGate(_)))
+            .all(|effect| !matches!(effect, GateEffect::PersistGate(_)))
     );
     assert!(gate.snapshot().records.is_empty());
 }

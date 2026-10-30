@@ -3,11 +3,17 @@
 //! The gate sits in front of every browser-facing HTTP path and every WebSocket
 //! upgrade that carries an `Origin`. Every gated HTTP path needs a valid
 //! `__Host-gate` cookie. Without one, only a top-level navigation (a GET with
-//! `Sec-Fetch-Dest: document`, or with no `Sec-Fetch-Dest`) is held on a
-//! minimal wait page while a pending approval is published to ntfy with Approve
-//! and Deny actions. The page polls `POST /__gate/poll` until the decision
-//! lands, then reloads. Any other gated request without a cookie gets a plain
-//! 403 and opens nothing; HEAD gets the wait-page headers and opens nothing.
+//! `Sec-Fetch-Dest: document`, or with no `Sec-Fetch-Dest`) may open an
+//! approval. It gets no page: a pending approval is published to ntfy with
+//! Approve and Deny actions and the adapter holds the request open for up to
+//! [`GATE_HOLD_MS`] ([`Verdict::Hold`]), asking [`Gate::check_hold`] whether it
+//! may go on. An approval inside the hold answers the held request with a 302
+//! to the same URL and the gate cookie. An approval that lands after the hold
+//! ended is claimed by the next navigation from the same client prefix, once.
+//! Every other outcome (timeout, deny, cooldown, capacity, no approval path)
+//! is [`Verdict::Drop`]: the adapter ends the connection with no content. Any
+//! other gated request without a cookie gets a plain 403 and opens nothing;
+//! HEAD is dropped and opens nothing.
 //!
 //! Nothing here touches sockets, clocks or randomness. The adapter passes
 //! `now_ms` with every call, supplies randomness through [`RelayRng`], sends
@@ -16,7 +22,7 @@
 //! and rate counters live in memory only.
 //!
 //! Without an `ntfy` section in the config there is no approval path. Gated
-//! pages then answer 503 with "Approval not configured.".
+//! navigations are then dropped.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -38,6 +44,8 @@ const COOKIE_LIFETIME_MS: u64 = COOKIE_MAX_AGE_SECS * 1000;
 pub const MIN_APPROVAL_TTL_SECS: u64 = 30;
 pub const MAX_APPROVAL_TTL_SECS: u64 = 120;
 pub const DEFAULT_APPROVAL_TTL_SECS: u64 = 90;
+/// How long the adapter holds an unapproved navigation open before dropping it.
+pub const GATE_HOLD_MS: u64 = 30_000;
 /// Pending approvals in total, across all prefixes.
 pub const MAX_PENDING: usize = 10;
 /// Cooldown per prefix after a pending approval ends.
@@ -50,10 +58,7 @@ pub const DECISION_WINDOW_MS: u64 = 60_000;
 /// pending list. A new prefix arriving at a full map is answered 429 after
 /// expired entries are pruned.
 pub const MAX_TRACKED_PREFIXES: usize = 4096;
-/// How long an approved or denied pending entry waits to be polled.
-const RESOLVED_KEEP_MS: u64 = 300_000;
 const DECISION_PATH: &str = "/__gate/decision";
-const POLL_PATH: &str = "/__gate/poll";
 const FORGET_PATH: &str = "/__gate/forget";
 const GATE_PREFIX: &str = "/__gate/";
 const MANAGE_PREFIX: &str = "/__gate/manage/";
@@ -166,6 +171,9 @@ pub struct Response {
 pub struct Request<'a> {
     pub method: &'a str,
     pub path: &'a str,
+    /// The raw query string without the `?`, if any. Only used to send an
+    /// admitted navigation back to the URL it asked for.
+    pub query: Option<&'a str>,
     /// True for a WebSocket upgrade.
     pub websocket: bool,
     pub origin: Option<&'a str>,
@@ -188,6 +196,7 @@ impl fmt::Debug for Request<'_> {
         f.debug_struct("Request")
             .field("method", &self.method)
             .field("path", &self.path)
+            .field("query", &self.query)
             .field("websocket", &self.websocket)
             .field("origin", &self.origin)
             .field("cookie", &self.cookie.map(|_| "<redacted>"))
@@ -207,12 +216,45 @@ pub enum Verdict {
     /// Answer 404 for HTTP. Refuse a WebSocket upgrade (the adapter closes
     /// with 1008 and an empty reason, or returns 404).
     Refuse,
-    /// Answer this response. It is the wait page, a limit or configuration
-    /// page, or a plain 403 for a gated request that cannot open an approval.
-    /// Any effects (the ntfy publish) must still run.
-    Wait(Response, Vec<GateEffect>),
-    /// A gate endpoint answered. Run the effects.
+    /// Run the effects (the ntfy publish), then hold the request open and
+    /// call [`Gate::check_hold`] until it admits or drops it. Nothing is
+    /// written to the client while it is held.
+    Hold(Hold, Vec<GateEffect>),
+    /// End the connection with no content: no status page, no body.
+    Drop,
+    /// Answer this response and run the effects. A gate endpoint, a plain 403
+    /// for a gated request that cannot open an approval, or the 302 with the
+    /// gate cookie for a navigation that claims an approval.
     Handled(Response, Vec<GateEffect>),
+}
+
+/// A navigation held open while its approval is pending. The adapter keeps it
+/// and passes it to [`Gate::check_hold`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hold {
+    pending: String,
+    location: String,
+    until_ms: u64,
+}
+
+impl Hold {
+    /// When the hold ends. [`Gate::check_hold`] drops the request at this time
+    /// unless the approval landed.
+    pub fn until_ms(&self) -> u64 {
+        self.until_ms
+    }
+}
+
+/// What [`Gate::check_hold`] decided for a held navigation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoldCheck {
+    /// Still waiting. Check again a little later.
+    Waiting,
+    /// Approved. Answer this 302 (same URL, gate cookie) and run the effects.
+    Admit(Response, Vec<GateEffect>),
+    /// Denied, timed out, or claimed by another request. End the connection
+    /// with no content.
+    Drop,
 }
 
 /// Outcome of counting one decision request against its prefix.
@@ -266,14 +308,13 @@ impl fmt::Display for Prefix {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     Waiting,
+    /// Approved and not yet claimed. Claimable until `decided_ms + ttl_ms`.
     Approved,
-    Denied,
 }
 
 struct Pending {
     id: String,
     prefix: Prefix,
-    poll_hash: [u8; 32],
     approve_hash: Option<[u8; 32]>,
     deny_hash: Option<[u8; 32]>,
     expires_ms: u64,
@@ -286,6 +327,7 @@ struct Pending {
 pub struct Gate {
     config: GateConfig,
     ttl_ms: u64,
+    hold_ms: u64,
     cookies: BTreeMap<[u8; 32], u64>,
     pending: Vec<Pending>,
     cooldowns: BTreeMap<Prefix, u64>,
@@ -333,11 +375,18 @@ impl Gate {
         Ok(Gate {
             config,
             ttl_ms,
+            hold_ms: GATE_HOLD_MS,
             cookies,
             pending: Vec::new(),
             cooldowns: BTreeMap::new(),
             decision_rates: BTreeMap::new(),
         })
+    }
+
+    /// Shorten (or restore) the hold, for tests. The value is clamped to
+    /// `1..=GATE_HOLD_MS`, so the hold can never be made longer.
+    pub fn set_hold_ms(&mut self, hold_ms: u64) {
+        self.hold_ms = hold_ms.clamp(1, GATE_HOLD_MS);
     }
 
     /// The cookie records to persist. Pending approvals are not included.
@@ -368,13 +417,13 @@ impl Gate {
     }
 
     /// The earliest time at which `tick` has work: an approval's expiry, the end
-    /// of a resolved approval's keep time, a cookie's expiry, a cooldown's end or
-    /// a decision window's end. None when nothing is tracked. `tick` at this
+    /// of an unclaimed approval's claim window, a cookie's expiry, a cooldown's
+    /// end or a decision window's end. None when nothing is tracked. `tick` at this
     /// time (and not before) does what the sweep would.
     pub fn next_deadline(&self) -> Option<u64> {
         let pending = self.pending.iter().map(|pending| match pending.state {
             State::Waiting => pending.expires_ms,
-            State::Approved | State::Denied => pending.decided_ms.saturating_add(RESOLVED_KEEP_MS),
+            State::Approved => pending.decided_ms.saturating_add(self.ttl_ms),
         });
         let cookies = self.cookies.values().copied();
         let cooldowns = self.cooldowns.values().copied();
@@ -420,32 +469,67 @@ impl Gate {
             return Verdict::Allow;
         }
         if gate_path {
-            return self.gate_endpoint(rng, req, cookie_ok);
+            return self.gate_endpoint(req, cookie_ok);
         }
         if cookie_ok {
             return Verdict::Allow;
         }
         // Without a cookie, only a top-level navigation may open an approval.
-        // HEAD gets the wait-page headers and never creates a pending. Anything
-        // else is a plain 403.
+        // HEAD is dropped and never creates a pending. Anything else is a
+        // plain 403.
         if req.method == "HEAD" {
-            return Verdict::Wait(self.head_page(rng), Vec::new());
+            return Verdict::Drop;
         }
         if req.method == "GET" && is_navigation(req.sec_fetch_dest) {
-            self.start_wait(rng, req)
+            self.navigate(rng, req)
         } else {
-            Verdict::Wait(forbidden(), Vec::new())
+            Verdict::Handled(forbidden(), Vec::new())
         }
     }
 
-    /// The headers of the wait page with an empty body and no pending. The
-    /// status is 503 when approval is not configured.
-    fn head_page(&self, rng: &mut dyn RelayRng) -> Response {
-        if self.config.ntfy.is_some() {
-            page(rng, 200, Notice::Waiting(String::new()), true)
-        } else {
-            page(rng, 503, Notice::NotConfigured, true)
+    /// Decide a held navigation at `now_ms`: admit it if its approval landed,
+    /// drop it if the approval is gone or the hold ended, else keep waiting.
+    /// An approval is claimed once: the first held request or navigation to
+    /// see it gets the cookie, and the entry is removed.
+    pub fn check_hold(&mut self, rng: &mut dyn RelayRng, hold: &Hold, now_ms: u64) -> HoldCheck {
+        self.sweep(now_ms);
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.id == hold.pending)
+        else {
+            return HoldCheck::Drop;
+        };
+        match self.pending[index].state {
+            State::Approved => {
+                self.pending.remove(index);
+                let (response, effects) = self.admit(rng, &hold.location, now_ms);
+                HoldCheck::Admit(response, effects)
+            }
+            State::Waiting if now_ms >= hold.until_ms => HoldCheck::Drop,
+            State::Waiting => HoldCheck::Waiting,
         }
+    }
+
+    /// Mint a cookie and answer a 302 back to `location` that sets it.
+    fn admit(
+        &mut self,
+        rng: &mut dyn RelayRng,
+        location: &str,
+        now_ms: u64,
+    ) -> (Response, Vec<GateEffect>) {
+        let value = random_token(rng);
+        self.cookies
+            .insert(sha256(&value), now_ms.saturating_add(COOKIE_LIFETIME_MS));
+        let mut headers = common_headers();
+        headers.push(("Location".into(), location.to_string()));
+        headers.push(("Set-Cookie".into(), set_cookie(&value)));
+        let response = Response {
+            status: 302,
+            headers,
+            body: Vec::new(),
+        };
+        (response, vec![GateEffect::PersistGate(self.snapshot())])
     }
 
     fn has_valid_cookie(&self, cookie: Option<&str>, now_ms: u64) -> bool {
@@ -456,15 +540,9 @@ impl Gate {
         })
     }
 
-    fn gate_endpoint(
-        &mut self,
-        rng: &mut dyn RelayRng,
-        req: &Request<'_>,
-        cookie_ok: bool,
-    ) -> Verdict {
+    fn gate_endpoint(&mut self, req: &Request<'_>, cookie_ok: bool) -> Verdict {
         match req.path {
             DECISION_PATH if req.method == "POST" => self.decide(req),
-            POLL_PATH if req.method == "POST" => self.poll(rng, req),
             FORGET_PATH if req.method == "POST" && cookie_ok && req.origin.is_some() => {
                 self.forget(req)
             }
@@ -503,67 +581,22 @@ impl Gate {
                     }
             });
             if let Some(index) = found {
-                let approve = action == "approve";
-                let pending = &mut self.pending[index];
-                pending.state = if approve {
-                    State::Approved
+                // A denied entry is removed at once, so its held requests drop.
+                // An approved one waits to be claimed.
+                let ended_prefix = self.pending[index].prefix;
+                if action == "approve" {
+                    let pending = &mut self.pending[index];
+                    pending.state = State::Approved;
+                    pending.decided_ms = now;
+                    pending.approve_hash = None;
+                    pending.deny_hash = None;
                 } else {
-                    State::Denied
-                };
-                pending.decided_ms = now;
-                pending.approve_hash = None;
-                pending.deny_hash = None;
-                let ended_prefix = pending.prefix;
+                    self.pending.remove(index);
+                }
                 self.set_cooldown(ended_prefix, now);
             }
         }
         Verdict::Handled(no_content(), Vec::new())
-    }
-
-    fn poll(&mut self, rng: &mut dyn RelayRng, req: &Request<'_>) -> Verdict {
-        let index = parse_poll_token(req.body).and_then(|token| {
-            let hash = sha256(&token);
-            self.pending
-                .iter()
-                .position(|pending| pending.poll_hash == hash)
-        });
-        let mut headers = common_headers();
-        headers.push(("Content-Type".into(), "application/json".into()));
-        let mut effects = Vec::new();
-        let state = match index {
-            None => "expired",
-            Some(index) => {
-                let current = self.pending[index].state;
-                match current {
-                    State::Waiting => "pending",
-                    State::Denied => {
-                        self.pending.remove(index);
-                        "denied"
-                    }
-                    State::Approved => {
-                        self.pending.remove(index);
-                        let value = random_token(rng);
-                        self.cookies.insert(
-                            sha256(&value),
-                            req.now_ms.saturating_add(COOKIE_LIFETIME_MS),
-                        );
-                        headers.push(("Set-Cookie".into(), set_cookie(&value)));
-                        effects.push(GateEffect::PersistGate(self.snapshot()));
-                        "approved"
-                    }
-                }
-            }
-        };
-        let body = serde_json::to_vec(&serde_json::json!({ "state": state }))
-            .expect("serializing a JSON object cannot fail");
-        Verdict::Handled(
-            Response {
-                status: 200,
-                headers,
-                body,
-            },
-            effects,
-        )
     }
 
     fn forget(&mut self, req: &Request<'_>) -> Verdict {
@@ -591,43 +624,62 @@ impl Gate {
         )
     }
 
-    /// Open a pending approval for a top-level navigation and publish it.
-    fn start_wait(&mut self, rng: &mut dyn RelayRng, req: &Request<'_>) -> Verdict {
+    /// A top-level navigation without a cookie. It claims an approval its
+    /// prefix already has, joins its prefix's waiting approval, or opens and
+    /// publishes a new one. Anything else is dropped.
+    fn navigate(&mut self, rng: &mut dyn RelayRng, req: &Request<'_>) -> Verdict {
         let Some(ntfy) = self.config.ntfy.clone() else {
-            let page = page(rng, 503, Notice::NotConfigured, false);
-            return Verdict::Wait(page, Vec::new());
+            return Verdict::Drop;
         };
         let prefix = Prefix::of(req.client_ip);
+        let location = self.location(req);
+        // An approval that landed after its hold ended. `sweep` already
+        // removed any past its claim window.
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.state == State::Approved && pending.prefix == prefix)
+        {
+            self.pending.remove(index);
+            let (response, effects) = self.admit(rng, &location, req.now_ms);
+            return Verdict::Handled(response, effects);
+        }
+        let until_ms = req.now_ms.saturating_add(self.hold_ms);
+        if let Some(pending) = self
+            .pending
+            .iter()
+            .find(|pending| pending.state == State::Waiting && pending.prefix == prefix)
+        {
+            let hold = Hold {
+                pending: pending.id.clone(),
+                location,
+                until_ms,
+            };
+            return Verdict::Hold(hold, Vec::new());
+        }
         let waiting = self
             .pending
             .iter()
             .filter(|pending| pending.state == State::Waiting)
             .count();
-        let busy = self
-            .pending
-            .iter()
-            .any(|pending| pending.state == State::Waiting && pending.prefix == prefix);
         let cooling = self
             .cooldowns
             .get(&prefix)
             .is_some_and(|until| *until > req.now_ms);
         // A new prefix needs room in the cooldown map and the pending list.
-        // Expired cooldowns and resolved entries were pruned by `sweep`.
+        // Expired cooldowns and claim windows were pruned by `sweep`.
         let cooldowns_full =
             !self.cooldowns.contains_key(&prefix) && self.cooldowns.len() >= MAX_TRACKED_PREFIXES;
         let pending_full = self.pending.len() >= MAX_TRACKED_PREFIXES;
-        if waiting >= MAX_PENDING || busy || cooling || cooldowns_full || pending_full {
-            let page = page(rng, 429, Notice::TryLater, false);
-            return Verdict::Wait(page, Vec::new());
+        if waiting >= MAX_PENDING || cooling || cooldowns_full || pending_full {
+            return Verdict::Drop;
         }
         let id = random_string(rng, 16);
-        let poll = random_token(rng);
         let approve = random_token(rng);
         let deny = random_token(rng);
         self.pending.push(Pending {
-            id,
+            id: id.clone(),
             prefix,
-            poll_hash: sha256(&poll),
             approve_hash: Some(sha256(&approve)),
             deny_hash: Some(sha256(&deny)),
             expires_ms: req.now_ms.saturating_add(self.ttl_ms),
@@ -635,8 +687,24 @@ impl Gate {
             state: State::Waiting,
         });
         let effect = ntfy_publish(&ntfy, &self.config.public_origin, prefix, &approve, &deny);
-        let page = page(rng, 200, Notice::Waiting(poll), false);
-        Verdict::Wait(page, vec![effect])
+        let hold = Hold {
+            pending: id,
+            location,
+            until_ms,
+        };
+        Verdict::Hold(hold, vec![effect])
+    }
+
+    /// The absolute URL a navigation asked for, on the public origin. It is
+    /// built on the origin so a path like `//elsewhere` cannot redirect off the
+    /// relay.
+    fn location(&self, req: &Request<'_>) -> String {
+        let mut location = format!("{}{}", self.config.public_origin, req.path);
+        if let Some(query) = req.query.filter(|query| !query.is_empty()) {
+            location.push('?');
+            location.push_str(query);
+        }
+        location
     }
 
     /// Count one decision request against its prefix. Expired windows were
@@ -678,8 +746,10 @@ impl Gate {
     }
 
     /// Apply expiry: an approval that times out starts its prefix's cooldown
-    /// and is removed. Resolved entries are dropped after a while.
+    /// and is removed. An approval nobody claimed is dropped when its claim
+    /// window (the approval TTL from the decision) ends.
     fn sweep(&mut self, now_ms: u64) {
+        let ttl_ms = self.ttl_ms;
         let mut expired = Vec::new();
         self.pending.retain(|pending| match pending.state {
             State::Waiting if pending.expires_ms <= now_ms => {
@@ -687,9 +757,7 @@ impl Gate {
                 false
             }
             State::Waiting => true,
-            State::Approved | State::Denied => {
-                pending.decided_ms.saturating_add(RESOLVED_KEEP_MS) > now_ms
-            }
+            State::Approved => pending.decided_ms.saturating_add(ttl_ms) > now_ms,
         });
         for (prefix, ended_at) in expired {
             self.set_cooldown(prefix, ended_at);
@@ -697,91 +765,6 @@ impl Gate {
         self.cooldowns.retain(|_, until| *until > now_ms);
         self.decision_rates
             .retain(|_, (start, _)| now_ms.saturating_sub(*start) < DECISION_WINDOW_MS);
-    }
-}
-
-enum Notice {
-    Waiting(String),
-    TryLater,
-    NotConfigured,
-}
-
-const PAGE: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style nonce="__NONCE__">
-body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:system-ui,sans-serif;background:#fff;color:#111}
-p{margin:.5rem 1rem;font-size:1.1rem;text-align:center}
-button{margin-top:1rem;font:inherit;padding:.5rem 1rem}
-</style>
-</head>
-<body>
-<p id="msg">__TEXT__</p>
-<p><button id="retry" type="button" hidden>Try again</button></p>
-__SCRIPT__
-</body>
-</html>
-"#;
-
-const WAIT_SCRIPT: &str = r#"
-(function () {
-  var token = "__TOKEN__";
-  var msg = document.getElementById("msg");
-  var retry = document.getElementById("retry");
-  retry.addEventListener("click", function () { location.reload(); });
-  function poll() {
-    fetch("/__gate/poll", {
-      method: "POST",
-      credentials: "same-origin",
-      cache: "no-store",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pending: token })
-    }).then(function (r) { return r.json(); }).then(function (j) {
-      if (j.state === "approved") { location.reload(); return; }
-      if (j.state === "pending") { setTimeout(poll, 1500); return; }
-      msg.textContent = "Not approved.";
-      retry.hidden = false;
-    }).catch(function () { setTimeout(poll, 3000); });
-  }
-  poll();
-})();
-"#;
-
-fn page(rng: &mut dyn RelayRng, status: u16, notice: Notice, head: bool) -> Response {
-    let nonce = random_string(rng, 16);
-    let (text, script) = match notice {
-        Notice::Waiting(token) => (
-            "Waiting for approval",
-            WAIT_SCRIPT.replace("__TOKEN__", &token),
-        ),
-        Notice::TryLater => (
-            "Too many requests are waiting. Try again later.",
-            String::new(),
-        ),
-        Notice::NotConfigured => ("Approval not configured.", String::new()),
-    };
-    let script_block = if script.is_empty() {
-        String::new()
-    } else {
-        format!("<script nonce=\"{nonce}\">{script}</script>")
-    };
-    let html = PAGE
-        .replace("__NONCE__", &nonce)
-        .replace("__TEXT__", text)
-        .replace("__SCRIPT__", &script_block);
-    let csp = format!(
-        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
-         connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-    );
-    let mut headers = common_headers();
-    headers.push(("Content-Type".into(), "text/html; charset=utf-8".into()));
-    headers.push(("Content-Security-Policy".into(), csp));
-    Response {
-        status,
-        headers,
-        body: if head { Vec::new() } else { html.into_bytes() },
     }
 }
 
@@ -828,11 +811,6 @@ fn ntfy_publish(
         headers,
         body: serde_json::to_vec(&body).expect("serializing a JSON object cannot fail"),
     }
-}
-
-fn parse_poll_token(body: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    value.get("pending")?.as_str().map(str::to_string)
 }
 
 fn cookie_hashes(cookie: Option<&str>) -> impl Iterator<Item = [u8; 32]> + '_ {

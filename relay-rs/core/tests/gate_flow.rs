@@ -1,36 +1,29 @@
-//! The approval flow: wait page, ntfy effect, decision, poll, cookie, forget,
-//! and the single-use and state rules around them.
+//! The approval flow: the held navigation, ntfy effect, decision, claim, cookie,
+//! forget, and the single-use and state rules around them.
 
 mod gate_support;
 
 use bp_relay_core::gate::{
-    ConfigError, Gate, GateConfig, GateEffect, GateSnapshot, NtfyConfig, Request, Verdict,
+    ConfigError, Gate, GateConfig, GateEffect, GateSnapshot, HoldCheck, NtfyConfig, Request,
+    Verdict,
 };
 use gate_support::*;
 
 const DECIDER: &str = "198.51.100.200";
 const UNKNOWN_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-/// Open a pending approval for CLIENT at T0 and return the poll token and
-/// the (approve, deny) bearers.
-fn open(gate: &mut Gate, rng: &mut TestRng) -> (String, String, String) {
-    let (page, effects) = wait_parts(get(gate, rng, CLIENT, T0));
-    let (approve, deny) = bearer_tokens(&effects[0]);
-    (poll_token(&page), approve, deny)
-}
-
 #[test]
 fn gate_approve_flow_end_to_end() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(100);
-    let (page, effects) = wait_parts(get(&mut gate, &mut rng, CLIENT, T0));
-    assert_eq!(page.status, 200);
+    let (hold, effects) = hold_parts(get(&mut gate, &mut rng, CLIENT, T0));
     assert_eq!(effects.len(), 1);
-    let token = poll_token(&page);
     let (approve, _) = bearer_tokens(&effects[0]);
 
-    let (pending, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 1_000));
-    assert_eq!(state_of(&pending), "pending");
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 1_000),
+        HoldCheck::Waiting
+    );
 
     let (decided, decision_effects) = handled_parts(decide(
         &mut gate,
@@ -43,11 +36,10 @@ fn gate_approve_flow_end_to_end() {
     assert_eq!(decided.status, 204);
     assert!(decision_effects.is_empty());
 
-    let (approved, approved_effects) =
-        handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&approved), "approved");
-    let cookie = set_cookie_value(&approved).expect("cookie on approval");
-    assert_eq!(snapshot_of(&approved_effects).records.len(), 1);
+    let (response, admitted_effects) = admit_parts(check(&mut gate, &mut rng, &hold, T0 + 3_000));
+    assert_eq!(response.status, 302);
+    let cookie = set_cookie_value(&response).expect("cookie on approval");
+    assert_eq!(snapshot_of(&admitted_effects).records.len(), 1);
 
     let verdict = get_with_cookie(&mut gate, &mut rng, "/", &cookie, T0 + 4_000);
     assert_eq!(verdict, Verdict::Allow);
@@ -57,7 +49,7 @@ fn gate_approve_flow_end_to_end() {
 fn gate_ntfy_request_matches_the_go_form() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(101);
-    let (_, effects) = wait_parts(get(&mut gate, &mut rng, CLIENT, T0));
+    let (_, effects) = hold_parts(get(&mut gate, &mut rng, CLIENT, T0));
     let GateEffect::NtfyPublish { url, headers, .. } = &effects[0] else {
         panic!("expected an ntfy publish");
     };
@@ -90,7 +82,7 @@ fn gate_ntfy_request_matches_the_go_form() {
 fn gate_ntfy_message_names_the_ipv4_prefix_not_the_full_ip() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(102);
-    let (_, effects) = wait_parts(get(&mut gate, &mut rng, CLIENT, T0));
+    let (_, effects) = hold_parts(get(&mut gate, &mut rng, CLIENT, T0));
     let json = ntfy_json(&effects[0]);
     assert_eq!(
         json["message"],
@@ -102,7 +94,7 @@ fn gate_ntfy_message_names_the_ipv4_prefix_not_the_full_ip() {
 fn gate_ntfy_message_names_the_ipv6_prefix_not_the_full_ip() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(103);
-    let (_, effects) = wait_parts(get(&mut gate, &mut rng, "2001:db8:1:2:3:4:5:6", T0));
+    let (_, effects) = hold_parts(get(&mut gate, &mut rng, "2001:db8:1:2:3:4:5:6", T0));
     let json = ntfy_json(&effects[0]);
     assert_eq!(
         json["message"],
@@ -122,7 +114,7 @@ fn gate_ntfy_without_token_sends_no_authorization_header() {
     };
     let mut gate = Gate::new(config, GateSnapshot::default(), T0).expect("valid config");
     let mut rng = TestRng::new(104);
-    let (_, effects) = wait_parts(get(&mut gate, &mut rng, CLIENT, T0));
+    let (_, effects) = hold_parts(get(&mut gate, &mut rng, CLIENT, T0));
     let GateEffect::NtfyPublish { headers, .. } = &effects[0] else {
         panic!("expected an ntfy publish");
     };
@@ -130,10 +122,10 @@ fn gate_ntfy_without_token_sends_no_authorization_header() {
 }
 
 #[test]
-fn gate_deny_flow_refuses_and_offers_no_cookie() {
+fn gate_deny_flow_drops_the_hold_and_offers_no_cookie() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(105);
-    let (token, _, deny) = open(&mut gate, &mut rng);
+    let (hold, _, deny) = open_hold(&mut gate, &mut rng, CLIENT, T0);
     let (decided, _) = handled_parts(decide(
         &mut gate,
         &mut rng,
@@ -144,24 +136,31 @@ fn gate_deny_flow_refuses_and_offers_no_cookie() {
     ));
     assert_eq!(decided.status, 204);
 
-    let (denied, effects) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&denied), "denied");
-    assert!(set_cookie_value(&denied).is_none());
-    assert!(effects.is_empty());
-
-    let again = poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_500);
-    let (consumed, _) = handled_parts(again);
-    assert_eq!(state_of(&consumed), "expired");
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 3_000),
+        HoldCheck::Drop
+    );
+    assert!(gate.snapshot().records.is_empty());
+    assert!(gate.pending_ids(T0 + 3_000).is_empty());
+    // The same hold again: the approval is gone, so it stays dropped.
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 3_500),
+        HoldCheck::Drop
+    );
 }
 
 #[test]
 fn gate_expiry_flow_times_out_and_starts_cooldown() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(106);
-    let (token, _, _) = open(&mut gate, &mut rng);
-    let (expired, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + TTL_MS));
-    assert_eq!(state_of(&expired), "expired");
-    assert!(set_cookie_value(&expired).is_none());
+    let (hold, _, _) = open_hold(&mut gate, &mut rng, CLIENT, T0);
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + TTL_MS),
+        HoldCheck::Drop
+    );
+    assert!(gate.pending_ids(T0 + TTL_MS).is_empty());
+    // The timed-out approval starts the prefix's cooldown.
+    assert!(is_drop(&get(&mut gate, &mut rng, CLIENT, T0 + TTL_MS)));
 }
 
 #[test]
@@ -172,18 +171,24 @@ fn gate_expiry_follows_the_configured_ttl() {
     };
     let mut gate = Gate::new(config, GateSnapshot::default(), T0).expect("valid config");
     let mut rng = TestRng::new(107);
-    let (token, _, _) = open(&mut gate, &mut rng);
-    let (still, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 29_999));
-    assert_eq!(state_of(&still), "pending");
-    let (gone, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 30_000));
-    assert_eq!(state_of(&gone), "expired");
+    let (hold, _, _) = open_hold(&mut gate, &mut rng, CLIENT, T0);
+    assert_eq!(gate.pending_ids(T0 + 29_999).len(), 1);
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 29_999),
+        HoldCheck::Waiting
+    );
+    assert!(gate.pending_ids(T0 + 30_000).is_empty());
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 30_000),
+        HoldCheck::Drop
+    );
 }
 
 #[test]
 fn gate_approve_token_cannot_be_used_twice_to_mint_cookies() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(108);
-    let (token, approve, _) = open(&mut gate, &mut rng);
+    let (hold, approve, _) = open_hold(&mut gate, &mut rng, CLIENT, T0);
     decide(
         &mut gate,
         &mut rng,
@@ -192,8 +197,13 @@ fn gate_approve_token_cannot_be_used_twice_to_mint_cookies() {
         DECIDER,
         T0 + 2_000,
     );
-    let (first, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&first), "approved");
+    let (first, _) = admit_parts(check(&mut gate, &mut rng, &hold, T0 + 3_000));
+    assert!(set_cookie_value(&first).is_some());
+    // The hold was claimed by its admit: checking it again is a drop.
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 3_500),
+        HoldCheck::Drop
+    );
 
     let (replay, effects) = handled_parts(decide(
         &mut gate,
@@ -205,15 +215,17 @@ fn gate_approve_token_cannot_be_used_twice_to_mint_cookies() {
     ));
     assert_eq!(replay.status, 204);
     assert!(effects.is_empty());
-    let (second, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 5_000));
-    assert_eq!(state_of(&second), "expired");
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 5_000),
+        HoldCheck::Drop
+    );
 }
 
 #[test]
 fn gate_deny_token_consumes_the_approve_token() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(109);
-    let (token, approve, deny) = open(&mut gate, &mut rng);
+    let (hold, approve, deny) = open_hold(&mut gate, &mut rng, CLIENT, T0);
     decide(&mut gate, &mut rng, &deny, "deny", DECIDER, T0 + 2_000);
     decide(
         &mut gate,
@@ -223,15 +235,17 @@ fn gate_deny_token_consumes_the_approve_token() {
         DECIDER,
         T0 + 2_100,
     );
-    let (state, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&state), "denied");
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 3_000),
+        HoldCheck::Drop
+    );
 }
 
 #[test]
 fn gate_approve_token_consumes_the_deny_token() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(110);
-    let (token, approve, deny) = open(&mut gate, &mut rng);
+    let (hold, approve, deny) = open_hold(&mut gate, &mut rng, CLIENT, T0);
     decide(
         &mut gate,
         &mut rng,
@@ -241,26 +255,28 @@ fn gate_approve_token_consumes_the_deny_token() {
         T0 + 2_000,
     );
     decide(&mut gate, &mut rng, &deny, "deny", DECIDER, T0 + 2_100);
-    let (state, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&state), "approved");
+    let (response, _) = admit_parts(check(&mut gate, &mut rng, &hold, T0 + 3_000));
+    assert_eq!(response.status, 302);
 }
 
 #[test]
 fn gate_decision_with_the_wrong_action_is_ignored() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(111);
-    let (token, approve, deny) = open(&mut gate, &mut rng);
+    let (hold, approve, deny) = open_hold(&mut gate, &mut rng, CLIENT, T0);
     decide(&mut gate, &mut rng, &approve, "deny", DECIDER, T0 + 2_000);
     decide(&mut gate, &mut rng, &deny, "approve", DECIDER, T0 + 2_100);
-    let (state, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&state), "pending");
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 3_000),
+        HoldCheck::Waiting
+    );
 }
 
 #[test]
 fn gate_decision_action_is_trimmed_and_case_insensitive() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(112);
-    let (token, approve, _) = open(&mut gate, &mut rng);
+    let (hold, approve, _) = open_hold(&mut gate, &mut rng, CLIENT, T0);
     decide(
         &mut gate,
         &mut rng,
@@ -269,15 +285,15 @@ fn gate_decision_action_is_trimmed_and_case_insensitive() {
         DECIDER,
         T0 + 2_000,
     );
-    let (state, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&state), "approved");
+    let (response, _) = admit_parts(check(&mut gate, &mut rng, &hold, T0 + 3_000));
+    assert_eq!(response.status, 302);
 }
 
 #[test]
 fn gate_decision_bearer_must_decode_to_32_bytes() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(113);
-    let (token, _, _) = open(&mut gate, &mut rng);
+    let (hold, _, _) = open_hold(&mut gate, &mut rng, CLIENT, T0);
     let (short, _) = handled_parts(decide(
         &mut gate,
         &mut rng,
@@ -287,15 +303,17 @@ fn gate_decision_bearer_must_decode_to_32_bytes() {
         T0 + 2_000,
     ));
     assert_eq!(short.status, 204);
-    let (state, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&state), "pending");
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 3_000),
+        HoldCheck::Waiting
+    );
 }
 
 #[test]
 fn gate_decision_with_an_unknown_bearer_is_ignored_and_answers_204() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(114);
-    let (token, _, _) = open(&mut gate, &mut rng);
+    let (hold, _, _) = open_hold(&mut gate, &mut rng, CLIENT, T0);
     let (response, effects) = handled_parts(decide(
         &mut gate,
         &mut rng,
@@ -307,18 +325,21 @@ fn gate_decision_with_an_unknown_bearer_is_ignored_and_answers_204() {
     assert_eq!(response.status, 204);
     assert!(response.body.is_empty());
     assert!(effects.is_empty());
-    let (state, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&state), "pending");
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 3_000),
+        HoldCheck::Waiting
+    );
 }
 
 #[test]
 fn gate_decision_without_authorization_answers_204() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(115);
-    let _ = open(&mut gate, &mut rng);
+    let _ = open_hold(&mut gate, &mut rng, CLIENT, T0);
     let request = Request {
         method: "POST",
         path: "/__gate/decision",
+        query: None,
         websocket: false,
         origin: None,
         cookie: None,
@@ -333,33 +354,23 @@ fn gate_decision_without_authorization_answers_204() {
 }
 
 #[test]
-fn gate_poll_with_an_unknown_token_is_expired() {
+fn gate_hold_of_an_unknown_approval_is_dropped() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(116);
-    let _ = open(&mut gate, &mut rng);
-    let (response, _) = handled_parts(poll(&mut gate, &mut rng, UNKNOWN_TOKEN, CLIENT, T0 + 1_000));
-    assert_eq!(state_of(&response), "expired");
+    let (hold, _, _) = open_hold(&mut gate, &mut rng, CLIENT, T0);
+    // A gate that never issued this approval knows nothing of the hold.
+    let mut other = new_gate();
+    assert_eq!(
+        check(&mut other, &mut rng, &hold, T0 + 1_000),
+        HoldCheck::Drop
+    );
 }
 
 #[test]
-fn gate_poll_with_a_bad_body_is_expired() {
-    let mut gate = new_gate();
-    let mut rng = TestRng::new(117);
-    let _ = open(&mut gate, &mut rng);
-    let request = Request {
-        body: b"not json",
-        ..req("POST", "/__gate/poll", CLIENT, T0 + 1_000)
-    };
-    let (response, _) = handled_parts(gate.handle(&mut rng, &request));
-    assert_eq!(response.status, 200);
-    assert_eq!(state_of(&response), "expired");
-}
-
-#[test]
-fn gate_poll_after_the_cookie_is_minted_is_expired() {
+fn gate_held_request_checked_after_a_claim_is_dropped() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(118);
-    let (token, approve, _) = open(&mut gate, &mut rng);
+    let (hold, approve, _) = open_hold(&mut gate, &mut rng, CLIENT, T0);
     decide(
         &mut gate,
         &mut rng,
@@ -368,24 +379,15 @@ fn gate_poll_after_the_cookie_is_minted_is_expired() {
         DECIDER,
         T0 + 2_000,
     );
-    let (first, _) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_000));
-    assert_eq!(state_of(&first), "approved");
-    let (second, effects) = handled_parts(poll(&mut gate, &mut rng, &token, CLIENT, T0 + 3_500));
-    assert_eq!(state_of(&second), "expired");
-    assert!(set_cookie_value(&second).is_none());
-    assert!(effects.is_empty());
-}
-
-#[test]
-fn gate_approval_without_ntfy_shows_the_not_configured_page() {
-    let mut gate = Gate::new(config(false), GateSnapshot::default(), T0).expect("valid config");
-    let mut rng = TestRng::new(119);
-    let (page, effects) = wait_parts(get(&mut gate, &mut rng, CLIENT, T0));
-    assert_eq!(page.status, 503);
-    assert!(effects.is_empty());
-    let body = String::from_utf8(page.body).expect("utf-8");
-    assert!(body.contains("Approval not configured."));
-    assert!(!body.contains("/__gate/poll"));
+    // A navigation from another address in the prefix claims the approval
+    // before the held request looks at it.
+    let (response, _) = handled_parts(get(&mut gate, &mut rng, "203.0.113.8", T0 + 2_500));
+    assert_eq!(response.status, 302);
+    assert!(set_cookie_value(&response).is_some());
+    assert_eq!(
+        check(&mut gate, &mut rng, &hold, T0 + 3_000),
+        HoldCheck::Drop
+    );
 }
 
 #[test]
@@ -406,8 +408,11 @@ fn gate_forget_clears_the_cookie_and_its_record() {
     assert!(set.starts_with("__Host-gate=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax"));
     assert!(snapshot_of(&effects).records.is_empty());
 
+    // The cookie is gone. The prefix is still cooling down from its approval.
     let verdict = get_with_cookie(&mut gate, &mut rng, "/", &cookie, T0 + 11_000);
-    assert!(matches!(verdict, Verdict::Wait(_, _)), "got {verdict:?}");
+    assert!(is_drop(&verdict), "got {verdict:?}");
+    let verdict = get_with_cookie(&mut gate, &mut rng, "/", &cookie, T0 + 16_000);
+    assert!(matches!(verdict, Verdict::Hold(_, _)), "got {verdict:?}");
 }
 
 #[test]
@@ -420,7 +425,7 @@ fn gate_public_origin_trailing_slash_is_stripped() {
     let mut rng = TestRng::new(121);
     let mut request = req("GET", "/", CLIENT, T0);
     request.origin = Some(ORIGIN);
-    let (_, effects) = wait_parts(gate.handle(&mut rng, &request));
+    let (_, effects) = hold_parts(gate.handle(&mut rng, &request));
     let json = ntfy_json(&effects[0]);
     assert_eq!(
         json["actions"][0]["url"],

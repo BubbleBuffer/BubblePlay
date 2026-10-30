@@ -27,7 +27,7 @@ are an error. Every validation error names the field it is about.
 | `approval_ttl_s` | `90` | Must be 30 to 120 seconds. |
 | `trusted_proxy_cidrs` | `[]` | CIDR ranges of reverse proxies. `X-Forwarded-For` is read only when the direct peer is in one of them. |
 | `turn` | none | Optional. `host`, `secret` (at least 32 bytes) and `ttl_s` (default `21600`, 300 to 86400). |
-| `ntfy` | none | Optional. `url` (http or https), `topic` and `token`. Without it the gate has no approval path and a browser gets 503. Approval messages carry the approve and deny bearers in their action headers, never the poll token. Publishes use rustls with the bundled webpki roots and a 10 s timeout. |
+| `ntfy` | none | Optional. `url` (http or https), `topic` and `token`. Without it the gate has no approval path and an unapproved navigation is dropped. Approval messages carry the approve and deny bearers in their action headers. Publishes use rustls with the bundled webpki roots and a 10 s timeout. |
 
 Environment values win over the file. An empty value is an error. Secrets never appear in
 logs or in `Debug` output.

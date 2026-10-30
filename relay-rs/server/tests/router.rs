@@ -12,6 +12,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, Response, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bp_relay_core::gate::GATE_HOLD_MS;
 use bp_relay_server::app::router;
 use bp_relay_server::config::{Config, Secret};
 use bp_relay_server::runtime::{Shared, cookie_hash};
@@ -70,6 +71,7 @@ fn app(assets: &Path) -> Router {
         ntfy: None,
         approval_ttl_s: 90,
         trusted_proxy_cidrs: Vec::new(),
+        gate_hold_ms: GATE_HOLD_MS,
     };
     router(Arc::new(Shared::new(&cfg).unwrap()))
 }

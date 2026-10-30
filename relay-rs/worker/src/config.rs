@@ -2,7 +2,9 @@
 //! (server/src/config.rs). Error messages name a field and never print its value.
 
 use bp_device_key::relay_origin;
-use bp_relay_core::gate::{GateConfig, MAX_APPROVAL_TTL_SECS, MIN_APPROVAL_TTL_SECS, NtfyConfig};
+use bp_relay_core::gate::{
+    GATE_HOLD_MS, GateConfig, MAX_APPROVAL_TTL_SECS, MIN_APPROVAL_TTL_SECS, NtfyConfig,
+};
 use bp_relay_core::relay::{CoreConfig, TurnConfig};
 use worker::url::Host;
 use worker::{Env, Url};
@@ -13,6 +15,9 @@ pub struct Settings {
     pub gate: GateConfig,
     /// The admin bearer. Checked against each admin and healthz request, never printed.
     pub admin_token: String,
+    /// A shorter gate hold, for the local tests only (`GATE_HOLD_MS`). Deployments leave it unset
+    /// and get the gate's 30 s. It can only shorten the hold.
+    pub gate_hold_ms: Option<u64>,
 }
 
 const DEFAULT_MAX_CONNECTIONS: usize = 32;
@@ -40,6 +45,16 @@ pub fn load(env: &Env) -> Result<Settings, String> {
             .ok()
             .filter(|value| (MIN_APPROVAL_TTL_SECS..=MAX_APPROVAL_TTL_SECS).contains(value))
             .ok_or_else(|| "APPROVAL_TTL_S must be 30..120 seconds".to_owned())?,
+    };
+
+    let gate_hold_ms = match optional_var(env, "GATE_HOLD_MS") {
+        None => None,
+        Some(text) => Some(
+            text.parse::<u64>()
+                .ok()
+                .filter(|value| (1..=GATE_HOLD_MS).contains(value))
+                .ok_or_else(|| format!("GATE_HOLD_MS must be 1..{GATE_HOLD_MS} milliseconds"))?,
+        ),
     };
 
     let turn = if optional_var(env, "TURN_HOST").is_some()
@@ -70,6 +85,7 @@ pub fn load(env: &Env) -> Result<Settings, String> {
         core,
         gate,
         admin_token,
+        gate_hold_ms,
     })
 }
 

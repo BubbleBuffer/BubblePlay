@@ -1,7 +1,7 @@
 // Local workerd tests for the relay Durable Object. Each run starts `wrangler dev --local` from
 // the crate root (after `worker-build --release`) on a free loopback port, with throwaway config
 // values, and stops every process it started. Every case name carries the `m3 ` prefix; the GET /
-// case is replaced by the gate's wait page (M3-C2). The `m3 ` cases port the native e2e behaviours
+// case is replaced by the gate's silent hold (M3-C2). The `m3 ` cases port the native e2e behaviours
 // from relay-rs/server/tests.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,6 +20,10 @@ import {
   TOKEN,
   approveBrowser,
   b64,
+  decide,
+  gateCookieOf,
+  expectDropped,
+  heldNavigation,
   browserJoin,
   dataSocket,
   freshClientIp,
@@ -27,7 +31,6 @@ import {
   identity,
   openOk,
   openSocket,
-  pollTokenOf,
   proveViewer,
   registerHost,
   startNtfy,
@@ -35,6 +38,10 @@ import {
   viewerIdentity,
   viewerJoin,
 } from './m3-support.mjs';
+
+// The shared instance holds an unapproved navigation this long instead of 30 s, so a dropped
+// navigation does not take a whole case timeout.
+const GATE_HOLD_MS = 4_000;
 
 const crateRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -45,7 +52,7 @@ let persistDir = '';
 before(async () => {
   persistDir = mkdtempSync(path.join(tmpdir(), 'bp-relay-m3-'));
   ntfy = await startNtfy();
-  relay = await startRelay({ persistDir, ntfy });
+  relay = await startRelay({ persistDir, ntfy, gateHoldMs: GATE_HOLD_MS });
 });
 
 after(async () => {
@@ -100,15 +107,12 @@ function authHost(host) {
 
 // M3-A cases (names kept from the stub).
 
-// M3-C2 replaces the M3-A 404: with the gate wired, a top-level navigation without a cookie opens
-// the wait page.
-test('m3 GET / without a cookie opens the gate wait page instead of a 404', { timeout: CASE_TIMEOUT_MS }, async () => {
-  const page = await httpRequest(relay.port, {
-    path: '/',
-    headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document' },
-  });
-  assert.equal(page.status, 200);
-  assert.match(page.body.toString('utf8'), /Waiting for approval/);
+// M3-C2 replaces the M3-A 404: with the gate wired, a top-level navigation without a cookie is
+// held open with no page, and with no decision it is dropped when the hold ends: the connection
+// fails with no content.
+test('m3 GET / without a cookie is held, then dropped with no content', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const error = await expectDropped(heldNavigation(relay.port, { path: '/', ip: freshClientIp() }));
+  assert.ok(error.ms >= GATE_HOLD_MS - 500, `held for ${error.ms} ms`);
 });
 
 test(
@@ -486,20 +490,12 @@ test('m3 the exact text {"type":"ping"} is answered with the exact text {"type":
 // M3-C2 HTTP surfaces. Native: e2e_gate_and_data.rs, e2e_m2.rs and e2e_registration.rs; the static
 // and healthz rules come from relay-rs/server/src/assets.rs and app.rs.
 
-test('m3 a viewer without a cookie gets the wait page, and ntfy names only the client prefix', { timeout: CASE_TIMEOUT_MS }, async () => {
+test('m3 a held viewer opens one ntfy approval naming only the client prefix, and a deny drops it', { timeout: CASE_TIMEOUT_MS }, async () => {
   const ip = freshClientIp();
   const prefix = `${ip.split('.').slice(0, 3).join('.')}.0/24`;
   const before = ntfy.count();
-  const page = await httpRequest(relay.port, {
-    path: '/',
-    ip,
-    headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
-  });
-  assert.equal(page.status, 200);
-  const html = page.body.toString('utf8');
-  assert.match(html, /Waiting for approval/);
-  const pending = pollTokenOf(html);
-
+  const held = heldNavigation(relay.port, { path: '/', ip });
+  held.catch(() => {});
   const publish = await ntfy.waitFor(
     before,
     (p) => p.body?.message === `Browser navigation awaiting approval from client prefix ${prefix}`,
@@ -510,7 +506,39 @@ test('m3 a viewer without a cookie gets the wait page, and ntfy names only the c
   assert.equal(publish.body.actions[1].label, 'Deny');
   const sent = JSON.stringify(publish.body);
   assert.ok(!sent.includes(ip), 'ntfy names the prefix, not the client address');
-  assert.ok(!sent.includes(pending), 'ntfy never carries the poll token');
+
+  // A second navigation from the prefix joins the same approval: no second publish.
+  const joined = heldNavigation(relay.port, { path: '/', ip });
+  joined.catch(() => {});
+  const deny = publish.body.actions[1].headers.Authorization.replace(/^Bearer /, '');
+  await decide(relay.port, deny, 'deny', ip);
+  for (const pending of [held, joined]) {
+    const error = await expectDropped(pending);
+    assert.ok(error.ms < GATE_HOLD_MS, `the deny ends the hold early (${error.ms} ms)`);
+  }
+  assert.equal(ntfy.count() - before, 1, 'the joined navigation opened no second approval');
+});
+
+test('m3 an approval after the hold is claimed once by the next navigation', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const ip = freshClientIp();
+  const before = ntfy.count();
+  const first = heldNavigation(relay.port, { path: '/', ip });
+  first.catch(() => {});
+  const prefix = `${ip.split('.').slice(0, 3).join('.')}.0/24`;
+  const publish = await ntfy.waitFor(
+    before,
+    (p) => p.body?.message === `Browser navigation awaiting approval from client prefix ${prefix}`,
+  );
+  await expectDropped(first);
+  const approve = publish.body.actions[0].headers.Authorization.replace(/^Bearer /, '');
+  await decide(relay.port, approve, 'approve', ip);
+  const { response, ms } = await heldNavigation(relay.port, { path: '/?a=1', ip });
+  assert.equal(response.status, 302);
+  assert.ok(ms < GATE_HOLD_MS, 'the claim is answered at once');
+  assert.equal(response.headers.location, `${relay.origin}/?a=1`);
+  assert.ok(gateCookieOf(response), 'the reload claims the cookie');
+  // Claimed once: the next navigation from the prefix is dropped (the decision's cooldown).
+  await expectDropped(heldNavigation(relay.port, { path: '/', ip }));
 });
 
 test('m3 approval grants the gate cookie, and the page is served with it', { timeout: CASE_TIMEOUT_MS }, async () => {
@@ -521,7 +549,7 @@ test('m3 approval grants the gate cookie, and the page is served with it', { tim
   assert.match(page.body.toString('utf8'), /^<!doctype html>/i);
 
   const bare = await httpRequest(relay.port, { path: '/', headers: { 'Sec-Fetch-Dest': 'empty' } });
-  assert.equal(bare.status, 403, 'a subresource without the cookie gets 403, not the wait page');
+  assert.equal(bare.status, 403, 'a subresource without the cookie gets 403 and is not held');
 });
 
 test('m3 a WebSocket with the gate cookie gets hello-ok with a media epoch', { timeout: CASE_TIMEOUT_MS }, async () => {
@@ -683,14 +711,9 @@ test('m3 static traversal, dotfile and backslash paths are 404, and POST is 404'
 // /pair is the browser page too (native: e2e_pair_* in e2e_gate_and_data.rs). The pairing code
 // rides in the fragment, which the page reads itself, so the Worker only maps the path.
 
-test('m3 GET /pair without a cookie opens the gate wait page', { timeout: CASE_TIMEOUT_MS }, async () => {
-  const page = await httpRequest(relay.port, {
-    path: '/pair',
-    ip: freshClientIp(),
-    headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
-  });
-  assert.equal(page.status, 200);
-  assert.match(page.body.toString('utf8'), /Waiting for approval/);
+test('m3 GET /pair without a cookie is held and dropped like /', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const error = await expectDropped(heldNavigation(relay.port, { path: '/pair', ip: freshClientIp() }));
+  assert.ok(error.ms >= GATE_HOLD_MS - 500, `held for ${error.ms} ms`);
 });
 
 test('m3 GET and HEAD /pair with a cookie serve index.html, as / does', { timeout: CASE_TIMEOUT_MS }, async () => {

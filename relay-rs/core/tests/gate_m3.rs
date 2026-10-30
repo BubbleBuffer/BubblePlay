@@ -9,14 +9,13 @@ use gate_support::*;
 const COOKIE_MS: u64 = COOKIE_MAX_AGE_SECS * 1000;
 const DECIDER: &str = "198.51.100.200";
 
-/// Runs the approval for CLIENT and returns the poll response and its effects.
-/// The cookie is minted at `poll_at`.
-fn approve_at(gate: &mut Gate, rng: &mut TestRng, poll_at: u64) -> (Response, Vec<GateEffect>) {
-    let (page, effects) = wait_parts(get(gate, rng, CLIENT, T0));
-    let token = poll_token(&page);
-    let (approve, _) = bearer_tokens(&effects[0]);
+/// Runs the approval for CLIENT and returns the admitted 302 and its effects.
+/// The approval is decided at T0 + 1_000 and the held navigation is checked at
+/// `check_at`, which mints the cookie.
+fn approve_at(gate: &mut Gate, rng: &mut TestRng, check_at: u64) -> (Response, Vec<GateEffect>) {
+    let (hold, approve, _) = open_hold(gate, rng, CLIENT, T0);
     decide(gate, rng, &approve, "approve", DECIDER, T0 + 1_000);
-    handled_parts(poll(gate, rng, &token, CLIENT, poll_at))
+    admit_parts(check(gate, rng, &hold, check_at))
 }
 
 #[test]
@@ -28,7 +27,7 @@ fn m3_a_fresh_gate_has_no_deadline() {
 fn m3_pending_approval_is_due_at_the_deadline_it_reports() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(400);
-    let _ = wait_parts(get(&mut gate, &mut rng, CLIENT, T0));
+    let _ = open_hold(&mut gate, &mut rng, CLIENT, T0);
     let due = gate
         .next_deadline()
         .expect("a waiting approval has a deadline");

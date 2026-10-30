@@ -6,12 +6,16 @@ use std::net::IpAddr;
 
 use bp_relay_core::RelayRng;
 use bp_relay_core::gate::{
-    Gate, GateConfig, GateEffect, GateSnapshot, NtfyConfig, Request, Response, Verdict,
+    GATE_HOLD_MS, Gate, GateConfig, GateEffect, GateSnapshot, Hold, HoldCheck, NtfyConfig, Request,
+    Response, Verdict,
 };
 
 pub const ORIGIN: &str = "https://relay.example";
 pub const T0: u64 = 1_000_000;
 pub const TTL_MS: u64 = 90_000;
+pub const HOLD_MS: u64 = GATE_HOLD_MS;
+/// The client that posts decisions in the helpers. Its prefix is not CLIENT's.
+pub const DECIDER: &str = "198.51.100.200";
 pub const CLIENT: &str = "203.0.113.7";
 pub const OTHER_PREFIX: &str = "198.51.100.7";
 
@@ -65,6 +69,7 @@ pub fn req<'a>(method: &'a str, path: &'a str, client: &str, now_ms: u64) -> Req
     Request {
         method,
         path,
+        query: None,
         websocket: false,
         origin: None,
         cookie: None,
@@ -105,6 +110,7 @@ pub fn decide(
     let request = Request {
         method: "POST",
         path: "/__gate/decision",
+        query: None,
         websocket: false,
         origin: None,
         cookie: None,
@@ -117,28 +123,39 @@ pub fn decide(
     gate.handle(rng, &request)
 }
 
-pub fn poll(gate: &mut Gate, rng: &mut TestRng, token: &str, client: &str, now: u64) -> Verdict {
-    let body = format!("{{\"pending\":\"{token}\"}}");
-    let request = Request {
-        method: "POST",
-        path: "/__gate/poll",
-        websocket: false,
-        origin: Some(ORIGIN),
-        cookie: None,
-        authorization: None,
-        sec_fetch_dest: None,
-        body: body.as_bytes(),
-        client_ip: ip(client),
-        now_ms: now,
-    };
-    gate.handle(rng, &request)
+/// The hold and effects of a held navigation. Panics on any other verdict.
+pub fn hold_parts(verdict: Verdict) -> (Hold, Vec<GateEffect>) {
+    match verdict {
+        Verdict::Hold(hold, effects) => (hold, effects),
+        other => panic!("expected a hold, got {other:?}"),
+    }
 }
 
-pub fn wait_parts(verdict: Verdict) -> (Response, Vec<GateEffect>) {
-    match verdict {
-        Verdict::Wait(response, effects) => (response, effects),
-        other => panic!("expected a wait page, got {other:?}"),
+/// Ask the gate about a held navigation at `now`.
+pub fn check(gate: &mut Gate, rng: &mut TestRng, hold: &Hold, now: u64) -> HoldCheck {
+    gate.check_hold(rng, hold, now)
+}
+
+/// The 302 and effects of an admitted hold. Panics on Waiting or Drop.
+pub fn admit_parts(check: HoldCheck) -> (Response, Vec<GateEffect>) {
+    match check {
+        HoldCheck::Admit(response, effects) => (response, effects),
+        other => panic!("expected an admit, got {other:?}"),
     }
+}
+
+/// Open a held navigation for `client` at `now` and return the hold and the
+/// approve and deny bearers its ntfy publish carries.
+pub fn open_hold(
+    gate: &mut Gate,
+    rng: &mut TestRng,
+    client: &str,
+    now: u64,
+) -> (Hold, String, String) {
+    let (hold, effects) = hold_parts(gate.handle(rng, &req("GET", "/", client, now)));
+    assert_eq!(effects.len(), 1, "a new approval publishes once");
+    let (approve, deny) = bearer_tokens(&effects[0]);
+    (hold, approve, deny)
 }
 
 pub fn handled_parts(verdict: Verdict) -> (Response, Vec<GateEffect>) {
@@ -154,15 +171,6 @@ pub fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.as_str())
-}
-
-/// The poll token the wait page carries.
-pub fn poll_token(response: &Response) -> String {
-    let html = String::from_utf8(response.body.clone()).expect("utf-8 page");
-    let marker = "var token = \"";
-    let start = html.find(marker).expect("token in page") + marker.len();
-    let end = start + html[start..].find('"').expect("token end");
-    html[start..end].to_string()
 }
 
 /// The parsed JSON body of an ntfy effect.
@@ -187,11 +195,6 @@ pub fn bearer_tokens(effect: &GateEffect) -> (String, String) {
     (token(0), token(1))
 }
 
-pub fn state_of(response: &Response) -> String {
-    let value: serde_json::Value = serde_json::from_slice(&response.body).expect("json");
-    value["state"].as_str().expect("state").to_string()
-}
-
 /// The `__Host-gate=<value>` pair from a Set-Cookie header, ready to send as a
 /// Cookie header. None when the response sets no gate cookie.
 pub fn set_cookie_value(response: &Response) -> Option<String> {
@@ -200,21 +203,18 @@ pub fn set_cookie_value(response: &Response) -> Option<String> {
     pair.starts_with("__Host-gate=").then(|| pair.to_string())
 }
 
-/// Run the whole approval for `client` and return the cookie it earns.
+/// Run the whole approval for `client` and return the cookie it earns: the
+/// navigation is held, approved, and admitted at `now + 2_000`.
 pub fn approve_client(gate: &mut Gate, rng: &mut TestRng, client: &str, now: u64) -> String {
-    let (page, effects) = wait_parts(gate.handle(rng, &req("GET", "/", client, now)));
-    let token = poll_token(&page);
-    let (approve, _) = bearer_tokens(&effects[0]);
-    decide(
-        gate,
-        rng,
-        &approve,
-        "approve",
-        "198.51.100.200",
-        now + 1_000,
-    );
-    let (response, _) = handled_parts(poll(gate, rng, &token, client, now + 2_000));
+    let (hold, approve, _) = open_hold(gate, rng, client, now);
+    decide(gate, rng, &approve, "approve", DECIDER, now + 1_000);
+    let (response, _) = admit_parts(check(gate, rng, &hold, now + 2_000));
     set_cookie_value(&response).expect("cookie set on approval")
+}
+
+/// Whether a verdict drops the request.
+pub fn is_drop(verdict: &Verdict) -> bool {
+    matches!(verdict, Verdict::Drop)
 }
 
 pub fn snapshot_of(effects: &[GateEffect]) -> GateSnapshot {
