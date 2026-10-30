@@ -1,9 +1,10 @@
-//! The state the Durable Object keeps in memory while it runs: the core relay, the gate and the
-//! live sockets. The sockets' own state is in their attachments and survives hibernation.
+//! The state the Durable Object keeps in memory while it runs: the core relay, the gate, the
+//! presence limiter and the live sockets. The sockets' own state is in their attachments and survives hibernation.
 
 use std::collections::BTreeMap;
 
 use bp_relay_core::gate::Gate;
+use bp_relay_core::presence::PresenceLimiter;
 use bp_relay_core::relay::{ConnId, Relay as CoreRelay};
 use worker::js_sys::{Date as JsDate, Function, Reflect};
 use worker::wasm_bindgen::{JsCast, JsValue};
@@ -15,6 +16,8 @@ const STORE_RETRY_MS: u64 = 1_000;
 pub struct Live {
     pub core: CoreRelay,
     pub gate: Gate,
+    /// Per-prefix counter for `GET /presence`. Memory only: eviction resets it.
+    pub presence: PresenceLimiter,
     pub sockets: BTreeMap<ConnId, WebSocket>,
     /// The canonical public origin, for the browser-socket check.
     pub origin: String,
