@@ -72,6 +72,8 @@ pub struct HostProtocol {
     effects: Vec<Effect>,
     last_drop_log: Option<Instant>,
     dropped: u64,
+    /// The current viewer's claimed device ID, kept for the pairing log after its session ends.
+    peer_viewer: Option<String>,
 }
 
 impl HostProtocol {
@@ -131,6 +133,7 @@ impl HostProtocol {
             effects: Vec::new(),
             last_drop_log: None,
             dropped: 0,
+            peer_viewer: None,
         })
     }
 
@@ -181,9 +184,14 @@ impl HostProtocol {
             match self.pairing.as_mut().filter(|window| !window.claimed) {
                 Some(window) => {
                     window.claimed = true;
+                    tracing::info!("pairing: viewer arrived in the open pairing window");
                     Some(PairingCode::parse(window.code.as_str())?)
                 }
                 None => {
+                    tracing::warn!(
+                        window_open = self.pairing.is_some(),
+                        "pairing: viewer arrived without an unused pairing window; refused"
+                    );
                     self.record_drop("pairing peer without an unused pairing window");
                     self.effects.push(Effect::Send(pair_close_message()));
                     self.effects.push(Effect::Ui(DevicesEvent::PairFailed));
@@ -215,12 +223,18 @@ impl HostProtocol {
     /// Relay-side brute-force protection closed the code early. It cannot end a normal viewer.
     pub fn pair_closed(&mut self) {
         if self.pairing.is_some() || self.peer_pairing {
+            tracing::warn!(
+                "pairing: relay dropped the window after too many failed attempts (pair-closed)"
+            );
             self.close_pairing(DevicesEvent::PairStopped, "relay closed pairing");
         }
     }
 
     /// Ends all local access on a signaling failure; never leaves a reusable pairing code.
     pub fn terminate(&mut self) {
+        if self.pairing.is_some() || self.peer_pairing {
+            log_window_closed("signaling connection ended", self.peer_viewer.as_deref());
+        }
         self.pairing = None;
         self.reset_peer();
         self.effects.push(Effect::Park);
@@ -244,10 +258,21 @@ impl HostProtocol {
         let events = match self.session.on_text(text) {
             Ok(events) => events,
             Err(error) => {
+                if self.peer_pairing {
+                    tracing::warn!(
+                        viewer = self.peer_viewer.as_deref().unwrap_or("unknown"),
+                        "pairing: viewer message could not be processed; pairing ended"
+                    );
+                }
                 self.terminate();
                 return Err(error.into());
             }
         };
+        if let Some(id) = self.session.claimed_viewer_id() {
+            if self.peer_viewer.as_deref() != Some(id) {
+                self.peer_viewer = Some(id.to_owned());
+            }
+        }
         let incoming = self.consume(events, first_ctl)?;
         if established_ctl {
             self.first_ctl_seen = true;
@@ -397,9 +422,11 @@ impl HostProtocol {
         self.offer_seen = false;
         self.answer_seen = false;
         self.dtls_seen = false;
+        self.peer_viewer = None;
     }
 
     fn close_pairing(&mut self, ui: DevicesEvent, reason: &'static str) {
+        log_window_closed(reason, self.peer_viewer.as_deref());
         self.pairing = None;
         self.effects.push(Effect::Send(pair_close_message()));
         if self.peer_pairing {
@@ -438,6 +465,10 @@ impl HostProtocol {
             deadline: now + PAIR_WINDOW,
             claimed: false,
         });
+        tracing::info!(
+            expires_in_s = PAIR_WINDOW.as_secs(),
+            "pairing: window opened by the owner"
+        );
         self.effects.push(Effect::Ui(event));
     }
 
@@ -456,11 +487,13 @@ impl HostProtocol {
             // A decision counts only for the request the window was showing: a click that
             // arrives after that request ended, or names another device, is ignored.
             DevicesCommand::Allow(id) if self.waiting_decision.as_deref() == Some(id.as_str()) => {
+                tracing::info!(viewer = %id, "pairing: owner allowed the viewer");
                 let events = self.session.allow()?;
                 self.waiting_decision = None;
                 self.consume(events, false)?;
             }
             DevicesCommand::Deny(id) if self.waiting_decision.as_deref() == Some(id.as_str()) => {
+                tracing::info!(viewer = %id, "pairing: owner denied the viewer");
                 let events = self.session.deny()?;
                 self.waiting_decision = None;
                 self.consume(events, false)?;
@@ -516,6 +549,10 @@ impl HostProtocol {
                     self.queue_list();
                 }
                 Event::PairRequest(request) => {
+                    tracing::info!(
+                        viewer = %request.viewer_id,
+                        "pairing: viewer proof verified; waiting for the owner's decision"
+                    );
                     self.waiting_decision = Some(request.viewer_id.clone());
                     let name = self
                         .trusted
@@ -535,6 +572,16 @@ impl HostProtocol {
                         UNNAMED_DEVICE,
                         SystemTime::now(),
                     );
+                    match &saved {
+                        Ok(_) => {
+                            tracing::info!(viewer = %viewer.id, "pairing: trusted device saved")
+                        }
+                        Err(error) => tracing::warn!(
+                            viewer = %viewer.id,
+                            error = %format!("{error:#}"),
+                            "pairing: saving the trusted device failed"
+                        ),
+                    }
                     // The durable add must happen before pair_saved can emit pair-done.
                     let events = self.session.pair_saved(saved.is_ok())?;
                     self.consume(events, false)?;
@@ -640,6 +687,9 @@ impl HostProtocol {
             _ => {}
         }
         let pairing = self.peer_pairing;
+        if pairing {
+            log_pairing_end(reason, self.peer_viewer.as_deref());
+        }
         self.reset_peer();
         if pairing {
             self.pairing = None;
@@ -716,6 +766,42 @@ impl HostProtocol {
             self.dropped = 0;
         }
     }
+}
+
+/// The outcome of a pairing session as fixed, secret-free labels: how it ended or which check
+/// failed. Every reason inside `End` is a static string written in dk_session, never wire data.
+fn pairing_outcome(reason: End) -> (bool, &'static str, &'static str) {
+    match reason {
+        End::PairFinished => (true, "paired", ""),
+        End::PairDenied => (true, "denied by the owner", ""),
+        End::PairSaveFailed => (false, "trusted list save failed", ""),
+        End::PairCodeMismatch => (false, "pair proof verification failed", "code mismatch"),
+        End::Auth(check) => (false, "handshake verification failed", check),
+        End::Protocol(check) => (false, "viewer protocol error", check),
+        End::Refused(check) => (false, "auth-hello refused", check),
+        End::Ctl(check) => (false, "control channel error", check),
+        End::DtlsBindRequired => (false, "DTLS bind impossible", ""),
+        End::Stopped(why) => (true, "stopped", why),
+        End::PeerReset => (true, "replaced by a new viewer", ""),
+    }
+}
+
+fn log_pairing_end(reason: End, viewer: Option<&str>) {
+    let (expected, outcome, check) = pairing_outcome(reason);
+    let viewer = viewer.unwrap_or("unknown");
+    if expected {
+        tracing::info!(viewer, outcome, check, "pairing: ended");
+    } else {
+        tracing::warn!(viewer, outcome, check, "pairing: failed");
+    }
+}
+
+fn log_window_closed(reason: &'static str, viewer: Option<&str>) {
+    tracing::info!(
+        reason,
+        viewer = viewer.unwrap_or("none"),
+        "pairing: window closed"
+    );
 }
 
 fn show_on(ui: &SharedDevicesUi, event: DevicesEvent) {
@@ -1606,5 +1692,148 @@ mod tests {
         host.poll().unwrap();
         assert!(sent(&host.take_effects()).is_empty());
         assert_eq!(host.trusted.devices().len(), 1);
+    }
+
+    /// Captures this thread's tracing output while `body` runs.
+    fn captured_logs(body: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Every string in the pairing fixture that is secret material: the code in both forms, the
+    /// relay admit value, and every value of the pairing messages except the viewer's device ID.
+    fn pairing_secrets() -> Vec<String> {
+        fn strings(value: &Value, out: &mut Vec<String>) {
+            match value {
+                Value::String(text) => out.push(text.clone()),
+                Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
+                Value::Object(map) => map
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "type" && key.as_str() != "id")
+                    .for_each(|(_, item)| strings(item, out)),
+                _ => {}
+            }
+        }
+        let f = fixture();
+        let pair = &f["phase2"]["pairing"];
+        let code = PairingCode::parse(string(&pair["code"])).unwrap();
+        let pc = bp_device_key::DeviceId::parse(string(&pair["pcId"])).unwrap();
+        let mut out = Vec::new();
+        strings(&pair["messages"], &mut out);
+        strings(&pair["wrongCodeViewerMac"], &mut out);
+        strings(&f["handshake"]["messages"]["authFinish"], &mut out);
+        // Keys, MACs, nonces and signatures; short labels such as roles and caps are not secrets.
+        out.retain(|value| value.len() >= 32);
+        out.extend([
+            code.as_str().to_owned(),
+            code.display().to_string(),
+            URL_SAFE_NO_PAD.encode(code.admit_hash(&pc)),
+        ]);
+        out.sort();
+        out.dedup();
+        assert!(out.len() >= 4, "fixture secrets found: {}", out.len());
+        out
+    }
+
+    fn assert_no_secrets(logs: &str) {
+        for secret in pairing_secrets() {
+            assert!(!logs.contains(&secret), "log leaked {secret:?}: {logs}");
+        }
+    }
+
+    #[test]
+    fn pairing_log_records_each_step_of_a_successful_pairing_without_secrets() {
+        let scratch = Scratch::new();
+        let (mut host, ui) = controller(&scratch.list(), false);
+        let logs = captured_logs(|| {
+            let id = request_pair(&mut host);
+            ui.commands.send(DevicesCommand::Allow(id)).unwrap();
+            host.poll().unwrap();
+        });
+        let viewer = host.trusted.devices()[0].id.clone();
+        for step in [
+            "pairing: window opened by the owner",
+            "pairing: viewer arrived in the open pairing window",
+            "pairing: viewer proof verified; waiting for the owner's decision",
+            "pairing: owner allowed the viewer",
+            "pairing: trusted device saved",
+            "pairing: ended",
+            "paired",
+        ] {
+            assert!(logs.contains(step), "missing {step:?} in {logs}");
+        }
+        assert!(logs.contains(&viewer), "viewer ID missing from {logs}");
+        assert_no_secrets(&logs);
+    }
+
+    #[test]
+    fn pairing_log_names_the_failed_check_and_the_viewer() {
+        let scratch = Scratch::new();
+        let (mut host, _) = controller(&scratch.list(), false);
+        let f = fixture();
+        let viewer = string(&f["phase2"]["pairing"]["messages"]["authHello"]["id"]).to_owned();
+        let logs = captured_logs(|| {
+            begin_pair(&mut host);
+            let wrong =
+                json!({"type":"pair-proof", "mac":f["phase2"]["pairing"]["wrongCodeViewerMac"]});
+            host.receive(&wrong.to_string()).unwrap();
+        });
+        assert!(logs.contains("pairing: failed"), "{logs}");
+        assert!(logs.contains("pair proof verification failed"), "{logs}");
+        assert!(logs.contains("code mismatch"), "{logs}");
+        assert!(logs.contains(&viewer), "viewer ID missing from {logs}");
+        assert_no_secrets(&logs);
+    }
+
+    #[test]
+    fn pairing_log_gives_the_reason_a_window_closed() {
+        let scratch = Scratch::new();
+        let (mut host, ui) = controller(&scratch.list(), false);
+        let f = fixture();
+        let code = || PairingCode::parse(string(&f["phase2"]["pairing"]["code"])).unwrap();
+        let logs = captured_logs(|| {
+            let now = Instant::now();
+            host.start_pairing(code(), now, SystemTime::now());
+            host.expire_pairing(now + PAIR_WINDOW);
+            host.start_pairing(code(), now, SystemTime::now());
+            ui.commands.send(DevicesCommand::CancelPairing).unwrap();
+            host.poll().unwrap();
+            host.start_pairing(code(), now, SystemTime::now());
+            host.pair_closed();
+            host.start_pairing(code(), now, SystemTime::now());
+            host.terminate();
+            // A pairing viewer with no open window is refused, and the log says so.
+            host.peer_joined(&joined(true)).unwrap();
+        });
+        for reason in [
+            "pairing expired",
+            "pairing cancelled",
+            "relay dropped the window",
+            "relay closed pairing",
+            "signaling connection ended",
+            "viewer arrived without an unused pairing window",
+        ] {
+            assert!(logs.contains(reason), "missing {reason:?} in {logs}");
+        }
+        assert_no_secrets(&logs);
     }
 }
