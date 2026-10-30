@@ -24,6 +24,10 @@ use super::logic::{
 };
 use super::platform::{dpapi_unprotect_hex, KillOnCloseJob};
 
+/// Stdin line that asks the host to tell connected pipe clients to show the
+/// Devices app. The host side defines the same literal.
+pub const SHOW_DEVICES_APP_LINE: &[u8] = b"show-devices-app\n";
+
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const POLL: Duration = Duration::from_millis(250);
 const NOT_CONFIGURED_RECHECK: Duration = Duration::from_secs(30);
@@ -90,6 +94,16 @@ impl HostStdin {
     /// Writes the fixed `open-devices` line to the current child. Fails with
     /// `NotConnected` when no child is running.
     pub fn request_open_devices(&self) -> io::Result<()> {
+        self.write_line(OPEN_DEVICES_LINE)
+    }
+
+    /// Writes the fixed `show-devices-app` line to the current child. Fails
+    /// with `NotConnected` when no child is running.
+    pub fn request_show_devices_app(&self) -> io::Result<()> {
+        self.write_line(SHOW_DEVICES_APP_LINE)
+    }
+
+    fn write_line(&self, line: &[u8]) -> io::Result<()> {
         let mut guard = match self.0.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -100,7 +114,7 @@ impl HostStdin {
                 "host is not running",
             ));
         };
-        stdin.write_all(OPEN_DEVICES_LINE)?;
+        stdin.write_all(line)?;
         stdin.flush()
     }
 }
@@ -376,6 +390,12 @@ impl SupervisorThread {
         self.stdin.request_open_devices()
     }
 
+    /// Asks the running host to tell the Devices app to show itself. Fails
+    /// with `NotConnected` when no host child is running.
+    pub fn request_show_devices_app(&self) -> io::Result<()> {
+        self.stdin.request_show_devices_app()
+    }
+
     pub fn stop(&mut self) {
         if let Some(tx) = self.stop.take() {
             let _ = tx.send(());
@@ -414,6 +434,38 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
         stdin.set(None);
         assert!(stdin.request_open_devices().is_err());
+    }
+
+    #[test]
+    fn show_request_without_a_running_host_is_refused() {
+        let stdin = HostStdin::default();
+        let error = stdin
+            .request_show_devices_app()
+            .expect_err("no child is running");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn show_line_is_the_fixed_literal() {
+        assert_eq!(SHOW_DEVICES_APP_LINE, b"show-devices-app\n");
+    }
+
+    #[test]
+    fn show_request_writes_exactly_the_line_to_a_child() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "more"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn more");
+        let stdin = HostStdin::default();
+        stdin.set(child.stdin.take());
+        stdin.request_show_devices_app().expect("written");
+        stdin.set(None); // closes the pipe so `more` finishes
+        let output = child.wait_with_output().expect("output");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(text.trim(), "show-devices-app");
     }
 
     #[test]
