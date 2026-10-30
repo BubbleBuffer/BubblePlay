@@ -27,6 +27,11 @@ on:
       - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/ServerConfig.kt"
       - ".github/workflows/app.yml"
   workflow_dispatch:
+    inputs:
+      update_goldens:
+        description: Rewrite the golden pictures on this runner and upload them as an artifact
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -79,7 +84,20 @@ jobs:
         run: flutter analyze lib test
       - name: Widget, golden and contract tests
         working-directory: app
-        run: flutter test
+        run: |
+          if [ "${{ inputs.update_goldens }}" = "true" ]; then
+            flutter test --update-goldens
+          else
+            flutter test
+          fi
+      - name: Upload golden pictures
+        if: ${{ inputs.update_goldens }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: app-goldens
+          path: app/test/**/goldens/*.png
+          if-no-files-found: error
+          retention-days: 14
       - name: Android debug APK
         working-directory: app
         run: flutter build apk --debug
