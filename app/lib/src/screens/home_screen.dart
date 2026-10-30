@@ -1,10 +1,14 @@
+import 'dart:async';
+
 import 'package:bb_ui/bb_ui.dart';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
 import '../model/model.dart';
+import '../devices/devices_controller.dart';
 import 'pc_actions.dart';
 import 'settings_screen.dart';
+import 'this_pc_detail.dart';
 
 /// Your PCs, with "This PC" pinned above them on Windows. Desktop shows the list beside the
 /// selected PC's details; a phone shows the list alone and opens a PC's actions from its row.
@@ -19,6 +23,33 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   String? _selectedId;
+  bool _thisPcSelected = false;
+  StreamSubscription<void>? _shows;
+
+  bool _started = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_started) return;
+    _started = true;
+    final env = AppScope.of(context);
+    final devices = env.devices;
+    if (devices == null) return;
+    // A `show` from the host (the tray's Devices item) or --section=this-pc picks This PC.
+    _thisPcSelected = env.initialSection == 'this-pc' || devices.showPending;
+    devices.consumeShow();
+    _shows = devices.shows.listen((_) {
+      devices.consumeShow();
+      if (mounted) setState(() => _thisPcSelected = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _shows?.cancel();
+    super.dispose();
+  }
 
   RemotePc? get _selected {
     final pcs = widget.state.pcs;
@@ -34,9 +65,15 @@ class _HomeScreenState extends State<HomeScreen> {
     final mobile = context.mobile;
     final list = _PcList(
       state: widget.state,
-      showThisPc: env.isWindows,
-      selectedId: _selected?.id,
-      onSelect: (pc) => setState(() => _selectedId = pc.id),
+      showThisPc: env.isWindows && !mobile,
+      devices: env.devices,
+      thisPcSelected: _thisPcSelected,
+      onSelectThisPc: () => setState(() => _thisPcSelected = true),
+      selectedId: _thisPcSelected ? null : _selected?.id,
+      onSelect: (pc) => setState(() {
+        _selectedId = pc.id;
+        _thisPcSelected = false;
+      }),
       mobile: mobile,
     );
     if (mobile) return SafeArea(child: list);
@@ -47,7 +84,9 @@ class _HomeScreenState extends State<HomeScreen> {
         const VLine(height: double.infinity),
         SizedBox(
           width: 380,
-          child: selected == null
+          child: _thisPcSelected && env.devices != null
+              ? ThisPcDetail(devices: env.devices!)
+              : selected == null
               ? const SizedBox.shrink()
               : PcDetail(key: ValueKey(selected.id), pc: selected),
         ),
@@ -60,6 +99,9 @@ class _PcList extends StatelessWidget {
   const _PcList({
     required this.state,
     required this.showThisPc,
+    required this.devices,
+    required this.thisPcSelected,
+    required this.onSelectThisPc,
     required this.selectedId,
     required this.onSelect,
     required this.mobile,
@@ -67,6 +109,9 @@ class _PcList extends StatelessWidget {
 
   final AppState state;
   final bool showThisPc;
+  final DevicesController? devices;
+  final bool thisPcSelected;
+  final VoidCallback onSelectThisPc;
   final String? selectedId;
   final ValueChanged<RemotePc> onSelect;
   final bool mobile;
@@ -86,7 +131,12 @@ class _PcList extends StatelessWidget {
               if (showThisPc) ...[
                 const SectionLabel('This PC', icon: Ico.monitorPlay),
                 const SizedBox(height: 8),
-                ThisPcRow(host: state.host),
+                ThisPcRow(
+                  host: state.host,
+                  devices: devices,
+                  selected: thisPcSelected,
+                  onSelect: onSelectThisPc,
+                ),
                 const SizedBox(height: 16),
                 const HLine(),
                 const SizedBox(height: 24),
@@ -96,11 +146,13 @@ class _PcList extends StatelessWidget {
                 subtitle: "Other PCs paired with this device's key.",
                 trailing: mobile
                     ? null
-                    : SecondaryButton(
-                        label: 'Pair a new PC',
-                        icon: Ico.plus,
-                        height: 36,
-                        onTap: () => controller.act(const StartPairing()),
+                    : IntrinsicWidth(
+                        child: SecondaryButton(
+                          label: 'Pair a new PC',
+                          icon: Ico.plus,
+                          height: 36,
+                          onTap: () => controller.act(const StartPairing()),
+                        ),
                       ),
               ),
               const SizedBox(height: 12),
@@ -136,12 +188,48 @@ class _PcList extends StatelessWidget {
 /// The pinned "This PC" row. Hosting itself is not in this version, so without a host it says
 /// so; with one it shows the host's name and run state.
 class ThisPcRow extends StatelessWidget {
-  const ThisPcRow({super.key, required this.host});
+  const ThisPcRow({
+    super.key,
+    required this.host,
+    this.devices,
+    this.selected = false,
+    this.onSelect,
+  });
 
   final HostStatus? host;
 
+  /// The host's Devices pipe; when set the row reflects it and opens the Devices detail.
+  final DevicesController? devices;
+  final bool selected;
+  final VoidCallback? onSelect;
+
   @override
   Widget build(BuildContext context) {
+    final devices = this.devices;
+    if (devices != null) {
+      return ListenableBuilder(
+        listenable: devices,
+        builder: (context, _) {
+          final state = devices.state;
+          final (label, kind) = switch (state.connection) {
+            LinkConnecting() => ('Connecting', StatusKind.attention),
+            LinkDisconnected() => ('Not connected', StatusKind.offline),
+            LinkConnected() => state.relayOnline
+                ? ('Relay online', StatusKind.online)
+                : ('Relay offline', StatusKind.attention),
+          };
+          final count = state.devices.length;
+          return DeviceRow(
+            icon: Ico.server,
+            title: state.pcName ?? 'This PC',
+            status: StatusPill(label, kind: kind),
+            meta: [if (state.isConnected) count == 1 ? '1 paired device' : '$count paired devices'],
+            selected: selected,
+            onTap: onSelect,
+          );
+        },
+      );
+    }
     final host = this.host;
     if (host == null) {
       return const DeviceRow(

@@ -1,3 +1,4 @@
+import 'package:flutter/widgets.dart' show IntrinsicWidth;
 import 'package:flutter_test/flutter_test.dart';
 
 import '../support/harness.dart';
@@ -31,6 +32,15 @@ void main() {
       expect(app.actions.single, {
         'Connect': {'pc_id': isA<String>()},
       });
+    });
+
+    testWidgets('Pair a new PC is as wide as its label, not the header', (tester) async {
+      await pumpApp(tester, contractState('home'));
+      final button = find.ancestor(
+        of: find.text('Pair a new PC'),
+        matching: find.byType(IntrinsicWidth),
+      );
+      expect(tester.getSize(button.first).width, lessThan(300));
     });
 
     testWidgets('Pair a new PC starts pairing', (tester) async {
