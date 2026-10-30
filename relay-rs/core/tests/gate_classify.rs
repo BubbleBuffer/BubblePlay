@@ -49,29 +49,29 @@ fn gate_origin_match_with_valid_cookie_is_allowed() {
 }
 
 #[test]
-fn gate_origin_absent_page_without_cookie_waits() {
+fn gate_origin_absent_page_without_cookie_is_held() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(4);
-    let (page, effects) = wait_parts(get(&mut gate, &mut rng, CLIENT, T0));
-    assert_eq!(page.status, 200);
+    let (hold, effects) = hold_parts(get(&mut gate, &mut rng, CLIENT, T0));
+    assert_eq!(hold.until_ms(), T0 + HOLD_MS);
     assert_eq!(effects.len(), 1);
 }
 
 #[test]
-fn gate_origin_match_page_without_cookie_waits() {
+fn gate_origin_match_page_without_cookie_is_held() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(5);
     let mut request = req("GET", "/", CLIENT, T0);
     request.origin = Some(ORIGIN);
-    let (_, effects) = wait_parts(gate.handle(&mut rng, &request));
+    let (_, effects) = hold_parts(gate.handle(&mut rng, &request));
     assert_eq!(effects.len(), 1);
 }
 
 #[test]
-fn gate_asset_path_without_cookie_waits_like_a_page() {
+fn gate_asset_path_without_cookie_is_held_like_a_page() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(6);
-    let (_, effects) = wait_parts(gate.handle(&mut rng, &req("GET", "/app.js", CLIENT, T0)));
+    let (_, effects) = hold_parts(gate.handle(&mut rng, &req("GET", "/app.js", CLIENT, T0)));
     assert_eq!(effects.len(), 1);
 }
 
@@ -105,21 +105,21 @@ fn gate_valid_cookie_is_found_among_other_cookies() {
 }
 
 #[test]
-fn gate_expired_cookie_waits_again() {
+fn gate_expired_cookie_is_held_again() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(10);
     let cookie = approve_client(&mut gate, &mut rng, CLIENT, T0);
     let after = T0 + 2_000 + COOKIE_MS;
     let verdict = get_with_cookie(&mut gate, &mut rng, "/", &cookie, after);
-    assert!(matches!(verdict, Verdict::Wait(_, _)), "got {verdict:?}");
+    assert!(matches!(verdict, Verdict::Hold(_, _)), "got {verdict:?}");
 }
 
 #[test]
-fn gate_unknown_cookie_waits() {
+fn gate_unknown_cookie_is_held() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(11);
     let verdict = get_with_cookie(&mut gate, &mut rng, "/", BOGUS_COOKIE, T0);
-    assert!(matches!(verdict, Verdict::Wait(_, _)), "got {verdict:?}");
+    assert!(matches!(verdict, Verdict::Hold(_, _)), "got {verdict:?}");
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn gate_post_without_cookie_is_403_and_opens_nothing() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(12);
     let request = req("POST", "/pair", CLIENT, T0);
-    let (page, effects) = wait_parts(gate.handle(&mut rng, &request));
+    let (page, effects) = handled_parts(gate.handle(&mut rng, &request));
     assert_eq!(page.status, 403);
     assert!(effects.is_empty());
     assert!(gate.snapshot().records.is_empty());
@@ -135,13 +135,13 @@ fn gate_post_without_cookie_is_403_and_opens_nothing() {
 }
 
 #[test]
-fn gate_head_without_cookie_waits_with_empty_body_and_opens_nothing() {
+fn gate_head_without_cookie_is_dropped_and_opens_nothing() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(13);
-    let (page, effects) = wait_parts(gate.handle(&mut rng, &req("HEAD", "/", CLIENT, T0)));
-    assert_eq!(page.status, 200);
-    assert!(page.body.is_empty());
-    assert!(effects.is_empty());
+    assert_eq!(
+        gate.handle(&mut rng, &req("HEAD", "/", CLIENT, T0)),
+        Verdict::Drop
+    );
     assert_eq!(gate.pending_ids(T0).len(), 0);
 }
 
@@ -158,14 +158,6 @@ fn gate_decision_with_get_is_refused() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(15);
     let request = req("GET", "/__gate/decision", CLIENT, T0);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
-}
-
-#[test]
-fn gate_poll_with_get_is_refused() {
-    let mut gate = new_gate();
-    let mut rng = TestRng::new(16);
-    let request = req("GET", "/__gate/poll", CLIENT, T0);
     assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
 }
 
@@ -258,7 +250,7 @@ fn gate_websocket_without_origin_is_allowed_without_cookie() {
 fn gate_websocket_under_gate_path_is_refused() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(26);
-    let request = ws_request("/__gate/poll", None, None);
+    let request = ws_request("/__gate/decision", None, None);
     assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
 }
 
@@ -268,6 +260,8 @@ fn gate_unknown_cookie_name_is_not_a_gate_cookie() {
     let mut rng = TestRng::new(27);
     let cookie = approve_client(&mut gate, &mut rng, CLIENT, T0);
     let renamed = cookie.replacen("__Host-gate=", "gate=", 1);
-    let verdict = get_with_cookie(&mut gate, &mut rng, "/", &renamed, T0 + 10_000);
-    assert!(matches!(verdict, Verdict::Wait(_, _)), "got {verdict:?}");
+    // Past the cooldown that the approval started, so the navigation is held
+    // rather than dropped.
+    let verdict = get_with_cookie(&mut gate, &mut rng, "/", &renamed, T0 + 20_000);
+    assert!(matches!(verdict, Verdict::Hold(_, _)), "got {verdict:?}");
 }
