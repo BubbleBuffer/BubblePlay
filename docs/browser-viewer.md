@@ -31,7 +31,7 @@ Removing a PC here forgets it in this browser. The PC keeps its own list.
 
 ## Pairing a new PC
 
-1. On the PC, open the tray menu and choose Devices, then Pair device.
+1. On the PC, left-click the tray icon (or choose Open BubblePlay in its menu), then Pair device.
 2. The tray shows a code and a QR code. Both carry `https://<relay>/pair#pc=<id>&code=<code>`.
 3. Open that link in the browser, or scan the QR code with it.
 4. The browser reads the fragment and removes it from the address bar at once.

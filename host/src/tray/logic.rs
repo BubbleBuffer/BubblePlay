@@ -457,6 +457,40 @@ pub fn status_line(state: &HostState, agent: &AgentStatus) -> String {
     format!("BubblePlay: {} ({input})", state.label())
 }
 
+/// Tray icon resource for light taskbars (dark outline), linked by build.rs.
+pub const TRAY_ICON_LIGHT: u16 = 2;
+/// Tray icon resource for dark taskbars (light outline), linked by build.rs.
+pub const TRAY_ICON_DARK: u16 = 3;
+
+/// Picks the tray icon from `SystemUsesLightTheme`: 0 or missing means a dark taskbar.
+pub fn tray_icon_resource(system_uses_light_theme: Option<u32>) -> u16 {
+    match system_uses_light_theme {
+        Some(0) | None => TRAY_ICON_DARK,
+        Some(_) => TRAY_ICON_LIGHT,
+    }
+}
+
+/// Lets one left-click through per double-click interval, so a double-click
+/// (button-up, double-click, button-up) opens BubblePlay once.
+#[derive(Debug, Default)]
+pub struct ClickDebounce {
+    last: Option<Instant>,
+}
+
+impl ClickDebounce {
+    /// True when this click should act; `window` is the system double-click time.
+    pub fn accept(&mut self, now: Instant, window: Duration) -> bool {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < window)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
 /// The Admin mode line shown under the "Admin mode" menu item.
 pub fn admin_mode_line(agent: &AgentStatus) -> Option<&'static str> {
     match agent {
@@ -616,9 +650,295 @@ pub fn unix_ms_now() -> u64 {
         .as_millis() as u64
 }
 
+// Tray menu command ids. TrackPopupMenu returns them; greyed lines reuse STATUS and BUILD.
+pub const CMD_STATUS: usize = 1;
+pub const CMD_ADMIN: usize = 2;
+pub const CMD_LOGIN: usize = 3;
+pub const CMD_RESTART: usize = 4;
+pub const CMD_LOGS: usize = 5;
+pub const CMD_QUIT: usize = 6;
+pub const CMD_ROLLBACK: usize = 7;
+pub const CMD_BUILD: usize = 8;
+pub const CMD_AGENT_UPDATE: usize = 9;
+pub const CMD_SECURE_HELPER_UPDATE: usize = 10;
+pub const CMD_AUDIO: usize = 11;
+pub const CMD_CPU_MODE: usize = 12;
+pub const CMD_EXPORT_KEY: usize = 13;
+pub const CMD_IMPORT_KEY: usize = 14;
+/// "Open BubblePlay": opens the Devices window. Also what a left-click on the icon does.
+pub const CMD_DEVICES: usize = 15;
+
+/// What the tray menu shows, gathered from the app when the menu opens.
+#[derive(Debug, Clone, Default)]
+pub struct MenuState {
+    pub status: String,
+    pub error: Option<String>,
+    pub build: String,
+    pub admin: bool,
+    pub admin_enabled: bool,
+    pub admin_line: Option<&'static str>,
+    /// (enabled, label) when an admin-agent update item is shown.
+    pub agent_update: Option<(bool, &'static str)>,
+    pub helper_line: String,
+    /// (enabled, label) when a privileged-helper update item is shown.
+    pub helper_update: Option<(bool, &'static str)>,
+    pub login: bool,
+    pub audio: bool,
+    pub cpu_mode: bool,
+    pub key_busy: bool,
+    pub can_roll_back: bool,
+}
+
+/// One tray menu entry, before it becomes a Win32 menu item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuEntry {
+    /// `default` items show bold; disabled items are greyed.
+    Item {
+        id: usize,
+        text: String,
+        enabled: bool,
+        checked: bool,
+        default: bool,
+    },
+    Separator,
+    Submenu {
+        text: String,
+        entries: Vec<MenuEntry>,
+    },
+}
+
+impl MenuEntry {
+    fn item(id: usize, text: &str, enabled: bool, checked: bool) -> Self {
+        Self::Item {
+            id,
+            text: text.to_owned(),
+            enabled,
+            checked,
+            default: false,
+        }
+    }
+
+    fn command(id: usize, text: &str) -> Self {
+        Self::item(id, text, true, false)
+    }
+
+    fn grey(id: usize, text: &str) -> Self {
+        Self::item(id, text, false, false)
+    }
+}
+
+/// The tray menu: Open BubblePlay and status on top, the everyday toggles, then More, then
+/// Restart host and Quit. Settings, key transfer, logs and diagnostics live under More.
+pub fn menu_layout(state: &MenuState) -> Vec<MenuEntry> {
+    let mut top = vec![MenuEntry::Item {
+        id: CMD_DEVICES,
+        text: "Open BubblePlay".to_owned(),
+        enabled: true,
+        checked: false,
+        default: true,
+    }];
+    top.push(MenuEntry::grey(CMD_STATUS, &state.status));
+    if let Some(error) = &state.error {
+        top.push(MenuEntry::grey(CMD_BUILD, error));
+    }
+    top.push(MenuEntry::Separator);
+    top.push(MenuEntry::item(
+        CMD_ADMIN,
+        "Admin mode",
+        state.admin_enabled,
+        state.admin,
+    ));
+    if let Some(line) = state.admin_line {
+        top.push(MenuEntry::grey(CMD_STATUS, line));
+    }
+    if let Some((enabled, label)) = state.agent_update {
+        top.push(MenuEntry::item(CMD_AGENT_UPDATE, label, enabled, false));
+    }
+    if let Some((enabled, label)) = state.helper_update {
+        top.push(MenuEntry::item(
+            CMD_SECURE_HELPER_UPDATE,
+            label,
+            enabled,
+            false,
+        ));
+    }
+    top.push(MenuEntry::item(
+        CMD_AUDIO,
+        "Stream PC sound",
+        true,
+        state.audio,
+    ));
+
+    let keys = !state.key_busy;
+    let mut more = vec![
+        MenuEntry::item(CMD_LOGIN, "Start at login", true, state.login),
+        MenuEntry::item(CMD_CPU_MODE, "CPU mode", true, state.cpu_mode),
+        MenuEntry::Separator,
+        MenuEntry::item(CMD_EXPORT_KEY, "Export PC key...", keys, false),
+        MenuEntry::item(CMD_IMPORT_KEY, "Import PC key...", keys, false),
+        MenuEntry::Separator,
+    ];
+    if state.can_roll_back {
+        more.push(MenuEntry::command(CMD_ROLLBACK, "Roll back host"));
+    }
+    more.push(MenuEntry::command(CMD_LOGS, "Open logs folder"));
+    more.push(MenuEntry::Separator);
+    more.push(MenuEntry::grey(CMD_BUILD, &state.build));
+    more.push(MenuEntry::grey(CMD_STATUS, &state.helper_line));
+    if let Some(line) = state.admin_line {
+        more.push(MenuEntry::grey(CMD_STATUS, line));
+    }
+    top.push(MenuEntry::Submenu {
+        text: "More".to_owned(),
+        entries: more,
+    });
+
+    top.push(MenuEntry::Separator);
+    top.push(MenuEntry::command(CMD_RESTART, "Restart host"));
+    top.push(MenuEntry::command(CMD_QUIT, "Quit"));
+    top
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compact view of a menu for order assertions: ids, "-" for separators, "More[...]".
+    fn menu_shape(entries: &[MenuEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                MenuEntry::Item { id, .. } => id.to_string(),
+                MenuEntry::Separator => "-".to_owned(),
+                MenuEntry::Submenu { text, entries } => {
+                    format!("{text}[{}]", menu_shape(entries).join(" "))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tray_icon_follows_system_theme_value() {
+        assert_eq!(tray_icon_resource(Some(1)), TRAY_ICON_LIGHT);
+        assert_eq!(tray_icon_resource(Some(0)), TRAY_ICON_DARK);
+        assert_eq!(tray_icon_resource(None), TRAY_ICON_DARK);
+        assert_eq!(tray_icon_resource(Some(7)), TRAY_ICON_LIGHT);
+    }
+
+    #[test]
+    fn click_debounce_lets_one_click_through_per_window() {
+        let window = Duration::from_millis(500);
+        let start = Instant::now();
+        let mut debounce = ClickDebounce::default();
+        assert!(debounce.accept(start, window));
+        // The second button-up of a double-click.
+        assert!(!debounce.accept(start + Duration::from_millis(200), window));
+        assert!(debounce.accept(start + Duration::from_millis(700), window));
+        assert!(!debounce.accept(start + Duration::from_millis(1100), window));
+        assert!(debounce.accept(start + Duration::from_millis(1300), window));
+    }
+
+    #[test]
+    fn menu_layout_minimal_order() {
+        let state = MenuState {
+            status: "Host running".into(),
+            build: "Build 1".into(),
+            helper_line: "Helper ok".into(),
+            admin_enabled: true,
+            ..MenuState::default()
+        };
+        let menu = menu_layout(&state);
+        assert_eq!(
+            menu_shape(&menu),
+            [
+                "15",
+                "1",
+                "-",
+                "2",
+                "11",
+                "More[3 12 - 13 14 - 5 - 8 1]",
+                "-",
+                "4",
+                "6"
+            ]
+        );
+        let MenuEntry::Item {
+            text,
+            default,
+            enabled,
+            ..
+        } = &menu[0]
+        else {
+            panic!("first entry is an item");
+        };
+        assert_eq!(text, "Open BubblePlay");
+        assert!(*default && *enabled);
+        let defaults = menu
+            .iter()
+            .filter(|entry| matches!(entry, MenuEntry::Item { default: true, .. }))
+            .count();
+        assert_eq!(defaults, 1);
+    }
+
+    #[test]
+    fn menu_layout_full_order() {
+        let state = MenuState {
+            status: "Host stopped".into(),
+            error: Some("Host error: boom".into()),
+            build: "Build 1".into(),
+            admin: true,
+            admin_enabled: false,
+            admin_line: Some("Admin agent not responding"),
+            agent_update: Some((true, AGENT_UPDATE_LABEL)),
+            helper_line: "Helper ok".into(),
+            helper_update: Some((false, SECURE_HELPER_UPDATE_LABEL)),
+            login: true,
+            audio: true,
+            cpu_mode: true,
+            key_busy: true,
+            can_roll_back: true,
+        };
+        let menu = menu_layout(&state);
+        assert_eq!(
+            menu_shape(&menu),
+            [
+                "15",
+                "1",
+                "8",
+                "-",
+                "2",
+                "1",
+                "9",
+                "10",
+                "11",
+                "More[3 12 - 13 14 - 7 5 - 8 1 1]",
+                "-",
+                "4",
+                "6"
+            ]
+        );
+        // Open BubblePlay stays enabled when the host is down; key items grey while busy.
+        assert!(matches!(&menu[0], MenuEntry::Item { enabled: true, .. }));
+        assert!(matches!(
+            &menu[4],
+            MenuEntry::Item {
+                enabled: false,
+                checked: true,
+                ..
+            }
+        ));
+        let MenuEntry::Submenu { entries, .. } = &menu[9] else {
+            panic!("More is a submenu");
+        };
+        assert!(matches!(
+            &entries[3],
+            MenuEntry::Item {
+                id: CMD_EXPORT_KEY,
+                enabled: false,
+                ..
+            }
+        ));
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

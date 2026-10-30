@@ -19,8 +19,9 @@ use windows::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RRF_RT_REG_DWORD,
 };
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, OpenMutexW, ResetEvent, SetEvent, WaitForSingleObject,
@@ -169,6 +170,28 @@ fn open_run_key(access: windows::Win32::System::Registry::REG_SAM_FLAGS) -> Resu
     };
     status.ok().context("opening HKCU Run key")?;
     Ok(key)
+}
+
+/// HKCU `...\Themes\Personalize` `SystemUsesLightTheme` (taskbar/notification-area theme),
+/// or `None` when the value is missing or unreadable.
+pub fn system_uses_light_theme() -> Option<u32> {
+    let key = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let name = wide("SystemUsesLightTheme");
+    let mut value = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: the strings are NUL-terminated; value/size describe a writable DWORD.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    status.is_ok().then_some(value)
 }
 
 pub fn read_run_value() -> Option<String> {

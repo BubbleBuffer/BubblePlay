@@ -45,7 +45,7 @@ On a non-NVIDIA adapter, the MF hardware line carries the NVENC reason after a s
 
 ## Controls
 
-- **Tray CPU mode toggle.** The tray menu item is "CPU mode". The setting is saved as `cpu_mode` in `%LOCALAPPDATA%\BubblePlay\tray.json`. A missing field means off. Toggling restarts the supervised host, and any connected viewer session ends. The supervisor passes `--cpu-mode` only when the setting is on ([`tray/logic.rs`](../../host/src/tray/logic.rs), [`tray/supervisor.rs`](../../host/src/tray/supervisor.rs)).
+- **Tray CPU mode toggle.** The tray menu item is "CPU mode", under More. The setting is saved as `cpu_mode` in `%LOCALAPPDATA%\BubblePlay\tray.json`. A missing field means off. Toggling restarts the supervised host, and any connected viewer session ends. The supervisor passes `--cpu-mode` only when the setting is on ([`tray/logic.rs`](../../host/src/tray/logic.rs), [`tray/supervisor.rs`](../../host/src/tray/supervisor.rs)).
 - **`--cpu-mode`.** The host flag for CPU mode. It forces MF software.
 - **`--encoder auto|nvenc|mf-hw|mf-sw`.** The host flag for the diagnostic override. Other values are rejected.
 
