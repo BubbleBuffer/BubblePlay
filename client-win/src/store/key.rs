@@ -449,16 +449,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
     fn export_of_a_current_protected_key_asks_for_nothing() {
         let dir = TempDir::new("export-current-protected");
         let store = KeyStore::in_dir(dir.path());
