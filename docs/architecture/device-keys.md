@@ -247,7 +247,7 @@ Each trusted key has permissions, set at pairing and editable in the tray. The h
 
 ## Tray management window
 
-Opened from the tray menu (**Devices…**), next to Admin mode, Start at login and Logs.
+Opened by a left-click on the tray icon or by **Open BubblePlay**, the bold first item of the tray menu.
 
 ```
 BubblePlay — Devices                               [Pair device] [Export PC key]
@@ -273,7 +273,7 @@ This PC   Office-PC   ID 7HQ2-K9MX-4RTD-P0ZB   Relay play.example.com (online)
 - Last seen comes from the host's own records, not the relay.
 - Native window, like the tray's other dialogs, following the BubblePlay product profile.
 
-**Current state of PC key backup (2026-10-15):** the tray menu has **Export PC key...** and **Import PC key...**, built in `host/src/tray/key_ui.rs`. Export asks for an optional passphrase, typed twice, then saves `<PC ID>.bpkey`. Import reads a `.bpkey`, asks for its passphrase when it is protected, asks to confirm the ID change, replaces the PC key and restarts the host. Both run on their own thread, so the tray stays responsive. Not yet checked on screen.
+**Current state of PC key backup (2026-10-15):** the tray menu's **More** submenu has **Export PC key...** and **Import PC key...**, built in `host/src/tray/key_ui.rs`. Export asks for an optional passphrase, typed twice, then saves `<PC ID>.bpkey`. Import reads a `.bpkey`, asks for its passphrase when it is protected, asks to confirm the ID change, replaces the PC key and restarts the host. Both run on their own thread, so the tray stays responsive. Not yet checked on screen.
 
 ## Cutover and removal
 

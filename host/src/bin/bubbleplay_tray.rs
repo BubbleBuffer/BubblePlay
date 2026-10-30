@@ -44,11 +44,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
     LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SetForegroundWindow, SetProcessDPIAware, SetTimer, TrackPopupMenu, TranslateMessage, HICON,
-    IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON,
-    SM_CYSMICON, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_DESTROY,
-    WM_ENDSESSION, WM_LBUTTONUP, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-    WS_OVERLAPPED,
+    SetForegroundWindow, SetMenuDefaultItem, SetProcessDPIAware, SetTimer, TrackPopupMenu,
+    TranslateMessage, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, MENU_ITEM_FLAGS, MF_CHECKED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_ENDSESSION,
+    WM_LBUTTONUP, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use bubbleplay_host::admin_agent::client::{probe, ProbeResult, AGENT_EXE};
@@ -62,10 +62,12 @@ use bubbleplay_host::secure_helper::protocol::{
     PROTOCOL_MAX as SECURE_PROTOCOL_MAX, PROTOCOL_MIN as SECURE_PROTOCOL_MIN,
 };
 use logic::{
-    admin_menu_enabled, admin_mode_line, run_key_command, running_probe_status,
+    admin_menu_enabled, admin_mode_line, menu_layout, run_key_command, running_probe_status,
     secure_helper_should_launch, start_secure_helper_for_viewer, status_line, unix_ms_now,
-    AgentStatus, HostState, ProbeGate, SecureHelperStatus, SharedLog, TraySettings, ViewerGate,
-    AGENT_UPDATE_LABEL, SECURE_HELPER_UPDATE_LABEL,
+    AgentStatus, HostState, MenuEntry, MenuState, ProbeGate, SecureHelperStatus, SharedLog,
+    TraySettings, ViewerGate, AGENT_UPDATE_LABEL, CMD_ADMIN, CMD_AGENT_UPDATE, CMD_AUDIO,
+    CMD_CPU_MODE, CMD_DEVICES, CMD_EXPORT_KEY, CMD_IMPORT_KEY, CMD_LOGIN, CMD_LOGS, CMD_QUIT,
+    CMD_RESTART, CMD_ROLLBACK, CMD_SECURE_HELPER_UPDATE, SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
     acquire_single_instance, create_manual_event, data_dir, end_agent_task, ensure_agent_task,
@@ -88,22 +90,6 @@ const WM_ADMIN_CHANGED: u32 = WM_APP + 4;
 /// Posted when a PC key export/import window flow ends; WPARAM = 1 when the key was replaced.
 const WM_KEY_UI_DONE: u32 = WM_APP + 5;
 const TIMER_ID: usize = 1;
-
-const CMD_STATUS: usize = 1;
-const CMD_ADMIN: usize = 2;
-const CMD_LOGIN: usize = 3;
-const CMD_RESTART: usize = 4;
-const CMD_LOGS: usize = 5;
-const CMD_QUIT: usize = 6;
-const CMD_ROLLBACK: usize = 7;
-const CMD_BUILD: usize = 8;
-const CMD_AGENT_UPDATE: usize = 9;
-const CMD_SECURE_HELPER_UPDATE: usize = 10;
-const CMD_AUDIO: usize = 11;
-const CMD_CPU_MODE: usize = 12;
-const CMD_EXPORT_KEY: usize = 13;
-const CMD_IMPORT_KEY: usize = 14;
-const CMD_DEVICES: usize = 15;
 
 /// Time the secure helper gets to answer after its task was started.
 const AGENT_START_GRACE: Duration = Duration::from_secs(15);
@@ -1242,11 +1228,13 @@ impl App {
 
     /// Asks the host child that is running now to open its Devices window.
     /// A replaced or exited child never receives the request.
+    /// "Open BubblePlay" stays enabled while the host is down, so this explains instead.
     fn open_devices(&self) {
-        let Some(user) = &self.user else {
-            return;
+        let delivered = match &self.user {
+            Some(user) => user.request_open_devices(),
+            None => Err(std::io::Error::other("no host child")),
         };
-        if let Err(error) = user.request_open_devices() {
+        if let Err(error) = delivered {
             tracing::warn!(?error, "devices window request not delivered");
             self.balloon(
                 "BubblePlay",
@@ -1368,61 +1356,42 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 fn show_menu(hwnd: HWND) {
-    let Some((
-        status,
-        admin,
-        admin_enabled,
-        admin_line,
-        login,
-        audio,
-        cpu_mode,
-        agent_update,
-        helper_line,
-        helper_update,
-        build,
-        error,
-        can_roll_back,
-        key_busy,
-        devices_enabled,
-    )) = with_app(|app| {
+    let Some(state) = with_app(|app| {
         app.refresh_admin_mode();
         app.drain_probes();
         // Starts a probe if none is in flight; the menu shows the last known status.
         app.check_agent(true);
         app.check_secure_helper(true);
-        let agent_update = if app.agent_update_running {
-            Some((MF_STRING | MF_GRAYED, "Admin agent update running..."))
-        } else if app.admin_on && app.agent.needs_update() {
-            Some((MF_STRING, AGENT_UPDATE_LABEL))
-        } else {
-            None
-        };
-        (
-            status_line(&app.state(), &app.agent),
-            app.admin_on,
-            admin_menu_enabled(app.admin_on, app.viewers.viewer_connected())
+        MenuState {
+            status: status_line(&app.state(), &app.agent),
+            error: app.host_error.clone(),
+            build: app.build_line(),
+            admin: app.admin_on,
+            admin_enabled: admin_menu_enabled(app.admin_on, app.viewers.viewer_connected())
                 && !app.admin_change_running,
-            admin_mode_line(&app.agent),
-            app.settings.start_at_login,
-            app.settings.audio,
-            app.settings.cpu_mode,
-            agent_update,
-            app.secure_helper.line(),
-            if app.agent_update_running {
-                Some((MF_STRING | MF_GRAYED, "Privileged helper update running..."))
-            } else if app.secure_helper.needs_update() {
-                Some((MF_STRING, SECURE_HELPER_UPDATE_LABEL))
+            admin_line: admin_mode_line(&app.agent),
+            agent_update: if app.agent_update_running {
+                Some((false, "Admin agent update running..."))
+            } else if app.admin_on && app.agent.needs_update() {
+                Some((true, AGENT_UPDATE_LABEL))
             } else {
                 None
             },
-            app.build_line(),
-            app.host_error.clone(),
-            app.can_roll_back(),
-            app.key_ui_running,
-            matches!(app.state(), HostState::Running { .. }),
-        )
-    })
-    else {
+            helper_line: app.secure_helper.line(),
+            helper_update: if app.agent_update_running {
+                Some((false, "Privileged helper update running..."))
+            } else if app.secure_helper.needs_update() {
+                Some((true, SECURE_HELPER_UPDATE_LABEL))
+            } else {
+                None
+            },
+            login: app.settings.start_at_login,
+            audio: app.settings.audio,
+            cpu_mode: app.settings.cpu_mode,
+            key_busy: app.key_ui_running,
+            can_roll_back: app.can_roll_back(),
+        }
+    }) else {
         return;
     };
     // SAFETY: standard popup-menu sequence on our own window.
@@ -1430,89 +1399,9 @@ fn show_menu(hwnd: HWND) {
         let Ok(menu) = CreatePopupMenu() else {
             return;
         };
-        let item = |flags, id, text: &str| {
-            let text = wide(text);
-            let _ = AppendMenuW(menu, flags, id, PCWSTR(text.as_ptr()));
-        };
-        item(MF_STRING | MF_GRAYED, CMD_STATUS, &status);
-        item(MF_STRING | MF_GRAYED, CMD_BUILD, &build);
-        if let Some(error) = error {
-            item(MF_STRING | MF_GRAYED, CMD_BUILD, &error);
-        }
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        item(
-            MF_STRING
-                | if admin {
-                    MF_CHECKED
-                } else {
-                    windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS(0)
-                }
-                | if admin_enabled {
-                    windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS(0)
-                } else {
-                    MF_GRAYED
-                },
-            CMD_ADMIN,
-            "Admin mode",
-        );
-        if let Some(line) = admin_line {
-            item(MF_STRING | MF_GRAYED, CMD_STATUS, line);
-        }
-        if let Some((flags, label)) = agent_update {
-            item(flags, CMD_AGENT_UPDATE, label);
-        }
-        item(MF_STRING | MF_GRAYED, CMD_STATUS, &helper_line);
-        if let Some((flags, label)) = helper_update {
-            item(flags, CMD_SECURE_HELPER_UPDATE, label);
-        }
-        item(
-            if login {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            },
-            CMD_LOGIN,
-            "Start at login",
-        );
-        item(
-            if audio {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            },
-            CMD_AUDIO,
-            "Stream PC sound",
-        );
-        item(
-            if cpu_mode {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            },
-            CMD_CPU_MODE,
-            "CPU mode",
-        );
-        let key_flags = if key_busy {
-            MF_STRING | MF_GRAYED
-        } else {
-            MF_STRING
-        };
-        item(key_flags, CMD_EXPORT_KEY, "Export PC key...");
-        item(key_flags, CMD_IMPORT_KEY, "Import PC key...");
-        let devices_flags = if devices_enabled {
-            MF_STRING
-        } else {
-            MF_STRING | MF_GRAYED
-        };
-        item(devices_flags, CMD_DEVICES, "Devices…");
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        item(MF_STRING, CMD_RESTART, "Restart host");
-        if can_roll_back {
-            item(MF_STRING, CMD_ROLLBACK, "Roll back host");
-        }
-        item(MF_STRING, CMD_LOGS, "Open logs folder");
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        item(MF_STRING, CMD_QUIT, "Quit");
+        append_menu_entries(menu, &menu_layout(&state));
+        // Bold "Open BubblePlay", the same action as a left-click on the icon.
+        let _ = SetMenuDefaultItem(menu, CMD_DEVICES as u32, 0);
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
         let _ = SetForegroundWindow(hwnd);
@@ -1526,9 +1415,58 @@ fn show_menu(hwnd: HWND) {
             None,
         );
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        // Destroys the More submenu with it.
         let _ = DestroyMenu(menu);
         if command.0 > 0 {
             with_app(|app| app.handle_command(command.0 as usize));
+        }
+    }
+}
+
+/// Appends `entries` to `menu`, creating submenus as popups owned by `menu`.
+///
+/// # Safety
+/// `menu` must be a live menu handle owned by this thread.
+unsafe fn append_menu_entries(menu: HMENU, entries: &[MenuEntry]) {
+    for entry in entries {
+        match entry {
+            MenuEntry::Item {
+                id,
+                text,
+                enabled,
+                checked,
+                ..
+            } => {
+                let mut flags = MF_STRING;
+                if !enabled {
+                    flags |= MF_GRAYED;
+                }
+                if *checked {
+                    flags |= MF_CHECKED;
+                }
+                let text = wide(text);
+                // SAFETY: caller guarantees `menu`; `text` outlives the call.
+                let _ = unsafe { AppendMenuW(menu, flags, *id, PCWSTR(text.as_ptr())) };
+            }
+            MenuEntry::Separator => {
+                // SAFETY: caller guarantees `menu`.
+                let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+            }
+            MenuEntry::Submenu { text, entries } => {
+                // SAFETY: a new popup is filled, then attached to `menu`, which then owns it.
+                unsafe {
+                    let Ok(submenu) = CreatePopupMenu() else {
+                        continue;
+                    };
+                    append_menu_entries(submenu, entries);
+                    let text = wide(text);
+                    let flags: MENU_ITEM_FLAGS = MF_STRING | MF_POPUP;
+                    if AppendMenuW(menu, flags, submenu.0 as usize, PCWSTR(text.as_ptr())).is_err()
+                    {
+                        let _ = DestroyMenu(submenu);
+                    }
+                }
+            }
         }
     }
 }
@@ -1542,7 +1480,10 @@ unsafe extern "system" fn window_proc(
     match message {
         WM_TRAY => {
             let event = (lparam.0 & 0xffff) as u32;
-            if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
+            // Legacy (pre-version-4) icon messages: left-click opens BubblePlay, right-click the menu.
+            if event == WM_LBUTTONUP {
+                with_app(|app| app.handle_command(CMD_DEVICES));
+            } else if event == WM_RBUTTONUP {
                 show_menu(hwnd);
             }
             LRESULT(0)
