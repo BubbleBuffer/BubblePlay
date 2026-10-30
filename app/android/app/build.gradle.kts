@@ -48,10 +48,12 @@ flutter {
     source = "../.."
 }
 
-// The Kotlin core (keys, auth, pcs, pairing) is compiled from the native app's source tree. A Sync
-// task stages only the packages the app contract needs (the Kotlin compile task ignores include
-// filters on shared source dirs); everything else there (ui, media, input, files, protocol, the
-// session) is left out. The staged copy is build output and is regenerated on every build.
+// The Kotlin core (keys, auth, pcs, pairing, and for the stream: net, media, input, protocol) is
+// compiled from the native app's source tree. A Sync task stages only the packages the app
+// contract needs (the Kotlin compile task ignores include filters on shared source dirs);
+// everything else there (ui, files) is left out, and so is input/Shortcuts.kt, the one file of
+// those packages that needs the native app's resources (R). The staged copy is build output and
+// is regenerated on every build.
 val nativeCore = rootProject.file("../../android/app/src/main/java")
 val stageNativeCore by tasks.registering(Sync::class) {
     from(nativeCore) {
@@ -59,9 +61,12 @@ val stageNativeCore by tasks.registering(Sync::class) {
             "de/bubblebuffer/bubbleplay/keys/**",
             "de/bubblebuffer/bubbleplay/auth/**",
             "de/bubblebuffer/bubbleplay/pcs/**",
-            "de/bubblebuffer/bubbleplay/net/PairingClient.kt",
-            "de/bubblebuffer/bubbleplay/net/ServerConfig.kt",
+            "de/bubblebuffer/bubbleplay/net/**",
+            "de/bubblebuffer/bubbleplay/media/**",
+            "de/bubblebuffer/bubbleplay/input/**",
+            "de/bubblebuffer/bubbleplay/protocol/**",
         )
+        exclude("de/bubblebuffer/bubbleplay/input/Shortcuts.kt")
     }
     into(layout.buildDirectory.dir("nativeCore"))
 }
