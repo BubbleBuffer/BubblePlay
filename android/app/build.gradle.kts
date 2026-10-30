@@ -62,9 +62,16 @@ android {
     }
 
     testOptions {
+        // Robolectric (ReadmeScreenshotTest) renders the real layouts, so the JVM tests need the app's resources.
+        unitTests.isIncludeAndroidResources = true
         unitTests.all {
             // The JVM tests read the shared contracts in <repo>/fixtures.
             it.systemProperty("bubbleplay.fixtures", rootProject.file("../fixtures").absolutePath)
+            // Where ReadmeScreenshotTest writes its PNGs; CI uploads this folder as an artifact.
+            it.systemProperty(
+                "bubbleplay.screenshots",
+                layout.buildDirectory.dir("screenshots").get().asFile.absolutePath,
+            )
             // Relay e2e tests (src/test/.../e2e): BP_RELAY_SERVER_BIN names the bp-relay binary, and
             // BP_E2E_REQUIRED=1 (CI) turns a missing binary into a failure instead of a skip.
             it.inputs.property("bpRelayServerBin", System.getenv("BP_RELAY_SERVER_BIN") ?: "")
@@ -88,4 +95,6 @@ dependencies {
     implementation("org.bouncycastle:bcprov-jdk18on:1.86")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    // Released 2026-09-10; 4.17 is the newest 4.x and supports compileSdk 35.
+    testImplementation("org.robolectric:robolectric:4.17")
 }

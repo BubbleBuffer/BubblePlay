@@ -321,3 +321,14 @@ jobs:
           BP_E2E_REQUIRED: "1"
         # android/gradlew is committed without the executable bit (mode 100644), so run it via bash.
         run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug
+      # PNGs from ReadmeScreenshotTest (Robolectric renders of the app's screens), kept even when the tests fail.
+      - name: Upload Android screenshots
+        if: always()
+        # A full artifact storage quota must not fail the tests.
+        continue-on-error: true
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: android-screenshots
+          path: android/app/build/screenshots/
+          if-no-files-found: error
+          retention-days: 14
