@@ -1,0 +1,32 @@
+[package]
+name = "bubbleplay_app_core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "BubblePlay Flutter app, Windows core: the real Backend and the flutter_rust_bridge seam"
+
+# Standalone crate (own lockfile, seeded from client-win/Cargo.lock): never look for a workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+bubbleplay-client = { path = "../../client-win", default-features = false }
+bp-device-key = { path = "../../crates/bp-device-key", features = ["keygen", "keyfile", "phase2"] }
+anyhow = "1"
+flutter_rust_bridge = "=2.13.0"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+zeroize = "1"
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
