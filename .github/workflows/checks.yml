@@ -320,7 +320,13 @@ jobs:
           # A missing relay binary fails the e2e tests instead of skipping them.
           BP_E2E_REQUIRED: "1"
         # android/gradlew is committed without the executable bit (mode 100644), so run it via bash.
-        run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug
+        # Retried twice: a transient registry error (429 and the like) must not fail the whole job.
+        run: |
+          for attempt in 1 2 3; do
+            bash ./gradlew --no-daemon testDebugUnitTest lintDebug && exit 0
+            echo "Gradle attempt $attempt failed"; sleep $((attempt * 30))
+          done
+          exit 1
       # PNGs from ReadmeScreenshotTest (Robolectric renders of the app's screens), kept even when the tests fail.
       - name: Upload Android screenshots
         if: always()
