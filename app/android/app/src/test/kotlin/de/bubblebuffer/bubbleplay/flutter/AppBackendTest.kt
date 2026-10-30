@@ -194,6 +194,19 @@ class AppBackendTest {
     }
 
     @Test
+    fun aStoredProblemShowsOnThePc() {
+        val f = Fixture()
+        f.pcs.put(PcEntry("77VH-7M56-8GJK-Y12J", "k", "https://relay.example", "", 0, f.now, "session_pc_key_changed"))
+        f.pcs.put(PcEntry("88VH-7M56-8GJK-Y12J", "k", "https://relay.example", "", 0, f.now, "session_control_failed"))
+        val backend = f.backend()
+        backend.act("\"CreateKey\"")
+        backend.act("\"CancelFlow\"")
+        val list = backend.state().getJSONArray("pcs")
+        assertEquals("KeyChanged", list.getJSONObject(0).getString("problem"))
+        assertTrue(list.getJSONObject(1).isNull("problem"))
+    }
+
+    @Test
     fun connectOpensThePlaceholderSessionAndDisconnectClosesIt() {
         val f = Fixture()
         f.pcs.put(PcEntry("77VH-7M56-8GJK-Y12J", "k", "https://relay.example", "", 0, f.now - 60_000))
