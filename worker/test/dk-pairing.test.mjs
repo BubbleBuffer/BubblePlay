@@ -34,7 +34,7 @@ async function harness({ code = pair.code, existing = null, mediaEpoch = hs.sess
     gate[type] = options => { screens.push([type, options]); events.push([type, options?.state]); };
   const records = new Map(existing ? [[existing.id, existing]] : []);
   const store = {
-    async load() { return JSON.stringify({ id: hs.viewer.id, label: "Viewer", kdf: null, aead: null }); },
+    async load() { return JSON.stringify({ format: "bubblebuffer-device-key", id: hs.viewer.id, label: "Viewer", kdf: null, aead: null }); },
     async listPcs() { return [...records.values()]; },
     async getPc(id) { return records.get(id) ?? null; },
     async putPc(record) { events.push(["save"]); records.set(record.id, normalizePcRecord(record)); },
