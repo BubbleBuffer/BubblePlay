@@ -107,7 +107,12 @@ pub fn gate_response(response: GateResponse) -> Result<Response> {
     let mut out = body.with_status(response.status);
     let headers = out.headers_mut();
     for (name, value) in &response.headers {
-        headers.append(name, value)?;
+        // from_bytes already set application/octet-stream; replace it rather than add a second.
+        if name.eq_ignore_ascii_case("content-type") {
+            headers.set(name, value)?;
+        } else {
+            headers.append(name, value)?;
+        }
     }
     Ok(out)
 }
