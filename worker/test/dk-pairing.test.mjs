@@ -38,6 +38,9 @@ async function harness({ code = pair.code, existing = null, mediaEpoch = hs.sess
     async listPcs() { return [...records.values()]; },
     async getPc(id) { return records.get(id) ?? null; },
     async putPc(record) { events.push(["save"]); records.set(record.id, normalizePcRecord(record)); },
+    async loadUnlocked() { return null; },
+    async saveUnlocked() {},
+    async clearUnlocked() { events.push(["clear-unlocked"]); },
   };
   const timers = new Map();
   let timerId = 0;
@@ -299,7 +302,7 @@ test("cancellation and locking invalidate pending proof/approval callbacks", asy
     const h = await harness();
     await h.auth();
     if (action === "cancel") await h.gate.last("showPairing").onCancel();
-    else h.app.lock();
+    else await h.app.lock();
     const count = h.gate.screens.length;
     await h.socket.receive(pair.messages.pairProofPc);
     await h.socket.receive(pair.messages.pairDone);

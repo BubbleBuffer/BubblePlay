@@ -343,7 +343,8 @@ fn m3_contradictory_snapshots_close_and_nothing_panics() {
     let pcs = h.relay.pcs().clone();
     let now = h.now;
 
-    // A second host snapshot under a higher id: a duplicate of a live host.
+    // A second host snapshot under a higher id: the newer host replaced the
+    // older one, so the older one is closed.
     let mut duplicate = host_snapshot.clone();
     duplicate.id = ConnId(900);
     let (_, out) = Relay::rehydrate(
@@ -352,8 +353,8 @@ fn m3_contradictory_snapshots_close_and_nothing_panics() {
         vec![host_snapshot.clone(), duplicate],
         now,
     );
-    assert_eq!(closes(&out, ConnId(900)), vec![(1008, String::new())]);
-    assert!(closes(&out, host).is_empty(), "{out:?}");
+    assert_eq!(closes(&out, host), vec![(1008, String::new())]);
+    assert!(closes(&out, ConnId(900)).is_empty(), "{out:?}");
 
     // An epoch that is not 32 lowercase hex digits.
     let mut bad_epoch = viewer_snapshot.clone();
@@ -526,4 +527,65 @@ fn m3_rehydrated_idle_socket_closes_within_one_step_of_its_deadline() {
         closed(&out, host),
         Some((1001, "peer disconnected".to_owned()))
     );
+}
+
+/// Rebuilds the relay from what is attached, as a Durable Object wake does, and
+/// settles the closes rehydrate returns. Returns those closes.
+fn wake(h: &mut Harness, attached: &mut Attached) -> Vec<Action> {
+    let snapshots: Vec<ConnSnapshot> = attached.values().cloned().collect();
+    let (relay, out) = Relay::rehydrate(
+        h.relay.config().clone(),
+        h.relay.pcs().clone(),
+        snapshots,
+        h.now,
+    );
+    h.relay = relay;
+    settle(h, attached, out)
+}
+
+/// The hour disconnect. A viewer whose old socket died reconnects; the relay
+/// replaces the old socket ("peer replaced") and closes it, but a dead peer
+/// never answers that close, so the socket and its attachment linger. Before
+/// the fix the worker left the attachment in place and rehydrate kept the
+/// lower id, so the next wake closed the live replacement 1008, which the
+/// viewer treats as final. Now the newer socket wins, and the session survives
+/// two hours of pings with a wake every minute (fake clock).
+#[test]
+fn m3_replaced_viewer_lingering_after_close_does_not_end_the_session() {
+    let mut attached = Attached::new();
+    let (mut h, host, pc, _) = start_with(|_| {}, &mut attached);
+    let (old, actions) = h.viewer_hello(&pc, false);
+    settle(&mut h, &mut attached, actions);
+    let lingering = attached[&old.id].clone();
+
+    let (new, actions) = h.viewer_hello(&pc, false);
+    assert_eq!(
+        closed(&actions, old.id),
+        Some((1008, "peer replaced".to_owned()))
+    );
+    settle(&mut h, &mut attached, actions);
+    // What the pre-fix worker left behind: the replaced socket, still attached.
+    attached.insert(old.id, lingering);
+
+    let out = wake(&mut h, &mut attached);
+    assert_eq!(closes(&out, old.id), vec![(1008, String::new())]);
+    assert!(closes(&out, new.id).is_empty(), "{out:?}");
+    assert!(closes(&out, host).is_empty(), "{out:?}");
+
+    for minute in 0..120 {
+        for _ in 0..4 {
+            let mut actions = h.advance(15_000);
+            actions.extend(h.text(new.id, &json!({"type": "ping"})));
+            actions.extend(ping(&mut h, host));
+            let seen = settle(&mut h, &mut attached, actions);
+            assert!(
+                closes(&seen, new.id).is_empty(),
+                "minute {minute}: {seen:?}"
+            );
+            assert!(closes(&seen, host).is_empty(), "minute {minute}: {seen:?}");
+        }
+        let out = wake(&mut h, &mut attached);
+        assert!(out.is_empty(), "minute {minute}: {out:?}");
+    }
+    assert!(attached.contains_key(&new.id) && attached.contains_key(&host));
 }

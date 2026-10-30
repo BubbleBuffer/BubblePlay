@@ -204,7 +204,7 @@ class Gate {
       box.append(line);
     }
     const error = this.line("error");
-    const lock = onLock ? this.button("Lock", "secondary", () => this.run(() => onLock(), error)) : null;
+    const lock = onLock ? this.button("Lock this browser", "secondary", () => this.run(() => onLock(), error)) : null;
     box.append(this.actionRow(lock), error);
     if (onForgetBrowser) {
       box.append(this.removal("Forget this browser", "Forget this browser? The relay will ask for approval again on the next visit. Your key and PC list stay in this browser.", () => onForgetBrowser()));

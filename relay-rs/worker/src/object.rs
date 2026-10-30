@@ -543,6 +543,15 @@ impl crate::Relay {
         let Some(ws) = guard.as_ref().and_then(|live| live.sockets.get(&id)) else {
             return;
         };
+        // A closed socket stays in getWebSockets() until its peer answers the close, which a dead
+        // peer never does. Drop its snapshot first, so a wake finds it stale and never restores
+        // it in place of the socket that replaced it.
+        if ws
+            .serialize_attachment(Option::<ConnSnapshot>::None)
+            .is_err()
+        {
+            worker::console_error!("relay could not clear a closed socket's attachment");
+        }
         if ws.close(Some(code), Some(reason)).is_err() {
             worker::console_error!("relay close failed");
         }
