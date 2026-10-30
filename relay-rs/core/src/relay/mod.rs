@@ -286,6 +286,13 @@ impl Relay {
         self.conns.get(&id).is_some_and(|c| !c.closing)
     }
 
+    /// True while a host socket for `pc` (a canonical device id) is open: the
+    /// state behind `online` in [`Relay::list_pcs`]. Read-only, for
+    /// `GET /presence`.
+    pub fn pc_online(&self, pc: &str) -> bool {
+        self.host_online(pc)
+    }
+
     /// The host signalling socket for a PC is open.
     fn host_online(&self, pc: &str) -> bool {
         self.peers
