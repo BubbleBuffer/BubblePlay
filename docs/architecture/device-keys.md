@@ -51,11 +51,11 @@ The first 80 bits of `SHA-256(raw 32-byte Ed25519 public key)`, written as 16 Cr
 
 ### Key file format
 
-One text file per key, extension `.bpkey`, UTF-8 JSON:
+One text file per key, extension `.bpkey`, UTF-8 JSON in the format `bubblebuffer-device-key` of the shared crate [`bubblebuffer-device-key`](https://github.com/BubbleBuffer/bubblebuffer-identity) (git tag v0.1.0, commit a539c7e). Rust uses the crate itself through `crates/bp-device-key`; the browser (`worker/public/devicekey.js`) and Android (`KeyFileCodec.kt`) implement the same format and are checked against the vendored shared fixture `fixtures/shared/device-keys-contract.json`.
 
 ```json
 {
-  "format": "bubbleplay-device-key",
+  "format": "bubblebuffer-device-key",
   "version": 1,
   "type": "ed25519",
   "id": "B7QK-2M9X-H4PD-R8TN",
@@ -73,6 +73,8 @@ One text file per key, extension `.bpkey`, UTF-8 JSON:
 - **AEAD: AES-256-GCM**, native in WebCrypto, Rust (`aes-gcm`) and Android (JCA). A file is encrypted once per passphrase change with a fresh random nonce. The associated data is the canonical JSON of every field except `private` and `aead.nonce`, so a tampered ID, public key or KDF parameters fail to decrypt.
 - **On import**, the client derives the public key from the seed and refuses the file if it does not match `public` and `id`. Unknown `version` or `type` is refused with a clear message.
 - `label` is the name the viewer sends in its `caps` control message after pairing; the PC stores "Unnamed device" at pairing ([Pairing A](#a-at-the-pc)).
+
+**Migration from `bubbleplay-device-key` (2026-10-30).** Files written before the move carry the old format name, which is also part of a protected file's associated data. Each platform keeps a reader for the old format (`bp_device_key::legacy`, `KeyFileCodec` and `devicekey.js`) and converts its stored key once: an unprotected key at start (the PC key in the tray, the Windows viewer, Android and the browser), a protected one at the next successful unlock, when the passphrase is in hand. The conversion keeps the key, ID, label and created time, reseals a protected key under the same passphrase with a fresh salt and nonce, writes the new file atomically beside a backup of the old one, reopens it and checks the ID and public key, and only then removes the backup. Any failure leaves the old file in place, logs one line and the app keeps using the old file for that run. Import accepts both formats and stores the new one; export writes only the new one. IDs, relay proofs (label `bubbleplay-relay-v1`) and the phase 2 handshake are unchanged.
 
 ### Where keys live
 

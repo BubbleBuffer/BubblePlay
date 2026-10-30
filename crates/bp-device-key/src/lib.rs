@@ -1,42 +1,41 @@
-//! BubblePlay device-key primitives: device IDs, relay proofs, the relay-origin canonical form
-//! and, behind features, key generation and the passphrase-protected key file (`.bpkey`).
-//!
-//! The module has no Windows dependencies and no storage or clock of its own, so it builds for
-//! `wasm32-unknown-unknown` as well as for the host and the relay.
+//! BubblePlay's device-key crate: a thin layer over the shared `bubblebuffer-device-key` crate
+//! (device IDs, Ed25519 keys, the `bubblebuffer-device-key` key file and relay proofs) plus what
+//! stays BubblePlay's own: the relay label `bubbleplay-relay-v1`, the relay-origin canonical form,
+//! the phase 2 handshake and, behind `keyfile`, the reader for the old `bubbleplay-device-key`
+//! files and their one-time conversion.
 //!
 //! Features:
 //!
 //! - default: device IDs, relay proof encoding, hashing, signing with an existing key and
 //!   verification, and the relay-origin canonicaliser.
-//! - `keygen`: key generation (pulls `getrandom`).
-//! - `keyfile`: the encrypted key file format (pulls `argon2` and `aes-gcm`).
+//! - `keygen`: `DeviceIdentity::generate` and, with `phase2`, the phase 2 generators.
+//! - `keyfile`: [`KeyFile`] (the shared format), the [`legacy`] reader and [`convert_legacy`].
 //! - `phase2`: the [`phase2`] module: handshake transcript and signatures, X25519 + HKDF
 //!   control keys, the sequenced AES-256-GCM `ctl` envelope, pairing codes, MACs and the
 //!   comparison number (pulls `x25519-dalek`, `hkdf`, `hmac` and `aes-gcm`).
-//!
-//! The host still has its own copy of this module in `host/src/device_key.rs`; a follow-up moves
-//! it onto this crate.
 
 #![forbid(unsafe_code)]
 
 use std::fmt;
 
-mod ids;
 mod proof;
 
 #[cfg(feature = "keyfile")]
 mod keyfile;
+#[cfg(feature = "keyfile")]
+pub mod legacy;
 
 #[cfg(feature = "phase2")]
 pub mod phase2;
 
-pub use ids::DeviceId;
+pub use bubblebuffer_device_key::DeviceId;
 pub use proof::{
     relay_origin, relay_proof_encoding, relay_proof_hash, verify_relay_proof, DeviceIdentity, Role,
+    RELAY_LABEL,
 };
 
 #[cfg(feature = "keyfile")]
-pub use keyfile::KeyFile;
+pub use keyfile::{convert_legacy, read_key_file, KeyFile, StoredKeyFile};
 
 /// Failures are distinct: `AuthenticationFailed` means the AEAD tag did not verify (wrong
 /// passphrase or altered authenticated metadata); the other variants are validation failures
@@ -44,6 +43,8 @@ pub use keyfile::KeyFile;
 #[derive(Debug)]
 pub enum DeviceKeyError {
     InvalidId,
+    /// The Ed25519 key is malformed, noncanonical or outside the prime-order subgroup.
+    InvalidPublicKey,
     /// A proof role other than the wire strings `host` and `viewer`.
     UnknownRole,
     /// JSON syntax, duplicate keys, unsupported JSON value kinds or nesting depth.
@@ -97,6 +98,7 @@ impl fmt::Display for DeviceKeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidId => write!(f, "device ID must be 16 Crockford base32 characters"),
+            Self::InvalidPublicKey => write!(f, "invalid Ed25519 public key"),
             Self::UnknownRole => write!(
                 f,
                 "unknown role (only \"host\" and \"viewer\" are accepted)"
@@ -167,3 +169,34 @@ impl fmt::Display for DeviceKeyError {
 }
 
 impl std::error::Error for DeviceKeyError {}
+
+impl From<bubblebuffer_device_key::DeviceKeyError> for DeviceKeyError {
+    fn from(error: bubblebuffer_device_key::DeviceKeyError) -> Self {
+        use bubblebuffer_device_key::DeviceKeyError as Shared;
+        match error {
+            Shared::InvalidId => Self::InvalidId,
+            Shared::InvalidPublicKey => Self::InvalidPublicKey,
+            Shared::UnknownRole => Self::UnknownRole,
+            Shared::Malformed(reason) => Self::Malformed(reason),
+            Shared::MissingField(field) => Self::MissingField(field),
+            Shared::UnknownField(field) => Self::UnknownField(field),
+            Shared::InvalidField(field) => Self::InvalidField(field),
+            Shared::InvalidEncoding(field) => Self::InvalidEncoding(field),
+            Shared::InvalidLength(field) => Self::InvalidLength(field),
+            Shared::UnsupportedFormat => Self::UnsupportedFormat,
+            Shared::UnsupportedVersion => Self::UnsupportedVersion,
+            Shared::UnsupportedType => Self::UnsupportedType,
+            Shared::UnsupportedKdf => Self::UnsupportedKdf,
+            Shared::UnsupportedAead => Self::UnsupportedAead,
+            Shared::IncompleteProtection => Self::IncompleteProtection,
+            Shared::IdMismatch => Self::IdMismatch,
+            Shared::PublicKeyMismatch => Self::PublicKeyMismatch,
+            Shared::PassphraseRequired => Self::PassphraseRequired,
+            Shared::PassphraseNotAccepted => Self::PassphraseNotAccepted,
+            Shared::AuthenticationFailed => Self::AuthenticationFailed,
+            Shared::Entropy => Self::Entropy,
+            Shared::InvalidSignature => Self::InvalidSignature,
+            Shared::Internal(what) => Self::Internal(what),
+        }
+    }
+}

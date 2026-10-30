@@ -2,7 +2,7 @@
 name = "bp-device-key"
 version = "0.1.0"
 edition = "2021"
-description = "BubblePlay device-key primitives: device IDs, relay proofs and the encrypted key file"
+description = "BubblePlay device keys on the shared bubblebuffer-device-key crate: relay label, origin, phase 2 and the old key file reader"
 license = "AGPL-3.0-or-later"
 
 # Standalone crate: never look for a parent workspace.
@@ -10,18 +10,23 @@ license = "AGPL-3.0-or-later"
 
 [features]
 default = []
-# Key generation from OS randomness. Pulls getrandom.
+# Key generation from OS randomness (the shared crate always has it; this adds the phase 2
+# generators and `DeviceIdentity::generate`).
 keygen = ["dep:rand_core", "rand_core/getrandom"]
-# The passphrase-encrypted key file format. Pulls argon2 and aes-gcm.
+# `KeyFile` (the shared format), the reader for the old format and the conversion. The old
+# reader pulls argon2 and aes-gcm.
 keyfile = ["dep:argon2", "dep:aes-gcm"]
 # Phase 2 handshake, ctl envelope and pairing primitives (the `phase2` module). No getrandom
 # unless `keygen` is on too, so it builds for wasm32-unknown-unknown.
 phase2 = ["dep:aes-gcm", "dep:aes", "dep:polyval", "dep:x25519-dalek", "dep:hkdf", "dep:hmac"]
 
 [dependencies]
+# The shared device identity crate: IDs, keys, the key file and relay proofs. Cargo.lock pins
+# the tag's commit, a539c7e.
+bubblebuffer-device-key = { git = "https://github.com/BubbleBuffer/bubblebuffer-identity", tag = "v0.1.0" }
 base64 = "0.22"
-# Exact pins: the device ID, the relay proof and the key file format are compatibility
-# contracts shared with the Go relay and the browser, so these do not float in a caret range.
+# Exact pins: the old key file reader and phase 2 are compatibility contracts shared with the
+# browser and Android, so these do not float in a caret range.
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "std", "zeroize"] }
 sha2 = "=0.10.9"
 url = "2"
@@ -42,3 +47,9 @@ hmac = { version = "=0.12.1", optional = true }
 [dev-dependencies]
 base64 = "0.22"
 serde_json = "1"
+
+# The shared crate always links getrandom 0.2 (key generation). On wasm32-unknown-unknown (the
+# Cloudflare Worker relay) it needs the `js` backend (crypto.getRandomValues) to build. The relay
+# never generates keys; it only verifies proofs.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

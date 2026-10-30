@@ -1,0 +1,188 @@
+{
+  "ids": [
+    {
+      "id": "47Z3-3QX1-AJH6-2RKB",
+      "name": "viewer",
+      "public": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+      "seedHex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "sha256Hex": "21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9"
+    },
+    {
+      "id": "77VH-7M56-8GJK-Y12J",
+      "name": "pc",
+      "public": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+      "seedHex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "sha256Hex": "39f713d0a644253f04529421b9f51b9b08979d08295959c4f3990ee617f5139f"
+    },
+    {
+      "id": "HN0B-W2W6-0QQ1-1M47",
+      "name": "crockford-aliases",
+      "parse": {
+        "canonical": "HN0B-W2W6-0QQ1-1M47",
+        "input": "hnobw2w6oqqilm47"
+      },
+      "public": "tMkq-zulfzq5Wf_m0xnJhISiFVoPTGWyw3AR_9GXsHU",
+      "seedHex": "0000000000000000000000000000000000000000000000000000000000000006",
+      "sha256Hex": "8d40be0b8605ee10d0879ee8546c62280007de30f6ae889e44575c2e539663e2"
+    }
+  ],
+  "keyFiles": {
+    "failures": [
+      {
+        "expected": "authentication-failed",
+        "file": {
+          "aead": {
+            "alg": "aes-256-gcm",
+            "nonce": "EBESExQVFhcYGRob"
+          },
+          "created": "2026-10-13T09:30:00Z",
+          "format": "bubblebuffer-device-key",
+          "id": "47Z3-3QX1-AJH6-2RKB",
+          "kdf": {
+            "alg": "argon2id",
+            "m": 65536,
+            "p": 1,
+            "salt": "AAECAwQFBgcICQoLDA0ODw",
+            "t": 3
+          },
+          "label": "Viewer \"test\" café",
+          "private": "gQy8pM6yr_hP5gH01VFFsghDwGJ0cKyVDh9AuGdFGNkRiQitxMdk5uYXuNwx_Pge",
+          "public": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+          "type": "ed25519",
+          "version": 1
+        },
+        "name": "wrong-passphrase",
+        "passphrase": "incorrect horse battery staple"
+      },
+      {
+        "expected": "authentication-failed",
+        "file": {
+          "aead": {
+            "alg": "aes-256-gcm",
+            "nonce": "EBESExQVFhcYGRob"
+          },
+          "created": "2026-10-13T09:30:00Z",
+          "format": "bubblebuffer-device-key",
+          "id": "47Z3-3QX1-AJH6-2RKB",
+          "kdf": {
+            "alg": "argon2id",
+            "m": 65536,
+            "p": 1,
+            "salt": "AAECAwQFBgcICQoLDA0ODw",
+            "t": 3
+          },
+          "label": "Tampered viewer label",
+          "private": "gQy8pM6yr_hP5gH01VFFsghDwGJ0cKyVDh9AuGdFGNkRiQitxMdk5uYXuNwx_Pge",
+          "public": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+          "type": "ed25519",
+          "version": 1
+        },
+        "name": "tampered-aad",
+        "passphrase": "correct horse battery staple"
+      }
+    ],
+    "passphrase": {
+      "aadHex": "7b2261656164223a7b22616c67223a226165732d3235362d67636d227d2c2263726561746564223a22323032362d31302d31335430393a33303a30305a222c22666f726d6174223a22627562626c656275666665722d6465766963652d6b6579222c226964223a2234375a332d335158312d414a48362d32524b42222c226b6466223a7b22616c67223a226172676f6e326964222c226d223a36353533362c2270223a312c2273616c74223a2241414543417751464267634943516f4c4441304f4477222c2274223a337d2c226c6162656c223a22566965776572205c22746573745c2220636166c3a9222c227075626c6963223a223131715941594b7843726656535f3754795751484f6737686376506170694d6c727749616150634855526f222c2274797065223a2265643235353139222c2276657273696f6e223a317d",
+      "aadUtf8": "{\"aead\":{\"alg\":\"aes-256-gcm\"},\"created\":\"2026-10-13T09:30:00Z\",\"format\":\"bubblebuffer-device-key\",\"id\":\"47Z3-3QX1-AJH6-2RKB\",\"kdf\":{\"alg\":\"argon2id\",\"m\":65536,\"p\":1,\"salt\":\"AAECAwQFBgcICQoLDA0ODw\",\"t\":3},\"label\":\"Viewer \\\"test\\\" café\",\"public\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\",\"type\":\"ed25519\",\"version\":1}",
+      "file": {
+        "aead": {
+          "alg": "aes-256-gcm",
+          "nonce": "EBESExQVFhcYGRob"
+        },
+        "created": "2026-10-13T09:30:00Z",
+        "format": "bubblebuffer-device-key",
+        "id": "47Z3-3QX1-AJH6-2RKB",
+        "kdf": {
+          "alg": "argon2id",
+          "m": 65536,
+          "p": 1,
+          "salt": "AAECAwQFBgcICQoLDA0ODw",
+          "t": 3
+        },
+        "label": "Viewer \"test\" café",
+        "private": "gQy8pM6yr_hP5gH01VFFsghDwGJ0cKyVDh9AuGdFGNkRiQitxMdk5uYXuNwx_Pge",
+        "public": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "type": "ed25519",
+        "version": 1
+      },
+      "kdfKeyHex": "0d1a3c6523c8f06e4e0af9c515aa5b5448cfebd6838f2d52c3d8b6ef8ddc3c2e",
+      "passphrase": "correct horse battery staple",
+      "seedHex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+    },
+    "plain": {
+      "file": {
+        "aead": null,
+        "created": "2026-10-13T09:30:00Z",
+        "format": "bubblebuffer-device-key",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "kdf": null,
+        "label": "PC test",
+        "private": "TM0Imyj_ltqdtsNG7BFOD1uKMZ81q6Yk2oz27U-4pvs",
+        "public": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "type": "ed25519",
+        "version": 1
+      },
+      "seedHex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+    }
+  },
+  "relayProof": {
+    "vectors": [
+      {
+        "encodingHex": "00000015627562626c656275666665722d72656c61792d763100000004686f73740000001468747470733a2f2f6578616d706c652e7465737400000020a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf00000013373756482d374d35362d38474a4b2d5931324a000000203d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "expected": "valid",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "label": "bubblebuffer-relay-v1",
+        "name": "host",
+        "nonce": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+        "nonceHex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+        "origin": "https://example.test",
+        "public": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "role": "host",
+        "sha256Hex": "6921db657c09e8fc895cf81ccc58ea5291533e907b242dc5925451466d189ebf",
+        "signature": "r3qx0kmQtiE60YnHtH62USqBPxLLsNUpfy9E6FEV-KJsb1LEMGjJTMtJirZNlka2QPc4hrJd7vCxiTeVNsOdAA"
+      },
+      {
+        "encodingHex": "00000015627562626c656275666665722d72656c61792d7631000000067669657765720000001468747470733a2f2f6578616d706c652e7465737400000020c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf0000001334375a332d335158312d414a48362d32524b4200000020d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "expected": "valid",
+        "id": "47Z3-3QX1-AJH6-2RKB",
+        "label": "bubblebuffer-relay-v1",
+        "name": "viewer",
+        "nonce": "wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t8",
+        "nonceHex": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+        "origin": "https://example.test",
+        "public": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "role": "viewer",
+        "sha256Hex": "dd922e904e4a9ce5467a06e4afb05462029793af9a150df39e92787c48a9bbd3",
+        "signature": "Ykr4KpIlq8xNLtoX9QKhUgRS8Gz55wzDe8VbC5T0udEUuJRPCW6mCoqd2Tf2BHpFy0eAPeUsmUTGSVWowAEEDg"
+      },
+      {
+        "encodingHex": "0000001c696e646570656e64656e742d70726f6a6563742d70726f6f662d763200000004686f73740000001468747470733a2f2f6578616d706c652e7465737400000020a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf00000013373756482d374d35362d38474a4b2d5931324a000000203d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "expected": "valid",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "label": "independent-project-proof-v2",
+        "name": "alternate-label",
+        "nonce": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+        "nonceHex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+        "origin": "https://example.test",
+        "public": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "role": "host",
+        "sha256Hex": "0626207c0e63f0f9a3d44f599626aa8279714b8beeef3e2b4e56e514e81cd34b",
+        "signature": "uUDkUc_bsVPEhSCpj1_PUmMrtSzYg4CC-TuPPmW6Q_5uqqS2LT6eIIBbs1iBMymPFvT_odefu9RdlleexvM-DQ"
+      },
+      {
+        "encodingHex": "00000015627562626c656275666665722d72656c61792d763100000004686f73740000002068747470733a2f2f6f746865722d72656c61792e6578616d706c652e7465737400000020a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf00000013373756482d374d35362d38474a4b2d5931324a000000203d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "expected": "invalid",
+        "id": "77VH-7M56-8GJK-Y12J",
+        "label": "bubblebuffer-relay-v1",
+        "name": "wrong-origin",
+        "nonce": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+        "nonceHex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+        "origin": "https://other-relay.example.test",
+        "public": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "role": "host",
+        "sha256Hex": "4b1421bac7ad602a33f4a583a297ddb0a330def8d576bfb312a1046d3c8494a1",
+        "signature": "r3qx0kmQtiE60YnHtH62USqBPxLLsNUpfy9E6FEV-KJsb1LEMGjJTMtJirZNlka2QPc4hrJd7vCxiTeVNsOdAA"
+      }
+    ]
+  }
+}

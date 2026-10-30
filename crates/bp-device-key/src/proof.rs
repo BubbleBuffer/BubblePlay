@@ -1,25 +1,25 @@
-//! Relay proofs, the relay-origin canonical form and an unlocked device identity.
+//! BubblePlay's relay proof on top of the shared crate, the relay-origin canonical form and an
+//! unlocked device identity.
 //!
 //! A device proves possession of its key by signing the SHA-256 hash of a length-prefixed
 //! encoding (see `docs/architecture/device-keys.md`, "Encodings for implementers"): the context
 //! label, the role, the relay origin, the relay's raw nonce, the canonical hyphenated device ID
-//! and the raw public key, each written as a uint32 big-endian length followed by its bytes.
+//! and the raw public key, each written as a uint32 big-endian length followed by its bytes. The
+//! shared crate builds and checks that encoding; BubblePlay always passes [`RELAY_LABEL`], so the
+//! bytes the live relay verifies are unchanged.
 
 use std::fmt;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-#[cfg(feature = "keygen")]
-use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256};
+use bubblebuffer_device_key::{DeviceKey, RelayProof, RelayRole};
+use ed25519_dalek::SigningKey;
 use url::Url;
-#[cfg(feature = "keygen")]
-use zeroize::Zeroizing;
 
 use crate::{DeviceId, DeviceKeyError};
 
-const RELAY_CONTEXT: &str = "bubbleplay-relay-v1";
+/// BubblePlay's relay proof label, the first field of every proof encoding.
+pub const RELAY_LABEL: &str = "bubbleplay-relay-v1";
 
 /// The party a proof is made for. The wire strings are fixed: `host` and `viewer`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,6 +45,13 @@ impl Role {
             _ => Err(DeviceKeyError::UnknownRole),
         }
     }
+
+    fn shared(self) -> RelayRole {
+        match self {
+            Self::Host => RelayRole::Host,
+            Self::Viewer => RelayRole::Viewer,
+        }
+    }
 }
 
 impl fmt::Display for Role {
@@ -59,48 +66,45 @@ impl fmt::Debug for Role {
     }
 }
 
-/// An unlocked device key. Holds only the signing key (zeroized on drop); `Debug` shows the ID.
+/// An unlocked device key (the shared crate's `DeviceKey`, zeroized on drop) with its ID.
+/// `Debug` shows the ID only.
 pub struct DeviceIdentity {
     id: DeviceId,
-    signing: SigningKey,
+    key: DeviceKey,
 }
 
 impl DeviceIdentity {
     /// Wraps an unlocked signing key. The ID is derived from the public key.
     pub fn from_signing_key(signing: SigningKey) -> Self {
-        let id = DeviceId::from_public_key(&signing.verifying_key().to_bytes());
-        Self { id, signing }
+        Self::from_key(DeviceKey::from(signing))
     }
 
     /// Builds an identity from the raw 32-byte Ed25519 seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        Self::from_signing_key(SigningKey::from_bytes(seed))
+        Self::from_key(DeviceKey::from_seed(seed))
+    }
+
+    /// Wraps a shared-crate key.
+    pub fn from_key(key: DeviceKey) -> Self {
+        Self { id: key.id(), key }
     }
 
     /// Generates a new key from OS randomness, in memory only. Storing it is the caller's job;
     /// with the `keyfile` feature, `KeyFile::create` also writes the key file format.
     #[cfg(feature = "keygen")]
     pub fn generate() -> Result<Self, DeviceKeyError> {
-        let mut seed = Zeroizing::new([0u8; 32]);
-        OsRng
-            .try_fill_bytes(&mut seed[..])
-            .map_err(|_| DeviceKeyError::Entropy)?;
-        Ok(Self::from_seed(&seed))
+        Ok(Self::from_key(DeviceKey::generate()?))
     }
 
-    /// Unlocks a plain (unprotected) key file. A passphrase-protected file is refused: nothing
-    /// can supply the passphrase here.
+    /// Unlocks a plain (unprotected) key file in the current format. A passphrase-protected
+    /// file is refused: nothing can supply the passphrase here.
     #[cfg(feature = "keyfile")]
     pub fn from_plain_key_json(text: &str) -> Result<Self, DeviceKeyError> {
         let file = crate::KeyFile::parse(text)?;
         if file.is_protected() {
             return Err(DeviceKeyError::PassphraseRequired);
         }
-        let signing = file.unlock(None)?;
-        Ok(Self {
-            id: file.id(),
-            signing,
-        })
+        Ok(Self::from_signing_key(file.unlock(None)?))
     }
 
     pub fn id(&self) -> DeviceId {
@@ -108,13 +112,18 @@ impl DeviceIdentity {
     }
 
     pub fn public_key(&self) -> [u8; 32] {
-        self.signing.verifying_key().to_bytes()
+        self.key.public_key()
+    }
+
+    /// The shared-crate key, for wrapping it in a key file.
+    pub fn key(&self) -> &DeviceKey {
+        &self.key
     }
 
     /// Ed25519 over `message` itself (phase 2 signs its context-prefixed bytes directly).
     #[cfg(feature = "phase2")]
     pub(crate) fn sign_bytes(&self, message: &[u8]) -> [u8; 64] {
-        self.signing.sign(message).to_bytes()
+        self.key.sign(message)
     }
 
     /// The raw public key as unpadded base64url, the form the relay expects in `hello`.
@@ -125,14 +134,10 @@ impl DeviceIdentity {
     /// Signs the relay proof for `role` at `origin` and the relay's `nonce`. The signed ID is
     /// always the canonical hyphenated form.
     pub fn sign_relay_proof(&self, role: Role, origin: &str, nonce: &[u8; 32]) -> [u8; 64] {
-        let hash = relay_proof_hash(
-            role,
-            origin,
-            nonce,
-            &self.id.to_string(),
-            &self.public_key(),
-        );
-        self.signing.sign(&hash).to_bytes()
+        // The only failure is a field longer than u32::MAX bytes; an origin never is.
+        let hash = relay_proof_hash(role, origin, nonce, self.id, &self.public_key())
+            .expect("relay origin shorter than 4 GiB");
+        self.key.sign(&hash)
     }
 }
 
@@ -144,30 +149,24 @@ impl fmt::Debug for DeviceIdentity {
     }
 }
 
-/// The relay-proof encoding: each field as uint32 big-endian length then bytes, in this order:
-/// the context label, the role, the relay origin, the raw nonce, the canonical ID and the raw
-/// public key.
+/// The relay-proof encoding with BubblePlay's label: each field as uint32 big-endian length then
+/// bytes, in this order: the label, the role, the relay origin, the raw nonce, the canonical ID
+/// and the raw public key.
 pub fn relay_proof_encoding(
     role: Role,
     origin: &str,
     nonce: &[u8; 32],
-    id: &str,
+    id: DeviceId,
     public: &[u8; 32],
-) -> Vec<u8> {
-    let fields: [&[u8]; 6] = [
-        RELAY_CONTEXT.as_bytes(),
-        role.as_str().as_bytes(),
-        origin.as_bytes(),
-        nonce.as_slice(),
-        id.as_bytes(),
-        public.as_slice(),
-    ];
-    let mut out = Vec::new();
-    for field in fields {
-        out.extend_from_slice(&(field.len() as u32).to_be_bytes());
-        out.extend_from_slice(field);
-    }
-    out
+) -> Result<Vec<u8>, DeviceKeyError> {
+    Ok(bubblebuffer_device_key::relay_proof_bytes(
+        RELAY_LABEL,
+        role.shared(),
+        origin,
+        nonce,
+        id,
+        public,
+    )?)
 }
 
 /// SHA-256 of the relay-proof encoding. Ed25519 signs these 32 bytes directly.
@@ -175,10 +174,17 @@ pub fn relay_proof_hash(
     role: Role,
     origin: &str,
     nonce: &[u8; 32],
-    id: &str,
+    id: DeviceId,
     public: &[u8; 32],
-) -> [u8; 32] {
-    Sha256::digest(relay_proof_encoding(role, origin, nonce, id, public)).into()
+) -> Result<[u8; 32], DeviceKeyError> {
+    Ok(bubblebuffer_device_key::relay_proof_hash(
+        RELAY_LABEL,
+        role.shared(),
+        origin,
+        nonce,
+        id,
+        public,
+    )?)
 }
 
 /// Checks a relay proof and returns the ID it authenticates.
@@ -194,26 +200,26 @@ pub fn verify_relay_proof(
     public_key: &[u8],
     signature: &[u8],
 ) -> Result<DeviceId, DeviceKeyError> {
-    let nonce: &[u8; 32] = nonce
+    let nonce: [u8; 32] = nonce
         .try_into()
         .map_err(|_| DeviceKeyError::InvalidLength("nonce"))?;
-    let public: &[u8; 32] = public_key
+    let public: [u8; 32] = public_key
         .try_into()
         .map_err(|_| DeviceKeyError::InvalidLength("public"))?;
-    let signature: &[u8; 64] = signature
+    let signature: [u8; 64] = signature
         .try_into()
         .map_err(|_| DeviceKeyError::InvalidLength("signature"))?;
     let claimed = DeviceId::parse(claimed_id)?;
-    if claimed != DeviceId::from_public_key(public) {
-        return Err(DeviceKeyError::IdMismatch);
-    }
-    let verifying =
-        VerifyingKey::from_bytes(public).map_err(|_| DeviceKeyError::InvalidEncoding("public"))?;
-    let hash = relay_proof_hash(role, origin, nonce, &claimed.to_string(), public);
-    verifying
-        .verify_strict(&hash, &Signature::from_bytes(signature))
-        .map_err(|_| DeviceKeyError::InvalidSignature)?;
-    Ok(claimed)
+    let proof = RelayProof::verify(
+        RELAY_LABEL,
+        role.shared(),
+        origin,
+        nonce,
+        claimed,
+        public,
+        signature,
+    )?;
+    Ok(proof.id)
 }
 
 /// The origin the relay signs for a worker URL: `https://host[:port]` for `wss`/`https`,
@@ -316,9 +322,12 @@ mod tests {
         let origin = host["origin"].as_str().expect("origin");
         let id = host["id"].as_str().expect("id");
         let public = public_of(&host);
-        let encoding = relay_proof_encoding(role, origin, &nonce, id, &public);
+        let encoding =
+            relay_proof_encoding(role, origin, &nonce, DeviceId::parse(id).unwrap(), &public)
+                .unwrap();
         assert_eq!(hex(&encoding), host["encodingHex"].as_str().expect("hex"));
-        let hash = relay_proof_hash(role, origin, &nonce, id, &public);
+        let hash =
+            relay_proof_hash(role, origin, &nonce, DeviceId::parse(id).unwrap(), &public).unwrap();
         assert_eq!(hex(&hash), host["sha256Hex"].as_str().expect("hash"));
 
         let identity = identity_of(&host);
@@ -342,9 +351,12 @@ mod tests {
         let origin = viewer["origin"].as_str().expect("origin");
         let id = viewer["id"].as_str().expect("id");
         let public = public_of(&viewer);
-        let encoding = relay_proof_encoding(role, origin, &nonce, id, &public);
+        let encoding =
+            relay_proof_encoding(role, origin, &nonce, DeviceId::parse(id).unwrap(), &public)
+                .unwrap();
         assert_eq!(hex(&encoding), viewer["encodingHex"].as_str().expect("hex"));
-        let hash = relay_proof_hash(role, origin, &nonce, id, &public);
+        let hash =
+            relay_proof_hash(role, origin, &nonce, DeviceId::parse(id).unwrap(), &public).unwrap();
         assert_eq!(hex(&hash), viewer["sha256Hex"].as_str().expect("hash"));
 
         let identity = identity_of(&viewer);
@@ -372,7 +384,14 @@ mod tests {
         let id = wrong["id"].as_str().expect("id");
         let public = public_of(&wrong);
         let origin = wrong["origin"].as_str().expect("origin");
-        let hash = relay_proof_hash(Role::Host, origin, &nonce, id, &public);
+        let hash = relay_proof_hash(
+            Role::Host,
+            origin,
+            &nonce,
+            DeviceId::parse(id).unwrap(),
+            &public,
+        )
+        .unwrap();
         assert_eq!(hex(&hash), wrong["sha256Hex"].as_str().expect("hash"));
         let signature = b64(wrong["signature"].as_str().expect("signature"));
         assert!(matches!(
