@@ -67,6 +67,20 @@ internal object StateJson {
         "default_monitor" to null,
     )
 
+    fun monitor(selector: String, name: String, width: Int, height: Int, x: Int, primary: Boolean): JSONObject = obj(
+        "selector" to selector,
+        "name" to name,
+        "width" to width,
+        "height" to height,
+        // The Android session does not know refresh rate or position: 0 Hz, side by side.
+        "refresh_hz" to 0,
+        "x" to x,
+        "y" to 0,
+        "primary" to primary,
+    )
+
+    fun reconnecting(attempt: Int): JSONObject = tagged("Reconnecting", obj("attempt" to attempt, "secs" to 0))
+
     fun session(pcId: String, pcName: String, mode: String, quality: String, audio: Boolean): JSONObject = obj(
         "pc_id" to pcId,
         "pc_name" to pcName,
