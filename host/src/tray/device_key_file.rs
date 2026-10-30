@@ -1,14 +1,14 @@
 //! Non-UI PC key storage for the tray. The file is a raw CurrentUser DPAPI blob of a plain
-//! `.bpkey` file. Failed loads preserve the file; callers can launch the host without a key.
+//! `.bpkey` file. Failed loads preserve the file; callers can launch the host without a key. A
+//! stored file in another format counts as no key and is replaced by a new one.
 
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
-use bp_device_key::legacy::LegacyKeyFile;
-use bp_device_key::{convert_legacy, read_key_file, KeyFile, StoredKeyFile};
+use anyhow::{anyhow, Context, Result};
+use bp_device_key::{DeviceKeyError, KeyFile};
 use rand_core::{OsRng, RngCore};
 use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
@@ -27,7 +27,8 @@ pub fn path_beside(host_config: &Path) -> PathBuf {
 }
 
 /// Load or create the PC key and return validated plain JSON for the child command only.
-/// Existing files are never replaced by this operation, including a file created concurrently.
+/// Existing files are never replaced by this operation, including a file created concurrently,
+/// except a file that unprotects to a key file in another format: that counts as no key.
 pub fn handoff(path: &Path, label: &str, created: &str) -> Result<Zeroizing<String>> {
     handoff_with_codec(
         path,
@@ -45,17 +46,30 @@ fn handoff_with_codec(
     protect: impl Fn(&[u8]) -> Result<Vec<u8>>,
     unprotect: impl Fn(&[u8]) -> Result<Vec<u8>>,
 ) -> Result<Zeroizing<String>> {
-    let protected = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
+    let mut replace = false;
+    let stored = match fs::read(path) {
+        Ok(bytes) => {
+            if is_other_format(&bytes, &unprotect) {
+                tracing::warn!("the stored PC key is in an unsupported format; creating a new one");
+                replace = true;
+                None
+            } else {
+                Some(bytes)
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("reading PC key; existing file preserved"),
+    };
+    let protected = match stored {
+        Some(bytes) => bytes,
+        None => {
             let key = KeyFile::create(label, created, None).context("creating PC key")?;
             let plain = Zeroizing::new(key.to_json().context("serializing PC key")?);
             let protected = protect(plain.as_bytes()).context("protecting PC key")?;
-            write_atomic(path, &protected, false)?;
+            write_atomic(path, &protected, replace)?;
             // The common path below verifies the actual stored DPAPI blob, even on first use.
             fs::read(path).context("reading newly created PC key")?
         }
-        Err(error) => return Err(error).context("reading PC key; existing file preserved"),
     };
     let bytes = Zeroizing::new(unprotect(&protected).context("unprotecting PC key")?);
     let text = std::str::from_utf8(&bytes).context("PC key is not UTF-8")?;
@@ -63,15 +77,15 @@ fn handoff_with_codec(
     Ok(Zeroizing::new(text.to_owned()))
 }
 
-/// Accepts a plain key in either format. Errors can contain unknown JSON field names, so the
+/// Accepts a plain key in the current format. Errors can contain unknown JSON field names, so the
 /// message is fixed and keeps those untrusted values out of logs.
 fn validate_plain(text: &str) -> Result<()> {
     let invalid = || anyhow!("PC key is not a valid plain device key file");
-    let stored = read_key_file(text).map_err(|_| invalid())?;
-    if stored.is_protected() {
+    let file = KeyFile::parse(text).map_err(|_| invalid())?;
+    if file.is_protected() {
         return Err(invalid());
     }
-    stored.unlock(None).map(|_| ()).map_err(|_| invalid())
+    file.unlock(None).map(|_| ()).map_err(|_| invalid())
 }
 
 /// Replaces the PC key file with the plain key `text` after validating it, as one protected file.
@@ -91,116 +105,14 @@ fn replace_with_codec(
     Ok(())
 }
 
-fn backup_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!("{FILE_NAME}.legacy-backup"))
-}
-
-/// Converts a PC key stored in the old `bubbleplay-device-key` format to the current format. A
-/// file already in the current format, a missing or an unreadable file is left alone. On any
-/// failure the old file is kept and one line is logged; the host then starts as it did before.
-pub fn migrate_legacy(path: &Path) {
-    if let Err(error) = migrate_legacy_with_codec(path, dpapi_protect_bytes, dpapi_unprotect_bytes)
-    {
-        tracing::warn!("PC key format upgrade did not finish; the old key file is kept: {error:#}");
-    }
-}
-
-fn migrate_legacy_with_codec(
-    path: &Path,
-    protect: impl Fn(&[u8]) -> Result<Vec<u8>>,
-    unprotect: impl Fn(&[u8]) -> Result<Vec<u8>>,
-) -> Result<()> {
-    let backup = backup_path(path);
-    if backup.exists() {
-        // Removes the backup when it holds the stored key, then the conversion below proceeds
-        // (it does nothing when the stored key is already current).
-        resolve_stale_backup(path, &backup, &unprotect)?;
-    }
-    let Ok(protected) = fs::read(path) else {
-        return Ok(());
-    };
-    let Some(text) = unprotect_text(&protected, &unprotect) else {
-        return Ok(());
-    };
-    let Ok(StoredKeyFile::Legacy(old)) = read_key_file(&text) else {
-        return Ok(());
-    };
-    if old.is_protected() {
-        return Ok(());
-    }
-    let (_, json) =
-        convert_legacy(&old, None).map_err(|_| anyhow!("converting the PC key failed"))?;
-    let json = Zeroizing::new(json);
-    if !write_atomic(&backup, &protected, false).context("saving the old PC key")? {
-        bail!("a legacy backup of the PC key already exists");
-    }
-    let replaced = protect(json.as_bytes())
-        .map_err(|_| anyhow!("protecting the converted PC key failed"))
-        .and_then(|blob| write_atomic(path, &blob, true).map(|_| ()))
-        .and_then(|()| verify_converted(path, &unprotect, &old));
-    match replaced {
-        Ok(()) => {
-            if fs::remove_file(&backup).is_err() {
-                tracing::warn!("converted PC key kept; its legacy backup could not be removed");
-            }
-            Ok(())
-        }
-        Err(error) => {
-            if write_atomic(path, &protected, true).is_ok() {
-                // The old blob is back in place, so the backup has done its job.
-                let _ = fs::remove_file(&backup);
-            } else {
-                tracing::warn!("the old PC key could not be put back; its backup is kept");
-            }
-            Err(error)
-        }
-    }
-}
-
-/// Reads the stored blob back and checks that it is the converted key: current format, unlocks
-/// without a passphrase, same ID and public key as the old file.
-fn verify_converted(
-    path: &Path,
-    unprotect: &impl Fn(&[u8]) -> Result<Vec<u8>>,
-    old: &LegacyKeyFile,
-) -> Result<()> {
-    let protected = fs::read(path).context("reading the converted PC key")?;
-    let text = unprotect_text(&protected, unprotect)
-        .ok_or_else(|| anyhow!("the converted PC key does not unprotect"))?;
-    let file = KeyFile::parse(&text).map_err(|_| anyhow!("the converted PC key does not parse"))?;
-    let signing = file
-        .unlock(None)
-        .map_err(|_| anyhow!("the converted PC key does not unlock"))?;
-    if file.id() != old.id()
-        || file.public_key() != old.public_key()
-        || signing.verifying_key().to_bytes() != *old.public_key()
-    {
-        bail!("the converted PC key does not match the old one");
-    }
-    Ok(())
-}
-
-/// A backup left by an interrupted conversion is removed only when the stored file holds the
-/// same key (in either format: the conversion may have stopped before or after replacing it).
-/// Otherwise both files are kept.
-fn resolve_stale_backup(
-    path: &Path,
-    backup: &Path,
-    unprotect: &impl Fn(&[u8]) -> Result<Vec<u8>>,
-) -> Result<()> {
-    let read_id = |file: &Path| {
-        fs::read(file)
-            .ok()
-            .and_then(|bytes| unprotect_text(&bytes, unprotect))
-            .and_then(|text| read_key_file(&text).ok())
-            .map(|stored| stored.id())
-    };
-    match (read_id(backup), read_id(path)) {
-        (Some(backup_id), Some(stored_id)) if backup_id == stored_id => {
-            fs::remove_file(backup).context("removing the stale legacy backup")
-        }
-        _ => bail!("a legacy backup is left beside the PC key; both files are kept"),
-    }
+/// True when the blob unprotects to a key file whose format is not the current one.
+fn is_other_format(protected: &[u8], unprotect: &impl Fn(&[u8]) -> Result<Vec<u8>>) -> bool {
+    unprotect_text(protected, unprotect).is_some_and(|text| {
+        matches!(
+            KeyFile::parse(&text),
+            Err(DeviceKeyError::UnsupportedFormat)
+        )
+    })
 }
 
 /// The plain text inside a stored blob, or `None` when it does not unprotect or is not UTF-8.
@@ -534,133 +446,40 @@ mod tests {
         dir.no_temps();
     }
 
-    fn legacy_plain() -> String {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../../fixtures/device-keys-contract.json"))
-                .unwrap();
-        fixture["legacyKeyFiles"]["plain"]["file"].to_string()
-    }
-
-    fn legacy_blob() -> Vec<u8> {
-        seal(legacy_plain().as_bytes()).unwrap()
+    fn other_format() -> String {
+        let mut file: serde_json::Value = serde_json::from_str(&plain("old")).unwrap();
+        file["format"] = serde_json::Value::from("other-format");
+        file.to_string()
     }
 
     #[test]
-    fn a_legacy_plain_key_is_converted_in_place_and_the_backup_is_removed() {
+    fn a_key_in_another_format_is_replaced_by_a_new_one() {
         let dir = Scratch::new();
         let path = dir.key();
-        let text = legacy_plain();
-        let old = LegacyKeyFile::parse(&text).unwrap();
-        fs::write(&path, seal(text.as_bytes()).unwrap()).unwrap();
-        migrate_legacy_with_codec(&path, seal, open).unwrap();
-        let json = String::from_utf8(open(&fs::read(&path).unwrap()).unwrap()).unwrap();
-        assert!(!json.contains("bubbleplay-device-key"));
-        let file = KeyFile::parse(&json).unwrap();
-        assert!(!file.is_protected());
-        assert_eq!(file.id(), old.id());
-        assert_eq!(file.public_key(), old.public_key());
-        assert_eq!(file.label(), old.label());
-        assert_eq!(file.created(), old.created());
-        assert!(!backup_path(&path).exists());
-        let handed = handoff_with_codec(&path, "unused", CREATED, fail, open).unwrap();
-        assert_eq!(KeyFile::parse(&handed).unwrap().id(), old.id());
+        let old = other_format();
+        fs::write(&path, seal(old.as_bytes()).unwrap()).unwrap();
+        let handed = handoff_with_codec(&path, "PC", CREATED, seal, open).unwrap();
+        let new = KeyFile::parse(&handed).unwrap();
+        assert_eq!(new.label(), "PC");
+        let stored = String::from_utf8(open(&fs::read(&path).unwrap()).unwrap()).unwrap();
+        assert_eq!(stored, handed.as_str());
+        assert_ne!(stored, old);
+        assert_eq!(
+            fs::read_dir(&dir.0).unwrap().count(),
+            1,
+            "no backup is kept"
+        );
         dir.no_temps();
     }
 
     #[test]
-    fn a_failed_protection_leaves_the_old_blob_byte_identical() {
+    fn a_failed_protection_leaves_a_key_in_another_format_untouched() {
         let dir = Scratch::new();
         let path = dir.key();
-        let before = legacy_blob();
+        let before = seal(other_format().as_bytes()).unwrap();
         fs::write(&path, &before).unwrap();
-        assert!(migrate_legacy_with_codec(&path, fail, open).is_err());
+        assert!(handoff_with_codec(&path, "PC", CREATED, fail, open).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
-        assert!(!backup_path(&path).exists());
         dir.no_temps();
-    }
-
-    #[test]
-    fn a_converted_blob_that_reads_back_as_another_key_is_rolled_back() {
-        let dir = Scratch::new();
-        let path = dir.key();
-        let before = legacy_blob();
-        fs::write(&path, &before).unwrap();
-        let other = seal(plain("other").as_bytes()).unwrap();
-        assert!(migrate_legacy_with_codec(&path, |_| Ok(other.clone()), open).is_err());
-        assert_eq!(fs::read(&path).unwrap(), before);
-        assert!(!backup_path(&path).exists());
-        dir.no_temps();
-    }
-
-    #[test]
-    fn a_file_already_in_the_current_format_is_left_alone() {
-        let dir = Scratch::new();
-        let path = dir.key();
-        let bytes = seal(plain("PC").as_bytes()).unwrap();
-        fs::write(&path, &bytes).unwrap();
-        migrate_legacy_with_codec(&path, fail, open).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert!(!backup_path(&path).exists());
-    }
-
-    #[test]
-    fn a_missing_or_unreadable_file_is_neither_created_nor_changed() {
-        let dir = Scratch::new();
-        let path = dir.key();
-        migrate_legacy_with_codec(&path, fail, open).unwrap();
-        assert!(!path.exists());
-        fs::write(&path, b"corrupt blob").unwrap();
-        migrate_legacy_with_codec(&path, fail, open).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"corrupt blob");
-        assert!(!backup_path(&path).exists());
-    }
-
-    #[test]
-    fn a_stale_backup_is_removed_when_the_stored_key_is_the_converted_one() {
-        let dir = Scratch::new();
-        let path = dir.key();
-        let old = LegacyKeyFile::parse(&legacy_plain()).unwrap();
-        let (_, json) = convert_legacy(&old, None).unwrap();
-        fs::write(backup_path(&path), legacy_blob()).unwrap();
-        let stored = seal(json.as_bytes()).unwrap();
-        fs::write(&path, &stored).unwrap();
-        migrate_legacy_with_codec(&path, fail, open).unwrap();
-        assert!(!backup_path(&path).exists());
-        assert_eq!(fs::read(&path).unwrap(), stored);
-    }
-
-    #[test]
-    fn a_stale_backup_of_the_same_legacy_key_is_dropped_and_the_conversion_proceeds() {
-        let dir = Scratch::new();
-        let path = dir.key();
-        fs::write(backup_path(&path), legacy_blob()).unwrap();
-        fs::write(&path, legacy_blob()).unwrap();
-        migrate_legacy_with_codec(&path, seal, open).unwrap();
-        assert!(!backup_path(&path).exists());
-        let text = String::from_utf8(open(&fs::read(&path).unwrap()).unwrap()).unwrap();
-        let converted = KeyFile::parse(&text).expect("current format");
-        let old = LegacyKeyFile::parse(&legacy_plain()).unwrap();
-        assert_eq!(converted.id(), old.id());
-    }
-
-    #[test]
-    fn a_stale_backup_of_another_key_is_kept_with_the_stored_file() {
-        let dir = Scratch::new();
-        let path = dir.key();
-        fs::write(backup_path(&path), b"some other blob").unwrap();
-        fs::write(&path, legacy_blob()).unwrap();
-        assert!(migrate_legacy_with_codec(&path, seal, open).is_err());
-        assert!(backup_path(&path).exists());
-        assert_eq!(fs::read(&path).unwrap(), legacy_blob());
-    }
-
-    #[test]
-    fn the_handoff_accepts_an_unconverted_legacy_plain_key() {
-        let dir = Scratch::new();
-        let path = dir.key();
-        fs::write(&path, legacy_blob()).unwrap();
-        let handed = handoff_with_codec(&path, "unused", CREATED, fail, open).unwrap();
-        assert_eq!(handed.as_str(), legacy_plain());
-        assert_eq!(fs::read(&path).unwrap(), legacy_blob());
     }
 }

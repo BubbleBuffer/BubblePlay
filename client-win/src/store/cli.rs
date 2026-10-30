@@ -86,7 +86,7 @@ fn key_import(file: &Path) -> Result<()> {
 
 fn key_export(file: &Path) -> Result<()> {
     let store = KeyStore::default_location()?;
-    let text = store.export(&mut |id| read_passphrase(&format!("Passphrase for {id}: ")))?;
+    let text = store.export()?;
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

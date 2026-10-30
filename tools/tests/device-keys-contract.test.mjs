@@ -63,28 +63,6 @@ function parseId(input) {
   assert.match(normalized, /^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{16}$/);
   return normalized.match(/.{4}/g).join("-");
 }
-// JCS serialization for the fixture's JSON domain (no lone surrogates/nonfinite numbers).
-function canonical(value) {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
-  const keys = Object.keys(value).sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
-  return "{" + keys.map(key => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
-}
-function fileAAD(file) {
-  const { private: omittedPrivate, aead, ...header } = file;
-  if (aead === null) header.aead = null;
-  else {
-    const { nonce: omittedNonce, ...algorithm } = aead;
-    header.aead = algorithm;
-  }
-  return text(canonical(header));
-}
-function keyFromPassphrase(file, passphrase) {
-  return crypto.argon2Sync("argon2id", {
-    message: text(passphrase), nonce: bytes(file.kdf.salt, 16),
-    memory: file.kdf.m, passes: file.kdf.t, parallelism: file.kdf.p, tagLength: 32,
-  });
-}
 function seal(key, nonce, aad, plaintext) {
   const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
   cipher.setAAD(aad);
@@ -97,15 +75,6 @@ function open(key, nonce, aad, encrypted) {
   decipher.setAuthTag(encrypted.subarray(-16));
   return Buffer.concat([decipher.update(encrypted.subarray(0, -16)), decipher.final()]);
 }
-function validateIdentity(file, seed) {
-  assert.equal(file.format, "bubbleplay-device-key");
-  assert.equal(file.version, 1);
-  assert.equal(file.type, "ed25519");
-  const publicBytes = rawPublic(secret(seed.toString("hex")));
-  assert.deepEqual(publicBytes, bytes(file.public, 32));
-  assert.equal(idOf(publicBytes), file.id);
-}
-
 test("three ID derivations and lowercase, O/I/L, unhyphenated parsing", () => {
   assert.equal(fixture.version, 1);
   assert.match(fixture.notes, /docs\/architecture\/device-keys\.md/);
@@ -126,57 +95,6 @@ test("three ID derivations and lowercase, O/I/L, unhyphenated parsing", () => {
     }
   }
 });
-
-test("plain bpkey contains the seed and consistent public key/ID", () => {
-  const { seedHex, file } = fixture.legacyKeyFiles.plain;
-  assert.equal(file.kdf, null);
-  assert.equal(file.aead, null);
-  const seed = bytes(file.private, 32);
-  assert.deepEqual(seed, fromHex(seedHex));
-  validateIdentity(file, seed);
-});
-
-test("protected bpkey metadata and RFC 8785 AAD remain checkable on Node 22", () => {
-  const vector = fixture.legacyKeyFiles.passphrase, file = vector.file;
-  assert.deepEqual(Object.keys(file).sort(), ["format", "version", "type", "id", "label", "created", "public", "kdf", "aead", "private"].sort());
-  assert.deepEqual(file.kdf, { alg: "argon2id", m: 65536, t: 3, p: 1, salt: file.kdf.salt });
-  assert.deepEqual(file.aead, { alg: "aes-256-gcm", nonce: file.aead.nonce });
-  bytes(file.kdf.salt, 16);
-  bytes(file.aead.nonce, 12);
-  bytes(file.private, 48);
-  validateIdentity(file, fromHex(vector.seedHex));
-  assert.equal(fileAAD(file).toString("utf8"), vector.aadUtf8);
-  assert.equal(fileAAD(file).toString("hex"), vector.aadHex);
-  // Sorting is independent of the order used by the serialized key file.
-  assert.deepEqual(fileAAD(Object.fromEntries(Object.entries(file).reverse())), fileAAD(file));
-  const [wrong, tampered] = fixture.legacyKeyFiles.failures;
-  assert.deepEqual(fixture.legacyKeyFiles.failures.map(v => v.name), ["wrong-passphrase", "tampered-aad"]);
-  assert.deepEqual(wrong.file, file);
-  assert.notEqual(wrong.passphrase, vector.passphrase);
-  assert.equal(tampered.passphrase, vector.passphrase);
-  assert.deepEqual({ ...tampered.file, label: file.label }, file);
-  assert.notDeepEqual(fileAAD(tampered.file), fileAAD(file));
-});
-
-test("Argon2id protected bpkey encrypts and decrypts the seed", t => {
-  if (typeof crypto.argon2Sync !== "function") return t.skip("needs Node >= 24.7 for argon2");
-  const { seedHex, passphrase, kdfKeyHex, file } = fixture.legacyKeyFiles.passphrase;
-  const key = keyFromPassphrase(file, passphrase);
-  assert.equal(key.toString("hex"), kdfKeyHex);
-  const encrypted = seal(key, bytes(file.aead.nonce, 12), fileAAD(file), fromHex(seedHex));
-  assert.deepEqual(encrypted, bytes(file.private, 48));
-  const seed = open(key, bytes(file.aead.nonce, 12), fileAAD(file), encrypted);
-  assert.deepEqual(seed, fromHex(seedHex));
-  validateIdentity(file, seed);
-});
-for (const vector of fixture.legacyKeyFiles.failures) {
-  test(`protected bpkey refuses ${vector.name}`, t => {
-    if (typeof crypto.argon2Sync !== "function") return t.skip("needs Node >= 24.7 for argon2");
-    assert.equal(vector.expected, "authentication-failed");
-    const key = keyFromPassphrase(vector.file, vector.passphrase);
-    assert.throws(() => open(key, bytes(vector.file.aead.nonce, 12), fileAAD(vector.file), bytes(vector.file.private, 48)), /authenticate/i);
-  });
-}
 
 function handshakeInputs() {
   const h = fixture.handshake;

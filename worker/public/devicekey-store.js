@@ -10,8 +10,8 @@ const VERSION = 2;
 const STORE = "keys";
 const PCS = "pcs";
 const RECORD = "device";
-// The record a format conversion replaces, kept until the new one reads back (dk-app.js). Removed with the key.
-const BACKUP = "device-backup";
+// A record an earlier release could leave behind. Never read; deleted whenever a key is saved or cleared.
+const STALE = "device-backup";
 const PC_NAME_MAX = 80;
 
 /** Trims and caps a PC name at 80 code points; an empty name falls back to the ID. */
@@ -134,24 +134,10 @@ export function createDeviceKeyStore({ indexedDB = globalThis.indexedDB } = {}) 
     },
     async save(text) {
       if (typeof text !== "string") throw new TypeError("Device-key storage accepts JSON text only.");
-      await transact("readwrite", store => store.put(text, RECORD));
-    },
-    async loadBackup() {
-      const text = await transact("readonly", store => store.get(BACKUP));
-      if (text === undefined) return null;
-      if (typeof text !== "string") throw new Error("Stored device-key backup is not JSON text.");
-      return text;
-    },
-    async saveBackup(text) {
-      if (typeof text !== "string") throw new TypeError("Device-key storage accepts JSON text only.");
-      await transact("readwrite", store => store.put(text, BACKUP));
-    },
-    async clearBackup() {
-      await transact("readwrite", store => store.delete(BACKUP));
+      await transact("readwrite", store => { store.delete(STALE); return store.put(text, RECORD); });
     },
     async clear() {
-      await transact("readwrite", store => store.delete(RECORD));
-      await transact("readwrite", store => store.delete(BACKUP));
+      await transact("readwrite", store => { store.delete(RECORD); return store.delete(STALE); });
     },
     ...pcStore,
   };

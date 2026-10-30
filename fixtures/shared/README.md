@@ -11,6 +11,5 @@ file from the new tag. `node tools/device-keys/gen-contract.mjs --check` checks 
 JavaScript implementation without rewriting it.
 
 It has three sections, all in the shared `bubblebuffer-device-key` format and with neutral relay
-labels: `ids`, `keyFiles` and `relayProof`. BubblePlay's own vectors (the old
-`bubbleplay-device-key` key files under `legacyKeyFiles`, relay proofs with the label
+labels: `ids`, `keyFiles` and `relayProof`. BubblePlay's own vectors (relay proofs with the label
 `bubbleplay-relay-v1`, the handshake and phase 2) stay in `fixtures/device-keys-contract.json`.

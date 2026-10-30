@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use bp_device_key::{convert_legacy, read_key_file, DeviceKeyError, StoredKeyFile};
+use bp_device_key::{DeviceKeyError, KeyFile};
 use windows::core::{w, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -118,7 +118,7 @@ fn export_file(key_path: &Path) -> std::result::Result<Option<PathBuf>, String> 
     let current = load_current(key_path).map_err(|error| {
         format!("The PC key could not be read, so nothing was exported. {error:#}")
     })?;
-    let key = read_key_file(&current).map_err(|error| {
+    let key = KeyFile::parse(&current).map_err(|error| {
         format!("The PC key could not be read, so nothing was exported. {error}")
     })?;
     let Some(passphrase) = ask_passphrase(flow_title(Flow::Export), PassphraseMode::Create, None)
@@ -199,7 +199,7 @@ pub enum Previous<'a> {
 /// A missing file is created first, as the host does at start.
 fn current_id(key_path: &Path) -> Option<String> {
     let text = load_current(key_path).ok()?;
-    read_key_file(&text).ok().map(|key| key.id().to_string())
+    KeyFile::parse(&text).ok().map(|key| key.id().to_string())
 }
 
 /// Checks the `.bpkey` text in `source` and, once `confirm` agrees, replaces the PC key at
@@ -212,7 +212,7 @@ pub fn import_key(
     passphrase: Option<&str>,
     confirm: impl FnOnce(Previous<'_>, &str) -> bool,
 ) -> std::result::Result<String, ImportError> {
-    let stored = read_key_file(source).map_err(|error| {
+    let stored = KeyFile::parse(source).map_err(|error| {
         ImportError::Failed(format!("This is not a BubblePlay key file. {error}"))
     })?;
     let file_passphrase = if stored.is_protected() {
@@ -223,13 +223,7 @@ pub fn import_key(
     } else {
         None
     };
-    // An old-format file is converted first, then stored in the current format as a plain key.
-    let unlocked = match &stored {
-        StoredKeyFile::Current(file) => file.rewrap(file_passphrase, None),
-        StoredKeyFile::Legacy(old) => convert_legacy(old, file_passphrase)
-            .and_then(|(file, _)| file.rewrap(file_passphrase, None)),
-    }
-    .map_err(unlock_error)?;
+    let unlocked = stored.rewrap(file_passphrase, None).map_err(unlock_error)?;
     let plain = unlocked.to_json().map(Zeroizing::new).map_err(|error| {
         ImportError::Failed(format!("The key file could not be prepared. {error}"))
     })?;
@@ -280,12 +274,7 @@ pub fn export_text(
     plain: &str,
     passphrase: Option<&str>,
 ) -> std::result::Result<Zeroizing<String>, DeviceKeyError> {
-    // The stored key is plain. An old-format one is converted here, so the export is always the
-    // current format.
-    let key = match read_key_file(plain)? {
-        StoredKeyFile::Current(file) => file,
-        StoredKeyFile::Legacy(old) => convert_legacy(&old, None)?.0,
-    };
+    let key = KeyFile::parse(plain)?;
     let wrapped = key.rewrap(None, passphrase)?;
     wrapped.to_json().map(Zeroizing::new)
 }
@@ -842,41 +831,27 @@ mod tests {
         assert!(replace_confirm_text("SAME-1", "SAME-1").contains("The PC ID stays SAME-1."));
     }
 
-    fn legacy_plain() -> String {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../../fixtures/device-keys-contract.json"))
-                .unwrap();
-        fixture["legacyKeyFiles"]["plain"]["file"].to_string()
+    fn other_format() -> String {
+        let mut file: serde_json::Value = serde_json::from_str(&plain_key("old")).unwrap();
+        file["format"] = serde_json::Value::from("other-format");
+        file.to_string()
     }
 
     #[test]
-    fn an_imported_legacy_file_is_stored_in_the_current_format() {
+    fn a_file_in_another_format_is_not_imported_or_exported() {
         let dir = Scratch::new();
         let key = dir.key();
-        let legacy = legacy_plain();
-        let old = bp_device_key::legacy::LegacyKeyFile::parse(&legacy).unwrap();
-        let new_id = import_key(&key, &legacy, None, |_, _| true).unwrap();
-        assert_eq!(new_id, old.id().to_string());
-        let loaded = load_current(&key).unwrap();
-        assert!(!loaded.contains("bubbleplay-device-key"));
-        let file = KeyFile::parse(&loaded).unwrap();
-        assert!(!file.is_protected());
-        assert_eq!(file.id(), old.id());
-        assert_eq!(file.public_key(), old.public_key());
-        assert_eq!(file.label(), old.label());
-        assert_eq!(file.created(), old.created());
-    }
-
-    #[test]
-    fn exporting_a_stored_legacy_key_writes_the_current_format() {
-        let legacy = legacy_plain();
-        let old = bp_device_key::legacy::LegacyKeyFile::parse(&legacy).unwrap();
-        let exported = export_text(&legacy, None).unwrap();
-        assert!(exported.contains(&format!("\"format\": \"{}\"", KeyFile::FORMAT)));
-        assert!(!exported.contains("bubbleplay-device-key"));
-        let file = KeyFile::parse(&exported).unwrap();
-        assert!(!file.is_protected());
-        assert_eq!(file.id(), old.id());
+        device_key_file::replace_pc_key(&key, &plain_key("PC")).unwrap();
+        let before = fs::read(&key).unwrap();
+        let result = import_key(&key, &other_format(), None, |_, _| {
+            panic!("confirm must not run")
+        });
+        assert!(matches!(result, Err(ImportError::Failed(_))));
+        assert_eq!(fs::read(&key).unwrap(), before);
+        assert!(matches!(
+            export_text(&other_format(), None),
+            Err(DeviceKeyError::UnsupportedFormat)
+        ));
     }
 
     #[test]

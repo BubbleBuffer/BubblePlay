@@ -1,15 +1,14 @@
 //! BubblePlay's device-key crate: a thin layer over the shared `bubblebuffer-device-key` crate
 //! (device IDs, Ed25519 keys, the `bubblebuffer-device-key` key file and relay proofs) plus what
 //! stays BubblePlay's own: the relay label `bubbleplay-relay-v1`, the relay-origin canonical form,
-//! the phase 2 handshake and, behind `keyfile`, the reader for the old `bubbleplay-device-key`
-//! files and their one-time conversion.
+//! the phase 2 handshake and, behind `keyfile`, the key file wrapper.
 //!
 //! Features:
 //!
 //! - default: device IDs, relay proof encoding, hashing, signing with an existing key and
 //!   verification, and the relay-origin canonicaliser.
 //! - `keygen`: `DeviceIdentity::generate` and, with `phase2`, the phase 2 generators.
-//! - `keyfile`: [`KeyFile`] (the shared format), the [`legacy`] reader and [`convert_legacy`].
+//! - `keyfile`: [`KeyFile`] (the shared format).
 //! - `phase2`: the [`phase2`] module: handshake transcript and signatures, X25519 + HKDF
 //!   control keys, the sequenced AES-256-GCM `ctl` envelope, pairing codes, MACs and the
 //!   comparison number (pulls `x25519-dalek`, `hkdf`, `hmac` and `aes-gcm`).
@@ -22,8 +21,6 @@ mod proof;
 
 #[cfg(feature = "keyfile")]
 mod keyfile;
-#[cfg(feature = "keyfile")]
-pub mod legacy;
 
 #[cfg(feature = "phase2")]
 pub mod phase2;
@@ -35,7 +32,7 @@ pub use proof::{
 };
 
 #[cfg(feature = "keyfile")]
-pub use keyfile::{convert_legacy, read_key_file, KeyFile, StoredKeyFile};
+pub use keyfile::KeyFile;
 
 /// Failures are distinct: `AuthenticationFailed` means the AEAD tag did not verify (wrong
 /// passphrase or altered authenticated metadata); the other variants are validation failures

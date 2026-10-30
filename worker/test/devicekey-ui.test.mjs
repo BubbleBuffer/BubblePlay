@@ -1,21 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  defaultKeyLabel, deviceKeyErrorMessage, exportFileName, passphraseValue, shareableKeyText, summarizeKeyFile,
+  defaultKeyLabel, deviceKeyErrorMessage, exportFileName, passphraseValue, summarizeKeyFile,
 } from "../public/devicekey-ui.js";
-
-test("import and export store or send a legacy key file converted, and any other text unchanged", async () => {
-  const legacy = JSON.stringify({ format: "bubbleplay-device-key", id: "B7QK-2M9X-H4PD-R8TN", kdf: null });
-  const shared = JSON.stringify({ format: "bubblebuffer-device-key", id: "B7QK-2M9X-H4PD-R8TN", kdf: null });
-  const calls = [];
-  const convert = async (text, passphrase) => { calls.push([text, passphrase]); return shared; };
-  assert.equal(await shareableKeyText(legacy, undefined, convert), shared);
-  assert.deepEqual(calls, [[legacy, undefined]]);
-  assert.equal(await shareableKeyText(shared, undefined, convert), shared);
-  assert.equal(calls.length, 1, "a shared-format file is not converted again");
-  assert.equal(await shareableKeyText("not json", undefined, convert), "not json");
-  assert.equal(calls.length, 1);
-});
 
 test("export file name uses the label, falls back to the ID, and drops characters Windows rejects", () => {
   assert.equal(exportFileName("Chrome on Windows", "B7QK-2M9X-H4PD-R8TN"), "Chrome on Windows.bpkey");

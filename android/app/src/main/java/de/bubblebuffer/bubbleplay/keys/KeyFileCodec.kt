@@ -24,10 +24,8 @@ class NewDeviceKey(val file: KeyFile, val key: DeviceKey)
  * [create]/[rewrap] with a passphrase run.
  */
 object KeyFileCodec {
-    /** The shared format name; [serialize], [create] and [rewrap] only ever write this one. */
+    /** The shared format name; the only one [parse] accepts and [serialize] writes. */
     internal const val FORMAT = "bubblebuffer-device-key"
-    /** The name of files written before the shared format. They are read and converted, never written. */
-    internal const val LEGACY_FORMAT = "bubbleplay-device-key"
     private const val TYPE = "ed25519"
     private const val VERSION = 1L
     private const val KDF_ALG = "argon2id"
@@ -49,8 +47,7 @@ object KeyFileCodec {
     /** Strictly parses key-file text (decode the file as UTF-8 before calling). */
     fun parse(text: String): KeyFile {
         val root = KeyJson.parseObject(text)
-        val format = (root["format"] as? String)?.takeIf { it == FORMAT || it == LEGACY_FORMAT }
-            ?: refuse(Reason.UNSUPPORTED_FORMAT, "not a BubblePlay device key")
+        if (root["format"] != FORMAT) refuse(Reason.UNSUPPORTED_FORMAT, "not a BubblePlay device key")
         if (root["version"] != VERSION) refuse(Reason.UNSUPPORTED_VERSION, "unsupported key file version")
         if (root["type"] != TYPE) refuse(Reason.UNSUPPORTED_TYPE, "unsupported key type")
         if (root.keys != FIELDS) malformed("unexpected or missing key file fields")
@@ -73,7 +70,7 @@ object KeyFileCodec {
             if (root["kdf"] == null) {
                 if (root["aead"] != null) malformed("aead is set but kdf is not")
                 if (sealed.size != KEY_BYTES) malformed("an unprotected key holds exactly a 32-byte seed")
-                return KeyFile(id, label, created, publicKey, null, null, sealed, format)
+                return KeyFile(id, label, created, publicKey, null, null, sealed)
             }
             val kdf = asObject(root["kdf"]) ?: malformed("kdf must be an object or null")
             if (kdf.keys != KDF_FIELDS) malformed("unexpected kdf fields")
@@ -87,7 +84,7 @@ object KeyFileCodec {
             val salt = StrictBase64Url.decode(kdf.string("salt"), SALT_BYTES)
             val nonce = StrictBase64Url.decode(aead.string("nonce"), NONCE_BYTES)
             if (sealed.size != KEY_BYTES + TAG_BYTES) malformed("a protected key holds a 32-byte seed plus its tag")
-            return KeyFile(id, label, created, publicKey, salt, nonce, sealed, format)
+            return KeyFile(id, label, created, publicKey, salt, nonce, sealed)
         } finally {
             // KeyFile owns a copy; this decoded buffer may contain a plain seed.
             sealed.fill(0)
@@ -96,9 +93,7 @@ object KeyFileCodec {
 
     /** Key-file text in the documented field order. */
     fun serialize(file: KeyFile): String {
-        // A protected legacy seed is sealed under the legacy header, so it cannot be written under the shared name.
-        require(!file.isLegacyFormat || !file.isProtected) { "convert a protected legacy key file before serialising it" }
-        val fields = header(file, FORMAT)
+        val fields = header(file)
         fields["aead"] = file.nonce?.let { nonce ->
             linkedMapOf<String, Any?>("alg" to AEAD_ALG, "nonce" to StrictBase64Url.encode(nonce))
         }
@@ -189,41 +184,13 @@ object KeyFileCodec {
         }
     }
 
-    /**
-     * Converts a legacy file to the shared format and returns its text. A plain file stays plain; a
-     * protected one keeps its passphrase, under a fresh salt and nonce. [passphrase] is what [unlock]
-     * takes for [file]. The text is read back, unlocked and checked against [file]'s ID and public key
-     * before it is returned, so a failed conversion never yields a file.
-     */
-    fun convertLegacy(file: KeyFile, passphrase: String?, random: SecureRandom = SecureRandom()): String {
-        require(file.isLegacyFormat) { "not a legacy key file" }
-        val text = unlock(file, passphrase).let { key ->
-            try {
-                key.withSeed { seed ->
-                    serialize(protect(file.id, file.label, file.created, file.publicKey, passphrase, seed, random))
-                }
-            } finally {
-                key.close()
-            }
-        }
-        val reread = unlock(parse(text), passphrase)
-        try {
-            if (reread.id != file.id || !MessageDigest.isEqual(reread.publicKey, file.publicKey)) {
-                refuse(Reason.IDENTITY_MISMATCH, "converted key file names another key")
-            }
-        } finally {
-            reread.close()
-        }
-        return text
-    }
-
-    /** RFC 8785 AAD: every header field except `private` and `aead.nonce`, under the file's own format name. */
+    /** RFC 8785 AAD: every header field except `private` and `aead.nonce`. */
     internal fun authenticatedData(file: KeyFile): ByteArray =
-        KeyJson.canonical(header(file, file.format)).toByteArray(Charsets.UTF_8)
+        KeyJson.canonical(header(file)).toByteArray(Charsets.UTF_8)
 
-    private fun header(file: KeyFile, format: String): LinkedHashMap<String, Any?> {
+    private fun header(file: KeyFile): LinkedHashMap<String, Any?> {
         val fields = LinkedHashMap<String, Any?>()
-        fields["format"] = format
+        fields["format"] = FORMAT
         fields["version"] = VERSION
         fields["type"] = TYPE
         fields["id"] = file.id
@@ -253,15 +220,15 @@ object KeyFileCodec {
         random: SecureRandom,
     ): KeyFile {
         // KeyFile copies its arguments, so passing the caller's seed does not hand out a second owner.
-        if (passphrase == null) return KeyFile(id, label, created, publicKey, null, null, seed, FORMAT)
+        if (passphrase == null) return KeyFile(id, label, created, publicKey, null, null, seed)
         val salt = ByteArray(SALT_BYTES).also { random.nextBytes(it) }
         val nonce = ByteArray(NONCE_BYTES).also { random.nextBytes(it) }
         // The AAD does not depend on `private`, so it can be computed before sealing.
-        val draft = KeyFile(id, label, created, publicKey, salt, nonce, ByteArray(0), FORMAT)
+        val draft = KeyFile(id, label, created, publicKey, salt, nonce, ByteArray(0))
         val wrapKey = deriveKey(passphrase, salt)
         try {
             val sealed = encrypt(wrapKey, nonce, authenticatedData(draft), seed)
-            return KeyFile(id, label, created, publicKey, salt, nonce, sealed, FORMAT)
+            return KeyFile(id, label, created, publicKey, salt, nonce, sealed)
         } finally {
             wrapKey.fill(0)
         }
