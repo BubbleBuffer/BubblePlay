@@ -10,6 +10,7 @@ use std::time::Duration;
 use bp_relay_core::gate::{
     Gate, GateEffect, GateSnapshot, Hold, HoldCheck, Request as GateRequest, Verdict,
 };
+use bp_relay_core::presence::{self, PRESENCE_PATH, PresenceLimiter};
 use bp_relay_core::relay::{
     Action, AdminError, ConnId, ConnSnapshot, Relay as CoreRelay, UpgradeRequest,
 };
@@ -51,8 +52,8 @@ struct Woken {
 
 impl crate::Relay {
     /// Every HTTP request and WebSocket upgrade, with the security headers added last. The order
-    /// is native's (app.rs): healthz, the body cap, the gate, then the admin API, a WebSocket
-    /// route or the static assets.
+    /// is native's (app.rs): healthz, the body cap, the gate, then `GET /presence`, the admin API,
+    /// a WebSocket route or the static assets.
     pub(crate) async fn on_fetch(&self, req: Request) -> Result<Response> {
         let response = self.route(req).await?;
         http::finish(response)
@@ -144,6 +145,26 @@ impl crate::Relay {
             }
             Verdict::Drop => return http::dropped(),
             Verdict::Allow => {}
+        }
+        // The gate lets a GET on /presence through before its navigation step, cookie or not.
+        if path == PRESENCE_PATH && method == Method::Get && !websocket {
+            let ids = url
+                .query_pairs()
+                .find(|(key, _)| key == "ids")
+                .map(|(_, value)| value.into_owned());
+            let response = {
+                let mut guard = self.live.borrow_mut();
+                let Some(live) = guard.as_mut() else {
+                    return server_error();
+                };
+                let Live {
+                    core,
+                    presence: limiter,
+                    ..
+                } = live;
+                presence::answer(limiter, core, client, ids.as_deref(), now_ms())
+            };
+            return http::gate_response(response);
         }
         if path.starts_with("/__gate/manage/") {
             return self.admin(&method, &path, authorization.as_deref()).await;
@@ -705,6 +726,7 @@ async fn wake_state(
         live: Live {
             core,
             gate,
+            presence: PresenceLimiter::new(),
             sockets,
             origin,
             pcs_healthy: true,

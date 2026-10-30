@@ -33,6 +33,7 @@ import {
   openSocket,
   proveViewer,
   registerHost,
+  sleep,
   startNtfy,
   startRelay,
   viewerIdentity,
@@ -599,6 +600,81 @@ test('m3 an unknown /__gate path is 404, with or without a cookie', { timeout: C
   }
   const wrongMethod = await httpRequest(relay.port, { path: '/__gate/decision', headers: { Cookie: cookie } });
   assert.equal(wrongMethod.status, 404, 'the decision route takes POST only');
+});
+
+// GET /presence (e2e_presence.rs, router.rs): unauthenticated, read-only host presence. It passes
+// the gate before the navigation step, so it never pushes ntfy, holds, or sets a cookie.
+
+function presenceGet(port, ids, { ip, headers = {} } = {}) {
+  return httpRequest(port, { path: `/presence?ids=${ids}`, ip, headers });
+}
+
+test('m3 presence follows the host socket and reports unknown ids false', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const ip = freshClientIp();
+  const host = identity(150);
+  const unknown = identity(151);
+  const ids = `${host.id},${unknown.id}`;
+  const read = async () => {
+    const res = await presenceGet(relay.port, ids, { ip });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['content-type'], 'application/json');
+    assert.equal(res.headers['cache-control'], 'no-store');
+    return JSON.parse(res.body.toString('utf8'));
+  };
+  assert.deepEqual(await read(), { [host.id]: false, [unknown.id]: false });
+  const { socket } = await registerHost(relay.port, host);
+  assert.deepEqual(await read(), { [host.id]: true, [unknown.id]: false });
+  socket.close();
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const body = await read();
+    if (body[host.id] === false) {
+      assert.deepEqual(body, { [host.id]: false, [unknown.id]: false });
+      break;
+    }
+    assert.ok(Date.now() < deadline, 'the host still shows online after it left');
+    await sleep(50);
+  }
+});
+
+test('m3 presence never pushes ntfy, holds or sets a cookie', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const ip = freshClientIp();
+  const id = identity(152).id;
+  const before = ntfy.count();
+  for (const headers of [{}, { 'Sec-Fetch-Dest': 'document' }, { 'Sec-Fetch-Dest': 'empty' }]) {
+    const started = Date.now();
+    const res = await presenceGet(relay.port, id, { ip, headers });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['set-cookie'], undefined);
+    assert.ok(Date.now() - started < GATE_HOLD_MS, 'presence was answered, not held');
+  }
+  await sleep(300);
+  assert.equal(ntfy.count(), before, 'presence pushed nothing to ntfy');
+  const foreign = await presenceGet(relay.port, id, { ip, headers: { Origin: 'https://evil.example' } });
+  assert.equal(foreign.status, 404, 'a foreign Origin is refused as before');
+  const post = await httpRequest(relay.port, { method: 'POST', path: `/presence?ids=${id}`, ip });
+  assert.equal(post.status, 403, 'other methods keep the gate answer');
+});
+
+test('m3 presence refuses bad queries and rate limits per prefix', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const ip = freshClientIp();
+  const many = Array.from({ length: 21 }, (_, n) => identity(160 + n).id).join(',');
+  for (const ids of [many, 'not-an-id', `${identity(160).id},`]) {
+    const res = await presenceGet(relay.port, ids, { ip });
+    assert.equal(res.status, 400, ids);
+    assert.equal(res.headers['cache-control'], 'no-store');
+  }
+  const id = identity(160).id;
+  // Three requests above already counted against this prefix.
+  for (let n = 3; n < 60; n += 1) {
+    assert.equal((await presenceGet(relay.port, id, { ip })).status, 200, `request ${n}`);
+  }
+  const limited = await presenceGet(relay.port, id, { ip });
+  assert.equal(limited.status, 429);
+  const retry = Number(limited.headers['retry-after']);
+  assert.ok(retry >= 1 && retry <= 60, `Retry-After ${limited.headers['retry-after']}`);
+  const other = await presenceGet(relay.port, id, { ip: freshClientIp() });
+  assert.equal(other.status, 200, 'another prefix is unaffected');
 });
 
 // Admin: list and delete (e2e_registration.rs), and the listing's count and no viewer IDs (e2e_m2.rs).

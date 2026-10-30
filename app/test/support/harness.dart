@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:bubbleplay_app/src/app.dart';
 import 'package:bubbleplay_app/src/app_controller.dart';
 import 'package:bubbleplay_app/src/backend/fake_channel.dart';
+import 'package:bubbleplay_app/src/devices/devices_controller.dart';
 import 'package:bubbleplay_app/src/platform/key_files.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -52,6 +53,8 @@ Future<TestApp> pumpApp(
   Brightness brightness = Brightness.dark,
   bool windows = true,
   ValueNotifier<Brightness?>? theme,
+  DevicesController? devices,
+  String? section,
 }) async {
   tester.view.physicalSize = Size(screen.width, screen.height);
   tester.view.devicePixelRatio = 1;
@@ -69,6 +72,8 @@ Future<TestApp> pumpApp(
         isWindows: windows,
         keyFiles: keyFiles,
         theme: theme,
+        devices: devices,
+        initialSection: section,
       ),
     ),
   );

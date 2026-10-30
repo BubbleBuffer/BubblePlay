@@ -105,7 +105,7 @@ internal class AppBackend(
     @Synchronized
     fun snapshot(): String {
         val entries = pcs.list().map { pc ->
-            StateJson.pc(pc.id, displayName(pc), pc.relay, lastSeenText(pc.lastSeen))
+            StateJson.pc(pc.id, displayName(pc), pc.relay, lastSeenText(pc.lastSeen), StateJson.pcProblem(pc.problem))
         }
         val shown = flow?.let { current ->
             current.optJSONObject("PairConfirm")?.takeIf { pairStarted > 0 }?.let { confirm ->
