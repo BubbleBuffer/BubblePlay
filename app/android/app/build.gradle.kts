@@ -65,10 +65,10 @@ val stageNativeCore by tasks.registering(Sync::class) {
     }
     into(layout.buildDirectory.dir("nativeCore"))
 }
-android.sourceSets.getByName("main").java.srcDir(stageNativeCore.map { it.destinationDir })
+android.sourceSets.getByName("main").java.srcDir(layout.buildDirectory.dir("nativeCore").get().asFile)
 tasks.configureEach {
     if (name.startsWith("compile") && name.contains("Kotlin")) dependsOn(stageNativeCore)
-    if (name.startsWith("ksp") || name.startsWith("lint")) dependsOn(stageNativeCore)
+    if (name.startsWith("ksp") || name.startsWith("lint") || name.endsWith("JavaWithJavac")) dependsOn(stageNativeCore)
 }
 
 dependencies {
