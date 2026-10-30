@@ -4,6 +4,16 @@ export function shouldReconnectAfterClose(closeCode, terminalFailure) {
   return !terminalFailure && closeCode !== 1008;
 }
 
+// The relay answers every signaling ping at once. A ping left unanswered this
+// long means the socket is dead even if the browser still calls it open (a
+// half-open TCP path after a network change), so the viewer recycles it. The
+// clock starts at the oldest unanswered ping, so hidden-tab timer throttling,
+// which only spaces the pings out, never trips it.
+export const SIGNALING_ANSWER_LIMIT_MS = 30_000;
+export function signalingUnanswered({ pingSentMs, inboundMs, nowMs, limitMs = SIGNALING_ANSWER_LIMIT_MS }) {
+  return pingSentMs !== null && inboundMs < pingSentMs && nowMs - pingSentMs >= limitMs;
+}
+
 // A failed WebRTC transport can leave the host's old RTC epoch alive long
 // enough to consume and ignore a replacement offer. Recycling signaling makes
 // the relay notify the host first, so both sides converge on a fresh epoch.

@@ -706,7 +706,7 @@ function memoryIDB({ existing = [] } = {}) {
           put: (value, key) => {
             writable();
             if (name === "pcs") { assert.equal(key, undefined); key = value.id; }
-            else assert.ok(key === "device" || key === "device-backup", `unexpected key ${key}`);
+            else assert.ok(key === "device" || key === "device-backup" || key === "unlocked", `unexpected key ${key}`);
             const copy = structuredClone(value);
             return run(() => key, () => data.set(key, copy));
           },
@@ -947,4 +947,68 @@ test("default exported API creates, parses, unlocks and rewraps protected JSON t
 test("KDF Worker rejects empty passwords and invalid salt sizes before starting a thread", async () => {
   await assert.rejects(deriveKeyInWorker({ password: new Uint8Array(), salt: new Uint8Array(16) }), /nonempty/);
   await assert.rejects(deriveKeyInWorker({ password: new Uint8Array([1]), salt: new Uint8Array(15) }), /16-byte salt/);
+});
+// ---- The kept unlocked key: a non-extractable CryptoKey, never raw key material.
+async function signingKeys() {
+  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const pkcs8 = await crypto.subtle.exportKey("pkcs8", pair.privateKey);
+  const publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const locked = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false, ["sign"]);
+  const open = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, true, ["sign"]);
+  return { publicRaw, locked, open };
+}
+
+test("the store keeps an unlocked key only as a non-extractable CryptoKey", async () => {
+  const indexedDB = memoryIDB();
+  const store = createDeviceKeyStore({ indexedDB });
+  const { publicRaw, locked } = await signingKeys();
+  assert.equal(await store.loadUnlocked(), null);
+  await store.saveUnlocked({ id: "47Z3-3QX1-AJH6-2RKB", publicRaw, privateKey: locked });
+  const kept = await createDeviceKeyStore({ indexedDB }).loadUnlocked();
+  assert.ok(kept.privateKey instanceof CryptoKey);
+  assert.equal(kept.privateKey.extractable, false);
+  assert.deepEqual([...kept.publicRaw], [...publicRaw]);
+  for (const format of ["pkcs8", "jwk", "raw"]) {
+    await assert.rejects(crypto.subtle.exportKey(format, kept.privateKey), `exportKey(${format}) must reject`);
+  }
+  // It still signs.
+  const signature = await crypto.subtle.sign("Ed25519", kept.privateKey, new Uint8Array([1, 2, 3]));
+  assert.equal(signature.byteLength, 64);
+  // The record holds the CryptoKey and the public key only, no raw private bytes.
+  const record = indexedDB.state.records.get("unlocked");
+  assert.deepEqual(Object.keys(record).sort(), ["id", "privateKey", "publicRaw"]);
+  assert.equal(indexedDB.state.opens, indexedDB.state.closes);
+});
+
+test("the store refuses an extractable, public or non-CryptoKey key", async () => {
+  const indexedDB = memoryIDB();
+  const store = createDeviceKeyStore({ indexedDB });
+  const { publicRaw, open } = await signingKeys();
+  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"]);
+  const lookalike = { type: "private", extractable: false, algorithm: { name: "Ed25519" }, usages: ["sign"] };
+  for (const privateKey of [open, pair.publicKey, lookalike, new Uint8Array(32)]) {
+    await assert.rejects(store.saveUnlocked({ id: "47Z3-3QX1-AJH6-2RKB", publicRaw, privateKey }), TypeError);
+  }
+  assert.equal(indexedDB.state.records.has("unlocked"), false);
+  // A tampered record that holds an extractable key is never returned.
+  indexedDB.state.records.set("unlocked", { id: "47Z3-3QX1-AJH6-2RKB", publicRaw, privateKey: open });
+  assert.equal(await store.loadUnlocked(), null);
+});
+
+test("saving or clearing the key file, and clearUnlocked, delete the kept unlocked key", async () => {
+  const indexedDB = memoryIDB();
+  const store = createDeviceKeyStore({ indexedDB });
+  const { publicRaw, locked } = await signingKeys();
+  const keep = () => store.saveUnlocked({ id: "47Z3-3QX1-AJH6-2RKB", publicRaw, privateKey: locked });
+  await keep();
+  await store.clearUnlocked();
+  assert.equal(await store.loadUnlocked(), null);
+  await keep();
+  await store.save("new text");
+  assert.equal(await store.loadUnlocked(), null);
+  assert.equal(await store.load(), "new text");
+  await keep();
+  await store.clear();
+  assert.equal(await store.loadUnlocked(), null);
+  assert.equal(indexedDB.state.records.size, 0);
 });

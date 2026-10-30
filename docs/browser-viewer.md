@@ -21,9 +21,18 @@ When the page opens, it asks for a device key. You can:
 - import a key file, or
 - unlock a protected key with its passphrase.
 
-The key is kept in the IndexedDB database `bubbleplay-device`.
-The unlocked private key is held in memory only.
-Lock forgets the unlocked key in memory. The next use asks you to unlock it again.
+The key file is kept in the IndexedDB database `bubbleplay-device`, exactly as created or imported; it stays the export and backup format.
+The passphrase is asked once per browser. After unlocking, the page keeps the private key in the same database as a non-extractable WebCrypto `CryptoKey`: page script can sign with it but cannot read or export it.
+A refresh or a new tab uses that key directly, with no passphrase.
+**Lock this browser** (PC list footer, or Settings > Browser access) deletes the kept key. The next visit asks for the passphrase again.
+Importing or creating a key, or changing its passphrase, also deletes it.
+
+The browser profile holds the kept key on disk. Anyone who can copy that profile can use the key in that browser until it is locked or revoked on the PC.
+
+## Staying connected
+
+A refresh on a PC page (`?pc=<id>`) goes straight back to that PC. If that PC is no longer in the list, the PC list opens.
+The page pings the relay every 15 seconds. If a ping goes unanswered for 30 seconds, the page reopens its relay socket and re-authenticates without showing anything; other socket drops reconnect the same way after 250 ms.
 
 ## Paired PCs
 
@@ -57,7 +66,7 @@ The pairing code is valid for 5 minutes.
 Settings has two groups that matter here.
 
 - **Device key:** export the key, change its passphrase, or remove it.
-- **Browser access:** Switch PC, Lock and Forget this browser.
+- **Browser access:** Switch PC, Lock this browser and Forget this browser.
 
 ## Tests
 

@@ -30,6 +30,8 @@ use serde_json::json;
 const SIGNALING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKER_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// Failed probes back off by doubling up to this interval.
+const WORKER_VERSION_PROBE_MAX_INTERVAL: Duration = Duration::from_secs(300);
 const BENCH_STATUS_MAX_BYTES: usize = 4_096;
 const FILE_DRAG_PREVIEW_MAX_BYTES: usize = 8_192;
 
@@ -1225,21 +1227,14 @@ impl WorkerVersionMonitor {
             .name("bubbleplay-worker-version".into())
             .spawn(move || {
                 let known = connected_version.filter(|value| canonical_worker_version_id(value));
-                loop {
-                    match stop_rx.recv_timeout(WORKER_VERSION_PROBE_INTERVAL) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    let current = match probe_worker_version(&url, &token) {
-                        Ok(Some(current)) => current,
-                        Ok(None) | Err(_) => continue,
-                    };
-                    if worker_version_changed(known.as_deref(), Some(&current)) {
-                        let connected = known.unwrap_or_else(|| "unversioned".to_string());
-                        let _ = change_tx.send((connected, current));
-                        break;
-                    }
-                }
+                run_worker_version_monitor(
+                    known,
+                    WORKER_VERSION_PROBE_INTERVAL,
+                    WORKER_VERSION_PROBE_MAX_INTERVAL,
+                    &stop_rx,
+                    &change_tx,
+                    || probe_worker_version(&url, &token),
+                );
             })
             .context("spawn Worker version monitor")?;
         Ok(Some(Self {
@@ -1250,6 +1245,48 @@ impl WorkerVersionMonitor {
 
     fn changed(&self) -> Option<(String, String)> {
         self.changes.try_recv().ok()
+    }
+}
+
+/// The probe loop. A relay that answers hello-ok without a Worker version (relay-rs never sends
+/// one) cannot report a cutover, so the monitor stops after that first answer instead of
+/// reconnecting every interval for the life of the connection. Failed probes back off.
+fn run_worker_version_monitor(
+    known: Option<String>,
+    interval: Duration,
+    max_interval: Duration,
+    stop: &Receiver<()>,
+    changes: &Sender<(String, String)>,
+    mut probe: impl FnMut() -> Result<Option<String>>,
+) {
+    let mut delay = interval;
+    loop {
+        match stop.recv_timeout(delay) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        match probe() {
+            Ok(Some(current)) => {
+                if worker_version_changed(known.as_deref(), Some(&current)) {
+                    let connected = known.unwrap_or_else(|| "unversioned".to_string());
+                    let _ = changes.send((connected, current));
+                    return;
+                }
+                delay = interval;
+            }
+            Ok(None) => {
+                info!("relay reports no Worker version; version monitor stopped");
+                return;
+            }
+            Err(error) => {
+                delay = delay.saturating_mul(2).min(max_interval);
+                debug!(
+                    error = %format!("{error:#}"),
+                    retry_in_s = delay.as_secs(),
+                    "Worker version probe failed"
+                );
+            }
+        }
     }
 }
 
@@ -1538,7 +1575,10 @@ impl Signaling {
                             continue;
                         }
                         Some("error") => {
-                            warn!("relay reported a signaling error");
+                            warn!(
+                                code = relay_error_code(&text),
+                                "relay reported a signaling error"
+                            );
                             continue;
                         }
                         Some("register-challenge") => continue,
@@ -1727,7 +1767,9 @@ impl Signaling {
                     }
                 }
                 Message::Ping(_) | Message::Pong(_) => {} // tungstenite auto-pongs
-                Message::Close(_) => {
+                Message::Close(frame) => {
+                    let (code, reason) = close_frame_summary(frame.as_ref());
+                    warn!(code, reason, "relay closed the signaling connection");
                     self.registered = false;
                     self.device_protocol.terminate();
                     self.flush_device_effects(&mut events)?;
@@ -2420,7 +2462,15 @@ fn probe_worker_version(url: &str, token: &str) -> Result<Option<String>> {
                 .with_context(|| format!("bad Worker version probe response: {text}"))?
             {
                 SignalMsg::HelloOk { worker_version_id } => {
+                    // Finish the close handshake (the relay closes 1000 right after hello-ok)
+                    // instead of dropping the socket mid-close. Reads are bounded by the
+                    // handshake read timeout.
                     let _ = ws.close(None);
+                    for _ in 0..4 {
+                        if ws.read().is_err() {
+                            break;
+                        }
+                    }
                     return Ok(worker_version_id.filter(|value| canonical_worker_version_id(value)));
                 }
                 SignalMsg::Error { message } => {
@@ -2594,6 +2644,36 @@ fn connect_with_timeout(
         .map_err(|error| anyhow::anyhow!("websocket handshake failed: {error:?}"))
 }
 
+/// A relay close frame as a code and a short, printable reason (relay reasons are fixed labels
+/// such as "invalid hello"; anything else is cut, never echoed whole).
+fn close_frame_summary(frame: Option<&tungstenite::protocol::CloseFrame>) -> (u16, String) {
+    match frame {
+        Some(frame) => (u16::from(frame.code), short_label(&frame.reason)),
+        None => (1005, String::new()),
+    }
+}
+
+/// The `code` (or `reason`) label of a relay `error` message, if it is a short printable label.
+fn relay_error_code(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            ["code", "reason"]
+                .into_iter()
+                .find_map(|key| value.get(key).and_then(|v| v.as_str()).map(short_label))
+        })
+        .unwrap_or_default()
+}
+
+fn short_label(text: &str) -> String {
+    let label: String = text
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(64)
+        .collect();
+    label
+}
+
 fn keepalive_expired(last_ack: Instant, now: Instant) -> bool {
     now.saturating_duration_since(last_ack) > KEEPALIVE_TIMEOUT
 }
@@ -2624,6 +2704,8 @@ mod tests {
         BenchStageTiming, BenchStatusEffective, BenchStatusEncoder, SignalMsg,
         WorkerVersionMonitor, BENCH_STATUS_MAX_BYTES, KEEPALIVE_TIMEOUT, V2_REDUNDANT_BENCH_FIELDS,
     };
+    use anyhow::Result;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2750,6 +2832,103 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    fn run_monitor(
+        known: Option<&str>,
+        mut answers: Vec<Result<Option<String>>>,
+    ) -> (usize, Option<(String, String)>) {
+        let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (change_tx, change_rx) = mpsc::channel();
+        let mut probes = 0;
+        answers.reverse();
+        super::run_worker_version_monitor(
+            known.map(str::to_owned),
+            Duration::from_millis(1),
+            Duration::from_millis(4),
+            &stop_rx,
+            &change_tx,
+            || {
+                probes += 1;
+                // The loop must end on its own; running out of answers is a test failure.
+                answers.pop().expect("version monitor kept probing")
+            },
+        );
+        (probes, change_rx.try_recv().ok())
+    }
+
+    #[test]
+    fn version_monitor_stops_after_a_relay_without_a_worker_version() {
+        // relay-rs answers hello-ok with no workerVersionId: one probe, then the monitor ends.
+        let (probes, change) = run_monitor(None, vec![Ok(None)]);
+        assert_eq!(probes, 1);
+        assert_eq!(change, None);
+        let (probes, change) = run_monitor(
+            Some("123e4567-e89b-42d3-a456-426614174000"),
+            vec![Ok(None), Ok(None)],
+        );
+        assert_eq!(probes, 1);
+        assert_eq!(change, None);
+    }
+
+    #[test]
+    fn version_monitor_backs_off_on_errors_and_reports_a_cutover() {
+        let old = "123e4567-e89b-42d3-a456-426614174000";
+        let new = "223e4567-e89b-42d3-a456-426614174000";
+        let (probes, change) = run_monitor(
+            Some(old),
+            vec![
+                Err(anyhow::anyhow!("offline")),
+                Err(anyhow::anyhow!("offline")),
+                Ok(Some(old.to_string())),
+                Ok(Some(new.to_string())),
+            ],
+        );
+        assert_eq!(probes, 4);
+        assert_eq!(change, Some((old.to_string(), new.to_string())));
+    }
+
+    #[test]
+    fn version_monitor_ends_when_the_connection_drops_it() {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (change_tx, _change_rx) = mpsc::channel();
+        stop_tx.send(()).unwrap();
+        let mut probes = 0;
+        super::run_worker_version_monitor(
+            None,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            &stop_rx,
+            &change_tx,
+            || {
+                probes += 1;
+                Ok(None)
+            },
+        );
+        assert_eq!(probes, 0);
+    }
+
+    #[test]
+    fn relay_refusal_labels_are_short_and_printable() {
+        assert_eq!(
+            super::relay_error_code(r#"{"type":"error","code":"pc-busy"}"#),
+            "pc-busy"
+        );
+        assert_eq!(super::relay_error_code(r#"{"type":"error"}"#), "");
+        let long = "x".repeat(500);
+        assert_eq!(
+            super::relay_error_code(&format!(r#"{{"type":"error","reason":"{long}\n"}}"#)).len(),
+            64
+        );
+        let frame = tungstenite::protocol::CloseFrame {
+            code: tungstenite::protocol::frame::coding::CloseCode::Policy,
+            reason: "invalid hello".into(),
+        };
+        assert_eq!(
+            super::close_frame_summary(Some(&frame)),
+            (1008, "invalid hello".to_string())
+        );
+        assert_eq!(super::close_frame_summary(None), (1005, String::new()));
     }
 
     #[test]

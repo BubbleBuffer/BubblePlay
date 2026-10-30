@@ -5,6 +5,7 @@ import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateI
 import {
   shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
+  signalingUnanswered,
   rtcPeerEndAction,
 } from "/recovery.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
@@ -738,6 +739,9 @@ let pendingRtcTracks = [];
 let signalingGeneration = 0;
 let reconnectTimer = null;
 let terminalSignalingFailure = false;
+// Signaling liveness (performance.now ms): the oldest unanswered ping, and the last inbound message.
+let signalingPingSentMs = null;
+let signalingInboundMs = 0;
 let pc = null;
 let lastIceCandidateError = null;
 let dc = null, motionDc = null;
@@ -958,6 +962,7 @@ function reconnectSignaling(reason) {
     // WebCrypto yields between messages. Preserve wire order across hello-ok,
     // auth-host and ctl rather than letting WebSocket callbacks race each other.
     socket.onmessage = ev => {
+      if (ws === socket) signalingInboundMs = performance.now();
       receiveQueue = receiveQueue.then(() => handleSignal(socket, generation, ev)).catch(() => {
         if (ws === socket && generation === signalingGeneration) endAuthenticatedSession({ title: "Session ended", body: "A control message failed its integrity check, so the session was closed." });
       });
@@ -1036,6 +1041,7 @@ async function handleSignal(socket, generation, ev) {
       if (signalingPc !== sessionPc || !signalingTicket) return endAuthenticatedSession({ title: "PC not reachable", body: "This PC does not support device keys or is not reachable." });
       signalingRegistered = true;
       signalingRegisteredAtMs = Date.now();
+      signalingPingSentMs = null;
       debugTrace("signaling-hello-ok", { generation, hasMediaEpoch: typeof msg.mediaEpoch === "string" });
       hudState.ws = "ok";
       currentIceServers = validateIceServers(msg.iceServers);
@@ -1224,9 +1230,18 @@ async function addRemoteIce(candidate, generation, ice) {
   }
 }
 
-// Keep the relay's WebSocket alive (15 s idle heartbeat, same as the host).
+// Keep the relay's WebSocket alive (15 s idle heartbeat, same as the host), and
+// recycle it silently when the relay stops answering (recovery.js signalingUnanswered).
 setInterval(() => {
-  if (signalingRegistered) sendRelay({ type: "ping" });
+  if (!signalingRegistered) return;
+  const now = performance.now();
+  if (signalingUnanswered({ pingSentMs: signalingPingSentMs, inboundMs: signalingInboundMs, nowMs: now })) {
+    signalingPingSentMs = null;
+    recycleSignaling("signaling-silent");
+    return;
+  }
+  if (signalingPingSentMs === null || signalingInboundMs >= signalingPingSentMs) signalingPingSentMs = now;
+  sendRelay({ type: "ping" });
 }, V4_HEARTBEAT_MS);
 
 // ---- WebRTC ----------------------------------------------------------------
