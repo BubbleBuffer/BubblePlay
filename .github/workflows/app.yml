@@ -78,7 +78,9 @@ jobs:
           "$dir/bin/flutter" config --no-analytics --no-cli-animations
       - name: Dependencies
         working-directory: app
-        run: flutter pub get
+        run: |
+          rm -rf .dart_tool
+          flutter pub get
       - name: Analyze
         working-directory: app
         run: flutter analyze lib test

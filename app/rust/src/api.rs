@@ -8,6 +8,7 @@ use flutter_rust_bridge::frb;
 
 use crate::backend::{AppBackend, Paths};
 use crate::contract::Core;
+use crate::devices_pipe::DevicesClient;
 use crate::frb_generated::StreamSink;
 
 static CORE: OnceLock<Mutex<Core>> = OnceLock::new();
@@ -48,4 +49,37 @@ pub fn app_changes(sink: StreamSink<()>) -> Result<()> {
         let _ = sink.add(());
     }));
     Ok(())
+}
+
+static DEVICES: Mutex<Option<DevicesClient>> = Mutex::new(None);
+
+fn devices() -> std::sync::MutexGuard<'static, Option<DevicesClient>> {
+    DEVICES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Connects to the host's Devices pipe and keeps reconnecting while the stream is listened to.
+/// Every event is one raw JSON line: the host's lines verbatim, plus `{"type":"connected"}` and
+/// `{"type":"disconnected","reason":...}` for the link itself. A second call replaces the first.
+pub fn devices_connect(sink: StreamSink<String>) -> Result<()> {
+    let old = devices().take();
+    drop(old);
+    let client = DevicesClient::start_default(Arc::new(move |line| sink.add(line).is_ok()));
+    *devices() = Some(client);
+    Ok(())
+}
+
+/// Sends one command line (a JSON object: open, revoke, startPairing, cancelPairing, allow,
+/// deny). Fails when the line is invalid or the host is not connected.
+#[frb(sync)]
+pub fn devices_send(line: String) -> Result<()> {
+    match devices().as_ref() {
+        Some(client) => client.send(&line).map_err(|e| anyhow!(e)),
+        None => Err(anyhow!("the Devices pipe is not connected")),
+    }
+}
+
+/// Stops the Devices pipe client.
+pub fn devices_disconnect() {
+    let old = devices().take();
+    drop(old);
 }

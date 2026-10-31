@@ -3,7 +3,6 @@ import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
 import '../model/model.dart';
-import '../widgets/passphrase_field.dart';
 
 /// The file this device stores its own key in. Its passphrase prompt is the unlock step, not an
 /// import from another device.
@@ -238,7 +237,7 @@ class _UnlockState extends State<_Unlock> {
           NoticeBanner(kind: NoticeKind.danger, message: error),
           const SizedBox(height: 16),
         ],
-        PassphraseField(
+        ObscuredField(
           controller: _passphrase,
           autofocus: true,
           onSubmitted: (_) => _submit(),
