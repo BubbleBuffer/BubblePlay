@@ -15,6 +15,10 @@ on:
       - "android/app/src/main/java/de/bubblebuffer/bubbleplay/pcs/**"
       - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/PairingClient.kt"
       - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/ServerConfig.kt"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/media/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/input/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/protocol/**"
       - ".github/workflows/app.yml"
   pull_request:
     branches: [master, "lane/**"]
@@ -25,6 +29,10 @@ on:
       - "android/app/src/main/java/de/bubblebuffer/bubbleplay/pcs/**"
       - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/PairingClient.kt"
       - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/ServerConfig.kt"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/net/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/media/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/input/**"
+      - "android/app/src/main/java/de/bubblebuffer/bubbleplay/protocol/**"
       - ".github/workflows/app.yml"
   workflow_dispatch:
     inputs:
