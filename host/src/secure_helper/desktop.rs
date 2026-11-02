@@ -66,7 +66,7 @@ impl PhysicalCoordinates {
             tracing::warn!(
                 epoch,
                 physical_coordinates = false,
-                error_code,
+                win_error = error_code,
                 "secure worker DPI binding failed"
             );
             anyhow::bail!("cannot establish secure worker physical DPI coordinates");

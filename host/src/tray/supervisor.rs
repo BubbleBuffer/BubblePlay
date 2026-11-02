@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 
 use super::device_key_file;
 use super::logic::{
-    build_host_args, Backoff, HostState, SharedLog, StoredHostConfig, TraySettings,
+    build_host_args, log_child_line, Backoff, HostState, StoredHostConfig, TraySettings,
 };
 use super::platform::{dpapi_unprotect_hex, KillOnCloseJob};
 
@@ -35,8 +35,6 @@ const NOT_CONFIGURED_RECHECK: Duration = Duration::from_secs(30);
 pub struct SupervisorConfig {
     pub host_exe: PathBuf,
     pub host_config: PathBuf,
-    /// Host stdout/stderr destination.
-    pub host_log: SharedLog,
     /// Optional lifecycle events for update probation.
     pub events: Option<Sender<HostEvent>>,
     /// Extra environment for the host (the admin agent's pipe name).
@@ -140,7 +138,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog, events: Option<Sender<HostEvent>>) {
+/// Read a host pipe line by line: lifecycle markers become events and warn/error output goes
+/// into the tray log (the host's own detailed log is `host-YYYY-MM-DD.jsonl`).
+fn pump<R: Read + Send + 'static>(
+    reader: R,
+    stream: &'static str,
+    events: Option<Sender<HostEvent>>,
+) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut line = Vec::with_capacity(512);
@@ -149,9 +153,13 @@ fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog, events: Option<Send
             match reader.read_until(b'\n', &mut line) {
                 // Keep draining even if logging fails, so the host never blocks
                 // on a full pipe.
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(error) => {
+                    tracing::warn!(%error, stream, "reading host output failed; output no longer captured");
+                    break;
+                }
                 Ok(_) => {
-                    log.append(&line);
+                    log_child_line("host", stream, &line);
                     if let Some(event) = line_event(&line) {
                         emit(&events, event);
                     }
@@ -169,6 +177,7 @@ fn load(config: &SupervisorConfig) -> Result<(StoredHostConfig, Secrets)> {
     let stored = StoredHostConfig::load(&config.host_config)?;
     let token = String::from_utf8(dpapi_unprotect_hex(&stored.token_dpapi_hex)?)
         .context("stored token is not UTF-8")?;
+    bubbleplay_host::logging::redact::register_secret(&token);
     Ok((stored, Secrets { token }))
 }
 
@@ -188,9 +197,8 @@ fn device_key_handoff(config: &SupervisorConfig) -> Option<Zeroizing<String>> {
     ) {
         Ok(key) => Some(key),
         Err(_) => {
-            config
-                .host_log
-                .append(b"PC device key unavailable; starting without a device ID\n");
+            // The key error is deliberately not logged: it can come from reading the key file.
+            tracing::warn!("PC device key unavailable; starting without a device ID");
             None
         }
     }
@@ -235,10 +243,10 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob, stdin: &HostStdin) -> 
     }
     stdin.set(child.stdin.take());
     if let Some(out) = child.stdout.take() {
-        pump(out, config.host_log.clone(), config.events.clone());
+        pump(out, "stdout", config.events.clone());
     }
     if let Some(err) = child.stderr.take() {
-        pump(err, config.host_log.clone(), config.events.clone());
+        pump(err, "stderr", config.events.clone());
     }
     Ok(child)
 }

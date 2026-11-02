@@ -15,9 +15,6 @@
 #![windows_subsystem = "windows"]
 
 #[allow(dead_code)]
-#[path = "../tray/logic.rs"]
-mod logic;
-#[allow(dead_code)]
 #[path = "../admin_agent/protocol.rs"]
 mod protocol;
 #[allow(dead_code)]
@@ -62,7 +59,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 
-use logic::SharedLog;
 use protocol::{
     read_frame, scoped_name, write_agent, Record, AGENT_MUTEX, AGENT_STOP_EVENT, TRAY_MUTEX,
 };
@@ -399,6 +395,7 @@ impl Agent {
             Ok(instance) => instance,
             Err(error) => {
                 tracing::error!(%error, pipe = %self.pipe, "cannot create the agent pipe (name taken?); exiting");
+                bubbleplay_host::logging::flush();
                 std::process::exit(1);
             }
         };
@@ -579,17 +576,18 @@ impl Agent {
     }
 }
 
-fn init_log(path: PathBuf) {
-    let log = SharedLog::new(path);
-    let _ = tracing_subscriber::fmt()
-        .with_writer(move || log.clone())
-        .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-        .try_init();
+/// Start the agent's JSONL log in `dir` (`agent-YYYY-MM-DD.jsonl`).
+fn init_log(dir: PathBuf) {
+    // Lives until the process ends; main() flushes before exiting.
+    std::mem::forget(bubbleplay_host::logging::init(
+        bubbleplay_host::logging::LogConfig::new("agent", dir),
+    ));
 }
 
 fn main() {
-    std::process::exit(run());
+    let code = run();
+    bubbleplay_host::logging::flush();
+    std::process::exit(code);
 }
 
 fn run() -> i32 {
@@ -605,7 +603,7 @@ fn run() -> i32 {
         let Some(dir) = exe.parent() else {
             return 1;
         };
-        init_log(dir.join("logs").join("admin-agent.log"));
+        init_log(dir.join("logs"));
         let Some(options) = options.as_ref() else {
             tracing::error!("unknown arguments");
             return 2;
@@ -624,7 +622,7 @@ fn run() -> i32 {
             // Not elevated and not an isolated dev instance: nothing to do.
             return 1;
         };
-        init_log(PathBuf::from(dir).join("logs").join("admin-agent.log"));
+        init_log(PathBuf::from(dir).join("logs"));
         if !options.dev {
             tracing::error!("not elevated; only --dev instances may run unelevated");
             return 1;
@@ -730,5 +728,6 @@ fn run() -> i32 {
     tracing::info!(reason, "admin input agent exiting");
     drop(instance);
     // Client threads may be blocked in pipe reads; end the process.
+    bubbleplay_host::logging::flush();
     std::process::exit(0);
 }

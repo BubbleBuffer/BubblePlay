@@ -31,6 +31,7 @@ mod supervisor;
 mod update;
 
 use std::cell::RefCell;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -69,10 +70,9 @@ use logic::{
     admin_menu_enabled, admin_mode_line, menu_layout, run_key_command, running_probe_status,
     secure_helper_should_launch, start_secure_helper_for_viewer, status_line, tray_icon_resource,
     unix_ms_now, AgentStatus, ClickDebounce, HostState, MenuEntry, MenuState, ProbeGate,
-    SecureHelperStatus, SharedLog, TraySettings, ViewerGate, AGENT_UPDATE_LABEL, CMD_ADMIN,
-    CMD_AGENT_UPDATE, CMD_AUDIO, CMD_CPU_MODE, CMD_DEVICES, CMD_EXPORT_KEY, CMD_IMPORT_KEY,
-    CMD_LOGIN, CMD_LOGS, CMD_QUIT, CMD_RESTART, CMD_ROLLBACK, CMD_SECURE_HELPER_UPDATE,
-    SECURE_HELPER_UPDATE_LABEL,
+    SecureHelperStatus, TraySettings, ViewerGate, AGENT_UPDATE_LABEL, CMD_ADMIN, CMD_AGENT_UPDATE,
+    CMD_AUDIO, CMD_CPU_MODE, CMD_DEVICES, CMD_EXPORT_KEY, CMD_IMPORT_KEY, CMD_LOGIN, CMD_LOGS,
+    CMD_QUIT, CMD_RESTART, CMD_ROLLBACK, CMD_SECURE_HELPER_UPDATE, SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
     acquire_single_instance, create_manual_event, data_dir, end_agent_task, ensure_agent_task,
@@ -136,20 +136,39 @@ fn logs_dir(data: &Path) -> PathBuf {
     data.join("logs")
 }
 
-fn init_tracing(log: SharedLog) {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(move || log.clone())
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+/// Start the tray's JSONL log (`tray-YYYY-MM-DD.jsonl`) and panic capture. The returned guard
+/// flushes on drop; keep it for the life of the process.
+fn init_tracing(logs: &Path) -> Option<bubbleplay_host::logging::LogGuard> {
+    bubbleplay_host::logging::init(bubbleplay_host::logging::LogConfig::new(
+        "tray",
+        logs.to_path_buf(),
+    ))
+}
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Copy a dev agent's output into the tray log (warn/error lines only, redacted by the log).
+fn pump_agent_output<R: std::io::Read + Send + 'static>(reader: R, stream: &'static str) {
+    use std::io::BufRead;
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(reader);
+        let mut line = Vec::with_capacity(256);
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Err(error) => {
+                    tracing::warn!(%error, stream, "reading agent output failed; output no longer captured");
+                    break;
+                }
+                Ok(_) => logic::log_child_line("agent", stream, &line),
+            }
+        }
+    });
 }
 
 fn supervisor_config(
     data: &Path,
-    host_log: SharedLog,
     events: Option<std::sync::mpsc::Sender<HostEvent>>,
     test_mode: bool,
 ) -> Result<SupervisorConfig> {
@@ -160,6 +179,10 @@ fn supervisor_config(
             "BUBBLEPLAY_SENDTO_DIR".to_string(),
             sendto_dir().to_string_lossy().into_owned(),
         ),
+        (
+            "BUBBLEPLAY_LOG_DIR".to_string(),
+            logs_dir(data).to_string_lossy().into_owned(),
+        ),
     ];
     if test_mode {
         // Isolated test instance: its agent is an unelevated --dev build.
@@ -168,7 +191,6 @@ fn supervisor_config(
     Ok(SupervisorConfig {
         host_exe: host_exe_beside(&exe),
         host_config: data.join("host.json"),
-        host_log,
         events,
         extra_env,
     })
@@ -284,7 +306,6 @@ struct App {
     admin_on: bool,
     admin_change_running: bool,
     test_mode: bool,
-    host_log: SharedLog,
     user: Option<SupervisorThread>,
     agent: AgentStatus,
     secure_helper: SecureHelperStatus,
@@ -416,12 +437,7 @@ impl App {
         if self.user.is_some() {
             return;
         }
-        match supervisor_config(
-            &self.data,
-            self.host_log.clone(),
-            Some(self.events_tx.clone()),
-            self.test_mode,
-        ) {
+        match supervisor_config(&self.data, Some(self.events_tx.clone()), self.test_mode) {
             Ok(config) => {
                 tracing::info!(exe = %config.host_exe.display(), "starting user-level host");
                 self.host_hash = sha256_file(&config.host_exe);
@@ -576,10 +592,21 @@ impl App {
             }
             let exe = std::env::current_exe().map_err(|error| error.to_string())?;
             let agent = exe.with_file_name(AGENT_EXE);
-            let child = std::process::Command::new(&agent)
+            let mut child = std::process::Command::new(&agent)
                 .arg("--dev")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
                 .map_err(|error| format!("starting {}: {error}", agent.display()))?;
+            // Output the agent writes outside its own log (a crash message) lands in the tray log.
+            if let Some(out) = child.stdout.take() {
+                pump_agent_output(out, "stdout");
+            }
+            if let Some(err) = child.stderr.take() {
+                pump_agent_output(err, "stderr");
+            }
             self.agent_child = Some(child);
             return Ok(());
         }
@@ -743,7 +770,7 @@ impl App {
         match result {
             ProbeResult::Ready(handshake) => {
                 if self.agent != AgentStatus::Ready {
-                    tracing::warn!(
+                    tracing::info!(
                         version = handshake.version,
                         agent_pid = handshake.agent_pid,
                         elevated = handshake.elevated,
@@ -1207,9 +1234,9 @@ impl App {
             let rolled_back = UpdateState::load(&self.update_state_path())
                 .is_some_and(|state| state.status == UpdateStatus::RolledBack);
             let message = if rolled_back {
-                "Rolled-back host keeps exiting; retrying with backoff (see host.log)"
+                "Rolled-back host keeps exiting; retrying with backoff (see the host log)"
             } else {
-                "Host keeps exiting; retrying with backoff (see host.log)"
+                "Host keeps exiting; retrying with backoff (see the host log)"
             };
             tracing::error!(message);
             self.host_error = Some(message.to_string());
@@ -1615,7 +1642,7 @@ fn run_tray() -> Result<i32> {
     let data = data_dir();
     let test_mode = std::env::var_os("BUBBLEPLAY_TRAY_DATA_DIR").is_some();
     let logs = logs_dir(&data);
-    init_tracing(SharedLog::new(logs.join("tray.log")));
+    let _log_guard = init_tracing(&logs);
     let Some(_instance) = acquire_single_instance(&scoped(TRAY_MUTEX))? else {
         return Ok(0);
     };
@@ -1671,7 +1698,6 @@ fn run_tray() -> Result<i32> {
         admin_on: bubbleplay_host::admin_mode::effective_for_console(),
         admin_change_running: false,
         test_mode,
-        host_log: SharedLog::new(logs.join("host.log")),
         user: None,
         agent: AgentStatus::Off,
         secure_helper: if test_mode || secure_helper_task_exists() {
