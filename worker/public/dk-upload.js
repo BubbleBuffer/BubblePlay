@@ -16,6 +16,7 @@ export const LIMIT_DEFAULTS = Object.freeze({
 export const MAX_BUFFERED = 16_384;
 export const INPUT_QUIET_MS = 250;
 export const ACK_TIMEOUT_MS = 20_000;
+export const MAX_FEEDBACK_BYTES = 128 * 1024;
 const ENVELOPE_BYTES = 256;
 const MAX_CONSECUTIVE_REJECTS = 5;
 const MAX_RETRY_AFTER_MS = 60_000;
@@ -126,11 +127,26 @@ export function createLogUploader({
     return true;
   }
 
+  /** A copy of the report whose feedback-begin stays under 128 KiB: oldest logs go first, then oldest errors. */
+  function fitReport(report) {
+    const body = { ...report };
+    if (!("screenshot" in body)) body.screenshot = null;
+    const probe = { type: "feedback-begin", v: 1, id: report.id, report: body, pngBytes: 0, chunks: 0 };
+    let size = utf8Message(probe);
+    for (const key of ["logs", "errors"]) {
+      if (size <= MAX_FEEDBACK_BYTES || !Array.isArray(body[key])) continue;
+      const items = body[key].slice();
+      let drop = 0;
+      while (size > MAX_FEEDBACK_BYTES && drop < items.length) size -= utf8Length(JSON.stringify(items[drop++])) + 1;
+      body[key] = items.slice(drop);
+    }
+    return body;
+  }
+
   function sendReport() {
     const report = reportQueue[0];
     if (!report || typeof report.id !== "string") { reportQueue.shift(); return true; }
-    const body = "screenshot" in report ? report : { ...report, screenshot: null };
-    const message = { type: "feedback-begin", v: 1, id: report.id, report: body, pngBytes: 0, chunks: 0 };
+    const message = { type: "feedback-begin", v: 1, id: report.id, report: fitReport(report), pngBytes: 0, chunks: 0 };
     reportQueue.shift();
     tried.add(report.id); // one attempt per connection; a failed one waits for the next
     if (!emit(message)) return true;
