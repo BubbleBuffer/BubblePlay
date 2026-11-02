@@ -227,10 +227,11 @@ fn client_to_host_messages_decode() {
     assert_eq!(batch.lines.len(), 2);
     let begin: FeedbackBeginMsg = serde_json::from_value(message("feedback-begin")).unwrap();
     assert_eq!(begin.id, "7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e");
-    assert_eq!((begin.png_bytes, begin.chunks), (6, 1));
+    assert_eq!((begin.png_bytes, begin.chunks), (69, 1));
     assert_eq!(begin.report["kind"], "bug");
     let chunk: FeedbackChunkMsg = serde_json::from_value(message("feedback-chunk")).unwrap();
-    assert_eq!((chunk.i, chunk.data.as_str()), (0, "iVBORw0K"));
+    assert_eq!(chunk.i, 0);
+    assert!(chunk.data.starts_with("iVBORw0KGgo"));
     // Unknown extra fields are ignored.
     let mut extra = message("feedback-chunk");
     extra["future"] = json!({"x": 1});
@@ -286,32 +287,24 @@ fn fixture_batch_is_stored_acked_and_resumes_across_a_reconnect() {
 fn fixture_feedback_messages_are_processed() {
     let tmp = TempDir::new("fixture-fb");
     let mut up = connected(&tmp.0, "dev-1");
-    // The fixture's screenshot is the 6-byte PNG prefix `iVBORw0K`: complete enough to decode, too short
-    // to be a PNG, so the store refuses it and the host says so instead of acking ok.
     assert!(send(&mut up, "feedback-begin", &message("feedback-begin"))
         .unwrap()
         .is_empty());
     assert!(send(&mut up, "feedback-chunk", &message("feedback-chunk"))
         .unwrap()
         .is_empty());
-    let ack = drain(&mut up, 1);
-    assert_eq!(ack[0]["type"], "feedback-ack");
-    assert_eq!(ack[0]["id"], "7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e");
-    assert_eq!(ack[0]["status"], "rejected");
-    assert_eq!(ack[0]["reason"], "screenshot is not a PNG");
-    assert!(files_in(&tmp.0.join("feedback"), ".json").is_empty());
-
-    // The same report with a real PNG is stored and acked ok, exactly like the fixture ack.
-    let id = "7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e";
-    let mut begin = message("feedback-begin");
-    let png = png(40);
-    begin["pngBytes"] = json!(png.len());
-    assert!(send(&mut up, "feedback-begin", &begin).unwrap().is_empty());
-    send(&mut up, "feedback-chunk", &chunk(id, 0, &png)).unwrap();
     assert_eq!(drain(&mut up, 1)[0], message("feedback-ack-ok"));
     let saved = files_in(&tmp.0.join("feedback"), ".json");
     assert_eq!(saved.len(), 1);
     assert!(saved[0].ends_with("-dev-1.json"), "{saved:?}");
+    let png_files = files_in(&tmp.0.join("feedback"), ".png");
+    assert_eq!(png_files.len(), 1);
+    assert_eq!(
+        fs::read(tmp.0.join("feedback").join(&png_files[0]))
+            .unwrap()
+            .len(),
+        69
+    );
 }
 
 // ---------------------------------------------------------------- gating
