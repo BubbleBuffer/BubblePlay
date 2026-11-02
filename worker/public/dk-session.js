@@ -4,6 +4,12 @@ import { beginViewerHandshake } from "./dk-handshake.js";
 import { parseSdpFingerprint, signBind, verifyBind } from "./dk-crypto.js";
 
 export const VIEWER_CAPS = Object.freeze(["control-aead-v1", "dtls-bind-v1"]);
+// Optional caps: advertised in the hello but never required of the PC.
+export const LOGS_CAP = "client-logs-v1";
+export const VIEWER_HELLO_CAPS = Object.freeze([...VIEWER_CAPS, LOGS_CAP]);
+// ctl messages of the log and report upload; delivered to onLogMessage only when both sides
+// negotiated client-logs-v1, ignored otherwise.
+const LOG_TYPES = new Set(["logs-state", "logs-ack", "feedback-ack"]);
 const AUTH_TIMEOUT_MS = 10_000;
 const BINARY_KINDS = new Set(["cursor", "input"]);
 
@@ -52,13 +58,13 @@ export function sessionRefusal(reason, message = "") {
  */
 export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin, epoch,
   transport = "webrtc", name = browserDeviceName(), send, onAuthenticated = () => {},
-  onMessage = () => {}, onBinary = () => {}, onMediaReady = () => {}, onFailure = () => {},
+  onMessage = () => {}, onLogMessage = () => {}, onBinary = () => {}, onMediaReady = () => {}, onFailure = () => {},
   schedule = setTimeout, cancel = clearTimeout, helloOptions }) {
   let ended = false, started = false, authenticated = false, capsReceived = false;
   let handshake = null, ctl = null, H = null, pcPublic = null;
   let timer = null, bindTimer = null, localBindSent = false, remoteBindVerified = false;
   let fingerprints = null, pendingBind = null, peerRevision = 0, bindWork = null;
-  let readyNotified = false;
+  let readyNotified = false, logsNegotiated = false;
   let incoming = Promise.resolve();
   const mediaReady = () => !ended && capsReceived && (transport === "wss" || (localBindSent && remoteBindVerified));
   const sendWire = message => !ended && send(message) !== false;
@@ -112,7 +118,7 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
         ({ H, pcPublic, ctl } = result);
         authenticated = true;
         // No endpoint traffic can precede the viewer's caps at sequence zero.
-        if (!await sendSealed({ type: "caps", caps: [...VIEWER_CAPS], name: String(name).replace(/[\x00-\x1f\x7f]/g, "").slice(0, 64) })) return;
+        if (!await sendSealed({ type: "caps", caps: [...VIEWER_HELLO_CAPS], name: String(name).replace(/[\x00-\x1f\x7f]/g, "").slice(0, 64) })) return;
         timer = schedule(() => fail("missing-cap:control-aead-v1"), AUTH_TIMEOUT_MS);
       } catch (error) { fail(error?.reason === "pc-key-changed" ? error.reason : "handshake-failed", undefined, error); }
       return;
@@ -143,10 +149,15 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
         const missing = required.find(cap => !inner.caps.includes(cap));
         if (missing) return fail(`missing-cap:${missing}`);
         capsReceived = true;
+        logsNegotiated = inner.caps.includes(LOGS_CAP);
         cancel(timer); timer = null;
         blog("info", "session authenticated", { transport });
         onAuthenticated();
         notifyReady();
+        return;
+      }
+      if (LOG_TYPES.has(inner.type)) {
+        if (logsNegotiated) { try { onLogMessage(inner); } catch { /* upload never breaks a session */ } }
         return;
       }
       await onMessage(inner);
@@ -155,6 +166,8 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
   return {
     get authenticated() { return authenticated && !ended; },
     get controlReady() { return capsReceived && !ended; },
+    /** True once both sides advertised client-logs-v1 (known after the PC's caps arrived). */
+    get logsNegotiated() { return logsNegotiated && !ended; },
     get mediaReady() { return mediaReady(); },
     get rtcReady() { return !ended && capsReceived && localBindSent && remoteBindVerified; },
     async start() {

@@ -14,6 +14,7 @@ const hex = value => new Uint8Array(Buffer.from(value, "hex"));
 const localSdp = `v=0\r\na=fingerprint:${hs.dtls.viewer.localFingerprint}\r\n`;
 const remoteSdp = `v=0\r\na=fingerprint:${hs.dtls.viewer.remoteFingerprint}\r\n`;
 const caps = ["control-aead-v1", "dtls-bind-v1"];
+const viewerCaps = [...caps, "client-logs-v1"];
 const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
 
 async function harness(options = {}) {
@@ -73,7 +74,7 @@ test("fixture handshake sends viewer caps first, and PC caps unlock control but 
   assert.deepEqual(h.events.sent, [hs.messages.authHello]);
   assert.equal(h.session.sendControl({ type: "offer", sdp: localSdp }), false);
   assert.equal(h.session.sendInput(new Uint8Array([1, 2])), false);
-  assert.deepEqual(await h.authenticate(), { type: "caps", caps, name: "Firefox on Linux" });
+  assert.deepEqual(await h.authenticate(), { type: "caps", caps: viewerCaps, name: "Firefox on Linux" });
   assert.deepEqual(h.events.sent[1], hs.messages.authFinish);
   assert.equal(h.events.sent[2].seq, 0);
   assert.equal(h.events.authenticated, 1);
@@ -142,7 +143,7 @@ test("opaque ASCII epochs preserve exact transcript bytes, including the relay's
       Buffer.concat([Buffer.from("bubbleplay-auth-viewer-v1"), H, pcSignature]), privateKey(hs.viewer.seedHex)).toString("base64url") });
     const key = async info => crypto.subtle.importKey("raw", hkdfSync("sha256", Buffer.from(hs.sharedSecretHex, "hex"), H, info, 32), "AES-GCM", false, ["encrypt", "decrypt"]);
     const pcCtl = createCtlChannel({ sendKey: await key("bubbleplay-ctl-v1 pc-to-viewer"), recvKey: await key("bubbleplay-ctl-v1 viewer-to-pc") });
-    assert.deepEqual(await pcCtl.openJson(h.events.sent[2]), { type: "caps", caps, name: "Firefox on Linux" });
+    assert.deepEqual(await pcCtl.openJson(h.events.sent[2]), { type: "caps", caps: viewerCaps, name: "Firefox on Linux" });
     await h.session.receive(await pcCtl.sealJson({ type: "caps", caps }));
     assert.equal(h.session.controlReady, true);
     assert.equal(h.session.mediaReady, true);
@@ -280,7 +281,7 @@ test("bind timeout ends the session, and a new peer cannot reuse an old readines
 
 test("WSS requires control-aead only, starts without bind and wraps exact binary input bytes", async () => {
   const h = await harness({ transport: "wss" });
-  assert.deepEqual(await h.authenticate(["control-aead-v1"]), { type: "caps", caps, name: "Firefox on Linux" });
+  assert.deepEqual(await h.authenticate(["control-aead-v1"]), { type: "caps", caps: viewerCaps, name: "Firefox on Linux" });
   assert.equal(h.session.mediaReady, true);
   assert.equal(h.session.rtcReady, false);
   assert.equal(h.events.ready, 1);
@@ -603,4 +604,31 @@ test("each failure cause gets its own plain text and a log line with the cause",
   } finally {
     globalThis.BPLog = previous;
   }
+});
+
+test("client-logs-v1 is advertised but optional; log messages are delivered only when both sides negotiated it", async () => {
+  const off = await harness({ onLogMessage: () => assert.fail("log message without the capability") });
+  assert.deepEqual((await off.authenticate()).caps, viewerCaps);
+  assert.equal(off.session.logsNegotiated, false);
+  await off.session.receive(await off.pcCtl.sealJson({ type: "logs-state", v: 1, cursors: {}, limits: {} }));
+  assert.deepEqual(off.events.messages, [], "ignored, and not passed on as an endpoint message either");
+  assert.equal(off.events.failures.length, 0);
+  off.session.close();
+
+  const got = [];
+  const on = await harness({ onLogMessage: message => got.push(message) });
+  await on.authenticate([...caps, "client-logs-v1"]);
+  assert.equal(on.session.logsNegotiated, true);
+  await on.session.receive(await on.pcCtl.sealJson({ type: "logs-state", v: 1, cursors: {}, limits: {} }));
+  await on.session.receive(await on.pcCtl.sealJson({ type: "feedback-ack", v: 1, id: "r1", status: "ok", reason: "" }));
+  assert.deepEqual(got.map(message => message.type), ["logs-state", "feedback-ack"]);
+  assert.deepEqual(on.events.messages, []);
+  on.session.close();
+
+  const broken = await harness({ onLogMessage: () => { throw new Error("uploader bug"); } });
+  await broken.authenticate([...caps, "client-logs-v1"]);
+  await broken.session.receive(await broken.pcCtl.sealJson({ type: "logs-ack", v: 1, stream: "browser", id: 1, status: "ok" }));
+  assert.equal(broken.events.failures.length, 0, "an upload failure never ends the session");
+  assert.equal(broken.session.controlReady, true);
+  broken.session.close();
 });
