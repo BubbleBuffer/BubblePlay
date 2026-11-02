@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { createLogUploader, formatCursor, parseCursor, LOGS_CAP } from "../public/dk-upload.js";
+import { createLogUploader, formatCursor, parseCursor, LOGS_CAP, MAX_FEEDBACK_BYTES } from "../public/dk-upload.js";
 import { createFeedback, SAVED_MEMORY_TEXT, SENT_TEXT } from "../public/dk-feedback.js";
 
 const contract = JSON.parse(readFileSync(new URL("../../fixtures/client-log-upload-contract.json", import.meta.url), "utf8"));
@@ -497,4 +497,34 @@ test("the real logger exposes head(), deleteReport() and report events without t
   assert.equal(seen.join(), "z1");
   assert.equal(await raw.deleteReport("z1"), true);
   assert.equal((await raw.listReports()).map(x => x.id).join(), "z2");
+});
+
+test("feedback-begin stays under 128 KiB: oldest logs are dropped first, then oldest errors", async () => {
+  const entry = (i, size) => ({ ts: "2026-11-02T13:45:12.345Z", level: "info", src: "browser", msg: `n${i} ` + "x".repeat(size) });
+  const big = { ...REPORT, id: "rep-big", logs: Array.from({ length: 200 }, (_, i) => entry(i, 900)),
+    errors: Array.from({ length: 20 }, (_, i) => entry(1000 + i, 900)) };
+  const r = rig();
+  await r.log.saveReport(big);
+  r.uploader.start();
+  await tick();
+  await r.advance(0);
+  const begin = r.sent.find(m => m.type === "feedback-begin");
+  assert.ok(Buffer.byteLength(JSON.stringify(begin)) <= MAX_FEEDBACK_BYTES);
+  assert.ok(begin.report.logs.length < 200 && begin.report.logs.length > 0);
+  assert.equal(begin.report.logs.at(-1).msg.split(" ")[0], "n199", "newest logs are kept");
+  assert.equal(begin.report.errors.length, 20, "errors untouched while dropping logs is enough");
+
+  const huge = { ...REPORT, id: "rep-huge", logs: Array.from({ length: 200 }, (_, i) => entry(i, 1500)),
+    errors: Array.from({ length: 20 }, (_, i) => entry(1000 + i, 9000)) };
+  const h = rig();
+  await h.log.saveReport(huge);
+  h.uploader.start();
+  await tick();
+  await h.advance(0);
+  const second = h.sent.find(m => m.type === "feedback-begin");
+  assert.ok(Buffer.byteLength(JSON.stringify(second)) <= MAX_FEEDBACK_BYTES);
+  assert.equal(second.report.logs.length, 0);
+  assert.ok(second.report.errors.length < 20);
+  assert.equal(second.report.errors.at(-1).msg.split(" ")[0], "n1019");
+  assert.equal((await h.log.listReports())[0].logs.length, 200, "the stored report is untouched");
 });
