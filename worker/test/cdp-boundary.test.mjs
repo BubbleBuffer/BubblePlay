@@ -18,7 +18,9 @@ test("external debug attempts report before module imports and across the WSS pr
   const prelude = client.match(/<script>\s*([\s\S]*?)<\/script>\s*<script type="module">/)?.[1];
   assert.ok(prelude, "the inline bootstrap prelude must be extracted from the client");
   assert.doesNotThrow(() => new Function(prelude));
-  assert.match(client, /fetch\("\/__diag\/client"/);
+  assert.doesNotMatch(client, /__diag/, "the dead /__diag/client post is gone");
+  assert.match(client, /window\.BPLog\?\.info\("trace"/);
+  assert.match(client, /<script src="\/dk-log\.js"><\/script>[\s\S]*window\.__bubbleplayDebugTrace/, "the logger loads before the bootstrap");
   assert.match(client, /debugAttempt/);
   assert.match(client, /trace\("bootstrap-inline"/);
   for (const stage of [
@@ -33,27 +35,25 @@ test("a normal page load creates and reports its own diagnostic attempt", () => 
   const prelude = client.match(/<script>\s*([\s\S]*?)<\/script>\s*<script type="module">/)?.[1];
   assert.ok(prelude, "the inline bootstrap prelude must be extracted from the client");
   const generatedAttempt = "11111111-2222-4333-8444-555555555555";
-  const requests = [];
-  const windowObject = {};
+  const lines = [];
+  const windowObject = { BPLog: { info: (...args) => lines.push(args) } };
 
-  new Function("location", "crypto", "fetch", "window", "addEventListener", "URLSearchParams", "Date", prelude)(
+  new Function("location", "crypto", "window", "URLSearchParams", prelude)(
     { search: "", pathname: "/" },
     { randomUUID: () => generatedAttempt },
-    (url, options) => {
-      requests.push({ url, options });
-      return Promise.resolve({ ok: true });
-    },
     windowObject,
-    () => {},
     URLSearchParams,
-    { now: () => 1_777_777_777_777 },
   );
 
   assert.equal(windowObject.__bubbleplayDebugTrace?.attemptId, generatedAttempt);
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].url, "/__diag/client");
-  assert.equal(JSON.parse(requests[0].options.body).attemptId, generatedAttempt);
-  assert.match(client, /detail: \{ attemptId: diagnosticAttemptId,/);
+  assert.equal(lines.length, 1);
+  assert.deepEqual(lines[0].slice(0, 2), ["trace", "bootstrap-inline"]);
+  assert.equal(lines[0][2].attempt, generatedAttempt);
+  assert.equal(lines[0][2].seq, 1);
+  // Without the logger script the page still starts.
+  assert.doesNotThrow(() => new Function("location", "crypto", "window", "URLSearchParams", prelude)(
+    { search: "", pathname: "/" }, { randomUUID: () => generatedAttempt }, {}, URLSearchParams));
+  assert.match(client, /attempt: diagnosticAttemptId,/);
 });
 
 test("forced WSS debugging preserves the original failure instead of falling back", () => {
@@ -376,10 +376,9 @@ test("WSS hybrid presentation parses before decode and composites only after the
   assert.ok(activeHybridMode);
   assert.match(activeHybridMode, /codecSession\.codec === "hevc"/);
   assert.match(client, /function decodeWssFrame\(frame\)[\s\S]*prepareHybridWssFrame/);
-  assert.match(client, /sendClientLog\("info", "hybrid-frame-activity"/);
-  assert.match(client, /sendClientLog\("warn", "wss-recovery-reset"/);
-  assert.match(client, /client-health[\s\S]*hybrid:\s*activeWssHybridCache\(\)\.snapshot\(\)/);
-  assert.match(client, /sendClientLog\("error", "decoder-decode-throw", \{\s*message:/);
+  assert.match(client, /viewerLog\("info", "hybrid-frame-activity"/);
+  assert.match(client, /viewerLog\("warn", "wss-recovery-reset"/);
+  assert.match(client, /viewerLog\("error", "decoder-decode-throw", \{\s*message:/);
   assert.match(client, /function drawFrame\(frame[\s\S]*drawBaseThenHybrid/);
   assert.match(client, /stopWssMedia\(\)[\s\S]*clearWssHybridCaches\(\)/);
   assert.match(client, /resyncWssDecoder\(reason\)[\s\S]*clearWssHybridCaches\(\)/);
@@ -402,7 +401,7 @@ test("intentional signaling recycle retains its initiator before invalidating th
   assert.match(recycle, /usingWssMedia,[\s\S]*mediaSocketOpen:/);
   assert.match(recycle, /mediaGeneration:[\s\S]*reconstructed:[\s\S]*presented:[\s\S]*receivedPackets:/);
   assert.match(recycle, /lastSignalingRecycle\s*=\s*\{\s*\.\.\.diagnostic,\s*atMs:\s*Date\.now\(\)\s*\}/);
-  const emittedAt = recycle.indexOf('sendClientLog("warn", "signaling-recycle", diagnostic)');
+  const emittedAt = recycle.indexOf('viewerLog("warn", "signaling-recycle", diagnostic)');
   const invalidatedAt = recycle.indexOf("ws = null");
   assert.ok(emittedAt >= 0 && invalidatedAt > emittedAt,
     "the diagnostic must use the still-open old signaling socket before it is invalidated");

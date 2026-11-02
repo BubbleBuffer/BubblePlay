@@ -1,0 +1,74 @@
+/* "Report a problem" dialog (dk-feedback.js). Tokens come from bubbleplay.css; the layout
+   follows the gate panel (dk-gate.css): fitted panel on the duvet ink, apricot only on Send. */
+
+.bp-feedback-scrim {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--calico-black) 62%, transparent);
+}
+
+.bp-feedback-scrim[hidden] { display: none; }
+
+.bp-feedback {
+  box-sizing: border-box;
+  width: min(440px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 24px;
+  color: var(--milk-cloth);
+  background: var(--duvet-ink);
+  border: 1px solid var(--thread-strong);
+  border-radius: 12px 18px 10px 16px;
+}
+
+.bp-feedback:focus { outline: none; }
+
+.bp-feedback h2 {
+  margin: 0 0 14px;
+  font-family: "Bricolage Grotesque", "Segoe UI", sans-serif;
+  font-size: 22px;
+  font-weight: 620;
+  line-height: 1.15;
+}
+
+.bp-feedback label {
+  display: block;
+  margin: 12px 0 6px;
+  font-size: 13px;
+  font-weight: 720;
+}
+
+.bp-feedback textarea,
+.bp-feedback select {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 10px 12px;
+  color: var(--milk-cloth);
+  background: var(--dark-surface);
+  border: 1px solid var(--thread-strong);
+  border-radius: 6px 10px 6px 8px;
+  font: inherit;
+}
+
+.bp-feedback textarea { min-height: 120px; resize: vertical; }
+
+.bp-feedback-help { margin: 12px 0 0; color: var(--muted-cream); font-size: 13px; line-height: 1.45; }
+.bp-feedback-status { min-height: 1.45em; margin: 10px 0 0; font-size: 13px; line-height: 1.45; }
+
+.bp-feedback-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.bp-feedback-actions button { min-width: 88px; min-height: 40px; padding: 8px 16px; }
+.bp-feedback-actions button[hidden] { display: none; }
+
+.bp-feedback-primary {
+  color: var(--calico-black);
+  background: var(--bright-apricot);
+  border-color: var(--bright-apricot);
+  font-weight: 680;
+}
+
+.bp-feedback-primary:hover { background: var(--calico-apricot); border-color: var(--calico-apricot); }
+.bp-feedback-primary:disabled { color: var(--dark-thread-strong); background: var(--duvet); border-color: var(--thread); }

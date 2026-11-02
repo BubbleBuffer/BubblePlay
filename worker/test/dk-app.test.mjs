@@ -217,6 +217,19 @@ test("pairing refusal shows the failed screen; cancel returns to the list", asyn
   assert.equal(h.gate.calls.at(-1)[0], "showPcList");
 });
 
+test("a relay close reason is shown and logged, and the pairing code is never logged", () => withLog(async ({ lines, secrets }) => {
+  const h = app();
+  await h.instance.start();
+  await h.gate.last("showPcList").onPair({ pc: PC_ID, code: "7K3QDM9X2P" });
+  h.pairings[0].onRefused({ code: 1008, reason: "unknown pc" });
+  assert.equal(h.gate.last("showPairing").message,
+    "The relay did not accept this code. Check the PC ID and code, or open a new code on the PC. Reason: unknown pc.");
+  const refused = lines.find(item => item.msg === "pairing refused by the relay");
+  assert.deepEqual(refused.fields, { closeCode: 1008, reason: "unknown pc" });
+  assert.ok(secrets.includes("7K3QD-M9X2P") && secrets.includes("7K3QDM9X2P"), "every form of the code is registered");
+  assert.ok(!JSON.stringify(lines).includes("7K3QD"));
+}));
+
 test("list rename, remove, forget and lock call the store, fetch and reload", async () => {
   const fetches = [];
   const h = app({ pcs: [{ id: PC_ID, name: "Desk", public: PUBLIC, paired: 1, lastUsed: null }],
@@ -366,3 +379,49 @@ test("after Lock this browser, the next visit asks for the passphrase again", as
   await again.instance.start();
   assert.equal(again.gate.last("showKeyScreen").mode, "unlock");
 });
+
+// ---- Logging of cases that used to be swallowed (dk-app.js blog calls reach globalThis.BPLog).
+async function withLog(body) {
+  const lines = [], secrets = [], contexts = [];
+  const previous = globalThis.BPLog;
+  globalThis.BPLog = { log: (level, target, msg, fields) => lines.push({ level, target, msg, fields }),
+    registerSecret: value => secrets.push(value), setContext: value => contexts.push(value) };
+  try { await body({ lines, secrets, contexts }); } finally { globalThis.BPLog = previous; }
+}
+
+test("keep-unlocked failures are logged with their cause and do not stop the unlock", () => withLog(async ({ lines, secrets, contexts }) => {
+  const store = memoryStore({ key: PROTECTED });
+  store.saveUnlocked = async () => { throw new Error("quota exceeded"); };
+  const h = app({ store });
+  await h.instance.start();
+  await h.gate.last("showKeyScreen").onUnlock("right");
+  assert.ok(h.gate.last("showPcList"), "unlock still succeeds");
+  const line = lines.find(item => item.msg === "could not keep the key unlocked");
+  assert.equal(line.level, "warn");
+  assert.match(line.fields.cause, /quota exceeded/);
+  assert.deepEqual(secrets, ["right"], "the passphrase is registered so it can never be logged");
+  assert.deepEqual(contexts.at(-1), { device: VIEWER_ID });
+  assert.ok(!JSON.stringify(lines).includes('"right"'));
+}));
+
+test("a failing read or clear of the kept key is logged", () => withLog(async ({ lines }) => {
+  const readFails = memoryStore({ key: PLAIN });
+  readFails.loadUnlocked = async () => { throw new Error("idb closed"); };
+  await app({ store: readFails }).instance.start();
+  assert.ok(lines.some(item => item.msg === "could not read the kept unlocked key" && /idb closed/.test(item.fields.cause)));
+
+  const other = Object.freeze({ id: "AAAA-AAAA-AAAA-AAAA", publicRaw: new Uint8Array(32), privateKey: { type: "private" } });
+  const clearFails = memoryStore({ key: PLAIN, unlocked: other });
+  clearFails.clearUnlocked = async () => { throw new Error("blocked"); };
+  await app({ store: clearFails }).instance.start();
+  assert.ok(lines.some(item => item.msg === "could not clear the stale unlocked key" && /blocked/.test(item.fields.cause)));
+}));
+
+test("a wrong passphrase is logged as a plain cause, without the passphrase", () => withLog(async ({ lines }) => {
+  const h = app({ key: PROTECTED });
+  await h.instance.start();
+  await assert.rejects(h.gate.last("showKeyScreen").onUnlock("wrong-one"));
+  const line = lines.find(item => item.msg === "key unlock failed");
+  assert.equal(line.fields.cause, "wrong passphrase");
+  assert.ok(!JSON.stringify(lines).includes("wrong-one"));
+}));

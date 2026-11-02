@@ -20,6 +20,13 @@ export function browserDeviceName(nav = globalThis.navigator) {
   return (os ? `${browser} on ${os}` : browser).slice(0, 64);
 }
 
+// Local viewer log (dk-log.js). Absent in tests and when the log script is blocked.
+const blog = (level, msg, fields) => { try { globalThis.BPLog?.log(level, "dk-session", msg, fields); } catch { /* logging never breaks a session */ } };
+const describe = error => {
+  if (error === undefined || error === null) return "";
+  return `${error.name || "Error"}: ${String(error.message ?? error)}`.slice(0, 160);
+};
+
 export function sessionRefusal(reason, message = "") {
   if (reason === "pc-key-changed") return { title: "PC key changed", body: "This PC answered with a different key than the one this browser paired with. The session was closed before anything was sent. If the PC was reinstalled, remove it from the list and pair again." };
   if (reason === "auth-timeout") return { title: "PC not reachable", body: "This PC does not support device keys or is not reachable." };
@@ -30,9 +37,14 @@ export function sessionRefusal(reason, message = "") {
       : "This browser lacks a capability the PC requires.";
     return { title: "PC refused the session", body: body + (typeof message === "string" && message ? ` ${message.slice(0, 200)}` : "") };
   }
-  return { title: "Session ended", body: reason === "bind-failed"
-    ? "The PC's connection could not be verified, so the session was closed."
-    : "A control message failed its integrity check, so the session was closed." };
+  const body = {
+    "bind-failed": "The PC's connection could not be verified, so the session was closed.",
+    "handshake-failed": "The PC's reply could not be verified, so the session was closed.",
+    "unexpected-message": "The PC sent a message this browser did not expect, so the session was closed.",
+    "socket-ended": "The connection to the PC dropped while the session was starting.",
+    "start-failed": "This browser could not start the secure session. Reload and try again.",
+  }[reason];
+  return { title: "Session ended", body: body || "A control message failed its integrity check, so the session was closed." };
 }
 
 /** `send` must return false if the socket is no longer current. Call receive in wire order.
@@ -51,9 +63,10 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
   const mediaReady = () => !ended && capsReceived && (transport === "wss" || (localBindSent && remoteBindVerified));
   const sendWire = message => !ended && send(message) !== false;
   const clearTimers = () => { cancel(timer); cancel(bindTimer); timer = bindTimer = null; };
-  function fail(reason = "control-failed", message) {
+  function fail(reason = "control-failed", message, cause) {
     if (ended) return;
     ended = true;
+    blog("warn", "session ended", { reason, cause: describe(cause) || undefined, authenticated });
     clearTimers();
     ctl = handshake = null;
     onFailure(sessionRefusal(reason, message), reason);
@@ -72,23 +85,24 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
       if (ended || ctl !== channel) return false;
       if (!sendWire(envelope)) throw new Error("socket ended");
       return true;
-    } catch { fail(); return false; }
+    } catch (error) { fail(error?.message === "socket ended" ? "socket-ended" : "control-failed", undefined, error); return false; }
   }
   async function checkBind(revision = peerRevision) {
     if (!fingerprints || !pendingBind || ended) return;
     const signature = pendingBind.signature;
     const { local, remote } = fingerprints;
     let valid = false;
-    try { valid = await verifyBind(pcPublic, H, remote, local, signature); } catch {}
+    let verifyError = null;
+    try { valid = await verifyBind(pcPublic, H, remote, local, signature); } catch (error) { verifyError = error; }
     if (ended || revision !== peerRevision) return;
-    if (!valid) return fail("bind-failed");
+    if (!valid) return fail("bind-failed", undefined, verifyError ?? new Error("signature did not verify"));
     remoteBindVerified = true;
     notifyReady();
   }
   async function receiveNow(message) {
     if (ended) return;
     if (message?.type === "auth-host") {
-      if (!handshake || authenticated) return fail();
+      if (!handshake || authenticated) return fail("unexpected-message", undefined, new Error("auth-host out of order"));
       // The deadline is for receiving auth-host. Verification may yield after
       // a reply that arrived just before the ten-second boundary.
       cancel(timer); timer = null;
@@ -100,7 +114,7 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
         // No endpoint traffic can precede the viewer's caps at sequence zero.
         if (!await sendSealed({ type: "caps", caps: [...VIEWER_CAPS], name: String(name).replace(/[\x00-\x1f\x7f]/g, "").slice(0, 64) })) return;
         timer = schedule(() => fail("missing-cap:control-aead-v1"), AUTH_TIMEOUT_MS);
-      } catch (error) { fail(error.reason === "pc-key-changed" ? error.reason : "control-failed"); }
+      } catch (error) { fail(error?.reason === "pc-key-changed" ? error.reason : "handshake-failed", undefined, error); }
       return;
     }
     if (message?.type === "auth-bind") {
@@ -112,30 +126,31 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
       await checkBind();
       return;
     }
-    if (message?.type !== "ctl" || !ctl) return fail();
+    if (message?.type !== "ctl" || !ctl) return fail("unexpected-message", undefined, new Error(`unexpected ${String(message?.type).slice(0, 40)}`));
     try {
       if (BINARY_KINDS.has(message.kind)) {
         const bytes = await ctl.open(message);
         if (!ended && capsReceived && mediaReady()) onBinary(message.kind, bytes);
-        else if (!capsReceived) fail();
+        else if (!capsReceived) fail("unexpected-message", undefined, new Error("binary before caps"));
         return;
       }
       const inner = await ctl.openJson(message);
       if (ended) return;
       if (inner.type === "error" && ["dtls-bind-required", "cap-missing"].includes(inner.code)) return fail(inner.code, inner.message);
       if (!capsReceived) {
-        if (inner.type !== "caps" || !Array.isArray(inner.caps) || !inner.caps.every(cap => typeof cap === "string")) return fail();
+        if (inner.type !== "caps" || !Array.isArray(inner.caps) || !inner.caps.every(cap => typeof cap === "string")) return fail("unexpected-message", undefined, new Error("first message was not caps"));
         const required = transport === "wss" ? ["control-aead-v1"] : VIEWER_CAPS;
         const missing = required.find(cap => !inner.caps.includes(cap));
         if (missing) return fail(`missing-cap:${missing}`);
         capsReceived = true;
         cancel(timer); timer = null;
+        blog("info", "session authenticated", { transport });
         onAuthenticated();
         notifyReady();
         return;
       }
       await onMessage(inner);
-    } catch { fail(); }
+    } catch (error) { fail("control-failed", undefined, error); }
   }
   return {
     get authenticated() { return authenticated && !ended; },
@@ -145,16 +160,16 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
     async start() {
       if (started || ended) return;
       started = true;
-      if (!(pinnedPublic instanceof Uint8Array) || pinnedPublic.length !== 32 || typeof epoch !== "string" || !/^[\x20-\x7e]{1,64}$/.test(epoch)) return fail();
+      if (!(pinnedPublic instanceof Uint8Array) || pinnedPublic.length !== 32 || typeof epoch !== "string" || !/^[\x20-\x7e]{1,64}$/.test(epoch)) return fail("start-failed", undefined, new Error("bad pinned key or epoch"));
       timer = schedule(() => fail("auth-timeout"), AUTH_TIMEOUT_MS);
       try {
         handshake = await beginViewerHandshake({ identity, pcId, pinnedPublic, relayOrigin, epoch, helloOptions,
           send: message => { if (!sendWire(message)) throw new Error("socket ended"); } });
-      } catch { fail(); }
+      } catch (error) { fail("start-failed", undefined, error); }
     },
     receive(message) {
       const work = incoming.then(() => receiveNow(message));
-      incoming = work.catch(() => fail());
+      incoming = work.catch(error => fail("control-failed", undefined, error));
       return incoming;
     },
     sendControl(message) {
@@ -191,7 +206,7 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
           localBindSent = true;
           await checkBind(revision);
           notifyReady();
-        } catch { if (revision === peerRevision) fail("bind-failed"); }
+        } catch (error) { if (revision === peerRevision) fail("bind-failed", undefined, error); }
       })();
       return bindWork;
     },
