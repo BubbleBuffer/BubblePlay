@@ -3,6 +3,7 @@ import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import 'app_controller.dart';
 import 'devices/devices_controller.dart';
+import 'feedback/feedback_controller.dart';
 import 'platform/key_files.dart';
 import 'screens/gate.dart';
 
@@ -16,6 +17,7 @@ class AppEnv {
     this.theme,
     this.devices,
     this.initialSection,
+    this.feedback,
   });
 
   final AppController controller;
@@ -30,6 +32,9 @@ class AppEnv {
 
   /// The section to open on start (`--section=this-pc`); null opens the PC list's first PC.
   final String? initialSection;
+
+  /// Where "Report a problem" stores reports; null makes Send report that it could not save.
+  final FeedbackServices? feedback;
 }
 
 class AppScope extends InheritedWidget {
@@ -48,7 +53,7 @@ class AppScope extends InheritedWidget {
 }
 
 /// The app root: bb-ui theme over a plain WidgetsApp (no Material).
-class BubblePlayApp extends StatelessWidget {
+class BubblePlayApp extends StatefulWidget {
   const BubblePlayApp({super.key, required this.env, this.brightness});
 
   final AppEnv env;
@@ -57,12 +62,24 @@ class BubblePlayApp extends StatelessWidget {
   final Brightness? brightness;
 
   @override
+  State<BubblePlayApp> createState() => _BubblePlayAppState();
+}
+
+class _BubblePlayAppState extends State<BubblePlayApp> {
+  final _navigatorKey = GlobalKey<NavigatorState>();
+  final _tracker = RouteTracker();
+
+  @override
   Widget build(BuildContext context) {
+    final env = widget.env;
+    final brightness = widget.brightness;
     final choice = env.theme;
     return ListenableBuilder(
       listenable: choice ?? const AlwaysStoppedAnimation<double>(0),
       builder: (context, _) => WidgetsApp(
         title: 'BubblePlay',
+        navigatorKey: _navigatorKey,
+        navigatorObservers: [_tracker],
         color: AppColors.light.desk,
         debugShowCheckedModeBanner: false,
         pageRouteBuilder: <T>(settings, builder) => PageRouteBuilder<T>(
@@ -83,7 +100,14 @@ class BubblePlayApp extends StatelessWidget {
                     color: context.colors.bgPrimary,
                     child: DefaultTextStyle(
                       style: ts(context.type.body, context.colors.textPrimary),
-                      child: ScrollConfiguration(behavior: const AppScrollBehavior(), child: child!),
+                      child: ScrollConfiguration(
+                        behavior: const AppScrollBehavior(),
+                        child: FeedbackHost(
+                          navigatorKey: _navigatorKey,
+                          tracker: _tracker,
+                          child: child!,
+                        ),
+                      ),
                     ),
                   ),
                 ),

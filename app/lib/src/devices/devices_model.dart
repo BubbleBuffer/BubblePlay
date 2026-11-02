@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import '../logging/app_log.dart';
+
 /// Why the host link is down (the synthetic `disconnected` line's `reason`).
 enum DisconnectReason {
   hostNotRunning,
@@ -132,7 +134,9 @@ DevicesEvent? parseDevicesLine(String line) {
     final json = jsonDecode(line);
     if (json is! Map) return null;
     return _parse(json.cast<String, Object?>());
-  } catch (_) {
+  } catch (e) {
+    // Only the error class: a format error's message quotes the line.
+    AppLog.warn('Devices', 'Ignored a malformed line from the host', fields: {'error_type': e.runtimeType.toString()});
     return null;
   }
 }

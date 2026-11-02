@@ -2,6 +2,8 @@ import 'package:bb_ui/bb_ui.dart';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
+import '../feedback/feedback_controller.dart';
+import '../logging/app_log.dart';
 import '../model/model.dart';
 
 /// The app version shown in About.
@@ -77,7 +79,8 @@ class _SettingsBodyState extends State<_SettingsBody> {
     String text;
     try {
       text = await env.controller.exportKey();
-    } catch (_) {
+    } catch (e) {
+      AppLog.error('Settings', 'Key export failed', error: e);
       if (mounted) setState(() => _exportFailed = true);
       return;
     }
@@ -85,7 +88,8 @@ class _SettingsBodyState extends State<_SettingsBody> {
     bool saved;
     try {
       saved = await env.keyFiles.save('bubbleplay-device-key.bpkey', text);
-    } catch (_) {
+    } catch (e) {
+      AppLog.error('Settings', 'Key file could not be saved', error: e);
       saved = false;
     }
     if (!mounted || !saved) return;
@@ -150,6 +154,16 @@ class _SettingsBodyState extends State<_SettingsBody> {
         const SettingsRow(
           label: 'Stored on this device',
           description: 'The key and the list of PCs never leave this device.',
+        ),
+        const SettingsHeading('Support', top: 24),
+        const SizedBox(height: 8),
+        SettingsRow(
+          label: 'Report a problem',
+          description: 'Send a note with the recent logs from this device.',
+          trailing: OutlineButton(
+            label: 'Report',
+            onTap: () => showFeedbackSheet(context),
+          ),
         ),
       ],
     );
