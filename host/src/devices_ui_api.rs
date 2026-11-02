@@ -2,8 +2,9 @@
 //!
 //! Host -> UI is [`DevicesEvent`], UI -> host is [`DevicesCommand`], both over
 //! std mpsc channels. The tray's "Devices..." item reaches the host as one of
-//! two fixed stdin lines: [`OPEN_DEVICES_LINE`] (open the Win32 window) or
-//! [`SHOW_DEVICES_APP_LINE`] (show the Devices section of the Flutter app);
+//! fixed stdin lines: [`OPEN_DEVICES_LINE`] (open the Win32 window),
+//! [`SHOW_DEVICES_APP_LINE`] (show the Devices section of the Flutter app) or
+//! [`OPEN_FEEDBACK_LINE`] (open the app's report sheet);
 //! any other stdin input is ignored.
 //!
 //! Pairing codes, QR URIs and comparison numbers are secrets for the time they
@@ -21,6 +22,9 @@ pub const OPEN_DEVICES_LINE: &[u8] = b"open-devices\n";
 /// The line the tray writes when the Flutter app shows the Devices section.
 pub const SHOW_DEVICES_APP_LINE: &[u8] = b"show-devices-app\n";
 
+/// The line the tray writes for "Report a problem": the app opens its report sheet.
+pub const OPEN_FEEDBACK_LINE: &[u8] = b"open-feedback\n";
+
 /// What a fixed stdin line asks the host for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdinRequest {
@@ -28,6 +32,8 @@ pub enum StdinRequest {
     OpenDevices,
     /// `show-devices-app`: tell connected app clients to show Devices.
     ShowDevicesApp,
+    /// `open-feedback`: tell connected app clients to open the report sheet.
+    OpenFeedback,
 }
 
 /// Longer stdin lines are discarded unread, so stdin cannot grow memory.
@@ -217,8 +223,8 @@ fn encode_component(value: &str) -> String {
     out
 }
 
-/// The request a stdin line makes. Only the exact `open-devices` and
-/// `show-devices-app` lines (their line ending aside) count; everything else
+/// The request a stdin line makes. Only the exact `open-devices`,
+/// `show-devices-app` and `open-feedback` lines (their line ending aside) count; everything else
 /// is ignored.
 pub fn parse_stdin_request(line: &[u8]) -> Option<StdinRequest> {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
@@ -226,6 +232,7 @@ pub fn parse_stdin_request(line: &[u8]) -> Option<StdinRequest> {
     match line {
         b"open-devices" => Some(StdinRequest::OpenDevices),
         b"show-devices-app" => Some(StdinRequest::ShowDevicesApp),
+        b"open-feedback" => Some(StdinRequest::OpenFeedback),
         _ => None,
     }
 }
@@ -402,6 +409,12 @@ mod tests {
             assert_eq!(parse_stdin_request(other), None, "{other:?}");
             assert_eq!(parse_stdin_line(other), None, "{other:?}");
         }
+        assert_eq!(
+            parse_stdin_request(OPEN_FEEDBACK_LINE),
+            Some(StdinRequest::OpenFeedback)
+        );
+        assert_eq!(parse_stdin_line(OPEN_FEEDBACK_LINE), None);
+        assert_eq!(parse_stdin_request(b"open-feedback x\n"), None);
         // The show line is never a window command.
         assert_eq!(parse_stdin_line(SHOW_DEVICES_APP_LINE), None);
     }

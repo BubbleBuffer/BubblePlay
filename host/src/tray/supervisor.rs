@@ -28,6 +28,10 @@ use super::platform::{dpapi_unprotect_hex, KillOnCloseJob};
 /// Devices app. The host side defines the same literal.
 pub const SHOW_DEVICES_APP_LINE: &[u8] = b"show-devices-app\n";
 
+/// Stdin line that asks the host to tell connected pipe clients to open the
+/// app's report sheet. The host side defines the same literal.
+pub const OPEN_FEEDBACK_LINE: &[u8] = b"open-feedback\n";
+
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const POLL: Duration = Duration::from_millis(250);
 const NOT_CONFIGURED_RECHECK: Duration = Duration::from_secs(30);
@@ -99,6 +103,12 @@ impl HostStdin {
     /// with `NotConnected` when no child is running.
     pub fn request_show_devices_app(&self) -> io::Result<()> {
         self.write_line(SHOW_DEVICES_APP_LINE)
+    }
+
+    /// Writes the fixed `open-feedback` line to the current child. Fails with
+    /// `NotConnected` when no child is running.
+    pub fn request_open_feedback(&self) -> io::Result<()> {
+        self.write_line(OPEN_FEEDBACK_LINE)
     }
 
     fn write_line(&self, line: &[u8]) -> io::Result<()> {
@@ -404,6 +414,12 @@ impl SupervisorThread {
         self.stdin.request_show_devices_app()
     }
 
+    /// Asks the running host to tell the app to open its report sheet. Fails
+    /// with `NotConnected` when no host child is running.
+    pub fn request_open_feedback(&self) -> io::Result<()> {
+        self.stdin.request_open_feedback()
+    }
+
     pub fn stop(&mut self) {
         if let Some(tx) = self.stop.take() {
             let _ = tx.send(());
@@ -451,6 +467,20 @@ mod tests {
             .request_show_devices_app()
             .expect_err("no child is running");
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn feedback_request_without_a_running_host_is_refused() {
+        let stdin = HostStdin::default();
+        let error = stdin
+            .request_open_feedback()
+            .expect_err("no child is running");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn feedback_line_is_the_fixed_literal() {
+        assert_eq!(OPEN_FEEDBACK_LINE, b"open-feedback\n");
     }
 
     #[test]

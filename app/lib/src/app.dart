@@ -1,4 +1,6 @@
 import 'package:bb_ui/bb_ui.dart';
+import 'dart:async';
+
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import 'app_controller.dart';
@@ -68,6 +70,33 @@ class BubblePlayApp extends StatefulWidget {
 class _BubblePlayAppState extends State<BubblePlayApp> {
   final _navigatorKey = GlobalKey<NavigatorState>();
   final _tracker = RouteTracker();
+  StreamSubscription<void>? _feedbackRequests;
+
+  @override
+  void initState() {
+    super.initState();
+    // The tray's "Report a problem" item arrives as `openFeedback` on the devices pipe.
+    final devices = widget.env.devices;
+    if (devices == null) return;
+    _feedbackRequests = devices.feedbackRequests.listen((_) => _openFeedback(devices));
+    if (devices.feedbackPending) {
+      // It arrived while the app was starting: open once the first frame has a navigator.
+      WidgetsBinding.instance.addPostFrameCallback((_) => _openFeedback(devices));
+    }
+  }
+
+  @override
+  void dispose() {
+    _feedbackRequests?.cancel();
+    super.dispose();
+  }
+
+  void _openFeedback(DevicesController devices) {
+    final context = _navigatorKey.currentContext;
+    if (!mounted || context == null) return;
+    devices.consumeFeedback();
+    unawaited(showFeedbackSheet(context));
+  }
 
   @override
   Widget build(BuildContext context) {

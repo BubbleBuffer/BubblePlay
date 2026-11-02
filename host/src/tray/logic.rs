@@ -548,6 +548,8 @@ pub const CMD_EXPORT_KEY: usize = 13;
 pub const CMD_IMPORT_KEY: usize = 14;
 /// "Open BubblePlay": opens the Devices window. Also what a left-click on the icon does.
 pub const CMD_DEVICES: usize = 15;
+/// "Report a problem": brings the app forward and opens its report sheet.
+pub const CMD_FEEDBACK: usize = 16;
 
 /// What the tray menu shows, gathered from the app when the menu opens.
 #[derive(Debug, Clone, Default)]
@@ -662,6 +664,7 @@ pub fn menu_layout(state: &MenuState) -> Vec<MenuEntry> {
     if state.can_roll_back {
         more.push(MenuEntry::command(CMD_ROLLBACK, "Roll back host"));
     }
+    more.push(MenuEntry::command(CMD_FEEDBACK, "Report a problem"));
     more.push(MenuEntry::command(CMD_LOGS, "Open logs folder"));
     more.push(MenuEntry::Separator);
     more.push(MenuEntry::grey(CMD_BUILD, &state.build));
@@ -738,7 +741,7 @@ mod tests {
                 "-",
                 "2",
                 "11",
-                "More[3 12 - 13 14 - 5 - 8 1]",
+                "More[3 12 - 13 14 - 16 5 - 8 1]",
                 "-",
                 "4",
                 "6"
@@ -760,6 +763,40 @@ mod tests {
             .filter(|entry| matches!(entry, MenuEntry::Item { default: true, .. }))
             .count();
         assert_eq!(defaults, 1);
+    }
+
+    #[test]
+    fn report_a_problem_is_always_enabled_under_more() {
+        let busy = MenuState {
+            admin: true,
+            admin_enabled: false,
+            key_busy: true,
+            ..MenuState::default()
+        };
+        for state in [MenuState::default(), busy] {
+            let menu = menu_layout(&state);
+            let more = menu
+                .iter()
+                .find_map(|entry| match entry {
+                    MenuEntry::Submenu { entries, .. } => Some(entries),
+                    _ => None,
+                })
+                .expect("More submenu");
+            let item = more
+                .iter()
+                .find(|entry| matches!(entry, MenuEntry::Item { id, .. } if *id == CMD_FEEDBACK))
+                .expect("Report a problem item");
+            assert_eq!(
+                item,
+                &MenuEntry::Item {
+                    id: CMD_FEEDBACK,
+                    text: "Report a problem".to_owned(),
+                    enabled: true,
+                    checked: false,
+                    default: false,
+                }
+            );
+        }
     }
 
     #[test]
@@ -793,7 +830,7 @@ mod tests {
                 "9",
                 "10",
                 "11",
-                "More[3 12 - 13 14 - 7 5 - 8 1 1]",
+                "More[3 12 - 13 14 - 7 16 5 - 8 1 1]",
                 "-",
                 "4",
                 "6"
