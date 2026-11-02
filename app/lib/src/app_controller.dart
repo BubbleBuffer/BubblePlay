@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 
 import 'backend/channel.dart';
+import 'logging/app_log.dart';
 import 'model/model.dart' as model;
 import 'presence/presence_service.dart';
 
@@ -32,6 +33,8 @@ class AppController extends ChangeNotifier {
   model.AppState? _state;
   Object? _error;
   bool _disposed = false;
+  String? _lastErrorText;
+  String? _loggedPc;
 
   /// The latest snapshot; null only until the first one arrives.
   model.AppState? get state => _state;
@@ -48,12 +51,36 @@ class AppController extends ChangeNotifier {
       _core = next;
       _state = _overlay(next);
       _error = null;
+      _lastErrorText = null;
+      _logContext(next);
     } catch (e) {
       if (_disposed) return;
       _error = e;
+      // Once per distinct error: a core that stays down must not fill the log on every poll.
+      final text = e.toString();
+      if (text != _lastErrorText) {
+        _lastErrorText = text;
+        AppLog.error('AppController', 'Could not read the core snapshot', error: e);
+      }
     }
     notifyListeners();
     _schedulePresence();
+  }
+
+  /// Keeps the log's device and PC context in step with the snapshot, and notes when a session
+  /// screen opens or closes.
+  void _logContext(model.AppState next) {
+    AppLog.setDevice(next.thisDevice.id);
+    final pc = next.session?.pcId;
+    if (pc == _loggedPc) return;
+    if (pc != null) {
+      AppLog.setContext(pc: pc);
+      AppLog.info('AppController', 'Session started');
+    } else {
+      AppLog.info('AppController', 'Session ended');
+      AppLog.setContext();
+    }
+    _loggedPc = pc;
   }
 
   /// Tells the controller whether the app is in the foreground; polling pauses in the background.
@@ -131,6 +158,8 @@ class AppController extends ChangeNotifier {
       await _channel.act(jsonEncode(action.toJson()));
     } catch (e) {
       _error = e;
+      // The action's class only: its fields can carry pairing codes and links.
+      AppLog.error('AppController', 'The core refused an action', error: e, fields: {'action': action.runtimeType.toString()});
       notifyListeners();
     }
   }

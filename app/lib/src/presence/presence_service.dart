@@ -2,8 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter/foundation.dart';
-
+import '../logging/app_log.dart';
 import '../model/model.dart' as model;
 
 /// What one `GET /presence` answered.
@@ -123,7 +122,12 @@ class PresenceService {
       });
       return out;
     } catch (e) {
-      if (kDebugMode) debugPrint('presence: request failed (${e.runtimeType})');
+      // Only the class: the error text can quote the request URL, which carries PC ids.
+      AppLog.warn(
+        'Presence',
+        'Presence request failed',
+        fields: {'error_type': e.runtimeType.toString()},
+      );
       return null;
     }
   }
