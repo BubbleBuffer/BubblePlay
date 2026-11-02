@@ -371,6 +371,7 @@ fn stream_session_against_fake_host() {
     let error = session.last_error();
     drop(session);
 
+    #[allow(clippy::type_complexity)]
     let col = |f: fn(&(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64)) -> Option<f64>| {
         windows.iter().filter_map(f).collect::<Vec<f64>>()
     };
