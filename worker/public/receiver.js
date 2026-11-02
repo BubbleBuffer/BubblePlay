@@ -31,6 +31,7 @@ import { touchPc } from "/devicekey-store.js";
 import { pcListUrl, registerProof, relayOrigin, viewerHello } from "/dk-relay.js";
 import { b64u } from "/dk-crypto.js";
 import { createViewerSession } from "/dk-session.js";
+import { createLogUploader } from "/dk-upload.js";
 import { createFileDragPreviewController, filesFromPaste, installFileTransferUi, mapFileDropPoint } from "/file-ui.js";
 
 const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
@@ -734,6 +735,8 @@ let sessionPc = null;
 let sessionPinnedPublic = null;
 let sessionGate = null;
 let sessionTouched = false;
+// Clock time of the last input send; the log uploader stays quiet for 250 ms after it.
+let lastInputSentMs = -Infinity;
 let authenticatedSession = null;
 let pendingRtcTracks = [];
 let signalingGeneration = 0;
@@ -752,8 +755,8 @@ let closingPeer = false;
 let cursorReconciler = null;
 const latchedModifiers = new Set();
 const input = new InputController({
-  sendControl: data => sendInput(data, dc),
-  sendMotion: data => sendInput(data, motionDc),
+  sendControl: data => { lastInputSentMs = Date.now(); return sendInput(data, dc); },
+  sendMotion: data => { lastInputSentMs = Date.now(); return sendInput(data, motionDc); },
   motionBuffered: () => motionDc?.bufferedAmount || (usingWssMedia ? ws?.bufferedAmount || 0 : 0),
   controlState: inputControlState,
 });
@@ -1028,17 +1031,29 @@ async function handleSignal(socket, generation, ev) {
       // File transfer hook (2/5): file sockets pair on the epoch.
       noteFileEpoch(mediaEpoch);
       const current = () => ws === socket && generation === signalingGeneration;
+      let logUploader = null;
       const session = createViewerSession({ identity: sessionIdentity, pcId: sessionPc, pinnedPublic: sessionPinnedPublic,
         relayOrigin: relayOrigin(location.href), epoch: msg.mediaEpoch, transport: wssSelected ? "wss" : "webrtc",
         send: message => current() && sendRelay(message),
         onAuthenticated: () => {
           if (!current()) return;
           viewerLog("info", "signaling-authenticated");
+          // Logs and saved reports go to the PC when it offers client-logs-v1. Never blocks the session.
+          try {
+            if (session.logsNegotiated && globalThis.BPLog && !logUploader) {
+              logUploader = createLogUploader({ log: globalThis.BPLog, pc: sessionPc,
+                send: message => current() && session.sendControl(message),
+                bufferedAmount: () => ws?.bufferedAmount || 0, lastInputAt: () => lastInputSentMs,
+                isActive: () => current() && authenticatedSession === session && ws?.readyState === WebSocket.OPEN });
+              logUploader.start();
+            }
+          } catch (error) { try { globalThis.BPLog?.warn("receiver", "log upload did not start", { cause: String(error?.message ?? error).slice(0, 160) }); } catch {} }
           sendStreamMode("signaling-start");
           if (wssSelected) requestWssMediaStart();
           else startPeer(peerGeneration);
         },
         onMessage: message => { if (current()) return handleEndpointSignal(socket, generation, message); },
+        onLogMessage: message => { if (current()) logUploader?.handle(message); },
         onBinary: (kind, bytes) => { if (current() && kind === "cursor") handleCursorState(bytes, "signaling"); },
         onMediaReady: () => { if (current()) openAuthenticatedMedia(); },
         onFailure: (refusal, reason) => { if (current()) { viewerLog("warn", "session-refused", { reason: String(reason || "unknown").slice(0, 80), title: refusal?.title }); endAuthenticatedSession(refusal); } },
