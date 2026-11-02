@@ -64,7 +64,7 @@ test("media sockets: presence, v4 frames, acks, keyframes and pings flow both wa
   }
 });
 
-test("a media socket with a ticket the relay did not issue is closed 1008 with an empty reason", { timeout: CASE_TIMEOUT_MS }, async () => {
+test("a media socket with a ticket the relay did not issue is closed 1008 with the reason not authorized", { timeout: CASE_TIMEOUT_MS }, async () => {
   const host = await openHost(relay, PC, [VIEWER.id]);
   const viewer = await admitViewer(relay, VIEWER, PC.id);
   const forged = await openDataSocket(relay, "/media-ws", PC.id, viewer.hello.mediaEpoch,
@@ -72,7 +72,7 @@ test("a media socket with a ticket the relay did not issue is closed 1008 with a
   try {
     const close = await forged.box.done;
     assert.equal(close.code, 1008);
-    assert.equal(close.reason, "");
+    assert.equal(close.reason, "not authorized");
     assert.equal(forged.box.items.some(message => message.type === "hello-ok"), false);
   } finally {
     await closeSocket(forged.socket);
