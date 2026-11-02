@@ -43,12 +43,33 @@ Future<void> _ctrlShiftF(WidgetTester tester, {bool settle = true}) async {
   }
 }
 
+/// True once a report JSON is in the outbox (the PNG is written before it).
+bool _stored() =>
+    Directory('${_root.path}/outbox').existsSync() &&
+    Directory('${_root.path}/outbox').listSync().any((e) => e.path.endsWith('.json'));
+
+bool _saveFailed() =>
+    find.text('The report could not be saved on this device.').evaluate().isNotEmpty;
+
 /// Lets real file work finish: the outbox writes with dart:io, whose steps each continue in the
 /// test's fake-async zone, so real time and pumps alternate.
-Future<void> _io(WidgetTester tester) async {
-  for (var i = 0; i < 12; i++) {
+/// With [until], it polls (up to about 15 s) for that condition instead of guessing a time, so a
+/// loaded machine only makes the test slower, never flaky.
+Future<void> _io(WidgetTester tester, {bool Function()? until}) async {
+  final rounds = until == null ? 12 : 500;
+  for (var i = 0; i < rounds; i++) {
     await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 30)));
     await tester.pump();
+    if (until != null && until()) break;
+  }
+  if (until != null) expect(until(), isTrue, reason: 'timed out waiting for file work');
+  if (until != null) {
+    // The sheet pops (and the toast appears) only after the store call finishes.
+    for (var i = 0; i < 500; i++) {
+      if (find.text('Report a problem').evaluate().isEmpty || _saveFailed()) break;
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 30)));
+      await tester.pump(const Duration(milliseconds: 50));
+    }
   }
   await tester.pump(const Duration(milliseconds: 600));
   await tester.pump();
@@ -99,7 +120,7 @@ void main() {
     );
     await tester.pump();
     await tester.tap(find.byKey(const ValueKey('feedback-send')));
-    await _io(tester);
+    await _io(tester, until: _stored);
     final items = await _pending(tester);
     expect(items.length, 1);
     final report = items.single.report;
@@ -131,7 +152,7 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('option-Idea')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey('feedback-send')));
-    await _io(tester);
+    await _io(tester, until: _stored);
     expect((await _pending(tester)).single.report['kind'], 'idea');
     await tester.pump(const Duration(seconds: 10));
     await tester.pumpAndSettle();
@@ -164,7 +185,7 @@ void main() {
     await _ctrlShiftF(tester);
     expect(find.byKey(const ValueKey('feedback-screenshot')), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('feedback-send')));
-    await _io(tester);
+    await _io(tester, until: _stored);
     var item = (await _pending(tester)).single;
     expect(item.png, isNotNull);
     expect(item.report['screenshot'], item.png!.uri.pathSegments.last);
@@ -178,7 +199,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('feedback-screenshot')), findsNothing);
     await tester.tap(find.byKey(const ValueKey('feedback-send')));
-    await _io(tester);
+    await _io(tester, until: _stored);
     item = (await _pending(tester)).single;
     expect(item.png, isNull);
     expect(item.report['screenshot'], isNull);
@@ -193,7 +214,7 @@ void main() {
     expect(_captures, 0);
     expect(find.byKey(const ValueKey('feedback-screenshot')), findsNothing);
     await tester.tap(find.byKey(const ValueKey('feedback-send')));
-    await _io(tester);
+    await _io(tester, until: _stored);
     final report = (await _pending(tester)).single.report;
     expect(report['route'], 'session');
     expect(report['pc'], isNotNull);
@@ -215,7 +236,7 @@ void main() {
     await _ctrlShiftF(tester);
     await tester.enterText(find.byKey(const ValueKey('feedback-text')), 'keep me');
     await tester.tap(find.byKey(const ValueKey('feedback-send')));
-    await _io(tester);
+    await _io(tester, until: _saveFailed);
     expect(find.text('The report could not be saved on this device.'), findsOneWidget);
     expect(find.text('keep me'), findsOneWidget);
   });
