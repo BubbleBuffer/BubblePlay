@@ -9,11 +9,11 @@ use serde_json::{Map, Value, json};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
-use super::Relay;
 use super::pcs::{MAX_PCS, PcRecord};
 use super::state::{Conn, Kind, Phase, Role, Ticket, key_for};
 use super::types::{Action, ConnId};
 use super::util;
+use super::{Relay, reasons};
 use crate::RelayRng;
 
 impl Relay {
@@ -31,13 +31,13 @@ impl Relay {
             return;
         };
         let Some(m) = util::parse_object(text) else {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "hello.malformed", out);
             return;
         };
         let role_text = util::text_of(&m, "role");
         let known_role = conn.role.hello_roles().contains(&role_text);
         if util::text_of(&m, "type") != "hello" || !known_role {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "hello.bad-role", out);
             return;
         }
         match conn.role {
@@ -73,15 +73,15 @@ impl Relay {
             return;
         };
         let Some(m) = util::parse_object(text) else {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "proof.malformed", out);
             return;
         };
         if util::text_of(&m, "type") != "register-proof" {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "proof.malformed", out);
             return;
         }
         let Some(signature) = util::decode_b64url(util::text_of(&m, "signature"), 64) else {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "proof.malformed", out);
             return;
         };
         let origin = self.config.public_origin.clone();
@@ -95,8 +95,12 @@ impl Relay {
             &signature,
         )
         .is_ok();
-        if !proof_ok || !self.can_register(&conn.pc, &public, token_valid) {
-            self.hello_refused(id, out);
+        if !proof_ok {
+            self.hello_refused(id, "proof.bad-signature", out);
+            return;
+        }
+        if !self.can_register(&conn.pc, &public, token_valid) {
+            self.hello_refused(id, "proof.cannot-register", out);
             return;
         }
         self.register_host(id, &conn.pc, public, now_ms, rng, out);
@@ -127,17 +131,17 @@ impl Relay {
             return;
         };
         let Some(m) = util::parse_object(text) else {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "proof.malformed", out);
             return;
         };
         if m.keys().any(|key| key != "type" && key != "signature")
             || util::text_of(&m, "type") != "register-proof"
         {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "proof.malformed", out);
             return;
         }
         let Some(signature) = util::decode_b64url(util::text_of(&m, "signature"), 64) else {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "proof.malformed", out);
             return;
         };
         let origin = self.config.public_origin.clone();
@@ -152,7 +156,7 @@ impl Relay {
         )
         .is_ok();
         if !proof_ok {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "proof.bad-signature", out);
             return;
         }
         let admitted = self
@@ -165,29 +169,31 @@ impl Relay {
         } else if let Some(pair) = pair {
             self.pair_attempt(id, device, pair, turn, now_ms, rng, out);
         } else {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "viewer.not-admitted", out);
         }
     }
 
-    /// Refuses a hello, a proof or any pre-auth failure. A viewer's refusal has
-    /// an empty reason (M2 section 1); a host keeps Go's "invalid hello".
-    pub(super) fn hello_refused(&mut self, id: ConnId, out: &mut Vec<Action>) {
-        let reason = match self.conns.get(&id).map(|c| c.role) {
-            Some(Role::Viewer) => "",
-            _ => "invalid hello",
+    /// Refuses a hello, a proof or any pre-auth failure, closing 1008. `class` is
+    /// the log class and picks the reason a viewer is told (see `viewer_reason`).
+    /// Hosts and the version probe keep Go's "invalid hello".
+    pub(super) fn hello_refused(&mut self, id: ConnId, class: &'static str, out: &mut Vec<Action>) {
+        let reason = match (self.conns.get(&id).map(|c| c.role), class) {
+            (Some(Role::Viewer), _) => viewer_reason(class),
+            (_, "timeout.hello") => reasons::TIMED_OUT,
+            _ => reasons::INVALID_HELLO,
         };
-        self.close(id, 1008, reason, out);
+        self.close(id, 1008, reason, class, out);
     }
 
     /// Refuses a data-socket hello whose ticket or epoch does not check out.
-    /// Those are auth failures, so the reason is empty (D8). Signalling sockets
-    /// keep Go's "invalid hello".
-    fn auth_refused(&mut self, id: ConnId, out: &mut Vec<Action>) {
+    /// Media and file sockets are told "not authorized"; signalling sockets keep
+    /// Go's "invalid hello".
+    fn auth_refused(&mut self, id: ConnId, class: &'static str, out: &mut Vec<Action>) {
         let reason = match self.conns.get(&id).map(|c| c.role.kind()) {
-            Some(Kind::Media | Kind::File) => "",
-            _ => "invalid hello",
+            Some(Kind::Media | Kind::File) => reasons::NOT_AUTHORIZED,
+            _ => reasons::INVALID_HELLO,
         };
-        self.close(id, 1008, reason, out);
+        self.close(id, 1008, reason, class, out);
     }
 
     fn token_matches(&self, supplied: &str) -> bool {
@@ -209,11 +215,11 @@ impl Relay {
     /// `/host-version-ws`: TOKEN-gated. Answers hello-ok, then closes 1000.
     fn version_probe(&mut self, id: ConnId, m: &Map<String, Value>, out: &mut Vec<Action>) {
         if !self.token_matches(util::text_of(m, "token")) {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "hello.bad-token", out);
             return;
         }
         self.send_text(id, json!({"type": "hello-ok"}).to_string(), out);
-        self.close(id, 1000, "version-probe-complete", out);
+        self.close(id, 1000, "version-probe-complete", "probe.complete", out);
     }
 
     /// The host's signalling hello: checks the identity, then sends the
@@ -230,7 +236,7 @@ impl Relay {
             return;
         };
         let Ok(claimed) = DeviceId::parse(util::text_of(m, "id")) else {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "hello.bad-identity", out);
             return;
         };
         let public = match util::decode_b64url(util::text_of(m, "public"), 32) {
@@ -240,23 +246,23 @@ impl Relay {
                 key
             }
             None => {
-                self.hello_refused(id, out);
+                self.hello_refused(id, "hello.bad-identity", out);
                 return;
             }
         };
         if claimed.to_string() != pc || DeviceId::from_public_key(&public) != claimed {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "hello.bad-identity", out);
             return;
         }
         // A supplied token must match TOKEN, even for a known PC.
         let token = util::text_of(m, "token");
         let token_valid = !token.is_empty() && self.token_matches(token);
         if !token.is_empty() && !token_valid {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "hello.bad-token", out);
             return;
         }
         if !self.can_register(&pc, &public, token_valid) {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "hello.cannot-register", out);
             return;
         }
         let nonce: [u8; 32] = util::random(rng);
@@ -316,7 +322,7 @@ impl Relay {
 
         let key = key_for(Role::Host, "", pc);
         if let Some(old) = self.peers.get(&key).copied().filter(|old| *old != id) {
-            self.evict(old, 1008, "peer replaced", out);
+            self.evict(old, 1008, "peer replaced", "peer.replaced", out);
             if let Some(viewer) = self.peers.get(&key_for(Role::Viewer, "", pc)).copied() {
                 self.send_text(viewer, json!({"type": "peer-left"}).to_string(), out);
             }
@@ -349,7 +355,7 @@ impl Relay {
         out: &mut Vec<Action>,
     ) {
         let Some(hello) = parse_viewer_hello(m) else {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "hello.bad-identity", out);
             return;
         };
         let nonce: [u8; 32] = util::random(rng);
@@ -393,7 +399,7 @@ impl Relay {
         };
         let key = key_for(Role::Viewer, "", &pc);
         if let Some(old) = self.peers.get(&key).copied().filter(|old| *old != id) {
-            self.evict(old, 1008, "peer replaced", out);
+            self.evict(old, 1008, "peer replaced", "peer.replaced", out);
         }
         let epoch: [u8; 16] = util::random(rng);
         let epoch = util::hex(&epoch);
@@ -408,7 +414,7 @@ impl Relay {
             .map(|(_, id)| *id)
             .collect();
         for old in stale {
-            self.evict(old, 1001, "stale epoch", out);
+            self.evict(old, 1001, "stale epoch", "epoch.rotated", out);
         }
 
         if let Some(conn) = self.conns.get_mut(&id) {
@@ -469,21 +475,21 @@ impl Relay {
         let Some(issuer_epoch) =
             self.valid_ticket(issuer_role, &conn.pc, util::text_of(m, "ticket"), now_ms)
         else {
-            self.auth_refused(id, out);
+            self.auth_refused(id, "ticket.invalid", out);
             return;
         };
         // A viewer ticket is bound to the epoch its issuer holds now.
         if issuer_role == Role::Viewer && issuer_epoch != conn.epoch {
-            self.auth_refused(id, out);
+            self.auth_refused(id, "ticket.epoch-mismatch", out);
             return;
         }
         if self.current_epoch(&conn.pc) != Some(conn.epoch.as_str()) {
-            self.auth_refused(id, out);
+            self.auth_refused(id, "epoch.stale", out);
             return;
         }
         let key = key_for(conn.role, &conn.epoch, &conn.pc);
         if let Some(old) = self.peers.get(&key).copied().filter(|old| *old != id) {
-            self.evict(old, 1008, "peer replaced", out);
+            self.evict(old, 1008, "peer replaced", "peer.replaced", out);
         }
         self.peers.insert(key, id);
         self.make_live(id, now_ms);
@@ -632,4 +638,17 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&Sha256::digest(bytes));
     out
+}
+
+/// The reason a viewer is told for a refusal of this class. Classes that say
+/// nothing the viewer could not already know get the generic "invalid hello".
+fn viewer_reason(class: &str) -> &'static str {
+    match class {
+        "pairing.wrong-code" | "pairing.no-window" => reasons::PAIRING_CODE,
+        "pairing.rate-limited" | "pairing.tracking-full" => reasons::RATE_LIMITED,
+        "viewer.not-admitted" => reasons::NOT_PAIRED,
+        "proof.bad-signature" => reasons::INVALID_PROOF,
+        "timeout.hello" | "timeout.proof" => reasons::TIMED_OUT,
+        _ => reasons::INVALID_HELLO,
+    }
 }

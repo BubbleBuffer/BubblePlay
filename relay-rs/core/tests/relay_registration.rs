@@ -162,7 +162,10 @@ fn hello_times_out_after_ten_seconds() {
     let a = identity(1);
     let id = h.upgrade(req(Route::HostWs, Some(&a.id().to_string()), None, false));
     assert!(h.advance(9_999).is_empty());
-    assert_eq!(closed(&h.advance(1), id), Some((1008, String::new())));
+    assert_eq!(
+        closed(&h.advance(1), id),
+        Some((1008, "timed out".to_owned()))
+    );
 }
 
 #[test]
