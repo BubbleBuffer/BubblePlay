@@ -93,10 +93,13 @@ fn states() -> BTreeMap<&'static str, AppState> {
         },
     );
     put("home", base());
-    put("home_empty", AppState {
-        this_device: base().this_device,
-        ..AppState::default()
-    });
+    put(
+        "home_empty",
+        AppState {
+            this_device: base().this_device,
+            ..AppState::default()
+        },
+    );
     let mut problems = base();
     problems.pcs = vec![
         RemotePc {
@@ -233,7 +236,10 @@ fn states() -> BTreeMap<&'static str, AppState> {
             error: Some("Remote pairing is not available in this version.".into()),
         }),
     );
-    put("pair_waiting", with_flow(pair_confirm(false, Outcome::Waiting)));
+    put(
+        "pair_waiting",
+        with_flow(pair_confirm(false, Outcome::Waiting)),
+    );
     put(
         "pair_approved_pc",
         with_flow(pair_confirm(false, Outcome::Approved { by: Answerer::Pc })),
@@ -251,8 +257,14 @@ fn states() -> BTreeMap<&'static str, AppState> {
         "pair_denied",
         with_flow(pair_confirm(false, Outcome::Denied { by: Answerer::Pc })),
     );
-    put("pair_timed_out", with_flow(pair_confirm(false, Outcome::TimedOut)));
-    put("pair_cancelled", with_flow(pair_confirm(false, Outcome::Cancelled)));
+    put(
+        "pair_timed_out",
+        with_flow(pair_confirm(false, Outcome::TimedOut)),
+    );
+    put(
+        "pair_cancelled",
+        with_flow(pair_confirm(false, Outcome::Cancelled)),
+    );
     put(
         "approval",
         with_flow(Flow::Approval {
@@ -270,7 +282,10 @@ fn states() -> BTreeMap<&'static str, AppState> {
         }),
     );
     let errors = [
-        ("failed_no_first_frame", ConnError::NoFirstFrame { secs: 15 }),
+        (
+            "failed_no_first_frame",
+            ConnError::NoFirstFrame { secs: 15 },
+        ),
         ("failed_relay", ConnError::RelayUnreachable),
         ("failed_busy", ConnError::PcBusy),
         ("failed_lost", ConnError::Lost { attempts: 5 }),
@@ -444,12 +459,7 @@ fn actions() -> BTreeMap<&'static str, Action> {
             allow: false,
         },
     );
-    put(
-        "revoke",
-        Action::Revoke {
-            device_id: id(),
-        },
-    );
+    put("revoke", Action::Revoke { device_id: id() });
     put(
         "set_may_vouch",
         Action::SetMayVouch {

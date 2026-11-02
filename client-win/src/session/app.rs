@@ -118,7 +118,7 @@ impl ShellApp for DevApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Monitor, PcKind};
+    use crate::model::PcKind;
     use crate::net::MonitorEntry;
     use std::sync::Mutex;
 

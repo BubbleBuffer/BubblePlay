@@ -92,7 +92,11 @@ impl PixelReader {
             MiscFlags: 0,
         };
         let mut staging = None;
-        unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)).unwrap() };
+        unsafe {
+            device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .unwrap()
+        };
         Self {
             ctx: unsafe { device.GetImmediateContext().unwrap() },
             staging: staging.unwrap(),
@@ -150,7 +154,12 @@ fn handoff_pass(reopen: bool, frames: usize) {
     for n in 0..frames + warmup {
         // Every frame a different colour, so a stale or half-visible frame is detected.
         let c = (n % 251) as u8;
-        let color = [c as f32 / 255.0, (255 - c) as f32 / 255.0, c as f32 / 255.0, 1.0];
+        let color = [
+            c as f32 / 255.0,
+            (255 - c) as f32 / 255.0,
+            c as f32 / 255.0,
+            1.0,
+        ];
         let expected = [c, 255 - c, c, 255]; // BGRA
 
         let t0 = Instant::now();
@@ -189,7 +198,10 @@ fn handoff_pass(reopen: bool, frames: usize) {
     report("copy first pixel + Map (waits for GPU)", &read);
     report("total: before draw -> first pixel read", &total);
     println!("  pixel mismatches: {mismatches} of {frames}");
-    assert_eq!(mismatches, 0, "a frame was not visible on the second device");
+    assert_eq!(
+        mismatches, 0,
+        "a frame was not visible on the second device"
+    );
 }
 
 #[test]
@@ -362,16 +374,25 @@ fn stream_session_against_fake_host() {
     let col = |f: fn(&(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64)) -> Option<f64>| {
         windows.iter().filter_map(f).collect::<Vec<f64>>()
     };
-    println!("StreamSession vs fake host (h264 1080p60 recording), {:?} measured:", measure);
+    println!(
+        "StreamSession vs fake host (h264 1080p60 recording), {:?} measured:",
+        measure
+    );
     println!("  {last}");
     println!("  session error: {error:?}");
-    println!("  per-second windows of StatsSnapshot ({} windows):", windows.len());
+    println!(
+        "  per-second windows of StatsSnapshot ({} windows):",
+        windows.len()
+    );
     report("decode->present p50 of each window", &col(|w| w.0));
     report("decode->present p95 of each window", &col(|w| w.1));
     report("receive->decode p50 of each window", &col(|w| w.2));
     report("receive->decode p95 of each window", &col(|w| w.3));
     report("presented fps of each window (not ms)", &col(|w| Some(w.4)));
-    println!("  frames published: {}, skipped by the poller: {skipped}", seen);
+    println!(
+        "  frames published: {}, skipped by the poller: {skipped}",
+        seen
+    );
     report("published-frame interval", &intervals);
     report("published -> first pixel read, 2nd device", &since_publish);
     report("  of which open handle + read (after detect)", &open_read);

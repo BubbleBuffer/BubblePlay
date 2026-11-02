@@ -86,7 +86,6 @@ fn monitor_view(entry: &MonitorEntry) -> Monitor {
     }
 }
 
-
 /// Applies one session action: leave, mode and display. Quality and stream sound have no live
 /// path yet. Returns true when the caller should tell the UI something changed.
 pub fn act(handles: &SessionHandles, stop: &AtomicBool, action: Action) -> bool {

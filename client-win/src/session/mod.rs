@@ -14,9 +14,9 @@ mod relay_e2e_tests;
 mod relay_pc;
 
 pub use crate::audio::AudioHandle as SessionAudioControl;
-pub use options::DevOptions;
 pub(crate) use crate::stream::{decode, live_input};
 pub use crate::stream::{SessionInputState, SessionStats};
+pub use options::DevOptions;
 
 use std::{
     collections::BTreeMap,
