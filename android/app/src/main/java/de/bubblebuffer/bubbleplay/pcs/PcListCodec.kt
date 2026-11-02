@@ -1,5 +1,6 @@
 package de.bubblebuffer.bubbleplay.pcs
 
+import de.bubblebuffer.bubbleplay.log.BpLog
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -36,6 +37,7 @@ object PcListCodec {
         val root = try {
             JSONObject(text)
         } catch (e: JSONException) {
+            BpLog.w("PcListCodec", "the stored PC list is not valid JSON and is treated as empty", null, emptyMap(), e)
             return emptyList()
         }
         val array = root.optJSONArray(KEY_PCS) ?: return emptyList()

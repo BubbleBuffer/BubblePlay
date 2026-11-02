@@ -15,6 +15,7 @@ import de.bubblebuffer.bubbleplay.auth.ViewerAuth
 import de.bubblebuffer.bubbleplay.auth.ViewerHello
 import de.bubblebuffer.bubbleplay.keys.DeviceKey
 import de.bubblebuffer.bubbleplay.keys.DeviceKeyException
+import de.bubblebuffer.bubbleplay.log.BpLog
 import de.bubblebuffer.bubbleplay.pcs.PcEntry
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -124,12 +125,13 @@ class PairingClient(
                 ownsScheduler = true
             }
             state = State.Opening
+            BpLog.i(TAG, "pairing started", link.pcId, mapOf("relay" to link.relay))
             emit { onStage(PairingStage.Connecting) }
             // A synchronous injected callback may have cancelled the attempt.
             if (state == State.Done) return
             val base = ServerConfig.parseServer(link.relay)
             if (base == null || PairLink.parse(link.toUri()) != link) {
-                fail(PairingFailure.Refused)
+                fail(PairingFailure.Refused, "the relay address or the pairing link is not valid")
                 return
             }
             val request = Request.Builder().url(ServerConfig(base, link.pcId).signalingUrl()).build()
@@ -146,6 +148,7 @@ class PairingClient(
     /** Ends the attempt; no listener call follows. */
     fun cancel() {
         synchronized(lock) {
+            if (state != State.Done) BpLog.i(TAG, "pairing cancelled by the user", link.pcId, mapOf("state" to state.name))
             cancelled = true
             stop(abort = true)
         }
@@ -157,10 +160,11 @@ class PairingClient(
                 if (state != State.Opening) return
                 socket = webSocket
                 state = State.Challenge
+                BpLog.i(TAG, "relay socket open", link.pcId)
                 try {
                     send(ViewerHello.hello(key, PairAdmit.hash(link.pcId, link.code)))
-                } catch (_: IllegalArgumentException) {
-                    fail(PairingFailure.Refused)
+                } catch (e: IllegalArgumentException) {
+                    fail(PairingFailure.Refused, "the relay hello could not be built", e)
                 }
             }
         }
@@ -170,17 +174,19 @@ class PairingClient(
                 if (state == State.Done || state == State.New) return
                 try {
                     receive(text)
-                } catch (_: AuthJson.Malformed) {
-                    fail(if (admitted) PairingFailure.ConnectionLost else PairingFailure.Refused)
-                } catch (_: DeviceKeyException) {
-                    fail(PairingFailure.ConnectionLost)
+                } catch (e: AuthJson.Malformed) {
+                    fail(if (admitted) PairingFailure.ConnectionLost else PairingFailure.Refused, "malformed message (${e.message}) in state ${state.name}")
+                } catch (e: DeviceKeyException) {
+                    fail(PairingFailure.ConnectionLost, "device key refused in state ${state.name}", e, mapOf("refusal" to e.reason.name))
                 }
             }
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
             synchronized(lock) {
-                if (state != State.Done) fail(if (admitted) PairingFailure.ConnectionLost else PairingFailure.Refused)
+                if (state != State.Done) {
+                    fail(if (admitted) PairingFailure.ConnectionLost else PairingFailure.Refused, "unexpected binary frame")
+                }
             }
         }
 
@@ -188,22 +194,27 @@ class PairingClient(
             synchronized(lock) {
                 if (state == State.Done) return
                 webSocket.close(code, "")
-                fail(closeFailure(code))
+                fail(closeFailure(code), "socket closing", null, closeFields(code, reason))
             }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             synchronized(lock) {
-                if (state != State.Done) fail(closeFailure(code))
+                if (state != State.Done) fail(closeFailure(code), "socket closed", null, closeFields(code, reason))
             }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             synchronized(lock) {
-                if (state != State.Done) fail(PairingFailure.ConnectionLost)
+                if (state != State.Done) {
+                    fail(PairingFailure.ConnectionLost, "socket failure", t, mapOf("http" to response?.code))
+                }
             }
         }
     }
+
+    private fun closeFields(code: Int, reason: String): Map<String, Any?> =
+        mapOf("wsClose" to code, "closeReason" to reason.take(120))
 
     private fun receive(text: String) {
         val type = AuthJson.string(AuthJson.parseObject(text), "type")
@@ -211,15 +222,17 @@ class PairingClient(
             State.Challenge -> {
                 val nonce = ViewerHello.parseRegisterChallenge(text)
                 state = State.Admission
+                BpLog.i(TAG, "relay challenge answered", link.pcId)
                 send(ViewerHello.registerProof(key, link.relay, nonce))
             }
             State.Admission -> {
                 val hello = ViewerHello.parseHelloOk(text, link.pcId)
                 if (!hello.pairing) {
-                    fail(PairingFailure.Refused)
+                    fail(PairingFailure.Refused, "the relay admitted this device but not in pairing mode")
                     return
                 }
                 admitted = true
+                BpLog.i(TAG, "admitted by the relay in pairing mode", link.pcId)
                 // Relay idle expiry is 90 s; the owner may use the full five-minute decision window.
                 heartbeat = scheduler!!.scheduleWithFixedDelay({
                     synchronized(lock) {
@@ -237,8 +250,8 @@ class PairingClient(
             }
             State.AuthHost, State.PcProof, State.Decision -> when (type) {
                 "pong", "peer-joined" -> Unit // Relay bookkeeping never advances the handshake.
-                "peer-left", "error" -> fail(PairingFailure.ConnectionLost)
-                "pair-closed" -> fail(PairingFailure.Refused)
+                "peer-left", "error" -> fail(PairingFailure.ConnectionLost, "the relay sent $type in state ${state.name}")
+                "pair-closed" -> fail(PairingFailure.Refused, "the relay sent pair-closed (pairing window closed or used)")
                 else -> {
                     val waitingForHost = state == State.AuthHost
                     val step = auth!!.onMessage(text)
@@ -249,7 +262,7 @@ class PairingClient(
                     apply(step)
                 }
             }
-            else -> fail(PairingFailure.ConnectionLost)
+            else -> fail(PairingFailure.ConnectionLost, "message in unexpected state ${state.name}")
         }
     }
 
@@ -260,41 +273,56 @@ class PairingClient(
             is AuthEvent.PairNumber -> {
                 state = State.Decision
                 armTimeout(PC_DECISION_TIMEOUT_MS)
+                BpLog.i(TAG, "comparison number shown, waiting for the PC owner", link.pcId)
                 emit { onStage(PairingStage.WaitingForPc) }
                 emit { onNumber(event.display) }
             }
             is AuthEvent.Paired -> {
                 val pc = PcEntry(event.pcId, AuthCrypto.b64(event.pcPublic), link.relay, name, now())
+                BpLog.i(TAG, "pairing complete, handing the PC to the caller", link.pcId)
                 stop()
                 emit { onPaired(pc) }
             }
             AuthEvent.Denied -> {
+                BpLog.i(TAG, "pairing denied by the PC owner", link.pcId)
                 stop()
                 emit { onDenied() }
             }
-            is AuthEvent.Failed -> fail(when (event.reason) {
-                AuthFailure.PAIR_MAC_MISMATCH -> PairingFailure.ProofMismatch
-                AuthFailure.ID_MISMATCH, AuthFailure.WRONG_PC, AuthFailure.PC_KEY_CHANGED,
-                AuthFailure.BAD_SIGNATURE, AuthFailure.KEY_AGREEMENT -> PairingFailure.PcKeyInvalid
-                AuthFailure.MALFORMED -> if (state == State.AuthHost) PairingFailure.PcKeyInvalid else PairingFailure.ConnectionLost
-                AuthFailure.UNEXPECTED_MESSAGE -> PairingFailure.ConnectionLost
-            })
-            is AuthEvent.Authenticated -> fail(PairingFailure.ConnectionLost)
+            is AuthEvent.Failed -> fail(authFailure(event.reason), "authentication failed: ${event.reason.name}")
+            is AuthEvent.Authenticated -> fail(PairingFailure.ConnectionLost, "unexpected normal-mode authentication")
         }
+    }
+
+    private fun authFailure(reason: AuthFailure): PairingFailure = when (reason) {
+        AuthFailure.PAIR_MAC_MISMATCH -> PairingFailure.ProofMismatch
+        AuthFailure.ID_MISMATCH, AuthFailure.WRONG_PC, AuthFailure.PC_KEY_CHANGED,
+        AuthFailure.BAD_SIGNATURE, AuthFailure.KEY_AGREEMENT -> PairingFailure.PcKeyInvalid
+        AuthFailure.MALFORMED -> if (state == State.AuthHost) PairingFailure.PcKeyInvalid else PairingFailure.ConnectionLost
+        AuthFailure.UNEXPECTED_MESSAGE -> PairingFailure.ConnectionLost
     }
 
     private fun send(text: String): Boolean {
         if (state == State.Done) return false
         if (socket?.send(text) == true) return true
-        fail(PairingFailure.ConnectionLost)
+        fail(PairingFailure.ConnectionLost, "sending to the relay failed in state ${state.name}")
         return false
     }
 
     private fun closeFailure(code: Int): PairingFailure =
         if (!admitted || code == 1008) PairingFailure.Refused else PairingFailure.ConnectionLost
 
-    private fun fail(reason: PairingFailure) {
+    private fun fail(
+        reason: PairingFailure,
+        why: String,
+        error: Throwable? = null,
+        extra: Map<String, Any?> = emptyMap(),
+    ) {
         if (state == State.Done) return
+        val fields = linkedMapOf<String, Any?>(
+            "failure" to reason.name, "state" to state.name, "admitted" to admitted, "why" to why,
+        )
+        fields.putAll(extra)
+        BpLog.w(TAG, "pairing failed", link.pcId, fields, error)
         stop(abort = true)
         emit { onFailed(reason) }
     }
@@ -304,7 +332,7 @@ class PairingClient(
         val generation = ++timeoutGeneration
         timeout = scheduler!!.schedule({
             synchronized(lock) {
-                if (state != State.Done && generation == timeoutGeneration) fail(PairingFailure.Timeout)
+                if (state != State.Done && generation == timeoutGeneration) fail(PairingFailure.Timeout, "no answer in state ${state.name} within $delayMs ms")
             }
         }, delayMs, TimeUnit.MILLISECONDS)
     }
@@ -337,6 +365,7 @@ class PairingClient(
     }
 
     companion object {
+        private const val TAG = "PairingClient"
         private const val RELAY_TIMEOUT_MS = 30_000L
         internal const val PC_DECISION_TIMEOUT_MS = 300_000L
     }

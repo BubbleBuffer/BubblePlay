@@ -131,7 +131,7 @@ class Handshake private constructor(
                 signature = AuthCrypto.unb64(AuthJson.string(m, "signature"), 64),
             )
         } catch (e: AuthJson.Malformed) {
-            throw AuthException(AuthFailure.MALFORMED, "auth-host: ${e.message}")
+            throw AuthException(AuthFailure.MALFORMED, "auth-host invalid (${e.message})")
         }
         if (!DeviceId.isCanonical(host.id)) throw AuthException(AuthFailure.MALFORMED, "auth-host ID is not canonical")
         if (DeviceId.fromPublicKey(host.public) != host.id) {
