@@ -1,0 +1,60 @@
+{
+  "contract": "client-log-upload",
+  "version": 1,
+  "capability": "client-logs-v1",
+  "limits": {
+    "maxBatchBytes": 16384,
+    "maxBatchLines": 100,
+    "connectionBudgetBytes": 8388608,
+    "minBatchIntervalMs": 500,
+    "maxFeedbackPngBytes": 5242880,
+    "maxFeedbackChunkBytes": 32768
+  },
+  "messages": [
+    {
+      "name": "logs-state",
+      "direction": "host-to-client",
+      "json": {"type":"logs-state","v":1,"cursors":{"app-android-core":"2026-11-02T13:45:12.345Z#000042"},"limits":{"maxBatchBytes":16384,"maxBatchLines":100,"connectionBudgetBytes":8388608,"minBatchIntervalMs":500}}
+    },
+    {
+      "name": "logs-batch",
+      "direction": "client-to-host",
+      "json": {"type":"logs-batch","v":1,"stream":"app-android-core","id":17,"from":"2026-11-02T13:45:12.345Z#000042","to":"2026-11-02T13:45:13.001Z#000044","live":false,"lines":["{\"ts\":\"2026-11-02T13:45:12.900Z\",\"level\":\"info\",\"src\":\"app-android-core\",\"device\":null,\"pc\":\"pc-1\",\"session\":null,\"target\":\"Pairing\",\"msg\":\"paired\",\"fields\":{}}","{\"ts\":\"2026-11-02T13:45:13.001Z\",\"level\":\"warn\",\"src\":\"app-android-core\",\"device\":null,\"pc\":\"pc-1\",\"session\":null,\"target\":\"Session\",\"msg\":\"session ended\",\"fields\":{\"reason\":\"peer closed\"}}"]}
+    },
+    {
+      "name": "logs-ack-ok",
+      "direction": "host-to-client",
+      "json": {"type":"logs-ack","v":1,"stream":"app-android-core","id":17,"status":"ok","cursor":"2026-11-02T13:45:13.001Z#000044","dropped":0,"retryAfterMs":0}
+    },
+    {
+      "name": "logs-ack-rate-limited",
+      "direction": "host-to-client",
+      "json": {"type":"logs-ack","v":1,"stream":"app-android-core","id":18,"status":"rate-limited","cursor":"2026-11-02T13:45:13.001Z#000044","dropped":0,"retryAfterMs":2000}
+    },
+    {
+      "name": "logs-ack-budget",
+      "direction": "host-to-client",
+      "json": {"type":"logs-ack","v":1,"stream":"app-android-core","id":19,"status":"budget","cursor":"2026-11-02T13:45:13.001Z#000044","dropped":0,"retryAfterMs":0}
+    },
+    {
+      "name": "logs-ack-rejected",
+      "direction": "host-to-client",
+      "json": {"type":"logs-ack","v":1,"stream":"app-android-core","id":20,"status":"rejected","reason":"batch too large","cursor":"2026-11-02T13:45:13.001Z#000044","dropped":0,"retryAfterMs":0}
+    },
+    {
+      "name": "feedback-begin",
+      "direction": "client-to-host",
+      "json": {"type":"feedback-begin","v":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","report":{"version":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","created":"2026-11-02T13:50:00.000Z","text":"Stream froze after unlock","kind":"bug","app":{"version":"0.3.0","build":"42","commit":"abc1234"},"platform":"android","device":{"id":"dev-1","name":"Pixel","model":"Pixel 8"},"pc":"pc-1","session":null,"route":"session","locale":"en-US","logs":[],"errors":[],"screenshot":null},"pngBytes":69,"chunks":1}
+    },
+    {
+      "name": "feedback-chunk",
+      "direction": "client-to-host",
+      "json": {"type":"feedback-chunk","v":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","i":0,"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}
+    },
+    {
+      "name": "feedback-ack-ok",
+      "direction": "host-to-client",
+      "json": {"type":"feedback-ack","v":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","status":"ok","reason":""}
+    }
+  ]
+}

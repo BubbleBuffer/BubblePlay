@@ -52,6 +52,7 @@ class BpLog internal constructor(
     private val dropped = AtomicLong()
     private val ioLock = Any()
     private val secrets = CopyOnWriteArrayList<String>()
+    private val writeListeners = CopyOnWriteArrayList<() -> Unit>()
     private var bytesSinceSweep = Long.MAX_VALUE // forces a sweep after the first write
     @Volatile private var device: String? = null
     @Volatile private var lastDropReport = clock()
@@ -74,6 +75,25 @@ class BpLog internal constructor(
     fun registerSecret(secret: String) {
         if (secret.isNotEmpty() && secret !in secrets) secrets.add(secret)
     }
+
+    /**
+     * Calls [listener] on the writer thread after lines reached the files (the upload queue's wake-up).
+     * It must return quickly and never throw into the log.
+     */
+    fun addWriteListener(listener: () -> Unit) {
+        writeListeners.add(listener)
+    }
+
+    fun removeWriteListener(listener: () -> Unit) {
+        writeListeners.remove(listener)
+    }
+
+    /**
+     * Lines after [after] that belong to [pcId] or to no PC, oldest first, with their upload cursors
+     * (see [LogCursor]). Reads the files, so it sees only lines already written.
+     */
+    internal fun readAfter(after: String, pcId: String?, maxLines: Int, maxBytes: Int): List<CursorLine> =
+        LogCursor.readAfter(root, after, pcId, maxLines, maxBytes)
 
     fun log(
         level: LogLevel,
@@ -276,6 +296,12 @@ class BpLog internal constructor(
             lastDay = day
         } finally {
             pending.addAndGet(-batch.size)
+            for (listener in writeListeners) {
+                try {
+                    listener()
+                } catch (_: Throwable) {
+                }
+            }
         }
     }
 
@@ -359,6 +385,9 @@ class BpLog internal constructor(
         private val DAY = Regex("(\\d{4}-\\d{2}-\\d{2})\\.jsonl$")
         private val TS: DateTimeFormatter =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)
+
+        /** The `ts` text of a line written at [millis] (also the first half of its upload cursor). */
+        internal fun formatTs(millis: Long): String = TS.format(Instant.ofEpochMilli(millis))
 
         @Volatile
         private var instance: BpLog? = null

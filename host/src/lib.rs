@@ -35,6 +35,7 @@ pub mod hybrid;
 pub mod input;
 pub mod input_diagnostics;
 pub mod link_capacity;
+pub mod log_upload;
 pub mod logging;
 pub mod mf_color;
 pub mod mf_encode;
