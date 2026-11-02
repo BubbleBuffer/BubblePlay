@@ -1,9 +1,13 @@
 package de.bubblebuffer.bubbleplay.auth
 
 import de.bubblebuffer.bubbleplay.Fixtures
+import de.bubblebuffer.bubbleplay.log.allText
+import de.bubblebuffer.bubbleplay.log.logLines
+import de.bubblebuffer.bubbleplay.log.withTestLog
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -147,6 +151,28 @@ class ViewerAuthTest {
             start()
             assertFailed(AuthFailure.UNEXPECTED_MESSAGE, start())
         }
+    }
+
+    @Test
+    fun failuresAreLoggedWithTheirCauseAndNoSecrets() = withTestLog { log, dir ->
+        normal().apply {
+            start()
+            onMessage(authHostWith { put("signature", b64(ByteArray(64))) })
+        }
+        pairing().apply {
+            start()
+            onMessage(authHostText())
+            onMessage("""{"type":"pair-proof","mac":"AAAA"}""")
+        }
+        log.flush()
+        val lines = dir.logLines().filter { it.getString("msg") == "viewer auth failed" }
+        assertEquals(2, lines.size)
+        assertEquals(pcId(), lines[0].getString("pc"))
+        assertEquals("BAD_SIGNATURE", lines[0].getJSONObject("fields").getString("failure"))
+        assertEquals("normal", lines[0].getJSONObject("fields").getString("mode"))
+        assertEquals("MALFORMED", lines[1].getJSONObject("fields").getString("failure"))
+        assertEquals("pairing", lines[1].getJSONObject("fields").getString("mode"))
+        assertFalse(dir.allText().contains(pairingVectors.getString("code")))
     }
 
     @Test

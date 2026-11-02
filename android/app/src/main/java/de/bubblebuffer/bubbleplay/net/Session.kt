@@ -8,6 +8,7 @@ import android.util.Log
 import de.bubblebuffer.bubbleplay.auth.ViewerAuth
 import de.bubblebuffer.bubbleplay.keys.DeviceKey
 import de.bubblebuffer.bubbleplay.keys.StrictBase64Url
+import de.bubblebuffer.bubbleplay.log.BpLog
 import de.bubblebuffer.bubbleplay.pcs.PcEntry
 import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.media.AudioPlayer
@@ -479,6 +480,7 @@ class Session(
 
     private fun endSession(problem: SessionProblem, detail: String? = null) {
         if (terminal != null) return
+        BpLog.w(TAG, "session ended", pc.id, mapOf("problem" to problem.resource, "detail" to detail))
         terminalProblem = problem.resource
         terminalDetail = detail
         terminal = if (detail == null) problem.text else problem.text.replace("%s", detail)

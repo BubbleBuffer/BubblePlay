@@ -1,5 +1,6 @@
 package de.bubblebuffer.bubbleplay.auth
 
+import de.bubblebuffer.bubbleplay.log.BpLog
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
@@ -156,6 +157,7 @@ class CtlChannel(sendKey: ByteArray, receiveKey: ByteArray) {
 
     private fun fail(reason: CtlException.Reason, message: String): Nothing {
         val failure = CtlException(reason, message)
+        BpLog.w("CtlChannel", "control channel failed", null, mapOf("failure" to reason.name, "detail" to message))
         failed = failure
         sendKey.fill(0)
         receiveKey.fill(0)
