@@ -14,7 +14,7 @@ pub struct SessionStats {
     pub(crate) media: MediaStats,
     pub(crate) transport: Arc<TransportStats>,
     /// Local volume/mute and audio counters, retained independently of the UI.
-    pub audio: super::SessionAudioControl,
+    pub audio: crate::audio::AudioHandle,
 }
 
 /// Input capture state is intentionally separate from model/UI state in this

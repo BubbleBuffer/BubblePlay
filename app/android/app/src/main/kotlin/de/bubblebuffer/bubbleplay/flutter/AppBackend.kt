@@ -14,6 +14,8 @@ import de.bubblebuffer.bubbleplay.net.PairingClient
 import de.bubblebuffer.bubbleplay.net.PairingFailure
 import de.bubblebuffer.bubbleplay.net.PairingListener
 import de.bubblebuffer.bubbleplay.net.PairingStage
+import de.bubblebuffer.bubbleplay.net.Session
+import org.json.JSONArray
 import de.bubblebuffer.bubbleplay.pcs.PcEntry
 import de.bubblebuffer.bubbleplay.pcs.PcStore
 import org.json.JSONObject
@@ -58,7 +60,9 @@ internal object ClientPairingRunner : PairingRunner {
  * Not thread-safe by itself: [act] and the pairing callbacks must run on one thread (the main
  * thread in the app, whatever the test chooses). [snapshot] may be read from any thread.
  *
- * M1 stops at the session boundary, like Windows: Connect opens a placeholder session.
+ * Connect starts a real session through [stream] (the Kotlin `Session` of the native app); the
+ * `session` of the snapshot carries what that session reports. With [StreamHost.None] it stays
+ * a placeholder, as in M1.
  */
 internal class AppBackend(
     private val keys: KeyStorage,
@@ -69,6 +73,7 @@ internal class AppBackend(
     private val clock: () -> Long = System::currentTimeMillis,
     private val zone: ZoneId = ZoneId.systemDefault(),
     private val unlocked: UnlockedHolder = UnlockedHolder.Global,
+    private val stream: StreamHost = StreamHost.None,
 ) {
     /** Where the unlocked key is kept. Production is [UnlockedKey]. */
     interface UnlockedHolder {
@@ -93,6 +98,10 @@ internal class AppBackend(
     private var pairStarted = 0L
     private var pairNumber = 0
     private var pairPc: Pair<String, String>? = null // pcId to relay of the pairing in progress
+    private var streamGeneration = 0 // tells the events of the current session from older ones
+    private var monitorSelectors = emptyList<String>()
+    private var reconnectAttempt = 0
+    private var lastStats = ""
 
     init {
         loadKey()
@@ -163,13 +172,26 @@ internal class AppBackend(
             "Forget" -> pcs.remove(args.getString("pc_id"))
             "Rename" -> rename(args.getString("pc_id"), args.getString("name"))
             "Connect" -> connect(args.getString("pc_id"))
-            "Disconnect" -> session = null
-            "SetMode" -> editSession { it.put("mode", args.getString("value")) }
-            "SetQuality" -> editSession { it.put("quality", args.getString("value")) }
-            "SetAudio" -> editSession { it.put("audio", args.getBoolean("value")) }
+            "Disconnect" -> endSession()
+            "SetMode" -> editSession {
+                val mode = args.getString("value")
+                it.put("mode", mode)
+                stream.setGameMode(mode == "Game")
+            }
+            "SetQuality" -> editSession { it.put("quality", args.getString("value")) } // no quality control on Android yet
+            "SetAudio" -> editSession {
+                val on = args.getBoolean("value")
+                it.put("audio", on)
+                stream.setSoundMuted(!on)
+            }
             "SetMonitor" -> editSession { s ->
                 val index = args.getInt("value")
-                if (index in 0 until s.getJSONArray("monitors").length()) s.put("monitor", index)
+                if (index in monitorSelectors.indices && index != s.getInt("monitor")) {
+                    s.put("monitor", index)
+                    s.put("monitor_pending", true)
+                    s.put("monitor_error", JSONObject.NULL)
+                    stream.requestMonitor(monitorSelectors[index])
+                }
             }
             // Not backed in M1, as on Windows: retries need a real connect, vouching and key
             // replacement are not in the live clients, the This PC actions are Windows host
@@ -344,8 +366,120 @@ internal class AppBackend(
 
     private fun connect(pcId: String) {
         val pc = pcs.get(pcId) ?: return
-        session = StateJson.session(pc.id, displayName(pc), "Work", "Auto", false)
+        endSession()
+        session = StateJson.session(pc.id, displayName(pc), "Work", "Auto", true)
         flow = null
+        monitorSelectors = emptyList()
+        reconnectAttempt = 0
+        lastStats = ""
+        val key = unlocked.get() ?: return
+        val generation = ++streamGeneration
+        stream.open(pc, key, deviceLabel, StreamListener(generation, pc.id))
+    }
+
+    /** Closes the stream and drops the session; events of the closed session are ignored from now on. */
+    private fun endSession() {
+        streamGeneration++
+        stream.close()
+        session = null
+    }
+
+    /** Refreshes the live numbers of the session (call about once a second while one is open). */
+    @Synchronized
+    fun refreshStats() {
+        val current = session ?: return
+        updateStats(current)
+        val text = current.getJSONObject("stats").toString() + current.getInt("rtt_ms")
+        if (text == lastStats) return
+        lastStats = text
+        notify()
+    }
+
+    /** True while a session is open (the app ticks [refreshStats] then). */
+    @get:Synchronized
+    val hasSession: Boolean get() = session != null
+
+    private fun updateStats(current: JSONObject) {
+        val live = stream.stats() ?: return
+        val stats = current.getJSONObject("stats")
+        stats.put("resolution", if (live.width > 0 && live.height > 0) "${live.width}x${live.height}" else "")
+        stats.put("fps", live.fps ?: 0.0)
+        stats.put("bitrate_mbps", (live.kbps ?: 0.0) / 1000.0)
+        stats.put("rtt_ms", live.rttMs ?: 0)
+        stats.put("dropped", live.dropped)
+        stats.put("transport", "wss")
+        stats.put("codec", live.codec.orEmpty())
+        // The Android decoder does not time single frames: decode_ms and frame_ms stay empty.
+        current.put("rtt_ms", live.rttMs ?: 0)
+    }
+
+    /** Events of one session, on the main thread. Anything from an older session is dropped. */
+    private inner class StreamListener(private val generation: Int, private val pcId: String) : StreamEvents {
+        private fun current(block: (JSONObject) -> Unit) = synchronized(this@AppBackend) {
+            if (generation != streamGeneration) return@synchronized
+            val s = session ?: return@synchronized
+            block(s)
+            notify()
+        }
+
+        override fun onStatus(status: Session.Status) {
+            if (status.state == Session.State.ERROR) {
+                synchronized(this@AppBackend) {
+                    if (generation != streamGeneration) return
+                    // A failed session ends; the PC card shows why (onPcState saved the problem).
+                    endSession()
+                    notify()
+                }
+                return
+            }
+            current { s ->
+                if (status.state == Session.State.RECONNECTING) {
+                    reconnectAttempt++
+                    s.put("link", StateJson.reconnecting(reconnectAttempt))
+                } else {
+                    if (status.state == Session.State.CONNECTED) reconnectAttempt = 0
+                    s.put("link", "Live")
+                }
+            }
+        }
+
+        override fun onMonitors(monitors: List<Session.Monitor>, error: String?) = current { s ->
+            if (error != null) {
+                s.put("monitor_error", error)
+                s.put("monitor_pending", false)
+                return@current
+            }
+            monitorSelectors = monitors.map { it.selector }
+            var x = 0
+            val list = JSONArray()
+            monitors.forEachIndexed { index, m ->
+                list.put(StateJson.monitor(m.selector, m.name, m.width, m.height, x, index == 0))
+                x += m.width
+            }
+            s.put("monitors", list)
+            val selected = monitors.indexOfFirst { it.selected }
+            if (selected >= 0) {
+                // A pick still waiting for the host keeps what the user chose until it is confirmed.
+                if (!s.getBoolean("monitor_pending") || s.getInt("monitor") == selected) {
+                    s.put("monitor", selected)
+                    s.put("monitor_pending", false)
+                }
+            }
+        }
+
+        override fun onVideoSize(width: Int, height: Int) = current { updateStats(it) }
+        override fun onLiveFrame() = current { updateStats(it) }
+
+        override fun onSecureDesktop(open: Boolean) = current { s ->
+            s.put("notice", if (open) "SecureDesktop" else JSONObject.NULL)
+        }
+
+        override fun onSoundCapability(enabled: Boolean) = current { it.put("audio_controls_available", enabled) }
+
+        override fun onPcState(lastSeen: Long, problem: String?) {
+            // Kept even when the session already ended (a terminal error ends it first).
+            pcs.touch(pcId, lastSeen, problem)
+        }
     }
 
     private fun displayName(pc: PcEntry): String = pc.name.ifEmpty { "PC " + pc.id.take(4) }

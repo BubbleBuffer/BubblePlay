@@ -14,6 +14,7 @@ pub mod media;
 pub mod model;
 pub mod net;
 pub mod store;
+pub mod stream;
 pub mod surface;
 
 #[cfg(feature = "egui-client")]

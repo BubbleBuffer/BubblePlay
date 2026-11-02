@@ -15,6 +15,7 @@ import 'src/feedback/shake_sensor.dart';
 import 'src/logging/app_log.dart';
 import 'src/logging/error_hooks.dart';
 import 'src/platform/key_files.dart';
+import 'src/session/stream_channel.dart';
 import 'src/presence/presence_lifecycle.dart';
 import 'src/presence/presence_service.dart';
 import 'src/screens/settings_screen.dart' show appVersion;
@@ -48,6 +49,7 @@ Future<void> _start(List<String> args) async {
         controller: controller,
         isWindows: isWindows,
         keyFiles: const SystemKeyFiles(),
+        stream: MethodStreamChannel(),
         theme: ValueNotifier<Brightness?>(null),
         devices: devicesChannel == null ? null : DevicesController(devicesChannel),
         initialSection: section,

@@ -12,8 +12,8 @@ use std::time::Instant;
 use anyhow::Result;
 use bp_device_key::{phase2::PairingCode, DeviceId, DeviceIdentity, DeviceKeyError, KeyFile};
 use bubbleplay_client::model::{
-    Action, Answerer, AppState, Backend, EnrollStep, Flow, Notifier, Outcome, PcKind, RemotePc,
-    Session, StreamMode,
+    Action, Answerer, AppState, Backend, ConnError, ConnStep, EnrollStep, Flow, Notifier, Outcome,
+    PcKind, PcProblem, RemotePc, Session, StepStatus, StreamMode,
 };
 use bubbleplay_client::net::{self, Codec, NetConfig, ViewerAuth};
 use bubbleplay_client::store::key::{KeyStore, KEY_FILE_NAME};
@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::applog;
 use crate::link;
+use crate::stream_host;
 
 /// Where the key and the PC list live.
 pub struct Paths {
@@ -205,7 +206,8 @@ fn refresh_pcs(paths: &Paths, inner: &mut Inner) {
 
 impl Backend for AppBackend {
     fn snapshot(&self) -> AppState {
-        let inner = lock(&self.inner);
+        let mut inner = lock(&self.inner);
+        self.overlay_session(&mut inner);
         let mut state = inner.state.clone();
         if let Some(started) = inner.pair_started {
             let secs = started.elapsed().as_secs() as u32;
@@ -280,11 +282,15 @@ impl AppBackend {
             }
             Action::Rename { pc_id, name } => self.rename(inner, &pc_id, &name),
             Action::Connect { pc_id } => self.connect(inner, &pc_id),
-            Action::Disconnect => inner.state.session = None,
+            Action::Disconnect => {
+                stream_host::stop();
+                inner.state.session = None;
+            }
             Action::SetMode(mode) => {
                 if let Some(session) = &mut inner.state.session {
                     session.mode = mode;
                 }
+                stream_host::act(Action::SetMode(mode));
             }
             Action::SetQuality(quality) => {
                 if let Some(session) = &mut inner.state.session {
@@ -297,11 +303,7 @@ impl AppBackend {
                 }
             }
             Action::SetMonitor(index) => {
-                if let Some(session) = &mut inner.state.session {
-                    if index < session.monitors.len() {
-                        session.monitor = index;
-                    }
-                }
+                stream_host::act(Action::SetMonitor(index));
             }
             // Not backed in M1: retries need a real connect; the This PC actions need the
             // host pipe (M3); vouching and key replacement are not in the live client yet;
@@ -504,16 +506,129 @@ impl AppBackend {
     }
 
     fn connect(&self, inner: &mut Inner, pc_id: &str) {
-        let Some(pc) = inner.state.pcs.iter().find(|pc| pc.id == pc_id) else {
+        let Some(pc) = inner.state.pcs.iter().find(|pc| pc.id == pc_id).cloned() else {
             return;
         };
-        inner.state.session = Some(Session {
+        let mode = pc.last_mode.unwrap_or(StreamMode::Work);
+        match self.start_stream(inner, &pc, mode) {
+            Ok(()) => {
+                inner.state.session = Some(Session {
+                    pc_id: pc.id.clone(),
+                    pc_name: pc.name.clone(),
+                    mode,
+                    ..Session::default()
+                });
+                inner.state.flow = None;
+            }
+            Err(error) => {
+                let text = format!("{error:#}");
+                inner.state.session = None;
+                self.end_with_error(inner, &pc.id, Some(&text));
+            }
+        }
+    }
+
+    fn start_stream(&self, inner: &Inner, pc: &RemotePc, mode: StreamMode) -> Result<()> {
+        let identity = inner
+            .identity
+            .as_ref()
+            .map(DeviceIdentity::duplicate)
+            .ok_or_else(|| anyhow::anyhow!("the viewer key is not unlocked"))?;
+        let device = DeviceId::parse(pc.id.trim())
+            .map_err(|_| anyhow::anyhow!("invalid PC ID {:?}", pc.id))?;
+        let viewer = ViewerAuth::new(identity, Some(device)).with_paired(self.paths.pcs.pinned()?);
+        let relay = if pc.relay.contains("://") {
+            pc.relay.clone()
+        } else {
+            format!("https://{}", pc.relay)
+        };
+        let notifier = Arc::clone(&self.notifier);
+        stream_host::start(stream_host::Start {
+            viewer,
+            relay,
             pc_id: pc.id.clone(),
             pc_name: pc.name.clone(),
-            mode: pc.last_mode.unwrap_or(StreamMode::Work),
-            ..Session::default()
-        });
-        inner.state.flow = None;
+            mode,
+            default_monitor: pc.default_monitor.clone(),
+            on_change: Arc::new(move || notify(&notifier)),
+        })
+    }
+
+    /// Puts the running session's numbers over the placeholder one, and turns a session that
+    /// ended by itself into a failure the app can show.
+    fn overlay_session(&self, inner: &mut Inner) {
+        let Some(status) = stream_host::status() else {
+            return;
+        };
+        let Some(current) = inner.state.session.clone() else {
+            stream_host::stop();
+            return;
+        };
+        if status.ended {
+            stream_host::stop();
+            inner.state.session = None;
+            if status.error.is_some() {
+                self.end_with_error(inner, &current.pc_id, status.error.as_deref());
+            }
+            return;
+        }
+        let mut session = status.session;
+        session.quality = current.quality;
+        session.audio = current.audio;
+        inner.state.session = Some(session);
+    }
+
+    /// Records why a connect or a running session ended: the PC's problem for Your PCs, and the
+    /// flow that tells the user.
+    fn end_with_error(&self, inner: &mut Inner, pc_id: &str, error: Option<&str>) {
+        let text = error.unwrap_or("The session ended.");
+        let lower = text.to_lowercase();
+        let (problem, flow) = if lower.contains("refused this viewer key")
+            || lower.contains("not admitted")
+            || lower.contains("not paired")
+        {
+            (
+                Some(PcProblem::NotAccepted),
+                Flow::Refused {
+                    pc_id: pc_id.to_owned(),
+                },
+            )
+        } else {
+            let (problem, error) = if lower.contains("pc key changed") {
+                (Some(PcProblem::KeyChanged), ConnError::PcKeyChanged)
+            } else if lower.contains("decoder") {
+                (
+                    None,
+                    ConnError::NoHardwareDecoder {
+                        codec: "H.264".to_owned(),
+                        detail: text.to_owned(),
+                    },
+                )
+            } else if lower.contains("first frame") {
+                (None, ConnError::NoFirstFrame { secs: 10 })
+            } else {
+                (
+                    Some(PcProblem::RelayUnreachable),
+                    ConnError::RelayUnreachable,
+                )
+            };
+            (
+                problem,
+                Flow::Failed {
+                    pc_id: pc_id.to_owned(),
+                    steps: vec![ConnStep {
+                        label: "Connect".to_owned(),
+                        detail: text.to_owned(),
+                        status: StepStatus::Failed,
+                    }],
+                    error,
+                },
+            )
+        };
+        if let Some(pc) = inner.state.pcs.iter_mut().find(|pc| pc.id == pc_id) {
+            pc.problem = problem;
+        }
+        inner.state.flow = Some(flow);
     }
 
     fn submit_pairing(

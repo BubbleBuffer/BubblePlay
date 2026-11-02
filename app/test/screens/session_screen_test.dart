@@ -31,7 +31,7 @@ void main() {
     testWidgets('fills the screen with black and says there is no video', (tester) async {
       await pumpApp(tester, contractState('session'));
       expect(blackArea, findsOneWidget);
-      expect(find.text('No video in this version.'), findsOneWidget);
+      expect(find.text('Waiting for video.'), findsOneWidget);
       expect(find.byType(EdgeTab), findsOneWidget);
       expect(find.byType(EdgeStrip), findsNothing);
     });
@@ -39,7 +39,7 @@ void main() {
     testWidgets('shows the same on a phone', (tester) async {
       await pumpApp(tester, contractState('session'), screen: Screen.phone, windows: false);
       expect(blackArea, findsOneWidget);
-      expect(find.text('No video in this version.'), findsOneWidget);
+      expect(find.text('Waiting for video.'), findsOneWidget);
       expect(find.byType(EdgeTab), findsOneWidget);
     });
 

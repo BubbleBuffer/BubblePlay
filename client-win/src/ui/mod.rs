@@ -97,6 +97,7 @@ pub enum Toast {
 
 /// Drives `--ui-demo`: each call moves the backend to the next scene and
 /// returns the UI state that goes with it.
+#[allow(clippy::len_without_is_empty)]
 pub trait DemoDriver {
     /// Number of scenes in one cycle.
     fn len(&self) -> usize;

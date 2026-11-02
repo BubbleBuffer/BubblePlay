@@ -8,7 +8,7 @@ One Flutter app in `app/` for Windows and Android, built on [bb-ui](https://gith
 - Pairing: the form (PC ID and one-time code through `CodeField`, which upper-cases and inserts the dashes, or a pairing link) and the number comparison wait with every outcome.
 - Key setup, unlock, export and import. A protected imported key is stored plain, behind Windows DPAPI or the Android Keystore; a protected stored key is unlocked in memory only.
 - Settings (key facts, export, theme) and the empty and error states.
-- Connect opens a placeholder session: bb-ui's session chrome over a black area. No video.
+- Connect opens a session (placeholder in M1, real streaming since M2, see Streaming).
 
 Not in this version, and not offered in the UI: streaming, retrying a connect, vouching, remote pairing, key replacement.
 
@@ -49,6 +49,30 @@ Tests in `app/test/`:
 - Tests: `cd app; flutter test` (`--exclude-tags golden` off CI).
 - Android debug APK and Kotlin tests: the App workflow (`.github/workflows/app.yml`, runs on build01).
 - Windows: `cd app; flutter build windows`. `app/build` is a junction to `F:\build\targets\BubblePlay-app\build` (output stays off C:). Cargokit builds the Rust core in the CMake step; the Rust target goes to the same F: area. The Rust FFI tests (`cargo test` in `app/rust`) need Windows because the key store uses DPAPI.
+
+
+## Streaming (milestone 2)
+
+Connect now streams the PC. Video never passes through Dart or the bridge: the platform decodes and renders into a native texture, Flutter shows it with a `Texture` widget.
+
+```
+Dart StreamVideo ──► StreamChannel (MethodChannel "bubbleplay/stream": textureId, videoRect, pointer, key)
+   Windows: runner stream_plugin.cc ──► bubbleplay_app_core.dll (bp_stream_* C ABI) ──► client-win/src/stream StreamSession
+   Android: MainActivity ──► SurfaceProducer texture ──► Kotlin Session + VideoDecoder   (docs/app/android-streaming.md)
+```
+
+- Windows: `StreamSession` (`client-win/src/stream/player.rs`, ungated, shared with the egui client's decode, ordering, stats and input modules) owns its own D3D11 device and an owner thread that decodes (Media Foundation) and draws each new frame with `VideoRenderer` into one of two alternating shared BGRA textures (`target.rs`), then `Flush`es. The runner registers a `GpuSurfaceTexture` (DXGI shared handle) whose descriptor comes from `bp_stream_front`, and marks a frame available from the core's frame callback. The two textures alternate because the engine does no synchronisation with the producer.
+- Windows input is captured natively: the runner's `FlutterWindow::MessageHandler` offers every window message to `bp_stream_message` first (raw input, keyboard hook, cursor clip), and a timer drives the capture's per-frame step. Dart reports the video rectangle in physical pixels; `pointer` and `key` are ignored on Windows. Android forwards touch and physical keys from Dart.
+- `app/rust/src/stream_host.rs` holds the one running session. `AppBackend::connect` starts it, `Disconnect` drops it, the snapshot overlays its monitors, mode, link and stats, and a session that ends on an error becomes `Flow::Failed` or `Flow::Refused` plus a `PcProblem` on the PC. State-change notifications are throttled to about four a second.
+- Tests: `client-win/tests/stream_target.rs` (a frame drawn on the session device is readable through the shared handle on a second device), `app/rust/tests/backend.rs`, `app/test/screens/stream_video_test.dart` (texture, rectangle, Android pointer and key forwarding), the Kotlin tests listed in `android-streaming.md`.
+
+### Measured latency
+
+Windows, headless against `fake-wss-host` (1080p60 H.264 recording, 20 s, dev profile, software H.264 MFT because this PC has no hardware decoder; `client-win/tests/stream_latency.rs`, run with `--ignored --nocapture`): 60 fps, 1203 of 1205 frames presented, decode to present p50 0.28 ms / p95 0.42 ms, publish to readable on a second D3D11 device p50 0.4 ms / p95 0.6 ms / max 1.0 ms. That is far below one frame at 60 Hz (16.7 ms), so the Flutter texture path is kept; no fallback is needed. Not measured: the egui path (it cannot run without a visible window) and the engine's own compositing; the on-screen check needs the owner. Android SurfaceProducer versus SurfaceView is not measured yet (needs the owner's phone); the SurfaceView fallback is not built.
+
+### Building on Windows
+
+`app/windows/toolchain-sdk22621.cmake` pins Windows SDK 10.0.22621 (SDK 10.0.26100 lacks x64 gdi32.lib here, MSB8037). Set `CMAKE_TOOLCHAIN_FILE` to it for the first configure. If the build fails on a long path, map the worktree to a short drive (`subst W: <worktree>`) and build from `W:\app`. Keep Cargo output on F: (`CARGO_TARGET_DIR=F:\build\targets\flutter-app-core`).
 
 ## Known limits
 

@@ -1,11 +1,14 @@
+import 'dart:async';
+
 import 'package:bb_ui/bb_ui.dart';
-import 'package:flutter/services.dart' show KeyDownEvent, LogicalKeyboardKey;
+import 'package:flutter/services.dart' show KeyDownEvent, KeyUpEvent, LogicalKeyboardKey;
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
 import '../model/model.dart';
+import 'stream_video.dart';
 
-/// The placeholder session: the session chrome over a black area, no video yet.
+/// The session: the native video (see [StreamVideo]) under the session chrome.
 ///
 /// The picture is the video's colour, not a theme colour, so it stays black in both themes. The
 /// chrome hangs from the top edge: the tab at rest, the strip once it is opened, then whatever the
@@ -44,6 +47,17 @@ class _SessionScreenState extends State<SessionScreen> {
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
       _toggleStrip();
+      return KeyEventResult.handled;
+    }
+    // Windows captures the keyboard natively; Android sends the physical key on.
+    if (!AppScope.of(context).isWindows && event.logicalKey != LogicalKeyboardKey.escape) {
+      final usage = event.physicalKey.usbHidUsage;
+      unawaited(
+        AppScope.of(context)
+            .stream
+            .key(usage: usage, down: event is! KeyUpEvent, modifiers: 0)
+            .catchError((_) {}),
+      );
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
@@ -87,7 +101,6 @@ class _SessionScreenState extends State<SessionScreen> {
   Widget build(BuildContext context) {
     final width = MediaQuery.sizeOf(context).width;
     final compact = context.mobile;
-    final top = AppColors.darkTheme.textSecondary;
 
     return Focus(
       focusNode: _keys,
@@ -98,15 +111,11 @@ class _SessionScreenState extends State<SessionScreen> {
         child: Stack(
           children: [
             Positioned.fill(
-              child: Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Text(
-                    'No video in this version.',
-                    textAlign: TextAlign.center,
-                    style: ts(context.type.ui, top),
-                  ),
-                ),
+              child: StreamVideo(
+                stream: AppScope.of(context).stream,
+                resolution: _session.stats.resolution,
+                forwardPointer: !AppScope.of(context).isWindows,
+                waiting: 'Waiting for video.',
               ),
             ),
             Positioned(

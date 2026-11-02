@@ -2,24 +2,21 @@
 
 mod app;
 mod audio_dev;
-mod decode;
 mod headless;
 pub(crate) mod input_dev;
-mod live_input;
 mod metrics;
 mod options;
-mod order;
 mod pacing;
 #[cfg(test)]
 mod relay_e2e_tests;
 #[cfg(test)]
 #[path = "../../tests/support/relay_pc.rs"]
 mod relay_pc;
-mod stats;
 
 pub use crate::audio::AudioHandle as SessionAudioControl;
+pub(crate) use crate::stream::{decode, live_input};
+pub use crate::stream::{SessionInputState, SessionStats};
 pub use options::DevOptions;
-pub use stats::{SessionInputState, SessionStats};
 
 use std::{
     collections::BTreeMap,
