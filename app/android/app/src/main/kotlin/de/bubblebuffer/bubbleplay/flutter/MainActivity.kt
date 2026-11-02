@@ -39,6 +39,7 @@ class MainActivity : FlutterActivity() {
             BpLog.current()?.flush()
             throw e
         }
+        val runner = ActRunner(backend, worker)
         val messenger = flutterEngine.dartExecutor.binaryMessenger
         val flutterApi = AppFlutterApi(messenger)
         backend.setNotifier { CoroutineScope(Dispatchers.Main).launch { flutterApi.changed() } }
@@ -47,20 +48,7 @@ class MainActivity : FlutterActivity() {
             object : AppHostApi {
                 override fun snapshot(): String = backend.snapshot()
 
-                override fun act(actionJson: String) {
-                    worker.execute {
-                        try {
-                            backend.act(actionJson)
-                        } catch (e: Exception) {
-                            // Class and top frame only: a JSON error message can quote the action,
-                            // which may carry a passphrase.
-                            BpLog.w(
-                                "MainActivity", "an app action failed", null,
-                                mapOf("exception" to e.javaClass.name, "at" to e.stackTrace.firstOrNull()?.toString()),
-                            )
-                        }
-                    }
-                }
+                override suspend fun act(actionJson: String) = runner.act(actionJson)
 
                 override fun exportKey(): String = backend.exportKey()
             },

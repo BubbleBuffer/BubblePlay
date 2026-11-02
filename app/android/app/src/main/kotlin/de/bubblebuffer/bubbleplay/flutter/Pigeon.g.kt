@@ -65,12 +65,16 @@ private open class PigeonPigeonCodec : StandardMessageCodec() {
   }
 }
 
+
 /** Generated interface from Pigeon that represents a handler of messages from Flutter. */
 interface AppHostApi {
   /** The current `AppState` as JSON. */
   fun snapshot(): String
-  /** Sends one `Action` (JSON). Returns at once; results arrive as later snapshots. */
-  fun act(actionJson: String)
+  /**
+   * Sends one `Action` (JSON). Completes when the core has run it, with an error when it threw;
+   * the effect arrives as a later snapshot.
+   */
+  suspend fun act(actionJson: String)
   /** The stored key as portable `.bpkey` text, for the user to save. Never part of a snapshot. */
   fun exportKey(): String
 
@@ -104,13 +108,15 @@ interface AppHostApi {
           channel.setMessageHandler { message, reply ->
             val args = message as List<Any?>
             val actionJsonArg = args[0] as String
-            val wrapped: List<Any?> = try {
-              api.act(actionJsonArg)
-              listOf(null)
-            } catch (exception: Throwable) {
-              PigeonPigeonUtils.wrapError(exception)
+            CoroutineScope(Dispatchers.Main).launch {
+              val wrapped: List<Any?> = try {
+                api.act(actionJsonArg)
+                listOf(null)
+              } catch (exception: Throwable) {
+                PigeonPigeonUtils.wrapError(exception)
+              }
+              reply.reply(wrapped)
             }
-            reply.reply(wrapped)
           }
         } else {
           channel.setMessageHandler(null)

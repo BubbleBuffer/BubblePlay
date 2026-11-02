@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart' hide Action, Flow;
 import 'app_controller.dart';
 import 'devices/devices_controller.dart';
 import 'feedback/feedback_controller.dart';
+import 'feedback/shake_detector.dart';
 import 'platform/key_files.dart';
 import 'screens/gate.dart';
 
@@ -20,6 +21,7 @@ class AppEnv {
     this.devices,
     this.initialSection,
     this.feedback,
+    this.shakeSamples,
   });
 
   final AppController controller;
@@ -37,6 +39,9 @@ class AppEnv {
 
   /// Where "Report a problem" stores reports; null makes Send report that it could not save.
   final FeedbackServices? feedback;
+
+  /// Opens the accelerometer for shake-to-report; null (everywhere but Android) turns it off.
+  final Stream<ShakeSample> Function()? shakeSamples;
 }
 
 class AppScope extends InheritedWidget {
@@ -71,10 +76,18 @@ class _BubblePlayAppState extends State<BubblePlayApp> {
   final _navigatorKey = GlobalKey<NavigatorState>();
   final _tracker = RouteTracker();
   StreamSubscription<void>? _feedbackRequests;
+  ShakeService? _shake;
 
   @override
   void initState() {
     super.initState();
+    if (widget.env.shakeSamples != null) {
+      _shake = ShakeService(
+        samples: widget.env.shakeSamples,
+        onShake: _onShake,
+        allowed: _shakeAllowed,
+      );
+    }
     // The tray's "Report a problem" item arrives as `openFeedback` on the devices pipe.
     final devices = widget.env.devices;
     if (devices == null) return;
@@ -87,8 +100,19 @@ class _BubblePlayAppState extends State<BubblePlayApp> {
 
   @override
   void dispose() {
+    _shake?.dispose();
     _feedbackRequests?.cancel();
     super.dispose();
+  }
+
+  /// Never while a remote session is on screen: a shake there is the phone moving with the game.
+  bool _shakeAllowed() =>
+      screenName(widget.env.controller.state) != 'session' && !(_tracker.current ?? '').contains('session');
+
+  void _onShake() {
+    final context = _navigatorKey.currentContext;
+    if (!mounted || context == null) return;
+    unawaited(showFeedbackSheet(context));
   }
 
   void _openFeedback(DevicesController devices) {
