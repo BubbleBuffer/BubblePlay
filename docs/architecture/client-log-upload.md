@@ -30,6 +30,7 @@ Client to host:
 {"type":"logs-batch","v":1,"stream":"app-android-core","id":17,"from":"<cursor before first line>","to":"<cursor of last line>","live":false,"lines":["{...jsonl...}","..."]}
 ```
 
+- `from` is informational (the host acknowledges by `to` and its stored cursor); a stream that has never uploaded sends an empty string or `"0"`.
 - `lines` are redacted JSONL lines as written locally. `id` is a client counter per connection. `live` is true for lines streamed as they are written, false for history.
 - One batch in flight per stream. The next batch is sent only after its ack.
 
@@ -48,7 +49,7 @@ Feedback reports (the report object is spec 4 of the charter, without the screen
 {"type":"feedback-begin","v":1,"id":"<report uuid>","report":{...},"pngBytes":123456,"chunks":3}
 {"type":"feedback-chunk","v":1,"id":"<report uuid>","i":0,"data":"<base64, at most 32768 bytes decoded>"}
 ```
-Host to client: `{"type":"feedback-ack","v":1,"id":"<report uuid>","status":"ok|rejected|retry","reason":"..."}`. `pngBytes` 0 and `chunks` 0 means no screenshot. The host assembles chunks in memory (limit 5 MiB, one report at a time per device, 60 s between chunks), then stores the report through `FeedbackStore`. `ok` means it is on disk: the client then deletes it from its outbox. Duplicate report ids are acknowledged `ok` without storing again.
+Host to client: `{"type":"feedback-ack","v":1,"id":"<report uuid>","status":"ok|rejected|retry","reason":"..."}`. `pngBytes` 0 and `chunks` 0 means no screenshot. The `feedback-begin` message must stay under 128 KiB serialized (the relay caps one ctl message at about 190 KB of JSON): clients drop the oldest entries of `report.logs`, then of `report.errors`, until it fits. The host assembles chunks in memory (limit 5 MiB, one report at a time per device, 60 s between chunks), then stores the report through `FeedbackStore`. `ok` means it is on disk: the client then deletes it from its outbox. Duplicate report ids are acknowledged `ok` without storing again.
 
 ## Priority
 

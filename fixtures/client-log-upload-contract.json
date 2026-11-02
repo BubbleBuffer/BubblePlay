@@ -44,12 +44,12 @@
     {
       "name": "feedback-begin",
       "direction": "client-to-host",
-      "json": {"type":"feedback-begin","v":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","report":{"version":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","created":"2026-11-02T13:50:00.000Z","text":"Stream froze after unlock","kind":"bug","app":{"version":"0.3.0","build":"42","commit":"abc1234"},"platform":"android","device":{"id":"dev-1","name":"Pixel","model":"Pixel 8"},"pc":"pc-1","session":null,"route":"session","locale":"en-US","logs":[],"errors":[],"screenshot":null},"pngBytes":6,"chunks":1}
+      "json": {"type":"feedback-begin","v":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","report":{"version":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","created":"2026-11-02T13:50:00.000Z","text":"Stream froze after unlock","kind":"bug","app":{"version":"0.3.0","build":"42","commit":"abc1234"},"platform":"android","device":{"id":"dev-1","name":"Pixel","model":"Pixel 8"},"pc":"pc-1","session":null,"route":"session","locale":"en-US","logs":[],"errors":[],"screenshot":null},"pngBytes":69,"chunks":1}
     },
     {
       "name": "feedback-chunk",
       "direction": "client-to-host",
-      "json": {"type":"feedback-chunk","v":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","i":0,"data":"iVBORw0K"}
+      "json": {"type":"feedback-chunk","v":1,"id":"7b1f0c6e-3d2a-4c55-9a58-0f1d2b3c4d5e","i":0,"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}
     },
     {
       "name": "feedback-ack-ok",
