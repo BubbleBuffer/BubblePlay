@@ -471,5 +471,6 @@ These are the only types forwarded on `/ws` (decision 15): viewer to PC `auth-he
 - *Caps (8):*
   - Unknown caps are ignored, and a missing cap means the feature is off.
   - Every cap needed at cutover (`control-aead-v1`, and `dtls-bind-v1` in WebRTC mode) is mandatory. A relay that strips caps can only cause a refusal, not a downgrade.
+  - Optional cap `client-logs-v1` (client log and feedback upload, [client-log-upload.md](client-log-upload.md)): the PC lists it in its ctl `caps`, the viewer in its `auth-hello` or its ctl `caps`. Missing on either side means off.
   - Caps are not in the transcript (above), so the endpoints may repeat them inside `ctl` after the handshake.
 - *PC key rotation:* there is no relay change. The new ID registers with `TOKEN`, and the operator removes the old record. The `rotate` statement reaches viewers inside `ctl`.

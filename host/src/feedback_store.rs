@@ -193,6 +193,29 @@ impl FeedbackStore {
         &self.dir
     }
 
+    /// Whether a report with this `id` from this device is already stored (the upload is a retry).
+    /// Reads the device's `*-<device-id>.json` files; reports are few and never auto-deleted.
+    pub fn contains_report(&self, device: &AuthenticatedDevice, id: &str) -> bool {
+        let suffix = format!("-{}.json", device.id());
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !name.ends_with(&suffix) {
+                return false;
+            }
+            match entry.metadata() {
+                Ok(meta) if meta.is_file() && meta.len() <= 4 * MAX_REPORT_BYTES as u64 => {}
+                _ => return false,
+            }
+            fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .is_some_and(|doc| doc.get("id").and_then(Value::as_str) == Some(id))
+        })
+    }
+
     pub fn save(
         &self,
         device: &AuthenticatedDevice,
