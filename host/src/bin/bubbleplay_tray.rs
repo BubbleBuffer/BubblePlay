@@ -19,6 +19,8 @@
 mod app_launch;
 #[path = "../tray/device_key_file.rs"]
 mod device_key_file;
+#[path = "../tray/feedback_ui.rs"]
+mod feedback_ui;
 #[path = "../tray/key_ui.rs"]
 mod key_ui;
 #[path = "../tray/logic.rs"]
@@ -95,6 +97,8 @@ const WM_AGENT_UPDATED: u32 = WM_APP + 3;
 const WM_ADMIN_CHANGED: u32 = WM_APP + 4;
 /// Posted when a PC key export/import window flow ends; WPARAM = 1 when the key was replaced.
 const WM_KEY_UI_DONE: u32 = WM_APP + 5;
+/// Posted when the "Report a problem" text box closes; WPARAM = 1 when a report was stored.
+const WM_FEEDBACK_DONE: u32 = WM_APP + 6;
 const TIMER_ID: usize = 1;
 
 /// Time the secure helper gets to answer after its task was started.
@@ -1321,7 +1325,7 @@ impl App {
     /// running host to tell it over the Devices pipe to open its report sheet.
     /// The app is the only place the sheet exists, so without the app, or
     /// without a running host to relay the request, the user gets a message
-    /// and [`open_feedback_fallback`] runs.
+    /// and [`App::open_feedback_fallback`] runs.
     fn open_feedback(&self) {
         tracing::info!("Report a problem clicked");
         let app = std::env::current_exe()
@@ -1341,7 +1345,7 @@ impl App {
                     "The BubblePlay app is not installed, so reports can't be sent from here.",
                     NIIF_WARNING,
                 );
-                open_feedback_fallback();
+                self.open_feedback_fallback();
                 return;
             }
             Err(error) => {
@@ -1351,7 +1355,7 @@ impl App {
                     "The BubblePlay app could not start.",
                     NIIF_WARNING,
                 );
-                open_feedback_fallback();
+                self.open_feedback_fallback();
                 return;
             }
         }
@@ -1369,7 +1373,29 @@ impl App {
                 "The host is not running, so the report form can't open.",
                 NIIF_WARNING,
             );
-            open_feedback_fallback();
+            self.open_feedback_fallback();
+        }
+    }
+
+    /// The plain Win32 report box for when the app cannot be reached. It runs on its own thread
+    /// and stores the report itself; the tray only shows the balloon when it closes.
+    fn open_feedback_fallback(&self) {
+        let hwnd = self.hwnd.0 as isize;
+        let started = feedback_ui::start(logs_dir(&self.data), move |saved| {
+            // SAFETY: posting to our own window; a failed post only loses the balloon.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    WM_FEEDBACK_DONE,
+                    WPARAM(usize::from(saved)),
+                    LPARAM(0),
+                )
+            };
+        });
+        match started {
+            Ok(true) => {}
+            Ok(false) => tracing::info!("the report window is already open"),
+            Err(error) => tracing::warn!(%error, "could not start the report window"),
         }
     }
 
@@ -1472,12 +1498,6 @@ impl App {
         }
         self.tick();
     }
-}
-
-/// What "Report a problem" does when the app cannot be reached. Today it only
-/// logs; the plain Win32 text box that takes over from here arrives later.
-fn open_feedback_fallback() {
-    tracing::warn!("Report a problem: app not reachable; no fallback form yet");
 }
 
 thread_local! {
@@ -1668,6 +1688,14 @@ unsafe extern "system" fn window_proc(
         WM_KEY_UI_DONE => {
             let replaced = wparam.0 != 0;
             with_app(|app| app.key_flow_done(replaced));
+            LRESULT(0)
+        }
+        WM_FEEDBACK_DONE => {
+            if wparam.0 != 0 {
+                with_app(|app| {
+                    app.balloon("BubblePlay", feedback_ui::SAVED_BALLOON, NIIF_INFO);
+                });
+            }
             LRESULT(0)
         }
         WM_QUIT_REQUEST => {

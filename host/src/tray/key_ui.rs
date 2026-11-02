@@ -419,7 +419,7 @@ fn ask_passphrase(
 }
 
 /// Runs this thread's message loop for `dialog` until it is destroyed and posts WM_QUIT.
-unsafe fn pump_until_quit(dialog: HWND) {
+pub(super) unsafe fn pump_until_quit(dialog: HWND) {
     let mut msg = MSG::default();
     loop {
         let status = GetMessageW(&mut msg, None, 0, 0).0;
@@ -435,14 +435,14 @@ unsafe fn pump_until_quit(dialog: HWND) {
 }
 
 /// Removes any WM_QUIT left by a destroyed window, so the next dialog on this thread is not cut short.
-unsafe fn drain_quit() {
+pub(super) unsafe fn drain_quit() {
     let mut msg = MSG::default();
     while PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
 }
 
 /// The system message font (usually Segoe UI 9pt), the one the rest of Windows uses. Returns a
 /// null font if the lookup fails; WM_SETFONT then falls back to the default font.
-unsafe fn message_font() -> HFONT {
+pub(super) unsafe fn message_font() -> HFONT {
     let mut metrics = NONCLIENTMETRICSW {
         cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
         ..Default::default()
@@ -460,7 +460,7 @@ unsafe fn message_font() -> HFONT {
 }
 
 /// Gives one child of the passphrase window the message font. The font arrives as the LPARAM.
-unsafe extern "system" fn set_child_font(child: HWND, font: LPARAM) -> BOOL {
+pub(super) unsafe extern "system" fn set_child_font(child: HWND, font: LPARAM) -> BOOL {
     let _ = SendMessageW(
         child,
         WM_SETFONT,
@@ -563,7 +563,7 @@ unsafe fn create_controls(
 }
 
 /// Creates one child control. `text` must be null-terminated, as `wide` returns it.
-unsafe fn child(
+pub(super) unsafe fn child(
     parent: HWND,
     instance: HINSTANCE,
     class: PCWSTR,
