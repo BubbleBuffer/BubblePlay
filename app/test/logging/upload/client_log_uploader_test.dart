@@ -656,6 +656,54 @@ void main() {
       up.dispose();
     });
 
+    test('feedback-begin stays under 128 KiB: oldest logs go first, then errors', () async {
+      final created = DateTime.utc(2026, 11, 2, 13, 50);
+      String line(int i) => jsonEncode({'ts': 't$i', 'msg': 'x' * 3000});
+      final logs = [for (var i = 0; i < 100; i++) line(i)];
+      final errors = [for (var i = 0; i < 20; i++) line(1000 + i)];
+      Future<Json> begin(String id, List<String> l, List<String> e) async {
+        await outbox.add(FeedbackReport(id: id, created: created, json: {
+          'version': 1,
+          'id': id,
+          'created': '2026-11-02T13:50:00.000Z',
+          'text': 'big',
+          'kind': 'bug',
+          'pc': 'pc-1',
+          'logs': l,
+          'errors': e,
+          'screenshot': null,
+        }));
+        final t = FakeTransport();
+        final up = makeUploader(t, FakeSource(), outbox: outbox, feedback: true)..start();
+        t.receive(stateMsg(state, interval: 0));
+        await until(() => t.ofType('feedback-begin').isNotEmpty);
+        up.dispose();
+        await outbox.markSent(id);
+        return t.ofType('feedback-begin').single;
+      }
+
+      var b = await begin('big-1', logs, errors);
+      expect(utf8.encode(jsonEncode(b)).length, lessThan(128 * 1024));
+      var r = b['report']! as Map;
+      expect((r['errors'] as List).length, 20, reason: 'errors kept while logs can go');
+      final kept = (r['logs'] as List).cast<String>();
+      expect(kept.length, lessThan(100));
+      expect(kept, logs.sublist(100 - kept.length), reason: 'the newest logs stay');
+
+      // Errors alone too big: logs all gone, oldest errors dropped.
+      final hugeErrors = [for (var i = 0; i < 100; i++) line(2000 + i)];
+      b = await begin('big-2', logs, hugeErrors);
+      expect(utf8.encode(jsonEncode(b)).length, lessThan(128 * 1024));
+      r = b['report']! as Map;
+      expect(r['logs'], isEmpty);
+      final ke = (r['errors'] as List).cast<String>();
+      expect(ke, hugeErrors.sublist(100 - ke.length));
+
+      // A small report is untouched.
+      b = await begin('small-1', logs.sublist(0, 3), const []);
+      expect((b['report']! as Map)['logs'], logs.sublist(0, 3));
+    });
+
     test('rejected keeps the report; other PCs reports are not sent here', () async {
       await queue('rep-3');
       await queue('rep-4', pc: 'pc-2');
