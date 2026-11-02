@@ -53,7 +53,7 @@ test("socket URLs select the requested or admitted PC without exposing credentia
 
 // Exercise receiver socket/callback wiring; dk-session tests own the cryptographic protocol.
 function signalHarness(identity) {
-  const output = [], endpoint = [], sockets = [], gateCalls = [], sessions = [];
+  const output = [], endpoint = [], sockets = [], gateCalls = [], sessions = [], logged = [];
   class Socket {
     static OPEN = 1; static CONNECTING = 0;
     constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
@@ -76,7 +76,8 @@ function signalHarness(identity) {
     setFileTransferAvailable() {}, clearTimeout() {},
     signalingSocketUrl: () => "wss://relay.test/ws?pc=pc-one",
     diagnosticAttemptId: "attempt", clientBuild: "test", requestedTransport: "auto",
-    codecSession: { codec: "h264" }, clientLogSequence: 0,
+    codecSession: { codec: "h264" },
+    BPLog: { log: (...args) => logged.push(args), setContext() {} },
     debugTrace: (...args) => output.push(args), recordSignalingError: (...args) => output.push(args),
     shouldReconnectAfterClose: () => false, restartPeer() {},
     setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
@@ -101,7 +102,7 @@ function signalHarness(identity) {
       return session;
     },
   });
-  vm.runInContext(["sendRelay", "sendControl", "sendClientLog", "handleSignal", "reconnectSignaling", "recycleSignaling",
+  vm.runInContext(["sendRelay", "sendControl", "viewerLog", "handleSignal", "reconnectSignaling", "recycleSignaling",
     "showNotAdmitted", "endAuthenticatedSession", "openAuthenticatedMedia", "updateAuthenticatedInputReady"]
     .map(receiverFunction).join("\n"), context);
   context.reconnectSignaling("startup");
@@ -112,7 +113,7 @@ function signalHarness(identity) {
   const authenticate = () => { const session = sessions.at(-1); session.controlReady = true; session.options.onAuthenticated(); };
   const mediaReady = () => { const session = sessions.at(-1); session.mediaReady = true; session.options.onMediaReady(); };
   const close = async event => { socket.readyState = 3; socket.onclose(event); await Promise.resolve(); await Promise.resolve(); };
-  return { context, socket, sockets, output, endpoint, gateCalls, sessions, helloOk, relay, authenticate, mediaReady, close };
+  return { context, socket, sockets, output, endpoint, logged, gateCalls, sessions, helloOk, relay, authenticate, mediaReady, close };
 }
 
 test("relay proof and admission start endpoint authentication without opening media or plaintext controls", async () => {
@@ -281,9 +282,10 @@ test("admission traces and authenticated client logs exclude session credentials
   h.socket.onopen();
   await h.helloOk({ pc: "pc-one", ticket });
   h.authenticate();
-  assert.ok(h.endpoint.some(message => message.type === "client-log"));
+  assert.ok(!h.endpoint.some(message => message.type === "client-log"), "no log message goes to the relay or PC");
+  assert.ok(h.logged.some(entry => entry[2] === "signaling-authenticated"), "the event is logged locally");
   assert.ok(h.output.some(message => message[0] === "signaling-hello-ok"));
-  assert.doesNotMatch(JSON.stringify([h.output, h.endpoint]), /test-only-secret-socket-ticket/);
+  assert.doesNotMatch(JSON.stringify([h.output, h.endpoint, h.logged]), /test-only-secret-socket-ticket/);
   assert.doesNotMatch(JSON.stringify(h.output.filter(message => Array.isArray(message))), /pc-one/);
 });
 
@@ -344,9 +346,8 @@ test("file hello reads the current ticket callback without exposing it in snapsh
 test("diagnostic snapshots, reports, telemetry and HUD do not read or spread credentials", () => {
   const paths = [
     source.slice(source.indexOf('setInterval(() => {\n  if (cursorReconciler'), source.indexOf("// ---- signaling")),
-    source.slice(source.indexOf("setInterval(() => sendClientLog"), source.indexOf("function reconnectSignaling")),
     source.slice(source.indexOf("if (diagnosticsEnabled) {"), source.indexOf("let previousInboundStats")),
-    receiverFunction("sendClientLog"), receiverFunction("sendClientProfile"),
+    receiverFunction("viewerLog"), receiverFunction("sendClientProfile"),
     receiverFunction("sendClientQos"), receiverFunction("diagnosticsReport"),
   ];
   for (const path of paths) {
@@ -354,6 +355,6 @@ test("diagnostic snapshots, reports, telemetry and HUD do not read or spread cre
     assert.doesNotMatch(path, /signalingTicket|signalingPc|\.\.\.msg|\.\.\.message|\.\.\.hello/);
   }
   const bootstrap = index.slice(index.indexOf("(() => {"), index.indexOf("})();") + 5);
-  assert.match(bootstrap, /fetch\("\/__diag\/client"/);
-  assert.doesNotMatch(bootstrap, /WebSocket|ticket|signalingPc|hello-ok/);
+  assert.match(bootstrap, /window\.BPLog\?\.info\("trace"/);
+  assert.doesNotMatch(bootstrap, /WebSocket|ticket|signalingPc|hello-ok|fetch\(/);
 });

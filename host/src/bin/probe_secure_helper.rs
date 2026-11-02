@@ -77,7 +77,7 @@ fn args() -> Result<Args> {
     let mut result = Args {
         out: PathBuf::new(),
         settings: local.join("tray.json"),
-        host_log: local.join("logs/host.log"),
+        host_log: latest_host_log(&local.join("logs")),
         run_id: format!(
             "{}-{}",
             std::process::id(),
@@ -92,7 +92,7 @@ fn args() -> Result<Args> {
             Some("--tray-settings") => result.settings = PathBuf::from(value),
             Some("--host-log") => result.host_log = PathBuf::from(value),
             Some("--run-id") => result.run_id = value.into_string().map_err(|_| anyhow::anyhow!("run-id must be UTF-8"))?,
-            _ => bail!("usage: probe_secure_helper --out-dir <new directory> [--tray-settings <tray.json>] [--host-log <host.log>]"),
+            _ => bail!("usage: probe_secure_helper --out-dir <new directory> [--tray-settings <tray.json>] [--host-log <host-YYYY-MM-DD.jsonl>]"),
         }
     }
     ensure!(!result.out.as_os_str().is_empty(), "--out-dir is required");
@@ -110,6 +110,20 @@ fn system_directory() -> Result<PathBuf> {
         CoTaskMemFree(Some(text.0.cast()));
     }
     Ok(PathBuf::from(path?))
+}
+/// The newest `host-YYYY-MM-DD[.N].jsonl` day file in the host's log directory.
+fn latest_host_log(logs: &Path) -> PathBuf {
+    let newest = fs::read_dir(logs)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("host-") && name.ends_with(".jsonl"))
+        })
+        .max();
+    newest.unwrap_or_else(|| logs.join("host.jsonl"))
 }
 fn no_viewer_in_log(text: &str) -> bool {
     let start = text.rfind("viewer session started");

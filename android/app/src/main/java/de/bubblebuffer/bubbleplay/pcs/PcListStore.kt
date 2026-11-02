@@ -1,6 +1,7 @@
 package de.bubblebuffer.bubbleplay.pcs
 
 import android.content.Context
+import de.bubblebuffer.bubbleplay.log.BpLog
 
 /**
  * [PcStore] over one text value, the JSON from [PcListCodec]. [Backing] is the app's SharedPreferences
@@ -27,21 +28,25 @@ class PcListStore(private val backing: Backing) : PcStore {
             current + entry
         }
         save(next)
+        BpLog.i("PcListStore", "PC saved", entry.id)
     }
 
     @Synchronized
     override fun rename(id: String, name: String) {
         save(list().map { if (it.id == id) it.copy(name = name) else it })
+        BpLog.i("PcListStore", "PC renamed", id)
     }
 
     @Synchronized
     override fun touch(id: String, lastSeen: Long, problem: String?) {
         save(list().map { if (it.id == id) it.copy(lastSeen = lastSeen, problem = problem) else it })
+        if (problem != null) BpLog.w("PcListStore", "PC marked with a problem", id, mapOf("problem" to problem))
     }
 
     @Synchronized
     override fun remove(id: String) {
         save(list().filterNot { it.id == id })
+        BpLog.i("PcListStore", "PC removed", id)
     }
 
     private fun save(entries: List<PcEntry>) = backing.write(PcListCodec.encode(entries))

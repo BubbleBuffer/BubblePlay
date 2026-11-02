@@ -573,26 +573,32 @@ fn native_drop_view_rejection(
 fn main() -> Result<()> {
     // Read and remove the tray's key handoff before anything else can spawn a child process.
     let device_key_handoff = bubbleplay_host::device_key::take_handoff_env();
-    tracing_subscriber::fmt()
-        .with_writer(|| std::io::LineWriter::new(std::io::stderr()))
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Stderr keeps the human-readable lines the tray reads; the JSONL file is the record.
+    let mut log_config = bubbleplay_host::logging::LogConfig::new(
+        "host",
+        bubbleplay_host::logging::default_log_dir(),
+    );
+    log_config.stderr = true;
+    let _log_guard = bubbleplay_host::logging::init(log_config);
 
     let mut args = parse_args()?;
+    if let Some(token) = args.token.as_deref() {
+        bubbleplay_host::logging::redact::register_secret(token);
+    }
     let handoff = device_key_handoff.as_deref().map(String::as_str);
     args.device_identity = match bubbleplay_host::device_key::identity_from_handoff(handoff) {
         Ok(identity) => {
-            if identity.is_none() {
-                info!("no PC device key supplied; starting without a device ID");
+            match identity.as_ref() {
+                Some(identity) => {
+                    bubbleplay_host::logging::set_device(Some(&identity.id().to_string()));
+                }
+                None => info!("no PC device key supplied; starting without a device ID"),
             }
             identity
         }
-        Err(_) => {
-            warn!("PC device key is unusable; starting without a device ID");
+        Err(error) => {
+            // The error names the failure class (format, passphrase, corrupt); it never holds key text.
+            warn!(%error, "PC device key is unusable; starting without a device ID");
             None
         }
     };
@@ -811,8 +817,9 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                 // Worker deploys reset the Durable Object, killing our WS
                 // and briefly 500ing new connections. That's transient —
                 // retry with backoff instead of taking the host down.
+                // `{:#}` prints the whole anyhow chain on one line ("signaling socket read failed (io): <os or tls error>").
                 error!(
-                    ?e,
+                    error = %format!("{e:#}"),
                     backoff_secs = backoff.as_secs(),
                     "serve session failed — retrying"
                 );
@@ -998,7 +1005,12 @@ fn end_rtc_peer(
 ) {
     *ice_connected = false;
     pending_candidates.clear();
-    let _ = pump.command(TransportCommand::ResetPeer);
+    if !pump.command(TransportCommand::ResetPeer) {
+        warn!(
+            reason,
+            "RTC transport did not accept the peer reset (queue full or stopped)"
+        );
+    }
     info!(reason, "RTC peer ended; the WSS session continues");
 }
 
@@ -2953,7 +2965,9 @@ fn run_serve(
                 },
                 SignalEvent::RemoteCandidate(_) if rtc_peer.ended() => {}
                 SignalEvent::RemoteCandidate(c) if offer_accepted => {
-                    let _ = pump.command(TransportCommand::RemoteCandidate(c));
+                    if !pump.command(TransportCommand::RemoteCandidate(c)) {
+                        warn!("RTC transport did not accept a remote candidate (queue full or stopped)");
+                    }
                 }
                 SignalEvent::RemoteCandidate(c) => pending_candidates.push_back(c),
                 SignalEvent::FileDragPreview(control) => {

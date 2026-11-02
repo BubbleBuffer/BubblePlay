@@ -1591,7 +1591,7 @@ fn link_loop(
         if let Some(close) = &close {
             if logged_closes.insert((close.code, close.reason.clone())) {
                 warn!(
-                    code = close.code,
+                    close_status = close.code,
                     reason = %close.reason,
                     epoch,
                     accepted,
@@ -1605,7 +1605,7 @@ fn link_loop(
             (CloseVerdict::Retry, _) | (_, None) => None,
             (CloseVerdict::Retired, Some(close)) => {
                 warn!(
-                    code = close.code,
+                    close_status = close.code,
                     epoch, "WSS v4 media epoch retired by relay; link stopped"
                 );
                 Some(V4LinkEnd::Retired {
@@ -1615,7 +1615,7 @@ fn link_loop(
             }
             (CloseVerdict::Refused, Some(close)) => {
                 warn!(
-                    code = close.code,
+                    close_status = close.code,
                     epoch,
                     refusals,
                     "relay refused the WSS v4 media hello repeatedly; link stopped"

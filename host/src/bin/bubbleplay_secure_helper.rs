@@ -1,8 +1,5 @@
 //! Scheduled task target. No implicit mode, dev bypass or permanent service.
 #![windows_subsystem = "windows"]
-#[allow(dead_code)]
-#[path = "../tray/logic.rs"]
-mod logic;
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Launch,
@@ -33,15 +30,17 @@ fn run() -> anyhow::Result<()> {
         // unlike launch/serve. It needs no SYSTEM-only logging setup.
         return bubbleplay_host::admin_mode::set_admin_mode(on);
     }
+    // log_path() still validates the protected install log directory; the JSONL day files live in it.
     let Ok(path) = bubbleplay_host::secure_helper::trust::log_path() else {
         anyhow::bail!("helper requires protected SYSTEM execution");
     };
-    let log = logic::SharedLog::new(path);
-    let _ = tracing_subscriber::fmt()
-        .with_writer(move || log.clone())
-        .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-        .try_init();
+    let Some(dir) = path.parent() else {
+        anyhow::bail!("helper log directory missing");
+    };
+    // Lives until the process ends; main() flushes before exiting on an error.
+    std::mem::forget(bubbleplay_host::logging::init(
+        bubbleplay_host::logging::LogConfig::new("helper", dir.to_path_buf()),
+    ));
     match command {
         Command::Launch => bubbleplay_host::secure_helper::runtime::launch(),
         Command::Serve => bubbleplay_host::secure_helper::runtime::serve(),
@@ -51,7 +50,8 @@ fn run() -> anyhow::Result<()> {
 fn main() {
     if let Err(e) = run() {
         eprintln!("secure helper stopped: {e}");
-        tracing::error!(error=%e,"secure helper stopped");
+        tracing::error!(error = %format!("{e:#}"), "secure helper stopped");
+        bubbleplay_host::logging::flush();
         std::process::exit(1);
     }
 }

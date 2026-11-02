@@ -21,7 +21,7 @@ test("browser shows and clears Admin warnings without changing input readiness",
     usingWssMedia: false, inputReady: true, hudState: { ice: "connected", ws: "open", rtt: "…" },
     monitorList: [], connectionStatus: { dataset: {}, title: "" }, connectionStatusLabel: { textContent: "" },
     document: { getElementById: id => id === "connection-retry" ? retry : { classList: { toggle: (key, value) => classes.set(key, value) } } },
-    sendClientLog: (...args) => logs.push(args),
+    viewerLog: (...args) => logs.push(args),
   });
   vm.runInContext(renderer + `\nfunction receive(msg) { switch(msg.type) { case "input-status": { ${handler} } } }`, context);
   const receive = fields => { context.msg = { ...receipt, ...fields }; vm.runInContext("receive(msg)", context); };

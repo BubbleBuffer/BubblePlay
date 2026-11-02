@@ -22,6 +22,11 @@ compatibility_date = "2026-07-15"
 # Keep top-level keys like this one above the first [table], or TOML will read them as part of that table.
 # routes = [{ pattern = "relay.example.com", custom_domain = true }]
 
+# Workers observability: collects the relay's structured console lines (src "relay").
+# Refusals and closes are logged there with a status, a reason and a class.
+[observability]
+enabled = true
+
 [durable_objects]
 bindings = [{ name = "RELAY", class_name = "Relay" }]
 

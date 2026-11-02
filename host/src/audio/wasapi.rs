@@ -53,7 +53,7 @@ impl ComApartment {
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         if hr.is_err() {
             warn!(
-                code = hr.0,
+                hresult = hr.0,
                 "audio capture thread kept its existing COM apartment"
             );
         }

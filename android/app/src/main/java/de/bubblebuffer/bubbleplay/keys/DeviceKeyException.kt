@@ -1,5 +1,7 @@
 package de.bubblebuffer.bubbleplay.keys
 
+import de.bubblebuffer.bubbleplay.log.BpLog
+
 /** A key or key file was refused. [reason] is for the caller's message; [message] is for logs. */
 class DeviceKeyException(val reason: Reason, message: String) : Exception(message) {
     enum class Reason {
@@ -17,7 +19,9 @@ class DeviceKeyException(val reason: Reason, message: String) : Exception(messag
     }
 }
 
-internal fun refuse(reason: DeviceKeyException.Reason, message: String): Nothing =
+internal fun refuse(reason: DeviceKeyException.Reason, message: String): Nothing {
+    BpLog.w("DeviceKey", "key or key file refused", null, mapOf("refusal" to reason.name, "detail" to message))
     throw DeviceKeyException(reason, message)
+}
 
 internal fun malformed(message: String): Nothing = refuse(DeviceKeyException.Reason.MALFORMED, message)

@@ -4,7 +4,6 @@
 //! attachment. After a hibernation it passes all the attachments back to
 //! `Relay::rehydrate`, and it asks `Relay::next_deadline` when to wake for `tick`.
 
-use super::Relay;
 use super::pairing::PairWindow;
 use super::pcs::PcTable;
 use super::state::{Conn, Kind, Phase, Role, Ticket, key_for};
@@ -12,6 +11,7 @@ use super::types::{
     Action, ConnId, ConnPhase, ConnSnapshot, CoreConfig, Route, SnapshotPairWindow, SnapshotTicket,
 };
 use super::util;
+use super::{Relay, reasons};
 use crate::gate::Prefix;
 use crate::limits::PAIR_PC_FAILURES;
 use crate::protocol::validate_epoch;
@@ -193,6 +193,7 @@ impl Relay {
     ) -> (Relay, Vec<Action>) {
         snapshots.sort_by_key(|snapshot| snapshot.id);
         let mut relay = Relay::new(config, pcs);
+        relay.clock_ms = now_ms;
         relay.next_id = snapshots
             .last()
             .map_or(1, |snapshot| snapshot.id.0.saturating_add(1));
@@ -203,7 +204,7 @@ impl Relay {
         for snapshot in snapshots {
             let id = snapshot.id;
             if previous == Some(id) {
-                out.push(Action::Close(id, 1008, String::new()));
+                relay.restore_refused(id, &snapshot, "restore.duplicate-id", &mut out);
                 continue;
             }
             previous = Some(id);
@@ -212,7 +213,7 @@ impl Relay {
                     signalling.push((snapshot, conn));
                 }
                 Some(conn) => data.push((snapshot, conn)),
-                None => out.push(Action::Close(id, 1008, String::new())),
+                None => relay.restore_refused(id, &snapshot, "restore.invalid", &mut out),
             }
         }
         // Signalling first: a data socket's epoch is checked against its room,
@@ -227,16 +228,43 @@ impl Relay {
                 _ => false,
             };
             if !adopted {
-                out.push(Action::Close(id, 1008, String::new()));
+                relay.restore_refused(id, &snapshot, "restore.not-adopted", &mut out);
             }
         }
         for (snapshot, conn) in data.into_iter().rev() {
             let id = snapshot.id;
             if !relay.adopt_data(id, conn) {
-                out.push(Action::Close(id, 1008, String::new()));
+                relay.restore_refused(id, &snapshot, "restore.data-stale", &mut out);
             }
         }
         (relay, out)
+    }
+
+    /// Closes a socket that cannot be restored after hibernation and logs why.
+    fn restore_refused(
+        &self,
+        id: ConnId,
+        snapshot: &ConnSnapshot,
+        class: &'static str,
+        out: &mut Vec<Action>,
+    ) {
+        out.push(Action::Close(
+            id,
+            1008,
+            reasons::SESSION_NOT_RESTORED.to_owned(),
+        ));
+        let pc = util::canonical_pc(&snapshot.pc);
+        self.log(
+            crate::log::Level::Warn,
+            "socket refused",
+            pc.as_deref(),
+            serde_json::json!({
+                "class": class,
+                "status": 1008,
+                "reason": reasons::SESSION_NOT_RESTORED,
+                "role": snapshot.route.role().name(),
+            }),
+        );
     }
 
     /// Checks one snapshot and builds its live socket, or None when it cannot be

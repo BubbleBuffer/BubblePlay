@@ -231,7 +231,7 @@ async fn e2e_ws_wrong_origin_is_404() {
 }
 
 #[tokio::test]
-async fn e2e_ws_origin_without_valid_cookie_is_accepted_then_closed_1008_empty() {
+async fn e2e_ws_origin_without_valid_cookie_is_accepted_then_closed_1008_not_approved() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let cookie = browser_cookie(&server, &env).await;
@@ -243,7 +243,10 @@ async fn e2e_ws_origin_without_valid_cookie_is_accepted_then_closed_1008_empty()
         let mut ws = connect(server.addr, &path, Some(ORIGIN), presented)
             .await
             .expect("the upgrade is accepted");
-        assert_eq!(expect_close(&mut ws).await, (1008, String::new()));
+        assert_eq!(
+            expect_close(&mut ws).await,
+            (1008, "not approved".to_string())
+        );
     }
     // The same path with the approved cookie still answers hello-ok.
     let (_ws, ok) =
@@ -350,7 +353,7 @@ async fn e2e_file_socket_forwards_both_ways_and_answers_ping() {
 }
 
 #[tokio::test]
-async fn e2e_wrong_ticket_closes_1008_with_empty_reason() {
+async fn e2e_wrong_ticket_closes_1008_not_authorized() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let s = session(&server, &env, 22).await;
@@ -369,7 +372,10 @@ async fn e2e_wrong_ticket_closes_1008_with_empty_reason() {
         json!({ "type": "hello", "role": "media-host", "ticket": bogus }),
     )
     .await;
-    assert_eq!(expect_close(&mut host_side).await, (1008, String::new()));
+    assert_eq!(
+        expect_close(&mut host_side).await,
+        (1008, "not authorized".to_string())
+    );
 
     let mut viewer_side = connect(
         server.addr,
@@ -384,7 +390,10 @@ async fn e2e_wrong_ticket_closes_1008_with_empty_reason() {
         json!({ "type": "hello", "role": "media-viewer", "ticket": bogus }),
     )
     .await;
-    assert_eq!(expect_close(&mut viewer_side).await, (1008, String::new()));
+    assert_eq!(
+        expect_close(&mut viewer_side).await,
+        (1008, "not authorized".to_string())
+    );
 }
 
 #[tokio::test]
@@ -501,8 +510,8 @@ async fn e2e_healthz_loopback_200_bad_host_404_head_empty() {
 }
 
 // M2 section 1: a socket with no Origin needs no gate cookie. The upgrade is accepted, and the
-// signed hello decides admission. A bare hello (no ID, no key) is refused 1008 with an empty
-// reason. The admitted and unlisted cases are in e2e_m2.rs.
+// signed hello decides admission. A bare hello (no ID, no key) is refused 1008 with the reason
+// "invalid hello". The admitted and unlisted cases are in e2e_m2.rs.
 #[tokio::test]
 async fn e2e_native_viewer_without_origin_upgrades_and_bare_hello_is_1008() {
     let env = Env::new().await;
@@ -512,7 +521,10 @@ async fn e2e_native_viewer_without_origin_upgrades_and_bare_hello_is_1008() {
         .await
         .expect("the upgrade is accepted without a cookie");
     send_json(&mut ws, json!({ "type": "hello", "role": "viewer" })).await;
-    assert_eq!(expect_close(&mut ws).await, (1008, String::new()));
+    assert_eq!(
+        expect_close(&mut ws).await,
+        (1008, "invalid hello".to_string())
+    );
 }
 
 /// With the gate cookie, GET and HEAD `/pair` serve the page as `/` does, and `/pair/x` stays 404.
@@ -695,7 +707,10 @@ async fn e2e_signal_viewer_takes_ws_and_the_old_name_is_refused() {
         }),
     )
     .await;
-    assert_eq!(expect_close(&mut old).await, (1008, String::new()));
+    assert_eq!(
+        expect_close(&mut old).await,
+        (1008, "invalid hello".to_string())
+    );
 
     let host = identity(35);
     let (_host_ws, _) = register_host(&server, &host, Some(TOKEN)).await;

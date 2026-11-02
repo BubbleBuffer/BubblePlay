@@ -1,12 +1,10 @@
-//! Platform-independent tray logic: restart backoff, size-capped log rotation,
+//! Platform-independent tray logic: restart backoff, child-output log classification,
 //! persisted settings, stored host configuration and host argument building.
 //! Everything here is unit-tested; Win32 glue lives in the tray binary.
 
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -16,10 +14,6 @@ pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A child that stays up this long is considered healthy and resets backoff.
 pub const HEALTHY_RUN: Duration = Duration::from_secs(5 * 60);
-
-pub const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
-/// Total files kept per log: the live file plus `LOG_KEEP - 1` rotations.
-pub const LOG_KEEP: usize = 5;
 
 /// Exponential restart backoff: 1 s doubling to 30 s, reset after a healthy run.
 #[derive(Debug, Clone)]
@@ -63,158 +57,45 @@ impl Backoff {
     }
 }
 
-/// Size-capped rotating log: `name.log`, `name.1.log` .. `name.{keep-1}.log`.
-/// Every I/O failure is swallowed (and counted) so logging can never take the
-/// tray or the host down.
-#[derive(Debug)]
-pub struct RotatingLog {
-    path: PathBuf,
-    max_bytes: u64,
-    keep: usize,
-    file: Option<File>,
-    size: u64,
-    failures: u64,
-}
-
-impl RotatingLog {
-    pub fn new(path: PathBuf, max_bytes: u64, keep: usize) -> Self {
-        let mut log = Self {
-            path,
-            max_bytes: max_bytes.max(1),
-            keep: keep.max(1),
-            file: None,
-            size: 0,
-            failures: 0,
+/// What a line of host or agent child output means for the tray log: `None` to skip it
+/// (routine info), otherwise the level to log it at. Tracing lines (`<ts> LEVEL target: msg`)
+/// map by their level word; anything else (a panic message, a backtrace, native library
+/// output) is a warning, or an error when it says so.
+pub fn child_line_level(line: &str) -> Option<tracing::Level> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut words = line.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let looks_like_tracing =
+        first.len() >= 10 && first.as_bytes()[0].is_ascii_digit() && first.contains('T');
+    if looks_like_tracing {
+        return match words.next() {
+            Some("ERROR") => Some(tracing::Level::ERROR),
+            Some("WARN") => Some(tracing::Level::WARN),
+            _ => None,
         };
-        log.open();
-        log
     }
-
-    #[cfg(test)]
-    pub fn failures(&self) -> u64 {
-        self.failures
-    }
-
-    pub fn rotated_path(&self, index: usize) -> PathBuf {
-        rotated_path(&self.path, index)
-    }
-
-    fn open(&mut self) {
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            Ok(file) => {
-                self.size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                self.file = Some(file);
-            }
-            Err(_) => {
-                self.failures += 1;
-                self.file = None;
-            }
-        }
-    }
-
-    fn rotate(&mut self) {
-        self.file = None;
-        if self.keep > 1 {
-            let _ = fs::remove_file(self.rotated_path(self.keep - 1));
-            for index in (1..self.keep - 1).rev() {
-                let from = self.rotated_path(index);
-                if from.exists() {
-                    let _ = fs::rename(&from, self.rotated_path(index + 1));
-                }
-            }
-            if fs::rename(&self.path, self.rotated_path(1)).is_err() {
-                self.failures += 1;
-                // Could not move the live file (e.g. another process holds it
-                // without FILE_SHARE_DELETE); truncate rather than grow forever.
-                let _ = File::create(&self.path);
-            }
-        } else {
-            let _ = File::create(&self.path);
-        }
-        self.open();
-        // If reopening failed the size would never reset; force it.
-        if self.file.is_none() {
-            self.size = 0;
-        }
-    }
-
-    /// Append `data`, rotating first when it would exceed the cap. Never fails.
-    pub fn append(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-        if self.size > 0 && self.size + data.len() as u64 > self.max_bytes {
-            self.rotate();
-        }
-        if self.file.is_none() {
-            self.open();
-        }
-        let Some(file) = self.file.as_mut() else {
-            return;
-        };
-        // A single oversized write is truncated to the cap rather than refused.
-        let len = data.len().min(self.max_bytes as usize);
-        match file.write_all(&data[..len]) {
-            Ok(()) => self.size += len as u64,
-            Err(_) => {
-                self.failures += 1;
-                self.file = None;
-            }
-        }
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("panicked") || lower.contains("fatal") || lower.contains("error") {
+        Some(tracing::Level::ERROR)
+    } else {
+        Some(tracing::Level::WARN)
     }
 }
 
-pub fn rotated_path(path: &Path, index: usize) -> PathBuf {
-    if index == 0 {
-        return path.to_path_buf();
-    }
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let name = match path.extension() {
-        Some(ext) => format!("{stem}.{index}.{}", ext.to_string_lossy()),
-        None => format!("{stem}.{index}"),
-    };
-    path.with_file_name(name)
-}
-
-/// Cloneable handle usable as an `io::Write` and a tracing `MakeWriter`.
-#[derive(Debug, Clone)]
-pub struct SharedLog(Arc<Mutex<RotatingLog>>);
-
-impl SharedLog {
-    pub fn new(path: PathBuf) -> Self {
-        Self(Arc::new(Mutex::new(RotatingLog::new(
-            path,
-            LOG_MAX_BYTES,
-            LOG_KEEP,
-        ))))
-    }
-
-    pub fn append(&self, data: &[u8]) {
-        let mut guard = match self.0.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.append(data);
-    }
-}
-
-impl Write for SharedLog {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.append(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+/// Write one line of child output into the tray log (target `child`), redacted by the log
+/// layer. `source` names the child (`host`, `agent`), `stream` is `stdout` or `stderr`.
+pub fn log_child_line(source: &'static str, stream: &'static str, line: &[u8]) {
+    let text = String::from_utf8_lossy(line);
+    let text = text.trim_end();
+    match child_line_level(text) {
+        Some(tracing::Level::ERROR) => {
+            tracing::error!(target: "child", source, stream, "{text}")
+        }
+        Some(_) => tracing::warn!(target: "child", source, stream, "{text}"),
+        None => {}
     }
 }
 
@@ -667,6 +548,8 @@ pub const CMD_EXPORT_KEY: usize = 13;
 pub const CMD_IMPORT_KEY: usize = 14;
 /// "Open BubblePlay": opens the Devices window. Also what a left-click on the icon does.
 pub const CMD_DEVICES: usize = 15;
+/// "Report a problem": brings the app forward and opens its report sheet.
+pub const CMD_FEEDBACK: usize = 16;
 
 /// What the tray menu shows, gathered from the app when the menu opens.
 #[derive(Debug, Clone, Default)]
@@ -781,6 +664,7 @@ pub fn menu_layout(state: &MenuState) -> Vec<MenuEntry> {
     if state.can_roll_back {
         more.push(MenuEntry::command(CMD_ROLLBACK, "Roll back host"));
     }
+    more.push(MenuEntry::command(CMD_FEEDBACK, "Report a problem"));
     more.push(MenuEntry::command(CMD_LOGS, "Open logs folder"));
     more.push(MenuEntry::Separator);
     more.push(MenuEntry::grey(CMD_BUILD, &state.build));
@@ -802,6 +686,7 @@ pub fn menu_layout(state: &MenuState) -> Vec<MenuEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// Compact view of a menu for order assertions: ids, "-" for separators, "More[...]".
     fn menu_shape(entries: &[MenuEntry]) -> Vec<String> {
@@ -856,7 +741,7 @@ mod tests {
                 "-",
                 "2",
                 "11",
-                "More[3 12 - 13 14 - 5 - 8 1]",
+                "More[3 12 - 13 14 - 16 5 - 8 1]",
                 "-",
                 "4",
                 "6"
@@ -878,6 +763,40 @@ mod tests {
             .filter(|entry| matches!(entry, MenuEntry::Item { default: true, .. }))
             .count();
         assert_eq!(defaults, 1);
+    }
+
+    #[test]
+    fn report_a_problem_is_always_enabled_under_more() {
+        let busy = MenuState {
+            admin: true,
+            admin_enabled: false,
+            key_busy: true,
+            ..MenuState::default()
+        };
+        for state in [MenuState::default(), busy] {
+            let menu = menu_layout(&state);
+            let more = menu
+                .iter()
+                .find_map(|entry| match entry {
+                    MenuEntry::Submenu { entries, .. } => Some(entries),
+                    _ => None,
+                })
+                .expect("More submenu");
+            let item = more
+                .iter()
+                .find(|entry| matches!(entry, MenuEntry::Item { id, .. } if *id == CMD_FEEDBACK))
+                .expect("Report a problem item");
+            assert_eq!(
+                item,
+                &MenuEntry::Item {
+                    id: CMD_FEEDBACK,
+                    text: "Report a problem".to_owned(),
+                    enabled: true,
+                    checked: false,
+                    default: false,
+                }
+            );
+        }
     }
 
     #[test]
@@ -911,7 +830,7 @@ mod tests {
                 "9",
                 "10",
                 "11",
-                "More[3 12 - 13 14 - 7 5 - 8 1 1]",
+                "More[3 12 - 13 14 - 7 16 5 - 8 1 1]",
                 "-",
                 "4",
                 "6"
@@ -963,56 +882,42 @@ mod tests {
     }
 
     #[test]
-    fn rotating_log_caps_size_and_file_count() {
-        let dir = temp_dir("rotate");
-        let path = dir.join("host.log");
-        let mut log = RotatingLog::new(path.clone(), 100, 3);
-        for _ in 0..20 {
-            log.append(&[b'x'; 40]);
-        }
-        assert!(fs::metadata(&path).unwrap().len() <= 100);
-        assert!(rotated_path(&path, 1).exists());
-        assert!(rotated_path(&path, 2).exists());
-        assert!(!rotated_path(&path, 3).exists());
-        for index in 0..3 {
-            assert!(fs::metadata(rotated_path(&path, index)).unwrap().len() <= 100);
-        }
-        assert_eq!(log.failures(), 0);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn rotating_log_truncates_oversized_write_and_keeps_existing_size() {
-        let dir = temp_dir("oversize");
-        let path = dir.join("tray.log");
-        fs::write(&path, b"existing\n").unwrap();
-        let mut log = RotatingLog::new(path.clone(), 64, 2);
-        log.append(&[b'y'; 200]);
-        // Existing content forced a rotation before the oversized write.
-        assert_eq!(fs::read(rotated_path(&path, 1)).unwrap(), b"existing\n");
-        assert_eq!(fs::metadata(&path).unwrap().len(), 64);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn rotating_log_never_panics_when_directory_is_unusable() {
-        let dir = temp_dir("unusable");
-        // A file where the log directory should be makes every open fail.
-        let blocker = dir.join("logs");
-        fs::write(&blocker, b"").unwrap();
-        let mut log = RotatingLog::new(blocker.join("host.log"), 10, 2);
-        for _ in 0..5 {
-            log.append(b"hello world\n");
-        }
-        assert!(log.failures() > 0);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn rotated_path_names() {
-        let path = Path::new(r"C:\logs\host.log");
-        assert_eq!(rotated_path(path, 0), PathBuf::from(r"C:\logs\host.log"));
-        assert_eq!(rotated_path(path, 3), PathBuf::from(r"C:\logs\host.3.log"));
+    fn child_lines_map_to_levels() {
+        use tracing::Level;
+        let level = |text: &str| child_line_level(text);
+        assert_eq!(
+            level(
+                "2026-11-02T10:00:00Z  WARN bubbleplay_host: x
+"
+            ),
+            Some(Level::WARN)
+        );
+        assert_eq!(
+            level("2026-11-02T10:00:00Z ERROR bubbleplay_host: x"),
+            Some(Level::ERROR)
+        );
+        assert_eq!(level("2026-11-02T10:00:00Z  INFO bubbleplay_host: x"), None);
+        assert_eq!(level("2026-11-02T10:00:00Z DEBUG a: b"), None);
+        assert_eq!(
+            level("thread 'main' panicked at src/main.rs:1:1:"),
+            Some(Level::ERROR)
+        );
+        assert_eq!(
+            level("   0: std::backtrace::Backtrace::capture"),
+            Some(Level::WARN)
+        );
+        assert_eq!(
+            level("The GPU driver reported: error 0x887a0005"),
+            Some(Level::ERROR)
+        );
+        assert_eq!(
+            level(
+                "   
+"
+            ),
+            None
+        );
+        assert_eq!(level(""), None);
     }
 
     #[test]

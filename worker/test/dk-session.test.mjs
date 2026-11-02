@@ -387,7 +387,7 @@ test("receiver drops plaintext endpoint frames and preserves mediaEpoch string i
     sessionGate: {}, Date, JSON, currentIceServers: null, mediaEpoch: null, wssSelected: false,
     hudState: {}, console: { info() {} }, location: { href: hs.relayOrigin }, validateIceServers: value => value,
     debugTrace() {}, noteFileEpoch() {}, renderAbout() {}, relayOrigin: () => hs.relayOrigin,
-    sendClientLog() {}, sendStreamMode() {}, startPeer() {}, peerGeneration: 0,
+    viewerLog() {}, sendStreamMode() {}, startPeer() {}, peerGeneration: 0,
     endAuthenticatedSession: refusal => errors.push(refusal),
     createViewerSession: config => { configs.push(config); return { async start() {}, receive: message => received.push(message) }; },
   });
@@ -532,7 +532,7 @@ test("receiver drains a final encrypted refusal before processing socket close o
     authenticatedSession: null, terminalSignalingFailure: false, reconnectTimer: null,
     ws: null, signalingGeneration: 0, signalingRegistered: true, signalingPc: hs.pc.id, signalingTicket: "ticket",
     latestInputStatus: null, inputStatusReason: null, hudState: {}, hud: { classList: { add() {} } },
-    signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, cleanupPeer: () => calls.push("cleanup"),
+    signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, cleanupPeer: () => calls.push("cleanup"),
     recordSignalingError() {}, shouldReconnectAfterClose: (_code, terminal) => !terminal,
     restartPeer: () => calls.push("restart"),
     setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
@@ -575,4 +575,32 @@ test("WSS teardown releases through ctl and cannot authorize an unbound DataChan
   assert.deepEqual(sent, ["ctl-input"]);
   assert.equal(vm.runInContext("sendInput(data, dc)", context), false);
   assert.equal(vm.runInContext("inputControlState()", context), "down");
+});
+
+test("each failure cause gets its own plain text and a log line with the cause", async () => {
+  const bodies = new Set(["handshake-failed", "unexpected-message", "socket-ended", "start-failed", "bind-failed", "control-failed"]
+    .map(reason => sessionRefusal(reason).body));
+  assert.equal(bodies.size, 6, "six distinct causes, six distinct messages");
+  assert.ok([...bodies].every(body => /\.$/.test(body) && !/undefined/.test(body)));
+  const lines = [];
+  const previous = globalThis.BPLog;
+  globalThis.BPLog = { log: (level, target, msg, fields) => lines.push({ level, target, msg, fields }) };
+  try {
+    const h = await harness();
+    await h.session.receive({ ...hs.messages.authHost, signature: hs.messages.authFinish.signature });
+    assert.equal(h.events.failures[0].reason, "handshake-failed");
+    assert.equal(h.events.failures[0].title, "Session ended");
+    const line = lines.find(item => item.msg === "session ended");
+    assert.equal(line.target, "dk-session");
+    assert.equal(line.fields.reason, "handshake-failed");
+    assert.ok(line.fields.cause, "the underlying error is logged");
+    const pin = await harness({ pinnedPublic: bytes(hs.viewer.public) });
+    await pin.session.receive(hs.messages.authHost);
+    assert.equal(pin.events.failures[0].reason, "pc-key-changed");
+    const stray = await harness();
+    await stray.session.receive({ type: "ctl", kind: "x", seq: 0, data: "AA" });
+    assert.equal(stray.events.failures[0].reason, "unexpected-message");
+  } finally {
+    globalThis.BPLog = previous;
+  }
 });

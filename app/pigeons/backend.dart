@@ -16,7 +16,9 @@ abstract class AppHostApi {
   /// The current `AppState` as JSON.
   String snapshot();
 
-  /// Sends one `Action` (JSON). Returns at once; results arrive as later snapshots.
+  /// Sends one `Action` (JSON). Completes when the core has run it, with an error when it threw;
+  /// the effect arrives as a later snapshot.
+  @async
   void act(String actionJson);
 
   /// The stored key as portable `.bpkey` text, for the user to save. Never part of a snapshot.

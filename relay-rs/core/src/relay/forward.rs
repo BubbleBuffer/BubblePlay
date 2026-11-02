@@ -6,15 +6,18 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 
-use super::Relay;
 use super::state::{Conn, Kind, Pending, Phase, Role};
 use super::types::{Action, ConnId};
 use super::util;
+use super::{Relay, reasons};
 use crate::limits::PENDING_LIMIT;
 use crate::protocol::{
     FileText, Invalid, MediaControl, SignalKind, validate_file_binary, validate_file_text,
     validate_media_binary, validate_media_text, validate_signal_text,
 };
+
+/// Dropped client-log messages are reported at most this often.
+const CLIENT_LOG_LINE_EVERY_MS: u64 = 60_000;
 
 impl Relay {
     /// A text frame on a live socket.
@@ -29,7 +32,7 @@ impl Relay {
             return;
         };
         if !self.data_epoch_current(&conn) {
-            self.close(id, 1008, "invalid packet", out);
+            self.close(id, 1008, reasons::INVALID_PACKET, "data.stale-epoch", out);
             return;
         }
         self.record_activity(id, now_ms, out);
@@ -52,7 +55,7 @@ impl Relay {
             return;
         };
         if !self.data_epoch_current(&conn) {
-            self.close(id, 1008, "invalid packet", out);
+            self.close(id, 1008, reasons::INVALID_PACKET, "data.stale-epoch", out);
             return;
         }
         self.record_activity(id, now_ms, out);
@@ -73,9 +76,15 @@ impl Relay {
                 Err(_) => {
                     // Go closes the other end of the pair, then this socket.
                     if let Some(other) = self.other_of(&conn) {
-                        self.evict(other, 1001, "file-peer-left", out);
+                        self.evict(other, 1001, "file-peer-left", "file.peer-left", out);
                     }
-                    self.close(id, 1008, "invalid packet", out);
+                    self.close(
+                        id,
+                        1008,
+                        reasons::INVALID_PACKET,
+                        "packet.invalid-file",
+                        out,
+                    );
                 }
             },
         }
@@ -100,9 +109,18 @@ impl Relay {
     ) {
         let msg = match validate_signal_text(conn.role.side(), text, &conn.epoch) {
             Ok(msg) => msg,
-            Err(Invalid::Drop) => return,
+            Err(Invalid::Drop) => {
+                self.note_dropped_signal(text, now_ms);
+                return;
+            }
             Err(Invalid::Close) => {
-                self.close(id, 1008, "invalid packet", out);
+                self.close(
+                    id,
+                    1008,
+                    reasons::INVALID_PACKET,
+                    "packet.invalid-signal",
+                    out,
+                );
                 return;
             }
         };
@@ -118,7 +136,7 @@ impl Relay {
                 if let Some(other) = self.other_of(conn) {
                     self.send_text(other, json!({"type": "peer-left"}).to_string(), out);
                 }
-                self.close(id, 1000, "bye", out);
+                self.close(id, 1000, "bye", "bye", out);
             }
             SignalKind::Admit => self.admit_list(conn, text, out),
             SignalKind::PairOpen => {
@@ -155,6 +173,31 @@ impl Relay {
         }
     }
 
+    /// A signalling message the relay drops. A client-log message is counted, and
+    /// at most once a minute a debug line says how many were dropped since the last
+    /// line. The line carries the count only, never the message.
+    fn note_dropped_signal(&mut self, text: &str, now_ms: u64) {
+        let is_client_log =
+            util::parse_object(text).is_some_and(|m| util::text_of(&m, "type") == "client-log");
+        if !is_client_log {
+            return;
+        }
+        self.client_log_dropped += 1;
+        let due = self
+            .client_log_logged_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= CLIENT_LOG_LINE_EVERY_MS);
+        if due {
+            let count = std::mem::take(&mut self.client_log_dropped);
+            self.client_log_logged_ms = Some(now_ms);
+            self.log(
+                crate::log::Level::Debug,
+                "client-log messages dropped",
+                None,
+                json!({"class": "client-log.dropped", "count": count}),
+            );
+        }
+    }
+
     /// Text on a media socket: ping, or a viewer's media-control message.
     fn media_text(&mut self, id: ConnId, conn: &Conn, text: &str, out: &mut Vec<Action>) {
         match validate_media_text(conn.role.side(), text, &conn.epoch) {
@@ -168,7 +211,13 @@ impl Relay {
                 }
             }
             Err(Invalid::Drop) => {}
-            Err(Invalid::Close) => self.close(id, 1008, "invalid packet", out),
+            Err(Invalid::Close) => self.close(
+                id,
+                1008,
+                reasons::INVALID_PACKET,
+                "packet.invalid-media",
+                out,
+            ),
         }
     }
 
@@ -178,7 +227,13 @@ impl Relay {
             Ok(FileText::Ping) => {
                 self.send_text(id, json!({"type": "pong"}).to_string(), out);
             }
-            Err(_) => self.close(id, 1008, "invalid packet", out),
+            Err(_) => self.close(
+                id,
+                1008,
+                reasons::INVALID_PACKET,
+                "packet.invalid-file",
+                out,
+            ),
         }
     }
 
@@ -222,7 +277,7 @@ impl Relay {
             .map(|(id, _)| *id)
             .collect();
         for viewer in dropped {
-            self.close(viewer, 1008, "", out);
+            self.close(viewer, 1008, reasons::ACCESS_REMOVED, "admit.removed", out);
             self.forget(viewer, out);
         }
     }

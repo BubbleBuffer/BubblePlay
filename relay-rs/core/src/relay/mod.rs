@@ -48,11 +48,50 @@ pub struct Relay {
     /// Failed pairing attempts per client prefix (M2 section 3).
     pair_failures: BTreeMap<Prefix, PairFailures>,
     next_id: u64,
+    /// The latest `now_ms` an entry point saw: the timestamp of log lines.
+    clock_ms: u64,
+    /// Client-log messages dropped since the last debug line about them.
+    client_log_dropped: u64,
+    /// When that debug line was last written.
+    client_log_logged_ms: Option<u64>,
+}
+
+/// The close reasons clients can show. No secrets, no detail an outsider could use.
+pub mod reasons {
+    /// Malformed or unexpected hello, proof or packet before the session is live.
+    pub const INVALID_HELLO: &str = "invalid hello";
+    /// A live socket sent a packet the relay does not accept.
+    pub const INVALID_PACKET: &str = "invalid packet";
+    /// The viewer's identity proof did not verify.
+    pub const INVALID_PROOF: &str = "invalid proof";
+    /// The viewer is not on the PC's admission list and offered no pairing code.
+    pub const NOT_PAIRED: &str = "not paired";
+    /// The pairing code was wrong, or no pairing window is open.
+    pub const PAIRING_CODE: &str = "pairing code not accepted";
+    /// Too many failed pairing attempts, from this network or against this PC.
+    pub const RATE_LIMITED: &str = "rate limited";
+    /// A media or file socket's ticket or epoch was not accepted.
+    pub const NOT_AUTHORIZED: &str = "not authorized";
+    /// The socket did not finish its hello or proof in time.
+    pub const TIMED_OUT: &str = "timed out";
+    /// The host removed this viewer from the admission list.
+    pub const ACCESS_REMOVED: &str = "access removed";
+    /// The site gate did not approve this browser socket.
+    pub const NOT_APPROVED: &str = "not approved";
+    /// The socket could not be restored after the relay woke from hibernation.
+    pub const SESSION_NOT_RESTORED: &str = "session not restored";
+    /// The PC was removed by the admin.
+    pub const PEER_REMOVED: &str = "peer removed";
 }
 
 impl Relay {
     /// A relay over the given PC table. The store is healthy.
     pub fn new(config: CoreConfig, pcs: PcTable) -> Self {
+        // The configured secrets must never appear in a log line, whatever is logged.
+        crate::log::register_secret(&config.token);
+        if let Some(turn) = &config.turn {
+            crate::log::register_secret(&turn.secret);
+        }
         Self {
             config,
             pcs,
@@ -63,7 +102,21 @@ impl Relay {
             pair_windows: BTreeMap::new(),
             pair_failures: BTreeMap::new(),
             next_id: 1,
+            clock_ms: 0,
+            client_log_dropped: 0,
+            client_log_logged_ms: None,
         }
+    }
+
+    /// Writes one relay log line (src "relay"). The PC id is cut to 8 characters.
+    fn log(
+        &self,
+        level: crate::log::Level,
+        msg: &str,
+        pc: Option<&str>,
+        fields: serde_json::Value,
+    ) {
+        crate::log::emit(level, self.clock_ms, "relay", msg, pc, fields);
     }
 
     /// The configuration this relay was built with.
@@ -92,27 +145,36 @@ impl Relay {
         client: IpAddr,
         now_ms: u64,
     ) -> Result<ConnId, Reject> {
+        self.clock_ms = self.clock_ms.max(now_ms);
         let role = req.route.role();
         let kind = role.kind();
         if req.route.needs_viewer() && !req.viewer_authorized {
-            return Err(Reject);
+            return Err(self.upgrade_refused("upgrade.gate", role, None));
         }
         let pc = match req.pc.as_deref() {
-            Some(raw) => util::canonical_pc(raw).ok_or(Reject)?,
+            Some(raw) => match util::canonical_pc(raw) {
+                Some(pc) => pc,
+                None => return Err(self.upgrade_refused("upgrade.bad-pc", role, None)),
+            },
             None if req.route == Route::HostVersionWs => String::new(),
-            None => return Err(Reject),
+            None => return Err(self.upgrade_refused("upgrade.no-pc", role, None)),
         };
         let epoch = if kind == Kind::Signal {
             String::new()
         } else {
-            let epoch = req.epoch.ok_or(Reject)?;
-            if !validate_epoch(&epoch) || self.current_epoch(&pc) != Some(epoch.as_str()) {
-                return Err(Reject);
+            let Some(epoch) = req.epoch else {
+                return Err(self.upgrade_refused("upgrade.no-epoch", role, Some(&pc)));
+            };
+            if !validate_epoch(&epoch) {
+                return Err(self.upgrade_refused("upgrade.bad-epoch", role, Some(&pc)));
+            }
+            if self.current_epoch(&pc) != Some(epoch.as_str()) {
+                return Err(self.upgrade_refused("upgrade.stale-epoch", role, Some(&pc)));
             }
             epoch
         };
         if self.conns.len() >= self.config.max_connections {
-            return Err(Reject);
+            return Err(self.upgrade_refused("upgrade.connection-cap", role, Some(&pc)));
         }
         let id = ConnId(self.next_id);
         self.next_id += 1;
@@ -137,6 +199,17 @@ impl Relay {
         Ok(id)
     }
 
+    /// Logs an upgrade the relay answers with HTTP 404.
+    fn upgrade_refused(&self, class: &'static str, role: Role, pc: Option<&str>) -> Reject {
+        self.log(
+            crate::log::Level::Warn,
+            "upgrade refused",
+            pc,
+            serde_json::json!({"class": class, "role": role.name(), "status": 404}),
+        );
+        Reject
+    }
+
     /// A text frame arrived on `id`. `rng` supplies the register challenge,
     /// tickets, the viewer epoch and TURN credential suffixes.
     pub fn on_text(
@@ -147,16 +220,17 @@ impl Relay {
         rng: &mut dyn RelayRng,
     ) -> Vec<Action> {
         let mut out = Vec::new();
+        self.clock_ms = self.clock_ms.max(now_ms);
         let Some(conn) = self.open_conn(id) else {
             return out;
         };
         let pre_auth = conn.phase != Phase::Live;
         if pre_auth && text.len() > HELLO_LIMIT {
-            self.hello_refused(id, &mut out);
+            self.hello_refused(id, "hello.oversize", &mut out);
             return out;
         }
         if text.len() > read_limit(conn.role.kind()) {
-            self.close(id, 1001, "peer disconnected", &mut out);
+            self.close(id, 1001, "peer disconnected", "limit.read", &mut out);
             return out;
         }
         match conn.phase {
@@ -171,16 +245,17 @@ impl Relay {
     /// A binary frame arrived on `id`.
     pub fn on_binary(&mut self, id: ConnId, bytes: &[u8], now_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
+        self.clock_ms = self.clock_ms.max(now_ms);
         let Some(conn) = self.open_conn(id) else {
             return out;
         };
         if conn.phase != Phase::Live {
             // Go refuses any non-text message before the hello and before the proof.
-            self.hello_refused(id, &mut out);
+            self.hello_refused(id, "hello.not-text", &mut out);
             return out;
         }
         if bytes.len() > read_limit(conn.role.kind()) {
-            self.close(id, 1001, "peer disconnected", &mut out);
+            self.close(id, 1001, "peer disconnected", "limit.read", &mut out);
             return out;
         }
         self.on_live_binary(id, bytes, now_ms, &mut out);
@@ -203,26 +278,27 @@ impl Relay {
     /// the socket), and expired failure counts are dropped.
     pub fn tick(&mut self, now_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
+        self.clock_ms = self.clock_ms.max(now_ms);
         self.expire_pairing(now_ms, &mut out);
         self.expire_tickets(now_ms, &mut out);
-        let due: Vec<(ConnId, Option<&'static str>)> = self
+        let due: Vec<(ConnId, &'static str)> = self
             .conns
             .iter()
             .filter(|(_, c)| !c.closing && now_ms >= c.deadline_ms)
             .map(|(id, c)| {
-                let challenge = match c.phase {
-                    Phase::Hello => Some(""),
-                    Phase::Proof { .. } => Some("invalid hello"),
-                    Phase::ViewerProof { .. } => Some(""),
-                    _ => None,
+                let class = match c.phase {
+                    Phase::Hello => "timeout.hello",
+                    Phase::Proof { .. } | Phase::ViewerProof { .. } => "timeout.proof",
+                    _ => "timeout.idle",
                 };
-                (*id, challenge)
+                (*id, class)
             })
             .collect();
-        for (id, challenge) in due {
-            match challenge {
-                Some(reason) => self.close(id, 1008, reason, &mut out),
-                None => self.close(id, 1001, "peer disconnected", &mut out),
+        for (id, class) in due {
+            if class == "timeout.idle" {
+                self.close(id, 1001, "peer disconnected", class, &mut out);
+            } else {
+                self.hello_refused(id, class, &mut out);
             }
         }
         out
@@ -268,7 +344,13 @@ impl Relay {
             .map(|(id, _)| *id)
             .collect();
         for host in hosts {
-            self.close(host, 1008, "peer removed", &mut out);
+            self.close(
+                host,
+                1008,
+                reasons::PEER_REMOVED,
+                "admin.pc-removed",
+                &mut out,
+            );
             self.forget(host, &mut out);
         }
         Ok(out)
@@ -317,17 +399,59 @@ impl Relay {
     }
 
     /// Marks a socket closing and queues the Close action. Idempotent.
-    fn close(&mut self, id: ConnId, code: u16, reason: &str, out: &mut Vec<Action>) {
-        if let Some(conn) = self.conns.get_mut(&id).filter(|c| !c.closing) {
+    /// `class` names why, for the log line: a short dotted word such as
+    /// `pairing.wrong-code`. Every close is logged with its status, reason and class.
+    fn close(
+        &mut self,
+        id: ConnId,
+        code: u16,
+        reason: &str,
+        class: &'static str,
+        out: &mut Vec<Action>,
+    ) {
+        let seen = self.conns.get_mut(&id).filter(|c| !c.closing).map(|conn| {
             conn.closing = true;
+            // A viewer that has not been admitted yet is known by the id it claimed.
+            let device = match &conn.phase {
+                Phase::ViewerProof { id, .. } if conn.device.is_empty() => id.to_string(),
+                _ => conn.device.clone(),
+            };
+            (conn.role, device, conn.pc.clone())
+        });
+        if let Some((role, device, pc)) = seen {
             out.push(Action::Close(id, code, reason.to_owned()));
+            let level = if code == 1008 {
+                crate::log::Level::Warn
+            } else {
+                crate::log::Level::Info
+            };
+            let msg = if code == 1008 {
+                "socket refused"
+            } else {
+                "socket closed"
+            };
+            let fields = serde_json::json!({
+                "class": class,
+                "status": code,
+                "reason": reason,
+                "role": role.name(),
+                "peer": (!device.is_empty()).then(|| crate::log::short_id(&device)),
+            });
+            self.log(level, msg, (!pc.is_empty()).then_some(pc.as_str()), fields);
         }
     }
 
     /// Closes a socket and drops it from the peer table without telling its
     /// peer. Go does this when a socket is replaced or cleared as stale.
-    fn evict(&mut self, id: ConnId, code: u16, reason: &str, out: &mut Vec<Action>) {
-        self.close(id, code, reason, out);
+    fn evict(
+        &mut self,
+        id: ConnId,
+        code: u16,
+        reason: &str,
+        class: &'static str,
+        out: &mut Vec<Action>,
+    ) {
+        self.close(id, code, reason, class, out);
         if let Some(conn) = self.conns.remove(&id) {
             let key = key_for(conn.role, &conn.epoch, &conn.pc);
             if self.peers.get(&key) == Some(&id) {
@@ -390,7 +514,7 @@ impl Relay {
             .map(|(_, id)| *id)
             .collect();
         for id in departed {
-            self.close(id, 1001, "viewer departed", out);
+            self.close(id, 1001, "viewer departed", "viewer.left", out);
         }
     }
 
@@ -417,7 +541,7 @@ impl Relay {
             ),
             Kind::File => {
                 self.peers.remove(&other_key);
-                self.close(other, 1001, "file-peer-left", out);
+                self.close(other, 1001, "file-peer-left", "file.peer-left", out);
             }
         }
     }

@@ -81,6 +81,7 @@ pub fn load(env: &Env) -> Result<Settings, String> {
         approval_ttl_secs,
         ntfy,
     };
+    bp_relay_core::log::register_secret(&admin_token);
     Ok(Settings {
         core,
         gate,

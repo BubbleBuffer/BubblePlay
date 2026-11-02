@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import '../logging/app_log.dart';
+
 /// Why the host link is down (the synthetic `disconnected` line's `reason`).
 enum DisconnectReason {
   hostNotRunning,
@@ -126,13 +128,20 @@ class ShowEvent extends DevicesEvent {
   const ShowEvent();
 }
 
+/// The tray's "Report a problem" item: open the report sheet.
+class OpenFeedbackEvent extends DevicesEvent {
+  const OpenFeedbackEvent();
+}
+
 /// Parses one line. Returns null for a malformed line or an unknown `type` (both ignored).
 DevicesEvent? parseDevicesLine(String line) {
   try {
     final json = jsonDecode(line);
     if (json is! Map) return null;
     return _parse(json.cast<String, Object?>());
-  } catch (_) {
+  } catch (e) {
+    // Only the error class: a format error's message quotes the line.
+    AppLog.warn('Devices', 'Ignored a malformed line from the host', fields: {'error_type': e.runtimeType.toString()});
     return null;
   }
 }
@@ -175,6 +184,7 @@ DevicesEvent? _parse(Map<String, Object?> m) => switch (m['type']) {
       'pairDone' => PairDoneEvent(id: _string(m, 'id'), name: _string(m, 'name')),
       'saveError' => SaveErrorEvent(_string(m, 'message')),
       'show' => const ShowEvent(),
+      'openFeedback' => const OpenFeedbackEvent(),
       _ => null,
     };
 

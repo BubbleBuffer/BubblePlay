@@ -97,6 +97,7 @@ test("a viewer that is not on the admission list is closed 1008 before hello-ok"
   try {
     const close = await stranger.raw.done;
     assert.equal(close.code, 1008);
+    assert.equal(close.reason, "not paired");
     assert.equal(stranger.raw.items.some(message => message.type === "hello-ok"), false);
     assert.equal(stranger.events.items.length, 0);
   } finally {

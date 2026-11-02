@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <title>BubblePlay</title>
+<script src="/dk-log.js"></script>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32">
 <style>
@@ -60,6 +61,7 @@
 <link rel="stylesheet" href="/bubbleplay.css">
 <link rel="stylesheet" href="/devicekey-ui.css">
 <link rel="stylesheet" href="/dk-gate.css">
+<link rel="stylesheet" href="/dk-feedback.css">
 </head>
 <body class="session-page mode-work">
 <!-- Session strip: docked top row (desktop, ≤32 px) or docked bottom bar (touch).
@@ -150,6 +152,7 @@
   <div id="pop-more-title" class="pop-caption">More</div>
   <button id="more-fullscreen" class="pop-row" type="button" data-ui-action="fullscreen"><span class="pop-row-title">Full screen</span><span class="pop-row-trail" id="more-fullscreen-state">Off</span></button>
   <button id="more-settings" class="pop-row" type="button" data-ui-action="settings"><span class="pop-row-title">Settings</span><span class="pop-row-detail">Quality, input, browser access</span></button>
+  <button id="more-feedback" class="pop-row" type="button" data-ui-action="feedback"><span class="pop-row-title">Report a problem</span><span class="pop-row-detail">Ctrl+Shift+F</span></button>
 </div>
 
 <aside id="settings-panel" class="bp-panel" role="dialog" aria-modal="false" aria-labelledby="settings-title" data-placement="panel" hidden>
@@ -187,6 +190,11 @@
       <pre id="diagnostics-output" aria-live="polite" hidden>Diagnostics are hidden.</pre>
     </details>
   </section>
+  <section class="settings-section" aria-labelledby="settings-feedback">
+    <h3 id="settings-feedback">Report a problem</h3>
+    <p class="setting-help">Saves a note with recent activity from this browser. It is sent to your PC the next time you connect. Shortcut: Ctrl+Shift+F.</p>
+    <div class="settings-actions"><button id="settings-report-problem" type="button" data-ui-action="feedback">Report a problem</button></div>
+  </section>
   <section class="settings-section" aria-labelledby="settings-about">
     <h3 id="settings-about">About</h3>
     <a id="about-source" class="about-source" href="https://github.com/BubbleBuffer/BubblePlay" target="_blank" rel="noopener noreferrer">Source code</a>
@@ -222,33 +230,17 @@
     if (typeof value === "string") return [key, value.slice(0, 512)];
     return [key, value ?? null];
   }));
+  // Page-start events go to the local browser log (dk-log.js, loaded first). Errors and
+  // rejections are captured by that script itself.
   const trace = (stage, detail = {}) => {
-    const payload = {
-      schemaVersion: 1,
-      attemptId: state.attemptId,
-      seq: ++state.seq,
-      atMs: Date.now(),
-      stage,
-      detail: normalizeDetail(detail),
-    };
-    fetch("/__diag/client", {
-      method: "POST",
-      credentials: "same-origin",
-      keepalive: true,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch(() => {});
+    try {
+      window.BPLog?.info("trace", stage, { attempt: state.attemptId, seq: ++state.seq, ...normalizeDetail(detail) });
+    } catch { /* tracing never breaks the page */ }
   };
   window.__bubbleplayDebugTrace = {
     attemptId: state.attemptId,
     trace,
   };
-  addEventListener("error", event => trace("window-error", {
-    message: String(event.message || "unknown"), source: String(event.filename || ""), line: event.lineno || 0,
-  }));
-  addEventListener("unhandledrejection", event => trace("unhandled-rejection", {
-    message: String(event.reason?.stack || event.reason || "unknown"),
-  }));
   trace("bootstrap-inline", {
     pathname: location.pathname,
     transport: search.get("transport") || "auto",

@@ -63,6 +63,11 @@ impl Role {
         }
     }
 
+    /// The role's hello name, for logs.
+    pub(crate) fn name(self) -> &'static str {
+        self.hello_roles()[0]
+    }
+
     /// The hello `role` strings this socket accepts. The viewer roles are
     /// `viewer`, `media-viewer` and `file-viewer`; any other name is refused
     /// as an unknown role.

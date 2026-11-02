@@ -12,6 +12,11 @@ binding = "ASSETS"
 run_worker_first = true
 not_found_handling = "none"
 
+# Workers observability: collects the relay's structured console lines (src "relay").
+# Refusals and closes are logged there with a status, a reason and a class.
+[observability]
+enabled = true
+
 [durable_objects]
 bindings = [{ name = "RELAY", class_name = "Relay" }]
 

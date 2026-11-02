@@ -1,5 +1,6 @@
 package de.bubblebuffer.bubbleplay.auth
 
+import de.bubblebuffer.bubbleplay.log.BpLog
 import java.security.MessageDigest
 
 /** What [ViewerAuth] reports. */
@@ -58,7 +59,7 @@ class ViewerAuth(private val handshake: Handshake) {
     /** The first step: send auth-hello. */
     @Synchronized
     fun start(): AuthStep {
-        if (state != State.NEW) return fail(AuthFailure.UNEXPECTED_MESSAGE)
+        if (state != State.NEW) return fail(AuthFailure.UNEXPECTED_MESSAGE, "start called twice")
         state = State.AWAIT_AUTH_HOST
         return AuthStep(listOf(handshake.authHello))
     }
@@ -69,22 +70,24 @@ class ViewerAuth(private val handshake: Handshake) {
         val m = try {
             AuthJson.parseObject(text)
         } catch (e: AuthJson.Malformed) {
-            return fail(AuthFailure.MALFORMED)
+            return fail(AuthFailure.MALFORMED, "message is not a JSON object: ${e.message}")
         }
-        val type = m["type"] as? String ?: return fail(AuthFailure.MALFORMED)
+        val type = m["type"] as? String ?: return fail(AuthFailure.MALFORMED, "message has no type")
         return when {
             type == "auth-host" && state == State.AWAIT_AUTH_HOST -> onAuthHost(text)
             type == "pair-proof" && state == State.AWAIT_PC_PROOF -> onPcProof(m)
             type == "pair-done" && state == State.AWAIT_DECISION -> {
-                if (m.size != 1) return fail(AuthFailure.MALFORMED)
+                if (m.size != 1) return fail(AuthFailure.MALFORMED, "pair-done has extra fields")
                 val done = result!!
+                log("pairing allowed by the PC")
                 finish(AuthStep(emptyList(), AuthEvent.Paired(done.pcId, done.pcPublic)))
             }
             type == "pair-denied" && (state == State.AWAIT_PC_PROOF || state == State.AWAIT_DECISION) -> {
-                if (m.size != 1) return fail(AuthFailure.MALFORMED)
+                if (m.size != 1) return fail(AuthFailure.MALFORMED, "pair-denied has extra fields")
+                log("pairing denied by the PC")
                 finish(AuthStep(emptyList(), AuthEvent.Denied))
             }
-            else -> fail(AuthFailure.UNEXPECTED_MESSAGE)
+            else -> fail(AuthFailure.UNEXPECTED_MESSAGE, "message type $type in state $state")
         }
     }
 
@@ -92,9 +95,10 @@ class ViewerAuth(private val handshake: Handshake) {
         val done = try {
             handshake.onAuthHost(text)
         } catch (e: AuthException) {
-            return fail(e.failure)
+            return fail(e.failure, e.message)
         }
         result = done
+        log("auth-host verified")
         if (!handshake.isPairing) {
             return finish(AuthStep(listOf(done.authFinish), AuthEvent.Authenticated(done.controlKeys.viewerChannel(), done.pcId, done.pcPublic)))
                 .also { done.controlKeys.wipe() }
@@ -114,13 +118,14 @@ class ViewerAuth(private val handshake: Handshake) {
             AuthJson.requireExactKeys(m, "type", "mac")
             AuthCrypto.unb64(AuthJson.string(m, "mac"), 32)
         } catch (e: AuthJson.Malformed) {
-            return fail(AuthFailure.MALFORMED)
+            return fail(AuthFailure.MALFORMED, "pair-proof invalid (${e.message})")
         }
         val done = result!!
         val hash = done.transcriptHash
         val expected = Pairing.pcMac(pairKey!!, hash)
-        if (!MessageDigest.isEqual(expected, mac)) return fail(AuthFailure.PAIR_MAC_MISMATCH)
+        if (!MessageDigest.isEqual(expected, mac)) return fail(AuthFailure.PAIR_MAC_MISMATCH, "the PC's pair proof did not match the code")
         wipePairKey()
+        log("PC pair proof verified")
         val number = Pairing.sasNumber(hash)
         state = State.AWAIT_DECISION
         return AuthStep(emptyList(), AuthEvent.PairNumber(number, Pairing.sasDisplay(number)))
@@ -132,7 +137,16 @@ class ViewerAuth(private val handshake: Handshake) {
         return step
     }
 
-    private fun fail(reason: AuthFailure): AuthStep = finish(AuthStep(emptyList(), AuthEvent.Failed(reason)))
+    private fun fail(reason: AuthFailure, detail: String? = null): AuthStep {
+        val fields = linkedMapOf<String, Any?>("failure" to reason.name, "mode" to modeName(), "state" to state.name)
+        if (detail != null) fields["detail"] = detail
+        BpLog.w("ViewerAuth", "viewer auth failed", handshake.mode.pcId, fields)
+        return finish(AuthStep(emptyList(), AuthEvent.Failed(reason)))
+    }
+
+    private fun modeName() = if (handshake.isPairing) "pairing" else "normal"
+
+    private fun log(msg: String) = BpLog.i("ViewerAuth", msg, handshake.mode.pcId, mapOf("mode" to modeName()))
 
     private fun wipePairKey() {
         pairKey?.fill(0)

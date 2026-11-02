@@ -1,8 +1,12 @@
 import 'package:bb_ui/bb_ui.dart';
+import 'dart:async';
+
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import 'app_controller.dart';
 import 'devices/devices_controller.dart';
+import 'feedback/feedback_controller.dart';
+import 'feedback/shake_detector.dart';
 import 'platform/key_files.dart';
 import 'screens/gate.dart';
 
@@ -16,6 +20,8 @@ class AppEnv {
     this.theme,
     this.devices,
     this.initialSection,
+    this.feedback,
+    this.shakeSamples,
   });
 
   final AppController controller;
@@ -30,6 +36,12 @@ class AppEnv {
 
   /// The section to open on start (`--section=this-pc`); null opens the PC list's first PC.
   final String? initialSection;
+
+  /// Where "Report a problem" stores reports; null makes Send report that it could not save.
+  final FeedbackServices? feedback;
+
+  /// Opens the accelerometer for shake-to-report; null (everywhere but Android) turns it off.
+  final Stream<ShakeSample> Function()? shakeSamples;
 }
 
 class AppScope extends InheritedWidget {
@@ -48,7 +60,7 @@ class AppScope extends InheritedWidget {
 }
 
 /// The app root: bb-ui theme over a plain WidgetsApp (no Material).
-class BubblePlayApp extends StatelessWidget {
+class BubblePlayApp extends StatefulWidget {
   const BubblePlayApp({super.key, required this.env, this.brightness});
 
   final AppEnv env;
@@ -57,12 +69,70 @@ class BubblePlayApp extends StatelessWidget {
   final Brightness? brightness;
 
   @override
+  State<BubblePlayApp> createState() => _BubblePlayAppState();
+}
+
+class _BubblePlayAppState extends State<BubblePlayApp> {
+  final _navigatorKey = GlobalKey<NavigatorState>();
+  final _tracker = RouteTracker();
+  StreamSubscription<void>? _feedbackRequests;
+  ShakeService? _shake;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.env.shakeSamples != null) {
+      _shake = ShakeService(
+        samples: widget.env.shakeSamples,
+        onShake: _onShake,
+        allowed: _shakeAllowed,
+      );
+    }
+    // The tray's "Report a problem" item arrives as `openFeedback` on the devices pipe.
+    final devices = widget.env.devices;
+    if (devices == null) return;
+    _feedbackRequests = devices.feedbackRequests.listen((_) => _openFeedback(devices));
+    if (devices.feedbackPending) {
+      // It arrived while the app was starting: open once the first frame has a navigator.
+      WidgetsBinding.instance.addPostFrameCallback((_) => _openFeedback(devices));
+    }
+  }
+
+  @override
+  void dispose() {
+    _shake?.dispose();
+    _feedbackRequests?.cancel();
+    super.dispose();
+  }
+
+  /// Never while a remote session is on screen: a shake there is the phone moving with the game.
+  bool _shakeAllowed() =>
+      screenName(widget.env.controller.state) != 'session' && !(_tracker.current ?? '').contains('session');
+
+  void _onShake() {
+    final context = _navigatorKey.currentContext;
+    if (!mounted || context == null) return;
+    unawaited(showFeedbackSheet(context));
+  }
+
+  void _openFeedback(DevicesController devices) {
+    final context = _navigatorKey.currentContext;
+    if (!mounted || context == null) return;
+    devices.consumeFeedback();
+    unawaited(showFeedbackSheet(context));
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final env = widget.env;
+    final brightness = widget.brightness;
     final choice = env.theme;
     return ListenableBuilder(
       listenable: choice ?? const AlwaysStoppedAnimation<double>(0),
       builder: (context, _) => WidgetsApp(
         title: 'BubblePlay',
+        navigatorKey: _navigatorKey,
+        navigatorObservers: [_tracker],
         color: AppColors.light.desk,
         debugShowCheckedModeBanner: false,
         pageRouteBuilder: <T>(settings, builder) => PageRouteBuilder<T>(
@@ -83,7 +153,14 @@ class BubblePlayApp extends StatelessWidget {
                     color: context.colors.bgPrimary,
                     child: DefaultTextStyle(
                       style: ts(context.type.body, context.colors.textPrimary),
-                      child: ScrollConfiguration(behavior: const AppScrollBehavior(), child: child!),
+                      child: ScrollConfiguration(
+                        behavior: const AppScrollBehavior(),
+                        child: FeedbackHost(
+                          navigatorKey: _navigatorKey,
+                          tracker: _tracker,
+                          child: child!,
+                        ),
+                      ),
                     ),
                   ),
                 ),

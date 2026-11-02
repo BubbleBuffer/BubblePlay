@@ -20,13 +20,17 @@ use zeroize::Zeroizing;
 
 use super::device_key_file;
 use super::logic::{
-    build_host_args, Backoff, HostState, SharedLog, StoredHostConfig, TraySettings,
+    build_host_args, log_child_line, Backoff, HostState, StoredHostConfig, TraySettings,
 };
 use super::platform::{dpapi_unprotect_hex, KillOnCloseJob};
 
 /// Stdin line that asks the host to tell connected pipe clients to show the
 /// Devices app. The host side defines the same literal.
 pub const SHOW_DEVICES_APP_LINE: &[u8] = b"show-devices-app\n";
+
+/// Stdin line that asks the host to tell connected pipe clients to open the
+/// app's report sheet. The host side defines the same literal.
+pub const OPEN_FEEDBACK_LINE: &[u8] = b"open-feedback\n";
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const POLL: Duration = Duration::from_millis(250);
@@ -35,8 +39,6 @@ const NOT_CONFIGURED_RECHECK: Duration = Duration::from_secs(30);
 pub struct SupervisorConfig {
     pub host_exe: PathBuf,
     pub host_config: PathBuf,
-    /// Host stdout/stderr destination.
-    pub host_log: SharedLog,
     /// Optional lifecycle events for update probation.
     pub events: Option<Sender<HostEvent>>,
     /// Extra environment for the host (the admin agent's pipe name).
@@ -103,6 +105,12 @@ impl HostStdin {
         self.write_line(SHOW_DEVICES_APP_LINE)
     }
 
+    /// Writes the fixed `open-feedback` line to the current child. Fails with
+    /// `NotConnected` when no child is running.
+    pub fn request_open_feedback(&self) -> io::Result<()> {
+        self.write_line(OPEN_FEEDBACK_LINE)
+    }
+
     fn write_line(&self, line: &[u8]) -> io::Result<()> {
         let mut guard = match self.0.lock() {
             Ok(guard) => guard,
@@ -140,7 +148,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog, events: Option<Sender<HostEvent>>) {
+/// Read a host pipe line by line: lifecycle markers become events and warn/error output goes
+/// into the tray log (the host's own detailed log is `host-YYYY-MM-DD.jsonl`).
+fn pump<R: Read + Send + 'static>(
+    reader: R,
+    stream: &'static str,
+    events: Option<Sender<HostEvent>>,
+) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut line = Vec::with_capacity(512);
@@ -149,9 +163,13 @@ fn pump<R: Read + Send + 'static>(reader: R, log: SharedLog, events: Option<Send
             match reader.read_until(b'\n', &mut line) {
                 // Keep draining even if logging fails, so the host never blocks
                 // on a full pipe.
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(error) => {
+                    tracing::warn!(%error, stream, "reading host output failed; output no longer captured");
+                    break;
+                }
                 Ok(_) => {
-                    log.append(&line);
+                    log_child_line("host", stream, &line);
                     if let Some(event) = line_event(&line) {
                         emit(&events, event);
                     }
@@ -169,6 +187,7 @@ fn load(config: &SupervisorConfig) -> Result<(StoredHostConfig, Secrets)> {
     let stored = StoredHostConfig::load(&config.host_config)?;
     let token = String::from_utf8(dpapi_unprotect_hex(&stored.token_dpapi_hex)?)
         .context("stored token is not UTF-8")?;
+    bubbleplay_host::logging::redact::register_secret(&token);
     Ok((stored, Secrets { token }))
 }
 
@@ -188,9 +207,8 @@ fn device_key_handoff(config: &SupervisorConfig) -> Option<Zeroizing<String>> {
     ) {
         Ok(key) => Some(key),
         Err(_) => {
-            config
-                .host_log
-                .append(b"PC device key unavailable; starting without a device ID\n");
+            // The key error is deliberately not logged: it can come from reading the key file.
+            tracing::warn!("PC device key unavailable; starting without a device ID");
             None
         }
     }
@@ -235,10 +253,10 @@ fn spawn(config: &SupervisorConfig, job: &KillOnCloseJob, stdin: &HostStdin) -> 
     }
     stdin.set(child.stdin.take());
     if let Some(out) = child.stdout.take() {
-        pump(out, config.host_log.clone(), config.events.clone());
+        pump(out, "stdout", config.events.clone());
     }
     if let Some(err) = child.stderr.take() {
-        pump(err, config.host_log.clone(), config.events.clone());
+        pump(err, "stderr", config.events.clone());
     }
     Ok(child)
 }
@@ -396,6 +414,12 @@ impl SupervisorThread {
         self.stdin.request_show_devices_app()
     }
 
+    /// Asks the running host to tell the app to open its report sheet. Fails
+    /// with `NotConnected` when no host child is running.
+    pub fn request_open_feedback(&self) -> io::Result<()> {
+        self.stdin.request_open_feedback()
+    }
+
     pub fn stop(&mut self) {
         if let Some(tx) = self.stop.take() {
             let _ = tx.send(());
@@ -443,6 +467,20 @@ mod tests {
             .request_show_devices_app()
             .expect_err("no child is running");
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn feedback_request_without_a_running_host_is_refused() {
+        let stdin = HostStdin::default();
+        let error = stdin
+            .request_open_feedback()
+            .expect_err("no child is running");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn feedback_line_is_the_fixed_literal() {
+        assert_eq!(OPEN_FEEDBACK_LINE, b"open-feedback\n");
     }
 
     #[test]

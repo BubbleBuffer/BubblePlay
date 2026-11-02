@@ -2,6 +2,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import '../logging/app_log.dart';
 import '../rust/api.dart' as api;
 import 'devices_channel.dart';
 
@@ -24,9 +25,12 @@ class FrbDevicesChannel implements DevicesChannel {
       return FrbDevicesChannel(
         connect: api.devicesConnect,
         sendLine: (line) => api.devicesSend(line: line),
-        disconnect: () => unawaited(api.devicesDisconnect()),
+        disconnect: () => unawaited(api.devicesDisconnect().catchError((Object e) {
+          AppLog.warn('Devices', 'Closing the host link failed', error: e);
+        })),
       );
-    } catch (_) {
+    } catch (e) {
+      AppLog.warn('Devices', 'The host link could not be opened', error: e);
       return null;
     }
   }

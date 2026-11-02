@@ -12,6 +12,9 @@ class FakeChannel implements AppChannel {
   final List<String> actions = <String>[];
   final StreamController<void> _changes = StreamController<void>.broadcast();
 
+  /// When set, [act] records the action and then throws this, like a core that failed it.
+  Object? actError;
+
   /// The key text [exportKey] returns.
   String keyText = '{"format":"bubbleplay-device-key"}';
 
@@ -26,6 +29,8 @@ class FakeChannel implements AppChannel {
   @override
   Future<void> act(String actionJson) async {
     actions.add(actionJson);
+    final error = actError;
+    if (error != null) throw error;
   }
 
   @override

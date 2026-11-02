@@ -104,9 +104,11 @@ user (local DXGI capture + SendInput). The relay token reaches the host only as
 - Config: `%LOCALAPPDATA%\BubblePlay\host.json` (`worker`, `tokenDpapiHex`,
   optional `monitor`; secrets CurrentUser DPAPI) and
   `tray.json` (`adminMode`, `startAtLogin`).
-- Logs: `%LOCALAPPDATA%\BubblePlay\logs` (`tray.log`, `host.log`), each capped
-  at 5 x 5 MiB; the elevated agent logs to
-  `%ProgramFiles%\BubblePlay\agent\logs\admin-agent.log`.
+- Logs: JSON lines, one file per UTC day, in `%LOCALAPPDATA%\BubblePlay\logs`
+  (`host-YYYY-MM-DD.jsonl`, `tray-YYYY-MM-DD.jsonl`), kept 7 days (20 MiB and
+  20 files per source at most); the elevated agent logs to
+  `%ProgramFiles%\BubblePlay\agent\logs\agent-YYYY-MM-DD.jsonl` and the secure
+  helper to `helper-YYYY-MM-DD.jsonl` in its protected install log folder.
 - Setup, from a normal PowerShell: `host/scripts/setup-tray.ps1` (use
   `-WhatIf` first). The user part needs no admin rights. Everything
   machine-wide runs in one elevated child (one UAC prompt, only when needed):

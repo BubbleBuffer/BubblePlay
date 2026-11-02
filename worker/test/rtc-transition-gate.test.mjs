@@ -101,7 +101,7 @@ function receiverHarness({ path = "native", reason = "desktop-source-transition"
     wssStartupRecoveries: 0, hasPresentedFrame: false, desktopAwaitingFrame: true, suppressDesktopTransitionOverlay: false,
     inputTransitionHold: false, inputReady: true, fileDropPresentedGeneration: null, fileDropPresentedViewportRevision: null,
     input: { resumeAfterTransition() {} }, onInputReady() {}, showContextHint() {}, renderDesktopState() {}, debugTrace() {},
-    clearFirstFrameWatchdog() {}, recoverWssStartup() {}, sendClientLog() {}, forgetRtcFailure() {}, rtcFailureStorage() {},
+    clearFirstFrameWatchdog() {}, recoverWssStartup() {}, viewerLog() {}, forgetRtcFailure() {}, rtcFailureStorage() {},
     rtcStartupFallback: { progress() {}, stop() {}, requestSent() {} }, document: { body: { classList: { add() {} } } },
     resyncPipeline: (why, gate) => resyncs.push({ why, gate }), sendControl: (message) => signals.push(message),
     recycleSignaling() {}, restartPeer() {},
