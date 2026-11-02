@@ -40,13 +40,13 @@ On the PC, under `%LOCALAPPDATA%\BubblePlay\logs` (host, tray) or the protected 
 
 The tray log also holds the host's and agent's raw stdout and stderr as lines with target `child`.
 
-On clients: `logs/pc/<pc-id>/<src>-YYYY-MM-DD.jsonl` (lines tied to a PC, 5 MB per PC), `logs/misc/` (the rest), `logs/outbox/` (reports waiting to be sent). 20 MB total, 30 days. Roots: Windows app `%LOCALAPPDATA%\BubblePlay\viewer\logs`; Android the app's `files/logs`, shared by the Dart process (`app-android`) and the Kotlin core (`app-android-core`), each writing its own files. The browser keeps a 2 MB ring in IndexedDB `bp-logs` (`lines`, `feedback`).
+On clients: `logs/pc/<pc-id>/<src>-YYYY-MM-DD.jsonl` (lines tied to a PC, 5 MB per PC), `logs/misc/` (the rest), `logs/outbox/` (reports waiting to be sent). 20 MB total, 30 days. The Rust side of the Windows app writes `app-win-rust-YYYY-MM-DD.jsonl` (src `app-win`, 60 lines per minute) into the same tree. Roots: Windows app `%LOCALAPPDATA%\BubblePlay\viewer\logs`; Android the app's `files/logs`, shared by the Dart process (`app-android`) and the Kotlin core (`app-android-core`), each writing its own files. The browser keeps a 2 MB ring in IndexedDB `bp-logs` (`lines`, `feedback`).
 
 The relay logs structured JSON to the console (Workers observability); `pc` and peer IDs are cut to 8 characters, and every refusal has a class (for example `pairing.wrong-code`) and a 1008 close reason clients can show.
 
 ## Feedback
 
-"Report a problem" is in the Flutter app (Ctrl+Shift+F, Settings, session menu), the browser viewer (Ctrl+Shift+F, More, Settings) and the tray menu (opens the app's sheet over the devices pipe, `open-feedback` / `openFeedback`). A report holds the text, kind (bug, complaint, idea, other), timestamp, app version and commit, platform, device, PC, session, screen, the last 200 log lines, the last 20 errors and, in the app, a screenshot of the Flutter UI (never the stream). It is saved in the client outbox and sent to the PC the client is connected to.
+"Report a problem" is in the Flutter app (Ctrl+Shift+F, Settings, session menu), the browser viewer (Ctrl+Shift+F, More, Settings) and the tray menu (opens the app's sheet over the devices pipe, `open-feedback` / `openFeedback`). A report holds the text, kind (bug, complaint, idea, other), timestamp, app version and commit, platform, device, PC, session, screen, the last 200 log lines, the last 20 errors and, in the app, a screenshot of the Flutter UI (never the stream). On Android, shaking the phone opens the sheet (not during a session). If the app is not installed, the tray shows a small text box and saves the report straight to `feedback\<ts>-this-pc.json`. It is saved in the client outbox and sent to the PC the client is connected to.
 
 ## Finding what happened around a feedback timestamp
 
@@ -60,4 +60,4 @@ bubbleplay-logs around 2026-11-02T13:45:12Z --window 5m [--src host,tray] [--dev
 ## Status
 
 Built: all of the above except the transfer of client logs and reports to the PC.
-Not built yet: the session-channel upload (historical lines, live stream, cursor acks, feedback upload). The host stores batches through `client_logs::ClientLogStore` and `feedback_store::FeedbackStore`, which the session code will call. The Rust side of the Windows app (`app/rust/src/backend.rs`) still swallows three errors without logging.
+Not built yet: the session-channel upload (historical lines, live stream, cursor acks, feedback upload). The host stores batches through `client_logs::ClientLogStore` and `feedback_store::FeedbackStore`, which the session code will call.
