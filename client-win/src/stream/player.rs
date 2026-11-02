@@ -325,6 +325,11 @@ impl StreamSession {
         *lock(&self.shared.front)
     }
 
+    /// The one-second media window and totals (decode-to-present percentiles, fps, counters).
+    pub fn stats(&self) -> crate::media::StatsSnapshot {
+        self.stats.snapshot()
+    }
+
     /// The most recent worker error, if the session ended on one.
     pub fn last_error(&self) -> Option<String> {
         lock(&self.shared.errors).last().cloned()
