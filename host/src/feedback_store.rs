@@ -8,7 +8,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Map, Value};
 
@@ -302,6 +302,7 @@ impl FeedbackStore {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::UNIX_EPOCH;
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -371,12 +372,24 @@ mod tests {
         assert_eq!(back["received"], "2026-11-02T13:38:32.345Z");
         assert_eq!(back["screenshot"], "20261102T133832345Z-phone-1.png");
         assert_eq!(
-            back["app"]["commit"], "[redacted]",
-            "non-plain app text is dropped"
+            back["app"]["commit"],
+            "0123456789abcdef0123456789abcdef01234567x"
         );
         assert_eq!(back["app"]["version"], "1.2.3");
         assert_eq!(back["pc"], "pc-9");
         assert_eq!(files(store.dir()).len(), 2, "no temp files left");
+    }
+
+    #[test]
+    fn non_plain_app_text_is_redacted() {
+        let tmp = TempDir::new();
+        let store = FeedbackStore::open(&tmp.0).unwrap();
+        let d = AuthenticatedDevice::new("phone-1").unwrap();
+        let mut r = report();
+        r["app"]["build"] = json!("45 token=abc/def");
+        let path = store.save_at(&d, r, None, at()).unwrap();
+        let back: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(back["app"]["build"], "[redacted]");
     }
 
     #[test]

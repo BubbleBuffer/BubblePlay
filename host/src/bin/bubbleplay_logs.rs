@@ -105,11 +105,11 @@ fn parse_feedback_name(name: &str) -> Option<(String, String)> {
     let base = name.strip_suffix(".json")?;
     let (ts, device) = base.split_once('-')?;
     let b = ts.as_bytes();
-    if b.len() != 20 || b[8] != b'T' || b[19] != b'Z' || device.is_empty() {
+    if b.len() != 19 || b[8] != b'T' || b[18] != b'Z' || device.is_empty() {
         return None;
     }
     let digits_ok = ts[..8].bytes().all(|c| c.is_ascii_digit())
-        && ts[9..19].bytes().all(|c| c.is_ascii_digit());
+        && ts[9..18].bytes().all(|c| c.is_ascii_digit());
     if !digits_ok {
         return None;
     }
