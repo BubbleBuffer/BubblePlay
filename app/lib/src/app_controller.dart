@@ -164,6 +164,13 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  /// Hides the failure notice (a later good snapshot clears it too).
+  void dismissError() {
+    if (_error == null) return;
+    _error = null;
+    notifyListeners();
+  }
+
   /// The stored key as portable text, for saving to a file.
   Future<String> exportKey() => _channel.exportKey();
 

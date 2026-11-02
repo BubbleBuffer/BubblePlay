@@ -28,13 +28,44 @@ class Gate extends StatelessWidget {
           );
         }
         final session = state.session;
-        if (session != null) return SessionScreen(state: state, session: session);
-        final flow = state.flow;
-        if (flow is Enroll) return EnrollScreen(state: state, step: flow.step);
+        final Widget screen;
+        if (session != null) {
+          screen = SessionScreen(state: state, session: session);
+        } else if (state.flow is Enroll) {
+          screen = EnrollScreen(state: state, step: (state.flow as Enroll).step);
+        } else {
+          final flow = state.flow;
+          screen = Stack(
+            children: [
+              Positioned.fill(child: HomeScreen(state: state)),
+              if (flow != null) Positioned.fill(child: FlowLayer(state: state, flow: flow)),
+            ],
+          );
+        }
+        if (controller.error == null) return screen;
+        // An action the core could not run: say so instead of looking as if it worked.
         return Stack(
           children: [
-            Positioned.fill(child: HomeScreen(state: state)),
-            if (flow != null) Positioned.fill(child: FlowLayer(state: state, flow: flow)),
+            Positioned.fill(child: screen),
+            Positioned(
+              left: 16,
+              right: 16,
+              top: 16,
+              child: SafeArea(
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 480),
+                    child: NoticeBanner(
+                      kind: NoticeKind.danger,
+                      title: 'That did not work',
+                      message: 'The app core could not run it. Try again.',
+                      actions: [TextBtn('Dismiss', onTap: controller.dismissError)],
+                    ),
+                  ),
+                ),
+              ),
+            ),
           ],
         );
       },

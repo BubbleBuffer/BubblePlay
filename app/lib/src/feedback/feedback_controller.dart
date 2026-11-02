@@ -4,8 +4,7 @@
 // [showFeedbackSheet] for any other menu (the session chrome menu calls it). The screenshot is
 // taken before the sheet covers the screen, from the Flutter UI only: never while a session is
 // showing (the remote picture is a texture, and it is nobody's to keep), and a failed or slow
-// capture just means no screenshot. Android's shake entry is not here: it needs the
-// accelerometer plugin (see the lane report).
+// capture just means no screenshot. Android's shake entry is in shake_detector.dart.
 
 import 'dart:async';
 import 'dart:io';

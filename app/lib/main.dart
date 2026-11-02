@@ -11,6 +11,7 @@ import 'src/devices/devices_controller.dart';
 import 'src/devices/frb_devices_channel.dart';
 import 'src/feedback/feedback_controller.dart';
 import 'src/feedback/outbox.dart';
+import 'src/feedback/shake_sensor.dart';
 import 'src/logging/app_log.dart';
 import 'src/logging/error_hooks.dart';
 import 'src/platform/key_files.dart';
@@ -51,6 +52,7 @@ Future<void> _start(List<String> args) async {
         devices: devicesChannel == null ? null : DevicesController(devicesChannel),
         initialSection: section,
         feedback: FeedbackServices(outbox: Outbox.forRoot(logRoot)),
+        shakeSamples: Platform.isAndroid ? accelerometerSamples : null,
       ),
     ),
   );

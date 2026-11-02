@@ -9,6 +9,7 @@ import de.bubblebuffer.bubbleplay.keys.DeviceKeyStore
 import de.bubblebuffer.bubbleplay.keys.KeyFile
 import de.bubblebuffer.bubbleplay.keys.KeyFileCodec
 import de.bubblebuffer.bubbleplay.keys.UnlockedKey
+import de.bubblebuffer.bubbleplay.log.BpLog
 import de.bubblebuffer.bubbleplay.net.PairingClient
 import de.bubblebuffer.bubbleplay.net.PairingFailure
 import de.bubblebuffer.bubbleplay.net.PairingListener
@@ -188,21 +189,25 @@ internal class AppBackend(
         val text = try {
             keys.load()
         } catch (e: Exception) {
+            BpLog.e(TAG, "the stored key cannot be read", null, emptyMap(), e)
             flow = refused(KEY_FILE_NAME, "The stored key cannot be read.")
             return
         }
         if (text == null) {
             deviceId = ""
+            BpLog.setDeviceId(null)
             flow = StateJson.choose
             return
         }
         val file = try {
             KeyFileCodec.parse(text)
         } catch (e: DeviceKeyException) {
+            BpLog.e(TAG, "the stored key cannot be parsed", null, mapOf("reason" to e.reason.name), e)
             flow = refused(KEY_FILE_NAME, "The stored key cannot be read.")
             return
         }
         deviceId = file.id
+        BpLog.setDeviceId(deviceId)
         if (file.isProtected) {
             stored = file
             flow = StateJson.importUnlock(KEY_FILE_NAME, null)
@@ -212,6 +217,7 @@ internal class AppBackend(
             unlocked.set(KeyFileCodec.unlock(file, null))
             if (flow?.has("Enroll") == true) flow = null
         } catch (e: DeviceKeyException) {
+            BpLog.e(TAG, "the stored key cannot be opened", null, mapOf("reason" to e.reason.name), e)
             flow = refused(KEY_FILE_NAME, "The stored key cannot be opened.")
         }
     }
@@ -223,9 +229,12 @@ internal class AppBackend(
             keys.save(KeyFileCodec.serialize(fresh.file))
             unlocked.set(fresh.key)
             deviceId = fresh.file.id
+            BpLog.setDeviceId(deviceId)
+            BpLog.i(TAG, "a device key was created")
             stored = null
             flow = StateJson.created
         } catch (e: Exception) {
+            BpLog.e(TAG, "the device key could not be created", null, emptyMap(), e)
             flow = refused("", "The key could not be created.")
         }
     }
@@ -240,6 +249,7 @@ internal class AppBackend(
             } else {
                 "This key file cannot be used."
             }
+            BpLog.w(TAG, "an imported key file was refused", null, mapOf("reason" to e.reason.name), e)
             flow = refused(fileName, reason)
             return
         }
@@ -260,9 +270,11 @@ internal class AppBackend(
                 keys.save(KeyFileCodec.serialize(plain))
             }
         } catch (e: DeviceKeyException) {
+            BpLog.w(TAG, "an imported key could not be unlocked", null, mapOf("reason" to e.reason.name), e)
             flow = refused(fileName, "This key file cannot be used.")
             return
         } catch (e: Exception) {
+            BpLog.e(TAG, "the imported key could not be stored", null, emptyMap(), e)
             flow = refused(fileName, "The key could not be stored.")
             return
         }
@@ -490,5 +502,6 @@ internal class AppBackend(
 
     private companion object {
         const val KEY_FILE_NAME = "device-key.bpkey"
+        const val TAG = "AppBackend"
     }
 }
