@@ -146,8 +146,10 @@ class DevicesController extends ChangeNotifier {
   final DateTime Function() _now;
   late final StreamSubscription<String> _subscription;
   final StreamController<void> _shows = StreamController<void>.broadcast();
+  final StreamController<void> _feedbackRequests = StreamController<void>.broadcast();
   DevicesState _state = const DevicesState();
   bool _showPending = false;
+  bool _feedbackPending = false;
   bool _disposed = false;
 
   DevicesState get state => _state;
@@ -162,6 +164,14 @@ class DevicesController extends ChangeNotifier {
   bool get showPending => _showPending;
 
   void consumeShow() => _showPending = false;
+
+  /// Fires when the host asked to open the report sheet.
+  Stream<void> get feedbackRequests => _feedbackRequests.stream;
+
+  /// True when an `openFeedback` arrived that nobody has acted on yet (the UI was not up).
+  bool get feedbackPending => _feedbackPending;
+
+  void consumeFeedback() => _feedbackPending = false;
 
   /// Time left on the pairing code; null unless pairing is waiting. Never negative.
   Duration? get remaining {
@@ -228,6 +238,10 @@ class DevicesController extends ChangeNotifier {
         _showPending = true;
         _shows.add(null);
         return;
+      case OpenFeedbackEvent():
+        _feedbackPending = true;
+        _feedbackRequests.add(null);
+        return;
     }
     notifyListeners();
   }
@@ -272,6 +286,7 @@ class DevicesController extends ChangeNotifier {
     _disposed = true;
     _subscription.cancel();
     _shows.close();
+    _feedbackRequests.close();
     _channel.dispose();
     super.dispose();
   }

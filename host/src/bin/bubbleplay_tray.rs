@@ -71,8 +71,9 @@ use logic::{
     secure_helper_should_launch, start_secure_helper_for_viewer, status_line, tray_icon_resource,
     unix_ms_now, AgentStatus, ClickDebounce, HostState, MenuEntry, MenuState, ProbeGate,
     SecureHelperStatus, TraySettings, ViewerGate, AGENT_UPDATE_LABEL, CMD_ADMIN, CMD_AGENT_UPDATE,
-    CMD_AUDIO, CMD_CPU_MODE, CMD_DEVICES, CMD_EXPORT_KEY, CMD_IMPORT_KEY, CMD_LOGIN, CMD_LOGS,
-    CMD_QUIT, CMD_RESTART, CMD_ROLLBACK, CMD_SECURE_HELPER_UPDATE, SECURE_HELPER_UPDATE_LABEL,
+    CMD_AUDIO, CMD_CPU_MODE, CMD_DEVICES, CMD_EXPORT_KEY, CMD_FEEDBACK, CMD_IMPORT_KEY, CMD_LOGIN,
+    CMD_LOGS, CMD_QUIT, CMD_RESTART, CMD_ROLLBACK, CMD_SECURE_HELPER_UPDATE,
+    SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
     acquire_single_instance, create_manual_event, data_dir, end_agent_task, ensure_agent_task,
@@ -1316,6 +1317,62 @@ impl App {
         }
     }
 
+    /// "Report a problem": raises (or starts) the Flutter app, then asks the
+    /// running host to tell it over the Devices pipe to open its report sheet.
+    /// The app is the only place the sheet exists, so without the app, or
+    /// without a running host to relay the request, the user gets a message
+    /// and [`open_feedback_fallback`] runs.
+    fn open_feedback(&self) {
+        tracing::info!("Report a problem clicked");
+        let app = std::env::current_exe()
+            .ok()
+            .map(|exe| app_launch::app_exe_beside(&exe))
+            .filter(|app| app.is_file());
+        match app_launch::open_app(app.as_deref(), &app_launch::Win32AppOps) {
+            Ok(app_launch::OpenOutcome::App { focus_refused }) => {
+                if focus_refused {
+                    tracing::warn!("Windows refused to raise the app window");
+                }
+            }
+            Ok(app_launch::OpenOutcome::Legacy) => {
+                tracing::warn!("Report a problem: the app is not installed");
+                self.balloon(
+                    "BubblePlay",
+                    "The BubblePlay app is not installed, so reports can't be sent from here.",
+                    NIIF_WARNING,
+                );
+                open_feedback_fallback();
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(?error, "Report a problem: could not start the app");
+                self.balloon(
+                    "BubblePlay",
+                    "The BubblePlay app could not start.",
+                    NIIF_WARNING,
+                );
+                open_feedback_fallback();
+                return;
+            }
+        }
+        let delivered = match &self.user {
+            Some(user) => user.request_open_feedback(),
+            None => Err(std::io::Error::other("no host child")),
+        };
+        if let Err(error) = delivered {
+            tracing::warn!(
+                ?error,
+                "Report a problem: request not delivered to the host"
+            );
+            self.balloon(
+                "BubblePlay",
+                "The host is not running, so the report form can't open.",
+                NIIF_WARNING,
+            );
+            open_feedback_fallback();
+        }
+    }
+
     /// Runs an owner key action on its own thread. The menu is greyed while it runs.
     fn start_key_flow(&mut self, flow: key_ui::Flow) {
         if self.key_ui_running {
@@ -1401,6 +1458,7 @@ impl App {
             CMD_EXPORT_KEY => self.start_key_flow(key_ui::Flow::Export),
             CMD_IMPORT_KEY => self.start_key_flow(key_ui::Flow::Import),
             CMD_DEVICES => self.open_devices(),
+            CMD_FEEDBACK => self.open_feedback(),
             CMD_RESTART => self.restart_host(),
             CMD_ROLLBACK => self.roll_back("requested from tray menu", false),
             CMD_LOGS => open_folder(&logs_dir(&self.data)),
@@ -1414,6 +1472,12 @@ impl App {
         }
         self.tick();
     }
+}
+
+/// What "Report a problem" does when the app cannot be reached. Today it only
+/// logs; the plain Win32 text box that takes over from here arrives later.
+fn open_feedback_fallback() {
+    tracing::warn!("Report a problem: app not reachable; no fallback form yet");
 }
 
 thread_local! {

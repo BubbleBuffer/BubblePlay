@@ -128,6 +128,11 @@ class ShowEvent extends DevicesEvent {
   const ShowEvent();
 }
 
+/// The tray's "Report a problem" item: open the report sheet.
+class OpenFeedbackEvent extends DevicesEvent {
+  const OpenFeedbackEvent();
+}
+
 /// Parses one line. Returns null for a malformed line or an unknown `type` (both ignored).
 DevicesEvent? parseDevicesLine(String line) {
   try {
@@ -179,6 +184,7 @@ DevicesEvent? _parse(Map<String, Object?> m) => switch (m['type']) {
       'pairDone' => PairDoneEvent(id: _string(m, 'id'), name: _string(m, 'name')),
       'saveError' => SaveErrorEvent(_string(m, 'message')),
       'show' => const ShowEvent(),
+      'openFeedback' => const OpenFeedbackEvent(),
       _ => null,
     };
 
