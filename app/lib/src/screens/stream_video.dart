@@ -101,7 +101,9 @@ class _StreamVideoState extends State<StreamVideo> {
     );
   }
 
-  void _pointer(String kind, PointerEvent event, Size area, {Offset scroll = Offset.zero}) {
+  void _pointer(String kind, PointerEvent event, {Offset scroll = Offset.zero}) {
+    final box = _box.currentContext?.findRenderObject();
+    final area = box is RenderBox && box.hasSize ? box.size : Size.zero;
     unawaited(
       widget.stream
           .pointer(
@@ -143,23 +145,16 @@ class _StreamVideoState extends State<StreamVideo> {
     }
     Widget video = Texture(textureId: texture, filterQuality: FilterQuality.medium);
     if (widget.forwardPointer) {
-      video = LayoutBuilder(
-        builder: (context, constraints) {
-          final area = constraints.biggest;
-          return Listener(
-            behavior: HitTestBehavior.opaque,
-            onPointerDown: (e) => _pointer('down', e, area),
-            onPointerMove: (e) => _pointer('move', e, area),
-            onPointerUp: (e) => _pointer('up', e, area),
-            onPointerCancel: (e) => _pointer('cancel', e, area),
-            onPointerSignal: (e) {
-              if (e is PointerScrollEvent) {
-                _pointer('scroll', e, area, scroll: e.scrollDelta);
-              }
-            },
-            child: video,
-          );
+      video = Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: (e) => _pointer('down', e),
+        onPointerMove: (e) => _pointer('move', e),
+        onPointerUp: (e) => _pointer('up', e),
+        onPointerCancel: (e) => _pointer('cancel', e),
+        onPointerSignal: (e) {
+          if (e is PointerScrollEvent) _pointer('scroll', e, scroll: e.scrollDelta);
         },
+        child: video,
       );
     }
     final aspect = _aspect;

@@ -50,7 +50,7 @@ class _SessionScreenState extends State<SessionScreen> {
       return KeyEventResult.handled;
     }
     // Windows captures the keyboard natively; Android sends the physical key on.
-    if (!AppScope.of(context).isWindows) {
+    if (!AppScope.of(context).isWindows && event.logicalKey != LogicalKeyboardKey.escape) {
       final usage = event.physicalKey.usbHidUsage;
       unawaited(
         AppScope.of(context)
