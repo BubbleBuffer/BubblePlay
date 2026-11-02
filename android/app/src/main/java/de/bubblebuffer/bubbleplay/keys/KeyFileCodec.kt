@@ -1,6 +1,7 @@
 package de.bubblebuffer.bubbleplay.keys
 
 import de.bubblebuffer.bubbleplay.keys.DeviceKeyException.Reason
+import de.bubblebuffer.bubbleplay.log.BpLog
 import java.security.GeneralSecurityException
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -122,7 +123,10 @@ object KeyFileCodec {
         return try {
             val key = DeviceKey.fromSeed(seed)
             try {
-                NewDeviceKey(protect(key.id, label, created, key.publicKey, passphrase, seed, random), key)
+                NewDeviceKey(protect(key.id, label, created, key.publicKey, passphrase, seed, random), key).also {
+                    BpLog.setDeviceId(key.id)
+                    BpLog.i("KeyFileCodec", "device key created", null, mapOf("sealed" to (passphrase != null)))
+                }
             } catch (e: Throwable) {
                 key.close()
                 throw e
@@ -143,7 +147,9 @@ object KeyFileCodec {
             require(passphrase == null) { "an unprotected key takes no passphrase" }
             val plainSeed = file.sealedSeed
             try {
-                return verified(file, DeviceKey.fromSeed(plainSeed))
+                return verified(file, DeviceKey.fromSeed(plainSeed)).also {
+                    BpLog.i("KeyFileCodec", "device key unlocked", null, mapOf("sealed" to false))
+                }
             } finally {
                 plainSeed.fill(0)
             }
@@ -154,13 +160,16 @@ object KeyFileCodec {
         val seed = try {
             decrypt(wrapKey, nonce, aad, file.sealedSeed)
         } catch (e: GeneralSecurityException) {
+            // refuse() below logs the refusal.
             refuse(Reason.AUTHENTICATION_FAILED, "wrong passphrase or altered key file")
         } finally {
             wrapKey.fill(0)
         }
         try {
             if (seed.size != KEY_BYTES) malformed("decrypted seed has the wrong size")
-            return verified(file, DeviceKey.fromSeed(seed))
+            return verified(file, DeviceKey.fromSeed(seed)).also {
+                BpLog.i("KeyFileCodec", "device key unlocked", null, mapOf("sealed" to true))
+            }
         } finally {
             seed.fill(0)
         }

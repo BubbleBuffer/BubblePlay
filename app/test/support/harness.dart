@@ -5,6 +5,7 @@ import 'package:bubbleplay_app/src/app.dart';
 import 'package:bubbleplay_app/src/app_controller.dart';
 import 'package:bubbleplay_app/src/backend/fake_channel.dart';
 import 'package:bubbleplay_app/src/devices/devices_controller.dart';
+import 'package:bubbleplay_app/src/feedback/feedback_controller.dart';
 import 'package:bubbleplay_app/src/platform/key_files.dart';
 import 'package:bubbleplay_app/src/session/stream_channel.dart';
 import 'package:flutter/widgets.dart';
@@ -57,6 +58,7 @@ Future<TestApp> pumpApp(
   StreamChannel? stream,
   DevicesController? devices,
   String? section,
+  FeedbackServices? feedback,
 }) async {
   tester.view.physicalSize = Size(screen.width, screen.height);
   tester.view.devicePixelRatio = 1;
@@ -77,6 +79,7 @@ Future<TestApp> pumpApp(
         stream: stream ?? const NoStreamChannel(),
         devices: devices,
         initialSection: section,
+        feedback: feedback,
       ),
     ),
   );

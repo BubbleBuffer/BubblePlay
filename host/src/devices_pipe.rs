@@ -8,6 +8,13 @@
 //! - the pipe server ([`DevicesPipe`]), fed through a [`DevicesPipeHandle`]
 //!   that implements [`DevicesUi`].
 //!
+//! Messages that are not device state: `show` (the tray's Devices item) and
+//! `openFeedback` (the tray's "Report a problem" item: the app opens its
+//! report sheet). Both are only broadcast to connected clients; the one
+//! exception is `openFeedback` sent while no client is connected (the app was
+//! just started), which is held for [`FEEDBACK_REPLAY_WINDOW`] and sent to the
+//! next client that connects.
+//!
 //! Pairing codes, QR URIs and comparison numbers travel on this pipe. They
 //! never reach a log line or `Debug` output; encoded lines are zeroed when
 //! dropped.
@@ -19,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use windows::core::{PCWSTR, PWSTR};
@@ -68,6 +75,9 @@ const CLIENT_QUEUE: usize = 64;
 const MAX_INSTANCES: u32 = 16;
 
 const PIPE_BUFFER: u32 = 16 * 1024;
+
+/// How long an `openFeedback` sent with no client connected waits for one.
+const FEEDBACK_REPLAY_WINDOW: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -138,6 +148,7 @@ pub enum ServerMessage<'a> {
         message: &'a str,
     },
     Show,
+    OpenFeedback,
 }
 
 impl ServerMessage<'_> {
@@ -156,6 +167,7 @@ impl ServerMessage<'_> {
             Self::PairDone { .. } => "pairDone",
             Self::SaveError { .. } => "saveError",
             Self::Show => "show",
+            Self::OpenFeedback => "openFeedback",
         }
     }
 }
@@ -666,6 +678,8 @@ struct State {
     last_list: Option<Line>,
     pairing: Pairing,
     relay_online: bool,
+    /// When an `openFeedback` arrived with nobody connected to receive it.
+    feedback_pending: Option<Instant>,
 }
 
 struct Shared {
@@ -716,6 +730,7 @@ impl DevicesPipe {
                 last_list: None,
                 pairing: Pairing::None,
                 relay_online,
+                feedback_pending: None,
             }),
             client_threads: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
@@ -775,6 +790,18 @@ impl DevicesPipeHandle {
     pub fn show_app(&self) {
         let mut state = lock(&self.shared.state);
         if let Some(line) = encode_line(&ServerMessage::Show) {
+            self.shared.broadcast(&mut state, &Arc::new(line));
+        }
+    }
+
+    /// Sends `openFeedback` to every connected client. With none connected
+    /// (the app is still starting) it is held briefly for the next one.
+    pub fn open_feedback(&self) {
+        let mut state = lock(&self.shared.state);
+        if state.clients.is_empty() {
+            tracing::info!("open-feedback held: no Devices pipe client yet");
+            state.feedback_pending = Some(Instant::now());
+        } else if let Some(line) = encode_line(&ServerMessage::OpenFeedback) {
             self.shared.broadcast(&mut state, &Arc::new(line));
         }
     }
@@ -922,7 +949,7 @@ impl Shared {
     }
 
     /// The `hello` line and the current state, in protocol order.
-    fn replay(&self, state: &State) -> Vec<Line> {
+    fn replay(&self, state: &mut State) -> Vec<Line> {
         let mut lines = Vec::new();
         let hello = ServerMessage::Hello {
             protocol: PROTOCOL_VERSION,
@@ -940,6 +967,13 @@ impl Shared {
         match &state.pairing {
             Pairing::None => {}
             Pairing::Waiting(line) | Pairing::Request(line) => lines.push(line.clone()),
+        }
+        if let Some(since) = state.feedback_pending.take() {
+            if since.elapsed() <= FEEDBACK_REPLAY_WINDOW {
+                if let Some(line) = encode_line(&ServerMessage::OpenFeedback) {
+                    lines.push(Arc::new(line));
+                }
+            }
         }
         lines
     }
@@ -968,7 +1002,7 @@ impl Shared {
                     self.broadcast(&mut state, &Arc::new(line));
                 }
             }
-            for line in self.replay(&state) {
+            for line in self.replay(&mut state) {
                 let _ = queue.try_send(line);
             }
             state.clients.push(Client {
@@ -1075,7 +1109,8 @@ impl<U: DevicesUi> DevicesUi for TeeDevicesUi<U> {
 
 /// Handles the tray's stdin requests: `open-devices` opens the Win32 window
 /// (`open_window`) and asks for a fresh list; `show-devices-app` only tells
-/// pipe clients to show Devices. Ends when `requests` or `commands` closes.
+/// pipe clients to show Devices; `open-feedback` tells them to open the report
+/// sheet. Ends when `requests` or `commands` closes.
 pub fn route_stdin_requests(
     requests: Receiver<StdinRequest>,
     mut open_window: impl FnMut(),
@@ -1093,6 +1128,10 @@ pub fn route_stdin_requests(
             StdinRequest::ShowDevicesApp => match &pipe {
                 Some(pipe) => pipe.show_app(),
                 None => tracing::info!("show-devices-app ignored: Devices pipe not running"),
+            },
+            StdinRequest::OpenFeedback => match &pipe {
+                Some(pipe) => pipe.open_feedback(),
+                None => tracing::info!("open-feedback ignored: Devices pipe not running"),
             },
         }
     }
@@ -1223,6 +1262,11 @@ mod tests {
             r#"{"type":"saveError","message":"disk\nfull"}"#
         );
         assert_eq!(text(&ServerMessage::Show), r#"{"type":"show"}"#);
+        assert_eq!(
+            text(&ServerMessage::OpenFeedback),
+            r#"{"type":"openFeedback"}"#
+        );
+        assert_eq!(ServerMessage::OpenFeedback.kind(), "openFeedback");
     }
 
     #[test]
@@ -1876,6 +1920,48 @@ mod tests {
         client.nothing_more();
         drop(requests_tx);
         router.join().expect("router");
+    }
+
+    #[test]
+    fn open_feedback_reaches_clients() {
+        let fixture = start();
+        let client = fixture.connect();
+        client.greeting(0);
+        let (requests_tx, requests) = mpsc::channel();
+        let (commands_tx, commands) = mpsc::channel();
+        let router = {
+            let pipe = Some(fixture.handle());
+            std::thread::spawn(move || route_stdin_requests(requests, || {}, commands_tx, pipe))
+        };
+        requests_tx.send(StdinRequest::OpenFeedback).expect("send");
+        assert_eq!(client.next_type(), "openFeedback");
+        assert!(commands.recv_timeout(Duration::from_millis(100)).is_err());
+        client.nothing_more();
+        drop(requests_tx);
+        router.join().expect("router");
+    }
+
+    #[test]
+    fn open_feedback_without_a_client_waits_for_the_next_one_once() {
+        let fixture = start();
+        fixture.handle().open_feedback();
+        let first = fixture.connect();
+        first.greeting(0);
+        assert_eq!(first.next_type(), "openFeedback");
+        first.nothing_more();
+        let second = fixture.connect();
+        second.greeting(0);
+        second.nothing_more();
+    }
+
+    #[test]
+    fn open_feedback_without_a_pipe_is_ignored() {
+        let (requests_tx, requests) = mpsc::channel();
+        let (commands_tx, commands) = mpsc::channel();
+        requests_tx.send(StdinRequest::OpenFeedback).expect("send");
+        drop(requests_tx);
+        route_stdin_requests(requests, || {}, commands_tx, None);
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]

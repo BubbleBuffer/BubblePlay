@@ -104,7 +104,8 @@ class AppHostApi {
     return pigeonVar_replyValue! as String;
   }
 
-  /// Sends one `Action` (JSON). Returns at once; results arrive as later snapshots.
+  /// Sends one `Action` (JSON). Completes when the core has run it, with an error when it threw;
+  /// the effect arrives as a later snapshot.
   Future<void> act(String actionJson) async {
     final pigeonVar_channelName = 'dev.flutter.pigeon.bubbleplay_app.AppHostApi.act$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(

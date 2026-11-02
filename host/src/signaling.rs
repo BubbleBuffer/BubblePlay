@@ -1517,7 +1517,16 @@ impl Signaling {
                 // TLS may surface "want read" as WouldBlock via native-tls too.
                 Err(e) => {
                     self.registered = false;
-                    return Err(e).context("ws read");
+                    let kind = match &e {
+                        WsError::ConnectionClosed => "closed",
+                        WsError::AlreadyClosed => "already-closed",
+                        WsError::Io(_) => "io",
+                        WsError::Tls(_) => "tls",
+                        WsError::Protocol(_) => "protocol",
+                        _ => "other",
+                    };
+                    warn!(error = %e, kind, "signaling socket read failed");
+                    return Err(e).context(format!("signaling socket read failed ({kind})"));
                 }
             };
             match msg {
@@ -1576,7 +1585,7 @@ impl Signaling {
                         }
                         Some("error") => {
                             warn!(
-                                code = relay_error_code(&text),
+                                relay_error = relay_error_code(&text),
                                 "relay reported a signaling error"
                             );
                             continue;
@@ -1769,7 +1778,10 @@ impl Signaling {
                 Message::Ping(_) | Message::Pong(_) => {} // tungstenite auto-pongs
                 Message::Close(frame) => {
                     let (code, reason) = close_frame_summary(frame.as_ref());
-                    warn!(code, reason, "relay closed the signaling connection");
+                    warn!(
+                        close_status = code,
+                        reason, "relay closed the signaling connection"
+                    );
                     self.registered = false;
                     self.device_protocol.terminate();
                     self.flush_device_effects(&mut events)?;
@@ -1814,14 +1826,15 @@ impl Signaling {
     /// warm on both sides (the worker consumes pings, never relays them).
     pub fn send_ping(&mut self) {
         let msg = SignalMsg::Ping;
-        if self
-            .ws
-            .send(Message::text(
-                serde_json::to_string(&msg).unwrap_or_default(),
-            ))
-            .is_ok()
-        {
-            self.ws.flush().ok();
+        match self.ws.send(Message::text(
+            serde_json::to_string(&msg).unwrap_or_default(),
+        )) {
+            Ok(()) => {
+                if let Err(error) = self.ws.flush() {
+                    debug!(%error, "keepalive flush failed");
+                }
+            }
+            Err(error) => debug!(%error, "keepalive send failed"),
         }
     }
 

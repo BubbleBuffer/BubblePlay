@@ -76,6 +76,10 @@ qrcode = { version = "=0.14.1", default-features = false }
 bp-relay-server = { path = "../relay-rs/server" }
 tokio = { version = "1", features = ["net", "rt-multi-thread"] }
 
+[[bin]]
+name = "bubbleplay-logs"
+path = "src/bin/bubbleplay_logs.rs"
+
 [profile.release]
 lto = "thin"
 

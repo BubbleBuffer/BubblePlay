@@ -5,6 +5,7 @@
 //! that to Dart through flutter_rust_bridge.
 
 pub mod api;
+pub mod applog;
 pub mod backend;
 pub mod contract;
 pub mod devices_pipe;

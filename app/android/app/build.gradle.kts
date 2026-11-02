@@ -60,6 +60,7 @@ val stageNativeCore by tasks.registering(Sync::class) {
         include(
             "de/bubblebuffer/bubbleplay/keys/**",
             "de/bubblebuffer/bubbleplay/auth/**",
+            "de/bubblebuffer/bubbleplay/log/**",
             "de/bubblebuffer/bubbleplay/pcs/**",
             "de/bubblebuffer/bubbleplay/net/**",
             "de/bubblebuffer/bubbleplay/media/**",

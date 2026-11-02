@@ -19,6 +19,7 @@ dependencies:
       path: packages/bb_ui
   file_picker: ^13.3.0
   qr: ^3.0.2
+  sensors_plus: ^7.1.1
 
 dev_dependencies:
   flutter_test:

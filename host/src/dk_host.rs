@@ -260,8 +260,15 @@ impl HostProtocol {
             Err(error) => {
                 if self.peer_pairing {
                     tracing::warn!(
+                        %error,
                         viewer = self.peer_viewer.as_deref().unwrap_or("unknown"),
                         "pairing: viewer message could not be processed; pairing ended"
+                    );
+                } else {
+                    tracing::warn!(
+                        %error,
+                        viewer = self.peer_viewer.as_deref().unwrap_or("unknown"),
+                        "viewer message could not be processed; ending the viewer"
                     );
                 }
                 self.terminate();
@@ -642,7 +649,14 @@ impl HostProtocol {
                                     incoming.push(Inbound::Json(json));
                                 }
                             }
-                            Err(_) => self.end_peer(End::Protocol("invalid WebRTC offer")),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    viewer = self.peer_viewer.as_deref().unwrap_or("unknown"),
+                                    "viewer sent an unusable WebRTC offer; ending the viewer"
+                                );
+                                self.end_peer(End::Protocol("invalid WebRTC offer"))
+                            }
                         }
                     } else if self.application_ready() || kind == "ice" {
                         incoming.push(Inbound::Json(json));
@@ -689,6 +703,31 @@ impl HostProtocol {
         let pairing = self.peer_pairing;
         if pairing {
             log_pairing_end(reason, self.peer_viewer.as_deref());
+        } else {
+            // Rejected viewers used to leave only a rate-limited debug line.
+            let viewer = self.peer_viewer.as_deref().unwrap_or("unknown");
+            match reason {
+                End::Protocol(check) => {
+                    tracing::warn!(viewer, check, "viewer rejected: protocol error")
+                }
+                End::Auth(check) => {
+                    tracing::warn!(
+                        viewer,
+                        check,
+                        "viewer rejected: handshake verification failed"
+                    )
+                }
+                End::Refused(check) => {
+                    tracing::warn!(viewer, check, "viewer rejected: auth-hello refused")
+                }
+                End::Ctl(check) => {
+                    tracing::warn!(viewer, check, "viewer rejected: control channel error")
+                }
+                End::DtlsBindRequired => {
+                    tracing::warn!(viewer, "viewer rejected: DTLS bind impossible")
+                }
+                _ => {}
+            }
         }
         self.reset_peer();
         if pairing {

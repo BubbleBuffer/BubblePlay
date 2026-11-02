@@ -368,7 +368,7 @@ function startFirstFrameHandshake(reason, forceNew = false) {
   desktopAwaitingFrame = true;
   renderDesktopState();
   sendFirstFrameRequest();
-  sendClientLog("info", "first-frame-request", { reason, transport });
+  viewerLog("info", "first-frame-request", { reason, transport });
   armFirstFrameWatchdog();
 }
 // An in-place WebRTC monitor or desktop-source transition that cannot be
@@ -379,7 +379,7 @@ const RTC_IN_PLACE_TRANSITIONS = ["monitor-transition", "desktop-source-transiti
 function recoverRtcInPlaceTransition(reason) {
   if (usingWssMedia || !RTC_IN_PLACE_TRANSITIONS.includes(firstFrameHandshake.reason)) return;
   const transition = firstFrameHandshake.reason;
-  sendClientLog("warn", `${transition}-restart`, { reason });
+  viewerLog("warn", `${transition}-restart`, { reason });
   restartRtcForTransition(transition);
 }
 // A transition that fell back to a peer restart still needs proof: the new
@@ -499,7 +499,7 @@ function handleFirstFrameMessage(message) {
       firstFrameHandshake.failureReason = "";
       desktopAwaitingFrame = false;
       renderDesktopState();
-      sendClientLog("warn", "first-frame-failure-ignored", {
+      viewerLog("warn", "first-frame-failure-ignored", {
         reason: String(message.reason || "host-failure").slice(0, 96),
         generation: message.generation ?? null,
       });
@@ -528,7 +528,7 @@ function invalidatePendingMonitorRequest(reason) {
   const invalidated = monitorRequestAfterRestart(monitorSwitchPending, reason);
   if (!invalidated) return;
   monitorSwitchPending = null;
-  sendClientLog("warn", "monitor-request-invalidated", invalidated);
+  viewerLog("warn", "monitor-request-invalidated", invalidated);
   renderMonitorList();
 }
 function renderMonitorList() {
@@ -624,7 +624,7 @@ function requestMonitor(selector) {
   });
   if (!readiness.allowed) {
     if (readiness.reason !== "pending")
-      sendClientLog("info", "monitor-request-deferred", { reason: readiness.reason, selector });
+      viewerLog("info", "monitor-request-deferred", { reason: readiness.reason, selector });
     return false;
   }
   monitorSwitchPending = selector;
@@ -841,7 +841,6 @@ const hybridTileCache = new HybridTileCache();
 const hevcTileCache = new HevcTileCache();
 let rtcStartupFallback = null;
 let rtcOfferSignaled = false;
-let clientLogSequence = 0;
 let signalingRegistered = false;
 let signalingRegisteredAtMs = null;
 let signalingHostEvidence = { seen: false, type: null, atMs: null };
@@ -873,34 +872,11 @@ function recordSignalingError(kind, message, detail = null) {
   lastSignalingError = { kind, message: String(message || kind), detail, atMs: Date.now() };
 }
 
-function sendClientLog(level, event, detail = {}) {
-  if (!signalingRegistered || ws?.readyState !== WebSocket.OPEN || ws.bufferedAmount > 32_768) return;
-  const message = { type: "client-log", seq: ++clientLogSequence, atMs: Date.now(),
-    level, event, detail: { attemptId: diagnosticAttemptId, build: clientBuild, transport: requestedTransport, codec: codecSession.codec, ...detail } };
-  if (JSON.stringify(message).length <= 2_048) sendControl(message);
+// Viewer events go to the local browser log (dk-log.js). Phase B uploads them to the PC.
+function viewerLog(level, event, detail = {}) {
+  globalThis.BPLog?.log(level, "receiver", event, { attempt: diagnosticAttemptId, build: clientBuild,
+    transport: requestedTransport, codec: codecSession.codec, ...detail });
 }
-
-setInterval(() => sendClientLog("info", "client-health", {
-  hud: { ice: hudState.ice, decoder: hudState.dec, fps: hudState.fps, presented: hudState.presented,
-    drops: hudState.dropped, resets: hudState.resyncs, gapMs: hudState.frameGap, maxGapMs: hudState.maxFrameGap,
-    dimensions: hudState.dimensions, generation: hudState.mediaGeneration },
-  media: { reconstructed: wssV4.lastSeq, presented: wssPresentedSequence,
-    recoveryState: wssRecoveryState, socketOpen: wssV4.socketOpen, packets: wssMediaReceivedPackets,
-    presentation: framePresentationTelemetry.snapshot(),
-    hybrid: activeWssHybridCache().snapshot() },
-  view: viewportHealthSnapshot(),
-  input: { ready: inputReady, state: desktopInputState,
-    sent: input.stats.controlSent, rejected: input.stats.controlDropped,
-    motionSent: input.stats.sent, motionRejected: input.stats.dropped,
-    host: latestInputStatus, cursor: cursorAppearance.snapshot() },
-}), 5_000);
-
-addEventListener("error", event => sendClientLog("error", "window-error", {
-  message: String(event.message || "unknown"), source: String(event.filename || ""), line: event.lineno || 0,
-}));
-addEventListener("unhandledrejection", event => sendClientLog("error", "unhandled-rejection", {
-  message: String(event.reason?.stack || event.reason || "unknown"),
-}));
 
 function reconnectSignaling(reason) {
   if (terminalSignalingFailure) return;
@@ -943,12 +919,13 @@ function reconnectSignaling(reason) {
       cleanupPeer();
       recordSignalingError("socket-close", `WebSocket closed (${event.code})`, { code: event.code, reason: event.reason || "" });
       debugTrace("signaling-close", { generation, code: event.code, reason: event.reason || "" });
+      viewerLog(event.code === 1008 ? "warn" : "info", "signaling-close", { generation, closeCode: event.code, reason: event.reason || "", admitted });
       hud.classList.add("bad");
       if (event.code === 1008) {
         // Policy close: refused before hello-ok, or dropped from the PC's list. Never reconnect.
         terminalSignalingFailure = true;
         releaseInput();
-        if (!admitted) showNotAdmitted();
+        if (!admitted) showNotAdmitted(event.reason);
         return;
       }
       if (!shouldReconnectAfterClose(event.code, terminalSignalingFailure)) {
@@ -963,7 +940,8 @@ function reconnectSignaling(reason) {
     // auth-host and ctl rather than letting WebSocket callbacks race each other.
     socket.onmessage = ev => {
       if (ws === socket) signalingInboundMs = performance.now();
-      receiveQueue = receiveQueue.then(() => handleSignal(socket, generation, ev)).catch(() => {
+      receiveQueue = receiveQueue.then(() => handleSignal(socket, generation, ev)).catch(error => {
+        if (ws === socket && generation === signalingGeneration) viewerLog("error", "signaling-message-failed", { error: String(error?.message || error), stack: String(error?.stack || "") });
         if (ws === socket && generation === signalingGeneration) endAuthenticatedSession({ title: "Session ended", body: "A control message failed its integrity check, so the session was closed." });
       });
     };
@@ -1004,7 +982,7 @@ function recycleSignaling(reason) {
   });
   lastSignalingRecycle = { ...diagnostic, atMs: Date.now() };
   debugTrace("signaling-recycle", diagnostic);
-  sendClientLog("warn", "signaling-recycle", diagnostic);
+  viewerLog("warn", "signaling-recycle", diagnostic);
   // Invalidate first so the intentional close cannot restart a peer with
   // credentials from the old signaling epoch.
   const socket = ws;
@@ -1055,7 +1033,7 @@ async function handleSignal(socket, generation, ev) {
         send: message => current() && sendRelay(message),
         onAuthenticated: () => {
           if (!current()) return;
-          sendClientLog("info", "signaling-authenticated");
+          viewerLog("info", "signaling-authenticated");
           sendStreamMode("signaling-start");
           if (wssSelected) requestWssMediaStart();
           else startPeer(peerGeneration);
@@ -1063,7 +1041,7 @@ async function handleSignal(socket, generation, ev) {
         onMessage: message => { if (current()) return handleEndpointSignal(socket, generation, message); },
         onBinary: (kind, bytes) => { if (current() && kind === "cursor") handleCursorState(bytes, "signaling"); },
         onMediaReady: () => { if (current()) openAuthenticatedMedia(); },
-        onFailure: refusal => { if (current()) endAuthenticatedSession(refusal); },
+        onFailure: (refusal, reason) => { if (current()) { viewerLog("warn", "session-refused", { reason: String(reason || "unknown").slice(0, 80), title: refusal?.title }); endAuthenticatedSession(refusal); } },
       });
       authenticatedSession = session;
       await session.start();
@@ -1080,6 +1058,7 @@ async function handleSignal(socket, generation, ev) {
       break;
     case "error":
       recordSignalingError("relay-error", msg.message, msg);
+      viewerLog("error", "relay-error", { message: typeof msg.message === "string" ? msg.message.slice(0, 200) : "" });
       endAuthenticatedSession({ title: "Session ended", body: typeof msg.message === "string" ? msg.message.slice(0, 200) : "The relay ended this session." });
       break;
     case "ping":
@@ -1154,7 +1133,7 @@ async function handleEndpointSignal(socket, generation, msg) {
       // Receipt-only updates omit reason; only an explicit null clears it.
       if (Object.hasOwn(msg, "reason")) inputStatusReason = msg.reason;
       renderConnectionStatus();
-      if ((msg.failedPackets || 0) > previousFailures) sendClientLog("error", "host-input-application-failed", {
+      if ((msg.failedPackets || 0) > previousFailures) viewerLog("error", "host-input-application-failed", {
         generation: msg.generation, requestedEvents: msg.requestedEvents,
         appliedEvents: msg.appliedEvents, failedPackets: msg.failedPackets,
         lastErrorCode: msg.lastErrorCode ?? null,
@@ -1204,7 +1183,7 @@ async function handleEndpointSignal(socket, generation, msg) {
       break;
     case "error":
       recordSignalingError("endpoint-error", msg.message, msg);
-      sendClientLog("error", "signaling-error", { message: msg.message });
+      viewerLog("error", "signaling-error", { message: msg.message });
       terminalSignalingFailure = true;
       hudState.ws = `err:${msg.message}`;
       hud.classList.add("bad");
@@ -1460,7 +1439,7 @@ function openWssV4Socket() {
       // restart from the keyframe the host sends when it sees this peer.
       wssV4.gate.reset(reconnect ? "reconnect" : "connect");
       debugTrace("media-v4-open", { reconnect, reconnects: wssV4.reconnects });
-      if (reconnect) sendClientLog("info", "wss-v4-reconnected", { reconnects: wssV4.reconnects });
+      if (reconnect) viewerLog("info", "wss-v4-reconnected", { reconnects: wssV4.reconnects });
       maybeStartWssHost();
     } else if (message.type === "media-peer") {
       const present = message.present === true;
@@ -1549,7 +1528,7 @@ function createWssAudioPlayer() {
     createContext: () => new AudioContext({ latencyHint: "interactive", sampleRate: 48000 }),
     createDecoder: init => new AudioDecoder(init),
     createChunk: init => new EncodedAudioChunk(init),
-    onError: error => sendClientLog("warn", "wss-audio-error", { name: error?.name || "error" }),
+    onError: error => viewerLog("warn", "wss-audio-error", { name: error?.name || "error" }),
   });
 }
 
@@ -1581,7 +1560,7 @@ function startWssV4() {
     if (wssV4.socketOpen && now - wssV4.lastSendAt >= V4_HEARTBEAT_MS) sendWssV4('{"type":"ping"}');
     // The relay answers every heartbeat; silence means a half-open socket.
     if (wssV4.socketOpen && now - wssV4.lastInboundAt > V4_HEARTBEAT_MS * 2 + 10_000) {
-      sendClientLog("warn", "wss-v4-silent-socket", { silentMs: Math.round(now - wssV4.lastInboundAt) });
+      viewerLog("warn", "wss-v4-silent-socket", { silentMs: Math.round(now - wssV4.lastInboundAt) });
       try { wssV4.socket?.close(4000, "silent"); } catch {}
     }
   }, 1_000);
@@ -1598,7 +1577,7 @@ function recordWssPacketRejection(reason) {
   wssPacketRejects.total++;
   wssPacketRejects.byReason[reason] = (wssPacketRejects.byReason[reason] || 0) + 1;
   if (wssPacketRejects.total <= 4) {
-    sendClientLog("error", "wss-media-packet-rejected", {
+    viewerLog("error", "wss-media-packet-rejected", {
       reason,
       count: wssPacketRejects.byReason[reason],
     });
@@ -1632,7 +1611,7 @@ function requestWssMediaStart() {
   // Closing it here makes the host interpret the transport fallback as the
   // browser leaving. The host stops admitting RTP once WSS is selected.
   hudState.ice = "wss"; hudState.route = "wss"; hudState.dec = `${codecSession.codec} wss`;
-  sendClientLog("info", "wss-start", { epoch: mediaEpoch, protocol: WSS_PROTOCOL, rememberedRtcFailure: startOnRememberedWss });
+  viewerLog("info", "wss-start", { epoch: mediaEpoch, protocol: WSS_PROTOCOL, rememberedRtcFailure: startOnRememberedWss });
   connected = true; updateAuthenticatedInputReady();
   wssStartedHost = false;
   // v4 decodes every frame in order: there is no deadline expiry.
@@ -1697,7 +1676,7 @@ async function selectWssCodec() {
     });
     if (!support?.supported) {
       if (main10) {
-        sendClientLog("error", "main10-configure-unsupported", { codec });
+        viewerLog("error", "main10-configure-unsupported", { codec });
         hudState.dec = "Main10 unsupported";
         return null;
       }
@@ -1705,7 +1684,7 @@ async function selectWssCodec() {
     }
   } catch {
     if (main10) {
-      sendClientLog("error", "main10-configure-unsupported", { codec });
+      viewerLog("error", "main10-configure-unsupported", { codec });
       hudState.dec = "Main10 unsupported";
       return null;
     }
@@ -1716,7 +1695,7 @@ async function selectWssCodec() {
       config => VideoDecoder.isConfigSupported(config),
     );
     hevcTileCache.setDecoderCapability(tileCapability);
-    sendClientLog(tileCapability.state === "supported" ? "info" : "warn",
+    viewerLog(tileCapability.state === "supported" ? "info" : "warn",
       "hevc-tile-decoder-capability", tileCapability);
   }
   return codecSession.codec;
@@ -1748,7 +1727,7 @@ function requestWssKeyframe(reason, requestId = null) {
   const now = performance.now();
   if (!requestId && requestWssKeyframe.lastAt && now - requestWssKeyframe.lastAt < 250) return false;
   requestWssKeyframe.lastAt = now;
-  sendClientLog("warn", "wss-keyframe-request", { reason, requestId });
+  viewerLog("warn", "wss-keyframe-request", { reason, requestId });
   if (usingWssMedia && !requestId) return sendWssV4(keyframeMessageV4(reason));
   sendControl({ type: "media-control", action: "keyframe", protocol: WSS_PROTOCOL, epoch: mediaEpoch, reason,
     ...(requestId ? { requestId } : {}), codec: codecSession.codec });
@@ -1780,7 +1759,7 @@ function resyncWssDecoder(reason) {
   resetRenderPacing();
   wssDecodeSequenceByTimestamp.clear(); wssFrameMeta = new WeakMap();
   wssPresentedFrameTraces.clear();
-  sendClientLog("warn", "wss-recovery-reset", {
+  viewerLog("warn", "wss-recovery-reset", {
     reason,
     decoderEpoch: wssDecoderEpoch,
     hybrid: activeWssHybridCache().snapshot(),
@@ -1852,14 +1831,14 @@ function endRtcPeerOnly(reason) {
   closingPeer = false;
   rtcStartupFallback?.stop(); rtcStartupFallback = null;
   debugTrace("rtc-peer-ended", { reason });
-  sendClientLog("warn", "rtc-peer-ended", { reason, transport: "wss" });
+  viewerLog("warn", "rtc-peer-ended", { reason, transport: "wss" });
 }
 
 function switchToWss(reason) {
   if (usingWssMedia) return;
   // Auto mode only reaches here when WebRTC could not start in this browser.
   rememberRtcFailure(rtcFailureStorage());
-  sendClientLog("warn", "rtc-failed-switch-to-wss", { reason, remembered: true });
+  viewerLog("warn", "rtc-failed-switch-to-wss", { reason, remembered: true });
   wssSelected = true;
   hudState.ice = `wss (${reason})`;
   requestWssMediaStart();
@@ -1891,14 +1870,14 @@ function networkRouteHealthSnapshot() {
 function probeNetworkRouteChange() {
   if (terminalSignalingFailure || !navigator.onLine || networkRouteProbeTimer !== null) return;
   const before = networkRouteHealthSnapshot();
-  sendClientLog("info", "network-route-probe", { phase: "start", ...before });
+  viewerLog("info", "network-route-probe", { phase: "start", ...before });
   networkRouteProbeTimer = setTimeout(() => {
     networkRouteProbeTimer = null;
     if (terminalSignalingFailure || before.signalingGeneration !== signalingGeneration) return;
     const after = networkRouteHealthSnapshot();
     const maxRenderedAgeMs = 1_000;
     const recover = shouldRecoverAfterNetworkRouteProbe(before, after, { maxRenderedAgeMs });
-    sendClientLog(recover ? "warn" : "info", "network-route-probe", {
+    viewerLog(recover ? "warn" : "info", "network-route-probe", {
       phase: "complete", recover, maxRenderedAgeMs, ...after,
     });
     if (recover) recoverNetworkRoute("connection-change-stalled");
@@ -1920,7 +1899,7 @@ function recoverNetworkRoute(reason) {
 
 function recoverWssStartup(reason) {
   if (!usingWssMedia) return;
-  sendClientLog("error", "wss-startup-failure", { reason, attempt: wssStartupRecoveries + 1 });
+  viewerLog("error", "wss-startup-failure", { reason, attempt: wssStartupRecoveries + 1 });
   if (requestedTransport === TRANSPORT.WSS) {
     // Forced WSS remains forced: rebuild the epoch, but never silently switch
     // to a different media transport.
@@ -1934,7 +1913,7 @@ function recoverWssStartup(reason) {
   }
   wssSelected = false;
   stopWssMedia();
-  sendClientLog("warn", "wss-fallback-webrtc", { reason });
+  viewerLog("warn", "wss-fallback-webrtc", { reason });
   recycleSignaling(`wss-fallback-${reason}`);
   restartPeer(`wss-fallback-${reason}`, false);
 }
@@ -1944,7 +1923,7 @@ const routeConnection = navigator.connection || navigator.mozConnection || navig
 routeConnection?.addEventListener("change", probeNetworkRouteChange);
 
 function noteWssFailure(reason) {
-  sendClientLog("error", "wss-failure", { reason });
+  viewerLog("error", "wss-failure", { reason });
   const hardCodecFailure = reason === "webcodecs-unsupported" || reason === "configure-unsupported" ||
     reason === "decode-error" || reason === "decode-throw";
   const main10 = activeWssMain10();
@@ -1983,7 +1962,7 @@ function decodeWssFrame(frame) {
   }
   if (prepared.activity && (prepared.activity.upserts || prepared.activity.invalidations ||
       prepared.activity.clears || prepared.activity.pngBytes)) {
-    sendClientLog("info", "hybrid-frame-activity", {
+    viewerLog("info", "hybrid-frame-activity", {
       generation: frame.generation,
       sequence: frame.sequence,
       cropRevision: prepared.cropRevision,
@@ -1997,7 +1976,7 @@ function decodeWssFrame(frame) {
   if (frame.key && wssRecoveryState === "awaiting-keyframe") {
     wssRecoveryPending = true;
     wssRecoveryState = "awaiting-keyframe-output";
-    sendClientLog("info", "wss-recovery-keyframe", { generation: frame.generation, sequence: frame.sequence, codec: frame.codec });
+    viewerLog("info", "wss-recovery-keyframe", { generation: frame.generation, sequence: frame.sequence, codec: frame.codec });
   }
   const frameTrace = frame.frameTrace ? { ...frame.frameTrace } : {};
   if (prepared.activity) {
@@ -2214,6 +2193,8 @@ export function startSession({ identity, pc, pinnedPublic, gate = null }) {
   sessionPinnedPublic = pin;
   sessionGate = gate;
   terminalSignalingFailure = false;
+  globalThis.BPLog?.setContext({ device: identity.id, pc, session: diagnosticAttemptId, build: clientBuild });
+  viewerLog("info", "session-start", { pcKnown: true });
   reconnectSignaling("startup");
 }
 
@@ -2234,10 +2215,12 @@ export function endSession() {
   try { socket?.close(1000, "session-ended"); } catch {}
 }
 
-function showNotAdmitted() {
+function showNotAdmitted(reason = "") {
+  // The relay puts a short reason in the 1008 close. Show it when present, plain text only.
+  const said = typeof reason === "string" ? reason.replace(/[^ -~]/g, "").trim().slice(0, 120) : "";
   sessionGate?.showRefusal({
     title: "Not admitted",
-    body: `The relay did not let this browser through to ${sessionPc}. If it was unpaired on the PC, pair again.`,
+    body: `The relay did not let this browser through to ${sessionPc}. If it was unpaired on the PC, pair again.${said ? ` Reason: ${said}.` : ""}`,
     actionLabel: "Back to PCs",
     onAction: () => location.assign(pcListUrl(location.href)),
   });
@@ -3094,7 +3077,7 @@ function followDecoderCodec(codec) {
   clearWssHybridCaches();
   wssNoOutputFailures = 0;
   if (wssRecoveryState === "awaiting-keyframe-output") wssRecoveryState = "awaiting-keyframe";
-  sendClientLog("info", "decoder-keyframe-codec-change", { previousCodec, codec });
+  viewerLog("info", "decoder-keyframe-codec-change", { previousCodec, codec });
 }
 
 function feedDecoder(chunk, generation) {
@@ -3157,7 +3140,7 @@ function feedDecoder(chunk, generation) {
               wssDecodeSequenceByTimestamp.delete(first[0]);
               if (!wssTimestampFallbackLogged) {
                 wssTimestampFallbackLogged = true;
-                sendClientLog("warn", "wss-timestamp-association-fallback", { frameTimestamp: frame.timestamp, metadataTimestamp: first[0] });
+                viewerLog("warn", "wss-timestamp-association-fallback", { frameTimestamp: frame.timestamp, metadataTimestamp: first[0] });
               }
             }
           }
@@ -3175,7 +3158,7 @@ function feedDecoder(chunk, generation) {
       },
       error: (e) => {
         if (decoderEpoch !== wssDecoderEpoch) return;
-        sendClientLog("error", "decoder-error", { message: String(e?.message || e) });
+        viewerLog("error", "decoder-error", { message: String(e?.message || e) });
         hudState.dec = `err:${e.message}`;
         if (usingWssMedia) noteWssFailure("decode-error"); else dropAndResync("decoder-error");
       },
@@ -3192,7 +3175,7 @@ function feedDecoder(chunk, generation) {
         debugTrace("decoder-configured", { codec });
       }
     } catch (e) {
-      sendClientLog("error", "decoder-config-error", { message: String(e?.message || e), codec });
+      viewerLog("error", "decoder-config-error", { message: String(e?.message || e), codec });
       hudState.dec = `cfg:${e.message}`;
       try { decoder.close(); } catch {}
       decoder = null;
@@ -3229,7 +3212,7 @@ function feedDecoder(chunk, generation) {
     hudState.queued = decoder.decodeQueueSize;
   } catch (e) {
     latencyGuard.releaseDecode();
-    sendClientLog("error", "decoder-decode-throw", {
+    viewerLog("error", "decoder-decode-throw", {
       message: String(e?.message || e).slice(0, 512),
       codec: chunk.codec,
       type: isKey ? "key" : "delta",
@@ -3501,7 +3484,7 @@ const fileUi = installFileTransferUi({
   resolveDrop: resolveNativeFileDrop,
   onDragPreview: (event, target) => fileDragPreview.update(event, target),
   onDragPreviewEnd: () => fileDragPreview.cancel(),
-  onError: error => sendClientLog("warn", "file-download-target", { message: String(error?.message || error) }),
+  onError: error => viewerLog("warn", "file-download-target", { message: String(error?.message || error) }),
 });
 function fileSocketUrl() {
   if (!mediaEpoch || !signalingPc || !signalingTicket || !authenticatedSession?.mediaReady) return null;
@@ -3988,7 +3971,7 @@ function armViewportTransitionTimeout(revision) {
       armViewportTransitionTimeout(revision);
       return;
     }
-    sendClientLog("warn", "viewport-transition-failed", { revision, requested: viewportPending.requested });
+    viewerLog("warn", "viewport-transition-failed", { revision, requested: viewportPending.requested });
     viewportConsecutiveTimeouts++;
     viewportPending = null;
     if (viewportConsecutiveTimeouts >= 2) sharpDisabledForSession = true;
@@ -4253,6 +4236,7 @@ const stripActions = {
   settings: (_button, viaKeyboard) => openPanel("settings-panel", stripSettingsButton, viaKeyboard),
   sound: () => soundController.toggle(),
   fullscreen: () => { popovers.close(); toggleFullscreen(); },
+  feedback: () => { popovers.close(); globalThis.BPFeedback?.open(); },
 };
 // Local PC sound button: shown only with the host's audio capability; the muted
 // glyph shows while muted or blocked (soundButtonView).

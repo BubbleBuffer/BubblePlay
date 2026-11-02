@@ -30,6 +30,25 @@ same state as `online` in the admin listing).
   usual answers (cookieless POST 403, HEAD dropped).
 - The Cloudflare build answers the route the same way from the Durable Object.
 
+## Logging
+
+Every refusal and close the relay core makes is logged as one JSON line (logging spec: `ts`, `level`,
+`src` "relay", `device` null, `pc`, `session` null, `target` "relay", `msg`, `fields`). `fields` carries
+`class` (a dotted reason class such as `pairing.wrong-code`, `viewer.not-admitted`, `timeout.hello`,
+`ticket.invalid`, `packet.invalid-signal`, `restore.invalid`, `gate.refused`, `upgrade.bad-pc`), `status`
+(the close code, or 404 for a refused upgrade), `reason` (the string the client got), `role` and, once known,
+`peer` (the viewer's id). PC and viewer ids are cut to their first 8 characters. A 1008 close is `warn`,
+any other close is `info`. Pairing codes, proofs, tickets, tokens and message contents are never passed to
+the logger, and the logger redacts sensitive keys, `key=value` pairs, bearer values, 40+ character blobs and
+the configured tokens as a net (`relay-rs/core/src/log.rs`).
+
+The core has no console, so each adapter installs a sink once: the native server writes the line to stderr
+(`server/src/log.rs`), the Worker to the console (`console.debug|log|warn|error` by level), where Workers
+observability (`[observability] enabled = true`) collects it. Client-log WebSocket messages
+(`type: "client-log"`) are still dropped, never forwarded; the relay logs a debug line `client-log
+messages dropped` with a count only, at most once a minute. Clients send their logs to the PC over the
+end-to-end session channel instead.
+
 ## Configuration: relay.json
 
 `serve` reads its config from `--config`, which defaults to `/data/relay.json`. Unknown fields
@@ -105,14 +124,14 @@ The viewer role names are `viewer` on `/ws`, `media-viewer` on `/media-ws` and `
 - An ID in the PC's `admitted` list is admitted. The relay sends `hello-ok` with a media ticket.
 - Otherwise, while the host has an open pairing window, a viewer that sends the window's 32-byte `pair` value is admitted in pairing mode. Its `hello-ok` carries `pairing: true` and no media ticket. A pairing viewer may send only `auth-hello`, `auth-finish`, `auth-bind` and `pair-proof`, and the host may send it only `auth-host`, `auth-bind`, `pair-proof`, `pair-done` and `pair-denied`. Everything else is dropped in that direction.
 - A pairing window opens with the host's `pair-open` and lasts 300 s. It closes on `pair-close`, when the host disconnects, or after 20 failed attempts against that PC. Five failures from one client prefix in 300 s refuse that prefix. The host gets `pair-closed` when a window closes on failures.
-- Anything else is closed 1008 with an empty reason.
-- A browser viewer (one that sends an `Origin`) also needs a valid gate cookie. Without one it is closed 1008 with an empty reason.
+- Anything else is closed 1008 with a short plain reason a client can show: "invalid hello" (a malformed or unexpected hello or proof), "invalid proof" (the identity proof did not verify), "not paired" (not admitted and no pairing code), "pairing code not accepted" (wrong code, or no pairing window open), "rate limited" (too many failed pairing attempts from this network, or the prefix table is full), "timed out" (no hello or proof in time). No reason carries a secret.
+- A browser viewer (one that sends an `Origin`) also needs a valid gate cookie. Without one it is closed 1008 "not approved".
 - Origin-less sockets are native clients. They are upgraded and judged by the signed hello alone.
 
 The host's `admit` message sets the admitted list. It has `viewers` (at most 256 canonical IDs, no
 duplicates) and `remotePairing` (a boolean). The relay stores `remotePairing` with the PC and
 reports it back, but admission does not read it. A viewer that drops off the admitted list is
-closed 1008 with an empty reason. A pairing viewer is not affected by that check.
+closed 1008 "access removed". A pairing viewer is not affected by that check.
 
 On `/ws` the relay forwards text only, and only these types:
 
@@ -137,7 +156,7 @@ Media and file sockets are not affected by this list.
 - The admin listing at `/__gate/manage/pcs` reports the count of admitted viewers per PC (`admitted`), never the IDs.
 - `last_seen` is derived, not stored: the PC table keeps `registered_ms` only, and on load `last_seen` is set equal to `registered_ms`. The admin listing shows a PC's last contact as its registration time until it connects again after a restart.
 - Queued frames drain before a close: a socket's frames already in its queue are sent before its close frame, including the 1008 and 1001 closes. The drain shares `CLOSE_TIMEOUT` (2 s). A socket being removed or replaced can therefore receive frames queued just before the close.
-- A failed-upgrade connection is reaped by `tick`: the core accepts an upgrade before the WebSocket handshake finishes. If the handshake fails, the connection stays until its hello deadline (10 s), and `tick` then closes it 1008 with an empty reason and forgets it. A socket still in its hello or viewer proof at its deadline is closed the same way, and a host that misses its proof deadline is closed 1008 "invalid hello".
+- A failed-upgrade connection is reaped by `tick`: the core accepts an upgrade before the WebSocket handshake finishes. If the handshake fails, the connection stays until its hello deadline (10 s), and `tick` then closes it 1008 "timed out" and forgets it. A socket still in its hello or viewer proof at its deadline is closed the same way, and a host that misses its proof deadline is closed 1008 "invalid hello".
 - Admin DELETE of an unknown PC returns 404 (`NotFound`) and persists nothing. Deleting a registered PC persists first and returns 204.
 
 ## M3 notes (Cloudflare build)

@@ -14,6 +14,9 @@ import de.bubblebuffer.bubbleplay.auth.pcId
 import de.bubblebuffer.bubbleplay.auth.pcKey
 import de.bubblebuffer.bubbleplay.auth.viewerKey
 import de.bubblebuffer.bubbleplay.keys.Ed25519Verify
+import de.bubblebuffer.bubbleplay.log.allText
+import de.bubblebuffer.bubbleplay.log.logLines
+import de.bubblebuffer.bubbleplay.log.withTestLog
 import de.bubblebuffer.bubbleplay.pcs.PcEntry
 import okhttp3.Protocol
 import okhttp3.Request
@@ -34,6 +37,70 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 class PairingClientTest {
+    @Test
+    fun aRefusalIsLoggedWithItsCauseAndNeverTheCode() = withTestLog { log, dir ->
+        Script().use { s ->
+            s.admit()
+            s.wire.listener.onClosing(s.wire, 1008, "pairing window closed")
+            log.flush()
+            val lines = dir.logLines()
+            val failed = lines.single { it.getString("msg") == "pairing failed" }
+            assertEquals("warn", failed.getString("level"))
+            assertEquals(s.link.pcId, failed.getString("pc"))
+            val fields = failed.getJSONObject("fields")
+            assertEquals("Refused", fields.getString("failure"))
+            assertEquals(1008, fields.getInt("wsClose"))
+            assertEquals("pairing window closed", fields.getString("closeReason"))
+            assertEquals("AuthHost", fields.getString("state"))
+            assertTrue(fields.getBoolean("admitted"))
+            assertTrue(lines.any { it.getString("msg") == "pairing started" })
+            assertTrue(lines.any { it.getString("msg") == "admitted by the relay in pairing mode" })
+            assertFalse(dir.allText().contains(s.link.code))
+        }
+    }
+
+    @Test
+    fun theWholePairingIsLoggedStepByStepWithoutTheCodeOrTheNumber() = withTestLog { log, dir ->
+        Script().use { s ->
+            s.admit()
+            s.prove()
+            s.wire.receive("""{"type":"pair-done"}""")
+            log.flush()
+            val messages = dir.logLines().map { it.getString("msg") }
+            for (step in listOf(
+                "pairing started", "relay socket open", "relay challenge answered",
+                "admitted by the relay in pairing mode", "auth-host verified", "PC pair proof verified",
+                "comparison number shown, waiting for the PC owner", "pairing allowed by the PC",
+                "pairing complete, handing the PC to the caller",
+            )) assertTrue("missing step: $step in $messages", step in messages)
+            val text = dir.allText()
+            assertFalse(text.contains(s.link.code))
+            assertFalse(text.contains(Pairing.sasNumber(s.hash)))
+            assertFalse(text.contains(Pairing.sasDisplay(Pairing.sasNumber(s.hash))))
+        }
+    }
+
+    @Test
+    fun aTimeoutAndASocketFailureAreLoggedWithTheirCause() = withTestLog { log, dir ->
+        Script().use { s ->
+            s.open()
+            s.timer.latestTimeout().fire()
+            log.flush()
+            val failed = dir.logLines().single { it.getString("msg") == "pairing failed" }.getJSONObject("fields")
+            assertEquals("Timeout", failed.getString("failure"))
+            assertTrue(failed.getString("why").startsWith("no answer in state Challenge"))
+        }
+        Script().use { s ->
+            s.open()
+            s.wire.fail()
+            log.flush()
+            val failed = dir.logLines().last { it.getString("msg") == "pairing failed" }.getJSONObject("fields")
+            assertEquals("ConnectionLost", failed.getString("failure"))
+            assertEquals("socket failure", failed.getString("why"))
+            assertEquals("java.io.IOException: offline", failed.getString("error"))
+        }
+    }
+
     @Test
     fun signedRelayAdmissionThenPairingPinsVerifiedPc() = Script().use { s ->
         s.admit()

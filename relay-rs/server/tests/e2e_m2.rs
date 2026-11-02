@@ -157,14 +157,17 @@ async fn m2_admitted_native_viewer_is_announced_to_the_host_with_its_epoch() {
 }
 
 #[tokio::test]
-async fn m2_unlisted_native_viewer_is_closed_1008_with_empty_reason() {
+async fn m2_unlisted_native_viewer_is_closed_1008_not_paired() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
     let host = identity(1);
     let (mut host_ws, _) = register_host(&server, &host, Some(TOKEN)).await;
     let mut viewer = native_viewer(&server, &pc_id(&host)).await;
     prove_viewer(&mut viewer, &identity(203), None).await;
-    assert_eq!(expect_close(&mut viewer).await, (1008, String::new()));
+    assert_eq!(
+        expect_close(&mut viewer).await,
+        (1008, "not paired".to_string())
+    );
     // The refusal never reaches the host, which stays connected and answers a ping.
     expect_quiet(&mut host_ws, Duration::from_millis(500)).await;
     send_json(&mut host_ws, json!({"type": "ping"})).await;
@@ -192,7 +195,10 @@ async fn m2_origin_without_a_gate_cookie_is_still_closed_1008() {
     let mut ws = connect(server.addr, &path, Some(ORIGIN), None)
         .await
         .expect("the upgrade is accepted so the browser sees a 1008");
-    assert_eq!(expect_close(&mut ws).await, (1008, String::new()));
+    assert_eq!(
+        expect_close(&mut ws).await,
+        (1008, "not approved".to_string())
+    );
 }
 
 #[tokio::test]

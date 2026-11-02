@@ -56,7 +56,10 @@ $mutationAuthorized = $false
 $runId = [Guid]::NewGuid().ToString('N')
 $markerPath = $null
 $settings = Join-Path $env:LOCALAPPDATA 'BubblePlay\tray.json'
-$hostLog = Join-Path $env:LOCALAPPDATA 'BubblePlay\logs\host.log'
+$hostLogDir = Join-Path $env:LOCALAPPDATA 'BubblePlay\logs'
+$hostLogNewest = Get-ChildItem -LiteralPath $hostLogDir -Filter 'host-*.jsonl' -File -ErrorAction SilentlyContinue |
+    Sort-Object Name -Descending | Select-Object -First 1
+$hostLog = if ($hostLogNewest) { $hostLogNewest.FullName } else { Join-Path $hostLogDir 'host.jsonl' }
 $ExePath = [IO.Path]::GetFullPath($ExePath)
 $OutDir = [IO.Path]::GetFullPath($OutDir).TrimEnd('\')
 $summaryPath = Join-Path $OutDir 'summary.json'

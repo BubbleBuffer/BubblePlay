@@ -3,8 +3,9 @@ package de.bubblebuffer.bubbleplay.flutter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
+import android.os.Bundle
 import de.bubblebuffer.bubbleplay.keys.DeviceKeyStore
+import de.bubblebuffer.bubbleplay.log.BpLog
 import de.bubblebuffer.bubbleplay.pcs.PcStore
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -30,20 +31,34 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // First thing: the log and the crash handler must exist before anything else can fail.
+        BpLog.init(applicationContext)
+        super.onCreate(savedInstanceState)
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val context = applicationContext
         val controller = StreamController(flutterEngine.renderer)
         stream = controller
-        val backend = AppBackend(
-            keys = StoreKeyStorage(DeviceKeyStore(context)),
-            pcs = PcStore.from(context),
-            pairing = ClientPairingRunner,
-            deviceLabel = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android viewer",
-            keyPathText = "App storage, protected by the Android Keystore",
-            stream = controller,
-        )
+        val backend = try {
+            AppBackend(
+                keys = StoreKeyStorage(DeviceKeyStore(context)),
+                pcs = PcStore.from(context),
+                pairing = ClientPairingRunner,
+                deviceLabel = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android viewer",
+                keyPathText = "App storage, protected by the Android Keystore",
+                stream = controller,
+            )
+        } catch (e: Throwable) {
+            // Not swallowed: the engine setup fails as before, but the cause is now in the log.
+            BpLog.e("MainActivity", "the app backend could not start", null, emptyMap(), e)
+            BpLog.current()?.flush()
+            throw e
+        }
         this.backend = backend
+        val runner = ActRunner(backend, worker)
         val messenger = flutterEngine.dartExecutor.binaryMessenger
         val flutterApi = AppFlutterApi(messenger)
         backend.setNotifier {
@@ -60,15 +75,7 @@ class MainActivity : FlutterActivity() {
             object : AppHostApi {
                 override fun snapshot(): String = backend.snapshot()
 
-                override fun act(actionJson: String) {
-                    worker.execute {
-                        try {
-                            backend.act(actionJson)
-                        } catch (e: Exception) {
-                            Log.w("BubblePlay", "action failed: ${e.javaClass.simpleName}")
-                        }
-                    }
-                }
+                override suspend fun act(actionJson: String) = runner.act(actionJson)
 
                 override fun exportKey(): String = backend.exportKey()
             },

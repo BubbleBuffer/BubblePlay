@@ -103,8 +103,23 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> Option<i32> {
     })
 }
 
+/// Every `agent-YYYY-MM-DD*.jsonl` day file of the dev agent, oldest first.
 fn log_text(dir: &Path) -> String {
-    std::fs::read_to_string(dir.join("logs").join("admin-agent.log")).unwrap_or_default()
+    let mut files: Vec<_> = std::fs::read_dir(dir.join("logs"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".jsonl"))
+        })
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+        .collect()
 }
 
 fn open_raw(pipe: &str) -> std::fs::File {

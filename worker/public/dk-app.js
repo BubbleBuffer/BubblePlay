@@ -14,8 +14,17 @@ import { deviceKeyErrorMessage, passphraseValue, summarizeKeyFile } from "./devi
 import { normalizePairingCode, openPairingSocket, pairAdmitHash, pcListUrl, relayOrigin } from "./dk-relay.js";
 import { b64u, pairKey, pairMac, verifyPairMac, comparisonNumber } from "./dk-crypto.js";
 import { beginViewerHandshake } from "./dk-handshake.js";
+import { installFeedback } from "./dk-feedback.js";
 
 export const FORGET_ENDPOINT = "/__gate/forget";
+
+// Local viewer log (dk-log.js). Absent in tests and when the script is blocked. Callers pass
+// plain causes (error class and message), never passphrases, codes, keys or key file text.
+const blog = (level, msg, fields) => { try { globalThis.BPLog?.log(level, "dk-app", msg, fields); } catch { /* logging never breaks the viewer */ } };
+const setLogContext = context => { try { globalThis.BPLog?.setContext(context); } catch { /* ignore */ } };
+const hideSecret = secret => { try { if (secret) globalThis.BPLog?.registerSecret(String(secret)); } catch { /* ignore */ } };
+const cause = error => (error === undefined || error === null ? undefined
+  : `${error.name || "Error"}: ${String(error.message ?? error)}`.slice(0, 160));
 
 /** Newest use first; never-used PCs after, by name. */
 export function sortPcs(pcs) {
@@ -74,11 +83,14 @@ export function createApp({
   }
 
   async function unlockWith(text, passphrase) {
+    hideSecret(passphrase);
     try {
       const key = await unlock(text, passphrase);
       identity = Object.freeze({ id: key.id, publicRaw: key.publicKey, privateKey: key.privateKey });
+      setLogContext({ device: key.id });
     } catch (error) {
       identity = null;
+      blog("warn", "key unlock failed", { cause: error?.code === "authentication-failed" ? "wrong passphrase" : cause(error) });
       if (error?.code === "authentication-failed") throw wrongPassphrase();
       const shown = new Error(deviceKeyErrorMessage(error));
       shown.code = error?.code ?? "unlock-failed";
@@ -86,16 +98,27 @@ export function createApp({
     }
     // Keep it for the next visit. The store refuses an extractable key; if the browser cannot
     // store a CryptoKey at all, the passphrase is simply asked again next time.
-    try { await store.saveUnlocked(identity); } catch { /* not kept */ }
+    try { await store.saveUnlocked(identity); } catch (error) {
+      blog("warn", "could not keep the key unlocked", { cause: cause(error) }); /* not kept */
+    }
   }
 
   /** The kept unlocked key, if it belongs to this key file; a stale one is deleted. */
   async function keptIdentity(file) {
     let kept = null;
-    try { kept = await store.loadUnlocked(); } catch { return null; }
+    try { kept = await store.loadUnlocked(); } catch (error) {
+      blog("warn", "could not read the kept unlocked key", { cause: cause(error) });
+      return null;
+    }
     if (!kept) return null;
-    if (kept.id === file.id && b64u.encode(kept.publicRaw) === file.public) return Object.freeze(kept);
-    try { await store.clearUnlocked(); } catch { /* next boot retries */ }
+    if (kept.id === file.id && b64u.encode(kept.publicRaw) === file.public) {
+      setLogContext({ device: kept.id });
+      return Object.freeze(kept);
+    }
+    blog("info", "kept unlocked key belongs to another key file; clearing it");
+    try { await store.clearUnlocked(); } catch (error) {
+      blog("warn", "could not clear the stale unlocked key", { cause: cause(error) }); /* next boot retries */
+    }
     return null;
   }
 
@@ -127,8 +150,12 @@ export function createApp({
     // A stored key in any other format counts as no key: setup replaces it.
     if (isOtherFormatKeyFileText(text)) return showSetup(false);
     let info = null, file = null;
-    try { file = JSON.parse(text); info = summarizeKeyFile(file); } catch { /* unreadable: offer replacement */ }
-    if (!info) return showSetup(true);
+    let parseError = null;
+    try { file = JSON.parse(text); info = summarizeKeyFile(file); } catch (error) { parseError = error; /* unreadable: offer replacement */ }
+    if (!info) {
+      blog("warn", "stored key file is unreadable", { cause: cause(parseError) ?? "key file summary is empty" });
+      return showSetup(true);
+    }
     const kept = await keptIdentity(file);
     if (kept) {
       identity = kept;
@@ -168,6 +195,7 @@ export function createApp({
       try {
         return await startPairing(link);
       } catch (error) {
+        blog("warn", "pairing link rejected", { cause: cause(error) });
         gate.showPairing({ state: "failed", pcId: undefined, message: error.message, onBack: showList });
         return;
       }
@@ -204,6 +232,8 @@ export function createApp({
     url.hash = "";
     history.replaceState(null, "", `${url.pathname}${url.search}`);
     gate.showBusy(`Connecting to ${record.name}…`);
+    setLogContext({ pc: record.id });
+    blog("info", "connecting to a PC");
     session = await loadSession();
     await session.startSession({ identity, pc: record.id, pinnedPublic: record.public, gate });
   }
@@ -211,6 +241,10 @@ export function createApp({
   /** Pair at the PC: prove the code and PC identity before showing a comparison number. */
   async function startPairing(input) {
     const { pc, code } = normalizePairingInput(input);
+    // The code is typed by hand or comes from a link; keep every form of it out of the log.
+    hideSecret(code); hideSecret(String(input.code ?? "").trim()); hideSecret(`${code.slice(0, 5)}-${code.slice(5)}`);
+    setLogContext({ pc });
+    blog("info", "pairing started");
     stopPairing();
     let socket = null;
     let ended = false;
@@ -231,12 +265,14 @@ export function createApp({
     const fail = (message, state = "failed") => {
       if (!active()) return;
       attempt.stop();
+      blog("warn", "pairing ended", { outcome: state, shown: message });
       gate.showPairing({ state, pcId: pc, message, onBack: showList });
     };
     const closedMessage = "The PC closed the pairing window. Open Pair device on the PC again.";
     const notReachable = () => {
       if (!active()) return;
       attempt.stop();
+      blog("warn", "pairing timed out", { stage });
       gate.showRefusal({ title: "PC not reachable", body: "This PC does not support device keys or is not reachable.",
         actionLabel: "Back to PCs", onAction: async () => {
           const url = new URL(pcListUrl(location.href));
@@ -256,6 +292,7 @@ export function createApp({
     // Even injected socket adapters must preserve the asynchronous handshake's message order.
     const inOrder = task => {
       queue = queue.then(async () => { if (active()) await task(); }).catch(error => {
+        blog("warn", "pairing exchange failed", { stage, cause: cause(error) });
         fail(error?.reason === "pc-key-changed"
           ? "This PC answered with a different key. Remove it from the PC list and pair again."
           : "The PC's pairing exchange could not be verified. Open a new pairing code on the PC and try again.");
@@ -327,12 +364,26 @@ export function createApp({
             fail(closedMessage);
           }
         }),
-        onRefused: () => fail("The relay did not accept this code. Check the PC ID and code, or open a new code on the PC."),
-        onClosed: () => { if (stage !== "done") fail(closedMessage); },
-        onError: () => { if (stage !== "done") fail("The pairing connection failed. Check the connection and try again."); },
+        onRefused: event => {
+          // The relay may put a short reason in the 1008 close; show it when present.
+          const said = typeof event?.reason === "string" ? event.reason.replace(/[^\x20-\x7e]/g, "").trim().slice(0, 120) : "";
+          blog("warn", "pairing refused by the relay", { closeCode: event?.code, reason: said });
+          fail(`The relay did not accept this code. Check the PC ID and code, or open a new code on the PC.${said ? ` Reason: ${said}.` : ""}`);
+        },
+        onClosed: (event, info) => {
+          if (stage === "done") return;
+          blog("warn", "pairing socket closed", { closeCode: event?.code, reason: String(event?.reason ?? "").slice(0, 120), admitted: info?.admitted, stage });
+          fail(closedMessage);
+        },
+        onError: event => {
+          if (stage === "done") return;
+          blog("warn", "pairing socket failed", { stage, cause: cause(event instanceof Error ? event : undefined) ?? "socket error" });
+          fail("The pairing connection failed. Check the connection and try again.");
+        },
       });
       return { pc, code, pair };
     } catch (error) {
+      blog("warn", "pairing could not start", { cause: cause(error) });
       fail(error.message);
     }
   }
@@ -341,8 +392,8 @@ export function createApp({
     const problem = new Error("This browser could not be forgotten. Check the connection and try again.");
     let response;
     try { response = await fetch(FORGET_ENDPOINT, { method: "POST", credentials: "same-origin" }); }
-    catch { throw problem; }
-    if (!response.ok) throw problem;
+    catch (error) { blog("warn", "forget this browser: request failed", { cause: cause(error) }); throw problem; }
+    if (!response.ok) { blog("warn", "forget this browser: refused", { status: response.status }); throw problem; }
     stopPairing();
     session?.endSession?.();
     reload();
@@ -379,9 +430,11 @@ export async function main(doc = globalThis.document) {
   const keyUi = await installDeviceKeyUi({ doc });
   const app = createApp({ gate, keyUi, loadSession });
   wireSettings(doc, app);
+  try { installFeedback(doc); } catch (error) { blog("warn", "report a problem is unavailable", { cause: cause(error) }); }
   try {
     await app.start();
   } catch (error) {
+    blog("error", "viewer start failed", { cause: cause(error), stack: String(error?.stack ?? "") });
     gate.showRefusal({ title: "Device key unavailable", body: deviceKeyErrorMessage(error) });
   }
 }
@@ -396,7 +449,10 @@ function wireSettings(doc, app) {
   on("switch-pc", () => app.switchPc());
   on("lock-key", async () => {
     try { await app.lock(); }
-    catch { if (status) status.textContent = "This browser could not be locked. Close other tabs and try again."; }
+    catch (error) {
+      blog("warn", "lock this browser failed", { cause: cause(error) });
+      if (status) status.textContent = "This browser could not be locked. Close other tabs and try again.";
+    }
   });
   on("forget-browser", async () => {
     if (!globalThis.confirm("Forget this browser? The next visit will require new browser approval.")) return;

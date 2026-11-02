@@ -2,6 +2,7 @@ package de.bubblebuffer.bubbleplay.keys
 
 import android.content.Context
 import android.util.AtomicFile
+import de.bubblebuffer.bubbleplay.log.BpLog
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
@@ -59,26 +60,42 @@ class DeviceKeyStore internal constructor(
 
     /** Null only when no local file exists; corruption and missing keys propagate. */
     fun loadPortable(): String? = synchronized(fileLock) {
-        val envelope = try {
-            envelopes.read()
-        } catch (missing: FileNotFoundException) {
-            // Do not mistake an existing but inaccessible file for a new install.
-            if (path.exists() || atomicBackup.exists()) throw missing
-            return@synchronized null
+        try {
+            val envelope = try {
+                envelopes.read()
+            } catch (missing: FileNotFoundException) {
+                // Do not mistake an existing but inaccessible file for a new install.
+                if (path.exists() || atomicBackup.exists()) throw missing
+                BpLog.i("DeviceKeyStore", "no stored device key")
+                return@synchronized null
+            }
+            decode(envelope)
+        } catch (failure: Throwable) {
+            BpLog.e("DeviceKeyStore", "the stored device key could not be loaded", null, emptyMap(), failure)
+            throw failure
         }
-        decode(envelope)
     }
 
     /** Also serves import. Replaces whatever is stored; text that is not a shared-format key file is refused. */
     fun savePortable(text: String) = synchronized(fileLock) {
-        KeyFileCodec.parse(text)
-        writeEnvelope(text.toByteArray(Charsets.UTF_8))
+        try {
+            KeyFileCodec.parse(text)
+            writeEnvelope(text.toByteArray(Charsets.UTF_8))
+            BpLog.i("DeviceKeyStore", "device key stored")
+        } catch (failure: Throwable) {
+            BpLog.e("DeviceKeyStore", "the device key could not be stored", null, emptyMap(), failure)
+            throw failure
+        }
     }
 
     /** Deletes the stored key and its backups. Throws if any of those files survives. */
     fun remove() = synchronized(fileLock) {
         val stuck = listOf(path, atomicBackup).filter { it.exists() && !it.delete() }
-        if (stuck.isNotEmpty()) throw IOException("could not delete the device key file")
+        if (stuck.isNotEmpty()) {
+            BpLog.e("DeviceKeyStore", "the device key file could not be deleted", null, mapOf("files" to stuck.size))
+            throw IOException("could not delete the device key file")
+        }
+        BpLog.i("DeviceKeyStore", "device key removed")
     }
 
     private fun decode(envelope: ByteArray): String {
@@ -88,7 +105,8 @@ class DeviceKeyStore internal constructor(
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
                 .decode(ByteBuffer.wrap(portableBytes)).toString()
-            KeyFileCodec.parse(text)
+            BpLog.setDeviceId(KeyFileCodec.parse(text).id)
+            BpLog.i("DeviceKeyStore", "stored device key loaded")
             return text
         } finally {
             portableBytes.fill(0)

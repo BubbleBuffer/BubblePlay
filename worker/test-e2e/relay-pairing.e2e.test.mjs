@@ -25,15 +25,15 @@ after(async () => {
 // A 32-byte value that is not the admit hash of any window.
 const wrongPair = () => randomBytes(32).toString("base64url");
 
-// The relay refuses a pairing viewer with 1008 and an empty reason, and never sends it hello-ok.
-async function assertRefused(connection, what) {
+// The relay refuses a pairing viewer with 1008 and a reason, and never sends it hello-ok.
+async function assertRefused(connection, what, reason = "pairing code not accepted") {
   const close = await connection.box.done;
   assert.equal(close.code, 1008, what);
-  assert.equal(close.reason, "", what);
+  assert.equal(close.reason, reason, what);
   assert.equal(connection.box.items.some(message => message.type === "hello-ok"), false, what);
 }
 
-test("a pairing code with no open window is refused 1008 with an empty reason", { timeout: CASE_TIMEOUT_MS }, async () => {
+test("a pairing code with no open window is refused 1008 with the reason pairing code not accepted", { timeout: CASE_TIMEOUT_MS }, async () => {
   const host = await openHost(relay, PC, []);
   const viewer = await connectViewer(relay, VIEWER, PC.id, { pair: wrongPair() });
   try {
@@ -91,7 +91,7 @@ test("five failed codes from one prefix refuse even the right code", { timeout: 
       }
       // The sixth attempt carries the right code, but the prefix is over its limit, so nothing is compared.
       const right = await connectViewer(own, VIEWER, PC.id, { pair: pairing.admit });
-      await assertRefused(right, "the right code after the prefix limit");
+      await assertRefused(right, "the right code after the prefix limit", "rate limited");
       await closeSocket(right.socket);
     } finally {
       await closeSocket(host.socket);

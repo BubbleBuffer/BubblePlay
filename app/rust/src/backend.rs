@@ -20,6 +20,7 @@ use bubbleplay_client::store::key::{KeyStore, KEY_FILE_NAME};
 use bubbleplay_client::store::pcs::PcStore;
 use zeroize::Zeroizing;
 
+use crate::applog;
 use crate::link;
 use crate::stream_host;
 
@@ -166,7 +167,15 @@ fn load_key(paths: &Paths, inner: &mut Inner) {
 }
 
 fn refresh_pcs(paths: &Paths, inner: &mut Inner) {
-    let entries = paths.pcs.load().unwrap_or_default();
+    let entries = paths.pcs.load().unwrap_or_else(|error| {
+        applog::error(
+            None,
+            "backend::refresh_pcs",
+            "The PC list could not be read",
+            &format!("{error:#}"),
+        );
+        Vec::new()
+    });
     let known: std::collections::HashMap<String, RemotePc> = inner
         .state
         .pcs
@@ -261,7 +270,14 @@ impl AppBackend {
                 relay,
             } => self.submit_pairing(inner, link, pc_id, code, relay),
             Action::Forget { pc_id } => {
-                let _ = self.paths.pcs.remove(&pc_id);
+                if let Err(error) = self.paths.pcs.remove(&pc_id) {
+                    applog::error(
+                        Some(&pc_id),
+                        "backend::forget",
+                        "A PC could not be removed",
+                        &format!("{error:#}"),
+                    );
+                }
                 refresh_pcs(&self.paths, inner);
             }
             Action::Rename { pc_id, name } => self.rename(inner, &pc_id, &name),
@@ -476,7 +492,14 @@ impl AppBackend {
         if let Ok(mut entries) = self.paths.pcs.load() {
             if let Some(entry) = entries.iter_mut().find(|entry| entry.id == pc_id) {
                 entry.name = name.to_owned();
-                let _ = self.paths.pcs.save(&entries);
+                if let Err(error) = self.paths.pcs.save(&entries) {
+                    applog::error(
+                        Some(pc_id),
+                        "backend::rename",
+                        "The PC list could not be saved",
+                        &format!("{error:#}"),
+                    );
+                }
             }
         }
         refresh_pcs(&self.paths, inner);

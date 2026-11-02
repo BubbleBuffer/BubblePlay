@@ -67,7 +67,7 @@ function harness(usingWssMedia = true) {
     debugFirstDecoderOutput: false, debugFirstDecoderConfigured: false,
     hudState: { dropped: 0 }, activeWssHybridMode: () => false, activeWssHybridCache: () => ({}),
     activeWssHevcCodec: () => "hev1.1.6.L120.B0", clearWssHybridCaches() {},
-    resetRenderPacing() {}, sendClientLog() {}, debugTrace() {}, streamModeValue: () => "desktop",
+    resetRenderPacing() {}, viewerLog() {}, debugTrace() {}, streamModeValue: () => "desktop",
     onDecodedFrame: frame => decoded.push(frame.timestamp),
     noteWssFailure: reason => failures.push(reason), beginWssRecovery: reason => failures.push(reason),
     requestKeyframe: reason => failures.push(reason), dropAndResync: reason => failures.push(reason),

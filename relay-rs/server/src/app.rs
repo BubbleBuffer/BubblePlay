@@ -181,7 +181,7 @@ fn dropped() -> Response {
     Response::new(Body::from_stream(failed))
 }
 
-/// Accepts a refused browser socket and closes it 1008 with an empty reason. A failed upgrade
+/// Accepts a refused browser socket and closes it 1008 "not approved". A failed upgrade
 /// reaches the browser as a bare 1006, and the browser reconnects in a loop. A 1008 tells it to
 /// stop.
 async fn refused_socket(state: &AppState, parts: &mut Parts) -> Response {
@@ -189,14 +189,25 @@ async fn refused_socket(state: &AppState, parts: &mut Parts) -> Response {
         Ok(upgrade) => upgrade,
         Err(rejection) => return rejection.into_response(),
     };
+    bp_relay_core::log::emit(
+        bp_relay_core::log::Level::Warn,
+        now_ms(),
+        "relay",
+        "socket refused",
+        None,
+        json!({"class": "gate.refused", "status": 1008, "reason": REFUSED_REASON}),
+    );
     upgrade.on_upgrade(|mut socket| async move {
         let frame = CloseFrame {
             code: 1008,
-            reason: String::new().into(),
+            reason: REFUSED_REASON.into(),
         };
         let _ = socket.send(Message::Close(Some(frame))).await;
     })
 }
+
+/// What a browser the gate did not approve is told.
+const REFUSED_REASON: &str = bp_relay_core::relay::reasons::NOT_APPROVED;
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())

@@ -12,7 +12,7 @@ use bp_relay_core::gate::{
 };
 use bp_relay_core::presence::{self, PRESENCE_PATH, PresenceLimiter};
 use bp_relay_core::relay::{
-    Action, AdminError, ConnId, ConnSnapshot, Relay as CoreRelay, UpgradeRequest,
+    Action, AdminError, ConnId, ConnSnapshot, Relay as CoreRelay, UpgradeRequest, reasons,
 };
 use serde_json::{Value, json};
 use worker::js_sys;
@@ -449,7 +449,19 @@ impl crate::Relay {
             }
         };
         for ws in stale {
-            let _ = ws.close(Some(1008), Some(""));
+            bp_relay_core::log::emit(
+                bp_relay_core::log::Level::Warn,
+                now_ms(),
+                "relay",
+                "socket refused",
+                None,
+                json!({
+                    "class": "restore.stale-attachment",
+                    "status": 1008,
+                    "reason": reasons::SESSION_NOT_RESTORED,
+                }),
+            );
+            let _ = ws.close(Some(1008), Some(reasons::SESSION_NOT_RESTORED));
         }
         *self.live.borrow_mut() = Some(woken.live);
         // Rehydrate's actions close the sockets that cannot come back. They write nothing.
@@ -758,10 +770,18 @@ fn server_error() -> Result<Response> {
     Ok(Response::empty()?.with_status(500))
 }
 
-/// Accepts a browser socket that the gate refused, and closes it 1008 with an empty reason.
+/// Accepts a browser socket that the gate refused, and closes it 1008 "not approved".
 fn refused_socket(state: &State) -> Result<Response> {
     let pair = WebSocketPair::new()?;
     state.accept_web_socket(&pair.server);
-    pair.server.close(Some(1008), Some(""))?;
+    bp_relay_core::log::emit(
+        bp_relay_core::log::Level::Warn,
+        now_ms(),
+        "relay",
+        "socket refused",
+        None,
+        json!({"class": "gate.refused", "status": 1008, "reason": reasons::NOT_APPROVED}),
+    );
+    pair.server.close(Some(1008), Some(reasons::NOT_APPROVED))?;
     Response::from_websocket(pair.client)
 }

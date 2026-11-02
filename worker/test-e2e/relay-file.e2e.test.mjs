@@ -79,13 +79,13 @@ test("file sockets refuse a viewer ticket on the host side, a forged viewer tick
     sockets.push(wrongRole);
     const wrongRoleClose = await wrongRole.box.done;
     assert.equal(wrongRoleClose.code, 1008);
-    assert.equal(wrongRoleClose.reason, "");
+    assert.equal(wrongRoleClose.reason, "not authorized");
 
     const forged = await openDataSocket(relay, "/file-ws", PC.id, epoch, { type: "hello", role: "file-viewer", ticket: "A".repeat(43) });
     sockets.push(forged);
     const forgedClose = await forged.box.done;
     assert.equal(forgedClose.code, 1008);
-    assert.equal(forgedClose.reason, "");
+    assert.equal(forgedClose.reason, "not authorized");
 
     assert.equal(await upgradeStatus(`${relay.ws}/file-ws?pc=${PC.id}&epoch=${"0".repeat(32)}`), 404);
   } finally {
