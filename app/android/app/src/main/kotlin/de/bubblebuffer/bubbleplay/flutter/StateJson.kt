@@ -52,7 +52,18 @@ internal object StateJson {
     fun approvedByPc(): JSONObject = tagged("Approved", obj("by" to "Pc"))
     fun deniedByPc(): JSONObject = tagged("Denied", obj("by" to "Pc"))
 
-    fun pc(id: String, name: String, relay: String, lastSeen: String?): JSONObject = obj(
+    /**
+     * The Rust `PcProblem` variant for the resource name the Kotlin core stores on a PC
+     * (`SessionProblem.resource`); a problem with no variant maps to null.
+     */
+    fun pcProblem(resource: String?): String? = when (resource) {
+        "session_pc_key_changed" -> "KeyChanged"
+        "session_relay_refused", "session_device_removed" -> "NotAccepted"
+        "session_auth_timeout" -> "RelayUnreachable"
+        else -> null
+    }
+
+    fun pc(id: String, name: String, relay: String, lastSeen: String?, problem: String? = null): JSONObject = obj(
         "id" to id,
         "name" to name,
         "kind" to "Desktop",
@@ -63,7 +74,7 @@ internal object StateJson {
         "last_seen" to lastSeen,
         "allowed" to "View and input",
         "vouch_request" to null,
-        "problem" to null,
+        "problem" to problem,
         "default_monitor" to null,
     )
 

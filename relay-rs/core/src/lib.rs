@@ -13,6 +13,7 @@
 
 pub mod gate;
 pub mod limits;
+pub mod presence;
 pub mod protocol;
 pub mod relay;
 pub mod rng;

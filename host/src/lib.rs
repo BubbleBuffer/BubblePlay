@@ -13,6 +13,7 @@ pub mod content_class;
 pub(crate) mod deadline_pipe;
 pub mod desktop_session;
 pub mod device_key;
+pub mod devices_pipe;
 pub mod devices_ui_api;
 pub mod devices_window;
 pub mod dk_host;

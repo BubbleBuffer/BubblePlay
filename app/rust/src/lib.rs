@@ -7,6 +7,7 @@
 pub mod api;
 pub mod backend;
 pub mod contract;
+pub mod devices_pipe;
 mod frb_generated;
 mod link;
 pub mod stream_host;

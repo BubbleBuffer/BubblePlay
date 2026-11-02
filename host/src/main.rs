@@ -657,6 +657,37 @@ fn remembered_monitor_attempt_exhausted(attempts: u32) -> bool {
     attempts >= REMEMBERED_MONITOR_MAX_ATTEMPTS
 }
 
+/// Starts the per-user Devices pipe for the Flutter app, or logs why not.
+fn start_devices_pipe(
+    info: &bubbleplay_host::devices_window::DevicesWindowInfo,
+    commands: std::sync::mpsc::Sender<bubbleplay_host::devices_ui_api::DevicesCommand>,
+) -> Option<bubbleplay_host::devices_pipe::DevicesPipe> {
+    use bubbleplay_host::devices_pipe as pipe;
+    let sid = match pipe::current_user_sid() {
+        Ok(sid) => sid,
+        Err(error) => {
+            warn!(%error, "Devices pipe not started: user SID unavailable");
+            return None;
+        }
+    };
+    let config = pipe::DevicesPipeConfig {
+        pipe_name: pipe::pipe_name_for_sid(&sid),
+        sid,
+        pc_name: info.pc_name.clone(),
+        pc_id: info.pc_id.clone(),
+        relay_origin: info.relay_origin.clone(),
+        relay_online: info.relay_online.clone(),
+        relay_poll: Duration::from_secs(1),
+    };
+    match pipe::DevicesPipe::start(config, commands) {
+        Ok(pipe) => Some(pipe),
+        Err(error) => {
+            warn!(%error, "Devices pipe not started; the app's Devices section stays offline");
+            None
+        }
+    }
+}
+
 /// Serve mode wrapper: a session ends when the peer leaves or ICE dies, but
 /// the host keeps running and accepts the next client. Fatal errors (bad
 /// token, capture failure) still exit — only session teardown retries.
@@ -666,39 +697,55 @@ fn run_serve_forever(args: &Args) -> Result<()> {
     let _vdd = start_vdd_keepalive(args)?;
     let (devices_host, devices_ui) = bubbleplay_host::devices_ui_api::channel();
     let relay_online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // The real Devices window needs the PC key; without one the events are only logged.
-    let devices_window = args.device_identity.as_ref().map(|identity| {
-        bubbleplay_host::devices_window::DevicesWindow::new(
-            bubbleplay_host::devices_window::DevicesWindowInfo {
-                pc_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
-                pc_id: identity.id().to_string(),
-                relay_origin: args
-                    .worker
-                    .as_deref()
-                    .and_then(bubbleplay_host::device_key::relay_origin)
-                    .unwrap_or_default(),
-                relay_online: relay_online.clone(),
-            },
-            devices_ui.commands.clone(),
-        )
+    // The real Devices window and the Devices pipe need the PC key; without
+    // one the events are only logged.
+    let devices_info = args.device_identity.as_ref().map(|identity| {
+        bubbleplay_host::devices_window::DevicesWindowInfo {
+            pc_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
+            pc_id: identity.id().to_string(),
+            relay_origin: args
+                .worker
+                .as_deref()
+                .and_then(bubbleplay_host::device_key::relay_origin)
+                .unwrap_or_default(),
+            relay_online: relay_online.clone(),
+        }
+    });
+    // The Flutter app's Devices section. Optional: the host runs on if the
+    // pipe cannot be created, and nothing waits for a client.
+    let devices_pipe = match &devices_info {
+        Some(info) => start_devices_pipe(info, devices_ui.commands.clone()),
+        None => {
+            info!("no device identity; Devices pipe not started");
+            None
+        }
+    };
+    let pipe_handle = devices_pipe
+        .as_ref()
+        .map(bubbleplay_host::devices_pipe::DevicesPipe::handle);
+    let devices_window = devices_info.map(|info| {
+        bubbleplay_host::devices_window::DevicesWindow::new(info, devices_ui.commands.clone())
     });
     match devices_window.clone() {
-        // The tray's "Devices..." line also raises an already-open window.
+        // The tray's "Devices..." line also raises an already-open window;
+        // its "show-devices-app" line only reaches the pipe clients.
         Some(window) => {
-            let (stdin_commands, stdin_lines) = std::sync::mpsc::channel();
-            bubbleplay_host::devices_ui_api::spawn_stdin_reader(std::io::stdin(), stdin_commands)?;
+            let (stdin_requests, stdin_lines) = std::sync::mpsc::channel();
+            bubbleplay_host::devices_ui_api::spawn_stdin_request_reader(
+                std::io::stdin(),
+                stdin_requests,
+            )?;
             let commands = devices_ui.commands.clone();
+            let pipe = pipe_handle.clone();
             std::thread::Builder::new()
                 .name("devices-open".into())
                 .spawn(move || {
-                    for command in stdin_lines {
-                        if command == bubbleplay_host::devices_ui_api::DevicesCommand::Open {
-                            window.open();
-                        }
-                        if commands.send(command).is_err() {
-                            break;
-                        }
-                    }
+                    bubbleplay_host::devices_pipe::route_stdin_requests(
+                        stdin_lines,
+                        || window.open(),
+                        commands,
+                        pipe,
+                    )
                 })?;
         }
         None => {
@@ -711,12 +758,20 @@ fn run_serve_forever(args: &Args) -> Result<()> {
     std::thread::Builder::new()
         .name("devices-ui".into())
         .spawn(move || match devices_window {
-            Some(window) => bubbleplay_host::devices_ui_api::run_ui(window, devices_ui.events),
+            Some(window) => bubbleplay_host::devices_ui_api::run_ui(
+                bubbleplay_host::devices_pipe::TeeDevicesUi {
+                    ui: window,
+                    pipe: pipe_handle,
+                },
+                devices_ui.events,
+            ),
             None => bubbleplay_host::devices_ui_api::run_ui(
                 bubbleplay_host::devices_ui_api::LogDevicesUi,
                 devices_ui.events,
             ),
         })?;
+    // Kept alive for the life of the host.
+    let _devices_pipe = devices_pipe;
     let devices_host = std::sync::Arc::new(std::sync::Mutex::new(devices_host));
     let mut selection = CaptureSelection::from_launch(args.monitor.as_deref());
     let mut backoff = Duration::from_secs(1);

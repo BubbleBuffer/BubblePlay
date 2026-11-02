@@ -17,8 +17,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bp_relay_core::RelayRng;
 use bp_relay_core::gate::{
     COOKIE_NAME, Gate, GateConfig, GateEffect, GateRecord, GateSnapshot, NtfyConfig,
+    Response as GateResponse,
 };
 use bp_relay_core::limits::{QUEUE_BYTE_LIMIT, QUEUE_FRAMES};
+use bp_relay_core::presence::{self, PresenceLimiter};
 use bp_relay_core::relay::{Action, ConnId, CoreConfig, PcRecord, PcTable, Relay, TurnConfig};
 use ipnet::IpNet;
 use serde_json::{Value, json};
@@ -127,6 +129,8 @@ pub struct Shared {
     pub trusted_proxies: Vec<IpNet>,
     relay: Mutex<Relay>,
     gate: Mutex<Gate>,
+    /// Per-prefix counter for `GET /presence`, in memory only.
+    presence: Mutex<PresenceLimiter>,
     conns: Mutex<HashMap<ConnId, Conn>>,
     pcs_write: AsyncMutex<()>,
     gate_write: AsyncMutex<()>,
@@ -187,6 +191,7 @@ impl Shared {
             trusted_proxies: cfg.trusted_proxy_cidrs.clone(),
             relay: Mutex::new(Relay::new(core, table)),
             gate: Mutex::new(gate),
+            presence: Mutex::new(PresenceLimiter::new()),
             conns: Mutex::new(HashMap::new()),
             pcs_write: AsyncMutex::new(()),
             gate_write: AsyncMutex::new(()),
@@ -204,6 +209,14 @@ impl Shared {
     /// The gate, locked for one synchronous call.
     pub fn gate(&self) -> MutexGuard<'_, Gate> {
         lock(&self.gate)
+    }
+
+    /// Answers `GET /presence` for `client`: the limiter, then a read of host presence. Nothing
+    /// else takes the limiter's lock, so holding it while the relay is read cannot deadlock.
+    pub fn presence(&self, client: IpAddr, ids: Option<&str>, now: u64) -> GateResponse {
+        let mut limiter = lock(&self.presence);
+        let relay = lock(&self.relay);
+        presence::answer(&mut limiter, &relay, client, ids, now)
     }
 
     /// True when a valid, unexpired gate cookie is among the request's cookies.

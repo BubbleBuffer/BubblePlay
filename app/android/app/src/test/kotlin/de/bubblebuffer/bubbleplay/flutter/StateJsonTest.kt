@@ -41,6 +41,19 @@ class StateJsonTest {
     }
 
     @Test
+    fun pcProblemsUseTheFixtureNamesAndUnknownOnesAreNull() {
+        val fixture = all().flatMap { s -> (0 until s.getJSONArray("pcs").length()).map { s.getJSONArray("pcs").getJSONObject(it) } }
+            .mapNotNull { it.optString("problem").takeIf { p -> p.isNotEmpty() && p != "null" } }.toSet()
+        val ours = listOf("session_pc_key_changed", "session_relay_refused", "session_device_removed", "session_auth_timeout")
+            .mapNotNull { StateJson.pcProblem(it) }.toSet()
+        assertEquals(fixture, ours)
+        assertEquals(null, StateJson.pcProblem("session_control_failed"))
+        assertEquals(null, StateJson.pcProblem(null))
+        assertEquals("KeyChanged", StateJson.pc("a", "b", "r", null, "KeyChanged").getString("problem"))
+        assertTrue(StateJson.pc("a", "b", "r", null).isNull("problem"))
+    }
+
+    @Test
     fun theSessionHasExactlyTheFieldsOfTheRustSession() {
         val ours = StateJson.session("77VH-7M56-8GJK-Y12J", "Studio", "Work", "Auto", false)
         val theirs = all().first { !it.isNull("session") }.getJSONObject("session")

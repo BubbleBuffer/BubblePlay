@@ -1,8 +1,10 @@
 //! Boundary between the host and the Devices window.
 //!
 //! Host -> UI is [`DevicesEvent`], UI -> host is [`DevicesCommand`], both over
-//! std mpsc channels. The tray's "Devices..." item reaches the host as the one
-//! fixed stdin line [`OPEN_DEVICES_LINE`]; any other stdin input is ignored.
+//! std mpsc channels. The tray's "Devices..." item reaches the host as one of
+//! two fixed stdin lines: [`OPEN_DEVICES_LINE`] (open the Win32 window) or
+//! [`SHOW_DEVICES_APP_LINE`] (show the Devices section of the Flutter app);
+//! any other stdin input is ignored.
 //!
 //! Pairing codes, QR URIs and comparison numbers are secrets for the time they
 //! are on screen, so their `Debug` output is redacted and no logger prints them.
@@ -15,6 +17,18 @@ use std::time::SystemTime;
 
 /// The one line the tray writes to the host's stdin for "Devices...".
 pub const OPEN_DEVICES_LINE: &[u8] = b"open-devices\n";
+
+/// The line the tray writes when the Flutter app shows the Devices section.
+pub const SHOW_DEVICES_APP_LINE: &[u8] = b"show-devices-app\n";
+
+/// What a fixed stdin line asks the host for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdinRequest {
+    /// `open-devices`: open (or raise) the Win32 Devices window.
+    OpenDevices,
+    /// `show-devices-app`: tell connected app clients to show Devices.
+    ShowDevicesApp,
+}
 
 /// Longer stdin lines are discarded unread, so stdin cannot grow memory.
 const MAX_STDIN_LINE: usize = 64;
@@ -203,12 +217,23 @@ fn encode_component(value: &str) -> String {
     out
 }
 
+/// The request a stdin line makes. Only the exact `open-devices` and
+/// `show-devices-app` lines (their line ending aside) count; everything else
+/// is ignored.
+pub fn parse_stdin_request(line: &[u8]) -> Option<StdinRequest> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    match line {
+        b"open-devices" => Some(StdinRequest::OpenDevices),
+        b"show-devices-app" => Some(StdinRequest::ShowDevicesApp),
+        _ => None,
+    }
+}
+
 /// The command a stdin line asks for. Only the exact `open-devices` line
 /// (its line ending aside) counts; everything else is ignored.
 pub fn parse_stdin_line(line: &[u8]) -> Option<DevicesCommand> {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    (line == b"open-devices").then_some(DevicesCommand::Open)
+    (parse_stdin_request(line) == Some(StdinRequest::OpenDevices)).then_some(DevicesCommand::Open)
 }
 
 /// Reads host stdin lines on a thread and forwards each command. The thread
@@ -219,10 +244,33 @@ pub fn spawn_stdin_reader<R: Read + Send + 'static>(
 ) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("devices-stdin".into())
-        .spawn(move || read_commands(reader, &commands))
+        .spawn(move || {
+            read_lines(reader, |line| match parse_stdin_line(line) {
+                Some(command) => commands.send(command).is_ok(),
+                None => true,
+            })
+        })
 }
 
-fn read_commands<R: Read>(reader: R, commands: &Sender<DevicesCommand>) {
+/// Reads host stdin lines on a thread and forwards each [`StdinRequest`].
+/// The thread ends at end of input or when the receiver is gone.
+pub fn spawn_stdin_request_reader<R: Read + Send + 'static>(
+    reader: R,
+    requests: Sender<StdinRequest>,
+) -> io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("devices-stdin".into())
+        .spawn(move || {
+            read_lines(reader, |line| match parse_stdin_request(line) {
+                Some(request) => requests.send(request).is_ok(),
+                None => true,
+            })
+        })
+}
+
+/// Feeds each stdin line of at most [`MAX_STDIN_LINE`] bytes to `line_fn`,
+/// which returns false to stop reading.
+fn read_lines<R: Read>(reader: R, mut line_fn: impl FnMut(&[u8]) -> bool) {
     let mut reader = BufReader::new(reader);
     let mut line = Vec::with_capacity(MAX_STDIN_LINE + 1);
     loop {
@@ -242,10 +290,8 @@ fn read_commands<R: Read>(reader: R, commands: &Sender<DevicesCommand>) {
             }
             continue;
         }
-        if let Some(command) = parse_stdin_line(&line) {
-            if commands.send(command).is_err() {
-                break;
-            }
+        if !line_fn(&line) {
+            break;
         }
         if !complete {
             // End of input without a line ending.
@@ -317,6 +363,76 @@ mod tests {
         for other in others {
             assert_eq!(parse_stdin_line(other), None, "{other:?}");
         }
+    }
+
+    fn read_requests(input: &[u8]) -> Vec<StdinRequest> {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_stdin_request_reader(Cursor::new(input.to_vec()), tx).expect("spawn");
+        handle.join().expect("reader thread");
+        rx.try_iter().collect()
+    }
+
+    #[test]
+    fn only_the_exact_lines_are_requests() {
+        assert_eq!(
+            parse_stdin_request(SHOW_DEVICES_APP_LINE),
+            Some(StdinRequest::ShowDevicesApp)
+        );
+        assert_eq!(
+            parse_stdin_request(b"show-devices-app\r\n"),
+            Some(StdinRequest::ShowDevicesApp)
+        );
+        assert_eq!(
+            parse_stdin_request(b"show-devices-app"),
+            Some(StdinRequest::ShowDevicesApp)
+        );
+        assert_eq!(
+            parse_stdin_request(OPEN_DEVICES_LINE),
+            Some(StdinRequest::OpenDevices)
+        );
+        let others: [&[u8]; 6] = [
+            b"Show-Devices-App\n",
+            b"show-devices-app \n",
+            b" show-devices-app\n",
+            b"show-devices-app extra\n",
+            b"show-devices\n",
+            b"show-devices-app\n\n",
+        ];
+        for other in others {
+            assert_eq!(parse_stdin_request(other), None, "{other:?}");
+            assert_eq!(parse_stdin_line(other), None, "{other:?}");
+        }
+        // The show line is never a window command.
+        assert_eq!(parse_stdin_line(SHOW_DEVICES_APP_LINE), None);
+    }
+
+    #[test]
+    fn request_reader_forwards_both_lines_in_order() {
+        let input = b"noise\nshow-devices-app\nopen-devices\nshow-devices-app-x\nshow-devices-app\r\nshow-devices-app";
+        assert_eq!(
+            read_requests(input),
+            vec![
+                StdinRequest::ShowDevicesApp,
+                StdinRequest::OpenDevices,
+                StdinRequest::ShowDevicesApp,
+                StdinRequest::ShowDevicesApp,
+            ]
+        );
+    }
+
+    #[test]
+    fn request_reader_skips_over_long_lines() {
+        let mut input = vec![b'x'; 5000];
+        input.extend_from_slice(b"show-devices-app\nshow-devices-app\n");
+        assert_eq!(read_requests(&input), vec![StdinRequest::ShowDevicesApp]);
+    }
+
+    #[test]
+    fn command_reader_ignores_the_show_line() {
+        assert_eq!(
+            read_all(b"show-devices-app\nopen-devices\n"),
+            vec![DevicesCommand::Open]
+        );
     }
 
     #[test]

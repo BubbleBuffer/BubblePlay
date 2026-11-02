@@ -1,6 +1,6 @@
 //! The axum router. `/healthz` is answered first, as the Docker probe needs it. Every other
-//! request goes through the gate; what the gate allows goes to the admin API, a WebSocket route or
-//! the static-asset handler. Every response gets the common security headers.
+//! request goes through the gate; what the gate allows goes to `GET /presence`, the admin API, a
+//! WebSocket route or the static-asset handler. Every response gets the common security headers.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use bp_relay_core::gate::{
     Hold, HoldCheck, Request as GateRequest, Response as GateResponse, Verdict,
 };
+use bp_relay_core::presence::PRESENCE_PATH;
 use bp_relay_core::relay::{AdminError, UpgradeRequest};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -115,6 +116,12 @@ async fn dispatch(
         }
         Verdict::Drop => dropped(),
         Verdict::Allow => {
+            // The gate lets a GET on /presence through before its navigation step, cookie or not.
+            if path == PRESENCE_PATH && parts.method == Method::GET && !websocket {
+                let ids = query_value(parts.uri.query(), "ids");
+                let response = state.presence(client, ids.as_deref(), now_ms());
+                return gate_response(response);
+            }
             if path.starts_with("/__gate/manage/") {
                 return admin(&state, &parts.method, path, &parts.headers).await;
             }
@@ -207,6 +214,13 @@ fn query_values(query: Option<&str>) -> (Option<String>, Option<String>) {
         }
     }
     (pc, epoch)
+}
+
+/// The first value of `key` in a query string, decoded.
+fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+    form_urlencoded::parse(query.unwrap_or("").as_bytes())
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
 }
 
 fn gate_response(response: GateResponse) -> Response {

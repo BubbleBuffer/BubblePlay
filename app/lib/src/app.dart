@@ -2,6 +2,7 @@ import 'package:bb_ui/bb_ui.dart';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import 'app_controller.dart';
+import 'devices/devices_controller.dart';
 import 'platform/key_files.dart';
 import 'session/stream_channel.dart';
 import 'screens/gate.dart';
@@ -15,6 +16,8 @@ class AppEnv {
     required this.keyFiles,
     this.theme,
     this.stream = const NoStreamChannel(),
+    this.devices,
+    this.initialSection,
   });
 
   final AppController controller;
@@ -26,6 +29,12 @@ class AppEnv {
 
   /// The person's light/dark choice; null follows the system.
   final ValueNotifier<Brightness?>? theme;
+
+  /// The host's Devices pipe (Windows only); null where there is no "This PC" to manage.
+  final DevicesController? devices;
+
+  /// The section to open on start (`--section=this-pc`); null opens the PC list's first PC.
+  final String? initialSection;
 }
 
 class AppScope extends InheritedWidget {
