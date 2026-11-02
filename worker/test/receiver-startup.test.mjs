@@ -55,7 +55,7 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
     terminalSignalingFailure: false, reconnectTimer: null, ws: null,
     signalingGeneration: 0, signalingRegistered: false, authenticatedSession: null,
     hudState: {}, hud: { classList: { add() {} } },
-    signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, recordSignalingError() {},
+    signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, recordSignalingError() {},
     shouldReconnectAfterClose: () => true, restartPeer() {}, cleanupPeer() {}, handleSignal() {},
     setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
   });
@@ -111,7 +111,7 @@ test("slow ICE renews an exhausted offer-time handshake; normal ICE retains its 
     clearFirstFrameWatchdog() { if (state.timer !== null) timers.delete(state.timer); state.timer = null; },
     firstFrameRequestId: () => `request-${++nextRequest}`,
     sendFirstFrameRequest: () => sent.push(state.requestId),
-    renderDesktopState() {}, sendClientLog() {}, sendControl() {}, recoverWssStartup() {},
+    renderDesktopState() {}, viewerLog() {}, sendControl() {}, recoverWssStartup() {},
     recoverRtcInPlaceTransition() {}, consumeRtcTransitionRestart: () => false,
     WSS_PROTOCOL: 4, codecSession: { codec: "hevc" },
     setTimeout: (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
