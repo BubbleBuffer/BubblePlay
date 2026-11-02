@@ -546,15 +546,16 @@ class ClientLogUploader {
           final end = at + _maxFeedbackChunkBytes > png.length ? png.length : at + _maxFeedbackChunkBytes;
           chunks.add(base64Encode(Uint8List.sublistView(png, at, end)));
         }
-        final report = {...item.report, 'screenshot': null};
-        return _Feedback(item.id, {
+        final begin = <String, Object?>{
           'type': 'feedback-begin',
           'v': 1,
           'id': item.id,
-          'report': report,
+          'report': {...item.report, 'screenshot': null},
           'pngBytes': png.length,
           'chunks': chunks.length,
-        }, chunks);
+        };
+        _fitBegin(begin);
+        return _Feedback(item.id, begin, chunks);
       } catch (_) {
         _fbBlocked.add(item.id);
       }
@@ -577,6 +578,29 @@ class ClientLogUploader {
     }
     _cooldown = _wake = _ackTimer = _retryTimer = _fbTimer = _fbRetryTimer = null;
   }
+}
+
+/// The relay caps one ctl message; feedback-begin must stay under this many bytes serialized.
+const maxFeedbackBeginBytes = 128 * 1024;
+
+/// Drops the oldest entries of `report.logs`, then of `report.errors`, until [begin] fits.
+void _fitBegin(Map<String, Object?> begin) {
+  final report = (begin['report']! as Map).cast<String, Object?>();
+  var total = utf8.encode(jsonEncode(begin)).length;
+  if (total < maxFeedbackBeginBytes) return;
+  for (final key in ['logs', 'errors']) {
+    final list = report[key];
+    if (list is! List) continue;
+    final kept = List<Object?>.of(list);
+    var drop = 0;
+    while (drop < kept.length && total >= maxFeedbackBeginBytes) {
+      total -= utf8.encode(jsonEncode(kept[drop])).length + 1;
+      drop++;
+    }
+    report[key] = kept.sublist(drop);
+    if (total < maxFeedbackBeginBytes) break;
+  }
+  begin['report'] = report;
 }
 
 int _clampInt(Object? v, int fallback, int min, int max) {
