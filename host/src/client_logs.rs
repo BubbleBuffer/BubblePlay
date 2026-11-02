@@ -791,7 +791,7 @@ mod tests {
         let n = lines.len() as u64;
         let ack = store.ingest_at(&d, batch(lines, 0, n), now()).unwrap();
         assert_eq!(ack.written, 1);
-        assert_eq!(ack.dropped_invalid, 6);
+        assert_eq!(ack.dropped_invalid, 7);
         assert_eq!(ack.dropped_future, 1);
         assert_eq!(ack.dropped_old, 1);
         assert_eq!(ack.dropped_oversize, 1);
@@ -903,7 +903,7 @@ mod tests {
         let d = dev("p");
         let mut cursor = 0;
         for day in ["2026-10-31", "2026-11-01", "2026-11-02"] {
-            let l = line(&format!("{day}T12:00:00.000Z"), &"m".repeat(150));
+            let l = line(&format!("{day}T12:00:00.000Z"), &"word ".repeat(30));
             cursor += 1;
             store
                 .ingest_at(&d, batch(vec![l.clone(), l], cursor - 1, cursor), now())
@@ -924,7 +924,7 @@ mod tests {
             ..Limits::default()
         };
         let store = ClientLogStore::open_with(&tmp.0, limits).unwrap();
-        let l = |day: &str| line(&format!("{day}T12:00:00.000Z"), &"m".repeat(150));
+        let l = |day: &str| line(&format!("{day}T12:00:00.000Z"), &"word ".repeat(30));
         store
             .ingest_at(
                 &dev("a"),
@@ -959,7 +959,7 @@ mod tests {
         };
         let store = ClientLogStore::open_with(&tmp.0, limits).unwrap();
         let d = dev("p");
-        let l = line("2026-11-02T12:00:00.000Z", &"m".repeat(300));
+        let l = line("2026-11-02T12:00:00.000Z", &"word ".repeat(60));
         store
             .ingest_at(&d, batch(vec![l.clone(), l.clone()], 0, 2), now())
             .unwrap();
@@ -1054,7 +1054,7 @@ mod tests {
         assert_eq!(parse_rfc3339_millis("1970-01-01T01:00:00+01:00"), Some(0));
         assert_eq!(parse_rfc3339_millis("1970-01-01T00:00:00.5Z"), Some(500));
         assert_eq!(format_millis(1500), "1970-01-01T00:00:01.500Z");
-        assert_eq!(parse_day("2024-02-29").is_some(), true);
+        assert!(parse_day("2024-02-29").is_some());
         assert_eq!(parse_day("2025-02-29"), None);
     }
 }
