@@ -74,7 +74,8 @@ impl Relay {
     }
 
     /// A viewer with a valid proof whose ID is not admitted presents `pair`.
-    /// Any refusal closes the socket with 1008 and an empty reason, and nothing
+    /// Any refusal closes the socket with 1008 and a short reason ("pairing code
+    /// not accepted", "rate limited"), and nothing
     /// is compared once the prefix is over its limit.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn pair_attempt(
@@ -98,17 +99,21 @@ impl Relay {
         // prefixes are refused, as the gate refuses them.
         let tracked = self.pair_failures.get(&prefix).copied();
         if tracked.is_none() && self.pair_failures.len() >= MAX_TRACKED_PREFIXES {
-            self.hello_refused(id, out);
+            self.hello_refused(id, "pairing.tracking-full", out);
             return;
         }
         if let Some(failures) = tracked {
             let live = now_ms < failures.start_ms + fail_window;
             if live && failures.count >= PAIR_PREFIX_FAILURES {
-                self.hello_refused(id, out);
+                self.hello_refused(id, "pairing.rate-limited", out);
                 return;
             }
         }
 
+        let window_open = self
+            .pair_windows
+            .get(&pc)
+            .is_some_and(|window| now_ms < window.expires_ms);
         let matched = self
             .pair_windows
             .get(&pc)
@@ -134,6 +139,12 @@ impl Relay {
         let dropped = failures.is_some_and(|count| count >= PAIR_PC_FAILURES);
         if dropped {
             self.pair_windows.remove(&pc);
+            self.log(
+                crate::log::Level::Warn,
+                "pairing window closed after too many failed attempts",
+                Some(&pc),
+                serde_json::json!({"class": "pairing.window-dropped", "failures": PAIR_PC_FAILURES}),
+            );
         }
         if failures.is_some() {
             // The PC-wide count must survive a hibernation, so the host's
@@ -143,7 +154,12 @@ impl Relay {
         if dropped && let Some(host) = self.peers.get(&key_for(Role::Host, "", &pc)).copied() {
             self.send_text(host, json!({"type": "pair-closed"}).to_string(), out);
         }
-        self.hello_refused(id, out);
+        let class = if window_open {
+            "pairing.wrong-code"
+        } else {
+            "pairing.no-window"
+        };
+        self.hello_refused(id, class, out);
     }
 
     /// Counts one failed attempt from `prefix`, starting a new window when the

@@ -25,6 +25,18 @@ pub use stubs::{AgentRoom, ApprovalGate, MediaRoom, Room};
 
 const RELAY_NAME: &str = "relay-v1";
 
+/// Relay log lines (structured JSON, one per call) go to the Workers console, where
+/// observability collects them. The level picks the console method.
+fn console_sink(level: bp_relay_core::log::Level, line: &str) {
+    use bp_relay_core::log::Level;
+    match level {
+        Level::Debug => worker::console_debug!("{}", line),
+        Level::Info => worker::console_log!("{}", line),
+        Level::Warn => worker::console_warn!("{}", line),
+        Level::Error => worker::console_error!("{}", line),
+    }
+}
+
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
@@ -48,6 +60,7 @@ pub struct Relay {
 impl DurableObject for Relay {
     fn new(state: State, env: Env) -> Self {
         console_error_panic_hook::set_once();
+        bp_relay_core::log::set_sink(console_sink);
         Self {
             state,
             env,

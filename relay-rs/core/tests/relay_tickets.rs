@@ -19,7 +19,7 @@ fn admitted(actions: &[bp_relay_core::Action], id: bp_relay_core::ConnId) -> boo
 }
 
 fn refused_data() -> Option<(u16, String)> {
-    Some((1008, String::new()))
+    Some((1008, "not authorized".to_owned()))
 }
 
 #[test]

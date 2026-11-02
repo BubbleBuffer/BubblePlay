@@ -277,8 +277,14 @@ fn m3_pre_auth_sockets_come_back_closed() {
         vec![host_snapshot, viewer_snapshot],
         h.now,
     );
-    assert_eq!(closes(&out, host), vec![(1008, String::new())]);
-    assert_eq!(closes(&out, viewer), vec![(1008, String::new())]);
+    assert_eq!(
+        closes(&out, host),
+        vec![(1008, "session not restored".to_owned())]
+    );
+    assert_eq!(
+        closes(&out, viewer),
+        vec![(1008, "session not restored".to_owned())]
+    );
 }
 
 #[test]
@@ -320,7 +326,10 @@ fn m3_pair_failure_count_survives_a_rehydration() {
         sent_types(&actions, host).contains(&"pair-closed".to_owned()),
         "{actions:?}"
     );
-    assert_eq!(closed(&actions, stranger), Some((1008, String::new())));
+    assert_eq!(
+        closed(&actions, stranger),
+        Some((1008, "pairing code not accepted".to_owned()))
+    );
 
     h.client = twentieth;
     let (stranger_a, actions) = h.viewer_join(&identity(201), &pc, false, Some(&WRONG));
@@ -328,7 +337,10 @@ fn m3_pair_failure_count_survives_a_rehydration() {
         sent_types(&actions, host).contains(&"pair-closed".to_owned()),
         "{actions:?}"
     );
-    assert_eq!(closed(&actions, stranger_a), Some((1008, String::new())));
+    assert_eq!(
+        closed(&actions, stranger_a),
+        Some((1008, "pairing code not accepted".to_owned()))
+    );
 }
 
 #[test]
@@ -353,20 +365,29 @@ fn m3_contradictory_snapshots_close_and_nothing_panics() {
         vec![host_snapshot.clone(), duplicate],
         now,
     );
-    assert_eq!(closes(&out, host), vec![(1008, String::new())]);
+    assert_eq!(
+        closes(&out, host),
+        vec![(1008, "session not restored".to_owned())]
+    );
     assert!(closes(&out, ConnId(900)).is_empty(), "{out:?}");
 
     // An epoch that is not 32 lowercase hex digits.
     let mut bad_epoch = viewer_snapshot.clone();
     bad_epoch.epoch = "bad epoch".to_owned();
     let (_, out) = Relay::rehydrate(config.clone(), pcs.clone(), vec![bad_epoch], now);
-    assert_eq!(closes(&out, viewer.id), vec![(1008, String::new())]);
+    assert_eq!(
+        closes(&out, viewer.id),
+        vec![(1008, "session not restored".to_owned())]
+    );
 
     // A socket that is not live.
     let mut early = host_snapshot;
     early.phase = ConnPhase::Hello;
     let (_, out) = Relay::rehydrate(config, pcs, vec![early], now);
-    assert_eq!(closes(&out, host), vec![(1008, String::new())]);
+    assert_eq!(
+        closes(&out, host),
+        vec![(1008, "session not restored".to_owned())]
+    );
 }
 
 #[test]
@@ -568,7 +589,10 @@ fn m3_replaced_viewer_lingering_after_close_does_not_end_the_session() {
     attached.insert(old.id, lingering);
 
     let out = wake(&mut h, &mut attached);
-    assert_eq!(closes(&out, old.id), vec![(1008, String::new())]);
+    assert_eq!(
+        closes(&out, old.id),
+        vec![(1008, "session not restored".to_owned())]
+    );
     assert!(closes(&out, new.id).is_empty(), "{out:?}");
     assert!(closes(&out, host).is_empty(), "{out:?}");
 

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bp_relay_server::{config, health, import, init, server};
+use bp_relay_server::{config, health, import, init, log, server};
 use clap::{Parser, Subcommand};
 
 const DEFAULT_CONFIG: &str = "/data/relay.json";
@@ -65,6 +65,7 @@ fn main() -> ExitCode {
 
 fn serve(path: &std::path::Path) -> Result<(), String> {
     let cfg = config::load_config(path).map_err(|e| e.to_string())?;
+    log::install(&cfg);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

@@ -117,12 +117,12 @@ test('m3 GET / without a cookie is held, then dropped with no content', { timeou
 });
 
 test(
-  'm3 a text hello sent to /ws closes the socket with 1008 and an empty reason',
+  'm3 a text hello sent to /ws closes the socket with 1008 and the reason invalid hello',
   { timeout: CASE_TIMEOUT_MS },
   async () => {
     const socket = await openOk(relay.port, `/ws?pc=${identity(70).id}`);
     socket.sendJson({ type: 'hello', role: 'viewer' });
-    assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: '' });
+    assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: 'invalid hello' });
     socket.close();
   },
 );
@@ -195,18 +195,18 @@ test('m3 version probe answers hello-ok then closes 1000, and a wrong token is r
 
 // Admission: native e2e_gate_and_data.rs and e2e_m2.rs.
 
-test('m3 native viewer without Origin upgrades and a bare hello is closed 1008 with an empty reason', { timeout: CASE_TIMEOUT_MS }, async () => {
+test('m3 native viewer without Origin upgrades and a bare hello is closed 1008 invalid hello', { timeout: CASE_TIMEOUT_MS }, async () => {
   const socket = await openOk(relay.port, `/ws?pc=${identity(40).id}`);
   socket.sendJson({ type: 'hello', role: 'viewer' });
-  assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: '' });
+  assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: 'invalid hello' });
 });
 
-test('m3 unlisted viewer is closed 1008 with an empty reason and the host stays connected', { timeout: CASE_TIMEOUT_MS }, async () => {
+test('m3 unlisted viewer is closed 1008 not paired and the host stays connected', { timeout: CASE_TIMEOUT_MS }, async () => {
   const host = identity(42);
   const { socket: hostSocket } = await registerHost(relay.port, host);
   const viewer = await openOk(relay.port, `/ws?pc=${host.id}`);
   await proveViewer(viewer, identity(203), { origin: relay.origin });
-  assert.deepEqual(await viewer.expectClose(10_000), { code: 1008, reason: '' });
+  assert.deepEqual(await viewer.expectClose(10_000), { code: 1008, reason: 'not paired' });
   await hostSocket.quiet(500);
   hostSocket.sendRawText(SYNC_PING);
   await hostSocket.nextJson('pong', 10_000);
@@ -240,7 +240,7 @@ test('m3 a wrong Origin on /ws is refused with 404', { timeout: CASE_TIMEOUT_MS 
   assert.equal(socket, null);
 });
 
-test('m3 an Origin without a valid gate cookie is accepted then closed 1008 with an empty reason', { timeout: CASE_TIMEOUT_MS }, async () => {
+test('m3 an Origin without a valid gate cookie is accepted then closed 1008 not approved', { timeout: CASE_TIMEOUT_MS }, async () => {
   // No cookie, then a cookie the gate does not hold. The upgrade succeeds so the browser sees a 1008.
   for (const cookie of [undefined, '__Host-gate=not-a-cookie']) {
     const { status, socket } = await openSocket(relay.port, `/ws?pc=${identity(44).id}`, {
@@ -248,7 +248,7 @@ test('m3 an Origin without a valid gate cookie is accepted then closed 1008 with
       cookie,
     });
     assert.equal(status, 101);
-    assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: '' });
+    assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: 'not approved' });
   }
 });
 
@@ -331,7 +331,7 @@ test('m3 a viewer offer never reaches an admitted host, and the ctl after it doe
 
 // Ticket sockets: native e2e_gate_and_data.rs and e2e_m2.rs.
 
-test('m3 a wrong ticket closes both media sockets 1008 with an empty reason', { timeout: CASE_TIMEOUT_MS }, async () => {
+test('m3 a wrong ticket closes both media sockets 1008 not authorized', { timeout: CASE_TIMEOUT_MS }, async () => {
   const host = identity(47);
   await registerHost(relay.port, host);
   const { socket: viewer, ok } = await viewerJoin(relay.port, host.id);
@@ -339,11 +339,11 @@ test('m3 a wrong ticket closes both media sockets 1008 with an empty reason', { 
 
   const hostMedia = await openOk(relay.port, `/host-media-ws?pc=${host.id}&epoch=${ok.mediaEpoch}`);
   hostMedia.sendJson({ type: 'hello', role: 'media-host', ticket: bogus });
-  assert.deepEqual(await hostMedia.expectClose(10_000), { code: 1008, reason: '' });
+  assert.deepEqual(await hostMedia.expectClose(10_000), { code: 1008, reason: 'not authorized' });
 
   const viewerMedia = await openOk(relay.port, `/media-ws?pc=${host.id}&epoch=${ok.mediaEpoch}`);
   viewerMedia.sendJson({ type: 'hello', role: 'media-viewer', ticket: bogus });
-  assert.deepEqual(await viewerMedia.expectClose(10_000), { code: 1008, reason: '' });
+  assert.deepEqual(await viewerMedia.expectClose(10_000), { code: 1008, reason: 'not authorized' });
   viewer.close();
 });
 
