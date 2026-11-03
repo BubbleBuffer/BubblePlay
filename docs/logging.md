@@ -35,8 +35,10 @@ On the PC, under `%LOCALAPPDATA%\BubblePlay\logs` (host, tray) or the protected 
 | Files | Contents | Retention |
 |---|---|---|
 | `host-YYYY-MM-DD.jsonl`, `tray-...`, `agent-...`, `helper-...` | the PC's own processes (`.N.jsonl` after 20 MiB) | 7 days, 20 files per source |
-| `clients\<device-id>\YYYY-MM-DD.jsonl`, `device.json`, `cursor.json` | logs sent by paired clients | 14 days, 20 MiB per device, 200 MiB total |
+| `clients\<device-id>\YYYY-MM-DD.jsonl`, `device.json`, `cursor.json` | logs sent by paired clients | 14 days, 20 MiB per device, 200 MiB total (swept at host start and every 24 h) |
 | `feedback\<YYYYMMDDTHHMMSSmmmZ>-<device-id>.json` (+ `.png`) | feedback reports | kept |
+
+`device.json` (name as paired, platform from the stream, app version, last seen) is written when a device's first batch on a connection arrives and its `last_seen` moves with every batch. Feedback reports are never swept. The host's own logs are age-cleaned (7 days) with a 20-file cap per source on top, which only cuts below 7 days after more than about three 20 MiB rollovers a day.
 
 The tray log also holds the host's and agent's raw stdout and stderr as lines with target `child`.
 
