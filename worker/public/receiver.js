@@ -16,8 +16,10 @@ import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/s
 import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
-  orderRtpCodecPreferences, rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes,
+  orderRtpCodecPreferences, rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes, selectWssDecoderPath,
 } from "/transport.js";
+import { createWssWorkerClient, wssWorkerSupported } from "/wss-worker-client.js";
+import { avcCodecFromSps } from "/wss-pipeline.js";
 import {
   desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,
   rtcAdmissionGate, rtcGateOpens, rtcInPlaceCapable, rtpTimestampAtOrAfter, transitionKeyframeVerdict,
@@ -56,7 +58,7 @@ const diagnosticAttemptId = window.__bubbleplayDebugTrace?.attemptId || null;
 // ---------------------------------------------------------------------------
 
 let screen = document.getElementById("screen");
-const sharpScreen = document.getElementById("sharp-screen");
+let sharpScreen = document.getElementById("sharp-screen");
 const stage = document.getElementById("stage");
 const visual = document.getElementById("visual");
 const inputSurface = document.getElementById("input-surface");
@@ -85,6 +87,14 @@ function replaceTransferredCanvas() {
   screen.replaceWith(replacement);
   screen = replacement;
   ctx = null;
+}
+
+function replaceTransferredSharpCanvas() {
+  const replacement = document.createElement("canvas");
+  replacement.id = "sharp-screen";
+  sharpScreen.replaceWith(replacement);
+  sharpScreen = replacement;
+  sharpCtx = null;
 }
 
 function releaseWebRtcVideoSink() {
@@ -800,6 +810,16 @@ let remoteDescriptionSet = false;
 let currentIceServers = STUN_FALLBACK;
 let mediaEpoch = null;
 let usingWssMedia = false;
+// WSS video decode+draw in a Worker (wss-worker.js). Null on the main-thread path.
+// While set, the canvases belong to the worker: sizes come from its messages.
+let wssWorker = null;
+let wssWorkerInit = Promise.resolve(false);
+let wssWorkerDisabled = false; // a worker failure this page: stay on the main thread
+let wssCanvasDims = null;
+let wssWorkerHybrid = null;
+let wssTileCapability = null;
+let wssCaptureId = 0;
+const wssCaptureWaiters = new Map();
 let wssSelected = requestedTransport === TRANSPORT.WSS || startOnRememberedWss;
 let wssReconnectTimer = null;
 let wssKeyframeTimer = null;
@@ -1370,6 +1390,7 @@ function clearWssTimers() {
 
 function stopWssMedia() {
   usingWssMedia = false;
+  teardownWssWorker();
   clearWssTimers();
   stopWssAudio();
   wssDecoderEpoch++;
@@ -1599,6 +1620,70 @@ function recordWssPacketRejection(reason) {
   }
 }
 
+function selectedWssDecoderPath() {
+  return selectWssDecoderPath({
+    requested: params.get("decoderPath"),
+    supported: wssWorkerSupported(),
+    disabled: wssWorkerDisabled,
+  });
+}
+
+// Hand both canvases to the WSS worker. Until it answers, maybeStartWssHost
+// waits, so no media arrives before the path is settled; if the worker cannot
+// run, the canvases come back and decode stays on the main thread.
+function beginWssWorker() {
+  const client = createWssWorkerClient({
+    onMessage: onWssWorkerMessage,
+    onFatal: (reason) => failWssWorker(reason),
+  });
+  wssWorker = client;
+  wssCanvasDims = { width: 0, height: 0 };
+  wssWorkerHybrid = null;
+  wssWorkerInit = client.start({
+    canvases: { main: screen, sharp: sharpScreen },
+    epoch: wssDecoderEpoch,
+    codec: codecSession.codec,
+  }).then((result) => {
+    if (wssWorker !== client) return false; // stopped while starting
+    if (result.ok) {
+      // A resync during the handshake moved the epoch the worker was started with.
+      client.post({ type: "resync", epoch: wssDecoderEpoch, reason: "worker-start" });
+      hudState.dec = `${codecSession.codec} wss (worker)`;
+      debugTrace("wss-worker-ready", {});
+      return true;
+    }
+    viewerLog("warn", "wss-worker-unavailable", { reason: result.reason });
+    teardownWssWorker();
+    ensureMainCanvas();
+    return false;
+  });
+}
+
+function teardownWssWorker() {
+  const client = wssWorker;
+  if (!client) return;
+  wssWorker = null;
+  wssCanvasDims = null;
+  wssWorkerHybrid = null;
+  const transferred = client.transferred;
+  client.stop();
+  for (const waiter of wssCaptureWaiters.values()) waiter(null);
+  wssCaptureWaiters.clear();
+  if (transferred) {
+    replaceTransferredCanvas();
+    replaceTransferredSharpCanvas();
+    renderedSharpView = null;
+  }
+}
+
+function failWssWorker(reason) {
+  viewerLog("error", "wss-worker-failure", { reason });
+  wssWorkerDisabled = true;
+  hudState.dec = `worker:${reason}`;
+  stopWssMedia();
+  setTimeout(requestWssMediaStart, 0);
+}
+
 function requestWssMediaStart() {
   if (usingWssMedia) return;
   if (!authenticatedSession?.controlReady || !signalingTicket) return;
@@ -1607,7 +1692,7 @@ function requestWssMediaStart() {
   // WebRTC transform worker may still own the visible canvas. Release only
   // that video sink before WSS reclaims a main-thread 2D context.
   releaseWebRtcVideoSink();
-  ensureMainCanvas();
+  if (selectedWssDecoderPath() === "worker") beginWssWorker(); else ensureMainCanvas();
   stage.classList.remove("native-video-input");
   wssSelected = true;
   usingWssMedia = true;
@@ -1656,6 +1741,13 @@ function activeWssHybridCache() {
 function clearWssHybridCaches() {
   hybridTileCache.clear();
   hevcTileCache.clear();
+  wssWorker?.post({ type: "clear-caches" });
+  wssWorkerHybrid = null;
+}
+
+// In worker mode the tile caches live in the worker; this is its last report.
+function wssHybridSnapshot() {
+  return wssWorker ? (wssWorkerHybrid ?? {}) : activeWssHybridCache().snapshot();
 }
 
 function activeWssHevcCodec() {
@@ -1710,6 +1802,7 @@ async function selectWssCodec() {
       config => VideoDecoder.isConfigSupported(config),
     );
     hevcTileCache.setDecoderCapability(tileCapability);
+    wssTileCapability = tileCapability;
     viewerLog(tileCapability.state === "supported" ? "info" : "warn",
       "hevc-tile-decoder-capability", tileCapability);
   }
@@ -1720,7 +1813,7 @@ async function maybeStartWssHost() {
   hudState.ice = wssV4.socketOpen ? "wss" : "wss connecting";
   if (wssStartedHost || wssStartInFlight || !wssV4.socketOpen) return;
   wssStartInFlight = true;
-  const [codec, audioDecodable] = await Promise.all([selectWssCodec(), wssAudioDecodable]);
+  const [codec, audioDecodable] = await Promise.all([selectWssCodec(), wssAudioDecodable, wssWorkerInit]);
   if (!codec) {
     wssStartInFlight = false;
     return;
@@ -1729,6 +1822,9 @@ async function maybeStartWssHost() {
     wssStartInFlight = false;
     return;
   }
+  // selectWssCodec may have fallen back to H.264 after the worker started.
+  wssWorker?.post({ type: "set-codec", codec: codecSession.codec });
+  if (wssTileCapability) wssWorker?.post({ type: "tile-capability", capability: wssTileCapability });
   wssStartedHost = true;
   wssStartInFlight = false;
   sendControl({ type: "media-control", action: "start", protocol: WSS_PROTOCOL, epoch: mediaEpoch,
@@ -1769,6 +1865,7 @@ function resyncWssDecoder(reason) {
   hudState.resyncs++;
   clearWssKeyframeWatchdog();
   wssDecoderEpoch++;
+  wssWorker?.post({ type: "resync", epoch: wssDecoderEpoch, reason });
   try { decoder?.close(); } catch {} decoder = null;
   latencyGuard.reset(reason);
   resetRenderPacing();
@@ -1777,7 +1874,7 @@ function resyncWssDecoder(reason) {
   viewerLog("warn", "wss-recovery-reset", {
     reason,
     decoderEpoch: wssDecoderEpoch,
-    hybrid: activeWssHybridCache().snapshot(),
+    hybrid: wssHybridSnapshot(),
   });
   clearWssHybridCaches();
   wssV4.gate.invalidate(reason);
@@ -1956,7 +2053,38 @@ function noteWssFailure(reason) {
   hudState.dec = `waiting keyframe (${reason})`;
 }
 
+// Worker path: the worker does the codec/hybrid checks, decode and draw. This
+// only forwards the frame with the main-thread state it needs (hybrid mode,
+// geometry for the frame's generation, desktop availability); the bytes move,
+// they are not copied. The epoch lets the worker drop frames sent before a resync.
+function postWssFrameToWorker(frame) {
+  rtcStartupFallback?.stop();
+  hudState.mediaGeneration = frame.generation;
+  const bytes = frame.data;
+  wssWorker.post({
+    type: "frame",
+    epoch: wssDecoderEpoch,
+    codec: frame.codec,
+    generation: frame.generation,
+    sequence: frame.sequence,
+    key: frame.key,
+    timestampUs: frame.timestampUs,
+    buffer: bytes.buffer,
+    byteOffset: bytes.byteOffset,
+    byteLength: bytes.byteLength,
+    hevcCodec: activeWssHevcCodec(),
+    hybridMode: activeWssHybridModeName(),
+    desktopAvailable,
+    view: viewportForGeneration(frame.generation),
+    frameTrace: frame.frameTrace,
+  }, [bytes.buffer]);
+}
+
 function decodeWssFrame(frame) {
+  if (wssWorker) {
+    if (wssWorker.ready) postWssFrameToWorker(frame);
+    return;
+  }
   if (typeof VideoDecoder === "undefined") { noteWssFailure("webcodecs-unsupported"); return; }
   const detectedCodec = detectAnnexBCodec(frame.data, { key: frame.key });
   const headerCodec = frame.codec === CODEC.HEVC ? "hevc" : "h264";
@@ -2282,6 +2410,42 @@ setInterval(() => {
 }, 1000);
 
 const PATTERN = { x: 64, y: 64, cell: 24, columns: 32, bits: 64 };
+// Canvas size: the worker owns the canvas on the WSS worker path (the element
+// keeps its placeholder size), so the receiver tracks the size it reports.
+function screenDims() {
+  return wssCanvasDims || { width: screen.width, height: screen.height };
+}
+function screenMedia() {
+  return wssCanvasDims
+    ? { getBoundingClientRect: () => screen.getBoundingClientRect(), width: wssCanvasDims.width, height: wssCanvasDims.height }
+    : screen;
+}
+
+// Worker path: ask the worker to render the PNG and read the timestamp pattern.
+function captureFromWorker() {
+  const dims = screenDims();
+  if (!usingWssMedia || !wssWorker?.ready || !dims.width || !dims.height || !wssLatestFrameTrace) return Promise.resolve(null);
+  const id = ++wssCaptureId;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { wssCaptureWaiters.delete(id); resolve(null); }, 5_000);
+    wssCaptureWaiters.set(id, (m) => {
+      clearTimeout(timer);
+      if (!m || m.error) { resolve(null); return; }
+      resolve({
+        pngDataUrl: m.pngDataUrl,
+        diagnostics: {
+          glassToGlass: m.glassToGlass,
+          renderedTimestamp: lastRenderedTimestamp,
+          framesDrawn,
+          frameTrace: { ...wssLatestFrameTrace },
+          frameTraceHistory: [...wssPresentedFrameTraces.values()].map(trace => ({ ...trace })),
+        },
+      });
+    });
+    wssWorker.post({ type: "capture", id, sharp: sharpScreen.classList.contains("active") });
+  });
+}
+
 function readTimestampPattern(target = screen, context = ctx) {
   if (target.width < PATTERN.x + PATTERN.cell * PATTERN.columns ||
       target.height < PATTERN.y + PATTERN.cell * 2) return null;
@@ -2392,6 +2556,7 @@ if (diagnosticsEnabled) {
       resetPresentationCounters();
     },
     captureFrame() {
+      if (wssWorker) return captureFromWorker();
       if (!usingWssMedia || !screen.width || !screen.height || !wssLatestFrameTrace) return null;
       const target = sharpScreen.classList.contains("active") ? sharpScreen : screen;
       return {
@@ -2449,7 +2614,8 @@ if (diagnosticsEnabled) {
             byReason: { ...wssPacketRejects.byReason },
           },
           presentation: framePresentationTelemetry.snapshot(),
-          hybrid: activeWssHybridCache().snapshot(),
+          hybrid: wssHybridSnapshot(),
+          decoderPath: wssWorker?.ready ? "worker" : "main",
         },
         audio: audioSnapshot(),
         viewport: viewportHealthSnapshot(),
@@ -2793,6 +2959,108 @@ setInterval(async () => {
     sendClientProfile();
   }
 }, 1000);
+
+// ---- WSS worker results ------------------------------------------------------
+function onWssWorkerMessage(m) {
+  if (!wssWorker) return;
+  switch (m.type) {
+    case "log": viewerLog(m.level, m.name, m.fields); return;
+    case "trace": debugTrace(m.name, m.fields); return;
+    case "capture-result": {
+      const waiter = wssCaptureWaiters.get(m.id);
+      if (waiter) { wssCaptureWaiters.delete(m.id); waiter(m); }
+      return;
+    }
+    case "worker-error": failWssWorker(m.message || "worker-error"); return;
+    default: break;
+  }
+  // Everything else describes decoder state: ignore what predates the last resync.
+  if (m.epoch !== wssDecoderEpoch) return;
+  switch (m.type) {
+    case "decoder-configured": hudState.dec = `${m.codec} (worker)`; break;
+    case "failure":
+      if (m.hud) hudState.dec = m.hud;
+      noteWssFailure(m.reason);
+      break;
+    case "drop":
+      hudState.dropped++;
+      if (m.recover) beginWssRecovery(m.recover);
+      break;
+    case "key-accepted":
+      if (wssRecoveryState === "awaiting-keyframe") {
+        wssRecoveryPending = true;
+        wssRecoveryState = "awaiting-keyframe-output";
+        viewerLog("info", "wss-recovery-keyframe", { generation: m.generation, sequence: m.sequence, codec: m.codec });
+      }
+      break;
+    case "key-fed": armWssKeyframeWatchdog(); break;
+    case "codec-follow": {
+      if (!codecSession.followBitstreamCodec(m.codec)) break;
+      clearWssKeyframeWatchdog();
+      resetRenderPacing();
+      wssPresentedFrameTraces.clear();
+      wssNoOutputFailures = 0;
+      if (wssRecoveryState === "awaiting-keyframe-output") wssRecoveryState = "awaiting-keyframe";
+      viewerLog("info", "decoder-keyframe-codec-change", { previousCodec: m.previousCodec, codec: m.codec });
+      break;
+    }
+    case "out": onWssWorkerFrameOut(m); break;
+    default: break;
+  }
+}
+
+// The worker decoded (and maybe drew) a frame: the receiver-side bookkeeping that
+// onDecodedFrame/drawFrame do on the main-thread path.
+function onWssWorkerFrameOut(m) {
+  clearWssKeyframeWatchdog();
+  wssNoOutputFailures = 0;
+  if (m.decodedSequence !== null) wssV4.decodedSeq = m.decodedSequence;
+  if (m.key && wssRecoveryState === "awaiting-keyframe-output") {
+    wssRecoveryPending = false;
+    wssRecoveryState = "healthy";
+  }
+  framesReceived++;
+  hudState.recv = framesReceived;
+  hudState.queued = m.queued;
+  if (!m.attempted) { wssV4.presentSkips++; return; }
+  framePresentationTelemetry.noteImmediateAttempt();
+  if (m.hybrid) wssWorkerHybrid = m.hybrid;
+  if (m.width) lastDecodedDimensions = { width: m.width, height: m.height };
+  if (!m.presented) return;
+  const w = m.width, h = m.height;
+  if (m.sharp) {
+    layoutSharpCanvas(m.view);
+    const gain = cropGain(m.view, w, h);
+    hudState.dimensions = `${m.view.width}x${m.view.height}→${w}x${h} ${gain.x.toFixed(1)}x/${gain.y.toFixed(1)}x`;
+  } else {
+    if (m.resized) {
+      wssCanvasDims = { width: w, height: h };
+      syncViewportAndFollow();
+    }
+    layoutSharpCanvas(null);
+    hudState.dimensions = `${w}x${h}`;
+  }
+  markFirstFramePresented(m.generation ?? null, m.cropRevision ?? null,
+    { gatePassed: transitionGatePassedToken !== null && transitionGatePassedToken === firstFrameHandshake.requestId });
+  framePresentationTelemetry.noteImmediatePresented();
+  const renderedAt = m.renderedAt;
+  wssLatestFrameTrace = { ...m.trace };
+  wssPresentedFrameTraces.set(m.trace.sequence >>> 0, { ...m.trace });
+  while (wssPresentedFrameTraces.size > 64) wssPresentedFrameTraces.delete(wssPresentedFrameTraces.keys().next().value);
+  if (lastFrameDrawnAt !== null) {
+    const frameGap = Math.max(0, Math.round(renderedAt - lastFrameDrawnAt));
+    hudState.frameGap = frameGap;
+    hudState.maxFrameGap = Math.max(Number(hudState.maxFrameGap) || 0, frameGap);
+  }
+  lastFrameDrawnAt = renderedAt;
+  lastRenderedTimestamp = m.timestamp;
+  lastRenderedDueMs = renderedAt;
+  hudState.lag = 0;
+  fpsWindow++;
+  framesDrawn++;
+  hudState.presented = framesDrawn;
+  wssPresentedSequence = m.sequence;
+}
 
 function onTrack(ev, generation = peerGeneration) {
   if (generation !== peerGeneration) return;
@@ -3309,26 +3577,6 @@ function drawFrame(frame, due = performance.now()) {
   }
 }
 
-// Parse the codec string (avc1.PPCCLL) from the first SPS NAL of an Annex B
-// keyframe. profile_idc/constraint/level are the first 3 bytes of the SPS
-// RBSP and never contain emulation-prevention bytes.
-function avcCodecFromSps(bytes) {
-  const hex2 = (n) => n.toString(16).toUpperCase().padStart(2, "0");
-  let i = 0;
-  while (i + 4 < bytes.length) {
-    const sc = bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1;
-    const sc4 = bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 0 && bytes[i + 3] === 1;
-    if (!sc && !sc4) { i++; continue; }
-    const nalStart = i + (sc4 ? 4 : 3);
-    const nalType = bytes[nalStart] & 0x1f;
-    if (nalType === 7 && nalStart + 4 < bytes.length) {
-      return `avc1.${hex2(bytes[nalStart + 1])}${hex2(bytes[nalStart + 2])}${hex2(bytes[nalStart + 3])}`;
-    }
-    i = nalStart;
-  }
-  return null;
-}
-
 // ---- input: pointer lock mouse ----------------------------------------------
 const BM = { 0: 1, 1: 4, 2: 2 }; // e.button -> bitmask (left, middle, right)
 let buttons = 0, touchButtons = 0;
@@ -3379,7 +3627,7 @@ document.addEventListener("mousemove", (e) => {
     if (pointerMode !== "desktop") return;
     if (e.target !== inputSurface) return;
     // Absolute fallback over the displayed video (not its letterbox): 0..65535.
-    const r = videoContentRect(activeVideo || screen);
+    const r = videoContentRect(activeVideo || screenMedia());
     if (r.width === 0 || r.height === 0) return;
     const x = clamp((e.clientX - r.left) / r.width, 0, 1);
     const y = clamp((e.clientY - r.top) / r.height, 0, 1);
@@ -3529,9 +3777,9 @@ function resolveNativeFileDrop(event) {
   // is transitional geometry and must not become a native drop target.
   if (viewportState.enabled && (!renderedSharpView || renderedSharpView.revision !== viewportState.revision ||
       renderedSharpView.generation !== fileDropPresentedGeneration)) return { error: "drop-not-ready" };
-  const media = activeVideo || screen;
-  const width = activeVideo ? activeVideo.videoWidth : screen.width;
-  const height = activeVideo ? activeVideo.videoHeight : screen.height;
+  const media = activeVideo || screenMedia();
+  const width = activeVideo ? activeVideo.videoWidth : screenDims().width;
+  const height = activeVideo ? activeVideo.videoHeight : screenDims().height;
   if (!(width > 0 && height > 0)) return { error: "drop-not-ready" };
   const area = streamArea();
   const drop = mapFileDropPoint({ x: event.clientX, y: event.clientY }, videoContentRect(media), area);
@@ -3939,7 +4187,7 @@ function sendStreamMode(reason) {
 }
 // The stream area in window coordinates, without #visual's zoom/pan transform.
 function streamArea() { const width = visual.offsetWidth || innerWidth, height = visual.offsetHeight || innerHeight; return { left: visual.offsetLeft, top: visual.offsetTop, width, height }; }
-function containedContentRect() { const area = streamArea(), areaWidth = area.width, areaHeight = area.height, mediaWidth = activeVideo?.videoWidth || screen.width, mediaHeight = activeVideo?.videoHeight || screen.height; if (!mediaWidth || !mediaHeight) return {x:area.left,y:area.top,width:areaWidth,height:areaHeight}; const scale=Math.min(areaWidth/mediaWidth,areaHeight/mediaHeight), width=mediaWidth*scale, height=mediaHeight*scale; return {x:area.left+(areaWidth-width)/2,y:area.top+(areaHeight-height)/2,width,height}; }
+function containedContentRect() { const area = streamArea(), areaWidth = area.width, areaHeight = area.height, mediaWidth = activeVideo?.videoWidth || screenDims().width, mediaHeight = activeVideo?.videoHeight || screenDims().height; if (!mediaWidth || !mediaHeight) return {x:area.left,y:area.top,width:areaWidth,height:areaHeight}; const scale=Math.min(areaWidth/mediaWidth,areaHeight/mediaHeight), width=mediaWidth*scale, height=mediaHeight*scale; return {x:area.left+(areaWidth-width)/2,y:area.top+(areaHeight-height)/2,width,height}; }
 function syncViewport() { const area = streamArea(); viewport.resize(area.width, area.height, area.left, area.top); viewport.setContent(containedContentRect()); renderTouchCursor(); }
 function renderTouchCursor() { cursorAppearance.render({ pointerMode, inputReady, point: remoteCursor.screenPoint(viewport), overlayVisible: touchCursorVisible, mousePointerActive }); }
 function centerCameraOnCursor() { if (shouldCenterCameraOnCursor({ zoom: viewport.zoom, pointerMode, synced: cursorReconciler.synced, locallyAuthoritative: locallyAuthoritativeCursor })) viewport.centerOnNormalized(remoteCursor.snapshot()); }

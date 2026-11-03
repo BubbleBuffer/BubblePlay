@@ -11,6 +11,7 @@
 // `post(message)`; the main thread (wss-worker-client.js + receiver.js) owns
 // recovery state, the HUD and ACKs (ACKs stay on receipt there).
 import { detectAnnexBCodec, shouldPresentDecodedV4 } from "./media-v4.js";
+import { decodeTimestampPatternBits } from "./latency.js";
 import { CODEC, drawBaseThenHybrid, HevcTileCache, HybridTileCache, prepareHybridWssFrame } from "./media.js";
 
 // Parse the codec string (avc1.PPCCLL) from the first SPS NAL of an Annex B
@@ -33,22 +34,60 @@ export function avcCodecFromSps(bytes) {
   return null;
 }
 
+// The host's glass-to-glass probe: a 32x2 grid of 24px cells at (64, 64).
+const PATTERN = { x: 64, y: 64, cell: 24, columns: 32, bits: 64 };
+
+export function readTimestampPattern(canvas, context, epochNow = () => Date.now()) {
+  if (!canvas || !context || canvas.width < PATTERN.x + PATTERN.cell * PATTERN.columns ||
+      canvas.height < PATTERN.y + PATTERN.cell * 2) return null;
+  try {
+    const image = context.getImageData(PATTERN.x, PATTERN.y, PATTERN.cell * PATTERN.columns, PATTERN.cell * 2);
+    const bits = [];
+    for (let index = 0; index < PATTERN.bits; index++) {
+      const column = index % PATTERN.columns;
+      const row = Math.floor(index / PATTERN.columns);
+      const px = column * PATTERN.cell + Math.floor(PATTERN.cell / 2);
+      const py = row * PATTERN.cell + Math.floor(PATTERN.cell / 2);
+      const offset = (py * image.width + px) * 4;
+      bits.push(image.data[offset] + image.data[offset + 1] + image.data[offset + 2] >= 384 ? 1 : 0);
+    }
+    const decoded = decodeTimestampPatternBits(bits);
+    if (!decoded) return null;
+    const ageMs = ((epochNow() >>> 0) - decoded.timestamp) >>> 0;
+    if (ageMs > 10_000) return null;
+    return { ...decoded, ageMs };
+  } catch {
+    return null;
+  }
+}
+
+async function canvasToPngDataUrl(canvas) {
+  const blob = await canvas.convertToBlob({ type: "image/png" });
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return `data:image/png;base64,${btoa(binary)}`;
+}
+
 const DEFAULT_HEVC_CODEC = "hev1.1.6.L120.B0";
 const MAX_PENDING_TIMESTAMPS = 64;
 const HYBRID_MODES = ["png-static-roi", "png-quiescent-detail", "hevc-quiescent-tiles"];
 const HYBRID_SNAPSHOT_INTERVAL_MS = 250;
 
 export function createWssPipeline({
-  post,
+  post: rawPost,
   now = () => performance.now(),
   createDecoder = (init) => new VideoDecoder(init),
   createChunk = (init) => new EncodedVideoChunk(init),
   hybridTileCache = new HybridTileCache(),
   hevcTileCache = new HevcTileCache(),
 } = {}) {
+  // Every message carries the epoch it was produced in, so the main thread
+  // can ignore anything that predates its latest resync.
+  let epoch = 0;
+  const post = (message) => rawPost({ epoch, ...message });
   let main = null; // { canvas, ctx }: the full-desktop canvas
   let sharp = null; // { canvas, ctx }: the sharp-viewport crop overlay
-  let epoch = 0;
   let codec = "hevc";
   let decoder = null;
   let sawKeyframe = false;
@@ -303,7 +342,7 @@ export function createWssPipeline({
     while (seqByTimestamp.size > MAX_PENDING_TIMESTAMPS) seqByTimestamp.delete(seqByTimestamp.keys().next().value);
     const fed = feed({ type: key ? "key" : "delta", timestamp, data: prepared.data, codec, frameTrace }, message.hevcCodec);
     // Arm only after a configured decoder accepted the keyframe.
-    if (fed && key && decoder?.state === "configured") post({ type: "key-fed", epoch });
+    if (fed && key && decoder?.state === "configured") post({ type: "key-fed" });
   }
 
   function followCodec(next) {
@@ -320,6 +359,21 @@ export function createWssPipeline({
     closeDecoder();
     resetFrameState();
     clearCaches();
+  }
+
+  // Diagnostics: the worker owns the pixels, so captures are answered here.
+  // The timestamp pattern is always read from the base canvas, as on the main thread.
+  async function capture({ id, sharp: wantSharp = false }) {
+    try {
+      const target = wantSharp && sharp ? sharp : main;
+      post({
+        type: "capture-result", id,
+        pngDataUrl: await canvasToPngDataUrl(target.canvas),
+        glassToGlass: readTimestampPattern(main.canvas, main.ctx),
+      });
+    } catch (error) {
+      post({ type: "capture-result", id, error: String(error?.message || error) });
+    }
   }
 
   function setTileCapability(capability) {
@@ -342,6 +396,7 @@ export function createWssPipeline({
     handleFrame,
     resync,
     clearCaches,
+    capture,
     setTileCapability,
     setCodec,
     stop,

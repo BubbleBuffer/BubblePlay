@@ -131,7 +131,7 @@ test("a decoder error and a decode throw are reported as failures", () => {
   const h = harness();
   h.pipeline.handleFrame(h.frame());
   h.decoders[0].init.error(new Error("boom"));
-  assert.deepEqual(h.posts.find((m) => m.type === "failure"), { type: "failure", reason: "decode-error", hud: "err:boom" });
+  assert.deepEqual(h.posts.find((m) => m.type === "failure"), { type: "failure", epoch: 0, reason: "decode-error", hud: "err:boom" });
   const t = harness();
   t.pipeline.handleFrame(t.frame());
   t.decoders[0].decode = () => { throw new Error("bad"); };
@@ -144,7 +144,7 @@ test("a keyframe in another codec reconfigures the decoder and tells the main th
   h.pipeline.handleFrame(h.frame());
   h.pipeline.handleFrame(h.frame({ codec: 2, data: H264_KEY, sequence: 2, timestampUs: 300 }));
   assert.equal(h.pipeline.codec, "h264");
-  assert.deepEqual(h.posts.find((m) => m.type === "codec-follow"), { type: "codec-follow", previousCodec: "hevc", codec: "h264" });
+  assert.deepEqual(h.posts.find((m) => m.type === "codec-follow"), { type: "codec-follow", epoch: 0, previousCodec: "hevc", codec: "h264" });
   assert.equal(h.decoders[0].closed, true);
   assert.equal(h.decoders[1].config.codec, "avc1.64002A");
   // A delta in the old codec is ignored.
@@ -273,4 +273,29 @@ test("resync, codec change and stop clear the caches; tile capability reaches th
   h.calls.length = 0;
   h.pipeline.stop();
   assert.deepEqual(h.calls, [["png", "clear"], ["hevc", "close"]]);
+});
+
+test("every message is stamped with the epoch of the last resync", () => {
+  const h = harness();
+  h.pipeline.resync({ epoch: 4 });
+  h.pipeline.handleFrame(h.frame({ epoch: 4 }));
+  assert.ok(h.posts.length > 0);
+  assert.ok(h.posts.every((m) => m.epoch === 4));
+});
+
+test("capture answers with a PNG data URL and the timestamp pattern from the base canvas", async () => {
+  const h = harness({ sharp: true });
+  const png = Uint8Array.of(137, 80, 78, 71);
+  for (const canvas of [h.canvas, h.sharpCanvas]) {
+    canvas.convertToBlob = async () => ({ arrayBuffer: async () => png.buffer });
+  }
+  h.sharpCanvas.marker = "sharp";
+  await h.pipeline.capture({ id: 9, sharp: true });
+  const result = h.posts.find((m) => m.type === "capture-result");
+  assert.equal(result.id, 9);
+  assert.equal(result.pngDataUrl, `data:image/png;base64,${Buffer.from(png).toString("base64")}`);
+  assert.equal(result.glassToGlass, null, "a canvas smaller than the pattern has no reading");
+  const failing = harness();
+  await failing.pipeline.capture({ id: 10 });
+  assert.match(failing.posts.find((m) => m.type === "capture-result").error, /convertToBlob/);
 });

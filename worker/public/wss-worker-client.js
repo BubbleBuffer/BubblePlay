@@ -84,6 +84,7 @@ export function createWssWorkerClient({
     start,
     stop,
     get ready() { return ready; },
+    get transferred() { return transferred; },
     post(message, transfer) { if (worker && ready) worker.postMessage(message, transfer || []); },
   };
 }

@@ -6,6 +6,7 @@ import { createLatencyGuard } from "../public/latency.js";
 import { CODEC, prepareHybridWssFrame } from "../public/media.js";
 import { detectAnnexBCodec, encodeFrameV4, parseFrameV4, V4ReceiveGate } from "../public/media-v4.js";
 import { createCodecSession } from "../public/transport.js";
+import { avcCodecFromSps } from "../public/wss-pipeline.js";
 
 const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
 const annexB = (nals, startBytes = 4) => Uint8Array.from(nals.flatMap(nal =>
@@ -57,7 +58,7 @@ function harness(usingWssMedia = true) {
     Uint8Array, WeakMap, Map, VideoDecoder: Decoder,
     EncodedVideoChunk: class { constructor(chunk) { Object.assign(this, chunk); } },
     performance: { now: () => 100 }, usingWssMedia, decoder: null,
-    detectAnnexBCodec, prepareHybridWssFrame, CODEC, codecSession: createCodecSession({ transport: "wss" }),
+    detectAnnexBCodec, prepareHybridWssFrame, CODEC, avcCodecFromSps, wssWorker: null, codecSession: createCodecSession({ transport: "wss" }),
     latencyGuard: createLatencyGuard({ onReset: () => assert.fail("codec switch must not reset the admitted generation") }),
     rtcStartupFallback: null, firstFrameHandshake: { requireAdmission: false },
     wssDecoderEpoch: 0, wssKeyframeTimer: null, wssNoOutputFailures: 0,
@@ -79,7 +80,6 @@ function harness(usingWssMedia = true) {
     extract("function clearWssKeyframeWatchdog(", "function resyncWssDecoder("),
     extract("function decodeWssFrame(", "async function startPeer("),
     extract("function followDecoderCodec(", "function drawFrame("),
-    extract("function avcCodecFromSps(", "// ---- input: pointer lock mouse"),
   ].join("\n"), context);
   return { context, decoders, decoded, failures, timers,
     feed(data, key, codec = CODEC.HEVC, seq = 0) {

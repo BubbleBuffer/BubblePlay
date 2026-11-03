@@ -87,3 +87,15 @@ export function createCodecSession({ transport = "webrtc", decoderPath = "native
     },
   };
 }
+
+/**
+ * Where WSS video is decoded and drawn: "worker" (WebCodecs plus OffscreenCanvas in
+ * a Dedicated Worker) or "main" (today's main-thread path). `?decoderPath=main`
+ * forces main for debugging, `?decoderPath=worker` forces the worker when the
+ * browser can do it. WebRTC does not use this: its default stays native.
+ */
+export const WSS_WORKER_DEFAULT = false;
+export function selectWssDecoderPath({ requested = null, supported = false, disabled = false, workerDefault = WSS_WORKER_DEFAULT } = {}) {
+  if (disabled || !supported || requested === "main") return "main";
+  return requested === "worker" || workerDefault ? "worker" : "main";
+}
