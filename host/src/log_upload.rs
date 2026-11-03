@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::client_logs::{
-    check_cursor, check_stream, AuthenticatedDevice, Batch, ClientLogStore, IngestError,
+    check_cursor, check_stream, AuthenticatedDevice, Batch, ClientLogStore, DeviceMeta, IngestError,
 };
 use crate::feedback_store::{FeedbackError, FeedbackStore, MAX_PNG_BYTES};
 
@@ -42,6 +42,10 @@ pub const MAX_FEEDBACK_PNG_BYTES: usize = MAX_PNG_BYTES;
 pub const MAX_FEEDBACK_CHUNK_BYTES: usize = 32 * 1024;
 pub const FEEDBACK_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 const JOB_QUEUE_CAPACITY: usize = 32;
+/// Client logs past retention are swept at start and then this often.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// `device.json` app version: the host learns none from the auth-hello.
+const UNKNOWN_VERSION: &str = "unknown";
 const MAX_DONE_PER_POLL: usize = 64;
 const RATE_LIMITED_RETRY_MS: u64 = 2_000;
 const STORAGE_RETRY_MS: u64 = 60_000;
@@ -180,6 +184,8 @@ pub struct UploadLimits {
     pub queue_capacity: usize,
     /// The clock the stores use for rate caps, retention and file names (tests fix it).
     pub clock: fn() -> SystemTime,
+    /// How often the worker sweeps client logs past retention (it also sweeps once at start).
+    pub sweep_interval: Duration,
 }
 
 impl Default for UploadLimits {
@@ -189,6 +195,7 @@ impl Default for UploadLimits {
             chunk_timeout: FEEDBACK_CHUNK_TIMEOUT,
             queue_capacity: JOB_QUEUE_CAPACITY,
             clock: SystemTime::now,
+            sweep_interval: SWEEP_INTERVAL,
         }
     }
 }
@@ -205,6 +212,8 @@ enum Job {
         device: AuthenticatedDevice,
         id: u64,
         batch: Batch,
+        /// Set on the first batch of a connection: who the device is, for `device.json`.
+        meta: Option<DeviceMeta>,
     },
     Feedback {
         gen: u64,
@@ -233,9 +242,34 @@ struct Worker {
 }
 
 impl Worker {
+    /// Delete client log files past retention. Runs on this thread, so it never overlaps an ingest.
+    fn sweep(&self) {
+        let report = self.logs.sweep((self.limits.clock)());
+        if report.removed_files > 0 {
+            tracing::info!(
+                files = report.removed_files,
+                bytes = report.removed_bytes,
+                "client log retention sweep"
+            );
+        }
+    }
+
     fn run(mut self, jobs: Receiver<Job>, done: mpsc::Sender<Done>) {
         let pause = Arc::clone(&self.pause);
-        for job in jobs {
+        let interval = self.limits.sweep_interval.max(Duration::from_millis(1));
+        self.sweep();
+        let mut next_sweep = Instant::now() + interval;
+        loop {
+            let job = match jobs.recv_timeout(next_sweep.saturating_duration_since(Instant::now()))
+            {
+                Ok(job) => job,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.sweep();
+                    next_sweep = Instant::now() + interval;
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
             let _turn = pause.lock().unwrap_or_else(|e| e.into_inner());
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(job)));
@@ -266,9 +300,15 @@ impl Worker {
                 device,
                 id,
                 batch,
+                meta,
             } => {
                 let stream = batch.stream.clone();
                 let now = (self.limits.clock)();
+                if let Some(meta) = meta {
+                    if let Err(error) = self.logs.device_meta_at(&device, &meta, now) {
+                        tracing::warn!(%error, "device.json could not be written");
+                    }
+                }
                 let (msg, cursors) = match self.logs.ingest_at(&device, batch, now) {
                     Ok(ack) => (
                         logs_ack_message(
@@ -393,6 +433,10 @@ struct Conn {
     budget_used: u64,
     cursors: BTreeMap<String, String>,
     feedback: Option<Assembly>,
+    /// The name the device was paired under.
+    name: String,
+    /// `device.json` was queued for this connection.
+    meta_sent: bool,
 }
 
 /// What [`LogUpload::on_message`] could not use: a static reason for the caller's drop counter.
@@ -467,7 +511,7 @@ impl LogUpload {
 
     /// A viewer authenticated as `device_id` (taken from the session, never from a message).
     /// `offered` says its auth-hello already carried `client-logs-v1`. Replaces any earlier connection.
-    pub fn start(&mut self, device_id: &str, offered: bool) {
+    pub fn start(&mut self, device_id: &str, name: &str, offered: bool) {
         self.generation += 1;
         self.conn = match AuthenticatedDevice::new(device_id) {
             Ok(device) => Some(Conn {
@@ -478,6 +522,8 @@ impl LogUpload {
                 budget_used: 0,
                 cursors: BTreeMap::new(),
                 feedback: None,
+                name: name.to_owned(),
+                meta_sent: false,
             }),
             Err(_) => {
                 tracing::warn!("client log upload off: the authenticated device id is unusable");
@@ -662,9 +708,15 @@ impl LogUpload {
                 cursor_from: batch.from,
                 cursor_to: batch.to,
             },
+            meta: (!conn.meta_sent).then(|| DeviceMeta {
+                name: conn.name.clone(),
+                platform: platform_of(&batch.stream).into(),
+                app_version: UNKNOWN_VERSION.into(),
+            }),
         };
         match jobs.try_send(job) {
             Ok(()) => {
+                conn.meta_sent = true;
                 conn.budget_used += bytes;
                 Ok(Vec::new())
             }
@@ -922,6 +974,16 @@ impl Drop for LogUpload {
 }
 
 /// Report ids are UUIDs: 1-64 characters of `[A-Za-z0-9-]`.
+/// The platform a client stream comes from; the host learns nothing more about the client.
+fn platform_of(stream: &str) -> &'static str {
+    match stream {
+        "app-win" => "windows",
+        "app-android" | "app-android-core" => "android",
+        "browser" => "browser",
+        _ => "unknown",
+    }
+}
+
 fn valid_report_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }

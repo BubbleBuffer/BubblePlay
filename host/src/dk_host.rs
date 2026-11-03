@@ -659,8 +659,13 @@ impl HostProtocol {
                     // The device id comes from the authenticated session, never from a message.
                     if !self.peer_pairing {
                         let offered = viewer.caps.iter().any(|cap| cap == CAP_CLIENT_LOGS);
+                        let name = self
+                            .trusted
+                            .get(&viewer.id)
+                            .map(|device| device.name.clone())
+                            .unwrap_or_else(|| UNNAMED_DEVICE.into());
                         if let Some(upload) = self.upload.as_mut() {
-                            upload.start(&viewer.id, offered);
+                            upload.start(&viewer.id, &name, offered);
                         }
                     }
                 }

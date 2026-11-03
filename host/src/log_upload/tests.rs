@@ -60,7 +60,7 @@ fn upload(root: &Path) -> LogUpload {
 /// A started, capability-negotiated connection for `device` with the initial `logs-state` consumed.
 fn connected(root: &Path, device: &str) -> LogUpload {
     let mut up = upload(root);
-    up.start(device, true);
+    up.start(device, "Test phone", true);
     let state = drain(&mut up, 1);
     assert_eq!(state[0]["type"], "logs-state");
     up
@@ -242,7 +242,7 @@ fn client_to_host_messages_decode() {
 fn fixture_batch_is_stored_acked_and_resumes_across_a_reconnect() {
     let tmp = TempDir::new("fixture");
     let mut up = upload(&tmp.0);
-    up.start("dev-1", true);
+    up.start("dev-1", "Test phone", true);
     let state = drain(&mut up, 1);
     assert_eq!(state[0]["type"], "logs-state");
     assert_eq!(state[0]["v"], 1);
@@ -266,7 +266,7 @@ fn fixture_batch_is_stored_acked_and_resumes_across_a_reconnect() {
 
     // A new connection (and a new process): the state carries the stored cursor.
     let mut up = upload(&tmp.0);
-    up.start("dev-1", true);
+    up.start("dev-1", "Test phone", true);
     let state = drain(&mut up, 1);
     assert_eq!(
         state[0]["cursors"],
@@ -279,7 +279,7 @@ fn fixture_batch_is_stored_acked_and_resumes_across_a_reconnect() {
     let stored = fs::read_to_string(tmp.0.join("clients/dev-1/2026-11-02.jsonl")).unwrap();
     assert_eq!(stored.lines().count(), 2);
     // Another device has its own cursor.
-    up.start("dev-2", true);
+    up.start("dev-2", "Test phone", true);
     assert_eq!(drain(&mut up, 1)[0]["cursors"], json!({}));
 }
 
@@ -326,7 +326,7 @@ fn messages_before_authentication_are_refused_and_counted() {
     assert!(up.poll().is_empty());
     assert!(!tmp.0.join("clients").read_dir().unwrap().any(|_| true));
     // Once the viewer is gone the state is gone too.
-    up.start("dev-1", true);
+    up.start("dev-1", "Test phone", true);
     drain(&mut up, 1);
     up.stop();
     assert!(send(&mut up, "logs-batch", &b).is_err());
@@ -336,7 +336,7 @@ fn messages_before_authentication_are_refused_and_counted() {
 fn capability_off_is_ignored_and_nothing_is_stored_or_sent() {
     let tmp = TempDir::new("capoff");
     let mut up = upload(&tmp.0);
-    up.start("dev-1", false);
+    up.start("dev-1", "Test phone", false);
     assert!(!up.enabled());
     let b = batch(
         "app-win",
@@ -489,7 +489,7 @@ fn connection_budget_is_enforced_with_a_budget_ack() {
         },
     )
     .unwrap();
-    up.start("dev-1", true);
+    up.start("dev-1", "Test phone", true);
     let state = drain(&mut up, 1);
     // The announced limit follows the configured budget.
     assert_eq!(state[0]["limits"]["connectionBudgetBytes"], size * 3);
@@ -532,7 +532,7 @@ fn connection_budget_is_enforced_with_a_budget_ack() {
     let stored = fs::read_to_string(tmp.0.join("clients/dev-1/2026-11-02.jsonl")).unwrap();
     assert_eq!(stored.lines().count(), 3);
     // The next connection has a fresh budget.
-    up.start("dev-1", true);
+    up.start("dev-1", "Test phone", true);
     drain(&mut up, 1);
     send(&mut up, "logs-batch", &batch("app-win", 1, 3, 4, &[l])).unwrap();
     assert_eq!(drain(&mut up, 1)[0]["status"], "ok");
@@ -549,7 +549,7 @@ fn a_full_queue_answers_rate_limited_and_the_retry_succeeds() {
         },
     )
     .unwrap();
-    up.start("dev-1", true);
+    up.start("dev-1", "Test phone", true);
     drain(&mut up, 1);
     let pause = up.pause_handle();
     let guard = pause.lock().unwrap();
@@ -593,7 +593,7 @@ fn daily_cap_of_the_store_becomes_a_rate_limited_ack() {
     .unwrap();
     let feedback = FeedbackStore::open(&tmp.0).unwrap();
     let mut up = LogUpload::with_stores(logs, feedback, limits());
-    up.start("dev-1", true);
+    up.start("dev-1", "Test phone", true);
     drain(&mut up, 1);
     let l = line("app-win", "2026-11-02T13:00:00.000Z", &"word ".repeat(30));
     send(
@@ -948,7 +948,7 @@ fn answers_of_an_earlier_connection_are_discarded() {
     let l = line("app-win", "2026-11-02T13:00:00.000Z", "x");
     send(&mut up, "logs-batch", &batch("app-win", 1, 0, 1, &[l])).unwrap();
     // The viewer reconnects (another device) while the worker still holds the job.
-    up.start("dev-2", true);
+    up.start("dev-2", "Test phone", true);
     drop(guard);
     let got = drain(&mut up, 1);
     assert_eq!(got[0]["type"], "logs-state", "{got:?}");
@@ -967,9 +967,126 @@ fn unusable_device_ids_turn_the_upload_off() {
     let tmp = TempDir::new("badid");
     let mut up = upload(&tmp.0);
     for bad in ["", "../x", "a b", "nul"] {
-        up.start(bad, true);
+        up.start(bad, "Test phone", true);
         assert!(!up.enabled(), "{bad:?}");
         let b = batch("app-win", 1, 0, 0, &[]);
         assert!(send(&mut up, "logs-batch", &b).is_err());
     }
+}
+
+// ---------------------------------------------------------------- retention and device.json
+
+fn client_day_file(root: &Path, device: &str, day: &str) -> PathBuf {
+    let dir = root.join("clients").join(device);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{day}.jsonl"));
+    fs::write(&path, "{}\n").unwrap();
+    path
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "timed out: {what}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn sweep_runs_at_start_and_every_interval_and_leaves_feedback_alone() {
+    let tmp = TempDir::new("sweep");
+    // The fixed clock is 2026-11-02: 14 days back is 2026-10-19.
+    let old = client_day_file(&tmp.0, "dev-1", "2026-10-18"); // 15 days
+    let keep = client_day_file(&tmp.0, "dev-1", "2026-10-20"); // 13 days
+    let today = client_day_file(&tmp.0, "dev-1", "2026-11-02");
+    fs::create_dir_all(tmp.0.join("feedback")).unwrap();
+    let report = tmp.0.join("feedback/20200101T000000000Z-dev-1.json");
+    fs::write(&report, "{}").unwrap();
+    let report_png = tmp.0.join("feedback/20200101T000000000Z-dev-1.png");
+    fs::write(&report_png, "x").unwrap();
+
+    let up = LogUpload::open_with(
+        &tmp.0,
+        UploadLimits {
+            sweep_interval: Duration::from_millis(40),
+            ..limits()
+        },
+    )
+    .unwrap();
+    wait_until("start-up sweep", || !old.exists());
+    assert!(keep.exists() && today.exists());
+    assert!(report.exists() && report_png.exists());
+
+    // A file that ages out while the host runs goes at the next interval.
+    let late = client_day_file(&tmp.0, "dev-2", "2026-10-01");
+    wait_until("periodic sweep", || !late.exists());
+    assert!(keep.exists() && today.exists());
+    assert!(report.exists() && report_png.exists());
+    drop(up);
+}
+
+#[test]
+fn the_default_sweep_interval_is_24_hours() {
+    assert_eq!(UploadLimits::default().sweep_interval, SWEEP_INTERVAL);
+    assert_eq!(SWEEP_INTERVAL, Duration::from_secs(86_400));
+}
+
+fn device_json(root: &Path, device: &str) -> Value {
+    serde_json::from_str(
+        &fs::read_to_string(root.join("clients").join(device).join("device.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn device_json_is_written_on_the_first_batch_and_updated_on_reconnect() {
+    let tmp = TempDir::new("devjson");
+    let mut up = upload(&tmp.0);
+    up.start("dev-1", "Pixel", true);
+    drain(&mut up, 1);
+    assert!(
+        !tmp.0.join("clients/dev-1").exists(),
+        "no folder before the first batch"
+    );
+    send(&mut up, "logs-batch", &message("logs-batch")).unwrap();
+    drain(&mut up, 1);
+    let meta = device_json(&tmp.0, "dev-1");
+    assert_eq!(meta["device"], "dev-1");
+    assert_eq!(meta["name"], "Pixel");
+    assert_eq!(meta["platform"], "android");
+    assert_eq!(meta["app_version"], "unknown");
+    assert_eq!(meta["last_seen"], "2026-11-02T14:00:00.000Z");
+
+    // The device was renamed and reconnects: the next first batch updates device.json.
+    up.start("dev-1", "Pixel 8", true);
+    drain(&mut up, 1);
+    let second = batch(
+        "app-win",
+        2,
+        0,
+        1,
+        &[line("app-win", "2026-11-02T13:00:00.000Z", "x")],
+    );
+    send(&mut up, "logs-batch", &second).unwrap();
+    drain(&mut up, 1);
+    let meta = device_json(&tmp.0, "dev-1");
+    assert_eq!(meta["name"], "Pixel 8");
+    assert_eq!(meta["platform"], "windows");
+}
+
+#[test]
+fn an_unauthenticated_connection_never_creates_a_folder_or_device_json() {
+    let tmp = TempDir::new("devjson-unauth");
+    let mut up = upload(&tmp.0);
+    send(&mut up, "logs-batch", &message("logs-batch")).unwrap_err();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(up.poll().is_empty());
+    assert!(!tmp.0.join("clients").read_dir().unwrap().any(|_| true));
+    // A device whose id is unusable has no connection either.
+    up.start("../escape", "Evil", true);
+    send(&mut up, "logs-batch", &message("logs-batch")).unwrap_err();
+    assert!(!tmp.0.join("clients").read_dir().unwrap().any(|_| true));
 }
