@@ -65,6 +65,10 @@ The pairing code is valid for 5 minutes.
 4. In WebRTC mode, media and input wait until the PC's DTLS auth-bind is verified. Both sides sign and verify the sha-256 `a=fingerprint` values from the SDP each one sent and received, normalised to `sha-256 AA:BB:...` (lowercase algorithm, uppercase hex). An SDP without a sha-256 fingerprint ends the session with the ctl error `dtls-bind-required`.
 5. Media and file sockets use the ticket from `hello-ok`, with the roles `media-viewer` and `file-viewer`.
 
+## Decode paths
+
+Over WSS the browser decodes with WebCodecs and draws in a Dedicated Worker (`wss-worker.js`), on `OffscreenCanvas`s it owns: the desktop canvas, the sharp-viewport crop and the hybrid PNG/HEVC tile overlay. The page keeps layout, input, HUD and the cursor overlay, ACKs frames on receipt (the worker reports `decodedSeq`) and sends the worker the viewport, hybrid mode and desktop state with each frame. If the browser lacks Worker, `VideoDecoder`, `OffscreenCanvas` or `transferControlToOffscreen`, or the worker fails to start or crashes, the page uses the main-thread decode path. `?decoderPath=main` forces that path for debugging, and the HUD shows `(worker)` after the codec when the worker path is active. WebRTC is unchanged: it decodes natively unless you pass `?decoderPath=webcodecs`.
+
 ## Settings
 
 Settings has two groups that matter here.
@@ -74,5 +78,5 @@ Settings has two groups that matter here.
 
 ## Tests
 
-- `worker/test` runs the unit tests. CI job `browser` runs them.
+- `worker/test` runs the unit tests. CI job `browser` runs them. CI has no real browser, so the WSS worker path is covered by `wss-pipeline.test.mjs` (the pipeline against a fake decoder and canvases) and `wss-worker-path.test.mjs` (path selector, worker handshake and source contracts).
 - `worker/test-e2e` runs the browser end-to-end tests against `bp-relay-server`. CI job `browser-e2e` runs them.
