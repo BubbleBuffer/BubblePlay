@@ -40,6 +40,16 @@ pub struct WindowMonitor {
     pub origin_y: i32,
 }
 
+/// What identifies the foreground window in the log: its class name, the file name of the
+/// owning process's executable and its pid. Never the title (private). Empty when a part
+/// could not be read. Not part of the follow decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowDetails {
+    pub class: String,
+    pub exe: String,
+    pub pid: u32,
+}
+
 /// One foreground sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sample {
@@ -52,6 +62,7 @@ pub enum Sample {
     Window {
         window: isize,
         monitor: WindowMonitor,
+        details: WindowDetails,
     },
 }
 
@@ -65,6 +76,8 @@ pub struct FollowWindow {
     /// The last confirmed pair. A pair is acted on once; a manual pick made
     /// after that therefore stays until the pair changes.
     handled: Option<Pair>,
+    /// The details of the window whose pair was last confirmed.
+    confirmed_details: WindowDetails,
     last_switch: Option<Instant>,
     edge: EdgeHold,
 }
@@ -230,7 +243,12 @@ impl FollowWindow {
     /// with the current capture monitor and calls [`Self::switched`] after an
     /// automatic switch.
     pub fn observe(&mut self, sample: Sample, now: Instant) -> Option<WindowMonitor> {
-        let Sample::Window { window, monitor } = sample else {
+        let Sample::Window {
+            window,
+            monitor,
+            details,
+        } = sample
+        else {
             self.candidate = None;
             return None;
         };
@@ -254,7 +272,14 @@ impl FollowWindow {
         self.candidate = None;
         let target = pair.1.clone();
         self.handled = Some(pair);
+        self.confirmed_details = details;
         Some(target)
+    }
+
+    /// The class, executable and pid of the window behind the monitor the last
+    /// [`Self::observe`] returned.
+    pub fn confirmed_details(&self) -> &WindowDetails {
+        &self.confirmed_details
     }
 
     /// Record an automatic switch for the rate limit.
@@ -328,9 +353,14 @@ pub fn sample_foreground() -> Sample {
         {
             return Sample::Ignored;
         }
-        let mut class = [0u16; 64];
-        let len = GetClassNameW(hwnd, &mut class);
-        if len > 0 && is_shell_class(&String::from_utf16_lossy(&class[..len as usize])) {
+        let mut class_buf = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut class_buf);
+        let class = if len > 0 {
+            String::from_utf16_lossy(&class_buf[..len as usize])
+        } else {
+            String::new()
+        };
+        if is_shell_class(&class) {
             return Sample::Ignored;
         }
         let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -356,8 +386,42 @@ pub fn sample_foreground() -> Sample {
                 origin_x: info.monitorInfo.rcMonitor.left,
                 origin_y: info.monitorInfo.rcMonitor.top,
             },
+            details: details_of(hwnd, class),
         }
     }
+}
+
+/// The owning process of `hwnd`, with its executable looked up only when the window or
+/// process changed since the last sample (the sampler runs four times a second).
+fn details_of(hwnd: windows::Win32::Foundation::HWND, class: String) -> WindowDetails {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(isize, u32, String)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let mut pid = 0u32;
+    // SAFETY: plain Win32 query with a valid out-pointer.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+    let key = hwnd.0 as isize;
+    let exe = LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        match last.as_ref() {
+            Some((h, p, exe)) if *h == key && *p == pid => exe.clone(),
+            _ => {
+                let exe = exe_file_name(pid);
+                *last = Some((key, pid, exe.clone()));
+                exe
+            }
+        }
+    });
+    WindowDetails { class, exe, pid }
+}
+
+/// File name (no directory) of the executable of process `pid`; empty when unreadable.
+fn exe_file_name(pid: u32) -> String {
+    crate::admin_agent::trust::process_image_path(pid)
+        .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default()
 }
 
 /// Sample the foreground move/size loop for edge hold (Win32; interactive
@@ -414,6 +478,19 @@ mod tests {
         Sample::Window {
             window,
             monitor: mon(n),
+            details: WindowDetails::default(),
+        }
+    }
+
+    fn win_with(window: isize, n: u8, class: &str, exe: &str, pid: u32) -> Sample {
+        Sample::Window {
+            window,
+            monitor: mon(n),
+            details: WindowDetails {
+                class: class.into(),
+                exe: exe.into(),
+                pid,
+            },
         }
     }
 
@@ -431,6 +508,34 @@ mod tests {
         // The same pair never fires again.
         assert_eq!(f.observe(win(1, 2), tick(t, 2)), None);
         assert_eq!(f.observe(win(1, 2), tick(t, 20)), None);
+    }
+
+    #[test]
+    fn confirmed_details_are_those_of_the_confirmed_window() {
+        let t = Instant::now();
+        let mut f = FollowWindow::default();
+        assert_eq!(
+            f.observe(
+                win_with(5, 2, "CabinetWClass", "explorer.exe", 4242),
+                tick(t, 0)
+            ),
+            None
+        );
+        assert_eq!(
+            f.observe(
+                win_with(5, 2, "CabinetWClass", "explorer.exe", 4242),
+                tick(t, 1)
+            ),
+            Some(mon(2))
+        );
+        assert_eq!(
+            f.confirmed_details(),
+            &WindowDetails {
+                class: "CabinetWClass".into(),
+                exe: "explorer.exe".into(),
+                pid: 4242,
+            }
+        );
     }
 
     #[test]

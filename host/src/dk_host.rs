@@ -1874,6 +1874,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        let _serial = crate::test_tracing::serial();
         tracing::subscriber::with_default(subscriber, body);
         let bytes = buffer.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()

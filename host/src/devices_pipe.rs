@@ -1437,10 +1437,14 @@ mod tests {
         name: String,
         commands: Receiver<DevicesCommand>,
         relay: Arc<AtomicBool>,
+        /// Pipe threads inherit the spawner's tracing dispatcher, and the callsite interest
+        /// cache is process-wide: every pipe test runs apart from the tests that install a
+        /// subscriber and read what it saw.
+        _serial: Option<std::sync::MutexGuard<'static, ()>>,
     }
 
     fn start() -> Fixture {
-        start_named(unique_name()).expect("pipe starts")
+        start_serialized(unique_name(), crate::test_tracing::serial()).expect("pipe starts")
     }
 
     fn config(name: String, relay: Arc<AtomicBool>) -> DevicesPipeConfig {
@@ -1456,6 +1460,21 @@ mod tests {
     }
 
     fn start_named(name: String) -> io::Result<Fixture> {
+        // A second start inside a test that already holds the lock through `start`.
+        start_with(name, None)
+    }
+
+    fn start_serialized(
+        name: String,
+        serial: std::sync::MutexGuard<'static, ()>,
+    ) -> io::Result<Fixture> {
+        start_with(name, Some(serial))
+    }
+
+    fn start_with(
+        name: String,
+        serial: Option<std::sync::MutexGuard<'static, ()>>,
+    ) -> io::Result<Fixture> {
         let relay = Arc::new(AtomicBool::new(false));
         let (tx, commands) = mpsc::channel();
         let pipe = DevicesPipe::start(config(name.clone(), relay.clone()), tx)?;
@@ -1464,6 +1483,7 @@ mod tests {
             name,
             commands,
             relay,
+            _serial: serial,
         })
     }
 
@@ -2023,6 +2043,7 @@ mod tests {
 
     #[test]
     fn secrets_never_reach_the_log() {
+        let serial = crate::test_tracing::serial();
         let capture = Capture::default();
         let writer = capture.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2034,7 +2055,7 @@ mod tests {
             // Callsites first hit by another test before this subscriber existed
             // may have cached "never"; recompute interest now that it is live.
             tracing::callsite::rebuild_interest_cache();
-            let fixture = start();
+            let fixture = start_serialized(unique_name(), serial).expect("pipe starts");
             let mut handle = fixture.handle();
             let client = fixture.connect();
             client.greeting(0);

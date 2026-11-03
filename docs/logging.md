@@ -40,7 +40,9 @@ On the PC, under `%LOCALAPPDATA%\BubblePlay\logs` (host, tray) or the protected 
 
 `device.json` (name as paired, platform from the stream, app version, last seen) is written when a device's first batch on a connection arrives and its `last_seen` moves with every batch. Feedback reports are never swept. The host's own logs are age-cleaned (7 days) with a 20-file cap per source on top, which only cuts below 7 days after more than about three 20 MiB rollovers a day.
 
-The tray log also holds the host's and agent's raw stdout and stderr as lines with target `child`.
+The tray log holds only the host's and agent's output that is not already in their own logs, as lines with target `child`: a panic message, a backtrace, native library output, a startup failure before the child's log was open. Their tracing lines are never echoed.
+
+Rates: the host's per-second statistics (WSS producer window and link totals as one `WSS stats` line, `remote input diagnostics`, `secure input summary`) go to debug and so not to the files; info carries their sum at most once per 60 s, plus one at session end. Encoder retunes (`NVENC pending configuration applied`) are info only when the encoder is reset. Host lines written while a viewer session is active carry its relay epoch (the 32-character session epoch the host already holds) in `session`; lines between sessions have `session: null`.
 
 On clients: `logs/pc/<pc-id>/<src>-YYYY-MM-DD.jsonl` (lines tied to a PC, 5 MB per PC), `logs/misc/` (the rest), `logs/outbox/` (reports waiting to be sent). 20 MB total, 30 days. The Rust side of the Windows app writes `app-win-rust-YYYY-MM-DD.jsonl` (src `app-win`, 60 lines per minute) into the same tree. Roots: Windows app `%LOCALAPPDATA%\BubblePlay\viewer\logs`; Android the app's `files/logs`, shared by the Dart process (`app-android`) and the Kotlin core (`app-android-core`), each writing its own files. The browser keeps a 2 MB ring in IndexedDB `bp-logs` (`lines`, `feedback`).
 

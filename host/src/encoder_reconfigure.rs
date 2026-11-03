@@ -41,6 +41,11 @@ impl ReconfigurePlan {
     pub fn forces_next_idr(self) -> bool {
         self.profile_changed || self.force_idr
     }
+
+    /// Routine retunes (bitrate, QP ceiling) log at debug; an encoder reset logs at info.
+    pub fn logs_at_info(self) -> bool {
+        self.reset_encoder
+    }
 }
 
 pub(crate) struct PendingReconfigure {
@@ -166,6 +171,26 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, Event::Reconfigure(at, _) if *at == frame))
             .count()
+    }
+
+    #[test]
+    fn only_an_encoder_reset_logs_at_info() {
+        let plans = |edit: fn(&mut PendingReconfigure)| {
+            let mut pending = PendingReconfigure::new(settings());
+            edit(&mut pending);
+            let mut seen = None;
+            pending
+                .flush_with(|plan| {
+                    seen = Some(plan);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            seen.unwrap()
+        };
+        assert!(!plans(|p| p.set_bitrate(1_000_000)).logs_at_info());
+        assert!(!plans(|p| p.set_max_qp(Some(28))).logs_at_info());
+        assert!(plans(|p| p.set_profile(1280, 720, 60)).logs_at_info());
+        assert!(plans(|p| p.reset_rate_control()).logs_at_info());
     }
 
     #[test]

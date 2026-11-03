@@ -37,6 +37,7 @@ use bubbleplay_host::rtc;
 use bubbleplay_host::scale;
 use bubbleplay_host::scroll_detect::{extend_to_runs, sample_tiles, ScrollDetector};
 use bubbleplay_host::signaling;
+use bubbleplay_host::stats_window;
 use bubbleplay_host::stun;
 use bubbleplay_host::temporal_diff;
 use bubbleplay_host::tile_hash::{TileHasher, MAX_HASHED_PER_MILLE};
@@ -955,6 +956,15 @@ impl LocalClipboardPoll {
     }
 }
 
+/// Clears the log's active session id when the serve loop ends, however it ends.
+struct SessionLogScope;
+
+impl Drop for SessionLogScope {
+    fn drop(&mut self) {
+        bubbleplay_host::logging::set_session(None);
+    }
+}
+
 /// Logs the tray's viewer markers: "viewer session started" once a viewer's
 /// media transport (RTC or WSS) is first up in this session, and "viewer
 /// session ended" when the session ends by any path (peer left, error). The
@@ -1334,9 +1344,85 @@ fn run_serve(
     let mut viewport_revision = 0u32;
     let mut last_logged_bwe: Option<u32> = None;
     let mut producer_loop_iterations = 0u64;
+    let mut stats_rollup = stats_window::Rollup::new(Instant::now(), stats_window::INFO_INTERVAL);
+    // Lines logged while a viewer session is up carry its epoch as `session`.
+    let _session_log = SessionLogScope;
+    let mut logged_session_epoch: Option<String> = None;
     let mut producer_window_started = Instant::now();
     let mut last_capture_stats = (0u64, 0u64);
     let mut viewer_session = ViewerSessionLog::default();
+    // One WSS stats line: the producer window `$w` (one second, or the sum of a rollup
+    // interval) with the link totals as they stand now. `$level` is `debug` or `info`.
+    macro_rules! wss_stats_line {
+        ($level:ident, $egress:expr, $w:expr) => {{
+            let w: &stats_window::ProducerWindow = $w;
+            let v4 = $egress.stats();
+            let tiles = tile_tracker
+                .as_ref()
+                .map(TileQualityTracker::stats)
+                .unwrap_or_default();
+            let debt_tiles = tile_tracker
+                .as_ref()
+                .map_or(0, TileQualityTracker::debt_tiles);
+            let pacing = v4_pacer.stats();
+            let classes = v4_pacer.counts();
+            tracing::$level!(
+                wss_preencode_skips = w.preencode_skips,
+                wss_submission_failures = w.submission_failures,
+                wss_idr_count = w.idr_count,
+                wss_delta_count = w.delta_count,
+                idr_percent = w.idr_percent(),
+                span_ms = w.span_ms,
+                producer_loop_iterations = w.loop_iterations,
+                capture_acquired = w.capture_acquired,
+                capture_new = w.capture_new,
+                wss_max_access_unit_bytes = w.max_access_unit_bytes,
+                connected = v4.connected,
+                peer_present = v4.peer_present,
+                frames_sent = v4.frames_sent,
+                bytes_sent = v4.bytes_sent,
+                keyframes_sent = v4.keyframes_sent,
+                refines_sent = v4.refines_sent,
+                skipped_budget = v4.skipped_budget,
+                acks = v4.acks,
+                heartbeats = v4.heartbeats,
+                reconnects = v4.reconnects,
+                inflight_frames = v4.inflight_frames,
+                inflight_bytes = v4.inflight_bytes,
+                bitrate_bps = v4.bitrate_bps,
+                min_rtt_ms = v4.min_rtt_ms,
+                last_rtt_ms = v4.last_rtt_ms,
+                ack_timeouts = v4.ack_timeouts,
+                keyframes = %format_keyframe_reasons(&wss_v4_keyframes),
+                noop_skipped = tiles.noop_repaints_skipped,
+                debt_tiles,
+                tiles_refined = tiles.tiles_refined,
+                refine_frames = tiles.refine_frames,
+                whole_frame_refines = tiles.whole_frame_refines,
+                hashed_tiles = tiles.hashed_tiles,
+                unhashed_tiles = tiles.unhashed_tiles,
+                tile_hash_us = w.tile_hash_us,
+                frame_qp_max = w.qp_max,
+                frame_qp_mean = w.qp_mean(),
+                capacity_bps = v4.capacity_bps,
+                rate_cap_bps = v4.rate_cap_bps,
+                constrained_ms = v4.constrained_ms,
+                budget_tokens = v4_pacer.tokens(),
+                content = classes.dominant().as_str(),
+                text_tiles = classes.text,
+                scroll_tiles = classes.scroll,
+                video_tiles = classes.video,
+                max_qp = encoder.as_ref().and_then(VideoEncoder::max_qp).unwrap_or(0),
+                paced_skips = pacing.paced_skips,
+                refines_deferred = pacing.refines_deferred,
+                refines_trimmed = pacing.refines_trimmed,
+                pointer_maps = pacing.pointer_maps,
+                scroll_detections,
+                scroll_dy,
+                "WSS stats"
+            );
+        }};
+    }
     // Current demand is control state, independent of filtered lifecycle logs.
     // The host holds this object so a new tray can discover an active viewer.
     let admin_demand = bubbleplay_host::admin_agent::demand::DemandSignal::from_env()?;
@@ -1672,6 +1758,10 @@ fn run_serve(
         signal_events.extend(awakened_events);
         session_stage!(Housekeeping);
         producer_loop_iterations = producer_loop_iterations.saturating_add(1);
+        if signaling.viewer_epoch() != logged_session_epoch.as_deref() {
+            logged_session_epoch = signaling.viewer_epoch().map(str::to_owned);
+            bubbleplay_host::logging::set_session(logged_session_epoch.as_deref());
+        }
         let loop_now = Instant::now();
         if loop_now >= next_benchmark_refresh {
             let next_profile = benchmark_lease.refresh(unix_time_ms()).cloned();
@@ -2423,8 +2513,12 @@ fn run_serve(
                                 if !capture.monitor_selector().eq_ignore_ascii_case(&selector) =>
                             {
                                 follow.switched(now);
+                                let details = follow.confirmed_details();
                                 info!(
                                     monitor = %selector,
+                                    window_class = %details.class,
+                                    window_exe = %details.exe,
+                                    window_pid = details.pid,
                                     "follow active window: switching monitor"
                                 );
                                 switch_capture_monitor!(&selector);
@@ -6500,83 +6594,28 @@ fn run_serve(
             .as_ref()
             .filter(|_| Instant::now() >= next_wss_stats)
         {
-            let encoded_total = wss_idr_count.saturating_add(wss_delta_count);
-            let idr_percent = wss_idr_count
-                .saturating_mul(100)
-                .checked_div(encoded_total)
-                .unwrap_or(0);
             let capture_stats = capture.local_capture_stats().unwrap_or(last_capture_stats);
-            let capture_acquired = capture_stats.0.saturating_sub(last_capture_stats.0);
-            let capture_new = capture_stats.1.saturating_sub(last_capture_stats.1);
-            last_capture_stats = capture_stats;
-            info!(
-                wss_preencode_skips,
-                wss_submission_failures,
-                wss_idr_count,
-                wss_delta_count,
-                idr_percent,
-                span_ms = producer_window_started.elapsed().as_millis() as u64,
-                producer_loop_iterations,
-                capture_acquired,
-                capture_new,
-                wss_max_access_unit_bytes,
-                "WSS producer window"
-            );
-            let v4 = egress.stats();
-            let tiles = tile_tracker
-                .as_ref()
-                .map(TileQualityTracker::stats)
-                .unwrap_or_default();
-            let debt_tiles = tile_tracker
-                .as_ref()
-                .map_or(0, TileQualityTracker::debt_tiles);
-            let pacing = v4_pacer.stats();
-            let classes = v4_pacer.counts();
-            info!(
-                connected = v4.connected,
-                peer_present = v4.peer_present,
-                frames_sent = v4.frames_sent,
-                bytes_sent = v4.bytes_sent,
-                keyframes_sent = v4.keyframes_sent,
-                refines_sent = v4.refines_sent,
-                skipped_budget = v4.skipped_budget,
-                acks = v4.acks,
-                heartbeats = v4.heartbeats,
-                reconnects = v4.reconnects,
-                inflight_frames = v4.inflight_frames,
-                inflight_bytes = v4.inflight_bytes,
-                bitrate_bps = v4.bitrate_bps,
-                min_rtt_ms = v4.min_rtt_ms,
-                last_rtt_ms = v4.last_rtt_ms,
-                ack_timeouts = v4.ack_timeouts,
-                keyframes = %format_keyframe_reasons(&wss_v4_keyframes),
-                noop_skipped = tiles.noop_repaints_skipped,
-                debt_tiles,
-                tiles_refined = tiles.tiles_refined,
-                refine_frames = tiles.refine_frames,
-                whole_frame_refines = tiles.whole_frame_refines,
-                hashed_tiles = tiles.hashed_tiles,
-                unhashed_tiles = tiles.unhashed_tiles,
+            let window = stats_window::ProducerWindow {
+                preencode_skips: wss_preencode_skips,
+                submission_failures: wss_submission_failures,
+                idr_count: wss_idr_count,
+                delta_count: wss_delta_count,
+                span_ms: producer_window_started.elapsed().as_millis() as u64,
+                loop_iterations: producer_loop_iterations,
+                capture_acquired: capture_stats.0.saturating_sub(last_capture_stats.0),
+                capture_new: capture_stats.1.saturating_sub(last_capture_stats.1),
+                max_access_unit_bytes: wss_max_access_unit_bytes,
                 tile_hash_us,
-                frame_qp_max = wss_v4_qp_window.0,
-                frame_qp_mean = wss_v4_qp_window.1 / wss_v4_qp_window.2.max(1),
-                capacity_bps = v4.capacity_bps,
-                rate_cap_bps = v4.rate_cap_bps,
-                constrained_ms = v4.constrained_ms,
-                budget_tokens = v4_pacer.tokens(),
-                content = classes.dominant().as_str(),
-                text_tiles = classes.text,
-                scroll_tiles = classes.scroll,
-                video_tiles = classes.video,
-                max_qp = encoder.as_ref().and_then(VideoEncoder::max_qp).unwrap_or(0),
-                paced_skips = pacing.paced_skips,
-                refines_deferred = pacing.refines_deferred,
-                refines_trimmed = pacing.refines_trimmed,
-                pointer_maps = pacing.pointer_maps,
-                scroll_detections,
-                scroll_dy,
-                "WSS v4 link totals"
-            );
+                qp_max: wss_v4_qp_window.0,
+                qp_sum: wss_v4_qp_window.1,
+                qp_count: wss_v4_qp_window.2,
+            };
+            last_capture_stats = capture_stats;
+            // Every second at debug; one rolled-up line a minute at info.
+            wss_stats_line!(debug, egress, &window);
+            if let Some(total) = stats_rollup.add(Instant::now(), &window) {
+                wss_stats_line!(info, egress, &total);
+            }
             tile_hash_us = 0;
             wss_v4_qp_window = (0, 0, 0);
             next_wss_stats = Instant::now() + Duration::from_secs(1);
@@ -6592,6 +6631,9 @@ fn run_serve(
         // at the top of the next iteration. DDA waits on its acquisition thread.
     }
     session_stage!(Cleanup);
+    if let (Some(total), Some(egress)) = (stats_rollup.finish(Instant::now()), wss_media.as_ref()) {
+        wss_stats_line!(info, egress, &total);
+    }
     file_drag_preview.cancel();
     if let Some(pending) = pending_native_drop.take() {
         pending.request.reject("drop-not-ready");

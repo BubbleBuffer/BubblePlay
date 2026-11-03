@@ -460,6 +460,8 @@ struct Shared {
     src: &'static str,
     capacity: usize,
     device: Mutex<Option<String>>,
+    /// The active session's id, used for lines that carry no `session` field of their own.
+    session: Mutex<Option<String>>,
     queue: Mutex<VecDeque<Item>>,
     wake: Condvar,
     writer: Mutex<Writer>,
@@ -487,6 +489,7 @@ impl Logger {
             src: config.src,
             capacity: config.queue_capacity.max(1),
             device: Mutex::new(None),
+            session: Mutex::new(None),
             queue: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
             writer: Mutex::new(Writer {
@@ -523,6 +526,12 @@ impl Logger {
         *lock(&self.shared.device) = device.map(str::to_string);
     }
 
+    /// Set the active session's id: later lines without their own `session` field carry it,
+    /// from every thread. `None` ends it.
+    pub fn set_session(&self, session: Option<&str>) {
+        *lock(&self.shared.session) = session.map(str::to_string);
+    }
+
     /// Write one line. Redacted, fitted to 8 KiB, queued; never panics and never blocks on I/O.
     pub fn log(&self, level: Level, target: &str, msg: &str, fields: Map<String, Value>) {
         self.log_at(SystemTime::now(), level, target, msg, fields);
@@ -538,7 +547,9 @@ impl Logger {
     ) {
         let (ts, day) = timestamp(at);
         let pc = fields.remove("pc");
-        let session = fields.remove("session");
+        let session = fields
+            .remove("session")
+            .or_else(|| lock(&self.shared.session).clone().map(Value::String));
         let device_field = fields.remove("device");
         let device = match device_field {
             Some(value) => value,
@@ -779,6 +790,14 @@ pub fn global() -> Option<&'static Logger> {
 pub fn set_device(device: Option<&str>) {
     if let Some(logger) = global() {
         logger.set_device(device);
+    }
+}
+
+/// Set the active session's id for later lines that carry no `session` field (no-op before
+/// [`init`]). `None` ends the session.
+pub fn set_session(session: Option<&str>) {
+    if let Some(logger) = global() {
+        logger.set_session(session);
     }
 }
 

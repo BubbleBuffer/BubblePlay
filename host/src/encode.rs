@@ -1722,16 +1722,27 @@ impl Nvenc {
             self.width = plan.settings.width;
             self.height = plan.settings.height;
             self.force_idr_next |= plan.forces_next_idr();
-            info!(
-                previous_bitrate_bps = previous_settings.bitrate_bps,
-                bitrate_bps = plan.settings.bitrate_bps,
-                max_qp = ?plan.settings.max_qp,
-                width = plan.settings.width,
-                height = plan.settings.height,
-                fps = plan.settings.fps,
-                reset_encoder = plan.reset_encoder,
-                "NVENC pending configuration applied"
-            );
+            // Adaptive bitrate and the QP ceiling retune about once a second; only an
+            // encoder reset (size, fps or rate-control reset) is worth an info line.
+            macro_rules! applied {
+                ($log:ident) => {
+                    $log!(
+                        previous_bitrate_bps = previous_settings.bitrate_bps,
+                        bitrate_bps = plan.settings.bitrate_bps,
+                        max_qp = ?plan.settings.max_qp,
+                        width = plan.settings.width,
+                        height = plan.settings.height,
+                        fps = plan.settings.fps,
+                        reset_encoder = plan.reset_encoder,
+                        "NVENC pending configuration applied"
+                    )
+                };
+            }
+            if plan.logs_at_info() {
+                applied!(info);
+            } else {
+                applied!(debug);
+            }
         }
         Ok(())
     }
