@@ -3438,6 +3438,10 @@ impl InputSink {
         let previous_reason = self.input_flow.reason();
         if let Some(transition) = self.input_flow.observe(reason) {
             match transition {
+                // Pausing input for a native file drag is by design, not a fault.
+                Some(InputDropReason::NativeDrag) => {
+                    info!(reason = "native-drag", "remote input started dropping")
+                }
                 Some(reason) => warn!(reason = reason.name(), "remote input started dropping"),
                 None => info!(
                     reason = previous_reason.map(InputDropReason::name),

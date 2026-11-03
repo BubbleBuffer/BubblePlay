@@ -455,15 +455,38 @@ impl AdminAgentLink {
             return None;
         }
         let mut applied_total = 0u32;
+        let mut retried = false;
         let deadline = Instant::now() + INJECT_TIMEOUT;
-        for chunk in records.chunks(MAX_RECORDS_PER_FRAME) {
-            let connection = self.connection.as_mut()?;
-            if let Err(error) = connection.send_frame(chunk, deadline) {
-                // A failed/cancelled write may already have delivered bytes.
-                // The receipt is unknown: never repeat this input locally.
-                self.fail(LinkError::Failed(error.to_string()));
-                return Some((applied_total, ERROR_AGENT_LOST));
-            }
+        for (index, chunk) in records.chunks(MAX_RECORDS_PER_FRAME).enumerate() {
+            let connection = loop {
+                let connection = self.connection.as_mut()?;
+                match connection.send_frame(chunk, deadline) {
+                    Ok(()) => break connection,
+                    Err(error) => {
+                        // The tray stops the agent after the last viewer leaves, while the host
+                        // keeps its pipe. A write that failed because the pipe is closed delivered
+                        // nothing, so the first batch can safely go again on a fresh connection.
+                        if !retried && index == 0 && write_never_delivered(&error) {
+                            retried = true;
+                            tracing::info!(
+                                %error,
+                                "admin agent pipe was closed before the batch was delivered; reconnecting once"
+                            );
+                            self.fail(LinkError::Failed(error.to_string()));
+                            self.retry_at = None;
+                            if !self.ensure_connected(Instant::now()) {
+                                // Nothing was delivered: the caller may inject locally.
+                                return None;
+                            }
+                            continue;
+                        }
+                        // A failed/cancelled write may already have delivered bytes.
+                        // The receipt is unknown: never repeat this input locally.
+                        self.fail(LinkError::Failed(error.to_string()));
+                        return Some((applied_total, ERROR_AGENT_LOST));
+                    }
+                }
+            };
             let reply = connection.receipt(deadline);
             match reply {
                 Ok(AgentMessage::Injected {
@@ -493,6 +516,13 @@ impl AdminAgentLink {
         }
         Some((applied_total, 0))
     }
+}
+
+/// A write that the OS refused because the pipe's other end is gone (ERROR_BROKEN_PIPE 109 or
+/// ERROR_NO_DATA 232): the bytes were never accepted, so nothing reached the agent. Other errors,
+/// including timeouts and our own "closed after incomplete I/O" marker, may have delivered data.
+fn write_never_delivered(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(109 | 232))
 }
 
 /// Where the agent must be installed (for scripts and diagnostics).
@@ -573,6 +603,21 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "watchdog cleanup was not finite: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn only_a_closed_pipe_write_counts_as_never_delivered() {
+        assert!(write_never_delivered(&io::Error::from_raw_os_error(232)));
+        assert!(write_never_delivered(&io::Error::from_raw_os_error(109)));
+        assert!(!write_never_delivered(&io::Error::from_raw_os_error(5)));
+        assert!(!write_never_delivered(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "deadline"
+        )));
+        assert!(!write_never_delivered(&io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "named pipe connection closed after incomplete I/O"
+        )));
     }
 
     #[test]

@@ -70,12 +70,12 @@ use bubbleplay_host::secure_helper::protocol::{
 };
 use logic::{
     admin_menu_enabled, admin_mode_line, menu_layout, run_key_command, running_probe_status,
-    secure_helper_should_launch, start_secure_helper_for_viewer, status_line, tray_icon_resource,
-    unix_ms_now, AgentStatus, ClickDebounce, HostState, MenuEntry, MenuState, ProbeGate,
-    SecureHelperStatus, TraySettings, ViewerGate, AGENT_UPDATE_LABEL, CMD_ADMIN, CMD_AGENT_UPDATE,
-    CMD_AUDIO, CMD_CPU_MODE, CMD_DEVICES, CMD_EXPORT_KEY, CMD_FEEDBACK, CMD_IMPORT_KEY, CMD_LOGIN,
-    CMD_LOGS, CMD_QUIT, CMD_RESTART, CMD_ROLLBACK, CMD_SECURE_HELPER_UPDATE,
-    SECURE_HELPER_UPDATE_LABEL,
+    secure_helper_should_launch, start_secure_helper_for_viewer, startup_probe_failure,
+    status_line, tray_icon_resource, unix_ms_now, AgentStatus, ClickDebounce, HostState, MenuEntry,
+    MenuState, ProbeGate, SecureHelperStatus, TraySettings, ViewerGate, AGENT_UPDATE_LABEL,
+    CMD_ADMIN, CMD_AGENT_UPDATE, CMD_AUDIO, CMD_CPU_MODE, CMD_DEVICES, CMD_EXPORT_KEY,
+    CMD_FEEDBACK, CMD_IMPORT_KEY, CMD_LOGIN, CMD_LOGS, CMD_QUIT, CMD_RESTART, CMD_ROLLBACK,
+    CMD_SECURE_HELPER_UPDATE, SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
     acquire_single_instance, create_manual_event, data_dir, end_agent_task, ensure_agent_task,
@@ -694,9 +694,9 @@ impl App {
         self.probe_gate.reset_throttle();
     }
 
-    fn stop_agent(&mut self) {
+    fn stop_agent(&mut self, reason: &'static str) {
         if self.agent_started.is_some() || self.agent_child.is_some() {
-            tracing::info!("stopping admin agent");
+            tracing::info!(reason, "stopping admin agent");
             self.stop_agent_process();
         }
         self.set_agent(AgentStatus::Off);
@@ -714,7 +714,7 @@ impl App {
         self.viewers
             .observe_active(active_from_env(), Instant::now());
         if !self.admin_on {
-            self.stop_agent();
+            self.stop_agent("admin mode turned off");
             let _ = publish_failure_in(&self.data, None);
             return;
         }
@@ -722,7 +722,11 @@ impl App {
             return;
         }
         if self.agent_started.is_some() || self.agent_child.is_some() {
-            tracing::info!("no viewer session: stopping admin agent");
+            tracing::info!(
+                reason = "no viewer session after the idle grace",
+                admin_on = self.admin_on,
+                "no viewer session: stopping admin agent"
+            );
             self.stop_agent_process();
         }
         let _ = publish_failure_in(&self.data, None);
@@ -817,20 +821,30 @@ impl App {
         } else {
             platform::agent_task_result()
         };
+        // The agent task was just started and has not created its pipe yet: expected, not stale.
+        let starting_up =
+            !timed_out && startup_probe_failure(&error, self.agent_started.map(|at| at.elapsed()));
         let reason = if timed_out {
             format!("the admin agent is not responding ({error}){result}")
         } else {
             format!("the admin agent does not answer ({error}){result}")
         };
-        self.report_agent_failure(&reason);
-        // Keep transient startup failure in diagnostics without a new balloon.
-        if self.agent != AgentStatus::Starting {
-            tracing::warn!(%reason, "admin agent probe failed");
+        if starting_up {
+            tracing::info!(%reason, "admin agent probe failed while the agent is starting; waiting");
+            if !retry {
+                self.set_agent(AgentStatus::Starting);
+            }
+        } else {
+            self.report_agent_failure(&reason);
+            // Keep transient startup failure in diagnostics without a new balloon.
+            if self.agent != AgentStatus::Starting {
+                tracing::warn!(%reason, "admin agent probe failed");
+            }
         }
         if retry {
             tracing::warn!(%reason, "admin agent needed; scheduling start");
             self.start_agent();
-        } else if running {
+        } else if running && !starting_up {
             self.set_agent(running_probe_status(timed_out, reason));
         }
     }
@@ -1464,7 +1478,7 @@ impl App {
         self.shut_down = true;
         tracing::info!("tray shutting down");
         self.stop_user();
-        self.stop_agent();
+        self.stop_agent("tray shutting down");
         self.remove_icon();
     }
 

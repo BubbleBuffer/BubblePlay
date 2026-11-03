@@ -268,6 +268,15 @@ pub fn running_probe_status(timed_out: bool, reason: String) -> AgentStatus {
     }
 }
 
+/// How long after a start the tray treats a missing pipe as "still starting".
+pub const AGENT_START_GRACE: Duration = Duration::from_secs(20);
+
+/// A probe error that is expected right after the tray started the agent: the pipe does not exist
+/// yet (os error 2, file not found). Never covers a protocol mismatch or a timeout.
+pub fn startup_probe_failure(error: &str, since_start: Option<Duration>) -> bool {
+    since_start.is_some_and(|age| age < AGENT_START_GRACE) && error.contains("(os error 2)")
+}
+
 /// Minimum time between probes that are not forced.
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// A probe still unreported after this long is treated as lost (its thread
@@ -1214,6 +1223,19 @@ mod tests {
             AGENT_UPDATE_LABEL,
             "Admin agent needs update (one admin prompt)"
         );
+    }
+
+    #[test]
+    fn missing_pipe_right_after_a_start_is_expected_startup() {
+        let missing = "The system cannot find the file specified. (os error 2)";
+        assert!(startup_probe_failure(missing, Some(Duration::from_secs(3))));
+        // No start pending, an old start, a different error: still a real failure.
+        assert!(!startup_probe_failure(missing, None));
+        assert!(!startup_probe_failure(missing, Some(AGENT_START_GRACE)));
+        assert!(!startup_probe_failure(
+            "Access is denied. (os error 5)",
+            Some(Duration::from_secs(3))
+        ));
     }
 
     #[test]

@@ -52,6 +52,10 @@ The relay logs structured JSON to the console (Workers observability); `pc` and 
 
 "Report a problem" is in the Flutter app (Ctrl+Shift+F, Settings, session menu), the browser viewer (Ctrl+Shift+F, More, Settings) and the tray menu (opens the app's sheet over the devices pipe, `open-feedback` / `openFeedback`). A report holds the text, kind (bug, complaint, idea, other), timestamp, app version and commit, platform, device, PC, session, screen, the last 200 log lines, the last 20 errors and, in the app, a screenshot of the Flutter UI (never the stream). On Android, shaking the phone opens the sheet (not during a session). If the app is not installed, the tray shows a small text box and saves the report straight to `feedback\<ts>-this-pc.json`. It is saved in the client outbox and sent to the PC the client is connected to.
 
+## Warn versus info (updated 2026-11-03)
+
+Expected events log at info: media closed by the relay with "viewer departed" or a stale epoch, mDNS `.local` remote candidates, input paused for a native file drag, capture unavailable because the display is off, and the tray's agent probe finding no pipe within 20 s of starting the agent. Anything else in those places stays at warn. Serve failures log the time since the last relay registration; the serve retry delay restarts at 1 s after a run that was registered for over 60 s. The WSS v4 media link pings every 15 s on its own clock, and a silent-link close reports the inbound age and ping count. The tray logs why it stops the admin agent (`reason`).
+
 ## Finding what happened around a feedback timestamp
 
 ```

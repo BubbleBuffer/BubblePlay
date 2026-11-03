@@ -666,6 +666,11 @@ impl Session {
         self.channel_mut()?.seal(kind, bytes)
     }
 
+    /// No peer event has arrived yet: a viewer message now is ahead of its `peer-joined`.
+    pub fn awaiting_peer(&self) -> bool {
+        matches!(self.state, State::Idle)
+    }
+
     /// The normal handshake finished and the ctl channel is open.
     pub fn is_established(&self) -> bool {
         matches!(self.state, State::Established(_))

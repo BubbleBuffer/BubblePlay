@@ -660,6 +660,18 @@ impl CaptureSelection {
 /// unintended display after a remembered monitor disappears.
 const REMEMBERED_MONITOR_MAX_ATTEMPTS: u32 = 3;
 
+/// A failed serve run that had been registered with the relay this long was healthy; the next
+/// retry starts over at the minimum backoff instead of the 30 s ceiling.
+const SERVE_HEALTHY_RUN: Duration = Duration::from_secs(60);
+
+fn next_serve_backoff(current: Duration, registered_for: Option<Duration>) -> Duration {
+    if registered_for.is_some_and(|d| d > SERVE_HEALTHY_RUN) {
+        Duration::from_secs(1)
+    } else {
+        (current * 2).min(Duration::from_secs(30))
+    }
+}
+
 fn remembered_monitor_attempt_exhausted(attempts: u32) -> bool {
     attempts >= REMEMBERED_MONITOR_MAX_ATTEMPTS
 }
@@ -782,6 +794,7 @@ fn run_serve_forever(args: &Args) -> Result<()> {
     let devices_host = std::sync::Arc::new(std::sync::Mutex::new(devices_host));
     let mut selection = CaptureSelection::from_launch(args.monitor.as_deref());
     let mut backoff = Duration::from_secs(1);
+    let mut last_registered_at: Option<Instant> = None;
     let mut unavailable_attempts = 0u32;
     loop {
         if selection.is_runtime() {
@@ -806,8 +819,18 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                 unavailable_attempts = 0;
             }
         }
-        let served = run_serve(args, &mut selection, devices_host.clone(), &relay_online);
+        let mut registered_at: Option<Instant> = None;
+        let served = run_serve(
+            args,
+            &mut selection,
+            devices_host.clone(),
+            &relay_online,
+            &mut registered_at,
+        );
         relay_online.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(at) = registered_at {
+            last_registered_at = Some(at);
+        }
         match served {
             Ok(()) => {
                 info!("session ended — waiting for next client");
@@ -819,13 +842,16 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                 // and briefly 500ing new connections. That's transient —
                 // retry with backoff instead of taking the host down.
                 // `{:#}` prints the whole anyhow chain on one line ("signaling socket read failed (io): <os or tls error>").
+                let registered_for = registered_at.map(|at| at.elapsed());
                 error!(
                     error = %format!("{e:#}"),
                     backoff_secs = backoff.as_secs(),
+                    registered_for_secs = registered_for.map(|d| d.as_secs()),
+                    since_last_registration_secs = last_registered_at.map(|at| at.elapsed().as_secs()),
                     "serve session failed — retrying"
                 );
                 std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                backoff = next_serve_backoff(backoff, registered_for);
             }
         }
     }
@@ -1039,6 +1065,7 @@ fn run_serve(
     selection: &mut CaptureSelection,
     devices_ui: bubbleplay_host::dk_host::SharedDevicesUi,
     relay_online: &std::sync::atomic::AtomicBool,
+    registered_at: &mut Option<Instant>,
 ) -> Result<()> {
     let watchdog = match session_watchdog::SessionWatchdog::start() {
         Ok(watchdog) => Some(watchdog),
@@ -1122,6 +1149,7 @@ fn run_serve(
     // The route's ticket expires 12 h after this hello-ok while the socket can
     // stay open; an idle session re-registers before then.
     let relay_registered_at = Instant::now();
+    *registered_at = Some(relay_registered_at);
     // File transfer runs in the user-level host (Downloads, clipboard and Send To
     // belong to the interactive user); the authenticated signaling route supplies
     // the file socket ticket.
@@ -2043,11 +2071,21 @@ fn run_serve(
                             "capture-unavailable",
                         );
                     }
-                    warn!(
-                        generation = media_generation,
-                        reason = %source.unavailable_reason(),
-                        "desktop capture unavailable; input suspended"
-                    );
+                    // A powered-off display comes back by itself: expected, not a fault.
+                    let reason = source.unavailable_reason();
+                    if reason == "display off" {
+                        info!(
+                            generation = media_generation,
+                            %reason,
+                            "desktop capture unavailable; input suspended"
+                        );
+                    } else {
+                        warn!(
+                            generation = media_generation,
+                            %reason,
+                            "desktop capture unavailable; input suspended"
+                        );
+                    }
                 }
                 CaptureAvailability::Active => {
                     capture_available = true;
@@ -2489,7 +2527,10 @@ fn run_serve(
                     switch_capture_monitor!(&selector, true);
                     // Same relative position on the new monitor while the
                     // button is still held, so the dragged window comes along.
-                    if capture.monitor_selector().eq_ignore_ascii_case(&selector) {
+                    // A cursor already past the edge is on the new monitor: leave it there.
+                    if from.contains(cursor)
+                        && capture.monitor_selector().eq_ignore_ascii_case(&selector)
+                    {
                         let (x, y) = follow_window::carry_cursor(cursor, from, to);
                         if !follow_window::set_cursor(x, y) {
                             warn!("follow active window: edge hold could not move the cursor");
@@ -6733,6 +6774,25 @@ fn physical_monitor_count() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn serve_backoff_resets_after_a_healthy_run_and_grows_on_quick_failures() {
+        use std::time::Duration;
+        let max = Duration::from_secs(30);
+        assert_eq!(
+            super::next_serve_backoff(max, Some(Duration::from_secs(120))),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            super::next_serve_backoff(Duration::from_secs(4), Some(Duration::from_secs(5))),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            super::next_serve_backoff(Duration::from_secs(1), None),
+            Duration::from_secs(2)
+        );
+        assert_eq!(super::next_serve_backoff(max, None), max);
+    }
+
     #[test]
     fn audio_cli_defaults_on_and_accepts_no_audio() {
         assert!(super::parse_args_from(std::iter::empty()).unwrap().audio);

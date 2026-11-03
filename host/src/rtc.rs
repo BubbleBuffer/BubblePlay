@@ -201,6 +201,15 @@ impl RtcSession {
                 self.rtc.add_remote_candidate(c);
                 debug!(sdp, "added remote candidate");
             }
+            // Browsers hide host addresses behind mDNS `.local` names that str0m cannot resolve;
+            // the viewer's other candidates carry the connection, so that is expected.
+            Err(e) if sdp.contains(".local") => {
+                info!(
+                    sdp,
+                    ?e,
+                    "ignoring mDNS remote candidate (cannot be resolved)"
+                )
+            }
             Err(e) => warn!(sdp, ?e, "ignoring bad remote candidate"),
         }
     }

@@ -78,7 +78,14 @@ pub struct HostProtocol {
     /// Receiving side of the client log and feedback upload; `None` when the logs directory is
     /// unusable (the `client-logs-v1` capability is then not advertised).
     upload: Option<LogUpload>,
+    /// An `auth-hello` that arrived before its `peer-joined` (the relay can deliver them in that
+    /// order after a re-registration), held briefly and verified like any other hello once the
+    /// peer-joined arrives.
+    early_hello: Option<(String, Instant)>,
 }
+
+/// How long an early `auth-hello` waits for its `peer-joined`.
+const EARLY_HELLO_WINDOW: Duration = Duration::from_secs(3);
 
 impl HostProtocol {
     /// A damaged trust file is an error, never an empty replacement list. The UI receives the
@@ -163,6 +170,7 @@ impl HostProtocol {
             dtls_seen: false,
             effects: Vec::new(),
             last_drop_log: None,
+            early_hello: None,
             dropped: 0,
             peer_viewer: None,
             upload,
@@ -198,6 +206,8 @@ impl HostProtocol {
     /// A new relay event always fences the old producer, including a warm WSS/RTC connection.
     pub fn peer_joined(&mut self, text: &str) -> Result<()> {
         self.expire_pairing(Instant::now());
+        // reset_peer below clears the held hello, so take it first.
+        let early_hello = self.early_hello.take();
         let peer = match dk_session::parse_peer_joined(text) {
             Ok(peer) => peer,
             Err(error) => {
@@ -239,6 +249,16 @@ impl HostProtocol {
         let events = self.session.peer_joined(peer, trusted, code)?;
         self.consume(events, false)?;
         self.queue_list();
+        if let Some((hello, held_at)) = early_hello {
+            if held_at.elapsed() <= EARLY_HELLO_WINDOW {
+                tracing::info!(
+                    held_ms = held_at.elapsed().as_millis() as u64,
+                    "auth-hello arrived before peer-joined; handling it now"
+                );
+                // Same checks as a hello received after the peer-joined.
+                self.receive(&hello)?;
+            }
+        }
         Ok(())
     }
 
@@ -282,9 +302,15 @@ impl HostProtocol {
             self.terminate();
             return Ok(Vec::new());
         }
-        let is_ctl = serde_json::from_str::<Value>(text)
+        let message_type = serde_json::from_str::<Value>(text)
             .ok()
-            .is_some_and(|value| value["type"] == "ctl");
+            .and_then(|value| value["type"].as_str().map(str::to_owned));
+        if message_type.as_deref() == Some("auth-hello") && self.session.awaiting_peer() {
+            tracing::info!("auth-hello before peer-joined; holding it for the peer-joined");
+            self.early_hello = Some((text.to_owned(), Instant::now()));
+            return Ok(Vec::new());
+        }
+        let is_ctl = message_type.as_deref() == Some("ctl");
         let established_ctl = is_ctl && self.session.is_established();
         let first_ctl = established_ctl && !self.first_ctl_seen;
         let events = match self.session.on_text(text) {
@@ -524,6 +550,7 @@ impl HostProtocol {
             upload.stop();
         }
         self.session.stop(End::Stopped("viewer reset"));
+        self.early_hello = None;
         self.epoch = None;
         self.peer_pairing = false;
         self.waiting_decision = None;
@@ -1068,6 +1095,42 @@ mod tests {
     fn joined(pairing: bool) -> String {
         json!({"type":"peer-joined", "mediaEpoch":fixture()["handshake"]["sessionEpoch"], "pairing":pairing}).to_string()
     }
+    #[test]
+    fn auth_hello_before_peer_joined_is_held_and_handled_after_it() {
+        let f = fixture();
+        let hello = f["handshake"]["messages"]["authHello"].to_string();
+        let finish = f["handshake"]["messages"]["authFinish"].to_string();
+        let scratch = Scratch::new();
+        let (mut host, _ui) = controller(&scratch.list(), true);
+        // The hello comes first: nothing happens yet, and it is not a failure.
+        assert!(host.receive(&hello).unwrap().is_empty());
+        assert!(host.session.awaiting_peer());
+        // The peer-joined arrives; the held hello is verified as usual (auth-host goes out).
+        host.peer_joined(&joined(false)).unwrap();
+        assert!(!host.session.awaiting_peer());
+        assert!(host
+            .take_effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(v) if v["type"] == "auth-host")));
+        host.receive(&finish).unwrap();
+        assert!(host.viewer_epoch().is_some());
+    }
+
+    #[test]
+    fn stale_early_hello_is_dropped_not_replayed() {
+        let f = fixture();
+        let hello = f["handshake"]["messages"]["authHello"].to_string();
+        let scratch = Scratch::new();
+        let (mut host, _ui) = controller(&scratch.list(), true);
+        host.receive(&hello).unwrap();
+        host.early_hello.as_mut().unwrap().1 = Instant::now() - EARLY_HELLO_WINDOW * 2;
+        host.peer_joined(&joined(false)).unwrap();
+        assert!(!host
+            .take_effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(v) if v["type"] == "auth-host")));
+    }
+
     /// The device-key handshake only: the transport mode is still unset.
     fn handshake(host: &mut HostProtocol) {
         let f = fixture();

@@ -27,9 +27,9 @@ pub const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(1);
 /// Edge-hold sampling cadence, used only while a move loop is active.
 pub const EDGE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 /// How long the cursor must stay at the edge before the stream switches.
-pub const EDGE_HOLD: Duration = Duration::from_millis(250);
+pub const EDGE_HOLD: Duration = Duration::from_millis(150);
 /// The edge zone: the cursor is at most this many pixels from the edge.
-pub const EDGE_ZONE_PX: i32 = 2;
+pub const EDGE_ZONE_PX: i32 = 8;
 
 /// The monitor holding most of the foreground window, as Win32 reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,13 +136,42 @@ struct EdgeHold {
     zone: Option<(Instant, Rect)>,
     /// An edge switch happened; no other until the cursor left the zone.
     disarmed: bool,
+    /// Closest the cursor came to an edge of the current monitor in this loop (negative: past it).
+    min_distance: Option<i32>,
+    /// A neighbouring monitor was found at some point in this loop.
+    neighbour_seen: bool,
+    /// The last reason logged for not switching, so a held state logs once.
+    last_reason: Option<&'static str>,
 }
 
-/// The monitor directly behind the edge of `current` that `cursor` is within
-/// [`EDGE_ZONE_PX`] of, at the cursor's position along that edge.
-pub fn edge_target(cursor: (i32, i32), current: Rect, monitors: &[Rect]) -> Option<Rect> {
+impl EdgeHold {
+    fn note(&mut self, reason: &'static str) {
+        if self.last_reason != Some(reason) {
+            self.last_reason = Some(reason);
+            tracing::info!(reason, "follow active window: edge hold did not switch");
+        }
+    }
+}
+
+/// How far the cursor is from the nearest edge of `current`: 0 on the edge pixel, negative when
+/// it is already past an edge.
+pub fn edge_distance(cursor: (i32, i32), current: Rect) -> i32 {
+    let (x, y) = cursor;
+    (x - current.left)
+        .min(current.right - 1 - x)
+        .min(y - current.top)
+        .min(current.bottom - 1 - y)
+}
+
+/// The monitor the cursor should carry the stream to, and whether the cursor is already on it
+/// (past the edge, as relative input can take the host cursor) rather than only near the edge.
+/// Neighbours come from the real monitor rectangles, whatever the layout.
+pub fn edge_probe(cursor: (i32, i32), current: Rect, monitors: &[Rect]) -> Option<(Rect, bool)> {
     if !current.contains(cursor) {
-        return None;
+        return monitors
+            .iter()
+            .find(|m| **m != current && m.contains(cursor))
+            .map(|m| (*m, true));
     }
     let (x, y) = cursor;
     // The point just beyond each edge the cursor is near.
@@ -156,8 +185,14 @@ pub fn edge_target(cursor: (i32, i32), current: Rect, monitors: &[Rect]) -> Opti
         monitors
             .iter()
             .find(|m| **m != current && m.contains(probe))
-            .copied()
+            .map(|m| (*m, false))
     })
+}
+
+/// The monitor behind (or under the cursor past) the edge of `current` that `cursor` is within
+/// [`EDGE_ZONE_PX`] of.
+pub fn edge_target(cursor: (i32, i32), current: Rect, monitors: &[Rect]) -> Option<Rect> {
+    edge_probe(cursor, current, monitors).map(|(target, _)| target)
 }
 
 /// Feed one edge-hold sample (only taken while a move loop may be active).
@@ -176,9 +211,20 @@ pub fn observe_edge(
     let last_switch = follow.last_switch;
     let edge = &mut follow.edge;
     let Some(sample) = moving else {
+        if edge.loop_start.is_some() {
+            tracing::info!(
+                closest_edge_px = edge.min_distance,
+                neighbour_found = edge.neighbour_seen,
+                switched = edge.disarmed,
+                "follow active window: window move ended"
+            );
+        }
         edge.loop_start = None;
         edge.resized = false;
         edge.zone = None;
+        edge.min_distance = None;
+        edge.neighbour_seen = false;
+        edge.last_reason = None;
         return None;
     };
     match edge.loop_start {
@@ -191,15 +237,31 @@ pub fn observe_edge(
             edge.loop_start = Some((sample.window, sample.size));
             edge.resized = false;
             edge.zone = None;
+            edge.min_distance = None;
+            edge.neighbour_seen = false;
+            edge.last_reason = None;
+            tracing::info!("follow active window: window move started");
         }
     }
-    let Some(target) = edge_target(sample.cursor, current, monitors) else {
-        edge.zone = None;
+    let distance = edge_distance(sample.cursor, current);
+    edge.min_distance = Some(edge.min_distance.map_or(distance, |d| d.min(distance)));
+    let Some((target, past_edge)) = edge_probe(sample.cursor, current, monitors) else {
+        if edge.zone.take().is_some() {
+            edge.note("left the edge zone before the hold elapsed");
+        } else if distance <= EDGE_ZONE_PX {
+            edge.note("no neighbouring monitor behind this edge");
+        }
         edge.disarmed = false;
         return None;
     };
+    edge.neighbour_seen = true;
     if edge.resized || edge.disarmed {
         edge.zone = None;
+        edge.note(if edge.resized {
+            "the window is being resized"
+        } else {
+            "already switched; waiting for the cursor to leave the zone"
+        });
         return None;
     }
     let since = match edge.zone {
@@ -209,9 +271,12 @@ pub fn observe_edge(
             now
         }
     };
-    if now.saturating_duration_since(since) < EDGE_HOLD
-        || last_switch.is_some_and(|at| now.saturating_duration_since(at) < MIN_SWITCH_INTERVAL)
-    {
+    let hold = if past_edge { Duration::ZERO } else { EDGE_HOLD };
+    if now.saturating_duration_since(since) < hold {
+        return None;
+    }
+    if last_switch.is_some_and(|at| now.saturating_duration_since(at) < MIN_SWITCH_INTERVAL) {
+        edge.note("cooldown after the last switch");
         return None;
     }
     edge.zone = None;
@@ -296,6 +361,53 @@ pub fn is_shell_class(class: &str) -> bool {
     )
 }
 
+/// A window that covers (nearly) all of at least two monitors is a screen-wide overlay, such as
+/// the Snipping Tool's capture layer, not a window living on one monitor. Following it would jump
+/// monitors, so it is ignored like a shell window.
+pub fn spans_multiple_monitors(window: Rect, monitors: &[Rect]) -> bool {
+    fn area(r: Rect) -> i64 {
+        i64::from((r.right - r.left).max(0)) * i64::from((r.bottom - r.top).max(0))
+    }
+    monitors
+        .iter()
+        .filter(|m| {
+            let overlap = Rect {
+                left: window.left.max(m.left),
+                top: window.top.max(m.top),
+                right: window.right.min(m.right),
+                bottom: window.bottom.min(m.bottom),
+            };
+            let monitor_area = area(**m);
+            monitor_area > 0 && area(overlap) * 10 >= monitor_area * 9
+        })
+        .count()
+        >= 2
+}
+
+/// The desktop rectangle of every attached monitor.
+fn monitor_rects() -> Vec<Rect> {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+    unsafe extern "system" fn collect(_: HMONITOR, _: HDC, rect: *mut RECT, data: LPARAM) -> BOOL {
+        // SAFETY: `data` is the Vec passed below and `rect` is valid for this call.
+        let (rects, r) = unsafe { (&mut *(data.0 as *mut Vec<Rect>), &*rect) };
+        rects.push(Rect {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        });
+        BOOL(1)
+    }
+    let mut rects: Vec<Rect> = Vec::new();
+    // SAFETY: the callback only runs during this call and `rects` outlives it.
+    let _ = unsafe {
+        EnumDisplayMonitors(None, None, Some(collect), LPARAM((&raw mut rects) as isize))
+    };
+    rects
+}
+
 /// Map a sampled monitor to a capture selector. Capture selectors are the
 /// monitor device names (`enumerate_monitors`), so the device name decides;
 /// the origin is a fallback for a monitor whose name could not be matched.
@@ -361,6 +473,22 @@ pub fn sample_foreground() -> Sample {
             String::new()
         };
         if is_shell_class(&class) {
+            return Sample::Ignored;
+        }
+        let mut window_rect = windows::Win32::Foundation::RECT::default();
+        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window_rect).is_ok()
+            && spans_multiple_monitors(
+                Rect {
+                    left: window_rect.left,
+                    top: window_rect.top,
+                    right: window_rect.right,
+                    bottom: window_rect.bottom,
+                },
+                &monitor_rects(),
+            )
+        {
+            // Ignored, so the current pair stays handled: coming back to the previous window
+            // does not switch either.
             return Sample::Ignored;
         }
         let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -492,6 +620,57 @@ mod tests {
                 pid,
             },
         }
+    }
+
+    #[test]
+    fn spanning_overlay_is_not_a_window_on_one_monitor() {
+        let left = Rect::new(0, 0, 1920, 1080);
+        let right = Rect::new(1920, 0, 2560, 1440);
+        let monitors = [left, right];
+        // A full virtual-screen overlay.
+        assert!(spans_multiple_monitors(
+            Rect::new(0, 0, 4480, 1440),
+            &monitors
+        ));
+        // Normal windows, maximised or straddling an edge, are not.
+        assert!(!spans_multiple_monitors(
+            Rect::new(1920, 0, 2560, 1440),
+            &monitors
+        ));
+        assert!(!spans_multiple_monitors(
+            Rect::new(1500, 100, 1000, 800),
+            &monitors
+        ));
+        assert!(!spans_multiple_monitors(
+            Rect::new(100, 100, 800, 600),
+            &monitors
+        ));
+        assert!(!spans_multiple_monitors(
+            Rect::new(0, 0, 4480, 1440),
+            &[left]
+        ));
+    }
+
+    #[test]
+    fn overlay_does_not_switch_and_returning_to_the_previous_window_does_not_either() {
+        let t = Instant::now();
+        let mut f = FollowWindow::default();
+        let win = |window, n| Sample::Window {
+            window,
+            monitor: mon(n),
+            details: WindowDetails::default(),
+        };
+        f.observe(win(1, 1), tick(t, 0));
+        assert!(f.observe(win(1, 1), tick(t, 1)).is_some());
+        // The sampler reports the spanning overlay as Ignored.
+        assert_eq!(f.observe(Sample::Ignored, tick(t, 2)), None);
+        assert_eq!(f.observe(Sample::Ignored, tick(t, 3)), None);
+        // Back on the first window: already handled, no switch.
+        assert_eq!(f.observe(win(1, 1), tick(t, 4)), None);
+        assert_eq!(f.observe(win(1, 1), tick(t, 5)), None);
+        // A normal window on the other monitor still switches.
+        assert_eq!(f.observe(win(2, 2), tick(t, 6)), None);
+        assert_eq!(f.observe(win(2, 2), tick(t, 7)), Some(mon(2)));
     }
 
     fn tick(start: Instant, step: u32) -> Instant {
@@ -723,29 +902,29 @@ mod tests {
     }
 
     #[test]
-    fn edge_hold_shorter_than_250_ms_does_nothing() {
+    fn edge_hold_shorter_than_150_ms_does_nothing() {
         let t = Instant::now();
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (1919, 500), M1, 0, 200), None);
-        // Leaving the edge before 250 ms restarts the hold.
+        assert_eq!(hold(&mut f, t, (1919, 500), M1, 0, 100), None);
+        // Leaving the edge zone before 150 ms restarts the hold.
         assert_eq!(
-            observe_edge(Some(&mut f), moving((1000, 500)), &ALL, M1, ms(t, 250)),
+            observe_edge(Some(&mut f), moving((1000, 500)), &ALL, M1, ms(t, 150)),
             None
         );
-        assert_eq!(hold(&mut f, t, (1919, 500), M1, 300, 500), None);
+        assert_eq!(hold(&mut f, t, (1919, 500), M1, 200, 300), None);
     }
 
     #[test]
-    fn edge_hold_of_250_ms_with_a_neighbour_switches() {
+    fn edge_hold_of_150_ms_with_a_neighbour_switches() {
         let t = Instant::now();
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (1918, 500), M1, 0, 1000), Some((250, M2)));
+        assert_eq!(hold(&mut f, t, (1918, 500), M1, 0, 1000), Some((150, M2)));
         // Monitor 2's left edge leads back to monitor 1.
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (1920, 100), M2, 0, 1000), Some((250, M1)));
+        assert_eq!(hold(&mut f, t, (1920, 100), M2, 0, 1000), Some((150, M1)));
         // Bottom edge of monitor 1 over monitor 3.
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (300, 1079), M1, 0, 1000), Some((250, M3)));
+        assert_eq!(hold(&mut f, t, (300, 1079), M1, 0, 1000), Some((150, M3)));
     }
 
     #[test]
@@ -754,8 +933,8 @@ mod tests {
         let mut f = FollowWindow::default();
         assert_eq!(hold(&mut f, t, (0, 500), M1, 0, 2000), None);
         assert_eq!(hold(&mut f, t, (500, 0), M1, 0, 2000), None);
-        // 3 px from the edge is outside the zone.
-        assert_eq!(hold(&mut f, t, (1916, 500), M1, 0, 2000), None);
+        // 20 px from the edge is outside the zone.
+        assert_eq!(hold(&mut f, t, (1899, 500), M1, 0, 2000), None);
     }
 
     #[test]
@@ -794,7 +973,7 @@ mod tests {
         );
         assert_eq!(
             hold(&mut f, t, (1919, 500), M1, 3100, 4000),
-            Some((3350, M2))
+            Some((3250, M2))
         );
     }
 
@@ -802,7 +981,7 @@ mod tests {
     fn no_second_switch_until_the_cursor_left_the_edge_zone() {
         let t = Instant::now();
         let mut f = FollowWindow::default();
-        assert_eq!(hold(&mut f, t, (1919, 500), M1, 0, 250), Some((250, M2)));
+        assert_eq!(hold(&mut f, t, (1919, 500), M1, 0, 250), Some((150, M2)));
         f.switched(ms(t, 250));
         // Suppose the stream switched but the cursor is still at monitor 1's
         // edge (current stays M1 here): no repeat, however long.
@@ -814,8 +993,49 @@ mod tests {
         );
         assert_eq!(
             hold(&mut f, t, (1919, 500), M1, 5100, 6000),
-            Some((5350, M2))
+            Some((5250, M2))
         );
+    }
+
+    #[test]
+    fn cursor_past_the_edge_on_the_neighbour_switches_at_once() {
+        let t = Instant::now();
+        // Relative input carried the host cursor onto monitor 2 while monitor 1 is captured.
+        let mut f = FollowWindow::default();
+        assert_eq!(hold(&mut f, t, (2100, 500), M1, 0, 1000), Some((0, M2)));
+        // Also across a vertical neighbour.
+        let mut f = FollowWindow::default();
+        assert_eq!(hold(&mut f, t, (300, 1200), M1, 0, 1000), Some((0, M3)));
+        // The cooldown still applies.
+        let mut f = FollowWindow::default();
+        f.switched(ms(t, 0));
+        assert_eq!(hold(&mut f, t, (2100, 500), M1, 0, 2000), Some((1000, M2)));
+    }
+
+    #[test]
+    fn jitter_inside_the_zone_does_not_restart_the_hold() {
+        let t = Instant::now();
+        let mut f = FollowWindow::default();
+        let found = [1912, 1919, 1915, 1913]
+            .iter()
+            .cycle()
+            .take(8)
+            .enumerate()
+            .find_map(|(i, x)| {
+                let at = (i as u64) * 50;
+                observe_edge(Some(&mut f), moving((*x, 500)), &ALL, M1, ms(t, at)).map(|r| (at, r))
+            });
+        assert_eq!(found, Some((150, M2)));
+    }
+
+    #[test]
+    fn past_the_edge_without_a_monitor_there_does_not_switch() {
+        let t = Instant::now();
+        let mut f = FollowWindow::default();
+        // Off every monitor (a gap), and past monitor 1's top edge.
+        assert_eq!(hold(&mut f, t, (-30, 500), M1, 0, 2000), None);
+        assert_eq!(hold(&mut f, t, (500, -30), M1, 0, 2000), None);
+        assert_eq!(edge_distance((-30, 500), M1), -30);
     }
 
     #[test]
@@ -852,9 +1072,9 @@ mod tests {
         let start = 2 * 250;
         assert_eq!(
             hold(&mut f, t, (1919, 500), M1, start + 1000, start + 2000),
-            Some((start + 1250, M2))
+            Some((start + 1150, M2))
         );
-        f.switched(ms(t, start + 1250));
+        f.switched(ms(t, start + 1150));
         // Dropped on monitor 2, the now-streamed monitor: the drop rule names
         // monitor 2 (the caller sees it is already streamed) and never 1.
         f.observe(Sample::Busy, ms(t, start + 1300));
