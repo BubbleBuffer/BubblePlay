@@ -40,7 +40,18 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val context = applicationContext
-        val controller = StreamController(flutterEngine.renderer)
+        val messenger = flutterEngine.dartExecutor.binaryMessenger
+        // The log upload's ctl bridge: events go to Dart on the main thread, calls come from it.
+        val ctlFlutterApi = CtlFlutterApi(messenger)
+        val ctlShell = CtlShell { kind, json ->
+            CoroutineScope(Dispatchers.Main).launch {
+                try {
+                    ctlFlutterApi.ctlEvent(kind, json)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        val controller = StreamController(flutterEngine.renderer, onCtl = ctlShell::attach)
         stream = controller
         val backend = try {
             AppBackend(
@@ -59,7 +70,6 @@ class MainActivity : FlutterActivity() {
         }
         this.backend = backend
         val runner = ActRunner(backend, worker)
-        val messenger = flutterEngine.dartExecutor.binaryMessenger
         val flutterApi = AppFlutterApi(messenger)
         backend.setNotifier {
             CoroutineScope(Dispatchers.Main).launch {
@@ -78,6 +88,14 @@ class MainActivity : FlutterActivity() {
                 override suspend fun act(actionJson: String) = runner.act(actionJson)
 
                 override fun exportKey(): String = backend.exportKey()
+            },
+        )
+        CtlHostApi.setUp(
+            messenger,
+            object : CtlHostApi {
+                override suspend fun ctlSend(json: String): Boolean = ctlShell.send(json)
+
+                override fun ctlState(): CtlState = ctlShell.state()
             },
         )
         // The video seam (app/lib/src/session/stream_channel.dart): the texture id of the session

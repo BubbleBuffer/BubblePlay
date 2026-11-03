@@ -7,6 +7,7 @@ import android.util.Log
 import android.view.Choreographer
 import android.view.Surface
 import de.bubblebuffer.bubbleplay.keys.DeviceKey
+import de.bubblebuffer.bubbleplay.log.CtlPassThrough
 import de.bubblebuffer.bubbleplay.net.Session
 import de.bubblebuffer.bubbleplay.pcs.PcEntry
 import io.flutter.view.TextureRegistry
@@ -19,6 +20,8 @@ import io.flutter.view.TextureRegistry
 internal class StreamController(
     private val textures: TextureRegistry,
     private val opener: StreamOpener = RealStreamOpener,
+    /** Told the ctl pass-through of each new session, and null when it ends (the log upload bridge). */
+    private val onCtl: (CtlPassThrough?) -> Unit = {},
 ) : StreamHost {
     private val main = Handler(Looper.getMainLooper())
 
@@ -127,6 +130,7 @@ internal class StreamController(
             return
         }
         port = opened
+        onCtl(opened.ctl)
         surfaces.bind()
         surfaces.available(texture.surface)
         opened.start()
@@ -145,6 +149,7 @@ internal class StreamController(
         port = null
         picture = false
         current?.stop()
+        onCtl(null)
         texture?.setCallback(null)
         texture?.release()
     }

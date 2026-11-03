@@ -43,6 +43,150 @@ private object PigeonPigeonUtils {
       )
     }
   }
+  fun doubleEquals(a: Double, b: Double): Boolean {
+    // Normalize -0.0 to 0.0 and handle NaN equality.
+    return (if (a == 0.0) 0.0 else a) == (if (b == 0.0) 0.0 else b) || (a.isNaN() && b.isNaN())
+  }
+
+  fun floatEquals(a: Float, b: Float): Boolean {
+    // Normalize -0.0 to 0.0 and handle NaN equality.
+    return (if (a == 0.0f) 0.0f else a) == (if (b == 0.0f) 0.0f else b) || (a.isNaN() && b.isNaN())
+  }
+
+  fun doubleHash(d: Double): Int {
+    // Normalize -0.0 to 0.0 and handle NaN to ensure consistent hash codes.
+    val normalized = if (d == 0.0) 0.0 else d
+    val bits = java.lang.Double.doubleToLongBits(normalized)
+    return (bits xor (bits ushr 32)).toInt()
+  }
+
+  fun floatHash(f: Float): Int {
+    // Normalize -0.0 to 0.0 and handle NaN to ensure consistent hash codes.
+    val normalized = if (f == 0.0f) 0.0f else f
+    return java.lang.Float.floatToIntBits(normalized)
+  }
+
+  fun deepEquals(a: Any?, b: Any?): Boolean {
+    if (a === b) {
+      return true
+    }
+    if (a == null || b == null) {
+      return false
+    }
+    if (a is ByteArray && b is ByteArray) {
+      return a.contentEquals(b)
+    }
+    if (a is IntArray && b is IntArray) {
+      return a.contentEquals(b)
+    }
+    if (a is LongArray && b is LongArray) {
+      return a.contentEquals(b)
+    }
+    if (a is DoubleArray && b is DoubleArray) {
+      if (a.size != b.size) return false
+      for (i in a.indices) {
+        if (!doubleEquals(a[i], b[i])) return false
+      }
+      return true
+    }
+    if (a is FloatArray && b is FloatArray) {
+      if (a.size != b.size) return false
+      for (i in a.indices) {
+        if (!floatEquals(a[i], b[i])) return false
+      }
+      return true
+    }
+    if (a is Array<*> && b is Array<*>) {
+      if (a.size != b.size) return false
+      for (i in a.indices) {
+        if (!deepEquals(a[i], b[i])) return false
+      }
+      return true
+    }
+    if (a is List<*> && b is List<*>) {
+      if (a.size != b.size) return false
+      val iterA = a.iterator()
+      val iterB = b.iterator()
+      while (iterA.hasNext() && iterB.hasNext()) {
+        if (!deepEquals(iterA.next(), iterB.next())) return false
+      }
+      return true
+    }
+    if (a is Map<*, *> && b is Map<*, *>) {
+      if (a.size != b.size) return false
+      for (entry in a) {
+        val key = entry.key
+        var found = false
+        for (bEntry in b) {
+          if (deepEquals(key, bEntry.key)) {
+            if (deepEquals(entry.value, bEntry.value)) {
+              found = true
+              break
+            } else {
+              return false
+            }
+          }
+        }
+        if (!found) return false
+      }
+      return true
+    }
+    if (a is Double && b is Double) {
+      return doubleEquals(a, b)
+    }
+    if (a is Float && b is Float) {
+      return floatEquals(a, b)
+    }
+    return a == b
+  }
+
+  fun deepHash(value: Any?): Int {
+    return when (value) {
+      null -> 0
+      is ByteArray -> value.contentHashCode()
+      is IntArray -> value.contentHashCode()
+      is LongArray -> value.contentHashCode()
+      is DoubleArray -> {
+        var result = 1
+        for (item in value) {
+          result = 31 * result + doubleHash(item)
+        }
+        result
+      }
+      is FloatArray -> {
+        var result = 1
+        for (item in value) {
+          result = 31 * result + floatHash(item)
+        }
+        result
+      }
+      is Array<*> -> {
+        var result = 1
+        for (item in value) {
+          result = 31 * result + deepHash(item)
+        }
+        result
+      }
+      is List<*> -> {
+        var result = 1
+        for (item in value) {
+          result = 31 * result + deepHash(item)
+        }
+        result
+      }
+      is Map<*, *> -> {
+        var result = 0
+        for (entry in value) {
+          result += ((deepHash(entry.key) * 31) xor deepHash(entry.value))
+        }
+        result
+      }
+      is Double -> doubleHash(value)
+      is Float -> floatHash(value)
+      else -> value.hashCode()
+    }
+  }
+
 }
 
 /**
@@ -56,12 +200,88 @@ class FlutterError (
   override val message: String? = null,
   val details: Any? = null
 ) : RuntimeException()
+
+/**
+ * The session control channel as the Dart upload queue sees it (docs/architecture/client-log-upload.md):
+ * the Kotlin shell hands it the ctl messages of the active session and sends what Dart queues.
+ *
+ * Generated class from Pigeon that represents data sent in messages.
+ */
+data class CtlState (
+  /** An authenticated connection is up. */
+  val open: Boolean,
+  /** Bytes waiting in the ctl send buffer. */
+  val bufferedBytes: Long,
+  /** Milliseconds since the last input event was sent; the largest int64 when there was none. */
+  val sinceLastInputMs: Long,
+  /** The connected PC's id; empty when there is no connection. */
+  val pcId: String,
+  /** The capabilities the PC advertised; empty when there is no connection. */
+  val peerCaps: List<String>
+)
+ {
+  companion object {
+    fun fromList(pigeonVar_list: List<Any?>): CtlState {
+      val open = pigeonVar_list[0] as Boolean
+      val bufferedBytes = pigeonVar_list[1] as Long
+      val sinceLastInputMs = pigeonVar_list[2] as Long
+      val pcId = pigeonVar_list[3] as String
+      val peerCaps = pigeonVar_list[4] as List<String>
+      return CtlState(open, bufferedBytes, sinceLastInputMs, pcId, peerCaps)
+    }
+  }
+  fun toList(): List<Any?> {
+    return listOf(
+      open,
+      bufferedBytes,
+      sinceLastInputMs,
+      pcId,
+      peerCaps,
+    )
+  }
+  override fun equals(other: Any?): Boolean {
+    if (other == null || other.javaClass != javaClass) {
+      return false
+    }
+    if (this === other) {
+      return true
+    }
+    val other = other as CtlState
+    return PigeonPigeonUtils.deepEquals(this.open, other.open) && PigeonPigeonUtils.deepEquals(this.bufferedBytes, other.bufferedBytes) && PigeonPigeonUtils.deepEquals(this.sinceLastInputMs, other.sinceLastInputMs) && PigeonPigeonUtils.deepEquals(this.pcId, other.pcId) && PigeonPigeonUtils.deepEquals(this.peerCaps, other.peerCaps)
+  }
+
+  override fun hashCode(): Int {
+    var result = javaClass.hashCode()
+    result = 31 * result + PigeonPigeonUtils.deepHash(this.open)
+    result = 31 * result + PigeonPigeonUtils.deepHash(this.bufferedBytes)
+    result = 31 * result + PigeonPigeonUtils.deepHash(this.sinceLastInputMs)
+    result = 31 * result + PigeonPigeonUtils.deepHash(this.pcId)
+    result = 31 * result + PigeonPigeonUtils.deepHash(this.peerCaps)
+    return result
+  }
+  override fun toString(): String {
+    return "CtlState(open=$open, bufferedBytes=$bufferedBytes, sinceLastInputMs=$sinceLastInputMs, pcId=$pcId, peerCaps=$peerCaps)"
+  }
+}
 private open class PigeonPigeonCodec : StandardMessageCodec() {
   override fun readValueOfType(type: Byte, buffer: ByteBuffer): Any? {
-    return     super.readValueOfType(type, buffer)
+    return when (type) {
+      129.toByte() -> {
+        return (readValue(buffer) as? List<Any?>)?.let {
+          CtlState.fromList(it)
+        }
+      }
+      else -> super.readValueOfType(type, buffer)
+    }
   }
   override fun writeValue(stream: ByteArrayOutputStream, value: Any?)   {
-    super.writeValue(stream, value)
+    when (value) {
+      is CtlState -> {
+        stream.write(129)
+        writeValue(stream, value.toList())
+      }
+      else -> super.writeValue(stream, value)
+    }
   }
 }
 
@@ -156,6 +376,91 @@ class AppFlutterApi(private val binaryMessenger: BinaryMessenger, private val me
       val channelName = "dev.flutter.pigeon.bubbleplay_app.AppFlutterApi.changed$separatedMessageChannelSuffix"
       val channel = BasicMessageChannel<Any?>(binaryMessenger, channelName, codec)
       channel.send(null) {
+        if (it is List<*>) {
+          if (it.size > 1) {
+            continuation.resumeWithException(FlutterError(it[0] as String, it[1] as String, it[2] as String?))
+          } else {
+            continuation.resume(Unit)
+          }
+        } else {
+          continuation.resumeWithException(PigeonPigeonUtils.createConnectionError(channelName))
+        } 
+      }
+    }
+  }
+}
+/** Generated interface from Pigeon that represents a handler of messages from Flutter. */
+interface CtlHostApi {
+  /** Sends one ctl message (JSON). False when there is no connection or the queue refused it. */
+  suspend fun ctlSend(json: String): Boolean
+  /** The connection's current state (cheap; polled while a connection is open). */
+  fun ctlState(): CtlState
+
+  companion object {
+    /** The codec used by CtlHostApi. */
+    val codec: MessageCodec<Any?> by lazy {
+      PigeonPigeonCodec()
+    }
+    /** Sets up an instance of `CtlHostApi` to handle messages through the `binaryMessenger`. */
+    @JvmOverloads
+    fun setUp(binaryMessenger: BinaryMessenger, api: CtlHostApi?, messageChannelSuffix: String = "") {
+      val separatedMessageChannelSuffix = if (messageChannelSuffix.isNotEmpty()) ".$messageChannelSuffix" else ""
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.bubbleplay_app.CtlHostApi.ctlSend$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { message, reply ->
+            val args = message as List<Any?>
+            val jsonArg = args[0] as String
+            CoroutineScope(Dispatchers.Main).launch {
+              val wrapped: List<Any?> = try {
+                listOf(api.ctlSend(jsonArg))
+              } catch (exception: Throwable) {
+                PigeonPigeonUtils.wrapError(exception)
+              }
+              reply.reply(wrapped)
+            }
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.bubbleplay_app.CtlHostApi.ctlState$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { _, reply ->
+            val wrapped: List<Any?> = try {
+              listOf(api.ctlState())
+            } catch (exception: Throwable) {
+              PigeonPigeonUtils.wrapError(exception)
+            }
+            reply.reply(wrapped)
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+    }
+  }
+}
+/** Generated class from Pigeon that represents Flutter messages that can be called from Kotlin. */
+class CtlFlutterApi(private val binaryMessenger: BinaryMessenger, private val messageChannelSuffix: String = "") {
+  companion object {
+    /** The codec used by CtlFlutterApi. */
+    val codec: MessageCodec<Any?> by lazy {
+      PigeonPigeonCodec()
+    }
+  }
+  /**
+   * A ctl event: [kind] is `opened` (json: `{"pcId": ..., "peerCaps": [...]}`), `message`
+   * (json: the ctl message) or `closed` (json: `{}`).
+   */
+  suspend fun ctlEvent(kindArg: String, jsonArg: String)
+{
+    val separatedMessageChannelSuffix = if (messageChannelSuffix.isNotEmpty()) ".$messageChannelSuffix" else ""
+    return suspendCancellableCoroutine { continuation ->
+      val channelName = "dev.flutter.pigeon.bubbleplay_app.CtlFlutterApi.ctlEvent$separatedMessageChannelSuffix"
+      val channel = BasicMessageChannel<Any?>(binaryMessenger, channelName, codec)
+      channel.send(listOf(kindArg, jsonArg)) {
         if (it is List<*>) {
           if (it.size > 1) {
             continuation.resumeWithException(FlutterError(it[0] as String, it[1] as String, it[2] as String?))

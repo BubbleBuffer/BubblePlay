@@ -87,6 +87,8 @@ internal class RealStreamPort(
     private val session: Session,
     override val input: InputSink,
 ) : StreamPort {
+    override val ctl get() = session.ctl
+
     override fun start() {
         session.start()
     }

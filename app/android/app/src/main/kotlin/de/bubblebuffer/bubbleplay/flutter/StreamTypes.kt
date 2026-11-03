@@ -2,6 +2,7 @@ package de.bubblebuffer.bubbleplay.flutter
 
 import android.view.Surface
 import de.bubblebuffer.bubbleplay.keys.DeviceKey
+import de.bubblebuffer.bubbleplay.log.CtlPassThrough
 import de.bubblebuffer.bubbleplay.net.Session
 import de.bubblebuffer.bubbleplay.pcs.PcEntry
 
@@ -41,6 +42,9 @@ internal data class StreamStats(
 /** The boundary around one real [Session] (production: [RealStreamPort]); fakes stand in for tests. */
 internal interface StreamPort {
     val input: InputSink
+
+    /** The session's ctl pass-through for the log upload; null for a port without a session. */
+    val ctl: CtlPassThrough? get() = null
     fun start()
     fun stop()
     fun requestMonitor(selector: String)
