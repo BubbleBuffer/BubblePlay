@@ -827,6 +827,16 @@ enum CloseVerdict {
     Refused,
 }
 
+/// Closes the relay sends in normal operation: the viewer left (1001 "viewer departed"), or the
+/// epoch was already replaced ("stale"/"retired", or no longer ours). They log at info.
+fn close_is_expected(close: &RelayClose, epoch_active: bool) -> bool {
+    let reason = close.reason.to_ascii_lowercase();
+    reason.contains("viewer departed")
+        || reason.contains("stale")
+        || reason.contains("retired")
+        || !epoch_active
+}
+
 /// What a socket's end means for the link. `refusals` counts consecutive
 /// refusals including this one. Only relay Close frames can end the link.
 fn close_verdict(
@@ -1590,24 +1600,43 @@ fn link_loop(
         let verdict = close_verdict(close.as_ref(), accepted, epoch_active, refusals);
         if let Some(close) = &close {
             if logged_closes.insert((close.code, close.reason.clone())) {
-                warn!(
-                    close_status = close.code,
-                    reason = %close.reason,
-                    epoch,
-                    accepted,
-                    epoch_active,
-                    refusals,
-                    "WSS v4 media socket closed by relay"
-                );
+                if close_is_expected(close, epoch_active) {
+                    info!(
+                        close_status = close.code,
+                        reason = %close.reason,
+                        epoch,
+                        accepted,
+                        epoch_active,
+                        refusals,
+                        "WSS v4 media socket closed by relay"
+                    );
+                } else {
+                    warn!(
+                        close_status = close.code,
+                        reason = %close.reason,
+                        epoch,
+                        accepted,
+                        epoch_active,
+                        refusals,
+                        "WSS v4 media socket closed by relay"
+                    );
+                }
             }
         }
         let end = match (verdict, close.clone()) {
             (CloseVerdict::Retry, _) | (_, None) => None,
             (CloseVerdict::Retired, Some(close)) => {
-                warn!(
-                    close_status = close.code,
-                    epoch, "WSS v4 media epoch retired by relay; link stopped"
-                );
+                if close_is_expected(&close, epoch_active) {
+                    info!(
+                        close_status = close.code,
+                        epoch, "WSS v4 media epoch retired by relay; link stopped"
+                    );
+                } else {
+                    warn!(
+                        close_status = close.code,
+                        epoch, "WSS v4 media epoch retired by relay; link stopped"
+                    );
+                }
                 Some(V4LinkEnd::Retired {
                     code: close.code,
                     reason: close.reason,
@@ -1842,7 +1871,9 @@ fn serve_socket(
     stop: &AtomicBool,
     activity: &Activity,
 ) -> Result<()> {
-    let mut last_outbound = Instant::now();
+    // Pings run on their own clock: video and audio sends must not reset it, or a busy sender never
+    // pings and a still screen (no inbound) trips the silence limit.
+    let mut last_ping = Instant::now();
     let mut last_inbound = Instant::now();
     loop {
         if stop.load(Ordering::Acquire) {
@@ -1856,8 +1887,9 @@ fn serve_socket(
         // Audio goes ahead of video on this writer, bounded per pass; it has
         // its own queue.
         let audio = send_audio(ws, shared, stop, activity)?;
-        if audio.sent {
-            last_outbound = Instant::now();
+        if ping_due(Instant::now(), last_ping) {
+            send_ping(ws, shared, stop, activity)?;
+            last_ping = Instant::now();
         }
         match rx.try_recv() {
             Ok(outgoing) => {
@@ -1871,7 +1903,6 @@ fn serve_socket(
                 drop(state);
                 if current {
                     send_message(ws, Message::binary(outgoing.packet), shared, stop, activity)?;
-                    last_outbound = Instant::now();
                 }
                 continue;
             }
@@ -1879,23 +1910,17 @@ fn serve_socket(
             Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
         }
         let now = Instant::now();
-        if now.saturating_duration_since(last_outbound) >= HEARTBEAT_INTERVAL {
-            send_message(
-                ws,
-                Message::text(r#"{"type":"ping"}"#),
-                shared,
-                stop,
-                activity,
-            )?;
-            last_outbound = now;
-            shared
+        if now.saturating_duration_since(last_inbound) >= INBOUND_SILENCE_LIMIT {
+            let heartbeats = shared
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .stats
-                .heartbeats += 1;
-        }
-        if now.saturating_duration_since(last_inbound) >= INBOUND_SILENCE_LIMIT {
-            bail!("v4 media socket silent");
+                .heartbeats;
+            bail!(
+                "v4 media socket silent (no inbound for {} s, {heartbeats} heartbeats sent, last ping {} s ago)",
+                now.saturating_duration_since(last_inbound).as_secs(),
+                now.saturating_duration_since(last_ping).as_secs()
+            );
         }
         let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
         // Latch the audio stall before expiry can forget the stalled frames.
@@ -1909,7 +1934,7 @@ fn serve_socket(
             let decision = state.rate.tick(now);
             record_rate_decision(&mut state, decision);
         }
-        let deadline = link_deadline(&state, now, last_outbound, last_inbound);
+        let deadline = link_deadline(&state, now, last_ping, last_inbound);
         drop(state);
         // A full audio pass may have left packets ready: don't wait on them.
         if audio.more {
@@ -1922,14 +1947,38 @@ fn serve_socket(
     }
 }
 
+fn ping_due(now: Instant, last_ping: Instant) -> bool {
+    now.saturating_duration_since(last_ping) >= HEARTBEAT_INTERVAL
+}
+
+fn send_ping(
+    ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    shared: &Mutex<Shared>,
+    stop: &AtomicBool,
+    activity: &Activity,
+) -> Result<()> {
+    send_message(
+        ws,
+        Message::text(r#"{"type":"ping"}"#),
+        shared,
+        stop,
+        activity,
+    )?;
+    shared
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .stats
+        .heartbeats += 1;
+    Ok(())
+}
+
 fn link_deadline(
     state: &Shared,
     now: Instant,
-    last_outbound: Instant,
+    last_ping: Instant,
     last_inbound: Instant,
 ) -> Instant {
-    let mut deadline =
-        (last_outbound + HEARTBEAT_INTERVAL).min(last_inbound + INBOUND_SILENCE_LIMIT);
+    let mut deadline = (last_ping + HEARTBEAT_INTERVAL).min(last_inbound + INBOUND_SILENCE_LIMIT);
     if state.policy.inflight_frames() != 0 {
         deadline = deadline.min(state.policy.last_progress + ACK_STALL_LIMIT);
     }
@@ -2323,6 +2372,26 @@ mod tests {
             V4AudioSubmit::Queued
         );
         assert!(shared.next_audio(at(1_500)).unwrap().discontinuity);
+    }
+
+    #[test]
+    fn ping_is_due_on_its_own_clock_despite_steady_outbound_traffic() {
+        // The writer no longer refreshes the ping clock on media sends: with a send every second and
+        // no inbound, a ping still falls due every HEARTBEAT_INTERVAL and a pong keeps the link alive.
+        let t0 = Instant::now();
+        let mut last_ping = t0;
+        let mut last_inbound = t0;
+        let mut pings = 0;
+        for sec in 1..=120u64 {
+            let now = t0 + Duration::from_secs(sec);
+            if ping_due(now, last_ping) {
+                pings += 1;
+                last_ping = now;
+                last_inbound = now; // pong
+            }
+            assert!(now.saturating_duration_since(last_inbound) < INBOUND_SILENCE_LIMIT);
+        }
+        assert_eq!(pings, 8);
     }
 
     #[test]
@@ -2919,6 +2988,19 @@ mod tests {
             1
         );
         link.shutdown();
+    }
+
+    #[test]
+    fn viewer_departed_and_stale_closes_are_expected() {
+        let close = |code, reason: &str| RelayClose {
+            code,
+            reason: reason.to_owned(),
+        };
+        assert!(close_is_expected(&close(1001, "viewer departed"), true));
+        assert!(close_is_expected(&close(1001, "stale epoch"), true));
+        assert!(close_is_expected(&close(1008, ""), false));
+        assert!(!close_is_expected(&close(1008, "bad hello"), true));
+        assert!(!close_is_expected(&close(1011, ""), true));
     }
 
     #[test]
