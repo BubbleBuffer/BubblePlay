@@ -42,8 +42,6 @@ pub const WHOLE_FRAME_REFINE_PER_MILLE: u64 = 500;
 pub const REFINE_DELTA_QP: i8 = -6;
 pub const CHANGED_DELTA_QP: i8 = 0;
 pub const UNCHANGED_DELTA_QP: i8 = 2;
-/// HEVC QP-map granularity used by NVENC in this host.
-pub const QP_MAP_CTB: u32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileQuality {
@@ -400,7 +398,8 @@ impl TileQualityTracker {
 /// Per-CTB delta-QP map for a refine frame: refined tiles get
 /// [`REFINE_DELTA_QP`], tiles that changed in this frame
 /// [`CHANGED_DELTA_QP`], the rest [`UNCHANGED_DELTA_QP`]. `crop` is the source
-/// rectangle scaled to `output_width` x `output_height`.
+/// rectangle scaled to `output_width` x `output_height`. `block` is the QP map
+/// cell size: 32 (HEVC CTB) or 16 (H.264 macroblock).
 pub fn refine_qp_map(
     grid: TileGrid,
     refined: &[usize],
@@ -408,8 +407,10 @@ pub fn refine_qp_map(
     crop: DamageRect,
     output_width: u32,
     output_height: u32,
+    block: u32,
 ) -> Option<HevcQpDeltaMap> {
-    if output_width == 0
+    if block == 0
+        || output_width == 0
         || output_height == 0
         || crop.left >= crop.right
         || crop.top >= crop.bottom
@@ -425,8 +426,8 @@ pub fn refine_qp_map(
     for &index in refined {
         level[index] = 2;
     }
-    let columns = output_width.div_ceil(QP_MAP_CTB);
-    let rows = output_height.div_ceil(QP_MAP_CTB);
+    let columns = output_width.div_ceil(block);
+    let rows = output_height.div_ceil(block);
     let crop_width = u64::from(crop.right - crop.left);
     let crop_height = u64::from(crop.bottom - crop.top);
     let to_source_x =
@@ -435,11 +436,11 @@ pub fn refine_qp_map(
         |y: u32| crop.top + (u64::from(y) * crop_height / u64::from(output_height)) as u32;
     let mut values = Vec::with_capacity((columns * rows) as usize);
     for row in 0..rows {
-        let top = to_source_y(row * QP_MAP_CTB);
-        let bottom = to_source_y(((row + 1) * QP_MAP_CTB).min(output_height)).max(top + 1);
+        let top = to_source_y(row * block);
+        let bottom = to_source_y(((row + 1) * block).min(output_height)).max(top + 1);
         for column in 0..columns {
-            let left = to_source_x(column * QP_MAP_CTB);
-            let right = to_source_x(((column + 1) * QP_MAP_CTB).min(output_width)).max(left + 1);
+            let left = to_source_x(column * block);
+            let right = to_source_x(((column + 1) * block).min(output_width)).max(left + 1);
             let mut best = 0u8;
             for tile_row in top / TILE_SIZE..bottom.min(grid.height).div_ceil(TILE_SIZE) {
                 for tile_column in left / TILE_SIZE..right.min(grid.width).div_ceil(TILE_SIZE) {
@@ -745,10 +746,36 @@ mod tests {
     }
 
     #[test]
+    fn refine_map_uses_the_h264_macroblock_grid() {
+        for (width, height, columns, rows) in [
+            (1920u32, 1080u32, 120u32, 68u32),
+            (2560, 1440, 160, 90),
+            (1366, 770, 86, 49),
+        ] {
+            let grid = TileGrid::new(width, height);
+            let full = rect(0, 0, width, height);
+            let map = refine_qp_map(grid, &[0], &[], full, width, height, 16).expect("map");
+            assert_eq!((map.columns, map.rows), (columns, rows));
+            assert_eq!(map.values.len(), (columns * rows) as usize);
+            // Tile 0 is 64 px: a 4x4 block of macroblocks is lowered.
+            assert_eq!(
+                map.values
+                    .iter()
+                    .filter(|value| **value == REFINE_DELTA_QP)
+                    .count(),
+                16
+            );
+            assert_eq!(map.values[0], REFINE_DELTA_QP);
+            assert_eq!(map.values[(3 * columns + 3) as usize], REFINE_DELTA_QP);
+            assert_eq!(map.values[4], UNCHANGED_DELTA_QP);
+        }
+    }
+
+    #[test]
     fn refine_map_marks_ctbs_by_tile_level() {
         let grid = TileGrid::new(256, 128);
         let full = rect(0, 0, 256, 128);
-        let map = refine_qp_map(grid, &[0], &[3], full, 256, 128).expect("map");
+        let map = refine_qp_map(grid, &[0], &[3], full, 256, 128, 32).expect("map");
         assert_eq!((map.columns, map.rows), (8, 4));
         // Tile 0 = CTBs (0..2, 0..2).
         assert_eq!(
@@ -765,7 +792,7 @@ mod tests {
         assert_eq!(&map.values[6..8], &[CHANGED_DELTA_QP, CHANGED_DELTA_QP]);
         assert_eq!(map.values[31], UNCHANGED_DELTA_QP);
         // Downscaled output (half size): one CTB covers a whole tile.
-        let map = refine_qp_map(grid, &[5], &[], full, 128, 64).expect("map");
+        let map = refine_qp_map(grid, &[5], &[], full, 128, 64, 32).expect("map");
         assert_eq!((map.columns, map.rows), (4, 2));
         assert_eq!(map.values[5], REFINE_DELTA_QP);
         assert_eq!(
@@ -776,9 +803,9 @@ mod tests {
             1
         );
         // A crop maps output CTBs into the cropped source.
-        let map = refine_qp_map(grid, &[7], &[], rect(128, 64, 256, 128), 64, 32).expect("map");
+        let map = refine_qp_map(grid, &[7], &[], rect(128, 64, 256, 128), 64, 32, 32).expect("map");
         assert_eq!(map.values, vec![UNCHANGED_DELTA_QP, REFINE_DELTA_QP]);
-        assert!(refine_qp_map(grid, &[0], &[], rect(0, 0, 300, 128), 64, 32).is_none());
+        assert!(refine_qp_map(grid, &[0], &[], rect(0, 0, 300, 128), 64, 32, 32).is_none());
     }
 
     #[test]

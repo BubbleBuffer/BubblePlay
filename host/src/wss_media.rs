@@ -252,6 +252,10 @@ impl WssMediaEgress {
         self.link.set_frame_size(width, height);
     }
 
+    pub fn set_frame_rate(&self, fps: u32) {
+        self.link.set_frame_rate(fps);
+    }
+
     /// Opt the BPA1 audio lane in (`audio:1` from the viewer's start) or out.
     pub fn set_audio_enabled(&self, enabled: bool) {
         self.link.set_audio_enabled(enabled);

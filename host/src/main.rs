@@ -4550,6 +4550,7 @@ fn run_serve(
                     }
                     if let Some(egress) = wss_media.as_ref() {
                         egress.set_frame_size(mode.width, mode.height);
+                        egress.set_frame_rate(mode.fps);
                     }
                     let mut wss_reservation = None;
                     let mut wss_forced_idr = false;
@@ -5181,6 +5182,7 @@ fn run_serve(
                                         ),
                                         scaled.width,
                                         scaled.height,
+                                        encoder.as_ref().map_or(32, VideoEncoder::qp_map_block),
                                     )
                                 })
                         } else {
