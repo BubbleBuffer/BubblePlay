@@ -120,7 +120,10 @@ class LogUploadE2eTest {
 
     private fun keysOf(o: JSONObject): Set<String> = o.keys().asSequence().toSet()
 
-    private fun lines(batch: JSONObject) = (0 until batch.getJSONArray("lines").length()).map { batch.getJSONArray("lines").getString(it) }
+    // Only the lines this test wrote: the core logs its own handshake lines too (for example "auth-host verified").
+    private fun lines(batch: JSONObject) = (0 until batch.getJSONArray("lines").length())
+        .map { batch.getJSONArray("lines").getString(it) }
+        .filter { JSONObject(it).getString("target") == "E2e" }
 
     @Test fun capabilityIsAdvertisedInHelloAndCaps() = withTestLog { _, _ ->
         val rig = Rig()
