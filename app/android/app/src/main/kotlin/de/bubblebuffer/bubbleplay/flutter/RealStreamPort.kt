@@ -3,6 +3,7 @@ package de.bubblebuffer.bubbleplay.flutter
 import android.view.Surface
 import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.keys.DeviceKey
+import de.bubblebuffer.bubbleplay.log.BpLog
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.Session
 import de.bubblebuffer.bubbleplay.pcs.PcEntry
@@ -87,11 +88,28 @@ internal class RealStreamPort(
     private val session: Session,
     override val input: InputSink,
 ) : StreamPort {
+    private val latency = LatencyStats {
+        BpLog.i(
+            "stream.latency",
+            if (it.final) "stream latency, session end" else "stream latency",
+            fields = mapOf(
+                "p50_ms" to it.p50Ms, "p95_ms" to it.p95Ms, "max_ms" to it.maxMs,
+                "frames" to it.frames, "dropped" to it.dropped,
+            ),
+        )
+    }
+
     override fun start() {
+        session.decoder.onPresentLatency = { ns -> latency.record(ns, session.decoder.skippedFrames) }
         session.start()
     }
 
-    override fun stop() = session.stop()
+    override fun stop() {
+        session.stop()
+        session.decoder.onPresentLatency = null
+        latency.finish()
+    }
+
     override fun requestMonitor(selector: String) {
         session.requestMonitor(selector)
     }

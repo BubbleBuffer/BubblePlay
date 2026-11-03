@@ -45,7 +45,7 @@ class VideoDecoder(private val listener: Listener) {
     private var height = 0
     private var csd: List<ByteArray> = emptyList()
     private val freeInputs = ArrayDeque<Int>()
-    private data class QueuedFrame(val frame: V4Frame, val mediaLeg: Int)
+    private data class QueuedFrame(val frame: V4Frame, val mediaLeg: Int, val submittedNs: Long = System.nanoTime())
     private val pending = ArrayDeque<QueuedFrame>()
     private val inFlight = HashMap<Long, QueuedFrame>()
     private var nextPts = 0L
@@ -56,6 +56,9 @@ class VideoDecoder(private val listener: Listener) {
     @Volatile var decodedFrames = 0L; private set
     @Volatile var presentedFrames = 0L; private set
     @Volatile var skippedFrames = 0L; private set
+    /** Optional stats hook: nanoseconds from submit() to the frame's release to the surface. Decoder thread. */
+    @Volatile var onPresentLatency: ((Long) -> Unit)? = null
+
     /** Sequence of the newest decoded output (sent back in ACKs as decodedSeq). */
     @Volatile var lastDecodedSeq: Long? = null; private set
 
@@ -81,7 +84,10 @@ class VideoDecoder(private val listener: Listener) {
         if (posted) done.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
 
-    fun submit(frame: V4Frame, mediaLeg: Int) = handler.post { onFrame(QueuedFrame(frame, mediaLeg)) }
+    fun submit(frame: V4Frame, mediaLeg: Int): Boolean {
+        val queued = QueuedFrame(frame, mediaLeg)
+        return handler.post { onFrame(queued) }
+    }
 
     /** Drop frames not yet queued (gate reset / reconnect). */
     fun dropPending() = handler.post { pending.clear() }
@@ -228,6 +234,7 @@ class VideoDecoder(private val listener: Listener) {
             fail("decoder-output"); return
         }
         presentedFrames++
+        if (queued != null) onPresentLatency?.invoke(System.nanoTime() - queued.submittedNs)
         if (queued != null) listener.onFramePresented(queued.frame.generation, queued.frame.seq, queued.frame.width, queued.frame.height, queued.mediaLeg)
     }
 

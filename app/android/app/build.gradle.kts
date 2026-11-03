@@ -31,9 +31,12 @@ android {
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
+            // Signed with the debug keys so `flutter run --release` works; the published APK is
+            // re-signed with the BubblePlay release key on linux01 (apk-publish bubbleplay-flutter).
             signingConfig = signingConfigs.getByName("debug")
+            // Not R8-tested with the Kotlin core (BouncyCastle, OkHttp): ship it unshrunk.
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }
