@@ -127,8 +127,8 @@ use tracing::{debug, info, warn};
 
 use crate::encoder_reconfigure::{EncoderSettings, PendingReconfigure};
 use crate::frame_damage::{
-    analyze_hevc_qp_delta_map, analyze_hevc_text_edge_qp_delta_map, DamageRect, HevcQpDeltaMap,
-    HevcQpMapDecision, QpMapRejectReason,
+    analyze_hevc_qp_delta_map, analyze_hevc_text_edge_qp_delta_map, expand_ctb_map_to_macroblocks,
+    DamageRect, HevcQpDeltaMap, HevcQpMapDecision, QpMapRejectReason,
 };
 use crate::gpu_gate::{self, GpuGate};
 
@@ -274,8 +274,16 @@ mod codec_policy_tests {
         );
         assert_eq!(
             super::qp_map_mode(options, VideoCodec::H264),
-            super::NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DISABLED
+            super::NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DELTA
         );
+        let mut off = options;
+        off.roi_mode = RoiMode::Off;
+        for codec in [VideoCodec::Hevc, VideoCodec::H264] {
+            assert_eq!(
+                super::qp_map_mode(off, codec),
+                super::NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DISABLED
+            );
+        }
         assert_eq!(
             super::input_buffer_format(options),
             super::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT
@@ -301,6 +309,78 @@ mod codec_policy_tests {
         assert_eq!(cfg.rcParams.targetQuality, 28);
         assert_eq!(cfg.rcParams.targetQualityLSB, 0);
         assert_eq!(cfg.rcParams.vbvBufferSize, 800_000);
+    }
+
+    #[test]
+    fn h264_refine_and_damage_maps_use_the_macroblock_grid() {
+        let mut options = EncoderOptions::production(Preset::P3);
+        options.roi_mode = RoiMode::Refine;
+        assert_eq!(super::qp_map_block(VideoCodec::H264), 16);
+        assert_eq!(super::qp_map_block(VideoCodec::Hevc), 32);
+        let full = DamageRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 50,
+        };
+        let damage = |map| FrameDamage {
+            source_width: 100,
+            source_height: 50,
+            crop: full,
+            rects: &[],
+            edge_scores: None,
+            prepared_qp_map: map,
+        };
+        // 100x50 is not a multiple of 16: 7x4 macroblocks, 4x2 CTBs.
+        let mb_map = crate::frame_damage::HevcQpDeltaMap {
+            columns: 7,
+            rows: 4,
+            values: vec![-6; 28],
+        };
+        let applied = evaluate_roi_map(
+            options,
+            VideoCodec::H264,
+            false,
+            100,
+            50,
+            Some(damage(Some(&mb_map))),
+        );
+        assert_eq!(applied.map.as_ref(), Some(&mb_map));
+        // A CTB-grid map is wrong for H.264 and is dropped.
+        let ctb_map = crate::frame_damage::HevcQpDeltaMap {
+            columns: 4,
+            rows: 2,
+            values: vec![-6; 8],
+        };
+        let wrong = evaluate_roi_map(
+            options,
+            VideoCodec::H264,
+            false,
+            100,
+            50,
+            Some(damage(Some(&ctb_map))),
+        );
+        assert!(wrong.map.is_none());
+
+        // Damage mode: the CTB analysis is expanded to macroblocks.
+        options.roi_mode = RoiMode::Damage;
+        let rects = [DamageRect {
+            left: 0,
+            top: 0,
+            right: 10,
+            bottom: 10,
+        }];
+        let frame = FrameDamage {
+            rects: &rects,
+            ..damage(None)
+        };
+        let evaluation = evaluate_roi_map(options, VideoCodec::H264, false, 100, 50, Some(frame));
+        let map = evaluation.map.expect("damage map");
+        assert_eq!((map.columns, map.rows), (7, 4));
+        assert_eq!(map.values.len(), 28);
+        // Only the first CTB changed: macroblocks (0..2, 0..2) are lowered.
+        let lowered: Vec<usize> = (0..28).filter(|i| map.values[*i] < 0).collect();
+        assert_eq!(lowered, vec![0, 1, 7, 8]);
     }
 
     #[test]
@@ -343,7 +423,7 @@ mod codec_policy_tests {
         );
         assert_eq!(applied.map.as_ref(), Some(&map));
         assert!(applied.telemetry.is_none());
-        for (codec, idr) in [(VideoCodec::Hevc, true), (VideoCodec::H264, false)] {
+        for (codec, idr) in [(VideoCodec::Hevc, true), (VideoCodec::H264, true)] {
             let skipped = evaluate_roi_map(options, codec, idr, 128, 64, Some(damage(Some(&map))));
             assert!(skipped.map.is_none() && skipped.telemetry.is_none());
         }
@@ -844,14 +924,15 @@ fn evaluate_roi_map(
             map: None,
             telemetry: None,
         };
-        if codec != VideoCodec::Hevc || force_idr {
+        if force_idr {
             return none;
         }
         let Some(map) = damage.and_then(|damage| damage.prepared_qp_map) else {
             return none;
         };
-        let valid = map.columns == output_width.div_ceil(32)
-            && map.rows == output_height.div_ceil(32)
+        let block = qp_map_block(codec);
+        let valid = map.columns == output_width.div_ceil(block)
+            && map.rows == output_height.div_ceil(block)
             && map.values.len() == (map.columns * map.rows) as usize
             && map
                 .values
@@ -864,9 +945,6 @@ fn evaluate_roi_map(
             map: Some(map.clone()),
             telemetry: None,
         };
-    }
-    if codec != VideoCodec::Hevc {
-        return rejected(RoiMapReason::UnsupportedEncoderState, 0, 0);
     }
     if force_idr {
         return rejected(RoiMapReason::Idr, 0, 0);
@@ -922,6 +1000,13 @@ fn evaluate_roi_map(
     };
     match decision {
         HevcQpMapDecision::Applied(map) => {
+            // Damage, text-edge and feedback maps are built on the 32 px CTB
+            // grid; H.264 wants one value per 16 px macroblock.
+            let map = if qp_map_block(codec) == 16 {
+                expand_ctb_map_to_macroblocks(&map, output_width, output_height)
+            } else {
+                map
+            };
             let changed_ctbs = map.values.iter().filter(|value| **value < 0).count() as u32;
             let total_ctbs = map.values.len() as u32;
             let min_delta = map.values.iter().copied().min();
@@ -1107,8 +1192,17 @@ fn input_buffer_format(options: EncoderOptions) -> NV_ENC_BUFFER_FORMAT {
     }
 }
 
-fn qp_map_mode(options: EncoderOptions, codec: VideoCodec) -> NV_ENC_QP_MAP_MODE {
-    if options.roi_mode != RoiMode::Off && codec == VideoCodec::Hevc {
+/// Edge length in pixels of one QP delta map cell: the 32 px CTB for HEVC,
+/// the 16 px macroblock for H.264.
+pub fn qp_map_block(codec: VideoCodec) -> u32 {
+    match codec {
+        VideoCodec::Hevc => 32,
+        VideoCodec::H264 => 16,
+    }
+}
+
+fn qp_map_mode(options: EncoderOptions, _codec: VideoCodec) -> NV_ENC_QP_MAP_MODE {
+    if options.roi_mode != RoiMode::Off {
         NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DELTA
     } else {
         NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DISABLED
@@ -1608,7 +1702,12 @@ impl Nvenc {
 
     /// Whether refine frames can carry a per-CTB delta-QP map.
     pub fn refine_qp_map_enabled(&self) -> bool {
-        self.options.roi_mode == RoiMode::Refine && self.codec == VideoCodec::Hevc
+        self.options.roi_mode == RoiMode::Refine
+    }
+
+    /// Edge length in pixels of one cell of this session's QP delta map.
+    pub fn qp_map_block(&self) -> u32 {
+        qp_map_block(self.codec)
     }
 
     pub fn codec(&self) -> VideoCodec {
@@ -1894,10 +1993,11 @@ impl Nvenc {
         );
         let mut qp_map = roi_evaluation.map.take();
         let qp_map_stats = if let Some(map) = qp_map.as_mut() {
-            let expected = self.width.div_ceil(32) * self.height.div_ceil(32);
+            let block = qp_map_block(self.codec);
+            let expected = self.width.div_ceil(block) * self.height.div_ceil(block);
             ensure!(
                 map.columns * map.rows == expected && map.values.len() == expected as usize,
-                "HEVC QP delta map dimensions do not match encoder CTB grid"
+                "QP delta map dimensions do not match the encoder QP grid"
             );
             pic.qpDeltaMap = map.values.as_mut_ptr();
             pic.qpDeltaMapSize = map.values.len() as u32;

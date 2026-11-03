@@ -30,6 +30,32 @@ pub enum HevcQpMapDecision {
     },
 }
 
+/// Expands a map on the 32 px CTB grid to the 16 px macroblock grid NVENC
+/// uses for H.264. Each macroblock takes the value of the CTB that contains
+/// it; sizes that are not multiples of 16 or 32 get a partial last row and
+/// column on both grids.
+pub fn expand_ctb_map_to_macroblocks(
+    map: &HevcQpDeltaMap,
+    output_width: u32,
+    output_height: u32,
+) -> HevcQpDeltaMap {
+    let columns = output_width.div_ceil(16);
+    let rows = output_height.div_ceil(16);
+    let mut values = Vec::with_capacity((columns * rows) as usize);
+    for row in 0..rows {
+        let source_row = (row / 2).min(map.rows.saturating_sub(1));
+        for column in 0..columns {
+            let source_column = (column / 2).min(map.columns.saturating_sub(1));
+            values.push(map.values[(source_row * map.columns + source_column) as usize]);
+        }
+    }
+    HevcQpDeltaMap {
+        columns,
+        rows,
+        values,
+    }
+}
+
 pub fn build_hevc_qp_delta_map(
     output_width: u32,
     output_height: u32,
@@ -209,7 +235,8 @@ pub fn analyze_hevc_text_edge_qp_delta_map(
 mod tests {
     use super::{
         analyze_hevc_qp_delta_map, analyze_hevc_text_edge_qp_delta_map, build_hevc_qp_delta_map,
-        DamageRect, HevcQpMapDecision, QpMapRejectReason,
+        expand_ctb_map_to_macroblocks, DamageRect, HevcQpDeltaMap, HevcQpMapDecision,
+        QpMapRejectReason,
     };
 
     #[test]
@@ -360,5 +387,36 @@ mod tests {
                 total_ctbs: 0,
             }
         );
+    }
+
+    #[test]
+    fn ctb_map_expands_to_the_macroblock_grid() {
+        for (width, height, ctb_cols, ctb_rows, mb_cols, mb_rows) in [
+            (1920u32, 1080u32, 60u32, 34u32, 120u32, 68u32),
+            (2560, 1440, 80, 45, 160, 90),
+            (1366, 770, 43, 25, 86, 49),
+        ] {
+            assert_eq!(width.div_ceil(32), ctb_cols);
+            assert_eq!(height.div_ceil(32), ctb_rows);
+            let values = (0..ctb_cols * ctb_rows)
+                .map(|i| (i % 5) as i8 - 2)
+                .collect();
+            let map = HevcQpDeltaMap {
+                columns: ctb_cols,
+                rows: ctb_rows,
+                values,
+            };
+            let expanded = expand_ctb_map_to_macroblocks(&map, width, height);
+            assert_eq!((expanded.columns, expanded.rows), (mb_cols, mb_rows));
+            assert_eq!(expanded.values.len(), (mb_cols * mb_rows) as usize);
+            for row in 0..mb_rows {
+                for column in 0..mb_cols {
+                    assert_eq!(
+                        expanded.values[(row * mb_cols + column) as usize],
+                        map.values[((row / 2) * ctb_cols + column / 2) as usize]
+                    );
+                }
+            }
+        }
     }
 }
