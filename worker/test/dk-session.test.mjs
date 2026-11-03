@@ -83,7 +83,8 @@ test("fixture handshake sends viewer caps first, and PC caps unlock control but 
   assert.equal(h.events.ready, 0);
   assert.equal(h.session.sendInput(new Uint8Array([1, 2])), false);
   assert.equal(h.session.sendControl({ type: "offer", sdp: localSdp }), true);
-  await flush();
+  // Sealing runs on WebCrypto's thread pool; wait for the message instead of a fixed number of ticks.
+  for (let i = 0; i < 500 && h.events.sent.length < 4; i++) await new Promise(resolve => setTimeout(resolve, 10));
   assert.deepEqual(await h.pcCtl.openJson(h.events.sent[3]), { type: "offer", sdp: localSdp });
   h.session.close();
 });

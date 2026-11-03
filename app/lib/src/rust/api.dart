@@ -39,3 +39,49 @@ void devicesSend({required String line}) =>
 /// Stops the Devices pipe client.
 Future<void> devicesDisconnect() =>
     RustLib.instance.api.crateApiDevicesDisconnect();
+
+/// Queues one upload message (`logs-batch`, `feedback-begin` or `feedback-chunk` as JSON) on
+/// the active session's control channel. False when there is no connection, the queue is
+/// full, or the message is not one of those kinds.
+bool ctlLogSend({required String json}) =>
+    RustLib.instance.api.crateApiCtlLogSend(json: json);
+
+/// The control channel's state; cheap, the Dart bridge polls it while a connection is open.
+CtlLogState ctlLogState() => RustLib.instance.api.crateApiCtlLogState();
+
+/// Control channel events for the upload queue, one JSON string each:
+/// `{"kind":"opened","pcId":..,"peerCaps":[..]}`, `{"kind":"message","json":{..}}` and
+/// `{"kind":"closed"}`. Only one subscription exists: a second call replaces the first (the
+/// old stream gets nothing more), and an already open connection is replayed as `opened`.
+Stream<String> ctlLogEvents() => RustLib.instance.api.crateApiCtlLogEvents();
+
+/// The control channel's state for the log upload queue.
+class CtlLogState {
+  /// Connected to a PC that advertised `client-logs-v1`: sends are accepted.
+  final bool open;
+
+  /// Bytes waiting in the outbound queue.
+  final PlatformInt64 bufferedBytes;
+
+  /// Milliseconds since the last input packet; the largest int64 if there was none yet.
+  final PlatformInt64 sinceLastInputMs;
+
+  const CtlLogState({
+    required this.open,
+    required this.bufferedBytes,
+    required this.sinceLastInputMs,
+  });
+
+  @override
+  int get hashCode =>
+      open.hashCode ^ bufferedBytes.hashCode ^ sinceLastInputMs.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CtlLogState &&
+          runtimeType == other.runtimeType &&
+          open == other.open &&
+          bufferedBytes == other.bufferedBytes &&
+          sinceLastInputMs == other.sinceLastInputMs;
+}

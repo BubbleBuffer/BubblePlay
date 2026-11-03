@@ -140,6 +140,9 @@ pub struct NetConfig {
     pub controls: SessionControls,
     /// Independent bounded audio lane; absent means this receiver cannot play Opus.
     pub audio: Option<crate::audio::AudioHandle>,
+    /// Log and feedback upload over the ctl channel. Present means the session advertises
+    /// `client-logs-v1`; absent leaves the wire exactly as before.
+    pub log_hook: Option<super::CtlLogHook>,
     /// Disabled only by the decode-free audio development harness.
     pub video_watchdog: bool,
     pub transport: TransportChoice,
@@ -159,6 +162,7 @@ impl NetConfig {
             stream_mode: None,
             controls: SessionControls::new(),
             audio: None,
+            log_hook: None,
             video_watchdog: true,
             transport: TransportChoice::Wss,
             ice_checking_timeout: AUTO_ICE_CHECKING_TIMEOUT,

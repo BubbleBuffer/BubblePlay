@@ -225,7 +225,10 @@ class ClientLogUploader {
 
   void _onFeedbackAck(Map<String, Object?> m) {
     final f = _fb;
-    if (f == null || !f.awaitingAck || m['id'] != f.id) return;
+    if (f == null || m['id'] != f.id) return;
+    // Only a `retry` may arrive before the last message is out: the control channel refused
+    // one of the messages (see UploadCoordinator), so the report starts over later.
+    if (!f.awaitingAck && m['status'] != 'retry') return;
     _ackTimer?.cancel();
     switch (m['status']) {
       case 'ok':

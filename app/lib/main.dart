@@ -14,6 +14,8 @@ import 'src/feedback/outbox.dart';
 import 'src/feedback/shake_sensor.dart';
 import 'src/logging/app_log.dart';
 import 'src/logging/error_hooks.dart';
+import 'src/logging/upload/ctl_bridge_factory.dart';
+import 'src/logging/upload/upload_coordinator.dart';
 import 'src/platform/key_files.dart';
 import 'src/session/stream_channel.dart';
 import 'src/presence/presence_lifecycle.dart';
@@ -43,6 +45,17 @@ Future<void> _start(List<String> args) async {
       .where((arg) => arg.startsWith(sectionFlag))
       .map((arg) => arg.substring(sectionFlag.length))
       .firstOrNull;
+  final outbox = Outbox.forRoot(logRoot);
+  final bridge = createPlatformCtlBridge();
+  final uploads = bridge == null
+      ? null
+      : UploadCoordinator(
+          bridge: bridge,
+          appLog: AppLog.instance,
+          outbox: outbox,
+          stream: AppLog.instance.src,
+        );
+  uploads?.start();
   runApp(
     BubblePlayApp(
       env: AppEnv(
@@ -53,7 +66,11 @@ Future<void> _start(List<String> args) async {
         theme: ValueNotifier<Brightness?>(null),
         devices: devicesChannel == null ? null : DevicesController(devicesChannel),
         initialSection: section,
-        feedback: FeedbackServices(outbox: Outbox.forRoot(logRoot)),
+        feedback: FeedbackServices(
+          outbox: outbox,
+          sent: uploads?.sentReports,
+          onQueued: uploads?.checkFeedback,
+        ),
         shakeSamples: Platform.isAndroid ? accelerometerSamples : null,
       ),
     ),

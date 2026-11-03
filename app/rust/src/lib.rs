@@ -8,6 +8,7 @@ pub mod api;
 pub mod applog;
 pub mod backend;
 pub mod contract;
+pub mod ctl_log;
 pub mod devices_pipe;
 mod frb_generated;
 mod link;

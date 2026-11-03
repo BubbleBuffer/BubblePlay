@@ -44,6 +44,140 @@ List<Object?> wrapResponse({Object? result, PlatformException? error, bool empty
   }
   return <Object?>[error.code, error.message, error.details];
 }
+bool _deepEquals(Object? a, Object? b) {
+  if (identical(a, b)) {
+    return true;
+  }
+  if (a is double && b is double) {
+    if (a.isNaN && b.isNaN) {
+      return true;
+    }
+    return a == b;
+  }
+  if (a is List && b is List) {
+    return a.length == b.length &&
+        a.indexed
+            .every(((int, dynamic) item) => _deepEquals(item.$2, b[item.$1]));
+  }
+  if (a is Map && b is Map) {
+    if (a.length != b.length) {
+      return false;
+    }
+    for (final MapEntry<Object?, Object?> entryA in a.entries) {
+      bool found = false;
+      for (final MapEntry<Object?, Object?> entryB in b.entries) {
+        if (_deepEquals(entryA.key, entryB.key)) {
+          if (_deepEquals(entryA.value, entryB.value)) {
+            found = true;
+            break;
+          } else {
+            return false;
+          }
+        }
+      }
+      if (!found) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return a == b;
+}
+
+int _deepHash(Object? value) {
+  if (value is List) {
+    return Object.hashAll(value.map(_deepHash));
+  }
+  if (value is Map) {
+    int result = 0;
+    for (final MapEntry<Object?, Object?> entry in value.entries) {
+      result += (_deepHash(entry.key) * 31) ^ _deepHash(entry.value);
+    }
+    return result;
+  }
+  if (value is double && value.isNaN) {
+    // Normalize NaN to a consistent hash.
+    return 0x7FF8000000000000.hashCode;
+  }
+  if (value is double && value == 0.0) {
+    // Normalize -0.0 to 0.0 so they have the same hash code.
+    return 0.0.hashCode;
+  }
+  return value.hashCode;
+}
+
+
+/// The session control channel as the Dart upload queue sees it (docs/architecture/client-log-upload.md):
+/// the Kotlin shell hands it the ctl messages of the active session and sends what Dart queues.
+class CtlState {
+  CtlState({
+    required this.open,
+    required this.bufferedBytes,
+    required this.sinceLastInputMs,
+    required this.pcId,
+    required this.peerCaps,
+  });
+
+  /// An authenticated connection is up.
+  bool open;
+
+  /// Bytes waiting in the ctl send buffer.
+  int bufferedBytes;
+
+  /// Milliseconds since the last input event was sent; the largest int64 when there was none.
+  int sinceLastInputMs;
+
+  /// The connected PC's id; empty when there is no connection.
+  String pcId;
+
+  /// The capabilities the PC advertised; empty when there is no connection.
+  List<String> peerCaps;
+
+  List<Object?> _toList() {
+    return <Object?>[
+      open,
+      bufferedBytes,
+      sinceLastInputMs,
+      pcId,
+      peerCaps,
+    ];
+  }
+
+  Object encode() {
+    return _toList();  }
+
+  static CtlState decode(Object result) {
+    result as List<Object?>;
+    return CtlState(
+      open: result[0]! as bool,
+      bufferedBytes: result[1]! as int,
+      sinceLastInputMs: result[2]! as int,
+      pcId: result[3]! as String,
+      peerCaps: (result[4]! as List<Object?>).cast<String>(),
+    );
+  }
+
+  @override
+  // ignore: avoid_equals_and_hash_code_on_mutable_classes
+  bool operator ==(Object other) {
+    if (other is! CtlState || other.runtimeType != runtimeType) {
+      return false;
+    }
+    if (identical(this, other)) {
+      return true;
+    }
+    return _deepEquals(open, other.open) && _deepEquals(bufferedBytes, other.bufferedBytes) && _deepEquals(sinceLastInputMs, other.sinceLastInputMs) && _deepEquals(pcId, other.pcId) && _deepEquals(peerCaps, other.peerCaps);
+  }
+
+  @override
+  // ignore: avoid_equals_and_hash_code_on_mutable_classes
+  int get hashCode => _deepHash(<Object?>[runtimeType, ..._toList()]);
+
+  @override
+  String toString() {
+    return 'CtlState(open: $open, bufferedBytes: $bufferedBytes, sinceLastInputMs: $sinceLastInputMs, pcId: $pcId, peerCaps: $peerCaps)';
+  }
+}
 
 
 class _PigeonCodec extends StandardMessageCodec {
@@ -53,6 +187,9 @@ class _PigeonCodec extends StandardMessageCodec {
     if (value is int) {
       buffer.putUint8(4);
       buffer.putInt64(value);
+    }    else if (value is CtlState) {
+      buffer.putUint8(129);
+      writeValue(buffer, value.encode());
     } else {
       super.writeValue(buffer, value);
     }
@@ -61,6 +198,8 @@ class _PigeonCodec extends StandardMessageCodec {
   @override
   Object? readValueOfType(int type, ReadBuffer buffer) {
     switch (type) {
+      case 129:
+        return CtlState.decode(readValue(buffer)!);
       default:
         return super.readValueOfType(type, buffer);
     }
@@ -167,6 +306,102 @@ abstract class AppFlutterApi {
         pigeonVar_channel.setMessageHandler((Object? message) async {
           try {
             api.changed();
+            return wrapResponse(empty: true);
+          } on PlatformException catch (e) {
+            return wrapResponse(error: e);
+          }          catch (e) {
+            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          }
+        });
+      }
+    }
+  }
+}
+
+class CtlHostApi {
+  /// Constructor for [CtlHostApi]. The [binaryMessenger] named argument is
+  /// available for dependency injection. If it is left null, the default
+  /// BinaryMessenger will be used which routes to the host platform.
+  CtlHostApi({
+      BinaryMessenger? binaryMessenger, 
+      String messageChannelSuffix = '', 
+      })
+      : pigeonVar_binaryMessenger = binaryMessenger,
+        pigeonVar_messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
+
+  final BinaryMessenger? pigeonVar_binaryMessenger;
+  static const MessageCodec<Object?> pigeonChannelCodec = _PigeonCodec();
+
+  final String pigeonVar_messageChannelSuffix;
+
+
+  /// Sends one ctl message (JSON). False when there is no connection or the queue refused it.
+  Future<bool> ctlSend(String json) async {
+    final pigeonVar_channelName = 'dev.flutter.pigeon.bubbleplay_app.CtlHostApi.ctlSend$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[json]);
+    final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
+
+    final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
+        pigeonVar_replyList,
+        pigeonVar_channelName,
+        isNullValid: false,
+    )
+    ;
+    return pigeonVar_replyValue! as bool;
+  }
+
+  /// The connection's current state (cheap; polled while a connection is open).
+  Future<CtlState> ctlState() async {
+    final pigeonVar_channelName = 'dev.flutter.pigeon.bubbleplay_app.CtlHostApi.ctlState$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(null);
+    final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
+
+    final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
+        pigeonVar_replyList,
+        pigeonVar_channelName,
+        isNullValid: false,
+    )
+    ;
+    return pigeonVar_replyValue! as CtlState;
+  }
+}
+
+abstract class CtlFlutterApi {
+  static const MessageCodec<Object?> pigeonChannelCodec = _PigeonCodec();
+
+  /// A ctl event: [kind] is `opened` (json: `{"pcId": ..., "peerCaps": [...]}`), `message`
+  /// (json: the ctl message) or `closed` (json: `{}`).
+  void ctlEvent(String kind, String json);
+
+  static void setUp(CtlFlutterApi? api, {
+    BinaryMessenger? binaryMessenger, 
+    String messageChannelSuffix = '',
+  }) 
+{
+    messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
+    {
+      final pigeonVar_channel = BasicMessageChannel<Object?>(
+          'dev.flutter.pigeon.bubbleplay_app.CtlFlutterApi.ctlEvent$messageChannelSuffix', pigeonChannelCodec,
+          binaryMessenger: binaryMessenger);
+      if (api == null) {
+        pigeonVar_channel.setMessageHandler(null);
+      } else {
+        pigeonVar_channel.setMessageHandler((Object? message) async {
+          final List<Object?> args = message! as List<Object?>;
+          final String arg_kind = args[0]! as String;
+          final String arg_json = args[1]! as String;
+          try {
+            api.ctlEvent(arg_kind, arg_json);
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);

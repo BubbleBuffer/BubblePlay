@@ -57,7 +57,16 @@ bubbleplay-logs around 2026-11-02T13:45:12Z --window 5m [--src host,tray] [--dev
 
 `feedback` lists reports with time and first line. `around` merges the PC's own logs and all client logs in the window, sorted by `ts`, each line prefixed by its file.
 
+## Upload to the PC
+
+A connected, authenticated client sends its logs and reports to the PC over the sealed session control channel, with the capability `client-logs-v1`. The wire format, cursors, acks and priority rules are in [architecture/client-log-upload.md](architecture/client-log-upload.md); the vectors are in `fixtures/client-log-upload-contract.json`.
+
+- The host stores batches through `client_logs::ClientLogStore` (per device and stream cursors in `clients\<device-id>\cursor.json`) and reports through `feedback_store::FeedbackStore`, with a per-connection budget of 8 MiB.
+- The browser (`dk-upload.js`), the Kotlin core (`LogUploader`, stream `app-android-core`) and the Dart app (`UploadCoordinator`, streams `app-win` and `app-android`) upload history first and then live lines. They send only when the control channel is idle: at most 16 KiB queued, no input in the last 250 ms, and one batch per 500 ms.
+- Dart reaches the control channel through `CtlBridge`: flutter_rust_bridge on Windows (`ctl_log_send`, `ctl_log_state`, `ctl_log_events`) and pigeon on Android (`CtlHostApi`, `CtlFlutterApi`).
+- When a report is acknowledged, the app shows "Sent to your PC."
+
 ## Status
 
-Built: all of the above except the transfer of client logs and reports to the PC.
-Not built yet: the session-channel upload (historical lines, live stream, cursor acks, feedback upload). The host stores batches through `client_logs::ClientLogStore` and `feedback_store::FeedbackStore`, which the session code will call.
+Built: everything above. Reports and logs reach the PC only while a session is connected; nothing is sent otherwise.
+Known gaps: the Android and Windows end-to-end tests run in CI only for the Kotlin side (they need the relay binary); the shake thresholds and the tray text box have not been seen on a real device or screen; the rest of `app/rust` outside `backend.rs` still logs nothing.

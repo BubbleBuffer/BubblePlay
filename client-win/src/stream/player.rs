@@ -64,6 +64,9 @@ pub struct StreamParams {
     pub on_frame: Arc<dyn Fn() + Send + Sync>,
     /// Runs on an internal thread whenever the session state may have changed.
     pub on_change: Arc<dyn Fn() + Send + Sync>,
+    /// Log and feedback upload over the ctl channel; `Some` makes the session advertise
+    /// `client-logs-v1`.
+    pub log_hook: Option<net::CtlLogHook>,
 }
 
 /// The picture to show now: the shared handle and its size.
@@ -179,6 +182,7 @@ impl StreamSession {
 
         let mut config = NetConfig::new(params.relay.clone(), net::Codec::H264, params.viewer);
         config.input = Some(input_link.clone());
+        config.log_hook = params.log_hook;
         config.stream_mode = Some(live_input::input_mode(params.mode).stream_mode().into());
         let controls = config.controls.clone();
         controls.initialize_mode(params.mode);

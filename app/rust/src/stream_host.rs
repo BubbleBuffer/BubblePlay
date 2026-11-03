@@ -97,6 +97,7 @@ mod imp {
                 }
             }),
             on_change: throttled(params.on_change),
+            log_hook: Some(crate::ctl_log::hook()),
         })?;
         *lock(&SESSION) = Some(Slot(session));
         Ok(())

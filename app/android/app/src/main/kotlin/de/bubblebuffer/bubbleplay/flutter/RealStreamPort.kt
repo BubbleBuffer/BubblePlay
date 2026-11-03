@@ -88,6 +88,7 @@ internal class RealStreamPort(
     private val session: Session,
     override val input: InputSink,
 ) : StreamPort {
+    override val ctl get() = session.ctl
     private val latency = LatencyStats {
         BpLog.i(
             "stream.latency",

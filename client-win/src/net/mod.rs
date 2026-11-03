@@ -6,6 +6,7 @@
 
 mod config;
 mod controls;
+mod ctl_hook;
 mod error;
 mod events;
 mod gate;
@@ -28,6 +29,7 @@ pub use config::{Codec, NetConfig, TransportChoice, ViewerAuth, AUTO_ICE_CHECKIN
 #[cfg(test)]
 pub use controls::MonitorError;
 pub use controls::{ModeOutcome, MonitorEntry, PickOutcome, SessionControls};
+pub use ctl_hook::{CtlLogEvent, CtlLogHook, CAP_CLIENT_LOGS};
 pub use error::NetError;
 pub use events::{DecoderFeedback, NetEvent, VideoFrame};
 pub use input::{InputLink, InputSnapshot};

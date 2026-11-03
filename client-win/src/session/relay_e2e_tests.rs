@@ -19,9 +19,10 @@ use serde_json::{json, Value};
 use super::relay_pc::*;
 use super::{pair_into, viewer_auth_in, DevOptions};
 use crate::net::phase2::{test_pc, Opened, CAP_CONTROL_AEAD, CAP_DTLS_BIND, MAX_NAME_CHARS};
+use crate::net::CAP_CLIENT_LOGS;
 use crate::net::{
-    Codec, DecoderFeedback, InputLink, NetConfig, NetError, NetEvent, TransportChoice,
-    TransportStats, ViewerAuth,
+    Codec, CtlLogEvent, CtlLogHook, DecoderFeedback, InputLink, NetConfig, NetError, NetEvent,
+    TransportChoice, TransportStats, ViewerAuth,
 };
 use crate::store::pcs::PcStore;
 
@@ -392,4 +393,218 @@ async fn an_unlisted_viewer_is_closed_with_1008_and_that_is_fatal() {
             .is_none_or(|value| value["type"] != "peer-joined" && value["type"] != "auth-hello"),
         "the PC never saw the unlisted viewer: {seen:?}"
     );
+}
+
+/// The client-log-upload contract vectors by name (fixtures/client-log-upload-contract.json).
+fn contract(name: &str) -> Value {
+    let doc: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/client-log-upload-contract.json"
+    ))
+    .expect("contract fixture");
+    doc["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["name"] == name)
+        .unwrap_or_else(|| panic!("fixture message {name}"))["json"]
+        .clone()
+}
+
+/// The next event of the hook's channel (async wait; the net thread produces them).
+async fn hook_event(events: &mpsc::Receiver<CtlLogEvent>) -> CtlLogEvent {
+    until("a log hook event", || events.try_recv().ok()).await
+}
+
+fn message_json(event: CtlLogEvent) -> Value {
+    let CtlLogEvent::Message(text) = event else {
+        panic!("expected a Message event, got {event:?}");
+    };
+    serde_json::from_str(&text).expect("routed JSON")
+}
+
+/// The PC's `caps` reply advertising `client-logs-v1`.
+async fn pc_caps_with_logs(host: &mut Ws, pc: &mut Viewer) {
+    let seq = pc
+        .send(
+            host,
+            json!({ "type": "caps", "caps": [CAP_CONTROL_AEAD, CAP_DTLS_BIND, CAP_CLIENT_LOGS] }),
+        )
+        .await;
+    assert_eq!(seq, 0, "the PC's first ctl is seq 0");
+}
+
+/// A configured hook advertises `client-logs-v1` in the auth-hello and the ctl caps, emits
+/// Opened with the PC's caps, routes the host's contract messages and carries the client's
+/// batch and feedback messages to the PC in order, sealed as their own ctl kinds.
+#[tokio::test(flavor = "current_thread")]
+async fn the_log_hook_carries_the_upload_contract_both_ways() {
+    let relay = Relay::start().await;
+    let viewer = viewer_identity(21);
+    let (mut host, _) = register_host(&relay, &[viewer.id().to_string()]).await;
+    let (hook, events) = CtlLogHook::channel();
+    let mut config = wss_config(&relay, viewer, vec![test_pc::fixture_pc()]);
+    config.log_hook = Some(hook.clone());
+    let mut client = Client::start(config);
+
+    let mut pc = handshake(&mut host, &relay.origin, true).await;
+    assert!(
+        pc.hello["caps"]
+            .as_array()
+            .expect("auth-hello caps")
+            .contains(&json!(CAP_CLIENT_LOGS)),
+        "auth-hello advertises the capability: {}",
+        pc.hello
+    );
+    let caps = viewer_caps(&mut host, &mut pc).await;
+    assert!(caps["caps"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(CAP_CLIENT_LOGS)));
+    assert!(
+        !hook.send(contract("logs-batch").to_string()),
+        "refused before Opened"
+    );
+    pc_caps_with_logs(&mut host, &mut pc).await;
+
+    let CtlLogEvent::Opened { pc_id, peer_caps } = hook_event(&events).await else {
+        panic!("the first event is Opened");
+    };
+    assert_eq!(pc_id, test_pc::fixture_pc().0.to_string());
+    assert!(peer_caps.iter().any(|cap| cap == CAP_CLIENT_LOGS));
+    assert!(hook.is_connected());
+
+    // Host -> client: logs-state.
+    let state = contract("logs-state");
+    pc.send(&mut host, state.clone()).await;
+    assert_eq!(message_json(hook_event(&events).await), state);
+
+    // Client -> host: a batch; the PC acks; the ack comes back as a Message.
+    let batch = contract("logs-batch");
+    assert!(hook.send(batch.to_string()));
+    assert_eq!(pc.recv_text(&mut host, "logs-batch").await, batch);
+    assert_eq!(hook.buffered_bytes(), 0, "the session took it");
+    let ack = contract("logs-ack-ok");
+    pc.send(&mut host, ack.clone()).await;
+    assert_eq!(message_json(hook_event(&events).await), ack);
+
+    // Feedback: begin and chunk in order, then the ack.
+    let (begin, chunk) = (contract("feedback-begin"), contract("feedback-chunk"));
+    assert!(hook.send(begin.to_string()) && hook.send(chunk.to_string()));
+    assert_eq!(pc.recv_text(&mut host, "feedback-begin").await, begin);
+    assert_eq!(pc.recv_text(&mut host, "feedback-chunk").await, chunk);
+    let feedback_ack = contract("feedback-ack-ok");
+    pc.send(&mut host, feedback_ack.clone()).await;
+    assert_eq!(message_json(hook_event(&events).await), feedback_ack);
+
+    // Kinds the hook does not route stay with the session's own handling.
+    let rejected = client.stats.snapshot().rejected_controls;
+    pc.send(&mut host, json!({ "type": "logs-batch", "v": 1 }))
+        .await;
+    until("the unrouted kind to be rejected", || {
+        (client.stats.snapshot().rejected_controls > rejected).then_some(())
+    })
+    .await;
+    assert!(events.try_recv().is_err(), "nothing routed for it");
+
+    client.finish().await.expect("a clean stop");
+    assert_eq!(hook_event(&events).await, CtlLogEvent::Closed);
+    assert!(!hook.is_connected());
+    assert!(!hook.send(batch.to_string()), "refused after Closed");
+}
+
+/// A PC without the capability: the client reports Opened (with the PC's caps) but the
+/// hook neither sends nor delivers.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pc_without_the_capability_gets_no_log_messages() {
+    let relay = Relay::start().await;
+    let viewer = viewer_identity(22);
+    let (mut host, _) = register_host(&relay, &[viewer.id().to_string()]).await;
+    let (hook, events) = CtlLogHook::channel();
+    let mut config = wss_config(&relay, viewer, vec![test_pc::fixture_pc()]);
+    config.log_hook = Some(hook.clone());
+    let mut client = Client::start(config);
+
+    let mut pc = handshake(&mut host, &relay.origin, true).await;
+    viewer_caps(&mut host, &mut pc).await;
+    pc_caps(&mut host, &mut pc).await;
+    let CtlLogEvent::Opened { peer_caps, .. } = hook_event(&events).await else {
+        panic!("Opened");
+    };
+    assert!(!peer_caps.iter().any(|cap| cap == CAP_CLIENT_LOGS));
+    assert!(!hook.send(contract("logs-batch").to_string()));
+    pc.send(&mut host, contract("logs-state")).await;
+    pc.recv_text(&mut host, "media-control").await;
+    client.finish().await.expect("a clean stop");
+    assert!(events
+        .try_iter()
+        .all(|event| !matches!(event, CtlLogEvent::Message(_))));
+}
+
+/// A reconnect is a new epoch: Closed for the old one, a new Opened for the next, and the
+/// queue starts empty.
+#[tokio::test(flavor = "current_thread")]
+async fn the_log_hook_reopens_on_each_reconnect() {
+    let relay = Relay::start().await;
+    let viewer = viewer_identity(23);
+    let viewer_id = viewer.id().to_string();
+    let (mut host, _) = register_host(&relay, std::slice::from_ref(&viewer_id)).await;
+    let (hook, events) = CtlLogHook::channel();
+    let mut config = wss_config(&relay, viewer, vec![test_pc::fixture_pc()]);
+    config.log_hook = Some(hook.clone());
+    let mut client = Client::start(config);
+
+    let mut pc = handshake(&mut host, &relay.origin, true).await;
+    viewer_caps(&mut host, &mut pc).await;
+    pc_caps_with_logs(&mut host, &mut pc).await;
+    assert!(matches!(
+        hook_event(&events).await,
+        CtlLogEvent::Opened { .. }
+    ));
+    // The PC goes away and comes back: the client reconnects with a fresh handshake.
+    drop(pc);
+    drop(host);
+    assert_eq!(hook_event(&events).await, CtlLogEvent::Closed);
+    assert!(
+        !hook.send(contract("logs-batch").to_string()),
+        "closed in between"
+    );
+    let (mut host, _) = register_host(&relay, &[viewer_id]).await;
+    let mut pc = handshake(&mut host, &relay.origin, true).await;
+    viewer_caps(&mut host, &mut pc).await;
+    pc_caps_with_logs(&mut host, &mut pc).await;
+    assert!(matches!(
+        hook_event(&events).await,
+        CtlLogEvent::Opened { .. }
+    ));
+    let batch = contract("logs-batch");
+    assert!(hook.send(batch.to_string()));
+    assert_eq!(pc.recv_text(&mut host, "logs-batch").await, batch);
+    client.finish().await.expect("a clean stop");
+    assert!(client.stats.snapshot().attempts >= 2);
+}
+
+/// Without a hook the session neither advertises the capability nor routes the kinds.
+#[tokio::test(flavor = "current_thread")]
+async fn a_session_without_a_hook_does_not_advertise_or_route_log_messages() {
+    let relay = Relay::start().await;
+    let viewer = viewer_identity(24);
+    let (mut host, _) = register_host(&relay, &[viewer.id().to_string()]).await;
+    let mut client = Client::start(wss_config(&relay, viewer, vec![test_pc::fixture_pc()]));
+
+    let mut pc = handshake(&mut host, &relay.origin, true).await;
+    assert_eq!(
+        pc.hello["caps"],
+        json!([CAP_CONTROL_AEAD, CAP_DTLS_BIND]),
+        "auth-hello caps are unchanged"
+    );
+    let caps = viewer_caps(&mut host, &mut pc).await;
+    assert_eq!(caps["caps"], json!([CAP_CONTROL_AEAD, CAP_DTLS_BIND]));
+    pc_caps_with_logs(&mut host, &mut pc).await;
+    pc.send(&mut host, contract("logs-state")).await;
+    until("the unrouted kind to be rejected", || {
+        (client.stats.snapshot().rejected_controls > 0).then_some(())
+    })
+    .await;
+    client.finish().await.expect("a clean stop");
+    assert_eq!(client.stats.snapshot().attempts, 1, "no reconnect");
 }

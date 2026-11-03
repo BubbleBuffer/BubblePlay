@@ -8,6 +8,7 @@ use flutter_rust_bridge::frb;
 
 use crate::backend::{AppBackend, Paths};
 use crate::contract::Core;
+use crate::ctl_log;
 use crate::devices_pipe::DevicesClient;
 use crate::frb_generated::StreamSink;
 
@@ -82,4 +83,42 @@ pub fn devices_send(line: String) -> Result<()> {
 pub fn devices_disconnect() {
     let old = devices().take();
     drop(old);
+}
+
+/// The control channel's state for the log upload queue.
+pub struct CtlLogState {
+    /// Connected to a PC that advertised `client-logs-v1`: sends are accepted.
+    pub open: bool,
+    /// Bytes waiting in the outbound queue.
+    pub buffered_bytes: i64,
+    /// Milliseconds since the last input packet; the largest int64 if there was none yet.
+    pub since_last_input_ms: i64,
+}
+
+/// Queues one upload message (`logs-batch`, `feedback-begin` or `feedback-chunk` as JSON) on
+/// the active session's control channel. False when there is no connection, the queue is
+/// full, or the message is not one of those kinds.
+#[frb(sync)]
+pub fn ctl_log_send(json: String) -> bool {
+    ctl_log::global().send(json)
+}
+
+/// The control channel's state; cheap, the Dart bridge polls it while a connection is open.
+#[frb(sync)]
+pub fn ctl_log_state() -> CtlLogState {
+    let state = ctl_log::global().state();
+    CtlLogState {
+        open: state.open,
+        buffered_bytes: state.buffered_bytes,
+        since_last_input_ms: state.since_last_input_ms,
+    }
+}
+
+/// Control channel events for the upload queue, one JSON string each:
+/// `{"kind":"opened","pcId":..,"peerCaps":[..]}`, `{"kind":"message","json":{..}}` and
+/// `{"kind":"closed"}`. Only one subscription exists: a second call replaces the first (the
+/// old stream gets nothing more), and an already open connection is replayed as `opened`.
+pub fn ctl_log_events(sink: StreamSink<String>) -> Result<()> {
+    ctl_log::global().subscribe(move |line| sink.add(line).is_ok());
+    Ok(())
 }

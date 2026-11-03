@@ -33,9 +33,15 @@ const _buildNumber = String.fromEnvironment('BUILD_NUMBER', defaultValue: '1');
 /// What the feedback flow needs from outside: where reports go, and (tests only) a stand-in
 /// for the screenshot.
 class FeedbackServices {
-  const FeedbackServices({required this.outbox, this.capture, this.log});
+  const FeedbackServices({required this.outbox, this.capture, this.log, this.sent, this.onQueued});
 
   final Outbox outbox;
+
+  /// Ids of reports the PC has taken while connected (null: no upload, the line never changes).
+  final Stream<String>? sent;
+
+  /// Called after a report is stored, so a connected upload sends it now.
+  final void Function()? onQueued;
 
   /// Replaces the real screenshot (widget tests: the real one needs the GPU).
   final Future<Uint8List?> Function()? capture;
@@ -91,6 +97,7 @@ class FeedbackController {
   final FeedbackServices? services;
 
   bool _isOpen = false;
+  String? _lastId;
 
   /// True while the sheet is up; a second open does nothing meanwhile.
   bool get isOpen => _isOpen;
@@ -121,12 +128,7 @@ class FeedbackController {
         (sheet) => FeedbackSheet(
           screenshot: screenshot,
           onSend: (text, kind, shot) => _store(text, kind, shot, info),
-          onStored: (sheetContext) => showToast(
-            sheetContext,
-            builder: (context, progress) => const ToastCard(
-              title: 'Saved. It is sent to your PC the next time you connect.',
-            ),
-          ),
+          onStored: _showStored,
         ),
       );
       return stored == true;
@@ -136,6 +138,40 @@ class FeedbackController {
     } finally {
       _isOpen = false;
     }
+  }
+
+  /// The state line: "Saved. ..." and, if the PC takes the report while the line is up
+  /// (connected), "Sent to your PC.".
+  void _showStored(BuildContext sheetContext) {
+    final id = _lastId;
+    final sent = ValueNotifier<bool>(false);
+    StreamSubscription<String>? sub;
+    Timer? stop;
+    void done() {
+      stop?.cancel();
+      unawaited(sub?.cancel());
+    }
+
+    final stream = services?.sent;
+    if (id != null && stream != null) {
+      sub = stream.listen((sentId) {
+        if (sentId != id) return;
+        sent.value = true;
+        done();
+      });
+      stop = Timer(const Duration(seconds: 12), done);
+    }
+    showToast(
+      sheetContext,
+      builder: (context, progress) => ListenableBuilder(
+        listenable: sent,
+        builder: (context, _) => ToastCard(
+          title: sent.value
+              ? 'Sent to your PC.'
+              : 'Saved. It is sent to your PC the next time you connect.',
+        ),
+      ),
+    );
   }
 
   Future<T?> _showSheet<T>(BuildContext context, WidgetBuilder builder) => context.mobile
@@ -194,6 +230,10 @@ class FeedbackController {
       );
       await outbox.add(report, screenshot: screenshot);
       AppLog.info('Feedback', 'Report stored', fields: {'kind': kind.name, 'id': id});
+      _lastId = id;
+      try {
+        services?.onQueued?.call();
+      } catch (_) {}
       return true;
     } catch (e, stack) {
       AppLog.error('Feedback', 'Could not store the report', error: e, stack: stack);
