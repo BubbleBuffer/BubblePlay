@@ -48,6 +48,7 @@ pub mod scale;
 pub mod scroll_detect;
 pub mod secure_helper;
 pub mod signaling;
+pub mod stats_window;
 pub mod stun;
 pub mod temporal_diff;
 pub mod tile_hash;
@@ -59,3 +60,19 @@ pub mod vdd;
 pub mod video_encoder;
 pub mod wss_media;
 pub mod wss_v4;
+
+/// Tests that install a scoped tracing subscriber and assert on what it saw take this lock:
+/// the callsite interest cache is process-wide, so two of them running at once can leave a
+/// callsite cached as disabled for the other.
+#[cfg(test)]
+pub(crate) mod test_tracing {
+    use std::sync::{Mutex, MutexGuard};
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub fn serial() -> MutexGuard<'static, ()> {
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}

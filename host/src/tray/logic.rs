@@ -57,10 +57,12 @@ impl Backoff {
     }
 }
 
-/// What a line of host or agent child output means for the tray log: `None` to skip it
-/// (routine info), otherwise the level to log it at. Tracing lines (`<ts> LEVEL target: msg`)
-/// map by their level word; anything else (a panic message, a backtrace, native library
-/// output) is a warning, or an error when it says so.
+/// What a line of host or agent child output means for the tray log: `None` to skip it,
+/// otherwise the level to log it at. Tracing lines (`<ts> LEVEL target: msg`) are skipped at
+/// every level: the child writes the same event to its own JSONL log, so echoing it would
+/// record it twice. Anything else (a panic message, a backtrace, native library output, an
+/// early startup failure before the child's log is up) is a warning, or an error when it
+/// says so.
 pub fn child_line_level(line: &str) -> Option<tracing::Level> {
     let line = line.trim();
     if line.is_empty() {
@@ -71,11 +73,7 @@ pub fn child_line_level(line: &str) -> Option<tracing::Level> {
     let looks_like_tracing =
         first.len() >= 10 && first.as_bytes()[0].is_ascii_digit() && first.contains('T');
     if looks_like_tracing {
-        return match words.next() {
-            Some("ERROR") => Some(tracing::Level::ERROR),
-            Some("WARN") => Some(tracing::Level::WARN),
-            _ => None,
-        };
+        return None;
     }
     let lower = line.to_ascii_lowercase();
     if lower.contains("panicked") || lower.contains("fatal") || lower.contains("error") {
@@ -885,17 +883,9 @@ mod tests {
     fn child_lines_map_to_levels() {
         use tracing::Level;
         let level = |text: &str| child_line_level(text);
-        assert_eq!(
-            level(
-                "2026-11-02T10:00:00Z  WARN bubbleplay_host: x
-"
-            ),
-            Some(Level::WARN)
-        );
-        assert_eq!(
-            level("2026-11-02T10:00:00Z ERROR bubbleplay_host: x"),
-            Some(Level::ERROR)
-        );
+        // Tracing lines are already in the child's own JSONL log: never echoed.
+        assert_eq!(level("2026-11-02T10:00:00Z  WARN bubbleplay_host: x"), None);
+        assert_eq!(level("2026-11-02T10:00:00Z ERROR bubbleplay_host: x"), None);
         assert_eq!(level("2026-11-02T10:00:00Z  INFO bubbleplay_host: x"), None);
         assert_eq!(level("2026-11-02T10:00:00Z DEBUG a: b"), None);
         assert_eq!(

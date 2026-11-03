@@ -1458,6 +1458,7 @@ pub struct InputSink {
     admin_enabled: bool,
     status_changes: InputStatusChanges,
     diagnostics: InputDiagnosticCounters,
+    diagnostics_rollup: crate::input_diagnostics::DiagnosticsRollup,
     input_flow: InputFlowTransitions,
     geometry_valid: bool,
     diagnostics_foreground_pid: Option<u32>,
@@ -3239,6 +3240,10 @@ impl InputSink {
             admin_enabled: false,
             status_changes: Default::default(),
             diagnostics: Default::default(),
+            diagnostics_rollup: crate::input_diagnostics::DiagnosticsRollup::new(
+                std::time::Instant::now(),
+                crate::input_diagnostics::DIAGNOSTICS_INFO_INTERVAL,
+            ),
             input_flow: Default::default(),
             geometry_valid: true,
             diagnostics_foreground_pid: None,
@@ -3446,23 +3451,44 @@ impl InputSink {
         std::mem::take(&mut self.diagnostics)
     }
 
+    /// Every window goes to debug; the sum of a minute (and the rest at session end) to info.
     pub fn log_diagnostics(&mut self) {
         let counters = self.take_diagnostics();
-        if !counters.is_empty() {
-            info!(
-                foreground_pid = self.diagnostics_foreground_pid,
-                received_by_kind = ?counters.named_receipts(),
-                drops_by_reason = ?counters.named_drops(),
-                local_calls = counters.route_calls[0],
-                admin_calls = counters.route_calls[1],
-                secure_submissions = counters.route_calls[2],
-                requested_events = counters.requested_events,
-                applied_events = counters.applied_events,
-                short_calls = counters.short_calls,
-                error_calls = counters.error_calls,
-                coalesced_packets = counters.coalesced_packets,
-                "remote input diagnostics"
-            );
+        if counters.is_empty() {
+            return;
+        }
+        self.write_diagnostics(&counters, false);
+        if let Some(total) = self
+            .diagnostics_rollup
+            .add(std::time::Instant::now(), &counters)
+        {
+            self.write_diagnostics(&total, true);
+        }
+    }
+
+    fn write_diagnostics(&self, counters: &InputDiagnosticCounters, info: bool) {
+        macro_rules! line {
+            ($level:ident) => {
+                tracing::$level!(
+                    foreground_pid = self.diagnostics_foreground_pid,
+                    received_by_kind = ?counters.named_receipts(),
+                    drops_by_reason = ?counters.named_drops(),
+                    local_calls = counters.route_calls[0],
+                    admin_calls = counters.route_calls[1],
+                    secure_submissions = counters.route_calls[2],
+                    requested_events = counters.requested_events,
+                    applied_events = counters.applied_events,
+                    short_calls = counters.short_calls,
+                    error_calls = counters.error_calls,
+                    coalesced_packets = counters.coalesced_packets,
+                    "remote input diagnostics"
+                )
+            };
+        }
+        if info {
+            line!(info);
+        } else {
+            line!(debug);
         }
     }
 
@@ -4119,6 +4145,12 @@ impl InputSink {
 impl Drop for InputSink {
     fn drop(&mut self) {
         self.release_all();
+        let rest = self.take_diagnostics();
+        self.diagnostics_rollup
+            .add(std::time::Instant::now(), &rest);
+        if let Some(total) = self.diagnostics_rollup.take() {
+            self.write_diagnostics(&total, true);
+        }
     }
 }
 

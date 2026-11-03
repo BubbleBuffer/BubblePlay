@@ -1,6 +1,14 @@
 use super::*;
 use std::sync::atomic::AtomicU32;
-use tracing::subscriber::with_default;
+
+/// Scoped subscriber, serialized with the other tests that install one.
+fn with_default<S, T>(subscriber: S, body: impl FnOnce() -> T) -> T
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    let _serial = crate::test_tracing::serial();
+    tracing::subscriber::with_default(subscriber, body)
+}
 use tracing_subscriber::layer::SubscriberExt;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -363,4 +371,25 @@ fn day_file_names_parse_strictly() {
     );
     assert_eq!(parse_day_file("host", "tray-2026-11-02.jsonl"), None);
     assert_eq!(parse_day_file("host", "host-2026-11-02.log"), None);
+}
+
+#[test]
+fn active_session_fills_lines_without_their_own() {
+    let (logger, dir) = logger("session", "host");
+    let subscriber = tracing_subscriber::registry().with(logger.layer());
+    with_default(subscriber, || {
+        tracing::info!("before");
+        logger.set_session(Some("0123456789abcdef0123456789abcdef"));
+        tracing::info!("during");
+        tracing::info!(session = "own", "explicit");
+        logger.set_session(None);
+        tracing::info!("after");
+    });
+    logger.shutdown();
+    let lines = lines(&dir);
+    assert_eq!(lines[0]["session"], Value::Null);
+    assert_eq!(lines[1]["session"], "0123456789abcdef0123456789abcdef");
+    assert_eq!(lines[2]["session"], "own");
+    assert_eq!(lines[3]["session"], Value::Null);
+    let _ = fs::remove_dir_all(dir);
 }

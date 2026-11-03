@@ -1,6 +1,7 @@
 //! Bounded, content-free input diagnostics. Counters contain packet categories,
 //! gate reasons and Windows receipt counts, never keys, text or positions.
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -113,6 +114,47 @@ impl InputDropReason {
     }
 }
 
+/// Seconds between info lines of the input diagnostics; the per-second counters go to debug.
+pub const DIAGNOSTICS_INFO_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Sums per-second diagnostics and releases the total once per interval.
+#[derive(Debug)]
+pub struct DiagnosticsRollup {
+    sum: InputDiagnosticCounters,
+    next: Instant,
+    interval: Duration,
+}
+
+impl DiagnosticsRollup {
+    pub fn new(now: Instant, interval: Duration) -> Self {
+        Self {
+            sum: InputDiagnosticCounters::default(),
+            next: now + interval,
+            interval,
+        }
+    }
+
+    /// Add one window. Returns the total (when it is not empty) once the interval has passed.
+    pub fn add(
+        &mut self,
+        now: Instant,
+        window: &InputDiagnosticCounters,
+    ) -> Option<InputDiagnosticCounters> {
+        self.sum.merge(window);
+        if now < self.next {
+            return None;
+        }
+        self.next = now + self.interval;
+        self.take()
+    }
+
+    /// What is left (session end).
+    pub fn take(&mut self) -> Option<InputDiagnosticCounters> {
+        let sum = std::mem::take(&mut self.sum);
+        (!sum.is_empty()).then_some(sum)
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct InputDiagnosticCounters {
     /// Kinds 0..=13 in wire order; slot 14 contains unknown/empty packets.
@@ -158,6 +200,26 @@ impl InputDiagnosticCounters {
                 self.error_calls = self.error_calls.saturating_add(1);
             }
         }
+    }
+
+    /// Add `other`'s counters to these.
+    pub fn merge(&mut self, other: &Self) {
+        for (a, b) in self.received_by_kind.iter_mut().zip(other.received_by_kind) {
+            *a = a.saturating_add(b);
+        }
+        for (a, b) in self.drops_by_reason.iter_mut().zip(other.drops_by_reason) {
+            *a = a.saturating_add(b);
+        }
+        for (a, b) in self.route_calls.iter_mut().zip(other.route_calls) {
+            *a = a.saturating_add(b);
+        }
+        self.requested_events = self.requested_events.saturating_add(other.requested_events);
+        self.applied_events = self.applied_events.saturating_add(other.applied_events);
+        self.short_calls = self.short_calls.saturating_add(other.short_calls);
+        self.error_calls = self.error_calls.saturating_add(other.error_calls);
+        self.coalesced_packets = self
+            .coalesced_packets
+            .saturating_add(other.coalesced_packets);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -301,5 +363,44 @@ mod tests {
         assert_eq!(flow.observe(Some(InputDropReason::NotReady)), None);
         assert_eq!(flow.observe(None), Some(None));
         assert_eq!(flow.observe(None), None);
+    }
+}
+
+#[cfg(test)]
+mod rollup_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_reach_info_once_per_interval_with_summed_counts() {
+        let start = Instant::now();
+        let mut rollup = DiagnosticsRollup::new(start, Duration::from_secs(60));
+        let mut released = Vec::new();
+        for second in 1..=120u64 {
+            let mut window = InputDiagnosticCounters::default();
+            window.received(Some(2));
+            window.dropped(InputDropReason::NotReady);
+            if let Some(total) = rollup.add(start + Duration::from_secs(second), &window) {
+                released.push(total);
+            }
+        }
+        assert_eq!(released.len(), 2);
+        assert_eq!(released[0].received_by_kind[2], 60);
+        assert_eq!(
+            released[0].drops_by_reason[InputDropReason::NotReady as usize],
+            60
+        );
+        // Idle windows release nothing; session end releases the remainder once.
+        let idle = InputDiagnosticCounters::default();
+        assert!(rollup
+            .add(start + Duration::from_secs(121), &idle)
+            .is_none());
+        assert!(rollup.take().is_none());
+        let one = InputDiagnosticCounters {
+            coalesced_packets: 3,
+            ..Default::default()
+        };
+        assert!(rollup.add(start + Duration::from_secs(122), &one).is_none());
+        assert_eq!(rollup.take().unwrap().coalesced_packets, 3);
+        assert!(rollup.take().is_none());
     }
 }
