@@ -190,3 +190,87 @@ test("a crop with no sharp canvas falls back to the base canvas", () => {
   h.output(h.decoders[0], 111);
   assert.equal(h.canvas.draws.length, 1);
 });
+
+function hybridWrap(accessUnit, { generation = 1, sequence = 1, cropRevision = 7 } = {}) {
+  const bytes = new Uint8Array(32 + accessUnit.length);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, 0x42504831);
+  view.setUint8(4, 1);
+  view.setUint32(8, generation);
+  view.setUint32(12, sequence);
+  view.setUint32(16, cropRevision);
+  view.setUint32(20, accessUnit.length);
+  bytes.set(accessUnit, 32);
+  return bytes;
+}
+
+function fakeCache(name, calls) {
+  return {
+    ingest: (frame) => { calls.push([name, "ingest", frame.sequence]); return true; },
+    draw: (ctx, metadata) => { calls.push([name, "draw", metadata.cropRevision]); return 2; },
+    clear: () => calls.push([name, "clear"]),
+    close: () => calls.push([name, "close"]),
+    setDecoderCapability: (capability) => calls.push([name, "capability", capability.state]),
+    snapshot: () => ({ name }),
+  };
+}
+
+function hybridHarness() {
+  const calls = [];
+  const posts = [];
+  const decoders = [];
+  const pipeline = createWssPipeline({
+    post: (m) => posts.push(m), now: () => 1000,
+    createDecoder: (init) => { const d = { init, state: "unconfigured", decodeQueueSize: 0, configure() { this.state = "configured"; }, decode() {}, close() { this.state = "closed"; } }; decoders.push(d); return d; },
+    createChunk: (init) => init,
+    hybridTileCache: fakeCache("png", calls), hevcTileCache: fakeCache("hevc", calls),
+  });
+  pipeline.attach({ main: fakeCanvas(), sharp: fakeCanvas() });
+  const send = (extra) => pipeline.handleFrame({ type: "frame", epoch: 0, codec: 1, generation: 1, sequence: 1, key: true,
+    data: HEVC_KEY, timestampUs: 111, view: { enabled: false }, hybridMode: "png-static-roi", frameTrace: {}, ...extra });
+  const output = (ts = 111) => decoders.at(-1).init.output({ timestamp: ts, displayWidth: 640, displayHeight: 360, close() {} });
+  return { calls, posts, decoders, pipeline, send, output };
+}
+
+test("hybrid frames are unwrapped, their tiles ingested, and drawn over the base frame", () => {
+  const h = hybridHarness();
+  h.send({ data: hybridWrap(HEVC_KEY) });
+  assert.deepEqual(h.calls.find((c) => c[1] === "ingest"), ["png", "ingest", 1]);
+  h.output();
+  assert.deepEqual(h.calls.find((c) => c[1] === "draw"), ["png", "draw", 7]);
+  const out = h.posts.find((m) => m.type === "out");
+  assert.equal(out.trace.hybridTilesDrawn, 2);
+  assert.deepEqual(out.hybrid, { name: "png" });
+});
+
+test("the HEVC tile cache is used for hevc-quiescent-tiles", () => {
+  const h = hybridHarness();
+  h.send({ data: hybridWrap(HEVC_KEY), hybridMode: "hevc-quiescent-tiles" });
+  assert.equal(h.calls.find((c) => c[1] === "ingest")[0], "hevc");
+});
+
+test("an unwrapped frame while a hybrid mode is active is rejected", () => {
+  const h = hybridHarness();
+  h.send({});
+  assert.ok(h.posts.some((m) => m.type === "failure" && m.reason === "hybrid-frame-invalid"));
+  assert.equal(h.decoders.length, 0);
+});
+
+test("with hybrid off frames pass through and the caches are never used", () => {
+  const h = hybridHarness();
+  h.send({ hybridMode: "off" });
+  h.output();
+  assert.equal(h.calls.filter((c) => c[1] === "ingest" || c[1] === "draw").length, 0);
+});
+
+test("resync, codec change and stop clear the caches; tile capability reaches the HEVC cache", () => {
+  const h = hybridHarness();
+  h.calls.length = 0;
+  h.pipeline.resync({ epoch: 1 });
+  assert.deepEqual(h.calls, [["png", "clear"], ["hevc", "clear"]]);
+  h.pipeline.setTileCapability({ state: "supported" });
+  assert.ok(h.calls.some((c) => c[0] === "hevc" && c[1] === "capability"));
+  h.calls.length = 0;
+  h.pipeline.stop();
+  assert.deepEqual(h.calls, [["png", "clear"], ["hevc", "close"]]);
+});

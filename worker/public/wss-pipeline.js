@@ -11,7 +11,7 @@
 // `post(message)`; the main thread (wss-worker-client.js + receiver.js) owns
 // recovery state, the HUD and ACKs (ACKs stay on receipt there).
 import { detectAnnexBCodec, shouldPresentDecodedV4 } from "./media-v4.js";
-import { CODEC } from "./media.js";
+import { CODEC, drawBaseThenHybrid, HevcTileCache, HybridTileCache, prepareHybridWssFrame } from "./media.js";
 
 // Parse the codec string (avc1.PPCCLL) from the first SPS NAL of an Annex B
 // keyframe. profile_idc/constraint/level are the first 3 bytes of the SPS
@@ -35,12 +35,16 @@ export function avcCodecFromSps(bytes) {
 
 const DEFAULT_HEVC_CODEC = "hev1.1.6.L120.B0";
 const MAX_PENDING_TIMESTAMPS = 64;
+const HYBRID_MODES = ["png-static-roi", "png-quiescent-detail", "hevc-quiescent-tiles"];
+const HYBRID_SNAPSHOT_INTERVAL_MS = 250;
 
 export function createWssPipeline({
   post,
   now = () => performance.now(),
   createDecoder = (init) => new VideoDecoder(init),
   createChunk = (init) => new EncodedVideoChunk(init),
+  hybridTileCache = new HybridTileCache(),
+  hevcTileCache = new HevcTileCache(),
 } = {}) {
   let main = null; // { canvas, ctx }: the full-desktop canvas
   let sharp = null; // { canvas, ctx }: the sharp-viewport crop overlay
@@ -55,6 +59,8 @@ export function createWssPipeline({
   let firstConfigured = false;
   let firstOutput = false;
   let timestampFallbackLogged = false;
+  let hybridMode = "off";
+  let lastHybridSnapshotAt = -Infinity;
 
   const log = (level, name, fields = {}) => post({ type: "log", level, name, fields });
   const trace = (name, fields = {}) => post({ type: "trace", name, fields });
@@ -73,6 +79,15 @@ export function createWssPipeline({
       sharp = { canvas: canvases.sharp, ctx: sharpCtx };
     }
     return true;
+  }
+
+  // Hybrid tile overlays only exist for HEVC; the mode name comes from the
+  // host's bench status and is sent along with every frame.
+  const hybridActive = () => codec === "hevc" && HYBRID_MODES.includes(hybridMode);
+  const activeCache = () => (hybridMode === "hevc-quiescent-tiles" ? hevcTileCache : hybridTileCache);
+  function clearCaches() {
+    hybridTileCache.clear();
+    hevcTileCache.clear();
   }
 
   function closeDecoder() {
@@ -194,14 +209,19 @@ export function createWssPipeline({
     const view = metadata?.view ?? null;
     // Never render a generation with stale geometry.
     if (!metadata || !view) return;
+    const hybrid = hybridActive();
+    const cache = activeCache();
+    const composite = (context) => (hybrid
+      ? drawBaseThenHybrid(context, frame, cache, metadata, w, h)
+      : (context.drawImage(frame, 0, 0, w, h), 0));
     if (view.enabled && sharp) {
       if (sharp.canvas.width !== w || sharp.canvas.height !== h) {
         sharp.canvas.width = w;
         sharp.canvas.height = h;
       }
-      sharp.ctx.drawImage(frame, 0, 0, w, h);
+      const tiles = composite(sharp.ctx);
       out.sharp = true;
-      finishPresent(frame, metadata, out, view, 0);
+      finishPresent(frame, metadata, out, view, tiles);
       return;
     }
     if (main.canvas.width !== w || main.canvas.height !== h) {
@@ -209,9 +229,9 @@ export function createWssPipeline({
       main.canvas.height = h;
       out.resized = true;
     }
-    main.ctx.drawImage(frame, 0, 0, w, h);
+    const tiles = composite(main.ctx);
     out.sharp = false;
-    finishPresent(frame, metadata, out, view, 0);
+    finishPresent(frame, metadata, out, view, tiles);
   }
 
   function finishPresent(frame, metadata, out, view, tilesDrawn) {
@@ -225,6 +245,10 @@ export function createWssPipeline({
     out.sequence = metadata.sequence >>> 0;
     out.renderedAt = renderedAt;
     out.trace = { ...metadata.frameTrace };
+    if (hybridActive() && renderedAt - lastHybridSnapshotAt >= HYBRID_SNAPSHOT_INTERVAL_MS) {
+      lastHybridSnapshotAt = renderedAt;
+      out.hybrid = activeCache().snapshot();
+    }
   }
 
   function handleFrame(message) {
@@ -236,25 +260,48 @@ export function createWssPipeline({
     const detectedCodec = detectAnnexBCodec(data, { key });
     const headerCodec = message.codec === CODEC.HEVC ? "hevc" : "h264";
     if (!key && (detectedCodec || headerCodec) !== codec) return;
-    const bitstreamCodec = detectedCodec;
+    hybridMode = typeof message.hybridMode === "string" ? message.hybridMode : "off";
+    const prepared = prepareHybridWssFrame({ generation: message.generation, sequence: message.sequence, data }, {
+      active: hybridActive() && detectedCodec !== "h264",
+      cache: activeCache(),
+    });
+    if (!prepared) { fail("hybrid-frame-invalid"); return; }
+    const bitstreamCodec = detectedCodec || detectAnnexBCodec(prepared.data, { key });
     const frameCodec = bitstreamCodec || headerCodec;
     if (frameCodec !== codec) {
       if (!key || !bitstreamCodec) return;
       followCodec(frameCodec);
     }
+    const activity = prepared.activity;
+    if (activity && (activity.upserts || activity.invalidations || activity.clears || activity.pngBytes)) {
+      log("info", "hybrid-frame-activity", {
+        generation: message.generation, sequence: message.sequence, cropRevision: prepared.cropRevision,
+        ...activity, hybrid: activeCache().snapshot(),
+      });
+    }
     const frameTrace = message.frameTrace ? { ...message.frameTrace } : {};
+    if (activity) {
+      frameTrace.hybridCropRevision = prepared.cropRevision;
+      frameTrace.hybridTileUpserts = activity.upserts;
+      frameTrace.hybridTileInvalidations = activity.invalidations;
+      frameTrace.hybridTileSuppressions = activity.suppressions;
+      frameTrace.hybridTileReactivations = activity.reactivations;
+      frameTrace.hybridTilePermanentInvalidations = activity.permanentInvalidations;
+      frameTrace.hybridTileClears = activity.clears;
+      frameTrace.hybridPngBytes = activity.pngBytes;
+    }
     if (key) post({ type: "key-accepted", generation: message.generation, sequence: message.sequence, codec: message.codec });
     const timestamp = message.timestampUs;
     seqByTimestamp.set(timestamp, {
       sequence: message.sequence,
       generation: message.generation,
       key,
-      cropRevision: null,
+      cropRevision: prepared.cropRevision,
       frameTrace,
       view: message.view ?? null,
     });
     while (seqByTimestamp.size > MAX_PENDING_TIMESTAMPS) seqByTimestamp.delete(seqByTimestamp.keys().next().value);
-    const fed = feed({ type: key ? "key" : "delta", timestamp, data, codec, frameTrace }, message.hevcCodec);
+    const fed = feed({ type: key ? "key" : "delta", timestamp, data: prepared.data, codec, frameTrace }, message.hevcCodec);
     // Arm only after a configured decoder accepted the keyframe.
     if (fed && key && decoder?.state === "configured") post({ type: "key-fed", epoch });
   }
@@ -264,6 +311,7 @@ export function createWssPipeline({
     codec = next;
     closeDecoder();
     resetFrameState();
+    clearCaches();
     post({ type: "codec-follow", previousCodec, codec: next });
   }
 
@@ -271,6 +319,11 @@ export function createWssPipeline({
     epoch = message.epoch;
     closeDecoder();
     resetFrameState();
+    clearCaches();
+  }
+
+  function setTileCapability(capability) {
+    hevcTileCache.setDecoderCapability(capability);
   }
 
   function setCodec(next) {
@@ -280,12 +333,16 @@ export function createWssPipeline({
   function stop() {
     closeDecoder();
     resetFrameState();
+    hybridTileCache.clear();
+    hevcTileCache.close();
   }
 
   return {
     attach,
     handleFrame,
     resync,
+    clearCaches,
+    setTileCapability,
     setCodec,
     stop,
     get codec() { return codec; },

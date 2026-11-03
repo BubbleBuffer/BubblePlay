@@ -31,6 +31,8 @@ self.onmessage = ({ data }) => {
       }
       case "frame": pipeline?.handleFrame(data); break;
       case "resync": pipeline?.resync(data); break;
+      case "clear-caches": pipeline?.clearCaches(); break;
+      case "tile-capability": pipeline?.setTileCapability(data.capability); break;
       default: break;
     }
   } catch (error) {
