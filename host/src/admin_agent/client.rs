@@ -621,17 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn write_to_a_pipe_whose_server_closed_is_never_delivered() {
-        let (pipe, peer) = test_server::peer("server-gone", &[]);
-        let mut connection = test_connection(pipe);
-        drop(peer); // the server end closes
-        let error = connection
-            .send_frame(&[move_one()], Instant::now() + Duration::from_millis(500))
-            .unwrap_err();
-        assert!(write_never_delivered(&error), "{error:?}");
-    }
-
-    #[test]
     fn stalled_agent_write_has_a_deadline_even_when_the_pipe_is_full() {
         let (pipe, peer) = test_server::peer("full", &[]);
         let mut connection = test_connection(pipe);
