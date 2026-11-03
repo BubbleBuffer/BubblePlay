@@ -7157,21 +7157,21 @@ mod tests {
         encoder_benchmark_contract_changed, encoder_mode_for_capture, fallback_mode,
         frame_admission_due, full_profile_uses_native_texture, idle_snapshot_completion_order,
         input_ready_after_presentation, input_ready_on_offer, lab_quality_keyframe_request,
-        producer_wait_duration, quiescent_damage_rects, quiescent_immediate_damage_rects,
-        quiescent_transition_followup_needed, quiescent_transition_upsert_allowed,
-        quiescent_validation_requests, record_benchmark_encode_stages,
-        record_benchmark_feedback_plan, record_benchmark_feedback_submission,
-        record_benchmark_hybrid_validation, record_benchmark_roi_activity,
-        record_benchmark_temporal_activity, recover_quiescent_after_unsubmitted_frame,
-        rejected_transition_requires_recovery, remembered_monitor_attempt_exhausted,
-        plan_viewport_request, same_viewport_geometry, session_capture_selector, should_forward_offer,
-        should_replace_wss_media_session, should_reset_lab_encoder_for_keyframe,
-        should_snapshot_idle_desktop, take_matching_transition, temporal_readback_policy,
-        valid_lab_quality_request_id, valid_monitor_refresh_control, viewport_from_q16, CachedIdr,
-        CachedIdrReplay, CaptureSelection, DesktopState, FirstFrameRecovery,
-        IdleSnapshotCompletionOrder, PendingFirstFrame, PendingSubmittedIdr, ProfileTransition,
-        TemporalReadbackPolicy, VideoMode, ViewportCrop, ViewportPlan, ViewportRequest,
-        REMEMBERED_MONITOR_MAX_ATTEMPTS,
+        plan_viewport_request, producer_wait_duration, quiescent_damage_rects,
+        quiescent_immediate_damage_rects, quiescent_transition_followup_needed,
+        quiescent_transition_upsert_allowed, quiescent_validation_requests,
+        record_benchmark_encode_stages, record_benchmark_feedback_plan,
+        record_benchmark_feedback_submission, record_benchmark_hybrid_validation,
+        record_benchmark_roi_activity, record_benchmark_temporal_activity,
+        recover_quiescent_after_unsubmitted_frame, rejected_transition_requires_recovery,
+        remembered_monitor_attempt_exhausted, same_viewport_geometry, session_capture_selector,
+        should_forward_offer, should_replace_wss_media_session,
+        should_reset_lab_encoder_for_keyframe, should_snapshot_idle_desktop,
+        take_matching_transition, temporal_readback_policy, valid_lab_quality_request_id,
+        valid_monitor_refresh_control, viewport_from_q16, CachedIdr, CachedIdrReplay,
+        CaptureSelection, DesktopState, FirstFrameRecovery, IdleSnapshotCompletionOrder,
+        PendingFirstFrame, PendingSubmittedIdr, ProfileTransition, TemporalReadbackPolicy,
+        VideoMode, ViewportCrop, ViewportPlan, ViewportRequest, REMEMBERED_MONITOR_MAX_ATTEMPTS,
         STATIC_REPLAY_DELAY,
     };
     use crate::encode::{
@@ -8099,20 +8099,41 @@ mod tests {
         assert_eq!(generation, 6);
         assert_eq!((crop.width, crop.height), (960, 540));
         // Same geometry, later revision: acknowledged without a new generation.
-        let again =
-            plan_viewport_request(true, true, req(2, true), 1, Some(crop), false, 6, 1920, 1080);
+        let again = plan_viewport_request(
+            true,
+            true,
+            req(2, true),
+            1,
+            Some(crop),
+            false,
+            6,
+            1920,
+            1080,
+        );
         assert!(matches!(again, ViewportPlan::Unchanged(c) if c.revision == 2));
         // Same geometry while its IDR is still pending: re-applied.
         let pending =
             plan_viewport_request(true, true, req(2, true), 1, Some(crop), true, 6, 1920, 1080);
         assert!(matches!(pending, ViewportPlan::Apply { generation: 7, .. }));
         // Reset to the full desktop is a new generation too.
-        let full =
-            plan_viewport_request(true, true, req(3, false), 2, Some(crop), false, 6, 1920, 1080);
+        let full = plan_viewport_request(
+            true,
+            true,
+            req(3, false),
+            2,
+            Some(crop),
+            false,
+            6,
+            1920,
+            1080,
+        );
         match full {
             ViewportPlan::Apply { crop, generation } => {
                 assert_eq!(generation, 7);
-                assert_eq!((crop.x, crop.y, crop.width, crop.height), (0, 0, 1920, 1080));
+                assert_eq!(
+                    (crop.x, crop.y, crop.width, crop.height),
+                    (0, 0, 1920, 1080)
+                );
             }
             other => panic!("reset must apply: {other:?}"),
         }
@@ -8120,8 +8141,17 @@ mod tests {
         let noop = plan_viewport_request(true, true, req(1, false), 0, None, false, 5, 1920, 1080);
         assert!(matches!(noop, ViewportPlan::Unchanged(_)));
         // The generation counter never lands on zero.
-        let wrap =
-            plan_viewport_request(true, true, req(1, true), 0, None, false, u32::MAX, 1920, 1080);
+        let wrap = plan_viewport_request(
+            true,
+            true,
+            req(1, true),
+            0,
+            None,
+            false,
+            u32::MAX,
+            1920,
+            1080,
+        );
         assert!(matches!(wrap, ViewportPlan::Apply { generation: 1, .. }));
     }
 
@@ -8138,13 +8168,22 @@ mod tests {
         let plan = |v4, epoch, request, current| {
             plan_viewport_request(v4, epoch, request, current, None, false, 1, 1920, 1080)
         };
-        assert!(matches!(plan(true, true, good, 3), ViewportPlan::Apply { .. }));
+        assert!(matches!(
+            plan(true, true, good, 3),
+            ViewportPlan::Apply { .. }
+        ));
         assert_eq!(plan(false, true, good, 3), ViewportPlan::Ignore); // v2/v3/none
         assert_eq!(plan(true, false, good, 3), ViewportPlan::Ignore); // no epoch
         assert_eq!(plan(true, true, good, 4), ViewportPlan::Ignore); // stale revision
-        let no_rev = ViewportRequest { revision: None, ..good };
+        let no_rev = ViewportRequest {
+            revision: None,
+            ..good
+        };
         assert_eq!(plan(true, true, no_rev, 3), ViewportPlan::Ignore);
-        let zero = ViewportRequest { width_q16: 0, ..good };
+        let zero = ViewportRequest {
+            width_q16: 0,
+            ..good
+        };
         assert_eq!(plan(true, true, zero, 3), ViewportPlan::Ignore);
         // A desktop too small to crop never accepts one.
         assert_eq!(
