@@ -3570,112 +3570,103 @@ fn run_serve(
                         next_idr = Instant::now();
                     }
                     if action == "viewport" && wss_media.is_some() {
-                        // v4 always streams the full desktop.
-                        if !matches!(protocol, Some(2 | 3)) || epoch.is_none() {
-                            warn!(?protocol, "WSS viewport request missing session metadata");
-                            continue;
-                        }
-                        let Some(revision) = revision else {
-                            continue;
-                        };
-                        if revision <= viewport_revision {
-                            continue;
-                        }
-                        let crop = match viewport_from_q16(
-                            revision,
-                            enabled.unwrap_or(false),
-                            x_q16.unwrap_or(0),
-                            y_q16.unwrap_or(0),
-                            width_q16.unwrap_or(u16::MAX),
-                            height_q16.unwrap_or(u16::MAX),
-                            capture.width(),
-                            capture.height(),
-                        ) {
-                            Some(crop) => crop,
-                            None => {
-                                warn!(revision, "invalid WSS viewport request");
-                                continue;
-                            }
-                        };
-                        let implicit_full = ViewportCrop {
-                            revision,
-                            x: 0,
-                            y: 0,
-                            width: capture.width(),
-                            height: capture.height(),
-                        };
-                        let current_crop = viewport_crop.unwrap_or(implicit_full);
-                        if pending_viewport_idr.is_none()
-                            && same_viewport_geometry(current_crop, crop)
-                        {
-                            viewport_revision = revision;
-                            viewport_crop = Some(crop);
-                            let state = if crop.x == 0
-                                && crop.y == 0
-                                && crop.width == capture.width()
-                                && crop.height == capture.height()
-                            {
-                                "full"
-                            } else {
-                                "active"
-                            };
-                            signaling.send_media_view(
-                                state,
-                                crop.revision,
-                                media_generation,
-                                capture.width(),
-                                capture.height(),
-                                crop.x,
-                                crop.y,
-                                crop.width,
-                                crop.height,
-                                "viewport-unchanged",
-                            );
-                            active_viewport = Some((crop.revision, media_generation));
-                            info!(
+                        let plan = plan_viewport_request(
+                            protocol == Some(4),
+                            epoch.is_some(),
+                            ViewportRequest {
                                 revision,
-                                generation = media_generation,
-                                crop_x = crop.x,
-                                crop_y = crop.y,
-                                crop_width = crop.width,
-                                crop_height = crop.height,
-                                "WSS viewport unchanged; acknowledged without IDR"
-                            );
-                            continue;
-                        }
-                        viewport_revision = revision;
-                        viewport_crop = Some(crop);
-                        info!(
-                            revision,
-                            enabled = enabled.unwrap_or(false),
-                            crop_x = crop.x,
-                            crop_y = crop.y,
-                            crop_width = crop.width,
-                            crop_height = crop.height,
-                            "WSS viewport prepared"
-                        );
-                        media_generation = media_generation.wrapping_add(1).max(1);
-                        media_sequence = 0;
-                        pending_wss_idr = None;
-                        pending_viewport_idr = None;
-                        latest_idr = None;
-                        capture.request_idle_snapshot();
-                        if let Some(enc) = encoder.as_mut() {
-                            enc.force_idr();
-                        }
-                        next_idr = Instant::now();
-                        signaling.send_media_view(
-                            "pending",
-                            crop.revision,
+                                enabled: enabled.unwrap_or(false),
+                                x_q16: x_q16.unwrap_or(0),
+                                y_q16: y_q16.unwrap_or(0),
+                                width_q16: width_q16.unwrap_or(u16::MAX),
+                                height_q16: height_q16.unwrap_or(u16::MAX),
+                            },
+                            viewport_revision,
+                            viewport_crop,
+                            pending_viewport_idr.is_some(),
                             media_generation,
                             capture.width(),
                             capture.height(),
-                            crop.x,
-                            crop.y,
-                            crop.width,
-                            crop.height,
-                            reason.as_deref().unwrap_or("sharp-viewport"),
                         );
+                        match plan {
+                            ViewportPlan::Ignore => {
+                                warn!(?protocol, ?revision, "WSS viewport request ignored");
+                                continue;
+                            }
+                            ViewportPlan::Unchanged(crop) => {
+                                viewport_revision = crop.revision;
+                                viewport_crop = Some(crop);
+                                let state = if crop.x == 0
+                                    && crop.y == 0
+                                    && crop.width == capture.width()
+                                    && crop.height == capture.height()
+                                {
+                                    "full"
+                                } else {
+                                    "active"
+                                };
+                                signaling.send_media_view(
+                                    state,
+                                    crop.revision,
+                                    media_generation,
+                                    capture.width(),
+                                    capture.height(),
+                                    crop.x,
+                                    crop.y,
+                                    crop.width,
+                                    crop.height,
+                                    "viewport-unchanged",
+                                );
+                                active_viewport = Some((crop.revision, media_generation));
+                                info!(
+                                    revision = crop.revision,
+                                    generation = media_generation,
+                                    crop_x = crop.x,
+                                    crop_y = crop.y,
+                                    crop_width = crop.width,
+                                    crop_height = crop.height,
+                                    "WSS viewport unchanged; acknowledged without IDR"
+                                );
+                                continue;
+                            }
+                            ViewportPlan::Apply { crop, generation } => {
+                                viewport_revision = crop.revision;
+                                viewport_crop = Some(crop);
+                                info!(
+                                    revision = crop.revision,
+                                    enabled = enabled.unwrap_or(false),
+                                    crop_x = crop.x,
+                                    crop_y = crop.y,
+                                    crop_width = crop.width,
+                                    crop_height = crop.height,
+                                    "WSS viewport prepared"
+                                );
+                                // A new generation plus a forced IDR: v4 receivers
+                                // drop deltas of a new generation until a keyframe.
+                                media_generation = generation;
+                                media_sequence = 0;
+                                pending_wss_idr = None;
+                                pending_viewport_idr = None;
+                                latest_idr = None;
+                                capture.request_idle_snapshot();
+                                if let Some(enc) = encoder.as_mut() {
+                                    enc.force_idr();
+                                }
+                                next_idr = Instant::now();
+                                signaling.send_media_view(
+                                    "pending",
+                                    crop.revision,
+                                    media_generation,
+                                    capture.width(),
+                                    capture.height(),
+                                    crop.x,
+                                    crop.y,
+                                    crop.width,
+                                    crop.height,
+                                    reason.as_deref().unwrap_or("sharp-viewport"),
+                                );
+                            }
+                        }
                     }
                     if matches!(action.as_str(), "start" | "keyframe") {
                         if let Some(requested) = requested {
@@ -4018,6 +4009,41 @@ fn run_serve(
                         stream_mode.label(),
                     );
                     profiles.on_idr_admitted();
+                }
+            }
+        }
+        if let Some((generation, sequence)) = wss_v4_events.latest_ack {
+            if pending_viewport_idr.as_ref().is_some_and(|pending| {
+                pending.generation == generation && sequence_reached(sequence, pending.sequence)
+            }) {
+                if let Some(pending) = pending_viewport_idr.take() {
+                    let state = if pending.crop.x == 0
+                        && pending.crop.y == 0
+                        && pending.crop.width == capture.width()
+                        && pending.crop.height == capture.height()
+                    {
+                        "full"
+                    } else {
+                        "active"
+                    };
+                    signaling.send_media_view(
+                        state,
+                        pending.crop.revision,
+                        pending.generation,
+                        capture.width(),
+                        capture.height(),
+                        pending.crop.x,
+                        pending.crop.y,
+                        pending.crop.width,
+                        pending.crop.height,
+                        "viewport-active",
+                    );
+                    active_viewport = Some((pending.crop.revision, pending.generation));
+                    info!(
+                        revision = pending.crop.revision,
+                        generation = pending.generation,
+                        "WSS viewport activated after IDR"
+                    );
                 }
             }
         }
@@ -7138,13 +7164,14 @@ mod tests {
         record_benchmark_hybrid_validation, record_benchmark_roi_activity,
         record_benchmark_temporal_activity, recover_quiescent_after_unsubmitted_frame,
         rejected_transition_requires_recovery, remembered_monitor_attempt_exhausted,
-        same_viewport_geometry, session_capture_selector, should_forward_offer,
+        plan_viewport_request, same_viewport_geometry, session_capture_selector, should_forward_offer,
         should_replace_wss_media_session, should_reset_lab_encoder_for_keyframe,
         should_snapshot_idle_desktop, take_matching_transition, temporal_readback_policy,
         valid_lab_quality_request_id, valid_monitor_refresh_control, viewport_from_q16, CachedIdr,
         CachedIdrReplay, CaptureSelection, DesktopState, FirstFrameRecovery,
         IdleSnapshotCompletionOrder, PendingFirstFrame, PendingSubmittedIdr, ProfileTransition,
-        TemporalReadbackPolicy, VideoMode, ViewportCrop, REMEMBERED_MONITOR_MAX_ATTEMPTS,
+        TemporalReadbackPolicy, VideoMode, ViewportCrop, ViewportPlan, ViewportRequest,
+        REMEMBERED_MONITOR_MAX_ATTEMPTS,
         STATIC_REPLAY_DELAY,
     };
     use crate::encode::{
@@ -8053,6 +8080,77 @@ mod tests {
         assert_eq!(crop.height % 2, 0);
         assert!(crop.x + crop.width <= 1920);
         assert!(crop.y + crop.height <= 1080);
+    }
+
+    #[test]
+    fn v4_viewport_request_bumps_generation_and_forces_a_keyframe() {
+        let req = |revision, enabled| ViewportRequest {
+            revision: Some(revision),
+            enabled,
+            x_q16: 16_384,
+            y_q16: 16_384,
+            width_q16: 32_768,
+            height_q16: 32_768,
+        };
+        let plan = plan_viewport_request(true, true, req(1, true), 0, None, false, 5, 1920, 1080);
+        let ViewportPlan::Apply { crop, generation } = plan else {
+            panic!("v4 viewport request must be applied: {plan:?}");
+        };
+        assert_eq!(generation, 6);
+        assert_eq!((crop.width, crop.height), (960, 540));
+        // Same geometry, later revision: acknowledged without a new generation.
+        let again =
+            plan_viewport_request(true, true, req(2, true), 1, Some(crop), false, 6, 1920, 1080);
+        assert!(matches!(again, ViewportPlan::Unchanged(c) if c.revision == 2));
+        // Same geometry while its IDR is still pending: re-applied.
+        let pending =
+            plan_viewport_request(true, true, req(2, true), 1, Some(crop), true, 6, 1920, 1080);
+        assert!(matches!(pending, ViewportPlan::Apply { generation: 7, .. }));
+        // Reset to the full desktop is a new generation too.
+        let full =
+            plan_viewport_request(true, true, req(3, false), 2, Some(crop), false, 6, 1920, 1080);
+        match full {
+            ViewportPlan::Apply { crop, generation } => {
+                assert_eq!(generation, 7);
+                assert_eq!((crop.x, crop.y, crop.width, crop.height), (0, 0, 1920, 1080));
+            }
+            other => panic!("reset must apply: {other:?}"),
+        }
+        // Resetting while already full is a no-op acknowledgement.
+        let noop = plan_viewport_request(true, true, req(1, false), 0, None, false, 5, 1920, 1080);
+        assert!(matches!(noop, ViewportPlan::Unchanged(_)));
+        // The generation counter never lands on zero.
+        let wrap =
+            plan_viewport_request(true, true, req(1, true), 0, None, false, u32::MAX, 1920, 1080);
+        assert!(matches!(wrap, ViewportPlan::Apply { generation: 1, .. }));
+    }
+
+    #[test]
+    fn invalid_or_unsupported_viewport_requests_are_ignored() {
+        let good = ViewportRequest {
+            revision: Some(4),
+            enabled: true,
+            x_q16: 0,
+            y_q16: 0,
+            width_q16: 32_768,
+            height_q16: 32_768,
+        };
+        let plan = |v4, epoch, request, current| {
+            plan_viewport_request(v4, epoch, request, current, None, false, 1, 1920, 1080)
+        };
+        assert!(matches!(plan(true, true, good, 3), ViewportPlan::Apply { .. }));
+        assert_eq!(plan(false, true, good, 3), ViewportPlan::Ignore); // v2/v3/none
+        assert_eq!(plan(true, false, good, 3), ViewportPlan::Ignore); // no epoch
+        assert_eq!(plan(true, true, good, 4), ViewportPlan::Ignore); // stale revision
+        let no_rev = ViewportRequest { revision: None, ..good };
+        assert_eq!(plan(true, true, no_rev, 3), ViewportPlan::Ignore);
+        let zero = ViewportRequest { width_q16: 0, ..good };
+        assert_eq!(plan(true, true, zero, 3), ViewportPlan::Ignore);
+        // A desktop too small to crop never accepts one.
+        assert_eq!(
+            plan_viewport_request(true, true, good, 3, None, false, 1, 300, 170),
+            ViewportPlan::Ignore
+        );
     }
 
     #[test]

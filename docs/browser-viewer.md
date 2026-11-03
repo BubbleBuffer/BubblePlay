@@ -69,6 +69,8 @@ The pairing code is valid for 5 minutes.
 
 Over WSS the browser decodes with WebCodecs and draws in a Dedicated Worker (`wss-worker.js`), on `OffscreenCanvas`s it owns: the desktop canvas, the sharp-viewport crop and the hybrid PNG/HEVC tile overlay. The page keeps layout, input, HUD and the cursor overlay, ACKs frames on receipt (the worker reports `decodedSeq`) and sends the worker the viewport, hybrid mode and desktop state with each frame. If the browser lacks Worker, `VideoDecoder`, `OffscreenCanvas` or `transferControlToOffscreen`, or the worker fails to start or crashes, the page uses the main-thread decode path. `?decoderPath=main` forces that path for debugging, and the HUD shows `(worker)` after the codec when the worker path is active. WebRTC is unchanged: it decodes natively unless you pass `?decoderPath=webcodecs`.
 
+**Sharp viewport (zoom).** When you zoom in, the browser sends a `media-control` `viewport` request (revision plus a Q16 crop rectangle, throttled to one per 100 ms) and the host encodes just that region of the desktop at full quality. On WSS v4 the crop travels out of band: the 28-byte frame header has no crop fields, so the host moves to a new media generation, forces a keyframe, announces `media-view` `pending` with the generation, and sends `active` once the receiver ACKs that keyframe. The viewer draws a frame on the sharp canvas only when its generation matches a known crop, and a request that does not complete in 1.5 s falls back to the full desktop (`viewport-timeout-full`). Zooming back out requests the full desktop the same way.
+
 ## Settings
 
 Settings has two groups that matter here.
