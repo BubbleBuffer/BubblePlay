@@ -4550,6 +4550,7 @@ fn run_serve(
                     }
                     if let Some(egress) = wss_media.as_ref() {
                         egress.set_frame_size(mode.width, mode.height);
+                        egress.set_frame_rate(mode.fps);
                     }
                     let mut wss_reservation = None;
                     let mut wss_forced_idr = false;
