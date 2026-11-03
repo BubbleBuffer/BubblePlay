@@ -8,8 +8,8 @@
 // IndexedDB the in-memory ring is all there is. Reports from "Report a problem" go to the
 // store "feedback" in the same database.
 //
-// Nothing here ever throws into a caller. Phase B (not built yet) uploads lines to the PC over
-// the encrypted session channel with BPLog.drain(pc, afterCursor); the host acks by cursor.
+// Nothing here ever throws into a caller. dk-upload.js uploads lines to the PC over the encrypted
+// session channel with BPLog.drain(pc, afterCursor); the host acks by cursor.
 (function installBPLog(root) {
   "use strict";
 
@@ -180,6 +180,7 @@
     let lastDropNote = 0;
     let inWrite = false;
     const memReports = [];
+    const reportListeners = { saved: new Set(), sent: new Set() };
     let capturing = false;
 
     const nextCursor = () => {
@@ -353,17 +354,48 @@
     /** Saves a report. Resolves {ok, persisted}; persisted is false when only memory holds it. */
     function saveReport(report) {
       return new Promise(resolve => {
-        const keep = () => { memReports.push(report); resolve({ ok: true, persisted: false }); };
+        const done = result => { resolve(result); notify("saved", report?.id); };
+        const keep = () => { memReports.push(report); done({ ok: true, persisted: false }); };
         try {
           if (!db) return keep();
           const tx = db.transaction(FEEDBACK, "readwrite");
           tx.objectStore(FEEDBACK).put(report);
-          tx.oncomplete = () => resolve({ ok: true, persisted: true });
+          tx.oncomplete = () => done({ ok: true, persisted: true });
           tx.onerror = tx.onabort = () => keep();
         } catch {
           keep();
         }
       });
+    }
+
+    /** Removes a report once the PC has stored it. Resolves true when it is gone. */
+    function deleteReport(id) {
+      return new Promise(resolve => {
+        const memory = () => {
+          for (let i = memReports.length - 1; i >= 0; i--) if (memReports[i]?.id === id) memReports.splice(i, 1);
+        };
+        memory();
+        try {
+          if (!db) return resolve(true);
+          const tx = db.transaction(FEEDBACK, "readwrite");
+          tx.objectStore(FEEDBACK).delete(id);
+          tx.oncomplete = () => resolve(true);
+          tx.onerror = tx.onabort = () => resolve(false);
+        } catch {
+          resolve(false);
+        }
+      });
+    }
+
+    function notify(kind, id) {
+      for (const listener of [...reportListeners[kind]]) {
+        try { listener(id); } catch { /* a listener never breaks the logger */ }
+      }
+    }
+    function listen(kind, listener) {
+      if (typeof listener !== "function") return () => {};
+      reportListeners[kind].add(listener);
+      return () => { reportListeners[kind].delete(listener); };
     }
 
     /** Saved reports waiting to go to a PC (phase B). */
@@ -465,6 +497,14 @@
       },
       saveReport,
       listReports,
+      deleteReport,
+      /** Calls the listener with the report id after a report is saved (the uploader sends it). */
+      onReportSaved: listener => listen("saved", listener),
+      /** Calls the listener with the report id after the PC acknowledged it. */
+      onReportSent: listener => listen("sent", listener),
+      reportSent: id => notify("sent", id),
+      /** Cursor of the newest line written so far (0 when none). */
+      head: () => lastCursor,
       flush,
       install,
       /** "memory" without IndexedDB, "opening" until the store loaded, then "ready". */

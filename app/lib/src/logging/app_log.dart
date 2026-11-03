@@ -54,7 +54,19 @@ class ReportLogs {
   final List<Map<String, Object?>> errors;
 }
 
-class AppLogger {
+/// What the upload queue reads lines from: [AppLogger] in the app, a fake in tests.
+abstract interface class LogLineSource {
+  /// See [AppLog.linesFor].
+  Future<LogPage> linesFor(String pcId, {String? afterCursor, int limit});
+
+  /// See [AppLog.miscLines].
+  Future<LogPage> miscLines({String? afterCursor, int limit});
+
+  /// Grows whenever lines reach the store, so a poller can skip reads while it is unchanged.
+  int get writeEpoch;
+}
+
+class AppLogger implements LogLineSource {
   AppLogger({
     required this.src,
     LogStore? store,
@@ -91,11 +103,31 @@ class AppLogger {
   int _dropped = 0;
   DateTime? _lastDropNote;
   bool _writeFailed = false;
+  int _writeEpoch = 0;
 
   /// Lines dropped because the queue was full, not yet reported.
   int get droppedPending => _dropped;
 
   LogStore? get store => _store;
+
+  @override
+  int get writeEpoch => _writeEpoch;
+
+  @override
+  Future<LogPage> linesFor(String pcId, {String? afterCursor, int limit = 500}) async {
+    final store = _store;
+    if (store == null || !isSafeId(pcId)) return LogPage(const [], afterCursor);
+    await flush();
+    return store.page(pcId, afterCursor: afterCursor, limit: limit);
+  }
+
+  @override
+  Future<LogPage> miscLines({String? afterCursor, int limit = 500}) async {
+    final store = _store;
+    if (store == null) return LogPage(const [], afterCursor);
+    await flush();
+    return store.page(null, afterCursor: afterCursor, limit: limit);
+  }
 
   /// The PC and session that following lines relate to (null clears it).
   void setContext({String? pc, String? session}) {
@@ -279,6 +311,7 @@ class AppLogger {
         for (final g in groups.entries) {
           try {
             await store.append(g.key, g.value);
+            _writeEpoch++;
             _writeFailed = false;
           } catch (_) {
             // Disk full or the directory is gone: drop the batch, never retry forever.
@@ -424,24 +457,16 @@ class AppLog {
   /// For the upload (phase B): the stored lines that relate to [pcId], oldest first, every
   /// process's files merged by `ts`, after [afterCursor] (null: from the start).
   ///
-  /// The returned [LogPage.cursor] is opaque (`<ts>#<n>`: the last line's `ts` and how many
-  /// lines with exactly that `ts` were delivered). Pass it back to continue; nothing is
+  /// The returned [LogPage.cursor] is opaque (`<ts>#<nnnnnn>`, fixed width: the last line's `ts` and
+  /// how many lines with exactly that `ts` were delivered). Pass it back to continue; nothing is
   /// delivered twice and nothing is skipped when several lines share a millisecond. Pending
   /// lines are written first. A [pcId] that is not a safe id returns nothing.
-  static Future<LogPage> linesFor(String pcId, {String? afterCursor, int limit = 500}) async {
-    final store = _instance.store;
-    if (store == null || !isSafeId(pcId)) return LogPage(const [], afterCursor);
-    await _instance.flush();
-    return store.page(pcId, afterCursor: afterCursor, limit: limit);
-  }
+  static Future<LogPage> linesFor(String pcId, {String? afterCursor, int limit = 500}) =>
+      _instance.linesFor(pcId, afterCursor: afterCursor, limit: limit);
 
   /// Like [linesFor] for the lines that relate to no PC (uploaded to the next PC connected).
-  static Future<LogPage> miscLines({String? afterCursor, int limit = 500}) async {
-    final store = _instance.store;
-    if (store == null) return LogPage(const [], afterCursor);
-    await _instance.flush();
-    return store.page(null, afterCursor: afterCursor, limit: limit);
-  }
+  static Future<LogPage> miscLines({String? afterCursor, int limit = 500}) =>
+      _instance.miscLines(afterCursor: afterCursor, limit: limit);
 }
 
 /// Where the log store lives (logging spec section 3): the app's own data directory plus

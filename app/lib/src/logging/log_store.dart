@@ -42,6 +42,9 @@ class StoredLine {
 }
 
 /// A page of lines for the upload (phase B) and the reports.
+///
+/// [cursor] is `<ts>#<nnnnnn>`: fixed width (`ts` has exactly three fractional digits, the
+/// count is zero-padded to six digits), so cursors of one source compare byte-wise in line order.
 class LogPage {
   const LogPage(this.lines, this.cursor, {this.more = false});
 
@@ -321,7 +324,9 @@ class _Cursor {
     return _Cursor(text.substring(0, i), count);
   }
 
-  String encode() => '$ts#$count';
+  /// Fixed width (six digits) so cursors of one stream compare byte-wise in line order.
+  /// [parse] still reads the older unpadded form.
+  String encode() => '$ts#${count.toString().padLeft(6, '0')}';
 }
 
 class _StoreFile {

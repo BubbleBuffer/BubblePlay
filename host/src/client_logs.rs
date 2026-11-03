@@ -1,6 +1,8 @@
 //! Host-side store for log batches uploaded by paired clients (spec 3, charter item 4).
 //!
-//! Layout under the logs root: `clients/<device-id>/YYYY-MM-DD.jsonl`, `device.json` and `cursor.json`.
+//! Layout under the logs root: `clients/<device-id>/YYYY-MM-DD.jsonl`, `device.json` and `cursor.json`
+//! (`{"cursors":{"<stream>":"<last accepted cursor>"}}`: one opaque string cursor per client stream, see
+//! docs/architecture/client-log-upload.md).
 //! The host never trusts the client: every line is parsed, validated, stamped with the authenticated
 //! device id and re-redacted before it is written. Callers must hold an [`AuthenticatedDevice`], which only
 //! an authenticated session should construct; rejecting unauthenticated peers stays the caller's duty,
@@ -9,7 +11,7 @@
 //! Limits (see [`Limits`]): batch 64 KiB, line 8 KiB, 20 MiB per device, 200 MiB total, 8 MiB per device per
 //! UTC day (rate cap, counted in memory per host process), 14 day retention ([`ClientLogStore::sweep`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,6 +45,9 @@ const SOURCES: [&str; 9] = [
     "app-android-core",
     "browser",
 ];
+/// The streams a client may upload: the `src` of the lines it owns.
+pub const CLIENT_STREAMS: [&str; 4] = ["app-win", "app-android", "app-android-core", "browser"];
+pub const MAX_CURSOR_LEN: usize = 64;
 const RESERVED_NAMES: [&str; 22] = [
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
@@ -55,6 +60,8 @@ pub enum IngestError {
         bytes: usize,
     },
     InvalidCursor,
+    /// The stream name is not one of [`CLIENT_STREAMS`].
+    InvalidStream,
     /// The device exceeded its daily byte budget; nothing was written and the cursor did not move.
     RateLimited,
     Io(String),
@@ -66,6 +73,7 @@ impl std::fmt::Display for IngestError {
             IngestError::InvalidDeviceId => write!(f, "invalid device id"),
             IngestError::BatchTooLarge { bytes } => write!(f, "batch too large ({bytes} bytes)"),
             IngestError::InvalidCursor => write!(f, "invalid cursor"),
+            IngestError::InvalidStream => write!(f, "invalid stream"),
             IngestError::RateLimited => write!(f, "daily log upload limit reached"),
             IngestError::Io(msg) => write!(f, "io error: {msg}"),
         }
@@ -92,6 +100,29 @@ pub fn sanitize_device_id(id: &str) -> Result<&str, IngestError> {
         Ok(id)
     } else {
         Err(IngestError::InvalidDeviceId)
+    }
+}
+
+/// A stream name must be one of [`CLIENT_STREAMS`].
+pub fn check_stream(stream: &str) -> Result<&str, IngestError> {
+    if CLIENT_STREAMS.contains(&stream) {
+        Ok(stream)
+    } else {
+        Err(IngestError::InvalidStream)
+    }
+}
+
+/// A cursor is 1-64 characters from `[0-9A-Za-z#:._-]`, compared byte-wise.
+pub fn check_cursor(cursor: &str) -> Result<&str, IngestError> {
+    let ok = !cursor.is_empty()
+        && cursor.len() <= MAX_CURSOR_LEN
+        && cursor
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'#' | b':' | b'.' | b'_' | b'-'));
+    if ok {
+        Ok(cursor)
+    } else {
+        Err(IngestError::InvalidCursor)
     }
 }
 
@@ -125,25 +156,40 @@ impl AuthenticatedDevice {
 
 #[derive(Debug, Clone)]
 pub struct Batch {
+    /// The client stream (the `src` of the lines), one of [`CLIENT_STREAMS`].
+    pub stream: String,
     /// Raw JSONL lines as the client sent them (without trailing newline).
     pub lines: Vec<String>,
     /// Client cursor before the first line of this batch.
-    pub cursor_from: u64,
-    /// Client cursor after the last line of this batch; this is what the host acks.
-    pub cursor_to: u64,
+    pub cursor_from: String,
+    /// Cursor of the last line of this batch; this is what the host acks.
+    pub cursor_to: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ack {
-    /// Highest cursor the host has persisted; the client resumes from here.
-    pub cursor: u64,
+    /// Highest cursor the host has persisted for the stream; the client resumes from here.
+    pub cursor: String,
     pub written: usize,
     pub dropped_invalid: usize,
+    /// Lines whose `src` is a valid source but not the stream they arrived on.
+    pub dropped_stream: usize,
     pub dropped_oversize: usize,
     pub dropped_future: usize,
     pub dropped_old: usize,
     /// The whole batch was at or below the stored cursor and was not written again.
     pub duplicate: bool,
+}
+
+impl Ack {
+    /// Every line the host refused (the wire `dropped` count).
+    pub fn dropped_total(&self) -> usize {
+        self.dropped_invalid
+            + self.dropped_stream
+            + self.dropped_oversize
+            + self.dropped_future
+            + self.dropped_old
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +426,7 @@ fn clamp_meta(text: &str) -> String {
 enum LineVerdict {
     Keep { day: String, text: String },
     Invalid,
+    WrongStream,
     Oversize,
     Future,
     Old,
@@ -407,19 +454,37 @@ impl ClientLogStore {
         self.clients.join(device.id())
     }
 
-    /// Highest acked cursor for the device (0 when unknown).
-    pub fn last_cursor(&self, device: &AuthenticatedDevice) -> u64 {
+    /// Last accepted cursor of one stream of the device (`None` when it never uploaded).
+    pub fn last_cursor(&self, device: &AuthenticatedDevice, stream: &str) -> Option<String> {
         let _guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        self.read_cursor(device.id())
+        self.read_cursors(device.id()).remove(stream)
     }
 
-    fn read_cursor(&self, id: &str) -> u64 {
+    /// Last accepted cursor of every stream of the device.
+    pub fn cursors(&self, device: &AuthenticatedDevice) -> BTreeMap<String, String> {
+        let _guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.read_cursors(device.id())
+    }
+
+    fn read_cursors(&self, id: &str) -> BTreeMap<String, String> {
         let path = self.clients.join(id).join("cursor.json");
-        fs::read_to_string(path)
+        let Some(Value::Object(root)) = fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .and_then(|value| value.get("cursor").and_then(Value::as_u64))
-            .unwrap_or(0)
+        else {
+            return BTreeMap::new();
+        };
+        let Some(Value::Object(map)) = root.get("cursors") else {
+            return BTreeMap::new();
+        };
+        map.iter()
+            .filter(|(stream, _)| CLIENT_STREAMS.contains(&stream.as_str()))
+            .filter_map(|(stream, cursor)| {
+                let cursor = cursor.as_str()?;
+                check_cursor(cursor).ok()?;
+                Some((stream.clone(), cursor.to_string()))
+            })
+            .collect()
     }
 
     /// Record who the device is. Writes `device.json` with name, platform, app version and last seen.
@@ -476,6 +541,9 @@ impl ClientLogStore {
     ) -> Result<Ack, IngestError> {
         // Defence in depth: the type already validated the id.
         let id = sanitize_device_id(device.id())?;
+        let stream = check_stream(&batch.stream)?;
+        check_cursor(&batch.cursor_from)?;
+        check_cursor(&batch.cursor_to)?;
         let size: usize = batch.lines.iter().map(|l| l.len() + 1).sum();
         if size > MAX_BATCH_BYTES {
             return Err(IngestError::BatchTooLarge { bytes: size });
@@ -484,27 +552,25 @@ impl ClientLogStore {
             return Err(IngestError::InvalidCursor);
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let stored = self.read_cursor(id);
-        if batch.cursor_to <= stored {
-            return Ok(Ack {
-                cursor: stored,
-                duplicate: true,
-                ..Ack::default()
-            });
+        let mut cursors = self.read_cursors(id);
+        if let Some(stored) = cursors.get(stream) {
+            // At or below the stored cursor (byte-wise): already stored, acknowledge without writing.
+            if batch.cursor_to <= *stored {
+                return Ok(Ack {
+                    cursor: stored.clone(),
+                    duplicate: true,
+                    ..Ack::default()
+                });
+            }
         }
-        // Partial overlap with what is stored: skip the lines the host already has, when the counts line up.
-        let mut lines = batch.lines.as_slice();
-        if batch.cursor_from < stored && (batch.cursor_to - batch.cursor_from) == lines.len() as u64
-        {
-            lines = &lines[(stored - batch.cursor_from) as usize..];
-        }
+        let lines = batch.lines.as_slice();
 
         let now_ms = epoch_ms(now);
         let mut ack = Ack::default();
         let mut by_day: Vec<(String, String)> = Vec::new();
         let mut bytes = 0u64;
         for raw in lines {
-            match self.check_line(id, raw, now_ms) {
+            match self.check_line(id, stream, raw, now_ms) {
                 LineVerdict::Keep { day, text } => {
                     bytes += text.len() as u64 + 1;
                     match by_day.iter_mut().find(|(d, _)| *d == day) {
@@ -517,6 +583,7 @@ impl ClientLogStore {
                     ack.written += 1;
                 }
                 LineVerdict::Invalid => ack.dropped_invalid += 1,
+                LineVerdict::WrongStream => ack.dropped_stream += 1,
                 LineVerdict::Oversize => ack.dropped_oversize += 1,
                 LineVerdict::Future => ack.dropped_future += 1,
                 LineVerdict::Old => ack.dropped_old += 1,
@@ -543,7 +610,8 @@ impl ClientLogStore {
         }
         entry.1 += bytes;
 
-        let cursor_doc = json!({ "cursor": batch.cursor_to });
+        cursors.insert(stream.to_string(), batch.cursor_to.clone());
+        let cursor_doc = json!({ "cursors": cursors });
         write_atomic(&dir.join("cursor.json"), cursor_doc.to_string().as_bytes())?;
         ack.cursor = batch.cursor_to;
         self.touch_last_seen(&dir, now);
@@ -551,7 +619,7 @@ impl ClientLogStore {
         Ok(ack)
     }
 
-    fn check_line(&self, id: &str, raw: &str, now_ms: i64) -> LineVerdict {
+    fn check_line(&self, id: &str, stream: &str, raw: &str, now_ms: i64) -> LineVerdict {
         if raw.len() > MAX_LINE_BYTES {
             return LineVerdict::Oversize;
         }
@@ -568,10 +636,8 @@ impl ClientLogStore {
             .get("level")
             .and_then(Value::as_str)
             .is_some_and(|l| LEVELS.contains(&l));
-        let src_ok = map
-            .get("src")
-            .and_then(Value::as_str)
-            .is_some_and(|s| SOURCES.contains(&s));
+        let src = map.get("src").and_then(Value::as_str).map(str::to_string);
+        let src_ok = src.as_deref().is_some_and(|s| SOURCES.contains(&s));
         let msg_ok = map.get("msg").is_some_and(Value::is_string);
         let optional_ok = ["device", "pc", "session", "target"]
             .iter()
@@ -581,6 +647,10 @@ impl ClientLogStore {
                 .is_none_or(|v| v.is_null() || v.is_object());
         if !(level_ok && src_ok && msg_ok && optional_ok) {
             return LineVerdict::Invalid;
+        }
+        // A stream carries only the lines its own process wrote.
+        if src.as_deref() != Some(stream) {
+            return LineVerdict::WrongStream;
         }
         if ts_ms > now_ms + FUTURE_SKEW_MS {
             return LineVerdict::Future;
@@ -687,11 +757,21 @@ mod tests {
         .to_string()
     }
 
+    /// Fixed-width counter cursor.
+    fn cur(n: u64) -> String {
+        format!("{n:020}")
+    }
+
     fn batch(lines: Vec<String>, from: u64, to: u64) -> Batch {
+        batch_on("app-win", lines, from, to)
+    }
+
+    fn batch_on(stream: &str, lines: Vec<String>, from: u64, to: u64) -> Batch {
         Batch {
+            stream: stream.to_string(),
             lines,
-            cursor_from: from,
-            cursor_to: to,
+            cursor_from: cur(from),
+            cursor_to: cur(to),
         }
     }
 
@@ -795,7 +875,7 @@ mod tests {
         assert_eq!(ack.dropped_future, 1);
         assert_eq!(ack.dropped_old, 1);
         assert_eq!(ack.dropped_oversize, 1);
-        assert_eq!(ack.cursor, n);
+        assert_eq!(ack.cursor, cur(n));
     }
 
     #[test]
@@ -813,7 +893,7 @@ mod tests {
             .collect();
         let err = store.ingest_at(&d, batch(lines, 0, 9), now()).unwrap_err();
         assert!(matches!(err, IngestError::BatchTooLarge { .. }));
-        assert_eq!(store.last_cursor(&d), 0);
+        assert_eq!(store.last_cursor(&d, "app-win"), None);
         assert!(!tmp.0.join("clients/p/2026-11-02.jsonl").exists());
     }
 
@@ -829,7 +909,9 @@ mod tests {
             "fields": {"token": "TOPSECRETVALUE", "nested": {"password": "hunter2hunter2"}, "note": "Bearer zzzzzzzz"}
         })
         .to_string();
-        store.ingest_at(&d, batch(vec![evil], 0, 1), now()).unwrap();
+        store
+            .ingest_at(&d, batch_on("browser", vec![evil], 0, 1), now())
+            .unwrap();
         let text = fs::read_to_string(tmp.0.join("clients/p/2026-11-02.jsonl")).unwrap();
         for leak in [
             "GRAPE-4821",
@@ -860,36 +942,133 @@ mod tests {
         {
             let store = ClientLogStore::open(&tmp.0).unwrap();
             let ack = store.ingest_at(&d, b1.clone(), now()).unwrap();
-            assert_eq!((ack.cursor, ack.duplicate), (2, false));
+            assert_eq!(
+                (ack.cursor.as_str(), ack.duplicate),
+                (cur(2).as_str(), false)
+            );
         }
-        // New process / reconnect: cursor is persisted.
+        // New process / reconnect: the cursor is persisted.
         let store = ClientLogStore::open(&tmp.0).unwrap();
-        assert_eq!(store.last_cursor(&d), 2);
+        assert_eq!(store.last_cursor(&d, "app-win"), Some(cur(2)));
+        assert_eq!(store.last_cursor(&d, "browser"), None);
+        // A resent batch is acknowledged without writing.
         let ack = store.ingest_at(&d, b1, now()).unwrap();
         assert!(ack.duplicate);
-        assert_eq!((ack.cursor, ack.written), (2, 0));
-        // Partial overlap: only the new line is written.
-        let b2 = batch(
-            vec![
-                line("2026-11-02T13:00:01.000Z", "2"),
-                line("2026-11-02T13:00:02.000Z", "3"),
-            ],
-            1,
-            3,
-        );
+        assert_eq!((ack.cursor.as_str(), ack.written), (cur(2).as_str(), 0));
+        // The next batch continues from the stored cursor.
+        let b2 = batch(vec![line("2026-11-02T13:00:02.000Z", "3")], 2, 3);
         let ack = store.ingest_at(&d, b2, now()).unwrap();
-        assert_eq!((ack.cursor, ack.written), (3, 1));
+        assert_eq!((ack.cursor.as_str(), ack.written), (cur(3).as_str(), 1));
         let text = fs::read_to_string(tmp.0.join("clients/p/2026-11-02.jsonl")).unwrap();
         assert_eq!(text.lines().count(), 3);
-        // Cursor never moves backwards.
+        // The cursor never moves backwards: a batch at or below it is acknowledged, not written.
         let old = batch(vec![line("2026-11-02T13:00:03.000Z", "old")], 0, 1);
-        assert!(store.ingest_at(&d, old, now()).unwrap().duplicate);
-        assert_eq!(store.last_cursor(&d), 3);
-        // Invalid cursor.
+        let ack = store.ingest_at(&d, old, now()).unwrap();
+        assert!(ack.duplicate);
+        assert_eq!(ack.cursor, cur(3));
+        let at = batch(vec![line("2026-11-02T13:00:03.000Z", "old")], 2, 3);
+        assert!(store.ingest_at(&d, at, now()).unwrap().duplicate);
+        assert_eq!(store.last_cursor(&d, "app-win"), Some(cur(3)));
+        assert_eq!(
+            fs::read_to_string(tmp.0.join("clients/p/2026-11-02.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        // Invalid cursors: backwards range, bad characters, empty, too long.
         assert_eq!(
             store.ingest_at(&d, batch(vec![], 5, 4), now()).unwrap_err(),
             IngestError::InvalidCursor
         );
+        for bad in ["", "has space", "a/b", "é", &"1".repeat(65)] {
+            let mut b = batch(vec![], 5, 6);
+            b.cursor_to = bad.to_string();
+            assert_eq!(
+                store.ingest_at(&d, b, now()).unwrap_err(),
+                IngestError::InvalidCursor,
+                "{bad:?}"
+            );
+        }
+        // Timestamp-style cursors compare byte-wise.
+        let mut b = batch(vec![], 0, 0);
+        b.stream = "browser".into();
+        b.cursor_from = "2026-11-02T13:45:12.345Z#000042".into();
+        b.cursor_to = "2026-11-02T13:45:13.001Z#000044".into();
+        assert_eq!(store.ingest_at(&d, b, now()).unwrap().written, 0);
+        assert_eq!(
+            store.last_cursor(&d, "browser").as_deref(),
+            Some("2026-11-02T13:45:13.001Z#000044")
+        );
+    }
+
+    #[test]
+    fn cursors_are_per_stream_and_the_stream_is_validated() {
+        let tmp = TempDir::new("streams");
+        let store = ClientLogStore::open(&tmp.0).unwrap();
+        let d = dev("p");
+        let core = |msg: &str| {
+            json!({"ts":"2026-11-02T13:00:00.000Z","level":"info","src":"app-android-core",
+                   "msg":msg})
+            .to_string()
+        };
+        store
+            .ingest_at(
+                &d,
+                batch_on("app-android-core", vec![core("a")], 0, 5),
+                now(),
+            )
+            .unwrap();
+        store
+            .ingest_at(
+                &d,
+                batch_on(
+                    "app-android",
+                    vec![json!({"ts":"2026-11-02T13:00:00.000Z","level":"info","src":"app-android","msg":"b"}).to_string()],
+                    0,
+                    2,
+                ),
+                now(),
+            )
+            .unwrap();
+        let all = store.cursors(&d);
+        assert_eq!(all.get("app-android-core"), Some(&cur(5)));
+        assert_eq!(all.get("app-android"), Some(&cur(2)));
+        assert_eq!(all.len(), 2);
+        // Unknown streams, including ones that are valid `src` values of other processes, are refused.
+        for bad in ["host", "tray", "evil", "", "../x", "APP-WIN"] {
+            let err = store
+                .ingest_at(&d, batch_on(bad, vec![core("x")], 0, 1), now())
+                .unwrap_err();
+            assert_eq!(err, IngestError::InvalidStream, "{bad:?}");
+        }
+        assert_eq!(store.cursors(&d).len(), 2);
+    }
+
+    #[test]
+    fn lines_whose_src_differs_from_the_stream_are_dropped_and_counted() {
+        let tmp = TempDir::new("mismatch");
+        let store = ClientLogStore::open(&tmp.0).unwrap();
+        let d = dev("p");
+        let other =
+            json!({"ts":"2026-11-02T13:00:00.000Z","level":"info","src":"host","msg":"spoof host"})
+                .to_string();
+        let lines = vec![
+            line("2026-11-02T13:00:00.000Z", "mine"),
+            other,
+            json!({"ts":"2026-11-02T13:00:00.000Z","level":"info","src":"browser","msg":"other client"})
+                .to_string(),
+        ];
+        let ack = store.ingest_at(&d, batch(lines, 0, 3), now()).unwrap();
+        assert_eq!(
+            (ack.written, ack.dropped_stream, ack.dropped_total()),
+            (1, 2, 2)
+        );
+        let text = fs::read_to_string(tmp.0.join("clients/p/2026-11-02.jsonl")).unwrap();
+        assert!(
+            text.contains("mine") && !text.contains("spoof host") && !text.contains("other client")
+        );
+        assert_eq!(ack.cursor, cur(3), "dropped lines still advance the cursor");
     }
 
     #[test]
@@ -967,7 +1146,11 @@ mod tests {
             .ingest_at(&d, batch(vec![l.clone(), l.clone()], 2, 4), now())
             .unwrap_err();
         assert_eq!(err, IngestError::RateLimited);
-        assert_eq!(store.last_cursor(&d), 2, "refused batch is not acked");
+        assert_eq!(
+            store.last_cursor(&d, "app-win"),
+            Some(cur(2)),
+            "refused batch is not acked"
+        );
         // Another device is unaffected; the next UTC day resets the budget.
         store
             .ingest_at(&dev("q"), batch(vec![l.clone()], 0, 1), now())

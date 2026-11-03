@@ -1,7 +1,7 @@
 // "Report a problem" for the browser viewer: a small dialog (menu item and Ctrl+Shift+F) that
 // builds a report from what the person wrote plus recent redacted log lines, and stores it in
-// IndexedDB (database "bp-logs", store "feedback") through dk-log.js. Phase B sends stored
-// reports to the PC the next time this browser connects. No screenshot is taken here: the
+// IndexedDB (database "bp-logs", store "feedback") through dk-log.js. dk-upload.js sends stored
+// reports to the PC when this browser is connected (and on the next connection otherwise). No screenshot is taken here: the
 // browser page shows the remote stream, which a report must never carry.
 // Report shape: docs/logging.md (version 1). Text goes in with textContent, never innerHTML.
 import { browserDeviceName } from "./dk-session.js";
@@ -14,6 +14,7 @@ export const FEEDBACK_KINDS = Object.freeze([
 ]);
 export const FEEDBACK_TEXT_MAX = 4000;
 export const SAVED_TEXT = "Saved. It is sent to your PC the next time you connect.";
+export const SENT_TEXT = "Sent to your PC.";
 export const SAVED_MEMORY_TEXT = "Saved for now. It is sent to your PC the next time you connect, if this tab stays open.";
 const LOG_LINES = 200;
 const ERROR_LINES = 20;
@@ -76,7 +77,7 @@ function element(doc, tag, props = {}, ...children) {
 /** The dialog. `doc`, `log` and the rest are test seams; production uses the page globals. */
 export function createFeedback({ doc = globalThis.document, log = globalThis.BPLog, nav, loc, now, id } = {}) {
   let root = null, dialog = null, field = null, kindSelect = null, status = null, send = null, cancel = null;
-  let returnFocus = null, saved = false, busy = false;
+  let returnFocus = null, saved = false, busy = false, savedId = null;
 
   function build() {
     root = element(doc, "div", { id: "bp-feedback", class: "bp-feedback-scrim" });
@@ -134,7 +135,7 @@ export function createFeedback({ doc = globalThis.document, log = globalThis.BPL
     if (!root) build();
     if (!root.hidden) return;
     returnFocus = doc.activeElement && doc.activeElement !== doc.body ? doc.activeElement : null;
-    saved = false; busy = false;
+    saved = false; busy = false; savedId = null;
     field.value = ""; field.readOnly = false; field.disabled = false; kindSelect.disabled = false;
     kindSelect.value = "bug";
     send.disabled = false; send.hidden = false;
@@ -167,6 +168,7 @@ export function createFeedback({ doc = globalThis.document, log = globalThis.BPL
       const report = buildReport({ text, kind: kindSelect.value, log, nav, loc, doc, now, id });
       const result = await log.saveReport(report);
       saved = true;
+      savedId = report.id;
       field.readOnly = true; kindSelect.disabled = true;
       send.hidden = true;
       cancel.textContent = "Close";
@@ -181,6 +183,13 @@ export function createFeedback({ doc = globalThis.document, log = globalThis.BPL
       busy = false;
     }
   }
+
+  // The PC acknowledged a report: while this dialog still shows it as saved, say it was sent.
+  try {
+    log?.onReportSent?.(id => {
+      if (saved && root && !root.hidden && id === savedId && status) status.textContent = SENT_TEXT;
+    });
+  } catch { /* the dialog works without the notice */ }
 
   /** Ctrl+Shift+F, in the capture phase so a running session does not forward it to the PC. */
   function onShortcut(event) {

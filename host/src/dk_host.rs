@@ -12,6 +12,7 @@ use crate::devices_ui_api::{pair_qr_uri, DeviceRow, DevicesCommand, DevicesEvent
 use crate::dk_session::{
     self, End, Event, OsRandomness, Randomness, Session, SessionConfig, Trusted,
 };
+use crate::log_upload::{self, LogUpload, CAP_CLIENT_LOGS};
 use crate::trusted_devices::{self, TrustedDevices, UNNAMED_DEVICE};
 
 pub type SharedDevicesUi = Arc<Mutex<HostEnds>>;
@@ -74,6 +75,9 @@ pub struct HostProtocol {
     dropped: u64,
     /// The current viewer's claimed device ID, kept for the pairing log after its session ends.
     peer_viewer: Option<String>,
+    /// Receiving side of the client log and feedback upload; `None` when the logs directory is
+    /// unusable (the `client-logs-v1` capability is then not advertised).
+    upload: Option<LogUpload>,
 }
 
 impl HostProtocol {
@@ -91,15 +95,25 @@ impl HostProtocol {
                 return Err(error).context("opening the trusted device list");
             }
         };
-        Self::with_store(
+        let logs_dir = crate::logging::default_log_dir();
+        let upload = match LogUpload::open(&logs_dir) {
+            Ok(upload) => Some(upload),
+            Err(error) => {
+                tracing::warn!(%error, "client log upload is off: the logs directory is unusable");
+                None
+            }
+        };
+        Self::with_store_logs(
             identity.duplicate(),
             origin,
             ui,
             trusted,
             Box::new(OsRandomness),
+            upload,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_store(
         identity: bp_device_key::DeviceIdentity,
         origin: &str,
@@ -107,12 +121,29 @@ impl HostProtocol {
         trusted: TrustedDevices,
         random: Box<dyn Randomness>,
     ) -> Result<Self> {
+        Self::with_store_logs(identity, origin, ui, trusted, random, None)
+    }
+
+    /// As [`HostProtocol::with_store`], with the client log upload receiver (advertised as
+    /// `client-logs-v1` in the host's ctl `caps`).
+    pub(crate) fn with_store_logs(
+        identity: bp_device_key::DeviceIdentity,
+        origin: &str,
+        ui: SharedDevicesUi,
+        trusted: TrustedDevices,
+        random: Box<dyn Randomness>,
+        upload: Option<LogUpload>,
+    ) -> Result<Self> {
         let pc_id = identity.id();
+        let mut pc_caps = vec!["control-aead-v1".to_owned(), "dtls-bind-v1".to_owned()];
+        if upload.is_some() {
+            pc_caps.push(CAP_CLIENT_LOGS.to_owned());
+        }
         let session = Session::new(
             SessionConfig {
                 identity,
                 relay_origin: origin.to_owned(),
-                pc_caps: vec!["control-aead-v1".into(), "dtls-bind-v1".into()],
+                pc_caps,
             },
             random,
         )?;
@@ -134,6 +165,7 @@ impl HostProtocol {
             last_drop_log: None,
             dropped: 0,
             peer_viewer: None,
+            upload,
         })
     }
 
@@ -382,7 +414,74 @@ impl HostProtocol {
         for command in commands {
             self.command(command, now)?;
         }
+        self.drain_upload();
         Ok(())
+    }
+
+    /// The viewer's ctl `caps` may advertise `client-logs-v1` (the cap is also read from its
+    /// auth-hello). Turning it on queues `logs-state`.
+    fn note_viewer_caps(&mut self, json: &str) {
+        let offered = serde_json::from_str::<Value>(json)
+            .ok()
+            .and_then(|value| value["caps"].as_array().cloned())
+            .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some(CAP_CLIENT_LOGS)));
+        if offered && self.session.is_established() && !self.peer_pairing {
+            if let Some(upload) = self.upload.as_mut() {
+                upload.offer();
+            }
+        }
+    }
+
+    /// One upload ctl message from the authenticated viewer. Answers that need no disk work are
+    /// queued here, the rest come from `drain_upload`.
+    fn upload_message(&mut self, kind: &str, json: &str) {
+        if self.peer_pairing || !self.session.is_established() {
+            self.record_drop("client log message before authentication");
+            return;
+        }
+        let Some(upload) = self.upload.as_mut() else {
+            self.record_drop("client log message while the upload is off");
+            return;
+        };
+        match upload.on_message(kind, json) {
+            Ok(replies) => self.send_upload(replies),
+            Err(reason) => self.record_drop(reason),
+        }
+    }
+
+    /// Worker results, a deferred `logs-state` and feedback timeouts. Never blocks.
+    fn drain_upload(&mut self) {
+        let Some(upload) = self.upload.as_mut() else {
+            return;
+        };
+        let replies = upload.poll();
+        if !replies.is_empty() {
+            self.send_upload(replies);
+        }
+    }
+
+    /// Seals upload answers as ctl messages. They are allowed before the transport latch: like `caps`
+    /// they are ours, small and need no media.
+    fn send_upload(&mut self, replies: Vec<Value>) {
+        for reply in replies {
+            if !self.session.is_established() || self.peer_pairing {
+                return;
+            }
+            let Some(kind) = reply["type"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            match self.session.seal_text(&kind, &reply.to_string()) {
+                Ok(envelope) => match serde_json::from_str(&envelope) {
+                    Ok(value) => self.effects.push(Effect::Send(value)),
+                    Err(error) => tracing::warn!(%error, "sealed upload answer is not JSON"),
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "sealing a client log answer failed; ending the viewer");
+                    self.terminate();
+                    return;
+                }
+            }
+        }
     }
 
     pub fn take_effects(&mut self) -> Vec<Effect> {
@@ -421,6 +520,9 @@ impl HostProtocol {
     }
 
     fn reset_peer(&mut self) {
+        if let Some(upload) = self.upload.as_mut() {
+            upload.stop();
+        }
         self.session.stop(End::Stopped("viewer reset"));
         self.epoch = None;
         self.peer_pairing = false;
@@ -554,6 +656,13 @@ impl HostProtocol {
                         Err(error) => self.save_error(error),
                     }
                     self.queue_list();
+                    // The device id comes from the authenticated session, never from a message.
+                    if !self.peer_pairing {
+                        let offered = viewer.caps.iter().any(|cap| cap == CAP_CLIENT_LOGS);
+                        if let Some(upload) = self.upload.as_mut() {
+                            upload.start(&viewer.id, offered);
+                        }
+                    }
                 }
                 Event::PairRequest(request) => {
                     tracing::info!(
@@ -619,6 +728,13 @@ impl HostProtocol {
                         if first_ctl {
                             self.update_name(&json);
                         }
+                        self.note_viewer_caps(&json);
+                        continue;
+                    }
+                    // Client log and feedback upload: valid for any authenticated viewer once the
+                    // capability is on, whatever the transport latch (they never touch media or input).
+                    if log_upload::is_upload_kind(&kind) {
+                        self.upload_message(&kind, &json);
                         continue;
                     }
                     // Decision 24 (see dk_session::Mode): a WSS media start for protocol 4 and this
@@ -1874,5 +1990,314 @@ mod tests {
             assert!(logs.contains(reason), "missing {reason:?} in {logs}");
         }
         assert_no_secrets(&logs);
+    }
+
+    // ---------------------------------------------------------------- client log upload
+
+    fn fixed_now() -> SystemTime {
+        // 2026-11-02T14:00:00Z, the day of the contract fixture's lines.
+        SystemTime::UNIX_EPOCH + Duration::from_millis(1_793_628_000_000)
+    }
+
+    fn logs_controller(list: &Path, logs: &Path) -> HostProtocol {
+        let f = fixture();
+        let viewer = &f["handshake"]["viewer"];
+        let mut trusted = trusted_devices::load(list).unwrap();
+        trusted
+            .add(
+                string(&viewer["id"]),
+                string(&viewer["public"]),
+                "Old name",
+                SystemTime::now(),
+            )
+            .unwrap();
+        let (host, _ui) = crate::devices_ui_api::channel();
+        let upload = LogUpload::open_with(
+            logs,
+            log_upload::UploadLimits {
+                clock: fixed_now,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        HostProtocol::with_store_logs(
+            bp_device_key::DeviceIdentity::from_seed(&hex32(&f["handshake"]["pc"]["seedHex"])),
+            ORIGIN,
+            Arc::new(Mutex::new(host)),
+            trusted,
+            Box::new(FixtureRandom),
+            Some(upload),
+        )
+        .unwrap()
+    }
+
+    fn pc_opener() -> CtlOpener {
+        CtlOpener::new(&hex32(
+            &fixture()["handshake"]["controlKeys"]["pcToViewerHex"],
+        ))
+    }
+
+    /// The ctl messages among `effects`, opened in order with `opener`.
+    fn open_ctl(opener: &mut CtlOpener, effects: &[Effect]) -> Vec<Value> {
+        sent(effects)
+            .into_iter()
+            .filter(|message| message["type"] == "ctl")
+            .map(|message| {
+                let plain = opener
+                    .open(
+                        string(&message["kind"]),
+                        message["seq"].as_u64().unwrap(),
+                        &URL_SAFE_NO_PAD.decode(string(&message["data"])).unwrap(),
+                    )
+                    .expect("ctl opens in sequence");
+                serde_json::from_slice(&plain).unwrap()
+            })
+            .collect()
+    }
+
+    /// Polls until `want` ctl messages from the host arrived (the upload worker answers later).
+    fn poll_ctl(host: &mut HostProtocol, opener: &mut CtlOpener, want: usize) -> Vec<Value> {
+        let start = Instant::now();
+        let mut out = Vec::new();
+        while out.len() < want {
+            host.poll().unwrap();
+            out.extend(open_ctl(opener, &host.take_effects()));
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "waiting for {want} ctl messages, have {out:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        out
+    }
+
+    fn upload_message(name: &str) -> Value {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../fixtures/client-log-upload-contract.json"
+        ))
+        .unwrap();
+        fixture["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["name"] == name)
+            .unwrap()["json"]
+            .clone()
+    }
+
+    fn viewer_id() -> String {
+        string(&fixture()["handshake"]["viewer"]["id"]).to_owned()
+    }
+
+    #[test]
+    fn host_advertises_client_logs_v1_only_when_the_upload_is_available() {
+        let scratch = Scratch::new();
+        let mut host = logs_controller(&scratch.list(), &scratch.0.join("logs"));
+        handshake(&mut host);
+        let mut opener = pc_opener();
+        let messages = open_ctl(&mut opener, &host.take_effects());
+        assert_eq!(
+            messages[0],
+            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1","client-logs-v1"]})
+        );
+        // Without the upload the cap is absent, as before.
+        let scratch2 = Scratch::new();
+        let (mut plain, _) = controller(&scratch2.list(), true);
+        handshake(&mut plain);
+        let messages = open_ctl(&mut pc_opener(), &plain.take_effects());
+        assert_eq!(
+            messages[0],
+            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1"]})
+        );
+    }
+
+    #[test]
+    fn logs_state_batch_ack_and_feedback_round_trip_over_the_sealed_channel() {
+        let scratch = Scratch::new();
+        let logs = scratch.0.join("logs");
+        let mut host = logs_controller(&scratch.list(), &logs);
+        // Only the handshake: no transport latch yet, uploads work for any authenticated viewer.
+        handshake(&mut host);
+        let mut pc = pc_opener();
+        open_ctl(&mut pc, &host.take_effects());
+        let mut viewer = viewer_sealer();
+
+        // The viewer advertises the cap in its ctl caps; logs-state follows.
+        host.receive(&ctl_json(
+            &mut viewer,
+            json!({"type":"caps","caps":["control-aead-v1","client-logs-v1"],"name":"Phone"}),
+        ))
+        .unwrap();
+        host.take_effects();
+        let state = poll_ctl(&mut host, &mut pc, 1);
+        assert_eq!(state[0]["type"], "logs-state");
+        assert_eq!(state[0]["cursors"], json!({}));
+        assert_eq!(
+            state[0]["limits"],
+            upload_message("logs-state")["limits"],
+            "limits are the contract's"
+        );
+
+        // The fixture batch is stored under the authenticated device id and acked.
+        let batch = upload_message("logs-batch");
+        assert!(host
+            .receive(&ctl_json(&mut viewer, batch.clone()))
+            .unwrap()
+            .is_empty());
+        let ack = poll_ctl(&mut host, &mut pc, 1);
+        assert_eq!(ack[0], upload_message("logs-ack-ok"));
+        let stored = std::fs::read_to_string(
+            logs.join("clients")
+                .join(viewer_id())
+                .join("2026-11-02.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(stored.lines().count(), 2);
+        assert!(stored.contains(&format!("\"device\":\"{}\"", viewer_id())));
+
+        // Feedback: begin, chunk, and an ack only once the file is on disk.
+        let mut begin = upload_message("feedback-begin");
+        let png: Vec<u8> = [
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A][..],
+            &[7; 12][..],
+        ]
+        .concat();
+        begin["pngBytes"] = json!(png.len());
+        host.receive(&ctl_json(&mut viewer, begin)).unwrap();
+        let mut chunk = upload_message("feedback-chunk");
+        chunk["data"] = json!(base64::engine::general_purpose::STANDARD.encode(&png));
+        host.receive(&ctl_json(&mut viewer, chunk)).unwrap();
+        let ack = poll_ctl(&mut host, &mut pc, 1);
+        assert_eq!(ack[0], upload_message("feedback-ack-ok"));
+        let saved: Vec<_> = std::fs::read_dir(logs.join("feedback"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(saved.len(), 2, "{saved:?}");
+        assert!(saved
+            .iter()
+            .all(|name| name.contains(&format!("-{}.", viewer_id()))));
+        assert!(
+            !host.application_ready(),
+            "uploads did not latch a transport"
+        );
+    }
+
+    #[test]
+    fn cursor_resumes_after_a_reconnect_and_a_resent_batch_is_not_stored_twice() {
+        let scratch = Scratch::new();
+        let logs = scratch.0.join("logs");
+        let mut host = logs_controller(&scratch.list(), &logs);
+        for round in 0..2 {
+            handshake(&mut host);
+            let mut pc = pc_opener();
+            open_ctl(&mut pc, &host.take_effects());
+            let mut viewer = viewer_sealer();
+            host.receive(&ctl_json(
+                &mut viewer,
+                json!({"type":"caps","caps":["client-logs-v1"]}),
+            ))
+            .unwrap();
+            let state = poll_ctl(&mut host, &mut pc, 1);
+            if round == 0 {
+                assert_eq!(state[0]["cursors"], json!({}));
+            } else {
+                assert_eq!(
+                    state[0]["cursors"],
+                    json!({"app-android-core": "2026-11-02T13:45:13.001Z#000044"})
+                );
+            }
+            host.receive(&ctl_json(&mut viewer, upload_message("logs-batch")))
+                .unwrap();
+            let ack = poll_ctl(&mut host, &mut pc, 1);
+            assert_eq!(ack[0], upload_message("logs-ack-ok"));
+            host.peer_left();
+            host.take_effects();
+        }
+        let stored = std::fs::read_to_string(
+            logs.join("clients")
+                .join(viewer_id())
+                .join("2026-11-02.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(
+            stored.lines().count(),
+            2,
+            "the resent batch was not written again"
+        );
+    }
+
+    #[test]
+    fn upload_messages_without_the_capability_or_authentication_are_dropped() {
+        let scratch = Scratch::new();
+        let logs = scratch.0.join("logs");
+        let mut host = logs_controller(&scratch.list(), &logs);
+
+        // No authenticated session at all.
+        let log = captured_logs(|| {
+            host.upload_message("logs-batch", &upload_message("logs-batch").to_string());
+        });
+        assert!(
+            log.contains("client log message before authentication"),
+            "{log}"
+        );
+        assert!(host.take_effects().is_empty());
+
+        // Authenticated, but the viewer never offered client-logs-v1.
+        handshake(&mut host);
+        let mut pc = pc_opener();
+        open_ctl(&mut pc, &host.take_effects());
+        let mut viewer = viewer_sealer();
+        host.receive(&ctl_json(&mut viewer, json!({"type":"caps","caps":[]})))
+            .unwrap();
+        for name in ["logs-batch", "feedback-begin"] {
+            assert!(host
+                .receive(&ctl_json(&mut viewer, upload_message(name)))
+                .unwrap()
+                .is_empty());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        host.poll().unwrap();
+        assert!(host.take_effects().is_empty(), "nothing is answered");
+        assert!(!logs.join("clients").join(viewer_id()).exists());
+        assert!(std::fs::read_dir(logs.join("feedback"))
+            .unwrap()
+            .next()
+            .is_none());
+        assert_eq!(host.upload.as_ref().unwrap().ignored(), 2);
+
+        // A pairing viewer has no ctl and no upload.
+        let scratch2 = Scratch::new();
+        let (mut pairing_host, _ui) = controller(&scratch2.list(), false);
+        begin_pair(&mut pairing_host);
+        let log = captured_logs(|| {
+            pairing_host.upload_message("logs-batch", &upload_message("logs-batch").to_string());
+        });
+        assert!(
+            log.contains("client log message before authentication"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_new_viewer_does_not_receive_answers_meant_for_the_previous_one() {
+        let scratch = Scratch::new();
+        let mut host = logs_controller(&scratch.list(), &scratch.0.join("logs"));
+        handshake(&mut host);
+        let mut pc = pc_opener();
+        open_ctl(&mut pc, &host.take_effects());
+        let mut viewer = viewer_sealer();
+        host.receive(&ctl_json(
+            &mut viewer,
+            json!({"type":"caps","caps":["client-logs-v1"]}),
+        ))
+        .unwrap();
+        // The viewer leaves before the worker's logs-state is polled.
+        host.peer_left();
+        host.take_effects();
+        std::thread::sleep(Duration::from_millis(100));
+        host.poll().unwrap();
+        assert!(host.take_effects().is_empty());
     }
 }
