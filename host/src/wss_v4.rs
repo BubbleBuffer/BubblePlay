@@ -54,11 +54,22 @@ pub const V4_FLAG_REFINE: u8 = 0x02;
 const V4_KNOWN_FLAGS: u8 = V4_FLAG_KEY | V4_FLAG_REFINE;
 pub const V4_MAX_REASON_CHARS: usize = 64;
 
-/// In-flight budget: skip (before encode) once un-ACKed bytes exceed this
-/// much airtime at the current bitrate, or once this many frames are
-/// un-ACKed.
+/// In-flight budget: skip (before encode) once un-ACKed bytes exceed the
+/// airtime budget at the current bitrate, or once the frame cap of un-ACKed
+/// frames is reached. Both scale with the link's baseline RTT
+/// ([`inflight_window`]); these are the floors (no RTT sample yet, or a
+/// low-latency link) and the caps.
 pub const INFLIGHT_BUDGET: Duration = Duration::from_millis(150);
 pub const INFLIGHT_MAX_FRAMES: usize = 4;
+pub const INFLIGHT_BUDGET_CAP: Duration = Duration::from_millis(400);
+pub const INFLIGHT_MAX_FRAMES_CAP: usize = 12;
+/// Frame cap = ceil((rtt + this) / frame interval) + 2; airtime budget =
+/// rtt + [`INFLIGHT_BUDGET_RTT_EXTRA_MS`].
+const INFLIGHT_FRAMES_RTT_EXTRA_MS: f64 = 40.0;
+const INFLIGHT_FRAMES_SLACK: usize = 2;
+const INFLIGHT_BUDGET_RTT_EXTRA_MS: f64 = 120.0;
+/// Frame interval assumed until the producer reports the stream's fps.
+const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 /// No ACK progress for this long while frames are in flight: forget the
 /// in-flight frames so sending can resume. This never forces a keyframe; a
 /// receiver whose decoder chain broke asks for one (seq gap / decode error).
@@ -100,7 +111,7 @@ const RATE_MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
 const RATE_RTT_SLACK_MS: f64 = 60.0;
 const RATE_RTT_FACTOR: f64 = 2.0;
 const WRITE_STALL_LIMIT: Duration = Duration::from_secs(10);
-const LINK_QUEUE_CAPACITY: usize = INFLIGHT_MAX_FRAMES + 2;
+const LINK_QUEUE_CAPACITY: usize = INFLIGHT_MAX_FRAMES_CAP + 2;
 /// Longest `V4Link::shutdown` waits for its worker before abandoning it. A
 /// worker stuck in DNS, TCP, TLS or upgrade finishes on its own later.
 const LINK_SHUTDOWN_WAIT: Duration = Duration::from_millis(400);
@@ -289,6 +300,42 @@ pub enum Admission {
     Backpressured,
 }
 
+/// The in-flight limits for one link: frame cap and airtime budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InflightWindow {
+    pub max_frames: usize,
+    pub budget: Duration,
+}
+
+impl InflightWindow {
+    /// Today's fixed window: used until an RTT sample exists.
+    pub const FLOOR: Self = Self {
+        max_frames: INFLIGHT_MAX_FRAMES,
+        budget: INFLIGHT_BUDGET,
+    };
+}
+
+/// RTT-scaled in-flight window. `min_rtt_ms` is the controller's baseline
+/// (minimum delta-frame ACK RTT over 10 s, so queueing delay we cause does
+/// not inflate the window); `None` means no sample yet.
+///
+/// frames = clamp(ceil((rtt + 40 ms) / frame interval) + 2, 4, 12);
+/// budget = clamp(rtt + 120 ms, 150 ms, 400 ms).
+pub fn inflight_window(min_rtt_ms: Option<f64>, frame_interval: Duration) -> InflightWindow {
+    let Some(rtt_ms) = min_rtt_ms.filter(|rtt| rtt.is_finite() && *rtt >= 0.0) else {
+        return InflightWindow::FLOOR;
+    };
+    let interval_ms = (frame_interval.as_secs_f64() * 1_000.0).max(1.0);
+    let frames = ((rtt_ms + INFLIGHT_FRAMES_RTT_EXTRA_MS) / interval_ms).ceil() as usize
+        + INFLIGHT_FRAMES_SLACK;
+    let budget_ms = rtt_ms + INFLIGHT_BUDGET_RTT_EXTRA_MS;
+    InflightWindow {
+        max_frames: frames.clamp(INFLIGHT_MAX_FRAMES, INFLIGHT_MAX_FRAMES_CAP),
+        budget: Duration::from_secs_f64(budget_ms / 1_000.0)
+            .clamp(INFLIGHT_BUDGET, INFLIGHT_BUDGET_CAP),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct InFlight {
     generation: u32,
@@ -314,6 +361,7 @@ pub struct SendPolicy {
     inflight_bytes: u64,
     need_key: bool,
     last_progress: Instant,
+    window: InflightWindow,
 }
 
 impl SendPolicy {
@@ -323,16 +371,31 @@ impl SendPolicy {
             inflight_bytes: 0,
             need_key: true,
             last_progress: now,
+            window: InflightWindow::FLOOR,
         }
     }
 
+    /// Airtime budget at the floor window (150 ms).
     pub fn budget_bytes(bitrate_bps: u64) -> u64 {
-        (bitrate_bps as u128 * INFLIGHT_BUDGET.as_millis() / 8_000) as u64
+        Self::budget_bytes_for(bitrate_bps, INFLIGHT_BUDGET)
+    }
+
+    fn budget_bytes_for(bitrate_bps: u64, budget: Duration) -> u64 {
+        (bitrate_bps as u128 * budget.as_millis() / 8_000) as u64
+    }
+
+    pub fn set_window(&mut self, window: InflightWindow) {
+        self.window = window;
+    }
+
+    pub fn window(&self) -> InflightWindow {
+        self.window
     }
 
     pub fn over_budget(&self, bitrate_bps: u64) -> bool {
-        self.inflight.len() >= INFLIGHT_MAX_FRAMES
-            || (!self.inflight.is_empty() && self.inflight_bytes > Self::budget_bytes(bitrate_bps))
+        self.inflight.len() >= self.window.max_frames
+            || (!self.inflight.is_empty()
+                && self.inflight_bytes > Self::budget_bytes_for(bitrate_bps, self.window.budget))
     }
 
     pub fn admit(&self, key: bool, bitrate_bps: u64) -> Admission {
@@ -900,6 +963,8 @@ struct Shared {
     events: V4Events,
     timestamps: TimestampExtender,
     frame_size: (u16, u16),
+    /// Stream frame interval, for the RTT-scaled in-flight window.
+    frame_interval: Duration,
     stats: V4Stats,
     audio: AudioLane,
 }
@@ -1145,6 +1210,7 @@ impl V4Link {
             events: V4Events::default(),
             timestamps: TimestampExtender::default(),
             frame_size: (0, 0),
+            frame_interval: DEFAULT_FRAME_INTERVAL,
             stats: V4Stats::default(),
             audio: AudioLane::default(),
         }));
@@ -1198,6 +1264,8 @@ impl V4Link {
             return V4Reserve::Backpressured;
         }
         let bitrate = shared.rate.bitrate_bps();
+        let window = inflight_window(shared.rate.min_rtt_ms(), shared.frame_interval);
+        shared.policy.set_window(window);
         match shared.policy.admit(key, bitrate) {
             Admission::Send => V4Reserve::Send,
             Admission::RequireKeyframe => V4Reserve::RequireKeyframe,
@@ -1336,6 +1404,11 @@ impl V4Link {
             .rate
             .set_bounds(Instant::now(), bitrate_bps, max_bps);
         self.activity.notify();
+    }
+
+    /// Stream frame rate, which scales the in-flight frame cap with RTT.
+    pub fn set_frame_rate(&self, fps: u32) {
+        self.lock().frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
     }
 
     pub fn set_frame_size(&self, width: u32, height: u32) {
@@ -1975,6 +2048,7 @@ mod tests {
             events: V4Events::default(),
             timestamps: TimestampExtender::default(),
             frame_size: (0, 0),
+            frame_interval: DEFAULT_FRAME_INTERVAL,
             stats: V4Stats::default(),
             audio: AudioLane::default(),
         }
@@ -2500,6 +2574,75 @@ mod tests {
         assert_eq!(policy.admit(true, 6_000_000), Admission::Send);
         policy.on_sent(now, 1, 1, 10_000, true);
         assert_eq!(policy.admit(false, 6_000_000), Admission::Send);
+    }
+
+    fn fps_interval(fps: f64) -> Duration {
+        Duration::from_secs_f64(1.0 / fps)
+    }
+
+    #[test]
+    fn inflight_window_without_rtt_sample_is_the_floor() {
+        assert_eq!(
+            inflight_window(None, fps_interval(60.0)),
+            InflightWindow::FLOOR
+        );
+        assert_eq!(InflightWindow::FLOOR.max_frames, 4);
+        assert_eq!(InflightWindow::FLOOR.budget, Duration::from_millis(150));
+        assert_eq!(
+            inflight_window(Some(f64::NAN), fps_interval(60.0)),
+            InflightWindow::FLOOR
+        );
+    }
+
+    #[test]
+    fn inflight_window_low_rtt_keeps_the_floors() {
+        // 30 fps: ceil(50 / 33.3) + 2 = 4, the floor; budget 130 ms -> 150 ms.
+        let low = inflight_window(Some(10.0), fps_interval(30.0));
+        assert_eq!(low.max_frames, INFLIGHT_MAX_FRAMES);
+        assert_eq!(low.budget, INFLIGHT_BUDGET);
+        // 60 fps: the formula itself gives 5 (ceil(50 / 16.7) + 2); budget floor holds.
+        let low60 = inflight_window(Some(10.0), fps_interval(60.0));
+        assert_eq!(low60.max_frames, 5);
+        assert_eq!(low60.budget, INFLIGHT_BUDGET);
+    }
+
+    #[test]
+    fn inflight_window_hundred_ms_rtt_at_sixty_fps() {
+        // ceil(140 / 16.67) + 2 = 11 frames; 100 + 120 = 220 ms.
+        let window = inflight_window(Some(100.0), fps_interval(60.0));
+        assert_eq!(window.max_frames, 11);
+        assert_eq!(window.budget, Duration::from_millis(220));
+    }
+
+    #[test]
+    fn inflight_window_very_high_rtt_hits_the_caps() {
+        let window = inflight_window(Some(500.0), fps_interval(60.0));
+        assert_eq!(window.max_frames, INFLIGHT_MAX_FRAMES_CAP);
+        assert_eq!(window.budget, INFLIGHT_BUDGET_CAP);
+        assert_eq!(window.max_frames, 12);
+        assert_eq!(window.budget, Duration::from_millis(400));
+        assert!(LINK_QUEUE_CAPACITY >= window.max_frames + 2);
+    }
+
+    #[test]
+    fn inflight_window_at_thirty_fps() {
+        // ceil(140 / 33.3) + 2 = 7 frames; 220 ms.
+        let window = inflight_window(Some(100.0), fps_interval(30.0));
+        assert_eq!(window.max_frames, 7);
+        assert_eq!(window.budget, Duration::from_millis(220));
+    }
+
+    #[test]
+    fn policy_admits_up_to_the_scaled_frame_cap() {
+        let now = Instant::now();
+        let mut policy = SendPolicy::new(now);
+        policy.set_window(inflight_window(Some(100.0), fps_interval(60.0)));
+        for seq in 1..=11 {
+            assert_eq!(policy.admit(seq == 1, 20_000_000), Admission::Send);
+            policy.on_sent(now, 1, seq, 100, seq == 1);
+        }
+        assert_eq!(policy.inflight_frames(), 11);
+        assert_eq!(policy.admit(false, 20_000_000), Admission::Backpressured);
     }
 
     #[test]
