@@ -78,6 +78,14 @@ Test PC: `tools/fake-wss-host` and the in-crate fake relays play the PC with the
 
 End-to-end against the real Rust relay: `src/session/relay_e2e_tests.rs` starts `bp-relay-server` in-process (a dev-dependency) with the PC side in `tests/support/relay_pc.rs`, and runs the real client threads. It covers an admitted connect with `ctl` both ways and a media ticket, a pinned-key mismatch refused after `auth-host`, `--pair` pinning the PC in `pcs.json` followed by a normal connect, and an unlisted viewer closed with 1008 (fatal). These run in the crate's lib test binary.
 
+### Log and feedback upload hook (2026-11-02)
+
+`net::CtlLogHook` (`client-win/src/net/ctl_hook.rs`, held in `NetConfig::log_hook`) is the core's generic side of [client-log-upload.md](client-log-upload.md); the Flutter app's upload queue uses it through the frb layer. With a hook configured the session advertises `client-logs-v1` in the `auth-hello` and the ctl caps; without one nothing changes.
+
+- Events: `Opened{pc_id, peer_caps}` after each authenticated connection (the hook sends and delivers only if the PC advertised the cap too), `Message(json)` for the host's `logs-state`, `logs-ack` and `feedback-ack` (every other kind keeps its normal handling), `Closed` when the socket epoch ends. A reconnect is a new `Opened`; queued messages die with their epoch.
+- `send(json)` queues `logs-batch`, `feedback-begin` or `feedback-chunk` (64 messages, 1 MiB, 128 KiB each; false when full, not connected or another kind). The session writes at most one per loop turn, last in `tick`, and none in a turn that wrote or still holds mode, monitor, input or keyframe work. They are sealed as ctl kinds like other endpoint messages.
+- `buffered_bytes()` is the hook queue (the WebSocket layer exposes no socket queue size); `since_last_input()` is stamped where `send_input_packet` writes (WebRTC lanes and the binary ctl `input` path), `Duration::MAX` before the first.
+
 ### CI
 
 The `client-win` job in `.github/workflows/checks.yml` runs on windows-latest with the pinned 1.97.1 toolchain:

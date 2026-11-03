@@ -313,6 +313,12 @@ impl InputLink {
         drop(state);
         self.notify.notify_one();
     }
+    /// Input the transport could write now: queued packets or an owed release barrier,
+    /// while the gate is open (a closed gate keeps them without sending anything).
+    pub(crate) fn has_pending(&self) -> bool {
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.view.ready && (state.needs_release || !state.queue.is_empty())
+    }
     pub(crate) fn next(&self) -> Option<Vec<u8>> {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if !state.view.ready {

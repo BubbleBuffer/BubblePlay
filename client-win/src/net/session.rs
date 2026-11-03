@@ -394,15 +394,22 @@ impl Session {
         origin: &str,
         epoch: &str,
         webrtc: bool,
-    ) -> Result<([u8; 32], [u8; 32]), Halt> {
-        let caps = [CAP_CONTROL_AEAD, CAP_DTLS_BIND];
+    ) -> Result<([u8; 32], [u8; 32], Vec<String>), Halt> {
+        // `client-logs-v1` is advertised only when a log hook is configured.
+        let base = [CAP_CONTROL_AEAD, CAP_DTLS_BIND];
+        let caps = if self.config.log_hook.is_some() {
+            super::ctl_hook::CtlLogHook::advertise(&base)
+        } else {
+            base.to_vec()
+        };
+        let caps = caps.as_slice();
         let (shake, hello) = p2::ViewerHandshake::start(
             viewer.identity(),
             PcTrust::Pinned(viewer.paired().to_vec()),
             viewer.pc(),
             origin,
             epoch,
-            &caps,
+            caps,
         )
         .map_err(device_keys)?;
         signal.send_plain(hello).await?;
@@ -419,13 +426,13 @@ impl Session {
         signal.send_plain(finish).await?;
         signal.ctl = Some(established.ctl);
         signal
-            .send(p2::viewer_caps(&caps, &p2::computer_name()))
+            .send(p2::viewer_caps(caps, &p2::computer_name()))
             .await?;
         let first = self
             .handshake(await_ctl(signal_rx, signal, &self.stats))
             .await?;
-        p2::check_caps(&first, webrtc).map_err(device_keys)?;
-        Ok((established.h, established.pc_public))
+        let peer_caps = p2::check_caps(&first, webrtc).map_err(device_keys)?;
+        Ok((established.h, established.pc_public, peer_caps))
     }
 
     /// Sleep for `delay` in ticks. Returns true when stop was requested first.
@@ -446,6 +453,10 @@ impl Session {
     async fn run_loop(&mut self, endpoint: RelayEndpoint) -> Result<(), NetError> {
         loop {
             let attempt = self.attempt(&endpoint).await;
+            // The log hook's connection ends with the socket epoch (a no-op if never opened).
+            if let Some(hook) = &self.config.log_hook {
+                hook.closed();
+            }
             // Pending monitor picks and queued mode targets end with the socket they were sent on.
             self.config.controls.epoch_restart();
             // Clear audio before backoff, including failures on either socket.
@@ -549,7 +560,7 @@ impl Session {
         let rtc_selected = self.config.transport != TransportChoice::Wss
             && !(self.config.transport == TransportChoice::Auto && self.remembered_rtc_failure);
         // The transcript epoch is the `hello-ok` mediaEpoch, byte for byte.
-        let (h, pc_public) = self
+        let (h, pc_public, peer_caps) = self
             .device_handshake(
                 &mut signal,
                 &mut signal_rx,
@@ -560,6 +571,12 @@ impl Session {
             )
             .await?;
         self.config.controls.epoch_registered(&wire);
+        if let Some(hook) = &self.config.log_hook {
+            hook.opened(
+                viewer.pc().map(|pc| pc.to_string()).unwrap_or_default(),
+                peer_caps,
+            );
+        }
         // A live mode the user chose (also before connect) is the start mode on reconnect.
         if let Some(mode) = self.config.controls.configured_mode() {
             self.config.stream_mode = Some(stream_mode_wire(mode).to_owned());
@@ -1031,6 +1048,15 @@ impl Session {
 
     /// An opened endpoint message from the PC.
     fn on_endpoint(&mut self, link: &mut Link, text: &str) -> Result<(), Halt> {
+        // Log upload replies go to the hook; without one they stay unknown kinds, as before.
+        if self
+            .config
+            .log_hook
+            .as_ref()
+            .is_some_and(|hook| hook.deliver(text))
+        {
+            return Ok(());
+        }
         if let Ok(value) = serde_json::from_str::<Value>(text) {
             match value["type"].as_str() {
                 Some("answer") => {
@@ -1155,8 +1181,9 @@ impl Session {
 
     /// Write the user's queued mode and monitor commands on the `/ws` socket.
     /// Commands were already taken out of the shared state, so no lock is held here.
-    async fn drain_controls(&mut self, link: &mut Link) -> Result<(), Halt> {
+    async fn drain_controls(&mut self, link: &mut Link) -> Result<bool, Halt> {
         let outbound = self.config.controls.take_outbound(&link.epoch.wire);
+        let sent = outbound.mode.is_some() || outbound.pick.is_some();
         if let Some(mode) = outbound.mode {
             // As `releaseInput` before `sendStreamMode("user-mode")`: held keys and buttons go first.
             if let Some(input) = self.config.input.clone() {
@@ -1187,12 +1214,13 @@ impl Session {
                 .send(monitor_control_message(&link.epoch.wire, &selector))
                 .await?;
         }
-        Ok(())
+        Ok(sent)
     }
 
-    async fn drain_input(&mut self, link: &mut Link) -> Result<(), Halt> {
+    /// True when input was written this turn or is still waiting (logs then yield).
+    async fn drain_input(&mut self, link: &mut Link) -> Result<bool, Halt> {
         let Some(input) = self.config.input.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         let ready = link.epoch.host_present
             && link.epoch.desktop_available
@@ -1205,13 +1233,15 @@ impl Session {
         // input is kept until the new frame reopens it. Losing the host or the
         // desktop input still releases through set_ready below.
         if !ready && input.monitor_hold() && link.epoch.host_present && link.epoch.desktop_enabled {
-            return Ok(());
+            return Ok(input.has_pending());
         }
+        let mut wrote = false;
         let was_ready = input.snapshot().ready;
         input.set_ready(ready);
         if was_ready && !ready {
             self.send_input_packet(link, vec![6]).await?;
             input.sent(true);
+            wrote = true;
         }
         if ready {
             for _ in 0..128 {
@@ -1226,6 +1256,7 @@ impl Session {
                 }
                 if self.send_input_packet(link, packet.clone()).await? {
                     input.sent(release);
+                    wrote = true;
                 } else {
                     if absolute {
                         input.absolute_unsent(&packet);
@@ -1235,7 +1266,14 @@ impl Session {
                 }
             }
         }
-        Ok(())
+        Ok(wrote || input.has_pending())
+    }
+
+    /// The log hook's "input just went out" stamp.
+    fn stamp_input(&self) {
+        if let Some(hook) = &self.config.log_hook {
+            hook.stamp_input();
+        }
     }
 
     async fn send_input_packet(&mut self, link: &mut Link, packet: Vec<u8>) -> Result<bool, Halt> {
@@ -1251,11 +1289,14 @@ impl Session {
                 } else {
                     stats.input_control_sent += 1;
                 }
+                drop(stats);
+                self.stamp_input();
                 return Ok(true);
             }
         }
         if link.media.is_some() {
             link.signal.send_binary(packet).await?;
+            self.stamp_input();
             return Ok(true);
         }
         Ok(false)
@@ -1596,11 +1637,15 @@ impl Session {
             link.signal.send(request).await?;
             self.pending_keyframe = Some("desktop-state".into());
         }
-        self.drain_controls(link).await?;
+        let controls_sent = self.drain_controls(link).await?;
         self.drain_feedback(link).await?;
-        self.drain_input(link).await?;
+        let input_busy = self.drain_input(link).await?;
         self.flush_reset()?;
         self.send_pending_keyframe(link).await?;
+        // Lowest priority: only when this turn had no control, input or keyframe work.
+        if logs_may_drain(controls_sent, input_busy, self.pending_keyframe.is_some()) {
+            self.drain_logs(link).await?;
+        }
 
         let now = Instant::now();
         if now.duration_since(link.signal.last_seen) >= self.timing.dead {
@@ -1624,6 +1669,18 @@ impl Session {
             }
         }
         self.check_first_frame(link).await
+    }
+
+    /// At most one log or feedback message from the hook per loop turn, sealed as its ctl
+    /// kind. Called last in `tick`, so it never goes ahead of input or media control.
+    async fn drain_logs(&mut self, link: &mut Link) -> Result<(), Halt> {
+        let Some(hook) = &self.config.log_hook else {
+            return Ok(());
+        };
+        if let Some(json) = hook.take_outbound() {
+            link.signal.send(json).await?;
+        }
+        Ok(())
     }
 
     async fn drain_feedback(&mut self, link: &mut Link) -> Result<(), Halt> {
@@ -2245,6 +2302,26 @@ fn is_monitor_transition(value: &Value) -> bool {
         value["reason"].as_str(),
         Some("monitor-switch" | "monitor-switched")
     )
+}
+
+/// Log and feedback messages go last: a loop turn that wrote or still holds control,
+/// input or keyframe work writes none.
+fn logs_may_drain(controls_sent: bool, input_busy: bool, keyframe_pending: bool) -> bool {
+    !(controls_sent || input_busy || keyframe_pending)
+}
+
+#[cfg(test)]
+mod log_priority_tests {
+    use super::logs_may_drain;
+
+    #[test]
+    fn any_control_input_or_keyframe_work_holds_logs_back() {
+        assert!(logs_may_drain(false, false, false));
+        assert!(!logs_may_drain(true, false, false));
+        assert!(!logs_may_drain(false, true, false));
+        assert!(!logs_may_drain(false, false, true));
+        assert!(!logs_may_drain(true, true, true));
+    }
 }
 
 #[cfg(test)]
