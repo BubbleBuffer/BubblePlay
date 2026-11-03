@@ -142,7 +142,7 @@ test("native video keeps an explicit input overlay and diagnostics count present
   assert.match(client, /stage\.classList\.add\("native-video-input"\)/);
   assert.match(client, /z-index:1;pointer-events:none/);
   assert.match(client, /function videoContentRect\(video\)/);
-  assert.match(client, /const r = videoContentRect\(activeVideo \|\| screen\);/);
+  assert.match(client, /const r = videoContentRect\(activeVideo \|\| screenMedia\(\)\);/);
   // The canvas scales up to the stage like the native video does.
   assert.match(client, /canvas \{\s*width: 100%; height: 100%;\s*object-fit: contain;/);
   assert.match(client, /framesDrawn = nativePresentation\.framesPresented/);
@@ -382,7 +382,7 @@ test("WSS hybrid presentation parses before decode and composites only after the
   assert.match(client, /function drawFrame\(frame[\s\S]*drawBaseThenHybrid/);
   assert.match(client, /stopWssMedia\(\)[\s\S]*clearWssHybridCaches\(\)/);
   assert.match(client, /resyncWssDecoder\(reason\)[\s\S]*clearWssHybridCaches\(\)/);
-  assert.match(client, /wssMedia:\s*\{[\s\S]*hybrid:\s*activeWssHybridCache\(\)\.snapshot\(\)/);
+  assert.match(client, /wssMedia:\s*\{[\s\S]*hybrid:\s*wssHybridSnapshot\(\)/);
 });
 
 test("peer departure recycles signaling before another peer offer", () => {
