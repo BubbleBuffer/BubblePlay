@@ -25,7 +25,7 @@ self.onmessage = ({ data }) => {
         pipeline = createWssPipeline({ post, now: () => performance.now() + offset });
         pipeline.resync({ epoch: data.epoch });
         pipeline.setCodec(data.codec);
-        post(pipeline.attach({ main: data.main }) ? { type: "worker-ready" }
+        post(pipeline.attach({ main: data.main, sharp: data.sharp }) ? { type: "worker-ready" }
           : { type: "worker-init-error", message: "OffscreenCanvas 2D context unavailable" });
         break;
       }

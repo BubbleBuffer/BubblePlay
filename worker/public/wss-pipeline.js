@@ -42,7 +42,8 @@ export function createWssPipeline({
   createDecoder = (init) => new VideoDecoder(init),
   createChunk = (init) => new EncodedVideoChunk(init),
 } = {}) {
-  let main = null; // { canvas, ctx }
+  let main = null; // { canvas, ctx }: the full-desktop canvas
+  let sharp = null; // { canvas, ctx }: the sharp-viewport crop overlay
   let epoch = 0;
   let codec = "hevc";
   let decoder = null;
@@ -64,6 +65,13 @@ export function createWssPipeline({
     const ctx = context(canvases.main);
     if (!ctx) return false;
     main = { canvas: canvases.main, ctx };
+    // The crop overlay is its own canvas so the base picture stays in place
+    // while a zoomed region is shown at full resolution on top of it.
+    if (canvases.sharp) {
+      const sharpCtx = context(canvases.sharp);
+      if (!sharpCtx) return false;
+      sharp = { canvas: canvases.sharp, ctx: sharpCtx };
+    }
     return true;
   }
 
@@ -186,12 +194,23 @@ export function createWssPipeline({
     const view = metadata?.view ?? null;
     // Never render a generation with stale geometry.
     if (!metadata || !view) return;
+    if (view.enabled && sharp) {
+      if (sharp.canvas.width !== w || sharp.canvas.height !== h) {
+        sharp.canvas.width = w;
+        sharp.canvas.height = h;
+      }
+      sharp.ctx.drawImage(frame, 0, 0, w, h);
+      out.sharp = true;
+      finishPresent(frame, metadata, out, view, 0);
+      return;
+    }
     if (main.canvas.width !== w || main.canvas.height !== h) {
       main.canvas.width = w;
       main.canvas.height = h;
       out.resized = true;
     }
     main.ctx.drawImage(frame, 0, 0, w, h);
+    out.sharp = false;
     finishPresent(frame, metadata, out, view, 0);
   }
 

@@ -12,7 +12,7 @@ function fakeCanvas() {
   return { width: 0, height: 0, draws, getContext: () => context };
 }
 
-function harness({ queue = 0 } = {}) {
+function harness({ queue = 0, sharp = false } = {}) {
   const posts = [];
   const decoders = [];
   const chunks = [];
@@ -33,7 +33,8 @@ function harness({ queue = 0 } = {}) {
     createChunk: (init) => init,
   });
   const canvas = fakeCanvas();
-  pipeline.attach({ main: canvas });
+  const sharpCanvas = fakeCanvas();
+  pipeline.attach(sharp ? { main: canvas, sharp: sharpCanvas } : { main: canvas });
   const frame = (overrides = {}) => ({
     type: "frame", epoch: 0, codec: 1, generation: 1, sequence: 1, key: true, data: HEVC_KEY,
     timestampUs: 111, view: { enabled: false }, hevcCodec: "hev1.1.6.L120.B0",
@@ -44,7 +45,7 @@ function harness({ queue = 0 } = {}) {
     decoder.init.output(out);
     return out;
   };
-  return { pipeline, posts, decoders, chunks, canvas, frame, output, tick: (ms) => { clock += ms; } };
+  return { pipeline, posts, decoders, chunks, canvas, sharpCanvas, frame, output, tick: (ms) => { clock += ms; } };
 }
 
 const types = (posts) => posts.map((message) => message.type);
@@ -163,4 +164,29 @@ test("timestamps that drifted are associated by arrival order", () => {
 test("avcCodecFromSps reads profile, constraints and level", () => {
   assert.equal(avcCodecFromSps(H264_KEY), "avc1.64002A");
   assert.equal(avcCodecFromSps(HEVC_DELTA), null);
+});
+
+test("a zoomed crop is drawn to the sharp canvas and leaves the base canvas alone", () => {
+  const h = harness({ sharp: true });
+  const crop = { enabled: true, x: 10, y: 20, width: 640, height: 360, desktopWidth: 1920, desktopHeight: 1080 };
+  h.pipeline.handleFrame(h.frame({ view: { enabled: false } }));
+  h.output(h.decoders[0], 111);
+  assert.equal(h.canvas.draws.length, 1);
+  h.tick(200);
+  h.pipeline.handleFrame(h.frame({ key: false, data: HEVC_DELTA, sequence: 2, timestampUs: 222, view: crop }));
+  h.output(h.decoders[0], 222, 640, 360);
+  assert.equal(h.canvas.draws.length, 1, "base canvas untouched");
+  assert.equal(h.sharpCanvas.draws.length, 1);
+  assert.equal(h.sharpCanvas.width, 640);
+  const out = h.posts.filter((m) => m.type === "out").at(-1);
+  assert.equal(out.sharp, true);
+  assert.deepEqual(out.view, crop);
+  assert.equal(out.resized, undefined, "the base canvas was not resized");
+});
+
+test("a crop with no sharp canvas falls back to the base canvas", () => {
+  const h = harness();
+  h.pipeline.handleFrame(h.frame({ view: { enabled: true } }));
+  h.output(h.decoders[0], 111);
+  assert.equal(h.canvas.draws.length, 1);
 });
