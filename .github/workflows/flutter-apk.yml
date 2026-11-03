@@ -1,0 +1,79 @@
+# Phone APK of the Flutter app (app/, de.bubblebuffer.bubbleplay.flutter), same path as android-apk:
+# build01 builds the release APK and streams it over vmbr1 to linux01, which aligns, re-signs it with
+# the BubblePlay release key (a separate applicationId from the native app) and publishes it to the
+# private F-Droid repo. No keystore, artifact or secret is involved.
+name: flutter-apk
+
+on:
+  workflow_dispatch:
+  # Every master push that passes Checks. Rapid merges collapse: a newer run cancels the older one.
+  workflow_run:
+    workflows: [Checks]
+    types: [completed]
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flutter-apk
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.47.5"
+
+jobs:
+  apk:
+    # Same guard as android-apk: only a successful Checks push run on this repository's own master.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'master' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: [self-hosted, build01]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # The commit Checks passed on, not whatever master is by now.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Flutter SDK
+        # One copy per version in the runner's home, shared with the App workflow.
+        run: |
+          dir="$HOME/flutter-$FLUTTER_VERSION"
+          if [ ! -x "$dir/bin/flutter" ]; then
+            tmp="$(mktemp -d)"
+            curl --proto '=https' --tlsv1.2 -sSfL -o "$tmp/flutter.tar.xz" \
+              "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
+            tar -xJf "$tmp/flutter.tar.xz" -C "$tmp"
+            rm -rf "$dir"
+            mv "$tmp/flutter" "$dir"
+            rm -rf "$tmp"
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          echo "PUB_CACHE=$HOME/.pub-cache" >> "$GITHUB_ENV"
+          "$dir/bin/flutter" config --no-analytics --no-cli-animations
+      - name: Dependencies
+        working-directory: app
+        run: |
+          rm -rf .dart_tool
+          flutter pub get
+      - name: Build release APK
+        working-directory: app
+        # The Windows-only Rust core is not part of the Android build. The APK is debug-signed here;
+        # linux01 re-signs it. versionCode = epoch minutes, the scheme of the native app.
+        run: flutter build apk --release --build-number="$(( $(date +%s) / 60 ))"
+      - name: Sign and publish on linux01
+        run: |
+          apk=app/build/app/outputs/flutter-apk/app-release.apk
+          test -s "$apk"
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -i /home/builder/.ssh/linux01-apk-bubbleplay-flutter dev@100.65.1.104 'apk-publish bubbleplay-flutter' \
+            < "$apk"
