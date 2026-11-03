@@ -6,7 +6,7 @@ The host sends captured frames to one of three video encoders. This page covers 
 
 ## Backends
 
-- **NVENC** is the NVIDIA SDK encoder. It is unchanged in this lane. It prefers HEVC and falls back to H.264.
+- **NVENC** is the NVIDIA SDK encoder. It is unchanged in this lane. It prefers HEVC and falls back to H.264. Both codecs get the NVENC delta-QP map (settled-tile refine, plus the damage, text-edge and feedback experiments): one value per 32 px CTB for HEVC, one per 16 px macroblock for H.264, with a partial last row and column when the size is not a multiple of the cell. The types are still named `Hevc*`.
 - **Media Foundation hardware H.264** is the Windows hardware MFT. It is **experimental, untested on AMD/Intel hardware**. Only an NVIDIA MFT has been exercised.
 - **Microsoft software H.264** is the inbox software MFT. It is the CPU mode encoder. It is also the auto-mode fallback when no hardware encoder starts.
 

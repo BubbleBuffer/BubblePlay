@@ -5182,6 +5182,7 @@ fn run_serve(
                                         ),
                                         scaled.width,
                                         scaled.height,
+                                        encoder.as_ref().map_or(32, VideoEncoder::qp_map_block),
                                     )
                                 })
                         } else {

@@ -458,6 +458,14 @@ impl VideoEncoder {
         }
     }
 
+    /// QP map cell size in pixels (32 for HEVC, 16 for H.264).
+    pub fn qp_map_block(&self) -> u32 {
+        match self {
+            Self::Nvenc(encoder) => encoder.qp_map_block(),
+            Self::Mf(_) => 16,
+        }
+    }
+
     pub fn codec(&self) -> VideoCodec {
         match self {
             Self::Nvenc(encoder) => encoder.codec(),
