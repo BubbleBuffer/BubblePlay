@@ -9,6 +9,8 @@ import de.bubblebuffer.bubbleplay.auth.ViewerAuth
 import de.bubblebuffer.bubbleplay.keys.DeviceKey
 import de.bubblebuffer.bubbleplay.keys.StrictBase64Url
 import de.bubblebuffer.bubbleplay.log.BpLog
+import de.bubblebuffer.bubbleplay.log.CtlLink
+import de.bubblebuffer.bubbleplay.log.CtlPassThrough
 import de.bubblebuffer.bubbleplay.pcs.PcEntry
 import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.media.AudioPlayer
@@ -113,6 +115,8 @@ class Session(
     @Volatile var soundMuted = false
         private set
     private var soundForeground = true
+    /** Log/feedback upload door (see [CtlPassThrough]): the Kotlin core's own uploader and the Dart process's pass-through. */
+    val ctl = CtlPassThrough { now() }
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -338,7 +342,7 @@ class Session(
         // onto the new channel before that generation presents its first frame.
         if (socket !== sig) return false
         return try {
-            current.sendInput(bytes).also { if (it) liveness.input(now()) }
+            current.sendInput(bytes).also { if (it) { liveness.input(now()); ctl.inputSent() } }
         } catch (_: Exception) {
             controlFailed(current)
             false
@@ -474,6 +478,7 @@ class Session(
 
     private fun closeWire() {
         cancelAuthTimer()
+        ctl.detach()
         wire?.close()
         wire = null
     }
@@ -553,6 +558,19 @@ class Session(
                     surfaceWatchdog?.let { handler.removeCallbacks(it) }
                     armSurfaceWatchdog(generation)
                 }
+                ctl.attach(pc.id, object : CtlLink {
+                    override fun send(json: String): Boolean {
+                        if (wire !== current) return false
+                        return try {
+                            current.sendJson(json)
+                        } catch (_: Exception) {
+                            controlFailed(current)
+                            false
+                        }
+                    }
+
+                    override val bufferedBytes: Long get() = queuedBytes()
+                })
                 sendSig(JSONObject().put("type", "media-control").put("action", "mode").put("protocol", V4.VERSION)
                     .put("epoch", mediaEpoch).put("streamMode", streamMode).put("reason", "signaling-start"))
                 startMedia()
@@ -579,7 +597,9 @@ class Session(
 
     private fun handleEndpoint(msg: JSONObject) {
         when (msg.optString("type")) {
-            "caps" -> Unit // Full protocol caps; feature details follow as host-capabilities.
+            // Full protocol caps; feature details follow as host-capabilities. The log/feedback door also
+            // takes the PC's caps (its "opened" event) and the upload acknowledgements.
+            "caps", "logs-state", "logs-ack", "feedback-ack" -> ctl.onEndpoint(msg)
             "host-capabilities" -> {
                 val files = msg.optInt("fileTransfer") >= 1
                 val sound = msg.optInt("audio") >= 1

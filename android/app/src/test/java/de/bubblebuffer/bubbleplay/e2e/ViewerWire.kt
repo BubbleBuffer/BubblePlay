@@ -3,6 +3,8 @@ package de.bubblebuffer.bubbleplay.e2e
 import de.bubblebuffer.bubbleplay.auth.AuthJson
 import de.bubblebuffer.bubbleplay.auth.ViewerAuth
 import de.bubblebuffer.bubbleplay.keys.DeviceKey
+import de.bubblebuffer.bubbleplay.log.CtlLink
+import de.bubblebuffer.bubbleplay.log.CtlPassThrough
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.SessionProblem
 import de.bubblebuffer.bubbleplay.net.SessionWire
@@ -12,6 +14,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import org.json.JSONObject
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
@@ -34,6 +37,8 @@ internal class ViewerWire(
     private val pcId: String,
     private val pcPublic: ByteArray,
     private val name: String,
+    /** When set, wired like Session wires its own: attach on Authenticated, endpoint messages in, detach on end. */
+    private val ctl: CtlPassThrough? = null,
 ) : AutoCloseable {
     /** A socket close as Session.signalingDown sees it. [problem] non-null means the session ends. */
     data class Closed(val code: Int, val problem: SessionProblem?)
@@ -45,6 +50,8 @@ internal class ViewerWire(
     val events = LinkedBlockingQueue<Any>()
     /** Every text the relay delivered to this viewer, in order. */
     val received = CopyOnWriteArrayList<String>()
+    /** What the ctl link reports as the send buffer (Session reports the socket queue). */
+    @Volatile var bufferedBytes = 0L
     @Volatile lateinit var wire: SessionWire
         private set
     @Volatile private var socket: WebSocket? = null
@@ -71,8 +78,19 @@ internal class ViewerWire(
                             webSocket.close(1000, "session-ended")
                         }
                     }, ViewerAuth.AUTH_HOST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                    is SessionWire.Event.Failed -> webSocket.close(1000, "session-ended")
-                    SessionWire.Event.Disconnected -> webSocket.cancel()
+                    is SessionWire.Event.Authenticated -> ctl?.attach(pcId, object : CtlLink {
+                        override fun send(json: String) = current.sendJson(json)
+                        override val bufferedBytes: Long get() = this@ViewerWire.bufferedBytes
+                    })
+                    is SessionWire.Event.Endpoint -> ctl?.onEndpoint(JSONObject(event.text))
+                    is SessionWire.Event.Failed -> {
+                        ctl?.detach()
+                        webSocket.close(1000, "session-ended")
+                    }
+                    SessionWire.Event.Disconnected -> {
+                        ctl?.detach()
+                        webSocket.cancel()
+                    }
                     else -> Unit
                 }
             }
@@ -81,11 +99,13 @@ internal class ViewerWire(
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) = Unit
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                ctl?.detach()
                 events.add(Closed(code, SessionProblem.closed(code, wire.admitted)))
                 webSocket.close(code, null)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                ctl?.detach()
                 events.add(Failure(t))
             }
         })

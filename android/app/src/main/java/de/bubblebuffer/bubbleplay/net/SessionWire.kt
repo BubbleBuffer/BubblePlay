@@ -11,6 +11,7 @@ import de.bubblebuffer.bubbleplay.auth.HelloOk
 import de.bubblebuffer.bubbleplay.auth.ViewerAuth
 import de.bubblebuffer.bubbleplay.auth.ViewerHello
 import de.bubblebuffer.bubbleplay.keys.DeviceKey
+import de.bubblebuffer.bubbleplay.log.CtlPassThrough
 
 /** Session-ending failures, with persistent resource names and an English fallback. */
 internal enum class SessionProblem(val resource: String, val text: String) {
@@ -109,7 +110,7 @@ internal class SessionWire(
                     if (hello.pairing) return fail(SessionProblem.AUTH_FAILED)
                     admitted = true
                     auth = ViewerAuth(Handshake.start(key, relayOrigin, hello.mediaEpoch,
-                        Handshake.Mode.Normal(pcId, pcPublic), random))
+                        Handshake.Mode.Normal(pcId, pcPublic), random, extraCaps = listOf(CtlPassThrough.CAP)))
                     state = State.AUTH
                     for (message in auth!!.start().send) if (!send(message)) return disconnected()
                     Event.Admitted(hello)
@@ -127,7 +128,7 @@ internal class SessionWire(
                             auth = null
                             state = State.READY
                             // The caps/name message must precede all application control and input.
-                            if (!sendJson(AuthJson.write(linkedMapOf("type" to "caps", "caps" to listOf(CtlChannel.CAP),
+                            if (!sendJson(AuthJson.write(linkedMapOf("type" to "caps", "caps" to listOf(CtlChannel.CAP, CtlPassThrough.CAP),
                                 "name" to cleanDeviceName(deviceName))))) return disconnected()
                             Event.Authenticated
                         }
