@@ -36,6 +36,9 @@ fn timing() -> Timing {
         keyframe_interval: Duration::from_millis(250),
         backoff_min: Duration::from_millis(10),
         backoff_max: Duration::from_millis(50),
+        recycled_auth: Duration::from_millis(200),
+        recycled_auth_max: Duration::from_millis(500),
+        recycled_budget: Duration::from_secs(4),
     }
 }
 
@@ -1540,4 +1543,116 @@ fn a_wrong_pc_proof_shows_no_number() {
     let (result, shown, _) = pair_case("70Q1K9MXR2", true);
     assert!(shown.is_empty());
     assert!(matches!(result, Err(NetError::DeviceKeys(_))));
+}
+
+fn present(h: &Harness, frame: &VideoFrame) {
+    h.feedback
+        .send(DecoderFeedback::Presented {
+            local_epoch: frame.local_epoch,
+            generation: frame.generation,
+            seq: frame.seq,
+        })
+        .unwrap();
+}
+
+/// A recycled session whose PC stays silent for a while retries with new signaling
+/// connections instead of ending, logs the close code, and logs the recovery once.
+#[test]
+fn a_recycled_session_retries_a_silent_pc_and_logs_the_recovery() {
+    let closing = Scenario {
+        close_in_session: Some(1001),
+        media: vec![key(1)],
+        ..Scenario::new(EPOCH_A)
+    };
+    let silent = || Scenario {
+        no_auth_host: true,
+        ..Scenario::new(EPOCH_A)
+    };
+    let h = start(
+        vec![closing, silent(), silent(), scenario(EPOCH_B, vec![key(1)])],
+        timing(),
+        8,
+    );
+    let (_, first) = until_frame(&h.events);
+    present(&h, &first);
+    let (_, second) = until_frame(&h.events);
+    present(&h, &second);
+    wait_for(|| {
+        h.stats
+            .log_lines()
+            .iter()
+            .any(|line| line.starts_with("recovered after"))
+    });
+    assert!(h.stats.snapshot().attempts >= 4);
+    let lines = h.stats.log_lines();
+    assert!(
+        lines.iter().any(|l| l.contains("closeCode=1001")),
+        "{lines:?}"
+    );
+    let recovered: Vec<_> = lines
+        .iter()
+        .filter(|l| l.starts_with("recovered after"))
+        .collect();
+    assert_eq!(recovered.len(), 1, "{lines:?}");
+    assert!(recovered[0].contains("attempts=3"), "{recovered:?}");
+    assert!(recovered[0].contains("recoveryMs="), "{recovered:?}");
+    h.finish().expect("clean stop");
+}
+
+/// The recycled retry has a budget: a PC that never answers ends in the same terminal
+/// error once the time since the loss is spent.
+#[test]
+fn a_recycled_session_gives_up_when_the_budget_is_spent() {
+    let closing = Scenario {
+        close_in_session: Some(1001),
+        ..Scenario::new(EPOCH_A)
+    };
+    let silent = || Scenario {
+        no_auth_host: true,
+        ..Scenario::new(EPOCH_A)
+    };
+    let timing = Timing {
+        recycled_budget: Duration::from_millis(900),
+        ..timing()
+    };
+    let mut h = start(
+        vec![
+            closing,
+            silent(),
+            silent(),
+            silent(),
+            silent(),
+            silent(),
+            silent(),
+        ],
+        timing,
+        8,
+    );
+    assert_eq!(
+        h.join(),
+        Err(NetError::DeviceKeys(
+            super::phase2::NO_DEVICE_KEYS.to_owned()
+        ))
+    );
+    assert!(h.stats.snapshot().attempts >= 3, "retried before giving up");
+}
+
+/// Only silence is retryable: a refusal on a recycled session stays terminal.
+#[test]
+fn a_recycled_session_does_not_retry_a_refusal() {
+    let closing = Scenario {
+        close_in_session: Some(1001),
+        ..Scenario::new(EPOCH_A)
+    };
+    let refusing = Scenario {
+        pc_error: Some(("not-paired".into(), "refused".into())),
+        ..Scenario::new(EPOCH_B)
+    };
+    let mut h = start(
+        vec![closing, refusing, scenario(EPOCH_B, vec![key(1)])],
+        timing(),
+        8,
+    );
+    assert!(matches!(h.join(), Err(NetError::DeviceKeys(_))));
+    assert_eq!(h.stats.snapshot().attempts, 2, "not retried");
 }

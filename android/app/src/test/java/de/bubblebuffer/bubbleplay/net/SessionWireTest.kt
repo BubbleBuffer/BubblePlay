@@ -245,4 +245,51 @@ class SessionWireTest {
         assertEquals(SessionProblem.AUTH_FAILED, (pairing.wire.receive(hello.toString()) as SessionWire.Event.Failed).problem)
         assertFalse(pairing.wire.admitted)
     }
+
+    @Test
+    fun recycledSessionWaitsShortBacksOffAndRetriesUntilTheBudgetIsSpent() {
+        var t = 1_000L
+        val retry = RecycledRetry { t }
+        // A first connection keeps the 10 s wait and the terminal timeout.
+        assertEquals(10_000L, retry.authHostTimeoutMs())
+        assertFalse(retry.canRetryTimeout())
+        retry.authenticated()
+        retry.lost()
+        assertEquals(listOf(3_000L, 4_500L, 6_750L, 8_000L, 8_000L), List(5) { retry.authHostTimeoutMs() })
+        t += 29_999
+        assertTrue(retry.canRetryTimeout())
+        t += 1
+        assertFalse(retry.canRetryTimeout())
+        // Established again: the budget and the backoff start over.
+        retry.authenticated()
+        retry.lost()
+        assertEquals(3_000L, retry.authHostTimeoutMs())
+        t += 29_000
+        assertTrue(retry.canRetryTimeout())
+    }
+
+    @Test
+    fun onlyTheAuthHostTimeoutIsRetryable() {
+        assertTrue(RecycledRetry.retryable(SessionProblem.AUTH_TIMEOUT))
+        for (problem in SessionProblem.values().filter { it != SessionProblem.AUTH_TIMEOUT }) {
+            assertFalse(problem.name, RecycledRetry.retryable(problem))
+        }
+    }
+
+    @Test
+    fun recoveryIsReportedOnceWithTimeAndAttemptsAndNeverOnTheFirstConnection() {
+        var t = 0L
+        val retry = RecycledRetry { t }
+        retry.connecting()
+        assertNull(retry.recovered())
+        retry.authenticated()
+        assertNull(retry.recovered())
+        t = 10_000
+        retry.lost()
+        t = 11_000; retry.connecting()
+        t = 14_000; retry.connecting()
+        t = 13_120 + 10_000; retry.authenticated()
+        assertEquals(13_120L to 2, retry.recovered())
+        assertNull(retry.recovered())
+    }
 }

@@ -924,6 +924,132 @@ fn m2_pairing_viewer_offer_is_not_buffered_for_the_next_host() {
     );
 }
 
+// ------------------------------------------- reconnect order (host after viewer)
+
+fn viewer_hello_from_viewer() -> Value {
+    // The default viewer identity is the test viewer; the shape is what matters.
+    let mut m = auth_hello_msg(201);
+    m["id"] = json!(listed_viewer());
+    m
+}
+
+#[test]
+fn m2_host_registering_after_the_viewer_gets_peer_joined_then_the_hello() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    h.close(host.id);
+    let (v, actions) = h.viewer_hello(&host.pc, false);
+    let epoch = v.epoch.clone();
+    assert!(sent_types(&actions, host.id).is_empty());
+    // Sent while the host is absent: held, not dropped.
+    assert!(h.text(v.id, &viewer_hello_from_viewer()).is_empty());
+    let (new_host, actions) = reregister(&mut h, &identity(1));
+    let sent = sent_json(&actions, new_host);
+    let types: Vec<&str> = sent.iter().map(|m| m["type"].as_str().unwrap()).collect();
+    assert_eq!(types, vec!["hello-ok", "peer-joined", "auth-hello"]);
+    assert_eq!(sent[1]["mediaEpoch"], json!(epoch));
+    assert_eq!(sent[1]["pairing"], json!(false));
+}
+
+#[test]
+fn m2_host_registering_after_the_viewer_gets_peer_joined_without_a_hello() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    h.close(host.id);
+    let (v, _) = h.viewer_hello(&host.pc, false);
+    let (new_host, actions) = reregister(&mut h, &identity(1));
+    let sent = sent_json(&actions, new_host);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["type"], json!("peer-joined"));
+    assert_eq!(sent[1]["mediaEpoch"], json!(v.epoch));
+}
+
+#[test]
+fn m2_host_registered_first_still_gets_peer_joined_once_and_a_live_hello() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    let (v, actions) = h.viewer_hello(&host.pc, false);
+    let joined = sent_json(&actions, host.id);
+    assert_eq!(joined.len(), 1);
+    assert_eq!(joined[0]["type"], json!("peer-joined"));
+    assert_eq!(joined[0]["mediaEpoch"], json!(v.epoch));
+    let actions = h.text(v.id, &viewer_hello_from_viewer());
+    assert_eq!(sent_types(&actions, host.id), vec!["auth-hello"]);
+}
+
+#[test]
+fn m2_hello_after_the_host_registered_is_forwarded_live_and_not_held() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    h.close(host.id);
+    let (v, _) = h.viewer_hello(&host.pc, false);
+    let (new_host, _) = reregister(&mut h, &identity(1));
+    let actions = h.text(v.id, &viewer_hello_from_viewer());
+    assert_eq!(sent_types(&actions, new_host), vec!["auth-hello"]);
+    // Nothing was held: a later host registration does not replay it.
+    h.close(new_host);
+    let (third, actions) = reregister(&mut h, &identity(1));
+    assert!(
+        !sent_types(&actions, third)
+            .iter()
+            .any(|t| t.as_str() == "auth-hello")
+    );
+}
+
+#[test]
+fn m2_only_the_latest_hello_is_held() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    h.close(host.id);
+    let (v, _) = h.viewer_hello(&host.pc, false);
+    let mut first = viewer_hello_from_viewer();
+    first["nonce"] = json!(b64(&[1u8; 32]));
+    let mut second = viewer_hello_from_viewer();
+    second["nonce"] = json!(b64(&[2u8; 32]));
+    h.text(v.id, &first);
+    h.text(v.id, &second);
+    let (new_host, actions) = reregister(&mut h, &identity(1));
+    let hellos: Vec<Value> = sent_json(&actions, new_host)
+        .into_iter()
+        .filter(|m| m["type"] == "auth-hello")
+        .collect();
+    assert_eq!(hellos, vec![second]);
+}
+
+#[test]
+fn m2_a_hello_from_an_older_epoch_is_not_delivered() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    h.close(host.id);
+    let (old, _) = h.viewer_hello(&host.pc, false);
+    h.text(old.id, &viewer_hello_from_viewer());
+    // The viewer reconnects: a new epoch, and the old hello must not survive.
+    let (newer, _) = h.viewer_hello(&host.pc, false);
+    assert_ne!(old.epoch, newer.epoch);
+    let (new_host, actions) = reregister(&mut h, &identity(1));
+    let sent = sent_json(&actions, new_host);
+    assert!(sent.iter().all(|m| m["type"] != "auth-hello"));
+    let joined = sent.iter().find(|m| m["type"] == "peer-joined").unwrap();
+    assert_eq!(joined["mediaEpoch"], json!(newer.epoch));
+}
+
+#[test]
+fn m2_a_hello_is_dropped_when_its_viewer_leaves() {
+    let mut h = Harness::new();
+    let host = host_up(&mut h);
+    h.close(host.id);
+    let (v, _) = h.viewer_hello(&host.pc, false);
+    h.text(v.id, &viewer_hello_from_viewer());
+    h.close(v.id);
+    let (new_host, actions) = reregister(&mut h, &identity(1));
+    let types = sent_types(&actions, new_host);
+    assert!(
+        !types
+            .iter()
+            .any(|t| t == "auth-hello" || t == "peer-joined")
+    );
+}
+
 // ------------------------------------------------------------- allowlist
 
 #[test]

@@ -308,7 +308,9 @@ impl<'a> SignalMessage<'a> {
     /// connected.
     pub fn bufferable(&self) -> bool {
         match self.kind {
-            SignalKind::Offer | SignalKind::Ice => true,
+            // auth-hello is held only for the next host registration, which
+            // sends peer-joined first. The host verifies it as if it had arrived live.
+            SignalKind::Offer | SignalKind::Ice | SignalKind::AuthHello => true,
             SignalKind::FirstFrame => self.phase() == "request",
             SignalKind::MediaControl => matches!(self.action(), "start" | "monitors" | "follow"),
             _ => false,

@@ -330,6 +330,7 @@ impl Relay {
         self.peers.insert(key, id);
         let room = self.rooms.entry(pc.to_owned()).or_default();
         let pending = std::mem::take(&mut room.pending);
+        let current_epoch = room.current_epoch.clone();
         self.make_live(id, now_ms);
         let ticket = self.issue_ticket(id, now_ms, rng);
         self.persist(id, out);
@@ -338,8 +339,29 @@ impl Relay {
             json!({"type": "hello-ok", "ticket": ticket, "pc": pc}).to_string(),
             out,
         );
+        // A viewer admitted while this host was away has not been announced to
+        // it. Announce it now, before any buffered message, with the epoch the
+        // viewer holds.
+        let viewer = self.peers.get(&key_for(Role::Viewer, "", pc)).copied();
+        let viewer_conn = viewer.and_then(|v| self.conns.get(&v));
+        let announced = match (viewer_conn, current_epoch) {
+            (Some(v), Some(epoch)) if v.epoch == epoch && !v.closing => Some((epoch, v.pairing)),
+            _ => None,
+        };
+        if let Some((epoch, pairing)) = &announced {
+            self.send_text(
+                id,
+                json!({"type": "peer-joined", "mediaEpoch": epoch, "pairing": pairing}).to_string(),
+                out,
+            );
+        }
         for buffered in pending {
-            self.send_text(id, buffered.raw, out);
+            let current = announced
+                .as_ref()
+                .is_some_and(|(epoch, _)| *epoch == buffered.epoch);
+            if current {
+                self.send_text(id, buffered.raw, out);
+            }
         }
     }
 

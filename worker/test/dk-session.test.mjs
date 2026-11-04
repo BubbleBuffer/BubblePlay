@@ -46,7 +46,7 @@ async function harness(options = {}) {
       authenticatedSession: null, signalingPc: null, signalingTicket: null, Date, JSON,
       mediaEpoch: null, wssSelected: sessionOptions.transport === "wss", hudState: {},
       location: { href: hs.relayOrigin }, validateIceServers: value => value, relayOrigin: () => hs.relayOrigin,
-      debugTrace() {}, renderAbout() {}, noteFileEpoch() {},
+      debugTrace() {}, renderAbout() {}, noteFileEpoch() {}, noteSessionAuthenticated() {}, sessionAuthTimeoutMs: () => undefined, handleSessionFailure: (refusal) => events.failures.push(refusal),
       endAuthenticatedSession: refusal => events.failures.push(refusal),
       // Observe real session traffic while the actual receiver handler supplies
       // the epoch from hello-ok. Test hooks replace only I/O and observation.
@@ -390,7 +390,7 @@ test("receiver drops plaintext endpoint frames and preserves mediaEpoch string i
     authenticatedSession: null, signalingPc: null, signalingTicket: null,
     sessionGate: {}, Date, JSON, currentIceServers: null, mediaEpoch: null, wssSelected: false,
     hudState: {}, console: { info() {} }, location: { href: hs.relayOrigin }, validateIceServers: value => value,
-    debugTrace() {}, noteFileEpoch() {}, renderAbout() {}, relayOrigin: () => hs.relayOrigin,
+    debugTrace() {}, noteFileEpoch() {}, renderAbout() {}, noteSessionAuthenticated() {}, sessionAuthTimeoutMs: () => undefined, handleSessionFailure() {}, relayOrigin: () => hs.relayOrigin,
     viewerLog() {}, sendStreamMode() {}, startPeer() {}, peerGeneration: 0,
     endAuthenticatedSession: refusal => errors.push(refusal),
     createViewerSession: config => { configs.push(config); return { async start() {}, receive: message => received.push(message) }; },
@@ -533,7 +533,7 @@ test("receiver drains a final encrypted refusal before processing socket close o
     constructor() { this.readyState = 0; sockets.push(this); }
   }
   const context = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, URL, Promise, performance: { now: () => 1 },
-    authenticatedSession: null, terminalSignalingFailure: false, reconnectTimer: null,
+    authenticatedSession: null, recoveryLossMs: null, recoveryAttempts: 0, noteConnectionLoss() {}, terminalSignalingFailure: false, reconnectTimer: null,
     ws: null, signalingGeneration: 0, signalingRegistered: true, signalingPc: hs.pc.id, signalingTicket: "ticket",
     latestInputStatus: null, inputStatusReason: null, hudState: {}, hud: { classList: { add() {} } },
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, cleanupPeer: () => calls.push("cleanup"),

@@ -33,6 +33,66 @@ internal enum class SessionProblem(val resource: String, val text: String) {
 }
 
 /**
+ * Retry policy for a recycled session (one that already authenticated in this app run): a silent
+ * host (auth-host timeout) is retried with a short, backing-off wait until [Handshake.RECYCLED_RETRY_BUDGET_MS]
+ * after the loss. First connections keep the 10 s wait and the terminal timeout. Pure: the clock is injected.
+ * Also tracks the loss-to-first-frame recovery for one log line.
+ */
+internal class RecycledRetry(private val clock: () -> Long) {
+    var everAuthenticated = false
+        private set
+    private var budgetStart: Long? = null
+    private var waits = 0
+    private var recoveryStart: Long? = null
+    private var attempts = 0
+
+    /** The session was lost after being established; the first loss starts the clocks. */
+    fun lost() {
+        if (!everAuthenticated) return
+        if (budgetStart == null) budgetStart = clock()
+        if (recoveryStart == null) { recoveryStart = clock(); attempts = 0 }
+    }
+
+    /** A signaling connection is being opened. */
+    fun connecting() { if (recoveryStart != null) attempts++ }
+
+    /** The auth-host wait for the connection that was just admitted, in ms. */
+    fun authHostTimeoutMs(): Long {
+        if (!everAuthenticated) return Handshake.AUTH_HOST_TIMEOUT_MS
+        var wait = Handshake.RECYCLED_AUTH_HOST_TIMEOUT_MS
+        repeat(waits) { wait = minOf(Handshake.RECYCLED_AUTH_HOST_TIMEOUT_MAX_MS, wait * 3 / 2) }
+        waits++
+        return minOf(wait, Handshake.RECYCLED_AUTH_HOST_TIMEOUT_MAX_MS)
+    }
+
+    /** An auth-host timeout happened: may the session retry instead of ending? */
+    fun canRetryTimeout(): Boolean {
+        if (!everAuthenticated) return false
+        lost()
+        return clock() - budgetStart!! < Handshake.RECYCLED_RETRY_BUDGET_MS
+    }
+
+    /** The session is established again: the budget and backoff reset. */
+    fun authenticated() {
+        everAuthenticated = true
+        budgetStart = null
+        waits = 0
+    }
+
+    /** First frame presented. Returns (ms since the loss, attempts) once per recovery, else null. */
+    fun recovered(): Pair<Long, Int>? {
+        val start = recoveryStart ?: return null
+        recoveryStart = null
+        return (clock() - start) to attempts
+    }
+
+    companion object {
+        /** Only the no-reply timeout is retryable; every refusal stays terminal. */
+        fun retryable(problem: SessionProblem): Boolean = problem == SessionProblem.AUTH_TIMEOUT
+    }
+}
+
+/**
  * One signaling socket's phase-2 protocol. No Android or socket types: the session supplies the
  * actual send function. The lock includes sealing AND sending, so concurrent input cannot put
  * seq N+1 on the socket before seq N. Each reconnect creates a new instance.

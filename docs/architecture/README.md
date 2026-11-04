@@ -18,7 +18,7 @@ Development-only tools in the Rust tree are excluded from the public Windows ZIP
 
 ## Transports and contracts
 
-The `/host-ws` and `/ws` sockets carry registration and the auth and pairing handshake. After that, session signaling, desktop state, cursor/clipboard controls and input travel inside `ctl`. WebRTC carries media directly or through separately configured TURN. WSS uses `/host-media-ws` and `/media-ws`, paired by the current session epoch; files have separate `/host-file-ws` and `/file-ws` sockets. A reconnect or changed epoch invalidates old sockets and input state.
+The `/host-ws` and `/ws` sockets carry registration and the auth and pairing handshake. After that, session signaling, desktop state, cursor/clipboard controls and input travel inside `ctl`. WebRTC carries media directly or through separately configured TURN. WSS uses `/host-media-ws` and `/media-ws`, paired by the current session epoch; files have separate `/host-file-ws` and `/file-ws` sockets. A reconnect or changed epoch invalidates old sockets and input state. [Reconnect order](reconnect.md) describes what happens when a relay reset drops every socket.
 
 WSS v4 sends one encoded access unit per binary message, with a 28-byte header describing codec, generation, sequence, capture time and dimensions. The receiver returns frame ACKs and keyframe requests on that media socket. Generation/sequence gates prevent stale deltas from being presented after recovery or a monitor switch. Host feedback controls capture/encoding admission instead of accumulating a queue of old frames.
 

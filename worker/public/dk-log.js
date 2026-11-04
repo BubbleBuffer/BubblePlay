@@ -34,7 +34,7 @@
     "code", "pairing", "psk", "signature", "auth", "cookie", "credential"];
   // Substrings that contain a sensitive word but are not secrets. keyboard, keyframe, keycode and
   // keyid are the spec's list; codec, decod and encod keep "codec", "decoder" and "encode" readable.
-  const ALLOWED_PARTS = ["keyboard", "keyframe", "keycode", "keyid", "codec", "decod", "encod"];
+  const ALLOWED_PARTS = ["keyboard", "keyframe", "keycode", "keyid", "closecode", "codec", "decod", "encod"];
   const URL_PARAMS = "token|key|secret|password|passphrase|code|ticket|proof|pairing|sig";
   const URL_PARAM_RE = new RegExp(`([?&#;])(${URL_PARAMS})=([^&#\\s"'<>]*)`, "gi");
   const BEARER_RE = /\bBearer\s+[^\s"',;]+/gi;

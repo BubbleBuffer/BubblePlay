@@ -26,7 +26,7 @@ Applied to `msg` and every string in `fields`, and re-applied by the host on ing
 4. Literal secrets a process registered at runtime.
 5. Any run of 40 or more characters from `[A-Za-z0-9+/_=-]` outside the `device`, `pc` and `session` fields.
 
-Consequence for authors: do not name log fields `code`, `key`, `auth` and the like (use `status`, `hresult`, `reason`); the value is masked.
+Consequence for authors: do not name log fields `code`, `key`, `auth` and the like (use `status`, `hresult`, `reason`); the value is masked. The one exception is `closeCode` (the WebSocket close code, a number such as 1006 or 1001), which is kept in the host, browser and Android redactors so the two can be told apart. `authCloseCode` and every other `code` key stay masked.
 
 ## Where files live
 
@@ -78,3 +78,7 @@ A connected, authenticated client sends its logs and reports to the PC over the 
 
 Built: everything above. Reports and logs reach the PC only while a session is connected; nothing is sent otherwise.
 Known gaps: the Android and Windows end-to-end tests run in CI only for the Kotlin side (they need the relay binary); the shake thresholds and the tray text box have not been seen on a real device or screen; the rest of `app/rust` outside `backend.rs` still logs nothing.
+
+## Recovery line (2026-11-04)
+
+After a lost signaling connection, each client logs one info line when the first frame is shown again: `recovered after <ms> ms, <n> attempts`, with the fields `recoveryMs` (loss to first frame) and `attempts` (signaling connections opened since the loss). Browser: target `receiver`; Android and the Windows client: the session log. It is not logged for a first connection. The signaling close lines carry `closeCode`. See [reconnect order](architecture/reconnect.md).

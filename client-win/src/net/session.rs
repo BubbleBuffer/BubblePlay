@@ -7,8 +7,8 @@
 //! loop never blocks on the decoder.
 
 use std::future::Future;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,6 +79,12 @@ pub(crate) struct Timing {
     /// First reconnect delay; doubles up to `backoff_max`.
     pub backoff_min: Duration,
     pub backoff_max: Duration,
+    /// Recycled session (authenticated before in this run): first `auth-host` wait; each
+    /// timeout multiplies the next wait by 1.5, up to `recycled_auth_max`.
+    pub recycled_auth: Duration,
+    pub recycled_auth_max: Duration,
+    /// Total time since a loss during which an `auth-host` timeout retries instead of ending.
+    pub recycled_budget: Duration,
 }
 
 impl Default for Timing {
@@ -93,6 +99,9 @@ impl Default for Timing {
             keyframe_interval: Duration::from_millis(250),
             backoff_min: Duration::from_millis(250),
             backoff_max: Duration::from_secs(5),
+            recycled_auth: Duration::from_secs(3),
+            recycled_auth_max: Duration::from_secs(8),
+            recycled_budget: Duration::from_secs(30),
         }
     }
 }
@@ -300,6 +309,13 @@ struct Session {
     started: Instant,
     backoff: Duration,
     ever_opened: bool,
+    /// Start of the retry budget: the first failure after the session was established.
+    /// Cleared when the device-key handshake succeeds again.
+    lost_at: Option<Instant>,
+    /// `auth-host` timeouts since the session was last established (backoff step).
+    auth_timeouts: AtomicU32,
+    /// Loss time and signaling connections made since, until the first frame is presented.
+    recovery: Option<(Instant, u64)>,
     throttle: KeyframeThrottle,
     /// Per-run counter; bumped for every new `/ws` epoch.
     local_epoch: u64,
@@ -334,6 +350,9 @@ impl Session {
             started: Instant::now(),
             backoff: Duration::ZERO,
             ever_opened: false,
+            lost_at: None,
+            auth_timeouts: AtomicU32::new(0),
+            recovery: None,
             throttle: KeyframeThrottle::new(timing.keyframe_interval),
             local_epoch: 0,
             gate: ReceiveGate::new(),
@@ -417,13 +436,22 @@ impl Session {
         )
         .map_err(device_keys)?;
         signal.send_plain(hello).await?;
+        // A recycled session (authenticated before in this run) waits less and retries a
+        // silent PC while the budget lasts; a first connection keeps the single long wait.
+        let (limit, expired) = self.auth_wait();
         let host = self
             .within(
-                self.timing.auth_host,
-                NetError::DeviceKeys(NO_DEVICE_KEYS.to_owned()),
+                limit,
+                expired,
                 await_plain(signal_rx, "auth-host", &self.stats),
             )
-            .await?;
+            .await
+            .map_err(|halt| {
+                if self.ever_opened && matches!(halt, Halt::Transient(_)) {
+                    self.auth_timeouts.fetch_add(1, Relaxed);
+                }
+                halt
+            })?;
         let (established, finish) = shake
             .on_auth_host(viewer.identity(), &host)
             .map_err(device_keys)?;
@@ -437,6 +465,30 @@ impl Session {
             .await?;
         let peer_caps = p2::check_caps(&first, webrtc).map_err(device_keys)?;
         Ok((established.h, established.pc_public, peer_caps))
+    }
+
+    /// The `auth-host` wait and the error its expiry gives. For a recycled session: 3 s, then
+    /// 4.5 s, 6.75 s, capped at 8 s, and a timeout is transient while under the budget.
+    fn auth_wait(&self) -> (Duration, NetError) {
+        let fatal = NetError::DeviceKeys(NO_DEVICE_KEYS.to_owned());
+        if !self.ever_opened {
+            return (self.timing.auth_host, fatal);
+        }
+        let step = self.auth_timeouts.load(Relaxed).min(16) as i32;
+        let limit = self
+            .timing
+            .recycled_auth
+            .mul_f64(1.5f64.powi(step))
+            .min(self.timing.recycled_auth_max);
+        let spent = self.lost_at.map_or(Duration::ZERO, |at| at.elapsed());
+        if spent + limit < self.timing.recycled_budget {
+            (
+                limit,
+                NetError::Socket("auth-host timeout, retrying".into()),
+            )
+        } else {
+            (limit, fatal)
+        }
     }
 
     /// Sleep for `delay` in ticks. Returns true when stop was requested first.
@@ -479,6 +531,11 @@ impl Session {
                     return Err(error);
                 }
                 Err(Halt::Transient(error)) => {
+                    if self.ever_opened {
+                        let now = Instant::now();
+                        self.lost_at.get_or_insert(now);
+                        self.recovery.get_or_insert((now, 0));
+                    }
                     self.stats.record_error(error.to_string());
                     self.stats.set_state(NetState::Backoff);
                     let delay = next_backoff(
@@ -510,6 +567,9 @@ impl Session {
         }
         self.stats.local_epoch.store(self.local_epoch, Relaxed);
         count(&self.stats.attempts);
+        if let Some((_, attempts)) = &mut self.recovery {
+            *attempts += 1;
+        }
         let reason = if self.ever_opened {
             "reconnect"
         } else {
@@ -579,6 +639,9 @@ impl Session {
             )
             .await?;
         self.config.controls.epoch_registered(&wire);
+        // Established again: the retry budget starts over at the next loss.
+        self.lost_at = None;
+        self.auth_timeouts.store(0, Relaxed);
         // `seq` counts per session: a new connection starts with no pictures.
         if let Some(previews) = &self.config.previews {
             previews.clear();
@@ -772,8 +835,8 @@ impl Session {
                     _=async {if let Some(input)=&self.config.input {input.notify.notified().await;} else {std::future::pending::<()>().await;}}=>Wake::Input,
                 };
                 match wake {
-                    Wake::Media(item)=> {let inbound=classify(item,"media")?;if let Some(media)=&mut link.media {media.last_seen=Instant::now();}self.on_media(link,inbound).await?;},
-                    Wake::Signal(item)=> {let inbound=classify(item,"signal")?;link.signal.last_seen=Instant::now();self.on_signal(link,inbound)?;},
+                    Wake::Media(item)=> {let inbound=classify(item,"media",&self.stats)?;if let Some(media)=&mut link.media {media.last_seen=Instant::now();}self.on_media(link,inbound).await?;},
+                    Wake::Signal(item)=> {let inbound=classify(item,"signal",&self.stats)?;link.signal.last_seen=Instant::now();self.on_signal(link,inbound)?;},
                     Wake::Udp(bytes,source)=> {if let Some(peer)=&mut link.rtc {if !peer.datagram(&bytes,source)? {self.stats.webrtc.lock().unwrap().rejected_datagrams+=1;}}},
                     Wake::Tick|Wake::Input=>{},
                 }
@@ -1704,6 +1767,17 @@ impl Session {
         Ok(())
     }
 
+    /// One info line for the first frame after a reconnect: time since the loss and the
+    /// signaling connections made since. Nothing on the first connection.
+    fn note_recovered(&mut self) {
+        if let Some((lost, attempts)) = self.recovery.take() {
+            let ms = lost.elapsed().as_millis();
+            self.stats.log_info(format!(
+                "recovered after {ms} ms, {attempts} attempts recoveryMs={ms} attempts={attempts}"
+            ));
+        }
+    }
+
     async fn drain_feedback(&mut self, link: &mut Link) -> Result<(), Halt> {
         while self.feedback_open {
             match self.feedback.try_recv() {
@@ -1742,6 +1816,7 @@ impl Session {
                     }
                 }
                 if self.config.headless_decoded_ready {
+                    self.note_recovered();
                     link.epoch.input_generation = Some(generation);
                     link.epoch.first_frame_deadline = None;
                     if let Some(peer) = &mut link.rtc {
@@ -1761,6 +1836,7 @@ impl Session {
                     }
                 }
                 link.epoch.first_frame_deadline = None;
+                self.note_recovered();
                 if !link.epoch.presented {
                     link.epoch.presented = true;
                     link.signal
@@ -1935,7 +2011,7 @@ async fn await_media_ready(source: &mut Source, stats: &TransportStats) -> Resul
     let mut hello = false;
     let mut peer = None;
     loop {
-        match classify(source.next().await, "media")? {
+        match classify(source.next().await, "media", stats)? {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(NetError::RelayError(message));
@@ -1967,7 +2043,7 @@ async fn await_register_challenge(
     stats: &TransportStats,
 ) -> Result<[u8; 32], NetError> {
     loop {
-        match classify(source.next().await, "signal")? {
+        match classify(source.next().await, "signal", stats)? {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(NetError::RelayError(message));
@@ -1990,7 +2066,7 @@ async fn await_hello_ok(
     stats: &TransportStats,
 ) -> Result<(Option<String>, Option<String>, Value), NetError> {
     loop {
-        match classify(source.next().await, "signal")? {
+        match classify(source.next().await, "signal", stats)? {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(NetError::RelayError(message));
@@ -2025,7 +2101,7 @@ async fn await_plain(
     stats: &TransportStats,
 ) -> Result<String, NetError> {
     loop {
-        match classify(source.next().await, "signal")? {
+        match classify(source.next().await, "signal", stats)? {
             Inbound::Text(text) => {
                 if let Some(message) = relay_error(&text) {
                     return Err(NetError::RelayError(message));
@@ -2054,7 +2130,7 @@ async fn await_ctl(
     stats: &TransportStats,
 ) -> Result<Opened, NetError> {
     loop {
-        match classify(source.next().await, "signal")? {
+        match classify(source.next().await, "signal", stats)? {
             Inbound::Text(text) => {
                 lane.last_seen = Instant::now();
                 if let Some(message) = relay_error(&text) {
@@ -2090,7 +2166,19 @@ async fn await_ctl(
 fn classify(
     item: Option<Result<Message, tungstenite::Error>>,
     label: &str,
+    stats: &TransportStats,
 ) -> Result<Inbound, NetError> {
+    if label == "signal" {
+        // The close code as a plain number; a socket that ends without a close frame is 1006.
+        match &item {
+            Some(Ok(Message::Close(frame))) => stats.log_info(format!(
+                "signaling down closeCode={}",
+                frame.as_ref().map_or(1005, |f| u16::from(f.code))
+            )),
+            None | Some(Err(_)) => stats.log_info("signaling down closeCode=1006".to_owned()),
+            _ => {}
+        }
+    }
     if let Some(Ok(Message::Close(Some(frame)))) = &item {
         if label == "signal" && frame.code == CloseCode::Policy {
             return Err(NetError::NotAdmitted);
@@ -2245,7 +2333,7 @@ async fn pair_session(
                 continue;
             }
         };
-        let Inbound::Text(text) = classify(item, "signal")? else {
+        let Inbound::Text(text) = classify(item, "signal", &stats)? else {
             continue;
         };
         if let Some(message) = relay_error(&text) {

@@ -163,6 +163,7 @@ impl Relay {
                     self.buffer(
                         &conn.pc,
                         Pending {
+                            epoch: conn.epoch.clone(),
                             kind: kind.as_str().to_owned(),
                             action: msg.action().to_owned(),
                             raw: text.to_owned(),
@@ -336,14 +337,18 @@ impl Relay {
     }
 
     /// Keeps a viewer message for the next host. media-control and first-frame
-    /// replace older messages of the same kind (same action for media-control).
+    /// and auth-hello replace older messages of the same kind (same action for
+    /// media-control).
     /// The buffer holds at most PENDING_LIMIT entries, oldest dropped first.
     fn buffer(&mut self, pc: &str, pending: Pending) {
         let room = self.rooms.entry(pc.to_owned()).or_default();
-        if pending.kind == "media-control" || pending.kind == "first-frame" {
+        if pending.kind == "media-control"
+            || pending.kind == "first-frame"
+            || pending.kind == "auth-hello"
+        {
             room.pending.retain(|old| {
                 !(old.kind == pending.kind
-                    && (pending.kind == "first-frame" || old.action == pending.action))
+                    && (pending.kind != "media-control" || old.action == pending.action))
             });
         }
         room.pending.push(pending);

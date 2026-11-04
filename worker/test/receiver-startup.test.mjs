@@ -50,7 +50,7 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
     static OPEN = 1; static CONNECTING = 0;
     constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
   }
-  const context = vm.createContext({ WebSocket: Socket, URL,
+  const context = vm.createContext({ WebSocket: Socket, URL, recoveryLossMs: null, recoveryAttempts: 0, noteConnectionLoss() {},
     inputStatusReason: "admin-required", latestInputStatus: { failedPackets: 2 },
     terminalSignalingFailure: false, reconnectTimer: null, ws: null,
     signalingGeneration: 0, signalingRegistered: false, authenticatedSession: null,

@@ -127,6 +127,10 @@ pub fn is_secret_key(key: &str) -> bool {
     if compact.contains("apikey") || compact.contains("privatekey") {
         return true;
     }
+    // A WebSocket close code is a number (1006, 1001), not a secret.
+    if compact == "closecode" {
+        return false;
+    }
     let mut i = 0;
     while i < tokens.len() {
         // Allow-listed pairs ("key_id", "key_code", "key_frame") are not secrets.
@@ -481,6 +485,15 @@ mod tests {
 
     fn text(input: &str) -> String {
         redact_text_with(input, &[])
+    }
+
+    #[test]
+    fn a_websocket_close_code_is_not_a_secret_but_other_codes_still_are() {
+        assert!(!is_secret_key("closeCode"));
+        assert!(!is_secret_key("close_code"));
+        assert!(is_secret_key("code"));
+        assert!(is_secret_key("pairing_code"));
+        assert!(is_secret_key("authCloseCode"));
     }
 
     #[test]

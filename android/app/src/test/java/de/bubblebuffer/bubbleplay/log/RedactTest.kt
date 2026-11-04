@@ -95,4 +95,15 @@ class RedactTest {
         assertEquals(true, Redact.field("admitted", true))
         assertEquals(null, Redact.field("detail", null))
     }
+
+    @Test
+    fun closeCodeIsAPlainNumberAndPassesButOtherCodesStayRedacted() {
+        assertEquals(1006, Redact.field("closeCode", 1006))
+        assertEquals("signaling down: closed 1001 (closeCode=1001)", text("signaling down: closed 1001 (closeCode=1001)"))
+        assertEquals("code=" + Redact.MASK, text("code=1006"))
+        assertEquals(Redact.MASK, Redact.field("code", 1006))
+        assertEquals(Redact.MASK, Redact.field("relay_code", 1006))
+        assertEquals(Redact.MASK, Redact.field("closeToken", "abc"))
+        assertEquals(Redact.MASK, Redact.field("authCloseCode", 1))
+    }
 }

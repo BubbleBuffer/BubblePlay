@@ -47,6 +47,11 @@ object Redact {
                 i += 2
                 continue
             }
+            // A WebSocket close code is a plain number, not a secret.
+            if (token == "close" && i + 1 < tokens.size && tokens[i + 1] == "code") {
+                i += 2
+                continue
+            }
             var cleaned = token
             for (allowed in KEY_ALLOWED) cleaned = cleaned.replace(allowed, "")
             if (SENSITIVE.any { cleaned.contains(it) }) return true

@@ -5,6 +5,8 @@ import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateI
 import {
   shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
+  recycledAuthTimeoutMs,
+  shouldRetryAuthTimeout,
   signalingUnanswered,
   rtcPeerEndAction,
 } from "/recovery.js";
@@ -445,6 +447,7 @@ function markFirstFramePresented(presentedGeneration = null, presentedViewportRe
   if (firstFrameHandshake.presented) return true;
   if (usingWssMedia) wssStartupRecoveries = 0;
   firstFrameHandshake.presented = true;
+  noteRecovered();
   monitorPreviews.onFirstFrame();
   if (!usingWssMedia) {
     rtcStartupFallback?.stop();
@@ -757,6 +760,14 @@ let pendingRtcTracks = [];
 let signalingGeneration = 0;
 let reconnectTimer = null;
 let terminalSignalingFailure = false;
+// Recovery after a lost signaling connection. everAuthenticated: this page had a session before,
+// so a silent PC is retried (recovery.js). recoveryLossMs: clock time of the loss, kept until the
+// first frame is shown again. recoveryBudgetStartMs: start of the retry budget, restarted by each
+// authentication. recoveryAttempts: signaling connections opened since the loss.
+let everAuthenticated = false;
+let recoveryLossMs = null;
+let recoveryBudgetStartMs = null;
+let recoveryAttempts = 0;
 // Signaling liveness (performance.now ms): the oldest unanswered ping, and the last inbound message.
 let signalingPingSentMs = null;
 let signalingInboundMs = 0;
@@ -906,6 +917,44 @@ function viewerLog(level, event, detail = {}) {
     transport: requestedTransport, codec: codecSession.codec, ...detail });
 }
 
+function noteConnectionLoss() {
+  if (!everAuthenticated) return;
+  const now = performance.now();
+  if (recoveryLossMs === null) { recoveryLossMs = now; recoveryAttempts = 0; }
+  if (recoveryBudgetStartMs === null) recoveryBudgetStartMs = now;
+}
+
+function noteSessionAuthenticated() {
+  everAuthenticated = true;
+  recoveryBudgetStartMs = null;
+}
+
+// Wait for the PC's auth-host: 10 s for a first connection, shorter and backing off for a recycled session.
+function sessionAuthTimeoutMs() {
+  return everAuthenticated && recoveryLossMs !== null ? recycledAuthTimeoutMs(recoveryAttempts - 1) : undefined;
+}
+
+function noteRecovered() {
+  if (recoveryLossMs === null) return;
+  const recoveryMs = Math.round(performance.now() - recoveryLossMs);
+  const attempts = recoveryAttempts;
+  recoveryLossMs = recoveryBudgetStartMs = null;
+  recoveryAttempts = 0;
+  viewerLog("info", `recovered after ${recoveryMs} ms, ${attempts} attempts`, { recoveryMs, attempts });
+}
+
+// A failed session. A silent PC on a recycled session retries on a new signaling connection while
+// the budget lasts; everything else ends the session as before.
+function handleSessionFailure(refusal, reason) {
+  noteConnectionLoss();
+  if (shouldRetryAuthTimeout({ reason, established: everAuthenticated, budgetStartMs: recoveryBudgetStartMs, nowMs: performance.now() })) {
+    viewerLog("info", "auth-timeout-retry", { attempts: recoveryAttempts, sinceLossMs: Math.round(performance.now() - recoveryLossMs) });
+    recycleSignaling("auth-timeout");
+    return;
+  }
+  endAuthenticatedSession(refusal);
+}
+
 function reconnectSignaling(reason) {
   if (terminalSignalingFailure) return;
   if (reconnectTimer || ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
@@ -917,6 +966,7 @@ function reconnectSignaling(reason) {
     authenticatedSession?.close();
     authenticatedSession = null;
     const generation = ++signalingGeneration;
+    if (recoveryLossMs !== null) recoveryAttempts++;
     const socketUrl = signalingSocketUrl();
     debugTrace("signaling-construct", {
       path: new URL(socketUrl).pathname,
@@ -936,6 +986,7 @@ function reconnectSignaling(reason) {
     const handleClose = event => {
       if (ws !== socket || generation !== signalingGeneration) return;
       const admitted = signalingRegistered;
+      noteConnectionLoss();
       hudState.ws = "closed";
       latestInputStatus = null;
       inputStatusReason = null;
@@ -989,6 +1040,7 @@ function signalingSocketUrl() {
 
 function recycleSignaling(reason) {
   if (terminalSignalingFailure) return;
+  noteConnectionLoss();
   latestInputStatus = null;
   inputStatusReason = null;
   invalidatePendingMonitorRequest(reason);
@@ -1058,10 +1110,11 @@ async function handleSignal(socket, generation, ev) {
       const current = () => ws === socket && generation === signalingGeneration;
       let logUploader = null;
       const session = createViewerSession({ identity: sessionIdentity, pcId: sessionPc, pinnedPublic: sessionPinnedPublic,
-        relayOrigin: relayOrigin(location.href), epoch: msg.mediaEpoch, transport: wssSelected ? "wss" : "webrtc",
+        relayOrigin: relayOrigin(location.href), epoch: msg.mediaEpoch, transport: wssSelected ? "wss" : "webrtc", authTimeoutMs: sessionAuthTimeoutMs(),
         send: message => current() && sendRelay(message),
         onAuthenticated: () => {
           if (!current()) return;
+          noteSessionAuthenticated();
           viewerLog("info", "signaling-authenticated");
           // Logs and saved reports go to the PC when it offers client-logs-v1. Never blocks the session.
           try {
@@ -1082,7 +1135,7 @@ async function handleSignal(socket, generation, ev) {
         onPreviewMessage: message => { if (current()) monitorPreviews.onMessage(message); },
         onBinary: (kind, bytes) => { if (current() && kind === "cursor") handleCursorState(bytes, "signaling"); },
         onMediaReady: () => { if (current()) openAuthenticatedMedia(); },
-        onFailure: (refusal, reason) => { if (current()) { viewerLog("warn", "session-refused", { reason: String(reason || "unknown").slice(0, 80), title: refusal?.title }); endAuthenticatedSession(refusal); } },
+        onFailure: (refusal, reason) => { if (current()) { viewerLog("warn", "session-refused", { reason: String(reason || "unknown").slice(0, 80), title: refusal?.title }); handleSessionFailure(refusal, reason); } },
       });
       authenticatedSession = session;
       monitorPreviews.reset();

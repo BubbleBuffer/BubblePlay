@@ -208,6 +208,9 @@ pub(crate) struct Conn {
 /// A buffered viewer message, kept for the next host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Pending {
+    /// The media epoch of the viewer socket that sent it. A message from an
+    /// older epoch is never delivered.
+    pub epoch: String,
     pub kind: String,
     pub action: String,
     pub raw: String,
