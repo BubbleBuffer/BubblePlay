@@ -437,7 +437,7 @@ Media and file sockets keep the phase 1 ticket hello. A browser socket (one with
   - A later `admit` does not close it. The viewer reconnects normally once it is listed.
 - Remote pairing (B) is phase 3.
 
-**Forwarded phase 2 types.** Each has exact keys, a direction and a size cap. None is buffered while the host is away. Anything with the wrong direction, shape or size is dropped.
+**Forwarded phase 2 types.** Each has exact keys, a direction and a size cap. Only `auth-hello` is held while the host is away (see [Reconnect order](reconnect.md)); the others are dropped. Anything with the wrong direction, shape or size is dropped.
 
 | Type | Direction | Cap | Fields |
 | --- | --- | --- | --- |

@@ -51,3 +51,27 @@ export function shouldRecoverAfterNetworkRouteProbe(before = {}, after = {}, {
 
   return after.peerConnectionState === "failed" || after.peerConnectionState === "disconnected";
 }
+
+// A relay reset drops every socket. The viewer is admitted again within about a
+// second, but the PC may re-register a few seconds later and so not answer the
+// first auth-hello. For a session that was already established, a silent PC is
+// retried on a fresh signaling connection instead of ending the session.
+export const RECYCLED_AUTH_TIMEOUT_MS = 3_000;
+export const RECYCLED_AUTH_TIMEOUT_MAX_MS = 8_000;
+export const RECOVERY_BUDGET_MS = 30_000;
+
+/** Wait for auth-host on attempt `attempt` (0 = the first since the loss): 3 s, 4.5 s, 6.75 s, then 8 s. */
+export function recycledAuthTimeoutMs(attempt) {
+  const step = Number.isInteger(attempt) && attempt > 0 ? attempt : 0;
+  return Math.min(RECYCLED_AUTH_TIMEOUT_MS * 1.5 ** step, RECYCLED_AUTH_TIMEOUT_MAX_MS);
+}
+
+/**
+ * True when a failed session should be retried rather than end on the terminal screen.
+ * Only the silent-PC timeout of a session that was established before is retried, and only
+ * while the recovery budget lasts. Refusals (bad key, not paired, 1008, missing cap) never are.
+ */
+export function shouldRetryAuthTimeout({ reason, established, budgetStartMs, nowMs, budgetMs = RECOVERY_BUDGET_MS }) {
+  return reason === "auth-timeout" && established === true && Number.isFinite(budgetStartMs) &&
+    nowMs - budgetStartMs < budgetMs;
+}

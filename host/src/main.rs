@@ -674,6 +674,18 @@ fn next_serve_backoff(current: Duration, registered_for: Option<Duration>) -> Du
     }
 }
 
+/// How long to wait before the next serve attempt, and the backoff to carry on with. A run that
+/// was registered for over `SERVE_HEALTHY_RUN` reconnects at once (the relay or the network reset
+/// it, the host did nothing wrong); repeated quick failures still back off.
+fn serve_retry(current: Duration, registered_for: Option<Duration>) -> (Duration, Duration) {
+    let next = next_serve_backoff(current, registered_for);
+    if registered_for.is_some_and(|d| d > SERVE_HEALTHY_RUN) {
+        (Duration::ZERO, next)
+    } else {
+        (current, next)
+    }
+}
+
 fn remembered_monitor_attempt_exhausted(attempts: u32) -> bool {
     attempts >= REMEMBERED_MONITOR_MAX_ATTEMPTS
 }
@@ -852,8 +864,9 @@ fn run_serve_forever(args: &Args) -> Result<()> {
                     since_last_registration_secs = last_registered_at.map(|at| at.elapsed().as_secs()),
                     "serve session failed — retrying"
                 );
-                std::thread::sleep(backoff);
-                backoff = next_serve_backoff(backoff, registered_for);
+                let (wait, next) = serve_retry(backoff, registered_for);
+                std::thread::sleep(wait);
+                backoff = next;
             }
         }
     }
@@ -6893,6 +6906,19 @@ mod tests {
             Duration::from_secs(2)
         );
         assert_eq!(super::next_serve_backoff(max, None), max);
+    }
+
+    #[test]
+    fn a_healthy_run_that_fails_reconnects_at_once_and_quick_failures_still_wait() {
+        use std::time::Duration;
+        let (wait, next) = super::serve_retry(Duration::from_secs(8), Some(Duration::from_secs(120)));
+        assert_eq!(wait, Duration::ZERO);
+        assert_eq!(next, Duration::from_secs(1));
+        let (wait, next) = super::serve_retry(Duration::from_secs(1), Some(Duration::from_secs(5)));
+        assert_eq!(wait, Duration::from_secs(1));
+        assert_eq!(next, Duration::from_secs(2));
+        let (wait, next) = super::serve_retry(Duration::from_secs(4), None);
+        assert_eq!((wait, next), (Duration::from_secs(4), Duration::from_secs(8)));
     }
 
     #[test]

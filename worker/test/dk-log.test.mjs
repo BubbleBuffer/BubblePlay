@@ -285,6 +285,16 @@ test("the installed global logger exists after the script runs and catches error
 
 const R = "[redacted]";
 
+test("a WebSocket closeCode (1006, 1001) is logged, other code keys stay redacted", () => {
+  const { log } = make();
+  log.info("t", "signaling-close", { closeCode: 1006, code: "7K3QD-M9X2P", pairingCode: 1001, authCloseCode: 1001 });
+  const f = log.recent(1)[0].fields;
+  assert.equal(f.closeCode, 1006);
+  assert.equal(f.code, R);
+  assert.equal(f.pairingCode, R);
+  assert.equal(f.authCloseCode, R);
+});
+
 test("rule 1: fields with secret-looking keys lose the whole value", () => {
   const { log } = make();
   log.info("t", "m", {

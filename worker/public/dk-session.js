@@ -58,12 +58,12 @@ export function sessionRefusal(reason, message = "") {
 }
 
 /** `send` must return false if the socket is no longer current. Call receive in wire order.
- * helloOptions and timers are test seams; production always generates fresh hello material.
+ * authTimeoutMs is the wait for auth-host (10 s; shorter for a recycled session). helloOptions and timers are test seams; production always generates fresh hello material.
  */
 export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin, epoch,
   transport = "webrtc", name = browserDeviceName(), send, onAuthenticated = () => {},
   onMessage = () => {}, onLogMessage = () => {}, onPreviewMessage = () => {}, onBinary = () => {}, onMediaReady = () => {}, onFailure = () => {},
-  schedule = setTimeout, cancel = clearTimeout, helloOptions }) {
+  schedule = setTimeout, cancel = clearTimeout, helloOptions, authTimeoutMs = AUTH_TIMEOUT_MS }) {
   let ended = false, started = false, authenticated = false, capsReceived = false;
   let handshake = null, ctl = null, H = null, pcPublic = null;
   let timer = null, bindTimer = null, localBindSent = false, remoteBindVerified = false;
@@ -185,7 +185,7 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
       if (started || ended) return;
       started = true;
       if (!(pinnedPublic instanceof Uint8Array) || pinnedPublic.length !== 32 || typeof epoch !== "string" || !/^[\x20-\x7e]{1,64}$/.test(epoch)) return fail("start-failed", undefined, new Error("bad pinned key or epoch"));
-      timer = schedule(() => fail("auth-timeout"), AUTH_TIMEOUT_MS);
+      timer = schedule(() => fail("auth-timeout"), authTimeoutMs);
       try {
         handshake = await beginViewerHandshake({ identity, pcId, pinnedPublic, relayOrigin, epoch, helloOptions,
           send: message => { if (!sendWire(message)) throw new Error("socket ended"); } });

@@ -79,6 +79,7 @@ pub struct TransportStats {
     pub(crate) last_decoded_seq: AtomicU64,
     pub(crate) stale_feedback: AtomicU64,
     last_error: Mutex<Option<String>>,
+    log: Mutex<Vec<String>>,
     window: Mutex<Window>,
     pub(crate) webrtc: Mutex<super::webrtc::stats::WebRtcStats>,
 }
@@ -229,6 +230,21 @@ impl TransportStats {
     pub(crate) fn record_keyframe(&self) {
         count(&self.keyframe_requests);
         note(&mut self.window.lock().unwrap().keyframes, Instant::now());
+    }
+
+    /// One info line of the net log: kept (last 64) for `log_lines` and written to stderr.
+    pub(crate) fn log_info(&self, line: String) {
+        eprintln!("BubblePlay net: {line}");
+        let mut log = self.log.lock().unwrap_or_else(|p| p.into_inner());
+        if log.len() >= 64 {
+            log.remove(0);
+        }
+        log.push(line);
+    }
+
+    /// The net log's info lines so far (newest last, at most 64).
+    pub fn log_lines(&self) -> Vec<String> {
+        self.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub(crate) fn record_error(&self, message: String) {

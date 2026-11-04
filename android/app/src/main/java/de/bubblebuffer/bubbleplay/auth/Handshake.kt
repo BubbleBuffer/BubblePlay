@@ -187,6 +187,13 @@ class Handshake private constructor(
         /** The viewer waits at most this long for auth-host; the runner enforces it (decisions item 16). */
         const val AUTH_HOST_TIMEOUT_MS = 10_000L
 
+        /** A recycled session (authenticated earlier in this run) waits 3 s, then backs off x1.5 up to 8 s. */
+        const val RECYCLED_AUTH_HOST_TIMEOUT_MS = 3_000L
+        const val RECYCLED_AUTH_HOST_TIMEOUT_MAX_MS = 8_000L
+
+        /** A recycled session retries a silent host for this long after the loss before the terminal state. */
+        const val RECYCLED_RETRY_BUDGET_MS = 30_000L
+
         /**
          * Starts a handshake. [relayOrigin] and [sessionEpoch] go into the transcript verbatim as
          * UTF-8. Caps are `control-aead-v1`, then [extraCaps], then `pair-v1` in pairing mode.

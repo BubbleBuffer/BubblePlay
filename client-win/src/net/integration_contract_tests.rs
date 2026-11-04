@@ -405,6 +405,9 @@ impl Client {
                     keyframe_interval: Duration::from_millis(250),
                     backoff_min: TICK,
                     backoff_max: TICK,
+                    recycled_auth: WAIT,
+                    recycled_auth_max: WAIT,
+                    recycled_budget: WAIT,
                 },
             )
         });

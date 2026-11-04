@@ -150,6 +150,8 @@ class Session(
     @Volatile private var sigOpen = false
     @Volatile private var registered = false
     private val sigRetry = ReconnectLoop()
+    // Recycled-session retry budget and recovery timing (clock starts at the loss, resets when established).
+    private val recycled = RecycledRetry { SystemClock.elapsedRealtime() }
     private var sigRetryTimer: Runnable? = null
     private var sigReconnecting = false
     private var mediaEpoch: String? = null
@@ -366,6 +368,7 @@ class Session(
         clearGrant()
         closeWire()
         if (!running || terminal != null) return
+        recycled.connecting()
         // The generation is assigned right after newWebSocket returns, on this
         // thread; callbacks read it on this thread too (via handler.post).
         var id = 0
@@ -422,7 +425,8 @@ class Session(
         if (!link.lost(id)) return
         val problem = SessionProblem.closed(httpCode, wire?.admitted == true)
         closeWire()
-        Log.i(TAG, "signaling down: $why (code=$httpCode)")
+        BpLog.i(TAG, "signaling down: $why (closeCode=$httpCode)", pc.id, mapOf("closeCode" to httpCode))
+        if (problem == null) recycled.lost()
         inputWarning.reset()
         sigOpen = false
         registered = false
@@ -553,15 +557,19 @@ class Session(
                 val watchdog = Runnable {
                     if (wire === current) {
                         val failure = current.authHostTimedOut()
-                        if (failure is SessionWire.Event.Failed) endSession(failure.problem, failure.detail)
+                        if (failure is SessionWire.Event.Failed) {
+                            if (RecycledRetry.retryable(failure.problem) && recycled.canRetryTimeout()) recycleSignaling("auth-host-timeout")
+                            else endSession(failure.problem, failure.detail)
+                        }
                     }
                 }
                 authTimer = watchdog
-                handler.postDelayed(watchdog, ViewerAuth.AUTH_HOST_TIMEOUT_MS)
+                handler.postDelayed(watchdog, recycled.authHostTimeoutMs())
             }
             SessionWire.Event.Authenticated -> {
                 cancelAuthTimer()
                 if (!link.authenticated(id, mediaEpoch)) return
+                recycled.authenticated()
                 registered = true
                 sigRetry.succeeded()
                 sigReconnecting = false
@@ -695,28 +703,31 @@ class Session(
 
     private fun handleRelay(msg: JSONObject) {
         when (msg.optString("type")) {
-            "peer-left" -> {
-                // The host went away: start a fresh signaling epoch, as the browser does.
-                Log.i(TAG, "peer-left: recycling signaling")
-                inputWarning.reset()
-                link.reset()
-                try { sig?.close(1000, "peer-left") } catch (_: Exception) {}
-                sig = null; sigOpen = false; registered = false
-                clearGrant()
-                closeWire()
-                closeMedia()
-                mediaEpoch = null
-                resetFirstFrame()
-                desktopKind = "default"; secureDesktop = null
-                followCapable = false
-                main.post { listener.onInputLost(); listener.onSecureDesktop(null); listener.onFileCapability(null); listener.onSoundCapability(false); listener.onFileEpoch(null); listener.onFollowCapability(false) }
-                sigRetry.resetBackoff()
-                scheduleSignalingReconnect("peer-left")
-            }
+            "peer-left" -> recycleSignaling("peer-left")
             "error" -> endSession(SessionProblem.RELAY_ERROR, msg.optString("message").ifEmpty { "relay error" }.take(180))
             "ping" -> sendSig(JSONObject().put("type", "pong"))
             "pong" -> if (pingSentAt != 0L) { rttMs = now() - pingSentAt; pingSentAt = 0L }
         }
+    }
+
+    /** The host went away or stayed silent: start a fresh signaling epoch, as the browser does. */
+    private fun recycleSignaling(why: String) {
+        Log.i(TAG, "$why: recycling signaling")
+        recycled.lost()
+        inputWarning.reset()
+        link.reset()
+        try { sig?.close(1000, why) } catch (_: Exception) {}
+        sig = null; sigOpen = false; registered = false
+        clearGrant()
+        closeWire()
+        closeMedia()
+        mediaEpoch = null
+        resetFirstFrame()
+        desktopKind = "default"; secureDesktop = null
+        followCapable = false
+        main.post { listener.onInputLost(); listener.onSecureDesktop(null); listener.onFileCapability(null); listener.onSoundCapability(false); listener.onFileEpoch(null); listener.onFollowCapability(false) }
+        sigRetry.resetBackoff()
+        scheduleSignalingReconnect(why)
     }
 
     private fun handleDesktopState(msg: JSONObject) {
@@ -851,6 +862,9 @@ class Session(
     }
 
     private fun completePresentation() {
+        recycled.recovered()?.let { (ms, attempts) ->
+            BpLog.i(TAG, "recovered after $ms ms, $attempts attempts", pc.id, mapOf("recoveryMs" to ms, "attempts" to attempts))
+        }
         cancelFirstFrame()
         monitorHold = false
         val wasAwaiting = awaitingFrame
