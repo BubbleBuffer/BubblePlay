@@ -395,13 +395,17 @@ impl Session {
         epoch: &str,
         webrtc: bool,
     ) -> Result<([u8; 32], [u8; 32], Vec<String>), Halt> {
-        // `client-logs-v1` is advertised only when a log hook is configured.
+        // `client-logs-v1` is advertised only when a log hook is configured,
+        // `monitor-previews-v1` only when a preview store is.
         let base = [CAP_CONTROL_AEAD, CAP_DTLS_BIND];
-        let caps = if self.config.log_hook.is_some() {
+        let mut caps = if self.config.log_hook.is_some() {
             super::ctl_hook::CtlLogHook::advertise(&base)
         } else {
             base.to_vec()
         };
+        if self.config.previews.is_some() {
+            caps.push(super::previews::CAP_MONITOR_PREVIEWS);
+        }
         let caps = caps.as_slice();
         let (shake, hello) = p2::ViewerHandshake::start(
             viewer.identity(),
@@ -456,6 +460,10 @@ impl Session {
             // The log hook's connection ends with the socket epoch (a no-op if never opened).
             if let Some(hook) = &self.config.log_hook {
                 hook.closed();
+            }
+            // Held monitor snapshots end with the session.
+            if let Some(previews) = &self.config.previews {
+                previews.clear();
             }
             // Pending monitor picks and queued mode targets end with the socket they were sent on.
             self.config.controls.epoch_restart();
@@ -571,6 +579,10 @@ impl Session {
             )
             .await?;
         self.config.controls.epoch_registered(&wire);
+        // `seq` counts per session: a new connection starts with no pictures.
+        if let Some(previews) = &self.config.previews {
+            previews.clear();
+        }
         if let Some(hook) = &self.config.log_hook {
             hook.opened(
                 viewer.pc().map(|pc| pc.to_string()).unwrap_or_default(),
@@ -1103,6 +1115,15 @@ impl Session {
                         && matches!(value["state"].as_str(), Some("active" | "unavailable")) =>
                 {
                     self.desktop_state(link, &value);
+                    return Ok(());
+                }
+                Some(super::previews::PREVIEW_KIND) if self.config.previews.is_some() => {
+                    // A picture never blocks the session; one that fails a check is dropped.
+                    if let Some(previews) = &self.config.previews {
+                        if previews.accept(text).is_err() {
+                            count(&self.stats.rejected_controls);
+                        }
+                    }
                     return Ok(());
                 }
                 Some("monitor-list" | "monitor-error") => {

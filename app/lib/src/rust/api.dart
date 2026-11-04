@@ -40,6 +40,16 @@ void devicesSend({required String line}) =>
 Future<void> devicesDisconnect() =>
     RustLib.instance.api.crateApiDevicesDisconnect();
 
+/// Removes and returns the held snapshot of the monitor `selector`, or null when none is
+/// held. Called when that monitor becomes the selected one: its picture is used once.
+MonitorPreviewData? monitorPreviewTake({required String selector}) =>
+    RustLib.instance.api.crateApiMonitorPreviewTake(selector: selector);
+
+/// The media generation of the last video frame shown, 0 before the first. It changes with
+/// the first live frame after the host switches monitor.
+PlatformInt64 mediaGeneration() =>
+    RustLib.instance.api.crateApiMediaGeneration();
+
 /// Queues one upload message (`logs-batch`, `feedback-begin` or `feedback-chunk` as JSON) on
 /// the active session's control channel. False when there is no connection, the queue is
 /// full, or the message is not one of those kinds.
@@ -84,4 +94,36 @@ class CtlLogState {
           open == other.open &&
           bufferedBytes == other.bufferedBytes &&
           sinceLastInputMs == other.sinceLastInputMs;
+}
+
+/// One monitor snapshot from the host (`monitor-previews-v1`).
+class MonitorPreviewData {
+  /// The `monitor-list` selector it shows.
+  final String monitor;
+  final int width;
+  final int height;
+
+  /// A baseline JPEG.
+  final Uint8List jpeg;
+
+  const MonitorPreviewData({
+    required this.monitor,
+    required this.width,
+    required this.height,
+    required this.jpeg,
+  });
+
+  @override
+  int get hashCode =>
+      monitor.hashCode ^ width.hashCode ^ height.hashCode ^ jpeg.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MonitorPreviewData &&
+          runtimeType == other.runtimeType &&
+          monitor == other.monitor &&
+          width == other.width &&
+          height == other.height &&
+          jpeg == other.jpeg;
 }

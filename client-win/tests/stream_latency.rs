@@ -310,6 +310,7 @@ fn stream_session_against_fake_host() {
         }),
         on_change: Arc::new(|| {}),
         log_hook: None,
+        previews: None,
     };
     let session = StreamSession::start(params).expect("start the stream session");
 

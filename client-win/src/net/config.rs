@@ -143,6 +143,9 @@ pub struct NetConfig {
     /// Log and feedback upload over the ctl channel. Present means the session advertises
     /// `client-logs-v1`; absent leaves the wire exactly as before.
     pub log_hook: Option<super::CtlLogHook>,
+    /// Holds the host's monitor snapshots. Present means the session advertises
+    /// `monitor-previews-v1`; absent leaves the wire exactly as before.
+    pub previews: Option<super::MonitorPreviews>,
     /// Disabled only by the decode-free audio development harness.
     pub video_watchdog: bool,
     pub transport: TransportChoice,
@@ -163,6 +166,7 @@ impl NetConfig {
             controls: SessionControls::new(),
             audio: None,
             log_hook: None,
+            previews: None,
             video_watchdog: true,
             transport: TransportChoice::Wss,
             ice_checking_timeout: AUTO_ICE_CHECKING_TIMEOUT,

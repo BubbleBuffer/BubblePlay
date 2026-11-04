@@ -17,6 +17,8 @@ import 'src/logging/error_hooks.dart';
 import 'src/logging/upload/ctl_bridge_factory.dart';
 import 'src/logging/upload/upload_coordinator.dart';
 import 'src/platform/key_files.dart';
+import 'src/session/monitor_previews.dart';
+import 'src/session/monitor_previews_windows.dart';
 import 'src/session/stream_channel.dart';
 import 'src/presence/presence_lifecycle.dart';
 import 'src/presence/presence_service.dart';
@@ -63,6 +65,7 @@ Future<void> _start(List<String> args) async {
         isWindows: isWindows,
         keyFiles: const SystemKeyFiles(),
         stream: MethodStreamChannel(),
+        previews: isWindows ? const RustMonitorPreviews() : const NoMonitorPreviews(),
         theme: ValueNotifier<Brightness?>(null),
         devices: devicesChannel == null ? null : DevicesController(devicesChannel),
         initialSection: section,

@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
 import '../model/model.dart';
+import 'monitor_preview_overlay.dart';
 import 'stream_video.dart';
 
 /// The session: the native video (see [StreamVideo]) under the session chrome.
@@ -33,6 +34,14 @@ class _SessionScreenState extends State<SessionScreen> {
   bool _stats = false;
 
   Session get _session => widget.session;
+
+  /// The selector of the monitor on screen, or null before the host's list.
+  String? get _selectedSelector {
+    final monitors = _session.monitors;
+    if (monitors.isEmpty) return null;
+    final index = _session.monitor;
+    return monitors[index >= 0 && index < monitors.length ? index : 0].selector;
+  }
 
   @override
   void dispose() {
@@ -116,6 +125,12 @@ class _SessionScreenState extends State<SessionScreen> {
                 resolution: _session.stats.resolution,
                 forwardPointer: !AppScope.of(context).isWindows,
                 waiting: 'Waiting for video.',
+              ),
+            ),
+            Positioned.fill(
+              child: MonitorPreviewOverlay(
+                source: AppScope.of(context).previews,
+                selected: _selectedSelector,
               ),
             ),
             Positioned(
