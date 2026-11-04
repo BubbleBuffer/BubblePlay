@@ -63,6 +63,8 @@ serde_json = "1"
 anyhow = "1"
 png = "0.18"
 base64 = "0.22"
+# Monitor preview snapshots (host/src/monitor_previews.rs): small pure-Rust baseline JPEG encoder.
+jpeg-encoder = { version = "0.6", default-features = false, features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opus = "0.4.0"

@@ -82,6 +82,8 @@ pub struct HostProtocol {
     /// order after a re-registration), held briefly and verified like any other hello once the
     /// peer-joined arrives.
     early_hello: Option<(String, Instant)>,
+    /// The caps the authenticated viewer advertised (auth-hello and later ctl `caps`).
+    viewer_caps: Vec<String>,
 }
 
 /// How long an early `auth-hello` waits for its `peer-joined`.
@@ -146,6 +148,7 @@ impl HostProtocol {
         if upload.is_some() {
             pc_caps.push(CAP_CLIENT_LOGS.to_owned());
         }
+        pc_caps.push(crate::monitor_previews::CAPABILITY.to_owned());
         let session = Session::new(
             SessionConfig {
                 identity,
@@ -174,6 +177,7 @@ impl HostProtocol {
             dropped: 0,
             peer_viewer: None,
             upload,
+            viewer_caps: Vec::new(),
         })
     }
 
@@ -189,6 +193,13 @@ impl HostProtocol {
     /// Kept as an explicit name for the signaling registration call site.
     pub fn admit_message(&self) -> Value {
         self.admit()
+    }
+
+    /// Whether the authenticated normal viewer advertised `cap`.
+    pub fn viewer_has_cap(&self, cap: &str) -> bool {
+        !self.peer_pairing
+            && self.session.is_established()
+            && self.viewer_caps.iter().any(|known| known == cap)
     }
 
     pub fn application_ready(&self) -> bool {
@@ -447,6 +458,16 @@ impl HostProtocol {
     /// The viewer's ctl `caps` may advertise `client-logs-v1` (the cap is also read from its
     /// auth-hello). Turning it on queues `logs-state`.
     fn note_viewer_caps(&mut self, json: &str) {
+        if let Some(caps) = serde_json::from_str::<Value>(json)
+            .ok()
+            .and_then(|value| value["caps"].as_array().cloned())
+        {
+            for cap in caps.iter().filter_map(Value::as_str) {
+                if !self.viewer_caps.iter().any(|known| known == cap) {
+                    self.viewer_caps.push(cap.to_owned());
+                }
+            }
+        }
         let offered = serde_json::from_str::<Value>(json)
             .ok()
             .and_then(|value| value["caps"].as_array().cloned())
@@ -683,6 +704,7 @@ impl HostProtocol {
                         Err(error) => self.save_error(error),
                     }
                     self.queue_list();
+                    self.viewer_caps = viewer.caps.clone();
                     // The device id comes from the authenticated session, never from a message.
                     if !self.peer_pairing {
                         let offered = viewer.caps.iter().any(|cap| cap == CAP_CLIENT_LOGS);
@@ -2167,7 +2189,7 @@ mod tests {
         let messages = open_ctl(&mut opener, &host.take_effects());
         assert_eq!(
             messages[0],
-            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1","client-logs-v1"]})
+            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1","client-logs-v1","monitor-previews-v1"]})
         );
         // Without the upload the cap is absent, as before.
         let scratch2 = Scratch::new();
@@ -2176,7 +2198,7 @@ mod tests {
         let messages = open_ctl(&mut pc_opener(), &plain.take_effects());
         assert_eq!(
             messages[0],
-            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1"]})
+            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1","monitor-previews-v1"]})
         );
     }
 
@@ -2251,6 +2273,32 @@ mod tests {
             !host.application_ready(),
             "uploads did not latch a transport"
         );
+    }
+
+    #[test]
+    fn viewer_capabilities_are_known_only_for_the_authenticated_viewer_that_sent_them() {
+        let scratch = Scratch::new();
+        let logs = scratch.0.join("logs");
+        let mut host = logs_controller(&scratch.list(), &logs);
+        let cap = crate::monitor_previews::CAPABILITY;
+        assert!(!host.viewer_has_cap(cap), "no session yet");
+        handshake(&mut host);
+        let mut pc = pc_opener();
+        open_ctl(&mut pc, &host.take_effects());
+        let mut viewer = viewer_sealer();
+        assert!(!host.viewer_has_cap(cap), "the viewer did not offer it");
+        host.receive(&ctl_json(
+            &mut viewer,
+            json!({"type":"caps","caps":["monitor-previews-v1"]}),
+        ))
+        .unwrap();
+        assert!(host.viewer_has_cap(cap));
+        assert!(!host.viewer_has_cap("something-else"));
+        host.peer_left();
+        host.take_effects();
+        assert!(!host.viewer_has_cap(cap), "gone with the session");
+        handshake(&mut host);
+        assert!(!host.viewer_has_cap(cap), "a new viewer starts without it");
     }
 
     #[test]

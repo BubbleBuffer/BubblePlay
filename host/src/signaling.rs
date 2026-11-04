@@ -1389,6 +1389,11 @@ impl Signaling {
         self.device_protocol.application_ready()
     }
 
+    /// Whether the authenticated viewer advertised the ctl capability `cap`.
+    pub fn viewer_has_cap(&self, cap: &str) -> bool {
+        self.device_protocol.viewer_has_cap(cap)
+    }
+
     pub fn viewer_epoch(&self) -> Option<&str> {
         self.device_protocol.viewer_epoch()
     }
