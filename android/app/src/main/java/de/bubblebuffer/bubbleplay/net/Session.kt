@@ -81,6 +81,10 @@ class Session(
         fun onFollowCapability(enabled: Boolean)
         /** The host's follow state from `monitor-list.follow`. */
         fun onFollowState(follow: Boolean)
+        /** A held picture of the monitor the host just switched to: show it scaled up over the video at once. */
+        fun onMonitorPreview(picture: MonitorPreviews.Picture) {}
+        /** The first live frame of the new media generation arrived (or the session ended): fade the picture out. */
+        fun onMonitorPreviewEnd() {}
     }
 
     enum class State { CONNECTING, CONNECTED, STATIC, RECONNECTING, ERROR }
@@ -117,6 +121,11 @@ class Session(
     private var soundForeground = true
     /** Log/feedback upload door (see [CtlPassThrough]): the Kotlin core's own uploader and the Dart process's pass-through. */
     val ctl = CtlPassThrough { now() }
+    // monitor-previews-v1 (session thread only): latest picture per monitor, the selected monitor of the last list,
+    // and whether a picture is on screen waiting for the live frame.
+    private val previews = MonitorPreviews()
+    private var selectedMonitor: String? = null
+    private var previewShown = false
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -478,9 +487,19 @@ class Session(
 
     private fun closeWire() {
         cancelAuthTimer()
+        previews.clear()
+        selectedMonitor = null
+        endPreview()
         ctl.detach()
         wire?.close()
         wire = null
+    }
+
+    /** Tells the UI to fade out the monitor preview, if one is showing. */
+    private fun endPreview() {
+        if (!previewShown) return
+        previewShown = false
+        main.post { listener.onMonitorPreviewEnd() }
     }
 
     private fun endSession(problem: SessionProblem, detail: String? = null) {
@@ -648,9 +667,25 @@ class Session(
                     if (selector.isEmpty() || selector.length > 128) return@mapNotNull null
                     Monitor(selector, m.optString("name").ifEmpty { selector }, m.optInt("width"), m.optInt("height"), m.optBoolean("selected"))
                 }
+                // The monitor became live: show its held picture over the video when the host just switched to it
+                // (a switch is waiting for its first frame), and drop it either way.
+                val selected = monitors.firstOrNull { it.selected }?.selector
+                val before = selectedMonitor
+                selectedMonitor = selected
+                var picture: MonitorPreviews.Picture? = null
+                if (selected != null) {
+                    if (before != null && before != selected && awaitingFrame) picture = previews.take(selected)
+                    else previews.drop(selected)
+                }
                 main.post { listener.onMonitors(monitors, null) }
+                if (picture != null) {
+                    previewShown = true
+                    val shown = picture
+                    main.post { listener.onMonitorPreview(shown) }
+                }
                 FollowWindow.listState(msg)?.let { follow -> main.post { listener.onFollowState(follow) } }
             }
+            "monitor-preview" -> previews.onMessage(msg)
             "monitor-error" -> {
                 val reason = msg.optString("reason").ifEmpty { "unknown error" }.take(180)
                 main.post { listener.onMonitors(emptyList(), reason) }
@@ -820,6 +855,7 @@ class Session(
         monitorHold = false
         val wasAwaiting = awaitingFrame
         setAwaiting(false)
+        endPreview()
         if (ffAdmitted) sendPresented()
         if (wasAwaiting) main.post { listener.onInputReady() }
     }

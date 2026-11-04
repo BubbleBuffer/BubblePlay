@@ -5,6 +5,7 @@ import de.bubblebuffer.bubbleplay.auth.CtlChannel
 import de.bubblebuffer.bubbleplay.auth.pcKey
 import de.bubblebuffer.bubbleplay.auth.viewerKey
 import de.bubblebuffer.bubbleplay.log.CtlPassThrough
+import de.bubblebuffer.bubbleplay.net.MonitorPreviews
 import de.bubblebuffer.bubbleplay.net.SessionWire
 import okhttp3.OkHttpClient
 import org.junit.After
@@ -55,7 +56,7 @@ class SessionE2eTest {
         // The PC builds its transcript with the epoch from peer-joined; the pinned key verifies.
         val handshake = pc.answerAuthHello(peer)
         assertEquals(viewerKey.id, handshake.viewerId)
-        assertEquals(listOf(CtlChannel.CAP, CtlPassThrough.CAP), handshake.viewerCaps)
+        assertEquals(listOf(CtlChannel.CAP, CtlPassThrough.CAP, MonitorPreviews.CAP), handshake.viewerCaps)
         handshake.awaitAuthFinish()
         viewer.expect<SessionWire.Event.Authenticated>()
 
@@ -64,7 +65,7 @@ class SessionE2eTest {
         assertEquals(CtlChannel.KIND_CAPS, caps.kind)
         val capsJson = AuthJson.parseObject(caps.text())
         assertEquals("caps", capsJson["type"])
-        assertEquals(listOf(CtlChannel.CAP, CtlPassThrough.CAP), capsJson["caps"])
+        assertEquals(listOf(CtlChannel.CAP, CtlPassThrough.CAP, MonitorPreviews.CAP), capsJson["caps"])
         assertEquals(DEVICE_NAME, capsJson["name"])
 
         // A binary input frame goes as ctl kind "input" and decrypts to the exact bytes.

@@ -9,6 +9,7 @@ import de.bubblebuffer.bubbleplay.log.BpLog
 import de.bubblebuffer.bubbleplay.log.CtlPassThrough
 import de.bubblebuffer.bubbleplay.log.LogLevel
 import de.bubblebuffer.bubbleplay.log.withTestLog
+import de.bubblebuffer.bubbleplay.net.MonitorPreviews
 import de.bubblebuffer.bubbleplay.net.SessionWire
 import okhttp3.OkHttpClient
 import org.json.JSONObject
@@ -128,8 +129,8 @@ class LogUploadE2eTest {
     @Test fun capabilityIsAdvertisedInHelloAndCaps() = withTestLog { _, _ ->
         val rig = Rig()
         val conn = rig.connect()
-        assertEquals(listOf(CtlChannel.CAP, CtlPassThrough.CAP), conn.handshake.viewerCaps)
-        assertEquals(listOf(CtlChannel.CAP, CtlPassThrough.CAP), conn.ctlCaps)
+        assertEquals(listOf(CtlChannel.CAP, CtlPassThrough.CAP, MonitorPreviews.CAP), conn.handshake.viewerCaps)
+        assertEquals(listOf(CtlChannel.CAP, CtlPassThrough.CAP, MonitorPreviews.CAP), conn.ctlCaps)
         assertEquals(contract.getString("capability"), CtlPassThrough.CAP)
     }
 
@@ -293,6 +294,6 @@ class LogUploadE2eTest {
         assertNotNull(opened)
         assertFalse(CtlPassThrough.CAP in opened!!.second) // the Dart side decides from this
         rig.pc.expectQuiet(900) // no logs-state arrives, so no batch leaves
-        assertEquals(CtlPassThrough.CAP, conn.ctlCaps.last())
+        assertTrue(CtlPassThrough.CAP in conn.ctlCaps)
     }
 }

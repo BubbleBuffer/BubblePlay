@@ -110,7 +110,7 @@ internal class SessionWire(
                     if (hello.pairing) return fail(SessionProblem.AUTH_FAILED)
                     admitted = true
                     auth = ViewerAuth(Handshake.start(key, relayOrigin, hello.mediaEpoch,
-                        Handshake.Mode.Normal(pcId, pcPublic), random, extraCaps = listOf(CtlPassThrough.CAP)))
+                        Handshake.Mode.Normal(pcId, pcPublic), random, extraCaps = listOf(CtlPassThrough.CAP, MonitorPreviews.CAP)))
                     state = State.AUTH
                     for (message in auth!!.start().send) if (!send(message)) return disconnected()
                     Event.Admitted(hello)
@@ -128,7 +128,7 @@ internal class SessionWire(
                             auth = null
                             state = State.READY
                             // The caps/name message must precede all application control and input.
-                            if (!sendJson(AuthJson.write(linkedMapOf("type" to "caps", "caps" to listOf(CtlChannel.CAP, CtlPassThrough.CAP),
+                            if (!sendJson(AuthJson.write(linkedMapOf("type" to "caps", "caps" to listOf(CtlChannel.CAP, CtlPassThrough.CAP, MonitorPreviews.CAP),
                                 "name" to cleanDeviceName(deviceName))))) return disconnected()
                             Event.Authenticated
                         }
