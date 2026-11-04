@@ -345,16 +345,13 @@ impl Relay {
         let viewer = self.peers.get(&key_for(Role::Viewer, "", pc)).copied();
         let viewer_conn = viewer.and_then(|v| self.conns.get(&v));
         let announced = match (viewer_conn, current_epoch) {
-            (Some(v), Some(epoch)) if v.epoch == epoch && !v.closing => {
-                Some((epoch, v.pairing))
-            }
+            (Some(v), Some(epoch)) if v.epoch == epoch && !v.closing => Some((epoch, v.pairing)),
             _ => None,
         };
         if let Some((epoch, pairing)) = &announced {
             self.send_text(
                 id,
-                json!({"type": "peer-joined", "mediaEpoch": epoch, "pairing": pairing})
-                    .to_string(),
+                json!({"type": "peer-joined", "mediaEpoch": epoch, "pairing": pairing}).to_string(),
                 out,
             );
         }

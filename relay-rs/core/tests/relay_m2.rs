@@ -1043,7 +1043,11 @@ fn m2_a_hello_is_dropped_when_its_viewer_leaves() {
     h.close(v.id);
     let (new_host, actions) = reregister(&mut h, &identity(1));
     let types = sent_types(&actions, new_host);
-    assert!(!types.iter().any(|t| t == "auth-hello" || t == "peer-joined"));
+    assert!(
+        !types
+            .iter()
+            .any(|t| t == "auth-hello" || t == "peer-joined")
+    );
 }
 
 // ------------------------------------------------------------- allowlist
