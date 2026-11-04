@@ -51,7 +51,11 @@ Future<void> pumpOverlay(
           height: 600,
           child: Stack(
             children: [
-              GestureDetector(onTap: onTapBelow, child: const SizedBox.expand()),
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: onTapBelow,
+                child: const SizedBox.expand(),
+              ),
               Positioned.fill(
                 child: MonitorPreviewOverlay(
                   source: source,
