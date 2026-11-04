@@ -9,7 +9,7 @@
 //!
 //! Without Windows there is no session: [`start`] fails and the runner functions do not exist.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use bubbleplay_client::model::{Session, StreamMode};
 use bubbleplay_client::net::ViewerAuth;
@@ -33,6 +33,14 @@ pub struct Status {
     pub error: Option<String>,
 }
 
+static PREVIEWS: OnceLock<bubbleplay_client::net::MonitorPreviews> = OnceLock::new();
+
+/// The process-wide store of the host's monitor snapshots (`monitor-previews-v1`). Every
+/// session shares it and clears it when a connection opens or ends.
+pub fn previews() -> &'static bubbleplay_client::net::MonitorPreviews {
+    PREVIEWS.get_or_init(bubbleplay_client::net::MonitorPreviews::new)
+}
+
 #[cfg(windows)]
 pub use imp::*;
 
@@ -50,6 +58,10 @@ pub fn act(_: bubbleplay_client::model::Action) -> bool {
 }
 #[cfg(not(windows))]
 pub fn stop() {}
+#[cfg(not(windows))]
+pub fn presented_generation() -> u32 {
+    0
+}
 
 #[allow(dead_code)]
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -98,6 +110,7 @@ mod imp {
             }),
             on_change: throttled(params.on_change),
             log_hook: Some(crate::ctl_log::hook()),
+            previews: Some(super::previews().clone()),
         })?;
         *lock(&SESSION) = Some(Slot(session));
         Ok(())
@@ -140,6 +153,13 @@ mod imp {
             ended: session.is_stopped(),
             error: session.last_error(),
         })
+    }
+
+    /// The media generation of the last frame shown; 0 before the first or without a session.
+    pub fn presented_generation() -> u32 {
+        lock(&SESSION)
+            .as_ref()
+            .map_or(0, |slot| slot.0.presented_generation())
     }
 
     pub fn act(action: Action) -> bool {

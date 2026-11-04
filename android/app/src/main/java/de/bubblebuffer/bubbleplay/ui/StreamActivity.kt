@@ -17,6 +17,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.PorterDuff
 import android.os.Build
@@ -59,6 +60,7 @@ import de.bubblebuffer.bubbleplay.input.TouchGestures
 import de.bubblebuffer.bubbleplay.input.TouchMode
 import de.bubblebuffer.bubbleplay.input.Viewport
 import de.bubblebuffer.bubbleplay.input.WheelAccumulator
+import de.bubblebuffer.bubbleplay.net.MonitorPreviews
 import de.bubblebuffer.bubbleplay.net.SecureDesktop
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.Session
@@ -94,6 +96,9 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private lateinit var frozenLayer: FrameLayout
     private lateinit var frozenImage: ImageView
     private lateinit var frozenLabel: TextView
+    // monitor-previews-v1: the held picture of the monitor just switched to, shown until its first live frame.
+    private lateinit var previewImage: ImageView
+    private var previewToken = 0
     /** When the activity last came to the foreground (0: logged already); for the resume timing log. */
     private var foregroundAt = 0L
     private lateinit var cursorView: CursorView
@@ -252,6 +257,12 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         frozenLabel = TextView(this).apply { styleStatusPill(this); setTextColor(STATUS_PENDING); setText(R.string.status_reconnecting) }
         frozenLayer.addView(frozenLabel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         stage.addView(frozenLayer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        previewImage = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_XY
+            pivotX = 0f; pivotY = 0f
+            visibility = View.GONE
+        }
+        stage.addView(previewImage, FrameLayout.LayoutParams(1, 1))
         cursorView = CursorView(this)
         stage.addView(cursorView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         stage.setOnTouchListener { _, event -> onStageTouch(event) }
@@ -674,6 +685,39 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         settingsView?.monitorsChanged()
     }
 
+    override fun onMonitorPreview(picture: MonitorPreviews.Picture) {
+        val token = ++previewToken
+        // Decode off the main thread; a late result (the live frame came first, or the session ended) is dropped.
+        Thread({
+            val bitmap = try {
+                BitmapFactory.decodeByteArray(picture.jpeg, 0, picture.jpeg.size)
+            } catch (_: Throwable) { null }
+            if (bitmap != null) main.post { if (token == previewToken && !isDestroyed) showPreview(bitmap) }
+        }, "bp-preview-decode").start()
+    }
+
+    override fun onMonitorPreviewEnd() {
+        previewToken++
+        hidePreview(fade = true)
+    }
+
+    private fun showPreview(bitmap: Bitmap) {
+        previewImage.animate().cancel()
+        previewImage.setImageBitmap(bitmap)
+        previewImage.alpha = 1f
+        previewImage.visibility = View.VISIBLE
+    }
+
+    private fun hidePreview(fade: Boolean) {
+        previewImage.animate().cancel()
+        if (previewImage.visibility != View.VISIBLE) return
+        val done = Runnable {
+            previewImage.visibility = View.GONE
+            previewImage.setImageDrawable(null)
+        }
+        if (fade) previewImage.animate().alpha(0f).setDuration(PREVIEW_FADE_MS).withEndAction(done).start() else done.run()
+    }
+
     override fun onVideoSize(width: Int, height: Int) {
         videoWidth = width; videoHeight = height
         video.holder.setFixedSize(width, height)
@@ -734,12 +778,17 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             flp.width = lp.width; flp.height = lp.height; flp.leftMargin = lp.leftMargin; flp.topMargin = lp.topMargin
             frozenImage.layoutParams = flp
         }
+        val plp = previewImage.layoutParams as FrameLayout.LayoutParams
+        if (plp.width != lp.width || plp.height != lp.height || plp.leftMargin != lp.leftMargin || plp.topMargin != lp.topMargin) {
+            plp.width = lp.width; plp.height = lp.height; plp.leftMargin = lp.leftMargin; plp.topMargin = lp.topMargin
+            previewImage.layoutParams = plp
+        }
         applyViewport()
     }
 
     private fun applyViewport() {
         val z = viewport.zoom
-        for (view in listOf(video, frozenImage)) {
+        for (view in listOf(video, frozenImage, previewImage)) {
             view.scaleX = z; view.scaleY = z
             view.translationX = viewport.x + viewport.contentX * (z - 1f)
             view.translationY = viewport.y + viewport.contentY * (z - 1f)
@@ -1491,6 +1540,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         /** About 35 % black over the frozen frame. */
         private const val FROZEN_DIM = 0x59000000
         private const val FROZEN_FADE_MS = 150L
+        private const val PREVIEW_FADE_MS = 200L
         private const val BACKGROUND_GRACE_MS = 30_000L
         private const val ESC_HOLD_MS = 1_000L
         private const val SCROLL_DP_PER_NOTCH = 40f

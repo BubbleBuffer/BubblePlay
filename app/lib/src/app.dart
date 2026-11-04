@@ -8,6 +8,7 @@ import 'devices/devices_controller.dart';
 import 'feedback/feedback_controller.dart';
 import 'feedback/shake_detector.dart';
 import 'platform/key_files.dart';
+import 'session/monitor_previews.dart';
 import 'session/stream_channel.dart';
 import 'screens/gate.dart';
 
@@ -20,6 +21,7 @@ class AppEnv {
     required this.keyFiles,
     this.theme,
     this.stream = const NoStreamChannel(),
+    this.previews = const NoMonitorPreviews(),
     this.devices,
     this.initialSection,
     this.feedback,
@@ -32,6 +34,9 @@ class AppEnv {
 
   /// The native session video and input (see session/stream_channel.dart).
   final StreamChannel stream;
+
+  /// Snapshots of the monitors the host is not streaming (Windows); none elsewhere.
+  final MonitorPreviewSource previews;
 
   /// The person's light/dark choice; null follows the system.
   final ValueNotifier<Brightness?>? theme;

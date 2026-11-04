@@ -6,6 +6,8 @@ import {
   desktopTransitionPlan, rtcAdmissionGate, rtcGateOpens, rtcInPlaceCapable, rtpTimestampAtOrAfter,
   transitionKeyframeAdmits, transitionKeyframeVerdict,
 } from "../public/monitor-selection.js";
+// receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
+const noMonitorPreviews = { reset() {}, onFirstFrame() {}, onMonitorList() {}, onMessage() {} };
 
 const contract = JSON.parse(readFileSync(new URL("../../fixtures/secure-desktop-contract.json", import.meta.url), "utf8")).webrtcInPlaceTransition;
 const SOURCE_REASONS = ["desktop-switched", "capture-recovered", "session-changed", "agent-restarted"];
@@ -92,7 +94,7 @@ function receiverHarness({ path = "native", reason = "desktop-source-transition"
   const restarts = [], signals = [], resyncs = [];
   const handshake = { requestId: "firstFrame_test1", reason, transport: "webrtc", epoch: null, generation: 0, phase: "starting",
     retries: 0, admitted: false, presented: false, requireAdmission: true, rtpGate: null, failureReason: "", timer: null };
-  const context = vm.createContext({
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews,
     rtcAdmissionGate, rtcGateOpens, rtcInPlaceCapable, rtpTimestampAtOrAfter,
     firstFrameHandshake: handshake, usingWssMedia: false, useWebCodecs: path !== "native",
     activeVideo: path === "native" ? {} : null, encodedWorker: path === "worker" ? {} : null, peerGeneration: 3,

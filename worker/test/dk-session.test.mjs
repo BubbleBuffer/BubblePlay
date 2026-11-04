@@ -5,6 +5,8 @@ import { createHash, createPrivateKey, hkdfSync, sign } from "node:crypto";
 import vm from "node:vm";
 import { createViewerSession, browserDeviceName, sessionRefusal } from "../public/dk-session.js";
 import { createCtlChannel } from "../public/dk-crypto.js";
+// receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
+const noMonitorPreviews = { reset() {}, onFirstFrame() {}, onMonitorList() {}, onMessage() {} };
 
 const { handshake: hs } = JSON.parse(readFileSync(new URL("../../fixtures/device-keys-contract.json", import.meta.url)));
 const inputContract = JSON.parse(readFileSync(new URL("../../fixtures/input-contract.json", import.meta.url)));
@@ -14,7 +16,7 @@ const hex = value => new Uint8Array(Buffer.from(value, "hex"));
 const localSdp = `v=0\r\na=fingerprint:${hs.dtls.viewer.localFingerprint}\r\n`;
 const remoteSdp = `v=0\r\na=fingerprint:${hs.dtls.viewer.remoteFingerprint}\r\n`;
 const caps = ["control-aead-v1", "dtls-bind-v1"];
-const viewerCaps = [...caps, "client-logs-v1"];
+const viewerCaps = [...caps, "client-logs-v1", "monitor-previews-v1"];
 const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
 
 async function harness(options = {}) {
@@ -39,7 +41,7 @@ async function harness(options = {}) {
   let session;
   if (viaReceiver) {
     const socket = {};
-    const context = vm.createContext({ ws: socket, signalingGeneration: 1, signalingRegistered: false,
+    const context = vm.createContext({ monitorPreviews: noMonitorPreviews, ws: socket, signalingGeneration: 1, signalingRegistered: false,
       sessionPc: hs.pc.id, sessionIdentity: sessionOptions.identity, sessionPinnedPublic: sessionOptions.pinnedPublic,
       authenticatedSession: null, signalingPc: null, signalingTicket: null, Date, JSON,
       mediaEpoch: null, wssSelected: sessionOptions.transport === "wss", hudState: {},
@@ -383,7 +385,7 @@ test("browser label uses brand/platform with a safe fallback", () => {
 test("receiver drops plaintext endpoint frames and preserves mediaEpoch string in authentication", async () => {
   const received = [], configs = [], errors = [];
   const socket = {};
-  const context = vm.createContext({ ws: socket, signalingGeneration: 7, signalingRegistered: false,
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, ws: socket, signalingGeneration: 7, signalingRegistered: false,
     sessionPc: hs.pc.id, sessionIdentity: {}, sessionPinnedPublic: bytes(hs.pc.public),
     authenticatedSession: null, signalingPc: null, signalingTicket: null,
     sessionGate: {}, Date, JSON, currentIceServers: null, mediaEpoch: null, wssSelected: false,
@@ -411,7 +413,7 @@ test("receiver drops plaintext endpoint frames and preserves mediaEpoch string i
 
 test("receiver cannot send DataChannel input or WSS media hello before authentication", () => {
   const sent = [];
-  const context = vm.createContext({ authenticatedSession: { mediaReady: false, rtcReady: false, sendInput: () => { sent.push("ctl-input"); return true; } },
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, authenticatedSession: { mediaReady: false, rtcReady: false, sendInput: () => { sent.push("ctl-input"); return true; } },
     desktopInputState: "enabled", desktopAvailable: true, desktopAwaitingFrame: false,
     usingWssMedia: false, signalingRegistered: true, WebSocket: { OPEN: 1 }, ws: { readyState: 1, bufferedAmount: 0 },
     mediaEpoch: hs.sessionEpoch, signalingTicket: "ticket", wssV4: {},
@@ -440,7 +442,7 @@ test("receiver disables and holds RTC audio/video tracks until the verified medi
   const candidate = {};
   const track = kind => ({ kind, enabled: true, readyState: "live", stop() { stopped.push(kind); this.readyState = "ended"; } });
   const video = track("video"), audio = track("audio");
-  const context = vm.createContext({ candidate, pc: candidate, generation: 4, peerGeneration: 4,
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, candidate, pc: candidate, generation: 4, peerGeneration: 4,
     authenticatedSession: { mediaReady: false }, usingWssMedia: false, wssSelected: false, pendingRtcTracks: [],
     sessionGate: { hide: () => rendered.push("gate-hidden") }, sessionTouched: false, sessionPc: hs.pc.id,
     touchPc: id => { persisted.push(id); return Promise.resolve(); },
@@ -470,7 +472,7 @@ test("receiver disables and holds RTC audio/video tracks until the verified medi
 test("receiver binds the peer only once DTLS is connected, with its actual local and remote SDP", () => {
   const bindings = [];
   const candidate = { connectionState: "connecting", localDescription: { sdp: localSdp }, remoteDescription: { sdp: remoteSdp } };
-  const context = vm.createContext({ pc: candidate, candidate, peerGeneration: 3,
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, pc: candidate, candidate, peerGeneration: 3,
     isCurrentPeer: generation => generation === 3, usingWssMedia: false, wssSelected: false,
     authenticatedSession: { bindPeer: descriptions => bindings.push(descriptions) },
   });
@@ -488,7 +490,7 @@ test("receiver binds the peer only once DTLS is connected, with its actual local
 
 test("receiver failure closes authentication, media, pending tracks and input with no reconnect", () => {
   const calls = [];
-  const context = vm.createContext({ terminalSignalingFailure: false,
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, terminalSignalingFailure: false,
     authenticatedSession: { close: () => calls.push("auth-close") }, reconnectTimer: 5,
     ws: { close: () => calls.push("socket-close") }, signalingGeneration: 3, signalingRegistered: true,
     signalingPc: hs.pc.id, signalingTicket: "ticket", clearTimeout: () => calls.push("reconnect-cancel"),
@@ -509,7 +511,7 @@ test("receiver failure closes authentication, media, pending tracks and input wi
   // Exercise the actual cleanup prefix that the failure path calls. Its order
   // closes stale tracks and sends release-all before removing the RTC lanes.
   const cleanupCalls = [];
-  const cleanupContext = vm.createContext({ authenticatedSession: { resetPeer: () => cleanupCalls.push("peer-reset") },
+  const cleanupContext = vm.createContext({ monitorPreviews: noMonitorPreviews, authenticatedSession: { resetPeer: () => cleanupCalls.push("peer-reset") },
     pendingRtcTracks: [{ event: { track: { stop: () => cleanupCalls.push("track-stop") } } }],
     fileDragPreview: { cancel() {} }, nativeFileDropPreviewAvailable: true,
     fileDropPresentedGeneration: 3, fileDropPresentedViewportRevision: 1, usingWssMedia: false,
@@ -530,7 +532,7 @@ test("receiver drains a final encrypted refusal before processing socket close o
     static OPEN = 1; static CONNECTING = 0;
     constructor() { this.readyState = 0; sockets.push(this); }
   }
-  const context = vm.createContext({ WebSocket: Socket, URL, Promise, performance: { now: () => 1 },
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, URL, Promise, performance: { now: () => 1 },
     authenticatedSession: null, terminalSignalingFailure: false, reconnectTimer: null,
     ws: null, signalingGeneration: 0, signalingRegistered: true, signalingPc: hs.pc.id, signalingTicket: "ticket",
     latestInputStatus: null, inputStatusReason: null, hudState: {}, hud: { classList: { add() {} } },
@@ -561,7 +563,7 @@ test("WSS teardown releases through ctl and cannot authorize an unbound DataChan
   const sent = [];
   let context;
   const lane = { readyState: "open", bufferedAmount: 0, send: () => sent.push("plaintext-dc") };
-  context = vm.createContext({ authenticatedSession: { mediaReady: true, rtcReady: false,
+  context = vm.createContext({ monitorPreviews: noMonitorPreviews, authenticatedSession: { mediaReady: true, rtcReady: false,
     sendInput: () => { sent.push("ctl-input"); return true; }, resetPeer() {} },
     desktopInputState: "enabled", desktopAvailable: true, desktopAwaitingFrame: false,
     usingWssMedia: true, signalingRegistered: true, WebSocket: { OPEN: 1 }, ws: { readyState: 1, bufferedAmount: 0 },
@@ -631,5 +633,30 @@ test("client-logs-v1 is advertised but optional; log messages are delivered only
   await broken.session.receive(await broken.pcCtl.sealJson({ type: "logs-ack", v: 1, stream: "browser", id: 1, status: "ok" }));
   assert.equal(broken.events.failures.length, 0, "an upload failure never ends the session");
   assert.equal(broken.session.controlReady, true);
+  broken.session.close();
+});
+
+test("monitor-previews-v1 is advertised; monitor-preview is delivered only when both sides negotiated it", async () => {
+  const off = await harness({ onPreviewMessage: () => assert.fail("preview without the capability") });
+  assert.ok((await off.authenticate()).caps.includes("monitor-previews-v1"));
+  assert.equal(off.session.previewsNegotiated, false);
+  await off.session.receive(await off.pcCtl.sealJson({ type: "monitor-preview", v: 1 }));
+  assert.deepEqual(off.events.messages, []);
+  assert.equal(off.events.failures.length, 0);
+  off.session.close();
+
+  const got = [];
+  const on = await harness({ onPreviewMessage: message => got.push(message) });
+  await on.authenticate([...caps, "monitor-previews-v1"]);
+  assert.equal(on.session.previewsNegotiated, true);
+  await on.session.receive(await on.pcCtl.sealJson({ type: "monitor-preview", v: 1, monitor: "m", seq: 1 }));
+  assert.deepEqual(got.map(message => message.type), ["monitor-preview"]);
+  assert.deepEqual(on.events.messages, [], "not passed on as an endpoint message");
+  on.session.close();
+
+  const broken = await harness({ onPreviewMessage: () => { throw new Error("bug"); } });
+  await broken.authenticate([...caps, "monitor-previews-v1"]);
+  await broken.session.receive(await broken.pcCtl.sealJson({ type: "monitor-preview", v: 1 }));
+  assert.equal(broken.events.failures.length, 0, "a picture failure never ends the session");
   broken.session.close();
 });

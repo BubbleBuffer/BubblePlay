@@ -11,6 +11,7 @@ use crate::contract::Core;
 use crate::ctl_log;
 use crate::devices_pipe::DevicesClient;
 use crate::frb_generated::StreamSink;
+use crate::stream_host;
 
 static CORE: OnceLock<Mutex<Core>> = OnceLock::new();
 
@@ -83,6 +84,36 @@ pub fn devices_send(line: String) -> Result<()> {
 pub fn devices_disconnect() {
     let old = devices().take();
     drop(old);
+}
+
+/// One monitor snapshot from the host (`monitor-previews-v1`).
+pub struct MonitorPreviewData {
+    /// The `monitor-list` selector it shows.
+    pub monitor: String,
+    pub width: u32,
+    pub height: u32,
+    /// A baseline JPEG.
+    pub jpeg: Vec<u8>,
+}
+
+/// Removes and returns the held snapshot of the monitor `selector`, or null when none is
+/// held. Called when that monitor becomes the selected one: its picture is used once.
+#[frb(sync)]
+pub fn monitor_preview_take(selector: String) -> Option<MonitorPreviewData> {
+    let preview = stream_host::previews().take(&selector)?;
+    Some(MonitorPreviewData {
+        monitor: preview.monitor,
+        width: preview.width,
+        height: preview.height,
+        jpeg: preview.jpeg.to_vec(),
+    })
+}
+
+/// The media generation of the last video frame shown, 0 before the first. It changes with
+/// the first live frame after the host switches monitor.
+#[frb(sync)]
+pub fn media_generation() -> i64 {
+    i64::from(stream_host::presented_generation())
 }
 
 /// The control channel's state for the log upload queue.

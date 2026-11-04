@@ -621,6 +621,45 @@ mod tests {
     }
 
     #[test]
+    fn write_to_a_pipe_whose_server_closed_is_never_delivered() {
+        // Holds the pipe lock, so the deadline tests never overlap this one's pipe work.
+        let (pipe, _guard) = test_server::closed_server("server-gone");
+        let mut connection = test_connection(pipe);
+        let error = connection
+            .send_frame(&[move_one()], Instant::now() + Duration::from_millis(500))
+            .unwrap_err();
+        assert!(write_never_delivered(&error), "{error:?}");
+    }
+
+    #[test]
+    fn reconnect_and_resend_after_a_closed_pipe_reaches_the_new_connection() {
+        let _guard = test_server::pipe_lock();
+        let name = format!(
+            r"\\.\pipe\BubblePlay.AdminAgent.unit-resend-{}",
+            std::process::id()
+        );
+        let server = test_server::listen(&name);
+        let pipe = open_pipe(&name).unwrap();
+        // The server end closes: the first write is refused (109/232) and delivered nothing.
+        test_server::close_after_connect(server);
+        let mut link = AdminAgentLink::new(name.clone(), true);
+        link.connection = Some(test_connection(pipe));
+        link.state = LinkState::Connected(link.connection.as_ref().unwrap().handshake);
+        // No agent listens any more: the reconnect fails, nothing was delivered, so the caller
+        // may inject locally (None), and the link backs off instead of retrying in a loop.
+        let result = link.inject(&[move_one()]);
+        assert_eq!(result, None);
+        assert!(
+            matches!(link.state(), LinkState::Fallback(_)),
+            "{:?}",
+            link.state()
+        );
+        assert_eq!(link.attempts(), 1, "exactly one reconnect attempt");
+        assert_eq!(link.inject(&[move_one()]), None);
+        assert_eq!(link.attempts(), 1, "failed reconnect must back off");
+    }
+
+    #[test]
     fn stalled_agent_write_has_a_deadline_even_when_the_pipe_is_full() {
         let (pipe, peer) = test_server::peer("full", &[]);
         let mut connection = test_connection(pipe);
@@ -887,6 +926,7 @@ mod tests {
         /// Worker performs no blocking reads/flushes. Its finite watchdog
         /// releases a synchronous pre-fix client instead of hanging the suite.
         pub struct Peer {
+            _lock: std::sync::MutexGuard<'static, ()>,
             release: mpsc::Sender<()>,
             worker: Option<thread::JoinHandle<()>>,
         }
@@ -898,6 +938,36 @@ mod tests {
                     worker.join().unwrap();
                 }
             }
+        }
+
+        static PIPE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// Pipe tests with deadlines take this so their timing never overlaps another
+        /// test's pipe work.
+        pub fn pipe_lock() -> std::sync::MutexGuard<'static, ()> {
+            PIPE_TESTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        /// A client pipe whose server end is already closed.
+        pub fn closed_server(suffix: &str) -> (BoundedPipe, std::sync::MutexGuard<'static, ()>) {
+            let guard = pipe_lock();
+            let name = format!(
+                r"\\.\pipe\BubblePlay.AdminAgent.closed-{}-{suffix}",
+                std::process::id()
+            );
+            let server = listen(&name);
+            let pipe = open_pipe(&name).unwrap();
+            close_after_connect(server);
+            (pipe, guard)
+        }
+
+        /// Connects the server side to the already open client, then closes it.
+        pub fn close_after_connect(server: Server) {
+            // SAFETY: server's owned, listening pipe. Client already opened it.
+            let _ = unsafe { windows::Win32::System::Pipes::ConnectNamedPipe(server.0, None) };
+            drop(server);
         }
 
         pub fn peer(suffix: &str, reply_prefix: &[u8]) -> (BoundedPipe, Peer) {
@@ -912,6 +982,7 @@ mod tests {
         }
 
         pub fn hold(server: Server, reply_prefix: &[u8]) -> Peer {
+            let lock = pipe_lock();
             // SAFETY: server's owned, listening pipe. Client already opened it.
             let connected =
                 unsafe { windows::Win32::System::Pipes::ConnectNamedPipe(server.0, None) };
@@ -932,6 +1003,7 @@ mod tests {
                 drop(file);
             });
             Peer {
+                _lock: lock,
                 release,
                 worker: Some(worker),
             }

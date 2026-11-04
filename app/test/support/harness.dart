@@ -7,6 +7,7 @@ import 'package:bubbleplay_app/src/backend/fake_channel.dart';
 import 'package:bubbleplay_app/src/devices/devices_controller.dart';
 import 'package:bubbleplay_app/src/feedback/feedback_controller.dart';
 import 'package:bubbleplay_app/src/platform/key_files.dart';
+import 'package:bubbleplay_app/src/session/monitor_previews.dart';
 import 'package:bubbleplay_app/src/session/stream_channel.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -56,6 +57,7 @@ Future<TestApp> pumpApp(
   bool windows = true,
   ValueNotifier<Brightness?>? theme,
   StreamChannel? stream,
+  MonitorPreviewSource? previews,
   DevicesController? devices,
   String? section,
   FeedbackServices? feedback,
@@ -77,6 +79,7 @@ Future<TestApp> pumpApp(
         keyFiles: keyFiles,
         theme: theme,
         stream: stream ?? const NoStreamChannel(),
+        previews: previews ?? const NoMonitorPreviews(),
         devices: devices,
         initialSection: section,
         feedback: feedback,

@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { decodeFilePacket, encodeOffer, validOfferMeta } from "../public/file-transfer.js";
 import { createFileDragPreviewController, installFileTransferUi, largeDropStatus, LARGE_DROP_BYTES, mapFileDropPoint, positionFileDropBadge, statusText } from "../public/file-ui.js";
+// receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
+const noMonitorPreviews = { reset() {}, onFirstFrame() {}, onMonitorList() {}, onMessage() {} };
 
 const meta = { name: "a.txt", size: 3, mime: "text/plain", mtimeMs: 0, purpose: "drop", batchId: 1, batchIndex: 0, batchCount: 1, drop: { x: 65535, y: 0, generation: 7, viewportRevision: 3 } };
 test("drop metadata requires bounded q16 coordinates; legacy purposes remain unchanged", () => {
@@ -53,7 +55,7 @@ test("rejected presentation cannot replace native drop's accepted generation or 
     const context={firstFrameHandshake:{presented:false,requireAdmission:true,admitted:true,generation:9,...handshake},
       fileDropPresentedGeneration:7,fileDropPresentedViewportRevision:3,usingWssMedia:true,wssStartupRecoveries:1,
       hasPresentedFrame:false,desktopAwaitingFrame:true,inputTransitionHold:false,suppressDesktopTransitionOverlay:true,
-      document:{body:{classList:{add(){}}}},debugTrace(){},clearFirstFrameWatchdog(){},renderDesktopState(){},showContextHint(){}};
+      monitorPreviews:{onFirstFrame(){}},document:{body:{classList:{add(){}}}},debugTrace(){},clearFirstFrameWatchdog(){},renderDesktopState(){},showContextHint(){}};
     context.result=runInNewContext(`${source}\nmarkFirstFramePresented(${generation},${revision})`,context);
     return context;
   };

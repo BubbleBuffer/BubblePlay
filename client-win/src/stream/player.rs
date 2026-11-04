@@ -9,7 +9,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc, Arc, Mutex, MutexGuard,
     },
     thread::{self, JoinHandle},
@@ -67,6 +67,9 @@ pub struct StreamParams {
     /// Log and feedback upload over the ctl channel; `Some` makes the session advertise
     /// `client-logs-v1`.
     pub log_hook: Option<net::CtlLogHook>,
+    /// Holds the host's monitor snapshots; `Some` makes the session advertise
+    /// `monitor-previews-v1`.
+    pub previews: Option<net::MonitorPreviews>,
 }
 
 /// The picture to show now: the shared handle and its size.
@@ -84,6 +87,8 @@ struct Shared {
     front: Mutex<Option<Front>>,
     errors: Mutex<Vec<String>>,
     serial: AtomicU64,
+    /// Media generation of the last frame shown; 0 before the first.
+    generation: AtomicU32,
 }
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -170,6 +175,7 @@ impl StreamSession {
             front: Mutex::new(None),
             errors: Mutex::new(Vec::new()),
             serial: AtomicU64::new(0),
+            generation: AtomicU32::new(0),
         });
         let media_stats = MediaStats::new();
         let transport = Arc::new(net::TransportStats::new());
@@ -183,6 +189,7 @@ impl StreamSession {
         let mut config = NetConfig::new(params.relay.clone(), net::Codec::H264, params.viewer);
         config.input = Some(input_link.clone());
         config.log_hook = params.log_hook;
+        config.previews = params.previews;
         config.stream_mode = Some(live_input::input_mode(params.mode).stream_mode().into());
         let controls = config.controls.clone();
         controls.initialize_mode(params.mode);
@@ -320,6 +327,12 @@ impl StreamSession {
     }
 
     /// True once the session has ended by itself (leave, error).
+    /// The media generation of the last frame shown, 0 before the first. It changes with the
+    /// first live frame after the host switches monitor.
+    pub fn presented_generation(&self) -> u32 {
+        self.shared.generation.load(Ordering::Acquire)
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
@@ -464,6 +477,7 @@ fn owner_thread(
     video.set_presented_callback(Arc::new({
         let metadata = metadata.clone();
         let feedback = feedback.clone();
+        let shared = shared.clone();
         move |pts, _at| {
             let meta = {
                 let mut entries = lock(&metadata);
@@ -472,6 +486,7 @@ fn owner_thread(
                 meta
             };
             if let Some(meta) = meta {
+                shared.generation.store(meta.generation, Ordering::Release);
                 let _ = feedback.send(DecoderFeedback::Presented {
                     local_epoch: meta.local_epoch,
                     generation: meta.generation,

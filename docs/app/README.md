@@ -34,6 +34,10 @@ Dart screens ──► AppController ──► AppChannel ──► Windows: flu
 - The pairing QR is drawn with the `qr` package into bb-ui's `QrFrame`.
 - The tray's Devices item opens or focuses `bubbleplay_app.exe --section=this-pc` when the app is installed beside the tray. It also writes the stdin line `show-devices-app` to the host, which sends `show` to the connected pipe clients. Without the app installed, the old Win32 Devices window opens.
 
+## Monitor previews
+
+On a monitor switch the session screen shows the host's latest snapshot of the target monitor (`monitor-previews-v1`, [architecture/monitor-previews.md](architecture/monitor-previews.md)) scaled up over the video, then fades it out on the first live frame. On Windows the Rust client (`client-win/src/net/previews.rs`) validates and holds the pictures and `monitor_preview_take` / `media_generation` (`app/rust/src/api.rs`) hand them to `app/lib/src/session/monitor_previews_windows.dart` and the overlay `screens/monitor_preview_overlay.dart`; other platforms use `NoMonitorPreviews` here (the Android app's Kotlin core has its own implementation). No snapshot held: nothing changes.
+
 ## Screens and tests
 
 Screens are in `app/lib/src/screens/`. Each takes the snapshot as an argument and sends actions through `AppScope.of(context).controller`. The app id on Android is `de.bubblebuffer.bubbleplay.flutter`, distinct from the existing native app.

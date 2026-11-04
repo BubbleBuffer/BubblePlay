@@ -39,6 +39,8 @@ pub mod log_upload;
 pub mod logging;
 pub mod mf_color;
 pub mod mf_encode;
+pub mod monitor_preview_capture;
+pub mod monitor_previews;
 pub mod native_file_drop;
 pub mod quality;
 pub mod reconstruction_feedback;

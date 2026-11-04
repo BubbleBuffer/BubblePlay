@@ -31,6 +31,8 @@ use bubbleplay_host::frame_damage;
 use bubbleplay_host::hevc_tiles;
 use bubbleplay_host::hybrid;
 use bubbleplay_host::input;
+use bubbleplay_host::monitor_preview_capture::PreviewService;
+use bubbleplay_host::monitor_previews;
 use bubbleplay_host::quality;
 use bubbleplay_host::reconstruction_feedback;
 use bubbleplay_host::rtc;
@@ -991,6 +993,20 @@ impl Drop for SessionLogScope {
     }
 }
 
+/// One info line per viewer session that used monitor previews.
+fn log_preview_summary(stats: bubbleplay_host::monitor_preview_capture::ServiceStats) {
+    info!(
+        sent = stats.sender.sent,
+        bytes = stats.sender.bytes,
+        skipped_unchanged = stats.sender.skipped_unchanged,
+        skipped_gated = stats.sender.skipped_gated,
+        skipped_budget = stats.sender.skipped_budget,
+        capture_failures = stats.capture_failures,
+        max_capture_ms = stats.max_capture_ms,
+        "monitor previews: session summary"
+    );
+}
+
 /// Logs the tray's viewer markers: "viewer session started" once a viewer's
 /// media transport (RTC or WSS) is first up in this session, and "viewer
 /// session ended" when the session ends by any path (peer left, error). The
@@ -1379,6 +1395,10 @@ fn run_serve(
     let mut producer_window_started = Instant::now();
     let mut last_capture_stats = (0u64, 0u64);
     let mut viewer_session = ViewerSessionLog::default();
+    // Monitor previews (`monitor-previews-v1`): started once a viewer that advertised the
+    // capability is attached, stopped with the viewer session.
+    let mut previews: Option<PreviewService> = None;
+    let mut preview_link = monitor_previews::StableLink::default();
     // One WSS stats line: the producer window `$w` (one second, or the sum of a rollup
     // interval) with the link totals as they stand now. `$level` is `debug` or `info`.
     macro_rules! wss_stats_line {
@@ -1486,6 +1506,7 @@ fn run_serve(
                 );
             } else {
                 carried_input.begin_switch($carry_input);
+                preview_link.note_switch(Instant::now());
                 if !$carry_input {
                     session_call!(Input, input_sink.release_all());
                 }
@@ -1582,6 +1603,9 @@ fn run_serve(
             capture.set_capture_demand(false)?;
             capture.end_viewer_session();
             carried_input.reset();
+            if let Some(service) = previews.take() {
+                log_preview_summary(service.finish());
+            }
             viewer_attached = false;
             // The viewer's media epoch ends with it. A kept egress would keep
             // reconnecting to a retired epoch that the relay refuses.
@@ -2467,6 +2491,46 @@ fn run_serve(
         }
         viewer_session.observe(viewer_attached && (ice_connected || wss_peer_live));
         admin_demand.observe(viewer_attached)?;
+        // Monitor previews: a worker thread takes and judges the pictures; this only feeds it the
+        // link state and sends what it hands over (at most one message per tick, after the
+        // transport work above, and nothing queues while the link is not stable).
+        if viewer_attached
+            && previews.is_none()
+            && signaling.viewer_has_cap(monitor_previews::CAPABILITY)
+        {
+            previews = Some(PreviewService::start(&capture.monitor_selector()));
+        }
+        if let Some(service) = previews.as_ref() {
+            let wss_stats = wss_media.as_ref().map(|egress| egress.stats());
+            let link = preview_link.observe(
+                Instant::now(),
+                monitor_previews::LinkSample {
+                    live: viewer_attached && (ice_connected || wss_peer_live),
+                    switching: pending_first_frame.is_some(),
+                    constrained: wss_stats
+                        .as_ref()
+                        .is_some_and(|v4| v4.capacity_bps != 0 || v4.rate_cap_bps != 0),
+                    reconnects: wss_stats.as_ref().map_or(0, |v4| v4.reconnects),
+                    target_bitrate: quality.target(),
+                },
+            );
+            service.set_streamed(&capture.monitor_selector());
+            service.set_stable(link.stable);
+            if let Some(snapshot) = service.try_next() {
+                if link.stable {
+                    signaling.send_text(
+                        &monitor_previews::message(
+                            &snapshot.monitor,
+                            snapshot.seq,
+                            snapshot.width,
+                            snapshot.height,
+                            &snapshot.jpeg,
+                        )
+                        .to_string(),
+                    );
+                }
+            }
+        }
         // Share follow-window's existing cadence even when following is off.
         // Token inspection is cached until foreground HWND/PID changes.
         let foreground_sample_now = Instant::now();
@@ -6700,6 +6764,9 @@ fn run_serve(
         // at the top of the next iteration. DDA waits on its acquisition thread.
     }
     session_stage!(Cleanup);
+    if let Some(service) = previews.take() {
+        log_preview_summary(service.finish());
+    }
     if let (Some(total), Some(egress)) = (stats_rollup.finish(Instant::now()), wss_media.as_ref()) {
         wss_stats_line!(info, egress, &total);
     }

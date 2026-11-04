@@ -1090,6 +1090,7 @@ mod tests {
             "caps",
             "first-frame",
             "clipboard",
+            "monitor-preview",
         ] {
             assert_eq!(route(Some(kind)), Route::Drop, "{kind}");
         }

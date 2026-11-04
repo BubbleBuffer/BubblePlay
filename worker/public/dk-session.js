@@ -6,10 +6,14 @@ import { parseSdpFingerprint, signBind, verifyBind } from "./dk-crypto.js";
 export const VIEWER_CAPS = Object.freeze(["control-aead-v1", "dtls-bind-v1"]);
 // Optional caps: advertised in the hello but never required of the PC.
 export const LOGS_CAP = "client-logs-v1";
-export const VIEWER_HELLO_CAPS = Object.freeze([...VIEWER_CAPS, LOGS_CAP]);
+export const PREVIEWS_CAP = "monitor-previews-v1";
+export const VIEWER_HELLO_CAPS = Object.freeze([...VIEWER_CAPS, LOGS_CAP, PREVIEWS_CAP]);
 // ctl messages of the log and report upload; delivered to onLogMessage only when both sides
 // negotiated client-logs-v1, ignored otherwise.
 const LOG_TYPES = new Set(["logs-state", "logs-ack", "feedback-ack"]);
+// Host monitor snapshots: delivered to onPreviewMessage only when both sides negotiated
+// monitor-previews-v1, ignored otherwise.
+const PREVIEW_TYPES = new Set(["monitor-preview"]);
 const AUTH_TIMEOUT_MS = 10_000;
 const BINARY_KINDS = new Set(["cursor", "input"]);
 
@@ -58,13 +62,13 @@ export function sessionRefusal(reason, message = "") {
  */
 export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin, epoch,
   transport = "webrtc", name = browserDeviceName(), send, onAuthenticated = () => {},
-  onMessage = () => {}, onLogMessage = () => {}, onBinary = () => {}, onMediaReady = () => {}, onFailure = () => {},
+  onMessage = () => {}, onLogMessage = () => {}, onPreviewMessage = () => {}, onBinary = () => {}, onMediaReady = () => {}, onFailure = () => {},
   schedule = setTimeout, cancel = clearTimeout, helloOptions }) {
   let ended = false, started = false, authenticated = false, capsReceived = false;
   let handshake = null, ctl = null, H = null, pcPublic = null;
   let timer = null, bindTimer = null, localBindSent = false, remoteBindVerified = false;
   let fingerprints = null, pendingBind = null, peerRevision = 0, bindWork = null;
-  let readyNotified = false, logsNegotiated = false;
+  let readyNotified = false, logsNegotiated = false, previewsNegotiated = false;
   let incoming = Promise.resolve();
   const mediaReady = () => !ended && capsReceived && (transport === "wss" || (localBindSent && remoteBindVerified));
   const sendWire = message => !ended && send(message) !== false;
@@ -150,6 +154,7 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
         if (missing) return fail(`missing-cap:${missing}`);
         capsReceived = true;
         logsNegotiated = inner.caps.includes(LOGS_CAP);
+        previewsNegotiated = inner.caps.includes(PREVIEWS_CAP);
         cancel(timer); timer = null;
         blog("info", "session authenticated", { transport });
         onAuthenticated();
@@ -160,6 +165,10 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
         if (logsNegotiated) { try { onLogMessage(inner); } catch { /* upload never breaks a session */ } }
         return;
       }
+      if (PREVIEW_TYPES.has(inner.type)) {
+        if (previewsNegotiated) { try { onPreviewMessage(inner); } catch { /* a picture never breaks a session */ } }
+        return;
+      }
       await onMessage(inner);
     } catch (error) { fail("control-failed", undefined, error); }
   }
@@ -168,6 +177,8 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
     get controlReady() { return capsReceived && !ended; },
     /** True once both sides advertised client-logs-v1 (known after the PC's caps arrived). */
     get logsNegotiated() { return logsNegotiated && !ended; },
+    /** True once both sides advertised monitor-previews-v1. */
+    get previewsNegotiated() { return previewsNegotiated && !ended; },
     get mediaReady() { return mediaReady(); },
     get rtcReady() { return !ended && capsReceived && localBindSent && remoteBindVerified; },
     async start() {

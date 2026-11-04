@@ -73,7 +73,7 @@ test("normal session: primitives match the contract, then control messages flow 
     const pcControl = await controlFor(answer);
 
     const viewerCaps = pcControl.open(await host.box.take(message => message.type === "ctl" && message.kind === "caps", "viewer caps"));
-    assert.deepEqual(viewerCaps.caps, ["control-aead-v1", "dtls-bind-v1", "client-logs-v1"]);
+    assert.deepEqual(viewerCaps.caps, ["control-aead-v1", "dtls-bind-v1", "client-logs-v1", "monitor-previews-v1"]);
     host.socket.send(JSON.stringify(pcControl.seal({ type: "caps", caps: ["control-aead-v1", "dtls-bind-v1"] })));
     await viewer.events.take(event => event.type === "authenticated", "viewer authenticated");
     assert.equal(viewer.session().controlReady, true);

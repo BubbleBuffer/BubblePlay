@@ -39,6 +39,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_bool(dynamic raw);
 
   @protected
+  MonitorPreviewData dco_decode_box_autoadd_monitor_preview_data(dynamic raw);
+
+  @protected
   CtlLogState dco_decode_ctl_log_state(dynamic raw);
 
   @protected
@@ -46,6 +49,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  MonitorPreviewData dco_decode_monitor_preview_data(dynamic raw);
+
+  @protected
+  MonitorPreviewData? dco_decode_opt_box_autoadd_monitor_preview_data(
+    dynamic raw,
+  );
+
+  @protected
+  int dco_decode_u_32(dynamic raw);
 
   @protected
   int dco_decode_u_8(dynamic raw);
@@ -73,6 +87,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
+  MonitorPreviewData sse_decode_box_autoadd_monitor_preview_data(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   CtlLogState sse_decode_ctl_log_state(SseDeserializer deserializer);
 
   @protected
@@ -80,6 +99,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
+
+  @protected
+  MonitorPreviewData sse_decode_monitor_preview_data(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MonitorPreviewData? sse_decode_opt_box_autoadd_monitor_preview_data(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  int sse_decode_u_32(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_8(SseDeserializer deserializer);
@@ -115,6 +147,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_monitor_preview_data(
+    MonitorPreviewData self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_ctl_log_state(CtlLogState self, SseSerializer serializer);
 
   @protected
@@ -125,6 +163,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     Uint8List self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_monitor_preview_data(
+    MonitorPreviewData self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_monitor_preview_data(
+    MonitorPreviewData? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_u_32(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_8(int self, SseSerializer serializer);
