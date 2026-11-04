@@ -34,6 +34,7 @@ import { pcListUrl, registerProof, relayOrigin, viewerHello } from "/dk-relay.js
 import { b64u } from "/dk-crypto.js";
 import { createViewerSession } from "/dk-session.js";
 import { createLogUploader } from "/dk-upload.js";
+import { createMonitorPreviews } from "/monitor-previews.js";
 import { createFileDragPreviewController, filesFromPaste, installFileTransferUi, mapFileDropPoint } from "/file-ui.js";
 
 const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
@@ -60,6 +61,8 @@ const diagnosticAttemptId = window.__bubbleplayDebugTrace?.attemptId || null;
 let screen = document.getElementById("screen");
 let sharpScreen = document.getElementById("sharp-screen");
 const stage = document.getElementById("stage");
+// monitor-previews-v1: the target monitor's snapshot shown over the video until its first live frame.
+const monitorPreviews = createMonitorPreviews({ el: document.getElementById("monitor-preview") });
 const visual = document.getElementById("visual");
 const inputSurface = document.getElementById("input-surface");
 const hud = document.getElementById("hud");
@@ -442,6 +445,7 @@ function markFirstFramePresented(presentedGeneration = null, presentedViewportRe
   if (firstFrameHandshake.presented) return true;
   if (usingWssMedia) wssStartupRecoveries = 0;
   firstFrameHandshake.presented = true;
+  monitorPreviews.onFirstFrame();
   if (!usingWssMedia) {
     rtcStartupFallback?.stop();
     forgetRtcFailure(rtcFailureStorage());
@@ -614,6 +618,7 @@ function handleMonitorList(message) {
   }
   monitorSwitchPending = null;
   monitorErrorNotice = null;
+  try { monitorPreviews.onMonitorList(monitorList); } catch { /* a picture never blocks a switch */ }
   renderMonitorList();
   applyDefaultMonitor();
 }
@@ -1074,11 +1079,13 @@ async function handleSignal(socket, generation, ev) {
         },
         onMessage: message => { if (current()) return handleEndpointSignal(socket, generation, message); },
         onLogMessage: message => { if (current()) logUploader?.handle(message); },
+        onPreviewMessage: message => { if (current()) monitorPreviews.onMessage(message); },
         onBinary: (kind, bytes) => { if (current() && kind === "cursor") handleCursorState(bytes, "signaling"); },
         onMediaReady: () => { if (current()) openAuthenticatedMedia(); },
         onFailure: (refusal, reason) => { if (current()) { viewerLog("warn", "session-refused", { reason: String(reason || "unknown").slice(0, 80), title: refusal?.title }); endAuthenticatedSession(refusal); } },
       });
       authenticatedSession = session;
+      monitorPreviews.reset();
       await session.start();
       break;
     }
@@ -1261,6 +1268,7 @@ setInterval(() => {
 // ---- WebRTC ----------------------------------------------------------------
 function endAuthenticatedSession(refusal) {
   terminalSignalingFailure = true;
+  monitorPreviews.reset();
   authenticatedSession?.close();
   authenticatedSession = null;
   clearTimeout(reconnectTimer); reconnectTimer = null;

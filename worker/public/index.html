@@ -30,6 +30,8 @@
     max-width: none; max-height: none; background: transparent; opacity: 0;
   }
   #stage.native-video-input #sharp-screen { display:none; }
+  #monitor-preview { position:fixed; inset:0; width:100%; height:100%; object-fit:contain; background:#000; z-index:3; pointer-events:none; image-rendering:auto; opacity:0; }
+  #monitor-preview[hidden] { display:none; }
   #hud { display:none; position: fixed; top: 8px; left: 8px; z-index: 30; font-size: 12px; line-height: 1.5; padding: 6px 10px; border-radius: 6px; pointer-events: none; white-space: pre; user-select: none; }
   #desktop-state { position:fixed; left:50%; top:50%; z-index:12; width:min(360px,calc(100vw - 32px)); transform:translate(-50%,-50%); padding:18px 20px; text-align:center; font-size:14px; line-height:1.45; }
   body.desktop-unavailable #visual { opacity:.28; }
@@ -91,7 +93,7 @@
   </div>
 </header>
 <button id="strip-handle" type="button" hidden aria-label="Show session controls" title="Show session controls"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></button>
-<div id="visual"><div id="stage"><canvas id="screen"></canvas><canvas id="sharp-screen"></canvas></div></div>
+<div id="visual"><div id="stage"><canvas id="screen"></canvas><canvas id="sharp-screen"></canvas></div><img id="monitor-preview" alt="" hidden></div>
 <div id="input-surface" tabindex="0" aria-label="Remote desktop input"></div>
 <div id="touch-cursor" aria-hidden="true">
   <svg viewBox="0 0 24 32" aria-hidden="true">

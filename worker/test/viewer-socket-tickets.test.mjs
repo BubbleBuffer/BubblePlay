@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { FileTransferClient } from "../public/file-client.js";
 import { b64urlDecode, pcListUrl, registerProof, relayOrigin, viewerHello } from "../public/dk-relay.js";
+// receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
+const noMonitorPreviews = { reset() {}, onFirstFrame() {}, onMonitorList() {}, onMessage() {} };
 
 const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").replaceAll("\r\n", "\n");
 const index = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
@@ -26,7 +28,7 @@ function receiverFunction(name) {
 }
 
 function urlHarness(overrides = {}) {
-  const context = vm.createContext({ URLSearchParams, proto: "wss:", location: { host: "relay.test" },
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, URLSearchParams, proto: "wss:", location: { host: "relay.test" },
     sessionPc: "requested-pc", mediaEpoch: epoch, signalingPc: "resolved-pc", signalingTicket: ticket,
     authenticatedSession: { mediaReady: true }, ...overrides });
   vm.runInContext(["signalingSocketUrl", "mediaSocketUrl", "fileSocketUrl"].map(receiverFunction).join("\n"), context);
@@ -60,7 +62,7 @@ function signalHarness(identity) {
     send(text) { output.push(JSON.parse(text)); }
     close() { this.readyState = 3; }
   }
-  const context = vm.createContext({ WebSocket: Socket, URL, URLSearchParams,
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, URL, URLSearchParams,
     performance: { now: () => 1 }, navigator: { onLine: true },
     ws: null, signalingGeneration: 0, signalingPc: null, signalingTicket: null,
     authenticatedSession: null, sessionPinnedPublic: new Uint8Array(32).fill(7),
@@ -295,7 +297,7 @@ test("media hello requires authenticated media and a current ticket; obsolete so
     constructor(url) { this.url = url; sockets.push(this); }
     send(text) { sent.push(text); }
   }
-  const h = vm.createContext({ WebSocket: Socket, usingWssMedia: true, mediaEpoch: epoch,
+  const h = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, usingWssMedia: true, mediaEpoch: epoch,
     wssV4: {}, signalingTicket: null, authenticatedSession: null,
     mediaSocketUrl: () => `wss://relay.test/media-ws?epoch=${epoch}&pc=pc-one`,
     performance: { now: () => 1 } });
