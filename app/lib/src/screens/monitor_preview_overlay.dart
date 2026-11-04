@@ -112,7 +112,7 @@ class _MonitorPreviewOverlayState extends State<MonitorPreviewOverlay>
       fit: BoxFit.fill,
       gaplessPlayback: true,
       filterQuality: FilterQuality.medium,
-      errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+      errorBuilder: (_, _, _) => const SizedBox.shrink(),
     );
     picture = aspect == null
         ? SizedBox.expand(child: picture)
