@@ -617,6 +617,81 @@ pub(super) fn viewport_from_q16(
     (crop.width >= 320 && crop.height >= 180).then_some(crop)
 }
 
+/// A viewer's `media-control viewport` request, as decoded from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ViewportRequest {
+    pub(super) revision: Option<u32>,
+    pub(super) enabled: bool,
+    pub(super) x_q16: u16,
+    pub(super) y_q16: u16,
+    pub(super) width_q16: u16,
+    pub(super) height_q16: u16,
+}
+
+/// What the producer loop does with a viewport request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ViewportPlan {
+    /// Stale, malformed or unsupported: no state change.
+    Ignore,
+    /// Same geometry as the current crop: acknowledge without an IDR.
+    Unchanged(ViewportCrop),
+    /// New geometry: switch to `generation` and force a keyframe.
+    Apply { crop: ViewportCrop, generation: u32 },
+}
+
+/// Decide a WSS v4 viewport request. The crop is out of band (the frame
+/// header has no crop fields), so a change moves to a new media generation
+/// and the caller forces an IDR; the receiver drops deltas of a new generation
+/// until that keyframe arrives.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_viewport_request(
+    protocol_v4: bool,
+    has_epoch: bool,
+    request: ViewportRequest,
+    viewport_revision: u32,
+    viewport_crop: Option<ViewportCrop>,
+    idr_pending: bool,
+    media_generation: u32,
+    desktop_width: u32,
+    desktop_height: u32,
+) -> ViewportPlan {
+    if !protocol_v4 || !has_epoch {
+        return ViewportPlan::Ignore;
+    }
+    let Some(revision) = request.revision else {
+        return ViewportPlan::Ignore;
+    };
+    if revision <= viewport_revision {
+        return ViewportPlan::Ignore;
+    }
+    let Some(crop) = viewport_from_q16(
+        revision,
+        request.enabled,
+        request.x_q16,
+        request.y_q16,
+        request.width_q16,
+        request.height_q16,
+        desktop_width,
+        desktop_height,
+    ) else {
+        return ViewportPlan::Ignore;
+    };
+    let current = viewport_crop.unwrap_or(ViewportCrop {
+        revision,
+        x: 0,
+        y: 0,
+        width: desktop_width,
+        height: desktop_height,
+    });
+    if !idr_pending && same_viewport_geometry(current, crop) {
+        return ViewportPlan::Unchanged(crop);
+    }
+    ViewportPlan::Apply {
+        crop,
+        generation: media_generation.wrapping_add(1).max(1),
+    }
+}
+
 pub(super) fn wss_preset(
     value: Option<&str>,
     max_bps: u32,

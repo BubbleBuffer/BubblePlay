@@ -323,6 +323,20 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
 
 
 
+test("sharp viewport crop is requested on WSS v4 (no protocol guard)", () => {
+  const client = readClientSource();
+  const body = (name) => {
+    const start = client.indexOf(`function ${name}(`);
+    assert.ok(start >= 0, `${name} exists`);
+    return client.slice(start, client.indexOf("\n}\n", start));
+  };
+  for (const name of ["sendViewportRequest", "scheduleSharpViewport"]) {
+    assert.doesNotMatch(body(name), /WSS_PROTOCOL[ ]*[!=]==/, `${name} must not gate the crop off on v4`);
+  }
+  assert.doesNotMatch(client, /v4 always streams the full desktop/);
+  assert.match(body("sendViewportRequest"), /type: "media-control", action: "viewport", protocol: WSS_PROTOCOL/);
+});
+
 test("QoS polling continues after ICE reaches completed", () => {
   const client = readClientSource();
   assert.match(client, /\["connected",\s*"completed"\]\.includes\(pc\.iceConnectionState\)/);

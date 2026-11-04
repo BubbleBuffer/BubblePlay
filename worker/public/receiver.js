@@ -4242,8 +4242,8 @@ function armViewportTransitionTimeout(revision) {
   }, 1_500);
 }
 function sendViewportRequest(crop, reason, force = false) {
-  // The sharp viewport crop has no v4 wire support: v4 always streams the full desktop.
-  if (!usingWssMedia || !wssStartedHost || viewportPending || WSS_PROTOCOL === 4) return false;
+  // The crop travels out of band (media-control viewport / media-view); frames carry only a generation.
+  if (!usingWssMedia || !wssStartedHost || viewportPending) return false;
   const active = activeViewportCrop();
   if (!force && !cropNeedsUpdate(active, crop, remoteDesktop.width, remoteDesktop.height)) return false;
   const revision = viewportRevision = (viewportRevision + 1) >>> 0;
@@ -4264,7 +4264,7 @@ function flushSharpViewport(reason = "sharp-viewport") {
   sendViewportRequest(viewportDesired, reason);
 }
 function scheduleSharpViewport(reason = "sharp-viewport") {
-  if (!usingWssMedia || !wssStartedHost || WSS_PROTOCOL === 4) return;
+  if (!usingWssMedia || !wssStartedHost) return;
   viewportDesired = computeDesiredViewport();
   if (viewportPending) return;
   clearTimeout(viewportTimer);
