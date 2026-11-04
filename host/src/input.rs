@@ -1461,6 +1461,9 @@ pub struct InputSink {
     diagnostics_rollup: crate::input_diagnostics::DiagnosticsRollup,
     input_flow: InputFlowTransitions,
     geometry_valid: bool,
+    /// Pixel offset added to absolute moves (and clamped to the desktop) while a window drag that
+    /// crossed monitors is in progress; see `begin_drag_offset`.
+    drag_offset: Option<(i32, i32)>,
     diagnostics_foreground_pid: Option<u32>,
     development_agent: bool,
     #[cfg(test)]
@@ -1807,6 +1810,25 @@ fn map_monitor_absolute_to_virtual(
     let virtual_desktop = virtual_desktop.sanitized();
     let pixel_x = normalized_axis_to_pixel(x, monitor.x, monitor.width);
     let pixel_y = normalized_axis_to_pixel(y, monitor.y, monitor.height);
+    (
+        pixel_to_normalized_axis(pixel_x, virtual_desktop.x, virtual_desktop.width),
+        pixel_to_normalized_axis(pixel_y, virtual_desktop.y, virtual_desktop.height),
+    )
+}
+
+/// Like [`map_monitor_absolute_to_virtual`], with the pixel shifted by `offset` and clamped to
+/// the desktop (a window drag that crossed monitors keeps the cursor where it was carried to).
+fn offset_absolute_to_virtual(
+    x: u16,
+    y: u16,
+    monitor: DesktopRegion,
+    virtual_desktop: DesktopRegion,
+    offset: (i32, i32),
+) -> (u16, u16) {
+    let monitor = monitor.sanitized();
+    let virtual_desktop = virtual_desktop.sanitized();
+    let pixel_x = normalized_axis_to_pixel(x, monitor.x, monitor.width).saturating_add(offset.0);
+    let pixel_y = normalized_axis_to_pixel(y, monitor.y, monitor.height).saturating_add(offset.1);
     (
         pixel_to_normalized_axis(pixel_x, virtual_desktop.x, virtual_desktop.width),
         pixel_to_normalized_axis(pixel_y, virtual_desktop.y, virtual_desktop.height),
@@ -2194,10 +2216,11 @@ mod tests {
     }
     use super::{
         cursor_snapshot, decode, keyboard_input, map_monitor_absolute_to_virtual, newer_sequence,
-        ClipboardAssembly, ClipboardChunk, ClipboardProgress, Command, CursorState, DesktopRegion,
-        HeldKey, InputApplication, InputFailureLogGate, InputState, CLIPBOARD_CHUNK_BYTES,
-        CLIPBOARD_MAX_CHUNKS, INPUT_FAILURE_LOG_INTERVAL, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-        KEYEVENTF_SCANCODE, SCAN_LCONTROL, SCAN_LWIN, VK_CONTROL, VK_MASK, VK_V,
+        normalized_axis_to_pixel, offset_absolute_to_virtual, ClipboardAssembly, ClipboardChunk,
+        ClipboardProgress, Command, CursorState, DesktopRegion, HeldKey, InputApplication,
+        InputFailureLogGate, InputSink, InputState, CLIPBOARD_CHUNK_BYTES, CLIPBOARD_MAX_CHUNKS,
+        INPUT_FAILURE_LOG_INTERVAL, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+        SCAN_LCONTROL, SCAN_LWIN, VK_CONTROL, VK_MASK, VK_V,
     };
     use std::time::Instant;
 
@@ -3216,6 +3239,58 @@ mod tests {
         assert!(right > 26_000 && right < 26_300);
         assert!(bottom > 62_000 && bottom < 62_200);
     }
+
+    #[test]
+    fn drag_offset_keeps_the_carried_cursor_and_clamps_to_the_desktop() {
+        let mon2 = DesktopRegion::new(1920, 0, 2560, 1440);
+        let desktop = DesktopRegion::new(0, 0, 4480, 1440);
+        let pixel_of = |(x, y): (u16, u16)| {
+            let w = u64::from(u16::MAX);
+            (
+                ((u64::from(x) * 4479 + w / 2) / w) as i32,
+                ((u64::from(y) * 1439 + w / 2) / w) as i32,
+            )
+        };
+        // The client pointer sat at the right edge of monitor 1 (pixel 2559 of 2560 on monitor 2
+        // once the view switched). The cursor was carried to (1936, 540).
+        let client = (u16::MAX, 20_000u16);
+        let mapped_x = normalized_axis_to_pixel(client.0, mon2.x, mon2.width);
+        let mapped_y = normalized_axis_to_pixel(client.1, mon2.y, mon2.height);
+        let offset = (1936 - mapped_x, 540 - mapped_y);
+        // The very same client position lands on the carried cursor.
+        let (nx, ny) = offset_absolute_to_virtual(client.0, client.1, mon2, desktop, offset);
+        let (px, py) = pixel_of((nx, ny));
+        assert!((px - 1936).abs() <= 1 && (py - 540).abs() <= 1, "{px},{py}");
+        // A client move of -100 px on monitor 2 moves the cursor by about -100 px.
+        let moved = client.0 - (100u64 * u64::from(u16::MAX) / 2559) as u16;
+        let (nx, _) = offset_absolute_to_virtual(moved, client.1, mon2, desktop, offset);
+        assert!((pixel_of((nx, 0)).0 - 1836).abs() <= 2);
+        // Far past the desktop edge clamps to it.
+        let (nx, ny) = offset_absolute_to_virtual(0, 0, mon2, desktop, (-10_000, -10_000));
+        assert_eq!((nx, ny), (0, 0));
+        let (nx, ny) =
+            offset_absolute_to_virtual(u16::MAX, u16::MAX, mon2, desktop, (9_000, 9_000));
+        assert_eq!((nx, ny), (u16::MAX, u16::MAX));
+    }
+
+    #[test]
+    fn drag_offset_lifecycle() {
+        let mut sink = InputSink::new();
+        sink.set_absolute_region(DesktopRegion::new(1920, 0, 2560, 1440));
+        // A relative client (no absolute position) needs no offset.
+        sink.begin_drag_offset(None, (1936, 540));
+        assert_eq!(sink.drag_offset, None);
+        sink.begin_drag_offset(Some((u16::MAX, 20_000)), (1936, 540));
+        assert!(sink.drag_offset.is_some());
+        // A later switch replaces it, a geometry change and the end of the loop clear it.
+        sink.begin_drag_offset(Some((0, 0)), (100, 100));
+        assert_eq!(sink.drag_offset, Some((100 - 1920, 100)));
+        sink.clear_drag_offset();
+        assert_eq!(sink.drag_offset, None);
+        sink.begin_drag_offset(Some((0, 0)), (100, 100));
+        sink.set_absolute_region(DesktopRegion::new(0, 0, 1920, 1080));
+        assert_eq!(sink.drag_offset, None);
+    }
 }
 
 impl Default for InputSink {
@@ -3246,6 +3321,7 @@ impl InputSink {
             ),
             input_flow: Default::default(),
             geometry_valid: true,
+            drag_offset: None,
             diagnostics_foreground_pid: None,
             development_agent: false,
             #[cfg(test)]
@@ -3371,6 +3447,39 @@ impl InputSink {
         self.geometry_valid = region.width > 0 && region.height > 0;
         self.absolute_region = region.sanitized();
         self.state.last_absolute_position = None;
+        self.drag_offset = None;
+    }
+
+    /// The client pointer of the latest absolute move; `None` for relative clients.
+    pub fn last_absolute_position(&self) -> Option<(u16, u16)> {
+        self.state.last_absolute_position
+    }
+
+    /// After an edge hold moved the host cursor to `translated` (desktop pixels), keep absolute
+    /// moves relative to that: `client_pointer` (the client's last absolute position before the
+    /// switch) now maps to `translated`, and later moves keep that offset. A relative client
+    /// (`None`) needs none. Replaces any earlier offset; cleared by [`Self::clear_drag_offset`],
+    /// by the left button's release and by a geometry change.
+    pub fn begin_drag_offset(
+        &mut self,
+        client_pointer: Option<(u16, u16)>,
+        translated: (i32, i32),
+    ) {
+        self.drag_offset = if self.secure_desktop {
+            None
+        } else {
+            client_pointer.map(|(x, y)| {
+                let region = self.absolute_region.sanitized();
+                (
+                    translated.0 - normalized_axis_to_pixel(x, region.x, region.width),
+                    translated.1 - normalized_axis_to_pixel(y, region.y, region.height),
+                )
+            })
+        };
+    }
+
+    pub fn clear_drag_offset(&mut self) {
+        self.drag_offset = None;
     }
 
     pub fn absolute_region(&self) -> DesktopRegion {
@@ -3977,13 +4086,18 @@ impl InputSink {
         } else {
             virtual_desktop_region().unwrap_or(self.absolute_region)
         };
-        let (x, y) = absolute_coordinates_for_input(
-            self.secure_desktop,
-            x,
-            y,
-            self.absolute_region,
-            virtual_desktop,
-        );
+        let (x, y) = match self.drag_offset.filter(|_| !self.secure_desktop) {
+            Some(offset) => {
+                offset_absolute_to_virtual(x, y, self.absolute_region, virtual_desktop, offset)
+            }
+            None => absolute_coordinates_for_input(
+                self.secure_desktop,
+                x,
+                y,
+                self.absolute_region,
+                virtual_desktop,
+            ),
+        };
         let input = INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
@@ -4004,6 +4118,10 @@ impl InputSink {
     fn buttons(&mut self, mask: u8) -> InputApplication {
         let changed = mask ^ self.state.buttons;
         self.state.buttons = mask;
+        if changed & 1 != 0 && mask & 1 == 0 {
+            // The drag ended: the next absolute move lands at the client's true pointer.
+            self.drag_offset = None;
+        }
         if changed == 0 {
             return InputApplication::default();
         }
@@ -4100,6 +4218,7 @@ impl InputSink {
             // requests queued before them, without waiting for native work.
             sync.reset();
         }
+        self.drag_offset = None;
         let (keys, buttons) = self.state.take_release_plan();
         let mut application = InputApplication::default();
         for key in keys {

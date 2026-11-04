@@ -10,8 +10,8 @@
 //!
 //! Edge hold ("Carrying a window to another monitor"): while a window is
 //! being moved, [`observe_edge`] switches the stream to the monitor behind the
-//! edge the cursor is held against, and [`carry_cursor`] places the cursor at
-//! the same relative position on that monitor so the window comes along.
+//! edge the cursor is held against, and [`translate_cursor`] places the cursor
+//! as if it had crossed onto that monitor so the window comes along.
 //! [`sample_move`] is its Win32 sampler.
 
 use std::time::{Duration, Instant};
@@ -198,7 +198,7 @@ pub fn edge_target(cursor: (i32, i32), current: Rect, monitors: &[Rect]) -> Opti
 /// Feed one edge-hold sample (only taken while a move loop may be active).
 /// `follow` is `None` when follow active window is off. `moving` is `None`
 /// when no move/size loop is active. Returns the monitor to switch to; the
-/// caller switches, moves the cursor with [`carry_cursor`] and calls
+/// caller switches, moves the cursor with [`translate_cursor`] and calls
 /// [`FollowWindow::switched`].
 pub fn observe_edge(
     follow: Option<&mut FollowWindow>,
@@ -286,20 +286,33 @@ pub fn observe_edge(
     Some(target)
 }
 
-/// The cursor at the same relative position on `to` as it was on `from`,
-/// clamped inside `to`.
-pub fn carry_cursor(cursor: (i32, i32), from: Rect, to: Rect) -> (i32, i32) {
-    fn axis(value: i32, from_lo: i32, from_hi: i32, to_lo: i32, to_hi: i32) -> i32 {
-        let from_len = i64::from(from_hi - from_lo).max(1);
-        let to_len = i64::from(to_hi - to_lo).max(1);
-        let offset = i64::from(value - from_lo).clamp(0, from_len - 1);
-        let mapped = i64::from(to_lo) + offset * to_len / from_len;
-        mapped.clamp(i64::from(to_lo), i64::from(to_hi) - 1) as i32
-    }
-    (
-        axis(cursor.0, from.left, from.right, to.left, to.right),
-        axis(cursor.1, from.top, from.bottom, to.top, to.bottom),
-    )
+/// Where the cursor lands when an edge hold carries the stream from `from` to `to`: as if it
+/// had crossed between the two real monitors. On the crossed axis it sits just inside the
+/// facing edge of `to` (twice [`EDGE_ZONE_PX`] in, so it starts outside the edge zone); on the
+/// other axis the desktop coordinate is kept, clamped into `to`, as Windows does between
+/// monitors. The crossed edge is the one of `from` that `to` lies beyond; when `to` lies beyond
+/// several (a diagonal neighbour), the one the cursor is nearest to.
+pub fn translate_cursor(cursor: (i32, i32), from: Rect, to: Rect) -> (i32, i32) {
+    let inset = EDGE_ZONE_PX * 2;
+    let (x, y) = cursor;
+    let clamp_x = |v: i32| v.clamp(to.left, (to.right - 1).max(to.left));
+    let clamp_y = |v: i32| v.clamp(to.top, (to.bottom - 1).max(to.top));
+    // (distance of the cursor to that edge of `from`, landing point)
+    let candidates = [
+        (to.right <= from.left)
+            .then(|| (x - from.left, (clamp_x(to.right - 1 - inset), clamp_y(y)))),
+        (to.left >= from.right)
+            .then(|| (from.right - 1 - x, (clamp_x(to.left + inset), clamp_y(y)))),
+        (to.bottom <= from.top)
+            .then(|| (y - from.top, (clamp_x(x), clamp_y(to.bottom - 1 - inset)))),
+        (to.top >= from.bottom)
+            .then(|| (from.bottom - 1 - y, (clamp_x(x), clamp_y(to.top + inset)))),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .min_by_key(|(distance, _)| *distance)
+        .map_or((clamp_x(x), clamp_y(y)), |(_, point)| point)
 }
 
 impl FollowWindow {
@@ -359,6 +372,16 @@ pub fn is_shell_class(class: &str) -> bool {
         class,
         "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
     )
+}
+
+/// Executables whose windows the rules ignore: the Snipping Tool's capture and editor windows
+/// (not shell classes, and not always wide enough to count as a screen-wide overlay), compared
+/// case-insensitively.
+const IGNORED_EXES: [&str; 2] = ["SnippingTool.exe", "ScreenClippingHost.exe"];
+
+/// Whether a window of the executable `exe` is ignored by following.
+pub fn is_ignored_exe(exe: &str) -> bool {
+    IGNORED_EXES.iter().any(|e| e.eq_ignore_ascii_case(exe))
 }
 
 /// A window that covers (nearly) all of at least two monitors is a screen-wide overlay, such as
@@ -475,6 +498,10 @@ pub fn sample_foreground() -> Sample {
         if is_shell_class(&class) {
             return Sample::Ignored;
         }
+        let details = details_of(hwnd, class);
+        if is_ignored_exe(&details.exe) {
+            return Sample::Ignored;
+        }
         let mut window_rect = windows::Win32::Foundation::RECT::default();
         if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window_rect).is_ok()
             && spans_multiple_monitors(
@@ -514,7 +541,7 @@ pub fn sample_foreground() -> Sample {
                 origin_x: info.monitorInfo.rcMonitor.left,
                 origin_y: info.monitorInfo.rcMonitor.top,
             },
-            details: details_of(hwnd, class),
+            details,
         }
     }
 }
@@ -822,6 +849,20 @@ mod tests {
         assert!(!is_shell_class("CabinetWClass"));
     }
 
+    #[test]
+    fn snipping_tool_windows_are_ignored() {
+        for exe in [
+            "SnippingTool.exe",
+            "snippingtool.EXE",
+            "ScreenClippingHost.exe",
+        ] {
+            assert!(is_ignored_exe(exe), "{exe}");
+        }
+        for exe in ["", "Notepad.exe", "SnippingTool.exe.bak", "explorer.exe"] {
+            assert!(!is_ignored_exe(exe), "{exe}");
+        }
+    }
+
     fn info(selector: &str, x: i32) -> MonitorInfo {
         MonitorInfo {
             selector: selector.into(),
@@ -1085,13 +1126,26 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_is_carried_to_the_same_relative_position() {
-        // Right edge of monitor 1 -> right edge of the larger monitor 2.
-        assert_eq!(carry_cursor((1919, 540), M1, M2), (1920 + 2558, 720));
-        // Left edge of monitor 2 -> left edge of monitor 1.
-        assert_eq!(carry_cursor((1920, 0), M2, M1), (0, 0));
-        // Clamped inside the target.
-        assert_eq!(carry_cursor((5000, -5), M1, M3), (959, 1080));
-        assert_eq!(carry_cursor((960, 1079), M1, M3), (480, 2159));
+    fn the_cursor_crosses_to_the_facing_edge_of_the_neighbour() {
+        // Right edge of monitor 1 -> just inside the left edge of monitor 2, same desktop y.
+        assert_eq!(translate_cursor((1919, 540), M1, M2), (1920 + 16, 540));
+        // Left edge of monitor 2 -> just inside the right edge of monitor 1.
+        assert_eq!(translate_cursor((1920, 100), M2, M1), (1919 - 16, 100));
+        // The other axis is clamped into a smaller target.
+        let small = Rect::new(1920, 200, 800, 600);
+        assert_eq!(translate_cursor((1919, 900), M1, small), (1920 + 16, 799));
+        assert_eq!(translate_cursor((1919, 50), M1, small), (1920 + 16, 200));
+        // Vertical neighbours: leaving the bottom arrives at the top and vice versa.
+        let below = Rect::new(100, 1080, 1000, 700);
+        assert_eq!(translate_cursor((500, 1079), M1, below), (500, 1080 + 16));
+        assert_eq!(translate_cursor((50, 1079), M1, below), (100, 1080 + 16));
+        assert_eq!(translate_cursor((500, 1080), below, M1), (500, 1079 - 16));
+        // A diagonal neighbour: the edge the cursor is at decides.
+        let diag = Rect::new(1920, 1080, 1920, 1080);
+        assert_eq!(translate_cursor((1919, 300), M1, diag), (1920 + 16, 1080));
+        assert_eq!(translate_cursor((300, 1079), M1, diag), (1920, 1080 + 16));
+        // The landing point is outside the edge zone of the target.
+        let (x, _) = translate_cursor((1919, 540), M1, M2);
+        assert!(edge_distance((x, 540), M2) > EDGE_ZONE_PX);
     }
 }

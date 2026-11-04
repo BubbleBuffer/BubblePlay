@@ -2581,6 +2581,8 @@ fn run_serve(
                 });
                 if moving.is_none() {
                     edge_monitors = None;
+                    // The move loop is over: absolute moves land where the client points again.
+                    input_sink.clear_drag_offset();
                 }
                 if let Some((from, to, selector, cursor)) = carry {
                     follow.switched(now);
@@ -2588,15 +2590,22 @@ fn run_serve(
                         monitor = %selector,
                         "follow active window: edge hold, switching monitor"
                     );
+                    // The client pointer before the switch (absolute clients only); the
+                    // switch resets the sink's geometry and forgets it.
+                    let client_pointer = input_sink.last_absolute_position();
                     switch_capture_monitor!(&selector, true);
-                    // Same relative position on the new monitor while the
-                    // button is still held, so the dragged window comes along.
-                    // A cursor already past the edge is on the new monitor: leave it there.
+                    // Cross onto the new monitor while the button is still held, so the
+                    // dragged window comes along. A cursor already past the edge is on the
+                    // new monitor: leave it there.
                     if from.contains(cursor)
                         && capture.monitor_selector().eq_ignore_ascii_case(&selector)
                     {
-                        let (x, y) = follow_window::carry_cursor(cursor, from, to);
-                        if !follow_window::set_cursor(x, y) {
+                        let (x, y) = follow_window::translate_cursor(cursor, from, to);
+                        if follow_window::set_cursor(x, y) {
+                            // An absolute client's next move would snap the cursor back to
+                            // its own pointer: offset its moves until the drag ends.
+                            input_sink.begin_drag_offset(client_pointer, (x, y));
+                        } else {
                             warn!("follow active window: edge hold could not move the cursor");
                         }
                     }
