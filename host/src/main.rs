@@ -1319,7 +1319,7 @@ fn run_serve(
     let mut benchmark_lease = args
         .benchmark_profile
         .clone()
-        .map(benchmark::BenchmarkLease::at)
+        .map(benchmark::BenchmarkLease::background)
         .unwrap_or_else(benchmark::BenchmarkLease::program_data);
     let mut next_benchmark_refresh = Instant::now();
     let mut benchmark_profile: Option<benchmark::BenchmarkProfile> = None;
@@ -1829,6 +1829,7 @@ fn run_serve(
         }
         let loop_now = Instant::now();
         if loop_now >= next_benchmark_refresh {
+            session_stage!(HousekeepingLease);
             let next_profile = benchmark_lease.refresh(unix_time_ms()).cloned();
             if next_profile != benchmark_profile {
                 benchmark_profile_revision =
@@ -1903,6 +1904,7 @@ fn run_serve(
         // failures deliberately continue the session for recovery; placing this
         // at the producer tail starves the only telemetry that lets Stream Lab
         // classify an unsupported NVENC combination and move on safely.
+        session_stage!(HousekeepingStatus);
         let benchmark_status_now = Instant::now();
         if benchmark_status_now >= next_benchmark_status {
             let status_sent = if let Some(profile) =
