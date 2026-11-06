@@ -75,3 +75,25 @@ export function shouldRetryAuthTimeout({ reason, established, budgetStartMs, now
   return reason === "auth-timeout" && established === true && Number.isFinite(budgetStartMs) &&
     nowMs - budgetStartMs < budgetMs;
 }
+
+// A reconnect of an established session can sit on a browser socket that never opens (an 11 s
+// construct-to-open was seen after a relay reset). Such a socket is abandoned and replaced.
+// A first connection is not timed: it may wait on the site gate.
+export const CONNECT_TIMEOUT_MS = 5_000;
+export const CONNECT_TIMEOUT_MAX_MS = 10_000;
+
+/** Wait for a signaling socket to open on attempt `attempt` (0 = the first since the loss): 5 s, 7.5 s, then 10 s. Null when not recovering. */
+export function connectTimeoutMs({ recovering, attempt }) {
+  if (recovering !== true) return null;
+  const step = Number.isInteger(attempt) && attempt > 0 ? attempt : 0;
+  return Math.min(CONNECT_TIMEOUT_MS * 1.5 ** step, CONNECT_TIMEOUT_MAX_MS);
+}
+
+/**
+ * On wake (page visible again, pageshow, online) a pending reconnect retries at once, as its timer
+ * may have been lost while the page was frozen. Not when a socket is already connecting or the
+ * session ended.
+ */
+export function shouldRetryOnWake({ timerPending, terminal, connecting }) {
+  return timerPending === true && terminal !== true && connecting !== true;
+}

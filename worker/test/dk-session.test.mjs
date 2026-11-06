@@ -539,7 +539,7 @@ test("receiver drains a final encrypted refusal before processing socket close o
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, cleanupPeer: () => calls.push("cleanup"),
     recordSignalingError() {}, shouldReconnectAfterClose: (_code, terminal) => !terminal,
     restartPeer: () => calls.push("restart"),
-    setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
+    clearTimeout() {}, connectTimeoutMs: () => null, connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
     handleSignal: async () => { calls.push("decrypt-start"); await decrypting; context.terminalSignalingFailure = true; calls.push("refusal"); },
   });
   const fn = source.slice(source.indexOf("function reconnectSignaling("), source.indexOf("\nfunction signalingSocketUrl("));

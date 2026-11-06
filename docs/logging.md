@@ -83,6 +83,10 @@ Known gaps: the Android and Windows end-to-end tests run in CI only for the Kotl
 
 After a lost signaling connection, each client logs one info line when the first frame is shown again: `recovered after <ms> ms, <n> attempts`, with the fields `recoveryMs` (loss to first frame) and `attempts` (signaling connections opened since the loss). Browser: target `receiver`; Android and the Windows client: the session log. It is not logged for a first connection. The signaling close lines carry `closeCode`. See [reconnect order](architecture/reconnect.md).
 
+## Browser reconnect lines (2026-11-06)
+
+While recovering, the browser logs one info line (target `receiver`) when it abandons a signaling socket that did not open in time, `signaling-connect-abandoned` with `connectAttempt` and `waitedMs`, and one when a wake event runs a pending reconnect, `reconnect-wake` with `event` (`visibilitychange`, `pageshow` or `online`). See [reconnect order](architecture/reconnect.md).
+
 ## Navigation type in the browser start line (2026-11-05)
 
 The browser's `bootstrap-inline` trace (target `trace`, written once when the page starts) carries `navigation`: the page's `performance.getEntriesByType("navigation")[0].type`, one of `navigate`, `reload`, `back_forward` or `prerender`, or `null` when the browser gives none. A tab that restarts during recovery with `reload` was reloaded (by the user or the browser); `navigate` is a fresh load of the address. The value passes the redactor unchanged.

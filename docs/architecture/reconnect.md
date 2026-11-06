@@ -31,6 +31,13 @@ A session that has authenticated once is "recycled" after a loss. For it, a miss
 
 When the first frame is shown again each client logs one info line with the total recovery time and the attempt count ([logging](../logging.md)). The signaling close code is logged as `closeCode`.
 
+## Browser: stuck socket and lost timer (2026-11-06)
+
+- **Connect timeout.** While recovering a session that authenticated before, a signaling socket that has not opened in time is abandoned and a new one is tried: 5 s, 7.5 s, then 10 s per attempt (`connectTimeoutMs`). The old socket's handlers are detached before it is closed, so a late event cannot act on it. A first connection is not timed, since it may wait on the site gate. A reconnect is not held there: a WebSocket upgrade is allowed or refused at once (the gate holds only navigations), so the cut-off cannot interrupt an approval.
+- **Wake.** While a reconnect is pending (its 250 ms timer is set), `visibilitychange` to visible, `pageshow` and `online` run it at once (`shouldRetryOnWake`), unless a socket is already connecting or the session ended. A frozen or throttled page could otherwise leave the retry timer unfired for minutes. There is no polling timer.
+- Real refusals stay terminal. The abandon and wake lines are logged ([logging](../logging.md)).
+- The Windows client already bounds the `/ws` open by its 10 s handshake limit. Android sets only an OkHttp connect timeout of 10 s with no read timeout, so a socket that connects but never completes the upgrade has no bound. Neither was changed.
+
 ## Not covered
 
 The media session does not survive a signaling failure: a signaling reset still rebuilds the media link. Keeping it alive needs a protocol change and is a separate decision.
