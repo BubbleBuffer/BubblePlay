@@ -243,8 +243,16 @@
     attemptId: state.attemptId,
     trace,
   };
+  // navigate | reload | back_forward | prerender: tells a manual reload from a recovery restart.
+  const navigationType = () => {
+    try {
+      const type = window.performance?.getEntriesByType?.("navigation")?.[0]?.type;
+      return typeof type === "string" ? type : null;
+    } catch { return null; }
+  };
   trace("bootstrap-inline", {
     pathname: location.pathname,
+    navigation: navigationType(),
     transport: search.get("transport") || "auto",
     decoderPath: search.get("decoderPath") || "native",
   });

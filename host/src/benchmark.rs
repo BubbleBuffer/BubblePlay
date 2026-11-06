@@ -1,11 +1,17 @@
 //! Expiring, local-only stream-lab override contract.
 //!
-//! The transport process polls this file while it is already awake. Invalid,
+//! The transport process polls this file from a background reader thread so a
+//! slow disk cannot stall the session thread; the session only adopts the
+//! latest published result. Invalid,
 //! expired, or out-of-policy profiles are treated exactly like no profile so
 //! production encoder policy resumes without an explicit cleanup message.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -393,27 +399,153 @@ pub fn load_profile(path: &Path, now_ms: u64) -> Option<BenchmarkProfile> {
     profile.is_valid(now_ms).then_some(profile)
 }
 
-#[derive(Debug, Default)]
+/// How often the background reader re-reads the lease file.
+const READER_INTERVAL: Duration = Duration::from_secs(1);
+/// A reader result older than this is not trusted: a reader stuck in a slow
+/// disk call must read as "lease cannot be confirmed", never as still valid.
+const READER_MAX_AGE: Duration = Duration::from_secs(5);
+/// How long dropping the lease waits for a reader stuck in disk I/O.
+const READER_JOIN_WAIT: Duration = Duration::from_secs(2);
+
+type Loader = Box<dyn Fn() -> Option<BenchmarkProfile> + Send + 'static>;
+
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+#[derive(Default)]
+struct ReaderShared {
+    /// Latest result and when the reader published it. The lock is only held
+    /// to swap the value, never across disk I/O.
+    latest: Mutex<Option<(Option<BenchmarkProfile>, Instant)>>,
+    finished: AtomicBool,
+}
+
+/// Reads the lease file off the session thread and publishes the result.
+struct LeaseReader {
+    shared: Arc<ReaderShared>,
+    stop: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+    max_age: Duration,
+}
+
+impl LeaseReader {
+    fn spawn(loader: Loader, interval: Duration, max_age: Duration) -> Self {
+        let shared = Arc::new(ReaderShared::default());
+        let (stop, stop_rx) = mpsc::channel::<()>();
+        let thread_shared = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("benchmark-lease-reader".into())
+            .spawn(move || {
+                loop {
+                    let result = loader();
+                    if let Ok(mut latest) = thread_shared.latest.lock() {
+                        *latest = Some((result, Instant::now()));
+                    }
+                    if !matches!(
+                        stop_rx.recv_timeout(interval),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        break;
+                    }
+                }
+                thread_shared.finished.store(true, Ordering::Release);
+            })
+            .ok();
+        if handle.is_none() {
+            shared.finished.store(true, Ordering::Release);
+        }
+        Self {
+            shared,
+            stop: Some(stop),
+            handle,
+            max_age,
+        }
+    }
+
+    /// Never touches the disk and never waits on the reader.
+    fn latest(&self, now_ms: u64) -> Option<BenchmarkProfile> {
+        let guard = self.shared.latest.try_lock().ok()?;
+        let (profile, read_at) = guard.as_ref()?;
+        if read_at.elapsed() > self.max_age {
+            return None;
+        }
+        profile.clone().filter(|profile| profile.is_valid(now_ms))
+    }
+}
+
+impl Drop for LeaseReader {
+    fn drop(&mut self) {
+        // Closing the channel wakes the reader between reads. A reader stuck
+        // in disk I/O is waited for briefly, then left to exit by itself when
+        // the call returns (it checks the channel before sleeping again).
+        self.stop.take();
+        let deadline = Instant::now() + READER_JOIN_WAIT;
+        while !self.shared.finished.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(handle) = self.handle.take() {
+            if self.shared.finished.load(Ordering::Acquire) {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+#[derive(Default)]
 pub struct BenchmarkLease {
     path: PathBuf,
+    reader: Option<LeaseReader>,
     active: Option<BenchmarkProfile>,
 }
 
 impl BenchmarkLease {
     pub fn program_data() -> Self {
+        Self::background(program_data_path())
+    }
+
+    /// Lease whose file is read by a background thread; `refresh` only
+    /// adopts the latest published result.
+    pub fn background(path: PathBuf) -> Self {
+        let read_path = path.clone();
+        Self::with_loader(
+            path,
+            Box::new(move || load_profile(&read_path, wall_ms())),
+            READER_INTERVAL,
+            READER_MAX_AGE,
+        )
+    }
+
+    fn with_loader(path: PathBuf, loader: Loader, interval: Duration, max_age: Duration) -> Self {
         Self {
-            path: program_data_path(),
+            path,
+            reader: Some(LeaseReader::spawn(loader, interval, max_age)),
             active: None,
         }
     }
 
+    /// Synchronous lease that reads the file inside `refresh`.
+    #[cfg(test)]
     pub fn at(path: PathBuf) -> Self {
-        Self { path, active: None }
+        Self {
+            path,
+            reader: None,
+            active: None,
+        }
     }
 
     /// Reload the lease. Returning `None` is the safe auto-revert signal.
+    /// With a background reader this does no disk I/O: a result that is
+    /// missing, older than the reader's max age, or expired reads as `None`.
     pub fn refresh(&mut self, now_ms: u64) -> Option<&BenchmarkProfile> {
-        self.active = load_profile(&self.path, now_ms);
+        self.active = match &self.reader {
+            Some(reader) => reader.latest(now_ms),
+            None => load_profile(&self.path, now_ms),
+        };
         self.active.as_ref()
     }
 
@@ -741,5 +873,111 @@ mod tests {
         assert!(lease.active().is_none());
         fs::remove_file(&path).ok();
         assert!(lease.refresh(1_000_000).is_none());
+    }
+
+    const LEASE_JSON: &str = r#"{"schemaVersion":1,"runId":"123e4567-e89b-42d3-a456-426614174000","expiresAtMs":1300000,"transport":"wss","codec":"hevc","streamMode":"work","adaptive":false,"width":1920,"height":1080,"fps":30,"bitrateBps":4000000,"encoder":{"preset":"p3","tuning":"ultra-low-latency","multipass":"disabled","aqStrength":8,"temporalAq":false,"vbvFrames":1}}"#;
+
+    fn sample_profile() -> BenchmarkProfile {
+        serde_json::from_str(LEASE_JSON).unwrap()
+    }
+
+    fn wait_for<F: FnMut() -> bool>(mut condition: F) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn background_lease_reads_the_file_off_the_calling_thread() {
+        let now = wall_ms();
+        let path = temp_profile(&LEASE_JSON.replace(
+            "\"expiresAtMs\":1300000",
+            &format!("\"expiresAtMs\":{}", now + 60_000),
+        ));
+        let mut lease = BenchmarkLease::background(path.clone());
+        assert!(wait_for(|| lease.refresh(wall_ms()).is_some()));
+        assert!(lease.refresh(now + 60_000).is_none());
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn session_side_does_not_block_while_the_reader_is_blocked() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let mut lease = BenchmarkLease::with_loader(
+            PathBuf::new(),
+            Box::new(move || {
+                entered_tx.send(()).ok();
+                let _ = release_rx.recv();
+                Some(sample_profile())
+            }),
+            Duration::from_millis(10),
+            Duration::from_secs(5),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        for _ in 0..1_000 {
+            assert!(lease.refresh(1_000_000).is_none());
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        assert!(wait_for(|| lease.refresh(1_000_000).is_some()));
+    }
+
+    #[test]
+    fn a_stuck_reader_expires_the_lease_instead_of_keeping_it_valid() {
+        let calls = Arc::new(Mutex::new(0u32));
+        let loader_calls = Arc::clone(&calls);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut lease = BenchmarkLease::with_loader(
+            PathBuf::new(),
+            Box::new(move || {
+                let mut count = loader_calls.lock().unwrap();
+                *count += 1;
+                if *count == 1 {
+                    return Some(sample_profile());
+                }
+                drop(count);
+                let _ = release_rx.recv();
+                None
+            }),
+            Duration::from_millis(5),
+            Duration::from_millis(150),
+        );
+        assert!(wait_for(|| lease.refresh(1_000_000).is_some()));
+        // The second read is stuck; the first result ages out.
+        assert!(wait_for(|| lease.refresh(1_000_000).is_none()));
+        thread::sleep(Duration::from_millis(50));
+        assert!(lease.refresh(1_000_000).is_none());
+        drop(release_tx);
+    }
+
+    #[test]
+    fn dropping_the_lease_stops_the_reader() {
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        struct Notify(mpsc::Sender<()>);
+        impl Drop for Notify {
+            fn drop(&mut self) {
+                self.0.send(()).ok();
+            }
+        }
+        let guard = Notify(done_tx);
+        let lease = BenchmarkLease::with_loader(
+            PathBuf::new(),
+            Box::new(move || {
+                let _keep = &guard;
+                None
+            }),
+            Duration::from_millis(5),
+            Duration::from_secs(5),
+        );
+        drop(lease);
+        // The loader (and its guard) is dropped only when the thread exits.
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 }

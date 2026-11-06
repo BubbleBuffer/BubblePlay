@@ -2,6 +2,7 @@ import { readClientSource } from "./helpers/client-source.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import vm from "node:vm";
 
 test("receiver diagnostics expose current host capabilities, capture and clock", () => {
   const client = readClientSource();
@@ -50,6 +51,33 @@ test("a normal page load creates and reports its own diagnostic attempt", () => 
   assert.deepEqual(lines[0].slice(0, 2), ["trace", "bootstrap-inline"]);
   assert.equal(lines[0][2].attempt, generatedAttempt);
   assert.equal(lines[0][2].seq, 1);
+  assert.equal(lines[0][2].navigation, null, "no performance entries: navigation is null");
+  for (const type of ["reload", "navigate", "back_forward"]) {
+    const typed = [];
+    new Function("location", "crypto", "window", "URLSearchParams", prelude)(
+      { search: "", pathname: "/" }, { randomUUID: () => generatedAttempt },
+      { BPLog: { info: (...args) => typed.push(args) },
+        performance: { getEntriesByType: kind => (kind === "navigation" ? [{ type }] : []) } },
+      URLSearchParams);
+    assert.equal(typed[0][2].navigation, type);
+  }
+  // A throwing Performance API never breaks the page or the trace.
+  const broken = [];
+  assert.doesNotThrow(() => new Function("location", "crypto", "window", "URLSearchParams", prelude)(
+    { search: "", pathname: "/" }, { randomUUID: () => generatedAttempt },
+    { BPLog: { info: (...args) => broken.push(args) }, performance: { getEntriesByType() { throw new Error("no"); } } },
+    URLSearchParams));
+  assert.equal(broken[0][2].navigation, null);
+  // The client logger's redactor keeps the value readable in the stored line.
+  const context = vm.createContext({ console: { warn() {}, error() {} }, addEventListener() {}, setTimeout: () => 1,
+    Date, JSON, Error, Promise, Set, Math, Number, String, Array, Object, RegExp, indexedDB: undefined });
+  context.globalThis = context;
+  vm.runInContext(readFileSync(new URL("../public/dk-log.js", import.meta.url), "utf8"), context);
+  const raw = context.BPLogCreate({ indexedDB: undefined, setTimeout: () => 1, console: { warn() {}, error() {} } });
+  for (const type of ["navigate", "reload", "back_forward", "prerender"]) {
+    raw.info("trace", "bootstrap-inline", { attempt: generatedAttempt, navigation: type });
+    assert.equal(JSON.parse(JSON.stringify(raw.recent(1)))[0].fields.navigation, type);
+  }
   // Without the logger script the page still starts.
   assert.doesNotThrow(() => new Function("location", "crypto", "window", "URLSearchParams", prelude)(
     { search: "", pathname: "/" }, { randomUUID: () => generatedAttempt }, {}, URLSearchParams));

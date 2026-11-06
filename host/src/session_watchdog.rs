@@ -27,6 +27,8 @@ pub(super) enum Stage {
     Encode,
     Publish,
     Cleanup,
+    HousekeepingLease,
+    HousekeepingStatus,
 }
 
 fn stage_name(id: u8) -> &'static str {
@@ -46,6 +48,8 @@ fn stage_name(id: u8) -> &'static str {
         13 => "encode",
         14 => "publish",
         15 => "cleanup",
+        16 => "housekeeping-lease",
+        17 => "housekeeping-status",
         _ => "unknown",
     }
 }
