@@ -36,7 +36,14 @@ When the first frame is shown again each client logs one info line with the tota
 - **Connect timeout.** While recovering a session that authenticated before, a signaling socket that has not opened in time is abandoned and a new one is tried: 5 s, 7.5 s, then 10 s per attempt (`connectTimeoutMs`). The old socket's handlers are detached before it is closed, so a late event cannot act on it. A first connection is not timed, since it may wait on the site gate. A reconnect is not held there: a WebSocket upgrade is allowed or refused at once (the gate holds only navigations), so the cut-off cannot interrupt an approval.
 - **Wake.** While a reconnect is pending (its 250 ms timer is set), `visibilitychange` to visible, `pageshow` and `online` run it at once (`shouldRetryOnWake`), unless a socket is already connecting or the session ended. A frozen or throttled page could otherwise leave the retry timer unfired for minutes. There is no polling timer.
 - Real refusals stay terminal. The abandon and wake lines are logged ([logging](../logging.md)).
-- The Windows client already bounds the `/ws` open by its 10 s handshake limit. Android sets only an OkHttp connect timeout of 10 s with no read timeout, so a socket that connects but never completes the upgrade has no bound. Neither was changed.
+- The Windows client bounds the `/ws` open by its 10 s handshake limit.
+
+## Android: stuck upgrade (2026-11-06)
+
+- The signaling socket (`openSignaling` in `net/Session.kt`) uses `forSignaling()` from [`net/SignalingHttp.kt`](../../android/app/src/main/java/de/bubblebuffer/bubbleplay/net/SignalingHttp.kt): an OkHttp `callTimeout` of 10 s (`SIGNALING_HANDSHAKE_MS`) over the whole open, so DNS, connect, TLS and the upgrade share one limit, like the Windows client. Before, only a 10 s connect timeout applied and a socket that connected but never answered the upgrade waited forever.
+- A timeout is an ordinary failure with no HTTP response (`onFailure`), so the existing signaling retry and the recycled-session budget above handle it. It is not a terminal refusal.
+- OkHttp stops the call timeout once the upgrade succeeds (`timeoutEarlyExit`) and clears the socket's read timeout, so an established quiet socket is never cut. `SignalingHttpTest` checks both against real sockets: a server that accepts and never answers fails inside the limit, and an upgraded socket stays open past it. The media socket and `PairingClient` are unchanged.
+- The Flutter app (`app/`) compiles this `net/` package from the native app's tree (`stageNativeCore` in `app/android/app/build.gradle.kts`), so both Android apps share the fix.
 
 ## Not covered
 

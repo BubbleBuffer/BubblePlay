@@ -131,6 +131,7 @@ class Session(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
         .build()
+    private val signalingHttp = http.forSignaling()
     private val random = SecureRandom()
     private val startedAt = SystemClock.elapsedRealtimeNanos()
 
@@ -373,7 +374,7 @@ class Session(
         // thread; callbacks read it on this thread too (via handler.post).
         var id = 0
         val request = Request.Builder().url(config.signalingUrl()).build()
-        val socket = http.newWebSocket(request, object : WebSocketListener() {
+        val socket = signalingHttp.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) = post({ id }) {
                 sigOpen = true
                 liveness.opened(now())
