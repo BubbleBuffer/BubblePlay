@@ -82,7 +82,7 @@ function signalHarness(identity) {
     BPLog: { log: (...args) => logged.push(args), setContext() {} },
     debugTrace: (...args) => output.push(args), recordSignalingError: (...args) => output.push(args),
     shouldReconnectAfterClose: () => false, restartPeer() {},
-    setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
+    clearTimeout() {}, connectTimeoutMs: () => null, connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
     noteConnectionLoss() {}, noteSessionAuthenticated() {}, sessionAuthTimeoutMs: () => undefined, handleSessionFailure: (refusal) => context.endAuthenticatedSession(refusal),
     recoveryLossMs: null, recoveryAttempts: 0,
     sendStreamMode: reason => endpoint.push(["stream-mode", reason]), wssSelected: false,
@@ -106,7 +106,7 @@ function signalHarness(identity) {
       return session;
     },
   });
-  vm.runInContext(["sendRelay", "sendControl", "viewerLog", "handleSignal", "reconnectSignaling", "recycleSignaling",
+  vm.runInContext(["sendRelay", "sendControl", "viewerLog", "handleSignal", "reconnectSignaling", "armConnectTimeout", "recycleSignaling",
     "showNotAdmitted", "endAuthenticatedSession", "openAuthenticatedMedia", "updateAuthenticatedInputReady"]
     .map(receiverFunction).join("\n"), context);
   context.reconnectSignaling("startup");

@@ -57,7 +57,7 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
     hudState: {}, hud: { classList: { add() {} } },
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, recordSignalingError() {},
     shouldReconnectAfterClose: () => true, restartPeer() {}, cleanupPeer() {}, handleSignal() {},
-    setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
+    clearTimeout() {}, connectTimeoutMs: () => null, connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
   });
   const fn = source.slice(source.indexOf("function reconnectSignaling("), source.indexOf("\nfunction signalingSocketUrl("));
   vm.runInContext(fn + '\nreconnectSignaling("startup");', context);

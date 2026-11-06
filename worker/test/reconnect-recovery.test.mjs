@@ -4,7 +4,8 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { createViewerSession } from "../public/dk-session.js";
 import {
-  RECOVERY_BUDGET_MS, recycledAuthTimeoutMs, shouldRetryAuthTimeout,
+  RECOVERY_BUDGET_MS, recycledAuthTimeoutMs, shouldRetryAuthTimeout, connectTimeoutMs, shouldRetryOnWake,
+  shouldReconnectAfterClose,
 } from "../public/recovery.js";
 
 const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").split(String.fromCharCode(13, 10)).join("\n");
@@ -104,4 +105,154 @@ test("one info line reports the total time and attempts when the first frame ret
   assert.equal(h.output.logs[0].level, "info");
   assert.deepEqual({ ...h.output.logs[0].detail }, { recoveryMs: 3120, attempts: 2 });
   assert.equal(h.context.recoveryLossMs, null);
+});
+
+test("the connect wait is 5 s, 7.5 s, then 10 s, and only while recovering", () => {
+  assert.deepEqual([0, 1, 2, 3, 9].map(attempt => connectTimeoutMs({ recovering: true, attempt })), [5000, 7500, 10000, 10000, 10000]);
+  assert.equal(connectTimeoutMs({ recovering: false, attempt: 0 }), null);
+});
+
+test("wake retries only a pending reconnect with no socket connecting", () => {
+  assert.equal(shouldRetryOnWake({ timerPending: true, terminal: false, connecting: false }), true);
+  assert.equal(shouldRetryOnWake({ timerPending: true, terminal: false, connecting: true }), false);
+  assert.equal(shouldRetryOnWake({ timerPending: false, terminal: false, connecting: false }), false);
+  assert.equal(shouldRetryOnWake({ timerPending: true, terminal: true, connecting: false }), false);
+});
+
+// ---- reconnectSignaling with a fake WebSocket and a virtual clock ---------------------------
+
+function signalingHarness({ recovering }) {
+  const sockets = [];
+  const logs = [];
+  const sent = [];
+  let clock = 0, nextId = 1;
+  let timers = [];
+  class FakeSocket {
+    static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+    constructor(url) { this.url = url; this.readyState = 0; this.closed = false; sockets.push(this); }
+    close() { this.closed = true; this.readyState = 3; }
+  }
+  const context = vm.createContext({
+    ws: null, signalingGeneration: 0, reconnectTimer: null, pendingConnect: null, connectTimer: null,
+    terminalSignalingFailure: false, recoveryLossMs: recovering ? 1 : null, recoveryAttempts: 0,
+    hudState: {}, latestInputStatus: null, inputStatusReason: null, authenticatedSession: null,
+    signalingRegistered: false, signalingPc: null, signalingTicket: null, sessionIdentity: {}, params: {},
+    hud: { classList: { add() {} } },
+    WebSocket: FakeSocket, URL, Promise, Math, Number, Array,
+    connectTimeoutMs, shouldRetryOnWake, shouldReconnectAfterClose,
+    setTimeout: (fn, delay) => { const id = nextId++; timers.push({ id, at: clock + delay, fn }); return id; },
+    clearTimeout: id => { timers = timers.filter(t => t.id !== id); },
+    signalingSocketUrl: () => "wss://relay.test/ws?pc=pc",
+    debugTrace() {}, viewerLog: (level, event, detail) => logs.push({ level, event, detail: { ...detail } }),
+    sendRelay: message => sent.push(message), viewerHello: () => ({ type: "hello" }), wantsTurn: () => false,
+    handleSignal: async () => {}, noteConnectionLoss() {}, cleanupPeer() {}, recordSignalingError() {},
+    releaseInput() {}, showNotAdmitted() {}, restartPeer() {}, performance: { now: () => clock },
+  });
+  vm.runInContext(["reconnectSignaling", "armConnectTimeout", "wakeReconnect"].map(fn).join("\n"), context);
+  const tick = ms => {
+    const end = clock + ms;
+    for (;;) {
+      const due = timers.filter(t => t.at <= end).sort((a, b) => a.at - b.at)[0];
+      if (!due) break;
+      timers = timers.filter(t => t !== due);
+      clock = due.at;
+      due.fn();
+    }
+    clock = end;
+  };
+  return { context, sockets, logs, sent, tick };
+}
+
+test("a socket that does not open is abandoned and replaced, waiting longer each time", () => {
+  const h = signalingHarness({ recovering: true });
+  h.context.reconnectSignaling("ws-closed");
+  h.tick(250);
+  assert.equal(h.sockets.length, 1);
+  const first = h.sockets[0];
+  const lateOpen = first.onopen;
+  h.tick(4999);
+  assert.equal(h.sockets.length, 1, "still waiting at 4.999 s");
+  h.tick(1);
+  assert.equal(first.closed, true);
+  assert.equal(first.onopen, null);
+  assert.equal(first.onclose, null);
+  assert.deepEqual(h.logs.map(l => [l.event, l.detail]), [["signaling-connect-abandoned", { connectAttempt: 1, waitedMs: 5000 }]]);
+  h.tick(250);
+  assert.equal(h.sockets.length, 2);
+  assert.equal(h.context.ws, h.sockets[1]);
+  // A late open event of the abandoned socket does nothing.
+  lateOpen();
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.context.ws, h.sockets[1]);
+  h.tick(7500);
+  h.tick(250);
+  assert.equal(h.sockets.length, 3);
+  h.tick(10_000);
+  h.tick(250);
+  h.tick(10_000);
+  assert.deepEqual(h.logs.map(l => l.detail.waitedMs), [5000, 7500, 10000, 10000]);
+});
+
+test("a socket that opens in time is kept", () => {
+  const h = signalingHarness({ recovering: true });
+  h.context.reconnectSignaling("ws-closed");
+  h.tick(250);
+  h.tick(2000);
+  h.sockets[0].readyState = 1;
+  h.sockets[0].onopen();
+  h.tick(60_000);
+  assert.equal(h.sockets.length, 1);
+  assert.equal(h.sockets[0].closed, false);
+  assert.deepEqual(h.logs, []);
+});
+
+test("a first connection is not timed", () => {
+  const h = signalingHarness({ recovering: false });
+  h.context.reconnectSignaling("startup");
+  assert.equal(h.sockets.length, 1);
+  h.tick(120_000);
+  assert.equal(h.sockets.length, 1);
+  assert.equal(h.sockets[0].closed, false);
+  assert.deepEqual(h.logs, []);
+});
+
+test("waking retries a pending reconnect at once and logs the event", () => {
+  const h = signalingHarness({ recovering: true });
+  h.context.reconnectSignaling("ws-closed");
+  assert.equal(h.sockets.length, 0);
+  h.context.wakeReconnect("visibilitychange");
+  assert.equal(h.sockets.length, 1);
+  assert.deepEqual(h.logs.map(l => [l.event, l.detail]), [["reconnect-wake", { event: "visibilitychange" }]]);
+  h.tick(250);
+  assert.equal(h.sockets.length, 1, "the cleared retry timer does not open a second socket");
+});
+
+test("waking does nothing while a socket is connecting, when nothing is pending, or after the end", () => {
+  const h = signalingHarness({ recovering: true });
+  h.context.wakeReconnect("online");
+  assert.equal(h.sockets.length, 0, "nothing pending");
+  h.context.reconnectSignaling("ws-closed");
+  h.tick(250);
+  h.context.wakeReconnect("pageshow");
+  assert.equal(h.sockets.length, 1, "already connecting");
+  assert.deepEqual(h.logs, []);
+  const ended = signalingHarness({ recovering: true });
+  ended.context.reconnectSignaling("ws-closed");
+  ended.context.terminalSignalingFailure = true;
+  ended.context.wakeReconnect("online");
+  assert.equal(ended.sockets.length, 0);
+});
+
+test("a policy refusal is terminal: no retry, no wake, no abandon timer", async () => {
+  const h = signalingHarness({ recovering: true });
+  h.context.reconnectSignaling("ws-closed");
+  h.tick(250);
+  h.sockets[0].readyState = 3;
+  h.sockets[0].onclose({ code: 1008, reason: "refused" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.context.terminalSignalingFailure, true);
+  h.context.wakeReconnect("online");
+  h.tick(60_000);
+  assert.equal(h.sockets.length, 1);
+  assert.deepEqual(h.logs.filter(l => l.event !== "signaling-close"), []);
 });

@@ -295,6 +295,12 @@ test("a WebSocket closeCode (1006, 1001) is logged, other code keys stay redacte
   assert.equal(f.authCloseCode, R);
 });
 
+test("the reconnect fields (connectAttempt, waitedMs, event) pass the redactor", () => {
+  const { log } = make();
+  log.info("t", "m", { connectAttempt: 2, waitedMs: 5000, event: "visibilitychange" });
+  assert.deepEqual({ ...log.recent(1)[0].fields }, { connectAttempt: 2, waitedMs: 5000, event: "visibilitychange" });
+});
+
 test("rule 1: fields with secret-looking keys lose the whole value", () => {
   const { log } = make();
   log.info("t", "m", {

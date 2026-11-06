@@ -6,6 +6,8 @@ import {
   shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
   recycledAuthTimeoutMs,
+  connectTimeoutMs,
+  shouldRetryOnWake,
   shouldRetryAuthTimeout,
   signalingUnanswered,
   rtcPeerEndAction,
@@ -761,6 +763,8 @@ let authenticatedSession = null;
 let pendingRtcTracks = [];
 let signalingGeneration = 0;
 let reconnectTimer = null;
+let pendingConnect = null;
+let connectTimer = null;
 let terminalSignalingFailure = false;
 // Recovery after a lost signaling connection. everAuthenticated: this page had a session before,
 // so a silent PC is retried (recovery.js). recoveryLossMs: clock time of the loss, kept until the
@@ -963,6 +967,7 @@ function reconnectSignaling(reason) {
   hudState.ws = `reconnecting (${reason})`;
   const connect = () => {
     reconnectTimer = null;
+    pendingConnect = null;
     latestInputStatus = null;
     inputStatusReason = null;
     authenticatedSession?.close();
@@ -978,15 +983,18 @@ function reconnectSignaling(reason) {
     const socket = new WebSocket(socketUrl);
     socket.binaryType = "arraybuffer";
     ws = socket;
+    armConnectTimeout(socket, generation);
     let receiveQueue = Promise.resolve();
     socket.onopen = () => {
       if (ws !== socket || generation !== signalingGeneration) return;
+      clearTimeout(connectTimer);
       hudState.ws = "open";
       debugTrace("signaling-open", { generation });
       sendRelay(viewerHello({ identity: sessionIdentity, turn: wantsTurn(params) }));
     };
     const handleClose = event => {
       if (ws !== socket || generation !== signalingGeneration) return;
+      clearTimeout(connectTimer);
       const admitted = signalingRegistered;
       noteConnectionLoss();
       hudState.ws = "closed";
@@ -1033,7 +1041,34 @@ function reconnectSignaling(reason) {
     };
   };
   if (reason === "startup") connect();
-  else reconnectTimer = setTimeout(connect, 250);
+  else { pendingConnect = connect; reconnectTimer = setTimeout(connect, 250); }
+}
+
+// A reconnect of an established session abandons a socket that has not opened in time (5, 7.5, then
+// 10 s) and tries a new one. Handlers are detached first so a late event of the old socket is ignored.
+function armConnectTimeout(socket, generation) {
+  clearTimeout(connectTimer);
+  const waitedMs = connectTimeoutMs({ recovering: recoveryLossMs !== null, attempt: recoveryAttempts - 1 });
+  if (waitedMs === null) return;
+  connectTimer = setTimeout(() => {
+    if (ws !== socket || generation !== signalingGeneration || socket.readyState !== WebSocket.CONNECTING) return;
+    viewerLog("info", "signaling-connect-abandoned", { connectAttempt: recoveryAttempts, waitedMs });
+    socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
+    ws = null;
+    signalingGeneration++;
+    try { socket.close(); } catch {}
+    reconnectSignaling("connect-timeout");
+  }, waitedMs);
+}
+
+// The page was frozen or came back online: a pending reconnect retries now instead of waiting for a timer.
+function wakeReconnect(event) {
+  if (!shouldRetryOnWake({ timerPending: reconnectTimer !== null && pendingConnect !== null,
+    terminal: terminalSignalingFailure, connecting: ws?.readyState === WebSocket.CONNECTING })) return;
+  const connect = pendingConnect;
+  clearTimeout(reconnectTimer); reconnectTimer = null; pendingConnect = null;
+  viewerLog("info", "reconnect-wake", { event });
+  connect();
 }
 
 function signalingSocketUrl() {
@@ -2094,6 +2129,9 @@ function recoverWssStartup(reason) {
 }
 
 addEventListener("online", () => recoverNetworkRoute("online"));
+addEventListener("online", () => wakeReconnect("online"));
+addEventListener("pageshow", () => wakeReconnect("pageshow"));
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") wakeReconnect("visibilitychange"); });
 const routeConnection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
 routeConnection?.addEventListener("change", probeNetworkRouteChange);
 
