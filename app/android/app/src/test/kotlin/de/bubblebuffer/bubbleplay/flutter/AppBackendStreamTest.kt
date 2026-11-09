@@ -102,6 +102,21 @@ class AppBackendStreamTest {
     }
 
     @Test
+    fun backgroundGraceExpiryDisconnectsLikeDisconnectAndTheNextConnectIsNormal() {
+        val events = connect()
+        events.onBackgroundExpired()
+        assertEquals("close", host.log.last())
+        assertTrue(noSession())
+        host.log.clear()
+        backend.act("""{"Connect":{"pc_id":"$pcId"}}""")
+        assertEquals(listOf("close", "open $pcId Test phone"), host.log)
+        assertFalse(noSession())
+        // The expired session's late events do nothing to the new one.
+        events.onBackgroundExpired()
+        assertFalse(noSession())
+    }
+
+    @Test
     fun modeAndAudioGoToTheSession() {
         connect()
         host.log.clear()

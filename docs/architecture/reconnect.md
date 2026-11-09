@@ -45,6 +45,19 @@ When the first frame is shown again each client logs one info line with the tota
 - OkHttp stops the call timeout once the upgrade succeeds (`timeoutEarlyExit`) and clears the socket's read timeout, so an established quiet socket is never cut. `SignalingHttpTest` checks both against real sockets: a server that accepts and never answers fails inside the limit, and an upgraded socket stays open past it. The media socket and `PairingClient` are unchanged.
 - The Flutter app (`app/`) compiles this `net/` package from the native app's tree (`stageNativeCore` in `app/android/app/build.gradle.kts`), so both Android apps share the fix.
 
+## Android phone app: background (2026-11-09)
+
+The Flutter app has no foreground service, wake lock or Wi-Fi lock (the foreground service `SessionService` belongs to the native app's `ui/` package, which the phone app does not compile). Before this change, going to the background only paused reconnect attempts and muted the sound: the media socket, the decoder, the audio track (volume 0, still decoding), the host's encoder and a 250 ms session tick all kept running.
+
+`BackgroundGrace` ([`net/BackgroundGrace.kt`](../../android/app/src/main/java/de/bubblebuffer/bubbleplay/net/BackgroundGrace.kt)) is the state machine; `Session` owns it only when constructed with `backgroundGraceMs` (the phone app passes 5 minutes; the native app does not, so it is unchanged). `MainActivity.onStop` and `onStart` drive it through `Session.setForeground`.
+
+- **Backgrounded** (the activity stops; screen off counts): media is closed at once, as for an ordinary media loss (`closeMedia`: media socket, first-frame and retry timers, audio), and the decoder releases its codec (`VideoDecoder.idle`; the surface stays). Media stays closed until the app returns (`mediaPaused`), also when a surface is attached meanwhile, and the surface watchdog does not count misses. The host sees its media peer leave and stops capture and encoding; the signaling socket, its 15 s ping and the reconnect hold stay as they were. The session tick slows to 1 s; the app's stats timer stops.
+- **Back within 5 minutes:** media reopens through the media-only path above (same signaling epoch and grant, `media-control start`, first-frame request), with no new authentication or pairing prompt. If signaling dropped meanwhile, the held reconnect runs first.
+- **After 5 minutes:** the session reports `onBackgroundExpired` and `AppBackend` ends it exactly as Disconnect does (`stream.close`, no session, PC list). Nothing reconnects by itself: the phone app has no auto-connect, so the next open is the normal one (the user taps the PC). The clock is `elapsedRealtime`: the timer runs on uptime, which stops in deep sleep, so a return after the grace disconnects even if the timer never fired.
+- A Disconnect or a terminal error during the grace cancels the timer.
+- Logs ([logging](../logging.md)): one info line each for backgrounded, resumed within grace (with `firstFrameMs`) and grace expired.
+- Host side (checked in code, not on a device): a media-socket close with signaling up stops video capture and sends nothing as an error. Host audio capture and Opus encoding keep running until the viewer's signaling ends, and each resume costs one IDR; there is no restart limit.
+
 ## Not covered
 
 The media session does not survive a signaling failure: a signaling reset still rebuilds the media link. Keeping it alive needs a protocol change and is a separate decision.

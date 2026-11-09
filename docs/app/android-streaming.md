@@ -47,9 +47,9 @@ AppBackend  --StreamHost-->  StreamController  --StreamPort-->  Session (net/Ses
 
 ## Not in this milestone
 
-- No foreground service: in the background Android may stop the network, so the session can end.
-  `MainActivity` tells the session when the app goes to the background (sound off, reconnect
-  attempts paused) and back.
+- No foreground service, wake lock or Wi-Fi lock. In the background the session stops media at
+  once and disconnects after 5 minutes; see "Background" in
+  [reconnect](../architecture/reconnect.md).
 - No drawn cursor (trackpad mode), local zoom or pan, clipboard, file transfer, follow-window or
   soft keyboard text; mouse input is not told apart from touch.
 - Quality has no control on Android (`quality_controls_available` is false).

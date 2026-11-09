@@ -92,6 +92,9 @@ class VideoDecoder(private val listener: Listener) {
     /** Drop frames not yet queued (gate reset / reconnect). */
     fun dropPending() = handler.post { pending.clear() }
 
+    /** Media stopped on purpose: let go of the codec (the surface stays); the next keyframe configures a new one. */
+    fun idle() = handler.post { releaseCodec(); pending.clear() }
+
     fun release() {
         handler.post { releaseCodec(); surface = null }
         thread.quitSafely()

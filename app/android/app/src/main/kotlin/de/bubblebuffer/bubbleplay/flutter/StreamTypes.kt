@@ -26,6 +26,9 @@ internal interface StreamEvents {
 
     /** The signaling socket that carried input was lost. */
     fun onInputLost() = Unit
+
+    /** The app stayed in the background past the grace period: end the session like Disconnect. */
+    fun onBackgroundExpired() = Unit
 }
 
 /** Live numbers for the `Stats` of the snapshot; null where the session does not know yet. */
