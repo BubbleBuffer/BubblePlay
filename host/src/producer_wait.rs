@@ -1,6 +1,7 @@
 //! Cursor notifications wake capture's owner without a 16 ms static-screen poll.
 use anyhow::{Context, Result};
 use bubbleplay_host::activity::Activity;
+use bubbleplay_host::input_stall::CURSOR_HOOK;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -110,6 +111,7 @@ thread_local! {
 }
 
 unsafe extern "system" fn mouse_changed(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _run = CURSOR_HOOK.running();
     if code == HC_ACTION as i32 {
         CURSOR_ACTIVITY.with(|state| {
             if let Some(state) = state.borrow().as_ref() {
@@ -170,7 +172,9 @@ impl CursorWake {
                 let _ = ready_tx.send(unsafe { GetCurrentThreadId() });
                 // No hooks or timeout polling while parked. The thread and
                 // message queue remain ready for the next activation.
+                // Hook callbacks run inside GetMessageW; they mark themselves busy.
                 while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+                    let _run = CURSOR_HOOK.running();
                     if message.message == CURSOR_CONTROL {
                         let active = worker.active.load(Ordering::Acquire);
                         if let Err(error) = reconcile_hooks(&mut hooks, active, NativeHooks::install) {

@@ -230,6 +230,14 @@ fn run<B: ClipboardBackend>(
         if epoch.load(Ordering::Acquire) != command_epoch {
             continue;
         }
+        use crate::input_stall::{step, StepArea};
+        step(
+            StepArea::Clipboard,
+            match command {
+                Command::Poll { .. } => "poll",
+                Command::Write { .. } => "write",
+            },
+        );
         let completion = match command {
             Command::Poll { reset, .. } => Completion::Polled {
                 epoch: command_epoch,
@@ -262,6 +270,7 @@ fn run<B: ClipboardBackend>(
                 }
             }
         };
+        crate::input_stall::step_done(crate::input_stall::StepArea::Clipboard);
         if stop.load(Ordering::Acquire) {
             break;
         }

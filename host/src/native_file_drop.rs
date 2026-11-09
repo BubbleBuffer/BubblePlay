@@ -203,6 +203,14 @@ impl Drop for DragGuard {
     }
 }
 
+/// Native drop threads whose input queue is attached to a foreground thread right now.
+static ATTACHED_QUEUES: AtomicUsize = AtomicUsize::new(0);
+
+/// How many native drop threads currently share the foreground thread's input queue.
+pub fn input_queue_attached() -> usize {
+    ATTACHED_QUEUES.load(Ordering::Acquire)
+}
+
 struct InputQueueGuard {
     native: u32,
     foreground: u32,
@@ -231,6 +239,10 @@ impl InputQueueGuard {
             return Err(windows::core::Error::from_thread())
                 .context("attach native OLE foreground input queue");
         }
+        if attached {
+            ATTACHED_QUEUES.fetch_add(1, Ordering::AcqRel);
+            crate::input_stall::step(crate::input_stall::StepArea::FileDrop, "queue attached");
+        }
         let guard = Self {
             native,
             foreground,
@@ -258,6 +270,7 @@ impl InputQueueGuard {
                 return false;
             }
             *attached = false;
+            ATTACHED_QUEUES.fetch_sub(1, Ordering::AcqRel);
             tracing::info!("native OLE foreground input queue detached");
         }
         true
@@ -1475,7 +1488,9 @@ fn run_drop(batch: &DropBatch, point: POINT, target: Option<NativeDropTarget>) -
             return Ok(());
         }
         tracing::info!("native drop entering DoDragDrop");
+        crate::input_stall::step(crate::input_stall::StepArea::FileDrop, "DoDragDrop");
         let hr = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+        crate::input_stall::step(crate::input_stall::StepArea::FileDrop, "post-drop pump");
         tracing::info!(
             hresult = hr.0,
             effect = effect.0,

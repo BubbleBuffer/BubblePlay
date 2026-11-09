@@ -374,6 +374,16 @@ pub fn is_shell_class(class: &str) -> bool {
     )
 }
 
+/// The class of the stand-in window DWM shows for a window whose app stopped responding. It is
+/// not where the user works: following it would switch monitors on a hang, and it disappears when
+/// the app recovers.
+pub const GHOST_CLASS: &str = "Ghost";
+
+/// Window classes the rules ignore besides the shell's: DWM's hung-app ghost windows.
+pub fn is_ignored_class(class: &str) -> bool {
+    is_shell_class(class) || class == GHOST_CLASS
+}
+
 /// Executables whose windows the rules ignore: the Snipping Tool's capture and editor windows
 /// (not shell classes, and not always wide enough to count as a screen-wide overlay), compared
 /// case-insensitively.
@@ -495,7 +505,7 @@ pub fn sample_foreground() -> Sample {
         } else {
             String::new()
         };
-        if is_shell_class(&class) {
+        if is_ignored_class(&class) {
             return Sample::Ignored;
         }
         let details = details_of(hwnd, class);
@@ -573,7 +583,7 @@ fn details_of(hwnd: windows::Win32::Foundation::HWND, class: String) -> WindowDe
 }
 
 /// File name (no directory) of the executable of process `pid`; empty when unreadable.
-fn exe_file_name(pid: u32) -> String {
+pub(crate) fn exe_file_name(pid: u32) -> String {
     crate::admin_agent::trust::process_image_path(pid)
         .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_default()
@@ -847,6 +857,17 @@ mod tests {
         }
         assert!(!is_shell_class("Notepad"));
         assert!(!is_shell_class("CabinetWClass"));
+    }
+
+    #[test]
+    fn ghost_windows_are_ignored() {
+        assert!(is_ignored_class("Ghost"));
+        for class in ["Progman", "Shell_TrayWnd"] {
+            assert!(is_ignored_class(class), "{class}");
+        }
+        for class in ["ghost", "GhostWindow", "Notepad", "Chrome_WidgetWin_1", ""] {
+            assert!(!is_ignored_class(class), "{class}");
+        }
     }
 
     #[test]

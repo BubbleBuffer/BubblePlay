@@ -720,6 +720,11 @@ impl CursorKindTracker {
         self.last_kind = None;
     }
 
+    /// The last sampled cursor kind; `None` before the first sample after a reset.
+    pub fn last_kind(&self) -> Option<CursorKind> {
+        self.last_kind
+    }
+
     pub fn set_active(&mut self, active: bool) {
         if self.headless_support.state.active != active {
             self.reset();

@@ -34,6 +34,7 @@ pub mod hevc_tiles;
 pub mod hybrid;
 pub mod input;
 pub mod input_diagnostics;
+pub mod input_stall;
 pub mod link_capacity;
 pub mod log_upload;
 pub mod logging;
