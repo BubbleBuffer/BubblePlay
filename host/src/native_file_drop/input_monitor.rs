@@ -179,6 +179,7 @@ fn pump(state: &Arc<MonitorState>) -> Result<()> {
             .store(state.elapsed_ms(), Ordering::Release);
         state.ready.store(true, Ordering::Release);
         tracing::info!("prepared native drop input monitor ready");
+        let _run = crate::input_stall::DROP_HOOK.running();
         while !state.stop.load(Ordering::Acquire) {
             let now = state.elapsed_ms();
             if now.saturating_sub(state.heartbeat_ms.load(Ordering::Acquire))
@@ -201,9 +202,15 @@ fn pump(state: &Arc<MonitorState>) -> Result<()> {
                     return Ok(());
                 }
             }
-            if MsgWaitForMultipleObjectsEx(None, PUMP_INTERVAL_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
-                == WAIT_FAILED
-            {
+            crate::input_stall::DROP_HOOK.idle();
+            let waited = MsgWaitForMultipleObjectsEx(
+                None,
+                PUMP_INTERVAL_MS,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            );
+            crate::input_stall::DROP_HOOK.busy();
+            if waited == WAIT_FAILED {
                 bail!("prepared drop input monitor wait failed");
             }
         }

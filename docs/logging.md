@@ -90,3 +90,15 @@ While recovering, the browser logs one info line (target `receiver`) when it aba
 ## Navigation type in the browser start line (2026-11-05)
 
 The browser's `bootstrap-inline` trace (target `trace`, written once when the page starts) carries `navigation`: the page's `performance.getEntriesByType("navigation")[0].type`, one of `navigate`, `reload`, `back_forward` or `prerender`, or `null` when the browser gives none. A tab that restarts during recovery with `reload` was reloaded (by the user or the browser); `navigate` is a fresh load of the address. The value passes the redactor unchanged.
+
+## Frozen foreground app (2026-11-09)
+
+While a viewer is attached, the host checks the foreground window on the 250 ms foreground tick (`host/src/input_stall.rs`). When the window is hung (`IsHungAppWindow`), DWM's `Ghost` stand-in is foreground, or the cursor has stayed `Wait` for 5 s, it logs one warn line per episode: `foreground app stopped responding while a viewer is attached`. A new episode starts only after a sample with none of the three. Fields:
+
+- `reason` (`hung`, `ghost` or `wait-cursor`), `foreground_exe`, `foreground_class`, `foreground_pid`, `wait_ms`;
+- `behind_ghost_exe`, `behind_ghost_class`, `behind_ghost_pid`: the last non-ghost foreground, which is the app the ghost stands in for;
+- `native_queue_attached`: native file drop threads whose input queue is attached to a foreground thread (`AttachThreadInput`) right now;
+- `cursor_hook_busy_ms`, `cursor_hook_last_event_ms`: how long the cursor-wake thread (owner of the host's `WH_MOUSE_LL` hook while a viewer is attached) has been out of its message wait, 0 while it waits, and the time since it last woke; `drop_hook_busy_ms` is the same for the prepared-drop input monitor's hooks;
+- `last_file_drop_step`, `last_clipboard_step`: the last step name, `running` or `done`, and its age. No clipboard or file content is logged.
+
+The line was added after a WhatsApp freeze on 2026-11-09 that a TeamViewer connection ended; the host's logs then showed no attached queue or drop hook, so these fields say on the next occurrence whether the host was involved.
