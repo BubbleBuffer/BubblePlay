@@ -467,6 +467,14 @@ internal class AppBackend(
             }
         }
 
+        override fun onBackgroundExpired() {
+            synchronized(this@AppBackend) {
+                if (generation != streamGeneration) return
+                endSession()
+                notify()
+            }
+        }
+
         override fun onVideoSize(width: Int, height: Int) = current { updateStats(it) }
         override fun onLiveFrame() = current { updateStats(it) }
 

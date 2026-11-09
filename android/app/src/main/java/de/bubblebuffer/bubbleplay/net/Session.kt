@@ -45,6 +45,8 @@ class Session(
     private val deviceName: String,
     val preferredCodec: String,
     private val listener: Listener,
+    /** Phone app: media stops when the app goes to the background and the session ends after this long (null: no such policy). */
+    backgroundGraceMs: Long? = null,
     private val onPcState: (lastSeen: Long, problem: String?) -> Unit = { _, _ -> },
 ) : RemoteInput.Transport, VideoDecoder.Listener {
 
@@ -85,6 +87,9 @@ class Session(
         fun onMonitorPreview(picture: MonitorPreviews.Picture) {}
         /** The first live frame of the new media generation arrived (or the session ended): fade the picture out. */
         fun onMonitorPreviewEnd() {}
+
+        /** The app stayed in the background past the grace period: the owner ends the session (like Disconnect). */
+        fun onBackgroundExpired() {}
     }
 
     enum class State { CONNECTING, CONNECTED, STATIC, RECONNECTING, ERROR }
@@ -109,6 +114,7 @@ class Session(
     data class Monitor(val selector: String, val name: String, val width: Int, val height: Int, val selected: Boolean)
 
     private val config = config
+    private val graceMs = backgroundGraceMs ?: 0L
     private val thread = HandlerThread("bp-session").apply { start() }
     private val handler = Handler(thread.looper)
     private val main = Handler(Looper.getMainLooper())
@@ -136,6 +142,11 @@ class Session(
     private val startedAt = SystemClock.elapsedRealtimeNanos()
 
     private var running = false
+    /** Media is held closed while the app is in the background; signaling stays up. */
+    private var mediaPaused = false
+    /** Set on a return within the grace: when the first live frame follows, one info line gives the time. */
+    private var resumedAt = -1L
+    private var resumedAway = 0L
     @Volatile private var cursorCallbacksEnabled = true
     private var terminal: String? = null
     private var terminalProblem: String? = null
@@ -218,6 +229,40 @@ class Session(
     private var ffWatchdog: Runnable? = null
 
     private var lastStatus: Status? = null
+
+    private val graceHost = object : BackgroundGrace.Host {
+        override fun stopMedia() {
+            BpLog.i(TAG, "backgrounded: media stopped", pc.id, mapOf("graceMs" to graceMs))
+            mediaPaused = true
+            resumedAt = -1L
+            surfaceWatchdog?.let { handler.removeCallbacks(it) }
+            surfaceWatchdog = null
+            // A surface wait must not count misses made while media is closed on purpose.
+            surfaceRecovery.waitingGeneration()?.let { surfaceRecovery.missed(it, signalingUp = false) }
+            closeMedia()
+            decoder.idle()
+        }
+
+        override fun resumeMedia(backgroundMs: Long) {
+            mediaPaused = false
+            resumedAt = now(); resumedAway = backgroundMs
+            if (surfaceWatchdog == null) surfaceRecovery.waitingGeneration()?.let { armSurfaceWatchdog(it) }
+            if (running && registered && media == null) startMedia()
+        }
+
+        override fun expired(backgroundMs: Long) {
+            BpLog.i(TAG, "grace expired: disconnected", pc.id, mapOf("backgroundMs" to backgroundMs, "graceMs" to graceMs))
+            main.post { listener.onBackgroundExpired() }
+        }
+    }
+    private val grace = backgroundGraceMs?.let { ms ->
+        BackgroundGrace(ms, ::now, { delay, task ->
+            val run = Runnable { task() }
+            handler.postDelayed(run, delay)
+            val cancel: () -> Unit = { handler.removeCallbacks(run) }
+            cancel
+        }, graceHost)
+    }
     private val tick = object : Runnable {
         override fun run() {
             if (!running) return
@@ -225,7 +270,7 @@ class Session(
             publishStatus()
             logStats()
             updateDiagnostics()
-            handler.postDelayed(this, 250)
+            handler.postDelayed(this, if (mediaPaused) 1_000 else 250)
         }
     }
 
@@ -301,6 +346,7 @@ class Session(
         cursorCallbacksEnabled = false
         handler.post {
             running = false
+            grace?.cancel()
             handler.removeCallbacksAndMessages(null)
             closeMedia()
             link.reset()
@@ -469,8 +515,10 @@ class Session(
     fun setForeground(value: Boolean) = handler.post {
         if (!value) {
             sigRetry.background(); mediaRetry.background()
+            if (running) grace?.background()
             return@post
         }
+        if (grace?.foreground() == false) return@post
         val sigOwed = sigRetry.foreground()
         val mediaOwed = mediaRetry.foreground()
         if (!running) return@post
@@ -512,6 +560,7 @@ class Session(
         BpLog.w(TAG, "session ended", pc.id, mapOf("problem" to problem.resource, "detail" to detail))
         terminalProblem = problem.resource
         terminalDetail = detail
+        grace?.cancel()
         terminal = if (detail == null) problem.text else problem.text.replace("%s", detail)
         sigRetry.cancel()
         cancelSigRetryTimer()
@@ -871,6 +920,11 @@ class Session(
         val wasAwaiting = awaitingFrame
         setAwaiting(false)
         endPreview()
+        if (resumedAt >= 0) {
+            val ms = now() - resumedAt
+            resumedAt = -1L
+            BpLog.i(TAG, "resumed within grace: first frame after $ms ms", pc.id, mapOf("firstFrameMs" to ms, "backgroundMs" to resumedAway))
+        }
         if (ffAdmitted) sendPresented()
         if (wasAwaiting) main.post { listener.onInputReady() }
     }
@@ -916,7 +970,7 @@ class Session(
 
     // ---- media (v4) -------------------------------------------------------------
     private fun startMedia() {
-        if (!registered || terminal != null || mediaEpoch == null || media != null || !surfaceRecovery.canRestartMedia()) return
+        if (!registered || terminal != null || mediaEpoch == null || media != null || mediaPaused || !surfaceRecovery.canRestartMedia()) return
         openMedia()
     }
 
@@ -1087,7 +1141,7 @@ class Session(
             reportLiveFrame = true
             if (attached && running) {
                 Log.i(TAG, "surface attached generation=$generation")
-                armSurfaceWatchdog(generation)
+                if (!mediaPaused) armSurfaceWatchdog(generation)
                 if (registered && media == null) startMedia()
             }
         }
@@ -1106,6 +1160,7 @@ class Session(
     private fun armSurfaceWatchdog(generation: Long) {
         val watchdog = Runnable {
             if (!running) return@Runnable
+            if (mediaPaused) { surfaceWatchdog = null; return@Runnable }
             when (surfaceRecovery.missed(generation, signalingUp = sigOpen && registered)) {
                 SurfaceRecovery.Action.WAIT -> armSurfaceWatchdog(generation)
                 SurfaceRecovery.Action.KEYFRAME -> {

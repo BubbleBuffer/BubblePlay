@@ -91,6 +91,10 @@ While recovering, the browser logs one info line (target `receiver`) when it aba
 
 The browser's `bootstrap-inline` trace (target `trace`, written once when the page starts) carries `navigation`: the page's `performance.getEntriesByType("navigation")[0].type`, one of `navigate`, `reload`, `back_forward` or `prerender`, or `null` when the browser gives none. A tab that restarts during recovery with `reload` was reloaded (by the user or the browser); `navigate` is a fresh load of the address. The value passes the redactor unchanged.
 
+## Android background lines (2026-11-09)
+
+The phone app's Kotlin core (`app-android-core`, target `Session`) logs one info line when the app goes to the background and media stops (`backgrounded: media stopped`, field `graceMs`), one when it returns within the 5 minute grace and the first live frame is shown (`resumed within grace: first frame after N ms`, fields `firstFrameMs`, `backgroundMs`) and one when the grace runs out and the session is disconnected (`grace expired: disconnected`, fields `backgroundMs`, `graceMs`). The field names avoid the redacted words; `RedactTest` checks they pass. See [reconnect](architecture/reconnect.md).
+
 ## Frozen foreground app (2026-11-09)
 
 While a viewer is attached, the host checks the foreground window on the 250 ms foreground tick (`host/src/input_stall.rs`). When the window is hung (`IsHungAppWindow`), DWM's `Ghost` stand-in is foreground, or the cursor has stayed `Wait` for 5 s, it logs one warn line per episode: `foreground app stopped responding while a viewer is attached`. A new episode starts only after a sample with none of the three. Fields:

@@ -4,6 +4,7 @@ import android.view.Surface
 import de.bubblebuffer.bubbleplay.input.RemoteInput
 import de.bubblebuffer.bubbleplay.keys.DeviceKey
 import de.bubblebuffer.bubbleplay.log.BpLog
+import de.bubblebuffer.bubbleplay.net.BackgroundGrace
 import de.bubblebuffer.bubbleplay.net.ServerConfig
 import de.bubblebuffer.bubbleplay.net.Session
 import de.bubblebuffer.bubbleplay.pcs.PcEntry
@@ -29,7 +30,7 @@ internal object RealStreamOpener : StreamOpener {
         // "automatic" preference), the label is the device name.
         val session = Session(
             config, pc, key, label.filterNot { Character.isISOControl(it) }.take(64), Session.chooseCodec("auto"), adapter,
-            events::onPcState,
+            backgroundGraceMs = BackgroundGrace.GRACE_MS, onPcState = events::onPcState,
         )
         val sink = RemoteInputSink(RemoteInput(session, {}, onDeferredInput))
         adapter.bind(session, sink)
@@ -62,6 +63,8 @@ internal object RealStreamOpener : StreamOpener {
             sink?.inputReady()
             session?.requestMonitorList()
         }
+
+        override fun onBackgroundExpired() = events.onBackgroundExpired()
 
         override fun onInputLost() {
             // The host drops held input with its session; mirror that so nothing stays down.

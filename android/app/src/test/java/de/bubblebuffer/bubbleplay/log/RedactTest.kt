@@ -97,6 +97,16 @@ class RedactTest {
     }
 
     @Test
+    fun backgroundGraceFieldsAndLinesPass() {
+        assertEquals(300000L, Redact.field("graceMs", 300000L))
+        assertEquals(850L, Redact.field("firstFrameMs", 850L))
+        assertEquals(42000L, Redact.field("backgroundMs", 42000L))
+        assertEquals("resumed within grace: first frame after 850 ms", text("resumed within grace: first frame after 850 ms"))
+        assertEquals("backgrounded: media stopped", text("backgrounded: media stopped"))
+        assertEquals("grace expired: disconnected", text("grace expired: disconnected"))
+    }
+
+    @Test
     fun closeCodeIsAPlainNumberAndPassesButOtherCodesStayRedacted() {
         assertEquals(1006, Redact.field("closeCode", 1006))
         assertEquals("signaling down: closed 1001 (closeCode=1001)", text("signaling down: closed 1001 (closeCode=1001)"))

@@ -111,14 +111,19 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    // No foreground service in this milestone: in the background Android may stop the network, so
-    // the session can end with it. The decoder and the sound follow the foreground state.
+    // No foreground service. In the background the session closes media at once, keeps signaling for
+    // 5 minutes (BackgroundGrace) and then disconnects; the stats timer stops with it.
     override fun onStart() {
         super.onStart()
         stream?.setForeground(true)
+        if (backend?.hasSession == true) {
+            main.removeCallbacks(statsTick)
+            main.postDelayed(statsTick, STATS_MS)
+        }
     }
 
     override fun onStop() {
+        main.removeCallbacks(statsTick)
         stream?.setForeground(false)
         super.onStop()
     }
