@@ -1277,6 +1277,7 @@ fn run_serve(
     let mut input_coalescer = InputPacketCoalescer::default();
     let mut cursor_tracker = CursorTracker::for_region(capture.region(), Instant::now());
     let mut cursor_kind_tracker = CursorKindTracker::new(Instant::now());
+    let mut stall_watch = bubbleplay_host::input_stall::StallWatch::default();
     let mut latest_cursor_kind: Option<[u8; 2]> = None;
     let mut next_cursor_poll = Instant::now();
     let mut next_cursor_event_sample = Instant::now();
@@ -2558,10 +2559,21 @@ fn run_serve(
         let foreground_sample = if foreground_live && foreground_sample_now >= next_follow_sample {
             next_follow_sample = foreground_sample_now + follow_window::SAMPLE_INTERVAL;
             input_sink.refresh_foreground_status();
+            // One warn line per frozen-foreground episode (docs/logging.md).
+            let cursor_wait = cursor_kind_tracker.last_kind() == Some(input::CursorKind::Wait);
+            if let Some(episode) = stall_watch.observe(
+                foreground_sample_now,
+                bubbleplay_host::input_stall::observe_foreground(cursor_wait),
+            ) {
+                bubbleplay_host::input_stall::report(&episode);
+            }
             follow_state
                 .as_ref()
                 .map(|_| follow_window::sample_foreground())
         } else {
+            if !foreground_live {
+                stall_watch.reset();
+            }
             None
         };
         if let Some(follow) = follow_state.as_mut() {
