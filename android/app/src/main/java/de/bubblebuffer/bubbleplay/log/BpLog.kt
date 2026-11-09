@@ -10,6 +10,7 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -49,6 +50,7 @@ class BpLog internal constructor(
 
     private val queue = ArrayBlockingQueue<Entry>(queueCapacity)
     private val pending = AtomicInteger()
+    private val queued = Semaphore(0) // wakes the writer; entries leave the queue only under ioLock
     private val dropped = AtomicLong()
     private val ioLock = Any()
     private val secrets = CopyOnWriteArrayList<String>()
@@ -147,6 +149,7 @@ class BpLog internal constructor(
                 dropped.incrementAndGet()
             }
         }
+        queued.release()
     }
 
     private fun build(
@@ -239,14 +242,18 @@ class BpLog internal constructor(
     private fun writerLoop() {
         try {
             while (!closed) {
-                val first = queue.poll(1, TimeUnit.SECONDS)
+                // Wait without taking an entry: an entry held by the writer outside ioLock could be
+                // overtaken by a flush() or a crash-handler write, which stores later lines first and
+                // breaks the per-file timestamp order the upload cursors rely on.
+                queued.tryAcquire(1, TimeUnit.SECONDS)
+                queued.drainPermits()
                 synchronized(ioLock) {
                     val batch = ArrayList<Entry>()
-                    if (first != null) batch.add(first)
                     queue.drainTo(batch, 256)
                     if (batch.isNotEmpty()) writeBatchLocked(batch)
                     reportDropsLocked()
                 }
+                if (queue.isNotEmpty()) queued.release()
             }
         } catch (_: InterruptedException) {
         } catch (_: Throwable) {

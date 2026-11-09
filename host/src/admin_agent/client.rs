@@ -734,7 +734,12 @@ mod tests {
 
     #[test]
     fn ambiguous_first_write_never_falls_back_to_local_input() {
-        let (pipe, peer) = test_server::peer("no-retry", &[]);
+        // The peer keeps its end open far longer than any deadline, so the call can only end because
+        // its own deadline expired. Wall-clock bounds on a shared CI runner cannot tell a scheduling
+        // stall from a hang, so the outcome (a timeout, not the peer closing) is asserted exactly and
+        // the elapsed time only has to stay well clear of the peer's hold.
+        let hold = Duration::from_secs(20);
+        let (pipe, peer) = test_server::peer_holding("no-retry", &[], hold);
         let mut link = AdminAgentLink::new("unused", true);
         link.connection = Some(test_connection(pipe));
         link.state = LinkState::Connected(link.connection.as_ref().unwrap().handshake);
@@ -744,13 +749,17 @@ mod tests {
         drop(peer);
         assert_eq!(result, Some((0, ERROR_AGENT_LOST)));
         assert!(
-            elapsed < Duration::from_millis(800),
-            "blocked for {elapsed:?}"
+            elapsed < hold / 2,
+            "blocked for {elapsed:?}, waiting for the peer instead of the {INJECT_TIMEOUT:?} deadline"
         );
-        assert!(matches!(
-            link.state(),
-            LinkState::Fallback(LinkError::Failed(_))
-        ));
+        assert!(
+            matches!(
+                link.state(),
+                LinkState::Fallback(LinkError::Failed(message)) if message.contains("timed out")
+            ),
+            "{:?}",
+            link.state()
+        );
         assert_eq!(link.inject(&[move_one()]), None);
         assert_eq!(link.attempts(), 0, "failed connection must back off");
     }
@@ -971,17 +980,33 @@ mod tests {
         }
 
         pub fn peer(suffix: &str, reply_prefix: &[u8]) -> (BoundedPipe, Peer) {
+            peer_holding(suffix, reply_prefix, PEER_HOLD)
+        }
+
+        /// Like [`peer`], but the server end stays open for `hold_for` (or until the peer drops).
+        pub fn peer_holding(
+            suffix: &str,
+            reply_prefix: &[u8],
+            hold_for: Duration,
+        ) -> (BoundedPipe, Peer) {
             let name = format!(
                 r"\\.\pipe\BubblePlay.AdminAgent.bounded-{}-{suffix}",
                 std::process::id()
             );
             let server = listen(&name);
             let pipe = open_pipe(&name).unwrap();
-            let peer = hold(server, reply_prefix);
+            let peer = hold_for_duration(server, reply_prefix, hold_for);
             (pipe, peer)
         }
 
+        /// How long a peer keeps its end open when nothing releases it earlier.
+        const PEER_HOLD: Duration = Duration::from_millis(1100);
+
         pub fn hold(server: Server, reply_prefix: &[u8]) -> Peer {
+            hold_for_duration(server, reply_prefix, PEER_HOLD)
+        }
+
+        pub fn hold_for_duration(server: Server, reply_prefix: &[u8], hold_for: Duration) -> Peer {
             let lock = pipe_lock();
             // SAFETY: server's owned, listening pipe. Client already opened it.
             let connected =
@@ -999,7 +1024,7 @@ mod tests {
             }
             let (release, wait) = mpsc::channel();
             let worker = thread::spawn(move || {
-                let _ = wait.recv_timeout(Duration::from_millis(1100));
+                let _ = wait.recv_timeout(hold_for);
                 drop(file);
             });
             Peer {
