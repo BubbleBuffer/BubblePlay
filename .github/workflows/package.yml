@@ -2,6 +2,8 @@ name: Package
 
 # On-demand Windows tray release candidate ZIP, for installer testing. Not a release.
 on:
+  push:
+    branches: [ci/windows-package, lane/sec-host]
   workflow_dispatch:
 
 permissions:
