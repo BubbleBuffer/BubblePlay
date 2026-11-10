@@ -4,9 +4,19 @@ import org.json.JSONObject
 import java.io.File
 import java.nio.file.Files
 
+/**
+ * A wall clock that never returns the same millisecond twice, so every line a test writes has its own `ts`.
+ * Lines sharing a `ts` in different files sort by file path, not by write order (see LogCursor), which made
+ * tests that write to several files back to back depend on whether two writes fell into one millisecond.
+ */
+internal fun strictlyIncreasingClock(): () -> Long {
+    val last = java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE)
+    return { last.updateAndGet { prev -> maxOf(prev + 1, System.currentTimeMillis()) } }
+}
+
 /** Runs [block] with a [BpLog] on a temp directory installed as the current log; cleans up after. */
 internal fun <T> withTestLog(
-    clock: () -> Long = System::currentTimeMillis,
+    clock: () -> Long = strictlyIncreasingClock(),
     mirror: (LogLevel, String) -> Unit = { _, _ -> },
     limits: LogLimits = LogLimits(),
     capacity: Int = 1024,

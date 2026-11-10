@@ -250,4 +250,23 @@ class BpLogTest {
         assertEquals(2, lines.size)
         assertTrue(lines.all { it.getString("device") == "DEVI-CE12-3456-7890" })
     }
+
+    @Test
+    fun linesReachTheFileInTheOrderTheyWereLoggedEvenWhileAnotherThreadFlushes() {
+        val clock = AtomicLong(t0)
+        withTestLog({ clock.get() }, capacity = 8192) { log, dir ->
+            val flusher = thread {
+                // flush() writes queued lines on its own thread; it must never pass a line the writer holds.
+                repeat(4000) { log.flush(timeoutMs = 50) }
+            }
+            repeat(4000) {
+                clock.incrementAndGet()
+                log.log(LogLevel.INFO, "T", "line $it", pcA)
+            }
+            flusher.join()
+            log.flush()
+            val stored = dir.logLines().map { it.getString("msg") }
+            assertEquals((0 until 4000).map { "line $it" }, stored)
+        }
+    }
 }
