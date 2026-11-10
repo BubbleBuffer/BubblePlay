@@ -26,7 +26,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::net::phase2::{test_pc, Opened};
 
-pub const TOKEN: &str = "tok-e2e";
+pub const TOKEN: &str = "client-e2e-registration-token-0001";
 /// How long the PC waits for any one message.
 pub const WAIT: Duration = Duration::from_secs(10);
 
@@ -60,7 +60,7 @@ impl Relay {
             assets_dir,
             state_dir,
             token: Secret::new(TOKEN),
-            admin_token: Secret::new("admin-e2e"),
+            admin_token: Secret::new("client-e2e-admin-token-00000000001"),
             max_connections: 32,
             turn: None,
             ntfy: None,
