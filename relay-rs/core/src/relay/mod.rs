@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use crate::RelayRng;
-use crate::gate::Prefix;
-use crate::limits::HELLO_LIMIT;
+use crate::gate::{Gate, MAX_TRACKED_PREFIXES, Prefix};
+use crate::limits::{HELLO_LIMIT, PREAUTH_READ_LIMIT};
 use crate::protocol::validate_epoch;
 use pairing::{PairFailures, PairWindow};
 use state::{Conn, Kind, Phase, Role, Room, key_for, read_limit};
@@ -47,6 +47,11 @@ pub struct Relay {
     pair_windows: BTreeMap<String, PairWindow>,
     /// Failed pairing attempts per client prefix (M2 section 3).
     pair_failures: BTreeMap<Prefix, PairFailures>,
+    /// Upgrade attempt windows, separate from authenticated connection capacity.
+    upgrade_attempts: BTreeMap<Prefix, (u64, u32)>,
+    /// Default token budget for standalone callers without a deployment gate.
+    auth_failures: BTreeMap<Prefix, (u64, u32)>,
+    bad_token_failure: Option<ConnId>,
     next_id: u64,
     /// The latest `now_ms` an entry point saw: the timestamp of log lines.
     clock_ms: u64,
@@ -101,6 +106,9 @@ impl Relay {
             rooms: BTreeMap::new(),
             pair_windows: BTreeMap::new(),
             pair_failures: BTreeMap::new(),
+            upgrade_attempts: BTreeMap::new(),
+            auth_failures: BTreeMap::new(),
+            bad_token_failure: None,
             next_id: 1,
             clock_ms: 0,
             client_log_dropped: 0,
@@ -148,6 +156,10 @@ impl Relay {
         self.clock_ms = self.clock_ms.max(now_ms);
         let role = req.route.role();
         let kind = role.kind();
+        let prefix = Prefix::of(client);
+        if !self.allow_upgrade(prefix, now_ms) {
+            return Err(self.upgrade_refused("upgrade.rate-limited", role, None));
+        }
         if req.route.needs_viewer() && !req.viewer_authorized {
             return Err(self.upgrade_refused("upgrade.gate", role, None));
         }
@@ -173,8 +185,19 @@ impl Relay {
             }
             epoch
         };
-        if self.conns.len() >= self.config.max_connections {
-            return Err(self.upgrade_refused("upgrade.connection-cap", role, Some(&pc)));
+        let unauthenticated = self
+            .conns
+            .values()
+            .filter(|c| c.phase != Phase::Live && !c.closing);
+        let (mut total, mut from_prefix) = (0, 0);
+        for conn in unauthenticated {
+            total += 1;
+            from_prefix += usize::from(conn.prefix == prefix);
+        }
+        if total >= self.config.max_unauthenticated_connections
+            || from_prefix >= self.config.max_unauthenticated_per_prefix
+        {
+            return Err(self.upgrade_refused("upgrade.unauthenticated-cap", role, Some(&pc)));
         }
         let id = ConnId(self.next_id);
         self.next_id += 1;
@@ -189,7 +212,7 @@ impl Relay {
                 deadline_ms: now_ms + self.config.timings.hello_ms,
                 closing: false,
                 ticket: None,
-                prefix: Prefix::of(client),
+                prefix,
                 device: String::new(),
                 pairing: false,
                 activity_ms: now_ms,
@@ -197,6 +220,67 @@ impl Relay {
             },
         );
         Ok(id)
+    }
+
+    /// Counts attempts before accepting the WebSocket, including refused upgrades.
+    fn allow_upgrade(&mut self, prefix: Prefix, now_ms: u64) -> bool {
+        self.upgrade_attempts
+            .retain(|_, (start, _)| now_ms.saturating_sub(*start) < 60_000);
+        if !self.upgrade_attempts.contains_key(&prefix)
+            && self.upgrade_attempts.len() >= MAX_TRACKED_PREFIXES
+        {
+            return false;
+        }
+        let (_, attempts) = self.upgrade_attempts.entry(prefix).or_insert((now_ms, 0));
+        *attempts = attempts.saturating_add(1);
+        *attempts <= self.config.upgrade_rate_per_prefix
+    }
+
+    /// The current transport read limit. Adapters apply this before reassembly.
+    pub fn read_limit(&self, id: ConnId) -> Option<usize> {
+        let conn = self.conns.get(&id).filter(|c| !c.closing)?;
+        Some(if conn.phase == Phase::Live {
+            read_limit(conn.role.kind())
+        } else {
+            PREAUTH_READ_LIMIT
+        })
+    }
+
+    /// Processes text using the deployment's shared gate authentication budget.
+    /// Adapters must use this entry point so HTTP and WebSocket token failures
+    /// consume the same per-prefix allowance.
+    pub fn on_text_with_gate(
+        &mut self,
+        id: ConnId,
+        text: &str,
+        now_ms: u64,
+        rng: &mut dyn RelayRng,
+        gate: &mut Gate,
+    ) -> Vec<Action> {
+        let Some(conn) = self.open_conn(id) else {
+            return Vec::new();
+        };
+        let token_attempt = Self::token_attempt(&conn, text);
+        if token_attempt && !gate.auth_prefix_allowed(conn.prefix, now_ms) {
+            self.clock_ms = self.clock_ms.max(now_ms);
+            let mut out = Vec::new();
+            self.hello_refused(id, "hello.auth-rate-limited", &mut out);
+            return out;
+        }
+        let out = self.on_text_unchecked(id, text, now_ms, rng);
+        if token_attempt && self.bad_token_failure == Some(id) {
+            gate.record_auth_prefix_failure(conn.prefix, now_ms);
+        }
+        out
+    }
+
+    fn token_attempt(conn: &Conn, text: &str) -> bool {
+        conn.phase == Phase::Hello
+            && (conn.role == Role::VersionProbe
+                || (conn.role == Role::Host
+                    && text.len() <= HELLO_LIMIT
+                    && util::parse_object(text)
+                        .is_some_and(|m| !util::text_of(&m, "token").is_empty())))
     }
 
     /// Logs an upgrade the relay answers with HTTP 404.
@@ -212,6 +296,8 @@ impl Relay {
 
     /// A text frame arrived on `id`. `rng` supplies the register challenge,
     /// tickets, the viewer epoch and TURN credential suffixes.
+    /// Standalone callers get the default token-failure budget; deployments use
+    /// [`Self::on_text_with_gate`] to share it with HTTP authentication.
     pub fn on_text(
         &mut self,
         id: ConnId,
@@ -219,12 +305,55 @@ impl Relay {
         now_ms: u64,
         rng: &mut dyn RelayRng,
     ) -> Vec<Action> {
+        let Some(conn) = self.open_conn(id) else {
+            return Vec::new();
+        };
+        let token_attempt = Self::token_attempt(&conn, text);
+        self.auth_failures
+            .retain(|_, (start, _)| now_ms.saturating_sub(*start) < 600_000);
+        let blocked = self
+            .auth_failures
+            .get(&conn.prefix)
+            .is_some_and(|(_, n)| *n >= 5)
+            || (!self.auth_failures.contains_key(&conn.prefix)
+                && self.auth_failures.len() >= MAX_TRACKED_PREFIXES);
+        if token_attempt && blocked {
+            self.clock_ms = self.clock_ms.max(now_ms);
+            let mut out = Vec::new();
+            self.hello_refused(id, "hello.auth-rate-limited", &mut out);
+            return out;
+        }
+        let out = self.on_text_unchecked(id, text, now_ms, rng);
+        if token_attempt && self.bad_token_failure == Some(id) {
+            let (_, failures) = self.auth_failures.entry(conn.prefix).or_insert((now_ms, 0));
+            *failures = failures.saturating_add(1);
+        }
+        out
+    }
+
+    fn on_text_unchecked(
+        &mut self,
+        id: ConnId,
+        text: &str,
+        now_ms: u64,
+        rng: &mut dyn RelayRng,
+    ) -> Vec<Action> {
         let mut out = Vec::new();
+        self.bad_token_failure = None;
         self.clock_ms = self.clock_ms.max(now_ms);
         let Some(conn) = self.open_conn(id) else {
             return out;
         };
         let pre_auth = conn.phase != Phase::Live;
+        if pre_auth && now_ms >= conn.deadline_ms {
+            let class = if conn.phase == Phase::Hello {
+                "timeout.hello"
+            } else {
+                "timeout.proof"
+            };
+            self.hello_refused(id, class, &mut out);
+            return out;
+        }
         if pre_auth && text.len() > HELLO_LIMIT {
             self.hello_refused(id, "hello.oversize", &mut out);
             return out;
@@ -396,6 +525,26 @@ impl Relay {
             conn.deadline_ms = now_ms + idle;
             conn.activity_ms = now_ms;
         }
+    }
+
+    /// Reserve authenticated capacity only after proof/ticket validation. A
+    /// verified replacement may reuse its peer's slot, before evicting that peer.
+    fn admit_capacity(&mut self, id: ConnId, out: &mut Vec<Action>) -> bool {
+        let Some(conn) = self.open_conn(id) else {
+            return false;
+        };
+        let key = key_for(conn.role, &conn.epoch, &conn.pc);
+        let replacing = self.peers.get(&key).is_some_and(|old| self.is_open(*old));
+        let live = self
+            .conns
+            .values()
+            .filter(|c| c.phase == Phase::Live && !c.closing)
+            .count();
+        if !replacing && live >= self.config.max_connections {
+            self.hello_refused(id, "hello.connection-cap", out);
+            return false;
+        }
+        true
     }
 
     /// Marks a socket closing and queues the Close action. Idempotent.

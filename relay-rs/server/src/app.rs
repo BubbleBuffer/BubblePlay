@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::ws::{CloseFrame, Message, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -20,6 +19,7 @@ use bp_relay_core::gate::{
 use bp_relay_core::presence::PRESENCE_PATH;
 use bp_relay_core::relay::{AdminError, UpgradeRequest};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use url::form_urlencoded;
 
@@ -55,6 +55,14 @@ async fn common_headers(request: Request, next: Next) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_str(&crate::assets::content_security_policy(None))
+                .expect("CSP is ASCII"),
+        );
+    }
     response
 }
 
@@ -64,19 +72,25 @@ async fn dispatch(
     request: Request,
 ) -> Response {
     let (mut parts, body) = request.into_parts();
+    let client = client_ip(peer, &parts.headers, &state.trusted_proxies);
+    let body: Bytes = match tokio::time::timeout(
+        Duration::from_secs(10),
+        to_bytes(body, GATE_BODY_LIMIT),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
     if parts.uri.path() == "/healthz"
         && (parts.method == Method::GET || parts.method == Method::HEAD)
     {
         return healthz(&state, peer, &parts.headers, parts.method == Method::HEAD);
     }
-    let body: Bytes = match to_bytes(body, GATE_BODY_LIMIT).await {
-        Ok(bytes) => bytes,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-    };
     let path = parts.uri.path();
     let websocket = header_str(&parts.headers, "upgrade")
         .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
-    let client = client_ip(peer, &parts.headers, &state.trusted_proxies);
     let verdict = {
         let req = GateRequest {
             method: parts.method.as_str(),
@@ -86,6 +100,7 @@ async fn dispatch(
             origin: header_str(&parts.headers, "origin"),
             cookie: header_str(&parts.headers, "cookie"),
             authorization: header_str(&parts.headers, "authorization"),
+            sec_fetch_mode: header_str(&parts.headers, "sec-fetch-mode"),
             sec_fetch_dest: header_str(&parts.headers, "sec-fetch-dest"),
             body: &body[..],
             client_ip: client,
@@ -102,7 +117,7 @@ async fn dispatch(
                 && header_str(&parts.headers, "origin") == Some(state.public_origin.as_str())
                 && route_for_path(path).is_some();
             if browser_socket {
-                return refused_socket(&state, &mut parts).await;
+                return refused_socket(&state, &mut parts, client);
             }
             StatusCode::NOT_FOUND.into_response()
         }
@@ -123,7 +138,7 @@ async fn dispatch(
                 return gate_response(response);
             }
             if path.starts_with("/__gate/manage/") {
-                return admin(&state, &parts.method, path, &parts.headers).await;
+                return admin(&state, &parts.method, path, &parts.headers, client).await;
             }
             if websocket {
                 let Some(route) = route_for_path(path) else {
@@ -135,17 +150,13 @@ async fn dispatch(
                 // valid gate cookie (M2 section 1).
                 let viewer_authorized = header_str(&parts.headers, "origin").is_none()
                     || state.cookie_valid(header_str(&parts.headers, "cookie"), now_ms());
-                let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-                    Ok(upgrade) => upgrade,
-                    Err(rejection) => return rejection.into_response(),
-                };
                 let req = UpgradeRequest {
                     route,
                     pc,
                     epoch,
                     viewer_authorized,
                 };
-                return accept(state, upgrade, req, client);
+                return accept(state, &mut parts, req, client);
             }
             serve_asset(&state.assets_dir, &parts.method, path, parts.uri.query()).await
         }
@@ -184,11 +195,7 @@ fn dropped() -> Response {
 /// Accepts a refused browser socket and closes it 1008 "not approved". A failed upgrade
 /// reaches the browser as a bare 1006, and the browser reconnects in a loop. A 1008 tells it to
 /// stop.
-async fn refused_socket(state: &AppState, parts: &mut Parts) -> Response {
-    let upgrade = match WebSocketUpgrade::from_request_parts(parts, state).await {
-        Ok(upgrade) => upgrade,
-        Err(rejection) => return rejection.into_response(),
-    };
+fn refused_socket(state: &AppState, parts: &mut Parts, client: std::net::IpAddr) -> Response {
     bp_relay_core::log::emit(
         bp_relay_core::log::Level::Warn,
         now_ms(),
@@ -197,13 +204,18 @@ async fn refused_socket(state: &AppState, parts: &mut Parts) -> Response {
         None,
         json!({"class": "gate.refused", "status": 1008, "reason": REFUSED_REASON}),
     );
-    upgrade.on_upgrade(|mut socket| async move {
-        let frame = CloseFrame {
-            code: 1008,
-            reason: REFUSED_REASON.into(),
-        };
-        let _ = socket.send(Message::Close(Some(frame))).await;
-    })
+    let Some(route) = route_for_path(parts.uri.path()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (pc, epoch) = query_values(parts.uri.query());
+    // This slot can only send the refusal close. It never processes a hello.
+    let req = UpgradeRequest {
+        route,
+        pc,
+        epoch,
+        viewer_authorized: true,
+    };
+    crate::socket::accept_refused(state.clone(), parts, req, client)
 }
 
 /// What a browser the gate did not approve is told.
@@ -253,8 +265,21 @@ fn gate_response(response: GateResponse) -> Response {
 /// a loopback address, the public origin host or the listen address (or is absent). Anything else
 /// is a 404. HEAD gets the status and headers only.
 fn healthz(state: &Shared, peer: SocketAddr, headers: &HeaderMap, head: bool) -> Response {
-    let allowed = host_allowed(state, headers)
-        && (peer.ip().is_loopback() || bearer_matches(headers, &state.admin_token));
+    let trusted_proxy = state
+        .trusted_proxies
+        .iter()
+        .any(|net| net.contains(&peer.ip()));
+    let client = client_ip(peer, headers, &state.trusted_proxies);
+    if !host_allowed(state, headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let local = peer.ip().is_loopback() && !trusted_proxy;
+    let mut gate = state.gate();
+    let allowed = local
+        || (gate.auth_allowed(client, now_ms()) && bearer_matches(headers, &state.admin_token));
+    if !allowed && !bearer_matches(headers, &state.admin_token) {
+        gate.record_auth_failure(client, now_ms());
+    }
     if !allowed {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -292,14 +317,27 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
     else {
         return false;
     };
-    bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
+    bool::from(Sha256::digest(presented.as_bytes()).ct_eq(&Sha256::digest(expected.as_bytes())))
 }
 
 /// The admin API, behind the admin bearer. Anything wrong with the bearer, the route or the id is
 /// 404.
-async fn admin(state: &Shared, method: &Method, path: &str, headers: &HeaderMap) -> Response {
-    if !bearer_matches(headers, &state.admin_token) {
-        return StatusCode::NOT_FOUND.into_response();
+async fn admin(
+    state: &Shared,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    client: std::net::IpAddr,
+) -> Response {
+    {
+        let mut gate = state.gate();
+        if !gate.auth_allowed(client, now_ms()) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if !bearer_matches(headers, &state.admin_token) {
+            gate.record_auth_failure(client, now_ms());
+            return StatusCode::NOT_FOUND.into_response();
+        }
     }
     if *method == Method::GET && path == "/__gate/manage/pcs" {
         let listing = state.relay().list_pcs();

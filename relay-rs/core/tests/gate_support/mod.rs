@@ -2,12 +2,13 @@
 //! builders and small parsers for the responses and ntfy effects.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use bp_relay_core::RelayRng;
 use bp_relay_core::gate::{
-    GATE_HOLD_MS, Gate, GateConfig, GateEffect, GateSnapshot, Hold, HoldCheck, NtfyConfig, Request,
-    Response, Verdict,
+    DEFAULT_AUTH_FAILURE_RATE, DEFAULT_NTFY_RATE, GATE_HOLD_MS, Gate, GateConfig, GateEffect,
+    GateSnapshot, Hold, HoldCheck, NtfyConfig, Request, Response, Verdict,
 };
 
 pub const ORIGIN: &str = "https://relay.example";
@@ -20,11 +21,21 @@ pub const CLIENT: &str = "203.0.113.7";
 pub const OTHER_PREFIX: &str = "198.51.100.7";
 
 /// Splitmix64 bytes: the same seed always gives the same stream.
-pub struct TestRng(u64);
+pub struct TestRng(u64, BTreeMap<IpAddr, String>);
 
 impl TestRng {
     pub fn new(seed: u64) -> Self {
-        TestRng(seed)
+        TestRng(seed, BTreeMap::new())
+    }
+
+    /// Simulate the same browser moving to another address.
+    pub fn copy_wait_cookie(&mut self, from: &str, to: &str) {
+        let cookie = self.1.get(&ip(from)).expect("waiting cookie").clone();
+        self.1.insert(ip(to), cookie);
+    }
+
+    pub fn wait_cookie(&self, client: &str) -> &str {
+        self.1.get(&ip(client)).expect("waiting cookie")
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -49,6 +60,8 @@ pub fn config(ntfy: bool) -> GateConfig {
     GateConfig {
         public_origin: ORIGIN.to_string(),
         approval_ttl_secs: 90,
+        ntfy_rate: DEFAULT_NTFY_RATE,
+        auth_failure_rate: DEFAULT_AUTH_FAILURE_RATE,
         ntfy: ntfy.then(|| NtfyConfig {
             url: "https://ntfy.example".into(),
             topic: "bp-gate".into(),
@@ -74,7 +87,8 @@ pub fn req<'a>(method: &'a str, path: &'a str, client: &str, now_ms: u64) -> Req
         origin: None,
         cookie: None,
         authorization: None,
-        sec_fetch_dest: None,
+        sec_fetch_mode: Some("navigate"),
+        sec_fetch_dest: Some("document"),
         body: &[],
         client_ip: ip(client),
         now_ms,
@@ -82,7 +96,42 @@ pub fn req<'a>(method: &'a str, path: &'a str, client: &str, now_ms: u64) -> Req
 }
 
 pub fn get(gate: &mut Gate, rng: &mut TestRng, client: &str, now: u64) -> Verdict {
-    gate.handle(rng, &req("GET", "/", client, now))
+    navigate_request(gate, rng, &req("GET", "/", client, now))
+}
+
+/// Simulate a browser retaining the waiting cookie and following its initial
+/// same-URL redirect. Effects from the redirect accompany the resulting hold.
+pub fn navigate_request(gate: &mut Gate, rng: &mut TestRng, req: &Request<'_>) -> Verdict {
+    let cookie = rng.1.get(&req.client_ip).cloned();
+    let mut request = *req;
+    if request.cookie.is_none() {
+        request.cookie = cookie.as_deref();
+    }
+    let verdict = gate.handle(rng, &request);
+    let Verdict::Handled(response, mut effects) = verdict else {
+        return verdict;
+    };
+    let wait = header(&response, "Set-Cookie")
+        .and_then(|value| value.split(';').next())
+        .filter(|value| value.starts_with("__Host-bp_wait="))
+        .map(str::to_string);
+    let Some(wait) = wait else {
+        return Verdict::Handled(response, effects);
+    };
+    assert_eq!(response.status, 302);
+    assert!(response.body.is_empty());
+    rng.1.insert(req.client_ip, wait.clone());
+    let follow = Request {
+        cookie: Some(&wait),
+        ..*req
+    };
+    match gate.handle(rng, &follow) {
+        Verdict::Hold(hold, more) => {
+            effects.extend(more);
+            Verdict::Hold(hold, effects)
+        }
+        other => panic!("waiting redirect must enter hold, got {other:?}"),
+    }
 }
 
 pub fn get_with_cookie(
@@ -94,7 +143,7 @@ pub fn get_with_cookie(
 ) -> Verdict {
     let mut request = req("GET", path, CLIENT, now);
     request.cookie = Some(cookie);
-    gate.handle(rng, &request)
+    navigate_request(gate, rng, &request)
 }
 
 /// POST a decision. `action` is the body, `bearer` the raw token.
@@ -115,6 +164,7 @@ pub fn decide(
         origin: None,
         cookie: None,
         authorization: Some(&authorization),
+        sec_fetch_mode: None,
         sec_fetch_dest: None,
         body: action.as_bytes(),
         client_ip: ip(client),
@@ -152,7 +202,7 @@ pub fn open_hold(
     client: &str,
     now: u64,
 ) -> (Hold, String, String) {
-    let (hold, effects) = hold_parts(gate.handle(rng, &req("GET", "/", client, now)));
+    let (hold, effects) = hold_parts(navigate_request(gate, rng, &req("GET", "/", client, now)));
     assert_eq!(effects.len(), 1, "a new approval publishes once");
     let (approve, deny) = bearer_tokens(&effects[0]);
     (hold, approve, deny)

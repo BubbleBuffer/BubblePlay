@@ -52,7 +52,7 @@ fn m3_cookie_is_due_at_its_expiry_and_then_nothing_is_tracked() {
     let _ = approve_at(&mut gate, &mut rng, mint);
 
     // Past the approval's keep time, so only the cookie is left to wake for.
-    let _ = gate.tick(T0 + 400_000);
+    let _ = gate.tick(T0 + 600_000);
     let expires = mint + COOKIE_MS;
     assert_eq!(gate.next_deadline(), Some(expires));
 

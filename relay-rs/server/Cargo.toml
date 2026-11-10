@@ -21,6 +21,10 @@ default = []
 axum = { version = "0.8", features = ["ws"] }
 bp-relay-core = { path = "../core" }
 futures-util = "0.3"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio", "service"] }
+tokio-tungstenite = "0.29"
+tower = { version = "0.5", features = ["util"] }
 base64 = "0.22"
 bp-device-key = { path = "../../crates/bp-device-key" }
 clap = { version = "4", features = ["derive"] }
@@ -40,5 +44,3 @@ url = "2"
 
 [dev-dependencies]
 tempfile = "3"
-tokio-tungstenite = "0.26"
-tower = { version = "0.5", features = ["util"] }

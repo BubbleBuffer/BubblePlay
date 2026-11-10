@@ -98,7 +98,7 @@ pub struct PcListing {
 pub struct Timings {
     /// Deadline for the first hello on any socket (10 s).
     pub hello_ms: u64,
-    /// Deadline for register-proof after register-challenge (30 s, single use).
+    /// Deadline for register-proof after register-challenge (10 s, single use).
     pub challenge_ms: u64,
     /// Idle timeout, refreshed by every processed message (90 s).
     pub idle_ms: u64,
@@ -114,7 +114,7 @@ impl Default for Timings {
     fn default() -> Self {
         Self {
             hello_ms: 10_000,
-            challenge_ms: 30_000,
+            challenge_ms: 10_000,
             idle_ms: 90_000,
             ticket_ttl_ms: 12 * 60 * 60 * 1000,
             pair_window_ms: 300_000,
@@ -141,8 +141,14 @@ pub struct CoreConfig {
     pub public_origin: String,
     /// TOKEN: the first-registration ticket and version-probe secret.
     pub token: String,
-    /// Maximum sockets in the relay (default 32).
+    /// Maximum authenticated sockets in the relay (default 32).
     pub max_connections: usize,
+    /// Maximum upgraded sockets awaiting authentication (default 16).
+    pub max_unauthenticated_connections: usize,
+    /// Maximum unauthenticated sockets per IPv4 /24 or IPv6 /56 (default 4).
+    pub max_unauthenticated_per_prefix: usize,
+    /// Upgrade attempts per client prefix in 60 seconds (default 30).
+    pub upgrade_rate_per_prefix: u32,
     /// Optional TURN settings.
     pub turn: Option<TurnConfig>,
     /// Protocol timings.
@@ -156,6 +162,9 @@ impl CoreConfig {
             public_origin: public_origin.into(),
             token: token.into(),
             max_connections: 32,
+            max_unauthenticated_connections: 16,
+            max_unauthenticated_per_prefix: 4,
+            upgrade_rate_per_prefix: 30,
             turn: None,
             timings: Timings::default(),
         }

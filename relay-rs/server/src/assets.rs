@@ -10,6 +10,8 @@
 //! Dotfiles (any path segment starting with `.`) are refused too. The Go relay does not do that
 //! check; it is part of this server's spec.
 
+use base64::{Engine, engine::general_purpose::STANDARD};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use axum::body::Body;
@@ -110,13 +112,9 @@ pub async fn serve_asset(
         return redirect_to_dot_slash(query);
     }
 
-    let body = if *method == Method::HEAD {
-        Vec::new()
-    } else {
-        match tokio::fs::read(&resolved).await {
-            Ok(bytes) => bytes,
-            Err(_) => return not_found(),
-        }
+    let body = match tokio::fs::read(&resolved).await {
+        Ok(bytes) => bytes,
+        Err(_) => return not_found(),
     };
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -128,7 +126,20 @@ pub async fn serve_asset(
     if let Ok(length) = HeaderValue::from_str(&meta.len().to_string()) {
         headers.insert(header::CONTENT_LENGTH, length);
     }
-    let mut response = Response::new(Body::from(body));
+    let html = content_type(&resolved)
+        .starts_with("text/html")
+        .then(|| std::str::from_utf8(&body).ok())
+        .flatten();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_str(&content_security_policy(html)).expect("CSP is ASCII"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    let mut response = Response::new(Body::from(if *method == Method::HEAD {
+        Vec::new()
+    } else {
+        body
+    }));
     *response.headers_mut() = headers;
     response
 }
@@ -143,6 +154,23 @@ fn redirect_to_dot_slash(query: Option<&str>) -> Response {
         response.headers_mut().insert(header::LOCATION, value);
     }
     response
+}
+
+/// Hash only the inline bootstrap. Same-origin workers perform the Argon2 WebAssembly KDF.
+pub(crate) fn content_security_policy(html: Option<&str>) -> String {
+    let mut script = "script-src 'self' 'wasm-unsafe-eval'".to_owned();
+    if let Some(html) = html {
+        let normalized = html.replace("\r\n", "\n").replace('\r', "\n");
+        for tail in normalized.split("<script>").skip(1) {
+            if let Some((source, _)) = tail.split_once("</script>") {
+                let hash = STANDARD.encode(Sha256::digest(source.as_bytes()));
+                script.push_str(&format!(" 'sha256-{hash}'"));
+            }
+        }
+    }
+    format!(
+        "default-src 'self'; {script}; connect-src 'self' wss: https:; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    )
 }
 
 #[cfg(test)]

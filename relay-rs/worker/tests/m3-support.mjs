@@ -20,8 +20,8 @@ export const NTFY_TOPIC = 'm3-approvals';
 export const NTFY_TOKEN = 'm3-ntfy-token-local';
 export const TURN_HOST = 'turn.test';
 export const TURN_SECRET = 'm3-turn-secret-local-padding-to-32-bytes';
-export const TOKEN = 'm3-token-local';
-export const ADMIN = 'm3-admin-local';
+export const TOKEN = 'm3-token-local-padding-to-at-least-32-characters';
+export const ADMIN = 'm3-admin-local-padding-to-at-least-32-characters';
 export const CLIENT_IP = '203.0.113.7';
 export const VIEWER_SEED = 200;
 export const CASE_TIMEOUT_MS = 30_000;
@@ -274,7 +274,7 @@ class RawSocket {
 
 // Opens a WebSocket upgrade. Resolves { status: 101, socket } when accepted, or
 // { status, socket: null } for an HTTP refusal. Headers are set exactly as given.
-export function openSocket(port, target, { origin, cookie, ip = CLIENT_IP } = {}) {
+export function openSocket(port, target, { origin, cookie, ip = freshSocketIp() } = {}) {
   return new Promise((resolve, reject) => {
     const sock = net.connect({ host: '127.0.0.1', port });
     const lines = [
@@ -363,8 +363,8 @@ export async function browserJoin(port, pc, cookie, { who = viewerIdentity(), tu
 // Registers a host on /host-ws. With `admit` it also admits the fixed viewer identity, as a real
 // host publishes its list. The sync ping returns only after everything sent before it is applied.
 // `token` defaults to the throwaway relay token; pass null for a PC that is already registered.
-export async function registerHost(port, who, { token = TOKEN, admit = true } = {}) {
-  const socket = await openOk(port, `/host-ws?pc=${who.id}`);
+export async function registerHost(port, who, { token = TOKEN, admit = true, ip } = {}) {
+  const socket = await openOk(port, `/host-ws?pc=${who.id}`, { ip });
   const hello = { type: 'hello', role: 'host', id: who.id, public: who.publicB64 };
   if (token) hello.token = token;
   socket.sendJson(hello);
@@ -394,6 +394,14 @@ export async function dataSocket(port, target, pc, epoch, role, ticket) {
 }
 
 const live = new Set();
+
+// Independent sockets exercise independent client networks unless a case explicitly shares one.
+// Otherwise unrelated bad-token cases exhaust the shared auth limiter for later cases.
+let socketCount = 0;
+function freshSocketIp() {
+  socketCount += 1;
+  return `198.${20 + Math.floor(socketCount / 250)}.${socketCount % 250}.7`;
+}
 
 function signalGroup(pid, sig) {
   try {
@@ -453,14 +461,39 @@ export function httpRequest(
 // A top-level navigation without a cookie, as a browser sends it. The gate holds it open while the
 // approval is pending; it resolves with the 302 that admits it, or rejects when the gate drops the
 // connection. Resolves to { response, ms } or rejects with { error, ms }.
-export async function heldNavigation(port, { path: target = '/', ip = CLIENT_IP } = {}) {
+const waitCookies = new Map();
+export async function browserWaitCookie(port, ip) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const cookie = waitCookies.get(`${port}:${ip}`);
+    if (cookie) return cookie;
+    await sleep(10);
+  }
+  throw new Error('the browser did not receive its wait binding cookie');
+}
+
+export async function heldNavigation(port, { path: target = '/', ip = CLIENT_IP, cookie } = {}) {
   const started = Date.now();
   try {
-    const response = await httpRequest(port, {
-      path: target,
-      ip,
-      headers: { Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
-    });
+    const key = `${port}:${ip}`;
+    let pendingCookie = cookie ?? waitCookies.get(key);
+    let response;
+    // A browser saves the wait cookie and follows the gate's binding redirect before it holds.
+    for (let redirects = 0; redirects < 3; redirects += 1) {
+      response = await httpRequest(port, {
+        path: target,
+        ip,
+        headers: {
+          Accept: 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+          ...(pendingCookie ? { Cookie: pendingCookie } : {}),
+        },
+      });
+      const binding = (response.headers['set-cookie'] ?? [])
+        .find((value) => value.startsWith('__Host-bp_wait=') && !value.startsWith('__Host-bp_wait=;'));
+      if (response.status !== 302 || !binding) break;
+      pendingCookie = binding.split(';')[0];
+      waitCookies.set(key, pendingCookie);
+    }
     return { response, ms: Date.now() - started };
   } catch (error) {
     const dropped = new Error(`navigation dropped after ${Date.now() - started} ms: ${error.message}`);
@@ -586,7 +619,7 @@ export async function approveBrowser(relay, ntfy, ip = freshClientIp()) {
 // config rejection (500) fails the start, so the cause shows up in the log instead of in a test.
 // `ntfy` (from startNtfy) turns approvals on, and `turn` adds the TURN ICE server. `gateHoldMs`
 // shortens the gate's 30 s hold (the test-only GATE_HOLD_MS var).
-export async function startRelay({ persistDir, maxConnections = 256, ntfy = null, turn = false, gateHoldMs = null }) {
+export async function startRelay({ persistDir, maxConnections = 256, ntfy = null, turn = false, gateHoldMs = null, vars: overrides = {} }) {
   if (!existsSync(path.join(crateRoot, 'build', 'worker', 'shim.mjs'))) {
     throw new Error('build/worker/shim.mjs is missing: run worker-build --release first');
   }
@@ -605,6 +638,14 @@ export async function startRelay({ persistDir, maxConnections = 256, ntfy = null
   if (ntfy) vars.push(['NTFY_URL', ntfy.url], ['NTFY_TOPIC', NTFY_TOPIC], ['NTFY_TOKEN', NTFY_TOKEN]);
   if (turn) vars.push(['TURN_HOST', TURN_HOST], ['TURN_SECRET', TURN_SECRET]);
   if (gateHoldMs !== null) vars.push(['GATE_HOLD_MS', String(gateHoldMs)]);
+  // This suite intentionally creates more than ten approval prompts. The flood-limit case
+  // sets a smaller explicit budget on its isolated relay instead.
+  vars.push(['NTFY_PUBLISH_LIMIT', '100']);
+  for (const [name, value] of Object.entries(overrides)) {
+    const existing = vars.find((entry) => entry[0] === name);
+    if (existing) existing[1] = String(value);
+    else vars.push([name, String(value)]);
+  }
   let output = '';
   const child = spawn(
     wranglerBin,
@@ -648,7 +689,7 @@ export async function startRelay({ persistDir, maxConnections = 256, ntfy = null
       try {
         const res = await httpRequest(port, {
           path: '/healthz',
-          headers: { Authorization: `Bearer ${ADMIN}` },
+          headers: { Authorization: `Bearer ${overrides.ADMIN_TOKEN ?? ADMIN}` },
           ip: null,
         });
         if (res.status === 500) {

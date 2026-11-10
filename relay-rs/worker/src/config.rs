@@ -3,7 +3,8 @@
 
 use bp_device_key::relay_origin;
 use bp_relay_core::gate::{
-    GATE_HOLD_MS, GateConfig, MAX_APPROVAL_TTL_SECS, MIN_APPROVAL_TTL_SECS, NtfyConfig,
+    DEFAULT_AUTH_FAILURE_RATE, DEFAULT_NTFY_RATE, GATE_HOLD_MS, GateConfig, MAX_APPROVAL_TTL_SECS,
+    MIN_APPROVAL_TTL_SECS, NtfyConfig, RateLimit,
 };
 use bp_relay_core::relay::{CoreConfig, TurnConfig};
 use worker::url::Host;
@@ -75,11 +76,19 @@ pub fn load(env: &Env) -> Result<Settings, String> {
 
     let mut core = CoreConfig::new(public_origin.clone(), token);
     core.max_connections = max_connections;
+    core.max_unauthenticated_connections =
+        positive_usize(env, "MAX_UNAUTHENTICATED_CONNECTIONS", 16)?;
+    core.max_unauthenticated_per_prefix = positive_usize(env, "MAX_UNAUTHENTICATED_PER_PREFIX", 4)?;
+    core.upgrade_rate_per_prefix =
+        u32::try_from(positive_usize(env, "UPGRADE_RATE_PER_PREFIX", 30)?)
+            .map_err(|_| "UPGRADE_RATE_PER_PREFIX is too large".to_owned())?;
     core.turn = turn;
     let gate = GateConfig {
         public_origin,
         approval_ttl_secs,
         ntfy,
+        ntfy_rate: rate_limit(env, "NTFY_PUBLISH", DEFAULT_NTFY_RATE)?,
+        auth_failure_rate: rate_limit(env, "AUTH_FAILURE", DEFAULT_AUTH_FAILURE_RATE)?,
     };
     bp_relay_core::log::register_secret(&admin_token);
     Ok(Settings {
@@ -158,7 +167,10 @@ fn ntfy_config(env: &Env) -> Result<NtfyConfig, String> {
     let token = match optional_secret(env, "NTFY_TOKEN") {
         None => None,
         Some(value) if value.is_empty() => return Err("NTFY_TOKEN is empty".to_owned()),
-        Some(value) => Some(value),
+        Some(value) => {
+            bp_relay_core::log::register_secret(&value);
+            Some(value)
+        }
     };
     Ok(NtfyConfig { url, topic, token })
 }
@@ -177,8 +189,34 @@ fn required_var(env: &Env, name: &str) -> Result<String, String> {
 
 fn required_secret(env: &Env, name: &str) -> Result<String, String> {
     let value = optional_secret(env, name).ok_or_else(|| format!("{name} is not set"))?;
-    if value.is_empty() {
-        return Err(format!("{name} is empty"));
+    if value.chars().count() < 32 {
+        return Err(format!(
+            "{name} must be at least 32 characters; generate a fresh token with openssl rand -hex 32"
+        ));
     }
     Ok(value)
+}
+
+fn positive_usize(env: &Env, name: &str, default: usize) -> Result<usize, String> {
+    match optional_var(env, name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("{name} must be a positive whole number")),
+    }
+}
+
+fn rate_limit(env: &Env, prefix: &str, default: RateLimit) -> Result<RateLimit, String> {
+    let limit_name = format!("{prefix}_LIMIT");
+    let window_name = format!("{prefix}_WINDOW_S");
+    let limit = positive_usize(env, &limit_name, default.limit as usize)?;
+    let limit = u32::try_from(limit).map_err(|_| format!("{limit_name} is too large"))?;
+    let seconds = positive_usize(env, &window_name, (default.window_ms / 1_000) as usize)?;
+    let window_ms = u64::try_from(seconds)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .ok_or_else(|| format!("{window_name} is too large"))?;
+    Ok(RateLimit { limit, window_ms })
 }

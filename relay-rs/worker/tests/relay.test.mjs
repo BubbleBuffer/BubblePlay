@@ -5,6 +5,7 @@
 // from relay-rs/server/tests.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -25,6 +26,7 @@ import {
   expectDropped,
   heldNavigation,
   browserJoin,
+  browserWaitCookie,
   dataSocket,
   freshClientIp,
   httpRequest,
@@ -107,6 +109,159 @@ function authHost(host) {
 }
 
 // M3-A cases (names kept from the stub).
+
+test('m3 config rejects short registration and admin tokens with a generation hint', { timeout: RESTART_TIMEOUT_MS }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bp-relay-m3-short-token-'));
+  try {
+    for (const name of ['RELAY_TOKEN', 'ADMIN_TOKEN']) {
+      await assert.rejects(
+        startRelay({ persistDir: dir, vars: { [name]: 'x'.repeat(31) } }),
+        new RegExp(`${name} must be at least 32 characters; generate a fresh token with openssl rand -hex 32`),
+      );
+    }
+    await withRelay(dir, async (instance) => {
+      const response = await httpRequest(instance.port, {
+        path: '/healthz', headers: { Authorization: `Bearer ${'a'.repeat(32)}` },
+      });
+      assert.equal(response.status, 200, 'exactly 32 characters is accepted');
+    }, { vars: { RELAY_TOKEN: 'r'.repeat(32), ADMIN_TOKEN: 'a'.repeat(32) } });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('m3 health and admin bearer failures share a prefix budget with relay token failures', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const ip = freshClientIp();
+  for (const target of ['/healthz', '/__gate/manage/pcs']) {
+    assert.equal((await httpRequest(relay.port, {
+      path: target, ip, headers: { Authorization: 'Bearer wrong' },
+    })).status, 404);
+  }
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const socket = await openOk(relay.port, `/host-version-ws?pc=${identity(110).id}`, { ip });
+    socket.sendJson({ type: 'hello', role: 'version-probe', token: 'wrong' });
+    assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: 'invalid hello' });
+    socket.close();
+  }
+  for (const target of ['/healthz', '/__gate/manage/pcs']) {
+    assert.equal((await httpRequest(relay.port, {
+      path: target, ip, headers: { Authorization: `Bearer ${ADMIN}` },
+    })).status, 404, 'valid credentials remain blocked until this prefix budget resets');
+  }
+  const other = await httpRequest(relay.port, {
+    path: '/healthz', ip: freshClientIp(), headers: { Authorization: `Bearer ${ADMIN}` },
+  });
+  assert.equal(other.status, 200, 'an independent prefix is unaffected');
+});
+
+test('m3 unauthenticated frames over 64 KiB close before hello processing', { timeout: CASE_TIMEOUT_MS }, async () => {
+  for (const kind of ['text', 'binary']) {
+    const socket = await openOk(relay.port, `/ws?pc=${identity(111).id}`);
+    if (kind === 'text') socket.sendRawText('x'.repeat(64 * 1024 + 1));
+    else socket.sendBinary(Buffer.alloc(64 * 1024 + 1));
+    assert.deepEqual(await socket.expectClose(10_000), { code: 1009, reason: 'message too large' });
+    socket.close();
+  }
+});
+
+test('m3 preauth prefix capacity is independent of established sockets', { timeout: RESTART_TIMEOUT_MS }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bp-relay-m3-preauth-cap-'));
+  try {
+    await withRelay(dir, async (instance) => {
+      const ip = freshClientIp();
+      const host = await registerHost(instance.port, identity(116), { ip });
+      const pending = await openOk(instance.port, `/ws?pc=${identity(112).id}`, { ip });
+      const refused = await openSocket(instance.port, `/ws?pc=${identity(113).id}`, { ip });
+      assert.equal(refused.status, 404);
+      const gateRefused = await openSocket(instance.port, `/ws?pc=${identity(113).id}`, {
+        ip, origin: instance.origin,
+      });
+      assert.equal(gateRefused.status, 404, 'a gate refusal cannot bypass occupied preauth slots');
+      const independent = await openOk(instance.port, `/ws?pc=${identity(114).id}`, { ip: freshClientIp() });
+      independent.close();
+      pending.close();
+      host.socket.close();
+    }, { vars: { MAX_UNAUTHENTICATED_PER_PREFIX: 1 } });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('m3 gate-refused upgrades share the prefix rate budget and release their preauth slots', { timeout: RESTART_TIMEOUT_MS }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bp-relay-m3-upgrade-rate-'));
+  try {
+    await withRelay(dir, async (instance) => {
+      const ip = freshClientIp();
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const socket = await openOk(instance.port, `/ws?pc=${identity(115).id}`, {
+          ip, origin: instance.origin,
+        });
+        assert.deepEqual(await socket.expectClose(10_000), { code: 1008, reason: 'not approved' });
+        socket.close();
+      }
+      for (const origin of [instance.origin, undefined]) {
+        assert.equal((await openSocket(instance.port, `/ws?pc=${identity(115).id}`, { ip, origin })).status, 404);
+      }
+    }, { vars: { UPGRADE_RATE_PER_PREFIX: 2, MAX_UNAUTHENTICATED_PER_PREFIX: 1 } });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('m3 the ntfy publish budget limits prompts across client prefixes', { timeout: RESTART_TIMEOUT_MS }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bp-relay-m3-ntfy-budget-'));
+  try {
+    await withRelay(dir, async (instance) => {
+      const before = ntfy.count();
+      for (let prompt = 0; prompt < 2; prompt += 1) {
+        const ip = freshClientIp();
+        const response = await httpRequest(instance.port, {
+          path: '/', ip, headers: { 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
+        });
+        assert.equal(response.status, 302);
+        assert.ok(response.headers['set-cookie'].some((value) => value.startsWith('__Host-bp_wait=')));
+        const prefix = `${ip.split('.').slice(0, 3).join('.')}.0/24`;
+        await ntfy.waitFor(before, (publish) => publish.body?.message?.includes(prefix));
+      }
+      const rejected = await httpRequest(instance.port, {
+        path: '/', ip: freshClientIp(), headers: { 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
+      });
+      assert.equal(rejected.status, 403);
+      assert.equal(rejected.headers['set-cookie'], undefined);
+      assert.equal(ntfy.count() - before, 2);
+    }, { ntfy, vars: { NTFY_PUBLISH_LIMIT: 2 } });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('m3 configured ntfy tokens are redacted from structured relay logs', { timeout: RESTART_TIMEOUT_MS }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'bp-relay-m3-ntfy-redaction-'));
+  try {
+    // Use a literal that a normal refusal log contains, to exercise the registration net
+    // through the production config loader and console sink without logging peer messages.
+    await withRelay(dir, async (instance) => {
+      const socket = await openOk(instance.port, `/ws?pc=${identity(117).id}`);
+      socket.sendRawText('{');
+      await socket.expectClose(10_000);
+      socket.close();
+      let lines = [];
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        lines = instance.log().split('\n').filter((line) => line.includes('"class":"hello.malformed"'));
+        if (lines.length) break;
+        await sleep(50);
+      }
+      assert.ok(lines.length, 'a production refusal reached the structured console sink');
+      for (const line of lines) {
+        assert.ok(!line.includes('invalid hello'), 'the configured ntfy token never leaves the logger');
+        assert.ok(line.includes('[redacted]'));
+      }
+    }, { ntfy, vars: { NTFY_TOKEN: 'invalid hello' } });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 // M3-C2 replaces the M3-A 404: with the gate wired, a top-level navigation without a cookie is
 // held open with no page, and with no decision it is dropped when the hold ends: the connection
@@ -509,7 +664,8 @@ test('m3 a held viewer opens one ntfy approval naming only the client prefix, an
   assert.ok(!sent.includes(ip), 'ntfy names the prefix, not the client address');
 
   // A second navigation from the prefix joins the same approval: no second publish.
-  const joined = heldNavigation(relay.port, { path: '/', ip });
+  const waitCookie = await browserWaitCookie(relay.port, ip);
+  const joined = heldNavigation(relay.port, { path: '/', ip, cookie: waitCookie });
   joined.catch(() => {});
   const deny = publish.body.actions[1].headers.Authorization.replace(/^Bearer /, '');
   await decide(relay.port, deny, 'deny', ip);
@@ -520,7 +676,7 @@ test('m3 a held viewer opens one ntfy approval naming only the client prefix, an
   assert.equal(ntfy.count() - before, 1, 'the joined navigation opened no second approval');
 });
 
-test('m3 an approval after the hold is claimed once by the next navigation', { timeout: CASE_TIMEOUT_MS }, async () => {
+test('m3 an approval after the hold is claimed once by the bound browser', { timeout: CASE_TIMEOUT_MS }, async () => {
   const ip = freshClientIp();
   const before = ntfy.count();
   const first = heldNavigation(relay.port, { path: '/', ip });
@@ -533,6 +689,10 @@ test('m3 an approval after the hold is claimed once by the next navigation', { t
   await expectDropped(first);
   const approve = publish.body.actions[0].headers.Authorization.replace(/^Bearer /, '');
   await decide(relay.port, approve, 'approve', ip);
+  await expectDropped(httpRequest(relay.port, {
+    path: '/?a=stolen', ip,
+    headers: { 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' },
+  }).then((response) => ({ response, ms: 0 })));
   const { response, ms } = await heldNavigation(relay.port, { path: '/?a=1', ip });
   assert.equal(response.status, 302);
   assert.ok(ms < GATE_HOLD_MS, 'the claim is answered at once');
@@ -540,6 +700,20 @@ test('m3 an approval after the hold is claimed once by the next navigation', { t
   assert.ok(gateCookieOf(response), 'the reload claims the cookie');
   // Claimed once: the next navigation from the prefix is dropped (the decision's cooldown).
   await expectDropped(heldNavigation(relay.port, { path: '/', ip }));
+});
+
+test('m3 only navigate mode and document destination can open an approval', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const before = ntfy.count();
+  for (const headers of [
+    { 'Sec-Fetch-Dest': 'document' },
+    { 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'cors' },
+    { 'Sec-Fetch-Dest': 'empty', 'Sec-Fetch-Mode': 'navigate' },
+  ]) {
+    const response = await httpRequest(relay.port, { path: '/', ip: freshClientIp(), headers });
+    assert.equal(response.status, 403);
+    assert.equal(response.headers['set-cookie'], undefined);
+  }
+  assert.equal(ntfy.count(), before);
 });
 
 test('m3 approval grants the gate cookie, and the page is served with it', { timeout: CASE_TIMEOUT_MS }, async () => {
@@ -772,6 +946,27 @@ test('m3 static files are served with the cookie, and HEAD has no body', { timeo
   const head = await httpRequest(relay.port, { method: 'HEAD', path: '/', headers: { Cookie: cookie } });
   assert.equal(head.status, 200);
   assert.equal(head.body.length, 0);
+  for (const response of [index, css, head]) {
+    assert.equal(response.headers['x-frame-options'], 'DENY');
+    const policy = response.headers['content-security-policy'];
+    for (const directive of [
+      "default-src 'self'", "connect-src 'self' wss: https:", "img-src 'self' data: blob:",
+      "media-src 'self' blob:", "style-src 'self' 'unsafe-inline'", "worker-src 'self' blob:",
+      "frame-ancestors 'none'", "base-uri 'none'", "form-action 'self'",
+    ]) assert.ok(policy.split('; ').includes(directive), directive);
+    const scripts = policy.split('; ').find((part) => part.startsWith('script-src '));
+    assert.match(scripts, /'self'/);
+    assert.match(scripts, /'wasm-unsafe-eval'/, 'Argon2 WASM remains allowed');
+    assert.ok(!scripts.includes("'unsafe-inline'") && !scripts.includes("'unsafe-eval'"));
+  }
+  const html = index.body.toString('utf8').replace(/\r\n?/g, '\n');
+  const inline = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assert.ok(inline.length > 0, 'the compatibility assertion covers the real inline bootstrap');
+  for (const [, source] of inline) {
+    const hash = crypto.createHash('sha256').update(source).digest('base64');
+    assert.ok(index.headers['content-security-policy'].includes(`'sha256-${hash}'`));
+  }
+  assert.equal(head.headers['content-security-policy'], index.headers['content-security-policy']);
 });
 
 test('m3 static traversal, dotfile and backslash paths are 404, and POST is 404', { timeout: CASE_TIMEOUT_MS }, async () => {

@@ -3,8 +3,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::ConnectInfo;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 use crate::app::router;
 use crate::config::Config;
@@ -29,10 +35,27 @@ pub async fn run(cfg: &Config, listener: TcpListener) -> Result<(), ServeError> 
     );
     let shared = Arc::new(Shared::new(cfg)?);
     let _ticker = AbortOnDrop(spawn_ticker(shared.clone()));
-    let app = router(shared).into_make_service_with_connect_info::<SocketAddr>();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let app = router(shared);
+    let mut connections = JoinSet::new();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            Some(_) = connections.join_next(), if !connections.is_empty() => {},
+            accepted = listener.accept() => {
+                let (socket, peer) = accepted?;
+                let service = TowerToHyperService::new(app.clone().layer(axum::Extension(ConnectInfo::<SocketAddr>(peer))));
+                connections.spawn(async move {
+                    let mut builder = http1::Builder::new();
+                    builder.timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(10));
+                    let _ = builder.serve_connection(TokioIo::new(socket), service).with_upgrades().await;
+                });
+            }
+        }
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
     tracing::info!("relay stopped");
     Ok(())
 }

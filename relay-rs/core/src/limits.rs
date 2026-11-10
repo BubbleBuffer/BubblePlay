@@ -31,6 +31,9 @@ pub const FILE_LIMIT: usize = 64 * 1024 + FILE_HEADER_BYTES;
 /// Hello and any other pre-authentication message: 16 KiB.
 pub const HELLO_LIMIT: usize = 16 * 1024;
 
+/// Transport read limit before authentication, independent of the socket route.
+pub const PREAUTH_READ_LIMIT: usize = 64 * 1024;
+
 /// Media-control text on a media socket (`validMediaControl`).
 pub const MEDIA_CONTROL_MAX: usize = 512;
 

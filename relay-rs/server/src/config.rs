@@ -68,6 +68,14 @@ pub struct Config {
     pub token: Secret,
     pub admin_token: Secret,
     pub max_connections: u32,
+    pub max_unauthenticated_connections: u32,
+    pub max_unauthenticated_per_prefix: u32,
+    pub upgrade_rate_per_prefix: u32,
+    pub ntfy_publish_limit: u32,
+    pub ntfy_publish_window_s: u32,
+    pub auth_failure_limit: u32,
+    pub auth_failure_window_s: u32,
+
     pub turn: Option<Turn>,
     pub ntfy: Option<Ntfy>,
     pub approval_ttl_s: u32,
@@ -102,6 +110,13 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+fn positive(field: &str, value: Option<u32>, default: u32) -> Result<u32, ConfigError> {
+    value
+        .filter(|v| *v > 0)
+        .or_else(|| value.is_none().then_some(default))
+        .ok_or_else(|| invalid(field, "must be at least 1"))
+}
+
 fn invalid(field: &str, reason: impl Into<String>) -> ConfigError {
     ConfigError::Invalid {
         field: field.to_string(),
@@ -119,6 +134,14 @@ struct RawConfig {
     token: Option<String>,
     admin_token: Option<String>,
     max_connections: Option<u32>,
+    max_unauthenticated_connections: Option<u32>,
+    max_unauthenticated_per_prefix: Option<u32>,
+    upgrade_rate_per_prefix: Option<u32>,
+    ntfy_publish_limit: Option<u32>,
+    ntfy_publish_window_s: Option<u32>,
+    auth_failure_limit: Option<u32>,
+    auth_failure_window_s: Option<u32>,
+
     turn: Option<RawTurn>,
     ntfy: Option<RawNtfy>,
     approval_ttl_s: Option<u32>,
@@ -185,6 +208,23 @@ pub fn parse_config(
         return Err(invalid("max_connections", "must be at least 1"));
     }
 
+    let max_unauthenticated_connections = positive(
+        "max_unauthenticated_connections",
+        raw.max_unauthenticated_connections,
+        16,
+    )?;
+    let max_unauthenticated_per_prefix = positive(
+        "max_unauthenticated_per_prefix",
+        raw.max_unauthenticated_per_prefix,
+        4,
+    )?;
+    let upgrade_rate_per_prefix =
+        positive("upgrade_rate_per_prefix", raw.upgrade_rate_per_prefix, 30)?;
+    let ntfy_publish_limit = positive("ntfy_publish_limit", raw.ntfy_publish_limit, 10)?;
+    let ntfy_publish_window_s = positive("ntfy_publish_window_s", raw.ntfy_publish_window_s, 600)?;
+    let auth_failure_limit = positive("auth_failure_limit", raw.auth_failure_limit, 5)?;
+    let auth_failure_window_s = positive("auth_failure_window_s", raw.auth_failure_window_s, 600)?;
+
     let approval_ttl_s = raw.approval_ttl_s.unwrap_or(DEFAULT_APPROVAL_TTL_S);
     if !(30..=120).contains(&approval_ttl_s) {
         return Err(invalid("approval_ttl_s", "must be 30..120 seconds"));
@@ -212,6 +252,14 @@ pub fn parse_config(
         token,
         admin_token,
         max_connections,
+        max_unauthenticated_connections,
+        max_unauthenticated_per_prefix,
+        upgrade_rate_per_prefix,
+        ntfy_publish_limit,
+        ntfy_publish_window_s,
+        auth_failure_limit,
+        auth_failure_window_s,
+
         turn,
         ntfy,
         approval_ttl_s,
@@ -272,7 +320,7 @@ fn secret_field(
         if value.is_empty() {
             return Err(invalid(env_name, "is set but empty"));
         }
-        return Ok(Secret::new(value));
+        return strong_secret(env_name, value);
     }
     match file_value {
         None => Err(invalid(
@@ -280,8 +328,18 @@ fn secret_field(
             format!("is required; set it in relay.json or in {env_name}"),
         )),
         Some(value) if value.is_empty() => Err(invalid(field, "is empty")),
-        Some(value) => Ok(Secret::new(value)),
+        Some(value) => strong_secret(field, value),
     }
+}
+
+fn strong_secret(field: &str, value: String) -> Result<Secret, ConfigError> {
+    if value.chars().count() < 32 {
+        return Err(invalid(
+            field,
+            "must be at least 32 characters; generate fresh 256-bit secrets with bp-relay init <path>",
+        ));
+    }
+    Ok(Secret::new(value))
 }
 
 fn parse_turn(raw: RawTurn) -> Result<Turn, ConfigError> {
@@ -335,7 +393,7 @@ mod tests {
     use super::*;
 
     fn base() -> String {
-        r#"{"public_origin":"https://relay.example.com","token":"tok-one","admin_token":"adm-one"}"#
+        r#"{"public_origin":"https://relay.example.com","token":"tok-onexxxxxxxxxxxxxxxxxxxxxxxxx","admin_token":"adm-onexxxxxxxxxxxxxxxxxxxxxxxxx"}"#
             .to_string()
     }
 
@@ -351,6 +409,30 @@ mod tests {
         match result {
             Ok(_) => panic!("expected a validation error"),
             Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn short_secrets_are_refused_in_file_and_environment() {
+        for field in ["token", "admin_token"] {
+            let mut value: serde_json::Value = serde_json::from_str(&base()).unwrap();
+            value[field] = "x".repeat(31).into();
+            let message = error_text(parse(&value.to_string()));
+            assert!(
+                message.starts_with(&format!("{field}:"))
+                    && message.contains("32 characters")
+                    && message.contains("init"),
+                "{message}"
+            );
+        }
+        for field in [ENV_TOKEN, ENV_ADMIN_TOKEN] {
+            let message = error_text(parse_config(&base(), &|name| {
+                (name == field).then(|| "short".into())
+            }));
+            assert!(
+                message.starts_with(field) && message.contains("init"),
+                "{message}"
+            );
         }
     }
 
@@ -403,13 +485,13 @@ mod tests {
     #[test]
     fn env_overrides_both_secrets() {
         let env = |name: &str| match name {
-            ENV_TOKEN => Some("env-token".to_string()),
-            ENV_ADMIN_TOKEN => Some("env-admin".to_string()),
+            ENV_TOKEN => Some("env-tokenxxxxxxxxxxxxxxxxxxxxxxx".to_string()),
+            ENV_ADMIN_TOKEN => Some("env-adminxxxxxxxxxxxxxxxxxxxxxxx".to_string()),
             _ => None,
         };
         let cfg = parse_config(&base(), &env).unwrap();
-        assert_eq!(cfg.token.expose(), "env-token");
-        assert_eq!(cfg.admin_token.expose(), "env-admin");
+        assert_eq!(cfg.token.expose(), "env-tokenxxxxxxxxxxxxxxxxxxxxxxx");
+        assert_eq!(cfg.admin_token.expose(), "env-adminxxxxxxxxxxxxxxxxxxxxxxx");
     }
 
     #[test]
@@ -429,8 +511,14 @@ mod tests {
     fn debug_output_never_shows_secrets() {
         let cfg = parse(&base()).unwrap();
         let shown = format!("{cfg:?}");
-        assert!(!shown.contains("tok-one"), "{shown}");
-        assert!(!shown.contains("adm-one"), "{shown}");
+        assert!(
+            !shown.contains("tok-onexxxxxxxxxxxxxxxxxxxxxxxxx"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("adm-onexxxxxxxxxxxxxxxxxxxxxxxxx"),
+            "{shown}"
+        );
     }
 
     #[test]

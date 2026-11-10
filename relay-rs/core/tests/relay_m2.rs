@@ -344,7 +344,7 @@ fn m2_unlisted_viewer_is_refused_with_a_reason() {
 }
 
 #[test]
-fn m2_challenge_expires_after_30_seconds() {
+fn m2_challenge_expires_at_10_seconds() {
     let mut h = Harness::new();
     let host = host_up(&mut h);
     let (id, _) = viewer_start(
@@ -352,12 +352,12 @@ fn m2_challenge_expires_after_30_seconds() {
         &host.pc,
         &viewer_hello_msg(&viewer_identity(), false),
     );
-    let actions = h.advance(30_001);
+    let actions = h.advance(10_000);
     assert!(refused(&actions, id, "timed out"));
 }
 
 #[test]
-fn m2_proof_at_29_seconds_is_accepted() {
+fn m2_proof_just_before_10_seconds_is_accepted() {
     let mut h = Harness::new();
     let host = host_up(&mut h);
     let (id, nonce) = viewer_start(
@@ -365,7 +365,7 @@ fn m2_proof_at_29_seconds_is_accepted() {
         &host.pc,
         &viewer_hello_msg(&viewer_identity(), false),
     );
-    h.advance(29_000);
+    h.advance(9_999);
     let actions = h.text(id, &viewer_proof_msg(&viewer_identity(), ORIGIN, &nonce));
     assert!(hello_ok(&actions, id).get("ticket").is_some());
 }
@@ -388,7 +388,7 @@ fn m2_hello_without_a_challenge_answer_is_closed_1008_with_a_reason() {
     let id = h.upgrade(req(Route::Ws, Some(&host.pc), None, true));
     let hello_actions = h.text(id, &viewer_hello_msg(&viewer_identity(), false));
     assert!(challenge_nonce(&hello_actions, id).is_some());
-    let timeout_actions = h.advance(30_000);
+    let timeout_actions = h.advance(10_000);
     assert_eq!(
         timeout_actions,
         vec![Action::Close(id, 1008, "timed out".to_owned())]
@@ -407,7 +407,7 @@ fn m2_host_challenge_timeout_keeps_the_invalid_hello_reason() {
     let mut h = Harness::new();
     let (id, actions) = h.host_hello(&identity(1), Some(TOKEN));
     assert!(challenge_nonce(&actions, id).is_some());
-    let out = h.advance(30_000);
+    let out = h.advance(10_000);
     assert_eq!(
         out,
         vec![Action::Close(id, 1008, "invalid hello".to_owned())]
@@ -821,6 +821,11 @@ fn m2_full_prefix_map_refuses_new_prefixes_and_keeps_tracked_ones() {
     // 4096 distinct prefixes, one failure each. The window is reopened every
     // 19 attempts so the twentieth failure never drops it.
     for i in 0..4096u16 {
+        // Keep this pairing-table test below the independent upgrade-table cap.
+        if i == 2048 {
+            h.advance(60_000);
+            h.text(host.id, &json!({"type": "ping"}));
+        }
         if i.is_multiple_of(19) {
             send_pair_open(&mut h, host.id, &PAIR_VALUE);
         }

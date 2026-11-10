@@ -16,6 +16,7 @@ const MAX_FORWARDED_HOPS: usize = 16;
 pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted_proxy_cidrs: &[IpNet]) -> IpAddr {
     let peer_ip = peer.ip();
     if !trusted_proxy_cidrs.iter().any(|net| net.contains(&peer_ip)) {
+        warn_untrusted_forwarding(peer_ip, headers);
         return peer_ip;
     }
     let raw = headers
@@ -38,6 +39,29 @@ pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted_proxy_cidrs: &[I
         }
     }
     peer_ip
+}
+
+/// A global one-per-minute warning avoids turning an untrusted header into a log flood.
+fn warn_untrusted_forwarding(peer: IpAddr, headers: &HeaderMap) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_WARNING_MS: AtomicU64 = AtomicU64::new(0);
+    if !headers.contains_key("x-forwarded-for") && !headers.contains_key("forwarded") {
+        return;
+    }
+    let now = crate::runtime::now_ms();
+    let next = NEXT_WARNING_MS.load(Ordering::Relaxed);
+    if now >= next
+        && NEXT_WARNING_MS
+            .compare_exchange(
+                next,
+                now.saturating_add(60_000),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        tracing::warn!(peer_ip = %peer, setting = "trusted_proxy_cidrs", "forwarding header from untrusted peer; configure trusted_proxy_cidrs behind a reverse proxy");
+    }
 }
 
 #[cfg(test)]

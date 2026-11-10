@@ -153,6 +153,10 @@ impl Shared {
         };
         let mut core = CoreConfig::new(cfg.public_origin.clone(), cfg.token.expose());
         core.max_connections = cfg.max_connections as usize;
+        core.max_unauthenticated_connections = cfg.max_unauthenticated_connections as usize;
+        core.max_unauthenticated_per_prefix = cfg.max_unauthenticated_per_prefix as usize;
+        core.upgrade_rate_per_prefix = cfg.upgrade_rate_per_prefix;
+
         core.turn = cfg.turn.as_ref().map(|turn| TurnConfig {
             host: turn.host.clone(),
             secret: turn.secret.expose().to_string(),
@@ -161,6 +165,14 @@ impl Shared {
         let gate_config = GateConfig {
             public_origin: cfg.public_origin.clone(),
             approval_ttl_secs: u64::from(cfg.approval_ttl_s),
+            ntfy_rate: bp_relay_core::gate::RateLimit {
+                limit: cfg.ntfy_publish_limit,
+                window_ms: u64::from(cfg.ntfy_publish_window_s) * 1000,
+            },
+            auth_failure_rate: bp_relay_core::gate::RateLimit {
+                limit: cfg.auth_failure_limit,
+                window_ms: u64::from(cfg.auth_failure_window_s) * 1000,
+            },
             ntfy: cfg.ntfy.as_ref().map(|ntfy| NtfyConfig {
                 url: ntfy.url.clone(),
                 topic: ntfy.topic.clone(),

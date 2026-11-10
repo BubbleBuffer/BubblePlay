@@ -21,7 +21,7 @@ fn presence_get_is_allowed_without_cookie_and_opens_nothing() {
     let mut rng = TestRng::new(300);
     for dest in [None, Some("document"), Some("empty")] {
         for n in 0..5 {
-            let verdict = gate.handle(&mut rng, &presence("GET", dest, T0 + n));
+            let verdict = navigate_request(&mut gate, &mut rng, &presence("GET", dest, T0 + n));
             assert_eq!(verdict, Verdict::Allow, "dest {dest:?}");
         }
     }
@@ -38,29 +38,46 @@ fn presence_with_foreign_origin_is_refused() {
     let mut rng = TestRng::new(301);
     let mut request = presence("GET", None, T0);
     request.origin = Some("https://evil.example");
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
     let mut request = presence("GET", None, T0);
     request.origin = Some(ORIGIN);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Allow);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Allow
+    );
 }
 
 #[test]
 fn other_methods_and_paths_keep_gate_behaviour() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(302);
-    let (response, effects) = handled_parts(gate.handle(&mut rng, &presence("POST", None, T0)));
+    let (response, effects) = handled_parts(navigate_request(
+        &mut gate,
+        &mut rng,
+        &presence("POST", None, T0),
+    ));
     assert_eq!(response.status, 403);
     assert!(effects.is_empty());
-    assert!(is_drop(&gate.handle(&mut rng, &presence("HEAD", None, T0))));
+    assert!(is_drop(&navigate_request(
+        &mut gate,
+        &mut rng,
+        &presence("HEAD", None, T0)
+    )));
     // Near misses are ordinary gated paths: a cookieless navigation holds.
     for path in ["/presence/", "/presenceX", "/Presence"] {
         let mut gate = new_gate();
-        let verdict = gate.handle(&mut rng, &req("GET", path, CLIENT, T0));
+        let verdict = navigate_request(&mut gate, &mut rng, &req("GET", path, CLIENT, T0));
         assert!(matches!(verdict, Verdict::Hold(..)), "{path}");
     }
     // A websocket on the path is not a presence query.
     let mut request = presence("GET", None, T0);
     request.websocket = true;
     request.origin = Some(ORIGIN);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }

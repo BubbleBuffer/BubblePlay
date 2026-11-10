@@ -344,12 +344,13 @@ fn gate_decision_without_authorization_answers_204() {
         origin: None,
         cookie: None,
         authorization: None,
+        sec_fetch_mode: None,
         sec_fetch_dest: None,
         body: b"approve",
         client_ip: ip(DECIDER),
         now_ms: T0 + 2_000,
     };
-    let (response, _) = handled_parts(gate.handle(&mut rng, &request));
+    let (response, _) = handled_parts(navigate_request(&mut gate, &mut rng, &request));
     assert_eq!(response.status, 204);
 }
 
@@ -379,7 +380,8 @@ fn gate_held_request_checked_after_a_claim_is_dropped() {
         DECIDER,
         T0 + 2_000,
     );
-    // A navigation from another address in the prefix claims the approval
+    rng.copy_wait_cookie(CLIENT, "203.0.113.8");
+    // The same browser at another address in the prefix claims the approval
     // before the held request looks at it.
     let (response, _) = handled_parts(get(&mut gate, &mut rng, "203.0.113.8", T0 + 2_500));
     assert_eq!(response.status, 302);
@@ -402,7 +404,7 @@ fn gate_forget_clears_the_cookie_and_its_record() {
         cookie: Some(&cookie),
         ..req("POST", "/__gate/forget", CLIENT, T0 + 10_000)
     };
-    let (response, effects) = handled_parts(gate.handle(&mut rng, &request));
+    let (response, effects) = handled_parts(navigate_request(&mut gate, &mut rng, &request));
     assert_eq!(response.status, 204);
     let set = header(&response, "Set-Cookie").expect("clearing cookie");
     assert!(set.starts_with("__Host-gate=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax"));
@@ -425,7 +427,7 @@ fn gate_public_origin_trailing_slash_is_stripped() {
     let mut rng = TestRng::new(121);
     let mut request = req("GET", "/", CLIENT, T0);
     request.origin = Some(ORIGIN);
-    let (_, effects) = hold_parts(gate.handle(&mut rng, &request));
+    let (_, effects) = hold_parts(navigate_request(&mut gate, &mut rng, &request));
     let json = ntfy_json(&effects[0]);
     assert_eq!(
         json["actions"][0]["url"],

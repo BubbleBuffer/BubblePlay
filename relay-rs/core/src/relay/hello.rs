@@ -177,6 +177,9 @@ impl Relay {
     /// the log class and picks the reason a viewer is told (see `viewer_reason`).
     /// Hosts and the version probe keep Go's "invalid hello".
     pub(super) fn hello_refused(&mut self, id: ConnId, class: &'static str, out: &mut Vec<Action>) {
+        if class == "hello.bad-token" {
+            self.bad_token_failure = Some(id);
+        }
         let reason = match (self.conns.get(&id).map(|c| c.role), class) {
             (Some(Role::Viewer), _) => viewer_reason(class),
             (_, "timeout.hello") => reasons::TIMED_OUT,
@@ -216,6 +219,9 @@ impl Relay {
     fn version_probe(&mut self, id: ConnId, m: &Map<String, Value>, out: &mut Vec<Action>) {
         if !self.token_matches(util::text_of(m, "token")) {
             self.hello_refused(id, "hello.bad-token", out);
+            return;
+        }
+        if !self.admit_capacity(id, out) {
             return;
         }
         self.send_text(id, json!({"type": "hello-ok"}).to_string(), out);
@@ -295,6 +301,9 @@ impl Relay {
         rng: &mut dyn RelayRng,
         out: &mut Vec<Action>,
     ) {
+        if !self.admit_capacity(id, out) {
+            return;
+        }
         // Re-registration keeps the admission list and the remote-pairing flag.
         let (first_seen, admitted, remote_pairing) = match self.pcs.records.get(pc) {
             Some(record) => (
@@ -419,6 +428,9 @@ impl Relay {
         let Some(pc) = self.conns.get(&id).map(|c| c.pc.clone()) else {
             return;
         };
+        if !self.admit_capacity(id, out) {
+            return;
+        }
         let key = key_for(Role::Viewer, "", &pc);
         if let Some(old) = self.peers.get(&key).copied().filter(|old| *old != id) {
             self.evict(old, 1008, "peer replaced", "peer.replaced", out);
@@ -507,6 +519,9 @@ impl Relay {
         }
         if self.current_epoch(&conn.pc) != Some(conn.epoch.as_str()) {
             self.auth_refused(id, "epoch.stale", out);
+            return;
+        }
+        if !self.admit_capacity(id, out) {
             return;
         }
         let key = key_for(conn.role, &conn.epoch, &conn.pc);
