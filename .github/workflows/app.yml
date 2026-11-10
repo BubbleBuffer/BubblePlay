@@ -102,17 +102,6 @@ jobs:
           else
             flutter test
           fi
-      - name: Package golden pictures for commit
-        if: ${{ inputs.update_goldens }}
-        run: tar -cf app-goldens-for-commit.tar -C app/test/screens goldens
-      - name: Transfer golden pictures for commit
-        if: ${{ inputs.update_goldens }}
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
-        with:
-          name: app-goldens-for-commit
-          path: app-goldens-for-commit.tar
-          if-no-files-found: error
-          retention-days: 1
       - name: Upload golden pictures
         if: ${{ inputs.update_goldens }}
         continue-on-error: true
@@ -157,15 +146,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: app-goldens-for-commit
+      - name: Flutter SDK
+        run: |
+          dir="$HOME/flutter-$FLUTTER_VERSION"
+          test -x "$dir/bin/flutter"
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          echo "PUB_CACHE=$HOME/.pub-cache" >> "$GITHUB_ENV"
+      - name: Render golden pictures
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter test --update-goldens
       - name: Commit golden pictures
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          rm -rf app/test/screens/goldens
-          tar -xf app-goldens-for-commit.tar -C app/test/screens
           git config user.name "BubblePlay CI"
           git config user.email "ci@users.noreply.github.com"
           git add app/test/screens/goldens
