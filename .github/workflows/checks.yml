@@ -191,7 +191,7 @@ jobs:
     runs-on: windows-latest
     # GitHub-hosted Windows minutes are billed: run on PRs, master and manual runs only, not on lane pushes.
     if: github.event_name != 'push' || github.ref == 'refs/heads/master'
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       # Read by the nvidia-video-codec-sdk build script. Set for every step, because
       # clippy and fmt run cargo from the repo root, which skips host/.cargo/config.toml.
@@ -244,6 +244,37 @@ jobs:
         run: cargo clippy --locked --offline --manifest-path host/Cargo.toml --all-targets -- -D warnings
       - name: Rustfmt
         run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
+      - name: Release binaries
+        # The shipped exes come from this build (host/scripts/update-tray.ps1 runs the same command).
+        # Run from host/ so host/.cargo/config.toml applies.
+        working-directory: host
+        run: cargo build --locked --offline --release --bins
+      - name: Shipped binaries import no VC runtime DLLs
+        # Every .exe and .dll at the top of host/target/release is shipped or would be: the four
+        # packaged exes (tools/package-release.ps1) plus any new bin. None may import the
+        # Visual C++ runtime, so the package runs on a machine without the Redistributable.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw 'No Visual Studio with C++ tools found.' }
+          $msvc = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $dumpbin = Join-Path $msvc.FullName 'bin\Hostx64\x64\dumpbin.exe'
+          $release = Join-Path $PWD 'host/target/release'
+          $shipped = @(Get-ChildItem -LiteralPath $release -File | Where-Object { $_.Extension -in '.exe', '.dll' })
+          foreach ($required in 'bubbleplay-host.exe', 'bubbleplay_tray.exe', 'bubbleplay_admin_agent.exe', 'bubbleplay_secure_helper.exe') {
+            if ($shipped.Name -notcontains $required) { throw "Shipped binary was not built: $required" }
+          }
+          $bad = @()
+          foreach ($file in $shipped) {
+            $dump = & $dumpbin /dependents $file.FullName
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $($file.Name)" }
+            $imports = @($dump | Where-Object { $_ -match '^\s+\S+\.dll$' } | ForEach-Object { $_.Trim() })
+            Write-Output "$($file.Name): $($imports -join ', ')"
+            $bad += @($imports | Where-Object { $_ -match '^(VCRUNTIME140|MSVCP140)[^\\/]*\.dll$' } | ForEach-Object { "$($file.Name) -> $_" })
+          }
+          if ($bad) { throw "VC runtime imports found (link the CRT statically):`n$($bad -join "`n")" }
 
   client-win:
     name: Windows client checks (windows-latest)
