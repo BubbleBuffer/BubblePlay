@@ -375,19 +375,43 @@ function Update-HostConfig {
 }
 
 # --- Stop the running tray ---------------------------------------------------------
+function Test-InstalledTrayPath([string]$Path) {
+    if (-not $Path) { return $false }
+    foreach ($root in @($MachineDir, $LegacyUserDir)) {
+        if ([string]::Equals($Path, (Join-Path $root 'bubbleplay_tray.exe'), [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
 function Stop-RunningTray {
     $roots = @(($MachineDir.TrimEnd('\') + '\'), ($LegacyUserDir.TrimEnd('\') + '\'))
     $running = @(Get-Process bubbleplay_tray -ErrorAction SilentlyContinue |
-        Where-Object { $path = $_.Path; $path -and @($roots | Where-Object { $path.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count })
+        Where-Object { Test-InstalledTrayPath $_.Path })
     if ($running.Count -eq 0) { Add-Step 'stop-tray' 'skipped' 'Tray is not running.'; return }
     if (-not $PSCmdlet.ShouldProcess('bubbleplay_tray', 'Quit running tray (its host and admin agent exit with it)')) {
         Add-Step 'stop-tray' 'planned' "Quit $($running.Count) running tray process(es); the host and admin agent exit with the tray."
         return
     }
-    $quitter = if (Test-Path -LiteralPath $TrayExe) { $TrayExe } else { $running[0].Path }
-    if ($quitter) { Start-Process -FilePath $quitter -ArgumentList '--quit' -Wait -WindowStyle Hidden }
-    Start-Sleep -Milliseconds 500
-    $running | Stop-Process -Force -ErrorAction SilentlyContinue
+    $quit = $null
+    $processIds = @($running | ForEach-Object { $_.Id })
+    try {
+        $quit = Start-Process -FilePath $running[0].Path -ArgumentList '--quit' -PassThru -WindowStyle Hidden
+        $processIds += $quit.Id
+        if (-not $quit.WaitForExit(10000)) { Add-Step 'stop-tray' 'warning' 'Tray quit request timed out after 10 seconds; stopping only matching installed tray processes.' }
+        else {
+            # The normal tray polls its quit event once per second. Allow a full
+            # tick after the sender exits before falling back to forced stop.
+            Start-Sleep -Milliseconds 1500
+        }
+    }
+    catch { Add-Step 'stop-tray' 'warning' "Tray quit request failed; stopping only matching installed tray processes: $($_.Exception.Message)" }
+    finally { if ($quit) { $quit.Dispose() } }
+    foreach ($processId in @($processIds | Sort-Object -Unique)) {
+        # Revalidate the current image before stopping a PID from the earlier
+        # snapshot (or the quitter). Unrelated tray copies are never stopped.
+        $current = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if ($current -and (Test-InstalledTrayPath $current.Path)) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
+    }
     Get-Process bubbleplay-host, bubbleplay_app, bubbleplay_admin_agent -ErrorAction SilentlyContinue |
         Where-Object { $path = $_.Path; $path -and @($roots | Where-Object { $path.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count } |
         Stop-Process -Force -ErrorAction SilentlyContinue
@@ -892,10 +916,20 @@ function Test-SystemHelperTaskCurrent([string]$Name, [string]$Arguments) {
     catch { return $false }
 }
 
+function Test-AccountMatchesSid([string]$Account, [string]$ExpectedSid) {
+    if ([string]::IsNullOrWhiteSpace($Account)) { return $false }
+    try {
+        try { $sid = [Security.Principal.SecurityIdentifier]::new($Account) }
+        catch { $sid = [Security.Principal.NTAccount]::new($Account).Translate([Security.Principal.SecurityIdentifier]) }
+        return $sid.Value -eq ([Security.Principal.SecurityIdentifier]::new($ExpectedSid)).Value
+    }
+    catch { return $false }
+}
+
 function Test-AgentTaskCurrent {
     try {
         $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $AgentTaskName -ErrorAction Stop
-        if ($task.Principal.UserId -notin @($UserName, $UserSid) -or $task.Principal.RunLevel -ne 'Highest' -or
+        if (-not (Test-AccountMatchesSid $task.Principal.UserId $UserSid) -or $task.Principal.RunLevel -ne 'Highest' -or
             $task.Principal.LogonType -ne 'Interactive' -or $task.Actions.Count -ne 1 -or $task.Triggers -or
             -not (Test-SamePath $task.Actions[0].Execute $AgentExe) -or
             -not (Test-SamePath $task.Actions[0].WorkingDirectory $AgentDir) -or $task.Actions[0].Arguments) { return $false }

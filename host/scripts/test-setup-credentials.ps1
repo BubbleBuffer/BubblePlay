@@ -237,3 +237,91 @@ finally {
     if (Test-Path -LiteralPath $fixture) { Remove-SafeTree $fixture }
 }
 Write-Output 'Receipt junction and fresh/update autostart checks passed using synthetic files and registry state.'
+
+foreach ($name in @('Test-AccountMatchesSid', 'Test-InstalledTrayPath', 'Stop-RunningTray')) {
+    $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+    if (-not $node) { throw "Missing tested function $name." }
+    Invoke-Expression $node.Extent.Text
+}
+# A well-known local group supplies localized qualified/bare account spellings
+# without creating an account or accessing a live scheduled task.
+$testSid = 'S-1-5-32-544'
+$testAccount = ([Security.Principal.SecurityIdentifier]::new($testSid)).Translate([Security.Principal.NTAccount]).Value
+$testBareAccount = ($testAccount -split '\\')[-1]
+foreach ($account in @($testSid, $testAccount, $testBareAccount)) {
+    if (-not (Test-AccountMatchesSid $account $testSid)) { throw "Equivalent task account spelling was rejected: $account" }
+    if (Test-AccountMatchesSid $account 'S-1-5-18') { throw 'Task identity must compare SIDs, not just accept a resolvable name.' }
+}
+$missingAccount = [Environment]::MachineName + '\__bp_missing_' + [Guid]::NewGuid().ToString('N').Substring(0, 6)
+foreach ($account in @('', 'S-not-a-sid', $missingAccount)) {
+    if (Test-AccountMatchesSid $account $testSid) { throw 'Empty/invalid/unresolvable task identities must be rejected.' }
+}
+
+# Synthetic processes cover an old installed --quit that never returns. Every
+# process API is mocked; no executable is launched, slept on or stopped.
+$MachineDir = Join-Path $tempRoot 'synthetic-machine-install'
+$LegacyUserDir = Join-Path $tempRoot 'synthetic-legacy-install'
+$TrayExe = Join-Path $MachineDir 'bubbleplay_tray.exe'
+$fakeTrays = @(
+    [pscustomobject]@{ Id = 101; Path = $TrayExe },
+    [pscustomobject]@{ Id = 102; Path = (Join-Path $LegacyUserDir 'bubbleplay_tray.exe') },
+    [pscustomobject]@{ Id = 103; Path = (Join-Path $MachineDir 'nested\bubbleplay_tray.exe') },
+    [pscustomobject]@{ Id = 104; Path = (Join-Path ($MachineDir + '-other') 'bubbleplay_tray.exe') },
+    [pscustomobject]@{ Id = 105; Path = (Join-Path $tempRoot 'unrelated\bubbleplay_tray.exe') },
+    [pscustomobject]@{ Id = 106; Path = $null }
+)
+$fakeQuitter = [pscustomobject]@{ Id = 107; Path = $TrayExe }
+$fakeQuitter | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+    param([int]$Milliseconds)
+    $script:quitWaitMilliseconds = $Milliseconds
+    return $script:quitCompletes
+}
+$fakeQuitter | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $script:quitDisposed = $true }
+$fakeProcesses = @{}
+foreach ($process in @($fakeTrays) + @($fakeQuitter)) { $fakeProcesses[[int]$process.Id] = $process }
+$stoppedIds = [Collections.Generic.List[int]]::new()
+$sleepMilliseconds = [Collections.Generic.List[int]]::new()
+function Get-Process {
+    param([string[]]$Name, [int]$Id, $ErrorAction)
+    if ($PSBoundParameters.ContainsKey('Id')) {
+        if ($script:swapTrayPid -and $Id -eq 101) { return [pscustomobject]@{ Id = 101; Path = (Join-Path $tempRoot 'unrelated\replacement.exe') } }
+        if ($script:fakeProcesses.ContainsKey($Id)) { return $script:fakeProcesses[$Id] }
+        return
+    }
+    if ($Name -contains 'bubbleplay_tray') { return $script:fakeTrays }
+    # No adjacent host/app/agent processes in this fixture.
+}
+function Start-Process {
+    param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $WindowStyle)
+    if ($Wait -or -not $PassThru -or -not (Test-InstalledTrayPath $FilePath) -or $ArgumentList -ne '--quit') { throw 'Quit launch must use a verified install image and a bounded process wait.' }
+    return $script:fakeQuitter
+}
+function Stop-Process {
+    [CmdletBinding()]
+    param([int[]]$Id, [Parameter(ValueFromPipeline = $true)]$InputObject, [switch]$Force)
+    process {
+        if ($InputObject) { throw 'Tray shutdown must stop explicit verified PIDs; adjacent process fixture is empty.' }
+        foreach ($processId in @($Id)) { if ($processId -gt 0) { $script:stoppedIds.Add($processId) } }
+    }
+}
+function Start-Sleep { param($Milliseconds) $script:sleepMilliseconds.Add([int]$Milliseconds) }
+function Invoke-TrayStop {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+    Stop-RunningTray
+}
+foreach ($quitCompletes in @($false, $true)) {
+    foreach ($swapTrayPid in @($false, $true)) {
+        $stoppedIds.Clear(); $stepDetails.Clear(); $sleepMilliseconds.Clear()
+        $quitWaitMilliseconds = 0; $quitDisposed = $false
+        Invoke-TrayStop -Confirm:$false
+        if ($quitWaitMilliseconds -ne 10000 -or -not $quitDisposed) { throw 'Installed --quit must have a ten-second bound and release its process handle.' }
+        $expected = if ($swapTrayPid) { '102,107' } else { '101,102,107' }
+        if ((@($stoppedIds | Sort-Object) -join ',') -ne $expected) { throw 'Tray shutdown stopped an unrelated, nested or replaced process image.' }
+        $expectedTimeouts = if ($quitCompletes) { 0 } else { 1 }
+        if (@($stepDetails | Where-Object { $_ -like 'stop-tray warning *timed out*' }).Count -ne $expectedTimeouts) { throw 'Only quit timeouts must record the timeout fallback.' }
+        $expectedSleep = if ($quitCompletes) { '1500' } else { '' }
+        if (($sleepMilliseconds -join ',') -ne $expectedSleep) { throw 'Completed quit requests need one bounded poll grace; timed-out requests need no extra delay.' }
+    }
+}
+Write-Output 'Task SID normalization and bounded, path-verified tray shutdown checks passed without live tasks or processes.'
